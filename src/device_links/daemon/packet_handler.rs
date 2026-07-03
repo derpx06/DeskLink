@@ -26,6 +26,13 @@ use crate::device_links::packet::{
 };
 use crate::device_links::pairing::PairState;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerMotion {
+    None,
+    Relative { dx: i32, dy: i32 },
+    Absolute { x: i32, y: i32 },
+}
+
 fn is_desktop_locked() -> bool {
     let Some(session_id) = std::env::var("XDG_SESSION_ID")
         .ok()
@@ -172,13 +179,26 @@ pub(super) fn packet_read_loop(
                     let scroll = packet.get_bool("scroll").unwrap_or(false);
                     let key = packet.get_str("key");
                     let special_key = packet.get_i64("specialKey").unwrap_or(0);
+                    let pointer_motion = mousepad_pointer_motion(&packet);
 
                     eprintln!(
-                        "[Daemon] Received remote input request: dx={:?}, dy={:?}, x={:?}, y={:?}, scroll={:?}, key={:?}, specialKey={:?}",
-                        dx, dy, x, y, scroll, key, special_key
+                        "[Daemon] Received remote input request: dx={:?}, dy={:?}, x={:?}, y={:?}, pointer={:?}, scroll={:?}, key={:?}, specialKey={:?}",
+                        dx, dy, x, y, pointer_motion, scroll, key, special_key
                     );
 
                     if let Some(ref mut enigo) = enigo_opt {
+                        let has_discrete_action = singleclick
+                            || doubleclick
+                            || middleclick
+                            || rightclick
+                            || singlehold
+                            || singlerelease
+                            || key.is_some()
+                            || special_key > 0;
+                        if !scroll && has_discrete_action {
+                            apply_pointer_motion(enigo, pointer_motion);
+                        }
+
                         if scroll {
                             if dy != 0.0 {
                                 let _ = enigo.scroll(dy as i32, Axis::Vertical);
@@ -267,8 +287,8 @@ pub(super) fn packet_read_loop(
                             if super_key {
                                 let _ = enigo.key(enigo::Key::Meta, Direction::Release);
                             }
-                        } else if dx != 0.0 || dy != 0.0 {
-                            let _ = enigo.move_mouse(dx as i32, dy as i32, Coordinate::Rel);
+                        } else {
+                            apply_pointer_motion(enigo, pointer_motion);
                         }
                     }
                 } else if packet.packet_type == PACKET_TYPE_CLIPBOARD
@@ -462,5 +482,89 @@ fn send_packet_reply(stream: &Arc<Mutex<SslStream<TcpStream>>>, packet: &Network
             let _ = locked_stream.write_all(&line);
             let _ = locked_stream.flush();
         }
+    }
+}
+
+fn mousepad_pointer_motion(packet: &NetworkPacket) -> PointerMotion {
+    if packet.body.contains_key("x") && packet.body.contains_key("y") {
+        let x = packet.body.get("x").and_then(value_as_i32).unwrap_or(0);
+        let y = packet.body.get("y").and_then(value_as_i32).unwrap_or(0);
+        return PointerMotion::Absolute { x, y };
+    }
+
+    let dx = packet.body.get("dx").and_then(value_as_i32).unwrap_or(0);
+    let dy = packet.body.get("dy").and_then(value_as_i32).unwrap_or(0);
+    if dx != 0 || dy != 0 {
+        PointerMotion::Relative { dx, dy }
+    } else {
+        PointerMotion::None
+    }
+}
+
+fn value_as_i32(value: &serde_json::Value) -> Option<i32> {
+    let number = value
+        .as_i64()
+        .map(|value| value as f64)
+        .or_else(|| value.as_f64())?;
+    if number.is_finite() && number >= i32::MIN as f64 && number <= i32::MAX as f64 {
+        Some(number.round() as i32)
+    } else {
+        None
+    }
+}
+
+fn apply_pointer_motion(enigo: &mut Enigo, motion: PointerMotion) {
+    match motion {
+        PointerMotion::None => {}
+        PointerMotion::Relative { dx, dy } => {
+            let _ = enigo.move_mouse(dx, dy, Coordinate::Rel);
+        }
+        PointerMotion::Absolute { x, y } => {
+            let _ = enigo.move_mouse(x, y, Coordinate::Abs);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn mousepad_absolute_coordinates_are_detected_even_at_zero() {
+        let mut packet = NetworkPacket::new(PACKET_TYPE_MOUSEPAD_REQUEST);
+        packet.body.insert("x".to_string(), Value::from(0));
+        packet.body.insert("y".to_string(), Value::from(0));
+
+        assert_eq!(
+            mousepad_pointer_motion(&packet),
+            PointerMotion::Absolute { x: 0, y: 0 }
+        );
+    }
+
+    #[test]
+    fn mousepad_absolute_coordinates_take_precedence_over_relative_delta() {
+        let mut packet = NetworkPacket::new(PACKET_TYPE_MOUSEPAD_REQUEST);
+        packet.body.insert("x".to_string(), Value::from(100));
+        packet.body.insert("y".to_string(), Value::from(200));
+        packet.body.insert("dx".to_string(), Value::from(5.0));
+        packet.body.insert("dy".to_string(), Value::from(6.0));
+
+        assert_eq!(
+            mousepad_pointer_motion(&packet),
+            PointerMotion::Absolute { x: 100, y: 200 }
+        );
+    }
+
+    #[test]
+    fn mousepad_relative_motion_rounds_delta_for_enigo() {
+        let mut packet = NetworkPacket::new(PACKET_TYPE_MOUSEPAD_REQUEST);
+        packet.body.insert("dx".to_string(), Value::from(4.8));
+        packet.body.insert("dy".to_string(), Value::from(-2.2));
+
+        assert_eq!(
+            mousepad_pointer_motion(&packet),
+            PointerMotion::Relative { dx: 5, dy: -2 }
+        );
     }
 }
