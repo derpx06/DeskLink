@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>derx06.desklink.com</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>DeskLink</name>
+  <summary>Connect GNOME with your phone</summary>
+  <description>
+    <p>
+      DeskLink is a GNOME client for the KDE Connect LAN protocol. It can pair
+      with compatible devices, share files and text, synchronize the clipboard,
+      send remote input, mirror phone notifications, show battery and media
+      status, request lock state changes, ring a paired phone, and send media,
+      volume, file browsing, and remote command requests.
+    </p>
+    <p>
+      This is a focused GNOME client and does not implement every upstream KDE
+      Connect desktop plugin.
+    </p>
+  </description>
+
+  <developer id="com.desklink">
+    <name>manas</name>
+  </developer>
+
+  <translation type="gettext">desklink</translation>
+  <launchable type="desktop-id">derx06.desklink.com.desktop</launchable>
+  <content_rating type="oars-1.1" />
+
+  <branding>
+    <color type="primary" scheme_preference="light">#3584e4</color>
+    <color type="primary" scheme_preference="dark">#62a0ea</color>
+  </branding>
+
+  <releases>
+    <release version="0.1.0" date="2026-07-02">
+      <description translate="no">
+        <p>GNOME client for core KDE Connect LAN protocol features.</p>
+        <ul>
+          <li>Pair and manage nearby devices.</li>
+          <li>Share files, text, URLs, clipboard content, notifications, and remote input.</li>
+          <li>Handle battery, media, volume, remote command, and SFTP browsing packets.</li>
+        </ul>
+      </description>
+    </release>
+  </releases>
+
+</component>

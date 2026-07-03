@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+  <requires lib="Adw" version="1.0"/>
+  <template class="DesklinkWindow" parent="AdwApplicationWindow">
+    <property name="title" translatable="yes">DeskLink</property>
+    <property name="default-width">860</property>
+    <property name="default-height">620</property>
+    <property name="content">
+      <object class="AdwToolbarView">
+        <child type="top">
+          <object class="AdwHeaderBar">
+            <property name="title-widget">
+              <object class="AdwWindowTitle">
+                <property name="title" translatable="yes">DeskLink</property>
+              </object>
+            </property>
+            <child type="end">
+              <object class="GtkButton" id="add_device_button">
+                <property name="icon-name">list-add-symbolic</property>
+                <property name="tooltip-text" translatable="yes">Discover &amp; Add Device</property>
+                <style>
+                  <class name="suggested-action"/>
+                </style>
+              </object>
+            </child>
+            <child type="end">
+              <object class="GtkMenuButton">
+                <property name="primary">True</property>
+                <property name="icon-name">open-menu-symbolic</property>
+                <property name="tooltip-text" translatable="yes">Main Menu</property>
+                <property name="menu-model">primary_menu</property>
+              </object>
+            </child>
+          </object>
+        </child>
+        <property name="content">
+          <object class="GtkBox">
+            <property name="orientation">vertical</property>
+            <property name="spacing">0</property>
+            <!-- Error banner spans full width above content -->
+            <child>
+              <object class="AdwBanner" id="error_banner">
+                <property name="revealed">False</property>
+              </object>
+            </child>
+            <child>
+              <object class="GtkBox">
+                <property name="orientation">vertical</property>
+                <property name="spacing">20</property>
+                <property name="margin-start">40</property>
+                <property name="margin-end">40</property>
+                <property name="margin-top">32</property>
+                <property name="margin-bottom">40</property>
+                <!-- Page header row -->
+                <child>
+                  <object class="GtkBox">
+                    <property name="orientation">horizontal</property>
+                    <property name="spacing">0</property>
+                    <property name="valign">center</property>
+                    <child>
+                      <object class="GtkBox">
+                        <property name="orientation">vertical</property>
+                        <property name="spacing">4</property>
+                        <property name="hexpand">True</property>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="label" translatable="yes">My Devices</property>
+                            <property name="xalign">0</property>
+                            <style>
+                              <class name="title-1"/>
+                            </style>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkBox">
+                            <property name="orientation">horizontal</property>
+                            <property name="spacing">6</property>
+                            <child>
+                              <object class="GtkLabel" id="nearby_count_label">
+                                <property name="label" translatable="yes">No devices yet</property>
+                                <property name="xalign">0</property>
+                                <style>
+                                  <class name="caption"/>
+                                  <class name="accent"/>
+                                </style>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkLabel" id="device_status_label">
+                                <property name="label" translatable="yes">· Pair a device to get started</property>
+                                <property name="xalign">0</property>
+                                <style>
+                                  <class name="caption"/>
+                                  <class name="dim-label"/>
+                                </style>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
+                    <!-- Discover button in header row -->
+                    <child>
+                      <object class="GtkButton" id="discover_button">
+                        <property name="label" translatable="yes">Discover</property>
+                        <property name="icon-name">find-location-symbolic</property>
+                        <property name="valign">center</property>
+                        <property name="tooltip-text" translatable="yes">Search for nearby devices</property>
+                      </object>
+                    </child>
+                  </object>
+                </child>
+                <!-- Device list -->
+                <child>
+                  <object class="GtkScrolledWindow">
+                    <property name="vexpand">True</property>
+                    <property name="hscrollbar-policy">never</property>
+                    <property name="child">
+                      <object class="GtkListBox" id="devices_list">
+                        <property name="selection-mode">none</property>
+                        <style>
+                          <class name="boxed-list"/>
+                        </style>
+                      </object>
+                    </property>
+                  </object>
+                </child>
+              </object>
+            </child>
+          </object>
+        </property>
+      </object>
+    </property>
+  </template>
+  <menu id="primary_menu">
+    <section>
+      <item>
+        <attribute name="label" translatable="yes">_Preferences</attribute>
+        <attribute name="action">app.preferences</attribute>
+      </item>
+      <item>
+        <attribute name="label" translatable="yes">_Keyboard Shortcuts</attribute>
+        <attribute name="action">app.shortcuts</attribute>
+      </item>
+      <item>
+        <attribute name="label" translatable="yes">_About DeskLink</attribute>
+        <attribute name="action">app.about</attribute>
+      </item>
+    </section>
+  </menu>
+</interface>

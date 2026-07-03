@@ -1,0 +1,6 @@
+# List of source files containing translatable strings.
+# Please keep this file sorted alphabetically.
+data/derx06.desklink.com.desktop.in
+data/derx06.desklink.com.metainfo.xml.in
+data/derx06.desklink.com.gschema.xml
+src/window.ui
