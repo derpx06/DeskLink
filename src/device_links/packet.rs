@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub const PROTOCOL_VERSION: i64 = 8;
@@ -26,6 +27,116 @@ pub const PACKET_TYPE_RUNCOMMAND: &str = "kdeconnect.runcommand";
 pub const PACKET_TYPE_RUNCOMMAND_REQUEST: &str = "kdeconnect.runcommand.request";
 pub const PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE: &str = "kdeconnect.mousepad.keyboardstate";
 pub const PACKET_TYPE_SHARE_REQUEST_UPDATE: &str = "kdeconnect.share.request.update";
+pub const PACKET_TYPE_SCREEN_REQUEST: &str = "desklink.screen.request";
+pub const PACKET_TYPE_SCREEN_READY: &str = "desklink.screen.ready";
+pub const PACKET_TYPE_SCREEN_FRAME: &str = "desklink.screen.frame";
+pub const PACKET_TYPE_SCREEN_STOP: &str = "desklink.screen.stop";
+pub const PACKET_TYPE_SCREEN_ERROR: &str = "desklink.screen.error";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreenFrameFormat {
+    Jpeg,
+    Webp,
+    Png,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScreenFrameHeader {
+    pub stream_id: String,
+    pub sequence: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: ScreenFrameFormat,
+    pub timestamp_millis: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedScreenFrame {
+    pub header: ScreenFrameHeader,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScreenFrameCodecError {
+    Truncated,
+    InvalidHeader,
+    InvalidLength,
+}
+
+impl std::fmt::Display for ScreenFrameCodecError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Truncated => write!(formatter, "screen frame message is truncated"),
+            Self::InvalidHeader => write!(formatter, "screen frame header is invalid"),
+            Self::InvalidLength => write!(formatter, "screen frame length exceeds supported range"),
+        }
+    }
+}
+
+impl std::error::Error for ScreenFrameCodecError {}
+
+pub fn encode_screen_frame(
+    header: &ScreenFrameHeader,
+    payload: &[u8],
+) -> Result<Vec<u8>, ScreenFrameCodecError> {
+    let header_bytes =
+        serde_json::to_vec(header).map_err(|_| ScreenFrameCodecError::InvalidHeader)?;
+    let header_len =
+        u32::try_from(header_bytes.len()).map_err(|_| ScreenFrameCodecError::InvalidLength)?;
+    let payload_len =
+        u32::try_from(payload.len()).map_err(|_| ScreenFrameCodecError::InvalidLength)?;
+
+    let mut encoded = Vec::with_capacity(8 + header_bytes.len() + payload.len());
+    encoded.extend_from_slice(&header_len.to_be_bytes());
+    encoded.extend_from_slice(&header_bytes);
+    encoded.extend_from_slice(&payload_len.to_be_bytes());
+    encoded.extend_from_slice(payload);
+    Ok(encoded)
+}
+
+pub fn decode_screen_frame(input: &[u8]) -> Result<DecodedScreenFrame, ScreenFrameCodecError> {
+    let mut offset = 0;
+    let header_len = read_u32(input, &mut offset)? as usize;
+    let header_end = offset
+        .checked_add(header_len)
+        .ok_or(ScreenFrameCodecError::InvalidLength)?;
+    if input.len() < header_end {
+        return Err(ScreenFrameCodecError::Truncated);
+    }
+
+    let header = serde_json::from_slice(&input[offset..header_end])
+        .map_err(|_| ScreenFrameCodecError::InvalidHeader)?;
+    offset = header_end;
+
+    let payload_len = read_u32(input, &mut offset)? as usize;
+    let payload_end = offset
+        .checked_add(payload_len)
+        .ok_or(ScreenFrameCodecError::InvalidLength)?;
+    if input.len() < payload_end {
+        return Err(ScreenFrameCodecError::Truncated);
+    }
+
+    Ok(DecodedScreenFrame {
+        header,
+        payload: input[offset..payload_end].to_vec(),
+    })
+}
+
+fn read_u32(input: &[u8], offset: &mut usize) -> Result<u32, ScreenFrameCodecError> {
+    let end = offset
+        .checked_add(4)
+        .ok_or(ScreenFrameCodecError::InvalidLength)?;
+    if input.len() < end {
+        return Err(ScreenFrameCodecError::Truncated);
+    }
+    let bytes = input[*offset..end]
+        .try_into()
+        .map_err(|_| ScreenFrameCodecError::Truncated)?;
+    *offset = end;
+    Ok(u32::from_be_bytes(bytes))
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NetworkPacket {
@@ -135,5 +246,39 @@ mod tests {
         let parsed = NetworkPacket::deserialize(&line).unwrap();
         assert_eq!(parsed.packet_type, PACKET_TYPE_PING);
         assert_eq!(parsed.get_str("message"), Some("hello"));
+    }
+
+    #[test]
+    fn desklink_screen_packet_constants_use_desklink_namespace() {
+        assert_eq!(PACKET_TYPE_SCREEN_REQUEST, "desklink.screen.request");
+        assert_eq!(PACKET_TYPE_SCREEN_READY, "desklink.screen.ready");
+        assert_eq!(PACKET_TYPE_SCREEN_FRAME, "desklink.screen.frame");
+        assert_eq!(PACKET_TYPE_SCREEN_STOP, "desklink.screen.stop");
+        assert_eq!(PACKET_TYPE_SCREEN_ERROR, "desklink.screen.error");
+    }
+
+    #[test]
+    fn screen_frame_codec_round_trips_header_and_payload() {
+        let header = ScreenFrameHeader {
+            stream_id: "desktop".to_string(),
+            sequence: 7,
+            width: 1280,
+            height: 720,
+            format: ScreenFrameFormat::Jpeg,
+            timestamp_millis: 1_234_567,
+        };
+        let encoded = encode_screen_frame(&header, b"frame-bytes").unwrap();
+
+        let decoded = decode_screen_frame(&encoded).unwrap();
+
+        assert_eq!(decoded.header, header);
+        assert_eq!(decoded.payload, b"frame-bytes");
+    }
+
+    #[test]
+    fn screen_frame_codec_rejects_truncated_messages() {
+        let error = decode_screen_frame(&[0, 0, 0, 20, b'{']).unwrap_err();
+
+        assert!(matches!(error, ScreenFrameCodecError::Truncated));
     }
 }

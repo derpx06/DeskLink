@@ -7,9 +7,10 @@ use super::packet::{
     PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS,
     PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_ACTION,
     PACKET_TYPE_NOTIFICATION_REPLY, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING,
-    PACKET_TYPE_RUNCOMMAND, PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP,
-    PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SHARE_REQUEST_UPDATE,
-    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
+    PACKET_TYPE_RUNCOMMAND, PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SCREEN_ERROR,
+    PACKET_TYPE_SCREEN_FRAME, PACKET_TYPE_SCREEN_READY, PACKET_TYPE_SCREEN_REQUEST,
+    PACKET_TYPE_SCREEN_STOP, PACKET_TYPE_SFTP, PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST,
+    PACKET_TYPE_SHARE_REQUEST_UPDATE, PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,11 @@ impl DeviceInfo {
                 PACKET_TYPE_FINDMYPHONE_REQUEST.to_string(),
                 PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE.to_string(),
                 PACKET_TYPE_SHARE_REQUEST_UPDATE.to_string(),
+                PACKET_TYPE_SCREEN_REQUEST.to_string(),
+                PACKET_TYPE_SCREEN_READY.to_string(),
+                PACKET_TYPE_SCREEN_FRAME.to_string(),
+                PACKET_TYPE_SCREEN_STOP.to_string(),
+                PACKET_TYPE_SCREEN_ERROR.to_string(),
             ],
             outgoing_capabilities: vec![
                 PACKET_TYPE_PING.to_string(),
@@ -77,6 +83,11 @@ impl DeviceInfo {
                 PACKET_TYPE_RUNCOMMAND_REQUEST.to_string(),
                 PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE.to_string(),
                 PACKET_TYPE_SHARE_REQUEST_UPDATE.to_string(),
+                PACKET_TYPE_SCREEN_REQUEST.to_string(),
+                PACKET_TYPE_SCREEN_READY.to_string(),
+                PACKET_TYPE_SCREEN_FRAME.to_string(),
+                PACKET_TYPE_SCREEN_STOP.to_string(),
+                PACKET_TYPE_SCREEN_ERROR.to_string(),
             ],
         }
     }
@@ -228,6 +239,32 @@ mod tests {
                     .outgoing_capabilities
                     .contains(&capability.to_string()),
                 "missing outgoing capability {capability}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_identity_advertises_desklink_screen_capabilities() {
+        let local = DeviceInfo::local("0123456789abcdef0123456789abcdef".into(), "DeskLink".into());
+
+        for capability in [
+            PACKET_TYPE_SCREEN_REQUEST,
+            PACKET_TYPE_SCREEN_READY,
+            PACKET_TYPE_SCREEN_FRAME,
+            PACKET_TYPE_SCREEN_STOP,
+            PACKET_TYPE_SCREEN_ERROR,
+        ] {
+            assert!(
+                local
+                    .incoming_capabilities
+                    .contains(&capability.to_string()),
+                "missing incoming screen capability {capability}"
+            );
+            assert!(
+                local
+                    .outgoing_capabilities
+                    .contains(&capability.to_string()),
+                "missing outgoing screen capability {capability}"
             );
         }
     }
