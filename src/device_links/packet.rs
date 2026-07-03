@@ -33,6 +33,7 @@ pub const PACKET_TYPE_SCREEN_FRAME: &str = "desklink.screen.frame";
 pub const PACKET_TYPE_SCREEN_STOP: &str = "desklink.screen.stop";
 pub const PACKET_TYPE_SCREEN_ERROR: &str = "desklink.screen.error";
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScreenFrameFormat {
@@ -41,6 +42,7 @@ pub enum ScreenFrameFormat {
     Png,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScreenFrameHeader {
@@ -52,12 +54,14 @@ pub struct ScreenFrameHeader {
     pub timestamp_millis: i64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedScreenFrame {
     pub header: ScreenFrameHeader,
     pub payload: Vec<u8>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScreenFrameCodecError {
     Truncated,
@@ -77,6 +81,7 @@ impl std::fmt::Display for ScreenFrameCodecError {
 
 impl std::error::Error for ScreenFrameCodecError {}
 
+#[allow(dead_code)]
 pub fn encode_screen_frame(
     header: &ScreenFrameHeader,
     payload: &[u8],
@@ -96,6 +101,7 @@ pub fn encode_screen_frame(
     Ok(encoded)
 }
 
+#[allow(dead_code)]
 pub fn decode_screen_frame(input: &[u8]) -> Result<DecodedScreenFrame, ScreenFrameCodecError> {
     let mut offset = 0;
     let header_len = read_u32(input, &mut offset)? as usize;
@@ -124,6 +130,7 @@ pub fn decode_screen_frame(input: &[u8]) -> Result<DecodedScreenFrame, ScreenFra
     })
 }
 
+#[allow(dead_code)]
 fn read_u32(input: &[u8], offset: &mut usize) -> Result<u32, ScreenFrameCodecError> {
     let end = offset
         .checked_add(4)

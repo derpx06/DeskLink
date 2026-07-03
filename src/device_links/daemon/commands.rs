@@ -6,8 +6,8 @@ use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK_REQUEST,
     PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION_ACTION,
     PACKET_TYPE_NOTIFICATION_REPLY, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING,
-    PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST,
-    PACKET_TYPE_SYSTEMVOLUME_REQUEST,
+    PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP,
+    PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
 };
 use crate::device_links::pairing::PairState;
 
@@ -20,6 +20,8 @@ pub enum DaemonCommand {
     Unpair(String),
     SendPing(String),
     SendMousepadRequest(String, serde_json::Map<String, serde_json::Value>),
+    SendScreenRequest(String, String),
+    SendScreenStop(String),
     SendFile(String, std::path::PathBuf),
     SendShareText(String, String),
     SendLockRequest(String, bool),
@@ -62,6 +64,8 @@ impl DaemonWorker {
             DaemonCommand::SendMousepadRequest(id, payload) => {
                 self.send_mousepad_request(&id, payload)
             }
+            DaemonCommand::SendScreenRequest(id, role) => self.send_screen_request(&id, &role),
+            DaemonCommand::SendScreenStop(id) => self.send_screen_stop(&id),
             DaemonCommand::SendFile(id, path) => self.send_file(&id, path),
             DaemonCommand::SendShareText(id, text) => self.send_share_text(&id, &text),
             DaemonCommand::SendLockRequest(id, lock) => self.send_lock_request(&id, lock),
@@ -174,6 +178,26 @@ impl DaemonWorker {
                 return Err("Device must be paired before sending remote control input".to_string());
             }
             let packet = NetworkPacket::with_body(PACKET_TYPE_MOUSEPAD_REQUEST, payload);
+            send_packet(&link.stream, &packet)
+        });
+    }
+
+    fn send_screen_request(&self, device_id: &str, role: &str) {
+        self.with_link(device_id, |link| {
+            if link.pairing.state != PairState::Paired {
+                return Err("Device must be paired before requesting screen sharing".to_string());
+            }
+            let packet = build_screen_request_packet(role);
+            send_packet(&link.stream, &packet)
+        });
+    }
+
+    fn send_screen_stop(&self, device_id: &str) {
+        self.with_link(device_id, |link| {
+            if link.pairing.state != PairState::Paired {
+                return Err("Device must be paired before stopping screen sharing".to_string());
+            }
+            let packet = build_screen_stop_packet();
             send_packet(&link.stream, &packet)
         });
     }
@@ -450,6 +474,19 @@ fn build_sftp_request_packet() -> NetworkPacket {
     packet
 }
 
+fn build_screen_request_packet(role: &str) -> NetworkPacket {
+    let mut packet = NetworkPacket::new(PACKET_TYPE_SCREEN_REQUEST);
+    packet.set("role", role);
+    packet.set("maxDimension", 1280);
+    packet.set("fps", 6);
+    packet.set("quality", 60);
+    packet
+}
+
+fn build_screen_stop_packet() -> NetworkPacket {
+    NetworkPacket::new(PACKET_TYPE_SCREEN_STOP)
+}
+
 fn build_notification_request_packet() -> NetworkPacket {
     let mut packet = NetworkPacket::new(PACKET_TYPE_NOTIFICATION_REQUEST);
     packet.set("request", true);
@@ -544,7 +581,8 @@ mod tests {
     use crate::device_links::packet::{
         PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_REPLY,
         PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_RUNCOMMAND_REQUEST,
-        PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
+        PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP, PACKET_TYPE_SHARE_REQUEST,
+        PACKET_TYPE_SYSTEMVOLUME_REQUEST,
     };
 
     #[test]
@@ -662,5 +700,23 @@ mod tests {
 
         assert_eq!(packet.packet_type, PACKET_TYPE_RUNCOMMAND_REQUEST);
         assert_eq!(packet.get_str("key"), Some("command-key"));
+    }
+
+    #[test]
+    fn screen_request_packet_asks_for_phone_screen_with_default_lan_quality() {
+        let packet = build_screen_request_packet("phone-screen");
+
+        assert_eq!(packet.packet_type, PACKET_TYPE_SCREEN_REQUEST);
+        assert_eq!(packet.get_str("role"), Some("phone-screen"));
+        assert_eq!(packet.get_i64("maxDimension"), Some(1280));
+        assert_eq!(packet.get_i64("fps"), Some(6));
+        assert_eq!(packet.get_i64("quality"), Some(60));
+    }
+
+    #[test]
+    fn screen_stop_packet_uses_screen_stop_type() {
+        let packet = build_screen_stop_packet();
+
+        assert_eq!(packet.packet_type, PACKET_TYPE_SCREEN_STOP);
     }
 }

@@ -179,7 +179,7 @@ impl DesklinkWindow {
                 &gtk::Image::builder()
                     .icon_name("network-wireless-symbolic")
                     .pixel_size(64)
-                    .css_classes(["dim-label"])
+                    .css_classes(["dimmed"])
                     .build(),
             );
             empty_card.append(
@@ -192,7 +192,7 @@ impl DesklinkWindow {
             empty_card.append(
                 &gtk::Label::builder()
                     .label("Make sure your phone is on the same Wi-Fi network, then tap Discover to find it.")
-                    .css_classes(["body", "dim-label"])
+                    .css_classes(["body", "dimmed"])
                     .halign(gtk::Align::Center)
                     .wrap(true)
                     .max_width_chars(48)
@@ -372,7 +372,7 @@ impl DesklinkWindow {
                 .label("Searching the local network for devices you can pair.")
                 .xalign(0.0)
                 .wrap(true)
-                .css_classes(["body", "dim-label"])
+                .css_classes(["body", "dimmed"])
                 .build(),
         );
 
@@ -521,7 +521,7 @@ fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget 
         &gtk::Label::builder()
             .label(format!("{} · {}", device.device_type, device.address))
             .xalign(0.0)
-            .css_classes(["caption", "dim-label"])
+            .css_classes(["caption", "dimmed"])
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build(),
     );
@@ -565,7 +565,7 @@ fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget 
         header_card.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         header_card.append(
             &gtk::Label::builder()
-                .label(format!("⚠  {error}"))
+                .label(format!("Warning: {error}"))
                 .xalign(0.0)
                 .wrap(true)
                 .margin_start(18)
@@ -652,7 +652,7 @@ fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget 
                 })
                 .xalign(0.0)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
-                .css_classes(["caption", "dim-label"])
+                .css_classes(["caption", "dimmed"])
                 .build(),
         );
         now_playing.append(&media_text);
@@ -998,7 +998,7 @@ fn show_share_text_dialog(daemon: DaemonHandle, device_id: String, parent: &gtk:
             .label("Send text or a URL to the paired device.")
             .xalign(0.0)
             .wrap(true)
-            .css_classes(["body", "dim-label"])
+            .css_classes(["body", "dimmed"])
             .build(),
     );
 
@@ -1097,7 +1097,7 @@ fn show_media_control_dialog(
             .label("Control the active media session on your paired device.")
             .xalign(0.0)
             .wrap(true)
-            .css_classes(["body", "dim-label"])
+            .css_classes(["body", "dimmed"])
             .build(),
     );
 
@@ -1245,7 +1245,7 @@ fn show_notifications_dialog(daemon: DaemonHandle, device: DeviceView, parent: &
                 .label("No mirrored notifications")
                 .margin_top(24)
                 .margin_bottom(24)
-                .css_classes(["dim-label"])
+                .css_classes(["dimmed"])
                 .build(),
         );
     } else {
@@ -1358,7 +1358,7 @@ fn show_volume_dialog(daemon: DaemonHandle, device: DeviceView, parent: &gtk::Wi
                 .label("No remote audio devices reported yet")
                 .margin_top(24)
                 .margin_bottom(24)
-                .css_classes(["dim-label"])
+                .css_classes(["dimmed"])
                 .build(),
         );
     } else {
@@ -1453,7 +1453,7 @@ fn show_remote_commands_dialog(daemon: DaemonHandle, device: DeviceView, parent:
                 .label("No remote commands reported yet")
                 .margin_top(24)
                 .margin_bottom(24)
-                .css_classes(["dim-label"])
+                .css_classes(["dimmed"])
                 .build(),
         );
     } else {
@@ -1542,7 +1542,7 @@ fn show_file_browsing_dialog(device: DeviceView, parent: &gtk::Window) {
                 .margin_bottom(24)
                 .margin_start(16)
                 .margin_end(16)
-                .css_classes(["dim-label"])
+                .css_classes(["dimmed"])
                 .build(),
         );
     }
@@ -1666,7 +1666,7 @@ fn unpaired_device_row(daemon: &DaemonHandle, device: DeviceView) -> adw::Action
         .icon_name(device_type_icon(&device.device_type))
         .pixel_size(32)
         .valign(gtk::Align::Center)
-        .css_classes(["dim-label"])
+        .css_classes(["dimmed"])
         .build();
     row.add_prefix(&icon);
 
@@ -1684,7 +1684,7 @@ fn unpaired_device_row(daemon: &DaemonHandle, device: DeviceView) -> adw::Action
                 &gtk::Label::builder()
                     .label("Waiting…")
                     .valign(gtk::Align::Center)
-                    .css_classes(["caption", "dim-label"])
+                    .css_classes(["caption", "dimmed"])
                     .build(),
             );
             row.add_suffix(
