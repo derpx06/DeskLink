@@ -5,7 +5,7 @@ use std::net::{Shutdown, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use super::network::read_ssl_packet;
+use super::network::{read_ssl_packet, send_packet};
 use super::packet_handler::packet_read_loop;
 use super::state::mark_status;
 use super::validation::{
@@ -14,6 +14,7 @@ use super::validation::{
 use crate::device_links::config::Config;
 use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::device_links::device_info::DeviceInfo;
+use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_NOTIFICATION_REQUEST};
 use crate::device_links::pairing::PairingHandler;
 
 pub(super) fn finish_secure_link(
@@ -108,7 +109,7 @@ pub(super) fn finish_secure_link(
         links.insert(
             secure_info.id.clone(),
             super::Link {
-                stream,
+                stream: Arc::clone(&stream),
                 certificate_pem: cert_pem,
                 local_public_der,
                 remote_public_der,
@@ -118,6 +119,17 @@ pub(super) fn finish_secure_link(
         );
     } else {
         return Err("Link lock poisoned".to_string());
+    }
+
+    if paired {
+        let mut request = NetworkPacket::new(PACKET_TYPE_NOTIFICATION_REQUEST);
+        request.set("request", true);
+        if let Err(error) = send_packet(&stream, &request) {
+            eprintln!(
+                "[Daemon] Failed to request current notifications from {}: {}",
+                secure_info.id, error
+            );
+        }
     }
 
     thread::spawn(move || {

@@ -10,6 +10,7 @@ use std::time::Duration;
 use super::clipboard::set_clipboard_text_from_remote;
 use super::file_transfer::receive_file_payload;
 use super::handshake::handle_disconnect;
+use super::screen_stream::start_desktop_screen_stream;
 use super::state::{
     remove_notification, update_battery_status, update_media_from_packet, update_pair_state,
     update_remote_commands, update_sftp_status, update_volume_status, upsert_notification,
@@ -21,10 +22,12 @@ use crate::device_links::packet::{
     PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST,
     PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS, PACKET_TYPE_NOTIFICATION,
     PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PAIR, PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND,
-    PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP, PACKET_TYPE_SHARE_REQUEST,
-    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
+    PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP,
+    PACKET_TYPE_SFTP, PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME,
+    PACKET_TYPE_SYSTEMVOLUME_REQUEST,
 };
 use crate::device_links::pairing::PairState;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PointerMotion {
@@ -59,6 +62,7 @@ pub(super) fn packet_read_loop(
     config: Arc<Mutex<Config>>,
 ) {
     let mut enigo_opt = Enigo::new(&Settings::default()).ok();
+    let mut desktop_screen_stream: Option<Arc<AtomicBool>> = None;
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
 
@@ -73,6 +77,7 @@ pub(super) fn packet_read_loop(
 
         match read_result {
             Ok(0) => {
+                stop_desktop_screen_stream(&mut desktop_screen_stream);
                 if handle_disconnect(&device_id, &stream, &devices, &links) {
                     eprintln!(
                         "[Daemon] Active link closed for {}. Marked unreachable.",
@@ -88,6 +93,7 @@ pub(super) fn packet_read_loop(
                         "[Daemon] Read line too long for {}. Disconnecting.",
                         device_id
                     );
+                    stop_desktop_screen_stream(&mut desktop_screen_stream);
                     handle_disconnect(&device_id, &stream, &devices, &links);
                     break;
                 }
@@ -147,6 +153,23 @@ pub(super) fn packet_read_loop(
                         device_id,
                         packet.get_str("message")
                     );
+                } else if packet.packet_type == PACKET_TYPE_SCREEN_REQUEST {
+                    if packet.get_str("role") == Some("desktop-screen") {
+                        if let Some(running) = desktop_screen_stream.take() {
+                            running.store(false, Ordering::Relaxed);
+                        }
+                        let fps = packet.get_i64("fps").unwrap_or(6);
+                        desktop_screen_stream = Some(start_desktop_screen_stream(
+                            device_id.clone(),
+                            Arc::clone(&stream),
+                            Arc::clone(&config),
+                            fps,
+                        ));
+                    }
+                } else if packet.packet_type == PACKET_TYPE_SCREEN_STOP {
+                    if let Some(running) = desktop_screen_stream.take() {
+                        running.store(false, Ordering::Relaxed);
+                    }
                 } else if packet.packet_type == PACKET_TYPE_BATTERY {
                     update_battery_status(&devices, &device_id, &packet);
                 } else if packet.packet_type == PACKET_TYPE_FINDMYPHONE_REQUEST {
@@ -201,24 +224,24 @@ pub(super) fn packet_read_loop(
 
                         if scroll {
                             if dy != 0.0 {
-                                let _ = enigo.scroll(dy as i32, Axis::Vertical);
+                                log_input_result("scroll vertical", enigo.scroll(dy as i32, Axis::Vertical));
                             }
                             if dx != 0.0 {
-                                let _ = enigo.scroll(dx as i32, Axis::Horizontal);
+                                log_input_result("scroll horizontal", enigo.scroll(dx as i32, Axis::Horizontal));
                             }
                         } else if singleclick {
-                            let _ = enigo.button(Button::Left, Direction::Click);
+                            log_input_result("left click", enigo.button(Button::Left, Direction::Click));
                         } else if doubleclick {
-                            let _ = enigo.button(Button::Left, Direction::Click);
-                            let _ = enigo.button(Button::Left, Direction::Click);
+                            log_input_result("double click 1", enigo.button(Button::Left, Direction::Click));
+                            log_input_result("double click 2", enigo.button(Button::Left, Direction::Click));
                         } else if middleclick {
-                            let _ = enigo.button(Button::Middle, Direction::Click);
+                            log_input_result("middle click", enigo.button(Button::Middle, Direction::Click));
                         } else if rightclick {
-                            let _ = enigo.button(Button::Right, Direction::Click);
+                            log_input_result("right click", enigo.button(Button::Right, Direction::Click));
                         } else if singlehold {
-                            let _ = enigo.button(Button::Left, Direction::Press);
+                            log_input_result("left press", enigo.button(Button::Left, Direction::Press));
                         } else if singlerelease {
-                            let _ = enigo.button(Button::Left, Direction::Release);
+                            log_input_result("left release", enigo.button(Button::Left, Direction::Release));
                         } else if key.is_some() || special_key > 0 {
                             let ctrl = packet.get_bool("ctrl").unwrap_or(false);
                             let alt = packet.get_bool("alt").unwrap_or(false);
@@ -226,16 +249,16 @@ pub(super) fn packet_read_loop(
                             let super_key = packet.get_bool("super").unwrap_or(false);
 
                             if ctrl {
-                                let _ = enigo.key(enigo::Key::Control, Direction::Press);
+                                log_input_result("control press", enigo.key(enigo::Key::Control, Direction::Press));
                             }
                             if alt {
-                                let _ = enigo.key(enigo::Key::Alt, Direction::Press);
+                                log_input_result("alt press", enigo.key(enigo::Key::Alt, Direction::Press));
                             }
                             if shift {
-                                let _ = enigo.key(enigo::Key::Shift, Direction::Press);
+                                log_input_result("shift press", enigo.key(enigo::Key::Shift, Direction::Press));
                             }
                             if super_key {
-                                let _ = enigo.key(enigo::Key::Meta, Direction::Press);
+                                log_input_result("meta press", enigo.key(enigo::Key::Meta, Direction::Press));
                             }
 
                             if special_key > 0 {
@@ -269,23 +292,23 @@ pub(super) fn packet_read_loop(
                                     _ => None,
                                 };
                                 if let Some(ek) = enigo_key {
-                                    let _ = enigo.key(ek, Direction::Click);
+                                    log_input_result("special key", enigo.key(ek, Direction::Click));
                                 }
                             } else if let Some(k) = key {
-                                let _ = enigo.text(k);
+                                log_input_result("text input", enigo.text(k));
                             }
 
                             if ctrl {
-                                let _ = enigo.key(enigo::Key::Control, Direction::Release);
+                                log_input_result("control release", enigo.key(enigo::Key::Control, Direction::Release));
                             }
                             if alt {
-                                let _ = enigo.key(enigo::Key::Alt, Direction::Release);
+                                log_input_result("alt release", enigo.key(enigo::Key::Alt, Direction::Release));
                             }
                             if shift {
-                                let _ = enigo.key(enigo::Key::Shift, Direction::Release);
+                                log_input_result("shift release", enigo.key(enigo::Key::Shift, Direction::Release));
                             }
                             if super_key {
-                                let _ = enigo.key(enigo::Key::Meta, Direction::Release);
+                                log_input_result("meta release", enigo.key(enigo::Key::Meta, Direction::Release));
                             }
                         } else {
                             apply_pointer_motion(enigo, pointer_motion);
@@ -464,6 +487,7 @@ pub(super) fn packet_read_loop(
                 thread::sleep(Duration::from_millis(20));
             }
             Err(error) => {
+                stop_desktop_screen_stream(&mut desktop_screen_stream);
                 if handle_disconnect(&device_id, &stream, &devices, &links) {
                     eprintln!(
                         "[Daemon] Read error for {}: {:?}. Marked unreachable.",
@@ -482,6 +506,18 @@ fn send_packet_reply(stream: &Arc<Mutex<SslStream<TcpStream>>>, packet: &Network
             let _ = locked_stream.write_all(&line);
             let _ = locked_stream.flush();
         }
+    }
+}
+
+fn stop_desktop_screen_stream(stream: &mut Option<Arc<AtomicBool>>) {
+    if let Some(running) = stream.take() {
+        running.store(false, Ordering::Relaxed);
+    }
+}
+
+fn log_input_result(action: &str, result: enigo::InputResult<()>) {
+    if let Err(error) = result {
+        eprintln!("[Daemon] Remote input failed during {action}: {error}");
     }
 }
 
@@ -517,10 +553,10 @@ fn apply_pointer_motion(enigo: &mut Enigo, motion: PointerMotion) {
     match motion {
         PointerMotion::None => {}
         PointerMotion::Relative { dx, dy } => {
-            let _ = enigo.move_mouse(dx, dy, Coordinate::Rel);
+            log_input_result("relative pointer move", enigo.move_mouse(dx, dy, Coordinate::Rel));
         }
         PointerMotion::Absolute { x, y } => {
-            let _ = enigo.move_mouse(x, y, Coordinate::Abs);
+            log_input_result("absolute pointer move", enigo.move_mouse(x, y, Coordinate::Abs));
         }
     }
 }

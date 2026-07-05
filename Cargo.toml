@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 arboard = "3.6.1"
 dirs = "6"
-enigo = "0.6.1"
+enigo = { version = "0.6.1", features = ["libei_smol", "wayland"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 gtk = { version = "0.9", package = "gtk4", features = ["gnome_47"] }
 hostname = "0.4"
