@@ -36,6 +36,49 @@ enum PointerMotion {
     Absolute { x: i32, y: i32 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacketAuthorization {
+    PairingAllowed,
+    PairedFeatureAllowed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacketAuthorizationError {
+    DeviceNotPaired,
+    PacketNotAllowedBeforePairing,
+    UnknownDevice,
+}
+
+/// Authorize packets before they reach any normal feature handler.
+///
+/// Pairing is the only pre-pairing allowlisted packet. Every ordinary feature
+/// packet requires the active link to be paired; an absent link is denied as
+/// an unknown device.
+fn authorize_incoming_packet(
+    pair_state: Option<PairState>,
+    packet: &NetworkPacket,
+) -> Result<PacketAuthorization, PacketAuthorizationError> {
+    let Some(pair_state) = pair_state else {
+        return Err(PacketAuthorizationError::UnknownDevice);
+    };
+
+    if packet.packet_type == PACKET_TYPE_PAIR {
+        return Ok(PacketAuthorization::PairingAllowed);
+    }
+
+    if pair_state == PairState::Paired {
+        return Ok(PacketAuthorization::PairedFeatureAllowed);
+    }
+
+    Err(match pair_state {
+        PairState::NotPaired => PacketAuthorizationError::DeviceNotPaired,
+        PairState::Requested | PairState::RequestedByPeer => {
+            PacketAuthorizationError::PacketNotAllowedBeforePairing
+        }
+        PairState::Paired => unreachable!("paired state was handled above"),
+    })
+}
+
 fn is_desktop_locked() -> bool {
     let Some(session_id) = std::env::var("XDG_SESSION_ID")
         .ok()
@@ -107,6 +150,20 @@ pub(super) fn packet_read_loop(
                     continue;
                 };
 
+                let pair_state = links
+                    .lock()
+                    .ok()
+                    .and_then(|links| links.get(&device_id).map(|link| link.pairing.state));
+                if let Err(error) = authorize_incoming_packet(pair_state, &packet) {
+                    eprintln!(
+                        "[Daemon] Rejected unauthorized packet: peer_id={} packet_type={} pair_state={:?} authorization_error={:?}",
+                        device_id, packet.packet_type, pair_state, error
+                    );
+                    continue;
+                }
+
+                // All non-pairing packets must pass the paired-device
+                // authorization gate before reaching feature handlers.
                 if packet.packet_type == PACKET_TYPE_PAIR {
                     eprintln!(
                         "[Daemon] Received pair packet from device {}: pair={:?}, timestamp={:?}",
@@ -224,24 +281,51 @@ pub(super) fn packet_read_loop(
 
                         if scroll {
                             if dy != 0.0 {
-                                log_input_result("scroll vertical", enigo.scroll(dy as i32, Axis::Vertical));
+                                log_input_result(
+                                    "scroll vertical",
+                                    enigo.scroll(dy as i32, Axis::Vertical),
+                                );
                             }
                             if dx != 0.0 {
-                                log_input_result("scroll horizontal", enigo.scroll(dx as i32, Axis::Horizontal));
+                                log_input_result(
+                                    "scroll horizontal",
+                                    enigo.scroll(dx as i32, Axis::Horizontal),
+                                );
                             }
                         } else if singleclick {
-                            log_input_result("left click", enigo.button(Button::Left, Direction::Click));
+                            log_input_result(
+                                "left click",
+                                enigo.button(Button::Left, Direction::Click),
+                            );
                         } else if doubleclick {
-                            log_input_result("double click 1", enigo.button(Button::Left, Direction::Click));
-                            log_input_result("double click 2", enigo.button(Button::Left, Direction::Click));
+                            log_input_result(
+                                "double click 1",
+                                enigo.button(Button::Left, Direction::Click),
+                            );
+                            log_input_result(
+                                "double click 2",
+                                enigo.button(Button::Left, Direction::Click),
+                            );
                         } else if middleclick {
-                            log_input_result("middle click", enigo.button(Button::Middle, Direction::Click));
+                            log_input_result(
+                                "middle click",
+                                enigo.button(Button::Middle, Direction::Click),
+                            );
                         } else if rightclick {
-                            log_input_result("right click", enigo.button(Button::Right, Direction::Click));
+                            log_input_result(
+                                "right click",
+                                enigo.button(Button::Right, Direction::Click),
+                            );
                         } else if singlehold {
-                            log_input_result("left press", enigo.button(Button::Left, Direction::Press));
+                            log_input_result(
+                                "left press",
+                                enigo.button(Button::Left, Direction::Press),
+                            );
                         } else if singlerelease {
-                            log_input_result("left release", enigo.button(Button::Left, Direction::Release));
+                            log_input_result(
+                                "left release",
+                                enigo.button(Button::Left, Direction::Release),
+                            );
                         } else if key.is_some() || special_key > 0 {
                             let ctrl = packet.get_bool("ctrl").unwrap_or(false);
                             let alt = packet.get_bool("alt").unwrap_or(false);
@@ -249,16 +333,28 @@ pub(super) fn packet_read_loop(
                             let super_key = packet.get_bool("super").unwrap_or(false);
 
                             if ctrl {
-                                log_input_result("control press", enigo.key(enigo::Key::Control, Direction::Press));
+                                log_input_result(
+                                    "control press",
+                                    enigo.key(enigo::Key::Control, Direction::Press),
+                                );
                             }
                             if alt {
-                                log_input_result("alt press", enigo.key(enigo::Key::Alt, Direction::Press));
+                                log_input_result(
+                                    "alt press",
+                                    enigo.key(enigo::Key::Alt, Direction::Press),
+                                );
                             }
                             if shift {
-                                log_input_result("shift press", enigo.key(enigo::Key::Shift, Direction::Press));
+                                log_input_result(
+                                    "shift press",
+                                    enigo.key(enigo::Key::Shift, Direction::Press),
+                                );
                             }
                             if super_key {
-                                log_input_result("meta press", enigo.key(enigo::Key::Meta, Direction::Press));
+                                log_input_result(
+                                    "meta press",
+                                    enigo.key(enigo::Key::Meta, Direction::Press),
+                                );
                             }
 
                             if special_key > 0 {
@@ -292,23 +388,38 @@ pub(super) fn packet_read_loop(
                                     _ => None,
                                 };
                                 if let Some(ek) = enigo_key {
-                                    log_input_result("special key", enigo.key(ek, Direction::Click));
+                                    log_input_result(
+                                        "special key",
+                                        enigo.key(ek, Direction::Click),
+                                    );
                                 }
                             } else if let Some(k) = key {
                                 log_input_result("text input", enigo.text(k));
                             }
 
                             if ctrl {
-                                log_input_result("control release", enigo.key(enigo::Key::Control, Direction::Release));
+                                log_input_result(
+                                    "control release",
+                                    enigo.key(enigo::Key::Control, Direction::Release),
+                                );
                             }
                             if alt {
-                                log_input_result("alt release", enigo.key(enigo::Key::Alt, Direction::Release));
+                                log_input_result(
+                                    "alt release",
+                                    enigo.key(enigo::Key::Alt, Direction::Release),
+                                );
                             }
                             if shift {
-                                log_input_result("shift release", enigo.key(enigo::Key::Shift, Direction::Release));
+                                log_input_result(
+                                    "shift release",
+                                    enigo.key(enigo::Key::Shift, Direction::Release),
+                                );
                             }
                             if super_key {
-                                log_input_result("meta release", enigo.key(enigo::Key::Meta, Direction::Release));
+                                log_input_result(
+                                    "meta release",
+                                    enigo.key(enigo::Key::Meta, Direction::Release),
+                                );
                             }
                         } else {
                             apply_pointer_motion(enigo, pointer_motion);
@@ -553,10 +664,16 @@ fn apply_pointer_motion(enigo: &mut Enigo, motion: PointerMotion) {
     match motion {
         PointerMotion::None => {}
         PointerMotion::Relative { dx, dy } => {
-            log_input_result("relative pointer move", enigo.move_mouse(dx, dy, Coordinate::Rel));
+            log_input_result(
+                "relative pointer move",
+                enigo.move_mouse(dx, dy, Coordinate::Rel),
+            );
         }
         PointerMotion::Absolute { x, y } => {
-            log_input_result("absolute pointer move", enigo.move_mouse(x, y, Coordinate::Abs));
+            log_input_result(
+                "absolute pointer move",
+                enigo.move_mouse(x, y, Coordinate::Abs),
+            );
         }
     }
 }
@@ -564,7 +681,92 @@ fn apply_pointer_motion(enigo: &mut Enigo, motion: PointerMotion) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device_links::packet::PACKET_TYPE_NOTIFICATION_ACTION;
     use serde_json::Value;
+
+    fn authorization(
+        packet_type: &str,
+        state: Option<PairState>,
+    ) -> Result<PacketAuthorization, PacketAuthorizationError> {
+        authorize_incoming_packet(state, &NetworkPacket::new(packet_type))
+    }
+
+    #[test]
+    fn paired_devices_may_use_feature_packets_and_pairing_packets() {
+        for packet_type in [
+            PACKET_TYPE_CLIPBOARD,
+            PACKET_TYPE_MOUSEPAD_REQUEST,
+            PACKET_TYPE_SHARE_REQUEST,
+            PACKET_TYPE_LOCK_REQUEST,
+            PACKET_TYPE_SCREEN_REQUEST,
+            PACKET_TYPE_NOTIFICATION_REQUEST,
+            PACKET_TYPE_NOTIFICATION_ACTION,
+            "unknown.future.packet",
+        ] {
+            assert_eq!(
+                authorization(packet_type, Some(PairState::Paired)),
+                Ok(PacketAuthorization::PairedFeatureAllowed),
+                "paired packet {packet_type} should be allowed"
+            );
+        }
+        assert_eq!(
+            authorization(PACKET_TYPE_PAIR, Some(PairState::Paired)),
+            Ok(PacketAuthorization::PairingAllowed)
+        );
+    }
+
+    #[test]
+    fn only_pairing_packets_are_allowed_before_pairing() {
+        for (state, expected_error) in [
+            (
+                PairState::NotPaired,
+                PacketAuthorizationError::DeviceNotPaired,
+            ),
+            (
+                PairState::Requested,
+                PacketAuthorizationError::PacketNotAllowedBeforePairing,
+            ),
+            (
+                PairState::RequestedByPeer,
+                PacketAuthorizationError::PacketNotAllowedBeforePairing,
+            ),
+        ] {
+            assert_eq!(
+                authorization(PACKET_TYPE_PAIR, Some(state)),
+                Ok(PacketAuthorization::PairingAllowed),
+                "pairing packet should be allowed in {state:?}"
+            );
+
+            for packet_type in [
+                PACKET_TYPE_CLIPBOARD,
+                PACKET_TYPE_MOUSEPAD_REQUEST,
+                PACKET_TYPE_SHARE_REQUEST,
+                PACKET_TYPE_LOCK_REQUEST,
+                PACKET_TYPE_SCREEN_REQUEST,
+                PACKET_TYPE_NOTIFICATION_REQUEST,
+                PACKET_TYPE_NOTIFICATION_ACTION,
+                "unknown.future.packet",
+            ] {
+                assert_eq!(
+                    authorization(packet_type, Some(state)),
+                    Err(expected_error),
+                    "unpaired packet {packet_type} should be denied in {state:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn packets_without_an_active_device_are_denied_as_unknown() {
+        assert_eq!(
+            authorization(PACKET_TYPE_PAIR, None),
+            Err(PacketAuthorizationError::UnknownDevice)
+        );
+        assert_eq!(
+            authorization(PACKET_TYPE_CLIPBOARD, None),
+            Err(PacketAuthorizationError::UnknownDevice)
+        );
+    }
 
     #[test]
     fn mousepad_absolute_coordinates_are_detected_even_at_zero() {
