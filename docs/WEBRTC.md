@@ -8,6 +8,8 @@ negotiation, and generation handover have completed successfully.
 ## Contract
 
 - One peer connection belongs to one logical `DeviceSession`.
+- `DeviceManager` is the only owner allowed to install, replace, or clear the
+  WebRTC transport for a session generation; replacement closes the old peer.
 - Every message carries the device ID, logical session ID, transport
   generation, unique message ID, message type, timestamp, and bounded payload.
 - Unknown channel labels, wrong reliability settings, stale generations,
