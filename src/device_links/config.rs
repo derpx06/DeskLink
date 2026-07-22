@@ -212,6 +212,8 @@ impl Config {
             "clipboard.enabled",
             "downloads.directory",
             "security.require-pairing",
+            "webrtc.enabled",
+            "webrtc.signaling.endpoint",
         ];
         if !ALLOWED_KEYS.contains(&key) {
             return Err(format!("Unknown DeskLink preference: {key}"));
@@ -221,6 +223,9 @@ impl Config {
         }
         if value.len() > 256 {
             return Err("Preference value is too long".to_string());
+        }
+        if key == "webrtc.signaling.endpoint" && !value.is_empty() && !value.starts_with("wss://") {
+            return Err("WebRTC signaling endpoint must use wss://".to_string());
         }
         self.stored
             .preferences
@@ -338,6 +343,23 @@ mod tests {
             reloaded.preferences().get("clipboard.enabled"),
             Some(&"false".to_string())
         );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn webrtc_signaling_endpoint_requires_explicit_secure_websocket() {
+        let dir =
+            std::env::temp_dir().join(format!("desklink-webrtc-preferences-{}", Uuid::new_v4()));
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        config
+            .set_preference(
+                "webrtc.signaling.endpoint",
+                "wss://example.invalid/signaling",
+            )
+            .unwrap();
+        assert!(config
+            .set_preference("webrtc.signaling.endpoint", "https://example.invalid")
+            .is_err());
         let _ = fs::remove_dir_all(dir);
     }
 }
