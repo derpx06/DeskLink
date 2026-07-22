@@ -1,7 +1,7 @@
 use openssl::ssl::SslStream;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::net::{Shutdown, TcpStream};
+use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -12,17 +12,22 @@ use super::validation::{
     enforce_unpaired_link_limit, validate_certificate_device_id, validate_pinned_certificate,
 };
 use crate::device_links::config::Config;
+use crate::device_links::core::device_manager::DeviceManager;
+use crate::device_links::core::device_manager::SessionBinding;
+use crate::device_links::core::device_session::DeviceConnectionState;
+use crate::device_links::core::events::{CoreEvent, EventBus};
 use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_NOTIFICATION_REQUEST};
-use crate::device_links::pairing::PairingHandler;
 
 pub(super) fn finish_secure_link(
     initial_info: DeviceInfo,
     mut stream: SslStream<TcpStream>,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
-    links: Arc<Mutex<HashMap<String, super::Link>>>,
+    sessions: DeviceManager,
+    events: EventBus,
+    transfer_cancellations: Arc<Mutex<HashSet<String>>>,
 ) -> Result<(), String> {
     let identity = config
         .lock()
@@ -60,7 +65,7 @@ pub(super) fn finish_secure_link(
         .public_key_to_der()
         .map_err(|err| err.to_string())?;
     validate_pinned_certificate(&config, &secure_info.id, &cert)?;
-    enforce_unpaired_link_limit(&config, &links, &secure_info.id)?;
+    enforce_unpaired_link_limit(&config, &sessions, &secure_info.id)?;
 
     let paired = config
         .lock()
@@ -85,6 +90,23 @@ pub(super) fn finish_secure_link(
         .map_err(|_| "Device lock poisoned".to_string())?
         .insert(secure_info.id.clone(), view);
 
+    if let Ok(devices) = devices.lock() {
+        if let Some(device) = devices.get(&secure_info.id) {
+            events.publish(CoreEvent::DeviceChanged {
+                device: Box::new(device.clone()),
+            });
+        }
+    }
+    events.publish(CoreEvent::ConnectionChanged {
+        device_id: secure_info.id.clone(),
+        state: if paired {
+            DeviceConnectionState::Paired
+        } else {
+            DeviceConnectionState::Unpaired
+        },
+        message: None,
+    });
+
     let stream = Arc::new(Mutex::new(stream));
     stream
         .lock()
@@ -92,34 +114,24 @@ pub(super) fn finish_secure_link(
         .get_ref()
         .set_nonblocking(true)
         .map_err(|err| err.to_string())?;
-    let read_stream = Arc::clone(&stream);
-    let read_devices = Arc::clone(&devices);
-    let read_links = Arc::clone(&links);
-    let read_config = Arc::clone(&config);
-    let device_id = secure_info.id.clone();
-    let pairing = PairingHandler::new(paired);
-
-    if let Ok(mut links) = links.lock() {
-        if let Some(existing) = links.remove(&secure_info.id) {
-            if let Ok(existing_stream) = existing.stream.lock() {
-                let _ = existing_stream.get_ref().shutdown(Shutdown::Both);
-            }
-        }
-
-        links.insert(
-            secure_info.id.clone(),
-            super::Link {
-                stream: Arc::clone(&stream),
-                certificate_pem: cert_pem,
-                local_public_der,
-                remote_public_der,
-                pairing,
-                info: secure_info.clone(),
-            },
-        );
-    } else {
-        return Err("Link lock poisoned".to_string());
+    let link = super::Link {
+        stream: Arc::clone(&stream),
+        certificate_pem: cert_pem,
+        local_public_der,
+        remote_public_der,
+        info: secure_info.clone(),
+    };
+    let registration = sessions
+        .register_link(secure_info.id.clone(), link, paired)
+        .map_err(|error| format!("Could not register device session: {error:?}"))?;
+    if let Some(replaced) = &registration.replaced_link {
+        replaced.close();
     }
+    let read_binding: SessionBinding = registration.binding.clone();
+    let read_devices = Arc::clone(&devices);
+    let read_config = Arc::clone(&config);
+    let read_events = events.clone();
+    let read_transfer_cancellations = Arc::clone(&transfer_cancellations);
 
     if paired {
         let mut request = NetworkPacket::new(PACKET_TYPE_NOTIFICATION_REQUEST);
@@ -134,39 +146,40 @@ pub(super) fn finish_secure_link(
 
     thread::spawn(move || {
         packet_read_loop(
-            device_id,
-            read_stream,
+            read_binding,
             read_devices,
-            read_links,
             read_config,
+            read_events,
+            read_transfer_cancellations,
+            sessions,
         )
     });
     Ok(())
 }
 
 pub(super) fn handle_disconnect(
-    device_id: &str,
-    stream: &Arc<Mutex<SslStream<TcpStream>>>,
+    binding: &crate::device_links::core::device_manager::SessionBinding,
+    sessions: &DeviceManager,
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    links: &Arc<Mutex<HashMap<String, super::Link>>>,
+    events: &EventBus,
 ) -> bool {
-    let mut is_active = false;
-    if let Ok(l) = links.lock() {
-        if let Some(link) = l.get(device_id) {
-            if Arc::ptr_eq(&link.stream, stream) {
-                is_active = true;
+    let result =
+        sessions.disconnect_if_current(binding, "The device connection was closed".to_string());
+    if result.was_current {
+        binding.link.close();
+        mark_status(devices, &binding.device_id, DeviceStatus::Unreachable);
+        if let Ok(devices) = devices.lock() {
+            if let Some(device) = devices.get(&binding.device_id) {
+                events.publish(CoreEvent::DeviceChanged {
+                    device: Box::new(device.clone()),
+                });
             }
         }
+        events.publish(CoreEvent::ConnectionChanged {
+            device_id: binding.device_id.clone(),
+            state: DeviceConnectionState::Unreachable,
+            message: Some("The device connection was closed".to_string()),
+        });
     }
-    if is_active {
-        mark_status(devices, device_id, DeviceStatus::Unreachable);
-        if let Ok(mut l) = links.lock() {
-            if let Some(link) = l.get(device_id) {
-                if Arc::ptr_eq(&link.stream, stream) {
-                    l.remove(device_id);
-                }
-            }
-        }
-    }
-    is_active
+    result.was_current
 }

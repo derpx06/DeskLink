@@ -21,27 +21,32 @@
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
+use std::cell::RefCell;
+use std::collections::HashMap;
 
+use crate::device_links::core::events::CoreEvent;
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::{DeviceNotification, DeviceStatus, DeviceView, VolumeSink};
+use crate::platform::sftp::SftpSession;
 
 mod imp {
     use super::*;
-    use std::cell::RefCell;
     use std::collections::HashSet;
 
     #[derive(Debug, Default, gtk::CompositeTemplate)]
     #[template(resource = "/derx06/desklink/com/window.ui")]
-    pub struct DesklinkWindow {
+    pub struct DeskLinkWindow {
         // Template widgets
         #[template_child]
         pub devices_list: TemplateChild<gtk::ListBox>,
+        #[template_child]
+        pub transfers_list: TemplateChild<gtk::ListBox>,
         #[template_child]
         pub error_banner: TemplateChild<adw::Banner>,
         #[template_child]
         pub add_device_button: TemplateChild<gtk::Button>,
         #[template_child]
-        pub discover_button: TemplateChild<gtk::Button>,
+        pub toast_overlay: TemplateChild<adw::ToastOverlay>,
         #[template_child]
         pub nearby_count_label: TemplateChild<gtk::Label>,
         #[template_child]
@@ -49,12 +54,14 @@ mod imp {
         pub daemon: RefCell<Option<DaemonHandle>>,
         pub notified_pair_requests: RefCell<HashSet<String>>,
         pub notified_remote_notifications: RefCell<HashSet<String>>,
+        pub transfers: RefCell<HashMap<String, TransferProgress>>,
+        pub sftp_sessions: RefCell<HashMap<String, SftpSession>>,
     }
 
     #[glib::object_subclass]
-    impl ObjectSubclass for DesklinkWindow {
-        const NAME: &'static str = "DesklinkWindow";
-        type Type = super::DesklinkWindow;
+    impl ObjectSubclass for DeskLinkWindow {
+        const NAME: &'static str = "DeskLinkWindow";
+        type Type = super::DeskLinkWindow;
         type ParentType = adw::ApplicationWindow;
 
         fn class_init(klass: &mut Self::Class) {
@@ -66,7 +73,7 @@ mod imp {
         }
     }
 
-    impl ObjectImpl for DesklinkWindow {
+    impl ObjectImpl for DeskLinkWindow {
         fn constructed(&self) {
             self.parent_constructed();
 
@@ -78,25 +85,35 @@ mod imp {
             });
 
             let window = self.obj().downgrade();
-            self.discover_button.connect_clicked(move |_| {
+            self.obj().connect_close_request(move |_| {
                 if let Some(window) = window.upgrade() {
-                    window.show_discovery_dialog();
+                    window.close_sftp_sessions();
                 }
+                glib::Propagation::Proceed
             });
         }
     }
-    impl WidgetImpl for DesklinkWindow {}
-    impl WindowImpl for DesklinkWindow {}
-    impl ApplicationWindowImpl for DesklinkWindow {}
-    impl AdwApplicationWindowImpl for DesklinkWindow {}
+    impl WidgetImpl for DeskLinkWindow {}
+    impl WindowImpl for DeskLinkWindow {}
+    impl ApplicationWindowImpl for DeskLinkWindow {}
+    impl AdwApplicationWindowImpl for DeskLinkWindow {}
+}
+
+#[derive(Debug, Clone)]
+pub struct TransferProgress {
+    state: String,
+    bytes_done: u64,
+    bytes_total: u64,
+    can_resume: bool,
+    error: Option<String>,
 }
 
 glib::wrapper! {
-    pub struct DesklinkWindow(ObjectSubclass<imp::DesklinkWindow>)
+    pub struct DeskLinkWindow(ObjectSubclass<imp::DeskLinkWindow>)
         @extends gtk::Widget, gtk::Window, gtk::ApplicationWindow, adw::ApplicationWindow,        @implements gio::ActionGroup, gio::ActionMap;
 }
 
-impl DesklinkWindow {
+impl DeskLinkWindow {
     pub fn new<P: IsA<gtk::Application>>(application: &P) -> Self {
         glib::Object::builder()
             .property("application", application)
@@ -107,15 +124,68 @@ impl DesklinkWindow {
         self.imp().daemon.replace(Some(daemon));
         self.refresh_devices();
 
+        let Some(daemon) = self.imp().daemon.borrow().clone() else {
+            return;
+        };
+        let receiver = daemon.subscribe_events();
         let weak = self.downgrade();
-        glib::timeout_add_seconds_local(1, move || {
-            if let Some(window) = weak.upgrade() {
-                window.refresh_devices();
-                glib::ControlFlow::Continue
-            } else {
-                glib::ControlFlow::Break
+        glib::MainContext::default().spawn_local(async move {
+            use futures::StreamExt;
+            let mut receiver = receiver;
+            while let Some(event) = receiver.next().await {
+                if let Some(window) = weak.upgrade() {
+                    window.handle_core_event(event);
+                } else {
+                    break;
+                }
             }
         });
+    }
+
+    fn handle_core_event(&self, event: CoreEvent) {
+        match event {
+            CoreEvent::DeviceChanged { .. }
+            | CoreEvent::PairingChanged { .. }
+            | CoreEvent::FeatureStateChanged { .. }
+            | CoreEvent::NotificationReceived { .. } => self.refresh_devices(),
+            CoreEvent::ConnectionChanged {
+                device_id,
+                state: crate::device_links::core::device_session::DeviceConnectionState::Unreachable,
+                ..
+            } => {
+                self.close_sftp_session(&device_id);
+                self.refresh_devices();
+            }
+            CoreEvent::ConnectionChanged { .. } => self.refresh_devices(),
+            CoreEvent::TransferChanged {
+                transfer_id,
+                state,
+                bytes_done,
+                bytes_total,
+                can_resume,
+                error,
+            } => {
+                self.imp().transfers.borrow_mut().insert(
+                    transfer_id,
+                    TransferProgress {
+                        state,
+                        bytes_done,
+                        bytes_total,
+                        can_resume,
+                        error,
+                    },
+                );
+                self.refresh_transfer_rows();
+            }
+            CoreEvent::Error { message, .. } => {
+                self.imp().error_banner.set_title(&message);
+                self.imp().error_banner.set_revealed(true);
+                self.imp()
+                    .toast_overlay
+                    .add_toast(adw::Toast::new(&message));
+                self.refresh_devices();
+            }
+        }
     }
 
     fn refresh_devices(&self) {
@@ -128,6 +198,7 @@ impl DesklinkWindow {
         if let Some(error) = errors.last() {
             imp.error_banner.set_title(error);
             imp.error_banner.set_revealed(true);
+            imp.toast_overlay.add_toast(adw::Toast::new(error));
             self.send_app_notification("desklink-error", "DeskLink", error);
         }
 
@@ -136,6 +207,7 @@ impl DesklinkWindow {
         }
 
         let devices = daemon.devices();
+        self.refresh_transfer_rows();
         let recent_devices: Vec<_> = devices
             .iter()
             .filter(|device| {
@@ -164,44 +236,18 @@ impl DesklinkWindow {
             imp.device_status_label
                 .set_label("· Pair a device to get started");
 
-            // Empty state card
-            let empty_card = gtk::Box::builder()
-                .orientation(gtk::Orientation::Vertical)
-                .spacing(16)
-                .margin_top(48)
-                .margin_bottom(48)
-                .margin_start(24)
-                .margin_end(24)
-                .halign(gtk::Align::Center)
+            let empty_page = adw::StatusPage::builder()
+                .icon_name("network-wireless-symbolic")
+                .title("No devices paired")
+                .description(
+                    "Keep your phone on the same Wi-Fi network, then add it from DeskLink.",
+                )
+                .vexpand(true)
                 .build();
-
-            empty_card.append(
-                &gtk::Image::builder()
-                    .icon_name("network-wireless-symbolic")
-                    .pixel_size(64)
-                    .css_classes(["dimmed"])
-                    .build(),
-            );
-            empty_card.append(
-                &gtk::Label::builder()
-                    .label("No Devices Paired")
-                    .css_classes(["title-2"])
-                    .halign(gtk::Align::Center)
-                    .build(),
-            );
-            empty_card.append(
-                &gtk::Label::builder()
-                    .label("Make sure your phone is on the same Wi-Fi network, then tap Discover to find it.")
-                    .css_classes(["body", "dimmed"])
-                    .halign(gtk::Align::Center)
-                    .wrap(true)
-                    .max_width_chars(48)
-                    .build(),
-            );
 
             let discover_btn = gtk::Button::builder()
                 .label("Discover Devices")
-                .css_classes(["suggested-action", "pill"])
+                .css_classes(["suggested-action"])
                 .halign(gtk::Align::Center)
                 .build();
             {
@@ -214,9 +260,8 @@ impl DesklinkWindow {
                     }
                 });
             }
-            empty_card.append(&discover_btn);
-
-            imp.devices_list.append(&empty_card);
+            empty_page.set_child(Some(&discover_btn));
+            imp.devices_list.append(&empty_page);
             return;
         }
 
@@ -314,6 +359,77 @@ impl DesklinkWindow {
         }
     }
 
+    fn close_sftp_session(&self, device_id: &str) {
+        if let Some(session) = self.imp().sftp_sessions.borrow_mut().remove(device_id) {
+            session.close();
+        }
+    }
+
+    fn close_sftp_sessions(&self) {
+        let sessions: Vec<_> = self.imp().sftp_sessions.borrow_mut().drain().collect();
+        for (_, session) in sessions {
+            session.close();
+        }
+    }
+
+    fn refresh_transfer_rows(&self) {
+        let imp = self.imp();
+        while let Some(child) = imp.transfers_list.first_child() {
+            imp.transfers_list.remove(&child);
+        }
+        let transfers = imp.transfers.borrow();
+        if let Some(parent) = imp.transfers_list.parent() {
+            parent.set_visible(!transfers.is_empty());
+        }
+        for (transfer_id, progress) in transfers.iter() {
+            let bytes = if progress.bytes_total == 0 {
+                "Waiting for payload".to_string()
+            } else {
+                format!("{} / {} bytes", progress.bytes_done, progress.bytes_total)
+            };
+            let subtitle = progress
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("{} · {}", progress.state, bytes));
+            let row = adw::ActionRow::builder()
+                .title(format!("Transfer {}", short_transfer_id(transfer_id)))
+                .subtitle(subtitle)
+                .activatable(false)
+                .build();
+            let progress_bar = gtk::ProgressBar::builder()
+                .valign(gtk::Align::Center)
+                .width_request(150)
+                .show_text(true)
+                .build();
+            if progress.bytes_total > 0 {
+                progress_bar.set_fraction(
+                    (progress.bytes_done as f64 / progress.bytes_total as f64).clamp(0.0, 1.0),
+                );
+            }
+            row.add_suffix(&progress_bar);
+            if progress.state != "completed" && progress.state != "cancelled" {
+                if let Some(daemon) = imp.daemon.borrow().clone() {
+                    let transfer_id = transfer_id.clone();
+                    let button = gtk::Button::builder()
+                        .icon_name("process-stop-symbolic")
+                        .tooltip_text(if progress.can_resume {
+                            "Cancel transfer"
+                        } else {
+                            "Stop transfer"
+                        })
+                        .valign(gtk::Align::Center)
+                        .build();
+                    button.update_property(&[gtk::accessible::Property::Label("Cancel transfer")]);
+                    button.connect_clicked(move |_| {
+                        daemon.send(DaemonCommand::CancelTransfer(transfer_id.clone()));
+                    });
+                    row.add_suffix(&button);
+                }
+            }
+            imp.transfers_list.append(&row);
+        }
+    }
+
     fn send_app_notification(&self, id: &str, title: &str, body: &str) {
         let Some(application) = self.application() else {
             return;
@@ -401,15 +517,26 @@ impl DesklinkWindow {
         populate_discovery_list(&list, &daemon);
         let weak_list = list.downgrade();
         let weak_window = window.downgrade();
-        glib::timeout_add_seconds_local(1, move || {
-            let Some(list) = weak_list.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            if weak_window.upgrade().is_none() {
-                return glib::ControlFlow::Break;
+        let mut receiver = daemon.subscribe_events();
+        glib::MainContext::default().spawn_local(async move {
+            use futures::StreamExt;
+            while let Some(event) = receiver.next().await {
+                let Some(list) = weak_list.upgrade() else {
+                    break;
+                };
+                if weak_window.upgrade().is_none() {
+                    break;
+                }
+                if matches!(
+                    event,
+                    CoreEvent::DeviceChanged { .. }
+                        | CoreEvent::ConnectionChanged { .. }
+                        | CoreEvent::PairingChanged { .. }
+                        | CoreEvent::Error { .. }
+                ) {
+                    populate_discovery_list(&list, &daemon);
+                }
             }
-            populate_discovery_list(&list, &daemon);
-            glib::ControlFlow::Continue
         });
 
         window.present();
@@ -423,6 +550,10 @@ fn recent_count_label(total: usize, pending: usize) -> String {
         (1, _) => "1 recent device".to_string(),
         _ => format!("{total} recent devices"),
     }
+}
+
+fn short_transfer_id(transfer_id: &str) -> &str {
+    transfer_id.get(..8).unwrap_or(transfer_id)
 }
 
 fn populate_discovery_list(list: &gtk::ListBox, daemon: &DaemonHandle) {
@@ -464,7 +595,7 @@ fn device_row(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget {
     }
 }
 
-/// Full card shown for a paired device — header + KDE Connect plugin grid.
+/// Full card shown for a paired device — header + DeskLink feature grid.
 fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget {
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -550,9 +681,26 @@ fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget 
     {
         let daemon = daemon.clone();
         let id = device.id.clone();
-        unpair_btn.connect_clicked(move |_| {
-            eprintln!("[UI] Unpair clicked for {}", id);
-            daemon.send(DaemonCommand::Unpair(id.clone()));
+        let name = device.name.clone();
+        unpair_btn.connect_clicked(move |button| {
+            let Some(window) = button.root().and_downcast::<gtk::Window>() else {
+                return;
+            };
+            let dialog = adw::AlertDialog::builder()
+                .heading("Unpair device?")
+                .body(format!("Remove the trusted pairing with {name}?"))
+                .build();
+            dialog.add_responses(&[("cancel", "Cancel"), ("unpair", "Unpair")]);
+            dialog.set_close_response("cancel");
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_response_appearance("unpair", adw::ResponseAppearance::Destructive);
+            let daemon = daemon.clone();
+            let id = id.clone();
+            dialog.choose(&window, None::<&gio::Cancellable>, move |response| {
+                if response == "unpair" {
+                    daemon.send(DaemonCommand::Unpair(id));
+                }
+            });
         });
     }
     right.append(&unpair_btn);
@@ -1236,7 +1384,6 @@ fn show_notifications_dialog(daemon: DaemonHandle, device: DeviceView, parent: &
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
-        .vexpand(true)
         .build();
 
     if device.notifications.is_empty() {
@@ -1250,12 +1397,81 @@ fn show_notifications_dialog(daemon: DaemonHandle, device: DeviceView, parent: &
         );
     } else {
         for notification in &device.notifications {
-            list.append(&notification_row(&daemon, &device.id, notification));
+            list.append(&notification_row(&daemon, &device.id, notification, parent));
         }
     }
-    content.append(&list);
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&list)
+        .vexpand(true)
+        .hexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vscrollbar_policy(gtk::PolicyType::Automatic)
+        .min_content_height(260)
+        .build();
+    content.append(&scroller);
     toolbar.set_content(Some(&content));
     window.set_content(Some(&toolbar));
+    let list_weak = list.downgrade();
+    let window_weak = window.downgrade();
+    let daemon_refresh = daemon.clone();
+    let device_id_refresh = device.id.clone();
+    let parent_refresh = parent.clone();
+    let mut receiver = daemon.subscribe_events();
+    glib::MainContext::default().spawn_local(async move {
+        use futures::StreamExt;
+        while let Some(event) = receiver.next().await {
+            let relevant = match event {
+                CoreEvent::NotificationReceived { device_id, .. }
+                | CoreEvent::ConnectionChanged { device_id, .. }
+                | CoreEvent::PairingChanged { device_id, .. }
+                | CoreEvent::Error {
+                    device_id: Some(device_id),
+                    ..
+                } => device_id == device_id_refresh,
+                CoreEvent::DeviceChanged { device } => device.id == device_id_refresh,
+                _ => false,
+            };
+            if !relevant {
+                continue;
+            }
+            let Some(window) = window_weak.upgrade() else {
+                break;
+            };
+            let Some(list) = list_weak.upgrade() else {
+                break;
+            };
+            let Some(device) = daemon_refresh
+                .devices()
+                .into_iter()
+                .find(|candidate| candidate.id == device_id_refresh)
+            else {
+                continue;
+            };
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            if device.notifications.is_empty() {
+                list.append(
+                    &gtk::Label::builder()
+                        .label("No mirrored notifications")
+                        .margin_top(24)
+                        .margin_bottom(24)
+                        .css_classes(["dimmed"])
+                        .build(),
+                );
+            } else {
+                for notification in &device.notifications {
+                    list.append(&notification_row(
+                        &daemon_refresh,
+                        &device.id,
+                        notification,
+                        &parent_refresh,
+                    ));
+                }
+            }
+            window.queue_resize();
+        }
+    });
     window.present();
 }
 
@@ -1263,6 +1479,7 @@ fn notification_row(
     daemon: &DaemonHandle,
     device_id: &str,
     notification: &DeviceNotification,
+    parent: &gtk::Window,
 ) -> adw::ActionRow {
     let title = if notification.title.is_empty() {
         notification.app_name.clone()
@@ -1279,6 +1496,8 @@ fn notification_row(
         .subtitle(subtitle)
         .build();
     row.set_use_markup(false);
+    row.set_title_lines(2);
+    row.set_subtitle_lines(4);
     row.set_activatable(false);
 
     if let Some(reply_id) = &notification.request_reply_id {
@@ -1286,12 +1505,32 @@ fn notification_row(
             let daemon = daemon.clone();
             let device_id = device_id.to_string();
             let reply_id = reply_id.clone();
+            let parent = parent.clone();
             move || {
-                daemon.send(DaemonCommand::ReplyNotification(
-                    device_id.clone(),
-                    reply_id.clone(),
-                    "Acknowledged".to_string(),
-                ));
+                let entry = gtk::Entry::builder()
+                    .placeholder_text("Write a reply")
+                    .activates_default(true)
+                    .build();
+                let dialog = adw::AlertDialog::builder()
+                    .heading("Reply to notification")
+                    .extra_child(&entry)
+                    .build();
+                dialog.add_responses(&[("cancel", "Cancel"), ("send", "Send")]);
+                dialog.set_close_response("cancel");
+                dialog.set_default_response(Some("send"));
+                let daemon = daemon.clone();
+                let device_id = device_id.clone();
+                let reply_id = reply_id.clone();
+                dialog.choose(&parent, None::<&gio::Cancellable>, move |response| {
+                    if response == "send" {
+                        let message = entry.text().trim().to_string();
+                        if !message.is_empty() {
+                            daemon.send(DaemonCommand::ReplyNotification(
+                                device_id, reply_id, message,
+                            ));
+                        }
+                    }
+                });
             }
         });
         row.add_suffix(&reply);
@@ -1497,6 +1736,16 @@ fn show_file_browsing_dialog(device: DeviceView, parent: &gtk::Window) {
         .default_height(340)
         .title("Browse Files")
         .build();
+    let sftp_session = std::rc::Rc::new(RefCell::new(None::<SftpSession>));
+    {
+        let sftp_session = sftp_session.clone();
+        window.connect_close_request(move |_| {
+            if let Some(session) = sftp_session.borrow_mut().take() {
+                session.close();
+            }
+            glib::Propagation::Proceed
+        });
+    }
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&adw::HeaderBar::new());
     let list = gtk::ListBox::builder()
@@ -1516,19 +1765,48 @@ fn show_file_browsing_dialog(device: DeviceView, parent: &gtk::Window) {
                     .build(),
             );
         } else {
-            list.append(
-                &adw::ActionRow::builder()
-                    .title("Connection")
-                    .subtitle(format!(
-                        "user {} · port {} · path {}",
-                        sftp.user.as_deref().unwrap_or("unknown"),
-                        sftp.port
-                            .map(|port| port.to_string())
-                            .unwrap_or_else(|| "unknown".to_string()),
-                        sftp.path.as_deref().unwrap_or("/")
-                    ))
-                    .build(),
-            );
+            let connection = adw::ActionRow::builder()
+                .title("Connection")
+                .subtitle(format!(
+                    "user {} · port {} · path {}",
+                    sftp.user.as_deref().unwrap_or("unknown"),
+                    sftp.port
+                        .map(|port| port.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    sftp.path.as_deref().unwrap_or("/")
+                ))
+                .build();
+            if let (Some(user), Some(port)) = (sftp.user.as_deref(), sftp.port) {
+                let host = device
+                    .address
+                    .rsplit_once(':')
+                    .map(|(host, _)| host)
+                    .unwrap_or(device.address.as_str());
+                let path = sftp.path.as_deref().unwrap_or("/");
+                let uri = format!("sftp://{}@{}:{}{}", user, host, port, path);
+                let parent = parent.clone();
+                let sftp_session = sftp_session.clone();
+                let open = gtk::Button::builder()
+                    .icon_name("folder-open-symbolic")
+                    .tooltip_text("Open in Files")
+                    .valign(gtk::Align::Center)
+                    .build();
+                open.update_property(&[gtk::accessible::Property::Label("Open remote files")]);
+                open.connect_clicked(
+                    move |_| match crate::platform::sftp::mount_and_open_session(&uri, &parent) {
+                        Ok(session) => {
+                            if let Some(previous) = sftp_session.borrow_mut().replace(session) {
+                                previous.close();
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("[DeskLink] Could not open remote files: {error}");
+                        }
+                    },
+                );
+                connection.add_suffix(&open);
+            }
+            list.append(&connection);
             for (path, name) in &sftp.directories {
                 list.append(&adw::ActionRow::builder().title(name).subtitle(path).build());
             }

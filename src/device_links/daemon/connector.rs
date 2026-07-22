@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -9,29 +10,53 @@ use super::handshake::finish_secure_link;
 use super::network::ssl_connector;
 use super::state::{push_error, upsert_device};
 use crate::device_links::config::Config;
+use crate::device_links::core::device_manager::DeviceManager;
+use crate::device_links::core::events::EventBus;
 use crate::device_links::device::DeviceView;
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::NetworkPacket;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn incoming_tcp_loop(
     listener: TcpListener,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
-    links: Arc<Mutex<HashMap<String, super::Link>>>,
+    sessions: DeviceManager,
+    shutdown: Arc<AtomicBool>,
+    transfer_cancellations: Arc<Mutex<HashSet<String>>>,
     errors: Arc<Mutex<Vec<String>>>,
+    events: EventBus,
 ) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    let _ = listener.set_nonblocking(true);
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _address)) => {
                 let config = Arc::clone(&config);
                 let devices = Arc::clone(&devices);
-                let links = Arc::clone(&links);
+                let sessions = sessions.clone();
+                let shutdown = Arc::clone(&shutdown);
                 let errors = Arc::clone(&errors);
+                let events = events.clone();
+                let transfer_cancellations = Arc::clone(&transfer_cancellations);
                 thread::spawn(move || {
-                    if let Err(error) = accept_incoming_device(stream, config, devices, links) {
+                    if let Err(error) = accept_incoming_device(
+                        stream,
+                        config,
+                        devices,
+                        sessions,
+                        shutdown,
+                        events,
+                        transfer_cancellations,
+                    ) {
                         push_error(&errors, error);
                     }
                 });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
             }
             Err(error) => push_error(&errors, format!("TCP listener failed: {error}")),
         }
@@ -42,8 +67,14 @@ fn accept_incoming_device(
     stream: TcpStream,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
-    links: Arc<Mutex<HashMap<String, super::Link>>>,
+    sessions: DeviceManager,
+    shutdown: Arc<AtomicBool>,
+    events: EventBus,
+    transfer_cancellations: Arc<Mutex<HashSet<String>>>,
 ) -> Result<(), String> {
+    if shutdown.load(Ordering::SeqCst) {
+        return Ok(());
+    }
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| err.to_string())?;
@@ -92,5 +123,13 @@ fn accept_incoming_device(
     let ssl_stream = connector
         .connect(&info.id, stream)
         .map_err(|err| err.to_string())?;
-    finish_secure_link(info, ssl_stream, config, devices, links)
+    finish_secure_link(
+        info,
+        ssl_stream,
+        config,
+        devices,
+        sessions,
+        events,
+        transfer_cancellations,
+    )
 }

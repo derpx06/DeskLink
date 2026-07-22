@@ -5,6 +5,7 @@ use gtk::glib;
 use serde_json::{Map, Value};
 use std::cell::Cell;
 use std::rc::Rc;
+use std::time::Duration;
 
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 
@@ -86,6 +87,13 @@ pub fn show_remote_control_dialog(
         .halign(gtk::Align::Center)
         .build();
 
+    let screen_picture = gtk::Picture::new();
+    screen_picture.set_hexpand(true);
+    screen_picture.set_vexpand(true);
+    screen_picture.set_can_shrink(true);
+    screen_picture.set_size_request(320, 180);
+    screen_picture.set_tooltip_text(Some("Live phone screen preview"));
+
     let trackpad_icon = gtk::Image::builder()
         .icon_name("input-touchpad-symbolic")
         .pixel_size(96)
@@ -100,6 +108,7 @@ pub fn show_remote_control_dialog(
         .halign(gtk::Align::Center)
         .build();
 
+    trackpad_vbox.append(&screen_picture);
     trackpad_vbox.append(&status_label);
     trackpad_vbox.append(&trackpad_icon);
     trackpad_vbox.append(&label);
@@ -118,6 +127,47 @@ pub fn show_remote_control_dialog(
     window.connect_close_request(move |_| {
         daemon_clone.send(DaemonCommand::SendScreenStop(id_clone.to_string()));
         glib::Propagation::Proceed
+    });
+
+    // DeviceView owns the last authenticated frame.  Polling only this small
+    // preview keeps the existing daemon/UI boundary intact while avoiding a
+    // second screen decoder or a duplicate network session in the UI.
+    let screen_picture_weak = screen_picture.downgrade();
+    let status_weak = status_label.downgrade();
+    let window_weak = window.downgrade();
+    let daemon_frames = daemon.clone();
+    let frame_device_id = device_id_rc.clone();
+    let last_sequence = Rc::new(Cell::new(None::<u64>));
+    let last_sequence_clone = last_sequence.clone();
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        if window_weak.upgrade().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        let Some(device) = daemon_frames
+            .devices()
+            .into_iter()
+            .find(|device| device.id == *frame_device_id)
+        else {
+            return glib::ControlFlow::Continue;
+        };
+        let Some(frame) = device.screen_frame else {
+            return glib::ControlFlow::Continue;
+        };
+        if last_sequence_clone.get() == Some(frame.sequence) {
+            return glib::ControlFlow::Continue;
+        }
+        let bytes = glib::Bytes::from(&frame.png);
+        if let Ok(texture) = gdk::Texture::from_bytes(&bytes) {
+            if let Some(picture) = screen_picture_weak.upgrade() {
+                picture.set_paintable(Some(&texture));
+            }
+            if let Some(status) = status_weak.upgrade() {
+                status.set_label("Live phone screen");
+                status.add_css_class("active");
+            }
+            last_sequence_clone.set(Some(frame.sequence));
+        }
+        glib::ControlFlow::Continue
     });
 
     // 1. Mouse Movement (EventControllerMotion)

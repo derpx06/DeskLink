@@ -2,7 +2,7 @@
 <interface>
   <requires lib="gtk" version="4.0"/>
   <requires lib="Adw" version="1.0"/>
-  <template class="DesklinkWindow" parent="AdwApplicationWindow">
+  <template class="DeskLinkWindow" parent="AdwApplicationWindow">
     <property name="title" translatable="yes">DeskLink</property>
     <property name="default-width">860</property>
     <property name="default-height">620</property>
@@ -35,7 +35,9 @@
           </object>
         </child>
         <property name="content">
-          <object class="GtkBox">
+          <object class="AdwToastOverlay" id="toast_overlay">
+            <property name="child">
+              <object class="GtkBox">
             <property name="orientation">vertical</property>
             <property name="spacing">0</property>
             <!-- Error banner spans full width above content -->
@@ -48,10 +50,10 @@
               <object class="GtkBox">
                 <property name="orientation">vertical</property>
                 <property name="spacing">20</property>
-                <property name="margin-start">40</property>
-                <property name="margin-end">40</property>
-                <property name="margin-top">32</property>
-                <property name="margin-bottom">40</property>
+                <property name="margin-start">24</property>
+                <property name="margin-end">24</property>
+                <property name="margin-top">24</property>
+                <property name="margin-bottom">24</property>
                 <!-- Page header row -->
                 <child>
                   <object class="GtkBox">
@@ -100,15 +102,6 @@
                         </child>
                       </object>
                     </child>
-                    <!-- Discover button in header row -->
-                    <child>
-                      <object class="GtkButton" id="discover_button">
-                        <property name="label" translatable="yes">Discover</property>
-                        <property name="icon-name">find-location-symbolic</property>
-                        <property name="valign">center</property>
-                        <property name="tooltip-text" translatable="yes">Search for nearby devices</property>
-                      </object>
-                    </child>
                   </object>
                 </child>
                 <!-- Device list -->
@@ -126,8 +119,36 @@
                     </property>
                   </object>
                 </child>
+                <child>
+                  <object class="GtkBox">
+                    <property name="orientation">vertical</property>
+                    <property name="spacing">8</property>
+                    <property name="visible">False</property>
+                    <property name="hexpand">True</property>
+                    <property name="vexpand">False</property>
+                    <child>
+                      <object class="GtkLabel">
+                        <property name="label" translatable="yes">Transfers</property>
+                        <property name="xalign">0</property>
+                        <style>
+                          <class name="title-3"/>
+                        </style>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="GtkListBox" id="transfers_list">
+                        <property name="selection-mode">none</property>
+                        <style>
+                          <class name="boxed-list"/>
+                        </style>
+                      </object>
+                    </child>
+                  </object>
+                </child>
               </object>
             </child>
+              </object>
+            </property>
           </object>
         </property>
       </object>
