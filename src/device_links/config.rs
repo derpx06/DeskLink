@@ -141,7 +141,23 @@ impl Config {
             info.outgoing_capabilities
                 .push(crate::device_links::packet::PACKET_TYPE_RUNCOMMAND.to_string());
         }
+        // WebRTC signaling is an opt-in control capability. It is never a
+        // public feature capability and must not be advertised until the
+        // packet reader has a concrete paired-session handler.
+        if self.webrtc_enabled() {
+            info.incoming_capabilities
+                .push(crate::protocol::desklink_v9::PACKET_TYPE_WEBRTC_SIGNAL_V1.to_string());
+            info.outgoing_capabilities
+                .push(crate::protocol::desklink_v9::PACKET_TYPE_WEBRTC_SIGNAL_V1.to_string());
+        }
         info
+    }
+
+    pub fn webrtc_enabled(&self) -> bool {
+        self.stored
+            .preferences
+            .get("webrtc.enabled")
+            .is_some_and(|value| value == "true")
     }
 
     pub fn key(&self) -> &PKey<Private> {

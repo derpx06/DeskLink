@@ -539,6 +539,7 @@ dependencies = [
  "gettext-rs",
  "gstreamer",
  "gstreamer-app",
+ "gstreamer-sdp",
  "gstreamer-video",
  "gstreamer-webrtc",
  "gtk4",

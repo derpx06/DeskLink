@@ -14,6 +14,7 @@ use crate::device_links::core::events::EventBus;
 use crate::device_links::device::DeviceView;
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::PROTOCOL_VERSION;
+use crate::device_links::webrtc::negotiation::WebRtcCoordinator;
 
 const MAX_UNPAIRED_CONNECTIONS: usize = 42;
 const MIN_CONNECTION_INTERVAL: Duration = Duration::from_millis(500);
@@ -106,6 +107,7 @@ pub(super) fn connect_to_device(
     sessions: DeviceManager,
     events: EventBus,
     transfer_cancellations: Arc<Mutex<HashSet<String>>>,
+    webrtc: WebRtcCoordinator,
 ) -> Result<(), String> {
     let mut stream = TcpStream::connect_timeout(
         &SocketAddr::new(address.ip(), remote_port),
@@ -136,5 +138,6 @@ pub(super) fn connect_to_device(
         sessions,
         events,
         transfer_cancellations,
+        webrtc,
     )
 }

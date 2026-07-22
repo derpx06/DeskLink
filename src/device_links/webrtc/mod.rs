@@ -9,6 +9,7 @@
 pub mod authentication;
 pub mod channel;
 pub mod envelope;
+pub mod negotiation;
 pub mod peer_connection;
 pub mod signaling;
 pub mod transport;

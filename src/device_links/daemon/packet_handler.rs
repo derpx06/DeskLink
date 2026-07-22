@@ -42,6 +42,7 @@ use crate::device_links::pairing::PairState;
 use crate::device_links::plugins::{
     connectivity, contacts, mpris, presenter, run_commands, sms, telephony, volume,
 };
+use crate::device_links::webrtc::negotiation::WebRtcCoordinator;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +108,7 @@ pub(super) fn packet_read_loop(
     events: EventBus,
     transfer_cancellations: Arc<Mutex<HashSet<String>>>,
     sessions: DeviceManager,
+    webrtc: WebRtcCoordinator,
 ) {
     let device_id = binding.device_id.clone();
     let stream = Arc::clone(&binding.link.stream);
@@ -130,7 +132,7 @@ pub(super) fn packet_read_loop(
         }
         let read_result = {
             let Ok(mut locked_stream) = stream.lock() else {
-                handle_disconnect(&binding, &sessions, &devices, &events);
+                handle_disconnect(&binding, &sessions, &webrtc, &devices, &events);
                 break;
             };
             locked_stream.read(&mut byte)
@@ -139,7 +141,7 @@ pub(super) fn packet_read_loop(
         match read_result {
             Ok(0) => {
                 stop_desktop_screen_stream(&mut desktop_screen_stream);
-                if handle_disconnect(&binding, &sessions, &devices, &events) {
+                if handle_disconnect(&binding, &sessions, &webrtc, &devices, &events) {
                     eprintln!(
                         "[Daemon] Active link closed for {}. Marked unreachable.",
                         device_id
@@ -161,7 +163,7 @@ pub(super) fn packet_read_loop(
                         retryable: false,
                     });
                     stop_desktop_screen_stream(&mut desktop_screen_stream);
-                    handle_disconnect(&binding, &sessions, &devices, &events);
+                    handle_disconnect(&binding, &sessions, &webrtc, &devices, &events);
                     break;
                 }
                 if byte[0] != b'\n' {
@@ -289,7 +291,34 @@ pub(super) fn packet_read_loop(
                                 device_id: device_id.clone(),
                                 state,
                             });
+                            if state == PairState::Paired {
+                                webrtc.begin_if_supported(
+                                    &binding,
+                                    Arc::clone(&config),
+                                    sessions.clone(),
+                                    events.clone(),
+                                );
+                            } else if previous_state == PairState::Paired {
+                                webrtc.close_for_binding(&binding, &sessions);
+                            }
                         }
+                    }
+                } else if packet.packet_type
+                    == crate::protocol::desklink_v9::PACKET_TYPE_WEBRTC_SIGNAL_V1
+                {
+                    if let Err(error) = webrtc.handle_packet(
+                        &binding,
+                        &packet,
+                        Arc::clone(&config),
+                        sessions.clone(),
+                        events.clone(),
+                    ) {
+                        events.publish(CoreEvent::Error {
+                            scope: "webrtc".to_string(),
+                            device_id: Some(device_id.clone()),
+                            message: format!("Rejected WebRTC signaling: {error}"),
+                            retryable: false,
+                        });
                     }
                 } else if packet.packet_type == PACKET_TYPE_PING {
                     eprintln!(
@@ -965,7 +994,7 @@ pub(super) fn packet_read_loop(
             }
             Err(error) => {
                 stop_desktop_screen_stream(&mut desktop_screen_stream);
-                if handle_disconnect(&binding, &sessions, &devices, &events) {
+                if handle_disconnect(&binding, &sessions, &webrtc, &devices, &events) {
                     eprintln!(
                         "[Daemon] Read error for {}: {:?}. Marked unreachable.",
                         device_id, error

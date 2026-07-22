@@ -15,6 +15,7 @@ use crate::device_links::core::events::EventBus;
 use crate::device_links::device::DeviceView;
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::NetworkPacket;
+use crate::device_links::webrtc::negotiation::WebRtcCoordinator;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn incoming_tcp_loop(
@@ -26,6 +27,7 @@ pub(super) fn incoming_tcp_loop(
     transfer_cancellations: Arc<Mutex<HashSet<String>>>,
     errors: Arc<Mutex<Vec<String>>>,
     events: EventBus,
+    webrtc: WebRtcCoordinator,
 ) {
     let _ = listener.set_nonblocking(true);
     loop {
@@ -41,6 +43,7 @@ pub(super) fn incoming_tcp_loop(
                 let errors = Arc::clone(&errors);
                 let events = events.clone();
                 let transfer_cancellations = Arc::clone(&transfer_cancellations);
+                let webrtc = webrtc.clone();
                 thread::spawn(move || {
                     if let Err(error) = accept_incoming_device(
                         stream,
@@ -50,6 +53,7 @@ pub(super) fn incoming_tcp_loop(
                         shutdown,
                         events,
                         transfer_cancellations,
+                        webrtc,
                     ) {
                         push_error(&errors, error);
                     }
@@ -63,6 +67,7 @@ pub(super) fn incoming_tcp_loop(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn accept_incoming_device(
     stream: TcpStream,
     config: Arc<Mutex<Config>>,
@@ -71,6 +76,7 @@ fn accept_incoming_device(
     shutdown: Arc<AtomicBool>,
     events: EventBus,
     transfer_cancellations: Arc<Mutex<HashSet<String>>>,
+    webrtc: WebRtcCoordinator,
 ) -> Result<(), String> {
     if shutdown.load(Ordering::SeqCst) {
         return Ok(());
@@ -131,5 +137,6 @@ fn accept_incoming_device(
         sessions,
         events,
         transfer_cancellations,
+        webrtc,
     )
 }

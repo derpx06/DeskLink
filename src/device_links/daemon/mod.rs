@@ -12,6 +12,7 @@ use crate::device_links::core::device_manager::DeviceManager;
 use crate::device_links::core::events::{CoreEvent, EventBus};
 pub(crate) use crate::device_links::core::session_link::Link;
 use crate::device_links::core::transfer_manager::{TransferCheckpointStore, TransferManager};
+use crate::device_links::webrtc::negotiation::WebRtcCoordinator;
 
 pub use commands::DaemonCommand;
 pub use handle::DaemonHandle;
@@ -46,6 +47,7 @@ pub(super) struct DaemonWorker {
     pub(super) transfer_manager: TransferManager,
     pub(super) transfer_store: TransferCheckpointStore,
     pub(super) events: EventBus,
+    pub(super) webrtc: WebRtcCoordinator,
     pub(super) command_rx: Receiver<DaemonCommand>,
     pub(super) tcp_port: u16,
 }
@@ -74,6 +76,7 @@ impl DaemonWorker {
                 .transfer_state_dir(),
         )?;
         let transfer_manager = TransferManager::default();
+        let webrtc = WebRtcCoordinator::default();
 
         {
             let config = Arc::clone(&config);
@@ -83,6 +86,7 @@ impl DaemonWorker {
             let errors = Arc::clone(&errors);
             let incoming_events = events.clone();
             let transfer_cancellations = Arc::clone(&transfer_cancellations);
+            let webrtc = webrtc.clone();
             thread::spawn(move || {
                 connector::incoming_tcp_loop(
                     tcp_listener,
@@ -93,6 +97,7 @@ impl DaemonWorker {
                     transfer_cancellations,
                     errors,
                     incoming_events,
+                    webrtc,
                 )
             });
         }
@@ -108,6 +113,7 @@ impl DaemonWorker {
             transfer_manager,
             transfer_store,
             events,
+            webrtc,
             command_rx,
             tcp_port,
         })
@@ -151,6 +157,7 @@ impl DaemonWorker {
         let errors = Arc::clone(&self.errors);
         let events = self.events.clone();
         let transfer_cancellations = Arc::clone(&self.transfer_cancellations);
+        let webrtc = self.webrtc.clone();
 
         thread::spawn(move || loop {
             if shutdown.load(Ordering::SeqCst) {
@@ -181,6 +188,7 @@ impl DaemonWorker {
                     sessions.clone(),
                     events.clone(),
                     Arc::clone(&transfer_cancellations),
+                    webrtc.clone(),
                 );
 
                 if let Err(error) = result {

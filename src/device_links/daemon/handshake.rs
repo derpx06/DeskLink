@@ -4,6 +4,7 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use super::network::{read_ssl_packet, send_packet};
 use super::packet_handler::packet_read_loop;
@@ -19,7 +20,9 @@ use crate::device_links::core::events::{CoreEvent, EventBus};
 use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_NOTIFICATION_REQUEST};
+use crate::device_links::webrtc::negotiation::WebRtcCoordinator;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finish_secure_link(
     initial_info: DeviceInfo,
     mut stream: SslStream<TcpStream>,
@@ -28,6 +31,7 @@ pub(super) fn finish_secure_link(
     sessions: DeviceManager,
     events: EventBus,
     transfer_cancellations: Arc<Mutex<HashSet<String>>>,
+    webrtc: WebRtcCoordinator,
 ) -> Result<(), String> {
     let identity = config
         .lock()
@@ -124,6 +128,7 @@ pub(super) fn finish_secure_link(
     let registration = sessions
         .register_link(secure_info.id.clone(), link, paired)
         .map_err(|error| format!("Could not register device session: {error:?}"))?;
+    webrtc.close_for_device(&secure_info.id);
     if let Some(replaced) = &registration.replaced_link {
         replaced.close();
     }
@@ -135,6 +140,7 @@ pub(super) fn finish_secure_link(
     let read_config = Arc::clone(&config);
     let read_events = events.clone();
     let read_transfer_cancellations = Arc::clone(&transfer_cancellations);
+    let reader_sessions = sessions.clone();
 
     if paired {
         let mut request = NetworkPacket::new(PACKET_TYPE_NOTIFICATION_REQUEST);
@@ -147,6 +153,7 @@ pub(super) fn finish_secure_link(
         }
     }
 
+    let reader_webrtc = webrtc.clone();
     thread::spawn(move || {
         packet_read_loop(
             read_binding,
@@ -154,18 +161,36 @@ pub(super) fn finish_secure_link(
             read_config,
             read_events,
             read_transfer_cancellations,
-            sessions,
+            reader_sessions,
+            reader_webrtc,
         )
     });
+
+    // Android starts its packet receiver as the control link is installed.
+    // Give that receiver a short, bounded chance to install before producing
+    // the first SDP offer; the protocol remains deterministic and does not
+    // depend on this delay for authorization or identity verification.
+    if paired {
+        let begin_binding = registration.binding;
+        let begin_config = Arc::clone(&config);
+        let begin_sessions = sessions;
+        let begin_events = events;
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(250));
+            webrtc.begin_if_supported(&begin_binding, begin_config, begin_sessions, begin_events);
+        });
+    }
     Ok(())
 }
 
 pub(super) fn handle_disconnect(
     binding: &crate::device_links::core::device_manager::SessionBinding,
     sessions: &DeviceManager,
+    webrtc: &WebRtcCoordinator,
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     events: &EventBus,
 ) -> bool {
+    webrtc.close_for_binding(binding, sessions);
     let result =
         sessions.disconnect_if_current(binding, "The device connection was closed".to_string());
     if result.was_current {

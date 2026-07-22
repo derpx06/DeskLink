@@ -6,6 +6,7 @@ use gstreamer as gst;
 
 use super::channel::{ChannelError, DataChannelSpec};
 use super::envelope::{EnvelopeError, MessageEnvelope};
+use super::peer_connection::PeerConnection;
 
 pub const MAX_QUEUED_MESSAGES: usize = 256;
 
@@ -75,8 +76,13 @@ pub struct WebRtcTransport {
     pub device_id: String,
     pub session_id: u64,
     pub connection_generation: u64,
-    peer: gst::Element,
+    peer: WebRtcPeer,
     inner: Arc<Mutex<TransportInner>>,
+}
+
+enum WebRtcPeer {
+    Element(gst::Element),
+    Connection(Arc<PeerConnection>),
 }
 
 impl WebRtcTransport {
@@ -117,7 +123,7 @@ impl WebRtcTransport {
             device_id,
             session_id,
             connection_generation,
-            peer,
+            peer: WebRtcPeer::Element(peer),
             inner: Arc::new(Mutex::new(TransportInner {
                 state: TransportState::New,
                 queue: VecDeque::new(),
@@ -125,8 +131,33 @@ impl WebRtcTransport {
         })
     }
 
+    /// Wrap the peer that completed the live SDP/ICE negotiation. The
+    /// `DeviceManager` owns this only after its control data channel opens.
+    pub fn from_peer(
+        device_id: impl Into<String>,
+        session_id: u64,
+        connection_generation: u64,
+        peer: Arc<PeerConnection>,
+    ) -> Self {
+        let device_id = device_id.into();
+        Self {
+            transport_id: format!("webrtc:{device_id}:{session_id}:{connection_generation}"),
+            device_id,
+            session_id,
+            connection_generation,
+            peer: WebRtcPeer::Connection(peer),
+            inner: Arc::new(Mutex::new(TransportInner {
+                state: TransportState::Connected,
+                queue: VecDeque::new(),
+            })),
+        }
+    }
+
     pub fn peer(&self) -> &gst::Element {
-        &self.peer
+        match &self.peer {
+            WebRtcPeer::Element(peer) => peer,
+            WebRtcPeer::Connection(peer) => peer.element(),
+        }
     }
 
     pub fn state(&self) -> TransportState {
@@ -206,7 +237,12 @@ impl WebRtcTransport {
             inner.state = TransportState::Closed;
             inner.queue.clear();
         }
-        let _ = self.peer.set_state(gst::State::Null);
+        match &self.peer {
+            WebRtcPeer::Element(peer) => {
+                let _ = peer.set_state(gst::State::Null);
+            }
+            WebRtcPeer::Connection(peer) => peer.close(),
+        }
     }
 }
 

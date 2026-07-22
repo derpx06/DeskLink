@@ -1,6 +1,10 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
+use base64::Engine;
+use openssl::hash::MessageDigest;
+use openssl::pkey::{PKey, Private, Public};
+use openssl::sign::{Signer, Verifier};
 use serde::{Deserialize, Serialize};
 
 use crate::device_links::packet::NetworkPacket;
@@ -32,6 +36,72 @@ pub enum SignalingMessageType {
 }
 
 impl SignalingMessage {
+    /// Bytes covered by the DeskLink identity-key signature. Keeping the
+    /// signature field out of the record binds every routing, SDP and ICE
+    /// field without signing a self-referential value. This is deliberately
+    /// a length-delimited record rather than JSON: Rust and Android JSON map
+    /// ordering differs and must not weaken cross-platform verification.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, SignalingError> {
+        let message_type = match self.message_type {
+            SignalingMessageType::Offer => "offer",
+            SignalingMessageType::Answer => "answer",
+            SignalingMessageType::IceCandidate => "ice_candidate",
+            SignalingMessageType::EndOfCandidates => "end_of_candidates",
+            SignalingMessageType::IceRestart => "ice_restart",
+            SignalingMessageType::Close => "close",
+        };
+        let payload = canonical_payload(&self.message_type, &self.payload)?;
+        let values = [
+            self.signaling_version.to_string(),
+            self.request_id.clone(),
+            self.session_attempt_id.clone(),
+            self.from_device_id.clone(),
+            self.to_device_id.clone(),
+            self.timestamp.to_string(),
+            message_type.to_string(),
+            payload,
+        ];
+        let mut bytes = Vec::new();
+        for value in values {
+            bytes.extend_from_slice(value.len().to_string().as_bytes());
+            bytes.push(b':');
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        Ok(bytes)
+    }
+
+    pub fn sign_with_key(&mut self, key: &PKey<Private>) -> Result<(), SignalingError> {
+        let mut signer = Signer::new(MessageDigest::sha256(), key)
+            .map_err(|error| SignalingError::Crypto(error.to_string()))?;
+        signer
+            .update(&self.canonical_bytes()?)
+            .map_err(|error| SignalingError::Crypto(error.to_string()))?;
+        let signature = signer
+            .sign_to_vec()
+            .map_err(|error| SignalingError::Crypto(error.to_string()))?;
+        self.signature = base64::engine::general_purpose::STANDARD.encode(signature);
+        Ok(())
+    }
+
+    pub fn verify_with_key(&self, key: &PKey<Public>) -> Result<(), SignalingError> {
+        let signature = base64::engine::general_purpose::STANDARD
+            .decode(&self.signature)
+            .map_err(|_| SignalingError::InvalidSignature)?;
+        let mut verifier = Verifier::new(MessageDigest::sha256(), key)
+            .map_err(|error| SignalingError::Crypto(error.to_string()))?;
+        verifier
+            .update(&self.canonical_bytes()?)
+            .map_err(|error| SignalingError::Crypto(error.to_string()))?;
+        if verifier
+            .verify(&signature)
+            .map_err(|error| SignalingError::Crypto(error.to_string()))?
+        {
+            Ok(())
+        } else {
+            Err(SignalingError::InvalidSignature)
+        }
+    }
+
     pub fn validate_for(
         &self,
         local_device_id: &str,
@@ -74,6 +144,39 @@ impl SignalingMessage {
     }
 }
 
+fn canonical_payload(
+    message_type: &SignalingMessageType,
+    payload: &serde_json::Value,
+) -> Result<String, SignalingError> {
+    match message_type {
+        SignalingMessageType::Offer | SignalingMessageType::Answer => payload
+            .get("sdp")
+            .and_then(serde_json::Value::as_str)
+            .map(|sdp| format!("sdp={sdp}"))
+            .ok_or(SignalingError::Malformed),
+        SignalingMessageType::IceCandidate => {
+            let index = payload
+                .get("sdpMLineIndex")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(SignalingError::Malformed)?;
+            let candidate = payload
+                .get("candidate")
+                .and_then(serde_json::Value::as_str)
+                .ok_or(SignalingError::Malformed)?;
+            Ok(format!("sdpMLineIndex={index}\ncandidate={candidate}"))
+        }
+        SignalingMessageType::EndOfCandidates
+        | SignalingMessageType::IceRestart
+        | SignalingMessageType::Close => {
+            if payload.is_object() {
+                Ok(String::new())
+            } else {
+                Err(SignalingError::Malformed)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SignalingError {
     UnsupportedVersion(u8),
@@ -81,6 +184,8 @@ pub enum SignalingError {
     WrongPacketType,
     Expired,
     Replay,
+    InvalidSignature,
+    Crypto(String),
     Malformed,
     Transport(String),
 }
@@ -284,6 +389,35 @@ mod tests {
         assert_eq!(
             message().validate_for("phone", 400_001),
             Err(SignalingError::Expired)
+        );
+    }
+
+    #[test]
+    fn signature_binds_sdp_and_routing_fields() {
+        use openssl::ec::{EcGroup, EcKey};
+        use openssl::nid::Nid;
+        use openssl::pkey::PKey;
+
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let private = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        let public = PKey::public_key_from_der(&private.public_key_to_der().unwrap()).unwrap();
+        let mut signed = message();
+        signed.sign_with_key(&private).unwrap();
+        signed.verify_with_key(&public).unwrap();
+        signed.payload = serde_json::json!({"sdp": "altered"});
+        assert_eq!(
+            signed.verify_with_key(&public),
+            Err(SignalingError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn canonical_record_matches_the_android_fixture() {
+        let mut fixture = message();
+        fixture.request_id = "request-1".to_string();
+        assert_eq!(
+            String::from_utf8(fixture.canonical_bytes().unwrap()).unwrap(),
+            "1:19:request-19:attempt-17:desktop5:phone4:10005:offer9:sdp=offer"
         );
     }
 }
