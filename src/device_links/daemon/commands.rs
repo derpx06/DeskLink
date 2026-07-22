@@ -165,6 +165,7 @@ impl DaemonWorker {
             DaemonCommand::Stop => {
                 self.shutdown
                     .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.sessions.terminate_all_webrtc();
                 for link in self.sessions.terminate_all() {
                     link.close();
                 }

@@ -127,6 +127,9 @@ pub(super) fn finish_secure_link(
     if let Some(replaced) = &registration.replaced_link {
         replaced.close();
     }
+    if let Some(replaced) = &registration.replaced_webrtc_transport {
+        replaced.close();
+    }
     let read_binding: SessionBinding = registration.binding.clone();
     let read_devices = Arc::clone(&devices);
     let read_config = Arc::clone(&config);
@@ -166,6 +169,13 @@ pub(super) fn handle_disconnect(
     let result =
         sessions.disconnect_if_current(binding, "The device connection was closed".to_string());
     if result.was_current {
+        if let Some(webrtc_binding) = sessions.current_webrtc_binding(&binding.device_id) {
+            if webrtc_binding.session_id == binding.session_id
+                && webrtc_binding.generation == binding.generation
+            {
+                sessions.clear_webrtc_if_current(&webrtc_binding);
+            }
+        }
         binding.link.close();
         mark_status(devices, &binding.device_id, DeviceStatus::Unreachable);
         if let Ok(devices) = devices.lock() {

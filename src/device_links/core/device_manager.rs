@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use super::device_session::{ConnectionGeneration, DeviceSession, SessionId, SessionState};
 use super::session_link::Link;
+use crate::device_links::webrtc::transport::WebRtcTransport;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
@@ -40,6 +41,7 @@ pub struct RegistrationResult {
     pub binding: SessionBinding,
     pub replaced_link: Option<Arc<Link>>,
     pub replaced_generation: Option<ConnectionGeneration>,
+    pub replaced_webrtc_transport: Option<Arc<WebRtcTransport>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,6 +57,30 @@ pub struct ReconnectLease {
     pub generation: ConnectionGeneration,
 }
 
+#[derive(Clone)]
+pub struct WebRtcBinding {
+    pub device_id: String,
+    pub session_id: SessionId,
+    pub generation: ConnectionGeneration,
+    pub transport: Arc<WebRtcTransport>,
+}
+
+impl std::fmt::Debug for WebRtcBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WebRtcBinding")
+            .field("device_id", &self.device_id)
+            .field("session_id", &self.session_id)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+pub struct WebRtcRegistration {
+    pub binding: WebRtcBinding,
+    pub replaced_transport: Option<Arc<WebRtcTransport>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceSessionSnapshot {
     pub session_id: SessionId,
@@ -68,6 +94,7 @@ pub struct DeviceSessionSnapshot {
 #[derive(Clone)]
 pub struct DeviceManager {
     sessions: Arc<Mutex<HashMap<String, DeviceSession>>>,
+    webrtc: Arc<Mutex<HashMap<String, WebRtcBinding>>>,
     next_session_id: Arc<AtomicU64>,
 }
 
@@ -81,6 +108,7 @@ impl DeviceManager {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            webrtc: Arc::new(Mutex::new(HashMap::new())),
             next_session_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -160,7 +188,7 @@ impl DeviceManager {
         session.clear_reconnect();
         session.transition(SessionState::Ready);
         let binding = SessionBinding {
-            device_id,
+            device_id: device_id.clone(),
             session_id: session.session_id,
             generation: session.connection_generation,
             link: session
@@ -170,10 +198,17 @@ impl DeviceManager {
                 .clone(),
             cancellation: Arc::clone(&session.cancellation),
         };
+        let replaced_webrtc_transport = self
+            .webrtc
+            .lock()
+            .ok()
+            .and_then(|mut bindings| bindings.remove(&device_id))
+            .map(|binding| binding.transport);
         Ok(RegistrationResult {
             binding,
             replaced_link,
             replaced_generation,
+            replaced_webrtc_transport,
         })
     }
 
@@ -310,6 +345,94 @@ impl DeviceManager {
             was_current: true,
             reconnect_scheduled: session.next_reconnect_at.is_some(),
         }
+    }
+
+    /// Installs one WebRTC transport only for the currently authenticated LAN
+    /// generation. The caller can later replace the LAN transport after the
+    /// WebRTC transcript and channel negotiation have completed.
+    pub fn register_webrtc_transport(
+        &self,
+        binding: &SessionBinding,
+        transport: WebRtcTransport,
+    ) -> Result<WebRtcRegistration, SessionError> {
+        if !self.is_current(binding) {
+            return Err(SessionError::StaleBinding);
+        }
+        let transport = Arc::new(transport);
+        let web_rtc_binding = WebRtcBinding {
+            device_id: binding.device_id.clone(),
+            session_id: binding.session_id,
+            generation: binding.generation,
+            transport,
+        };
+        let replaced_binding = self
+            .webrtc
+            .lock()
+            .map_err(|_| SessionError::UnknownSession)?
+            .insert(binding.device_id.clone(), web_rtc_binding.clone());
+        if let Some(previous) = &replaced_binding {
+            previous.transport.close();
+        }
+        Ok(WebRtcRegistration {
+            binding: web_rtc_binding,
+            replaced_transport: replaced_binding.map(|binding| binding.transport),
+        })
+    }
+
+    pub fn current_webrtc_binding(&self, device_id: &str) -> Option<WebRtcBinding> {
+        self.webrtc.lock().ok()?.get(device_id).cloned()
+    }
+
+    pub fn is_current_webrtc(&self, binding: &WebRtcBinding) -> bool {
+        let Some(current_session) = self.current_binding(&binding.device_id) else {
+            return false;
+        };
+        current_session.session_id == binding.session_id
+            && current_session.generation == binding.generation
+            && self
+                .webrtc
+                .lock()
+                .ok()
+                .and_then(|bindings| bindings.get(&binding.device_id).cloned())
+                .is_some_and(|current| {
+                    current.session_id == binding.session_id
+                        && current.generation == binding.generation
+                        && Arc::ptr_eq(&current.transport, &binding.transport)
+                })
+    }
+
+    pub fn clear_webrtc_if_current(&self, binding: &WebRtcBinding) -> bool {
+        let removed = self.webrtc.lock().ok().and_then(|mut bindings| {
+            let current = bindings.get(&binding.device_id)?;
+            if current.session_id != binding.session_id
+                || current.generation != binding.generation
+                || !Arc::ptr_eq(&current.transport, &binding.transport)
+            {
+                return None;
+            }
+            bindings.remove(&binding.device_id)
+        });
+        if let Some(current) = removed {
+            current.transport.close();
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn terminate_all_webrtc(&self) -> Vec<Arc<WebRtcTransport>> {
+        let transports: Vec<Arc<WebRtcTransport>> = self
+            .webrtc
+            .lock()
+            .map(|mut bindings| {
+                bindings
+                    .drain()
+                    .map(|(_, binding)| binding.transport)
+                    .collect()
+            })
+            .unwrap_or_default();
+        transports.iter().for_each(|transport| transport.close());
+        transports
     }
 
     pub fn claim_reconnect(&self, device_id: &str, now: Instant) -> Option<ReconnectLease> {
@@ -469,6 +592,36 @@ mod tests {
             manager.get(DEVICE_ID).unwrap().pair_state(),
             PairState::Paired
         );
+    }
+
+    #[test]
+    fn one_webrtc_transport_is_owned_per_current_session_generation() {
+        let manager = DeviceManager::new();
+        let lan = manager
+            .register_link(DEVICE_ID.to_string(), link(), true)
+            .expect("LAN link should register");
+        let first = manager
+            .register_webrtc_transport(
+                &lan.binding,
+                WebRtcTransport::new(DEVICE_ID, lan.binding.session_id, lan.binding.generation)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(manager.is_current_webrtc(&first.binding));
+
+        let second = manager
+            .register_webrtc_transport(
+                &lan.binding,
+                WebRtcTransport::new(DEVICE_ID, lan.binding.session_id, lan.binding.generation)
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(second.replaced_transport.is_some());
+        assert!(!manager.is_current_webrtc(&first.binding));
+        assert!(manager.is_current_webrtc(&second.binding));
+        assert!(!manager.clear_webrtc_if_current(&first.binding));
+        assert!(manager.clear_webrtc_if_current(&second.binding));
+        assert!(manager.current_webrtc_binding(DEVICE_ID).is_none());
     }
 
     #[test]
