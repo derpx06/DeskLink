@@ -157,7 +157,25 @@ impl Config {
         self.stored
             .preferences
             .get("webrtc.enabled")
-            .is_some_and(|value| value == "true")
+            .is_none_or(|value| value == "true")
+    }
+
+    pub fn webrtc_ice_servers(
+        &self,
+    ) -> Result<crate::device_links::webrtc::transport::IceServerConfig, String> {
+        crate::device_links::webrtc::transport::IceServerConfig::parse(
+            self.stored
+                .preferences
+                .get("webrtc.stun.servers")
+                .map(String::as_str)
+                .unwrap_or_default(),
+            self.stored
+                .preferences
+                .get("webrtc.turn.servers")
+                .map(String::as_str)
+                .unwrap_or_default(),
+        )
+        .map_err(|error| error.to_string())
     }
 
     pub fn key(&self) -> &PKey<Private> {
@@ -170,6 +188,16 @@ impl Config {
 
     pub fn transfer_state_dir(&self) -> PathBuf {
         self.base_dir.join("transfers")
+    }
+
+    pub fn download_directory(&self) -> PathBuf {
+        self.stored
+            .preferences
+            .get("downloads.directory")
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(dirs::download_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     pub fn is_trusted(&self, device_id: &str) -> bool {
@@ -230,6 +258,8 @@ impl Config {
             "security.require-pairing",
             "webrtc.enabled",
             "webrtc.signaling.endpoint",
+            "webrtc.stun.servers",
+            "webrtc.turn.servers",
         ];
         if !ALLOWED_KEYS.contains(&key) {
             return Err(format!("Unknown DeskLink preference: {key}"));
@@ -242,6 +272,28 @@ impl Config {
         }
         if key == "webrtc.signaling.endpoint" && !value.is_empty() && !value.starts_with("wss://") {
             return Err("WebRTC signaling endpoint must use wss://".to_string());
+        }
+        if key == "webrtc.stun.servers" || key == "webrtc.turn.servers" {
+            let stun = if key == "webrtc.stun.servers" {
+                value
+            } else {
+                self.stored
+                    .preferences
+                    .get("webrtc.stun.servers")
+                    .map(String::as_str)
+                    .unwrap_or_default()
+            };
+            let turn = if key == "webrtc.turn.servers" {
+                value
+            } else {
+                self.stored
+                    .preferences
+                    .get("webrtc.turn.servers")
+                    .map(String::as_str)
+                    .unwrap_or_default()
+            };
+            crate::device_links::webrtc::transport::IceServerConfig::parse(stun, turn)
+                .map_err(|error| error.to_string())?;
         }
         self.stored
             .preferences

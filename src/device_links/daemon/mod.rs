@@ -77,6 +77,17 @@ impl DaemonWorker {
         )?;
         let transfer_manager = TransferManager::default();
         let webrtc = WebRtcCoordinator::default();
+        webrtc.attach_devices(Arc::clone(&devices));
+        let download_root = config
+            .lock()
+            .map_err(|_| "Config lock poisoned".to_string())?
+            .download_directory();
+        webrtc.configure_file_transfers(
+            transfer_manager.clone(),
+            transfer_store.clone(),
+            Arc::clone(&transfer_cancellations),
+            download_root,
+        )?;
 
         {
             let config = Arc::clone(&config);
@@ -235,7 +246,27 @@ impl DaemonWorker {
                         if !sessions.is_current(&binding) {
                             continue;
                         }
-                        if let Err(error) = network::send_packet(&binding.link.stream, &packet) {
+                        let result = sessions
+                            .current_webrtc_binding(&session.device_id)
+                            .filter(|web_rtc| sessions.is_current_webrtc(web_rtc))
+                            .ok_or_else(|| {
+                                "DeskLink WebRTC feature transport is unavailable".to_string()
+                            })
+                            .and_then(|web_rtc| {
+                                web_rtc
+                                    .transport
+                                    .send_packet(
+                                        &packet,
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|duration| {
+                                                duration.as_millis().min(i64::MAX as u128) as i64
+                                            })
+                                            .unwrap_or_default(),
+                                    )
+                                    .map_err(|error| error.to_string())
+                            });
+                        if let Err(error) = result {
                             state::push_error(
                                 &errors,
                                 format!("Battery update to {} failed: {error}", session.device_id),

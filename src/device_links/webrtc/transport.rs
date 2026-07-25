@@ -6,7 +6,11 @@ use gstreamer as gst;
 
 use super::channel::{ChannelError, DataChannelSpec};
 use super::envelope::{EnvelopeError, MessageEnvelope};
+use super::handover::{HandoverMessage, HandoverState};
+use super::packet_bridge::{encode_packet, PacketBridgeError};
 use super::peer_connection::PeerConnection;
+use super::wire_binding::WebRtcWireBinding;
+use crate::device_links::packet::NetworkPacket;
 
 pub const MAX_QUEUED_MESSAGES: usize = 256;
 
@@ -17,15 +21,40 @@ pub struct IceServerConfig {
 }
 
 impl IceServerConfig {
+    pub fn parse(stun: &str, turn: &str) -> Result<Self, TransportError> {
+        fn split(value: &str) -> Vec<String> {
+            value
+                .split([',', '\n'])
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        }
+        let value = Self {
+            stun_servers: split(stun),
+            turn_servers: split(turn),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
     pub fn validate(&self) -> Result<(), TransportError> {
-        for uri in self.stun_servers.iter().chain(self.turn_servers.iter()) {
-            if !(uri.starts_with("stun://")
-                || uri.starts_with("stuns://")
-                || uri.starts_with("turn://")
-                || uri.starts_with("turns://"))
-            {
+        if self.stun_servers.len() > 8 || self.turn_servers.len() > 8 {
+            return Err(TransportError::Gstreamer(
+                "at most eight STUN and eight TURN servers may be configured".to_string(),
+            ));
+        }
+        for uri in &self.stun_servers {
+            if !(uri.starts_with("stun://") || uri.starts_with("stuns://")) {
                 return Err(TransportError::Gstreamer(format!(
-                    "unsupported ICE server URI: {uri}"
+                    "unsupported STUN server URI: {uri}"
+                )));
+            }
+        }
+        for uri in &self.turn_servers {
+            if !(uri.starts_with("turn://") || uri.starts_with("turns://")) {
+                return Err(TransportError::Gstreamer(format!(
+                    "unsupported TURN server URI: {uri}"
                 )));
             }
         }
@@ -51,6 +80,9 @@ pub enum TransportError {
     Backpressure,
     Channel(ChannelError),
     Envelope(EnvelopeError),
+    PacketBridge(PacketBridgeError),
+    HandoverIncomplete,
+    InvalidHandoverTransition,
 }
 
 impl std::fmt::Display for TransportError {
@@ -62,6 +94,7 @@ impl std::error::Error for TransportError {}
 
 struct TransportInner {
     state: TransportState,
+    handover: HandoverState,
     queue: VecDeque<Vec<u8>>,
 }
 
@@ -76,6 +109,7 @@ pub struct WebRtcTransport {
     pub device_id: String,
     pub session_id: u64,
     pub connection_generation: u64,
+    pub wire_binding: WebRtcWireBinding,
     peer: WebRtcPeer,
     inner: Arc<Mutex<TransportInner>>,
 }
@@ -118,14 +152,22 @@ impl WebRtcTransport {
             peer.set_property("turn-server", turn);
         }
         let device_id = device_id.into();
+        let wire_binding = WebRtcWireBinding {
+            sender_device_id: device_id.clone(),
+            peer_device_id: device_id.clone(),
+            session_id,
+            generation: connection_generation,
+        };
         Ok(Self {
             transport_id: format!("webrtc:{device_id}:{session_id}:{connection_generation}"),
             device_id,
             session_id,
             connection_generation,
+            wire_binding,
             peer: WebRtcPeer::Element(peer),
             inner: Arc::new(Mutex::new(TransportInner {
                 state: TransportState::New,
+                handover: HandoverState::Negotiating,
                 queue: VecDeque::new(),
             })),
         })
@@ -133,21 +175,21 @@ impl WebRtcTransport {
 
     /// Wrap the peer that completed the live SDP/ICE negotiation. The
     /// `DeviceManager` owns this only after its control data channel opens.
-    pub fn from_peer(
-        device_id: impl Into<String>,
-        session_id: u64,
-        connection_generation: u64,
-        peer: Arc<PeerConnection>,
-    ) -> Self {
-        let device_id = device_id.into();
+    pub fn from_peer(wire_binding: WebRtcWireBinding, peer: Arc<PeerConnection>) -> Self {
+        let device_id = wire_binding.peer_device_id.clone();
         Self {
-            transport_id: format!("webrtc:{device_id}:{session_id}:{connection_generation}"),
+            transport_id: format!(
+                "webrtc:{device_id}:{}:{}",
+                wire_binding.session_id, wire_binding.generation
+            ),
             device_id,
-            session_id,
-            connection_generation,
+            session_id: wire_binding.session_id,
+            connection_generation: wire_binding.generation,
+            wire_binding,
             peer: WebRtcPeer::Connection(peer),
             inner: Arc::new(Mutex::new(TransportInner {
                 state: TransportState::Connected,
+                handover: HandoverState::Negotiating,
                 queue: VecDeque::new(),
             })),
         }
@@ -165,6 +207,30 @@ impl WebRtcTransport {
             .lock()
             .map(|inner| inner.state)
             .unwrap_or(TransportState::Failed)
+    }
+
+    pub fn handover_state(&self) -> HandoverState {
+        self.inner
+            .lock()
+            .map(|inner| inner.handover)
+            .unwrap_or(HandoverState::Failed)
+    }
+
+    pub fn features_allowed(&self) -> bool {
+        self.state() == TransportState::Connected && self.handover_state().features_allowed()
+    }
+
+    pub fn advance_handover(
+        &self,
+        message: HandoverMessage,
+    ) -> Result<HandoverState, TransportError> {
+        let mut inner = self.inner.lock().map_err(|_| TransportError::Closed)?;
+        let next = inner
+            .handover
+            .receive(message)
+            .map_err(|_| TransportError::InvalidHandoverTransition)?;
+        inner.handover = next;
+        Ok(next)
     }
 
     pub fn set_state(&self, state: TransportState) -> Result<(), TransportError> {
@@ -190,7 +256,11 @@ impl WebRtcTransport {
 
     pub fn enqueue(&self, envelope: &MessageEnvelope) -> Result<(), TransportError> {
         envelope
-            .validate(&self.device_id, self.session_id, self.connection_generation)
+            .validate(
+                &self.wire_binding.sender_device_id,
+                self.wire_binding.session_id,
+                self.wire_binding.generation,
+            )
             .map_err(TransportError::Envelope)?;
         let bytes = serde_json::to_vec(envelope)
             .map_err(|_| TransportError::Envelope(EnvelopeError::Malformed))?;
@@ -201,7 +271,18 @@ impl WebRtcTransport {
         if inner.queue.len() >= MAX_QUEUED_MESSAGES {
             return Err(TransportError::Backpressure);
         }
-        inner.queue.push_back(bytes);
+        match &self.peer {
+            WebRtcPeer::Connection(peer) => {
+                let channel = DataChannelSpec::for_label(&envelope.channel).ok_or_else(|| {
+                    TransportError::Envelope(EnvelopeError::UnknownChannel(
+                        envelope.channel.clone(),
+                    ))
+                })?;
+                peer.send_envelope(&channel, envelope)
+                    .map_err(TransportError::Gstreamer)?;
+            }
+            WebRtcPeer::Element(_) => inner.queue.push_back(bytes),
+        }
         Ok(())
     }
 
@@ -213,15 +294,31 @@ impl WebRtcTransport {
         timestamp: i64,
     ) -> Result<(), TransportError> {
         let envelope = MessageEnvelope::new(
-            &self.device_id,
-            self.session_id,
-            self.connection_generation,
+            &self.wire_binding.sender_device_id,
+            self.wire_binding.session_id,
+            self.wire_binding.generation,
             channel,
             message_type,
             payload,
             timestamp,
         )
         .map_err(TransportError::Envelope)?;
+        self.enqueue(&envelope)
+    }
+
+    /// Sends an existing paired DeskLink feature packet on its fixed data
+    /// channel. Pairing, SDP/ICE signaling, and payload packets are rejected
+    /// by the bridge and must retain their dedicated paths.
+    pub fn send_packet(
+        &self,
+        packet: &NetworkPacket,
+        timestamp: i64,
+    ) -> Result<(), TransportError> {
+        if !self.features_allowed() {
+            return Err(TransportError::HandoverIncomplete);
+        }
+        let envelope = encode_packet(&self.wire_binding, packet, timestamp)
+            .map_err(TransportError::PacketBridge)?;
         self.enqueue(&envelope)
     }
 
@@ -267,5 +364,45 @@ mod tests {
             transport.enqueue(&envelope),
             Err(TransportError::Envelope(EnvelopeError::StaleGeneration))
         ));
+    }
+
+    #[test]
+    fn paired_packet_is_enveloped_on_the_events_channel() {
+        let transport = WebRtcTransport::new("phone", 7, 2).unwrap();
+        let mut packet = NetworkPacket::new("desklink.clipboard");
+        packet.set("content", "DeskLink");
+
+        assert!(matches!(
+            transport.send_packet(&packet, 1),
+            Err(TransportError::HandoverIncomplete)
+        ));
+        transport
+            .advance_handover(crate::device_links::webrtc::handover::HandoverMessage::Authenticated)
+            .unwrap();
+        transport
+            .advance_handover(crate::device_links::webrtc::handover::HandoverMessage::Capabilities)
+            .unwrap();
+        transport
+            .advance_handover(crate::device_links::webrtc::handover::HandoverMessage::FeatureReady)
+            .unwrap();
+        transport.set_state(TransportState::Connected).unwrap();
+        transport.send_packet(&packet, 1).unwrap();
+        let encoded = transport.drain_queue();
+        assert_eq!(encoded.len(), 1);
+        let envelope: MessageEnvelope = serde_json::from_slice(&encoded[0]).unwrap();
+        assert_eq!(envelope.channel, DataChannelSpec::EVENTS.label);
+    }
+
+    #[test]
+    fn ice_configuration_is_explicit_and_scheme_checked() {
+        let config = IceServerConfig::parse(
+            "stun://one.example:3478, stun://two.example:3478",
+            "turns://user:credential@relay.example:5349",
+        )
+        .unwrap();
+        assert_eq!(config.stun_servers.len(), 2);
+        assert_eq!(config.turn_servers.len(), 1);
+        assert!(IceServerConfig::parse("https://invalid.example", "").is_err());
+        assert!(IceServerConfig::parse("", "stun://wrong.example").is_err());
     }
 }

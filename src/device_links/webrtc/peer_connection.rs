@@ -1,11 +1,16 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use gst::prelude::*;
 use gstreamer as gst;
+use gstreamer_app::{AppSink, AppSinkCallbacks, AppSrc};
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc::{
-    WebRTCDataChannel, WebRTCDataChannelState, WebRTCSDPType, WebRTCSessionDescription,
+    WebRTCDataChannel, WebRTCDataChannelState, WebRTCPeerConnectionState, WebRTCSDPType,
+    WebRTCSessionDescription,
 };
 
 use super::channel::{ChannelError, DataChannelSpec};
@@ -17,9 +22,24 @@ use super::envelope::MessageEnvelope;
 pub enum PeerEvent {
     Offer(String),
     Answer(String),
-    IceCandidate { mline_index: u32, candidate: String },
+    IceCandidate {
+        mline_index: u32,
+        candidate: String,
+    },
     EndOfCandidates,
     ControlChannelOpen,
+    Message {
+        channel: String,
+        bytes: Vec<u8>,
+    },
+    VideoFrame {
+        sequence: u64,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    },
+    Connected,
+    Disconnected,
     Failure(String),
 }
 
@@ -33,6 +53,10 @@ pub struct PeerConnection {
     pipeline: Option<gst::Pipeline>,
     channels: Arc<Mutex<HashMap<String, WebRTCDataChannel>>>,
     events: Option<PeerEventSink>,
+    video_source: Arc<Mutex<Option<AppSrc>>>,
+    video_stop: Arc<Mutex<Option<Arc<AtomicBool>>>>,
+    video_worker: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    video_sequence: Arc<AtomicU64>,
 }
 
 impl PeerConnection {
@@ -43,17 +67,37 @@ impl PeerConnection {
             pipeline: None,
             channels: Arc::new(Mutex::new(HashMap::new())),
             events: None,
+            video_source: Arc::new(Mutex::new(None)),
+            video_stop: Arc::new(Mutex::new(None)),
+            video_worker: Arc::new(Mutex::new(None)),
+            video_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Construct a running data-channel-only peer connection. The pipeline is
     /// required: `webrtcbin` does not produce SDP or ICE while detached.
     pub fn new_negotiated(events: PeerEventSink) -> Result<Self, String> {
+        Self::new_negotiated_with_ice(events, &[], &[])
+    }
+
+    pub fn new_negotiated_with_ice(
+        events: PeerEventSink,
+        stun_servers: &[String],
+        turn_servers: &[String],
+    ) -> Result<Self, String> {
         gst::init().map_err(|error| error.to_string())?;
         let element = gst::ElementFactory::make("webrtcbin")
             .name("desklink-webrtcbin")
             .build()
             .map_err(|error| error.to_string())?;
+        if let Some(stun) = stun_servers.first() {
+            element.set_property("stun-server", stun);
+        }
+        for turn in turn_servers {
+            if !element.emit_by_name::<bool>("add-turn-server", &[turn]) {
+                return Err(format!("GStreamer rejected TURN server URI: {turn}"));
+            }
+        }
         let pipeline = gst::Pipeline::new();
         pipeline.add(&element).map_err(|error| error.to_string())?;
         let peer = Self {
@@ -61,7 +105,16 @@ impl PeerConnection {
             pipeline: Some(pipeline),
             channels: Arc::new(Mutex::new(HashMap::new())),
             events: Some(events),
+            video_source: Arc::new(Mutex::new(None)),
+            video_stop: Arc::new(Mutex::new(None)),
+            video_worker: Arc::new(Mutex::new(None)),
+            video_sequence: Arc::new(AtomicU64::new(0)),
         };
+        // Install the receive/send VP8 media path before the first SDP offer.
+        // If a runtime lacks one of the optional screen elements, ordinary
+        // WebRTC control traffic remains usable and a screen request reports
+        // the unavailable backend explicitly.
+        let _ = peer.install_video_pipeline();
         peer.attach_webrtc_callbacks();
         peer.pipeline
             .as_ref()
@@ -73,6 +126,157 @@ impl PeerConnection {
 
     pub fn element(&self) -> &gst::Element {
         &self.element
+    }
+
+    fn install_video_pipeline(&self) -> Result<(), String> {
+        let pipeline = self
+            .pipeline
+            .as_ref()
+            .ok_or_else(|| "WebRTC screen media requires a running pipeline".to_string())?;
+        if self
+            .video_source
+            .lock()
+            .map_err(|_| "WebRTC video source lock poisoned".to_string())?
+            .is_some()
+        {
+            return Ok(());
+        }
+
+        let raw_caps = gst::Caps::builder("video/x-raw")
+            .field("format", "RGBA")
+            .field("framerate", gst::Fraction::new(12, 1))
+            .build();
+        let source = AppSrc::builder()
+            .name("desklink-screen-source")
+            .caps(&raw_caps)
+            .is_live(true)
+            .format(gst::Format::Time)
+            .max_buffers(2)
+            .build();
+        let convert = gst::ElementFactory::make("videoconvert")
+            .name("desklink-screen-convert")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let encoder = gst::ElementFactory::make("vp8enc")
+            .name("desklink-screen-vp8")
+            .build()
+            .map_err(|error| error.to_string())?;
+        encoder.set_property("deadline", 1_i64);
+        let payloader = gst::ElementFactory::make("rtpvp8pay")
+            .name("desklink-screen-payloader")
+            .build()
+            .map_err(|error| error.to_string())?;
+
+        pipeline
+            .add_many([source.upcast_ref(), &convert, &encoder, &payloader])
+            .map_err(|error| error.to_string())?;
+        gst::Element::link_many([source.upcast_ref(), &convert, &encoder, &payloader])
+            .map_err(|error| error.to_string())?;
+        let sink_pad = self
+            .element
+            .request_pad_simple("sink_%u")
+            .ok_or_else(|| "WebRTC peer did not expose a video sink pad".to_string())?;
+        let payloader_src = payloader
+            .static_pad("src")
+            .ok_or_else(|| "VP8 payloader has no source pad".to_string())?;
+        payloader_src
+            .link(&sink_pad)
+            .map_err(|error| format!("Could not link VP8 screen track: {error}"))?;
+        source
+            .upcast_ref::<gst::Element>()
+            .sync_state_with_parent()
+            .map_err(|error| error.to_string())?;
+        convert
+            .sync_state_with_parent()
+            .map_err(|error| error.to_string())?;
+        encoder
+            .sync_state_with_parent()
+            .map_err(|error| error.to_string())?;
+        payloader
+            .sync_state_with_parent()
+            .map_err(|error| error.to_string())?;
+        *self
+            .video_source
+            .lock()
+            .map_err(|_| "WebRTC video source lock poisoned".to_string())? = Some(source);
+        Ok(())
+    }
+
+    pub fn start_screen_capture(&self) -> Result<(), String> {
+        self.install_video_pipeline()?;
+        self.stop_screen_capture();
+        let source = self
+            .video_source
+            .lock()
+            .map_err(|_| "WebRTC video source lock poisoned".to_string())?
+            .clone()
+            .ok_or_else(|| "WebRTC screen source is unavailable".to_string())?;
+        let capture = crate::platform::screen_cast::ScreenCastCapture::new()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::Builder::new()
+            .name("desklink-webrtc-screen".to_string())
+            .spawn(move || {
+                let mut sequence = 0_u64;
+                while !worker_stop.load(Ordering::Relaxed) {
+                    let Ok((rgba, width, height)) = capture.next_rgba(Duration::from_secs(3))
+                    else {
+                        break;
+                    };
+                    let caps = gst::Caps::builder("video/x-raw")
+                        .field("format", "RGBA")
+                        .field("width", width as i32)
+                        .field("height", height as i32)
+                        .field("framerate", gst::Fraction::new(12, 1))
+                        .build();
+                    source.set_caps(Some(&caps));
+                    let Ok(mut buffer) = gst::Buffer::with_size(rgba.len()) else {
+                        break;
+                    };
+                    let timestamp = gst::ClockTime::from_mseconds(sequence * 83);
+                    {
+                        let Some(buffer_ref) = buffer.get_mut() else {
+                            break;
+                        };
+                        {
+                            let Ok(mut map) = buffer_ref.map_writable() else {
+                                break;
+                            };
+                            map.as_mut_slice().copy_from_slice(&rgba);
+                        }
+                        buffer_ref.set_pts(timestamp);
+                        buffer_ref.set_dts(timestamp);
+                        buffer_ref.set_duration(gst::ClockTime::from_mseconds(83));
+                    }
+                    if source.push_buffer(buffer).is_err() {
+                        break;
+                    }
+                    sequence = sequence.saturating_add(1);
+                }
+            })
+            .map_err(|error| format!("Could not start WebRTC screen capture: {error}"))?;
+        *self
+            .video_stop
+            .lock()
+            .map_err(|_| "WebRTC video stop lock poisoned".to_string())? = Some(stop);
+        *self
+            .video_worker
+            .lock()
+            .map_err(|_| "WebRTC video worker lock poisoned".to_string())? = Some(worker);
+        Ok(())
+    }
+
+    pub fn stop_screen_capture(&self) {
+        if let Ok(mut stop) = self.video_stop.lock() {
+            if let Some(stop) = stop.take() {
+                stop.store(true, Ordering::Relaxed);
+            }
+        }
+        if let Ok(mut worker) = self.video_worker.lock() {
+            if let Some(worker) = worker.take() {
+                let _ = worker.join();
+            }
+        }
     }
 
     pub fn create_channels(&self) -> Result<(), ChannelError> {
@@ -238,6 +442,23 @@ impl PeerConnection {
     }
 
     fn attach_webrtc_callbacks(&self) {
+        let state_events = self.events.clone();
+        self.element
+            .connect_notify(Some("connection-state"), move |element, _| {
+                let state = element.property::<WebRTCPeerConnectionState>("connection-state");
+                let event = match state {
+                    WebRTCPeerConnectionState::Connected => Some(PeerEvent::Connected),
+                    WebRTCPeerConnectionState::Disconnected => Some(PeerEvent::Disconnected),
+                    WebRTCPeerConnectionState::Failed => Some(PeerEvent::Failure(
+                        "WebRTC peer connection failed".to_string(),
+                    )),
+                    _ => None,
+                };
+                if let (Some(events), Some(event)) = (state_events.as_ref(), event) {
+                    events(event);
+                }
+            });
+
         let events = self.events.clone();
         self.element
             .connect("on-ice-candidate", false, move |values| {
@@ -273,6 +494,115 @@ impl PeerConnection {
                 None
             }
         });
+
+        let Some(pipeline) = self.pipeline.clone() else {
+            return;
+        };
+        let events = self.events.clone();
+        let frame_sequence = Arc::clone(&self.video_sequence);
+        self.element.connect_pad_added(move |_, pad| {
+            let Some(caps) = pad.current_caps().or_else(|| Some(pad.query_caps(None))) else {
+                return;
+            };
+            let Some(structure) = caps.structure(0) else {
+                return;
+            };
+            if structure.name() != "application/x-rtp"
+                || structure.get::<String>("media").ok().as_deref() != Some("video")
+            {
+                return;
+            }
+
+            let result = (|| -> Result<(), String> {
+                let frame_sequence = Arc::clone(&frame_sequence);
+                let depay = gst::ElementFactory::make("rtpvp8depay")
+                    .name("desklink-screen-depay")
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                let decoder = gst::ElementFactory::make("vp8dec")
+                    .name("desklink-screen-decoder")
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                let convert = gst::ElementFactory::make("videoconvert")
+                    .name("desklink-screen-receive-convert")
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                let raw_caps = gst::Caps::builder("video/x-raw")
+                    .field("format", "RGBA")
+                    .build();
+                let filter = gst::ElementFactory::make("capsfilter")
+                    .property("caps", &raw_caps)
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                let sink = AppSink::builder()
+                    .name("desklink-screen-sink")
+                    .caps(&raw_caps)
+                    .max_buffers(2)
+                    .sync(false)
+                    .build();
+                let sample_events = events.clone();
+                sink.set_callbacks(
+                    AppSinkCallbacks::builder()
+                        .new_sample(move |sink| {
+                            let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                            let caps = sample.caps().ok_or(gst::FlowError::NotNegotiated)?;
+                            let structure =
+                                caps.structure(0).ok_or(gst::FlowError::NotNegotiated)?;
+                            let width = structure
+                                .get::<i32>("width")
+                                .map_err(|_| gst::FlowError::NotNegotiated)?;
+                            let height = structure
+                                .get::<i32>("height")
+                                .map_err(|_| gst::FlowError::NotNegotiated)?;
+                            let buffer = sample.buffer().ok_or(gst::FlowError::NotNegotiated)?;
+                            let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
+                            if let Some(events) = sample_events.as_ref() {
+                                events(PeerEvent::VideoFrame {
+                                    sequence: frame_sequence.fetch_add(1, Ordering::Relaxed) + 1,
+                                    width: width.max(0) as u32,
+                                    height: height.max(0) as u32,
+                                    rgba: map.as_slice().to_vec(),
+                                });
+                            }
+                            Ok(gst::FlowSuccess::Ok)
+                        })
+                        .build(),
+                );
+                pipeline
+                    .add_many([&depay, &decoder, &convert, &filter, sink.upcast_ref()])
+                    .map_err(|error| error.to_string())?;
+                gst::Element::link_many([&depay, &decoder, &convert, &filter, sink.upcast_ref()])
+                    .map_err(|error| error.to_string())?;
+                let sink_pad = depay
+                    .static_pad("sink")
+                    .ok_or_else(|| "VP8 depayloader has no sink pad".to_string())?;
+                pad.link(&sink_pad)
+                    .map_err(|error| format!("Could not link incoming VP8 track: {error}"))?;
+                depay
+                    .sync_state_with_parent()
+                    .map_err(|error| error.to_string())?;
+                decoder
+                    .sync_state_with_parent()
+                    .map_err(|error| error.to_string())?;
+                convert
+                    .sync_state_with_parent()
+                    .map_err(|error| error.to_string())?;
+                filter
+                    .sync_state_with_parent()
+                    .map_err(|error| error.to_string())?;
+                sink.upcast_ref::<gst::Element>()
+                    .sync_state_with_parent()
+                    .map_err(|error| error.to_string())?;
+                Ok(())
+            })();
+            if let Err(error) = result {
+                if let Some(events) = events.as_ref() {
+                    events(PeerEvent::Failure(format!(
+                        "Could not attach incoming VP8 screen track: {error}"
+                    )));
+                }
+            }
+        });
     }
 
     fn install_channel(&self, channel: WebRTCDataChannel) -> Result<(), ChannelError> {
@@ -280,6 +610,7 @@ impl PeerConnection {
     }
 
     pub fn close(&self) {
+        self.stop_screen_capture();
         if let Ok(channels) = self.channels.lock() {
             for channel in channels.values() {
                 channel.close();
@@ -318,6 +649,16 @@ fn install_channel_into(
         }
     });
     let error_label = label.clone();
+    let message_label = label.clone();
+    let message_events = events.clone();
+    channel.connect_on_message_data(move |_, bytes| {
+        if let (Some(bytes), Some(events)) = (bytes, message_events.as_ref()) {
+            events(PeerEvent::Message {
+                channel: message_label.clone(),
+                bytes: bytes.as_ref().to_vec(),
+            });
+        }
+    });
     channel.connect_on_error(move |_, error| {
         if let Some(events) = events.as_ref() {
             events(PeerEvent::Failure(format!(
@@ -353,6 +694,7 @@ mod tests {
 
     #[test]
     fn rejects_oversized_sdp_before_gstreamer_parses_it() {
+        gst::init().unwrap();
         let element = gst::ElementFactory::make("webrtcbin").build().unwrap();
         let peer = PeerConnection::new(element);
         assert!(peer.accept_answer(&"x".repeat(256 * 1024 + 1)).is_err());

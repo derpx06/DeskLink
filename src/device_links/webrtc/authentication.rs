@@ -1,5 +1,5 @@
 use openssl::hash::MessageDigest;
-use openssl::pkey::{PKey, Private, Public};
+use openssl::pkey::{PKey, PKeyRef, Private, Public};
 use openssl::sign::{Signer, Verifier};
 use serde::{Deserialize, Serialize};
 
@@ -29,7 +29,11 @@ impl AuthenticationTranscript {
     pub fn sign(&self, private_key_pem: &[u8]) -> Result<Vec<u8>, AuthenticationError> {
         let key = PKey::<Private>::private_key_from_pem(private_key_pem)
             .map_err(|error| AuthenticationError::Key(error.to_string()))?;
-        let mut signer = Signer::new(MessageDigest::sha256(), &key)
+        self.sign_with_key(&key)
+    }
+
+    pub fn sign_with_key(&self, key: &PKeyRef<Private>) -> Result<Vec<u8>, AuthenticationError> {
+        let mut signer = Signer::new(MessageDigest::sha256(), key)
             .map_err(|error| AuthenticationError::Crypto(error.to_string()))?;
         signer
             .update(
@@ -50,7 +54,15 @@ impl AuthenticationTranscript {
     ) -> Result<(), AuthenticationError> {
         let key = PKey::<Public>::public_key_from_pem(public_key_pem)
             .map_err(|error| AuthenticationError::Key(error.to_string()))?;
-        let mut verifier = Verifier::new(MessageDigest::sha256(), &key)
+        self.verify_with_key(&key, signature)
+    }
+
+    pub fn verify_with_key(
+        &self,
+        key: &PKeyRef<Public>,
+        signature: &[u8],
+    ) -> Result<(), AuthenticationError> {
+        let mut verifier = Verifier::new(MessageDigest::sha256(), key)
             .map_err(|error| AuthenticationError::Crypto(error.to_string()))?;
         verifier
             .update(
@@ -124,6 +136,14 @@ mod tests {
         assert_eq!(
             changed.verify(&public_pem, &signature),
             Err(AuthenticationError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn canonical_transcript_matches_android_field_order() {
+        assert_eq!(
+            String::from_utf8(transcript().canonical_bytes().unwrap()).unwrap(),
+            r#"{"sessionAttemptId":"attempt","initiatorDeviceId":"desktop","responderDeviceId":"phone","sessionId":4,"connectionGeneration":2,"initiatorNonce":"a","responderNonce":"b","offerSha256":"offer","answerSha256":"answer","initiatorDtlsFingerprint":"one","responderDtlsFingerprint":"two","protocolVersion":1,"timestamp":1}"#
         );
     }
 }

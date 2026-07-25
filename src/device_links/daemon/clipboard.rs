@@ -1,10 +1,10 @@
-use std::io::Write;
 use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use super::DaemonWorker;
+use crate::device_links::core::events::CoreEvent;
 use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_CLIPBOARD};
 use crate::device_links::pairing::PairState;
 
@@ -36,6 +36,7 @@ pub(super) fn set_clipboard_text_from_remote(content: &str) {
 impl DaemonWorker {
     pub(super) fn start_clipboard_listener(&self) {
         let sessions = self.sessions.clone();
+        let events = self.events.clone();
         let shutdown = std::sync::Arc::clone(&self.shutdown);
         thread::spawn(move || loop {
             if shutdown.load(Ordering::SeqCst) {
@@ -81,10 +82,25 @@ impl DaemonWorker {
                                 "[Daemon] Local clipboard changed. Syncing to device {}: {:?}",
                                 session.device_id, current_text
                             );
-                            if let Ok(mut stream) = binding.link.stream.lock() {
-                                if let Ok(bytes) = packet.serialize_line() {
-                                    let _ = stream.write_all(&bytes);
-                                }
+                            let result = sessions
+                                .current_webrtc_binding(&session.device_id)
+                                .filter(|web_rtc| sessions.is_current_webrtc(web_rtc))
+                                .ok_or_else(|| {
+                                    "DeskLink WebRTC feature transport is unavailable".to_string()
+                                })
+                                .and_then(|web_rtc| {
+                                    web_rtc
+                                        .transport
+                                        .send_packet(&packet, now_millis())
+                                        .map_err(|error| error.to_string())
+                                });
+                            if let Err(error) = result {
+                                events.publish(CoreEvent::Error {
+                                    scope: "clipboard".to_string(),
+                                    device_id: Some(session.device_id.clone()),
+                                    message: error,
+                                    retryable: true,
+                                });
                             }
                         }
                     }

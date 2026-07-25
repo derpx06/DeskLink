@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use super::network::{read_ssl_packet, send_packet};
+use super::network::read_ssl_packet;
 use super::packet_handler::packet_read_loop;
 use super::state::mark_status;
 use super::validation::{
@@ -19,7 +19,6 @@ use crate::device_links::core::device_session::DeviceConnectionState;
 use crate::device_links::core::events::{CoreEvent, EventBus};
 use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::device_links::device_info::DeviceInfo;
-use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_NOTIFICATION_REQUEST};
 use crate::device_links::webrtc::negotiation::WebRtcCoordinator;
 
 #[allow(clippy::too_many_arguments)]
@@ -141,17 +140,6 @@ pub(super) fn finish_secure_link(
     let read_events = events.clone();
     let read_transfer_cancellations = Arc::clone(&transfer_cancellations);
     let reader_sessions = sessions.clone();
-
-    if paired {
-        let mut request = NetworkPacket::new(PACKET_TYPE_NOTIFICATION_REQUEST);
-        request.set("request", true);
-        if let Err(error) = send_packet(&stream, &request) {
-            eprintln!(
-                "[Daemon] Failed to request current notifications from {}: {}",
-                secure_info.id, error
-            );
-        }
-    }
 
     let reader_webrtc = webrtc.clone();
     thread::spawn(move || {

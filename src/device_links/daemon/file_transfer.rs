@@ -29,6 +29,24 @@ impl DaemonWorker {
         file_path: std::path::PathBuf,
         transfer_id: String,
     ) {
+        if let Err(error) = self.webrtc.start_file_send(
+            device_id,
+            file_path,
+            transfer_id.clone(),
+            &self.sessions,
+            &self.events,
+        ) {
+            publish_transfer_failure(&self.events, &transfer_id, error);
+        }
+    }
+
+    #[allow(dead_code)]
+    fn send_file_with_legacy_tls(
+        &self,
+        device_id: &str,
+        file_path: std::path::PathBuf,
+        transfer_id: String,
+    ) {
         let filename = match file_path.file_name().and_then(|s| s.to_str()) {
             Some(name) => name.to_string(),
             None => {

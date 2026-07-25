@@ -21,16 +21,17 @@ pub(crate) struct Link {
 impl Link {
     #[cfg(test)]
     pub(crate) fn test_link(info: DeviceInfo) -> Self {
-        let listener =
-            std::net::TcpListener::bind("127.0.0.1:0").expect("test link listener should bind");
-        let address = listener
-            .local_addr()
-            .expect("test link listener should have an address");
-        let client = std::net::TcpStream::connect(address)
-            .expect("test link should connect to its loopback peer");
-        let (_peer, _) = listener
-            .accept()
-            .expect("test link listener should accept its peer");
+        // The manager tests only exercise ownership, generations, and
+        // cancellation.  Use a local file descriptor wrapped as a
+        // TcpStream so those tests do not need network or loopback access in
+        // sandboxed CI.  No TLS handshake or I/O is performed on this link.
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .expect("test link backing file should open");
+        let client = unsafe { std::net::TcpStream::from_raw_fd(file.into_raw_fd()) };
         let context = openssl::ssl::SslContext::builder(openssl::ssl::SslMethod::tls())
             .expect("test SSL context should build")
             .build();

@@ -4,11 +4,12 @@ use super::state::{mark_error, push_error, update_pair_state};
 use super::{DaemonWorker, Link};
 use crate::device_links::core::device_manager::SessionBinding;
 use crate::device_links::core::events::CoreEvent;
+use crate::device_links::core::packet_router::{PacketDirection, PacketRouter};
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK_REQUEST,
     PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_PING,
     PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP,
-    PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
+    PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
 };
 use crate::device_links::pairing::PairState;
 use crate::device_links::plugins::notifications;
@@ -37,6 +38,8 @@ pub enum DaemonCommand {
     SendMprisSetVolume(String, String, i64),
     SendMprisSeek(String, String, i64),
     SendSftpRequest(String),
+    BrowsePhoneFiles(String, String),
+    DownloadPhoneFile(String, String),
     RequestNotifications(String),
     DismissNotification(String, String),
     ReplyNotification(String, String, String),
@@ -89,17 +92,15 @@ impl DaemonWorker {
                 self.send_file_with_id(&id, path, transfer_id)
             }
             DaemonCommand::CancelTransfer(transfer_id) => {
-                if let Ok(mut cancelled) = self.transfer_cancellations.lock() {
-                    cancelled.insert(transfer_id.clone());
-                }
-                if let Ok(Some(snapshot)) = self.transfer_store.mark_cancelled(&transfer_id) {
-                    self.events.publish(CoreEvent::TransferChanged {
-                        transfer_id: snapshot.transfer_id,
-                        state: "cancelled".to_string(),
-                        bytes_done: snapshot.bytes_done,
-                        bytes_total: snapshot.bytes_total,
-                        can_resume: false,
-                        error: None,
+                if let Err(error) =
+                    self.webrtc
+                        .cancel_file_transfer(&transfer_id, &self.sessions, &self.events)
+                {
+                    self.events.publish(CoreEvent::Error {
+                        scope: "transfer".to_string(),
+                        device_id: None,
+                        message: error,
+                        retryable: true,
                     });
                 }
             }
@@ -118,6 +119,10 @@ impl DaemonWorker {
                 self.send_mpris_seek(&id, &player, offset)
             }
             DaemonCommand::SendSftpRequest(id) => self.send_sftp_request(&id),
+            DaemonCommand::BrowsePhoneFiles(id, entry_id) => self.browse_phone_files(&id, entry_id),
+            DaemonCommand::DownloadPhoneFile(id, entry_id) => {
+                self.download_phone_file(&id, entry_id)
+            }
             DaemonCommand::RequestNotifications(id) => self.request_notifications(&id),
             DaemonCommand::DismissNotification(id, notification_id) => {
                 self.dismiss_notification(&id, &notification_id)
@@ -210,6 +215,36 @@ impl DaemonWorker {
             .map_err(|error| format!("Could not calculate pairing verification key: {error:?}"))
     }
 
+    fn send_feature_packet(&self, device_id: &str, packet: &NetworkPacket) -> Result<(), String> {
+        let binding = self
+            .sessions
+            .current_binding(device_id)
+            .ok_or_else(|| "Device is not connected".to_string())?;
+        if self.sessions.pairing_state(&binding).ok() != Some(PairState::Paired) {
+            return Err("Device must be paired before sending feature traffic".to_string());
+        }
+        PacketRouter::new(
+            Vec::<String>::new(),
+            binding.link.info.incoming_capabilities.clone(),
+        )
+        .authorize(packet, PacketDirection::Outgoing)
+        .map_err(|error| {
+            format!(
+                "Remote device does not accept {}: {error:?}",
+                packet.packet_type
+            )
+        })?;
+        let web_rtc = self
+            .sessions
+            .current_webrtc_binding(device_id)
+            .filter(|web_rtc| self.sessions.is_current_webrtc(web_rtc))
+            .ok_or_else(|| "DeskLink WebRTC feature transport is unavailable".to_string())?;
+        web_rtc
+            .transport
+            .send_packet(packet, current_time_millis())
+            .map_err(|error| error.to_string())
+    }
+
     fn send_pair_request(&self, device_id: &str) {
         self.with_link(device_id, |link| {
             let packet =
@@ -238,40 +273,40 @@ impl DaemonWorker {
             if self.pairing_state_for_link(device_id, link)? != PairState::Paired {
                 return Err("Device must be paired before requesting contacts".to_string());
             }
-            send_packet(
-                &link.stream,
+            self.send_feature_packet(
+                device_id,
                 &crate::device_links::plugins::contacts::request_all_uids_timestamps(),
             )
         });
     }
 
     fn send_contact_vcards_request(&self, device_id: &str, uids: &[String]) {
-        self.with_link(device_id, |link| {
+        self.with_link(device_id, |_link| {
             let packet = crate::device_links::plugins::contacts::request_vcards(uids)?;
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
     fn send_sms_conversations_request(&self, device_id: &str) {
-        self.with_link(device_id, |link| {
-            send_packet(
-                &link.stream,
+        self.with_link(device_id, |_link| {
+            self.send_feature_packet(
+                device_id,
                 &crate::device_links::plugins::sms::request_conversations(),
             )
         });
     }
 
     fn send_sms_conversation_request(&self, device_id: &str, thread_id: &str) {
-        self.with_link(device_id, |link| {
+        self.with_link(device_id, |_link| {
             let packet = crate::device_links::plugins::sms::request_conversation(thread_id)?;
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
     fn send_telephony_mute(&self, device_id: &str) {
-        self.with_link(device_id, |link| {
-            send_packet(
-                &link.stream,
+        self.with_link(device_id, |_link| {
+            self.send_feature_packet(
+                device_id,
                 &crate::device_links::plugins::telephony::request_mute(),
             )
         });
@@ -322,7 +357,7 @@ impl DaemonWorker {
             }
             let mut packet = NetworkPacket::new(PACKET_TYPE_PING);
             packet.set("message", "Ping from DeskLink");
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -336,7 +371,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before sending remote control input".to_string());
             }
             let packet = NetworkPacket::with_body(PACKET_TYPE_MOUSEPAD_REQUEST, payload);
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -346,7 +381,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before requesting screen sharing".to_string());
             }
             let packet = build_screen_request_packet(role);
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -356,7 +391,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before stopping screen sharing".to_string());
             }
             let packet = build_screen_stop_packet();
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -366,7 +401,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before sharing text".to_string());
             }
             let packet = build_share_text_packet(text)?;
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -381,7 +416,7 @@ impl DaemonWorker {
             let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_CLIPBOARD);
             packet.set("content", text);
             packet.set("timestamp", current_time_millis());
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -392,7 +427,7 @@ impl DaemonWorker {
             }
             let mut packet = NetworkPacket::new(PACKET_TYPE_LOCK_REQUEST);
             packet.set("setLocked", lock);
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -402,7 +437,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before ringing it".to_string());
             }
             let packet = NetworkPacket::new(PACKET_TYPE_FINDMYPHONE_REQUEST);
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -412,7 +447,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before controlling media".to_string());
             }
             let packet = build_mpris_action_packet(player, action);
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -422,7 +457,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before requesting media status".to_string());
             }
             let packet = build_mpris_status_request_packet(player.as_deref());
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -432,7 +467,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before controlling media volume".to_string());
             }
             let packet = build_mpris_set_volume_packet(player, volume)?;
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -442,7 +477,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before seeking media".to_string());
             }
             let packet = build_mpris_seek_packet(player, offset)?;
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -451,8 +486,31 @@ impl DaemonWorker {
             if self.pairing_state_for_link(device_id, link)? != PairState::Paired {
                 return Err("Device must be paired before requesting file browsing".to_string());
             }
-            let packet = build_sftp_request_packet();
-            send_packet(&link.stream, &packet)
+            self.webrtc
+                .request_phone_file_roots(device_id, &self.sessions, &self.events)
+                .map(|_| ())
+        });
+    }
+
+    fn browse_phone_files(&self, device_id: &str, entry_id: String) {
+        self.with_link(device_id, |link| {
+            if self.pairing_state_for_link(device_id, link)? != PairState::Paired {
+                return Err("Device must be paired before browsing files".to_string());
+            }
+            self.webrtc
+                .request_phone_file_list(device_id, entry_id, &self.sessions, &self.events)
+                .map(|_| ())
+        });
+    }
+
+    fn download_phone_file(&self, device_id: &str, entry_id: String) {
+        self.with_link(device_id, |link| {
+            if self.pairing_state_for_link(device_id, link)? != PairState::Paired {
+                return Err("Device must be paired before downloading phone files".to_string());
+            }
+            self.webrtc
+                .request_phone_file_download(device_id, entry_id, &self.sessions, &self.events)
+                .map(|_| ())
         });
     }
 
@@ -462,7 +520,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before requesting notifications".to_string());
             }
             let packet = build_notification_request_packet();
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -472,7 +530,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before dismissing notifications".to_string());
             }
             let packet = build_notification_dismiss_packet(notification_id)?;
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -482,7 +540,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before replying to notifications".to_string());
             }
             let packet = build_notification_reply_packet(reply_id, message)?;
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -494,7 +552,7 @@ impl DaemonWorker {
                 );
             }
             let packet = build_notification_action_packet(key, action)?;
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -504,7 +562,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before requesting system volume".to_string());
             }
             let packet = build_system_volume_request_packet();
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -520,7 +578,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before changing system volume".to_string());
             }
             let packet = build_system_volume_set_packet(name, volume, muted)?;
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -530,7 +588,7 @@ impl DaemonWorker {
                 return Err("Device must be paired before requesting remote commands".to_string());
             }
             let packet = build_remote_command_list_request_packet();
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -556,7 +614,7 @@ impl DaemonWorker {
                 return Err("Remote command was not advertised by this device".to_string());
             }
             let packet = build_remote_command_execute_packet(key)?;
-            send_packet(&link.stream, &packet)
+            self.send_feature_packet(device_id, &packet)
         });
     }
 
@@ -652,12 +710,6 @@ fn build_mpris_seek_packet(player: &str, offset: i64) -> Result<NetworkPacket, S
     packet.set("player", player);
     packet.set("Seek", offset);
     Ok(packet)
-}
-
-fn build_sftp_request_packet() -> NetworkPacket {
-    let mut packet = NetworkPacket::new(PACKET_TYPE_SFTP_REQUEST);
-    packet.set("startBrowsing", true);
-    packet
 }
 
 fn build_screen_request_packet(role: &str) -> NetworkPacket {
@@ -786,14 +838,6 @@ mod tests {
         assert_eq!(packet.packet_type, PACKET_TYPE_MPRIS_REQUEST);
         assert_eq!(packet.get_str("player"), Some("org.mpris.MediaPlayer2.vlc"));
         assert_eq!(packet.get_str("action"), Some("Next"));
-    }
-
-    #[test]
-    fn sftp_request_packet_starts_remote_browsing() {
-        let packet = build_sftp_request_packet();
-
-        assert_eq!(packet.packet_type, PACKET_TYPE_SFTP_REQUEST);
-        assert_eq!(packet.get_bool("startBrowsing"), Some(true));
     }
 
     #[test]

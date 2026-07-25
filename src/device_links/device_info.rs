@@ -112,12 +112,16 @@ mod tests {
     }
 
     #[test]
-    fn local_identity_advertises_screen_frame_receiver() {
+    fn local_identity_advertises_screen_control_without_legacy_frame_packets() {
         let local = DeviceInfo::local("0123456789abcdef0123456789abcdef".into(), "DeskLink".into());
         let (incoming, outgoing) = desktop_capabilities();
         assert_eq!(local.incoming_capabilities, incoming);
         assert_eq!(local.outgoing_capabilities, outgoing);
         assert!(local
+            .incoming_capabilities
+            .iter()
+            .any(|capability| capability == "desklink.screen.ready"));
+        assert!(!local
             .incoming_capabilities
             .iter()
             .any(|capability| capability == "desklink.screen.frame"));

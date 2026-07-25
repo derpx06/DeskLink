@@ -74,6 +74,19 @@ impl ScreenCastCapture {
             .map_err(|error| format!("Screen capture did not produce a frame: {error}"))??;
         encode_png(frame)
     }
+
+    /// Return one compositor-authorized frame as tightly packed RGBA pixels.
+    /// WebRTC media senders use this path directly; it avoids encoding a PNG
+    /// and then wrapping that image in a second transport payload.
+    pub fn next_rgba(&self, timeout: Duration) -> Result<(Vec<u8>, u32, u32), String> {
+        let frame = self
+            .receiver
+            .recv_timeout(timeout)
+            .map_err(|error| format!("Screen capture did not produce a frame: {error}"))??;
+        let width = frame.width;
+        let height = frame.height;
+        Ok((to_rgba(&frame)?, width, height))
+    }
 }
 
 impl Drop for ScreenCastCapture {

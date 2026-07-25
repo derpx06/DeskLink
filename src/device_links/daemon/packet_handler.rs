@@ -1,8 +1,7 @@
 use enigo::{Axis, Button, Coordinate, Direction, Key};
-use openssl::ssl::SslStream;
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::Read;
+use std::sync::mpsc::{self, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -66,6 +65,48 @@ enum PacketAuthorizationError {
     UnsupportedPacket,
 }
 
+/// Identifies the authenticated transport boundary that delivered a packet.
+/// LAN is deliberately a bootstrap/signaling path; ordinary paired features
+/// are accepted only from the WebRTC session after symmetric handover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PacketSource {
+    LanBootstrap,
+    WebRtc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PacketSourceAuthorizationError {
+    FeaturePacketOnLan,
+    BootstrapPacketOnWebRtc,
+    HandoverIncomplete,
+}
+
+fn authorize_packet_source(
+    source: PacketSource,
+    packet: &NetworkPacket,
+    webrtc_feature_ready: bool,
+) -> Result<(), PacketSourceAuthorizationError> {
+    let bootstrap_packet = matches!(
+        packet.packet_type.as_str(),
+        crate::protocol::desklink_v9::PACKET_TYPE_IDENTITY
+            | PACKET_TYPE_PAIR
+            | crate::protocol::desklink_v9::PACKET_TYPE_WEBRTC_SIGNAL_V1
+    );
+    match (source, bootstrap_packet, webrtc_feature_ready) {
+        (PacketSource::LanBootstrap, true, _) => Ok(()),
+        (PacketSource::LanBootstrap, false, _) => {
+            Err(PacketSourceAuthorizationError::FeaturePacketOnLan)
+        }
+        (PacketSource::WebRtc, true, _) => {
+            Err(PacketSourceAuthorizationError::BootstrapPacketOnWebRtc)
+        }
+        (PacketSource::WebRtc, false, true) => Ok(()),
+        (PacketSource::WebRtc, false, false) => {
+            Err(PacketSourceAuthorizationError::HandoverIncomplete)
+        }
+    }
+}
+
 /// Authorize packets before they reach any normal feature handler.
 ///
 /// Pairing is the only pre-pairing allowlisted packet. Every ordinary feature
@@ -124,18 +165,44 @@ pub(super) fn packet_read_loop(
     let mut desktop_screen_stream: Option<Arc<AtomicBool>> = None;
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
+    if let Ok(locked_stream) = stream.lock() {
+        let _ = locked_stream
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(200)));
+    }
+    let (webrtc_sender, webrtc_receiver) = mpsc::sync_channel::<NetworkPacket>(256);
+    webrtc.register_packet_sink(
+        &binding,
+        Arc::new(move |packet| match webrtc_sender.try_send(packet) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                Err("Desktop WebRTC packet inbox reached its bounded capacity".to_string())
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                Err("Desktop WebRTC packet dispatcher is closed".to_string())
+            }
+        }),
+    );
 
     loop {
         if !sessions.is_current(&binding) || binding.cancellation.load(Ordering::SeqCst) {
             stop_desktop_screen_stream(&mut desktop_screen_stream);
             break;
         }
-        let read_result = {
-            let Ok(mut locked_stream) = stream.lock() else {
-                handle_disconnect(&binding, &sessions, &webrtc, &devices, &events);
-                break;
-            };
-            locked_stream.read(&mut byte)
+        let mut webrtc_packet = None;
+        let read_result = match webrtc_receiver.try_recv() {
+            Ok(packet) => {
+                webrtc_packet = Some(packet);
+                Ok(1)
+            }
+            Err(TryRecvError::Empty) => {
+                let Ok(mut locked_stream) = stream.lock() else {
+                    handle_disconnect(&binding, &sessions, &webrtc, &devices, &events);
+                    break;
+                };
+                locked_stream.read(&mut byte)
+            }
+            Err(TryRecvError::Disconnected) => break,
         };
 
         match read_result {
@@ -150,39 +217,44 @@ pub(super) fn packet_read_loop(
                 break;
             }
             Ok(_) => {
-                line.push(byte[0]);
-                if line.len() > 32 * 1024 * 1024 {
-                    eprintln!(
-                        "[Daemon] Read line too long for {}. Disconnecting.",
-                        device_id
-                    );
-                    events.publish(CoreEvent::Error {
-                        scope: "protocol".to_string(),
-                        device_id: Some(device_id.clone()),
-                        message: "Incoming packet exceeded the maximum size".to_string(),
-                        retryable: false,
-                    });
-                    stop_desktop_screen_stream(&mut desktop_screen_stream);
-                    handle_disconnect(&binding, &sessions, &webrtc, &devices, &events);
-                    break;
-                }
-                if byte[0] != b'\n' {
-                    continue;
-                }
-
-                let packet = NetworkPacket::deserialize(&line);
-                line.clear();
-                let packet = match packet {
-                    Ok(packet) => packet,
-                    Err(error) => {
+                let (source, packet) = if let Some(packet) = webrtc_packet.take() {
+                    (PacketSource::WebRtc, packet)
+                } else {
+                    line.push(byte[0]);
+                    if line.len() > 32 * 1024 * 1024 {
+                        eprintln!(
+                            "[Daemon] Read line too long for {}. Disconnecting.",
+                            device_id
+                        );
                         events.publish(CoreEvent::Error {
                             scope: "protocol".to_string(),
                             device_id: Some(device_id.clone()),
-                            message: format!("Malformed packet rejected: {error}"),
+                            message: "Incoming packet exceeded the maximum size".to_string(),
                             retryable: false,
                         });
+                        stop_desktop_screen_stream(&mut desktop_screen_stream);
+                        handle_disconnect(&binding, &sessions, &webrtc, &devices, &events);
+                        break;
+                    }
+                    if byte[0] != b'\n' {
                         continue;
                     }
+
+                    let packet = NetworkPacket::deserialize(&line);
+                    line.clear();
+                    let packet = match packet {
+                        Ok(packet) => packet,
+                        Err(error) => {
+                            events.publish(CoreEvent::Error {
+                                scope: "protocol".to_string(),
+                                device_id: Some(device_id.clone()),
+                                message: format!("Malformed packet rejected: {error}"),
+                                retryable: false,
+                            });
+                            continue;
+                        }
+                    };
+                    (PacketSource::LanBootstrap, packet)
                 };
 
                 // A newer authenticated connection may have replaced this
@@ -212,6 +284,25 @@ pub(super) fn packet_read_loop(
                     update_pair_state(&devices, &device_id, pair_state, None);
                 }
                 let pair_state = Some(pair_state);
+                let feature_ready = sessions
+                    .current_webrtc_binding(&device_id)
+                    .filter(|webrtc_binding| sessions.is_current_webrtc(webrtc_binding))
+                    .is_some_and(|webrtc_binding| webrtc_binding.transport.features_allowed());
+                if let Err(error) = authorize_packet_source(source, &packet, feature_ready) {
+                    events.publish(CoreEvent::Error {
+                        scope: "transport-authorization".to_string(),
+                        device_id: Some(device_id.clone()),
+                        message: format!(
+                            "Rejected {} from {source:?}: {error:?}",
+                            packet.packet_type
+                        ),
+                        retryable: matches!(
+                            error,
+                            PacketSourceAuthorizationError::HandoverIncomplete
+                        ),
+                    });
+                    continue;
+                }
                 let local_incoming_capabilities = config
                     .lock()
                     .ok()
@@ -381,19 +472,34 @@ pub(super) fn packet_read_loop(
                     eprintln!("[Daemon] Phone screen stream failed for {device_id}: {error}");
                 } else if packet.packet_type == PACKET_TYPE_SCREEN_REQUEST {
                     if packet.get_str("role") == Some("desktop-screen") {
-                        if let Some(running) = desktop_screen_stream.take() {
-                            running.store(false, Ordering::Relaxed);
+                        if source == PacketSource::WebRtc {
+                            if let Err(error) = webrtc
+                                .start_desktop_screen_for_binding(&binding, &sessions, &events)
+                            {
+                                events.publish(CoreEvent::Error {
+                                    scope: "screen".to_string(),
+                                    device_id: Some(device_id.clone()),
+                                    message: error,
+                                    retryable: true,
+                                });
+                            }
+                        } else {
+                            if let Some(running) = desktop_screen_stream.take() {
+                                running.store(false, Ordering::Relaxed);
+                            }
+                            let fps = packet.get_i64("fps").unwrap_or(6);
+                            desktop_screen_stream = Some(start_desktop_screen_stream(
+                                device_id.clone(),
+                                Arc::clone(&stream),
+                                Arc::clone(&config),
+                                fps,
+                            ));
                         }
-                        let fps = packet.get_i64("fps").unwrap_or(6);
-                        desktop_screen_stream = Some(start_desktop_screen_stream(
-                            device_id.clone(),
-                            Arc::clone(&stream),
-                            Arc::clone(&config),
-                            fps,
-                        ));
                     }
                 } else if packet.packet_type == PACKET_TYPE_SCREEN_STOP {
-                    if let Some(running) = desktop_screen_stream.take() {
+                    if source == PacketSource::WebRtc {
+                        webrtc.stop_desktop_screen_for_binding(&binding);
+                    } else if let Some(running) = desktop_screen_stream.take() {
                         running.store(false, Ordering::Relaxed);
                     }
                 } else if packet.packet_type == PACKET_TYPE_BATTERY {
@@ -838,7 +944,7 @@ pub(super) fn packet_read_loop(
                     };
                     match result {
                         Ok(reply) => {
-                            if let Err(error) = send_packet_reply(&stream, &reply) {
+                            if let Err(error) = send_packet_reply(&sessions, &binding, &reply) {
                                 eprintln!("[Daemon] Failed to send media response: {error}");
                             }
                         }
@@ -879,14 +985,15 @@ pub(super) fn packet_read_loop(
                     };
                     match result {
                         Ok(reply) => {
-                            if let Err(error) = send_packet_reply(&stream, &reply) {
+                            if let Err(error) = send_packet_reply(&sessions, &binding, &reply) {
                                 eprintln!("[Daemon] Failed to send volume response: {error}");
                             }
                         }
                         Err(error) => {
                             let mut reply = NetworkPacket::new(PACKET_TYPE_SYSTEMVOLUME);
                             reply.set("errorMessage", error.clone());
-                            if let Err(send_error) = send_packet_reply(&stream, &reply) {
+                            if let Err(send_error) = send_packet_reply(&sessions, &binding, &reply)
+                            {
                                 eprintln!("[Daemon] Failed to report volume error: {send_error}");
                             }
                         }
@@ -898,7 +1005,7 @@ pub(super) fn packet_read_loop(
                         match config.lock() {
                             Ok(config) => {
                                 let reply = run_commands::command_list_packet(&config);
-                                if let Err(error) = send_packet_reply(&stream, &reply) {
+                                if let Err(error) = send_packet_reply(&sessions, &binding, &reply) {
                                     eprintln!("[Daemon] Failed to send command response: {error}");
                                 }
                             }
@@ -917,7 +1024,7 @@ pub(super) fn packet_read_loop(
                         if let Err(error) = result {
                             reply.set("errorMessage", error);
                         }
-                        if let Err(error) = send_packet_reply(&stream, &reply) {
+                        if let Err(error) = send_packet_reply(&sessions, &binding, &reply) {
                             eprintln!("[Daemon] Failed to send command result: {error}");
                         }
                     }
@@ -933,7 +1040,7 @@ pub(super) fn packet_read_loop(
                             Ok(is_locked) => {
                                 let mut reply = NetworkPacket::new(PACKET_TYPE_LOCK);
                                 reply.set("isLocked", is_locked);
-                                if let Err(error) = send_packet_reply(&stream, &reply) {
+                                if let Err(error) = send_packet_reply(&sessions, &binding, &reply) {
                                     eprintln!(
                                         "[Daemon] Failed to send lock status response: {error}"
                                     );
@@ -960,7 +1067,9 @@ pub(super) fn packet_read_loop(
                                     let mut result = NetworkPacket::new(PACKET_TYPE_LOCK);
                                     result.set("lockResult", success);
                                     result.set("isLocked", success);
-                                    if let Err(error) = send_packet_reply(&stream, &result) {
+                                    if let Err(error) =
+                                        send_packet_reply(&sessions, &binding, &result)
+                                    {
                                         eprintln!("[Daemon] Failed to send lock result: {error}");
                                     }
                                 }
@@ -972,7 +1081,9 @@ pub(super) fn packet_read_loop(
                                 let mut result = NetworkPacket::new(PACKET_TYPE_LOCK);
                                 result.set("lockResult", false);
                                 result.set("errorMessage", error.clone());
-                                if let Err(send_error) = send_packet_reply(&stream, &result) {
+                                if let Err(send_error) =
+                                    send_packet_reply(&sessions, &binding, &result)
+                                {
                                     eprintln!("[Daemon] Failed to report lock error: {send_error}");
                                 }
                             }
@@ -1004,20 +1115,32 @@ pub(super) fn packet_read_loop(
             }
         }
     }
+    webrtc.unregister_packet_sink(&binding);
 }
 
 fn send_packet_reply(
-    stream: &Arc<Mutex<SslStream<TcpStream>>>,
+    sessions: &DeviceManager,
+    binding: &SessionBinding,
     packet: &NetworkPacket,
 ) -> Result<(), String> {
-    let mut locked_stream = stream
-        .lock()
-        .map_err(|_| "Stream lock poisoned".to_string())?;
-    let line = packet.serialize_line().map_err(|error| error.to_string())?;
-    locked_stream
-        .write_all(&line)
-        .map_err(|error| error.to_string())?;
-    locked_stream.flush().map_err(|error| error.to_string())
+    if !sessions.is_current(binding) {
+        return Err("DeskLink session became stale before sending a feature reply".to_string());
+    }
+    let web_rtc = sessions
+        .current_webrtc_binding(&binding.device_id)
+        .filter(|web_rtc| sessions.is_current_webrtc(web_rtc))
+        .ok_or_else(|| "DeskLink WebRTC feature transport is unavailable".to_string())?;
+    web_rtc
+        .transport
+        .send_packet(packet, current_time_millis())
+        .map_err(|error| error.to_string())
+}
+
+fn current_time_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or_default()
 }
 
 fn stop_desktop_screen_stream(stream: &mut Option<Arc<AtomicBool>>) {
@@ -1171,6 +1294,45 @@ mod tests {
         assert_eq!(
             authorization("unknown.future.packet", Some(PairState::Paired)),
             Err(PacketAuthorizationError::UnsupportedPacket)
+        );
+    }
+
+    #[test]
+    fn lan_is_restricted_to_pairing_and_signed_webrtc_signaling() {
+        let pair = NetworkPacket::new(PACKET_TYPE_PAIR);
+        let signal = NetworkPacket::new(crate::protocol::desklink_v9::PACKET_TYPE_WEBRTC_SIGNAL_V1);
+        let clipboard = NetworkPacket::new(PACKET_TYPE_CLIPBOARD);
+
+        assert_eq!(
+            authorize_packet_source(PacketSource::LanBootstrap, &pair, false),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_packet_source(PacketSource::LanBootstrap, &signal, false),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_packet_source(PacketSource::LanBootstrap, &clipboard, true),
+            Err(PacketSourceAuthorizationError::FeaturePacketOnLan)
+        );
+    }
+
+    #[test]
+    fn webrtc_features_require_completed_handover() {
+        let clipboard = NetworkPacket::new(PACKET_TYPE_CLIPBOARD);
+        let pair = NetworkPacket::new(PACKET_TYPE_PAIR);
+
+        assert_eq!(
+            authorize_packet_source(PacketSource::WebRtc, &clipboard, false),
+            Err(PacketSourceAuthorizationError::HandoverIncomplete)
+        );
+        assert_eq!(
+            authorize_packet_source(PacketSource::WebRtc, &clipboard, true),
+            Ok(())
+        );
+        assert_eq!(
+            authorize_packet_source(PacketSource::WebRtc, &pair, true),
+            Err(PacketSourceAuthorizationError::BootstrapPacketOnWebRtc)
         );
     }
 
