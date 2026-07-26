@@ -156,10 +156,10 @@ mod tests {
 
         assert_eq!(parsed.id, local.id);
         assert_eq!(parsed.name, "DeskLink");
-        assert_eq!(parsed.protocol_version, 8);
+        assert_eq!(parsed.protocol_version, 9);
         assert!(parsed
             .incoming_capabilities
-            .contains(&"kdeconnect.ping".into()));
+            .contains(&"desklink.ping".into()));
     }
 
     #[test]

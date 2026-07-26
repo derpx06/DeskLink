@@ -1,31 +1,48 @@
+#![allow(dead_code)]
+
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: i64 = 8;
-pub const PACKET_TYPE_IDENTITY: &str = "kdeconnect.identity";
-pub const PACKET_TYPE_PAIR: &str = "kdeconnect.pair";
-pub const PACKET_TYPE_PING: &str = "kdeconnect.ping";
-pub const PACKET_TYPE_MOUSEPAD_REQUEST: &str = "kdeconnect.mousepad.request";
-pub const PACKET_TYPE_SHARE_REQUEST: &str = "kdeconnect.share.request";
-pub const PACKET_TYPE_CLIPBOARD: &str = "kdeconnect.clipboard";
-pub const PACKET_TYPE_CLIPBOARD_CONNECT: &str = "kdeconnect.clipboard.connect";
-pub const PACKET_TYPE_LOCK: &str = "kdeconnect.lock";
-pub const PACKET_TYPE_LOCK_REQUEST: &str = "kdeconnect.lock.request";
-pub const PACKET_TYPE_FINDMYPHONE_REQUEST: &str = "kdeconnect.findmyphone.request";
-pub const PACKET_TYPE_MPRIS: &str = "kdeconnect.mpris";
-pub const PACKET_TYPE_MPRIS_REQUEST: &str = "kdeconnect.mpris.request";
-pub const PACKET_TYPE_SFTP: &str = "kdeconnect.sftp";
-pub const PACKET_TYPE_SFTP_REQUEST: &str = "kdeconnect.sftp.request";
-pub const PACKET_TYPE_BATTERY: &str = "kdeconnect.battery";
-pub const PACKET_TYPE_NOTIFICATION: &str = "kdeconnect.notification";
-pub const PACKET_TYPE_NOTIFICATION_REQUEST: &str = "kdeconnect.notification.request";
-pub const PACKET_TYPE_NOTIFICATION_REPLY: &str = "kdeconnect.notification.reply";
-pub const PACKET_TYPE_NOTIFICATION_ACTION: &str = "kdeconnect.notification.action";
-pub const PACKET_TYPE_SYSTEMVOLUME: &str = "kdeconnect.systemvolume";
-pub const PACKET_TYPE_SYSTEMVOLUME_REQUEST: &str = "kdeconnect.systemvolume.request";
-pub const PACKET_TYPE_RUNCOMMAND: &str = "kdeconnect.runcommand";
-pub const PACKET_TYPE_RUNCOMMAND_REQUEST: &str = "kdeconnect.runcommand.request";
-pub const PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE: &str = "kdeconnect.mousepad.keyboardstate";
-pub const PACKET_TYPE_SHARE_REQUEST_UPDATE: &str = "kdeconnect.share.request.update";
+/// Active DeskLink protocol v9 identifiers. Legacy KDE Connect-compatible
+/// identifiers are retained only in `protocol::legacy_kdeconnect_v8`.
+pub const PROTOCOL_VERSION: i64 = 9;
+pub const PACKET_TYPE_IDENTITY: &str = "desklink.identity";
+pub const PACKET_TYPE_PAIR: &str = "desklink.pair";
+pub const PACKET_TYPE_PING: &str = "desklink.ping";
+pub const PACKET_TYPE_MOUSEPAD_REQUEST: &str = "desklink.mousepad.request";
+pub const PACKET_TYPE_MOUSEPAD_ECHO: &str = "desklink.mousepad.echo";
+pub const PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE: &str = "desklink.mousepad.keyboardstate";
+pub const PACKET_TYPE_SHARE_REQUEST: &str = "desklink.share.request";
+pub const PACKET_TYPE_SHARE_REQUEST_UPDATE: &str = "desklink.share.request.update";
+pub const PACKET_TYPE_CLIPBOARD: &str = "desklink.clipboard";
+pub const PACKET_TYPE_CLIPBOARD_CONNECT: &str = "desklink.clipboard.connect";
+pub const PACKET_TYPE_LOCK: &str = "desklink.lock";
+pub const PACKET_TYPE_LOCK_REQUEST: &str = "desklink.lock.request";
+pub const PACKET_TYPE_FINDMYPHONE_REQUEST: &str = "desklink.findmyphone.request";
+pub const PACKET_TYPE_MPRIS: &str = "desklink.mpris";
+pub const PACKET_TYPE_MPRIS_REQUEST: &str = "desklink.mpris.request";
+pub const PACKET_TYPE_SFTP: &str = "desklink.sftp";
+pub const PACKET_TYPE_SFTP_REQUEST: &str = "desklink.sftp.request";
+pub const PACKET_TYPE_BATTERY: &str = "desklink.battery";
+pub const PACKET_TYPE_NOTIFICATION: &str = "desklink.notification";
+pub const PACKET_TYPE_NOTIFICATION_REQUEST: &str = "desklink.notification.request";
+pub const PACKET_TYPE_NOTIFICATION_CANCEL: &str = "desklink.notification.cancel";
+pub const PACKET_TYPE_NOTIFICATION_REPLY: &str = "desklink.notification.reply";
+pub const PACKET_TYPE_NOTIFICATION_ACTION: &str = "desklink.notification.action";
+pub const PACKET_TYPE_SYSTEMVOLUME: &str = "desklink.systemvolume";
+pub const PACKET_TYPE_SYSTEMVOLUME_REQUEST: &str = "desklink.systemvolume.request";
+pub const PACKET_TYPE_RUNCOMMAND: &str = "desklink.runcommand";
+pub const PACKET_TYPE_RUNCOMMAND_REQUEST: &str = "desklink.runcommand.request";
+pub const PACKET_TYPE_SCREEN_REQUEST: &str = "desklink.screen.request";
+pub const PACKET_TYPE_SCREEN_READY: &str = "desklink.screen.ready";
+pub const PACKET_TYPE_SCREEN_FRAME: &str = "desklink.screen.frame";
+pub const PACKET_TYPE_SCREEN_STOP: &str = "desklink.screen.stop";
+pub const PACKET_TYPE_SCREEN_ERROR: &str = "desklink.screen.error";
+pub const PACKET_TYPE_PRESENTER: &str = "desklink.presenter";
+pub const PACKET_TYPE_CONTACTS_REQUEST: &str = "desklink.contacts.request";
+pub const PACKET_TYPE_SMS_REQUEST: &str = "desklink.sms.request";
+pub const PACKET_TYPE_TELEPHONY_REQUEST: &str = "desklink.telephony.request";
+pub const PACKET_TYPE_CONNECTIVITY_REPORT: &str = "desklink.connectivity_report";
+pub const PACKET_TYPE_WEBRTC_SIGNAL_V1: &str = "desklink.webrtc.signal.v1";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NetworkPacket {
@@ -86,6 +103,12 @@ impl NetworkPacket {
         }
         let mut bytes = serde_json::to_vec(&Value::Object(root))?;
         bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    pub fn serialize(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut bytes = self.serialize_line()?;
+        let _ = bytes.pop();
         Ok(bytes)
     }
 

@@ -21,6 +21,7 @@
 mod application;
 mod config;
 mod device_links;
+mod protocol;
 mod remote_control;
 mod window;
 
