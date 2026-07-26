@@ -5,6 +5,7 @@ pub(crate) mod file_protocol;
 mod handover;
 mod peer_connection;
 mod signaling;
+pub(crate) mod transfer_manager;
 
 #[allow(unused_imports)]
 pub use handover::{

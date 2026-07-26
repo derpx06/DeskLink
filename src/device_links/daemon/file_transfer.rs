@@ -9,9 +9,39 @@ use super::network::ssl_acceptor;
 use super::DaemonWorker;
 use crate::device_links::config::Config;
 use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_SHARE_REQUEST};
+use crate::device_links::webrtc::coordinator::start_file_transfer;
 
 impl DaemonWorker {
     pub(super) fn send_file(&self, device_id: &str, file_path: std::path::PathBuf) {
+        let prepared = self
+            .sessions
+            .current_binding(device_id)
+            .ok_or_else(|| "Device is not connected".to_string())
+            .and_then(|binding| {
+                self.sessions
+                    .feature_transport_snapshot(&binding)
+                    .map_err(|error| error.to_string())
+            });
+        match prepared {
+            Ok(transport) if transport.web_rtc_ready => {
+                if let Err(error) = start_file_transfer(&self.sessions, &transport, &file_path) {
+                    eprintln!("[Daemon] WebRTC file transfer failed: {error}");
+                }
+                return;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("[Daemon] Could not prepare file transfer: {error}");
+                return;
+            }
+        }
+        self.send_file_legacy(device_id, file_path);
+    }
+
+    /// Kept only while mutual WebRTC feature-ready remains gated.  Once the
+    /// Android/Rust file integration gate passes this path is removed rather
+    /// than becoming a paired-feature fallback.
+    fn send_file_legacy(&self, device_id: &str, file_path: std::path::PathBuf) {
         let filename = match file_path.file_name().and_then(|s| s.to_str()) {
             Some(name) => name.to_string(),
             None => {

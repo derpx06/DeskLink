@@ -124,6 +124,13 @@ impl Config {
         &self.certificate
     }
 
+    /// Private state for resumable WebRTC file transfers.  This remains below
+    /// the existing protocol directory so rebranding and transport migration
+    /// never move identities or pairing records.
+    pub fn transfer_state_dir(&self) -> PathBuf {
+        self.base_dir.join("webrtc-transfers")
+    }
+
     pub fn is_trusted(&self, device_id: &str) -> bool {
         self.stored.trusted_devices.contains_key(device_id)
     }

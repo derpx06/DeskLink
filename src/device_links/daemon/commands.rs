@@ -2,7 +2,7 @@ use super::discovery::broadcast_identity;
 use super::network::send_packet;
 use super::state::{mark_error, push_error, update_pair_state};
 use super::DaemonWorker;
-use crate::device_links::core::{DeviceSession, SessionBinding};
+use crate::device_links::core::{DeviceSession, FeatureTransportSnapshot, SessionBinding};
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK_REQUEST,
     PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION_ACTION,
@@ -157,13 +157,10 @@ impl DaemonWorker {
     }
 
     fn send_ping(&self, device_id: &str) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before sending ping".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let mut packet = NetworkPacket::new(PACKET_TYPE_PING);
             packet.set("message", "Ping from DeskLink");
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
@@ -172,145 +169,101 @@ impl DaemonWorker {
         device_id: &str,
         payload: serde_json::Map<String, serde_json::Value>,
     ) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before sending remote control input".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = NetworkPacket::with_body(PACKET_TYPE_MOUSEPAD_REQUEST, payload);
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn send_share_text(&self, device_id: &str, text: &str) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before sharing text".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = build_share_text_packet(text)?;
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn send_lock_request(&self, device_id: &str, lock: bool) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before sending lock request".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let mut packet = NetworkPacket::new(PACKET_TYPE_LOCK_REQUEST);
             packet.set("setLocked", lock);
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn send_find_phone(&self, device_id: &str) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before ringing it".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = NetworkPacket::new(PACKET_TYPE_FINDMYPHONE_REQUEST);
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn send_mpris_action(&self, device_id: &str, player: &str, action: &str) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before controlling media".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = build_mpris_action_packet(player, action);
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn request_mpris_status(&self, device_id: &str, player: Option<String>) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before requesting media status".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = build_mpris_status_request_packet(player.as_deref());
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn send_mpris_set_volume(&self, device_id: &str, player: &str, volume: i64) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before controlling media volume".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = build_mpris_set_volume_packet(player, volume)?;
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn send_mpris_seek(&self, device_id: &str, player: &str, offset: i64) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before seeking media".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = build_mpris_seek_packet(player, offset)?;
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn send_sftp_request(&self, device_id: &str) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before requesting file browsing".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = build_sftp_request_packet();
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn request_notifications(&self, device_id: &str) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before requesting notifications".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = build_notification_request_packet();
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn dismiss_notification(&self, device_id: &str, notification_id: &str) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before dismissing notifications".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = build_notification_dismiss_packet(notification_id)?;
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn reply_notification(&self, device_id: &str, reply_id: &str, message: &str) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before replying to notifications".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = build_notification_reply_packet(reply_id, message)?;
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn trigger_notification_action(&self, device_id: &str, key: &str, action: &str) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err(
-                    "Device must be paired before triggering notification actions".to_string(),
-                );
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = build_notification_action_packet(key, action)?;
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn request_system_volume(&self, device_id: &str) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before requesting system volume".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = build_system_volume_request_packet();
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
@@ -321,30 +274,21 @@ impl DaemonWorker {
         volume: Option<i64>,
         muted: Option<bool>,
     ) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before changing system volume".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = build_system_volume_set_packet(name, volume, muted)?;
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn request_remote_commands(&self, device_id: &str) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before requesting remote commands".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let packet = build_remote_command_list_request_packet();
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 
     fn execute_remote_command(&self, device_id: &str, key: &str) {
-        self.with_link(device_id, |session, binding| {
-            if session.pairing.state != PairState::Paired {
-                return Err("Device must be paired before executing remote commands".to_string());
-            }
+        self.with_feature_transport(device_id, |transport| {
             let key = key.trim();
             let advertised = self
                 .devices
@@ -362,8 +306,39 @@ impl DaemonWorker {
                 return Err("Remote command was not advertised by this device".to_string());
             }
             let packet = build_remote_command_execute_packet(key)?;
-            send_feature_packet(session, binding, &packet)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
+    }
+
+    /// Builds a generation-checked transport snapshot under the session lock,
+    /// then runs the caller after the lock has been released.  Feature sends
+    /// therefore cannot block link replacement, shutdown, or ICE recovery.
+    fn with_feature_transport(
+        &self,
+        device_id: &str,
+        f: impl FnOnce(&FeatureTransportSnapshot) -> Result<(), String>,
+    ) {
+        let result = self
+            .sessions
+            .current_binding(device_id)
+            .ok_or_else(|| "Device is not connected".to_string())
+            .and_then(|binding| {
+                self.sessions
+                    .feature_transport_snapshot(&binding)
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|transport| {
+                if !transport.paired {
+                    return Err(
+                        "Device must be paired before sending DeskLink features".to_string()
+                    );
+                }
+                f(&transport)
+            });
+        if let Err(error) = result {
+            mark_error(&self.devices, device_id, error.clone());
+            push_error(&self.errors, error);
+        }
     }
 
     pub(super) fn with_link(

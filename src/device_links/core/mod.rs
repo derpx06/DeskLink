@@ -4,7 +4,8 @@ mod session_link;
 
 #[allow(unused_imports)]
 pub use device_manager::{
-    DeviceManager, DisconnectResult, ReconnectLease, RegistrationResult, SessionError,
+    DeviceManager, DisconnectResult, FeatureTransportSnapshot, ReconnectLease, RegistrationResult,
+    SessionError,
 };
 pub use device_session::{
     ConnectionGeneration, DeviceSession, SessionBinding, SessionId, SessionState,

@@ -4,11 +4,26 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::device_links::pairing::PairingHandler;
+use crate::device_links::webrtc::transfer_manager::WebRtcTransferManager;
 use crate::device_links::webrtc::{DesktopWebRtcPeer, HandoverRuntime, WebRtcWireBinding};
 
 use super::{
     ConnectionGeneration, DeviceSession, SessionBinding, SessionId, SessionLink, SessionState,
 };
+
+/// Immutable transport data copied from the authoritative session while its
+/// lock is held.  Callers must perform network I/O only after obtaining this
+/// snapshot: GStreamer and TLS callbacks may synchronously trigger lifecycle
+/// work, so holding the session mutex across a send can deadlock recovery.
+#[derive(Clone)]
+pub struct FeatureTransportSnapshot {
+    pub binding: SessionBinding,
+    pub paired: bool,
+    pub web_rtc_peer: Option<Arc<DesktopWebRtcPeer>>,
+    pub transfer_manager: Option<Arc<WebRtcTransferManager>>,
+    pub web_rtc_wire: Option<WebRtcWireBinding>,
+    pub web_rtc_ready: bool,
+}
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +113,7 @@ impl DeviceManager {
                     session.webrtc_handover = None;
                     session.seen_webrtc_request_ids.clear();
                     session.seen_webrtc_message_ids.clear();
+                    session.transfer_manager = None;
                     session.active_webrtc.take()
                 } else {
                     None
@@ -137,6 +153,7 @@ impl DeviceManager {
                     state: SessionState::Ready,
                     active_link: Some(Arc::clone(&link)),
                     active_webrtc: None,
+                    transfer_manager: None,
                     webrtc_attempt_id: None,
                     webrtc_handover: None,
                     seen_webrtc_request_ids: Default::default(),
@@ -184,6 +201,39 @@ impl DeviceManager {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Takes a generation-checked, immutable view of the current transport.
+    /// The snapshot is intentionally not a capability to mutate session
+    /// state.  A caller must re-check [`Self::is_current`] immediately before
+    /// I/O; the wire generation then protects the receiver if replacement
+    /// races with that send.
+    pub fn feature_transport_snapshot(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<FeatureTransportSnapshot, SessionError> {
+        self.with_session(binding, |session| {
+            let (web_rtc_peer, transfer_manager, web_rtc_wire, web_rtc_ready) = match (
+                session.active_webrtc.as_ref(),
+                session.webrtc_handover.as_ref(),
+            ) {
+                (Some(peer), Some(handover)) => (
+                    Some(Arc::clone(peer)),
+                    session.transfer_manager.as_ref().cloned(),
+                    Some(handover.wire_binding.clone()),
+                    handover.features_ready(),
+                ),
+                _ => (None, None, None, false),
+            };
+            FeatureTransportSnapshot {
+                binding: binding.clone(),
+                paired: session.pairing.state == crate::device_links::pairing::PairState::Paired,
+                web_rtc_peer,
+                transfer_manager,
+                web_rtc_wire,
+                web_rtc_ready,
+            }
+        })
     }
 
     pub fn is_current(&self, binding: &SessionBinding) -> bool {
@@ -274,6 +324,7 @@ impl DeviceManager {
         session.webrtc_handover = None;
         session.seen_webrtc_request_ids.clear();
         session.seen_webrtc_message_ids.clear();
+        session.transfer_manager = None;
         let webrtc = session.active_webrtc.take();
         DisconnectResult {
             was_current: true,
@@ -291,12 +342,14 @@ impl DeviceManager {
         attempt_id: String,
         wire_binding: WebRtcWireBinding,
         peer: DesktopWebRtcPeer,
+        transfer_manager: Arc<WebRtcTransferManager>,
     ) -> Result<Option<Arc<DesktopWebRtcPeer>>, SessionError> {
         self.with_session(binding, |session| {
             if session.pairing.state != crate::device_links::pairing::PairState::Paired {
                 return Err(SessionError::NotPaired);
             }
             let replaced = session.active_webrtc.replace(Arc::new(peer));
+            session.transfer_manager = Some(transfer_manager);
             session.webrtc_handover = Some(HandoverRuntime::new(attempt_id.clone(), wire_binding));
             session.webrtc_attempt_id = Some(attempt_id);
             session.seen_webrtc_request_ids.clear();
@@ -496,6 +549,7 @@ impl DeviceManager {
                 if let Some(peer) = session.active_webrtc.take() {
                     peers.push(peer);
                 }
+                session.transfer_manager = None;
                 session.active_link.take()
             })
             .collect();
@@ -560,6 +614,25 @@ mod tests {
         assert!(manager.is_current(&second.binding));
         assert!(second.replaced_link.unwrap().is_closed());
         assert!(first.binding.cancellation.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn transport_snapshot_becomes_stale_after_link_replacement() {
+        let manager = DeviceManager::new();
+        let first = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        let snapshot = manager.feature_transport_snapshot(&first).unwrap();
+        let replacement = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+
+        assert!(snapshot.paired);
+        assert!(!snapshot.web_rtc_ready);
+        assert!(!manager.is_current(&snapshot.binding));
+        assert!(manager.is_current(&replacement));
     }
 
     #[test]

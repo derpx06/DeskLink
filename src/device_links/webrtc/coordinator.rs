@@ -15,11 +15,13 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::device_links::config::Config;
-use crate::device_links::core::{DeviceManager, DeviceSession, SessionBinding};
+use crate::device_links::core::{DeviceManager, FeatureTransportSnapshot, SessionBinding};
 use crate::device_links::daemon::network::send_packet;
 use crate::device_links::device::DeviceView;
 use crate::device_links::packet::NetworkPacket;
 
+use super::file_protocol::{FileControl, FILE_CHUNK_MESSAGE_TYPE, FILE_CONTROL_MESSAGE_TYPE};
+use super::transfer_manager::{TransferEvent, WebRtcTransferManager};
 use super::{
     AuthenticationTranscript, DesktopWebRtcPeer, HandoverControlKind, HandoverControlMessage,
     PeerEvent, SignalingMessageType, WebRtcChannel, WebRtcEnvelope, WebRtcPacketBridge,
@@ -49,10 +51,17 @@ pub(crate) fn start_initiator(
     }
     let attempt_id = Uuid::new_v4().to_string();
     let wire = WebRtcWireBinding::from_attempt(local_device_id, remote_device_id, &attempt_id)?;
+    let transfer_manager = new_transfer_manager(&config)?;
     let (sender, receiver) = mpsc::channel();
     let peer = DesktopWebRtcPeer::new(true, sender)?;
     let replaced = sessions
-        .install_webrtc_peer(&binding, attempt_id.clone(), wire.clone(), peer)
+        .install_webrtc_peer(
+            &binding,
+            attempt_id.clone(),
+            wire.clone(),
+            peer,
+            Arc::clone(&transfer_manager),
+        )
         .map_err(|error| error.to_string())?;
     if let Some(replaced) = replaced {
         replaced.close();
@@ -65,7 +74,8 @@ pub(crate) fn start_initiator(
         Arc::clone(&sessions),
         config,
         devices,
-    );
+        transfer_manager,
+    )?;
     let peer = sessions
         .active_webrtc_peer(&binding, &attempt_id)
         .map_err(|error| error.to_string())?;
@@ -179,26 +189,59 @@ pub(crate) fn handle_signaling_packet(
 /// complete; the handover code below intentionally does not emit local
 /// `feature-ready` yet.
 pub(crate) fn send_feature_packet(
-    session: &DeviceSession,
-    binding: &SessionBinding,
+    sessions: &DeviceManager,
+    transport: &FeatureTransportSnapshot,
     packet: &NetworkPacket,
 ) -> Result<(), String> {
-    let transport = match (
-        session.active_webrtc.as_ref(),
-        session.webrtc_handover.as_ref(),
-    ) {
-        (Some(peer), Some(handover)) if handover.features_ready() => {
-            Ok((Arc::clone(peer), handover.wire_binding.clone()))
-        }
-        _ => Err(()),
-    };
-    if let Ok((peer, wire)) = transport {
-        let envelope = WebRtcPacketBridge::encode(&wire, packet, now_millis())?;
+    if !sessions.is_current(&transport.binding) {
+        return Err("DeskLink session was replaced before feature send".to_string());
+    }
+    if !transport.paired {
+        return Err("Device must be paired before sending DeskLink features".to_string());
+    }
+    if transport.web_rtc_ready {
+        let peer = transport
+            .web_rtc_peer
+            .as_ref()
+            .ok_or_else(|| "DeskLink WebRTC handover has no active peer".to_string())?;
+        let wire = transport
+            .web_rtc_wire
+            .as_ref()
+            .ok_or_else(|| "DeskLink WebRTC handover has no wire binding".to_string())?;
+        let envelope = WebRtcPacketBridge::encode(wire, packet, now_millis())?;
         let text = String::from_utf8(envelope.to_json()?)
             .map_err(|_| "DeskLink WebRTC feature serialization was not UTF-8".to_string())?;
         return peer.send_text(WebRtcPacketBridge::channel_for(packet), &text);
     }
-    send_packet(binding.link.stream()?, packet)
+    // Transitional path. This is removed when every desktop handler, file
+    // transfer, input lease, and screen track is WebRTC-backed. Keeping it
+    // here prevents an incomplete handover from dropping user data.
+    send_packet(transport.binding.link.stream()?, packet)
+}
+
+/// Starts a desktop-originated transfer through the current authenticated
+/// WebRTC peer. It has no LAN fallback once feature-ready is active.
+pub(crate) fn start_file_transfer(
+    sessions: &DeviceManager,
+    transport: &FeatureTransportSnapshot,
+    source: &std::path::Path,
+) -> Result<(), String> {
+    if !sessions.is_current(&transport.binding) || !transport.web_rtc_ready {
+        return Err("DeskLink WebRTC file transport is unavailable".to_string());
+    }
+    let peer = transport
+        .web_rtc_peer
+        .as_ref()
+        .ok_or_else(|| "DeskLink WebRTC file transfer has no active peer".to_string())?;
+    let wire = transport
+        .web_rtc_wire
+        .as_ref()
+        .ok_or_else(|| "DeskLink WebRTC file transfer has no wire binding".to_string())?;
+    let manager = transport
+        .transfer_manager
+        .as_ref()
+        .ok_or_else(|| "DeskLink WebRTC file transfer manager is unavailable".to_string())?;
+    send_transfer_events(peer, wire, manager.start_send(wire, source)?)
 }
 
 fn install_responder(
@@ -211,10 +254,17 @@ fn install_responder(
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
 ) -> Result<Arc<DesktopWebRtcPeer>, String> {
     let wire = WebRtcWireBinding::from_attempt(local_device_id, remote_device_id, &attempt_id)?;
+    let transfer_manager = new_transfer_manager(&config)?;
     let (sender, receiver) = mpsc::channel();
     let peer = DesktopWebRtcPeer::new(false, sender)?;
     let replaced = sessions
-        .install_webrtc_peer(&binding, attempt_id.clone(), wire.clone(), peer)
+        .install_webrtc_peer(
+            &binding,
+            attempt_id.clone(),
+            wire.clone(),
+            peer,
+            Arc::clone(&transfer_manager),
+        )
         .map_err(|error| error.to_string())?;
     if let Some(replaced) = replaced {
         replaced.close();
@@ -227,12 +277,14 @@ fn install_responder(
         Arc::clone(&sessions),
         config,
         devices,
-    );
+        transfer_manager,
+    )?;
     sessions
         .active_webrtc_peer(&binding, &attempt_id)
         .map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_arguments)] // Captures one immutable peer/session context.
 fn spawn_event_worker(
     binding: SessionBinding,
     attempt_id: String,
@@ -241,7 +293,8 @@ fn spawn_event_worker(
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
-) {
+    transfer_manager: Arc<WebRtcTransferManager>,
+) -> Result<(), String> {
     thread::spawn(move || {
         while let Ok(event) = receiver.recv() {
             if !sessions.is_current(&binding)
@@ -319,18 +372,19 @@ fn spawn_event_worker(
                         &sessions,
                         &config,
                         &devices,
+                        &transfer_manager,
                     ) {
                         eprintln!("[DeskLink] Rejected WebRTC data-channel message: {error}");
                     }
                 }
                 PeerEvent::Binary { channel, bytes } => {
-                    // The binary transport surface is deliberately limited to
-                    // file-data. A later transfer manager owns checkpoint and
-                    // checksum validation; until it is installed, fail the
-                    // message explicitly instead of treating it as a legacy
-                    // payload socket transfer.
+                    // Android wraps file data in an authenticated envelope,
+                    // including when the underlying data channel is binary.
+                    // Raw chunks have no generation/replay binding and are
+                    // therefore rejected rather than falling back to a TLS
+                    // payload socket.
                     eprintln!(
-                        "[DeskLink] WebRTC binary payload on {} is awaiting the file-transfer manager ({} bytes)",
+                        "[DeskLink] Rejected raw WebRTC binary payload on {} ({} bytes)",
                         channel.label(),
                         bytes.len(),
                     );
@@ -349,6 +403,19 @@ fn spawn_event_worker(
             }
         }
     });
+    Ok(())
+}
+
+fn new_transfer_manager(config: &Arc<Mutex<Config>>) -> Result<Arc<WebRtcTransferManager>, String> {
+    let config = config
+        .lock()
+        .map_err(|_| "DeskLink configuration lock poisoned".to_string())?;
+    let transfer_state = config.transfer_state_dir();
+    let downloads = dirs::download_dir().unwrap_or_else(|| transfer_state.join("downloads"));
+    Ok(Arc::new(WebRtcTransferManager::new(
+        transfer_state,
+        downloads,
+    )?))
 }
 
 fn begin_handover(
@@ -389,8 +456,23 @@ fn handle_peer_envelope(
     sessions: &Arc<DeviceManager>,
     config: &Arc<Mutex<Config>>,
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    transfer_manager: &Arc<WebRtcTransferManager>,
 ) -> Result<(), String> {
     let envelope = WebRtcEnvelope::from_json(bytes)?;
+    if matches!(
+        envelope.message_type.as_str(),
+        FILE_CONTROL_MESSAGE_TYPE | FILE_CHUNK_MESSAGE_TYPE
+    ) {
+        return handle_file_envelope(
+            binding,
+            attempt_id,
+            wire,
+            channel,
+            envelope,
+            sessions,
+            transfer_manager,
+        );
+    }
     if channel != WebRtcChannel::Control {
         let packet = WebRtcPacketBridge::decode(wire, &envelope)?;
         sessions
@@ -590,6 +672,90 @@ fn handle_peer_envelope(
             Ok(())
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_file_envelope(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    channel: WebRtcChannel,
+    envelope: WebRtcEnvelope,
+    sessions: &Arc<DeviceManager>,
+    transfer_manager: &Arc<WebRtcTransferManager>,
+) -> Result<(), String> {
+    if !sessions
+        .webrtc_features_ready(binding, attempt_id)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("DeskLink WebRTC file transfer arrived before feature handover".to_string());
+    }
+    let expected_channel = match envelope.message_type.as_str() {
+        FILE_CONTROL_MESSAGE_TYPE => WebRtcChannel::FileControl,
+        FILE_CHUNK_MESSAGE_TYPE => WebRtcChannel::FileData,
+        _ => unreachable!("file envelope has already been classified"),
+    };
+    if channel != expected_channel || envelope.channel != expected_channel.label() {
+        return Err("DeskLink WebRTC file message arrived on the wrong channel".to_string());
+    }
+    let payload = envelope.validate(wire)?;
+    sessions
+        .accept_webrtc_envelope(binding, attempt_id, envelope.message_id)
+        .map_err(|error| error.to_string())?;
+    let events = match expected_channel {
+        WebRtcChannel::FileControl => {
+            transfer_manager.handle_control(wire, FileControl::from_json(&payload)?)?
+        }
+        WebRtcChannel::FileData => transfer_manager.handle_chunk(wire, &payload)?,
+        _ => unreachable!("file channel classification is exhaustive"),
+    };
+    let peer = sessions
+        .active_webrtc_peer(binding, attempt_id)
+        .map_err(|error| error.to_string())?;
+    send_transfer_events(&peer, wire, events)
+}
+
+fn send_transfer_events(
+    peer: &DesktopWebRtcPeer,
+    wire: &WebRtcWireBinding,
+    events: Vec<TransferEvent>,
+) -> Result<(), String> {
+    for event in events {
+        match event {
+            TransferEvent::SendControl(control) => {
+                let encoded = control.to_json()?;
+                let envelope = WebRtcEnvelope::create(
+                    wire,
+                    WebRtcChannel::FileControl,
+                    FILE_CONTROL_MESSAGE_TYPE,
+                    &encoded,
+                    now_millis(),
+                )?;
+                let text = String::from_utf8(envelope.to_json()?)
+                    .map_err(|_| "DeskLink WebRTC file envelope was not UTF-8".to_string())?;
+                peer.send_text(WebRtcChannel::FileControl, &text)?;
+            }
+            TransferEvent::SendChunk(chunk) => {
+                let envelope = WebRtcEnvelope::create(
+                    wire,
+                    WebRtcChannel::FileData,
+                    FILE_CHUNK_MESSAGE_TYPE,
+                    &chunk,
+                    now_millis(),
+                )?;
+                let text = String::from_utf8(envelope.to_json()?)
+                    .map_err(|_| "DeskLink WebRTC file envelope was not UTF-8".to_string())?;
+                peer.send_text(WebRtcChannel::FileData, &text)?;
+            }
+            TransferEvent::Completed { transfer_id, path } => {
+                eprintln!(
+                    "[DeskLink] WebRTC transfer {transfer_id} completed at {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn send_capabilities(

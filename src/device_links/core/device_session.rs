@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::device_links::pairing::PairingHandler;
+use crate::device_links::webrtc::transfer_manager::WebRtcTransferManager;
 use crate::device_links::webrtc::{DesktopWebRtcPeer, HandoverRuntime};
 
 use super::SessionLink;
@@ -33,6 +34,10 @@ pub struct DeviceSession {
     /// The only WebRTC peer allowed to carry traffic for this logical session.
     /// It is replaced together with the bootstrap link generation.
     pub active_webrtc: Option<Arc<DesktopWebRtcPeer>>,
+    /// Checkpoint owner shared by the peer worker and desktop commands. It is
+    /// cleared with the peer so an old generation cannot resume a transfer on
+    /// a replacement connection.
+    pub transfer_manager: Option<Arc<WebRtcTransferManager>>,
     pub webrtc_attempt_id: Option<String>,
     /// Authentication and mutual feature-readiness state for the current
     /// WebRTC peer. This is reset whenever its transport generation changes.
