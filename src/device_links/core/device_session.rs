@@ -38,6 +38,8 @@ pub struct DeviceSession {
     /// WebRTC peer. This is reset whenever its transport generation changes.
     pub webrtc_handover: Option<HandoverRuntime>,
     pub seen_webrtc_request_ids: HashSet<String>,
+    /// Bounded idempotency cache for authenticated data-channel envelopes.
+    pub seen_webrtc_message_ids: HashSet<String>,
     pub cancellation: Arc<AtomicBool>,
     pub connected_at: Option<Instant>,
     pub last_disconnect_reason: Option<String>,

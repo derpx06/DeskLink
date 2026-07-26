@@ -177,7 +177,10 @@ impl WebRtcEnvelope {
         {
             return Err("WebRTC envelope generation is stale".to_string());
         }
-        if self.message_id.is_empty() || self.message_type.is_empty() {
+        if self.message_id.is_empty()
+            || Uuid::parse_str(&self.message_id).is_err()
+            || self.message_type.is_empty()
+        {
             return Err("Malformed WebRTC envelope".to_string());
         }
         WebRtcChannel::parse(&self.channel)?;
@@ -352,5 +355,21 @@ mod tests {
         let packet = NetworkPacket::new(PACKET_TYPE_PAIR);
 
         assert!(WebRtcPacketBridge::encode(&binding, &packet, 1).is_err());
+    }
+
+    #[test]
+    fn envelope_rejects_a_non_uuid_message_id() {
+        let binding = WebRtcWireBinding::from_attempt(
+            "desktop",
+            "phone",
+            "01234567-89ab-cdef-0123-456789abcdef",
+        )
+        .unwrap();
+        let mut packet = NetworkPacket::new(PACKET_TYPE_CLIPBOARD);
+        packet.set("content", "DeskLink clipboard");
+        let mut envelope = WebRtcPacketBridge::encode(&binding, &packet, 1).unwrap();
+        envelope.message_id = "not-a-uuid".to_string();
+
+        assert!(WebRtcPacketBridge::decode(&binding, &envelope).is_err());
     }
 }

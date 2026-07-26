@@ -380,6 +380,9 @@ fn handle_peer_envelope(
     let envelope = WebRtcEnvelope::from_json(bytes)?;
     if channel != WebRtcChannel::Control {
         let packet = WebRtcPacketBridge::decode(wire, &envelope)?;
+        sessions
+            .accept_webrtc_envelope(binding, attempt_id, envelope.message_id.clone())
+            .map_err(|error| error.to_string())?;
         return crate::device_links::daemon::packet_handler::dispatch_webrtc_feature_packet(
             binding, packet, devices, sessions, config,
         );
@@ -391,6 +394,9 @@ fn handle_peer_envelope(
         return Err("DeskLink WebRTC handover arrived on the wrong channel".to_string());
     }
     let payload = envelope.validate(wire)?;
+    sessions
+        .accept_webrtc_envelope(binding, attempt_id, envelope.message_id.clone())
+        .map_err(|error| error.to_string())?;
     let message = HandoverControlMessage::from_json(&payload)?;
     message.validate(wire, attempt_id, now_millis())?;
     let local_is_initiator = wire.sender_device_id < wire.peer_device_id;

@@ -97,6 +97,7 @@ impl DeviceManager {
                     session.webrtc_attempt_id = None;
                     session.webrtc_handover = None;
                     session.seen_webrtc_request_ids.clear();
+                    session.seen_webrtc_message_ids.clear();
                     session.active_webrtc.take()
                 } else {
                     None
@@ -139,6 +140,7 @@ impl DeviceManager {
                     webrtc_attempt_id: None,
                     webrtc_handover: None,
                     seen_webrtc_request_ids: Default::default(),
+                    seen_webrtc_message_ids: Default::default(),
                     cancellation: Arc::new(AtomicBool::new(false)),
                     connected_at: Some(now),
                     last_disconnect_reason: None,
@@ -271,6 +273,7 @@ impl DeviceManager {
         session.webrtc_attempt_id = None;
         session.webrtc_handover = None;
         session.seen_webrtc_request_ids.clear();
+        session.seen_webrtc_message_ids.clear();
         let webrtc = session.active_webrtc.take();
         DisconnectResult {
             was_current: true,
@@ -297,6 +300,7 @@ impl DeviceManager {
             session.webrtc_handover = Some(HandoverRuntime::new(attempt_id.clone(), wire_binding));
             session.webrtc_attempt_id = Some(attempt_id);
             session.seen_webrtc_request_ids.clear();
+            session.seen_webrtc_message_ids.clear();
             Ok(replaced)
         })?
     }
@@ -394,6 +398,32 @@ impl DeviceManager {
         })?
     }
 
+    /// Accepts a data-channel envelope message ID exactly once for the active
+    /// WebRTC attempt. The cache is session-owned so a stale peer callback
+    /// cannot bypass replay protection after a link replacement.
+    pub fn accept_webrtc_envelope(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+        message_id: String,
+    ) -> Result<(), SessionError> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            if !session.seen_webrtc_message_ids.insert(message_id) {
+                return Err(SessionError::ReplayDetected);
+            }
+            while session.seen_webrtc_message_ids.len() > 4096 {
+                let Some(oldest) = session.seen_webrtc_message_ids.iter().next().cloned() else {
+                    break;
+                };
+                session.seen_webrtc_message_ids.remove(&oldest);
+            }
+            Ok(())
+        })?
+    }
+
     #[allow(dead_code)]
     pub fn claim_reconnect(&self, device_id: &str, now: Instant) -> Option<ReconnectLease> {
         let mut sessions = self.sessions.lock().ok()?;
@@ -462,6 +492,7 @@ impl DeviceManager {
                 session.webrtc_attempt_id = None;
                 session.webrtc_handover = None;
                 session.seen_webrtc_request_ids.clear();
+                session.seen_webrtc_message_ids.clear();
                 if let Some(peer) = session.active_webrtc.take() {
                     peers.push(peer);
                 }
@@ -632,5 +663,29 @@ mod tests {
             .unwrap();
 
         assert!(!handover_present);
+    }
+
+    #[test]
+    fn a_webrtc_envelope_is_accepted_only_once_per_attempt() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        manager
+            .with_session(&binding, |session| {
+                session.webrtc_attempt_id = Some("attempt".to_string());
+            })
+            .unwrap();
+
+        manager
+            .accept_webrtc_envelope(&binding, "attempt", "message-1".to_string())
+            .unwrap();
+        assert_eq!(
+            manager
+                .accept_webrtc_envelope(&binding, "attempt", "message-1".to_string())
+                .unwrap_err(),
+            SessionError::ReplayDetected
+        );
     }
 }
