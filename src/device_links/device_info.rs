@@ -1,16 +1,7 @@
 use serde_json::Value;
 
+use super::features::FeatureRegistry;
 use super::packet::{NetworkPacket, PACKET_TYPE_IDENTITY, PROTOCOL_VERSION};
-use super::packet::{
-    PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
-    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST,
-    PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS,
-    PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_ACTION,
-    PACKET_TYPE_NOTIFICATION_REPLY, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING,
-    PACKET_TYPE_RUNCOMMAND, PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP,
-    PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SHARE_REQUEST_UPDATE,
-    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_WEBRTC_SIGNAL_V1,
-};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -24,64 +15,14 @@ pub struct DeviceInfo {
 
 impl DeviceInfo {
     pub fn local(id: String, name: String) -> Self {
+        let registry = FeatureRegistry::desktop();
         Self {
             id,
             name,
             device_type: "desktop".to_string(),
             protocol_version: PROTOCOL_VERSION,
-            incoming_capabilities: vec![
-                PACKET_TYPE_PING.to_string(),
-                PACKET_TYPE_MOUSEPAD_REQUEST.to_string(),
-                PACKET_TYPE_SHARE_REQUEST.to_string(),
-                PACKET_TYPE_CLIPBOARD.to_string(),
-                PACKET_TYPE_CLIPBOARD_CONNECT.to_string(),
-                PACKET_TYPE_LOCK.to_string(),
-                PACKET_TYPE_LOCK_REQUEST.to_string(),
-                PACKET_TYPE_MPRIS.to_string(),
-                PACKET_TYPE_MPRIS_REQUEST.to_string(),
-                PACKET_TYPE_SFTP.to_string(),
-                PACKET_TYPE_BATTERY.to_string(),
-                PACKET_TYPE_NOTIFICATION.to_string(),
-                PACKET_TYPE_NOTIFICATION_REQUEST.to_string(),
-                PACKET_TYPE_NOTIFICATION_REPLY.to_string(),
-                PACKET_TYPE_NOTIFICATION_ACTION.to_string(),
-                PACKET_TYPE_SYSTEMVOLUME.to_string(),
-                PACKET_TYPE_SYSTEMVOLUME_REQUEST.to_string(),
-                PACKET_TYPE_RUNCOMMAND.to_string(),
-                PACKET_TYPE_RUNCOMMAND_REQUEST.to_string(),
-                PACKET_TYPE_FINDMYPHONE_REQUEST.to_string(),
-                PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE.to_string(),
-                PACKET_TYPE_SHARE_REQUEST_UPDATE.to_string(),
-                // Bootstrap-only: signed SDP/ICE records still travel over
-                // the paired LAN TLS link, never as feature traffic.
-                PACKET_TYPE_WEBRTC_SIGNAL_V1.to_string(),
-            ],
-            outgoing_capabilities: vec![
-                PACKET_TYPE_PING.to_string(),
-                PACKET_TYPE_MOUSEPAD_REQUEST.to_string(),
-                PACKET_TYPE_SHARE_REQUEST.to_string(),
-                PACKET_TYPE_CLIPBOARD.to_string(),
-                PACKET_TYPE_CLIPBOARD_CONNECT.to_string(),
-                PACKET_TYPE_LOCK.to_string(),
-                PACKET_TYPE_LOCK_REQUEST.to_string(),
-                PACKET_TYPE_FINDMYPHONE_REQUEST.to_string(),
-                PACKET_TYPE_MPRIS.to_string(),
-                PACKET_TYPE_MPRIS_REQUEST.to_string(),
-                PACKET_TYPE_SFTP.to_string(),
-                PACKET_TYPE_SFTP_REQUEST.to_string(),
-                PACKET_TYPE_BATTERY.to_string(),
-                PACKET_TYPE_NOTIFICATION.to_string(),
-                PACKET_TYPE_NOTIFICATION_REQUEST.to_string(),
-                PACKET_TYPE_NOTIFICATION_REPLY.to_string(),
-                PACKET_TYPE_NOTIFICATION_ACTION.to_string(),
-                PACKET_TYPE_SYSTEMVOLUME.to_string(),
-                PACKET_TYPE_SYSTEMVOLUME_REQUEST.to_string(),
-                PACKET_TYPE_RUNCOMMAND.to_string(),
-                PACKET_TYPE_RUNCOMMAND_REQUEST.to_string(),
-                PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE.to_string(),
-                PACKET_TYPE_SHARE_REQUEST_UPDATE.to_string(),
-                PACKET_TYPE_WEBRTC_SIGNAL_V1.to_string(),
-            ],
+            incoming_capabilities: registry.incoming_capabilities().to_vec(),
+            outgoing_capabilities: registry.outgoing_capabilities().to_vec(),
         }
     }
 
@@ -150,6 +91,8 @@ fn is_valid_device_id(id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::device_links::packet::PACKET_TYPE_PING;
+
     use super::*;
 
     #[test]
@@ -167,75 +110,18 @@ mod tests {
     }
 
     #[test]
-    fn local_identity_advertises_v2_capabilities() {
+    fn local_identity_advertises_only_registered_capabilities() {
         let local = DeviceInfo::local("0123456789abcdef0123456789abcdef".into(), "DeskLink".into());
 
-        for capability in [
-            PACKET_TYPE_PING,
-            PACKET_TYPE_MOUSEPAD_REQUEST,
-            PACKET_TYPE_SHARE_REQUEST,
-            PACKET_TYPE_CLIPBOARD,
-            PACKET_TYPE_CLIPBOARD_CONNECT,
-            PACKET_TYPE_LOCK,
-            PACKET_TYPE_LOCK_REQUEST,
-            PACKET_TYPE_MPRIS,
-            PACKET_TYPE_MPRIS_REQUEST,
-            PACKET_TYPE_SFTP,
-            PACKET_TYPE_BATTERY,
-            PACKET_TYPE_NOTIFICATION,
-            PACKET_TYPE_NOTIFICATION_REQUEST,
-            PACKET_TYPE_NOTIFICATION_REPLY,
-            PACKET_TYPE_NOTIFICATION_ACTION,
-            PACKET_TYPE_SYSTEMVOLUME,
-            PACKET_TYPE_SYSTEMVOLUME_REQUEST,
-            PACKET_TYPE_RUNCOMMAND,
-            PACKET_TYPE_RUNCOMMAND_REQUEST,
-            PACKET_TYPE_FINDMYPHONE_REQUEST,
-            PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE,
-            PACKET_TYPE_SHARE_REQUEST_UPDATE,
-            PACKET_TYPE_WEBRTC_SIGNAL_V1,
-        ] {
-            assert!(
-                local
-                    .incoming_capabilities
-                    .contains(&capability.to_string()),
-                "missing incoming capability {capability}"
-            );
-        }
-
-        for capability in [
-            PACKET_TYPE_PING,
-            PACKET_TYPE_MOUSEPAD_REQUEST,
-            PACKET_TYPE_SHARE_REQUEST,
-            PACKET_TYPE_CLIPBOARD,
-            PACKET_TYPE_CLIPBOARD_CONNECT,
-            PACKET_TYPE_LOCK,
-            PACKET_TYPE_LOCK_REQUEST,
-            PACKET_TYPE_FINDMYPHONE_REQUEST,
-            PACKET_TYPE_MPRIS,
-            PACKET_TYPE_MPRIS_REQUEST,
-            PACKET_TYPE_SFTP,
-            PACKET_TYPE_SFTP_REQUEST,
-            PACKET_TYPE_BATTERY,
-            PACKET_TYPE_NOTIFICATION,
-            PACKET_TYPE_NOTIFICATION_REQUEST,
-            PACKET_TYPE_NOTIFICATION_REPLY,
-            PACKET_TYPE_NOTIFICATION_ACTION,
-            PACKET_TYPE_SYSTEMVOLUME,
-            PACKET_TYPE_SYSTEMVOLUME_REQUEST,
-            PACKET_TYPE_RUNCOMMAND,
-            PACKET_TYPE_RUNCOMMAND_REQUEST,
-            PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE,
-            PACKET_TYPE_SHARE_REQUEST_UPDATE,
-            PACKET_TYPE_WEBRTC_SIGNAL_V1,
-        ] {
-            assert!(
-                local
-                    .outgoing_capabilities
-                    .contains(&capability.to_string()),
-                "missing outgoing capability {capability}"
-            );
-        }
+        assert!(local
+            .incoming_capabilities
+            .contains(&PACKET_TYPE_PING.to_string()));
+        assert!(!local
+            .incoming_capabilities
+            .contains(&"desklink.mousepad.request".to_string()));
+        assert!(!local
+            .outgoing_capabilities
+            .contains(&"desklink.lock.request".to_string()));
     }
 
     #[test]

@@ -3,6 +3,7 @@ pub mod core;
 pub mod daemon;
 pub mod device;
 pub mod device_info;
+pub mod features;
 pub mod packet;
 pub mod pairing;
 pub mod webrtc;
