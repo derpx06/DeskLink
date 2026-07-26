@@ -119,6 +119,7 @@ pub(super) fn finish_secure_link(
             binding.clone(),
             Arc::clone(&sessions),
             Arc::clone(&config),
+            Arc::clone(&devices),
         ) {
             // Bootstrap LAN remains available until mutual feature-ready, so
             // a failed optional negotiation must not tear down a paired link.

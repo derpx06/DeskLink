@@ -21,10 +21,11 @@ use crate::device_links::device::DeviceView;
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
     PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST,
-    PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS, PACKET_TYPE_NOTIFICATION,
-    PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PAIR, PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND,
-    PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP, PACKET_TYPE_SHARE_REQUEST,
-    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_WEBRTC_SIGNAL_V1,
+    PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST,
+    PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PAIR, PACKET_TYPE_PING,
+    PACKET_TYPE_RUNCOMMAND, PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP,
+    PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME,
+    PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
 use crate::device_links::pairing::PairState;
 
@@ -150,6 +151,7 @@ pub(super) fn packet_read_loop(
                             &packet,
                             Arc::clone(&sessions),
                             Arc::clone(&config),
+                            Arc::clone(&devices),
                         )
                     {
                         eprintln!("[Daemon] Rejected DeskLink WebRTC signaling: {error}");
@@ -208,6 +210,7 @@ pub(super) fn packet_read_loop(
                                     binding.clone(),
                                     Arc::clone(&sessions),
                                     Arc::clone(&config),
+                                    Arc::clone(&devices),
                                 )
                             {
                                 eprintln!(
@@ -540,6 +543,126 @@ pub(super) fn packet_read_loop(
                 break;
             }
         }
+    }
+}
+
+/// Applies a packet that arrived through an authenticated WebRTC envelope.
+///
+/// This intentionally starts with the state-only handlers that have no
+/// dependency on the legacy TLS stream. Requests that need a reply, the legacy
+/// payload socket, or the future portal input lease remain rejected until
+/// their WebRTC-native implementations are complete. The coordinator never
+/// sends `feature-ready` while any of those handlers are unavailable.
+pub(crate) fn dispatch_webrtc_feature_packet(
+    binding: &SessionBinding,
+    packet: NetworkPacket,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    sessions: &Arc<DeviceManager>,
+    config: &Arc<Mutex<Config>>,
+) -> Result<(), String> {
+    let local_info = config
+        .lock()
+        .map_err(|_| "DeskLink configuration lock poisoned".to_string())?
+        .local_device_info();
+    SharedPacketDispatcher::authorize(
+        PacketSource::WebRtc,
+        binding,
+        sessions,
+        &local_info,
+        &packet,
+    )
+    .map_err(|error| error.to_string())?;
+
+    let device_id = &binding.device_id;
+    match packet.packet_type.as_str() {
+        PACKET_TYPE_PING => {
+            eprintln!("[Daemon] WebRTC ping received from {device_id}");
+            Ok(())
+        }
+        PACKET_TYPE_BATTERY => {
+            update_battery_status(devices, device_id, &packet);
+            Ok(())
+        }
+        PACKET_TYPE_CLIPBOARD | PACKET_TYPE_CLIPBOARD_CONNECT => {
+            let content = packet
+                .get_str("content")
+                .ok_or_else(|| "DeskLink WebRTC clipboard packet has no content".to_string())?;
+            set_clipboard_text_from_remote(content);
+            Ok(())
+        }
+        PACKET_TYPE_SHARE_REQUEST => {
+            if let Some(text) = packet.get_str("text") {
+                set_clipboard_text_from_remote(text);
+                Ok(())
+            } else if let Some(url) = packet.get_str("url") {
+                std::process::Command::new("xdg-open")
+                    .arg(url)
+                    .spawn()
+                    .map_err(|error| format!("Could not open shared URL: {error}"))?;
+                Ok(())
+            } else {
+                Err("DeskLink WebRTC file transfer requires the file-data channel".to_string())
+            }
+        }
+        PACKET_TYPE_MPRIS => {
+            update_media_from_packet(devices, device_id, &packet);
+            Ok(())
+        }
+        PACKET_TYPE_NOTIFICATION => {
+            if packet.get_bool("isCancel").unwrap_or(false) {
+                let id = packet
+                    .get_str("id")
+                    .ok_or_else(|| "DeskLink WebRTC notification cancel has no id".to_string())?;
+                remove_notification(devices, device_id, id);
+            } else {
+                upsert_notification(devices, device_id, &packet);
+            }
+            Ok(())
+        }
+        PACKET_TYPE_NOTIFICATION_REQUEST => {
+            if let Some(cancel_id) = packet.get_str("cancel") {
+                remove_notification(devices, device_id, cancel_id);
+                Ok(())
+            } else {
+                Err("DeskLink WebRTC notification request needs a response handler".to_string())
+            }
+        }
+        PACKET_TYPE_SYSTEMVOLUME => {
+            update_volume_status(devices, device_id, &packet);
+            Ok(())
+        }
+        PACKET_TYPE_RUNCOMMAND => {
+            update_remote_commands(devices, device_id, &packet);
+            Ok(())
+        }
+        PACKET_TYPE_SFTP => {
+            update_sftp_status(devices, device_id, &packet);
+            Ok(())
+        }
+        PACKET_TYPE_FINDMYPHONE_REQUEST => {
+            std::process::Command::new("canberra-gtk-play")
+                .args(["-i", "bell"])
+                .spawn()
+                .map_err(|error| format!("Could not play DeskLink find-device sound: {error}"))?;
+            Ok(())
+        }
+        PACKET_TYPE_MOUSEPAD_REQUEST => Err(
+            "DeskLink WebRTC remote input requires a granted GNOME RemoteDesktop portal lease"
+                .to_string(),
+        ),
+        PACKET_TYPE_LOCK | PACKET_TYPE_LOCK_REQUEST => {
+            Err("DeskLink WebRTC lock control requires the logind backend".to_string())
+        }
+        PACKET_TYPE_SYSTEMVOLUME_REQUEST
+        | PACKET_TYPE_RUNCOMMAND_REQUEST
+        | PACKET_TYPE_MPRIS_REQUEST
+        | PACKET_TYPE_SFTP_REQUEST => {
+            Err("DeskLink WebRTC request needs its corresponding desktop backend".to_string())
+        }
+        _ => Err(format!(
+            "DeskLink has no active WebRTC handler for {}",
+            packet.packet_type
+        )),
     }
 }
 

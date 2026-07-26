@@ -4,6 +4,7 @@
 //! `webrtcbin` events back into those signed records. Feature envelopes are
 //! deliberately handled by the shared dispatcher, not here.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,14 +15,15 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::device_links::config::Config;
-use crate::device_links::core::{DeviceManager, SessionBinding};
+use crate::device_links::core::{DeviceManager, DeviceSession, SessionBinding};
 use crate::device_links::daemon::network::send_packet;
+use crate::device_links::device::DeviceView;
 use crate::device_links::packet::NetworkPacket;
 
 use super::{
     AuthenticationTranscript, DesktopWebRtcPeer, HandoverControlKind, HandoverControlMessage,
-    PeerEvent, SignalingMessageType, WebRtcChannel, WebRtcEnvelope, WebRtcSignalingMessage,
-    WebRtcWireBinding, HANDOVER_MESSAGE_TYPE,
+    PeerEvent, SignalingMessageType, WebRtcChannel, WebRtcEnvelope, WebRtcPacketBridge,
+    WebRtcSignalingMessage, WebRtcWireBinding, HANDOVER_MESSAGE_TYPE,
 };
 
 /// Starts the deterministic desktop-initiated negotiation. The caller must
@@ -30,6 +32,7 @@ pub(crate) fn start_initiator(
     binding: SessionBinding,
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
+    devices: Arc<Mutex<HashMap<String, DeviceView>>>,
 ) -> Result<(), String> {
     let (local_device_id, remote_device_id) = local_and_remote_device_ids(&binding, &config)?;
     if local_device_id >= remote_device_id {
@@ -61,6 +64,7 @@ pub(crate) fn start_initiator(
         receiver,
         Arc::clone(&sessions),
         config,
+        devices,
     );
     let peer = sessions
         .active_webrtc_peer(&binding, &attempt_id)
@@ -75,6 +79,7 @@ pub(crate) fn handle_signaling_packet(
     packet: &NetworkPacket,
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
+    devices: Arc<Mutex<HashMap<String, DeviceView>>>,
 ) -> Result<(), String> {
     if !sessions.is_current(binding) {
         return Err("Stale DeskLink session rejected WebRTC signaling".to_string());
@@ -111,6 +116,7 @@ pub(crate) fn handle_signaling_packet(
                 &message.from_device_id,
                 Arc::clone(&sessions),
                 Arc::clone(&config),
+                Arc::clone(&devices),
             )?
         }
         _ => sessions
@@ -167,6 +173,33 @@ pub(crate) fn handle_signaling_packet(
     }
 }
 
+/// Sends a paired feature through the authenticated WebRTC transport once the
+/// session has reached mutual `feature-ready`. Before that point this is the
+/// explicit transition path over the bootstrap TLS link; pairing and signaling
+/// callers must continue to use their dedicated LAN methods instead.
+pub(crate) fn send_feature_packet(
+    session: &DeviceSession,
+    binding: &SessionBinding,
+    packet: &NetworkPacket,
+) -> Result<(), String> {
+    let transport = match (
+        session.active_webrtc.as_ref(),
+        session.webrtc_handover.as_ref(),
+    ) {
+        (Some(peer), Some(handover)) if handover.features_ready() => {
+            Some((Arc::clone(peer), handover.wire_binding.clone()))
+        }
+        _ => None,
+    };
+    if let Some((peer, wire)) = transport {
+        let envelope = WebRtcPacketBridge::encode(&wire, packet, now_millis())?;
+        let text = String::from_utf8(envelope.to_json()?)
+            .map_err(|_| "DeskLink WebRTC feature serialization was not UTF-8".to_string())?;
+        return peer.send_text(WebRtcPacketBridge::channel_for(packet), &text);
+    }
+    send_packet(binding.link.stream()?, packet)
+}
+
 fn install_responder(
     binding: SessionBinding,
     attempt_id: String,
@@ -174,6 +207,7 @@ fn install_responder(
     remote_device_id: &str,
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
+    devices: Arc<Mutex<HashMap<String, DeviceView>>>,
 ) -> Result<Arc<DesktopWebRtcPeer>, String> {
     let wire = WebRtcWireBinding::from_attempt(local_device_id, remote_device_id, &attempt_id)?;
     let (sender, receiver) = mpsc::channel();
@@ -191,6 +225,7 @@ fn install_responder(
         receiver,
         Arc::clone(&sessions),
         config,
+        devices,
     );
     sessions
         .active_webrtc_peer(&binding, &attempt_id)
@@ -204,6 +239,7 @@ fn spawn_event_worker(
     receiver: Receiver<PeerEvent>,
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
+    devices: Arc<Mutex<HashMap<String, DeviceView>>>,
 ) {
     thread::spawn(move || {
         while let Ok(event) = receiver.recv() {
@@ -281,6 +317,7 @@ fn spawn_event_worker(
                         &bytes,
                         &sessions,
                         &config,
+                        &devices,
                     ) {
                         eprintln!("[DeskLink] Rejected WebRTC data-channel message: {error}");
                     }
@@ -329,6 +366,7 @@ fn begin_handover(
     send_control(binding, attempt_id, wire, message, sessions)
 }
 
+#[allow(clippy::too_many_arguments)] // Captures immutable session/event context without global state.
 fn handle_peer_envelope(
     binding: &SessionBinding,
     attempt_id: &str,
@@ -337,14 +375,15 @@ fn handle_peer_envelope(
     bytes: &[u8],
     sessions: &Arc<DeviceManager>,
     config: &Arc<Mutex<Config>>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
 ) -> Result<(), String> {
-    if channel != WebRtcChannel::Control {
-        // Feature envelopes are deliberately kept disabled until the shared
-        // feature dispatcher owns both inbound sources. Dropping them here is
-        // safe because this side has not sent feature-ready.
-        return Err("DeskLink WebRTC feature dispatch is not enabled yet".to_string());
-    }
     let envelope = WebRtcEnvelope::from_json(bytes)?;
+    if channel != WebRtcChannel::Control {
+        let packet = WebRtcPacketBridge::decode(wire, &envelope)?;
+        return crate::device_links::daemon::packet_handler::dispatch_webrtc_feature_packet(
+            binding, packet, devices, sessions, config,
+        );
+    }
     if envelope.message_type != HANDOVER_MESSAGE_TYPE {
         return Err("Unsupported DeskLink WebRTC control message type".to_string());
     }
