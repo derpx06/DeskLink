@@ -10,7 +10,9 @@ use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_WEBRTC_SIGNAL_V1};
 
 pub const SIGNALING_VERSION: i64 = 1;
 const MAX_AGE_MILLIS: i64 = 5 * 60 * 1000;
-const MAX_SDP_BYTES: usize = 512 * 1024;
+// Android rejects SDP above 256 KiB. Keep the bootstrap contract symmetric so
+// neither side accepts signaling data the other side cannot process.
+const MAX_SDP_BYTES: usize = 256 * 1024;
 const MAX_CANDIDATE_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

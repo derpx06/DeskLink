@@ -45,6 +45,211 @@ pub enum HandoverMessage {
     Close,
 }
 
+/// Mutable, per-peer state for the post-DTLS handover.  This belongs to the
+/// logical device session: a stale peer generation must never be able to make
+/// a replacement transport feature-ready.
+///
+/// The control coordinator records the transcript material here as SDP and
+/// control messages arrive.  Keeping it separate from the GStreamer peer
+/// object makes the security decisions testable without a media runtime.
+#[derive(Debug, Clone)]
+pub struct HandoverRuntime {
+    pub attempt_id: String,
+    pub wire_binding: WebRtcWireBinding,
+    pub state: HandoverState,
+    pub offer_sdp: Option<String>,
+    pub answer_sdp: Option<String>,
+    pub local_nonce: Option<String>,
+    pub remote_nonce: Option<String>,
+    pub authentication_timestamp: Option<i64>,
+    local_authenticated: bool,
+    remote_authenticated: bool,
+    local_capabilities_confirmed: bool,
+    remote_capabilities_confirmed: bool,
+    local_feature_ready: bool,
+    remote_feature_ready: bool,
+}
+
+impl HandoverRuntime {
+    pub fn new(attempt_id: String, wire_binding: WebRtcWireBinding) -> Self {
+        Self {
+            attempt_id,
+            wire_binding,
+            state: HandoverState::Negotiating,
+            offer_sdp: None,
+            answer_sdp: None,
+            local_nonce: None,
+            remote_nonce: None,
+            authentication_timestamp: None,
+            local_authenticated: false,
+            remote_authenticated: false,
+            local_capabilities_confirmed: false,
+            remote_capabilities_confirmed: false,
+            local_feature_ready: false,
+            remote_feature_ready: false,
+        }
+    }
+
+    pub fn record_offer(&mut self, sdp: String) -> Result<(), String> {
+        Self::record_once(&mut self.offer_sdp, sdp, "offer")
+    }
+
+    pub fn record_answer(&mut self, sdp: String) -> Result<(), String> {
+        Self::record_once(&mut self.answer_sdp, sdp, "answer")
+    }
+
+    pub fn record_local_nonce(&mut self, nonce: String) -> Result<(), String> {
+        Self::record_once(&mut self.local_nonce, nonce, "local nonce")
+    }
+
+    pub fn record_remote_nonce(&mut self, nonce: String) -> Result<(), String> {
+        Self::record_once(&mut self.remote_nonce, nonce, "remote nonce")
+    }
+
+    pub fn record_authentication_timestamp(&mut self, timestamp: i64) -> Result<(), String> {
+        if timestamp <= 0 {
+            return Err("DeskLink WebRTC authentication timestamp is invalid".to_string());
+        }
+        match self.authentication_timestamp {
+            Some(existing) if existing != timestamp => Err(
+                "DeskLink WebRTC authentication timestamp changed during one attempt".to_string(),
+            ),
+            Some(_) => Ok(()),
+            None => {
+                self.authentication_timestamp = Some(timestamp);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn mark_local_authenticated(&mut self) -> Result<(), String> {
+        self.ensure_negotiating("authenticate")?;
+        self.local_authenticated = true;
+        self.refresh_state();
+        Ok(())
+    }
+
+    pub fn mark_remote_authenticated(&mut self) -> Result<(), String> {
+        self.ensure_negotiating("accept authentication")?;
+        self.remote_authenticated = true;
+        self.refresh_state();
+        Ok(())
+    }
+
+    pub fn mark_local_capabilities_confirmed(&mut self) -> Result<(), String> {
+        self.ensure_authenticated("confirm local capabilities")?;
+        self.local_capabilities_confirmed = true;
+        self.refresh_state();
+        Ok(())
+    }
+
+    pub fn mark_remote_capabilities_confirmed(&mut self) -> Result<(), String> {
+        self.ensure_authenticated("accept remote capabilities")?;
+        self.remote_capabilities_confirmed = true;
+        self.refresh_state();
+        Ok(())
+    }
+
+    pub fn mark_local_feature_ready(&mut self) -> Result<(), String> {
+        self.ensure_capabilities_confirmed("enable local feature transport")?;
+        self.local_feature_ready = true;
+        self.refresh_state();
+        Ok(())
+    }
+
+    pub fn mark_remote_feature_ready(&mut self) -> Result<(), String> {
+        self.ensure_capabilities_confirmed("accept remote feature transport")?;
+        self.remote_feature_ready = true;
+        self.refresh_state();
+        Ok(())
+    }
+
+    pub const fn features_ready(&self) -> bool {
+        self.local_feature_ready && self.remote_feature_ready && self.state.features_allowed()
+    }
+
+    pub const fn local_capabilities_confirmed(&self) -> bool {
+        self.local_capabilities_confirmed
+    }
+
+    pub const fn local_feature_ready(&self) -> bool {
+        self.local_feature_ready
+    }
+
+    pub const fn remote_authenticated(&self) -> bool {
+        self.remote_authenticated
+    }
+
+    pub fn fail(&mut self) {
+        self.state = HandoverState::Failed;
+    }
+
+    fn record_once(slot: &mut Option<String>, value: String, field: &str) -> Result<(), String> {
+        if value.is_empty() {
+            return Err(format!("DeskLink WebRTC {field} must not be empty"));
+        }
+        match slot {
+            Some(existing) if existing != &value => Err(format!(
+                "DeskLink WebRTC {field} changed during one session attempt"
+            )),
+            Some(_) => Ok(()),
+            None => {
+                *slot = Some(value);
+                Ok(())
+            }
+        }
+    }
+
+    fn ensure_negotiating(&self, operation: &str) -> Result<(), String> {
+        if self.state == HandoverState::Failed {
+            return Err(format!(
+                "Cannot {operation}: DeskLink WebRTC handover has failed"
+            ));
+        }
+        if self.offer_sdp.is_none() || self.answer_sdp.is_none() {
+            return Err(format!(
+                "Cannot {operation}: DeskLink WebRTC SDP negotiation is incomplete"
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_authenticated(&self, operation: &str) -> Result<(), String> {
+        self.ensure_negotiating(operation)?;
+        if !(self.local_authenticated && self.remote_authenticated) {
+            return Err(format!(
+                "Cannot {operation}: DeskLink WebRTC peers are not mutually authenticated"
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_capabilities_confirmed(&self, operation: &str) -> Result<(), String> {
+        self.ensure_authenticated(operation)?;
+        if !(self.local_capabilities_confirmed && self.remote_capabilities_confirmed) {
+            return Err(format!(
+                "Cannot {operation}: DeskLink WebRTC capabilities are not mutually confirmed"
+            ));
+        }
+        Ok(())
+    }
+
+    fn refresh_state(&mut self) {
+        if self.state == HandoverState::Failed {
+            return;
+        }
+        self.state = if self.local_feature_ready && self.remote_feature_ready {
+            HandoverState::FeatureReady
+        } else if self.local_capabilities_confirmed && self.remote_capabilities_confirmed {
+            HandoverState::CapabilitiesConfirmed
+        } else if self.local_authenticated && self.remote_authenticated {
+            HandoverState::Authenticated
+        } else {
+            HandoverState::Negotiating
+        };
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HandoverControlKind {
     #[serde(rename = "hello")]
@@ -293,5 +498,34 @@ mod tests {
         assert!(transcript.verify(&public, &signature));
         transcript.answer_sha256 = "changed".to_string();
         assert!(!transcript.verify(&public, &signature));
+    }
+
+    #[test]
+    fn runtime_requires_bidirectional_feature_ready_confirmation() {
+        let wire = binding("desktop", "phone");
+        let mut runtime = HandoverRuntime::new("attempt".to_string(), wire);
+        runtime.record_offer("offer".to_string()).unwrap();
+        runtime.record_answer("answer".to_string()).unwrap();
+        runtime.mark_local_authenticated().unwrap();
+        runtime.mark_remote_authenticated().unwrap();
+        runtime.mark_local_capabilities_confirmed().unwrap();
+        runtime.mark_remote_capabilities_confirmed().unwrap();
+        runtime.mark_local_feature_ready().unwrap();
+
+        assert_eq!(runtime.state, HandoverState::CapabilitiesConfirmed);
+        assert!(!runtime.features_ready());
+
+        runtime.mark_remote_feature_ready().unwrap();
+        assert_eq!(runtime.state, HandoverState::FeatureReady);
+        assert!(runtime.features_ready());
+    }
+
+    #[test]
+    fn runtime_rejects_changed_sdp_for_one_attempt() {
+        let wire = binding("desktop", "phone");
+        let mut runtime = HandoverRuntime::new("attempt".to_string(), wire);
+        runtime.record_offer("offer-one".to_string()).unwrap();
+
+        assert!(runtime.record_offer("offer-two".to_string()).is_err());
     }
 }

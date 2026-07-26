@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::device_links::pairing::PairingHandler;
-use crate::device_links::webrtc::DesktopWebRtcPeer;
+use crate::device_links::webrtc::{DesktopWebRtcPeer, HandoverRuntime};
 
 use super::SessionLink;
 
@@ -34,6 +34,9 @@ pub struct DeviceSession {
     /// It is replaced together with the bootstrap link generation.
     pub active_webrtc: Option<Arc<DesktopWebRtcPeer>>,
     pub webrtc_attempt_id: Option<String>,
+    /// Authentication and mutual feature-readiness state for the current
+    /// WebRTC peer. This is reset whenever its transport generation changes.
+    pub webrtc_handover: Option<HandoverRuntime>,
     pub seen_webrtc_request_ids: HashSet<String>,
     pub cancellation: Arc<AtomicBool>,
     pub connected_at: Option<Instant>,

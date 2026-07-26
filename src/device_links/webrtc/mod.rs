@@ -8,7 +8,7 @@ mod signaling;
 #[allow(unused_imports)]
 pub use handover::{
     AuthenticationTranscript, HandoverControlKind, HandoverControlMessage, HandoverMessage,
-    HandoverState,
+    HandoverRuntime, HandoverState, HANDOVER_MESSAGE_TYPE,
 };
 #[allow(unused_imports)]
 pub use peer_connection::{DesktopWebRtcPeer, PeerEvent};

@@ -8,6 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::clipboard::set_clipboard_text_from_remote;
+use super::dispatcher::{PacketSource, SharedPacketDispatcher};
 use super::file_transfer::receive_file_payload;
 use super::handshake::handle_disconnect;
 use super::state::{
@@ -23,7 +24,7 @@ use crate::device_links::packet::{
     PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS, PACKET_TYPE_NOTIFICATION,
     PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PAIR, PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND,
     PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP, PACKET_TYPE_SHARE_REQUEST,
-    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
+    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
 use crate::device_links::pairing::PairState;
 
@@ -124,6 +125,38 @@ pub(super) fn packet_read_loop(
                     break;
                 }
 
+                let local_info = match config.lock() {
+                    Ok(config) => config.local_device_info(),
+                    Err(_) => {
+                        eprintln!("[Daemon] Rejected packet: DeskLink configuration lock failed");
+                        continue;
+                    }
+                };
+                if let Err(error) = SharedPacketDispatcher::authorize(
+                    PacketSource::LanBootstrap,
+                    &binding,
+                    &sessions,
+                    &local_info,
+                    &packet,
+                ) {
+                    eprintln!("[Daemon] Rejected {} packet: {error}", packet.packet_type);
+                    continue;
+                }
+
+                if packet.packet_type == PACKET_TYPE_WEBRTC_SIGNAL_V1 {
+                    if let Err(error) =
+                        crate::device_links::webrtc::coordinator::handle_signaling_packet(
+                            &binding,
+                            &packet,
+                            Arc::clone(&sessions),
+                            Arc::clone(&config),
+                        )
+                    {
+                        eprintln!("[Daemon] Rejected DeskLink WebRTC signaling: {error}");
+                    }
+                    continue;
+                }
+
                 if packet.packet_type == PACKET_TYPE_PAIR {
                     eprintln!(
                         "[Daemon] Received pair packet from device {}: pair={:?}, timestamp={:?}",
@@ -162,6 +195,26 @@ pub(super) fn packet_read_loop(
                             }
                         }
                         update_pair_state(&devices, &device_id, state, verification_key);
+                        if state == PairState::Paired
+                            && binding
+                                .link
+                                .info
+                                .incoming_capabilities
+                                .iter()
+                                .any(|capability| capability == PACKET_TYPE_WEBRTC_SIGNAL_V1)
+                        {
+                            if let Err(error) =
+                                crate::device_links::webrtc::coordinator::start_initiator(
+                                    binding.clone(),
+                                    Arc::clone(&sessions),
+                                    Arc::clone(&config),
+                                )
+                            {
+                                eprintln!(
+                                    "[Daemon] DeskLink WebRTC negotiation unavailable: {error}"
+                                );
+                            }
+                        }
                     }
                 } else if packet.packet_type == PACKET_TYPE_PING {
                     eprintln!(

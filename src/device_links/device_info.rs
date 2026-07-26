@@ -9,7 +9,7 @@ use super::packet::{
     PACKET_TYPE_NOTIFICATION_REPLY, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING,
     PACKET_TYPE_RUNCOMMAND, PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP,
     PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SHARE_REQUEST_UPDATE,
-    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
+    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +52,9 @@ impl DeviceInfo {
                 PACKET_TYPE_FINDMYPHONE_REQUEST.to_string(),
                 PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE.to_string(),
                 PACKET_TYPE_SHARE_REQUEST_UPDATE.to_string(),
+                // Bootstrap-only: signed SDP/ICE records still travel over
+                // the paired LAN TLS link, never as feature traffic.
+                PACKET_TYPE_WEBRTC_SIGNAL_V1.to_string(),
             ],
             outgoing_capabilities: vec![
                 PACKET_TYPE_PING.to_string(),
@@ -77,6 +80,7 @@ impl DeviceInfo {
                 PACKET_TYPE_RUNCOMMAND_REQUEST.to_string(),
                 PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE.to_string(),
                 PACKET_TYPE_SHARE_REQUEST_UPDATE.to_string(),
+                PACKET_TYPE_WEBRTC_SIGNAL_V1.to_string(),
             ],
         }
     }
@@ -189,6 +193,7 @@ mod tests {
             PACKET_TYPE_FINDMYPHONE_REQUEST,
             PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE,
             PACKET_TYPE_SHARE_REQUEST_UPDATE,
+            PACKET_TYPE_WEBRTC_SIGNAL_V1,
         ] {
             assert!(
                 local
@@ -222,6 +227,7 @@ mod tests {
             PACKET_TYPE_RUNCOMMAND_REQUEST,
             PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE,
             PACKET_TYPE_SHARE_REQUEST_UPDATE,
+            PACKET_TYPE_WEBRTC_SIGNAL_V1,
         ] {
             assert!(
                 local

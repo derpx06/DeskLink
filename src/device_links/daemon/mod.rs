@@ -15,6 +15,7 @@ pub mod clipboard;
 pub mod commands;
 pub mod connector;
 pub mod discovery;
+pub mod dispatcher;
 pub mod file_transfer;
 pub mod handle;
 pub mod handshake;

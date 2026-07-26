@@ -15,6 +15,7 @@ use crate::device_links::config::Config;
 use crate::device_links::core::{DeviceManager, SessionBinding, SessionLink};
 use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::device_links::device_info::DeviceInfo;
+use crate::device_links::packet::PACKET_TYPE_WEBRTC_SIGNAL_V1;
 
 pub(super) fn finish_secure_link(
     initial_info: DeviceInfo,
@@ -106,6 +107,24 @@ pub(super) fn finish_secure_link(
     }
 
     let binding = registration.binding;
+    let remote_supports_webrtc = paired
+        && binding
+            .link
+            .info
+            .incoming_capabilities
+            .iter()
+            .any(|capability| capability == PACKET_TYPE_WEBRTC_SIGNAL_V1);
+    if remote_supports_webrtc {
+        if let Err(error) = crate::device_links::webrtc::coordinator::start_initiator(
+            binding.clone(),
+            Arc::clone(&sessions),
+            Arc::clone(&config),
+        ) {
+            // Bootstrap LAN remains available until mutual feature-ready, so
+            // a failed optional negotiation must not tear down a paired link.
+            eprintln!("[Daemon] DeskLink WebRTC negotiation unavailable: {error}");
+        }
+    }
     let read_devices = Arc::clone(&devices);
     let read_sessions = Arc::clone(&sessions);
     let read_config = Arc::clone(&config);

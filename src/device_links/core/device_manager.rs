@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::device_links::pairing::PairingHandler;
-use crate::device_links::webrtc::DesktopWebRtcPeer;
+use crate::device_links::webrtc::{DesktopWebRtcPeer, HandoverRuntime, WebRtcWireBinding};
 
 use super::{
     ConnectionGeneration, DeviceSession, SessionBinding, SessionId, SessionLink, SessionState,
@@ -95,6 +95,7 @@ impl DeviceManager {
                     .map(|_| session.connection_generation);
                 let replaced_webrtc = if replaced_link.is_some() {
                     session.webrtc_attempt_id = None;
+                    session.webrtc_handover = None;
                     session.seen_webrtc_request_ids.clear();
                     session.active_webrtc.take()
                 } else {
@@ -136,6 +137,7 @@ impl DeviceManager {
                     active_link: Some(Arc::clone(&link)),
                     active_webrtc: None,
                     webrtc_attempt_id: None,
+                    webrtc_handover: None,
                     seen_webrtc_request_ids: Default::default(),
                     cancellation: Arc::new(AtomicBool::new(false)),
                     connected_at: Some(now),
@@ -267,6 +269,7 @@ impl DeviceManager {
         session.cancellation.store(true, Ordering::Release);
         let link = session.active_link.take();
         session.webrtc_attempt_id = None;
+        session.webrtc_handover = None;
         session.seen_webrtc_request_ids.clear();
         let webrtc = session.active_webrtc.take();
         DisconnectResult {
@@ -283,6 +286,7 @@ impl DeviceManager {
         &self,
         binding: &SessionBinding,
         attempt_id: String,
+        wire_binding: WebRtcWireBinding,
         peer: DesktopWebRtcPeer,
     ) -> Result<Option<Arc<DesktopWebRtcPeer>>, SessionError> {
         self.with_session(binding, |session| {
@@ -290,6 +294,7 @@ impl DeviceManager {
                 return Err(SessionError::NotPaired);
             }
             let replaced = session.active_webrtc.replace(Arc::new(peer));
+            session.webrtc_handover = Some(HandoverRuntime::new(attempt_id.clone(), wire_binding));
             session.webrtc_attempt_id = Some(attempt_id);
             session.seen_webrtc_request_ids.clear();
             Ok(replaced)
@@ -311,6 +316,49 @@ impl DeviceManager {
                 .cloned()
                 .ok_or(SessionError::UnknownSession)
         })?
+    }
+
+    /// Reads the handover state from the session owner. A false value is a
+    /// deliberate safe default: LAN feature traffic remains available only
+    /// until both peers have completed their authenticated handover.
+    #[allow(dead_code)] // Consumed by the shared feature-dispatcher slice.
+    pub fn webrtc_features_ready(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+    ) -> Result<bool, SessionError> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            Ok(session
+                .webrtc_handover
+                .as_ref()
+                .is_some_and(HandoverRuntime::features_ready))
+        })?
+    }
+
+    /// Serializes all mutations of the WebRTC handover runtime through the
+    /// authoritative session. It prevents a callback from a replaced peer
+    /// generation from changing current transport policy.
+    pub fn with_webrtc_handover<R>(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+        operation: impl FnOnce(&mut HandoverRuntime) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err("DeskLink WebRTC session was replaced".to_string());
+            }
+            let handover = session
+                .webrtc_handover
+                .as_mut()
+                .ok_or_else(|| "DeskLink WebRTC handover is not initialized".to_string())?;
+            operation(handover)
+        })
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
     }
 
     /// Returns the active peer only once for a signed signaling request ID.
@@ -412,6 +460,7 @@ impl DeviceManager {
                 session.next_reconnect_at = None;
                 session.cancellation.store(true, Ordering::Release);
                 session.webrtc_attempt_id = None;
+                session.webrtc_handover = None;
                 session.seen_webrtc_request_ids.clear();
                 if let Some(peer) = session.active_webrtc.take() {
                     peers.push(peer);
@@ -551,5 +600,37 @@ mod tests {
         assert!(second.cancellation.load(Ordering::Acquire));
         assert!(manager.current_binding("phone-1").is_none());
         assert!(manager.current_binding("phone-2").is_none());
+    }
+
+    #[test]
+    fn replacement_discards_the_previous_handover_state() {
+        use crate::device_links::webrtc::{HandoverRuntime, WebRtcWireBinding};
+
+        let manager = DeviceManager::new();
+        let first = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        manager
+            .with_session(&first, |session| {
+                let wire = WebRtcWireBinding::from_attempt(
+                    "desktop",
+                    "phone-1",
+                    "01234567-89ab-cdef-0123-456789abcdef",
+                )
+                .unwrap();
+                session.webrtc_handover = Some(HandoverRuntime::new("attempt".to_string(), wire));
+            })
+            .unwrap();
+
+        let replacement = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        let handover_present = manager
+            .with_session(&replacement, |session| session.webrtc_handover.is_some())
+            .unwrap();
+
+        assert!(!handover_present);
     }
 }
