@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use gst::prelude::*;
 use gst_webrtc::{
@@ -10,7 +10,7 @@ use gst_webrtc::{
 
 use super::{SignalingMessageType, WebRtcChannel, MAX_ENVELOPE_BYTES};
 
-static GST_INIT: Once = Once::new();
+static GST_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerEvent {
@@ -25,6 +25,10 @@ pub enum PeerEvent {
     EndOfCandidates,
     ChannelOpened(WebRtcChannel),
     Envelope {
+        channel: WebRtcChannel,
+        bytes: Vec<u8>,
+    },
+    Binary {
         channel: WebRtcChannel,
         bytes: Vec<u8>,
     },
@@ -177,6 +181,27 @@ impl DesktopWebRtcPeer {
             .map_err(|error| format!("Could not send DeskLink WebRTC data: {error}"))
     }
 
+    /// Sends a bounded binary payload over the dedicated file-data channel.
+    /// Feature envelopes always use text channels; accepting arbitrary binary
+    /// payloads on them would make channel authorization ambiguous.
+    pub fn send_file_data(&self, bytes: &[u8]) -> Result<(), String> {
+        validate_file_data(bytes)?;
+        let channel = self
+            .channels
+            .lock()
+            .map_err(|_| "DeskLink WebRTC channel lock poisoned".to_string())?
+            .get(&WebRtcChannel::FileData)
+            .cloned()
+            .ok_or_else(|| "DeskLink WebRTC file-data channel is not open".to_string())?;
+        if channel.ready_state() != WebRTCDataChannelState::Open {
+            return Err("DeskLink WebRTC file-data channel is not open".to_string());
+        }
+        let data = gst::glib::Bytes::from_owned(bytes.to_vec());
+        channel
+            .send_data_full(Some(&data))
+            .map_err(|error| format!("Could not send DeskLink WebRTC file data: {error}"))
+    }
+
     pub fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
@@ -220,9 +245,16 @@ impl Drop for DesktopWebRtcPeer {
 }
 
 fn ensure_gstreamer() -> Result<(), String> {
-    let mut result = Ok(());
-    GST_INIT.call_once(|| result = gst::init().map_err(|error| error.to_string()));
-    result
+    GST_INIT
+        .get_or_init(|| gst::init().map_err(|error| error.to_string()))
+        .clone()
+}
+
+fn validate_file_data(bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() > MAX_ENVELOPE_BYTES {
+        return Err("DeskLink WebRTC file-data chunk is outside the allowed size".to_string());
+    }
+    Ok(())
 }
 
 fn channel_options(channel: WebRtcChannel) -> gst::Structure {
@@ -355,6 +387,30 @@ fn install_data_channel(
             bytes: data.as_bytes().to_vec(),
         });
     });
+    let binary_events = events.clone();
+    channel.connect_on_message_data(move |_, data| {
+        let Some(data) = data else {
+            let _ = binary_events.send(PeerEvent::Error(
+                "DeskLink WebRTC received an empty binary message".to_string(),
+            ));
+            return;
+        };
+        let bytes = data.as_ref();
+        if channel_kind != WebRtcChannel::FileData {
+            let _ = binary_events.send(PeerEvent::Error(
+                "DeskLink WebRTC rejected binary data on a non-file channel".to_string(),
+            ));
+            return;
+        }
+        if let Err(error) = validate_file_data(bytes) {
+            let _ = binary_events.send(PeerEvent::Error(error));
+            return;
+        }
+        let _ = binary_events.send(PeerEvent::Binary {
+            channel: channel_kind,
+            bytes: bytes.to_vec(),
+        });
+    });
     let error_events = events;
     channel.connect_on_error(move |_, error| {
         let _ = error_events.send(PeerEvent::Error(format!(
@@ -443,5 +499,12 @@ mod tests {
         assert!(channels.contains_key(&WebRtcChannel::InputRealtime));
         drop(channels);
         peer.close();
+    }
+
+    #[test]
+    fn file_data_is_bounded_and_nonempty() {
+        assert!(validate_file_data(&[1]).is_ok());
+        assert!(validate_file_data(&[]).is_err());
+        assert!(validate_file_data(&vec![0; MAX_ENVELOPE_BYTES + 1]).is_err());
     }
 }

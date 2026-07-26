@@ -174,9 +174,10 @@ pub(crate) fn handle_signaling_packet(
 }
 
 /// Sends a paired feature through the authenticated WebRTC transport once the
-/// session has reached mutual `feature-ready`. Before that point this is the
-/// explicit transition path over the bootstrap TLS link; pairing and signaling
-/// callers must continue to use their dedicated LAN methods instead.
+/// session has reached mutual `feature-ready`. The temporary LAN transition
+/// path remains until the file, portal-input, and screen-track backends are
+/// complete; the handover code below intentionally does not emit local
+/// `feature-ready` yet.
 pub(crate) fn send_feature_packet(
     session: &DeviceSession,
     binding: &SessionBinding,
@@ -187,11 +188,11 @@ pub(crate) fn send_feature_packet(
         session.webrtc_handover.as_ref(),
     ) {
         (Some(peer), Some(handover)) if handover.features_ready() => {
-            Some((Arc::clone(peer), handover.wire_binding.clone()))
+            Ok((Arc::clone(peer), handover.wire_binding.clone()))
         }
-        _ => None,
+        _ => Err(()),
     };
-    if let Some((peer, wire)) = transport {
+    if let Ok((peer, wire)) = transport {
         let envelope = WebRtcPacketBridge::encode(&wire, packet, now_millis())?;
         let text = String::from_utf8(envelope.to_json()?)
             .map_err(|_| "DeskLink WebRTC feature serialization was not UTF-8".to_string())?;
@@ -321,6 +322,18 @@ fn spawn_event_worker(
                     ) {
                         eprintln!("[DeskLink] Rejected WebRTC data-channel message: {error}");
                     }
+                }
+                PeerEvent::Binary { channel, bytes } => {
+                    // The binary transport surface is deliberately limited to
+                    // file-data. A later transfer manager owns checkpoint and
+                    // checksum validation; until it is installed, fail the
+                    // message explicitly instead of treating it as a legacy
+                    // payload socket transfer.
+                    eprintln!(
+                        "[DeskLink] WebRTC binary payload on {} is awaiting the file-transfer manager ({} bytes)",
+                        channel.label(),
+                        bytes.len(),
+                    );
                 }
                 PeerEvent::Error(error) => eprintln!("[DeskLink] WebRTC peer error: {error}"),
                 PeerEvent::ConnectionChanged(state) => {
@@ -557,9 +570,6 @@ fn handle_peer_envelope(
             sessions.with_webrtc_handover(binding, attempt_id, |handover| {
                 handover.mark_remote_feature_ready()
             })?;
-            // Do not send local feature-ready until ordinary packets have a
-            // real shared dispatcher and outbound sender. This prevents the
-            // Android peer from disabling LAN feature traffic prematurely.
             eprintln!(
                 "[DeskLink] Remote WebRTC peer is ready; desktop feature dispatch remains gated"
             );
