@@ -1,5 +1,20 @@
 #![allow(dead_code)] // Wired into the live GStreamer transport in the next slice.
 
+pub(crate) mod coordinator;
+mod handover;
+mod peer_connection;
+mod signaling;
+
+#[allow(unused_imports)]
+pub use handover::{
+    AuthenticationTranscript, HandoverControlKind, HandoverControlMessage, HandoverMessage,
+    HandoverState,
+};
+#[allow(unused_imports)]
+pub use peer_connection::{DesktopWebRtcPeer, PeerEvent};
+#[allow(unused_imports)]
+pub use signaling::{SignalingMessageType, WebRtcSignalingMessage};
+
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -15,7 +30,7 @@ pub const NETWORK_PACKET_MESSAGE_TYPE: &str = "desklink.packet.v1";
 pub const MAX_PAYLOAD_BYTES: usize = 128 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 256 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WebRtcChannel {
     Control,
     Events,
@@ -23,9 +38,22 @@ pub enum WebRtcChannel {
     InputRealtime,
     FileControl,
     FileData,
+    /// Reserved for a future explicitly authorised terminal feature. No
+    /// packet bridge operation may currently select this channel.
+    Terminal,
 }
 
 impl WebRtcChannel {
+    pub const ALL: [Self; 7] = [
+        Self::Control,
+        Self::Events,
+        Self::InputReliable,
+        Self::InputRealtime,
+        Self::FileControl,
+        Self::FileData,
+        Self::Terminal,
+    ];
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Control => "desklink-control-v1",
@@ -34,6 +62,7 @@ impl WebRtcChannel {
             Self::InputRealtime => "desklink-input-realtime-v1",
             Self::FileControl => "desklink-file-control-v1",
             Self::FileData => "desklink-file-data-v1",
+            Self::Terminal => "desklink-terminal-v1",
         }
     }
 
@@ -57,6 +86,7 @@ impl WebRtcChannel {
             "desklink-input-realtime-v1" => Ok(Self::InputRealtime),
             "desklink-file-control-v1" => Ok(Self::FileControl),
             "desklink-file-data-v1" => Ok(Self::FileData),
+            "desklink-terminal-v1" => Ok(Self::Terminal),
             _ => Err("Unknown DeskLink WebRTC data channel".to_string()),
         }
     }

@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::device_links::pairing::PairingHandler;
+use crate::device_links::webrtc::DesktopWebRtcPeer;
 
 use super::{
     ConnectionGeneration, DeviceSession, SessionBinding, SessionId, SessionLink, SessionState,
@@ -17,6 +18,8 @@ pub enum SessionError {
     TerminatedSession,
     AlreadyClaimed,
     NotEligibleForReconnect,
+    NotPaired,
+    ReplayDetected,
     Poisoned,
 }
 
@@ -28,6 +31,8 @@ impl std::fmt::Display for SessionError {
             Self::TerminatedSession => "Device session is terminated",
             Self::AlreadyClaimed => "Reconnect is already in progress",
             Self::NotEligibleForReconnect => "Device session is not eligible for reconnect",
+            Self::NotPaired => "DeskLink WebRTC requires a paired device session",
+            Self::ReplayDetected => "DeskLink WebRTC signaling request was replayed",
             Self::Poisoned => "Device session lock poisoned",
         };
         formatter.write_str(message)
@@ -35,11 +40,11 @@ impl std::fmt::Display for SessionError {
 }
 
 #[allow(dead_code)]
-#[derive(Debug)]
 pub struct RegistrationResult {
     pub binding: SessionBinding,
     pub replaced_link: Option<Arc<SessionLink>>,
     pub replaced_generation: Option<ConnectionGeneration>,
+    pub replaced_webrtc: Option<Arc<DesktopWebRtcPeer>>,
 }
 
 #[allow(dead_code)]
@@ -50,10 +55,10 @@ pub struct ReconnectLease {
     pub generation: ConnectionGeneration,
 }
 
-#[derive(Debug)]
 pub struct DisconnectResult {
     pub was_current: bool,
     pub link: Option<Arc<SessionLink>>,
+    pub webrtc: Option<Arc<DesktopWebRtcPeer>>,
 }
 
 pub struct DeviceManager {
@@ -88,6 +93,13 @@ impl DeviceManager {
                 let replaced_generation = replaced_link
                     .as_ref()
                     .map(|_| session.connection_generation);
+                let replaced_webrtc = if replaced_link.is_some() {
+                    session.webrtc_attempt_id = None;
+                    session.seen_webrtc_request_ids.clear();
+                    session.active_webrtc.take()
+                } else {
+                    None
+                };
                 if replaced_link.is_some() {
                     session.cancellation.store(true, Ordering::Release);
                     session.connection_generation = session.connection_generation.saturating_add(1);
@@ -111,6 +123,7 @@ impl DeviceManager {
                     binding,
                     replaced_link,
                     replaced_generation,
+                    replaced_webrtc,
                 }
             } else {
                 let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
@@ -121,6 +134,9 @@ impl DeviceManager {
                     pairing: PairingHandler::new(initially_paired),
                     state: SessionState::Ready,
                     active_link: Some(Arc::clone(&link)),
+                    active_webrtc: None,
+                    webrtc_attempt_id: None,
+                    seen_webrtc_request_ids: Default::default(),
                     cancellation: Arc::new(AtomicBool::new(false)),
                     connected_at: Some(now),
                     last_disconnect_reason: None,
@@ -134,6 +150,7 @@ impl DeviceManager {
                     binding,
                     replaced_link: None,
                     replaced_generation: None,
+                    replaced_webrtc: None,
                 }
             }
         };
@@ -220,12 +237,14 @@ impl DeviceManager {
             return DisconnectResult {
                 was_current: false,
                 link: None,
+                webrtc: None,
             };
         };
         let Some(session) = sessions.get_mut(&binding.device_id) else {
             return DisconnectResult {
                 was_current: false,
                 link: None,
+                webrtc: None,
             };
         };
         let matches = session.session_id == binding.session_id
@@ -239,6 +258,7 @@ impl DeviceManager {
             return DisconnectResult {
                 was_current: false,
                 link: None,
+                webrtc: None,
             };
         }
         session.state = SessionState::Disconnected;
@@ -246,10 +266,84 @@ impl DeviceManager {
         session.connected_at = None;
         session.cancellation.store(true, Ordering::Release);
         let link = session.active_link.take();
+        session.webrtc_attempt_id = None;
+        session.seen_webrtc_request_ids.clear();
+        let webrtc = session.active_webrtc.take();
         DisconnectResult {
             was_current: true,
             link,
+            webrtc,
         }
+    }
+
+    /// Atomically installs the only current WebRTC peer for a current DeskLink
+    /// session. The caller closes a replaced peer after this manager lock is
+    /// released so GStreamer callbacks cannot deadlock the session core.
+    pub fn install_webrtc_peer(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: String,
+        peer: DesktopWebRtcPeer,
+    ) -> Result<Option<Arc<DesktopWebRtcPeer>>, SessionError> {
+        self.with_session(binding, |session| {
+            if session.pairing.state != crate::device_links::pairing::PairState::Paired {
+                return Err(SessionError::NotPaired);
+            }
+            let replaced = session.active_webrtc.replace(Arc::new(peer));
+            session.webrtc_attempt_id = Some(attempt_id);
+            session.seen_webrtc_request_ids.clear();
+            Ok(replaced)
+        })?
+    }
+
+    pub fn active_webrtc_peer(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+    ) -> Result<Arc<DesktopWebRtcPeer>, SessionError> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            session
+                .active_webrtc
+                .as_ref()
+                .cloned()
+                .ok_or(SessionError::UnknownSession)
+        })?
+    }
+
+    /// Returns the active peer only once for a signed signaling request ID.
+    /// The bounded replay cache belongs to the session rather than a packet
+    /// reader so duplicate LAN links cannot bypass it.
+    pub fn accept_webrtc_signal(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+        request_id: String,
+    ) -> Result<Arc<DesktopWebRtcPeer>, SessionError> {
+        self.with_session(binding, |session| {
+            if session.pairing.state != crate::device_links::pairing::PairState::Paired {
+                return Err(SessionError::NotPaired);
+            }
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            if !session.seen_webrtc_request_ids.insert(request_id) {
+                return Err(SessionError::ReplayDetected);
+            }
+            while session.seen_webrtc_request_ids.len() > 4096 {
+                let Some(oldest) = session.seen_webrtc_request_ids.iter().next().cloned() else {
+                    break;
+                };
+                session.seen_webrtc_request_ids.remove(&oldest);
+            }
+            session
+                .active_webrtc
+                .as_ref()
+                .cloned()
+                .ok_or(SessionError::UnknownSession)
+        })?
     }
 
     #[allow(dead_code)]
@@ -309,16 +403,27 @@ impl DeviceManager {
         let Ok(mut sessions) = self.sessions.lock() else {
             return Vec::new();
         };
-        sessions
+        let mut peers = Vec::new();
+        let links = sessions
             .values_mut()
             .filter_map(|session| {
                 session.state = SessionState::Terminated;
                 session.reconnect_scheduled = false;
                 session.next_reconnect_at = None;
                 session.cancellation.store(true, Ordering::Release);
+                session.webrtc_attempt_id = None;
+                session.seen_webrtc_request_ids.clear();
+                if let Some(peer) = session.active_webrtc.take() {
+                    peers.push(peer);
+                }
                 session.active_link.take()
             })
-            .collect()
+            .collect();
+        drop(sessions);
+        for peer in peers {
+            peer.close();
+        }
+        links
     }
 
     pub fn unpaired_session_count(&self) -> usize {

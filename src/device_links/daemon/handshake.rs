@@ -101,6 +101,9 @@ pub(super) fn finish_secure_link(
     if let Some(replaced) = registration.replaced_link {
         replaced.close();
     }
+    if let Some(replaced) = registration.replaced_webrtc {
+        replaced.close();
+    }
 
     let binding = registration.binding;
     let read_devices = Arc::clone(&devices);
@@ -122,6 +125,9 @@ pub(super) fn handle_disconnect(
     }
     if let Some(link) = result.link {
         link.close();
+    }
+    if let Some(peer) = result.webrtc {
+        peer.close();
     }
     mark_status(devices, &binding.device_id, DeviceStatus::Unreachable);
     true

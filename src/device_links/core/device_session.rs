@@ -1,8 +1,10 @@
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::device_links::pairing::PairingHandler;
+use crate::device_links::webrtc::DesktopWebRtcPeer;
 
 use super::SessionLink;
 
@@ -28,6 +30,11 @@ pub struct DeviceSession {
     pub pairing: PairingHandler,
     pub state: SessionState,
     pub active_link: Option<Arc<SessionLink>>,
+    /// The only WebRTC peer allowed to carry traffic for this logical session.
+    /// It is replaced together with the bootstrap link generation.
+    pub active_webrtc: Option<Arc<DesktopWebRtcPeer>>,
+    pub webrtc_attempt_id: Option<String>,
+    pub seen_webrtc_request_ids: HashSet<String>,
     pub cancellation: Arc<AtomicBool>,
     pub connected_at: Option<Instant>,
     pub last_disconnect_reason: Option<String>,

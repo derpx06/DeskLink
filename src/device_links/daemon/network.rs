@@ -35,7 +35,7 @@ pub(super) fn bind_tcp_listener() -> Result<TcpListener, String> {
     ))
 }
 
-pub(super) fn send_packet(
+pub(crate) fn send_packet(
     stream: &Arc<Mutex<SslStream<TcpStream>>>,
     packet: &NetworkPacket,
 ) -> Result<(), String> {

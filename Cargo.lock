@@ -202,6 +202,7 @@ dependencies = [
  "enigo",
  "gettext-rs",
  "gstreamer",
+ "gstreamer-sdp",
  "gstreamer-webrtc",
  "gtk4",
  "hostname",
