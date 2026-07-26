@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,6 +10,7 @@ use super::state::{mark_error, push_error, upsert_device};
 use super::validation::{connect_to_device, should_throttle_connection};
 use super::DaemonWorker;
 use crate::device_links::config::Config;
+use crate::device_links::core::DeviceManager;
 use crate::device_links::device::DeviceView;
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_IDENTITY};
@@ -24,14 +26,15 @@ impl DaemonWorker {
         socket.set_broadcast(true).map_err(|err| err.to_string())?;
         let config = Arc::clone(&self.config);
         let devices = Arc::clone(&self.devices);
-        let links = Arc::clone(&self.links);
+        let sessions = Arc::clone(&self.sessions);
         let errors = Arc::clone(&self.errors);
+        let shutdown = Arc::clone(&self.shutdown);
         let tcp_port = self.tcp_port;
         let last_connections = Arc::new(Mutex::new(HashMap::new()));
 
         thread::spawn(move || {
             let mut buffer = [0u8; 65536];
-            loop {
+            while !shutdown.load(Ordering::Acquire) {
                 match socket.recv_from(&mut buffer) {
                     Ok((len, address)) => {
                         if let Ok(packet) = NetworkPacket::deserialize(&buffer[..len]) {
@@ -42,7 +45,7 @@ impl DaemonWorker {
                                     tcp_port,
                                     &config,
                                     &devices,
-                                    &links,
+                                    &sessions,
                                     &errors,
                                     &last_connections,
                                 );
@@ -63,12 +66,20 @@ impl DaemonWorker {
     pub(super) fn start_broadcaster(&self) {
         let config = Arc::clone(&self.config);
         let errors = Arc::clone(&self.errors);
+        let shutdown = Arc::clone(&self.shutdown);
         let tcp_port = self.tcp_port;
-        thread::spawn(move || loop {
-            if let Err(error) = broadcast_identity(&config, tcp_port) {
-                push_error(&errors, error);
+        thread::spawn(move || {
+            while !shutdown.load(Ordering::Acquire) {
+                if let Err(error) = broadcast_identity(&config, tcp_port) {
+                    push_error(&errors, error);
+                }
+                for _ in 0..30 {
+                    if shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
             }
-            thread::sleep(Duration::from_secs(15));
         });
     }
 }
@@ -97,7 +108,7 @@ fn handle_identity_packet(
     local_tcp_port: u16,
     config: &Arc<Mutex<Config>>,
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    links: &Arc<Mutex<HashMap<String, super::Link>>>,
+    sessions: &Arc<DeviceManager>,
     errors: &Arc<Mutex<Vec<String>>>,
     last_connections: &Arc<Mutex<HashMap<String, Instant>>>,
 ) {
@@ -151,7 +162,7 @@ fn handle_identity_packet(
 
     let config = Arc::clone(config);
     let devices = Arc::clone(devices);
-    let links = Arc::clone(links);
+    let sessions = Arc::clone(sessions);
 
     thread::spawn(move || {
         if let Err(error) = connect_to_device(
@@ -160,7 +171,7 @@ fn handle_identity_packet(
             remote_port,
             config,
             devices.clone(),
-            links,
+            sessions,
         ) {
             mark_error(&devices, &info.id, error.clone());
             eprintln!(

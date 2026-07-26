@@ -1,7 +1,8 @@
 use super::discovery::broadcast_identity;
 use super::network::send_packet;
 use super::state::{mark_error, push_error, update_pair_state};
-use super::{DaemonWorker, Link};
+use super::DaemonWorker;
+use crate::device_links::core::{DeviceSession, SessionBinding};
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK_REQUEST,
     PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION_ACTION,
@@ -41,7 +42,7 @@ pub enum DaemonCommand {
 }
 
 impl DaemonWorker {
-    pub(super) fn handle_command(&self, command: DaemonCommand) {
+    pub(super) fn handle_command(&self, command: DaemonCommand) -> bool {
         match command {
             DaemonCommand::Discover => {
                 if let Err(error) = broadcast_identity(&self.config, self.tcp_port) {
@@ -93,57 +94,58 @@ impl DaemonWorker {
             }
             DaemonCommand::RequestRemoteCommands(id) => self.request_remote_commands(&id),
             DaemonCommand::ExecuteRemoteCommand(id, key) => self.execute_remote_command(&id, &key),
-            DaemonCommand::Stop => {}
+            DaemonCommand::Stop => return true,
         }
+        false
     }
     fn send_pair_request(&self, device_id: &str) {
-        self.with_link(device_id, |link| {
-            let packet = link.pairing.request_packet();
-            send_packet(&link.stream, &packet)?;
-            if link.pairing.state == PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            let packet = session.pairing.request_packet();
+            send_packet(binding.link.stream()?, &packet)?;
+            if session.pairing.state == PairState::Paired {
                 self.config
                     .lock()
                     .map_err(|_| "Config lock poisoned".to_string())?
-                    .trust_device(&link.info, link.certificate_pem.clone())?;
+                    .trust_device(&binding.link.info, binding.link.certificate_pem.clone())?;
                 update_pair_state(&self.devices, device_id, PairState::Paired, None);
                 return Ok(());
             }
             update_pair_state(
                 &self.devices,
                 device_id,
-                link.pairing.state,
-                Some(link.verification_key()),
+                session.pairing.state,
+                Some(binding.link.verification_key(session.pairing.timestamp())),
             );
             Ok(())
         });
     }
 
     fn accept_pair(&self, device_id: &str) {
-        self.with_link(device_id, |link| {
-            let packet = link.pairing.accept_packet();
-            send_packet(&link.stream, &packet)?;
+        self.with_link(device_id, |session, binding| {
+            let packet = session.pairing.accept_packet();
+            send_packet(binding.link.stream()?, &packet)?;
             self.config
                 .lock()
                 .map_err(|_| "Config lock poisoned".to_string())?
-                .trust_device(&link.info, link.certificate_pem.clone())?;
+                .trust_device(&binding.link.info, binding.link.certificate_pem.clone())?;
             update_pair_state(&self.devices, device_id, PairState::Paired, None);
             Ok(())
         });
     }
 
     fn reject_pair(&self, device_id: &str) {
-        self.with_link(device_id, |link| {
-            let packet = link.pairing.reject_packet();
-            send_packet(&link.stream, &packet)?;
+        self.with_link(device_id, |session, binding| {
+            let packet = session.pairing.reject_packet();
+            send_packet(binding.link.stream()?, &packet)?;
             update_pair_state(&self.devices, device_id, PairState::NotPaired, None);
             Ok(())
         });
     }
 
     fn unpair(&self, device_id: &str) {
-        self.with_link(device_id, |link| {
-            let packet = link.pairing.reject_packet();
-            let _ = send_packet(&link.stream, &packet);
+        self.with_link(device_id, |session, binding| {
+            let packet = session.pairing.reject_packet();
+            let _ = send_packet(binding.link.stream()?, &packet);
             self.config
                 .lock()
                 .map_err(|_| "Config lock poisoned".to_string())?
@@ -154,13 +156,13 @@ impl DaemonWorker {
     }
 
     fn send_ping(&self, device_id: &str) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before sending ping".to_string());
             }
             let mut packet = NetworkPacket::new(PACKET_TYPE_PING);
             packet.set("message", "Ping from DeskLink");
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
@@ -169,145 +171,145 @@ impl DaemonWorker {
         device_id: &str,
         payload: serde_json::Map<String, serde_json::Value>,
     ) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before sending remote control input".to_string());
             }
             let packet = NetworkPacket::with_body(PACKET_TYPE_MOUSEPAD_REQUEST, payload);
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn send_share_text(&self, device_id: &str, text: &str) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before sharing text".to_string());
             }
             let packet = build_share_text_packet(text)?;
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn send_lock_request(&self, device_id: &str, lock: bool) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before sending lock request".to_string());
             }
             let mut packet = NetworkPacket::new(PACKET_TYPE_LOCK_REQUEST);
             packet.set("setLocked", lock);
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn send_find_phone(&self, device_id: &str) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before ringing it".to_string());
             }
             let packet = NetworkPacket::new(PACKET_TYPE_FINDMYPHONE_REQUEST);
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn send_mpris_action(&self, device_id: &str, player: &str, action: &str) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before controlling media".to_string());
             }
             let packet = build_mpris_action_packet(player, action);
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn request_mpris_status(&self, device_id: &str, player: Option<String>) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before requesting media status".to_string());
             }
             let packet = build_mpris_status_request_packet(player.as_deref());
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn send_mpris_set_volume(&self, device_id: &str, player: &str, volume: i64) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before controlling media volume".to_string());
             }
             let packet = build_mpris_set_volume_packet(player, volume)?;
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn send_mpris_seek(&self, device_id: &str, player: &str, offset: i64) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before seeking media".to_string());
             }
             let packet = build_mpris_seek_packet(player, offset)?;
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn send_sftp_request(&self, device_id: &str) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before requesting file browsing".to_string());
             }
             let packet = build_sftp_request_packet();
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn request_notifications(&self, device_id: &str) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before requesting notifications".to_string());
             }
             let packet = build_notification_request_packet();
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn dismiss_notification(&self, device_id: &str, notification_id: &str) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before dismissing notifications".to_string());
             }
             let packet = build_notification_dismiss_packet(notification_id)?;
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn reply_notification(&self, device_id: &str, reply_id: &str, message: &str) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before replying to notifications".to_string());
             }
             let packet = build_notification_reply_packet(reply_id, message)?;
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn trigger_notification_action(&self, device_id: &str, key: &str, action: &str) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err(
                     "Device must be paired before triggering notification actions".to_string(),
                 );
             }
             let packet = build_notification_action_packet(key, action)?;
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn request_system_volume(&self, device_id: &str) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before requesting system volume".to_string());
             }
             let packet = build_system_volume_request_packet();
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
@@ -318,28 +320,28 @@ impl DaemonWorker {
         volume: Option<i64>,
         muted: Option<bool>,
     ) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before changing system volume".to_string());
             }
             let packet = build_system_volume_set_packet(name, volume, muted)?;
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn request_remote_commands(&self, device_id: &str) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before requesting remote commands".to_string());
             }
             let packet = build_remote_command_list_request_packet();
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     fn execute_remote_command(&self, device_id: &str, key: &str) {
-        self.with_link(device_id, |link| {
-            if link.pairing.state != PairState::Paired {
+        self.with_link(device_id, |session, binding| {
+            if session.pairing.state != PairState::Paired {
                 return Err("Device must be paired before executing remote commands".to_string());
             }
             let key = key.trim();
@@ -359,24 +361,23 @@ impl DaemonWorker {
                 return Err("Remote command was not advertised by this device".to_string());
             }
             let packet = build_remote_command_execute_packet(key)?;
-            send_packet(&link.stream, &packet)
+            send_packet(binding.link.stream()?, &packet)
         });
     }
 
     pub(super) fn with_link(
         &self,
         device_id: &str,
-        f: impl FnOnce(&mut Link) -> Result<(), String>,
+        f: impl FnOnce(&mut DeviceSession, &SessionBinding) -> Result<(), String>,
     ) {
         let result = self
-            .links
-            .lock()
-            .map_err(|_| "Link lock poisoned".to_string())
-            .and_then(|mut links| {
-                let link = links
-                    .get_mut(device_id)
-                    .ok_or_else(|| "Device is not connected".to_string())?;
-                f(link)
+            .sessions
+            .current_binding(device_id)
+            .ok_or_else(|| "Device is not connected".to_string())
+            .and_then(|binding| {
+                self.sessions
+                    .with_session(&binding, |session| f(session, &binding))
+                    .map_err(|error| error.to_string())?
             });
         if let Err(error) = result {
             mark_error(&self.devices, device_id, error.clone());

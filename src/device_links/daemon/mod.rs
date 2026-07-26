@@ -1,14 +1,12 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::config::Config;
+use super::core::DeviceManager;
 use super::device::DeviceView;
-use super::device_info::DeviceInfo;
-use super::pairing::PairingHandler;
-use openssl::ssl::SslStream;
-use std::net::TcpStream;
 
 pub use commands::DaemonCommand;
 pub use handle::DaemonHandle;
@@ -25,29 +23,11 @@ pub mod packet_handler;
 pub mod state;
 pub mod validation;
 
-pub(super) struct Link {
-    pub(super) stream: Arc<Mutex<SslStream<TcpStream>>>,
-    pub(super) certificate_pem: String,
-    pub(super) local_public_der: Vec<u8>,
-    pub(super) remote_public_der: Vec<u8>,
-    pub(super) pairing: PairingHandler,
-    pub(super) info: DeviceInfo,
-}
-
-impl Link {
-    pub(super) fn verification_key(&self) -> String {
-        PairingHandler::verification_key(
-            &self.local_public_der,
-            &self.remote_public_der,
-            self.pairing.timestamp(),
-        )
-    }
-}
-
 pub(super) struct DaemonWorker {
     pub(super) config: Arc<Mutex<Config>>,
     pub(super) devices: Arc<Mutex<HashMap<String, DeviceView>>>,
-    pub(super) links: Arc<Mutex<HashMap<String, Link>>>,
+    pub(super) sessions: Arc<DeviceManager>,
+    pub(super) shutdown: Arc<AtomicBool>,
     pub(super) errors: Arc<Mutex<Vec<String>>>,
     pub(super) command_rx: Receiver<DaemonCommand>,
     pub(super) tcp_port: u16,
@@ -65,22 +45,35 @@ impl DaemonWorker {
             .local_addr()
             .map_err(|err| err.to_string())?
             .port();
-        let links = Arc::new(Mutex::new(HashMap::new()));
+        let sessions = Arc::new(DeviceManager::new());
+        let shutdown = Arc::new(AtomicBool::new(false));
+        tcp_listener
+            .set_nonblocking(true)
+            .map_err(|err| err.to_string())?;
 
         {
             let config = Arc::clone(&config);
             let devices = Arc::clone(&devices);
-            let links = Arc::clone(&links);
+            let sessions = Arc::clone(&sessions);
             let errors = Arc::clone(&errors);
+            let shutdown = Arc::clone(&shutdown);
             thread::spawn(move || {
-                connector::incoming_tcp_loop(tcp_listener, config, devices, links, errors)
+                connector::incoming_tcp_loop(
+                    tcp_listener,
+                    config,
+                    devices,
+                    sessions,
+                    errors,
+                    shutdown,
+                )
             });
         }
 
         Ok(Self {
             config,
             devices,
-            links,
+            sessions,
+            shutdown,
             errors,
             command_rx,
             tcp_port,
@@ -94,7 +87,13 @@ impl DaemonWorker {
 
         while let Ok(command) = self.command_rx.recv() {
             eprintln!("[Daemon] Received command: {:?}", command);
-            self.handle_command(command);
+            if self.handle_command(command) {
+                break;
+            }
+        }
+        self.shutdown.store(true, Ordering::Release);
+        for link in self.sessions.terminate_all() {
+            link.close();
         }
         Ok(())
     }

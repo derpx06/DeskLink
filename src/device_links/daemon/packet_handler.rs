@@ -15,6 +15,7 @@ use super::state::{
     update_remote_commands, update_sftp_status, update_volume_status, upsert_notification,
 };
 use crate::device_links::config::Config;
+use crate::device_links::core::{DeviceManager, SessionBinding};
 use crate::device_links::device::DeviceView;
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
@@ -45,20 +46,35 @@ fn is_desktop_locked() -> bool {
 }
 
 pub(super) fn packet_read_loop(
-    device_id: String,
-    stream: Arc<Mutex<SslStream<TcpStream>>>,
+    binding: SessionBinding,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
-    links: Arc<Mutex<HashMap<String, super::Link>>>,
+    sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
 ) {
+    let device_id = binding.device_id.clone();
+    let stream = match binding.link.stream() {
+        Ok(stream) => Arc::clone(stream),
+        Err(error) => {
+            eprintln!("[Daemon] Session reader could not start for {device_id}: {error}");
+            return;
+        }
+    };
     let mut enigo_opt = Enigo::new(&Settings::default()).ok();
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
 
     loop {
+        if !sessions.is_current(&binding) {
+            break;
+        }
         let read_result = {
             let Ok(mut locked_stream) = stream.lock() else {
-                handle_disconnect(&device_id, &stream, &devices, &links);
+                handle_disconnect(
+                    &binding,
+                    &devices,
+                    &sessions,
+                    "Session stream lock failed".to_string(),
+                );
                 break;
             };
             locked_stream.read(&mut byte)
@@ -66,7 +82,12 @@ pub(super) fn packet_read_loop(
 
         match read_result {
             Ok(0) => {
-                if handle_disconnect(&device_id, &stream, &devices, &links) {
+                if handle_disconnect(
+                    &binding,
+                    &devices,
+                    &sessions,
+                    "Peer closed the connection".to_string(),
+                ) {
                     eprintln!(
                         "[Daemon] Active link closed for {}. Marked unreachable.",
                         device_id
@@ -81,7 +102,12 @@ pub(super) fn packet_read_loop(
                         "[Daemon] Read line too long for {}. Disconnecting.",
                         device_id
                     );
-                    handle_disconnect(&device_id, &stream, &devices, &links);
+                    handle_disconnect(
+                        &binding,
+                        &devices,
+                        &sessions,
+                        "Packet exceeded the maximum size".to_string(),
+                    );
                     break;
                 }
                 if byte[0] != b'\n' {
@@ -94,6 +120,10 @@ pub(super) fn packet_read_loop(
                     continue;
                 };
 
+                if !sessions.is_current(&binding) {
+                    break;
+                }
+
                 if packet.packet_type == PACKET_TYPE_PAIR {
                     eprintln!(
                         "[Daemon] Received pair packet from device {}: pair={:?}, timestamp={:?}",
@@ -101,38 +131,37 @@ pub(super) fn packet_read_loop(
                         packet.get_bool("pair"),
                         packet.get_i64("timestamp")
                     );
-                    if let Ok(mut links) = links.lock() {
-                        if let Some(link) = links.get_mut(&device_id) {
-                            let previous_state = link.pairing.state;
-                            link.pairing.receive(&packet);
-                            eprintln!(
-                                "[Daemon] Pairing state transitioned from {:?} to {:?}",
-                                previous_state, link.pairing.state
-                            );
-                            if link.pairing.state == PairState::Paired {
-                                if let Ok(mut config) = config.lock() {
-                                    eprintln!("[Daemon] Trusting device {}", device_id);
-                                    let _ = config
-                                        .trust_device(&link.info, link.certificate_pem.clone());
-                                }
-                            } else if previous_state == PairState::Paired
-                                && link.pairing.state == PairState::NotPaired
-                            {
-                                if let Ok(mut config) = config.lock() {
-                                    eprintln!(
-                                        "[Daemon] Untrusting device {} due to state transition",
-                                        device_id
-                                    );
-                                    let _ = config.untrust_device(&device_id);
-                                }
-                            }
-                            let key = if link.pairing.state == PairState::RequestedByPeer {
-                                Some(link.verification_key())
+                    let pairing = sessions.with_session(&binding, |session| {
+                        let previous_state = session.pairing.state;
+                        session.pairing.receive(&packet);
+                        let verification_key =
+                            if session.pairing.state == PairState::RequestedByPeer {
+                                Some(binding.link.verification_key(session.pairing.timestamp()))
                             } else {
                                 None
                             };
-                            update_pair_state(&devices, &device_id, link.pairing.state, key);
+                        (previous_state, session.pairing.state, verification_key)
+                    });
+                    if let Ok((previous_state, state, verification_key)) = pairing {
+                        eprintln!(
+                            "[Daemon] Pairing state transitioned from {:?} to {:?}",
+                            previous_state, state
+                        );
+                        if state == PairState::Paired {
+                            if let Ok(mut config) = config.lock() {
+                                let _ = config.trust_device(
+                                    &binding.link.info,
+                                    binding.link.certificate_pem.clone(),
+                                );
+                            }
+                        } else if previous_state == PairState::Paired
+                            && state == PairState::NotPaired
+                        {
+                            if let Ok(mut config) = config.lock() {
+                                let _ = config.untrust_device(&device_id);
+                            }
                         }
+                        update_pair_state(&devices, &device_id, state, verification_key);
                     }
                 } else if packet.packet_type == PACKET_TYPE_PING {
                     eprintln!(
@@ -444,7 +473,12 @@ pub(super) fn packet_read_loop(
                 thread::sleep(Duration::from_millis(20));
             }
             Err(error) => {
-                if handle_disconnect(&device_id, &stream, &devices, &links) {
+                if handle_disconnect(
+                    &binding,
+                    &devices,
+                    &sessions,
+                    format!("Read error: {error}"),
+                ) {
                     eprintln!(
                         "[Daemon] Read error for {}: {:?}. Marked unreachable.",
                         device_id, error

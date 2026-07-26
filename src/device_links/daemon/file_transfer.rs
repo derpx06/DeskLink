@@ -60,18 +60,26 @@ impl DaemonWorker {
         info.insert("port".to_string(), serde_json::Value::from(port));
         packet.payload_transfer_info = Some(info);
 
-        let mut sent = false;
-        if let Ok(mut links) = self.links.lock() {
-            if let Some(link) = links.get_mut(device_id) {
-                if let Ok(mut stream) = link.stream.lock() {
-                    if let Ok(bytes) = packet.serialize_line() {
-                        if stream.write_all(&bytes).is_ok() {
-                            sent = true;
-                        }
-                    }
+        let sent = self
+            .sessions
+            .current_binding(device_id)
+            .filter(|binding| self.sessions.is_current(binding))
+            .and_then(|binding| {
+                let paired = self
+                    .sessions
+                    .with_session(&binding, |session| {
+                        session.pairing.state == crate::device_links::pairing::PairState::Paired
+                    })
+                    .ok()?;
+                if !paired {
+                    return None;
                 }
-            }
-        }
+                let stream = binding.link.stream().ok()?;
+                let bytes = packet.serialize_line().ok()?;
+                stream.lock().ok()?.write_all(&bytes).ok()?;
+                Some(())
+            })
+            .is_some();
 
         if !sent {
             eprintln!(

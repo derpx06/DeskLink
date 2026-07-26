@@ -1,4 +1,5 @@
 pub mod config;
+pub mod core;
 pub mod daemon;
 pub mod device;
 pub mod device_info;

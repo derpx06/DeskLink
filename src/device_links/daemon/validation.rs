@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use super::handshake::finish_secure_link;
 use super::network::ssl_acceptor;
 use crate::device_links::config::Config;
+use crate::device_links::core::DeviceManager;
 use crate::device_links::device::DeviceView;
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::PROTOCOL_VERSION;
@@ -36,7 +37,7 @@ pub(super) fn should_throttle_connection(
 
 pub(super) fn enforce_unpaired_link_limit(
     config: &Arc<Mutex<Config>>,
-    links: &Arc<Mutex<HashMap<String, super::Link>>>,
+    sessions: &Arc<DeviceManager>,
     device_id: &str,
 ) -> Result<(), String> {
     if config
@@ -46,12 +47,7 @@ pub(super) fn enforce_unpaired_link_limit(
     {
         return Ok(());
     }
-    let unpaired_count = links
-        .lock()
-        .map_err(|_| "Link lock poisoned".to_string())?
-        .values()
-        .filter(|link| link.pairing.state != crate::device_links::pairing::PairState::Paired)
-        .count();
+    let unpaired_count = sessions.unpaired_session_count();
     if unpaired_count >= MAX_UNPAIRED_CONNECTIONS {
         Err("Too many unpaired devices are connected".to_string())
     } else {
@@ -105,16 +101,8 @@ pub(super) fn connect_to_device(
     remote_port: u16,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
-    links: Arc<Mutex<HashMap<String, super::Link>>>,
+    sessions: Arc<DeviceManager>,
 ) -> Result<(), String> {
-    if links
-        .lock()
-        .map_err(|_| "Link lock poisoned".to_string())?
-        .contains_key(&initial_info.id)
-    {
-        return Ok(());
-    }
-
     let mut stream =
         TcpStream::connect((address.ip(), remote_port)).map_err(|err| err.to_string())?;
     stream
@@ -133,5 +121,5 @@ pub(super) fn connect_to_device(
 
     let acceptor = ssl_acceptor(&config)?;
     let ssl_stream = acceptor.accept(stream).map_err(|err| err.to_string())?;
-    finish_secure_link(initial_info, ssl_stream, config, devices, links)
+    finish_secure_link(initial_info, ssl_stream, config, devices, sessions)
 }

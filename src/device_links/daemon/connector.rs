@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -9,6 +10,7 @@ use super::handshake::finish_secure_link;
 use super::network::ssl_connector;
 use super::state::{push_error, upsert_device};
 use crate::device_links::config::Config;
+use crate::device_links::core::DeviceManager;
 use crate::device_links::device::DeviceView;
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::NetworkPacket;
@@ -17,21 +19,25 @@ pub(super) fn incoming_tcp_loop(
     listener: TcpListener,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
-    links: Arc<Mutex<HashMap<String, super::Link>>>,
+    sessions: Arc<DeviceManager>,
     errors: Arc<Mutex<Vec<String>>>,
+    shutdown: Arc<AtomicBool>,
 ) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    while !shutdown.load(Ordering::Acquire) {
+        match listener.accept() {
+            Ok((stream, _)) => {
                 let config = Arc::clone(&config);
                 let devices = Arc::clone(&devices);
-                let links = Arc::clone(&links);
+                let sessions = Arc::clone(&sessions);
                 let errors = Arc::clone(&errors);
                 thread::spawn(move || {
-                    if let Err(error) = accept_incoming_device(stream, config, devices, links) {
+                    if let Err(error) = accept_incoming_device(stream, config, devices, sessions) {
                         push_error(&errors, error);
                     }
                 });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(50));
             }
             Err(error) => push_error(&errors, format!("TCP listener failed: {error}")),
         }
@@ -42,7 +48,7 @@ fn accept_incoming_device(
     stream: TcpStream,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
-    links: Arc<Mutex<HashMap<String, super::Link>>>,
+    sessions: Arc<DeviceManager>,
 ) -> Result<(), String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -92,5 +98,5 @@ fn accept_incoming_device(
     let ssl_stream = connector
         .connect(&info.id, stream)
         .map_err(|err| err.to_string())?;
-    finish_secure_link(info, ssl_stream, config, devices, links)
+    finish_secure_link(info, ssl_stream, config, devices, sessions)
 }
