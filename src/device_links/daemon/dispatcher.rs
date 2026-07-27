@@ -26,6 +26,7 @@ pub(crate) enum DispatchError {
     UnpairedFeature,
     BootstrapOnWebRtc,
     FeatureOnLanAfterHandover,
+    PayloadOnLan,
     PayloadOnWebRtc,
     UnsupportedByDeskLink,
     UnsupportedByPeer,
@@ -45,6 +46,9 @@ impl std::fmt::Display for DispatchError {
             Self::PayloadOnWebRtc => {
                 "DeskLink rejected a legacy payload packet on the WebRTC event bridge"
             }
+            Self::PayloadOnLan => {
+                "DeskLink rejected a legacy payload packet on the LAN feature path"
+            }
             Self::UnsupportedByDeskLink => {
                 "DeskLink rejected a packet with no active local handler"
             }
@@ -56,9 +60,8 @@ impl std::fmt::Display for DispatchError {
     }
 }
 
-/// Performs only authorization. Feature effects remain in the feature layer
-/// so both LAN transition traffic and WebRTC packets can share their existing
-/// handlers without weakening the source policy.
+/// Performs only authorization. LAN is bootstrap-only; paired feature packets
+/// are accepted exclusively from an authenticated WebRTC handover.
 pub(crate) struct SharedPacketDispatcher;
 
 impl SharedPacketDispatcher {
@@ -89,6 +92,14 @@ impl SharedPacketDispatcher {
             // generic packet bridge.
             return Err(DispatchError::PayloadOnWebRtc);
         }
+        if source == PacketSource::LanBootstrap
+            && (packet.payload_size.is_some() || packet.payload_transfer_info.is_some())
+        {
+            // File bytes are WebRTC file-data messages only.  Reject the
+            // legacy TCP payload descriptor before any LAN handler can open a
+            // socket or mutate the destination filesystem.
+            return Err(DispatchError::PayloadOnLan);
+        }
 
         let result = sessions.with_session(binding, |session| {
             let paired = session.pairing.state == PairState::Paired;
@@ -110,7 +121,7 @@ impl SharedPacketDispatcher {
         if !paired {
             return Err(DispatchError::UnpairedFeature);
         }
-        if source == PacketSource::LanBootstrap && feature_ready {
+        if source == PacketSource::LanBootstrap {
             return Err(DispatchError::FeatureOnLanAfterHandover);
         }
         if source == PacketSource::WebRtc && !feature_ready {
@@ -202,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_features_that_the_paired_peer_did_not_advertise() {
+    fn rejects_lan_features_before_handover() {
         let manager = DeviceManager::new();
         let binding = paired_binding(&manager, Vec::new());
 
@@ -215,7 +226,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, DispatchError::UnsupportedByPeer);
+        assert_eq!(error, DispatchError::FeatureOnLanAfterHandover);
     }
 
     #[test]
@@ -256,5 +267,25 @@ mod tests {
             &packet,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn rejects_legacy_payload_descriptors_on_lan() {
+        let manager = DeviceManager::new();
+        let binding = paired_binding(&manager, vec![PACKET_TYPE_CLIPBOARD.to_string()]);
+        let mut packet = NetworkPacket::new(PACKET_TYPE_CLIPBOARD);
+        packet.payload_size = Some(4);
+
+        assert_eq!(
+            SharedPacketDispatcher::authorize(
+                PacketSource::LanBootstrap,
+                &binding,
+                &manager,
+                &local(),
+                &packet,
+            )
+            .unwrap_err(),
+            DispatchError::PayloadOnLan
+        );
     }
 }

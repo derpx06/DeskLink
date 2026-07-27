@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use super::clipboard::set_clipboard_text_from_remote;
 use super::dispatcher::{PacketSource, SharedPacketDispatcher};
-use super::file_transfer::receive_file_payload;
 use super::handshake::handle_disconnect;
 use super::state::{
     remove_notification, update_battery_status, update_media_from_packet, update_pair_state,
@@ -364,37 +363,14 @@ pub(super) fn packet_read_loop(
                         set_clipboard_text_from_remote(content);
                     }
                 } else if packet.packet_type == PACKET_TYPE_SHARE_REQUEST {
-                    if let (Some(size), Some(info)) =
-                        (packet.payload_size, &packet.payload_transfer_info)
-                    {
-                        let filename = packet
-                            .get_str("filename")
-                            .unwrap_or("received_file")
-                            .to_string();
-                        let port = info.get("port").and_then(|v| v.as_i64()).unwrap_or(0) as u16;
-                        eprintln!("[Daemon] Incoming file transfer request: filename={}, size={} bytes, port={}", filename, size, port);
-
-                        if port > 0 {
-                            if let Ok(Ok(peer_ip)) = stream.lock().map(|s| s.get_ref().peer_addr())
-                            {
-                                let ip = peer_ip.ip().to_string();
-                                let device_id_clone = device_id.clone();
-                                let config_clone = Arc::clone(&config);
-
-                                thread::spawn(move || {
-                                    if let Err(e) = receive_file_payload(
-                                        &device_id_clone,
-                                        &ip,
-                                        port,
-                                        size,
-                                        &filename,
-                                        config_clone,
-                                    ) {
-                                        eprintln!("[Daemon] File download failed: {}", e);
-                                    }
-                                });
-                            }
-                        }
+                    if packet.payload_size.is_some() || packet.payload_transfer_info.is_some() {
+                        // SharedPacketDispatcher rejects this before reaching
+                        // the handler.  Keep this guard as defense in depth
+                        // for future LAN reader call sites.
+                        eprintln!(
+                            "[Daemon] Rejected legacy LAN file payload; WebRTC file-data is required"
+                        );
+                        continue;
                     } else if let Some(text) = packet.get_str("text") {
                         eprintln!("[Daemon] Received shared text: {:?}", text);
                         set_clipboard_text_from_remote(text);

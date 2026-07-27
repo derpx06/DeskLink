@@ -172,6 +172,10 @@ impl HandoverRuntime {
         self.local_capabilities_confirmed
     }
 
+    pub const fn capabilities_confirmed(&self) -> bool {
+        self.local_capabilities_confirmed && self.remote_capabilities_confirmed
+    }
+
     pub const fn local_feature_ready(&self) -> bool {
         self.local_feature_ready
     }

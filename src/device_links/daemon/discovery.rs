@@ -125,6 +125,10 @@ fn handle_identity_packet(
     if should_throttle_connection(last_connections, &info.id) {
         return;
     }
+
+    if sessions.current_binding(&info.id).is_some() {
+        return;
+    }
     let paired = config
         .lock()
         .map(|config| config.is_trusted(&info.id))

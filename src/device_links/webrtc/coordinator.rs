@@ -184,10 +184,9 @@ pub(crate) fn handle_signaling_packet(
 }
 
 /// Sends a paired feature through the authenticated WebRTC transport once the
-/// session has reached mutual `feature-ready`. The temporary LAN transition
-/// path remains until the file, portal-input, and screen-track backends are
-/// complete; the handover code below intentionally does not emit local
-/// `feature-ready` yet.
+/// session has reached mutual `feature-ready`. LAN is never used for paired
+/// file data; the handover responder below must complete before a transfer can
+/// start.
 pub(crate) fn send_feature_packet(
     sessions: &DeviceManager,
     transport: &FeatureTransportSnapshot,
@@ -199,24 +198,24 @@ pub(crate) fn send_feature_packet(
     if !transport.paired {
         return Err("Device must be paired before sending DeskLink features".to_string());
     }
-    if transport.web_rtc_ready {
-        let peer = transport
-            .web_rtc_peer
-            .as_ref()
-            .ok_or_else(|| "DeskLink WebRTC handover has no active peer".to_string())?;
-        let wire = transport
-            .web_rtc_wire
-            .as_ref()
-            .ok_or_else(|| "DeskLink WebRTC handover has no wire binding".to_string())?;
-        let envelope = WebRtcPacketBridge::encode(wire, packet, now_millis())?;
-        let text = String::from_utf8(envelope.to_json()?)
-            .map_err(|_| "DeskLink WebRTC feature serialization was not UTF-8".to_string())?;
-        return peer.send_text(WebRtcPacketBridge::channel_for(packet), &text);
+    if !transport.web_rtc_ready {
+        return Err(
+            "DeskLink WebRTC feature transport is not ready; paired features are not sent over LAN"
+                .to_string(),
+        );
     }
-    // Transitional path. This is removed when every desktop handler, file
-    // transfer, input lease, and screen track is WebRTC-backed. Keeping it
-    // here prevents an incomplete handover from dropping user data.
-    send_packet(transport.binding.link.stream()?, packet)
+    let peer = transport
+        .web_rtc_peer
+        .as_ref()
+        .ok_or_else(|| "DeskLink WebRTC handover has no active peer".to_string())?;
+    let wire = transport
+        .web_rtc_wire
+        .as_ref()
+        .ok_or_else(|| "DeskLink WebRTC handover has no wire binding".to_string())?;
+    let envelope = WebRtcPacketBridge::encode(wire, packet, now_millis())?;
+    let text = String::from_utf8(envelope.to_json()?)
+        .map_err(|_| "DeskLink WebRTC feature serialization was not UTF-8".to_string())?;
+    peer.send_text(WebRtcPacketBridge::channel_for(packet), &text)
 }
 
 /// Starts a desktop-originated transfer through the current authenticated
@@ -646,16 +645,14 @@ fn handle_peer_envelope(
             })?;
             // `send_capabilities` is intentionally idempotent and makes the
             // order of the two peers' messages harmless.
-            send_capabilities(binding, attempt_id, wire, sessions, config)
+            send_capabilities(binding, attempt_id, wire, sessions, config)?;
+            send_feature_ready_if_possible(binding, attempt_id, wire, sessions)
         }
         HandoverControlKind::FeatureReady => {
             sessions.with_webrtc_handover(binding, attempt_id, |handover| {
                 handover.mark_remote_feature_ready()
             })?;
-            eprintln!(
-                "[DeskLink] Remote WebRTC peer is ready; desktop feature dispatch remains gated"
-            );
-            Ok(())
+            send_feature_ready_if_possible(binding, attempt_id, wire, sessions)
         }
         HandoverControlKind::Degraded => {
             sessions.with_webrtc_handover(binding, attempt_id, |handover| {
@@ -672,6 +669,34 @@ fn handle_peer_envelope(
             Ok(())
         }
     }
+}
+
+/// Completes the desktop half of the symmetric handover. Android sends its
+/// `feature-ready` after receiving desktop capabilities; desktop must answer
+/// with its own message before either side installs the feature transport.
+fn send_feature_ready_if_possible(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    sessions: &Arc<DeviceManager>,
+) -> Result<(), String> {
+    let should_send = sessions.with_webrtc_handover(binding, attempt_id, |handover| {
+        Ok(handover.capabilities_confirmed() && !handover.local_feature_ready())
+    })?;
+    if !should_send {
+        return Ok(());
+    }
+
+    let message = HandoverControlMessage::new(
+        HandoverControlKind::FeatureReady,
+        attempt_id,
+        wire,
+        now_millis(),
+    );
+    send_control(binding, attempt_id, wire, message, sessions)?;
+    sessions.with_webrtc_handover(binding, attempt_id, |handover| {
+        handover.mark_local_feature_ready()
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

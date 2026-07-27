@@ -5,6 +5,7 @@ use crate::device_links::packet::{
     PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND,
     PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP, PACKET_TYPE_SFTP_REQUEST,
     PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
+    PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
 
 /// The capability contract for the desktop feature layer.  A packet is listed
@@ -33,6 +34,7 @@ impl FeatureRegistry {
                 PACKET_TYPE_RUNCOMMAND,
                 PACKET_TYPE_SFTP,
                 PACKET_TYPE_FINDMYPHONE_REQUEST,
+                PACKET_TYPE_WEBRTC_SIGNAL_V1,
             ]),
             outgoing: capabilities(&[
                 PACKET_TYPE_PING,
@@ -46,6 +48,7 @@ impl FeatureRegistry {
                 PACKET_TYPE_NOTIFICATION_ACTION,
                 PACKET_TYPE_SYSTEMVOLUME_REQUEST,
                 PACKET_TYPE_RUNCOMMAND_REQUEST,
+                PACKET_TYPE_WEBRTC_SIGNAL_V1,
             ]),
         }
     }

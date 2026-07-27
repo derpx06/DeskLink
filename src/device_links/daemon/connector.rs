@@ -50,6 +50,14 @@ fn accept_incoming_device(
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     sessions: Arc<DeviceManager>,
 ) -> Result<(), String> {
+    // The listener is non-blocking so the accept loop can observe shutdown.
+    // Accepted sockets must be made blocking before OpenSSL starts its
+    // handshake; otherwise a transient incomplete TLS read is surfaced as
+    // `nonblocking read call would have blocked` and the valid peer is
+    // incorrectly disconnected.
+    stream
+        .set_nonblocking(false)
+        .map_err(|err| format!("Could not configure incoming socket: {err}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| err.to_string())?;

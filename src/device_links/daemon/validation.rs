@@ -103,8 +103,20 @@ pub(super) fn connect_to_device(
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     sessions: Arc<DeviceManager>,
 ) -> Result<(), String> {
+    // Discovery and an inbound connection can race. If the peer became
+    // authoritative after discovery scheduled this worker, do not create a
+    // duplicate TLS handshake that will be discarded by Android.
+    if sessions.current_binding(&initial_info.id).is_some() {
+        return Ok(());
+    }
     let mut stream =
         TcpStream::connect((address.ip(), remote_port)).map_err(|err| err.to_string())?;
+    // Keep the transport blocking for the complete TLS handshake. The packet
+    // reader switches it to non-blocking only after the secure identity
+    // exchange has completed.
+    stream
+        .set_nonblocking(false)
+        .map_err(|err| format!("Could not configure outgoing socket: {err}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| err.to_string())?;
@@ -115,6 +127,9 @@ pub(super) fn connect_to_device(
         .to_identity_packet(0);
     identity.set("targetDeviceId", initial_info.id.clone());
     identity.set("targetProtocolVersion", PROTOCOL_VERSION);
+    if sessions.current_binding(&initial_info.id).is_some() {
+        return Ok(());
+    }
     stream
         .write_all(&identity.serialize_line().map_err(|err| err.to_string())?)
         .map_err(|err| err.to_string())?;
