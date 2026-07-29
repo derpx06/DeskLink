@@ -1,7 +1,8 @@
 use crate::device_links::packet::{
     PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
     PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST,
-    PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_REPLY,
+    PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_ACTION,
+    PACKET_TYPE_NOTIFICATION_REPLY,
     PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND,
     PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP, PACKET_TYPE_SFTP_REQUEST,
     PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
@@ -10,8 +11,9 @@ use crate::device_links::packet::{
 
 /// The capability contract for the desktop feature layer.  A packet is listed
 /// only when the current desktop process has a handler that can consume it or
-/// a command path that can construct it.  Portal and host-backend dependent
-/// features are deliberately absent until their adapters are installed.
+/// a command path that can construct it.  Remote input is included because
+/// the authenticated WebRTC dispatcher owns the input handler; the runtime
+/// backend still reports an error if the host cannot accept input.
 #[derive(Debug, Clone)]
 pub struct FeatureRegistry {
     incoming: Vec<String>,
@@ -34,6 +36,7 @@ impl FeatureRegistry {
                 PACKET_TYPE_RUNCOMMAND,
                 PACKET_TYPE_SFTP,
                 PACKET_TYPE_FINDMYPHONE_REQUEST,
+                PACKET_TYPE_MOUSEPAD_REQUEST,
                 PACKET_TYPE_WEBRTC_SIGNAL_V1,
             ]),
             outgoing: capabilities(&[
@@ -48,6 +51,7 @@ impl FeatureRegistry {
                 PACKET_TYPE_NOTIFICATION_ACTION,
                 PACKET_TYPE_SYSTEMVOLUME_REQUEST,
                 PACKET_TYPE_RUNCOMMAND_REQUEST,
+                PACKET_TYPE_MOUSEPAD_REQUEST,
                 PACKET_TYPE_WEBRTC_SIGNAL_V1,
             ]),
         }
@@ -80,7 +84,7 @@ mod tests {
         assert!(registry
             .incoming_capabilities()
             .contains(&"desklink.ping".to_string()));
-        assert!(!registry
+        assert!(registry
             .incoming_capabilities()
             .contains(&"desklink.mousepad.request".to_string()));
     }

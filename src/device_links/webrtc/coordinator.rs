@@ -95,6 +95,11 @@ pub(crate) fn handle_signaling_packet(
         return Err("Stale DeskLink session rejected WebRTC signaling".to_string());
     }
     let message = WebRtcSignalingMessage::from_network_packet(packet)?;
+    eprintln!(
+        "[DeskLink] Received WebRTC {:?} signaling message from {}",
+        message.message_type,
+        message.from_device_id
+    );
     let local_device_id = config
         .lock()
         .map_err(|_| "DeskLink configuration lock poisoned".to_string())?
@@ -133,6 +138,11 @@ pub(crate) fn handle_signaling_packet(
             .active_webrtc_peer(binding, &message.session_attempt_id)
             .map_err(|error| error.to_string())?,
     };
+
+    eprintln!(
+        "[DeskLink] Applying WebRTC {:?} signaling message",
+        message.message_type
+    );
 
     sessions
         .accept_webrtc_signal(

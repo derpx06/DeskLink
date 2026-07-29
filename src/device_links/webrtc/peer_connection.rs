@@ -435,11 +435,16 @@ fn request_local_description(
     }
     let webrtcbin_for_reply = webrtcbin.clone();
     let events_for_reply = events.clone();
+    let description_field = match message_type {
+        SignalingMessageType::Offer => "offer",
+        SignalingMessageType::Answer => "answer",
+        _ => return Err("Invalid local DeskLink WebRTC description type".to_string()),
+    };
     let promise = gst::Promise::with_change_func(move |reply| {
         let description = reply
             .ok()
             .and_then(|reply| reply)
-            .and_then(|reply| reply.value("offer").ok())
+            .and_then(|reply| reply.value(description_field).ok())
             .and_then(|value| value.get::<WebRTCSessionDescription>().ok());
         let Some(description) = description else {
             let _ = events_for_reply.send(PeerEvent::Error(
@@ -476,7 +481,7 @@ fn request_local_description(
     let action = match message_type {
         SignalingMessageType::Offer => "create-offer",
         SignalingMessageType::Answer => "create-answer",
-        _ => return Err("Invalid local DeskLink WebRTC description type".to_string()),
+        _ => unreachable!("message type was validated above"),
     };
     webrtcbin.emit_by_name::<()>(action, &[&None::<gst::Structure>, &promise]);
     Ok(())
