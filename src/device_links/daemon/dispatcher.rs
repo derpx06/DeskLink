@@ -6,6 +6,7 @@
 
 use crate::device_links::core::{DeviceManager, SessionBinding};
 use crate::device_links::device_info::DeviceInfo;
+use crate::device_links::features::is_initial_webrtc_feature;
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_IDENTITY, PACKET_TYPE_PAIR, PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
@@ -28,6 +29,7 @@ pub(crate) enum DispatchError {
     FeatureOnLanAfterHandover,
     PayloadOnLan,
     PayloadOnWebRtc,
+    FeatureNotEnabled,
     UnsupportedByDeskLink,
     UnsupportedByPeer,
 }
@@ -48,6 +50,9 @@ impl std::fmt::Display for DispatchError {
             }
             Self::PayloadOnLan => {
                 "DeskLink rejected a legacy payload packet on the LAN feature path"
+            }
+            Self::FeatureNotEnabled => {
+                "DeskLink rejected a feature that is not enabled in the active WebRTC profile"
             }
             Self::UnsupportedByDeskLink => {
                 "DeskLink rejected a packet with no active local handler"
@@ -127,6 +132,9 @@ impl SharedPacketDispatcher {
         if source == PacketSource::WebRtc && !feature_ready {
             return Err(DispatchError::UnpairedFeature);
         }
+        if source == PacketSource::WebRtc && !is_initial_webrtc_feature(&packet.packet_type) {
+            return Err(DispatchError::FeatureNotEnabled);
+        }
         if !local_info
             .incoming_capabilities
             .iter()
@@ -144,7 +152,9 @@ impl SharedPacketDispatcher {
 #[cfg(test)]
 mod tests {
     use crate::device_links::core::{DeviceManager, SessionLink};
-    use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_PAIR};
+    use crate::device_links::packet::{
+        NetworkPacket, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_PAIR, PACKET_TYPE_PING,
+    };
     use crate::device_links::webrtc::{HandoverRuntime, WebRtcWireBinding};
 
     use super::*;
@@ -230,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_lan_features_and_allows_webrtc_features_after_handover() {
+    fn rejects_lan_features_and_non_profile_webrtc_features_after_handover() {
         let manager = DeviceManager::new();
         let binding = paired_binding(&manager, vec![PACKET_TYPE_CLIPBOARD.to_string()]);
         manager
@@ -259,12 +269,43 @@ mod tests {
             .unwrap_err(),
             DispatchError::FeatureOnLanAfterHandover
         );
-        assert!(SharedPacketDispatcher::authorize(
+        assert_eq!(
+            SharedPacketDispatcher::authorize(
             PacketSource::WebRtc,
             &binding,
             &manager,
             &local(),
             &packet,
+        )
+        .unwrap_err(),
+            DispatchError::FeatureNotEnabled
+        );
+    }
+
+    #[test]
+    fn allows_ping_over_webrtc_after_handover() {
+        let manager = DeviceManager::new();
+        let binding = paired_binding(&manager, vec![PACKET_TYPE_PING.to_string()]);
+        manager
+            .with_session(&binding, |session| {
+                let wire = WebRtcWireBinding::from_attempt(
+                    "desktop",
+                    "phone",
+                    "01234567-89ab-cdef-0123-456789abcdef",
+                )
+                .unwrap();
+                let mut runtime = HandoverRuntime::new("attempt".to_string(), wire);
+                make_feature_ready(&mut runtime);
+                session.webrtc_handover = Some(runtime);
+            })
+            .unwrap();
+
+        assert!(SharedPacketDispatcher::authorize(
+            PacketSource::WebRtc,
+            &binding,
+            &manager,
+            &local(),
+            &NetworkPacket::new(PACKET_TYPE_PING),
         )
         .is_ok());
     }

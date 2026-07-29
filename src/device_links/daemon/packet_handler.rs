@@ -123,7 +123,7 @@ pub(super) fn packet_read_loop(
 
                 if packet.packet_type == PACKET_TYPE_WEBRTC_SIGNAL_V1 {
                     eprintln!(
-                        "[Daemon] Received WebRTC bootstrap signaling from {}",
+                        "[DL-WRTC-BOOT] received signed bootstrap signal from {}",
                         device_id
                     );
                 }
@@ -151,10 +151,6 @@ pub(super) fn packet_read_loop(
                 }
 
                 if packet.packet_type == PACKET_TYPE_WEBRTC_SIGNAL_V1 {
-                    eprintln!(
-                        "[Daemon] Dispatching WebRTC bootstrap signaling from {}",
-                        device_id
-                    );
                     if let Err(error) =
                         crate::device_links::webrtc::coordinator::handle_signaling_packet(
                             &binding,
@@ -633,7 +629,10 @@ pub(crate) fn dispatch_webrtc_feature_packet(
                 .map_err(|error| format!("Could not play DeskLink find-device sound: {error}"))?;
             Ok(())
         }
-        PACKET_TYPE_MOUSEPAD_REQUEST => apply_remote_input(&packet),
+        PACKET_TYPE_MOUSEPAD_REQUEST => Err(
+            "DeskLink WebRTC remote input requires a granted GNOME RemoteDesktop portal lease"
+                .to_string(),
+        ),
         PACKET_TYPE_LOCK | PACKET_TYPE_LOCK_REQUEST => {
             Err("DeskLink WebRTC lock control requires the logind backend".to_string())
         }
@@ -648,148 +647,6 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             packet.packet_type
         )),
     }
-}
-
-/// Applies an already authenticated remote-input packet.  This function is
-/// called only from the WebRTC feature dispatcher; the LAN reader keeps its
-/// legacy branch disabled by the source-aware authorization gate.
-fn apply_remote_input(packet: &NetworkPacket) -> Result<(), String> {
-    let mut enigo = Enigo::new(&Settings::default())
-        .map_err(|_| "DeskLink could not initialize the desktop input backend".to_string())?;
-
-    let dx = packet
-        .body
-        .get("dx")
-        .and_then(|value| value.as_f64())
-        .unwrap_or(0.0);
-    let dy = packet
-        .body
-        .get("dy")
-        .and_then(|value| value.as_f64())
-        .unwrap_or(0.0);
-    let singleclick = packet.get_bool("singleclick").unwrap_or(false);
-    let doubleclick = packet.get_bool("doubleclick").unwrap_or(false);
-    let middleclick = packet.get_bool("middleclick").unwrap_or(false);
-    let rightclick = packet.get_bool("rightclick").unwrap_or(false);
-    let singlehold = packet.get_bool("singlehold").unwrap_or(false);
-    let singlerelease = packet.get_bool("singlerelease").unwrap_or(false);
-    let scroll = packet.get_bool("scroll").unwrap_or(false);
-    let key = packet.get_str("key");
-    let special_key = packet.get_i64("specialKey").unwrap_or(0);
-
-    if scroll {
-        if dy != 0.0 && enigo.scroll(dy as i32, Axis::Vertical).is_err() {
-            return Err("DeskLink could not send vertical scroll input".to_string());
-        }
-        if dx != 0.0 && enigo.scroll(dx as i32, Axis::Horizontal).is_err() {
-            return Err("DeskLink could not send horizontal scroll input".to_string());
-        }
-        return Ok(());
-    }
-
-    let button = if singleclick || doubleclick || middleclick || rightclick {
-        if singleclick || doubleclick {
-            Some(Button::Left)
-        } else if middleclick {
-            Some(Button::Middle)
-        } else {
-            Some(Button::Right)
-        }
-    } else {
-        None
-    };
-    if let Some(button) = button {
-        let clicks = if doubleclick { 2 } else { 1 };
-        for _ in 0..clicks {
-            if enigo.button(button, Direction::Click).is_err() {
-                return Err("DeskLink could not send mouse button input".to_string());
-            }
-        }
-        return Ok(());
-    }
-    if singlehold && enigo.button(Button::Left, Direction::Press).is_err() {
-        return Err("DeskLink could not press the mouse button".to_string());
-    }
-    if singlerelease && enigo.button(Button::Left, Direction::Release).is_err() {
-        return Err("DeskLink could not release the mouse button".to_string());
-    }
-    if singlehold || singlerelease {
-        return Ok(());
-    }
-
-    if key.is_some() || special_key > 0 {
-        let modifiers = [
-            ("ctrl", enigo::Key::Control),
-            ("alt", enigo::Key::Alt),
-            ("shift", enigo::Key::Shift),
-            ("super", enigo::Key::Meta),
-        ];
-        for (name, modifier) in modifiers {
-            if packet.get_bool(name).unwrap_or(false)
-                && enigo.key(modifier, Direction::Press).is_err()
-            {
-                return Err("DeskLink could not press a keyboard modifier".to_string());
-            }
-        }
-
-        if special_key > 0 {
-            let special = match special_key {
-                1 => Some(enigo::Key::Backspace),
-                2 => Some(enigo::Key::Tab),
-                3 | 12 => Some(enigo::Key::Return),
-                4 => Some(enigo::Key::LeftArrow),
-                5 => Some(enigo::Key::UpArrow),
-                6 => Some(enigo::Key::RightArrow),
-                7 => Some(enigo::Key::DownArrow),
-                8 => Some(enigo::Key::PageUp),
-                9 => Some(enigo::Key::PageDown),
-                10 => Some(enigo::Key::Home),
-                11 => Some(enigo::Key::End),
-                13 => Some(enigo::Key::Delete),
-                14 => Some(enigo::Key::Escape),
-                21..=32 => Some(match special_key {
-                    21 => enigo::Key::F1,
-                    22 => enigo::Key::F2,
-                    23 => enigo::Key::F3,
-                    24 => enigo::Key::F4,
-                    25 => enigo::Key::F5,
-                    26 => enigo::Key::F6,
-                    27 => enigo::Key::F7,
-                    28 => enigo::Key::F8,
-                    29 => enigo::Key::F9,
-                    30 => enigo::Key::F10,
-                    31 => enigo::Key::F11,
-                    _ => enigo::Key::F12,
-                }),
-                _ => None,
-            };
-            if let Some(key) = special {
-                if enigo.key(key, Direction::Click).is_err() {
-                    return Err("DeskLink could not send the special key".to_string());
-                }
-            }
-        } else if let Some(key) = key {
-            if enigo.text(key).is_err() {
-                return Err("DeskLink could not send keyboard text".to_string());
-            }
-        }
-
-        for (name, modifier) in modifiers {
-            if packet.get_bool(name).unwrap_or(false)
-                && enigo.key(modifier, Direction::Release).is_err()
-            {
-                return Err("DeskLink could not release a keyboard modifier".to_string());
-            }
-        }
-        return Ok(());
-    }
-
-    if dx != 0.0 || dy != 0.0 {
-        if enigo.move_mouse(dx as i32, dy as i32, Coordinate::Rel).is_err() {
-            return Err("DeskLink could not move the pointer".to_string());
-        }
-    }
-    Ok(())
 }
 
 fn send_packet_reply(stream: &Arc<Mutex<SslStream<TcpStream>>>, packet: &NetworkPacket) {

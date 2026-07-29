@@ -123,6 +123,7 @@ pub(super) fn finish_secure_link(
     }
 
     let binding = registration.binding;
+    eprintln!("[DL-WRTC-BOOT] secure bootstrap link ready for {}", binding.device_id);
     let remote_supports_webrtc = paired
         && binding
             .link
