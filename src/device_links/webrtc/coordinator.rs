@@ -21,11 +21,15 @@ use crate::device_links::device::DeviceView;
 use crate::device_links::packet::NetworkPacket;
 
 use super::file_protocol::{FileControl, FILE_CHUNK_MESSAGE_TYPE, FILE_CONTROL_MESSAGE_TYPE};
+use super::portal::{PortalInputLease, PortalLeaseKind, RemotePortalRegistry};
 use super::transfer_manager::{TransferEvent, WebRtcTransferManager};
 use super::{
     AuthenticationTranscript, DesktopWebRtcPeer, HandoverControlKind, HandoverControlMessage,
-    PeerEvent, SignalingMessageType, WebRtcChannel, WebRtcEnvelope, WebRtcPacketBridge,
+    PeerEvent, RemoteSessionControlKind, RemoteSessionControlMessage, ScreenDirection,
+    SignalingMessageType, WebRtcChannel, WebRtcEnvelope, WebRtcPacketBridge,
     WebRtcSignalingMessage, WebRtcWireBinding, HANDOVER_MESSAGE_TYPE,
+    INPUT_SEQUENCE_FIELD, LEASE_ID_FIELD, REMOTE_SESSION_ID_FIELD,
+    REMOTE_SESSION_MESSAGE_TYPE,
 };
 
 /// Starts the deterministic desktop-initiated negotiation. The caller must
@@ -53,7 +57,7 @@ pub(crate) fn start_initiator(
     let wire = WebRtcWireBinding::from_attempt(local_device_id, remote_device_id, &attempt_id)?;
     let transfer_manager = new_transfer_manager(&config)?;
     let (sender, receiver) = mpsc::channel();
-    let peer = DesktopWebRtcPeer::new(true, sender)?;
+    let peer = DesktopWebRtcPeer::new(binding.device_id.clone(), true, sender)?;
     let replaced = sessions
         .install_webrtc_peer(
             &binding,
@@ -182,10 +186,27 @@ pub(crate) fn handle_signaling_packet(
             peer.add_ice_candidate(index, candidate)
         }
         SignalingMessageType::EndOfCandidates => Ok(()),
-        SignalingMessageType::IceRestart => Err(
-            "DeskLink WebRTC ICE restart is not enabled until authenticated handover is active"
-                .to_string(),
-        ),
+        SignalingMessageType::IceRestart => {
+            // The peer already entered the same signed recovery flow, so do
+            // not echo `ICE_RESTART` back and create a signaling loop. The
+            // deterministic initiator will rebuild after the bounded delay.
+            let wire = sessions.with_webrtc_handover(
+                binding,
+                &message.session_attempt_id,
+                |handover| Ok(handover.wire_binding.clone()),
+            )?;
+            schedule_terminal_peer_recovery(
+                binding.clone(),
+                message.session_attempt_id.clone(),
+                wire,
+                sessions,
+                config,
+                devices,
+                "The paired device requested WebRTC recovery".to_string(),
+                false,
+            );
+            Ok(())
+        }
         SignalingMessageType::Close => {
             peer.close();
             Ok(())
@@ -228,8 +249,172 @@ pub(crate) fn send_feature_packet(
     peer.send_text(WebRtcPacketBridge::channel_for(packet), &text)
 }
 
+/// Starts a view-only session from an explicit desktop UI action.  Starting a
+/// view never implicitly grants input control; the peer must ask for a
+/// generation-bound lease in a separate action.
+pub(crate) fn request_remote_view(
+    sessions: &DeviceManager,
+    transport: &FeatureTransportSnapshot,
+    direction: ScreenDirection,
+) -> Result<(), String> {
+    if !sessions.is_current(&transport.binding) || !transport.web_rtc_ready {
+        return Err("DeskLink WebRTC remote viewing is unavailable".to_string());
+    }
+    let (attempt_id, wire, message) = sessions
+        .with_session(&transport.binding, |session| -> Result<_, String> {
+            let attempt_id = session
+                .webrtc_attempt_id
+                .clone()
+                .ok_or_else(|| "DeskLink WebRTC session is not active".to_string())?;
+            let wire = session
+                .webrtc_handover
+                .as_ref()
+                .map(|handover| handover.wire_binding.clone())
+                .ok_or_else(|| "DeskLink WebRTC session has no wire binding".to_string())?;
+            let remote_session_id = session.remote_session.start_view(direction);
+            let sequence = session.remote_session.next_sequence();
+            let message = RemoteSessionControlMessage::new(
+                RemoteSessionControlKind::RequestView,
+                attempt_id.clone(),
+                &wire,
+                remote_session_id,
+                sequence,
+                Some(direction),
+                None,
+                None,
+                None,
+                None,
+            );
+            Ok((attempt_id, wire, message))
+        })
+        .map_err(|error| error.to_string())??;
+    send_remote_session_control(sessions, &transport.binding, &attempt_id, &wire, message)
+}
+
+/// Requests a control lease only after a local user explicitly chooses
+/// “Enable control” for the active remote view.
+pub(crate) fn request_remote_control(
+    sessions: &DeviceManager,
+    transport: &FeatureTransportSnapshot,
+) -> Result<(), String> {
+    if !sessions.is_current(&transport.binding) || !transport.web_rtc_ready {
+        return Err("DeskLink WebRTC remote control is unavailable".to_string());
+    }
+    let (attempt_id, wire, message) = sessions
+        .with_session(&transport.binding, |session| -> Result<_, String> {
+            let attempt_id = session
+                .webrtc_attempt_id
+                .clone()
+                .ok_or_else(|| "DeskLink WebRTC session is not active".to_string())?;
+            let wire = session
+                .webrtc_handover
+                .as_ref()
+                .map(|handover| handover.wire_binding.clone())
+                .ok_or_else(|| "DeskLink WebRTC session has no wire binding".to_string())?;
+            let remote_session_id = session.remote_session.request_control()?;
+            let sequence = session.remote_session.next_sequence();
+            let message = RemoteSessionControlMessage::new(
+                RemoteSessionControlKind::RequestControl,
+                attempt_id.clone(),
+                &wire,
+                remote_session_id,
+                sequence,
+                session.remote_session.direction,
+                None,
+                None,
+                None,
+                None,
+            );
+            Ok((attempt_id, wire, message))
+        })
+        .map_err(|error| error.to_string())??;
+    send_remote_session_control(sessions, &transport.binding, &attempt_id, &wire, message)
+}
+
+/// Stops a remote view/control session and tells the peer to release its
+/// capture, accessibility, and pressed-input state before local resources are
+/// closed.
+pub(crate) fn stop_remote_session(
+    sessions: &DeviceManager,
+    transport: &FeatureTransportSnapshot,
+) -> Result<(), String> {
+    if let Some(peer) = transport.web_rtc_peer.as_ref() {
+        peer.stop_desktop_capture();
+    }
+    let context = sessions
+        .with_session(&transport.binding, |session| -> Result<_, String> {
+            let Some(remote_session_id) = session.remote_session.remote_session_id.clone() else {
+                return Ok(None);
+            };
+            let attempt_id = session
+                .webrtc_attempt_id
+                .clone()
+                .ok_or_else(|| "DeskLink WebRTC session is not active".to_string())?;
+            let wire = session
+                .webrtc_handover
+                .as_ref()
+                .map(|handover| handover.wire_binding.clone())
+                .ok_or_else(|| "DeskLink WebRTC session has no wire binding".to_string())?;
+            let message = RemoteSessionControlMessage::new(
+                RemoteSessionControlKind::Release,
+                attempt_id.clone(),
+                &wire,
+                remote_session_id,
+                session.remote_session.next_sequence(),
+                session.remote_session.direction,
+                None,
+                None,
+                None,
+                None,
+            );
+            session.remote_session.stop();
+            Ok(Some((attempt_id, wire, message)))
+        })
+        .map_err(|error| error.to_string())??;
+    RemotePortalRegistry::global().release(&transport.binding);
+    if let Some((attempt_id, wire, message)) = context {
+        send_remote_session_control(sessions, &transport.binding, &attempt_id, &wire, message)?;
+    }
+    Ok(())
+}
+
+/// Adds the binding and monotonic lease sequence required by an input packet.
+/// The send itself occurs after the session lock is released.
+pub(crate) fn send_remote_input_packet(
+    sessions: &DeviceManager,
+    transport: &FeatureTransportSnapshot,
+    packet: &NetworkPacket,
+) -> Result<(), String> {
+    if !sessions.is_current(&transport.binding) || !transport.web_rtc_ready {
+        return Err("DeskLink WebRTC remote control is unavailable".to_string());
+    }
+    let mut packet = packet.clone();
+    let (remote_session_id, lease_id, sequence) = sessions
+        .with_session(&transport.binding, |session| -> Result<_, String> {
+            let wire = session
+                .webrtc_handover
+                .as_ref()
+                .map(|handover| handover.wire_binding.clone())
+                .ok_or_else(|| "DeskLink WebRTC session has no wire binding".to_string())?;
+            if session.remote_session.direction != Some(ScreenDirection::PhoneToDesktop) {
+                return Err(
+                    "DeskLink input can control the phone only while viewing the phone screen"
+                        .to_string(),
+                );
+            }
+            session
+                .remote_session
+                .prepare_outbound_input(&wire.sender_device_id, wire.generation)
+        })
+        .map_err(|error| error.to_string())??;
+    packet.set(REMOTE_SESSION_ID_FIELD, remote_session_id);
+    packet.set(LEASE_ID_FIELD, lease_id);
+    packet.set(INPUT_SEQUENCE_FIELD, sequence as i64);
+    send_feature_packet(sessions, transport, &packet)
+}
+
 /// Starts a desktop-originated transfer through the current authenticated
-/// WebRTC peer. It has no LAN fallback once feature-ready is active.
+/// WebRTC peer. It has no LAN fallback at any handover stage.
 pub(crate) fn start_file_transfer(
     sessions: &DeviceManager,
     transport: &FeatureTransportSnapshot,
@@ -265,7 +450,7 @@ fn install_responder(
     let wire = WebRtcWireBinding::from_attempt(local_device_id, remote_device_id, &attempt_id)?;
     let transfer_manager = new_transfer_manager(&config)?;
     let (sender, receiver) = mpsc::channel();
-    let peer = DesktopWebRtcPeer::new(false, sender)?;
+    let peer = DesktopWebRtcPeer::new(binding.device_id.clone(), false, sender)?;
     let replaced = sessions
         .install_webrtc_peer(
             &binding,
@@ -400,7 +585,40 @@ fn spawn_event_worker(
                 }
                 PeerEvent::Error(error) => eprintln!("[DeskLink] WebRTC peer error: {error}"),
                 PeerEvent::ConnectionChanged(state) => {
-                    eprintln!("[DeskLink] WebRTC peer state: {state}")
+                    eprintln!("[DeskLink] WebRTC peer state: {state}");
+                    // `disconnected` is a recoverable ICE state and can occur
+                    // briefly as Android turns its display off.  Only terminal
+                    // states revoke feature readiness, so a short transition
+                    // cannot make DeskLink discard a working peer.
+                    let terminal = state.to_ascii_lowercase();
+                    if terminal.contains("disconnected") {
+                        if let Ok(peer) = sessions.active_webrtc_peer(&binding, &attempt_id) {
+                            if peer.arm_disconnected_grace() {
+                                spawn_disconnected_grace(
+                                    binding.clone(),
+                                    attempt_id.clone(),
+                                    wire.clone(),
+                                    peer,
+                                    Arc::clone(&sessions),
+                                    Arc::clone(&config),
+                                    Arc::clone(&devices),
+                                );
+                            }
+                        }
+                    }
+                    if terminal.contains("failed") || terminal.contains("closed") {
+                        schedule_terminal_peer_recovery(
+                            binding.clone(),
+                            attempt_id.clone(),
+                            wire.clone(),
+                            Arc::clone(&sessions),
+                            Arc::clone(&config),
+                            Arc::clone(&devices),
+                            format!("WebRTC connection entered terminal state: {state}"),
+                            true,
+                        );
+                        break;
+                    }
                 }
                 PeerEvent::ChannelOpened(WebRtcChannel::Control) => {
                     if let Err(error) = begin_handover(&binding, &attempt_id, &wire, &sessions) {
@@ -408,11 +626,131 @@ fn spawn_event_worker(
                     }
                 }
                 PeerEvent::ChannelOpened(_) => {}
-                PeerEvent::Closed => break,
+                PeerEvent::Closed => {
+                    schedule_terminal_peer_recovery(
+                        binding.clone(),
+                        attempt_id.clone(),
+                        wire.clone(),
+                        Arc::clone(&sessions),
+                        Arc::clone(&config),
+                        Arc::clone(&devices),
+                        "WebRTC peer closed".to_string(),
+                        true,
+                    );
+                    break;
+                }
             }
         }
     });
     Ok(())
+}
+
+/// Retires one terminal peer and schedules a deterministic, bounded rebuild.
+/// The signed LAN socket carries only the `ICE_RESTART` signal and subsequent
+/// SDP/ICE exchange; no paired feature packet is ever sent through it.
+fn schedule_terminal_peer_recovery(
+    binding: SessionBinding,
+    attempt_id: String,
+    wire: WebRtcWireBinding,
+    sessions: Arc<DeviceManager>,
+    config: Arc<Mutex<Config>>,
+    devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    reason: String,
+    notify_peer: bool,
+) {
+    // Ask Android to enter its matching bounded recovery state before the old
+    // peer is removed locally. A signaling write can fail after Wi-Fi loss;
+    // the local deterministic initiator still attempts a replacement over a
+    // retained bootstrap link when possible.
+    if notify_peer {
+        if let Err(error) = send_signed_signal(
+            &binding,
+            &wire,
+            &attempt_id,
+            SignalingMessageType::IceRestart,
+            Map::new(),
+            &config,
+        ) {
+            eprintln!("[DeskLink] Could not request remote WebRTC recovery: {error}");
+        }
+    }
+
+    let schedule = match sessions.begin_webrtc_recovery(&binding, &attempt_id, reason) {
+        Ok(Some(schedule)) => schedule,
+        Ok(None) | Err(_) => return,
+    };
+    schedule.replaced_peer.close();
+
+    // Only the deterministic lower device ID creates the next offer. The
+    // other side remains in Reconnecting and waits for that authenticated
+    // offer, avoiding SDP glare and duplicate peer connections.
+    if wire.sender_device_id >= wire.peer_device_id {
+        return;
+    }
+    spawn_recovery_offer(binding, sessions, config, devices, schedule.delay);
+}
+
+fn spawn_recovery_offer(
+    binding: SessionBinding,
+    sessions: Arc<DeviceManager>,
+    config: Arc<Mutex<Config>>,
+    devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    delay: std::time::Duration,
+) {
+    thread::spawn(move || {
+        thread::sleep(delay);
+        let claimed = sessions
+            .claim_scheduled_webrtc_recovery(&binding, std::time::Instant::now())
+            .unwrap_or(false);
+        if !claimed || !sessions.is_current(&binding) {
+            return;
+        }
+        if let Err(error) = start_initiator(
+            binding.clone(),
+            Arc::clone(&sessions),
+            Arc::clone(&config),
+            Arc::clone(&devices),
+        ) {
+            eprintln!("[DeskLink] WebRTC recovery offer failed: {error}");
+            if let Ok(Some(next_delay)) = sessions.rearm_webrtc_recovery(&binding, error) {
+                spawn_recovery_offer(binding, sessions, config, devices, next_delay);
+            }
+        }
+    });
+}
+
+/// Mirrors Android's short disconnected grace period. Screen lock and Wi-Fi
+/// roaming can produce a transient `Disconnected` notification even while ICE
+/// recovers on its own; only an unchanged peer that remains disconnected for
+/// the full interval enters the signed rebuild flow.
+fn spawn_disconnected_grace(
+    binding: SessionBinding,
+    attempt_id: String,
+    wire: WebRtcWireBinding,
+    peer: Arc<DesktopWebRtcPeer>,
+    sessions: Arc<DeviceManager>,
+    config: Arc<Mutex<Config>>,
+    devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+) {
+    thread::spawn(move || {
+        thread::sleep(std::time::Duration::from_secs(12));
+        let still_current = match sessions.active_webrtc_peer(&binding, &attempt_id) {
+            Ok(current_peer) => Arc::ptr_eq(&current_peer, &peer),
+            Err(_) => false,
+        };
+        if still_current && peer.is_still_disconnected() {
+            schedule_terminal_peer_recovery(
+                binding,
+                attempt_id,
+                wire,
+                sessions,
+                config,
+                devices,
+                "WebRTC remained disconnected after the recovery grace period".to_string(),
+                true,
+            );
+        }
+    });
 }
 
 fn new_transfer_manager(config: &Arc<Mutex<Config>>) -> Result<Arc<WebRtcTransferManager>, String> {
@@ -487,15 +825,27 @@ fn handle_peer_envelope(
         sessions
             .accept_webrtc_envelope(binding, attempt_id, envelope.message_id.clone())
             .map_err(|error| error.to_string())?;
+        if matches!(
+            packet.packet_type.as_str(),
+            crate::device_links::packet::PACKET_TYPE_MOUSEPAD_REQUEST
+                | crate::device_links::packet::PACKET_TYPE_PRESENTER
+        ) {
+            authorize_remote_input(binding, attempt_id, wire, &packet, sessions)?;
+        }
         return crate::device_links::daemon::packet_handler::dispatch_webrtc_feature_packet(
             binding, packet, devices, sessions, config,
         );
     }
+    if envelope.channel != WebRtcChannel::Control.label() {
+        return Err("DeskLink WebRTC control message arrived on the wrong channel".to_string());
+    }
+    if envelope.message_type == REMOTE_SESSION_MESSAGE_TYPE {
+        return handle_remote_session_message(
+            binding, attempt_id, wire, envelope, sessions, config,
+        );
+    }
     if envelope.message_type != HANDOVER_MESSAGE_TYPE {
         return Err("Unsupported DeskLink WebRTC control message type".to_string());
-    }
-    if envelope.channel != WebRtcChannel::Control.label() {
-        return Err("DeskLink WebRTC handover arrived on the wrong channel".to_string());
     }
     let payload = envelope.validate(wire)?;
     sessions
@@ -656,13 +1006,33 @@ fn handle_peer_envelope(
             // `send_capabilities` is intentionally idempotent and makes the
             // order of the two peers' messages harmless.
             send_capabilities(binding, attempt_id, wire, sessions, config)?;
-            send_feature_ready_if_possible(binding, attempt_id, wire, sessions)
+            send_feature_ready_if_possible(binding, attempt_id, wire, sessions)?;
+            sessions
+                .mark_webrtc_ready(binding, attempt_id)
+                .map_err(|error| error.to_string())?;
+            resume_transfers_if_ready(
+                binding,
+                attempt_id,
+                wire,
+                sessions,
+                transfer_manager,
+            )
         }
         HandoverControlKind::FeatureReady => {
             sessions.with_webrtc_handover(binding, attempt_id, |handover| {
                 handover.mark_remote_feature_ready()
             })?;
-            send_feature_ready_if_possible(binding, attempt_id, wire, sessions)
+            send_feature_ready_if_possible(binding, attempt_id, wire, sessions)?;
+            sessions
+                .mark_webrtc_ready(binding, attempt_id)
+                .map_err(|error| error.to_string())?;
+            resume_transfers_if_ready(
+                binding,
+                attempt_id,
+                wire,
+                sessions,
+                transfer_manager,
+            )
         }
         HandoverControlKind::Degraded => {
             sessions.with_webrtc_handover(binding, attempt_id, |handover| {
@@ -678,6 +1048,508 @@ fn handle_peer_envelope(
                 .close();
             Ok(())
         }
+    }
+}
+
+fn authorize_remote_input(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    packet: &NetworkPacket,
+    sessions: &Arc<DeviceManager>,
+) -> Result<(), String> {
+    let remote_session_id = packet
+        .get_str(REMOTE_SESSION_ID_FIELD)
+        .ok_or_else(|| "DeskLink remote input has no session ID".to_string())?;
+    let lease_id = packet
+        .get_str(LEASE_ID_FIELD)
+        .ok_or_else(|| "DeskLink remote input has no control lease".to_string())?;
+    let sequence = packet
+        .get_i64(INPUT_SEQUENCE_FIELD)
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "DeskLink remote input has an invalid sequence".to_string())?;
+    sessions
+        .with_remote_session(binding, |remote_session| {
+            if remote_session.direction != Some(ScreenDirection::DesktopToPhone) {
+                return Err(
+                    "DeskLink received desktop input outside a desktop-to-phone view"
+                        .to_string(),
+                );
+            }
+            let lease = remote_session
+                .control_lease
+                .as_mut()
+                .ok_or_else(|| "DeskLink remote input has no granted portal lease".to_string())?;
+            lease.accept_input(
+                remote_session_id,
+                lease_id,
+                &wire.peer_device_id,
+                wire.generation,
+                sequence,
+                now_millis(),
+            )
+        })
+        .map_err(|error| error.to_string())??;
+
+    if message.kind == RemoteSessionControlKind::ScreenReady
+        && message.direction == Some(ScreenDirection::PhoneToDesktop)
+    {
+        if let (Some(width), Some(height)) = (message.screen_width, message.screen_height) {
+            super::video_receive::set_input_size(
+                &binding.device_id,
+                i32::try_from(width).unwrap_or_default(),
+                i32::try_from(height).unwrap_or_default(),
+            );
+        }
+    }
+    if let Err(error) = RemotePortalRegistry::global().inject(binding, packet) {
+        // A portal revocation/closure must end the current control lease at
+        // once. Preserve the view session so Android can present an explicit
+        // retry action, then notify it over the authenticated control channel
+        // instead of allowing repeated packets to create a prompt loop.
+        let remote_session_id = sessions
+            .with_remote_session(binding, |remote_session| remote_session.pause())
+            .map_err(|session_error| session_error.to_string())?;
+        RemotePortalRegistry::global().release(binding);
+        if let Some(remote_session_id) = remote_session_id {
+            if let Ok(message) = make_remote_session_message(
+                binding,
+                attempt_id,
+                sessions,
+                RemoteSessionControlKind::PauseLocked,
+                remote_session_id,
+                None,
+                None,
+                None,
+                Some(format!("GNOME remote-control permission closed: {error}")),
+            ) {
+                let _ = send_remote_session_control(sessions, binding, attempt_id, wire, message);
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn handle_remote_session_message(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    envelope: WebRtcEnvelope,
+    sessions: &Arc<DeviceManager>,
+    config: &Arc<Mutex<Config>>,
+) -> Result<(), String> {
+    if !sessions
+        .webrtc_features_ready(binding, attempt_id)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("DeskLink remote session arrived before WebRTC feature-ready".to_string());
+    }
+    let payload = envelope.validate(wire)?;
+    sessions
+        .accept_webrtc_envelope(binding, attempt_id, envelope.message_id)
+        .map_err(|error| error.to_string())?;
+    let message = RemoteSessionControlMessage::from_json(&payload)?;
+    message.validate(wire, attempt_id, now_millis())?;
+
+    sessions
+        .with_remote_session(binding, |remote_session| {
+            remote_session.accept_control_message(
+                &message,
+                &wire.peer_device_id,
+                wire.generation,
+                now_millis(),
+            )
+        })
+        .map_err(|error| error.to_string())??;
+
+    match message.kind {
+        RemoteSessionControlKind::RequestView => match message.direction {
+            // Android owns MediaProjection and starts it after receiving the
+            // grant. The desktop video receiver is already part of this peer
+            // before feature-ready, so accepting the request cannot cause a
+            // second connection or a permission loop.
+            Some(ScreenDirection::PhoneToDesktop) => {
+                let response = make_remote_session_message(
+                    binding,
+                    attempt_id,
+                    sessions,
+                    RemoteSessionControlKind::ViewGranted,
+                    message.remote_session_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+                send_remote_session_control(sessions, binding, attempt_id, wire, response)?;
+            }
+            Some(ScreenDirection::DesktopToPhone) => {
+                // An explicit remote-view action is the only path that may
+                // create a ScreenCast portal request. The portal session also
+                // prepares devices, but it remains unable to inject input
+                // until the later authenticated control lease is granted.
+                begin_desktop_view_portal(
+                    binding.clone(),
+                    attempt_id.to_string(),
+                    wire.clone(),
+                    message.remote_session_id,
+                    Arc::clone(sessions),
+                    Arc::clone(config),
+                )?;
+            }
+            None => return Err("DeskLink remote-view request has no direction".to_string()),
+        },
+        RemoteSessionControlKind::RequestControl | RemoteSessionControlKind::TakeoverRequest => {
+            if message.direction != Some(ScreenDirection::DesktopToPhone) {
+                let response = make_remote_session_message(
+                    binding,
+                    attempt_id,
+                    sessions,
+                    RemoteSessionControlKind::ControlDenied,
+                    message.remote_session_id,
+                    None,
+                    None,
+                    None,
+                    Some("DeskLink control must be requested by the device viewing the desktop".to_string()),
+                )?;
+                return send_remote_session_control(sessions, binding, attempt_id, wire, response);
+            }
+            if RemotePortalRegistry::global().contains(binding) {
+                grant_existing_desktop_control_lease(
+                    binding,
+                    attempt_id,
+                    wire,
+                    message.remote_session_id,
+                    sessions,
+                )?;
+            } else {
+                let response = make_remote_session_message(
+                    binding,
+                    attempt_id,
+                    sessions,
+                    RemoteSessionControlKind::ControlDenied,
+                    message.remote_session_id,
+                    None,
+                    None,
+                    None,
+                    Some("Start desktop viewing and approve GNOME permission before enabling control".to_string()),
+                )?;
+                send_remote_session_control(sessions, binding, attempt_id, wire, response)?;
+            }
+        }
+        RemoteSessionControlKind::Release
+        | RemoteSessionControlKind::ScreenStopped
+        | RemoteSessionControlKind::ScreenError
+        | RemoteSessionControlKind::PauseLocked => {
+            stop_desktop_capture(binding, attempt_id, sessions);
+            super::video_receive::clear_device(&binding.device_id);
+            RemotePortalRegistry::global().release(binding);
+        }
+        RemoteSessionControlKind::ControlGranted | RemoteSessionControlKind::TakeoverGranted => {
+            start_control_heartbeat(
+                binding.clone(),
+                attempt_id.to_string(),
+                wire.clone(),
+                Arc::clone(sessions),
+            );
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Keeps an idle, locally owned control lease alive without accepting any
+/// input from a stale session. The per-lease epoch makes duplicate workers and
+/// replaced peers harmless: only the current generation can create a message.
+fn start_control_heartbeat(
+    binding: SessionBinding,
+    attempt_id: String,
+    wire: WebRtcWireBinding,
+    sessions: Arc<DeviceManager>,
+) {
+    let epoch = match sessions.with_remote_session(&binding, |remote_session| {
+        remote_session.local_heartbeat_epoch(&wire.sender_device_id, wire.generation)
+    }) {
+        Ok(Some(epoch)) => epoch,
+        Ok(None) | Err(_) => return,
+    };
+    thread::spawn(move || loop {
+        thread::sleep(std::time::Duration::from_secs(10));
+        if !sessions.is_current(&binding)
+            || sessions.active_webrtc_peer(&binding, &attempt_id).is_err()
+        {
+            break;
+        }
+        let heartbeat = match sessions.with_remote_session(&binding, |remote_session| {
+            remote_session
+                .prepare_local_heartbeat(&wire.sender_device_id, wire.generation, epoch)
+                .map(|(remote_session_id, lease_id, sequence)| {
+                    RemoteSessionControlMessage::new(
+                        RemoteSessionControlKind::Heartbeat,
+                        attempt_id.clone(),
+                        &wire,
+                        remote_session_id,
+                        sequence,
+                        remote_session.direction,
+                        Some(lease_id),
+                        Some(wire.sender_device_id.clone()),
+                        None,
+                        None,
+                    )
+                })
+        }) {
+            Ok(Some(message)) => message,
+            Ok(None) | Err(_) => break,
+        };
+        if send_remote_session_control(&sessions, &binding, &attempt_id, &wire, heartbeat)
+            .is_err()
+        {
+            break;
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn make_remote_session_message(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    sessions: &DeviceManager,
+    kind: RemoteSessionControlKind,
+    remote_session_id: String,
+    lease_id: Option<String>,
+    owner_device_id: Option<String>,
+    lease_expires_at: Option<i64>,
+    reason: Option<String>,
+) -> Result<RemoteSessionControlMessage, String> {
+    sessions
+        .with_session(binding, |session| -> Result<_, String> {
+            let wire = session
+                .webrtc_handover
+                .as_ref()
+                .map(|handover| handover.wire_binding.clone())
+                .ok_or_else(|| "DeskLink WebRTC session has no wire binding".to_string())?;
+            Ok(RemoteSessionControlMessage::new(
+                kind,
+                attempt_id,
+                &wire,
+                remote_session_id,
+                session.remote_session.next_sequence(),
+                session.remote_session.direction,
+                lease_id,
+                owner_device_id,
+                lease_expires_at,
+                reason,
+            ))
+        })
+        .map_err(|error| error.to_string())?
+}
+
+fn begin_desktop_view_portal(
+    binding: SessionBinding,
+    attempt_id: String,
+    wire: WebRtcWireBinding,
+    remote_session_id: String,
+    sessions: Arc<DeviceManager>,
+    config: Arc<Mutex<Config>>,
+) -> Result<(), String> {
+    let restore_token = config
+        .lock()
+        .map_err(|_| "DeskLink configuration lock poisoned".to_string())?
+        .remote_desktop_restore_token(&binding.device_id);
+    let (lease, ready) = PortalInputLease::request(restore_token, PortalLeaseKind::DesktopView)?;
+    thread::Builder::new()
+        .name("DeskLink-DesktopScreenCast-Permission".to_string())
+        .spawn(move || {
+            let result = ready
+                .recv()
+                .map_err(|_| "DeskLink portal permission worker stopped".to_string())
+                .and_then(|result| result);
+            let response = match result {
+                Ok(ready) => (|| -> Result<RemoteSessionControlMessage, String> {
+                    // `PortalScreenCapture` owns the PipeWire FD. Destructure
+                    // the response before handing the FD to GStreamer so the
+                    // independent restore token remains available for
+                    // persistence after capture starts.
+                    let super::portal::PortalLeaseReady {
+                        restore_token,
+                        screen_capture,
+                    } = ready;
+                    let capture = screen_capture.ok_or_else(|| {
+                        "GNOME did not provide a selected desktop monitor".to_string()
+                    })?;
+                    let peer = sessions
+                        .active_webrtc_peer(&binding, &attempt_id)
+                        .map_err(|error| error.to_string())?;
+                    peer.start_desktop_capture(capture)?;
+                    let portal_lease_id = lease.id().to_string();
+                    let portal_closed = lease.take_closed_receiver();
+                    if let Err(error) = RemotePortalRegistry::global().install(&binding, lease) {
+                        peer.stop_desktop_capture();
+                        return Err(error);
+                    }
+                    if let Some(token) = restore_token {
+                        config
+                            .lock()
+                            .map_err(|_| "DeskLink configuration lock poisoned".to_string())?
+                            .set_remote_desktop_restore_token(binding.device_id.clone(), Some(token))?;
+                    }
+                    sessions
+                        .with_remote_session(&binding, |remote_session| {
+                            remote_session.mark_viewing(
+                                &remote_session_id,
+                                ScreenDirection::DesktopToPhone,
+                            )
+                        })
+                        .map_err(|error| error.to_string())??;
+                    if let Some(portal_closed) = portal_closed {
+                        monitor_portal_closure(
+                            binding.clone(),
+                            attempt_id.clone(),
+                            wire.clone(),
+                            remote_session_id.clone(),
+                            portal_lease_id,
+                            portal_closed,
+                            Arc::clone(&sessions),
+                        );
+                    }
+                    make_remote_session_message(
+                        &binding,
+                        &attempt_id,
+                        &sessions,
+                        RemoteSessionControlKind::ViewGranted,
+                        remote_session_id.clone(),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                })(),
+                Err(error) => make_remote_session_message(
+                    &binding,
+                    &attempt_id,
+                    &sessions,
+                    RemoteSessionControlKind::ViewDenied,
+                    remote_session_id.clone(),
+                    None,
+                    None,
+                    None,
+                    Some(error),
+                ),
+            };
+            match response {
+                Ok(message) => {
+                    if let Err(error) = send_remote_session_control(
+                        &sessions,
+                        &binding,
+                        &attempt_id,
+                        &wire,
+                        message,
+                    ) {
+                        RemotePortalRegistry::global().release(&binding);
+                        stop_desktop_capture(&binding, &attempt_id, &sessions);
+                        eprintln!("[DeskLink] Could not send desktop screen permission result: {error}");
+                    }
+                }
+                Err(error) => {
+                    stop_desktop_capture(&binding, &attempt_id, &sessions);
+                    RemotePortalRegistry::global().release(&binding);
+                    eprintln!("[DeskLink] Could not start desktop screen sharing: {error}");
+                }
+            }
+        })
+        .map_err(|error| format!("Could not start DeskLink ScreenCast permission worker: {error}"))?;
+    Ok(())
+}
+
+/// A portal can be closed by GNOME at any time, including when no input is
+/// currently moving. Observe that closure and invalidate the exact lease that
+/// created it; the lease ID prevents an old worker from pausing a later retry.
+fn monitor_portal_closure(
+    binding: SessionBinding,
+    attempt_id: String,
+    wire: WebRtcWireBinding,
+    expected_remote_session_id: String,
+    portal_lease_id: String,
+    closed: std::sync::mpsc::Receiver<()>,
+    sessions: Arc<DeviceManager>,
+) {
+    let _ = thread::Builder::new()
+        .name("DeskLink-RemoteDesktop-PortalClose".to_string())
+        .spawn(move || {
+            let _ = closed.recv();
+            if !sessions.is_current(&binding)
+                || !RemotePortalRegistry::global().is_current_lease(&binding, &portal_lease_id)
+            {
+                return;
+            }
+            let remote_session_id = sessions
+                .with_remote_session(&binding, |remote_session| {
+                    if remote_session.remote_session_id.as_deref()
+                        == Some(expected_remote_session_id.as_str())
+                    {
+                        remote_session.pause()
+                    } else {
+                        None
+                    }
+                })
+                .ok()
+                .flatten();
+            stop_desktop_capture(&binding, &attempt_id, &sessions);
+            RemotePortalRegistry::global().release(&binding);
+            let Some(remote_session_id) = remote_session_id else {
+                return;
+            };
+            if let Ok(message) = make_remote_session_message(
+                &binding,
+                &attempt_id,
+                &sessions,
+                RemoteSessionControlKind::PauseLocked,
+                remote_session_id,
+                None,
+                None,
+                None,
+                Some("GNOME remote-control permission was closed".to_string()),
+            ) {
+                let _ = send_remote_session_control(&sessions, &binding, &attempt_id, &wire, message);
+            }
+        });
+}
+
+fn grant_existing_desktop_control_lease(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    remote_session_id: String,
+    sessions: &Arc<DeviceManager>,
+) -> Result<(), String> {
+    let grant = sessions
+        .with_remote_session(binding, |remote_session| {
+            remote_session.grant_control(
+                &remote_session_id,
+                wire.peer_device_id.clone(),
+                wire.generation,
+                now_millis(),
+            )
+        })
+        .map_err(|error| error.to_string())??;
+    let message = make_remote_session_message(
+        binding,
+        attempt_id,
+        sessions,
+        RemoteSessionControlKind::ControlGranted,
+        remote_session_id,
+        Some(grant.lease_id),
+        Some(grant.owner_device_id),
+        Some(grant.expires_at),
+        None,
+    )?;
+    send_remote_session_control(sessions, binding, attempt_id, wire, message)
+}
+
+fn stop_desktop_capture(binding: &SessionBinding, attempt_id: &str, sessions: &DeviceManager) {
+    if let Ok(peer) = sessions.active_webrtc_peer(binding, attempt_id) {
+        peer.stop_desktop_capture();
     }
 }
 
@@ -707,6 +1579,30 @@ fn send_feature_ready_if_possible(
     sessions.with_webrtc_handover(binding, attempt_id, |handover| {
         handover.mark_local_feature_ready()
     })
+}
+
+/// Replays outstanding offers only after both peers have completed the
+/// authenticated handover.  This is intentionally called after either
+/// capability or `feature-ready` control message: control packets can arrive
+/// in either order, while `resume_sends` is idempotent for one peer.
+fn resume_transfers_if_ready(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    sessions: &Arc<DeviceManager>,
+    transfer_manager: &Arc<WebRtcTransferManager>,
+) -> Result<(), String> {
+    if !sessions
+        .webrtc_features_ready(binding, attempt_id)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(());
+    }
+    let peer = sessions
+        .active_webrtc_peer(binding, attempt_id)
+        .map_err(|error| error.to_string())?;
+    let events = transfer_manager.resume_sends(wire)?;
+    send_transfer_events(&peer, wire, events)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -841,6 +1737,29 @@ fn send_control(
     )?;
     let text = String::from_utf8(envelope.to_json()?)
         .map_err(|_| "DeskLink WebRTC control serialization was not UTF-8".to_string())?;
+    sessions
+        .active_webrtc_peer(binding, attempt_id)
+        .map_err(|error| error.to_string())?
+        .send_text(WebRtcChannel::Control, &text)
+}
+
+fn send_remote_session_control(
+    sessions: &DeviceManager,
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    message: RemoteSessionControlMessage,
+) -> Result<(), String> {
+    let payload = message.to_json()?;
+    let envelope = WebRtcEnvelope::create(
+        wire,
+        WebRtcChannel::Control,
+        REMOTE_SESSION_MESSAGE_TYPE,
+        &payload,
+        now_millis(),
+    )?;
+    let text = String::from_utf8(envelope.to_json()?)
+        .map_err(|_| "DeskLink remote-session control serialization was not UTF-8".to_string())?;
     sessions
         .active_webrtc_peer(binding, attempt_id)
         .map_err(|error| error.to_string())?

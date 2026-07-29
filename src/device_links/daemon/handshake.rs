@@ -96,6 +96,22 @@ pub(super) fn finish_secure_link(
         remote_public_der,
         secure_info,
     );
+    if let Some(current) = sessions.current_binding(&initial_info.id) {
+        if sessions.has_ready_webrtc(&current) {
+            // A current WebRTC peer is the paired-feature transport.  Do not
+            // replace it merely because discovery established another TLS
+            // bootstrap connection: replacement invalidates the active
+            // generation and used to make Android screen-off look like a full
+            // device disconnect.  A later WebRTC recovery will deliberately
+            // establish a fresh bootstrap session after the peer has degraded.
+            link.close();
+            eprintln!(
+                "[Daemon] Ignoring replacement LAN bootstrap link for {}; authenticated WebRTC remains active.",
+                initial_info.id
+            );
+            return Ok(());
+        }
+    }
     let registration = sessions
         .register_link(initial_info.id.clone(), link, paired)
         .map_err(|error| error.to_string())?;
@@ -121,8 +137,9 @@ pub(super) fn finish_secure_link(
             Arc::clone(&config),
             Arc::clone(&devices),
         ) {
-            // Bootstrap LAN remains available until mutual feature-ready, so
-            // a failed optional negotiation must not tear down a paired link.
+            // Keep the signed bootstrap link so a bounded WebRTC rebuild can
+            // retry. Paired features remain blocked; they never fall back to
+            // this LAN/TLS transport.
             eprintln!("[Daemon] DeskLink WebRTC negotiation unavailable: {error}");
         }
     }
@@ -139,6 +156,18 @@ pub(super) fn handle_disconnect(
     sessions: &Arc<DeviceManager>,
     reason: String,
 ) -> bool {
+    if sessions.has_ready_webrtc(binding) {
+        // The TCP/TLS stream is bootstrap/signaling-only after the mutual
+        // WebRTC handover.  Closing it must stop this reader, but must not
+        // cancel the authenticated DTLS/SCTP feature session or overwrite the
+        // paired device status.
+        binding.link.close();
+        eprintln!(
+            "[Daemon] LAN bootstrap link closed for {}; preserving active WebRTC feature session.",
+            binding.device_id
+        );
+        return false;
+    }
     let result = sessions.disconnect_if_current(binding, reason);
     if !result.was_current {
         return false;
