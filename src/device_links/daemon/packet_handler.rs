@@ -1,4 +1,3 @@
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 use openssl::ssl::SslStream;
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -60,7 +59,6 @@ pub(super) fn packet_read_loop(
             return;
         }
     };
-    let mut enigo_opt = Enigo::new(&Settings::default()).ok();
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
 
@@ -235,126 +233,10 @@ pub(super) fn packet_read_loop(
                         .args(["-i", "bell"])
                         .spawn();
                 } else if packet.packet_type == PACKET_TYPE_MOUSEPAD_REQUEST {
-                    let dx = packet
-                        .body
-                        .get("dx")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
-                    let dy = packet
-                        .body
-                        .get("dy")
-                        .and_then(|v| v.as_f64())
-                        .unwrap_or(0.0);
-                    let x = packet.body.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let y = packet.body.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                    let singleclick = packet.get_bool("singleclick").unwrap_or(false);
-                    let doubleclick = packet.get_bool("doubleclick").unwrap_or(false);
-                    let middleclick = packet.get_bool("middleclick").unwrap_or(false);
-                    let rightclick = packet.get_bool("rightclick").unwrap_or(false);
-                    let singlehold = packet.get_bool("singlehold").unwrap_or(false);
-                    let singlerelease = packet.get_bool("singlerelease").unwrap_or(false);
-                    let scroll = packet.get_bool("scroll").unwrap_or(false);
-                    let key = packet.get_str("key");
-                    let special_key = packet.get_i64("specialKey").unwrap_or(0);
-
                     eprintln!(
-                        "[Daemon] Received remote input request: dx={:?}, dy={:?}, x={:?}, y={:?}, scroll={:?}, key={:?}, specialKey={:?}",
-                        dx, dy, x, y, scroll, key, special_key
+                        "[Daemon] Rejected legacy LAN remote input from {}: WebRTC portal control is required",
+                        device_id
                     );
-
-                    if let Some(ref mut enigo) = enigo_opt {
-                        if scroll {
-                            if dy != 0.0 {
-                                let _ = enigo.scroll(dy as i32, Axis::Vertical);
-                            }
-                            if dx != 0.0 {
-                                let _ = enigo.scroll(dx as i32, Axis::Horizontal);
-                            }
-                        } else if singleclick {
-                            let _ = enigo.button(Button::Left, Direction::Click);
-                        } else if doubleclick {
-                            let _ = enigo.button(Button::Left, Direction::Click);
-                            let _ = enigo.button(Button::Left, Direction::Click);
-                        } else if middleclick {
-                            let _ = enigo.button(Button::Middle, Direction::Click);
-                        } else if rightclick {
-                            let _ = enigo.button(Button::Right, Direction::Click);
-                        } else if singlehold {
-                            let _ = enigo.button(Button::Left, Direction::Press);
-                        } else if singlerelease {
-                            let _ = enigo.button(Button::Left, Direction::Release);
-                        } else if key.is_some() || special_key > 0 {
-                            let ctrl = packet.get_bool("ctrl").unwrap_or(false);
-                            let alt = packet.get_bool("alt").unwrap_or(false);
-                            let shift = packet.get_bool("shift").unwrap_or(false);
-                            let super_key = packet.get_bool("super").unwrap_or(false);
-
-                            if ctrl {
-                                let _ = enigo.key(enigo::Key::Control, Direction::Press);
-                            }
-                            if alt {
-                                let _ = enigo.key(enigo::Key::Alt, Direction::Press);
-                            }
-                            if shift {
-                                let _ = enigo.key(enigo::Key::Shift, Direction::Press);
-                            }
-                            if super_key {
-                                let _ = enigo.key(enigo::Key::Meta, Direction::Press);
-                            }
-
-                            if special_key > 0 {
-                                let enigo_key = match special_key {
-                                    1 => Some(enigo::Key::Backspace),
-                                    2 => Some(enigo::Key::Tab),
-                                    3 => Some(enigo::Key::Return),
-                                    4 => Some(enigo::Key::LeftArrow),
-                                    5 => Some(enigo::Key::UpArrow),
-                                    6 => Some(enigo::Key::RightArrow),
-                                    7 => Some(enigo::Key::DownArrow),
-                                    8 => Some(enigo::Key::PageUp),
-                                    9 => Some(enigo::Key::PageDown),
-                                    10 => Some(enigo::Key::Home),
-                                    11 => Some(enigo::Key::End),
-                                    12 => Some(enigo::Key::Return),
-                                    13 => Some(enigo::Key::Delete),
-                                    14 => Some(enigo::Key::Escape),
-                                    21 => Some(enigo::Key::F1),
-                                    22 => Some(enigo::Key::F2),
-                                    23 => Some(enigo::Key::F3),
-                                    24 => Some(enigo::Key::F4),
-                                    25 => Some(enigo::Key::F5),
-                                    26 => Some(enigo::Key::F6),
-                                    27 => Some(enigo::Key::F7),
-                                    28 => Some(enigo::Key::F8),
-                                    29 => Some(enigo::Key::F9),
-                                    30 => Some(enigo::Key::F10),
-                                    31 => Some(enigo::Key::F11),
-                                    32 => Some(enigo::Key::F12),
-                                    _ => None,
-                                };
-                                if let Some(ek) = enigo_key {
-                                    let _ = enigo.key(ek, Direction::Click);
-                                }
-                            } else if let Some(k) = key {
-                                let _ = enigo.text(k);
-                            }
-
-                            if ctrl {
-                                let _ = enigo.key(enigo::Key::Control, Direction::Release);
-                            }
-                            if alt {
-                                let _ = enigo.key(enigo::Key::Alt, Direction::Release);
-                            }
-                            if shift {
-                                let _ = enigo.key(enigo::Key::Shift, Direction::Release);
-                            }
-                            if super_key {
-                                let _ = enigo.key(enigo::Key::Meta, Direction::Release);
-                            }
-                        } else if dx != 0.0 || dy != 0.0 {
-                            let _ = enigo.move_mouse(dx as i32, dy as i32, Coordinate::Rel);
-                        }
-                    }
                 } else if packet.packet_type == PACKET_TYPE_CLIPBOARD
                     || packet.packet_type == PACKET_TYPE_CLIPBOARD_CONNECT
                 {
@@ -524,11 +406,11 @@ pub(super) fn packet_read_loop(
 
 /// Applies a packet that arrived through an authenticated WebRTC envelope.
 ///
-/// This intentionally starts with the state-only handlers that have no
-/// dependency on the legacy TLS stream. Requests that need a reply, the legacy
-/// payload socket, or the future portal input lease remain rejected until
-/// their WebRTC-native implementations are complete. The coordinator never
-/// sends `feature-ready` while any of those handlers are unavailable.
+/// This is the paired-feature path. It never depends on the bootstrap TLS
+/// stream: regular packets arrive through `desklink-events-v1`, input has
+/// already been lease-authorized by the coordinator, and file bytes use their
+/// dedicated WebRTC file-data channel. Unsupported host backends return a
+/// visible error instead of silently falling back to LAN.
 pub(crate) fn dispatch_webrtc_feature_packet(
     binding: &SessionBinding,
     packet: NetworkPacket,
@@ -622,10 +504,13 @@ pub(crate) fn dispatch_webrtc_feature_packet(
                 .map_err(|error| format!("Could not play DeskLink find-device sound: {error}"))?;
             Ok(())
         }
-        PACKET_TYPE_MOUSEPAD_REQUEST => Err(
-            "DeskLink WebRTC remote input requires a granted GNOME RemoteDesktop portal lease"
-                .to_string(),
-        ),
+        // The coordinator has already verified the WebRTC session, lease,
+        // generation, and monotonic input sequence, then dispatched the
+        // action through the GNOME portal. No raw LAN or Enigo input path is
+        // reachable from this shared WebRTC dispatcher.
+        PACKET_TYPE_MOUSEPAD_REQUEST | crate::device_links::packet::PACKET_TYPE_PRESENTER => {
+            Ok(())
+        }
         PACKET_TYPE_LOCK | PACKET_TYPE_LOCK_REQUEST => {
             Err("DeskLink WebRTC lock control requires the logind backend".to_string())
         }

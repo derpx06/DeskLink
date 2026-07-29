@@ -10,9 +10,11 @@
     "finish-args" : [
         "--share=network",
         "--share=ipc",
+        "--socket=pipewire",
         "--socket=fallback-x11",
         "--device=dri",
-        "--socket=wayland"
+        "--socket=wayland",
+        "--talk-name=org.freedesktop.portal.Desktop"
     ],
     "build-options" : {
         "append-path" : "/usr/lib/sdk/rust-stable/bin",

@@ -28,6 +28,12 @@ struct StoredConfig {
     device_id: String,
     device_name: String,
     trusted_devices: HashMap<String, TrustedDevice>,
+    /// Portal restore tokens are revocable desktop-consent references, never
+    /// pairing credentials. They are keyed by the paired device ID so a
+    /// replacement WebRTC generation can request the same user-approved
+    /// RemoteDesktop session without creating a prompt loop.
+    #[serde(default)]
+    remote_desktop_restore_tokens: HashMap<String, String>,
 }
 
 pub struct Config {
@@ -59,6 +65,7 @@ impl Config {
                 device_id,
                 device_name,
                 trusted_devices: HashMap::new(),
+                remote_desktop_restore_tokens: HashMap::new(),
             }
         };
 
@@ -169,6 +176,28 @@ impl Config {
 
     pub fn untrust_device(&mut self, device_id: &str) -> Result<(), String> {
         self.stored.trusted_devices.remove(device_id);
+        self.stored.remote_desktop_restore_tokens.remove(device_id);
+        self.save()
+    }
+
+    pub fn remote_desktop_restore_token(&self, device_id: &str) -> Option<String> {
+        self.stored.remote_desktop_restore_tokens.get(device_id).cloned()
+    }
+
+    pub fn set_remote_desktop_restore_token(
+        &mut self,
+        device_id: impl Into<String>,
+        token: Option<String>,
+    ) -> Result<(), String> {
+        let device_id = device_id.into();
+        match token.filter(|value| !value.is_empty()) {
+            Some(token) => {
+                self.stored.remote_desktop_restore_tokens.insert(device_id, token);
+            }
+            None => {
+                self.stored.remote_desktop_restore_tokens.remove(&device_id);
+            }
+        }
         self.save()
     }
 }
