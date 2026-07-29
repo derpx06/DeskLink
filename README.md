@@ -10,8 +10,10 @@ protocol v8; it is not advertised or transmitted by the active path.
 
 Current support: same-LAN discovery and direct encrypted communication.
 
-Not yet implemented: Internet relay, WebRTC, Wi-Fi Direct, remote shell,
-phone-to-desktop screen capture, and a shared virtual library.
+WebRTC transport groundwork is present but is not enabled by default until
+same-LAN negotiation, authentication, recovery, and physical-device gates
+pass. Internet relay, Wi-Fi Direct, remote shell, phone-to-desktop screen
+capture, and a shared virtual library are not implemented.
 
 ## Implemented features
 

@@ -61,6 +61,7 @@ pub const PACKET_TYPE_TELEPHONY_REQUEST: &str = "desklink.telephony.request";
 pub const PACKET_TYPE_TELEPHONY: &str = "desklink.telephony";
 pub const PACKET_TYPE_TELEPHONY_REQUEST_MUTE: &str = "desklink.telephony.request_mute";
 pub const PACKET_TYPE_CONNECTIVITY_REPORT: &str = "desklink.connectivity_report";
+pub const PACKET_TYPE_WEBRTC_SIGNAL_V1: &str = "desklink.webrtc.signal.v1";
 
 /// Every packet that can be accepted before a device is trusted.
 pub const PRE_PAIRING_PACKET_TYPES: &[&str] = &[PACKET_TYPE_PAIR];

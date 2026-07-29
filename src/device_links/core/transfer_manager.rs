@@ -217,6 +217,24 @@ impl TransferCheckpointStore {
         }
     }
 
+    pub fn list(&self) -> Result<Vec<TransferCheckpoint>, String> {
+        let mut checkpoints = Vec::new();
+        for entry in fs::read_dir(&self.directory).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path).map_err(|error| error.to_string())?;
+            let checkpoint: TransferCheckpoint = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("Invalid transfer checkpoint {path:?}: {error}"))?;
+            checkpoint.validate()?;
+            checkpoints.push(checkpoint);
+        }
+        checkpoints.sort_by(|left, right| left.transfer_id.cmp(&right.transfer_id));
+        Ok(checkpoints)
+    }
+
     pub fn mark_cancelled(&self, transfer_id: &str) -> Result<Option<TransferSnapshot>, String> {
         let Some(mut checkpoint) = self.load(transfer_id)? else {
             return Ok(None);
@@ -377,6 +395,7 @@ mod tests {
 
         let actual = store.load("transfer-1").unwrap().unwrap();
         assert_eq!(actual, expected);
+        assert_eq!(store.list().unwrap(), vec![expected.clone()]);
         assert!(store.path_for("../escape").is_err());
         store.remove("transfer-1").unwrap();
         assert!(store.load("transfer-1").unwrap().is_none());
