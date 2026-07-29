@@ -121,6 +121,13 @@ pub(super) fn packet_read_loop(
                     continue;
                 };
 
+                if packet.packet_type == PACKET_TYPE_WEBRTC_SIGNAL_V1 {
+                    eprintln!(
+                        "[DL-WRTC-BOOT] received signed bootstrap signal from {}",
+                        device_id
+                    );
+                }
+
                 if !sessions.is_current(&binding) {
                     break;
                 }

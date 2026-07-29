@@ -18,6 +18,7 @@ use crate::device_links::config::Config;
 use crate::device_links::core::{DeviceManager, FeatureTransportSnapshot, SessionBinding};
 use crate::device_links::daemon::network::send_packet;
 use crate::device_links::device::DeviceView;
+use crate::device_links::features::{initial_webrtc_capabilities, is_initial_webrtc_feature};
 use crate::device_links::packet::NetworkPacket;
 
 use super::file_protocol::{FileControl, FILE_CHUNK_MESSAGE_TYPE, FILE_CONTROL_MESSAGE_TYPE};
@@ -95,6 +96,10 @@ pub(crate) fn handle_signaling_packet(
         return Err("Stale DeskLink session rejected WebRTC signaling".to_string());
     }
     let message = WebRtcSignalingMessage::from_network_packet(packet)?;
+    eprintln!(
+        "[DL-WRTC-BOOT] handling {:?} from {}",
+        message.message_type, message.from_device_id
+    );
     let local_device_id = config
         .lock()
         .map_err(|_| "DeskLink configuration lock poisoned".to_string())?
@@ -119,15 +124,26 @@ pub(crate) fn handle_signaling_packet(
                     "Rejected unexpected DeskLink WebRTC offer from non-initiator".to_string(),
                 );
             }
-            install_responder(
-                binding.clone(),
-                message.session_attempt_id.clone(),
-                &local_device_id,
-                &message.from_device_id,
-                Arc::clone(&sessions),
-                Arc::clone(&config),
-                Arc::clone(&devices),
-            )?
+            match offer_attempt_disposition(
+                sessions
+                    .active_webrtc_attempt(binding)
+                    .map_err(|error| error.to_string())?
+                    .as_deref(),
+                &message.session_attempt_id,
+            )? {
+                OfferAttemptDisposition::ReuseCurrent => sessions
+                    .active_webrtc_peer(binding, &message.session_attempt_id)
+                    .map_err(|error| error.to_string())?,
+                OfferAttemptDisposition::InstallNew => install_responder(
+                    binding.clone(),
+                    message.session_attempt_id.clone(),
+                    &local_device_id,
+                    &message.from_device_id,
+                    Arc::clone(&sessions),
+                    Arc::clone(&config),
+                    Arc::clone(&devices),
+                )?,
+            }
         }
         _ => sessions
             .active_webrtc_peer(binding, &message.session_attempt_id)
@@ -203,6 +219,12 @@ pub(crate) fn send_feature_packet(
             "DeskLink WebRTC feature transport is not ready; paired features are not sent over LAN"
                 .to_string(),
         );
+    }
+    if !is_initial_webrtc_feature(&packet.packet_type) {
+        return Err(format!(
+            "{} is not enabled in the initial DeskLink WebRTC feature profile",
+            packet.packet_type
+        ));
     }
     let peer = transport
         .web_rtc_peer
@@ -806,8 +828,8 @@ fn send_capabilities(
         wire,
         now_millis(),
     );
-    message.incoming_capabilities = feature_capabilities(&info.incoming_capabilities);
-    message.outgoing_capabilities = feature_capabilities(&info.outgoing_capabilities);
+    message.incoming_capabilities = initial_webrtc_capabilities(&info.incoming_capabilities);
+    message.outgoing_capabilities = initial_webrtc_capabilities(&info.outgoing_capabilities);
     send_control(binding, attempt_id, wire, message, sessions)?;
     sessions.with_webrtc_handover(binding, attempt_id, |handover| {
         handover.mark_local_capabilities_confirmed()
@@ -898,28 +920,19 @@ fn verify_remote_capabilities(
     binding: &SessionBinding,
     message: &HandoverControlMessage,
 ) -> Result<(), String> {
-    let expected_incoming = feature_capabilities(&binding.link.info.incoming_capabilities);
-    let expected_outgoing = feature_capabilities(&binding.link.info.outgoing_capabilities);
-    if feature_capabilities(&message.incoming_capabilities) != expected_incoming {
+    let expected_incoming = initial_webrtc_capabilities(&binding.link.info.incoming_capabilities);
+    let expected_outgoing = initial_webrtc_capabilities(&binding.link.info.outgoing_capabilities);
+    if initial_webrtc_capabilities(&message.incoming_capabilities) != expected_incoming
+        || message.incoming_capabilities != expected_incoming
+    {
         return Err("WebRTC incoming capabilities do not match the paired identity".to_string());
     }
-    if feature_capabilities(&message.outgoing_capabilities) != expected_outgoing {
+    if initial_webrtc_capabilities(&message.outgoing_capabilities) != expected_outgoing
+        || message.outgoing_capabilities != expected_outgoing
+    {
         return Err("WebRTC outgoing capabilities do not match the paired identity".to_string());
     }
     Ok(())
-}
-
-fn feature_capabilities(capabilities: &[String]) -> Vec<String> {
-    let mut result: Vec<_> = capabilities
-        .iter()
-        .filter(|capability| {
-            capability.as_str() != crate::device_links::packet::PACKET_TYPE_WEBRTC_SIGNAL_V1
-        })
-        .cloned()
-        .collect();
-    result.sort();
-    result.dedup();
-    result
 }
 
 fn required_nonce(value: Option<&str>, label: &str) -> Result<String, String> {
@@ -927,6 +940,30 @@ fn required_nonce(value: Option<&str>, label: &str) -> Result<String, String> {
         .filter(|value| !value.is_empty() && value.len() <= 256)
         .map(ToString::to_string)
         .ok_or_else(|| format!("DeskLink WebRTC handover has no valid {label}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OfferAttemptDisposition {
+    InstallNew,
+    ReuseCurrent,
+}
+
+/// A random attempt ID has no trustworthy chronological ordering.  Once a
+/// generation owns an offer, a different offer can only be a delayed/stale
+/// record; a socket replacement creates a new session generation before a
+/// legitimate restart is accepted.
+fn offer_attempt_disposition(
+    active_attempt: Option<&str>,
+    received_attempt: &str,
+) -> Result<OfferAttemptDisposition, String> {
+    if received_attempt.is_empty() {
+        return Err("DeskLink WebRTC offer has no attempt identifier".to_string());
+    }
+    match active_attempt {
+        None => Ok(OfferAttemptDisposition::InstallNew),
+        Some(active) if active == received_attempt => Ok(OfferAttemptDisposition::ReuseCurrent),
+        Some(_) => Err("Rejected stale DeskLink WebRTC offer for a replaced attempt".to_string()),
+    }
 }
 
 fn sha256_hex(value: &str) -> String {
@@ -967,6 +1004,7 @@ fn send_signed_signal(
         .sign(config.key())?
         .to_network_packet()
     };
+    eprintln!("[DL-WRTC-BOOT] sending {:?} bootstrap signal", message_type);
     send_packet(binding.link.stream()?, &packet)
 }
 
@@ -987,4 +1025,18 @@ fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{offer_attempt_disposition, OfferAttemptDisposition};
+
+    #[test]
+    fn stale_offer_cannot_replace_the_current_attempt() {
+        assert_eq!(
+            offer_attempt_disposition(Some("current"), "current").unwrap(),
+            OfferAttemptDisposition::ReuseCurrent
+        );
+        assert!(offer_attempt_disposition(Some("current"), "delayed").is_err());
+    }
 }

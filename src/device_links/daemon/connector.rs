@@ -32,6 +32,7 @@ pub(super) fn incoming_tcp_loop(
                 let errors = Arc::clone(&errors);
                 thread::spawn(move || {
                     if let Err(error) = accept_incoming_device(stream, config, devices, sessions) {
+                        eprintln!("[DL-WRTC-BOOT] incoming bootstrap connection rejected: {error}");
                         push_error(&errors, error);
                     }
                 });

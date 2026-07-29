@@ -329,7 +329,11 @@ fn install_webrtcbin_callbacks(
     });
 
     let state_events = events.clone();
-    webrtcbin.connect_notify_local(Some("connection-state"), move |element, _| {
+    // `webrtcbin` emits state changes from its streaming/GLib worker.  The
+    // `_local` variant wraps this closure in a ThreadGuard and aborts the
+    // process when that worker invokes it.  The event sender is Send + Sync,
+    // so use the cross-thread signal connection and forward only a string.
+    webrtcbin.connect_notify(Some("connection-state"), move |element, _| {
         let state = element.property_value("connection-state");
         let _ = state_events.send(PeerEvent::ConnectionChanged(format!("{state:?}")));
     });
@@ -435,11 +439,12 @@ fn request_local_description(
     }
     let webrtcbin_for_reply = webrtcbin.clone();
     let events_for_reply = events.clone();
+    let description_field = local_description_promise_field(message_type)?;
     let promise = gst::Promise::with_change_func(move |reply| {
         let description = reply
             .ok()
             .and_then(|reply| reply)
-            .and_then(|reply| reply.value("offer").ok())
+            .and_then(|reply| reply.value(description_field).ok())
             .and_then(|value| value.get::<WebRTCSessionDescription>().ok());
         let Some(description) = description else {
             let _ = events_for_reply.send(PeerEvent::Error(
@@ -482,6 +487,19 @@ fn request_local_description(
     Ok(())
 }
 
+/// GStreamer exposes a different reply field for `create-offer` and
+/// `create-answer`. Reading `offer` for both silently loses every responder
+/// answer and leaves the paired feature transport permanently gated.
+fn local_description_promise_field(
+    message_type: SignalingMessageType,
+) -> Result<&'static str, String> {
+    match message_type {
+        SignalingMessageType::Offer => Ok("offer"),
+        SignalingMessageType::Answer => Ok("answer"),
+        _ => Err("Invalid local DeskLink WebRTC description type".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
@@ -506,5 +524,13 @@ mod tests {
         assert!(validate_file_data(&[1]).is_ok());
         assert!(validate_file_data(&[]).is_err());
         assert!(validate_file_data(&vec![0; MAX_ENVELOPE_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn answer_creation_reads_the_answer_promise_field() {
+        assert_eq!(
+            local_description_promise_field(SignalingMessageType::Answer).unwrap(),
+            "answer"
+        );
     }
 }

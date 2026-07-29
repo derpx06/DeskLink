@@ -375,6 +375,16 @@ impl DeviceManager {
         })?
     }
 
+    /// Returns the signed attempt currently associated with this transport
+    /// generation.  Bootstrap SDP/ICE messages must never replace it merely
+    /// because they arrived later on a retried TLS socket.
+    pub fn active_webrtc_attempt(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<Option<String>, SessionError> {
+        self.with_session(binding, |session| Ok(session.webrtc_attempt_id.clone()))?
+    }
+
     /// Reads the handover state from the session owner. A false value is a
     /// deliberate safe default: LAN feature traffic remains available only
     /// until both peers have completed their authenticated handover.

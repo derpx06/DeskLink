@@ -1,12 +1,30 @@
 use crate::device_links::packet::{
-    PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
-    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST,
-    PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_REPLY,
-    PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND,
-    PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP, PACKET_TYPE_SFTP_REQUEST,
-    PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
-    PACKET_TYPE_WEBRTC_SIGNAL_V1,
+    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
+
+/// The first production WebRTC profile is deliberately small.  A capability
+/// must not be advertised merely because an old LAN handler exists: paired
+/// features have no LAN fallback, so only features proven on the authenticated
+/// WebRTC path may be offered here.
+const INITIAL_WEBRTC_FEATURES: [&str; 2] = [PACKET_TYPE_PING, PACKET_TYPE_FINDMYPHONE_REQUEST];
+
+pub(crate) fn is_initial_webrtc_feature(packet_type: &str) -> bool {
+    INITIAL_WEBRTC_FEATURES.contains(&packet_type)
+}
+
+/// Returns the enabled WebRTC subset of an authenticated identity capability
+/// list.  The identity may describe future or legacy features, but the
+/// handover must activate only the profile that both applications implement.
+pub(crate) fn initial_webrtc_capabilities(capabilities: &[String]) -> Vec<String> {
+    let mut result: Vec<_> = capabilities
+        .iter()
+        .filter(|capability| is_initial_webrtc_feature(capability))
+        .cloned()
+        .collect();
+    result.sort();
+    result.dedup();
+    result
+}
 
 /// The capability contract for the desktop feature layer.  A packet is listed
 /// only when the current desktop process has a handler that can consume it or
@@ -23,31 +41,12 @@ impl FeatureRegistry {
         Self {
             incoming: capabilities(&[
                 PACKET_TYPE_PING,
-                PACKET_TYPE_BATTERY,
-                PACKET_TYPE_CLIPBOARD,
-                PACKET_TYPE_CLIPBOARD_CONNECT,
-                PACKET_TYPE_SHARE_REQUEST,
-                PACKET_TYPE_MPRIS,
-                PACKET_TYPE_NOTIFICATION,
-                PACKET_TYPE_NOTIFICATION_REQUEST,
-                PACKET_TYPE_SYSTEMVOLUME,
-                PACKET_TYPE_RUNCOMMAND,
-                PACKET_TYPE_SFTP,
                 PACKET_TYPE_FINDMYPHONE_REQUEST,
                 PACKET_TYPE_WEBRTC_SIGNAL_V1,
             ]),
             outgoing: capabilities(&[
                 PACKET_TYPE_PING,
-                PACKET_TYPE_CLIPBOARD,
-                PACKET_TYPE_SHARE_REQUEST,
                 PACKET_TYPE_FINDMYPHONE_REQUEST,
-                PACKET_TYPE_MPRIS_REQUEST,
-                PACKET_TYPE_SFTP_REQUEST,
-                PACKET_TYPE_NOTIFICATION_REQUEST,
-                PACKET_TYPE_NOTIFICATION_REPLY,
-                PACKET_TYPE_NOTIFICATION_ACTION,
-                PACKET_TYPE_SYSTEMVOLUME_REQUEST,
-                PACKET_TYPE_RUNCOMMAND_REQUEST,
                 PACKET_TYPE_WEBRTC_SIGNAL_V1,
             ]),
         }
@@ -92,5 +91,18 @@ mod tests {
         incoming.sort();
         incoming.dedup();
         assert_eq!(incoming, registry.incoming_capabilities());
+    }
+
+    #[test]
+    fn initial_webrtc_profile_advertises_only_ping_and_find_phone() {
+        let registry = FeatureRegistry::desktop();
+        let expected = vec![
+            "desklink.findmyphone.request".to_string(),
+            "desklink.ping".to_string(),
+            "desklink.webrtc.signal.v1".to_string(),
+        ];
+
+        assert_eq!(registry.incoming_capabilities(), expected);
+        assert_eq!(registry.outgoing_capabilities(), expected);
     }
 }
