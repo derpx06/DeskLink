@@ -6,7 +6,6 @@ use std::time::Instant;
 use crate::device_links::pairing::PairingHandler;
 use crate::device_links::webrtc::transfer_manager::WebRtcTransferManager;
 use crate::device_links::webrtc::{DesktopWebRtcPeer, HandoverRuntime};
-use crate::device_links::webrtc::RemoteSession;
 
 use super::SessionLink;
 
@@ -46,9 +45,6 @@ pub struct DeviceSession {
     pub seen_webrtc_request_ids: HashSet<String>,
     /// Bounded idempotency cache for authenticated data-channel envelopes.
     pub seen_webrtc_message_ids: HashSet<String>,
-    /// Remote view/control state belongs to the same generation as the peer.
-    /// A replacement peer gets a fresh manager and cannot reuse an old lease.
-    pub remote_session: RemoteSession,
     pub cancellation: Arc<AtomicBool>,
     pub connected_at: Option<Instant>,
     pub last_disconnect_reason: Option<String>,

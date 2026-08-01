@@ -58,43 +58,18 @@ struct SendCheckpoint {
 }
 
 impl SendCheckpoint {
-    /// The durable identity for a resumable transfer.  A new authenticated
-    /// WebRTC connection deliberately has a different session/generation, so
-    /// those values cannot be used to decide whether its checkpoint belongs
-    /// to the same paired peer.
-    fn peer_matches(&self, wire: &WebRtcWireBinding) -> bool {
-        self.device_id == wire.peer_device_id
-    }
-
     fn wire_matches(&self, wire: &WebRtcWireBinding) -> bool {
-        self.peer_matches(wire)
+        self.device_id == wire.peer_device_id
             && self.session_id == wire.session_id
             && self.generation == wire.generation
-    }
-
-    fn rebind(&mut self, wire: &WebRtcWireBinding) {
-        self.session_id = wire.session_id;
-        self.generation = wire.generation;
-        // An acknowledgement for a chunk from the previous connection must
-        // never be accepted on the replacement peer.
-        self.awaiting_offset = None;
     }
 }
 
 impl ReceiveCheckpoint {
-    fn peer_matches(&self, wire: &WebRtcWireBinding) -> bool {
-        self.device_id == wire.peer_device_id
-    }
-
     fn wire_matches(&self, wire: &WebRtcWireBinding) -> bool {
-        self.peer_matches(wire)
+        self.device_id == wire.peer_device_id
             && self.session_id == wire.session_id
             && self.generation == wire.generation
-    }
-
-    fn rebind(&mut self, wire: &WebRtcWireBinding) {
-        self.session_id = wire.session_id;
-        self.generation = wire.generation;
     }
 }
 
@@ -200,90 +175,6 @@ impl WebRtcTransferManager {
             &checkpoint,
             0,
         ))])
-    }
-
-    /// Re-advertises durable outgoing transfers after a replacement WebRTC
-    /// peer reaches authenticated `feature-ready`.  The receiver chooses the
-    /// last verified offset in its `Accept`, so this never retransmits an
-    /// unverified offset merely because the network connection changed.
-    ///
-    /// Checkpoints are re-bound only after the coordinator has authenticated
-    /// the new peer.  Chunks and acknowledgements still require an exact
-    /// current wire binding, which prevents a stale data channel from
-    /// continuing a transfer after peer replacement.
-    pub fn resume_sends(
-        &self,
-        wire: &WebRtcWireBinding,
-    ) -> Result<Vec<TransferEvent>, String> {
-        let entries = fs::read_dir(&self.state_root)
-            .map_err(|error| format!("Could not inspect DeskLink transfer state: {error}"))?;
-        let mut events = Vec::new();
-
-        for entry in entries {
-            let entry = entry
-                .map_err(|error| format!("Could not inspect DeskLink transfer state: {error}"))?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let Some(transfer_id) = name
-                .strip_prefix(".desklink-")
-                .and_then(|value| value.strip_suffix(".send.json"))
-            else {
-                continue;
-            };
-            // Treat persisted state as input too: never construct paths from
-            // an unchecked checkpoint name.
-            let checkpoint_path = self.send_checkpoint_path(transfer_id)?;
-            ensure_regular_file(&checkpoint_path)?;
-            let Some(mut checkpoint) = self.load_send_checkpoint(transfer_id)? else {
-                continue;
-            };
-            if !checkpoint.peer_matches(wire) {
-                continue;
-            }
-            if self
-                .outgoing
-                .lock()
-                .map_err(|_| "DeskLink transfer manager lock poisoned".to_string())?
-                .contains_key(&checkpoint.transfer_id)
-            {
-                continue;
-            }
-
-            let source = self.checked_state_path(&checkpoint.source_name)?;
-            ensure_regular_file(&source)?;
-            if fs::metadata(&source)
-                .map_err(|error| format!("Could not inspect DeskLink transfer snapshot: {error}"))?
-                .len()
-                != checkpoint.total_size
-            {
-                return Err(format!(
-                    "DeskLink transfer snapshot no longer matches checkpoint {}",
-                    checkpoint.transfer_id
-                ));
-            }
-            // Do not re-hash a multi-gigabyte local snapshot on the WebRTC
-            // control worker during every reconnect.  The snapshot is
-            // DeskLink-owned state and the receiver still verifies the
-            // checkpoint's SHA-256 before atomically publishing anything.
-            // A changed local source can therefore cause only a visible
-            // failed transfer, never a corrupted completed download.
-
-            checkpoint.rebind(wire);
-            self.save_send_checkpoint(&checkpoint)?;
-            self.outgoing
-                .lock()
-                .map_err(|_| "DeskLink transfer manager lock poisoned".to_string())?
-                .insert(checkpoint.transfer_id.clone(), checkpoint.clone());
-            events.push(TransferEvent::SendControl(self.send_control(
-                wire,
-                FileAction::Offer,
-                &checkpoint,
-                0,
-            )));
-        }
-
-        Ok(events)
     }
 
     /// Processes an authenticated file-control envelope.  Returned events
@@ -423,7 +314,7 @@ impl WebRtcTransferManager {
             .ok_or_else(|| "DeskLink WebRTC file offer has no checksum".to_string())?;
         let checkpoint = match self.load_checkpoint(&message.transfer_id)? {
             Some(existing) => {
-                if !existing.peer_matches(wire)
+                if !existing.wire_matches(wire)
                     || existing.token != message.transfer_token
                     || existing.filename != filename
                     || existing.total_size != total_size
@@ -444,11 +335,7 @@ impl WebRtcTransferManager {
                         "DeskLink incoming partial file does not match its checkpoint".to_string(),
                     );
                 }
-                let mut resumed = existing;
-                // Only a matching, authenticated offer may move a durable
-                // partial file to the new WebRTC connection generation.
-                resumed.rebind(wire);
-                resumed
+                existing
             }
             None => {
                 let part_name = format!(".desklink-{}.part", message.transfer_id);

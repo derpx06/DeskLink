@@ -4,11 +4,8 @@ pub(crate) mod coordinator;
 pub(crate) mod file_protocol;
 mod handover;
 mod peer_connection;
-pub(crate) mod portal;
-pub(crate) mod remote_session;
 mod signaling;
 pub(crate) mod transfer_manager;
-pub(crate) mod video_receive;
 
 #[allow(unused_imports)]
 pub use handover::{
@@ -17,11 +14,6 @@ pub use handover::{
 };
 #[allow(unused_imports)]
 pub use peer_connection::{DesktopWebRtcPeer, PeerEvent};
-pub use remote_session::{
-    RemoteControlLease, RemoteSession, RemoteSessionControlKind, RemoteSessionControlMessage,
-    RemoteSessionState, ScreenDirection, INPUT_SEQUENCE_FIELD, LEASE_ID_FIELD,
-    REMOTE_SESSION_ID_FIELD, REMOTE_SESSION_MESSAGE_TYPE,
-};
 #[allow(unused_imports)]
 pub use signaling::{SignalingMessageType, WebRtcSignalingMessage};
 

@@ -11,13 +11,7 @@ use crate::device_links::packet::{
     PACKET_TYPE_SYSTEMVOLUME_REQUEST,
 };
 use crate::device_links::pairing::PairState;
-use crate::device_links::webrtc::{
-    coordinator::{
-        request_remote_control, request_remote_view, send_feature_packet, send_remote_input_packet,
-        stop_remote_session,
-    },
-    ScreenDirection,
-};
+use crate::device_links::webrtc::coordinator::send_feature_packet;
 
 #[derive(Debug, Clone)]
 pub enum DaemonCommand {
@@ -28,9 +22,6 @@ pub enum DaemonCommand {
     Unpair(String),
     SendPing(String),
     SendMousepadRequest(String, serde_json::Map<String, serde_json::Value>),
-    RequestRemoteView(String, ScreenDirection),
-    RequestRemoteControl(String),
-    StopRemoteSession(String),
     SendFile(String, std::path::PathBuf),
     SendShareText(String, String),
     SendLockRequest(String, bool),
@@ -73,11 +64,6 @@ impl DaemonWorker {
             DaemonCommand::SendMousepadRequest(id, payload) => {
                 self.send_mousepad_request(&id, payload)
             }
-            DaemonCommand::RequestRemoteView(id, direction) => {
-                self.request_remote_view(&id, direction)
-            }
-            DaemonCommand::RequestRemoteControl(id) => self.request_remote_control(&id),
-            DaemonCommand::StopRemoteSession(id) => self.stop_remote_session(&id),
             DaemonCommand::SendFile(id, path) => self.send_file(&id, path),
             DaemonCommand::SendShareText(id, text) => self.send_share_text(&id, &text),
             DaemonCommand::SendLockRequest(id, lock) => self.send_lock_request(&id, lock),
@@ -185,25 +171,7 @@ impl DaemonWorker {
     ) {
         self.with_feature_transport(device_id, |transport| {
             let packet = NetworkPacket::with_body(PACKET_TYPE_MOUSEPAD_REQUEST, payload);
-            send_remote_input_packet(&self.sessions, transport, &packet)
-        });
-    }
-
-    fn request_remote_view(&self, device_id: &str, direction: ScreenDirection) {
-        self.with_feature_transport(device_id, |transport| {
-            request_remote_view(&self.sessions, transport, direction)
-        });
-    }
-
-    fn request_remote_control(&self, device_id: &str) {
-        self.with_feature_transport(device_id, |transport| {
-            request_remote_control(&self.sessions, transport)
-        });
-    }
-
-    fn stop_remote_session(&self, device_id: &str) {
-        self.with_feature_transport(device_id, |transport| {
-            stop_remote_session(&self.sessions, transport)
+            send_feature_packet(&self.sessions, transport, &packet)
         });
     }
 

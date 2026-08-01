@@ -525,7 +525,6 @@ mod tests {
         assert!(validate_file_data(&[]).is_err());
         assert!(validate_file_data(&vec![0; MAX_ENVELOPE_BYTES + 1]).is_err());
     }
-
     #[test]
     fn answer_creation_reads_the_answer_promise_field() {
         assert_eq!(
