@@ -116,7 +116,7 @@ mod tests {
         assert!(local
             .incoming_capabilities
             .contains(&PACKET_TYPE_PING.to_string()));
-        assert!(local
+        assert!(!local
             .incoming_capabilities
             .contains(&"desklink.mousepad.request".to_string()));
         assert!(!local

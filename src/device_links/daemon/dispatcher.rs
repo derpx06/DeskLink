@@ -153,7 +153,8 @@ impl SharedPacketDispatcher {
 mod tests {
     use crate::device_links::core::{DeviceManager, SessionLink};
     use crate::device_links::packet::{
-        NetworkPacket, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_PAIR, PACKET_TYPE_PING,
+        NetworkPacket, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_PAIR,
+        PACKET_TYPE_PING,
     };
     use crate::device_links::webrtc::{HandoverRuntime, WebRtcWireBinding};
 
@@ -271,13 +272,13 @@ mod tests {
         );
         assert_eq!(
             SharedPacketDispatcher::authorize(
-            PacketSource::WebRtc,
-            &binding,
-            &manager,
-            &local(),
-            &packet,
-        )
-        .unwrap_err(),
+                PacketSource::WebRtc,
+                &binding,
+                &manager,
+                &local(),
+                &packet,
+            )
+            .unwrap_err(),
             DispatchError::FeatureNotEnabled
         );
     }
@@ -308,6 +309,46 @@ mod tests {
             &NetworkPacket::new(PACKET_TYPE_PING),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn allows_find_phone_only_over_webrtc_after_handover() {
+        let manager = DeviceManager::new();
+        let binding = paired_binding(&manager, vec![PACKET_TYPE_FINDMYPHONE_REQUEST.to_string()]);
+        manager
+            .with_session(&binding, |session| {
+                let wire = WebRtcWireBinding::from_attempt(
+                    "desktop",
+                    "phone",
+                    "01234567-89ab-cdef-0123-456789abcdef",
+                )
+                .unwrap();
+                let mut runtime = HandoverRuntime::new("attempt".to_string(), wire);
+                make_feature_ready(&mut runtime);
+                session.webrtc_handover = Some(runtime);
+            })
+            .unwrap();
+        let packet = NetworkPacket::new(PACKET_TYPE_FINDMYPHONE_REQUEST);
+
+        assert!(SharedPacketDispatcher::authorize(
+            PacketSource::WebRtc,
+            &binding,
+            &manager,
+            &local(),
+            &packet,
+        )
+        .is_ok());
+        assert_eq!(
+            SharedPacketDispatcher::authorize(
+                PacketSource::LanBootstrap,
+                &binding,
+                &manager,
+                &local(),
+                &packet,
+            )
+            .unwrap_err(),
+            DispatchError::FeatureOnLanAfterHandover
+        );
     }
 
     #[test]
