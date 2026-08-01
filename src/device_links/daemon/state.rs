@@ -393,7 +393,7 @@ pub(super) fn update_sftp_status(
     }
 }
 
-pub(crate) fn update_screen_frame(
+pub(super) fn update_screen_frame(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     device_id: &str,
     frame: ScreenFrame,

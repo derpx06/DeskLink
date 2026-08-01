@@ -27,12 +27,7 @@ use std::collections::HashMap;
 use crate::device_links::core::events::CoreEvent;
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::{DeviceNotification, DeviceStatus, DeviceView, VolumeSink};
-
-#[derive(Debug, Clone)]
-pub(crate) struct PhoneFileDialog {
-    window: adw::Window,
-    list: gtk::ListBox,
-}
+use crate::platform::sftp::SftpSession;
 
 mod imp {
     use super::*;
@@ -60,7 +55,7 @@ mod imp {
         pub notified_pair_requests: RefCell<HashSet<String>>,
         pub notified_remote_notifications: RefCell<HashSet<String>>,
         pub transfers: RefCell<HashMap<String, TransferProgress>>,
-        pub(crate) phone_file_dialogs: RefCell<HashMap<String, PhoneFileDialog>>,
+        pub sftp_sessions: RefCell<HashMap<String, SftpSession>>,
     }
 
     #[glib::object_subclass]
@@ -92,7 +87,7 @@ mod imp {
             let window = self.obj().downgrade();
             self.obj().connect_close_request(move |_| {
                 if let Some(window) = window.upgrade() {
-                    window.close_phone_file_dialogs();
+                    window.close_sftp_sessions();
                 }
                 glib::Propagation::Proceed
             });
@@ -149,14 +144,6 @@ impl DeskLinkWindow {
 
     fn handle_core_event(&self, event: CoreEvent) {
         match event {
-            CoreEvent::FeatureStateChanged {
-                device_id,
-                feature,
-                state,
-                details,
-            } if feature == "phone-files" => {
-                self.update_phone_file_dialog(&device_id, &state, &details);
-            }
             CoreEvent::DeviceChanged { .. }
             | CoreEvent::PairingChanged { .. }
             | CoreEvent::FeatureStateChanged { .. }
@@ -166,7 +153,7 @@ impl DeskLinkWindow {
                 state: crate::device_links::core::device_session::DeviceConnectionState::Unreachable,
                 ..
             } => {
-                self.close_phone_file_dialog(&device_id);
+                self.close_sftp_session(&device_id);
                 self.refresh_devices();
             }
             CoreEvent::ConnectionChanged { .. } => self.refresh_devices(),
@@ -372,200 +359,16 @@ impl DeskLinkWindow {
         }
     }
 
-    fn close_phone_file_dialog(&self, device_id: &str) {
-        if let Some(dialog) = self.imp().phone_file_dialogs.borrow_mut().remove(device_id) {
-            dialog.window.close();
+    fn close_sftp_session(&self, device_id: &str) {
+        if let Some(session) = self.imp().sftp_sessions.borrow_mut().remove(device_id) {
+            session.close();
         }
     }
 
-    fn close_phone_file_dialogs(&self) {
-        let dialogs: Vec<_> = self.imp().phone_file_dialogs.borrow_mut().drain().collect();
-        for (_, dialog) in dialogs {
-            dialog.window.close();
-        }
-    }
-
-    fn show_phone_file_dialog(&self, device_id: String, device_name: String) {
-        if let Some(existing) = self.imp().phone_file_dialogs.borrow().get(&device_id) {
-            existing.window.present();
-            return;
-        }
-        let window = adw::Window::builder()
-            .transient_for(self)
-            .modal(true)
-            .default_width(560)
-            .default_height(520)
-            .title(format!("Files on {device_name}"))
-            .build();
-        let toolbar = adw::ToolbarView::new();
-        let header = adw::HeaderBar::new();
-        let home = gtk::Button::builder()
-            .icon_name("go-home-symbolic")
-            .tooltip_text("Storage roots")
-            .build();
-        home.update_property(&[gtk::accessible::Property::Label("Show storage roots")]);
-        if let Some(daemon) = self.imp().daemon.borrow().clone() {
-            let id = device_id.clone();
-            home.connect_clicked(move |_| daemon.send(DaemonCommand::SendSftpRequest(id.clone())));
-        }
-        header.pack_start(&home);
-        toolbar.add_top_bar(&header);
-        let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
-            .margin_top(18)
-            .margin_bottom(18)
-            .margin_start(18)
-            .margin_end(18)
-            .build();
-        list.append(
-            &adw::ActionRow::builder()
-                .title("Loading phone storage…")
-                .subtitle("Waiting for the authenticated WebRTC file channel")
-                .build(),
-        );
-        let scrolled = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .child(&list)
-            .build();
-        toolbar.set_content(Some(&scrolled));
-        window.set_content(Some(&toolbar));
-
-        let weak = self.downgrade();
-        let closed_id = device_id.clone();
-        window.connect_close_request(move |_| {
-            if let Some(window) = weak.upgrade() {
-                window
-                    .imp()
-                    .phone_file_dialogs
-                    .borrow_mut()
-                    .remove(&closed_id);
-            }
-            glib::Propagation::Proceed
-        });
-        self.imp().phone_file_dialogs.borrow_mut().insert(
-            device_id,
-            PhoneFileDialog {
-                window: window.clone(),
-                list,
-            },
-        );
-        window.present();
-    }
-
-    fn update_phone_file_dialog(&self, device_id: &str, state: &str, details: &serde_json::Value) {
-        let dialogs = self.imp().phone_file_dialogs.borrow();
-        let Some(dialog) = dialogs.get(device_id) else {
-            return;
-        };
-        while let Some(child) = dialog.list.first_child() {
-            dialog.list.remove(&child);
-        }
-        if state == "Requesting" {
-            dialog.list.append(
-                &adw::ActionRow::builder()
-                    .title("Loading…")
-                    .subtitle("Requesting phone storage over WebRTC")
-                    .build(),
-            );
-            return;
-        }
-        if let Some(error) = details.get("error").and_then(serde_json::Value::as_str) {
-            dialog.list.append(
-                &adw::ActionRow::builder()
-                    .title("Could not browse phone files")
-                    .subtitle(error)
-                    .build(),
-            );
-            return;
-        }
-        let entries = details
-            .get("result")
-            .and_then(|result| result.get("entries"))
-            .and_then(serde_json::Value::as_array);
-        let Some(entries) = entries else {
-            dialog.list.append(
-                &adw::ActionRow::builder()
-                    .title("No files available")
-                    .subtitle("The phone returned no authorized storage entries")
-                    .build(),
-            );
-            return;
-        };
-        if entries.is_empty() {
-            dialog.list.append(
-                &adw::ActionRow::builder()
-                    .title("This folder is empty")
-                    .subtitle("No accessible entries were returned")
-                    .build(),
-            );
-        }
-        for entry in entries {
-            let Some(entry_id) = entry.get("entryId").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let name = entry
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("Unnamed");
-            let is_directory = entry
-                .get("directory")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            let size = entry
-                .get("size")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            let row = adw::ActionRow::builder()
-                .title(name)
-                .subtitle(if is_directory {
-                    "Folder".to_string()
-                } else {
-                    format!("{size} bytes")
-                })
-                .activatable(is_directory)
-                .build();
-            row.set_use_markup(false);
-            row.add_prefix(
-                &gtk::Image::builder()
-                    .icon_name(if is_directory {
-                        "folder-symbolic"
-                    } else {
-                        "text-x-generic-symbolic"
-                    })
-                    .build(),
-            );
-            if is_directory {
-                if let Some(daemon) = self.imp().daemon.borrow().clone() {
-                    let id = device_id.to_string();
-                    let entry_id = entry_id.to_string();
-                    row.connect_activated(move |_| {
-                        daemon.send(DaemonCommand::BrowsePhoneFiles(
-                            id.clone(),
-                            entry_id.clone(),
-                        ));
-                    });
-                }
-            } else if let Some(daemon) = self.imp().daemon.borrow().clone() {
-                let id = device_id.to_string();
-                let entry_id = entry_id.to_string();
-                let download = gtk::Button::builder()
-                    .icon_name("folder-download-symbolic")
-                    .tooltip_text("Download file")
-                    .valign(gtk::Align::Center)
-                    .build();
-                download
-                    .update_property(&[gtk::accessible::Property::Label("Download phone file")]);
-                download.connect_clicked(move |_| {
-                    daemon.send(DaemonCommand::DownloadPhoneFile(
-                        id.clone(),
-                        entry_id.clone(),
-                    ));
-                });
-                row.add_suffix(&download);
-            }
-            dialog.list.append(&row);
+    fn close_sftp_sessions(&self) {
+        let sessions: Vec<_> = self.imp().sftp_sessions.borrow_mut().drain().collect();
+        for (_, session) in sessions {
+            session.close();
         }
     }
 
@@ -1160,14 +963,11 @@ fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget 
         {
             let daemon = daemon.clone();
             let id = device.id.clone();
-            let device_name = device.name.clone();
+            let browsing_device = device.clone();
             move |btn| {
                 daemon.send(DaemonCommand::SendSftpRequest(id.clone()));
-                if let Some(root) = btn
-                    .ancestor(DeskLinkWindow::static_type())
-                    .and_downcast::<DeskLinkWindow>()
-                {
-                    root.show_phone_file_dialog(id.clone(), device_name.clone());
+                if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
+                    show_file_browsing_dialog(browsing_device.clone(), &root);
                 }
             }
         },
@@ -1922,6 +1722,107 @@ fn show_remote_commands_dialog(daemon: DaemonHandle, device: DeviceView, parent:
             row.add_suffix(&run);
             list.append(&row);
         }
+    }
+    toolbar.set_content(Some(&list));
+    window.set_content(Some(&toolbar));
+    window.present();
+}
+
+fn show_file_browsing_dialog(device: DeviceView, parent: &gtk::Window) {
+    let window = adw::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .default_width(520)
+        .default_height(340)
+        .title("Browse Files")
+        .build();
+    let sftp_session = std::rc::Rc::new(RefCell::new(None::<SftpSession>));
+    {
+        let sftp_session = sftp_session.clone();
+        window.connect_close_request(move |_| {
+            if let Some(session) = sftp_session.borrow_mut().take() {
+                session.close();
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .margin_top(18)
+        .margin_bottom(18)
+        .margin_start(18)
+        .margin_end(18)
+        .css_classes(["boxed-list"])
+        .build();
+    if let Some(sftp) = &device.sftp_status {
+        if let Some(error) = &sftp.error {
+            list.append(
+                &adw::ActionRow::builder()
+                    .title("SFTP Error")
+                    .subtitle(error)
+                    .build(),
+            );
+        } else {
+            let connection = adw::ActionRow::builder()
+                .title("Connection")
+                .subtitle(format!(
+                    "user {} · port {} · path {}",
+                    sftp.user.as_deref().unwrap_or("unknown"),
+                    sftp.port
+                        .map(|port| port.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    sftp.path.as_deref().unwrap_or("/")
+                ))
+                .build();
+            if let (Some(user), Some(port)) = (sftp.user.as_deref(), sftp.port) {
+                let host = device
+                    .address
+                    .rsplit_once(':')
+                    .map(|(host, _)| host)
+                    .unwrap_or(device.address.as_str());
+                let path = sftp.path.as_deref().unwrap_or("/");
+                let uri = format!("sftp://{}@{}:{}{}", user, host, port, path);
+                let parent = parent.clone();
+                let sftp_session = sftp_session.clone();
+                let open = gtk::Button::builder()
+                    .icon_name("folder-open-symbolic")
+                    .tooltip_text("Open in Files")
+                    .valign(gtk::Align::Center)
+                    .build();
+                open.update_property(&[gtk::accessible::Property::Label("Open remote files")]);
+                open.connect_clicked(
+                    move |_| match crate::platform::sftp::mount_and_open_session(&uri, &parent) {
+                        Ok(session) => {
+                            if let Some(previous) = sftp_session.borrow_mut().replace(session) {
+                                previous.close();
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("[DeskLink] Could not open remote files: {error}");
+                        }
+                    },
+                );
+                connection.add_suffix(&open);
+            }
+            list.append(&connection);
+            for (path, name) in &sftp.directories {
+                list.append(&adw::ActionRow::builder().title(name).subtitle(path).build());
+            }
+        }
+    } else {
+        list.append(
+            &gtk::Label::builder()
+                .label("File browsing request sent. Details appear after the device replies.")
+                .wrap(true)
+                .margin_top(24)
+                .margin_bottom(24)
+                .margin_start(16)
+                .margin_end(16)
+                .css_classes(["dimmed"])
+                .build(),
+        );
     }
     toolbar.set_content(Some(&list));
     window.set_content(Some(&toolbar));
