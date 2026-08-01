@@ -7,7 +7,7 @@ edition = "2021"
 arboard = "3.6.1"
 base64 = "0.22"
 dirs = "6"
-enigo = { version = "0.6.1", features = ["libei_smol", "wayland"] }
+enigo = "0.6.1"
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 gtk = { version = "0.9", package = "gtk4", features = ["gnome_47"] }
 hostname = "0.4"
@@ -16,12 +16,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 socket2 = "0.6"
 uuid = { version = "1", features = ["v4"] }
-mdns-sd = "0.20.2"
-zbus = { version = "5", default-features = false, features = ["blocking-api"] }
-ashpd = { version = "0.12.3", default-features = false, features = ["async-std"] }
-futures = "0.3"
-pipewire = "0.10"
-png = "0.17"
 
 [dependencies.gst]
 package = "gstreamer"

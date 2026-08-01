@@ -6,9 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::device_links::config::Config;
 use crate::device_links::packet::NetworkPacket;
-pub(super) use crate::protocol::desklink_v9::{MAX_TCP_PORT, MIN_TCP_PORT, UDP_PORT};
 
-pub(super) const MAX_PACKET_LINE_SIZE: usize = 32 * 1024 * 1024;
+const UDP_PORT: u16 = 1716;
+pub(super) const MIN_TCP_PORT: u16 = 1716;
+pub(super) const MAX_TCP_PORT: u16 = 1764;
 
 pub(super) fn bind_udp_listener() -> Result<UdpSocket, String> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
@@ -65,7 +66,7 @@ pub(super) fn read_ssl_packet(stream: &mut SslStream<TcpStream>) -> Result<Netwo
             }
             break;
         }
-        if line.len() > MAX_PACKET_LINE_SIZE {
+        if line.len() > 32 * 1024 * 1024 {
             return Err("Packet is too large".to_string());
         }
     }
@@ -84,12 +85,7 @@ pub(super) fn ssl_acceptor(config: &Arc<Mutex<Config>>) -> Result<SslAcceptor, S
     builder
         .set_private_key(config.key())
         .map_err(|err| err.to_string())?;
-    builder.set_verify_callback(
-        SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
-        |preverify_ok, context| {
-            preverify_ok || (context.error_depth() == 0 && context.error().as_raw() == 18)
-        },
-    );
+    builder.set_verify_callback(SslVerifyMode::PEER, |_preverify_ok, _ctx| true);
     Ok(builder.build())
 }
 
@@ -104,8 +100,6 @@ pub(super) fn ssl_connector(config: &Arc<Mutex<Config>>) -> Result<SslConnector,
     builder
         .set_private_key(config.key())
         .map_err(|err| err.to_string())?;
-    builder.set_verify_callback(SslVerifyMode::PEER, |preverify_ok, context| {
-        preverify_ok || (context.error_depth() == 0 && context.error().as_raw() == 18)
-    });
+    builder.set_verify_callback(SslVerifyMode::PEER, |_preverify_ok, _ctx| true);
     Ok(builder.build())
 }

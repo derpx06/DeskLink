@@ -76,15 +76,6 @@ pub struct SystemVolumeStatus {
     pub sinks: Vec<VolumeSink>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScreenFrame {
-    pub width: u32,
-    pub height: u32,
-    pub sequence: u64,
-    pub timestamp_millis: i64,
-    pub png: Vec<u8>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RemoteCommand {
     pub key: String,
@@ -97,38 +88,9 @@ pub struct SftpStatus {
     pub user: Option<String>,
     pub port: Option<i64>,
     pub path: Option<String>,
+    pub password: Option<String>,
     pub directories: Vec<(String, String)>,
     pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SmsMessage {
-    pub id: String,
-    pub thread_id: String,
-    pub address: String,
-    pub body: String,
-    pub timestamp: i64,
-    pub read: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ContactSummary {
-    pub uid: String,
-    pub name: String,
-    pub phones: Vec<String>,
-    pub emails: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct TelephonyStatus {
-    pub event: String,
-    pub phone_number: Option<String>,
-    pub contact_name: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ConnectivityStatus {
-    pub signal_strengths: Vec<(String, String, i64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,11 +110,6 @@ pub struct DeviceView {
     pub volume_status: Option<SystemVolumeStatus>,
     pub available_commands: Vec<RemoteCommand>,
     pub sftp_status: Option<SftpStatus>,
-    pub screen_frame: Option<ScreenFrame>,
-    pub sms_messages: Vec<SmsMessage>,
-    pub contacts: Vec<ContactSummary>,
-    pub telephony_status: Option<TelephonyStatus>,
-    pub connectivity_status: Option<ConnectivityStatus>,
 }
 
 impl DeviceView {
@@ -177,11 +134,6 @@ impl DeviceView {
             volume_status: None,
             available_commands: Vec::new(),
             sftp_status: None,
-            screen_frame: None,
-            sms_messages: Vec::new(),
-            contacts: Vec::new(),
-            telephony_status: None,
-            connectivity_status: None,
         }
     }
 
