@@ -1,12 +1,17 @@
 use crate::device_links::packet::{
-    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_WEBRTC_SIGNAL_V1,
+    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_SHARE_REQUEST,
+    PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
 
 /// The first production WebRTC profile is deliberately small.  A capability
 /// must not be advertised merely because an old LAN handler exists: paired
 /// features have no LAN fallback, so only features proven on the authenticated
 /// WebRTC path may be offered here.
-const INITIAL_WEBRTC_FEATURES: [&str; 2] = [PACKET_TYPE_PING, PACKET_TYPE_FINDMYPHONE_REQUEST];
+const INITIAL_WEBRTC_FEATURES: [&str; 3] = [
+    PACKET_TYPE_PING,
+    PACKET_TYPE_FINDMYPHONE_REQUEST,
+    PACKET_TYPE_SHARE_REQUEST,
+];
 
 pub(crate) fn is_initial_webrtc_feature(packet_type: &str) -> bool {
     INITIAL_WEBRTC_FEATURES.contains(&packet_type)
@@ -42,11 +47,13 @@ impl FeatureRegistry {
             incoming: capabilities(&[
                 PACKET_TYPE_PING,
                 PACKET_TYPE_FINDMYPHONE_REQUEST,
+                PACKET_TYPE_SHARE_REQUEST,
                 PACKET_TYPE_WEBRTC_SIGNAL_V1,
             ]),
             outgoing: capabilities(&[
                 PACKET_TYPE_PING,
                 PACKET_TYPE_FINDMYPHONE_REQUEST,
+                PACKET_TYPE_SHARE_REQUEST,
                 PACKET_TYPE_WEBRTC_SIGNAL_V1,
             ]),
         }
@@ -94,11 +101,12 @@ mod tests {
     }
 
     #[test]
-    fn initial_webrtc_profile_advertises_only_ping_and_find_phone() {
+    fn initial_webrtc_profile_advertises_file_sharing_with_ping_and_find_phone() {
         let registry = FeatureRegistry::desktop();
         let expected = vec![
             "desklink.findmyphone.request".to_string(),
             "desklink.ping".to_string(),
+            "desklink.share.request".to_string(),
             "desklink.webrtc.signal.v1".to_string(),
         ];
 
