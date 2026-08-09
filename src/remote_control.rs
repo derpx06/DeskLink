@@ -5,7 +5,6 @@ use gtk::glib;
 use serde_json::{Map, Value};
 use std::cell::Cell;
 use std::rc::Rc;
-use std::time::Duration;
 
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 
@@ -20,7 +19,7 @@ pub fn show_remote_control_dialog(
         .trackpad-box {
             background-color: alpha(@theme_bg_color, 0.4);
             border: 1px solid alpha(@theme_fg_color, 0.12);
-            border-radius: 12px;
+            border-radius: 16px;
             margin: 20px;
             transition: border-color 0.25s ease, background-color 0.25s ease;
         }
@@ -82,17 +81,10 @@ pub fn show_remote_control_dialog(
         .build();
 
     let status_label = gtk::Label::builder()
-        .label("Phone screen requested")
+        .label("⚪ Click trackpad to type directly")
         .css_classes(["status-pill"])
         .halign(gtk::Align::Center)
         .build();
-
-    let screen_picture = gtk::Picture::new();
-    screen_picture.set_hexpand(true);
-    screen_picture.set_vexpand(true);
-    screen_picture.set_can_shrink(true);
-    screen_picture.set_size_request(320, 180);
-    screen_picture.set_tooltip_text(Some("Live phone screen preview"));
 
     let trackpad_icon = gtk::Image::builder()
         .icon_name("input-touchpad-symbolic")
@@ -102,13 +94,12 @@ pub fn show_remote_control_dialog(
         .build();
 
     let label = gtk::Label::builder()
-        .label("<b>Phone Screen Preview</b>\n\nWaiting for live frames from the phone\nPointer input is mapped to the phone screen")
+        .label("<b>Virtual Trackpad</b>\n\nHover mouse here to move cursor\nClick / tap to select or right-click\nScroll to scroll page")
         .use_markup(true)
         .justify(gtk::Justification::Center)
         .halign(gtk::Align::Center)
         .build();
 
-    trackpad_vbox.append(&screen_picture);
     trackpad_vbox.append(&status_label);
     trackpad_vbox.append(&trackpad_icon);
     trackpad_vbox.append(&label);
@@ -117,58 +108,6 @@ pub fn show_remote_control_dialog(
     content_vbox.append(&trackpad_area);
 
     let device_id_rc = Rc::new(device_id);
-    daemon.send(DaemonCommand::SendScreenRequest(
-        device_id_rc.to_string(),
-        "phone-screen".to_string(),
-    ));
-
-    let daemon_clone = daemon.clone();
-    let id_clone = device_id_rc.clone();
-    window.connect_close_request(move |_| {
-        daemon_clone.send(DaemonCommand::SendScreenStop(id_clone.to_string()));
-        glib::Propagation::Proceed
-    });
-
-    // DeviceView owns the last authenticated frame.  Polling only this small
-    // preview keeps the existing daemon/UI boundary intact while avoiding a
-    // second screen decoder or a duplicate network session in the UI.
-    let screen_picture_weak = screen_picture.downgrade();
-    let status_weak = status_label.downgrade();
-    let window_weak = window.downgrade();
-    let daemon_frames = daemon.clone();
-    let frame_device_id = device_id_rc.clone();
-    let last_sequence = Rc::new(Cell::new(None::<u64>));
-    let last_sequence_clone = last_sequence.clone();
-    glib::timeout_add_local(Duration::from_millis(100), move || {
-        if window_weak.upgrade().is_none() {
-            return glib::ControlFlow::Break;
-        }
-        let Some(device) = daemon_frames
-            .devices()
-            .into_iter()
-            .find(|device| device.id == *frame_device_id)
-        else {
-            return glib::ControlFlow::Continue;
-        };
-        let Some(frame) = device.screen_frame else {
-            return glib::ControlFlow::Continue;
-        };
-        if last_sequence_clone.get() == Some(frame.sequence) {
-            return glib::ControlFlow::Continue;
-        }
-        let bytes = glib::Bytes::from(&frame.png);
-        if let Ok(texture) = gdk::Texture::from_bytes(&bytes) {
-            if let Some(picture) = screen_picture_weak.upgrade() {
-                picture.set_paintable(Some(&texture));
-            }
-            if let Some(status) = status_weak.upgrade() {
-                status.set_label("Live phone screen");
-                status.add_css_class("active");
-            }
-            last_sequence_clone.set(Some(frame.sequence));
-        }
-        glib::ControlFlow::Continue
-    });
 
     // 1. Mouse Movement (EventControllerMotion)
     let motion = gtk::EventControllerMotion::new();
@@ -187,7 +126,6 @@ pub fn show_remote_control_dialog(
 
     let lx = last_x.clone();
     let ly = last_y.clone();
-    let trackpad_weak = trackpad_area.downgrade();
     motion.connect_motion(move |_, x, y| {
         let delta_x = x - lx.get();
         let delta_y = y - ly.get();
@@ -196,22 +134,8 @@ pub fn show_remote_control_dialog(
 
         if delta_x.abs() > 0.0001 || delta_y.abs() > 0.0001 {
             let mut payload = Map::new();
-            if let Some(trackpad) = trackpad_weak.upgrade() {
-                if let Some((remote_x, remote_y)) = map_preview_position(
-                    x,
-                    y,
-                    trackpad.width(),
-                    trackpad.height(),
-                    DEFAULT_REMOTE_PHONE_WIDTH,
-                    DEFAULT_REMOTE_PHONE_HEIGHT,
-                ) {
-                    payload.insert("x".to_string(), Value::from(remote_x));
-                    payload.insert("y".to_string(), Value::from(remote_y));
-                } else {
-                    payload.insert("dx".to_string(), Value::from(delta_x));
-                    payload.insert("dy".to_string(), Value::from(delta_y));
-                }
-            }
+            payload.insert("dx".to_string(), Value::from(delta_x));
+            payload.insert("dy".to_string(), Value::from(delta_y));
             daemon_clone.send(DaemonCommand::SendMousepadRequest(
                 id_clone.to_string(),
                 payload,
@@ -226,27 +150,16 @@ pub fn show_remote_control_dialog(
     let daemon_clone = daemon.clone();
     let id_clone = device_id_rc.clone();
     let trackpad_weak = trackpad_area.downgrade();
-    click.connect_pressed(move |click, _, x, y| {
+    click.connect_pressed(move |click, _, _, _| {
         if let Some(trackpad) = trackpad_weak.upgrade() {
             trackpad.grab_focus();
-            let button = click.current_button();
-            if let Some(mut payload) = click_payload(button) {
-                if let Some((remote_x, remote_y)) = map_preview_position(
-                    x,
-                    y,
-                    trackpad.width(),
-                    trackpad.height(),
-                    DEFAULT_REMOTE_PHONE_WIDTH,
-                    DEFAULT_REMOTE_PHONE_HEIGHT,
-                ) {
-                    payload.insert("x".to_string(), Value::from(remote_x));
-                    payload.insert("y".to_string(), Value::from(remote_y));
-                }
-                daemon_clone.send(DaemonCommand::SendMousepadRequest(
-                    id_clone.to_string(),
-                    payload,
-                ));
-            }
+        }
+        let button = click.current_button();
+        if let Some(payload) = click_payload(button) {
+            daemon_clone.send(DaemonCommand::SendMousepadRequest(
+                id_clone.to_string(),
+                payload,
+            ));
         }
     });
 
@@ -316,7 +229,7 @@ pub fn show_remote_control_dialog(
     let status_weak = status_label.downgrade();
     focus_controller.connect_enter(move |_| {
         if let Some(status) = status_weak.upgrade() {
-            status.set_label("Keyboard input active");
+            status.set_label("🟢 Keyboard Input Active");
             status.add_css_class("active");
         }
     });
@@ -324,7 +237,7 @@ pub fn show_remote_control_dialog(
     let status_weak2 = status_label.downgrade();
     focus_controller.connect_leave(move |_| {
         if let Some(status) = status_weak2.upgrade() {
-            status.set_label("Click preview to type");
+            status.set_label("⚪ Click trackpad to type directly");
             status.remove_css_class("active");
         }
     });
@@ -443,30 +356,6 @@ fn click_payload(button: u32) -> Option<Map<String, Value>> {
     Some(payload)
 }
 
-const DEFAULT_REMOTE_PHONE_WIDTH: i32 = 1080;
-const DEFAULT_REMOTE_PHONE_HEIGHT: i32 = 2400;
-
-fn map_preview_position(
-    x: f64,
-    y: f64,
-    preview_width: i32,
-    preview_height: i32,
-    remote_width: i32,
-    remote_height: i32,
-) -> Option<(i32, i32)> {
-    if preview_width <= 0 || preview_height <= 0 || remote_width <= 0 || remote_height <= 0 {
-        return None;
-    }
-
-    let remote_x = ((x / f64::from(preview_width)) * f64::from(remote_width))
-        .round()
-        .clamp(0.0, f64::from(remote_width - 1)) as i32;
-    let remote_y = ((y / f64::from(preview_height)) * f64::from(remote_height))
-        .round()
-        .clamp(0.0, f64::from(remote_height - 1)) as i32;
-    Some((remote_x, remote_y))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,21 +379,5 @@ mod tests {
         payload_has_only_bool(click_payload(gdk::BUTTON_SECONDARY).unwrap(), "rightclick");
         payload_has_only_bool(click_payload(gdk::BUTTON_MIDDLE).unwrap(), "middleclick");
         assert!(click_payload(8).is_none());
-    }
-
-    #[test]
-    fn preview_position_maps_to_remote_screen_coordinates() {
-        assert_eq!(
-            map_preview_position(200.0, 400.0, 400, 800, 1080, 2400),
-            Some((540, 1200))
-        );
-    }
-
-    #[test]
-    fn preview_position_clamps_to_remote_screen_bounds() {
-        assert_eq!(
-            map_preview_position(999.0, -10.0, 400, 800, 1080, 2400),
-            Some((1079, 0))
-        );
     }
 }

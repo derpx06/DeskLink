@@ -2,12 +2,14 @@
 <interface>
   <requires lib="gtk" version="4.0"/>
   <requires lib="Adw" version="1.0"/>
-  <template class="DeskLinkWindow" parent="AdwApplicationWindow">
+  <template class="DesklinkWindow" parent="AdwApplicationWindow">
     <property name="title" translatable="yes">DeskLink</property>
     <property name="default-width">860</property>
     <property name="default-height">620</property>
     <property name="content">
-      <object class="AdwToolbarView">
+      <object class="AdwToastOverlay" id="toast_overlay">
+        <property name="child">
+          <object class="AdwToolbarView">
         <child type="top">
           <object class="AdwHeaderBar">
             <property name="title-widget">
@@ -15,15 +17,6 @@
                 <property name="title" translatable="yes">DeskLink</property>
               </object>
             </property>
-            <child type="end">
-              <object class="GtkButton" id="add_device_button">
-                <property name="icon-name">list-add-symbolic</property>
-                <property name="tooltip-text" translatable="yes">Discover &amp; Add Device</property>
-                <style>
-                  <class name="suggested-action"/>
-                </style>
-              </object>
-            </child>
             <child type="end">
               <object class="GtkMenuButton">
                 <property name="primary">True</property>
@@ -35,120 +28,147 @@
           </object>
         </child>
         <property name="content">
-          <object class="AdwToastOverlay" id="toast_overlay">
-            <property name="child">
-              <object class="GtkBox">
-            <property name="orientation">vertical</property>
-            <property name="spacing">0</property>
-            <!-- Error banner spans full width above content -->
-            <child>
-              <object class="AdwBanner" id="error_banner">
-                <property name="revealed">False</property>
-              </object>
-            </child>
-            <child>
-              <object class="GtkBox">
-                <property name="orientation">vertical</property>
-                <property name="spacing">20</property>
-                <property name="margin-start">24</property>
-                <property name="margin-end">24</property>
-                <property name="margin-top">24</property>
-                <property name="margin-bottom">24</property>
-                <!-- Page header row -->
-                <child>
-                  <object class="GtkBox">
-                    <property name="orientation">horizontal</property>
-                    <property name="spacing">0</property>
-                    <property name="valign">center</property>
-                    <child>
-                      <object class="GtkBox">
-                        <property name="orientation">vertical</property>
-                        <property name="spacing">4</property>
-                        <property name="hexpand">True</property>
-                        <child>
-                          <object class="GtkLabel">
-                            <property name="label" translatable="yes">My Devices</property>
-                            <property name="xalign">0</property>
-                            <style>
-                              <class name="title-1"/>
-                            </style>
+          <object class="AdwNavigationSplitView" id="split_view">
+            <property name="min-sidebar-width">240</property>
+            <property name="max-sidebar-width">340</property>
+            <property name="sidebar">
+              <object class="AdwNavigationPage">
+                <property name="title" translatable="yes">Devices</property>
+                <property name="child">
+                  <object class="AdwToolbarView">
+                    <child type="top">
+                      <object class="AdwHeaderBar">
+                        <property name="show-end-title-buttons">False</property>
+                        <property name="title-widget">
+                          <object class="AdwWindowTitle">
+                            <property name="title" translatable="yes">Devices</property>
+                            <property name="subtitle" translatable="yes">Select a device</property>
                           </object>
-                        </child>
-                        <child>
-                          <object class="GtkBox">
-                            <property name="orientation">horizontal</property>
-                            <property name="spacing">6</property>
-                            <child>
-                              <object class="GtkLabel" id="nearby_count_label">
-                                <property name="label" translatable="yes">No devices yet</property>
-                                <property name="xalign">0</property>
-                                <style>
-                                  <class name="caption"/>
-                                  <class name="accent"/>
-                                </style>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="GtkLabel" id="device_status_label">
-                                <property name="label" translatable="yes">· Pair a device to get started</property>
-                                <property name="xalign">0</property>
-                                <style>
-                                  <class name="caption"/>
-                                  <class name="dimmed"/>
-                                </style>
-                              </object>
-                            </child>
+                        </property>
+                        <child type="end">
+                          <object class="GtkToggleButton" id="search_button">
+                            <property name="icon-name">system-search-symbolic</property>
+                            <property name="tooltip-text" translatable="yes">Search devices</property>
                           </object>
                         </child>
                       </object>
                     </child>
-                  </object>
-                </child>
-                <!-- Device list -->
-                <child>
-                  <object class="GtkScrolledWindow">
-                    <property name="vexpand">True</property>
-                    <property name="hscrollbar-policy">never</property>
-                    <property name="child">
-                      <object class="GtkListBox" id="devices_list">
-                        <property name="selection-mode">none</property>
-                        <style>
-                          <class name="boxed-list"/>
-                        </style>
+                    <child type="top">
+                      <object class="GtkSearchBar" id="search_bar">
+                        <property name="search-mode-enabled">False</property>
+                        <property name="show-close-button">True</property>
+                        <property name="child">
+                          <object class="GtkSearchEntry" id="search_entry">
+                            <property name="placeholder-text" translatable="yes">Search devices</property>
+                            <property name="width-chars">24</property>
+                          </object>
+                        </property>
+                      </object>
+                    </child>
+                    <property name="content">
+                      <object class="GtkBox">
+                        <property name="orientation">vertical</property>
+                        <property name="vexpand">True</property>
+                        <child>
+                          <object class="GtkScrolledWindow">
+                            <property name="vexpand">True</property>
+                            <property name="hscrollbar-policy">never</property>
+                            <property name="child">
+                              <object class="GtkListBox" id="devices_list">
+                                <property name="selection-mode">single</property>
+                                <property name="activate-on-single-click">True</property>
+                                <style>
+                                  <class name="boxed-list"/>
+                                </style>
+                              </object>
+                            </property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkSeparator">
+                            <property name="margin-top">8</property>
+                            <property name="margin-bottom">8</property>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkListBox" id="sidebar_actions">
+                            <property name="selection-mode">none</property>
+                            <property name="margin-bottom">8</property>
+                            <child>
+                              <object class="AdwActionRow" id="pair_new_row">
+                                <property name="title" translatable="yes">Pair New Device</property>
+                                <property name="activatable">True</property>
+                                <child type="prefix">
+                                  <object class="GtkImage">
+                                    <property name="icon-name">list-add-symbolic</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwActionRow" id="settings_row">
+                                <property name="title" translatable="yes">Settings</property>
+                                <property name="activatable">True</property>
+                                <child type="prefix">
+                                  <object class="GtkImage">
+                                    <property name="icon-name">emblem-system-symbolic</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="AdwActionRow" id="about_row">
+                                <property name="title" translatable="yes">About DeskLink</property>
+                                <property name="activatable">True</property>
+                                <child type="prefix">
+                                  <object class="GtkImage">
+                                    <property name="icon-name">help-about-symbolic</property>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                          </object>
+                        </child>
                       </object>
                     </property>
                   </object>
-                </child>
-                <child>
-                  <object class="GtkBox">
+                </property>
+              </object>
+            </property>
+            <property name="content">
+              <object class="AdwNavigationPage">
+                <property name="title" translatable="yes">Device</property>
+                <property name="child">
+                  <object class="GtkBox" id="detail_content">
                     <property name="orientation">vertical</property>
-                    <property name="spacing">8</property>
-                    <property name="visible">False</property>
-                    <property name="hexpand">True</property>
-                    <property name="vexpand">False</property>
+                    <property name="vexpand">True</property>
                     <child>
-                      <object class="GtkLabel">
-                        <property name="label" translatable="yes">Transfers</property>
-                        <property name="xalign">0</property>
-                        <style>
-                          <class name="title-3"/>
-                        </style>
+                      <object class="AdwBanner" id="error_banner">
+                        <property name="revealed">False</property>
                       </object>
                     </child>
                     <child>
-                      <object class="GtkListBox" id="transfers_list">
-                        <property name="selection-mode">none</property>
-                        <style>
-                          <class name="boxed-list"/>
-                        </style>
+                      <object class="GtkScrolledWindow" id="detail_scroll">
+                        <property name="vexpand">True</property>
+                        <property name="hscrollbar-policy">never</property>
+                        <property name="child">
+                          <object class="GtkBox" id="detail_body">
+                            <property name="orientation">vertical</property>
+                            <property name="spacing">20</property>
+                            <property name="margin-start">32</property>
+                            <property name="margin-end">32</property>
+                            <property name="margin-top">28</property>
+                            <property name="margin-bottom">32</property>
+                          </object>
+                        </property>
                       </object>
                     </child>
                   </object>
-                </child>
-              </object>
-            </child>
+                </property>
               </object>
             </property>
+          </object>
+        </property>
           </object>
         </property>
       </object>

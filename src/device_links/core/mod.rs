@@ -1,16 +1,13 @@
-//! Shared connection-core contracts.
-//!
-//! The daemon still owns the existing GTK-facing state during the migration,
-//! but all new connection and feature code uses these product-neutral types.
+mod device_manager;
+mod device_session;
+mod session_link;
 
-#![allow(dead_code)]
-
-pub mod capability_registry;
-pub mod device_manager;
-pub mod device_session;
-pub mod errors;
-pub mod events;
-pub mod packet_router;
-pub mod service;
-pub mod session_link;
-pub mod transfer_manager;
+#[allow(unused_imports)]
+pub use device_manager::{
+    DeviceManager, DisconnectResult, FeatureTransportSnapshot, ReconnectLease, RegistrationResult,
+    SessionError,
+};
+pub use device_session::{
+    ConnectionGeneration, DeviceSession, SessionBinding, SessionId, SessionState,
+};
+pub use session_link::SessionLink;

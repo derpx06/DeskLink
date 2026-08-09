@@ -1,14 +1,19 @@
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
-use super::session_link::Link;
-use crate::device_links::pairing::{PairState, PairingHandler};
+use crate::device_links::pairing::PairingHandler;
+use crate::device_links::webrtc::transfer_manager::WebRtcTransferManager;
+use crate::device_links::webrtc::{DesktopWebRtcPeer, HandoverRuntime};
+
+use super::SessionLink;
 
 pub type SessionId = u64;
 pub type ConnectionGeneration = u64;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
     Connecting,
     Authenticating,
@@ -19,107 +24,76 @@ pub enum SessionState {
     Terminated,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeviceConnectionState {
-    Discovered,
-    Connecting,
-    Authenticating,
-    Unpaired,
-    Paired,
-    Reconnecting { attempt: u32 },
-    Unreachable,
-}
-
-#[derive(Clone)]
 pub struct DeviceSession {
     pub session_id: SessionId,
     pub connection_generation: ConnectionGeneration,
     pub device_id: String,
-    pub pairing: Arc<Mutex<PairingHandler>>,
+    pub pairing: PairingHandler,
     pub state: SessionState,
-    pub active_link: Option<Arc<Link>>,
+    pub active_link: Option<Arc<SessionLink>>,
+    /// The only WebRTC peer allowed to carry traffic for this logical session.
+    /// It is replaced together with the bootstrap link generation.
+    pub active_webrtc: Option<Arc<DesktopWebRtcPeer>>,
+    /// Checkpoint owner shared by the peer worker and desktop commands. It is
+    /// cleared with the peer so an old generation cannot resume a transfer on
+    /// a replacement connection.
+    pub transfer_manager: Option<Arc<WebRtcTransferManager>>,
+    pub webrtc_attempt_id: Option<String>,
+    /// Authentication and mutual feature-readiness state for the current
+    /// WebRTC peer. This is reset whenever its transport generation changes.
+    pub webrtc_handover: Option<HandoverRuntime>,
+    pub seen_webrtc_request_ids: HashSet<String>,
+    /// Bounded idempotency cache for authenticated data-channel envelopes.
+    pub seen_webrtc_message_ids: HashSet<String>,
     pub cancellation: Arc<AtomicBool>,
     pub connected_at: Option<Instant>,
     pub last_disconnect_reason: Option<String>,
-    pub last_change: Instant,
     pub reconnect_attempt: u32,
     pub reconnect_scheduled: bool,
     pub next_reconnect_at: Option<Instant>,
 }
 
 impl DeviceSession {
-    pub fn new(
-        session_id: SessionId,
-        device_id: impl Into<String>,
-        initially_paired: bool,
-    ) -> Self {
-        Self {
-            session_id,
-            connection_generation: 0,
-            device_id: device_id.into(),
-            pairing: Arc::new(Mutex::new(PairingHandler::new(initially_paired))),
-            state: SessionState::Disconnected,
-            active_link: None,
-            cancellation: Arc::new(AtomicBool::new(false)),
-            connected_at: None,
-            last_disconnect_reason: None,
-            last_change: Instant::now(),
-            reconnect_attempt: 0,
-            reconnect_scheduled: false,
-            next_reconnect_at: None,
-        }
+    pub fn binding(&self) -> Option<SessionBinding> {
+        self.active_link.as_ref().map(|link| SessionBinding {
+            device_id: self.device_id.clone(),
+            session_id: self.session_id,
+            generation: self.connection_generation,
+            link: Arc::clone(link),
+            cancellation: Arc::clone(&self.cancellation),
+        })
     }
 
-    pub fn transition(&mut self, state: SessionState) {
-        self.state = state;
-        self.last_change = Instant::now();
+    /// Drops all state that is cryptographically bound to a particular paired
+    /// relationship.  Pairing changes must never leave an old WebRTC peer or
+    /// handover attempt behind: a later re-pair would otherwise see a peer as
+    /// already installed and skip negotiation.
+    pub fn clear_webrtc_state(&mut self) -> Option<Arc<DesktopWebRtcPeer>> {
+        self.webrtc_attempt_id = None;
+        self.webrtc_handover = None;
+        self.transfer_manager = None;
+        self.seen_webrtc_request_ids.clear();
+        self.seen_webrtc_message_ids.clear();
+        self.active_webrtc.take()
     }
+}
 
-    pub fn pair_state(&self) -> PairState {
-        self.pairing
-            .lock()
-            .map(|pairing| pairing.state)
-            .unwrap_or(PairState::NotPaired)
-    }
+#[derive(Clone)]
+pub struct SessionBinding {
+    pub device_id: String,
+    pub session_id: SessionId,
+    pub generation: ConnectionGeneration,
+    pub link: Arc<SessionLink>,
+    pub cancellation: Arc<AtomicBool>,
+}
 
-    pub fn is_terminated(&self) -> bool {
-        self.state == SessionState::Terminated
-    }
-
-    pub fn reconnect_due(&self, now: Instant) -> bool {
-        !self.is_terminated()
-            && self.pair_state() == PairState::Paired
-            && !self.reconnect_scheduled
-            && self
-                .next_reconnect_at
-                .is_some_and(|next_attempt| next_attempt <= now)
-    }
-
-    pub fn schedule_reconnect(&mut self, now: Instant) {
-        if self.is_terminated() || self.pair_state() != PairState::Paired {
-            return;
-        }
-        self.reconnect_scheduled = false;
-        self.next_reconnect_at = Some(now);
-    }
-
-    pub fn reconnect_failed(&mut self, now: Instant) {
-        self.reconnect_attempt = self.reconnect_attempt.saturating_add(1);
-        let seconds = (1u64 << self.reconnect_attempt.min(6)).min(60);
-        self.reconnect_scheduled = false;
-        self.next_reconnect_at = Some(now + Duration::from_secs(seconds));
-        self.transition(SessionState::Reconnecting);
-    }
-
-    pub fn reconnect_succeeded(&mut self) {
-        self.reconnect_attempt = 0;
-        self.reconnect_scheduled = false;
-        self.next_reconnect_at = None;
-    }
-
-    pub fn clear_reconnect(&mut self) {
-        self.reconnect_scheduled = false;
-        self.next_reconnect_at = None;
-        self.reconnect_attempt = 0;
+impl std::fmt::Debug for SessionBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionBinding")
+            .field("device_id", &self.device_id)
+            .field("session_id", &self.session_id)
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
     }
 }

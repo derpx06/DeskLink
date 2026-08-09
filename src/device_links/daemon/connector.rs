@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,55 +6,38 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use super::handle::DaemonEvent;
 use super::handshake::finish_secure_link;
 use super::network::ssl_connector;
 use super::state::{push_error, upsert_device};
 use crate::device_links::config::Config;
-use crate::device_links::core::device_manager::DeviceManager;
-use crate::device_links::core::events::EventBus;
+use crate::device_links::core::DeviceManager;
 use crate::device_links::device::DeviceView;
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::NetworkPacket;
-use crate::device_links::webrtc::negotiation::WebRtcCoordinator;
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn incoming_tcp_loop(
     listener: TcpListener,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
-    sessions: DeviceManager,
-    shutdown: Arc<AtomicBool>,
-    transfer_cancellations: Arc<Mutex<HashSet<String>>>,
+    sessions: Arc<DeviceManager>,
     errors: Arc<Mutex<Vec<String>>>,
-    events: EventBus,
-    webrtc: WebRtcCoordinator,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
+    shutdown: Arc<AtomicBool>,
 ) {
-    let _ = listener.set_nonblocking(true);
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
+    while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((stream, _address)) => {
+            Ok((stream, _)) => {
                 let config = Arc::clone(&config);
                 let devices = Arc::clone(&devices);
-                let sessions = sessions.clone();
-                let shutdown = Arc::clone(&shutdown);
+                let sessions = Arc::clone(&sessions);
                 let errors = Arc::clone(&errors);
-                let events = events.clone();
-                let transfer_cancellations = Arc::clone(&transfer_cancellations);
-                let webrtc = webrtc.clone();
+                let events = Arc::clone(&events);
                 thread::spawn(move || {
-                    if let Err(error) = accept_incoming_device(
-                        stream,
-                        config,
-                        devices,
-                        sessions,
-                        shutdown,
-                        events,
-                        transfer_cancellations,
-                        webrtc,
-                    ) {
+                    if let Err(error) =
+                        accept_incoming_device(stream, config, devices, sessions, events)
+                    {
+                        eprintln!("[DL-WRTC-BOOT] incoming bootstrap connection rejected: {error}");
                         push_error(&errors, error);
                     }
                 });
@@ -67,20 +50,21 @@ pub(super) fn incoming_tcp_loop(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn accept_incoming_device(
     stream: TcpStream,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
-    sessions: DeviceManager,
-    shutdown: Arc<AtomicBool>,
-    events: EventBus,
-    transfer_cancellations: Arc<Mutex<HashSet<String>>>,
-    webrtc: WebRtcCoordinator,
+    sessions: Arc<DeviceManager>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
 ) -> Result<(), String> {
-    if shutdown.load(Ordering::SeqCst) {
-        return Ok(());
-    }
+    // The listener is non-blocking so the accept loop can observe shutdown.
+    // Accepted sockets must be made blocking before OpenSSL starts its
+    // handshake; otherwise a transient incomplete TLS read is surfaced as
+    // `nonblocking read call would have blocked` and the valid peer is
+    // incorrectly disconnected.
+    stream
+        .set_nonblocking(false)
+        .map_err(|err| format!("Could not configure incoming socket: {err}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| err.to_string())?;
@@ -129,14 +113,5 @@ fn accept_incoming_device(
     let ssl_stream = connector
         .connect(&info.id, stream)
         .map_err(|err| err.to_string())?;
-    finish_secure_link(
-        info,
-        ssl_stream,
-        config,
-        devices,
-        sessions,
-        events,
-        transfer_cancellations,
-        webrtc,
-    )
+    finish_secure_link(info, ssl_stream, config, devices, sessions, events)
 }

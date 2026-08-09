@@ -1,55 +1,89 @@
-use std::net::TcpStream;
+use openssl::ssl::SslStream;
+use std::net::{Shutdown, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use openssl::ssl::SslStream;
-
 use crate::device_links::device_info::DeviceInfo;
+use crate::device_links::pairing::PairingHandler;
 
-/// Authenticated transport for one accepted connection generation.
-///
-/// Pairing is intentionally shared with `DeviceSession`; replacing a TCP/TLS
-/// link must never reset the device's trust state.
-#[derive(Clone)]
-pub(crate) struct Link {
-    pub(crate) stream: Arc<Mutex<SslStream<TcpStream>>>,
-    pub(crate) certificate_pem: String,
-    pub(crate) local_public_der: Vec<u8>,
-    pub(crate) remote_public_der: Vec<u8>,
-    pub(crate) info: DeviceInfo,
+pub struct SessionLink {
+    stream: Option<Arc<Mutex<SslStream<TcpStream>>>>,
+    pub certificate_pem: String,
+    pub local_public_der: Vec<u8>,
+    pub remote_public_der: Vec<u8>,
+    pub info: DeviceInfo,
+    closed: AtomicBool,
 }
 
-impl Link {
-    #[cfg(test)]
-    pub(crate) fn test_link(info: DeviceInfo) -> Self {
-        // The manager tests only exercise ownership, generations, and
-        // cancellation.  Use a local file descriptor wrapped as a
-        // TcpStream so those tests do not need network or loopback access in
-        // sandboxed CI.  No TLS handshake or I/O is performed on this link.
-        use std::os::fd::{FromRawFd, IntoRawFd};
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/null")
-            .expect("test link backing file should open");
-        let client = unsafe { std::net::TcpStream::from_raw_fd(file.into_raw_fd()) };
-        let context = openssl::ssl::SslContext::builder(openssl::ssl::SslMethod::tls())
-            .expect("test SSL context should build")
-            .build();
-        let ssl = openssl::ssl::Ssl::new(&context).expect("test SSL session should build");
-        let stream =
-            openssl::ssl::SslStream::new(ssl, client).expect("test SSL stream should build");
+impl SessionLink {
+    pub fn new(
+        stream: Arc<Mutex<SslStream<TcpStream>>>,
+        certificate_pem: String,
+        local_public_der: Vec<u8>,
+        remote_public_der: Vec<u8>,
+        info: DeviceInfo,
+    ) -> Self {
         Self {
-            stream: Arc::new(Mutex::new(stream)),
-            certificate_pem: String::new(),
-            local_public_der: Vec::new(),
-            remote_public_der: Vec::new(),
+            stream: Some(stream),
+            certificate_pem,
+            local_public_der,
+            remote_public_der,
             info,
+            closed: AtomicBool::new(false),
         }
     }
 
-    pub(crate) fn close(&self) {
-        if let Ok(stream) = self.stream.lock() {
-            let _ = stream.get_ref().shutdown(std::net::Shutdown::Both);
+    pub fn stream(&self) -> Result<&Arc<Mutex<SslStream<TcpStream>>>, String> {
+        self.stream
+            .as_ref()
+            .ok_or_else(|| "Session link has no network stream".to_string())
+    }
+
+    pub fn verification_key(&self, timestamp: i64) -> String {
+        PairingHandler::verification_key(&self.local_public_der, &self.remote_public_der, timestamp)
+    }
+
+    pub fn close(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
         }
+        if let Some(stream) = &self.stream {
+            if let Ok(stream) = stream.lock() {
+                let _ = stream.get_ref().shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub fn test_placeholder(device_id: &str) -> Self {
+        Self {
+            stream: None,
+            certificate_pem: String::new(),
+            local_public_der: Vec::new(),
+            remote_public_der: Vec::new(),
+            info: DeviceInfo {
+                id: device_id.to_string(),
+                name: device_id.to_string(),
+                device_type: "phone".to_string(),
+                protocol_version: 9,
+                incoming_capabilities: Vec::new(),
+                outgoing_capabilities: Vec::new(),
+            },
+            closed: AtomicBool::new(false),
+        }
+    }
+}
+
+impl std::fmt::Debug for SessionLink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionLink")
+            .field("device_id", &self.info.id)
+            .field("closed", &self.is_closed())
+            .finish_non_exhaustive()
     }
 }

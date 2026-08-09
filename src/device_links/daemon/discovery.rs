@@ -5,19 +5,25 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::network::{bind_udp_listener, MAX_TCP_PORT, MIN_TCP_PORT, UDP_PORT};
-use super::state::{publish_device_changed, push_error, upsert_device};
-use super::validation::should_throttle_connection;
-use super::{DaemonWorker, ReconnectTarget};
+use super::handle::DaemonEvent;
+use super::network::{bind_udp_listener, MAX_TCP_PORT, MIN_TCP_PORT};
+use super::state::{mark_error, push_error, upsert_device};
+use super::validation::{connect_to_device, should_throttle_connection};
+use super::DaemonWorker;
 use crate::device_links::config::Config;
-use crate::device_links::core::device_manager::DeviceManager;
-use crate::device_links::core::device_session::DeviceConnectionState;
-use crate::device_links::core::events::{CoreEvent, EventBus};
+use crate::device_links::core::DeviceManager;
 use crate::device_links::device::DeviceView;
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_IDENTITY};
-use crate::protocol::desklink_v9::MDNS_SERVICE_TYPE;
-use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
+
+const UDP_PORT: u16 = 1716;
+
+/// A connection worker may lose the normal inbound/outbound race after it has
+/// already entered a blocking TLS handshake. Its eventual timeout is stale:
+/// publishing it would overwrite the healthy authoritative session in the UI.
+fn should_publish_outgoing_failure(sessions: &DeviceManager, device_id: &str) -> bool {
+    sessions.current_binding(device_id).is_none()
+}
 
 impl DaemonWorker {
     pub(super) fn start_udp_listener(&self) -> Result<(), String> {
@@ -28,20 +34,16 @@ impl DaemonWorker {
         socket.set_broadcast(true).map_err(|err| err.to_string())?;
         let config = Arc::clone(&self.config);
         let devices = Arc::clone(&self.devices);
-        let reconnect_targets = Arc::clone(&self.reconnect_targets);
-        let sessions = self.sessions.clone();
-        let shutdown = Arc::clone(&self.shutdown);
+        let sessions = Arc::clone(&self.sessions);
         let errors = Arc::clone(&self.errors);
-        let events = self.events.clone();
+        let events = Arc::clone(&self.events);
+        let shutdown = Arc::clone(&self.shutdown);
         let tcp_port = self.tcp_port;
         let last_connections = Arc::new(Mutex::new(HashMap::new()));
 
         thread::spawn(move || {
             let mut buffer = [0u8; 65536];
-            loop {
-                if shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
+            while !shutdown.load(Ordering::Acquire) {
                 match socket.recv_from(&mut buffer) {
                     Ok((len, address)) => {
                         if let Ok(packet) = NetworkPacket::deserialize(&buffer[..len]) {
@@ -52,11 +54,10 @@ impl DaemonWorker {
                                     tcp_port,
                                     &config,
                                     &devices,
-                                    &reconnect_targets,
                                     &sessions,
                                     &errors,
-                                    &last_connections,
                                     &events,
+                                    &last_connections,
                                 );
                             }
                         }
@@ -72,138 +73,24 @@ impl DaemonWorker {
         Ok(())
     }
 
-    /// Publish and browse the native DeskLink DNS-SD service. Broadcast remains
-    /// enabled above because some mobile networks filter multicast, but mDNS
-    /// gives us discovery after an interface change without waiting for a
-    /// broadcast interval.
-    pub(super) fn start_mdns(&self) -> Result<(), String> {
-        let daemon = ServiceDaemon::new().map_err(|error| error.to_string())?;
-        let config = Arc::clone(&self.config);
-        let devices = Arc::clone(&self.devices);
-        let reconnect_targets = Arc::clone(&self.reconnect_targets);
-        let sessions = self.sessions.clone();
-        let shutdown = Arc::clone(&self.shutdown);
-        let tcp_port = self.tcp_port;
-        let events_bus = self.events.clone();
-
-        let local = config
-            .lock()
-            .map_err(|_| "Config lock poisoned".to_string())?
-            .local_device_info();
-        let local_ip = local_ipv4().ok_or_else(|| {
-            "Could not determine a local IPv4 address for DeskLink mDNS".to_string()
-        })?;
-        let host = format!("desklink-{}.local.", &local.id[..8]);
-        let mut properties = HashMap::new();
-        properties.insert("id".to_string(), local.id.clone());
-        properties.insert("name".to_string(), local.name.clone());
-        properties.insert("type".to_string(), local.device_type.clone());
-        properties.insert("protocol".to_string(), local.protocol_version.to_string());
-        let service_type = format!("{MDNS_SERVICE_TYPE}.local.");
-        let service = ServiceInfo::new(
-            &service_type,
-            &local.id,
-            &host,
-            std::net::IpAddr::V4(local_ip),
-            tcp_port,
-            Some(properties),
-        )
-        .map_err(|error| error.to_string())?;
-        daemon
-            .register(service)
-            .map_err(|error| error.to_string())?;
-        let events = daemon
-            .browse(&service_type)
-            .map_err(|error| error.to_string())?;
-
-        thread::spawn(move || {
-            // Keep the daemon alive for the lifetime of the event loop. Its
-            // background socket threads handle address refreshes for us.
-            let _daemon = daemon;
-            while let Ok(event) = events.recv_timeout(Duration::from_secs(30)) {
-                if shutdown.load(Ordering::SeqCst) {
-                    break;
-                }
-                if let ServiceEvent::ServiceResolved(info) = event {
-                    let Some(device_id) = info.get_property_val_str("id") else {
-                        continue;
-                    };
-                    if device_id == local.id {
-                        continue;
-                    }
-                    let Some(address) = info
-                        .get_addresses_v4()
-                        .into_iter()
-                        .next()
-                        .map(|ip| SocketAddr::new(ip.into(), info.get_port()))
-                    else {
-                        continue;
-                    };
-                    let name = info
-                        .get_property_val_str("name")
-                        .unwrap_or(device_id)
-                        .to_string();
-                    let device_type = info
-                        .get_property_val_str("type")
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let protocol_version = info
-                        .get_property_val_str("protocol")
-                        .and_then(|value| value.parse().ok())
-                        .unwrap_or(0);
-                    let info = DeviceInfo {
-                        id: device_id.to_string(),
-                        name,
-                        device_type,
-                        protocol_version,
-                        incoming_capabilities: Vec::new(),
-                        outgoing_capabilities: Vec::new(),
-                    };
-                    if !(MIN_TCP_PORT..=MAX_TCP_PORT).contains(&address.port()) {
-                        continue;
-                    }
-                    let paired = config
-                        .lock()
-                        .ok()
-                        .map(|config| config.is_trusted(&info.id))
-                        .unwrap_or(false);
-                    upsert_device(&devices, &info, address.ip().to_string(), paired);
-                    publish_device_changed(&devices, &events_bus, &info.id);
-                    events_bus.publish(CoreEvent::ConnectionChanged {
-                        device_id: info.id.clone(),
-                        state: DeviceConnectionState::Discovered,
-                        message: None,
-                    });
-                    remember_target(&reconnect_targets, &sessions, info, address, paired);
-                }
-            }
-        });
-        Ok(())
-    }
-
     pub(super) fn start_broadcaster(&self) {
         let config = Arc::clone(&self.config);
         let errors = Arc::clone(&self.errors);
         let shutdown = Arc::clone(&self.shutdown);
         let tcp_port = self.tcp_port;
-        thread::spawn(move || loop {
-            if shutdown.load(Ordering::SeqCst) {
-                break;
+        thread::spawn(move || {
+            while !shutdown.load(Ordering::Acquire) {
+                if let Err(error) = broadcast_identity(&config, tcp_port) {
+                    push_error(&errors, error);
+                }
+                for _ in 0..30 {
+                    if shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
             }
-            if let Err(error) = broadcast_identity(&config, tcp_port) {
-                push_error(&errors, error);
-            }
-            thread::sleep(Duration::from_secs(15));
         });
-    }
-}
-
-fn local_ipv4() -> Option<std::net::Ipv4Addr> {
-    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
-    socket.connect(("192.0.2.1", 9)).ok()?;
-    match socket.local_addr().ok()?.ip() {
-        std::net::IpAddr::V4(ip) if !ip.is_loopback() => Some(ip),
-        _ => None,
     }
 }
 
@@ -231,11 +118,10 @@ fn handle_identity_packet(
     local_tcp_port: u16,
     config: &Arc<Mutex<Config>>,
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    reconnect_targets: &Arc<Mutex<HashMap<String, ReconnectTarget>>>,
-    sessions: &DeviceManager,
+    sessions: &Arc<DeviceManager>,
     errors: &Arc<Mutex<Vec<String>>>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
     last_connections: &Arc<Mutex<HashMap<String, Instant>>>,
-    events: &EventBus,
 ) {
     let Some(info) = DeviceInfo::from_identity_packet(&packet) else {
         return;
@@ -248,6 +134,10 @@ fn handle_identity_packet(
         return;
     }
     if should_throttle_connection(last_connections, &info.id) {
+        return;
+    }
+
+    if sessions.current_binding(&info.id).is_some() {
         return;
     }
     let paired = config
@@ -271,12 +161,6 @@ fn handle_identity_packet(
         return;
     }
     upsert_device(devices, &info, address.ip().to_string(), paired);
-    publish_device_changed(devices, events, &info.id);
-    events.publish(CoreEvent::ConnectionChanged {
-        device_id: info.id.clone(),
-        state: DeviceConnectionState::Discovered,
-        message: None,
-    });
 
     let Some(remote_port) = packet
         .get_i64("tcpPort")
@@ -291,31 +175,55 @@ fn handle_identity_packet(
         return;
     }
 
-    remember_target(
-        reconnect_targets,
-        sessions,
-        info,
-        SocketAddr::new(address.ip(), remote_port),
-        paired,
-    );
+    let config = Arc::clone(config);
+    let devices = Arc::clone(devices);
+    let sessions = Arc::clone(sessions);
+    let events = Arc::clone(events);
+
+    thread::spawn(move || {
+        if let Err(error) = connect_to_device(
+            info.clone(),
+            address,
+            remote_port,
+            config,
+            devices.clone(),
+            Arc::clone(&sessions),
+            events,
+        ) {
+            if should_publish_outgoing_failure(&sessions, &info.id) {
+                mark_error(&devices, &info.id, error.clone());
+                eprintln!(
+                    "[Daemon] Outgoing TCP connection to {} failed: {}",
+                    info.id, error
+                );
+            } else {
+                eprintln!(
+                    "[DL-WRTC-BOOT] ignored stale outgoing connection failure for {}: {}",
+                    info.id, error
+                );
+            }
+        }
+    });
 }
 
-fn remember_target(
-    targets: &Arc<Mutex<HashMap<String, ReconnectTarget>>>,
-    sessions: &DeviceManager,
-    info: DeviceInfo,
-    address: SocketAddr,
-    paired: bool,
-) {
-    let device_id = info.id.clone();
-    if let Ok(mut targets) = targets.lock() {
-        targets
-            .entry(info.id.clone())
-            .and_modify(|target| {
-                target.info = info.clone();
-                target.address = address;
-            })
-            .or_insert(ReconnectTarget { info, address });
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device_links::core::SessionLink;
+
+    #[test]
+    fn stale_outgoing_failure_is_not_published_after_an_inbound_link_wins() {
+        let sessions = DeviceManager::new();
+        assert!(should_publish_outgoing_failure(&sessions, "phone-1"));
+
+        sessions
+            .register_link(
+                "phone-1".to_string(),
+                SessionLink::test_placeholder("phone-1"),
+                true,
+            )
+            .unwrap();
+
+        assert!(!should_publish_outgoing_failure(&sessions, "phone-1"));
     }
-    sessions.observe_device(&device_id, paired);
 }

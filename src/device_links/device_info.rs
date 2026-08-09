@@ -1,7 +1,9 @@
 use serde_json::Value;
 
-use super::core::capability_registry::desktop_capabilities;
-use super::packet::{NetworkPacket, PACKET_TYPE_IDENTITY, PROTOCOL_VERSION};
+use super::features::FeatureRegistry;
+use super::packet::{
+    NetworkPacket, PACKET_TYPE_IDENTITY, PACKET_TYPE_WEBRTC_SIGNAL_V1, PROTOCOL_VERSION,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -15,7 +17,20 @@ pub struct DeviceInfo {
 
 impl DeviceInfo {
     pub fn local(id: String, name: String) -> Self {
-        let (incoming_capabilities, outgoing_capabilities) = desktop_capabilities();
+        let registry = FeatureRegistry::desktop();
+        let mut incoming_capabilities = registry.incoming_capabilities().to_vec();
+        let mut outgoing_capabilities = registry.outgoing_capabilities().to_vec();
+
+        // WebRTC signaling is bootstrap transport metadata, not a feature
+        // handler.  It must be present in every DeskLink v9 identity so a
+        // peer can negotiate a fresh data-channel session after re-pairing or
+        // a bootstrap socket replacement.
+        incoming_capabilities.push(PACKET_TYPE_WEBRTC_SIGNAL_V1.to_string());
+        outgoing_capabilities.push(PACKET_TYPE_WEBRTC_SIGNAL_V1.to_string());
+        incoming_capabilities.sort();
+        incoming_capabilities.dedup();
+        outgoing_capabilities.sort();
+        outgoing_capabilities.dedup();
         Self {
             id,
             name,
@@ -47,10 +62,6 @@ impl DeviceInfo {
         if !is_valid_device_id(&id) || name.is_empty() {
             return None;
         }
-        let protocol_version = packet.get_i64("protocolVersion").unwrap_or(-1);
-        if protocol_version != PROTOCOL_VERSION {
-            return None;
-        }
         Some(Self {
             id,
             name,
@@ -58,7 +69,7 @@ impl DeviceInfo {
                 .get_str("deviceType")
                 .unwrap_or("unknown")
                 .to_string(),
-            protocol_version,
+            protocol_version: packet.get_i64("protocolVersion").unwrap_or(-1),
             incoming_capabilities: string_array(packet.body.get("incomingCapabilities")),
             outgoing_capabilities: string_array(packet.body.get("outgoingCapabilities")),
         })
@@ -95,6 +106,8 @@ fn is_valid_device_id(id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::device_links::packet::PACKET_TYPE_PING;
+
     use super::*;
 
     #[test]
@@ -108,23 +121,40 @@ mod tests {
         assert_eq!(parsed.protocol_version, 9);
         assert!(parsed
             .incoming_capabilities
-            .contains(&"desklink.ping".to_string()));
+            .contains(&"desklink.ping".into()));
     }
 
     #[test]
-    fn local_identity_advertises_screen_control_without_legacy_frame_packets() {
+    fn local_identity_advertises_only_registered_capabilities() {
         let local = DeviceInfo::local("0123456789abcdef0123456789abcdef".into(), "DeskLink".into());
-        let (incoming, outgoing) = desktop_capabilities();
-        assert_eq!(local.incoming_capabilities, incoming);
-        assert_eq!(local.outgoing_capabilities, outgoing);
+
         assert!(local
             .incoming_capabilities
-            .iter()
-            .any(|capability| capability == "desklink.screen.ready"));
+            .contains(&PACKET_TYPE_PING.to_string()));
         assert!(!local
             .incoming_capabilities
-            .iter()
-            .any(|capability| capability == "desklink.screen.frame"));
+            .contains(&"desklink.mousepad.request".to_string()));
+        assert!(local
+            .outgoing_capabilities
+            .contains(&"desklink.findmyphone.request".to_string()));
+        assert!(!local
+            .outgoing_capabilities
+            .contains(&"desklink.lock.request".to_string()));
+        assert!(!local
+            .outgoing_capabilities
+            .contains(&"desklink.systemvolume.request".to_string()));
+    }
+
+    #[test]
+    fn local_identity_always_advertises_webrtc_bootstrap_signaling() {
+        let local = DeviceInfo::local("0123456789abcdef0123456789abcdef".into(), "DeskLink".into());
+
+        assert!(local
+            .incoming_capabilities
+            .contains(&"desklink.webrtc.signal.v1".to_string()));
+        assert!(local
+            .outgoing_capabilities
+            .contains(&"desklink.webrtc.signal.v1".to_string()));
     }
 
     #[test]

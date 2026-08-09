@@ -1,13 +1,25 @@
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use super::commands::DaemonCommand;
 use super::state::push_error;
 use super::DaemonWorker;
-use crate::device_links::core::events::CoreEvent;
-use crate::device_links::core::service::CoreService;
 use crate::device_links::device::DeviceView;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DaemonEvent {
+    PingReceived {
+        device_id: String,
+        device_name: String,
+        message: Option<String>,
+    },
+    FindPhoneReceived {
+        device_id: String,
+        device_name: String,
+    },
+}
 
 struct DaemonStopGuard(Sender<DaemonCommand>);
 
@@ -27,36 +39,31 @@ impl std::fmt::Debug for DaemonStopGuard {
 pub struct DaemonHandle {
     command_tx: Sender<DaemonCommand>,
     _stop_guard: Arc<DaemonStopGuard>,
-    core: CoreService,
+    devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    errors: Arc<Mutex<Vec<String>>>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
 }
 
 impl DaemonHandle {
     pub fn start() -> Self {
         let (command_tx, command_rx) = mpsc::channel();
-        let core = CoreService::new();
-        let devices = core.devices_storage();
-        let errors = core.errors_storage();
-        let events = core.events();
+        let devices = Arc::new(Mutex::new(HashMap::new()));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
         let worker_devices = Arc::clone(&devices);
         let worker_errors = Arc::clone(&errors);
-        let worker_events = events.clone();
+        let worker_events = Arc::clone(&events);
 
         thread::spawn(move || {
             if let Err(error) = DaemonWorker::new(
                 worker_devices,
                 worker_errors.clone(),
+                worker_events,
                 command_rx,
-                worker_events.clone(),
             )
             .and_then(DaemonWorker::run)
             {
                 push_error(&worker_errors, error);
-                worker_events.publish(CoreEvent::Error {
-                    scope: "daemon".to_string(),
-                    device_id: None,
-                    message: "The DeskLink daemon stopped unexpectedly".to_string(),
-                    retryable: true,
-                });
             }
         });
 
@@ -65,42 +72,37 @@ impl DaemonHandle {
         Self {
             command_tx,
             _stop_guard: stop_guard,
-            core,
+            devices,
+            errors,
+            events,
         }
     }
 
     pub fn devices(&self) -> Vec<DeviceView> {
-        self.core.snapshot()
+        let mut devices: Vec<_> = self
+            .devices
+            .lock()
+            .map(|devices| devices.values().cloned().collect())
+            .unwrap_or_default();
+        devices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        devices
     }
 
     pub fn drain_errors(&self) -> Vec<String> {
-        self.core.drain_errors()
+        self.errors
+            .lock()
+            .map(|mut errors| errors.drain(..).collect())
+            .unwrap_or_default()
     }
 
     pub fn send(&self, command: DaemonCommand) {
         let _ = self.command_tx.send(command);
     }
 
-    pub fn try_send(&self, command: DaemonCommand) -> bool {
-        self.command_tx.send(command).is_ok()
-    }
-
-    pub fn subscribe_events(&self) -> futures::channel::mpsc::UnboundedReceiver<CoreEvent> {
-        self.core.subscribe()
-    }
-
-    pub fn report_error(
-        &self,
-        scope: impl Into<String>,
-        device_id: Option<String>,
-        message: impl Into<String>,
-        retryable: bool,
-    ) {
-        self.core.publish(CoreEvent::Error {
-            scope: scope.into(),
-            device_id,
-            message: message.into(),
-            retryable,
-        });
+    pub fn drain_events(&self) -> Vec<DaemonEvent> {
+        self.events
+            .lock()
+            .map(|mut events| events.drain(..).collect())
+            .unwrap_or_default()
     }
 }

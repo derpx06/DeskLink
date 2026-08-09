@@ -3,7 +3,6 @@ use openssl::hash::{hash, MessageDigest};
 use super::packet::{NetworkPacket, PACKET_TYPE_PAIR};
 
 const ALLOWED_TIMESTAMP_DIFFERENCE_SECONDS: i64 = 30 * 60;
-const PAIRING_REQUEST_TIMEOUT_SECONDS: i64 = 5 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairState {
@@ -114,20 +113,6 @@ impl PairingHandler {
     pub fn timestamp(&self) -> i64 {
         self.timestamp
     }
-
-    pub fn expire_if_needed(&mut self) -> bool {
-        if matches!(
-            self.state,
-            PairState::Requested | PairState::RequestedByPeer
-        ) && self.timestamp > 0
-            && unix_secs().saturating_sub(self.timestamp) > PAIRING_REQUEST_TIMEOUT_SECONDS
-        {
-            self.state = PairState::NotPaired;
-            self.timestamp = 0;
-            return true;
-        }
-        false
-    }
 }
 
 fn unix_secs() -> i64 {
@@ -214,16 +199,5 @@ mod tests {
         handler.receive(&packet);
 
         assert_eq!(handler.state, PairState::Paired);
-    }
-
-    #[test]
-    fn pending_pairing_expires_without_becoming_trusted() {
-        let mut handler = PairingHandler::new(false);
-        handler.state = PairState::Requested;
-        handler.timestamp = unix_secs() - PAIRING_REQUEST_TIMEOUT_SECONDS - 1;
-
-        assert!(handler.expire_if_needed());
-        assert_eq!(handler.state, PairState::NotPaired);
-        assert_eq!(handler.timestamp(), 0);
     }
 }

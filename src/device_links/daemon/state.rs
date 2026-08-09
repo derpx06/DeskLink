@@ -1,11 +1,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::device_links::core::events::{CoreEvent, EventBus};
 use crate::device_links::device::{
-    BatteryStatus, ConnectivityStatus, ContactSummary, DeviceNotification, DeviceStatus,
-    DeviceView, MediaStatus, RemoteCommand, ScreenFrame, SftpStatus, SmsMessage,
-    SystemVolumeStatus, TelephonyStatus, VolumeSink,
+    BatteryStatus, DeviceNotification, DeviceStatus, DeviceView, MediaStatus, RemoteCommand,
+    SftpStatus, SystemVolumeStatus, VolumeSink,
 };
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::NetworkPacket;
@@ -26,6 +24,8 @@ pub(super) fn upsert_device(
                 device.device_type = info.device_type.clone();
                 device.address = address.clone();
                 device.protocol_version = info.protocol_version;
+                device.incoming_capabilities = info.incoming_capabilities.clone();
+                device.outgoing_capabilities = info.outgoing_capabilities.clone();
                 if paired {
                     device.status = DeviceStatus::Paired;
                     device.trusted = true;
@@ -73,23 +73,17 @@ pub(super) fn mark_error(
     }
 }
 
-pub(super) fn push_error(errors: &Arc<Mutex<Vec<String>>>, error: String) {
-    if let Ok(mut errors) = errors.lock() {
-        errors.push(error);
+pub(crate) fn clear_error(devices: &Arc<Mutex<HashMap<String, DeviceView>>>, device_id: &str) {
+    if let Ok(mut devices) = devices.lock() {
+        if let Some(device) = devices.get_mut(device_id) {
+            device.last_error = None;
+        }
     }
 }
 
-pub(super) fn publish_device_changed(
-    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    events: &EventBus,
-    device_id: &str,
-) {
-    if let Ok(devices) = devices.lock() {
-        if let Some(device) = devices.get(device_id) {
-            events.publish(CoreEvent::DeviceChanged {
-                device: Box::new(device.clone()),
-            });
-        }
+pub(super) fn push_error(errors: &Arc<Mutex<Vec<String>>>, error: String) {
+    if let Ok(mut errors) = errors.lock() {
+        errors.push(error);
     }
 }
 
@@ -174,54 +168,6 @@ pub(super) fn update_battery_status(
                 battery_quantity: packet.get_i64("batteryQuantity"),
                 threshold_event: packet.get_i64("thresholdEvent"),
             });
-        }
-    }
-}
-
-pub(super) fn update_sms_messages(
-    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    device_id: &str,
-    messages: Vec<SmsMessage>,
-) {
-    if let Ok(mut devices) = devices.lock() {
-        if let Some(device) = devices.get_mut(device_id) {
-            device.sms_messages = messages;
-        }
-    }
-}
-
-pub(super) fn update_contacts(
-    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    device_id: &str,
-    contacts: Vec<ContactSummary>,
-) {
-    if let Ok(mut devices) = devices.lock() {
-        if let Some(device) = devices.get_mut(device_id) {
-            device.contacts = contacts;
-        }
-    }
-}
-
-pub(super) fn update_telephony_status(
-    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    device_id: &str,
-    status: TelephonyStatus,
-) {
-    if let Ok(mut devices) = devices.lock() {
-        if let Some(device) = devices.get_mut(device_id) {
-            device.telephony_status = Some(status);
-        }
-    }
-}
-
-pub(super) fn update_connectivity_status(
-    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    device_id: &str,
-    status: ConnectivityStatus,
-) {
-    if let Ok(mut devices) = devices.lock() {
-        if let Some(device) = devices.get_mut(device_id) {
-            device.connectivity_status = Some(status);
         }
     }
 }
@@ -380,6 +326,9 @@ pub(super) fn update_sftp_status(
         path: packet
             .get_str("path")
             .map(|value| sanitize_text(value, 500)),
+        password: packet
+            .get_str("password")
+            .map(|value| sanitize_text(value, 500)),
         directories: parse_sftp_directories(packet),
         error: packet
             .get_str("errorMessage")
@@ -389,18 +338,6 @@ pub(super) fn update_sftp_status(
     if let Ok(mut devices) = devices.lock() {
         if let Some(device) = devices.get_mut(device_id) {
             device.sftp_status = Some(status);
-        }
-    }
-}
-
-pub(crate) fn update_screen_frame(
-    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    device_id: &str,
-    frame: ScreenFrame,
-) {
-    if let Ok(mut devices) = devices.lock() {
-        if let Some(device) = devices.get_mut(device_id) {
-            device.screen_frame = Some(frame);
         }
     }
 }

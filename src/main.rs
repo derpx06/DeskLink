@@ -19,20 +19,14 @@
  */
 
 mod application;
-mod branding;
-mod cli;
-mod config {
-    include!(concat!(env!("OUT_DIR"), "/config.rs"));
-}
-mod dbus;
+mod config;
 mod device_links;
-mod platform;
 mod protocol;
 mod remote_control;
 mod window;
 
-use self::application::DeskLinkApplication;
-use self::window::DeskLinkWindow;
+use self::application::DesklinkApplication;
+use self::window::DesklinkWindow;
 
 use config::{GETTEXT_PACKAGE, LOCALEDIR};
 use gettextrs::{bind_textdomain_codeset, bindtextdomain, textdomain};
@@ -40,9 +34,6 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 
 fn main() -> glib::ExitCode {
-    if let Some(exit_code) = cli::run() {
-        return exit_code;
-    }
     // Set up gettext translations
     bindtextdomain(GETTEXT_PACKAGE, LOCALEDIR).expect("Unable to bind the text domain");
     bind_textdomain_codeset(GETTEXT_PACKAGE, "UTF-8")
@@ -56,7 +47,7 @@ fn main() -> glib::ExitCode {
     // Create a new GtkApplication. The application manages our main loop,
     // application windows, integration with the window manager/compositor, and
     // desktop features such as file opening and single-instance applications.
-    let app = DeskLinkApplication::new("derx06.desklink.com", &gio::ApplicationFlags::empty());
+    let app = DesklinkApplication::new("derx06.desklink.com", &gio::ApplicationFlags::empty());
 
     // Run the application. This function will block until the application
     // exits. Upon return, we have our exit code to return to the shell. (This

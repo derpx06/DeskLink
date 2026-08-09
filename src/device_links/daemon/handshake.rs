@@ -1,11 +1,12 @@
 use openssl::ssl::SslStream;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use super::handle::DaemonEvent;
 use super::network::read_ssl_packet;
 use super::packet_handler::packet_read_loop;
 use super::state::mark_status;
@@ -13,24 +14,18 @@ use super::validation::{
     enforce_unpaired_link_limit, validate_certificate_device_id, validate_pinned_certificate,
 };
 use crate::device_links::config::Config;
-use crate::device_links::core::device_manager::DeviceManager;
-use crate::device_links::core::device_manager::SessionBinding;
-use crate::device_links::core::device_session::DeviceConnectionState;
-use crate::device_links::core::events::{CoreEvent, EventBus};
+use crate::device_links::core::{DeviceManager, SessionBinding, SessionLink};
 use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::device_links::device_info::DeviceInfo;
-use crate::device_links::webrtc::negotiation::WebRtcCoordinator;
+use crate::device_links::packet::PACKET_TYPE_WEBRTC_SIGNAL_V1;
 
-#[allow(clippy::too_many_arguments)]
 pub(super) fn finish_secure_link(
     initial_info: DeviceInfo,
     mut stream: SslStream<TcpStream>,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
-    sessions: DeviceManager,
-    events: EventBus,
-    transfer_cancellations: Arc<Mutex<HashSet<String>>>,
-    webrtc: WebRtcCoordinator,
+    sessions: Arc<DeviceManager>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
 ) -> Result<(), String> {
     let identity = config
         .lock()
@@ -93,116 +88,163 @@ pub(super) fn finish_secure_link(
         .map_err(|_| "Device lock poisoned".to_string())?
         .insert(secure_info.id.clone(), view);
 
-    if let Ok(devices) = devices.lock() {
-        if let Some(device) = devices.get(&secure_info.id) {
-            events.publish(CoreEvent::DeviceChanged {
-                device: Box::new(device.clone()),
-            });
-        }
-    }
-    events.publish(CoreEvent::ConnectionChanged {
-        device_id: secure_info.id.clone(),
-        state: if paired {
-            DeviceConnectionState::Paired
-        } else {
-            DeviceConnectionState::Unpaired
-        },
-        message: None,
-    });
-
-    let stream = Arc::new(Mutex::new(stream));
+    // Keep the TLS stream in one mode for its entire lifetime.  Toggling an
+    // OpenSSL stream between nonblocking and blocking mode from the reader
+    // and sender threads races with OpenSSL's internal WANT_READ/WANT_WRITE
+    // state and can surface a false "nonblocking read call would have
+    // blocked" error during WebRTC signaling.  A short read timeout keeps
+    // shutdown responsive without changing the socket mode underneath the
+    // active TLS stream.
     stream
-        .lock()
-        .map_err(|_| "Stream lock poisoned".to_string())?
         .get_ref()
-        .set_nonblocking(true)
+        .set_nonblocking(false)
         .map_err(|err| err.to_string())?;
-    let link = super::Link {
-        stream: Arc::clone(&stream),
-        certificate_pem: cert_pem,
+    stream
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(|err| err.to_string())?;
+    stream
+        .get_ref()
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .map_err(|err| err.to_string())?;
+    let link = SessionLink::new(
+        Arc::new(Mutex::new(stream)),
+        cert_pem,
         local_public_der,
         remote_public_der,
-        info: secure_info.clone(),
-    };
+        secure_info,
+    );
+    if sessions.has_ready_webrtc(&initial_info.id) {
+        // Android may refresh the short-lived LAN bootstrap socket while its
+        // authenticated WebRTC peer is healthy.  This socket cannot become a
+        // second session: closing it preserves the existing generation and
+        // avoids tearing down all paired features for a discovery refresh.
+        eprintln!(
+            "[DL-WRTC-BOOT] ignoring refreshed bootstrap socket for {}; retaining feature-ready WebRTC session",
+            initial_info.id
+        );
+        link.close();
+        return Ok(());
+    }
     let registration = sessions
-        .register_link(secure_info.id.clone(), link, paired)
-        .map_err(|error| format!("Could not register device session: {error:?}"))?;
-    webrtc.close_for_device(&secure_info.id);
-    if let Some(replaced) = &registration.replaced_link {
+        .register_link(initial_info.id.clone(), link, paired)
+        .map_err(|error| error.to_string())?;
+    if let Some(replaced) = registration.replaced_link {
         replaced.close();
     }
-    if let Some(replaced) = &registration.replaced_webrtc_transport {
+    if let Some(replaced) = registration.replaced_webrtc {
         replaced.close();
     }
-    let read_binding: SessionBinding = registration.binding.clone();
-    let read_devices = Arc::clone(&devices);
-    let read_config = Arc::clone(&config);
-    let read_events = events.clone();
-    let read_transfer_cancellations = Arc::clone(&transfer_cancellations);
-    let reader_sessions = sessions.clone();
 
-    let reader_webrtc = webrtc.clone();
+    let binding = registration.binding;
+    eprintln!(
+        "[DL-WRTC-BOOT] secure bootstrap link ready for {} (session {}, generation {})",
+        binding.device_id, binding.session_id, binding.generation
+    );
+    let remote_supports_webrtc = paired
+        && binding
+            .link
+            .info
+            .incoming_capabilities
+            .iter()
+            .any(|capability| capability == PACKET_TYPE_WEBRTC_SIGNAL_V1);
+    eprintln!(
+        "[DL-WRTC-BOOT] peer WebRTC signaling capability: {}",
+        remote_supports_webrtc
+    );
+    let read_devices = Arc::clone(&devices);
+    let read_sessions = Arc::clone(&sessions);
+    let read_config = Arc::clone(&config);
+    let read_binding = binding.clone();
+    let read_events = Arc::clone(&events);
     thread::spawn(move || {
         packet_read_loop(
             read_binding,
             read_devices,
+            read_sessions,
             read_config,
             read_events,
-            read_transfer_cancellations,
-            reader_sessions,
-            reader_webrtc,
         )
     });
 
-    // Android starts its packet receiver as the control link is installed.
-    // Give that receiver a short, bounded chance to install before producing
-    // the first SDP offer; the protocol remains deterministic and does not
-    // depend on this delay for authorization or identity verification.
-    if paired {
-        let begin_binding = registration.binding;
-        let begin_config = Arc::clone(&config);
-        let begin_sessions = sessions;
-        let begin_events = events;
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(250));
-            webrtc.begin_if_supported(&begin_binding, begin_config, begin_sessions, begin_events);
-        });
+    if remote_supports_webrtc {
+        schedule_webrtc_bootstrap(
+            binding,
+            Arc::clone(&sessions),
+            Arc::clone(&config),
+            Arc::clone(&devices),
+            Arc::clone(&events),
+        );
     }
     Ok(())
 }
 
-pub(super) fn handle_disconnect(
-    binding: &crate::device_links::core::device_manager::SessionBinding,
-    sessions: &DeviceManager,
-    webrtc: &WebRtcCoordinator,
-    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    events: &EventBus,
-) -> bool {
-    webrtc.close_for_binding(binding, sessions);
-    let result =
-        sessions.disconnect_if_current(binding, "The device connection was closed".to_string());
-    if result.was_current {
-        if let Some(webrtc_binding) = sessions.current_webrtc_binding(&binding.device_id) {
-            if webrtc_binding.session_id == binding.session_id
-                && webrtc_binding.generation == binding.generation
+/// Start SDP/ICE only after the normal packet reader owns the TLS stream.
+/// Both implementations use buffered identity readers during the secure
+/// handshake; signaling sent before those readers are retired can otherwise
+/// be prefetched and lost. A bounded retry is safe because each request is
+/// signed and replay-protected, and it stops as soon as an attempt is active.
+fn schedule_webrtc_bootstrap(
+    binding: SessionBinding,
+    sessions: Arc<DeviceManager>,
+    config: Arc<Mutex<Config>>,
+    devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
+) {
+    thread::spawn(move || {
+        for delay in [250_u64, 1_000, 2_000, 4_000] {
+            thread::sleep(Duration::from_millis(delay));
+            if !sessions.is_current(&binding) {
+                eprintln!(
+                    "[DL-WRTC-BOOT] bootstrap scheduler stopped for stale generation {}",
+                    binding.generation
+                );
+                return;
+            }
+            if sessions
+                .active_webrtc_attempt(&binding)
+                .ok()
+                .flatten()
+                .is_some()
             {
-                sessions.clear_webrtc_if_current(&webrtc_binding);
+                return;
+            }
+            if let Err(error) = crate::device_links::webrtc::coordinator::start_initiator(
+                binding.clone(),
+                Arc::clone(&sessions),
+                Arc::clone(&config),
+                Arc::clone(&devices),
+                Arc::clone(&events),
+            ) {
+                eprintln!("[Daemon] DeskLink WebRTC bootstrap attempt failed: {error}");
             }
         }
-        binding.link.close();
-        mark_status(devices, &binding.device_id, DeviceStatus::Unreachable);
-        if let Ok(devices) = devices.lock() {
-            if let Some(device) = devices.get(&binding.device_id) {
-                events.publish(CoreEvent::DeviceChanged {
-                    device: Box::new(device.clone()),
-                });
-            }
-        }
-        events.publish(CoreEvent::ConnectionChanged {
-            device_id: binding.device_id.clone(),
-            state: DeviceConnectionState::Unreachable,
-            message: Some("The device connection was closed".to_string()),
-        });
+    });
+}
+
+pub(super) fn handle_disconnect(
+    binding: &SessionBinding,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    sessions: &Arc<DeviceManager>,
+    reason: String,
+) -> bool {
+    let result = sessions.bootstrap_disconnected_if_current(binding, reason);
+    if !result.was_current {
+        return false;
     }
-    result.was_current
+    if let Some(link) = result.link {
+        link.close();
+    }
+    if result.feature_transport_retained {
+        eprintln!(
+            "[DL-WRTC-BOOT] bootstrap link closed for {}; retained authenticated WebRTC feature transport",
+            binding.device_id
+        );
+        return false;
+    }
+    if let Some(peer) = result.webrtc {
+        peer.close();
+    }
+    mark_status(devices, &binding.device_id, DeviceStatus::Unreachable);
+    true
 }

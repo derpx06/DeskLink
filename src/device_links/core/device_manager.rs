@@ -1,12 +1,31 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use super::device_session::{ConnectionGeneration, DeviceSession, SessionId, SessionState};
-use super::session_link::Link;
-use crate::device_links::webrtc::transport::WebRtcTransport;
+use crate::device_links::pairing::PairingHandler;
+use crate::device_links::webrtc::transfer_manager::WebRtcTransferManager;
+use crate::device_links::webrtc::{DesktopWebRtcPeer, HandoverRuntime, WebRtcWireBinding};
 
+use super::{
+    ConnectionGeneration, DeviceSession, SessionBinding, SessionId, SessionLink, SessionState,
+};
+
+/// Immutable transport data copied from the authoritative session while its
+/// lock is held.  Callers must perform network I/O only after obtaining this
+/// snapshot: GStreamer and TLS callbacks may synchronously trigger lifecycle
+/// work, so holding the session mutex across a send can deadlock recovery.
+#[derive(Clone)]
+pub struct FeatureTransportSnapshot {
+    pub binding: SessionBinding,
+    pub paired: bool,
+    pub web_rtc_peer: Option<Arc<DesktopWebRtcPeer>>,
+    pub transfer_manager: Option<Arc<WebRtcTransferManager>>,
+    pub web_rtc_wire: Option<WebRtcWireBinding>,
+    pub web_rtc_ready: bool,
+}
+
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
     UnknownSession,
@@ -14,42 +33,36 @@ pub enum SessionError {
     TerminatedSession,
     AlreadyClaimed,
     NotEligibleForReconnect,
+    NotPaired,
+    ReplayDetected,
+    Poisoned,
 }
 
-#[derive(Clone)]
-pub struct SessionBinding {
-    pub device_id: String,
-    pub session_id: SessionId,
-    pub generation: ConnectionGeneration,
-    pub link: Arc<Link>,
-    pub cancellation: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl std::fmt::Debug for SessionBinding {
+impl std::fmt::Display for SessionError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("SessionBinding")
-            .field("device_id", &self.device_id)
-            .field("session_id", &self.session_id)
-            .field("generation", &self.generation)
-            .finish()
+        let message = match self {
+            Self::UnknownSession => "Device session is unknown",
+            Self::StaleBinding => "Connection was replaced by a newer session generation",
+            Self::TerminatedSession => "Device session is terminated",
+            Self::AlreadyClaimed => "Reconnect is already in progress",
+            Self::NotEligibleForReconnect => "Device session is not eligible for reconnect",
+            Self::NotPaired => "DeskLink WebRTC requires a paired device session",
+            Self::ReplayDetected => "DeskLink WebRTC signaling request was replayed",
+            Self::Poisoned => "Device session lock poisoned",
+        };
+        formatter.write_str(message)
     }
 }
 
-#[derive(Clone)]
+#[allow(dead_code)]
 pub struct RegistrationResult {
     pub binding: SessionBinding,
-    pub replaced_link: Option<Arc<Link>>,
+    pub replaced_link: Option<Arc<SessionLink>>,
     pub replaced_generation: Option<ConnectionGeneration>,
-    pub replaced_webrtc_transport: Option<Arc<WebRtcTransport>>,
+    pub replaced_webrtc: Option<Arc<DesktopWebRtcPeer>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DisconnectResult {
-    pub was_current: bool,
-    pub reconnect_scheduled: bool,
-}
-
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconnectLease {
     pub device_id: String,
@@ -57,191 +70,207 @@ pub struct ReconnectLease {
     pub generation: ConnectionGeneration,
 }
 
-#[derive(Clone)]
-pub struct WebRtcBinding {
-    pub device_id: String,
-    pub session_id: SessionId,
-    pub generation: ConnectionGeneration,
-    pub transport: Arc<WebRtcTransport>,
+pub struct DisconnectResult {
+    pub was_current: bool,
+    /// The closed socket was only the LAN bootstrap/signaling path.  A
+    /// mutually feature-ready WebRTC peer remains authoritative for the
+    /// logical session and must not be cancelled with that socket.
+    pub feature_transport_retained: bool,
+    pub link: Option<Arc<SessionLink>>,
+    pub webrtc: Option<Arc<DesktopWebRtcPeer>>,
 }
 
-impl std::fmt::Debug for WebRtcBinding {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("WebRtcBinding")
-            .field("device_id", &self.device_id)
-            .field("session_id", &self.session_id)
-            .field("generation", &self.generation)
-            .finish()
-    }
-}
-
-pub struct WebRtcRegistration {
-    pub binding: WebRtcBinding,
-    pub replaced_transport: Option<Arc<WebRtcTransport>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceSessionSnapshot {
-    pub session_id: SessionId,
-    pub connection_generation: ConnectionGeneration,
-    pub device_id: String,
-    pub state: SessionState,
-    pub pair_state: crate::device_links::pairing::PairState,
-    pub reconnect_attempt: u32,
-}
-
-#[derive(Clone)]
 pub struct DeviceManager {
-    sessions: Arc<Mutex<HashMap<String, DeviceSession>>>,
-    webrtc: Arc<Mutex<HashMap<String, WebRtcBinding>>>,
-    next_session_id: Arc<AtomicU64>,
-}
-
-impl Default for DeviceManager {
-    fn default() -> Self {
-        Self::new()
-    }
+    next_session_id: AtomicU64,
+    sessions: Mutex<HashMap<String, DeviceSession>>,
 }
 
 impl DeviceManager {
     pub fn new() -> Self {
         Self {
-            sessions: Arc::new(Mutex::new(HashMap::new())),
-            webrtc: Arc::new(Mutex::new(HashMap::new())),
-            next_session_id: Arc::new(AtomicU64::new(1)),
-        }
-    }
-
-    pub fn ensure(&self, device_id: &str) -> DeviceSession {
-        let mut sessions = self.sessions.lock().expect("device session lock poisoned");
-        sessions
-            .entry(device_id.to_string())
-            .or_insert_with(|| {
-                let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
-                DeviceSession::new(session_id, device_id, false)
-            })
-            .clone()
-    }
-
-    pub fn observe_device(&self, device_id: &str, initially_paired: bool) -> DeviceSession {
-        let mut sessions = self.sessions.lock().expect("device session lock poisoned");
-        let session = sessions.entry(device_id.to_string()).or_insert_with(|| {
-            let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
-            DeviceSession::new(session_id, device_id, initially_paired)
-        });
-        if initially_paired
-            && session.active_link.is_none()
-            && session.pair_state() != crate::device_links::pairing::PairState::Paired
-        {
-            session.pairing = Arc::new(Mutex::new(
-                crate::device_links::pairing::PairingHandler::new(true),
-            ));
-        }
-        if initially_paired && session.active_link.is_none() && session.next_reconnect_at.is_none()
-        {
-            session.schedule_reconnect(Instant::now());
-        }
-        session.clone()
-    }
-
-    pub fn schedule_reconnect(&self, device_id: &str, now: Instant) {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            if let Some(session) = sessions.get_mut(device_id) {
-                session.schedule_reconnect(now);
-            }
+            next_session_id: AtomicU64::new(1),
+            sessions: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn register_link(
         &self,
         device_id: String,
-        link: Link,
+        link: SessionLink,
         initially_paired: bool,
     ) -> Result<RegistrationResult, SessionError> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| SessionError::UnknownSession)?;
-        let session = sessions.entry(device_id.clone()).or_insert_with(|| {
-            let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
-            DeviceSession::new(session_id, device_id.clone(), initially_paired)
-        });
-        if session.is_terminated() {
-            return Err(SessionError::TerminatedSession);
-        }
+        let link = Arc::new(link);
+        let result = {
+            let mut sessions = self.sessions.lock().map_err(|_| SessionError::Poisoned)?;
+            let now = Instant::now();
 
-        let replaced_link = session.active_link.take();
-        let replaced_generation = if replaced_link.is_some() {
-            Some(session.connection_generation)
-        } else {
-            None
+            if let Some(session) = sessions.get_mut(&device_id) {
+                if session.state == SessionState::Terminated {
+                    return Err(SessionError::TerminatedSession);
+                }
+                let replaced_generation = Some(session.connection_generation);
+                let replaced_link = session.active_link.replace(Arc::clone(&link));
+                let replaced_webrtc = session.active_webrtc.take();
+
+                // Every accepted connection after the first represents a new
+                // transport generation, including a reconnect after
+                // `disconnect_if_current` removed the old link.  Reusing the
+                // cancelled token from the disconnected generation makes the
+                // new packet reader stale before it starts and prevents
+                // WebRTC bootstrap from ever running.
+                session.cancellation.store(true, Ordering::Release);
+                session.connection_generation = session.connection_generation.saturating_add(1);
+                session.cancellation = Arc::new(AtomicBool::new(false));
+                session.clear_webrtc_state();
+                if initially_paired
+                    && session.pairing.state != crate::device_links::pairing::PairState::Paired
+                {
+                    session.pairing = PairingHandler::new(true);
+                }
+                session.state = SessionState::Ready;
+                session.connected_at = Some(now);
+                session.last_disconnect_reason = None;
+                session.reconnect_attempt = 0;
+                session.reconnect_scheduled = false;
+                session.next_reconnect_at = None;
+                let binding = session
+                    .binding()
+                    .expect("registered session always has a link");
+                RegistrationResult {
+                    binding,
+                    replaced_link,
+                    replaced_generation,
+                    replaced_webrtc,
+                }
+            } else {
+                let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+                let session = DeviceSession {
+                    session_id,
+                    connection_generation: 1,
+                    device_id: device_id.clone(),
+                    pairing: PairingHandler::new(initially_paired),
+                    state: SessionState::Ready,
+                    active_link: Some(Arc::clone(&link)),
+                    active_webrtc: None,
+                    transfer_manager: None,
+                    webrtc_attempt_id: None,
+                    webrtc_handover: None,
+                    seen_webrtc_request_ids: Default::default(),
+                    seen_webrtc_message_ids: Default::default(),
+                    cancellation: Arc::new(AtomicBool::new(false)),
+                    connected_at: Some(now),
+                    last_disconnect_reason: None,
+                    reconnect_attempt: 0,
+                    reconnect_scheduled: false,
+                    next_reconnect_at: None,
+                };
+                let binding = session.binding().expect("new session always has a link");
+                sessions.insert(device_id, session);
+                RegistrationResult {
+                    binding,
+                    replaced_link: None,
+                    replaced_generation: None,
+                    replaced_webrtc: None,
+                }
+            }
         };
-        if replaced_link.is_some() {
-            session.cancellation.store(true, Ordering::SeqCst);
+        if let Some(replaced_link) = &result.replaced_link {
+            replaced_link.close();
         }
-        session.connection_generation = session.connection_generation.saturating_add(1);
-        session.cancellation = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        session.active_link = Some(Arc::new(link));
-        session.connected_at = Some(Instant::now());
-        session.last_disconnect_reason = None;
-        session.clear_reconnect();
-        session.transition(SessionState::Ready);
-        let binding = SessionBinding {
-            device_id: device_id.clone(),
-            session_id: session.session_id,
-            generation: session.connection_generation,
-            link: session
-                .active_link
-                .as_ref()
-                .expect("active link installed")
-                .clone(),
-            cancellation: Arc::clone(&session.cancellation),
-        };
-        let replaced_webrtc_transport = self
-            .webrtc
-            .lock()
-            .ok()
-            .and_then(|mut bindings| bindings.remove(&device_id))
-            .map(|binding| binding.transport);
-        Ok(RegistrationResult {
-            binding,
-            replaced_link,
-            replaced_generation,
-            replaced_webrtc_transport,
-        })
+        Ok(result)
     }
 
     pub fn current_binding(&self, device_id: &str) -> Option<SessionBinding> {
         let sessions = self.sessions.lock().ok()?;
         let session = sessions.get(device_id)?;
-        let link = session.active_link.as_ref()?.clone();
-        Some(SessionBinding {
-            device_id: device_id.to_string(),
-            session_id: session.session_id,
-            generation: session.connection_generation,
-            link,
-            cancellation: Arc::clone(&session.cancellation),
+        if session.state == SessionState::Terminated {
+            return None;
+        }
+        session.binding()
+    }
+
+    pub fn current_bindings(&self) -> Vec<SessionBinding> {
+        self.sessions
+            .lock()
+            .map(|sessions| {
+                sessions
+                    .values()
+                    .filter(|session| session.state != SessionState::Terminated)
+                    .filter_map(DeviceSession::binding)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Returns whether a device already has a mutually feature-ready WebRTC
+    /// peer.  A later LAN socket is only a bootstrap/signaling candidate in
+    /// that state and must not replace the live feature generation.
+    pub fn has_ready_webrtc(&self, device_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| {
+                sessions.get(device_id).map(|session| {
+                    session
+                        .webrtc_handover
+                        .as_ref()
+                        .is_some_and(HandoverRuntime::features_ready)
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Takes a generation-checked, immutable view of the current transport.
+    /// The snapshot is intentionally not a capability to mutate session
+    /// state.  A caller must re-check [`Self::is_current`] immediately before
+    /// I/O; the wire generation then protects the receiver if replacement
+    /// races with that send.
+    pub fn feature_transport_snapshot(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<FeatureTransportSnapshot, SessionError> {
+        self.with_session(binding, |session| {
+            let (web_rtc_peer, transfer_manager, web_rtc_wire, web_rtc_ready) = match (
+                session.active_webrtc.as_ref(),
+                session.webrtc_handover.as_ref(),
+            ) {
+                (Some(peer), Some(handover)) => (
+                    Some(Arc::clone(peer)),
+                    session.transfer_manager.as_ref().cloned(),
+                    Some(handover.wire_binding.clone()),
+                    handover.features_ready(),
+                ),
+                _ => (None, None, None, false),
+            };
+            FeatureTransportSnapshot {
+                binding: binding.clone(),
+                paired: session.pairing.state == crate::device_links::pairing::PairState::Paired,
+                web_rtc_peer,
+                transfer_manager,
+                web_rtc_wire,
+                web_rtc_ready,
+            }
         })
     }
 
     pub fn is_current(&self, binding: &SessionBinding) -> bool {
-        let Some(session) = self
-            .sessions
-            .lock()
-            .ok()
-            .and_then(|sessions| sessions.get(&binding.device_id).cloned())
-        else {
+        if binding.cancellation.load(Ordering::Acquire) {
+            return false;
+        }
+        let Ok(sessions) = self.sessions.lock() else {
             return false;
         };
-        session.session_id == binding.session_id
+        let Some(session) = sessions.get(&binding.device_id) else {
+            return false;
+        };
+        session.state != SessionState::Terminated
+            && session.session_id == binding.session_id
             && session.connection_generation == binding.generation
             && session
                 .active_link
                 .as_ref()
                 .is_some_and(|link| Arc::ptr_eq(link, &binding.link))
             && Arc::ptr_eq(&session.cancellation, &binding.cancellation)
-            && !session.is_terminated()
     }
 
     pub fn with_session<R>(
@@ -249,59 +278,25 @@ impl DeviceManager {
         binding: &SessionBinding,
         operation: impl FnOnce(&mut DeviceSession) -> R,
     ) -> Result<R, SessionError> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| SessionError::UnknownSession)?;
+        let mut sessions = self.sessions.lock().map_err(|_| SessionError::Poisoned)?;
         let session = sessions
             .get_mut(&binding.device_id)
             .ok_or(SessionError::UnknownSession)?;
-        if session.is_terminated() {
+        if session.state == SessionState::Terminated {
             return Err(SessionError::TerminatedSession);
         }
-        if session.session_id != binding.session_id
-            || session.connection_generation != binding.generation
-            || session
+        let is_current = session.session_id == binding.session_id
+            && session.connection_generation == binding.generation
+            && session
                 .active_link
                 .as_ref()
-                .is_none_or(|link| !Arc::ptr_eq(link, &binding.link))
-        {
+                .is_some_and(|link| Arc::ptr_eq(link, &binding.link))
+            && Arc::ptr_eq(&session.cancellation, &binding.cancellation)
+            && !binding.cancellation.load(Ordering::Acquire);
+        if !is_current {
             return Err(SessionError::StaleBinding);
         }
         Ok(operation(session))
-    }
-
-    pub fn with_pairing<R>(
-        &self,
-        binding: &SessionBinding,
-        operation: impl FnOnce(&mut crate::device_links::pairing::PairingHandler) -> R,
-    ) -> Result<R, SessionError> {
-        let result = self.with_session(binding, |session| match session.pairing.lock() {
-            Ok(mut pairing) => Ok(operation(&mut pairing)),
-            Err(_) => Err(()),
-        })?;
-        result.map_err(|_| SessionError::UnknownSession)
-    }
-
-    pub fn pairing_state(
-        &self,
-        binding: &SessionBinding,
-    ) -> Result<crate::device_links::pairing::PairState, SessionError> {
-        self.with_session(binding, |session| session.pair_state())
-    }
-
-    pub fn verification_key(&self, binding: &SessionBinding) -> Result<String, SessionError> {
-        self.with_session(binding, |session| {
-            crate::device_links::pairing::PairingHandler::verification_key(
-                &binding.link.local_public_der,
-                &binding.link.remote_public_der,
-                session
-                    .pairing
-                    .lock()
-                    .map(|pairing| pairing.timestamp())
-                    .unwrap_or_default(),
-            )
-        })
     }
 
     pub fn disconnect_if_current(
@@ -312,471 +307,701 @@ impl DeviceManager {
         let Ok(mut sessions) = self.sessions.lock() else {
             return DisconnectResult {
                 was_current: false,
-                reconnect_scheduled: false,
+                feature_transport_retained: false,
+                link: None,
+                webrtc: None,
             };
         };
         let Some(session) = sessions.get_mut(&binding.device_id) else {
             return DisconnectResult {
                 was_current: false,
-                reconnect_scheduled: false,
+                feature_transport_retained: false,
+                link: None,
+                webrtc: None,
             };
         };
-        if session.session_id != binding.session_id
-            || session.connection_generation != binding.generation
-            || session
+        let matches = session.session_id == binding.session_id
+            && session.connection_generation == binding.generation
+            && session
                 .active_link
                 .as_ref()
-                .is_none_or(|link| !Arc::ptr_eq(link, &binding.link))
-        {
+                .is_some_and(|link| Arc::ptr_eq(link, &binding.link))
+            && Arc::ptr_eq(&session.cancellation, &binding.cancellation);
+        if !matches || session.state == SessionState::Terminated {
             return DisconnectResult {
                 was_current: false,
-                reconnect_scheduled: false,
+                feature_transport_retained: false,
+                link: None,
+                webrtc: None,
             };
         }
-        session.active_link = None;
-        session.cancellation.store(true, Ordering::SeqCst);
+        session.state = SessionState::Disconnected;
         session.last_disconnect_reason = Some(reason);
         session.connected_at = None;
-        session.transition(SessionState::Disconnected);
-        if session.pair_state() == crate::device_links::pairing::PairState::Paired {
-            session.schedule_reconnect(Instant::now());
-        }
+        session.cancellation.store(true, Ordering::Release);
+        let link = session.active_link.take();
+        let webrtc = session.clear_webrtc_state();
         DisconnectResult {
             was_current: true,
-            reconnect_scheduled: session.next_reconnect_at.is_some(),
+            feature_transport_retained: false,
+            link,
+            webrtc,
         }
     }
 
-    /// Installs one WebRTC transport only for the currently authenticated LAN
-    /// generation. The caller can later replace the LAN transport after the
-    /// WebRTC transcript and channel negotiation have completed.
-    pub fn register_webrtc_transport(
+    /// Handles loss of the LAN discovery/pairing/signaling socket without
+    /// conflating it with loss of an already authenticated WebRTC feature
+    /// peer.  The current binding intentionally retains its link identity:
+    /// WebRTC callbacks are generation-bound to that binding, while the
+    /// socket itself is closed after this manager lock is released.
+    pub fn bootstrap_disconnected_if_current(
         &self,
         binding: &SessionBinding,
-        transport: WebRtcTransport,
-    ) -> Result<WebRtcRegistration, SessionError> {
-        if !self.is_current(binding) {
-            return Err(SessionError::StaleBinding);
-        }
-        let transport = Arc::new(transport);
-        let web_rtc_binding = WebRtcBinding {
-            device_id: binding.device_id.clone(),
-            session_id: binding.session_id,
-            generation: binding.generation,
-            transport,
+        reason: String,
+    ) -> DisconnectResult {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return DisconnectResult {
+                was_current: false,
+                feature_transport_retained: false,
+                link: None,
+                webrtc: None,
+            };
         };
-        let replaced_binding = self
-            .webrtc
-            .lock()
-            .map_err(|_| SessionError::UnknownSession)?
-            .insert(binding.device_id.clone(), web_rtc_binding.clone());
-        if let Some(previous) = &replaced_binding {
-            previous.transport.close();
+        let Some(session) = sessions.get_mut(&binding.device_id) else {
+            return DisconnectResult {
+                was_current: false,
+                feature_transport_retained: false,
+                link: None,
+                webrtc: None,
+            };
+        };
+        let matches = session.session_id == binding.session_id
+            && session.connection_generation == binding.generation
+            && session
+                .active_link
+                .as_ref()
+                .is_some_and(|link| Arc::ptr_eq(link, &binding.link))
+            && Arc::ptr_eq(&session.cancellation, &binding.cancellation);
+        if !matches || session.state == SessionState::Terminated {
+            return DisconnectResult {
+                was_current: false,
+                feature_transport_retained: false,
+                link: None,
+                webrtc: None,
+            };
         }
-        Ok(WebRtcRegistration {
-            binding: web_rtc_binding,
-            replaced_transport: replaced_binding.map(|binding| binding.transport),
+
+        // `HandoverRuntime::features_ready` is reached only after the
+        // installed peer has completed mutual authentication, capabilities,
+        // and feature-ready confirmation.  Peer and handover are installed
+        // and cleared together by this manager.
+        let web_rtc_ready = session
+            .webrtc_handover
+            .as_ref()
+            .is_some_and(HandoverRuntime::features_ready);
+        if web_rtc_ready {
+            // Do not cancel the generation or clear peer/handover state.  The
+            // retained Arc is returned only so the caller can close the dead
+            // bootstrap socket without doing I/O under the session lock.
+            session.state = SessionState::Ready;
+            session.last_disconnect_reason = None;
+            return DisconnectResult {
+                was_current: true,
+                feature_transport_retained: true,
+                link: session.active_link.as_ref().cloned(),
+                webrtc: None,
+            };
+        }
+        drop(sessions);
+        self.disconnect_if_current(binding, reason)
+    }
+
+    /// Atomically installs the only current WebRTC peer for a current DeskLink
+    /// session. The caller closes a replaced peer after this manager lock is
+    /// released so GStreamer callbacks cannot deadlock the session core.
+    pub fn install_webrtc_peer(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: String,
+        wire_binding: WebRtcWireBinding,
+        peer: DesktopWebRtcPeer,
+        transfer_manager: Arc<WebRtcTransferManager>,
+    ) -> Result<Option<Arc<DesktopWebRtcPeer>>, SessionError> {
+        self.with_session(binding, |session| {
+            if session.pairing.state != crate::device_links::pairing::PairState::Paired {
+                return Err(SessionError::NotPaired);
+            }
+            let replaced = session.active_webrtc.replace(Arc::new(peer));
+            session.transfer_manager = Some(transfer_manager);
+            session.webrtc_handover = Some(HandoverRuntime::new(attempt_id.clone(), wire_binding));
+            session.webrtc_attempt_id = Some(attempt_id);
+            session.seen_webrtc_request_ids.clear();
+            session.seen_webrtc_message_ids.clear();
+            Ok(replaced)
+        })?
+    }
+
+    pub fn active_webrtc_peer(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+    ) -> Result<Arc<DesktopWebRtcPeer>, SessionError> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            session
+                .active_webrtc
+                .as_ref()
+                .cloned()
+                .ok_or(SessionError::UnknownSession)
+        })?
+    }
+
+    /// Returns the signed attempt currently associated with this transport
+    /// generation.  Bootstrap SDP/ICE messages must never replace it merely
+    /// because they arrived later on a retried TLS socket.
+    pub fn active_webrtc_attempt(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<Option<String>, SessionError> {
+        self.with_session(binding, |session| Ok(session.webrtc_attempt_id.clone()))?
+    }
+
+    /// Reads the handover state from the session owner. A false value is a
+    /// deliberate safe default: LAN feature traffic remains available only
+    /// until both peers have completed their authenticated handover.
+    #[allow(dead_code)] // Consumed by the shared feature-dispatcher slice.
+    pub fn webrtc_features_ready(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+    ) -> Result<bool, SessionError> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            Ok(session
+                .webrtc_handover
+                .as_ref()
+                .is_some_and(HandoverRuntime::features_ready))
+        })?
+    }
+
+    /// Invalidates one WebRTC attempt without dropping the authenticated LAN
+    /// bootstrap session. Only the current attempt may clear the peer; stale
+    /// GStreamer callbacks receive `StaleBinding` and cannot affect a newer
+    /// generation.
+    pub fn clear_webrtc_if_current(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+        reason: String,
+    ) -> Result<Option<Arc<DesktopWebRtcPeer>>, SessionError> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            session.last_disconnect_reason = Some(reason);
+            Ok(session.clear_webrtc_state())
+        })?
+    }
+
+    /// Revokes the local pairing state and every WebRTC object derived from
+    /// it.  The returned peer is deliberately closed by the caller only after
+    /// the session lock has been released, because peer callbacks can trigger
+    /// lifecycle work.
+    pub fn revoke_pairing(
+        &self,
+        binding: &SessionBinding,
+        reason: String,
+    ) -> Result<
+        (
+            crate::device_links::packet::NetworkPacket,
+            Option<Arc<DesktopWebRtcPeer>>,
+        ),
+        SessionError,
+    > {
+        self.with_session(binding, |session| {
+            let packet = session.pairing.reject_packet();
+            session.last_disconnect_reason = Some(reason);
+            (packet, session.clear_webrtc_state())
         })
     }
 
-    pub fn current_webrtc_binding(&self, device_id: &str) -> Option<WebRtcBinding> {
-        self.webrtc.lock().ok()?.get(device_id).cloned()
-    }
-
-    pub fn is_current_webrtc(&self, binding: &WebRtcBinding) -> bool {
-        let Some(current_session) = self.current_binding(&binding.device_id) else {
-            return false;
-        };
-        current_session.session_id == binding.session_id
-            && current_session.generation == binding.generation
-            && self
-                .webrtc
-                .lock()
-                .ok()
-                .and_then(|bindings| bindings.get(&binding.device_id).cloned())
-                .is_some_and(|current| {
-                    current.session_id == binding.session_id
-                        && current.generation == binding.generation
-                        && Arc::ptr_eq(&current.transport, &binding.transport)
-                })
-    }
-
-    pub fn clear_webrtc_if_current(&self, binding: &WebRtcBinding) -> bool {
-        let removed = self.webrtc.lock().ok().and_then(|mut bindings| {
-            let current = bindings.get(&binding.device_id)?;
-            if current.session_id != binding.session_id
-                || current.generation != binding.generation
-                || !Arc::ptr_eq(&current.transport, &binding.transport)
-            {
-                return None;
+    /// Serializes all mutations of the WebRTC handover runtime through the
+    /// authoritative session. It prevents a callback from a replaced peer
+    /// generation from changing current transport policy.
+    pub fn with_webrtc_handover<R>(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+        operation: impl FnOnce(&mut HandoverRuntime) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err("DeskLink WebRTC session was replaced".to_string());
             }
-            bindings.remove(&binding.device_id)
-        });
-        if let Some(current) = removed {
-            current.transport.close();
-            true
-        } else {
-            false
-        }
+            let handover = session
+                .webrtc_handover
+                .as_mut()
+                .ok_or_else(|| "DeskLink WebRTC handover is not initialized".to_string())?;
+            operation(handover)
+        })
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
     }
 
-    pub fn terminate_all_webrtc(&self) -> Vec<Arc<WebRtcTransport>> {
-        let transports: Vec<Arc<WebRtcTransport>> = self
-            .webrtc
-            .lock()
-            .map(|mut bindings| {
-                bindings
-                    .drain()
-                    .map(|(_, binding)| binding.transport)
-                    .collect()
-            })
-            .unwrap_or_default();
-        transports.iter().for_each(|transport| transport.close());
-        transports
+    /// Returns the active peer only once for a signed signaling request ID.
+    /// The bounded replay cache belongs to the session rather than a packet
+    /// reader so duplicate LAN links cannot bypass it.
+    pub fn accept_webrtc_signal(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+        request_id: String,
+    ) -> Result<Arc<DesktopWebRtcPeer>, SessionError> {
+        self.with_session(binding, |session| {
+            if session.pairing.state != crate::device_links::pairing::PairState::Paired {
+                return Err(SessionError::NotPaired);
+            }
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            if !session.seen_webrtc_request_ids.insert(request_id) {
+                return Err(SessionError::ReplayDetected);
+            }
+            while session.seen_webrtc_request_ids.len() > 4096 {
+                let Some(oldest) = session.seen_webrtc_request_ids.iter().next().cloned() else {
+                    break;
+                };
+                session.seen_webrtc_request_ids.remove(&oldest);
+            }
+            session
+                .active_webrtc
+                .as_ref()
+                .cloned()
+                .ok_or(SessionError::UnknownSession)
+        })?
     }
 
+    /// Accepts a data-channel envelope message ID exactly once for the active
+    /// WebRTC attempt. The cache is session-owned so a stale peer callback
+    /// cannot bypass replay protection after a link replacement.
+    pub fn accept_webrtc_envelope(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+        message_id: String,
+    ) -> Result<(), SessionError> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            if !session.seen_webrtc_message_ids.insert(message_id) {
+                return Err(SessionError::ReplayDetected);
+            }
+            while session.seen_webrtc_message_ids.len() > 4096 {
+                let Some(oldest) = session.seen_webrtc_message_ids.iter().next().cloned() else {
+                    break;
+                };
+                session.seen_webrtc_message_ids.remove(&oldest);
+            }
+            Ok(())
+        })?
+    }
+
+    #[allow(dead_code)]
     pub fn claim_reconnect(&self, device_id: &str, now: Instant) -> Option<ReconnectLease> {
-        if let Ok(mut sessions) = self.sessions.lock() {
-            let session = sessions.get_mut(device_id)?;
-            if session.is_terminated() || session.active_link.is_some() {
-                return None;
-            }
-            if !session.reconnect_due(now) {
-                return None;
-            }
-            session.reconnect_scheduled = true;
-            session.transition(SessionState::Reconnecting);
-            return Some(ReconnectLease {
-                device_id: device_id.to_string(),
-                session_id: session.session_id,
-                generation: session.connection_generation,
-            });
+        let mut sessions = self.sessions.lock().ok()?;
+        let session = sessions.get_mut(device_id)?;
+        if session.state == SessionState::Terminated
+            || session.pairing.state != crate::device_links::pairing::PairState::Paired
+            || session.reconnect_scheduled
+            || session.next_reconnect_at.is_some_and(|at| at > now)
+        {
+            return None;
         }
-        None
+        session.state = SessionState::Reconnecting;
+        session.reconnect_scheduled = true;
+        Some(ReconnectLease {
+            device_id: device_id.to_string(),
+            session_id: session.session_id,
+            generation: session.connection_generation,
+        })
     }
 
+    #[allow(dead_code)]
     pub fn reconnect_succeeded(&self, lease: &ReconnectLease) {
         if let Ok(mut sessions) = self.sessions.lock() {
             if let Some(session) = sessions.get_mut(&lease.device_id) {
                 if session.session_id == lease.session_id
                     && session.connection_generation == lease.generation
+                    && session.state != SessionState::Terminated
                 {
-                    session.reconnect_succeeded();
+                    session.reconnect_scheduled = false;
+                    session.reconnect_attempt = 0;
+                    session.next_reconnect_at = None;
                 }
             }
         }
     }
 
-    pub fn reconnect_failed(&self, lease: &ReconnectLease, _reason: String) {
+    #[allow(dead_code)]
+    pub fn reconnect_failed(&self, lease: &ReconnectLease, reason: String) {
         if let Ok(mut sessions) = self.sessions.lock() {
             if let Some(session) = sessions.get_mut(&lease.device_id) {
                 if session.session_id == lease.session_id
                     && session.connection_generation == lease.generation
+                    && session.state != SessionState::Terminated
                 {
-                    session.reconnect_failed(Instant::now());
+                    session.state = SessionState::Disconnected;
+                    session.reconnect_scheduled = false;
+                    session.reconnect_attempt = session.reconnect_attempt.saturating_add(1);
+                    session.last_disconnect_reason = Some(reason);
                 }
             }
         }
     }
 
-    pub fn terminate_all(&self) -> Vec<Arc<Link>> {
+    pub fn terminate_all(&self) -> Vec<Arc<SessionLink>> {
         let Ok(mut sessions) = self.sessions.lock() else {
             return Vec::new();
         };
-        let mut links = Vec::new();
-        for session in sessions.values_mut() {
-            session.transition(SessionState::Terminated);
-            session.cancellation.store(true, Ordering::SeqCst);
-            session.clear_reconnect();
-            if let Some(link) = session.active_link.take() {
-                links.push(link);
-            }
+        let mut peers = Vec::new();
+        let links = sessions
+            .values_mut()
+            .filter_map(|session| {
+                session.state = SessionState::Terminated;
+                session.reconnect_scheduled = false;
+                session.next_reconnect_at = None;
+                session.cancellation.store(true, Ordering::Release);
+                if let Some(peer) = session.clear_webrtc_state() {
+                    peers.push(peer);
+                }
+                session.active_link.take()
+            })
+            .collect();
+        drop(sessions);
+        for peer in peers {
+            peer.close();
         }
         links
     }
 
-    pub fn sessions_snapshot(&self) -> Vec<DeviceSessionSnapshot> {
-        self.sessions
-            .lock()
-            .map(|sessions| {
-                sessions
-                    .values()
-                    .map(|session| DeviceSessionSnapshot {
-                        session_id: session.session_id,
-                        connection_generation: session.connection_generation,
-                        device_id: session.device_id.clone(),
-                        state: session.state.clone(),
-                        pair_state: session.pair_state(),
-                        reconnect_attempt: session.reconnect_attempt,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub fn unpaired_count(&self) -> usize {
+    pub fn unpaired_session_count(&self) -> usize {
         self.sessions
             .lock()
             .map(|sessions| {
                 sessions
                     .values()
                     .filter(|session| {
-                        session.pair_state() != crate::device_links::pairing::PairState::Paired
+                        session.active_link.is_some()
+                            && session.pairing.state
+                                != crate::device_links::pairing::PairState::Paired
                     })
                     .count()
             })
-            .unwrap_or_default()
+            .unwrap_or(0)
     }
+}
 
-    pub fn get(&self, device_id: &str) -> Option<DeviceSession> {
-        self.sessions.lock().ok()?.get(device_id).cloned()
+impl Default for DeviceManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Link;
     use super::*;
-    use crate::device_links::device_info::DeviceInfo;
-    use crate::device_links::pairing::PairState;
-    use std::sync::Arc;
-    use std::thread;
-    use std::time::{Duration, Instant};
 
-    const DEVICE_ID: &str = "0123456789abcdef0123456789abcdef";
-
-    fn link() -> Link {
-        Link::test_link(DeviceInfo::local(
-            DEVICE_ID.to_string(),
-            "DeskLink test".to_string(),
-        ))
+    fn link(device_id: &str) -> SessionLink {
+        SessionLink::test_placeholder(device_id)
     }
 
     #[test]
-    fn first_registration_creates_one_ready_session() {
+    fn a_new_manager_has_no_current_binding() {
         let manager = DeviceManager::new();
 
-        let registration = manager
-            .register_link(DEVICE_ID.to_string(), link(), true)
-            .expect("first link should register");
-        let snapshots = manager.sessions_snapshot();
-
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].session_id, registration.binding.session_id);
-        assert_eq!(snapshots[0].connection_generation, 1);
-        assert_eq!(snapshots[0].state, SessionState::Ready);
-        assert_eq!(snapshots[0].pair_state, PairState::Paired);
-        assert!(manager.is_current(&registration.binding));
+        assert!(manager.current_binding("phone-1").is_none());
     }
 
     #[test]
-    fn replacement_keeps_session_id_and_increments_generation() {
+    fn replacement_keeps_session_id_and_makes_old_binding_stale() {
         let manager = DeviceManager::new();
         let first = manager
-            .register_link(DEVICE_ID.to_string(), link(), true)
-            .expect("first link should register");
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap();
         let second = manager
-            .register_link(DEVICE_ID.to_string(), link(), false)
-            .expect("replacement link should register");
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap();
 
         assert_eq!(first.binding.session_id, second.binding.session_id);
-        assert_eq!(first.binding.generation, 1);
-        assert_eq!(second.binding.generation, 2);
-        assert_eq!(second.replaced_generation, Some(1));
-        assert!(second.replaced_link.is_some());
-        assert!(first.binding.cancellation.load(Ordering::SeqCst));
-        assert!(!second.binding.cancellation.load(Ordering::SeqCst));
+        assert_eq!(second.binding.generation, first.binding.generation + 1);
         assert!(!manager.is_current(&first.binding));
         assert!(manager.is_current(&second.binding));
-        assert_eq!(
-            manager.get(DEVICE_ID).unwrap().pair_state(),
-            PairState::Paired
-        );
+        assert!(second.replaced_link.unwrap().is_closed());
+        assert!(first.binding.cancellation.load(Ordering::Acquire));
     }
 
     #[test]
-    fn one_webrtc_transport_is_owned_per_current_session_generation() {
+    fn transport_snapshot_becomes_stale_after_link_replacement() {
         let manager = DeviceManager::new();
-        let lan = manager
-            .register_link(DEVICE_ID.to_string(), link(), true)
-            .expect("LAN link should register");
         let first = manager
-            .register_webrtc_transport(
-                &lan.binding,
-                WebRtcTransport::new(DEVICE_ID, lan.binding.session_id, lan.binding.generation)
-                    .unwrap(),
-            )
-            .unwrap();
-        assert!(manager.is_current_webrtc(&first.binding));
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        let snapshot = manager.feature_transport_snapshot(&first).unwrap();
+        let replacement = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
 
-        let second = manager
-            .register_webrtc_transport(
-                &lan.binding,
-                WebRtcTransport::new(DEVICE_ID, lan.binding.session_id, lan.binding.generation)
-                    .unwrap(),
-            )
-            .unwrap();
-        assert!(second.replaced_transport.is_some());
-        assert!(!manager.is_current_webrtc(&first.binding));
-        assert!(manager.is_current_webrtc(&second.binding));
-        assert!(!manager.clear_webrtc_if_current(&first.binding));
-        assert!(manager.clear_webrtc_if_current(&second.binding));
-        assert!(manager.current_webrtc_binding(DEVICE_ID).is_none());
+        assert!(snapshot.paired);
+        assert!(!snapshot.web_rtc_ready);
+        assert!(!manager.is_current(&snapshot.binding));
+        assert!(manager.is_current(&replacement));
     }
 
     #[test]
-    fn stale_binding_cannot_disconnect_or_mutate_session() {
+    fn stale_disconnect_cannot_clear_a_replacement() {
         let manager = DeviceManager::new();
         let first = manager
-            .register_link(DEVICE_ID.to_string(), link(), true)
-            .expect("first link should register");
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap();
         let second = manager
-            .register_link(DEVICE_ID.to_string(), link(), true)
-            .expect("replacement link should register");
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap();
 
-        assert_eq!(
-            manager.disconnect_if_current(&first.binding, "stale".to_string()),
-            DisconnectResult {
-                was_current: false,
-                reconnect_scheduled: false,
-            }
-        );
-        assert_eq!(
-            manager.with_session(&first.binding, |_| ()),
-            Err(SessionError::StaleBinding)
-        );
+        let stale = manager.disconnect_if_current(&first.binding, "old reader ended".to_string());
+
+        assert!(!stale.was_current);
         assert!(manager.is_current(&second.binding));
-        assert_eq!(manager.get(DEVICE_ID).unwrap().state, SessionState::Ready);
     }
 
     #[test]
-    fn current_disconnect_schedules_reconnect_only_for_paired_session() {
+    fn pairing_state_survives_transport_replacement() {
         let manager = DeviceManager::new();
+        let first = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap();
+        let second = manager
+            .register_link("phone-1".to_string(), link("phone-1"), false)
+            .unwrap();
+
         let paired = manager
-            .register_link(DEVICE_ID.to_string(), link(), true)
-            .expect("paired link should register");
-        let result = manager.disconnect_if_current(&paired.binding, "network loss".to_string());
+            .with_session(&second.binding, |session| {
+                session.pairing.state == crate::device_links::pairing::PairState::Paired
+            })
+            .unwrap();
 
-        assert!(result.was_current);
-        assert!(result.reconnect_scheduled);
-        let session = manager.get(DEVICE_ID).unwrap();
-        assert_eq!(session.state, SessionState::Disconnected);
-        assert_eq!(
-            session.last_disconnect_reason.as_deref(),
-            Some("network loss")
-        );
-
-        let unpaired_id = "abcdefabcdefabcdefabcdefabcdefab";
-        let unpaired = manager
-            .register_link(unpaired_id.to_string(), link(), false)
-            .expect("unpaired link should register");
-        let result = manager.disconnect_if_current(&unpaired.binding, "closed".to_string());
-        assert!(result.was_current);
-        assert!(!result.reconnect_scheduled);
-        assert!(manager
-            .claim_reconnect(unpaired_id, Instant::now())
-            .is_none());
+        assert!(paired);
+        assert_eq!(first.binding.session_id, second.binding.session_id);
     }
 
     #[test]
     fn only_one_reconnect_lease_can_be_claimed() {
         let manager = DeviceManager::new();
-        manager.observe_device(DEVICE_ID, true);
-        let now = Instant::now() + Duration::from_millis(1);
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        let disconnected = manager.disconnect_if_current(&binding, "network lost".to_string());
+        assert!(disconnected.was_current);
 
-        let lease = manager
-            .claim_reconnect(DEVICE_ID, now)
-            .expect("paired session should have one due lease");
-        assert!(manager.claim_reconnect(DEVICE_ID, now).is_none());
-        assert_eq!(lease.session_id, manager.get(DEVICE_ID).unwrap().session_id);
+        assert!(manager.claim_reconnect("phone-1", Instant::now()).is_some());
+        assert!(manager.claim_reconnect("phone-1", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn registration_after_disconnect_creates_a_live_new_generation() {
+        let manager = DeviceManager::new();
+        let first = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        let disconnected =
+            manager.disconnect_if_current(&first, "bootstrap socket closed".to_string());
+        assert!(disconnected.was_current);
+        assert!(first.cancellation.load(Ordering::Acquire));
+
+        let reconnected = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+
+        assert_eq!(reconnected.session_id, first.session_id);
+        assert_eq!(reconnected.generation, first.generation + 1);
+        assert!(!reconnected.cancellation.load(Ordering::Acquire));
+        assert!(manager.is_current(&reconnected));
+    }
+
+    #[test]
+    fn bootstrap_disconnect_preserves_feature_ready_generation() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let wire = WebRtcWireBinding::from_attempt("desktop", "phone-1", &attempt_id).unwrap();
+        manager
+            .with_session(&binding, |session| {
+                let mut handover = HandoverRuntime::new(attempt_id.clone(), wire);
+                handover.record_offer("offer".to_string()).unwrap();
+                handover.record_answer("answer".to_string()).unwrap();
+                handover.mark_local_authenticated().unwrap();
+                handover.mark_remote_authenticated().unwrap();
+                handover.mark_local_capabilities_confirmed().unwrap();
+                handover.mark_remote_capabilities_confirmed().unwrap();
+                handover.mark_local_feature_ready().unwrap();
+                handover.mark_remote_feature_ready().unwrap();
+                session.webrtc_handover = Some(handover);
+                // The concrete GStreamer peer is not needed by this manager
+                // test. Presence is represented by retaining the handover
+                // runtime, while production only reaches this state with an
+                // installed peer.
+            })
+            .unwrap();
+
+        let disconnected = manager
+            .bootstrap_disconnected_if_current(&binding, "bootstrap socket closed".to_string());
+        assert!(disconnected.was_current);
+        assert!(disconnected.feature_transport_retained);
+        assert!(manager.is_current(&binding));
+        assert!(!binding.cancellation.load(Ordering::Acquire));
         assert_eq!(
-            manager.get(DEVICE_ID).unwrap().state,
-            SessionState::Reconnecting
+            manager
+                .with_session(&binding, |session| session.connection_generation)
+                .unwrap(),
+            binding.generation,
         );
     }
 
     #[test]
-    fn successful_registration_invalidates_old_reconnect_lease() {
+    fn stale_webrtc_failure_cannot_clear_a_new_attempt() {
         let manager = DeviceManager::new();
-        manager.observe_device(DEVICE_ID, true);
-        let lease = manager
-            .claim_reconnect(DEVICE_ID, Instant::now())
-            .expect("reconnect lease should be claimable");
-        let registration = manager
-            .register_link(DEVICE_ID.to_string(), link(), true)
-            .expect("reconnect should register");
-
-        assert_eq!(registration.binding.generation, lease.generation + 1);
-        manager.reconnect_failed(&lease, "late failure".to_string());
-        let session = manager.get(DEVICE_ID).unwrap();
-        assert_eq!(session.state, SessionState::Ready);
-        assert_eq!(session.reconnect_attempt, 0);
-        assert!(session.next_reconnect_at.is_none());
-    }
-
-    #[test]
-    fn stale_reconnect_lease_cannot_update_newer_generation() {
-        let manager = DeviceManager::new();
-        manager.observe_device(DEVICE_ID, true);
-        let lease = manager
-            .claim_reconnect(DEVICE_ID, Instant::now())
-            .expect("reconnect lease should be claimable");
-        let registration = manager
-            .register_link(DEVICE_ID.to_string(), link(), true)
-            .expect("new generation should register");
-
-        manager.reconnect_failed(&lease, "stale failure".to_string());
-        assert!(manager.is_current(&registration.binding));
-        assert_eq!(manager.get(DEVICE_ID).unwrap().state, SessionState::Ready);
-    }
-
-    #[test]
-    fn terminated_sessions_reject_new_links_and_reconnect() {
-        let manager = DeviceManager::new();
-        let registration = manager
-            .register_link(DEVICE_ID.to_string(), link(), true)
-            .expect("link should register");
-        let terminated_links = manager.terminate_all();
-
-        assert_eq!(terminated_links.len(), 1);
-        assert!(registration.binding.cancellation.load(Ordering::SeqCst));
-        assert!(manager.current_binding(DEVICE_ID).is_none());
-        assert!(manager.claim_reconnect(DEVICE_ID, Instant::now()).is_none());
-        assert!(matches!(
-            manager.register_link(DEVICE_ID.to_string(), link(), true),
-            Err(SessionError::TerminatedSession)
-        ));
-    }
-
-    #[test]
-    fn concurrent_registration_converges_to_one_current_binding() {
-        let manager = Arc::new(DeviceManager::new());
-        let workers = (0..8)
-            .map(|_| {
-                let manager = Arc::clone(&manager);
-                thread::spawn(move || {
-                    manager
-                        .register_link(DEVICE_ID.to_string(), link(), true)
-                        .expect("concurrent registration should succeed")
-                })
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        manager
+            .with_session(&binding, |session| {
+                session.webrtc_attempt_id = Some("current-attempt".to_string());
             })
-            .collect::<Vec<_>>();
-        let registrations = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("registration worker should finish"))
-            .collect::<Vec<_>>();
+            .unwrap();
 
-        let current = manager
-            .current_binding(DEVICE_ID)
-            .expect("one current binding should remain");
-        assert_eq!(manager.sessions_snapshot().len(), 1);
-        assert_eq!(current.generation, 8);
+        assert!(matches!(
+            manager.clear_webrtc_if_current(
+                &binding,
+                "stale-attempt",
+                "old peer failed".to_string(),
+            ),
+            Err(SessionError::StaleBinding)
+        ));
         assert_eq!(
-            registrations
-                .iter()
-                .filter(|registration| manager.is_current(&registration.binding))
-                .count(),
-            1
+            manager
+                .with_session(&binding, |session| session.webrtc_attempt_id.clone())
+                .unwrap(),
+            Some("current-attempt".to_string()),
+        );
+    }
+
+    #[test]
+    fn unpairing_clears_the_active_webrtc_attempt() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        manager
+            .with_session(&binding, |session| {
+                session.webrtc_attempt_id = Some("old-attempt".to_string());
+            })
+            .unwrap();
+
+        manager
+            .revoke_pairing(&binding, "user unpaired the device".to_string())
+            .unwrap();
+
+        assert_eq!(manager.active_webrtc_attempt(&binding).unwrap(), None);
+    }
+
+    #[test]
+    fn terminate_all_cancels_each_current_binding() {
+        let manager = DeviceManager::new();
+        let first = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        let second = manager
+            .register_link("phone-2".to_string(), link("phone-2"), false)
+            .unwrap()
+            .binding;
+
+        let links = manager.terminate_all();
+
+        assert_eq!(links.len(), 2);
+        assert!(first.cancellation.load(Ordering::Acquire));
+        assert!(second.cancellation.load(Ordering::Acquire));
+        assert!(manager.current_binding("phone-1").is_none());
+        assert!(manager.current_binding("phone-2").is_none());
+    }
+
+    #[test]
+    fn replacement_discards_the_previous_handover_state() {
+        use crate::device_links::webrtc::{HandoverRuntime, WebRtcWireBinding};
+
+        let manager = DeviceManager::new();
+        let first = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        manager
+            .with_session(&first, |session| {
+                let wire = WebRtcWireBinding::from_attempt(
+                    "desktop",
+                    "phone-1",
+                    "01234567-89ab-cdef-0123-456789abcdef",
+                )
+                .unwrap();
+                session.webrtc_handover = Some(HandoverRuntime::new("attempt".to_string(), wire));
+            })
+            .unwrap();
+
+        let replacement = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        let handover_present = manager
+            .with_session(&replacement, |session| session.webrtc_handover.is_some())
+            .unwrap();
+
+        assert!(!handover_present);
+    }
+
+    #[test]
+    fn a_webrtc_envelope_is_accepted_only_once_per_attempt() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        manager
+            .with_session(&binding, |session| {
+                session.webrtc_attempt_id = Some("attempt".to_string());
+            })
+            .unwrap();
+
+        manager
+            .accept_webrtc_envelope(&binding, "attempt", "message-1".to_string())
+            .unwrap();
+        assert_eq!(
+            manager
+                .accept_webrtc_envelope(&binding, "attempt", "message-1".to_string())
+                .unwrap_err(),
+            SessionError::ReplayDetected
         );
     }
 }
