@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
+use super::handle::DaemonEvent;
 use super::handshake::finish_secure_link;
 use super::network::ssl_connector;
 use super::state::{push_error, upsert_device};
@@ -21,6 +22,7 @@ pub(super) fn incoming_tcp_loop(
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     sessions: Arc<DeviceManager>,
     errors: Arc<Mutex<Vec<String>>>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
     shutdown: Arc<AtomicBool>,
 ) {
     while !shutdown.load(Ordering::Acquire) {
@@ -30,8 +32,11 @@ pub(super) fn incoming_tcp_loop(
                 let devices = Arc::clone(&devices);
                 let sessions = Arc::clone(&sessions);
                 let errors = Arc::clone(&errors);
+                let events = Arc::clone(&events);
                 thread::spawn(move || {
-                    if let Err(error) = accept_incoming_device(stream, config, devices, sessions) {
+                    if let Err(error) =
+                        accept_incoming_device(stream, config, devices, sessions, events)
+                    {
                         eprintln!("[DL-WRTC-BOOT] incoming bootstrap connection rejected: {error}");
                         push_error(&errors, error);
                     }
@@ -50,6 +55,7 @@ fn accept_incoming_device(
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     sessions: Arc<DeviceManager>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
 ) -> Result<(), String> {
     // The listener is non-blocking so the accept loop can observe shutdown.
     // Accepted sockets must be made blocking before OpenSSL starts its
@@ -107,5 +113,5 @@ fn accept_incoming_device(
     let ssl_stream = connector
         .connect(&info.id, stream)
         .map_err(|err| err.to_string())?;
-    finish_secure_link(info, ssl_stream, config, devices, sessions)
+    finish_secure_link(info, ssl_stream, config, devices, sessions, events)
 }

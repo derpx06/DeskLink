@@ -42,12 +42,10 @@ pub(crate) fn send_packet(
     let mut stream = stream
         .lock()
         .map_err(|_| "Stream lock poisoned".to_string())?;
-    let _ = stream.get_ref().set_nonblocking(false);
-    let result = stream
+    stream
         .write_all(&packet.serialize_line().map_err(|err| err.to_string())?)
-        .map_err(|err| err.to_string());
-    let _ = stream.get_ref().set_nonblocking(true);
-    result
+        .and_then(|_| stream.flush())
+        .map_err(|err| err.to_string())
 }
 
 pub(super) fn read_ssl_packet(stream: &mut SslStream<TcpStream>) -> Result<NetworkPacket, String> {

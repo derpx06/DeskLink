@@ -100,6 +100,8 @@ pub struct DeviceView {
     pub device_type: String,
     pub address: String,
     pub protocol_version: i64,
+    pub incoming_capabilities: Vec<String>,
+    pub outgoing_capabilities: Vec<String>,
     pub status: DeviceStatus,
     pub trusted: bool,
     pub verification_key: Option<String>,
@@ -120,6 +122,8 @@ impl DeviceView {
             device_type: info.device_type.clone(),
             address,
             protocol_version: info.protocol_version,
+            incoming_capabilities: info.incoming_capabilities.clone(),
+            outgoing_capabilities: info.outgoing_capabilities.clone(),
             trusted: paired,
             status: if paired {
                 DeviceStatus::Paired

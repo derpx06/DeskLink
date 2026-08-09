@@ -24,6 +24,8 @@ pub(super) fn upsert_device(
                 device.device_type = info.device_type.clone();
                 device.address = address.clone();
                 device.protocol_version = info.protocol_version;
+                device.incoming_capabilities = info.incoming_capabilities.clone();
+                device.outgoing_capabilities = info.outgoing_capabilities.clone();
                 if paired {
                     device.status = DeviceStatus::Paired;
                     device.trusted = true;
@@ -67,6 +69,14 @@ pub(super) fn mark_error(
     if let Ok(mut devices) = devices.lock() {
         if let Some(device) = devices.get_mut(device_id) {
             device.last_error = Some(error);
+        }
+    }
+}
+
+pub(crate) fn clear_error(devices: &Arc<Mutex<HashMap<String, DeviceView>>>, device_id: &str) {
+    if let Ok(mut devices) = devices.lock() {
+        if let Some(device) = devices.get_mut(device_id) {
+            device.last_error = None;
         }
     }
 }

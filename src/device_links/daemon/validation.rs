@@ -6,6 +6,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use super::handle::DaemonEvent;
 use super::handshake::finish_secure_link;
 use super::network::ssl_acceptor;
 use crate::device_links::config::Config;
@@ -102,6 +103,7 @@ pub(super) fn connect_to_device(
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     sessions: Arc<DeviceManager>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
 ) -> Result<(), String> {
     // Discovery and an inbound connection can race. If the peer became
     // authoritative after discovery scheduled this worker, do not create a
@@ -136,5 +138,5 @@ pub(super) fn connect_to_device(
 
     let acceptor = ssl_acceptor(&config)?;
     let ssl_stream = acceptor.accept(stream).map_err(|err| err.to_string())?;
-    finish_secure_link(initial_info, ssl_stream, config, devices, sessions)
+    finish_secure_link(initial_info, ssl_stream, config, devices, sessions, events)
 }

@@ -22,8 +22,15 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 
-use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
+use crate::device_links::daemon::{DaemonCommand, DaemonEvent, DaemonHandle};
 use crate::device_links::device::{DeviceNotification, DeviceStatus, DeviceView, VolumeSink};
+use crate::device_links::features::FeatureRegistry;
+use crate::device_links::packet::{
+    PACKET_TYPE_CLIPBOARD, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK_REQUEST,
+    PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION_REQUEST,
+    PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP_REQUEST,
+    PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
+};
 
 mod imp {
     use super::*;
@@ -39,14 +46,24 @@ mod imp {
         #[template_child]
         pub error_banner: TemplateChild<adw::Banner>,
         #[template_child]
-        pub add_device_button: TemplateChild<gtk::Button>,
+        pub search_button: TemplateChild<gtk::ToggleButton>,
         #[template_child]
-        pub discover_button: TemplateChild<gtk::Button>,
+        pub search_bar: TemplateChild<gtk::SearchBar>,
         #[template_child]
-        pub nearby_count_label: TemplateChild<gtk::Label>,
+        pub search_entry: TemplateChild<gtk::SearchEntry>,
         #[template_child]
-        pub device_status_label: TemplateChild<gtk::Label>,
+        pub pair_new_row: TemplateChild<adw::ActionRow>,
+        #[template_child]
+        pub settings_row: TemplateChild<adw::ActionRow>,
+        #[template_child]
+        pub about_row: TemplateChild<adw::ActionRow>,
+        #[template_child]
+        pub detail_body: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub toast_overlay: TemplateChild<adw::ToastOverlay>,
         pub daemon: RefCell<Option<DaemonHandle>>,
+        pub last_devices_snapshot: RefCell<Option<String>>,
+        pub selected_device_id: RefCell<Option<String>>,
         pub notified_pair_requests: RefCell<HashSet<String>>,
         pub notified_remote_notifications: RefCell<HashSet<String>>,
     }
@@ -70,17 +87,63 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
 
+            let window_widget = self.obj().clone().upcast::<gtk::Widget>();
+            self.search_bar.set_key_capture_widget(Some(&window_widget));
+            gtk::prelude::AccessibleExtManual::update_property(
+                &*self.search_button,
+                &[gtk::accessible::Property::Label("Search devices")],
+            );
+            self.search_button
+                .bind_property("active", &*self.search_bar, "search-mode-enabled")
+                .bidirectional()
+                .sync_create()
+                .build();
+
             let window = self.obj().downgrade();
-            self.add_device_button.connect_clicked(move |_| {
+            self.search_entry.connect_search_changed(move |_| {
+                if let Some(window) = window.upgrade() {
+                    window.refresh_devices();
+                }
+            });
+
+            let window = self.obj().downgrade();
+            self.devices_list.connect_row_selected(move |_, row| {
+                let Some(window) = window.upgrade() else {
+                    return;
+                };
+                let Some(row) = row else {
+                    return;
+                };
+                let id = row.widget_name();
+                if id.is_empty() {
+                    return;
+                }
+                window
+                    .imp()
+                    .selected_device_id
+                    .replace(Some(id.to_string()));
+                window.refresh_devices();
+            });
+
+            let window = self.obj().downgrade();
+            self.pair_new_row.connect_activated(move |_| {
                 if let Some(window) = window.upgrade() {
                     window.show_discovery_dialog();
                 }
             });
 
             let window = self.obj().downgrade();
-            self.discover_button.connect_clicked(move |_| {
+            self.settings_row.connect_activated(move |_| {
                 if let Some(window) = window.upgrade() {
-                    window.show_discovery_dialog();
+                    let _ =
+                        gtk::prelude::WidgetExt::activate_action(&window, "app.preferences", None);
+                }
+            });
+
+            let window = self.obj().downgrade();
+            self.about_row.connect_activated(move |_| {
+                if let Some(window) = window.upgrade() {
+                    let _ = gtk::prelude::WidgetExt::activate_action(&window, "app.about", None);
                 }
             });
         }
@@ -131,8 +194,34 @@ impl DesklinkWindow {
             self.send_app_notification("desklink-error", "DeskLink", error);
         }
 
-        while let Some(child) = imp.devices_list.first_child() {
-            imp.devices_list.remove(&child);
+        for event in daemon.drain_events() {
+            match event {
+                DaemonEvent::PingReceived {
+                    device_id,
+                    device_name,
+                    message,
+                } => {
+                    self.send_feature_notification(
+                        &format!("desklink-ping-{device_id}-{}", glib::monotonic_time()),
+                        &format!("Ping from {device_name}"),
+                        message
+                            .as_deref()
+                            .unwrap_or("Your phone sent a Ping through DeskLink."),
+                    );
+                    self.show_feature_toast(&format!("Ping received from {device_name}"));
+                }
+                DaemonEvent::FindPhoneReceived {
+                    device_id,
+                    device_name,
+                } => {
+                    self.send_feature_notification(
+                        &format!("desklink-find-phone-{device_id}-{}", glib::monotonic_time()),
+                        &format!("Find Phone request from {device_name}"),
+                        "Your phone asked DeskLink to ring this computer.",
+                    );
+                    self.show_feature_toast(&format!("Find Phone request from {device_name}"));
+                }
+            }
         }
 
         let devices = daemon.devices();
@@ -157,85 +246,72 @@ impl DesklinkWindow {
             .cloned()
             .collect();
 
+        let query = imp.search_entry.text().trim().to_lowercase();
+        let filtered_devices: Vec<_> = recent_devices
+            .iter()
+            .filter(|device| {
+                query.is_empty()
+                    || device.name.to_lowercase().contains(&query)
+                    || device.device_type.to_lowercase().contains(&query)
+                    || device.address.to_lowercase().contains(&query)
+                    || device.id.to_lowercase().contains(&query)
+            })
+            .cloned()
+            .collect();
+
+        let selected_id = imp.selected_device_id.borrow().clone();
+        if selected_id
+            .as_ref()
+            .is_none_or(|id| filtered_devices.iter().all(|device| &device.id != id))
+        {
+            imp.selected_device_id
+                .replace(filtered_devices.first().map(|device| device.id.clone()));
+        }
+
+        let snapshot = serde_json::to_string(&(
+            &filtered_devices,
+            &query,
+            imp.selected_device_id.borrow().clone(),
+        ))
+        .unwrap_or_default();
+        if imp.last_devices_snapshot.borrow().as_ref() == Some(&snapshot) {
+            return;
+        }
+        imp.last_devices_snapshot.replace(Some(snapshot));
+
+        while let Some(child) = imp.devices_list.first_child() {
+            imp.devices_list.remove(&child);
+        }
+
         if recent_devices.is_empty() {
             imp.notified_pair_requests.borrow_mut().clear();
             imp.notified_remote_notifications.borrow_mut().clear();
-            imp.nearby_count_label.set_label("No devices yet");
-            imp.device_status_label
-                .set_label("· Pair a device to get started");
-
-            // Empty state card
-            let empty_card = gtk::Box::builder()
-                .orientation(gtk::Orientation::Vertical)
-                .spacing(16)
-                .margin_top(48)
-                .margin_bottom(48)
-                .margin_start(24)
-                .margin_end(24)
-                .halign(gtk::Align::Center)
-                .build();
-
-            empty_card.append(
-                &gtk::Image::builder()
-                    .icon_name("network-wireless-symbolic")
-                    .pixel_size(64)
-                    .css_classes(["dim-label"])
+            imp.devices_list.append(
+                &adw::ActionRow::builder()
+                    .title("No devices yet")
+                    .subtitle("Pair a device to get started.")
                     .build(),
             );
-            empty_card.append(
-                &gtk::Label::builder()
-                    .label("No Devices Paired")
-                    .css_classes(["title-2"])
-                    .halign(gtk::Align::Center)
-                    .build(),
+            self.show_detail_empty(
+                "No device selected",
+                "Pair a phone or computer to manage it from DeskLink.",
             );
-            empty_card.append(
-                &gtk::Label::builder()
-                    .label("Make sure your phone is on the same Wi-Fi network, then tap Discover to find it.")
-                    .css_classes(["body", "dim-label"])
-                    .halign(gtk::Align::Center)
-                    .wrap(true)
-                    .max_width_chars(48)
-                    .build(),
-            );
-
-            let discover_btn = gtk::Button::builder()
-                .label("Discover Devices")
-                .css_classes(["suggested-action", "pill"])
-                .halign(gtk::Align::Center)
-                .build();
-            {
-                let daemon = daemon.clone();
-                let window = self.downgrade();
-                discover_btn.connect_clicked(move |_| {
-                    daemon.send(DaemonCommand::Discover);
-                    if let Some(w) = window.upgrade() {
-                        w.show_discovery_dialog();
-                    }
-                });
-            }
-            empty_card.append(&discover_btn);
-
-            imp.devices_list.append(&empty_card);
             return;
         }
 
-        let pending_count = recent_devices
-            .iter()
-            .filter(|device| {
-                matches!(
-                    device.status,
-                    DeviceStatus::PairRequested | DeviceStatus::PairRequestedByPeer
-                )
-            })
-            .count();
-        imp.nearby_count_label
-            .set_label(&recent_count_label(recent_devices.len(), pending_count));
-        imp.device_status_label.set_label(if pending_count > 0 {
-            "· Pairing request pending"
-        } else {
-            "· Ready"
-        });
+        if filtered_devices.is_empty() {
+            imp.devices_list.append(
+                &adw::ActionRow::builder()
+                    .title("No matching devices")
+                    .subtitle("Try a different name, type, or address.")
+                    .build(),
+            );
+            self.show_detail_empty(
+                "No matching device",
+                "Clear the search to see your devices.",
+            );
+            return;
+        }
 
         let current_pair_requests = recent_devices
             .iter()
@@ -279,6 +355,15 @@ impl DesklinkWindow {
                     .collect::<Vec<_>>()
             })
             .collect::<std::collections::HashSet<_>>();
+
+        if errors.is_empty()
+            && recent_devices
+                .iter()
+                .all(|device| device.last_error.is_none())
+        {
+            imp.error_banner.set_revealed(false);
+        }
+
         imp.notified_remote_notifications
             .borrow_mut()
             .retain(|notification_id| current_notifications.contains(notification_id));
@@ -309,9 +394,46 @@ impl DesklinkWindow {
             }
         }
 
-        for device in recent_devices {
-            imp.devices_list.append(&device_row(&daemon, device));
+        let selected_id = imp.selected_device_id.borrow().clone();
+        for device in &filtered_devices {
+            let row = device_sidebar_row(&daemon, device.clone());
+            let is_selected = selected_id.as_deref() == Some(device.id.as_str());
+            imp.devices_list.append(&row);
+            if is_selected {
+                imp.devices_list.select_row(Some(&row));
+            }
         }
+        self.render_selected_device(&daemon, &filtered_devices);
+    }
+
+    fn show_detail_empty(&self, title: &str, description: &str) {
+        let body = &self.imp().detail_body;
+        while let Some(child) = body.first_child() {
+            body.remove(&child);
+        }
+        let page = adw::StatusPage::builder()
+            .icon_name("computer-symbolic")
+            .title(title)
+            .description(description)
+            .vexpand(true)
+            .build();
+        body.append(&page);
+    }
+
+    fn render_selected_device(&self, daemon: &DaemonHandle, devices: &[DeviceView]) {
+        let Some(selected_id) = self.imp().selected_device_id.borrow().clone() else {
+            self.show_detail_empty("No device selected", "Select a device from the sidebar.");
+            return;
+        };
+        let Some(device) = devices.iter().find(|device| device.id == selected_id) else {
+            self.show_detail_empty("No device selected", "Select a device from the sidebar.");
+            return;
+        };
+        let body = &self.imp().detail_body;
+        while let Some(child) = body.first_child() {
+            body.remove(&child);
+        }
+        body.append(&device_row(daemon, device.clone()));
     }
 
     fn send_app_notification(&self, id: &str, title: &str, body: &str) {
@@ -322,6 +444,23 @@ impl DesklinkWindow {
         notification.set_body(Some(body));
         notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
         application.send_notification(Some(id), &notification);
+    }
+
+    fn send_feature_notification(&self, id: &str, title: &str, body: &str) {
+        let Some(application) = self.application() else {
+            return;
+        };
+        let notification = gio::Notification::new(title);
+        notification.set_body(Some(body));
+        notification.set_priority(gio::NotificationPriority::High);
+        notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+        application.send_notification(Some(id), &notification);
+    }
+
+    fn show_feature_toast(&self, message: &str) {
+        let toast = adw::Toast::new(message);
+        toast.set_timeout(4);
+        self.imp().toast_overlay.add_toast(toast);
     }
 
     fn show_discovery_dialog(&self) {
@@ -416,15 +555,6 @@ impl DesklinkWindow {
     }
 }
 
-fn recent_count_label(total: usize, pending: usize) -> String {
-    match (total, pending) {
-        (_, 1) => "1 pairing request".to_string(),
-        (_, pending) if pending > 1 => format!("{pending} pairing requests"),
-        (1, _) => "1 recent device".to_string(),
-        _ => format!("{total} recent devices"),
-    }
-}
-
 fn populate_discovery_list(list: &gtk::ListBox, daemon: &DaemonHandle) {
     while let Some(child) = list.first_child() {
         list.remove(&child);
@@ -464,7 +594,55 @@ fn device_row(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget {
     }
 }
 
-/// Full card shown for a paired device — header + KDE Connect plugin grid.
+fn device_sidebar_row(daemon: &DaemonHandle, device: DeviceView) -> adw::ActionRow {
+    let status = match &device.status {
+        DeviceStatus::Paired => "Connected",
+        DeviceStatus::Unreachable => "Unavailable",
+        _ => device.status.label(),
+    };
+    let row = adw::ActionRow::builder()
+        .title(&device.name)
+        .subtitle(format!("{} · {status}", device.device_type))
+        .activatable(true)
+        .build();
+    row.set_widget_name(&device.id);
+    row.set_use_markup(false);
+
+    let icon = gtk::Image::builder()
+        .icon_name(device_type_icon(&device.device_type))
+        .pixel_size(24)
+        .build();
+    row.add_prefix(&icon);
+
+    if device.trusted {
+        let unpair = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Remove device")
+            .css_classes(["flat", "circular"])
+            .valign(gtk::Align::Center)
+            .build();
+        let daemon = daemon.clone();
+        let id = device.id.clone();
+        unpair.connect_clicked(move |_| {
+            daemon.send(DaemonCommand::Unpair(id.clone()));
+        });
+        row.add_suffix(&unpair);
+    }
+    row
+}
+
+fn can_send_feature(device: &DeviceView, packet_type: &str) -> bool {
+    FeatureRegistry::desktop()
+        .outgoing_capabilities()
+        .iter()
+        .any(|capability| capability == packet_type)
+        && device
+            .incoming_capabilities
+            .iter()
+            .any(|capability| capability == packet_type)
+}
+
+/// Full detail view shown for a paired device — header plus DeskLink features.
 fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget {
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -679,218 +857,243 @@ fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget 
 
     // Row 1 — Communication
     let row1 = plugin_row();
-    row1.append(&plugin_tile_active(
-        "Ping",
-        "dialog-ok-symbolic",
-        "Test connection",
-        {
-            let daemon = daemon.clone();
-            let id = device.id.clone();
-            move |_btn| {
-                daemon.send(DaemonCommand::SendPing(id.clone()));
-            }
-        },
-    ));
-    row1.append(&plugin_tile_active(
-        "Send File",
-        "document-send-symbolic",
-        "Share files with your device",
-        {
-            let daemon = daemon.clone();
-            let id = device.id.clone();
-            move |btn| {
-                if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
-                    let file_dialog = gtk::FileDialog::builder()
-                        .title("Select File to Send")
-                        .build();
+    if can_send_feature(&device, PACKET_TYPE_PING) {
+        row1.append(&plugin_tile_active(
+            "Ping",
+            "dialog-ok-symbolic",
+            "Test connection",
+            {
+                let daemon = daemon.clone();
+                let id = device.id.clone();
+                move |_btn| {
+                    daemon.send(DaemonCommand::SendPing(id.clone()));
+                }
+            },
+        ));
+    }
+    if can_send_feature(&device, PACKET_TYPE_SHARE_REQUEST) {
+        row1.append(&plugin_tile_active(
+            "Send File",
+            "document-send-symbolic",
+            "Share files with your device",
+            {
+                let daemon = daemon.clone();
+                let id = device.id.clone();
+                move |btn| {
+                    if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
+                        let file_dialog = gtk::FileDialog::builder()
+                            .title("Select File to Send")
+                            .build();
 
-                    let daemon = daemon.clone();
-                    let id = id.clone();
-                    file_dialog.open(Some(&root), gio::Cancellable::NONE, move |result| {
-                        if let Ok(file) = result {
-                            if let Some(path) = file.path() {
-                                eprintln!("[UI] Selected file to send: {:?}", path);
-                                daemon.send(DaemonCommand::SendFile(id.clone(), path));
+                        let daemon = daemon.clone();
+                        let id = id.clone();
+                        file_dialog.open(Some(&root), gio::Cancellable::NONE, move |result| {
+                            if let Ok(file) = result {
+                                if let Some(path) = file.path() {
+                                    eprintln!("[UI] Selected file to send: {:?}", path);
+                                    daemon.send(DaemonCommand::SendFile(id.clone(), path));
+                                }
                             }
-                        }
-                    });
+                        });
+                    }
                 }
-            }
-        },
-    ));
-    row1.append(&plugin_tile_active(
-        "Share Text",
-        "insert-text-symbolic",
-        "Send text or a URL to your device",
-        {
-            let daemon = daemon.clone();
-            let id = device.id.clone();
+            },
+        ));
+        row1.append(&plugin_tile_active(
+            "Share Text",
+            "insert-text-symbolic",
+            "Send text or a URL to your device",
+            {
+                let daemon = daemon.clone();
+                let id = device.id.clone();
+                move |btn| {
+                    if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
+                        show_share_text_dialog(daemon.clone(), id.clone(), &root);
+                    }
+                }
+            },
+        ));
+    }
+    if can_send_feature(&device, PACKET_TYPE_CLIPBOARD) {
+        row1.append(&plugin_tile_active("Clipboard", "edit-paste-symbolic", "Clipboard sync runs automatically while paired", {
             move |btn| {
                 if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
-                    show_share_text_dialog(daemon.clone(), id.clone(), &root);
+                    show_info_dialog(&root, "Clipboard Sync", "Clipboard synchronization runs automatically while the device is connected and paired.");
                 }
             }
-        },
-    ));
-    row1.append(&plugin_tile_active("Clipboard", "edit-paste-symbolic", "Clipboard sync runs automatically while paired", {
-        move |btn| {
-            if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
-                show_info_dialog(&root, "Clipboard Sync", "Clipboard synchronization runs automatically while the device is connected and paired.");
-            }
-        }
-    }));
+        }));
+    }
     grid_card.append(&row1);
 
     grid_card.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
     // Row 2 — Control
     let row2 = plugin_row();
-    row2.append(&plugin_tile_active(
-        "Find Phone",
-        "find-location-symbolic",
-        "Make your phone ring",
-        {
-            let daemon = daemon.clone();
-            let id = device.id.clone();
-            move |_btn| {
-                daemon.send(DaemonCommand::SendFindPhone(id.clone()));
-            }
-        },
-    ));
-    row2.append(&plugin_tile_active(
-        "Remote Control",
-        "input-mouse-symbolic",
-        "Control phone mouse and keyboard",
-        {
-            let daemon = daemon.clone();
-            let id = device.id.clone();
-            move |btn| {
-                if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
-                    crate::remote_control::show_remote_control_dialog(
-                        daemon.clone(),
-                        id.clone(),
-                        &root,
-                    );
+    if can_send_feature(&device, PACKET_TYPE_FINDMYPHONE_REQUEST) {
+        row2.append(&plugin_tile_active(
+            "Find Phone",
+            "find-location-symbolic",
+            "Make your phone ring",
+            {
+                let daemon = daemon.clone();
+                let id = device.id.clone();
+                move |_btn| {
+                    daemon.send(DaemonCommand::SendFindPhone(id.clone()));
                 }
-            }
-        },
-    ));
-    row2.append(&plugin_tile_active(
-        "Lock Screen",
-        "system-lock-screen-symbolic",
-        "Lock your phone remotely",
-        {
-            let daemon = daemon.clone();
-            let id = device.id.clone();
-            move |_btn| {
-                daemon.send(DaemonCommand::SendLockRequest(id.clone(), true));
-            }
-        },
-    ));
-    row2.append(&plugin_tile_active(
-        "Media Control",
-        "media-playback-start-symbolic",
-        "Control music & video",
-        {
-            let daemon = daemon.clone();
-            let id = device.id.clone();
-            let media_device = device.clone();
-            move |btn| {
-                daemon.send(DaemonCommand::RequestMprisStatus(id.clone(), None));
-                if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
-                    show_media_control_dialog(
-                        daemon.clone(),
-                        id.clone(),
-                        media_device.clone(),
-                        &root,
-                    );
+            },
+        ));
+    }
+    if can_send_feature(&device, PACKET_TYPE_MOUSEPAD_REQUEST) {
+        row2.append(&plugin_tile_active(
+            "Remote Control",
+            "input-mouse-symbolic",
+            "Control phone mouse and keyboard",
+            {
+                let daemon = daemon.clone();
+                let id = device.id.clone();
+                move |btn| {
+                    if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
+                        crate::remote_control::show_remote_control_dialog(
+                            daemon.clone(),
+                            id.clone(),
+                            &root,
+                        );
+                    }
                 }
-            }
-        },
-    ));
-    row2.append(&plugin_tile_active(
-        "Browse Files",
-        "folder-remote-symbolic",
-        "Request phone storage access",
-        {
-            let daemon = daemon.clone();
-            let id = device.id.clone();
-            let browsing_device = device.clone();
-            move |btn| {
-                daemon.send(DaemonCommand::SendSftpRequest(id.clone()));
-                if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
-                    show_file_browsing_dialog(browsing_device.clone(), &root);
+            },
+        ));
+    }
+    if can_send_feature(&device, PACKET_TYPE_LOCK_REQUEST) {
+        row2.append(&plugin_tile_active(
+            "Lock Screen",
+            "system-lock-screen-symbolic",
+            "Lock your phone remotely",
+            {
+                let daemon = daemon.clone();
+                let id = device.id.clone();
+                move |_btn| {
+                    daemon.send(DaemonCommand::SendLockRequest(id.clone(), true));
                 }
-            }
-        },
-    ));
+            },
+        ));
+    }
+    if can_send_feature(&device, PACKET_TYPE_MPRIS_REQUEST) {
+        row2.append(&plugin_tile_active(
+            "Media Control",
+            "media-playback-start-symbolic",
+            "Control music & video",
+            {
+                let daemon = daemon.clone();
+                let id = device.id.clone();
+                let media_device = device.clone();
+                move |btn| {
+                    daemon.send(DaemonCommand::RequestMprisStatus(id.clone(), None));
+                    if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
+                        show_media_control_dialog(
+                            daemon.clone(),
+                            id.clone(),
+                            media_device.clone(),
+                            &root,
+                        );
+                    }
+                }
+            },
+        ));
+    }
+    if can_send_feature(&device, PACKET_TYPE_SFTP_REQUEST) {
+        row2.append(&plugin_tile_active(
+            "Browse Files",
+            "folder-remote-symbolic",
+            "Request phone storage access",
+            {
+                let daemon = daemon.clone();
+                let id = device.id.clone();
+                let browsing_device = device.clone();
+                move |btn| {
+                    daemon.send(DaemonCommand::SendSftpRequest(id.clone()));
+                    if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
+                        show_file_browsing_dialog(browsing_device.clone(), &root);
+                    }
+                }
+            },
+        ));
+    }
     grid_card.append(&row2);
 
     grid_card.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
 
     // Row 3 — v2 status and desktop integration
     let row3 = plugin_row();
-    row3.append(&plugin_tile_active(
-        "Notifications",
-        "preferences-system-notifications-symbolic",
-        "View mirrored phone notifications",
-        {
-            let daemon = daemon.clone();
-            let id = device.id.clone();
-            let device = device.clone();
-            move |btn| {
-                daemon.send(DaemonCommand::RequestNotifications(id.clone()));
-                if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
-                    show_notifications_dialog(daemon.clone(), device.clone(), &root);
+    if can_send_feature(&device, PACKET_TYPE_NOTIFICATION_REQUEST) {
+        row3.append(&plugin_tile_active(
+            "Notifications",
+            "preferences-system-notifications-symbolic",
+            "View mirrored phone notifications",
+            {
+                let daemon = daemon.clone();
+                let id = device.id.clone();
+                let device = device.clone();
+                move |btn| {
+                    daemon.send(DaemonCommand::RequestNotifications(id.clone()));
+                    if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
+                        show_notifications_dialog(daemon.clone(), device.clone(), &root);
+                    }
                 }
-            }
-        },
-    ));
-    row3.append(&plugin_tile_active(
-        "Volume",
-        "audio-volume-high-symbolic",
-        "View and control remote volume",
-        {
-            let daemon = daemon.clone();
-            let id = device.id.clone();
-            let device = device.clone();
-            move |btn| {
-                daemon.send(DaemonCommand::RequestSystemVolume(id.clone()));
-                if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
-                    show_volume_dialog(daemon.clone(), device.clone(), &root);
+            },
+        ));
+    }
+    if can_send_feature(&device, PACKET_TYPE_SYSTEMVOLUME_REQUEST) {
+        row3.append(&plugin_tile_active(
+            "Volume",
+            "audio-volume-high-symbolic",
+            "View and control remote volume",
+            {
+                let daemon = daemon.clone();
+                let id = device.id.clone();
+                let device = device.clone();
+                move |btn| {
+                    daemon.send(DaemonCommand::RequestSystemVolume(id.clone()));
+                    if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
+                        show_volume_dialog(daemon.clone(), device.clone(), &root);
+                    }
                 }
-            }
-        },
-    ));
-    row3.append(&plugin_tile_active(
-        "Commands",
-        "utilities-terminal-symbolic",
-        "Run commands exposed by your device",
-        {
-            let daemon = daemon.clone();
-            let id = device.id.clone();
-            let device = device.clone();
-            move |btn| {
-                daemon.send(DaemonCommand::RequestRemoteCommands(id.clone()));
-                if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
-                    show_remote_commands_dialog(daemon.clone(), device.clone(), &root);
+            },
+        ));
+    }
+    if can_send_feature(&device, PACKET_TYPE_RUNCOMMAND_REQUEST) {
+        row3.append(&plugin_tile_active(
+            "Commands",
+            "utilities-terminal-symbolic",
+            "Run commands exposed by your device",
+            {
+                let daemon = daemon.clone();
+                let id = device.id.clone();
+                let device = device.clone();
+                move |btn| {
+                    daemon.send(DaemonCommand::RequestRemoteCommands(id.clone()));
+                    if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
+                        show_remote_commands_dialog(daemon.clone(), device.clone(), &root);
+                    }
                 }
-            }
-        },
-    ));
+            },
+        ));
+    }
+    let can_refresh_media = can_send_feature(&device, PACKET_TYPE_MPRIS_REQUEST);
+    let can_refresh_notifications = can_send_feature(&device, PACKET_TYPE_NOTIFICATION_REQUEST);
     row3.append(&plugin_tile_active(
         "Refresh Status",
         "view-refresh-symbolic",
-        "Request media, volume, notifications, commands, and file browsing",
+        "Refresh available WebRTC feature state",
         {
             let daemon = daemon.clone();
             let id = device.id.clone();
             move |_btn| {
-                daemon.send(DaemonCommand::RequestMprisStatus(id.clone(), None));
-                daemon.send(DaemonCommand::RequestNotifications(id.clone()));
-                daemon.send(DaemonCommand::RequestSystemVolume(id.clone()));
-                daemon.send(DaemonCommand::RequestRemoteCommands(id.clone()));
-                daemon.send(DaemonCommand::SendSftpRequest(id.clone()));
+                if can_refresh_media {
+                    daemon.send(DaemonCommand::RequestMprisStatus(id.clone(), None));
+                }
+                if can_refresh_notifications {
+                    daemon.send(DaemonCommand::RequestNotifications(id.clone()));
+                }
             }
         },
     ));
@@ -1741,4 +1944,26 @@ fn command_button(label: &str, icon_name: &str, action: impl Fn() + 'static) -> 
         .build();
     button.connect_clicked(move |_| action());
     button
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device_links::device_info::DeviceInfo;
+
+    #[test]
+    fn feature_tiles_require_both_a_local_sender_and_peer_receiver() {
+        let info = DeviceInfo {
+            id: "0123456789abcdef0123456789abcdef".to_string(),
+            name: "Phone".to_string(),
+            device_type: "phone".to_string(),
+            protocol_version: 9,
+            incoming_capabilities: vec![PACKET_TYPE_PING.to_string()],
+            outgoing_capabilities: Vec::new(),
+        };
+        let device = DeviceView::from_info(&info, "127.0.0.1".to_string(), true);
+
+        assert!(can_send_feature(&device, PACKET_TYPE_PING));
+        assert!(!can_send_feature(&device, PACKET_TYPE_MOUSEPAD_REQUEST));
+    }
 }

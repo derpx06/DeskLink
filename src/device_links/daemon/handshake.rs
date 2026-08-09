@@ -4,7 +4,9 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
+use super::handle::DaemonEvent;
 use super::network::read_ssl_packet;
 use super::packet_handler::packet_read_loop;
 use super::state::mark_status;
@@ -23,6 +25,7 @@ pub(super) fn finish_secure_link(
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     sessions: Arc<DeviceManager>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
 ) -> Result<(), String> {
     let identity = config
         .lock()
@@ -85,9 +88,24 @@ pub(super) fn finish_secure_link(
         .map_err(|_| "Device lock poisoned".to_string())?
         .insert(secure_info.id.clone(), view);
 
+    // Keep the TLS stream in one mode for its entire lifetime.  Toggling an
+    // OpenSSL stream between nonblocking and blocking mode from the reader
+    // and sender threads races with OpenSSL's internal WANT_READ/WANT_WRITE
+    // state and can surface a false "nonblocking read call would have
+    // blocked" error during WebRTC signaling.  A short read timeout keeps
+    // shutdown responsive without changing the socket mode underneath the
+    // active TLS stream.
     stream
         .get_ref()
-        .set_nonblocking(true)
+        .set_nonblocking(false)
+        .map_err(|err| err.to_string())?;
+    stream
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .map_err(|err| err.to_string())?;
+    stream
+        .get_ref()
+        .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| err.to_string())?;
     let link = SessionLink::new(
         Arc::new(Mutex::new(stream)),
@@ -96,6 +114,18 @@ pub(super) fn finish_secure_link(
         remote_public_der,
         secure_info,
     );
+    if sessions.has_ready_webrtc(&initial_info.id) {
+        // Android may refresh the short-lived LAN bootstrap socket while its
+        // authenticated WebRTC peer is healthy.  This socket cannot become a
+        // second session: closing it preserves the existing generation and
+        // avoids tearing down all paired features for a discovery refresh.
+        eprintln!(
+            "[DL-WRTC-BOOT] ignoring refreshed bootstrap socket for {}; retaining feature-ready WebRTC session",
+            initial_info.id
+        );
+        link.close();
+        return Ok(());
+    }
     let registration = sessions
         .register_link(initial_info.id.clone(), link, paired)
         .map_err(|error| error.to_string())?;
@@ -108,8 +138,8 @@ pub(super) fn finish_secure_link(
 
     let binding = registration.binding;
     eprintln!(
-        "[DL-WRTC-BOOT] secure bootstrap link ready for {}",
-        binding.device_id
+        "[DL-WRTC-BOOT] secure bootstrap link ready for {} (session {}, generation {})",
+        binding.device_id, binding.session_id, binding.generation
     );
     let remote_supports_webrtc = paired
         && binding
@@ -118,23 +148,78 @@ pub(super) fn finish_secure_link(
             .incoming_capabilities
             .iter()
             .any(|capability| capability == PACKET_TYPE_WEBRTC_SIGNAL_V1);
-    if remote_supports_webrtc {
-        if let Err(error) = crate::device_links::webrtc::coordinator::start_initiator(
-            binding.clone(),
-            Arc::clone(&sessions),
-            Arc::clone(&config),
-            Arc::clone(&devices),
-        ) {
-            // Bootstrap LAN remains available until mutual feature-ready, so
-            // a failed optional negotiation must not tear down a paired link.
-            eprintln!("[Daemon] DeskLink WebRTC negotiation unavailable: {error}");
-        }
-    }
+    eprintln!(
+        "[DL-WRTC-BOOT] peer WebRTC signaling capability: {}",
+        remote_supports_webrtc
+    );
     let read_devices = Arc::clone(&devices);
     let read_sessions = Arc::clone(&sessions);
     let read_config = Arc::clone(&config);
-    thread::spawn(move || packet_read_loop(binding, read_devices, read_sessions, read_config));
+    let read_binding = binding.clone();
+    let read_events = Arc::clone(&events);
+    thread::spawn(move || {
+        packet_read_loop(
+            read_binding,
+            read_devices,
+            read_sessions,
+            read_config,
+            read_events,
+        )
+    });
+
+    if remote_supports_webrtc {
+        schedule_webrtc_bootstrap(
+            binding,
+            Arc::clone(&sessions),
+            Arc::clone(&config),
+            Arc::clone(&devices),
+            Arc::clone(&events),
+        );
+    }
     Ok(())
+}
+
+/// Start SDP/ICE only after the normal packet reader owns the TLS stream.
+/// Both implementations use buffered identity readers during the secure
+/// handshake; signaling sent before those readers are retired can otherwise
+/// be prefetched and lost. A bounded retry is safe because each request is
+/// signed and replay-protected, and it stops as soon as an attempt is active.
+fn schedule_webrtc_bootstrap(
+    binding: SessionBinding,
+    sessions: Arc<DeviceManager>,
+    config: Arc<Mutex<Config>>,
+    devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
+) {
+    thread::spawn(move || {
+        for delay in [250_u64, 1_000, 2_000, 4_000] {
+            thread::sleep(Duration::from_millis(delay));
+            if !sessions.is_current(&binding) {
+                eprintln!(
+                    "[DL-WRTC-BOOT] bootstrap scheduler stopped for stale generation {}",
+                    binding.generation
+                );
+                return;
+            }
+            if sessions
+                .active_webrtc_attempt(&binding)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                return;
+            }
+            if let Err(error) = crate::device_links::webrtc::coordinator::start_initiator(
+                binding.clone(),
+                Arc::clone(&sessions),
+                Arc::clone(&config),
+                Arc::clone(&devices),
+                Arc::clone(&events),
+            ) {
+                eprintln!("[Daemon] DeskLink WebRTC bootstrap attempt failed: {error}");
+            }
+        }
+    });
 }
 
 pub(super) fn handle_disconnect(
@@ -143,12 +228,19 @@ pub(super) fn handle_disconnect(
     sessions: &Arc<DeviceManager>,
     reason: String,
 ) -> bool {
-    let result = sessions.disconnect_if_current(binding, reason);
+    let result = sessions.bootstrap_disconnected_if_current(binding, reason);
     if !result.was_current {
         return false;
     }
     if let Some(link) = result.link {
         link.close();
+    }
+    if result.feature_transport_retained {
+        eprintln!(
+            "[DL-WRTC-BOOT] bootstrap link closed for {}; retained authenticated WebRTC feature transport",
+            binding.device_id
+        );
+        return false;
     }
     if let Some(peer) = result.webrtc {
         peer.close();

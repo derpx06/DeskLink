@@ -9,7 +9,7 @@ use super::core::DeviceManager;
 use super::device::DeviceView;
 
 pub use commands::DaemonCommand;
-pub use handle::DaemonHandle;
+pub use handle::{DaemonEvent, DaemonHandle};
 
 pub mod clipboard;
 pub mod commands;
@@ -30,6 +30,7 @@ pub(super) struct DaemonWorker {
     pub(super) sessions: Arc<DeviceManager>,
     pub(super) shutdown: Arc<AtomicBool>,
     pub(super) errors: Arc<Mutex<Vec<String>>>,
+    pub(super) events: Arc<Mutex<Vec<handle::DaemonEvent>>>,
     pub(super) command_rx: Receiver<DaemonCommand>,
     pub(super) tcp_port: u16,
 }
@@ -38,6 +39,7 @@ impl DaemonWorker {
     pub(super) fn new(
         devices: Arc<Mutex<HashMap<String, DeviceView>>>,
         errors: Arc<Mutex<Vec<String>>>,
+        events: Arc<Mutex<Vec<handle::DaemonEvent>>>,
         command_rx: Receiver<DaemonCommand>,
     ) -> Result<Self, String> {
         let config = Arc::new(Mutex::new(Config::load()?));
@@ -57,6 +59,7 @@ impl DaemonWorker {
             let devices = Arc::clone(&devices);
             let sessions = Arc::clone(&sessions);
             let errors = Arc::clone(&errors);
+            let events = Arc::clone(&events);
             let shutdown = Arc::clone(&shutdown);
             thread::spawn(move || {
                 connector::incoming_tcp_loop(
@@ -65,6 +68,7 @@ impl DaemonWorker {
                     devices,
                     sessions,
                     errors,
+                    events,
                     shutdown,
                 )
             });
@@ -76,6 +80,7 @@ impl DaemonWorker {
             sessions,
             shutdown,
             errors,
+            events,
             command_rx,
             tcp_port,
         })

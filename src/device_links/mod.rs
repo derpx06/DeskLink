@@ -6,4 +6,5 @@ pub mod device_info;
 pub mod features;
 pub mod packet;
 pub mod pairing;
+pub mod transport;
 pub mod webrtc;

@@ -257,6 +257,19 @@ fn validate_file_data(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+fn local_ice_event(sdp_m_line_index: u32, candidate: String) -> PeerEvent {
+    if candidate.is_empty() {
+        PeerEvent::EndOfCandidates
+    } else if candidate.len() > 16 * 1024 {
+        PeerEvent::Error("Received an oversized local DeskLink WebRTC ICE candidate".to_string())
+    } else {
+        PeerEvent::IceCandidate {
+            sdp_m_line_index,
+            candidate,
+        }
+    }
+}
+
 fn channel_options(channel: WebRtcChannel) -> gst::Structure {
     let mut builder = gst::Structure::builder("application/x-desklink-data-channel")
         .field("ordered", channel.ordered());
@@ -295,16 +308,7 @@ fn install_webrtcbin_callbacks(
     webrtcbin.connect("on-ice-candidate", false, move |values| {
         let sdp_m_line_index = values[1].get::<u32>().unwrap_or_default();
         let candidate = values[2].get::<String>().unwrap_or_else(|_| String::new());
-        if candidate.is_empty() || candidate.len() > 16 * 1024 {
-            let _ = ice_events.send(PeerEvent::Error(
-                "Received an invalid local DeskLink WebRTC ICE candidate".to_string(),
-            ));
-        } else {
-            let _ = ice_events.send(PeerEvent::IceCandidate {
-                sdp_m_line_index,
-                candidate,
-            });
-        }
+        let _ = ice_events.send(local_ice_event(sdp_m_line_index, candidate));
         None
     });
 
@@ -531,5 +535,13 @@ mod tests {
             local_description_promise_field(SignalingMessageType::Answer).unwrap(),
             "answer"
         );
+    }
+
+    #[test]
+    fn empty_local_ice_candidate_marks_gathering_complete() {
+        assert!(matches!(
+            local_ice_event(0, String::new()),
+            PeerEvent::EndOfCandidates
+        ));
     }
 }

@@ -16,9 +16,11 @@ use uuid::Uuid;
 
 use crate::device_links::config::Config;
 use crate::device_links::core::{DeviceManager, FeatureTransportSnapshot, SessionBinding};
+use crate::device_links::daemon::handle::DaemonEvent;
 use crate::device_links::daemon::network::send_packet;
+use crate::device_links::daemon::state::clear_error;
 use crate::device_links::device::DeviceView;
-use crate::device_links::features::{initial_webrtc_capabilities, is_initial_webrtc_feature};
+use crate::device_links::features::{is_webrtc_feature, webrtc_capabilities};
 use crate::device_links::packet::NetworkPacket;
 
 use super::file_protocol::{FileControl, FILE_CHUNK_MESSAGE_TYPE, FILE_CONTROL_MESSAGE_TYPE};
@@ -29,17 +31,29 @@ use super::{
     WebRtcSignalingMessage, WebRtcWireBinding, HANDOVER_MESSAGE_TYPE,
 };
 
-/// Starts the deterministic desktop-initiated negotiation. The caller must
-/// first confirm that the paired peer advertised signed WebRTC signaling.
+/// Starts the deterministic desktop-initiated negotiation, or asks the
+/// deterministic remote initiator to rebuild its peer after this desktop
+/// process has restarted. The restart request is signed bootstrap signaling;
+/// it never carries paired feature traffic over LAN.
 pub(crate) fn start_initiator(
     binding: SessionBinding,
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
 ) -> Result<(), String> {
     let (local_device_id, remote_device_id) = local_and_remote_device_ids(&binding, &config)?;
     if local_device_id >= remote_device_id {
-        return Ok(());
+        let request_id = Uuid::new_v4().to_string();
+        let wire = WebRtcWireBinding::from_attempt(local_device_id, remote_device_id, &request_id)?;
+        return send_signed_signal(
+            &binding,
+            &wire,
+            &request_id,
+            SignalingMessageType::RestartRequest,
+            Map::new(),
+            &config,
+        );
     }
     if !sessions.is_current(&binding) {
         return Err("Stale DeskLink session cannot start WebRTC".to_string());
@@ -75,6 +89,7 @@ pub(crate) fn start_initiator(
         Arc::clone(&sessions),
         config,
         devices,
+        events,
         transfer_manager,
     )?;
     let peer = sessions
@@ -91,6 +106,7 @@ pub(crate) fn handle_signaling_packet(
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
 ) -> Result<(), String> {
     if !sessions.is_current(binding) {
         return Err("Stale DeskLink session rejected WebRTC signaling".to_string());
@@ -142,6 +158,7 @@ pub(crate) fn handle_signaling_packet(
                     Arc::clone(&sessions),
                     Arc::clone(&config),
                     Arc::clone(&devices),
+                    Arc::clone(&events),
                 )?,
             }
         }
@@ -192,6 +209,9 @@ pub(crate) fn handle_signaling_packet(
             "DeskLink WebRTC ICE restart is not enabled until authenticated handover is active"
                 .to_string(),
         ),
+        SignalingMessageType::RestartRequest => {
+            Err("Unexpected DeskLink WebRTC restart request on the responder".to_string())
+        }
         SignalingMessageType::Close => {
             peer.close();
             Ok(())
@@ -220,9 +240,33 @@ pub(crate) fn send_feature_packet(
                 .to_string(),
         );
     }
-    if !is_initial_webrtc_feature(&packet.packet_type) {
+    if !is_webrtc_feature(&packet.packet_type) {
         return Err(format!(
-            "{} is not enabled in the initial DeskLink WebRTC feature profile",
+            "{} is not enabled in the DeskLink WebRTC feature profile",
+            packet.packet_type
+        ));
+    }
+    let registry = crate::device_links::features::FeatureRegistry::desktop();
+    if !registry
+        .outgoing_capabilities()
+        .iter()
+        .any(|capability| capability == &packet.packet_type)
+    {
+        return Err(format!(
+            "DeskLink has no outgoing handler for {}",
+            packet.packet_type
+        ));
+    }
+    if !transport
+        .binding
+        .link
+        .info
+        .incoming_capabilities
+        .iter()
+        .any(|capability| capability == &packet.packet_type)
+    {
+        return Err(format!(
+            "The paired device does not accept {}",
             packet.packet_type
         ));
     }
@@ -265,6 +309,7 @@ pub(crate) fn start_file_transfer(
     send_transfer_events(peer, wire, manager.start_send(wire, source)?)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_responder(
     binding: SessionBinding,
     attempt_id: String,
@@ -273,6 +318,7 @@ fn install_responder(
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
 ) -> Result<Arc<DesktopWebRtcPeer>, String> {
     let wire = WebRtcWireBinding::from_attempt(local_device_id, remote_device_id, &attempt_id)?;
     let transfer_manager = new_transfer_manager(&config)?;
@@ -298,6 +344,7 @@ fn install_responder(
         Arc::clone(&sessions),
         config,
         devices,
+        events,
         transfer_manager,
     )?;
     sessions
@@ -314,6 +361,7 @@ fn spawn_event_worker(
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
     transfer_manager: Arc<WebRtcTransferManager>,
 ) -> Result<(), String> {
     thread::spawn(move || {
@@ -393,6 +441,7 @@ fn spawn_event_worker(
                         &sessions,
                         &config,
                         &devices,
+                        &events,
                         &transfer_manager,
                     ) {
                         eprintln!("[DeskLink] Rejected WebRTC data-channel message: {error}");
@@ -412,7 +461,33 @@ fn spawn_event_worker(
                 }
                 PeerEvent::Error(error) => eprintln!("[DeskLink] WebRTC peer error: {error}"),
                 PeerEvent::ConnectionChanged(state) => {
-                    eprintln!("[DeskLink] WebRTC peer state: {state}")
+                    eprintln!("[DeskLink] WebRTC peer state: {state}");
+                    if is_terminal_peer_state(&state) {
+                        let reason = format!("WebRTC peer entered terminal state: {state}");
+                        match sessions.clear_webrtc_if_current(
+                            &binding,
+                            &attempt_id,
+                            reason.clone(),
+                        ) {
+                            Ok(Some(peer)) => {
+                                peer.close();
+                                eprintln!("[DeskLink] WebRTC peer cleared; starting a fresh signed attempt");
+                                if let Err(error) = start_initiator(
+                                    binding.clone(),
+                                    Arc::clone(&sessions),
+                                    Arc::clone(&config),
+                                    Arc::clone(&devices),
+                                    Arc::clone(&events),
+                                ) {
+                                    eprintln!("[DeskLink] WebRTC recovery attempt failed: {error}");
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                eprintln!("[DeskLink] Ignored stale WebRTC peer failure: {error}")
+                            }
+                        }
+                    }
                 }
                 PeerEvent::ChannelOpened(WebRtcChannel::Control) => {
                     if let Err(error) = begin_handover(&binding, &attempt_id, &wire, &sessions) {
@@ -425,6 +500,11 @@ fn spawn_event_worker(
         }
     });
     Ok(())
+}
+
+fn is_terminal_peer_state(state: &str) -> bool {
+    let state = state.to_ascii_lowercase();
+    state.contains("failed") || state.contains("disconnected") || state.contains("closed")
 }
 
 fn new_transfer_manager(config: &Arc<Mutex<Config>>) -> Result<Arc<WebRtcTransferManager>, String> {
@@ -477,6 +557,7 @@ fn handle_peer_envelope(
     sessions: &Arc<DeviceManager>,
     config: &Arc<Mutex<Config>>,
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
     transfer_manager: &Arc<WebRtcTransferManager>,
 ) -> Result<(), String> {
     let envelope = WebRtcEnvelope::from_json(bytes)?;
@@ -500,7 +581,7 @@ fn handle_peer_envelope(
             .accept_webrtc_envelope(binding, attempt_id, envelope.message_id.clone())
             .map_err(|error| error.to_string())?;
         return crate::device_links::daemon::packet_handler::dispatch_webrtc_feature_packet(
-            binding, packet, devices, sessions, config,
+            binding, packet, devices, sessions, config, events,
         );
     }
     if envelope.message_type != HANDOVER_MESSAGE_TYPE {
@@ -674,7 +755,18 @@ fn handle_peer_envelope(
             sessions.with_webrtc_handover(binding, attempt_id, |handover| {
                 handover.mark_remote_feature_ready()
             })?;
-            send_feature_ready_if_possible(binding, attempt_id, wire, sessions)
+            send_feature_ready_if_possible(binding, attempt_id, wire, sessions)?;
+            if sessions
+                .webrtc_features_ready(binding, attempt_id)
+                .map_err(|error| error.to_string())?
+            {
+                clear_error(devices, &binding.device_id);
+                eprintln!(
+                    "[DeskLink] WebRTC feature transport ready for {}",
+                    binding.device_id
+                );
+            }
+            Ok(())
         }
         HandoverControlKind::Degraded => {
             sessions.with_webrtc_handover(binding, attempt_id, |handover| {
@@ -828,8 +920,8 @@ fn send_capabilities(
         wire,
         now_millis(),
     );
-    message.incoming_capabilities = initial_webrtc_capabilities(&info.incoming_capabilities);
-    message.outgoing_capabilities = initial_webrtc_capabilities(&info.outgoing_capabilities);
+    message.incoming_capabilities = webrtc_capabilities(&info.incoming_capabilities);
+    message.outgoing_capabilities = webrtc_capabilities(&info.outgoing_capabilities);
     send_control(binding, attempt_id, wire, message, sessions)?;
     sessions.with_webrtc_handover(binding, attempt_id, |handover| {
         handover.mark_local_capabilities_confirmed()
@@ -920,14 +1012,14 @@ fn verify_remote_capabilities(
     binding: &SessionBinding,
     message: &HandoverControlMessage,
 ) -> Result<(), String> {
-    let expected_incoming = initial_webrtc_capabilities(&binding.link.info.incoming_capabilities);
-    let expected_outgoing = initial_webrtc_capabilities(&binding.link.info.outgoing_capabilities);
-    if initial_webrtc_capabilities(&message.incoming_capabilities) != expected_incoming
+    let expected_incoming = webrtc_capabilities(&binding.link.info.incoming_capabilities);
+    let expected_outgoing = webrtc_capabilities(&binding.link.info.outgoing_capabilities);
+    if webrtc_capabilities(&message.incoming_capabilities) != expected_incoming
         || message.incoming_capabilities != expected_incoming
     {
         return Err("WebRTC incoming capabilities do not match the paired identity".to_string());
     }
-    if initial_webrtc_capabilities(&message.outgoing_capabilities) != expected_outgoing
+    if webrtc_capabilities(&message.outgoing_capabilities) != expected_outgoing
         || message.outgoing_capabilities != expected_outgoing
     {
         return Err("WebRTC outgoing capabilities do not match the paired identity".to_string());

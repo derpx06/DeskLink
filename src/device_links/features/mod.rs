@@ -1,4 +1,4 @@
 mod registry;
 
 pub use registry::FeatureRegistry;
-pub(crate) use registry::{initial_webrtc_capabilities, is_initial_webrtc_feature};
+pub(crate) use registry::{is_webrtc_feature, webrtc_capabilities};

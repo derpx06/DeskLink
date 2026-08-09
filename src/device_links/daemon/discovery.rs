@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::handle::DaemonEvent;
 use super::network::{bind_udp_listener, MAX_TCP_PORT, MIN_TCP_PORT};
 use super::state::{mark_error, push_error, upsert_device};
 use super::validation::{connect_to_device, should_throttle_connection};
@@ -17,6 +18,13 @@ use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_IDENTITY};
 
 const UDP_PORT: u16 = 1716;
 
+/// A connection worker may lose the normal inbound/outbound race after it has
+/// already entered a blocking TLS handshake. Its eventual timeout is stale:
+/// publishing it would overwrite the healthy authoritative session in the UI.
+fn should_publish_outgoing_failure(sessions: &DeviceManager, device_id: &str) -> bool {
+    sessions.current_binding(device_id).is_none()
+}
+
 impl DaemonWorker {
     pub(super) fn start_udp_listener(&self) -> Result<(), String> {
         let socket = bind_udp_listener()?;
@@ -28,6 +36,7 @@ impl DaemonWorker {
         let devices = Arc::clone(&self.devices);
         let sessions = Arc::clone(&self.sessions);
         let errors = Arc::clone(&self.errors);
+        let events = Arc::clone(&self.events);
         let shutdown = Arc::clone(&self.shutdown);
         let tcp_port = self.tcp_port;
         let last_connections = Arc::new(Mutex::new(HashMap::new()));
@@ -47,6 +56,7 @@ impl DaemonWorker {
                                     &devices,
                                     &sessions,
                                     &errors,
+                                    &events,
                                     &last_connections,
                                 );
                             }
@@ -110,6 +120,7 @@ fn handle_identity_packet(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     sessions: &Arc<DeviceManager>,
     errors: &Arc<Mutex<Vec<String>>>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
     last_connections: &Arc<Mutex<HashMap<String, Instant>>>,
 ) {
     let Some(info) = DeviceInfo::from_identity_packet(&packet) else {
@@ -167,6 +178,7 @@ fn handle_identity_packet(
     let config = Arc::clone(config);
     let devices = Arc::clone(devices);
     let sessions = Arc::clone(sessions);
+    let events = Arc::clone(events);
 
     thread::spawn(move || {
         if let Err(error) = connect_to_device(
@@ -175,13 +187,43 @@ fn handle_identity_packet(
             remote_port,
             config,
             devices.clone(),
-            sessions,
+            Arc::clone(&sessions),
+            events,
         ) {
-            mark_error(&devices, &info.id, error.clone());
-            eprintln!(
-                "[Daemon] Outgoing TCP connection to {} failed: {}",
-                info.id, error
-            );
+            if should_publish_outgoing_failure(&sessions, &info.id) {
+                mark_error(&devices, &info.id, error.clone());
+                eprintln!(
+                    "[Daemon] Outgoing TCP connection to {} failed: {}",
+                    info.id, error
+                );
+            } else {
+                eprintln!(
+                    "[DL-WRTC-BOOT] ignored stale outgoing connection failure for {}: {}",
+                    info.id, error
+                );
+            }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device_links::core::SessionLink;
+
+    #[test]
+    fn stale_outgoing_failure_is_not_published_after_an_inbound_link_wins() {
+        let sessions = DeviceManager::new();
+        assert!(should_publish_outgoing_failure(&sessions, "phone-1"));
+
+        sessions
+            .register_link(
+                "phone-1".to_string(),
+                SessionLink::test_placeholder("phone-1"),
+                true,
+            )
+            .unwrap();
+
+        assert!(!should_publish_outgoing_failure(&sessions, "phone-1"));
+    }
 }

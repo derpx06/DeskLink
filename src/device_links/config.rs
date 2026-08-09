@@ -71,8 +71,17 @@ impl Config {
             generate_key().map_err(|err| err.to_string())?
         };
         let certificate = if cert_path.exists() {
-            X509::from_pem(&fs::read(&cert_path).map_err(|err| err.to_string())?)
-                .map_err(|err| err.to_string())?
+            let certificate_bytes = fs::read(&cert_path).map_err(|err| err.to_string())?;
+            match X509::from_pem(&certificate_bytes) {
+                Ok(certificate) => certificate,
+                Err(_) => {
+                    // A truncated or malformed local certificate must not prevent
+                    // DeskLink from starting. The private key and device ID remain
+                    // authoritative, so rebuild only the certificate and keep all
+                    // pairing/configuration state untouched.
+                    generate_certificate(&key, &stored.device_id).map_err(|err| err.to_string())?
+                }
+            }
         } else {
             generate_certificate(&key, &stored.device_id).map_err(|err| err.to_string())?
         };
@@ -223,6 +232,26 @@ mod tests {
 
         let second = Config::load_from_dir(dir.clone()).unwrap();
         assert_eq!(second.local_device_info().id, first_id);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn malformed_certificate_is_rebuilt_without_changing_identity() {
+        let dir = std::env::temp_dir().join(format!("desklink-cert-test-{}", Uuid::new_v4()));
+        let first = Config::load_from_dir(dir.clone()).unwrap();
+        let first_id = first.local_device_info().id;
+        drop(first);
+
+        fs::write(dir.join("certificate.pem"), b"").unwrap();
+
+        let repaired = Config::load_from_dir(dir.clone()).unwrap();
+        assert_eq!(repaired.local_device_info().id, first_id);
+        assert!(repaired
+            .certificate()
+            .to_pem()
+            .unwrap()
+            .starts_with(b"-----BEGIN CERTIFICATE-----"));
 
         let _ = fs::remove_dir_all(dir);
     }

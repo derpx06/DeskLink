@@ -2,7 +2,7 @@ use super::discovery::broadcast_identity;
 use super::network::send_packet;
 use super::state::{mark_error, push_error, update_pair_state};
 use super::DaemonWorker;
-use crate::device_links::core::{DeviceSession, FeatureTransportSnapshot, SessionBinding};
+use crate::device_links::core::{DeviceSession, SessionBinding};
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK_REQUEST,
     PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION_ACTION,
@@ -11,7 +11,7 @@ use crate::device_links::packet::{
     PACKET_TYPE_SYSTEMVOLUME_REQUEST,
 };
 use crate::device_links::pairing::PairState;
-use crate::device_links::webrtc::coordinator::send_feature_packet;
+use crate::device_links::transport::{should_surface_send_error, FeatureTransport};
 
 #[derive(Debug, Clone)]
 pub enum DaemonCommand {
@@ -135,32 +135,62 @@ impl DaemonWorker {
     }
 
     fn reject_pair(&self, device_id: &str) {
-        self.with_link(device_id, |session, binding| {
-            let packet = session.pairing.reject_packet();
-            send_packet(binding.link.stream()?, &packet)?;
-            update_pair_state(&self.devices, device_id, PairState::NotPaired, None);
-            Ok(())
-        });
+        self.revoke_pairing(device_id, "Pairing request was rejected", false);
     }
 
     fn unpair(&self, device_id: &str) {
-        self.with_link(device_id, |session, binding| {
-            let packet = session.pairing.reject_packet();
-            let _ = send_packet(binding.link.stream()?, &packet);
-            self.config
+        self.revoke_pairing(device_id, "Device was unpaired", true);
+    }
+
+    fn revoke_pairing(&self, device_id: &str, reason: &str, remove_trust: bool) {
+        let result = self
+            .sessions
+            .current_binding(device_id)
+            .ok_or_else(|| "Device is not connected".to_string())
+            .and_then(|binding| {
+                let (packet, peer) = self
+                    .sessions
+                    .revoke_pairing(&binding, reason.to_string())
+                    .map_err(|error| error.to_string())?;
+
+                // The pairing packet remains bootstrap traffic.  The local
+                // revocation is already committed even if this final packet
+                // cannot be delivered, so a stale peer cannot survive.
+                let send_result = binding
+                    .link
+                    .stream()
+                    .and_then(|stream| send_packet(stream, &packet));
+                if let Some(peer) = peer {
+                    peer.close();
+                }
+                send_result
+            });
+
+        if remove_trust {
+            if let Err(error) = self
+                .config
                 .lock()
-                .map_err(|_| "Config lock poisoned".to_string())?
-                .untrust_device(device_id)?;
-            update_pair_state(&self.devices, device_id, PairState::NotPaired, None);
-            Ok(())
-        });
+                .map_err(|_| "Config lock poisoned".to_string())
+                .and_then(|mut config| config.untrust_device(device_id))
+            {
+                mark_error(&self.devices, device_id, error.clone());
+                push_error(&self.errors, error);
+                return;
+            }
+        }
+
+        update_pair_state(&self.devices, device_id, PairState::NotPaired, None);
+        if let Err(error) = result {
+            mark_error(&self.devices, device_id, error.clone());
+            push_error(&self.errors, error);
+        }
     }
 
     fn send_ping(&self, device_id: &str) {
         self.with_feature_transport(device_id, |transport| {
             let mut packet = NetworkPacket::new(PACKET_TYPE_PING);
             packet.set("message", "Ping from DeskLink");
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
@@ -171,14 +201,14 @@ impl DaemonWorker {
     ) {
         self.with_feature_transport(device_id, |transport| {
             let packet = NetworkPacket::with_body(PACKET_TYPE_MOUSEPAD_REQUEST, payload);
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
     fn send_share_text(&self, device_id: &str, text: &str) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_share_text_packet(text)?;
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
@@ -186,84 +216,84 @@ impl DaemonWorker {
         self.with_feature_transport(device_id, |transport| {
             let mut packet = NetworkPacket::new(PACKET_TYPE_LOCK_REQUEST);
             packet.set("setLocked", lock);
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
     fn send_find_phone(&self, device_id: &str) {
         self.with_feature_transport(device_id, |transport| {
             let packet = NetworkPacket::new(PACKET_TYPE_FINDMYPHONE_REQUEST);
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
     fn send_mpris_action(&self, device_id: &str, player: &str, action: &str) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_mpris_action_packet(player, action);
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
     fn request_mpris_status(&self, device_id: &str, player: Option<String>) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_mpris_status_request_packet(player.as_deref());
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
     fn send_mpris_set_volume(&self, device_id: &str, player: &str, volume: i64) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_mpris_set_volume_packet(player, volume)?;
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
     fn send_mpris_seek(&self, device_id: &str, player: &str, offset: i64) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_mpris_seek_packet(player, offset)?;
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
     fn send_sftp_request(&self, device_id: &str) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_sftp_request_packet();
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
     fn request_notifications(&self, device_id: &str) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_notification_request_packet();
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
     fn dismiss_notification(&self, device_id: &str, notification_id: &str) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_notification_dismiss_packet(notification_id)?;
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
     fn reply_notification(&self, device_id: &str, reply_id: &str, message: &str) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_notification_reply_packet(reply_id, message)?;
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
     fn trigger_notification_action(&self, device_id: &str, key: &str, action: &str) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_notification_action_packet(key, action)?;
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
     fn request_system_volume(&self, device_id: &str) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_system_volume_request_packet();
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
@@ -276,14 +306,14 @@ impl DaemonWorker {
     ) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_system_volume_set_packet(name, volume, muted)?;
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
     fn request_remote_commands(&self, device_id: &str) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_remote_command_list_request_packet();
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
@@ -306,7 +336,7 @@ impl DaemonWorker {
                 return Err("Remote command was not advertised by this device".to_string());
             }
             let packet = build_remote_command_execute_packet(key)?;
-            send_feature_packet(&self.sessions, transport, &packet)
+            transport.send(&packet)
         });
     }
 
@@ -316,28 +346,17 @@ impl DaemonWorker {
     fn with_feature_transport(
         &self,
         device_id: &str,
-        f: impl FnOnce(&FeatureTransportSnapshot) -> Result<(), String>,
+        f: impl FnOnce(&FeatureTransport) -> Result<(), String>,
     ) {
-        let result = self
-            .sessions
-            .current_binding(device_id)
-            .ok_or_else(|| "Device is not connected".to_string())
-            .and_then(|binding| {
-                self.sessions
-                    .feature_transport_snapshot(&binding)
-                    .map_err(|error| error.to_string())
-            })
-            .and_then(|transport| {
-                if !transport.paired {
-                    return Err(
-                        "Device must be paired before sending DeskLink features".to_string()
-                    );
-                }
-                f(&transport)
-            });
+        let result = FeatureTransport::for_device(&self.sessions, device_id)
+            .and_then(|transport| f(&transport));
         if let Err(error) = result {
-            mark_error(&self.devices, device_id, error.clone());
-            push_error(&self.errors, error);
+            if should_surface_send_error(&error) {
+                mark_error(&self.devices, device_id, error.clone());
+                push_error(&self.errors, error);
+            } else {
+                eprintln!("[DeskLink] Feature send deferred during WebRTC recovery: {error}");
+            }
         }
     }
 

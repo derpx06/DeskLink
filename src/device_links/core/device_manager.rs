@@ -72,6 +72,10 @@ pub struct ReconnectLease {
 
 pub struct DisconnectResult {
     pub was_current: bool,
+    /// The closed socket was only the LAN bootstrap/signaling path.  A
+    /// mutually feature-ready WebRTC peer remains authoritative for the
+    /// logical session and must not be cancelled with that socket.
+    pub feature_transport_retained: bool,
     pub link: Option<Arc<SessionLink>>,
     pub webrtc: Option<Arc<DesktopWebRtcPeer>>,
 }
@@ -104,25 +108,20 @@ impl DeviceManager {
                 if session.state == SessionState::Terminated {
                     return Err(SessionError::TerminatedSession);
                 }
+                let replaced_generation = Some(session.connection_generation);
                 let replaced_link = session.active_link.replace(Arc::clone(&link));
-                let replaced_generation = replaced_link
-                    .as_ref()
-                    .map(|_| session.connection_generation);
-                let replaced_webrtc = if replaced_link.is_some() {
-                    session.webrtc_attempt_id = None;
-                    session.webrtc_handover = None;
-                    session.seen_webrtc_request_ids.clear();
-                    session.seen_webrtc_message_ids.clear();
-                    session.transfer_manager = None;
-                    session.active_webrtc.take()
-                } else {
-                    None
-                };
-                if replaced_link.is_some() {
-                    session.cancellation.store(true, Ordering::Release);
-                    session.connection_generation = session.connection_generation.saturating_add(1);
-                    session.cancellation = Arc::new(AtomicBool::new(false));
-                }
+                let replaced_webrtc = session.active_webrtc.take();
+
+                // Every accepted connection after the first represents a new
+                // transport generation, including a reconnect after
+                // `disconnect_if_current` removed the old link.  Reusing the
+                // cancelled token from the disconnected generation makes the
+                // new packet reader stale before it starts and prevents
+                // WebRTC bootstrap from ever running.
+                session.cancellation.store(true, Ordering::Release);
+                session.connection_generation = session.connection_generation.saturating_add(1);
+                session.cancellation = Arc::new(AtomicBool::new(false));
+                session.clear_webrtc_state();
                 if initially_paired
                     && session.pairing.state != crate::device_links::pairing::PairState::Paired
                 {
@@ -201,6 +200,24 @@ impl DeviceManager {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Returns whether a device already has a mutually feature-ready WebRTC
+    /// peer.  A later LAN socket is only a bootstrap/signaling candidate in
+    /// that state and must not replace the live feature generation.
+    pub fn has_ready_webrtc(&self, device_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| {
+                sessions.get(device_id).map(|session| {
+                    session
+                        .webrtc_handover
+                        .as_ref()
+                        .is_some_and(HandoverRuntime::features_ready)
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// Takes a generation-checked, immutable view of the current transport.
@@ -290,6 +307,7 @@ impl DeviceManager {
         let Ok(mut sessions) = self.sessions.lock() else {
             return DisconnectResult {
                 was_current: false,
+                feature_transport_retained: false,
                 link: None,
                 webrtc: None,
             };
@@ -297,6 +315,7 @@ impl DeviceManager {
         let Some(session) = sessions.get_mut(&binding.device_id) else {
             return DisconnectResult {
                 was_current: false,
+                feature_transport_retained: false,
                 link: None,
                 webrtc: None,
             };
@@ -311,6 +330,7 @@ impl DeviceManager {
         if !matches || session.state == SessionState::Terminated {
             return DisconnectResult {
                 was_current: false,
+                feature_transport_retained: false,
                 link: None,
                 webrtc: None,
             };
@@ -320,17 +340,80 @@ impl DeviceManager {
         session.connected_at = None;
         session.cancellation.store(true, Ordering::Release);
         let link = session.active_link.take();
-        session.webrtc_attempt_id = None;
-        session.webrtc_handover = None;
-        session.seen_webrtc_request_ids.clear();
-        session.seen_webrtc_message_ids.clear();
-        session.transfer_manager = None;
-        let webrtc = session.active_webrtc.take();
+        let webrtc = session.clear_webrtc_state();
         DisconnectResult {
             was_current: true,
+            feature_transport_retained: false,
             link,
             webrtc,
         }
+    }
+
+    /// Handles loss of the LAN discovery/pairing/signaling socket without
+    /// conflating it with loss of an already authenticated WebRTC feature
+    /// peer.  The current binding intentionally retains its link identity:
+    /// WebRTC callbacks are generation-bound to that binding, while the
+    /// socket itself is closed after this manager lock is released.
+    pub fn bootstrap_disconnected_if_current(
+        &self,
+        binding: &SessionBinding,
+        reason: String,
+    ) -> DisconnectResult {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return DisconnectResult {
+                was_current: false,
+                feature_transport_retained: false,
+                link: None,
+                webrtc: None,
+            };
+        };
+        let Some(session) = sessions.get_mut(&binding.device_id) else {
+            return DisconnectResult {
+                was_current: false,
+                feature_transport_retained: false,
+                link: None,
+                webrtc: None,
+            };
+        };
+        let matches = session.session_id == binding.session_id
+            && session.connection_generation == binding.generation
+            && session
+                .active_link
+                .as_ref()
+                .is_some_and(|link| Arc::ptr_eq(link, &binding.link))
+            && Arc::ptr_eq(&session.cancellation, &binding.cancellation);
+        if !matches || session.state == SessionState::Terminated {
+            return DisconnectResult {
+                was_current: false,
+                feature_transport_retained: false,
+                link: None,
+                webrtc: None,
+            };
+        }
+
+        // `HandoverRuntime::features_ready` is reached only after the
+        // installed peer has completed mutual authentication, capabilities,
+        // and feature-ready confirmation.  Peer and handover are installed
+        // and cleared together by this manager.
+        let web_rtc_ready = session
+            .webrtc_handover
+            .as_ref()
+            .is_some_and(HandoverRuntime::features_ready);
+        if web_rtc_ready {
+            // Do not cancel the generation or clear peer/handover state.  The
+            // retained Arc is returned only so the caller can close the dead
+            // bootstrap socket without doing I/O under the session lock.
+            session.state = SessionState::Ready;
+            session.last_disconnect_reason = None;
+            return DisconnectResult {
+                was_current: true,
+                feature_transport_retained: true,
+                link: session.active_link.as_ref().cloned(),
+                webrtc: None,
+            };
+        }
+        drop(sessions);
+        self.disconnect_if_current(binding, reason)
     }
 
     /// Atomically installs the only current WebRTC peer for a current DeskLink
@@ -403,6 +486,47 @@ impl DeviceManager {
                 .as_ref()
                 .is_some_and(HandoverRuntime::features_ready))
         })?
+    }
+
+    /// Invalidates one WebRTC attempt without dropping the authenticated LAN
+    /// bootstrap session. Only the current attempt may clear the peer; stale
+    /// GStreamer callbacks receive `StaleBinding` and cannot affect a newer
+    /// generation.
+    pub fn clear_webrtc_if_current(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+        reason: String,
+    ) -> Result<Option<Arc<DesktopWebRtcPeer>>, SessionError> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            session.last_disconnect_reason = Some(reason);
+            Ok(session.clear_webrtc_state())
+        })?
+    }
+
+    /// Revokes the local pairing state and every WebRTC object derived from
+    /// it.  The returned peer is deliberately closed by the caller only after
+    /// the session lock has been released, because peer callbacks can trigger
+    /// lifecycle work.
+    pub fn revoke_pairing(
+        &self,
+        binding: &SessionBinding,
+        reason: String,
+    ) -> Result<
+        (
+            crate::device_links::packet::NetworkPacket,
+            Option<Arc<DesktopWebRtcPeer>>,
+        ),
+        SessionError,
+    > {
+        self.with_session(binding, |session| {
+            let packet = session.pairing.reject_packet();
+            session.last_disconnect_reason = Some(reason);
+            (packet, session.clear_webrtc_state())
+        })
     }
 
     /// Serializes all mutations of the WebRTC handover runtime through the
@@ -552,14 +676,9 @@ impl DeviceManager {
                 session.reconnect_scheduled = false;
                 session.next_reconnect_at = None;
                 session.cancellation.store(true, Ordering::Release);
-                session.webrtc_attempt_id = None;
-                session.webrtc_handover = None;
-                session.seen_webrtc_request_ids.clear();
-                session.seen_webrtc_message_ids.clear();
-                if let Some(peer) = session.active_webrtc.take() {
+                if let Some(peer) = session.clear_webrtc_state() {
                     peers.push(peer);
                 }
-                session.transfer_manager = None;
                 session.active_link.take()
             })
             .collect();
@@ -693,6 +812,120 @@ mod tests {
 
         assert!(manager.claim_reconnect("phone-1", Instant::now()).is_some());
         assert!(manager.claim_reconnect("phone-1", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn registration_after_disconnect_creates_a_live_new_generation() {
+        let manager = DeviceManager::new();
+        let first = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        let disconnected =
+            manager.disconnect_if_current(&first, "bootstrap socket closed".to_string());
+        assert!(disconnected.was_current);
+        assert!(first.cancellation.load(Ordering::Acquire));
+
+        let reconnected = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+
+        assert_eq!(reconnected.session_id, first.session_id);
+        assert_eq!(reconnected.generation, first.generation + 1);
+        assert!(!reconnected.cancellation.load(Ordering::Acquire));
+        assert!(manager.is_current(&reconnected));
+    }
+
+    #[test]
+    fn bootstrap_disconnect_preserves_feature_ready_generation() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let wire = WebRtcWireBinding::from_attempt("desktop", "phone-1", &attempt_id).unwrap();
+        manager
+            .with_session(&binding, |session| {
+                let mut handover = HandoverRuntime::new(attempt_id.clone(), wire);
+                handover.record_offer("offer".to_string()).unwrap();
+                handover.record_answer("answer".to_string()).unwrap();
+                handover.mark_local_authenticated().unwrap();
+                handover.mark_remote_authenticated().unwrap();
+                handover.mark_local_capabilities_confirmed().unwrap();
+                handover.mark_remote_capabilities_confirmed().unwrap();
+                handover.mark_local_feature_ready().unwrap();
+                handover.mark_remote_feature_ready().unwrap();
+                session.webrtc_handover = Some(handover);
+                // The concrete GStreamer peer is not needed by this manager
+                // test. Presence is represented by retaining the handover
+                // runtime, while production only reaches this state with an
+                // installed peer.
+            })
+            .unwrap();
+
+        let disconnected = manager
+            .bootstrap_disconnected_if_current(&binding, "bootstrap socket closed".to_string());
+        assert!(disconnected.was_current);
+        assert!(disconnected.feature_transport_retained);
+        assert!(manager.is_current(&binding));
+        assert!(!binding.cancellation.load(Ordering::Acquire));
+        assert_eq!(
+            manager
+                .with_session(&binding, |session| session.connection_generation)
+                .unwrap(),
+            binding.generation,
+        );
+    }
+
+    #[test]
+    fn stale_webrtc_failure_cannot_clear_a_new_attempt() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        manager
+            .with_session(&binding, |session| {
+                session.webrtc_attempt_id = Some("current-attempt".to_string());
+            })
+            .unwrap();
+
+        assert!(matches!(
+            manager.clear_webrtc_if_current(
+                &binding,
+                "stale-attempt",
+                "old peer failed".to_string(),
+            ),
+            Err(SessionError::StaleBinding)
+        ));
+        assert_eq!(
+            manager
+                .with_session(&binding, |session| session.webrtc_attempt_id.clone())
+                .unwrap(),
+            Some("current-attempt".to_string()),
+        );
+    }
+
+    #[test]
+    fn unpairing_clears_the_active_webrtc_attempt() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        manager
+            .with_session(&binding, |session| {
+                session.webrtc_attempt_id = Some("old-attempt".to_string());
+            })
+            .unwrap();
+
+        manager
+            .revoke_pairing(&binding, "user unpaired the device".to_string())
+            .unwrap();
+
+        assert_eq!(manager.active_webrtc_attempt(&binding).unwrap(), None);
     }
 
     #[test]

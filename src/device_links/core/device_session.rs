@@ -63,6 +63,19 @@ impl DeviceSession {
             cancellation: Arc::clone(&self.cancellation),
         })
     }
+
+    /// Drops all state that is cryptographically bound to a particular paired
+    /// relationship.  Pairing changes must never leave an old WebRTC peer or
+    /// handover attempt behind: a later re-pair would otherwise see a peer as
+    /// already installed and skip negotiation.
+    pub fn clear_webrtc_state(&mut self) -> Option<Arc<DesktopWebRtcPeer>> {
+        self.webrtc_attempt_id = None;
+        self.webrtc_handover = None;
+        self.transfer_manager = None;
+        self.seen_webrtc_request_ids.clear();
+        self.seen_webrtc_message_ids.clear();
+        self.active_webrtc.take()
+    }
 }
 
 #[derive(Clone)]

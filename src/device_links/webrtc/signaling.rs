@@ -22,6 +22,7 @@ pub enum SignalingMessageType {
     IceCandidate,
     EndOfCandidates,
     IceRestart,
+    RestartRequest,
     Close,
 }
 
@@ -33,6 +34,7 @@ impl SignalingMessageType {
             Self::IceCandidate => "ice_candidate",
             Self::EndOfCandidates => "end_of_candidates",
             Self::IceRestart => "ice_restart",
+            Self::RestartRequest => "restart_request",
             Self::Close => "close",
         }
     }
@@ -44,6 +46,7 @@ impl SignalingMessageType {
             "ice_candidate" => Ok(Self::IceCandidate),
             "end_of_candidates" => Ok(Self::EndOfCandidates),
             "ice_restart" => Ok(Self::IceRestart),
+            "restart_request" => Ok(Self::RestartRequest),
             "close" => Ok(Self::Close),
             _ => Err("Unknown DeskLink WebRTC signaling message type".to_string()),
         }
@@ -249,6 +252,7 @@ impl WebRtcSignalingMessage {
             }
             SignalingMessageType::EndOfCandidates
             | SignalingMessageType::IceRestart
+            | SignalingMessageType::RestartRequest
             | SignalingMessageType::Close => Ok(String::new()),
         }
     }
@@ -313,5 +317,29 @@ mod tests {
 
         message.to_device_id = "different-phone".to_string();
         assert!(!message.verify(&public));
+    }
+
+    #[test]
+    fn signed_restart_request_round_trips_with_an_empty_payload() {
+        let private = test_key();
+        let public = PKey::public_key_from_der(&private.public_key_to_der().unwrap()).unwrap();
+        let message = WebRtcSignalingMessage::unsigned(
+            "restart-request-attempt",
+            "desktop",
+            "phone",
+            100,
+            SignalingMessageType::RestartRequest,
+            Map::new(),
+        )
+        .sign(&private)
+        .unwrap();
+
+        let parsed = WebRtcSignalingMessage::from_network_packet(&message.to_network_packet())
+            .expect("restart request should parse");
+        parsed.validate_for("phone", 100).unwrap();
+
+        assert_eq!(parsed.message_type, SignalingMessageType::RestartRequest);
+        assert!(parsed.verify(&public));
+        assert!(parsed.canonical_bytes().is_ok());
     }
 }

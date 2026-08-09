@@ -6,7 +6,7 @@
 
 use crate::device_links::core::{DeviceManager, SessionBinding};
 use crate::device_links::device_info::DeviceInfo;
-use crate::device_links::features::is_initial_webrtc_feature;
+use crate::device_links::features::is_webrtc_feature;
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_IDENTITY, PACKET_TYPE_PAIR, PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
@@ -132,7 +132,7 @@ impl SharedPacketDispatcher {
         if source == PacketSource::WebRtc && !feature_ready {
             return Err(DispatchError::UnpairedFeature);
         }
-        if source == PacketSource::WebRtc && !is_initial_webrtc_feature(&packet.packet_type) {
+        if source == PacketSource::WebRtc && !is_webrtc_feature(&packet.packet_type) {
             return Err(DispatchError::FeatureNotEnabled);
         }
         if !local_info
@@ -241,9 +241,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_lan_features_and_non_profile_webrtc_features_after_handover() {
+    fn rejects_lan_ping_but_allows_it_over_webrtc_after_handover() {
         let manager = DeviceManager::new();
-        let binding = paired_binding(&manager, vec![PACKET_TYPE_CLIPBOARD.to_string()]);
+        let binding = paired_binding(&manager, vec![PACKET_TYPE_PING.to_string()]);
         manager
             .with_session(&binding, |session| {
                 let wire = WebRtcWireBinding::from_attempt(
@@ -257,7 +257,7 @@ mod tests {
                 session.webrtc_handover = Some(runtime);
             })
             .unwrap();
-        let packet = NetworkPacket::new(PACKET_TYPE_CLIPBOARD);
+        let packet = NetworkPacket::new(PACKET_TYPE_PING);
 
         assert_eq!(
             SharedPacketDispatcher::authorize(
@@ -270,17 +270,14 @@ mod tests {
             .unwrap_err(),
             DispatchError::FeatureOnLanAfterHandover
         );
-        assert_eq!(
-            SharedPacketDispatcher::authorize(
-                PacketSource::WebRtc,
-                &binding,
-                &manager,
-                &local(),
-                &packet,
-            )
-            .unwrap_err(),
-            DispatchError::FeatureNotEnabled
-        );
+        assert!(SharedPacketDispatcher::authorize(
+            PacketSource::WebRtc,
+            &binding,
+            &manager,
+            &local(),
+            &packet,
+        )
+        .is_ok());
     }
 
     #[test]

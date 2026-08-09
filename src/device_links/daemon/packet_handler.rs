@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use super::clipboard::set_clipboard_text_from_remote;
 use super::dispatcher::{PacketSource, SharedPacketDispatcher};
+use super::handle::DaemonEvent;
 use super::handshake::handle_disconnect;
 use super::state::{
     remove_notification, update_battery_status, update_media_from_packet, update_pair_state,
@@ -51,6 +52,7 @@ pub(super) fn packet_read_loop(
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
 ) {
     let device_id = binding.device_id.clone();
     let stream = match binding.link.stream() {
@@ -158,6 +160,7 @@ pub(super) fn packet_read_loop(
                             Arc::clone(&sessions),
                             Arc::clone(&config),
                             Arc::clone(&devices),
+                            Arc::clone(&events),
                         )
                     {
                         eprintln!("[Daemon] Rejected DeskLink WebRTC signaling: {error}");
@@ -198,6 +201,21 @@ pub(super) fn packet_read_loop(
                         } else if previous_state == PairState::Paired
                             && state == PairState::NotPaired
                         {
+                            // A remote unpair invalidates the signed WebRTC
+                            // peer and every handover/replay record tied to
+                            // the old pairing.  Without this cleanup a later
+                            // re-pair sees an old peer and never negotiates a
+                            // fresh feature transport.
+                            match sessions.revoke_pairing(
+                                &binding,
+                                "The paired device removed this pairing".to_string(),
+                            ) {
+                                Ok((_packet, Some(peer))) => peer.close(),
+                                Ok((_packet, None)) => {}
+                                Err(error) => eprintln!(
+                                    "[Daemon] Could not clear WebRTC after remote unpair: {error}"
+                                ),
+                            }
                             if let Ok(mut config) = config.lock() {
                                 let _ = config.untrust_device(&device_id);
                             }
@@ -217,6 +235,7 @@ pub(super) fn packet_read_loop(
                                     Arc::clone(&sessions),
                                     Arc::clone(&config),
                                     Arc::clone(&devices),
+                                    Arc::clone(&events),
                                 )
                             {
                                 eprintln!(
@@ -231,6 +250,13 @@ pub(super) fn packet_read_loop(
                         device_id,
                         packet.get_str("message")
                     );
+                    if let Ok(mut events) = events.lock() {
+                        events.push(DaemonEvent::PingReceived {
+                            device_id: device_id.clone(),
+                            device_name: binding.link.info.name.clone(),
+                            message: packet.get_str("message").map(str::to_string),
+                        });
+                    }
                 } else if packet.packet_type == PACKET_TYPE_BATTERY {
                     update_battery_status(&devices, &device_id, &packet);
                 } else if packet.packet_type == PACKET_TYPE_FINDMYPHONE_REQUEST {
@@ -241,6 +267,12 @@ pub(super) fn packet_read_loop(
                     let _ = std::process::Command::new("canberra-gtk-play")
                         .args(["-i", "bell"])
                         .spawn();
+                    if let Ok(mut events) = events.lock() {
+                        events.push(DaemonEvent::FindPhoneReceived {
+                            device_id: device_id.clone(),
+                            device_name: binding.link.info.name.clone(),
+                        });
+                    }
                 } else if packet.packet_type == PACKET_TYPE_MOUSEPAD_REQUEST {
                     let dx = packet
                         .body
@@ -542,6 +574,7 @@ pub(crate) fn dispatch_webrtc_feature_packet(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     sessions: &Arc<DeviceManager>,
     config: &Arc<Mutex<Config>>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
 ) -> Result<(), String> {
     let local_info = config
         .lock()
@@ -560,6 +593,13 @@ pub(crate) fn dispatch_webrtc_feature_packet(
     match packet.packet_type.as_str() {
         PACKET_TYPE_PING => {
             eprintln!("[Daemon] WebRTC ping received from {device_id}");
+            if let Ok(mut queued) = events.lock() {
+                queued.push(DaemonEvent::PingReceived {
+                    device_id: device_id.clone(),
+                    device_name: binding.link.info.name.clone(),
+                    message: packet.get_str("message").map(str::to_string),
+                });
+            }
             Ok(())
         }
         PACKET_TYPE_BATTERY => {
@@ -627,6 +667,12 @@ pub(crate) fn dispatch_webrtc_feature_packet(
                 .args(["-i", "bell"])
                 .spawn()
                 .map_err(|error| format!("Could not play DeskLink find-device sound: {error}"))?;
+            if let Ok(mut queued) = events.lock() {
+                queued.push(DaemonEvent::FindPhoneReceived {
+                    device_id: device_id.clone(),
+                    device_name: binding.link.info.name.clone(),
+                });
+            }
             Ok(())
         }
         PACKET_TYPE_MOUSEPAD_REQUEST => Err(
