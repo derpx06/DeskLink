@@ -1,28 +1,36 @@
 use openssl::ssl::SslStream;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::net::{Shutdown, TcpStream};
+use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
-use super::network::{read_ssl_packet, send_packet};
+use super::network::read_ssl_packet;
 use super::packet_handler::packet_read_loop;
 use super::state::mark_status;
 use super::validation::{
     enforce_unpaired_link_limit, validate_certificate_device_id, validate_pinned_certificate,
 };
 use crate::device_links::config::Config;
+use crate::device_links::core::device_manager::DeviceManager;
+use crate::device_links::core::device_manager::SessionBinding;
+use crate::device_links::core::device_session::DeviceConnectionState;
+use crate::device_links::core::events::{CoreEvent, EventBus};
 use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::device_links::device_info::DeviceInfo;
-use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_NOTIFICATION_REQUEST};
-use crate::device_links::pairing::PairingHandler;
+use crate::device_links::webrtc::negotiation::WebRtcCoordinator;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finish_secure_link(
     initial_info: DeviceInfo,
     mut stream: SslStream<TcpStream>,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
-    links: Arc<Mutex<HashMap<String, super::Link>>>,
+    sessions: DeviceManager,
+    events: EventBus,
+    transfer_cancellations: Arc<Mutex<HashSet<String>>>,
+    webrtc: WebRtcCoordinator,
 ) -> Result<(), String> {
     let identity = config
         .lock()
@@ -60,7 +68,7 @@ pub(super) fn finish_secure_link(
         .public_key_to_der()
         .map_err(|err| err.to_string())?;
     validate_pinned_certificate(&config, &secure_info.id, &cert)?;
-    enforce_unpaired_link_limit(&config, &links, &secure_info.id)?;
+    enforce_unpaired_link_limit(&config, &sessions, &secure_info.id)?;
 
     let paired = config
         .lock()
@@ -85,6 +93,23 @@ pub(super) fn finish_secure_link(
         .map_err(|_| "Device lock poisoned".to_string())?
         .insert(secure_info.id.clone(), view);
 
+    if let Ok(devices) = devices.lock() {
+        if let Some(device) = devices.get(&secure_info.id) {
+            events.publish(CoreEvent::DeviceChanged {
+                device: Box::new(device.clone()),
+            });
+        }
+    }
+    events.publish(CoreEvent::ConnectionChanged {
+        device_id: secure_info.id.clone(),
+        state: if paired {
+            DeviceConnectionState::Paired
+        } else {
+            DeviceConnectionState::Unpaired
+        },
+        message: None,
+    });
+
     let stream = Arc::new(Mutex::new(stream));
     stream
         .lock()
@@ -92,81 +117,92 @@ pub(super) fn finish_secure_link(
         .get_ref()
         .set_nonblocking(true)
         .map_err(|err| err.to_string())?;
-    let read_stream = Arc::clone(&stream);
+    let link = super::Link {
+        stream: Arc::clone(&stream),
+        certificate_pem: cert_pem,
+        local_public_der,
+        remote_public_der,
+        info: secure_info.clone(),
+    };
+    let registration = sessions
+        .register_link(secure_info.id.clone(), link, paired)
+        .map_err(|error| format!("Could not register device session: {error:?}"))?;
+    webrtc.close_for_device(&secure_info.id);
+    if let Some(replaced) = &registration.replaced_link {
+        replaced.close();
+    }
+    if let Some(replaced) = &registration.replaced_webrtc_transport {
+        replaced.close();
+    }
+    let read_binding: SessionBinding = registration.binding.clone();
     let read_devices = Arc::clone(&devices);
-    let read_links = Arc::clone(&links);
     let read_config = Arc::clone(&config);
-    let device_id = secure_info.id.clone();
-    let pairing = PairingHandler::new(paired);
+    let read_events = events.clone();
+    let read_transfer_cancellations = Arc::clone(&transfer_cancellations);
+    let reader_sessions = sessions.clone();
 
-    if let Ok(mut links) = links.lock() {
-        if let Some(existing) = links.remove(&secure_info.id) {
-            if let Ok(existing_stream) = existing.stream.lock() {
-                let _ = existing_stream.get_ref().shutdown(Shutdown::Both);
-            }
-        }
-
-        links.insert(
-            secure_info.id.clone(),
-            super::Link {
-                stream: Arc::clone(&stream),
-                certificate_pem: cert_pem,
-                local_public_der,
-                remote_public_der,
-                pairing,
-                info: secure_info.clone(),
-            },
-        );
-    } else {
-        return Err("Link lock poisoned".to_string());
-    }
-
-    if paired {
-        let mut request = NetworkPacket::new(PACKET_TYPE_NOTIFICATION_REQUEST);
-        request.set("request", true);
-        if let Err(error) = send_packet(&stream, &request) {
-            eprintln!(
-                "[Daemon] Failed to request current notifications from {}: {}",
-                secure_info.id, error
-            );
-        }
-    }
-
+    let reader_webrtc = webrtc.clone();
     thread::spawn(move || {
         packet_read_loop(
-            device_id,
-            read_stream,
+            read_binding,
             read_devices,
-            read_links,
             read_config,
+            read_events,
+            read_transfer_cancellations,
+            reader_sessions,
+            reader_webrtc,
         )
     });
+
+    // Android starts its packet receiver as the control link is installed.
+    // Give that receiver a short, bounded chance to install before producing
+    // the first SDP offer; the protocol remains deterministic and does not
+    // depend on this delay for authorization or identity verification.
+    if paired {
+        let begin_binding = registration.binding;
+        let begin_config = Arc::clone(&config);
+        let begin_sessions = sessions;
+        let begin_events = events;
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(250));
+            webrtc.begin_if_supported(&begin_binding, begin_config, begin_sessions, begin_events);
+        });
+    }
     Ok(())
 }
 
 pub(super) fn handle_disconnect(
-    device_id: &str,
-    stream: &Arc<Mutex<SslStream<TcpStream>>>,
+    binding: &crate::device_links::core::device_manager::SessionBinding,
+    sessions: &DeviceManager,
+    webrtc: &WebRtcCoordinator,
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    links: &Arc<Mutex<HashMap<String, super::Link>>>,
+    events: &EventBus,
 ) -> bool {
-    let mut is_active = false;
-    if let Ok(l) = links.lock() {
-        if let Some(link) = l.get(device_id) {
-            if Arc::ptr_eq(&link.stream, stream) {
-                is_active = true;
+    webrtc.close_for_binding(binding, sessions);
+    let result =
+        sessions.disconnect_if_current(binding, "The device connection was closed".to_string());
+    if result.was_current {
+        if let Some(webrtc_binding) = sessions.current_webrtc_binding(&binding.device_id) {
+            if webrtc_binding.session_id == binding.session_id
+                && webrtc_binding.generation == binding.generation
+            {
+                sessions.clear_webrtc_if_current(&webrtc_binding);
             }
         }
-    }
-    if is_active {
-        mark_status(devices, device_id, DeviceStatus::Unreachable);
-        if let Ok(mut l) = links.lock() {
-            if let Some(link) = l.get(device_id) {
-                if Arc::ptr_eq(&link.stream, stream) {
-                    l.remove(device_id);
-                }
+        binding.link.close();
+        mark_status(devices, &binding.device_id, DeviceStatus::Unreachable);
+        if let Ok(devices) = devices.lock() {
+            if let Some(device) = devices.get(&binding.device_id) {
+                events.publish(CoreEvent::DeviceChanged {
+                    device: Box::new(device.clone()),
+                });
             }
         }
+        events.publish(CoreEvent::ConnectionChanged {
+            device_id: binding.device_id.clone(),
+            state: DeviceConnectionState::Unreachable,
+            message: Some("The device connection was closed".to_string()),
+        });
     }
-    is_active
+    result.was_current
 }

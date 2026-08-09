@@ -23,38 +23,46 @@ use adw::subclass::prelude::*;
 use gettextrs::gettext;
 use gtk::{gio, glib};
 
+use crate::branding::{LEGACY_PROTOCOL_DISPLAY_NAME, PRODUCT_DESCRIPTION, PRODUCT_NAME};
 use crate::config::VERSION;
 use crate::device_links::daemon::DaemonHandle;
-use crate::DesklinkWindow;
+use crate::DeskLinkWindow;
 
 mod imp {
     use super::*;
     use std::cell::RefCell;
 
     #[derive(Default)]
-    pub struct DesklinkApplication {
+    pub struct DeskLinkApplication {
         pub daemon: RefCell<Option<DaemonHandle>>,
     }
 
     #[glib::object_subclass]
-    impl ObjectSubclass for DesklinkApplication {
-        const NAME: &'static str = "DesklinkApplication";
-        type Type = super::DesklinkApplication;
+    impl ObjectSubclass for DeskLinkApplication {
+        const NAME: &'static str = "DeskLinkApplication";
+        type Type = super::DeskLinkApplication;
         type ParentType = adw::Application;
     }
 
-    impl ObjectImpl for DesklinkApplication {
+    impl ObjectImpl for DeskLinkApplication {
         fn constructed(&self) {
             self.parent_constructed();
             let obj = self.obj();
-            self.daemon.replace(Some(DaemonHandle::start()));
             obj.setup_gactions();
             obj.set_accels_for_action("app.quit", &["<control>q"]);
             obj.set_accels_for_action("app.shortcuts", &["<control>question"]);
         }
     }
 
-    impl ApplicationImpl for DesklinkApplication {
+    impl ApplicationImpl for DeskLinkApplication {
+        fn startup(&self) {
+            self.parent_startup();
+            let application = self.obj();
+            let daemon = DaemonHandle::start();
+            crate::dbus::start(application.upcast_ref(), daemon.clone());
+            self.daemon.replace(Some(daemon));
+        }
+
         // We connect to the activate callback to create a window when the application
         // has been launched. Additionally, this callback notifies us when the user
         // tries to launch a "second instance" of the application. When they try
@@ -68,17 +76,17 @@ mod imp {
         }
     }
 
-    impl GtkApplicationImpl for DesklinkApplication {}
-    impl AdwApplicationImpl for DesklinkApplication {}
+    impl GtkApplicationImpl for DeskLinkApplication {}
+    impl AdwApplicationImpl for DeskLinkApplication {}
 }
 
 glib::wrapper! {
-    pub struct DesklinkApplication(ObjectSubclass<imp::DesklinkApplication>)
+    pub struct DeskLinkApplication(ObjectSubclass<imp::DeskLinkApplication>)
         @extends gio::Application, gtk::Application, adw::Application,
         @implements gio::ActionGroup, gio::ActionMap;
 }
 
-impl DesklinkApplication {
+impl DeskLinkApplication {
     pub fn new(application_id: &str, flags: &gio::ApplicationFlags) -> Self {
         glib::Object::builder()
             .property("application-id", application_id)
@@ -114,7 +122,7 @@ impl DesklinkApplication {
 
     fn main_window(&self) -> gtk::Window {
         self.active_window().unwrap_or_else(|| {
-            let window = DesklinkWindow::new(self);
+            let window = DeskLinkWindow::new(self);
             if let Some(daemon) = self.daemon_handle() {
                 window.set_daemon(daemon);
             }
@@ -125,7 +133,7 @@ impl DesklinkApplication {
     fn show_about(&self) {
         let window = self.main_window();
         let about = adw::AboutDialog::builder()
-            .application_name("DeskLink")
+            .application_name(PRODUCT_NAME)
             .application_icon("derx06.desklink.com")
             .developer_name("manas")
             .version(VERSION)
@@ -154,12 +162,14 @@ impl DesklinkApplication {
         let page = adw::PreferencesPage::new();
         let network_group = adw::PreferencesGroup::builder()
             .title("Connection")
-            .description("DeskLink uses the KDE Connect LAN protocol on ports 1716-1764.")
+            .description(PRODUCT_DESCRIPTION)
             .build();
 
         let discovery_row = adw::ActionRow::builder()
             .title("Device Discovery")
-            .subtitle("Broadcast identity packets and listen for nearby KDE Connect devices.")
+            .subtitle(format!(
+                "Uses {LEGACY_PROTOCOL_DISPLAY_NAME} on ports 1716–1764."
+            ))
             .build();
         let discover = gtk::Button::builder()
             .label("Discover Now")

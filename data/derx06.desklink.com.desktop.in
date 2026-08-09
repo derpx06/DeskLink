@@ -1,11 +1,12 @@
 [Desktop Entry]
 Name=DeskLink
+Comment=Connect and control your devices securely
 Exec=desklink
 Icon=derx06.desklink.com
 Terminal=false
 Type=Application
 Categories=Utility;
-Keywords=GTK;
+Keywords=phone;devices;sharing;clipboard;remote;
 StartupNotify=true
 DBusActivatable=true
 X-GNOME-UsesNotifications=true

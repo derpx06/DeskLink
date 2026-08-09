@@ -1,6 +1,9 @@
 pub mod config;
+pub mod core;
 pub mod daemon;
 pub mod device;
 pub mod device_info;
 pub mod packet;
 pub mod pairing;
+pub mod plugins;
+pub mod webrtc;

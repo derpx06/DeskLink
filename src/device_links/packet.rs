@@ -1,37 +1,31 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-pub const PROTOCOL_VERSION: i64 = 8;
-pub const PACKET_TYPE_IDENTITY: &str = "kdeconnect.identity";
-pub const PACKET_TYPE_PAIR: &str = "kdeconnect.pair";
-pub const PACKET_TYPE_PING: &str = "kdeconnect.ping";
-pub const PACKET_TYPE_MOUSEPAD_REQUEST: &str = "kdeconnect.mousepad.request";
-pub const PACKET_TYPE_SHARE_REQUEST: &str = "kdeconnect.share.request";
-pub const PACKET_TYPE_CLIPBOARD: &str = "kdeconnect.clipboard";
-pub const PACKET_TYPE_CLIPBOARD_CONNECT: &str = "kdeconnect.clipboard.connect";
-pub const PACKET_TYPE_LOCK: &str = "kdeconnect.lock";
-pub const PACKET_TYPE_LOCK_REQUEST: &str = "kdeconnect.lock.request";
-pub const PACKET_TYPE_FINDMYPHONE_REQUEST: &str = "kdeconnect.findmyphone.request";
-pub const PACKET_TYPE_MPRIS: &str = "kdeconnect.mpris";
-pub const PACKET_TYPE_MPRIS_REQUEST: &str = "kdeconnect.mpris.request";
-pub const PACKET_TYPE_SFTP: &str = "kdeconnect.sftp";
-pub const PACKET_TYPE_SFTP_REQUEST: &str = "kdeconnect.sftp.request";
-pub const PACKET_TYPE_BATTERY: &str = "kdeconnect.battery";
-pub const PACKET_TYPE_NOTIFICATION: &str = "kdeconnect.notification";
-pub const PACKET_TYPE_NOTIFICATION_REQUEST: &str = "kdeconnect.notification.request";
-pub const PACKET_TYPE_NOTIFICATION_REPLY: &str = "kdeconnect.notification.reply";
-pub const PACKET_TYPE_NOTIFICATION_ACTION: &str = "kdeconnect.notification.action";
-pub const PACKET_TYPE_SYSTEMVOLUME: &str = "kdeconnect.systemvolume";
-pub const PACKET_TYPE_SYSTEMVOLUME_REQUEST: &str = "kdeconnect.systemvolume.request";
-pub const PACKET_TYPE_RUNCOMMAND: &str = "kdeconnect.runcommand";
-pub const PACKET_TYPE_RUNCOMMAND_REQUEST: &str = "kdeconnect.runcommand.request";
-pub const PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE: &str = "kdeconnect.mousepad.keyboardstate";
-pub const PACKET_TYPE_SHARE_REQUEST_UPDATE: &str = "kdeconnect.share.request.update";
-pub const PACKET_TYPE_SCREEN_REQUEST: &str = "desklink.screen.request";
-pub const PACKET_TYPE_SCREEN_READY: &str = "desklink.screen.ready";
-pub const PACKET_TYPE_SCREEN_FRAME: &str = "desklink.screen.frame";
-pub const PACKET_TYPE_SCREEN_STOP: &str = "desklink.screen.stop";
-pub const PACKET_TYPE_SCREEN_ERROR: &str = "desklink.screen.error";
+// Compatibility re-exports keep existing feature modules stable while the
+// active native DeskLink identifiers live in `protocol::desklink_v9`.
+#[allow(unused_imports)]
+pub use crate::protocol::desklink_v9::{
+    PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
+    PACKET_TYPE_CONNECTIVITY_REPORT, PACKET_TYPE_CONTACTS_REQUEST,
+    PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS, PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID,
+    PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS, PACKET_TYPE_CONTACTS_RESPONSE_VCARDS,
+    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_IDENTITY, PACKET_TYPE_LOCK,
+    PACKET_TYPE_LOCK_REQUEST, PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE, PACKET_TYPE_MOUSEPAD_REQUEST,
+    PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION,
+    PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_CANCEL,
+    PACKET_TYPE_NOTIFICATION_REPLY, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PAIR,
+    PACKET_TYPE_PING, PACKET_TYPE_PRESENTER, PACKET_TYPE_RUNCOMMAND,
+    PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP, PACKET_TYPE_SFTP_REQUEST,
+    PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SHARE_REQUEST_UPDATE, PACKET_TYPE_SMS_ATTACHMENT_FILE,
+    PACKET_TYPE_SMS_MESSAGES, PACKET_TYPE_SMS_REQUEST, PACKET_TYPE_SMS_REQUEST_ATTACHMENT,
+    PACKET_TYPE_SMS_REQUEST_CONVERSATION, PACKET_TYPE_SMS_REQUEST_CONVERSATIONS,
+    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_TELEPHONY,
+    PACKET_TYPE_TELEPHONY_REQUEST, PACKET_TYPE_TELEPHONY_REQUEST_MUTE, PROTOCOL_VERSION,
+};
+pub use crate::protocol::desklink_v9::{
+    PACKET_TYPE_SCREEN_ERROR, PACKET_TYPE_SCREEN_FRAME, PACKET_TYPE_SCREEN_READY,
+    PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP,
+};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +237,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_protocol_constants_remain_wire_compatible() {
+        use crate::protocol::legacy_kdeconnect_v8;
+
+        assert_eq!(legacy_kdeconnect_v8::PROTOCOL_VERSION, 8);
+        assert_eq!(
+            legacy_kdeconnect_v8::PACKET_TYPE_IDENTITY,
+            "kdeconnect.identity"
+        );
+        assert_eq!(legacy_kdeconnect_v8::PACKET_TYPE_PAIR, "kdeconnect.pair");
+        assert_eq!(legacy_kdeconnect_v8::PACKET_TYPE_PING, "kdeconnect.ping");
+        assert_eq!(
+            legacy_kdeconnect_v8::PACKET_TYPE_CLIPBOARD,
+            "kdeconnect.clipboard"
+        );
+        assert_eq!(
+            legacy_kdeconnect_v8::PACKET_TYPE_SHARE_REQUEST,
+            "kdeconnect.share.request"
+        );
+        assert_eq!(
+            legacy_kdeconnect_v8::PACKET_TYPE_MOUSEPAD_REQUEST,
+            "kdeconnect.mousepad.request"
+        );
+        assert_eq!(
+            legacy_kdeconnect_v8::PACKET_TYPE_NOTIFICATION,
+            "kdeconnect.notification"
+        );
+        assert_eq!(legacy_kdeconnect_v8::PACKET_TYPE_MPRIS, "kdeconnect.mpris");
+    }
+
+    #[test]
     fn serializes_and_unserializes_newline_delimited_packets() {
         let mut packet = NetworkPacket::new(PACKET_TYPE_PING);
         packet.set("message", "hello");
@@ -287,5 +311,25 @@ mod tests {
         let error = decode_screen_frame(&[0, 0, 0, 20, b'{']).unwrap_err();
 
         assert!(matches!(error, ScreenFrameCodecError::Truncated));
+    }
+
+    #[test]
+    fn native_golden_fixtures_parse_without_legacy_packet_names() {
+        let fixtures = include_str!("../../../protocol/testdata/desklink_v9/packets.jsonl");
+        let expected = [
+            "desklink.identity",
+            "desklink.pair",
+            "desklink.ping",
+            "desklink.clipboard",
+            "desklink.share.request",
+            "desklink.notification",
+            "desklink.mpris.request",
+            "desklink.systemvolume.request",
+        ];
+        for (line, expected_type) in fixtures.lines().zip(expected) {
+            let packet = NetworkPacket::deserialize(line.as_bytes()).unwrap();
+            assert_eq!(packet.packet_type, expected_type);
+            assert!(packet.packet_type.starts_with("desklink."));
+        }
     }
 }

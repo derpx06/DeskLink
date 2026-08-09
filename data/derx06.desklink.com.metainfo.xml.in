@@ -5,19 +5,16 @@
   <project_license>GPL-3.0-or-later</project_license>
 
   <name>DeskLink</name>
-  <summary>Connect GNOME with your phone</summary>
+  <summary>Connect your phone and Linux devices securely</summary>
   <description>
     <p>
-      DeskLink is a GNOME client for the KDE Connect LAN protocol. It can pair
-      with compatible devices, share files and text, synchronize the clipboard,
-      send remote input, mirror phone notifications, show battery and media
-      status, request lock state changes, ring a paired phone, and send media,
-      volume, file browsing, and remote command requests.
+      DeskLink is a phone-to-Linux connectivity application using DeskLink
+      Protocol v9. It can pair with compatible devices, share files and text,
+      synchronize the clipboard, send remote input, mirror phone notifications,
+      show battery and media status, request lock state changes, ring a paired
+      phone, and send media, volume, file browsing, and remote command requests.
     </p>
-    <p>
-      This is a focused GNOME client and does not implement every upstream KDE
-      Connect desktop plugin.
-    </p>
+    <p>DeskLink is a focused GNOME client and does not implement every optional plugin.</p>
   </description>
 
   <developer id="com.desklink">
@@ -36,7 +33,7 @@
   <releases>
     <release version="0.1.0" date="2026-07-02">
       <description translate="no">
-        <p>GNOME client for core KDE Connect LAN protocol features.</p>
+        <p>GNOME client for core DeskLink protocol-compatible LAN features.</p>
         <ul>
           <li>Pair and manage nearby devices.</li>
           <li>Share files, text, URLs, clipboard content, notifications, and remote input.</li>

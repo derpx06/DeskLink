@@ -1,17 +1,7 @@
 use serde_json::Value;
 
+use super::core::capability_registry::desktop_capabilities;
 use super::packet::{NetworkPacket, PACKET_TYPE_IDENTITY, PROTOCOL_VERSION};
-use super::packet::{
-    PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
-    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST,
-    PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS,
-    PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_ACTION,
-    PACKET_TYPE_NOTIFICATION_REPLY, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING,
-    PACKET_TYPE_RUNCOMMAND, PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SCREEN_ERROR,
-    PACKET_TYPE_SCREEN_FRAME, PACKET_TYPE_SCREEN_READY, PACKET_TYPE_SCREEN_REQUEST,
-    PACKET_TYPE_SCREEN_STOP, PACKET_TYPE_SFTP, PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST,
-    PACKET_TYPE_SHARE_REQUEST_UPDATE, PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
-};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
@@ -25,70 +15,14 @@ pub struct DeviceInfo {
 
 impl DeviceInfo {
     pub fn local(id: String, name: String) -> Self {
+        let (incoming_capabilities, outgoing_capabilities) = desktop_capabilities();
         Self {
             id,
             name,
             device_type: "desktop".to_string(),
             protocol_version: PROTOCOL_VERSION,
-            incoming_capabilities: vec![
-                PACKET_TYPE_PING.to_string(),
-                PACKET_TYPE_MOUSEPAD_REQUEST.to_string(),
-                PACKET_TYPE_SHARE_REQUEST.to_string(),
-                PACKET_TYPE_CLIPBOARD.to_string(),
-                PACKET_TYPE_CLIPBOARD_CONNECT.to_string(),
-                PACKET_TYPE_LOCK.to_string(),
-                PACKET_TYPE_LOCK_REQUEST.to_string(),
-                PACKET_TYPE_MPRIS.to_string(),
-                PACKET_TYPE_MPRIS_REQUEST.to_string(),
-                PACKET_TYPE_SFTP.to_string(),
-                PACKET_TYPE_BATTERY.to_string(),
-                PACKET_TYPE_NOTIFICATION.to_string(),
-                PACKET_TYPE_NOTIFICATION_REQUEST.to_string(),
-                PACKET_TYPE_NOTIFICATION_REPLY.to_string(),
-                PACKET_TYPE_NOTIFICATION_ACTION.to_string(),
-                PACKET_TYPE_SYSTEMVOLUME.to_string(),
-                PACKET_TYPE_SYSTEMVOLUME_REQUEST.to_string(),
-                PACKET_TYPE_RUNCOMMAND.to_string(),
-                PACKET_TYPE_RUNCOMMAND_REQUEST.to_string(),
-                PACKET_TYPE_FINDMYPHONE_REQUEST.to_string(),
-                PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE.to_string(),
-                PACKET_TYPE_SHARE_REQUEST_UPDATE.to_string(),
-                PACKET_TYPE_SCREEN_REQUEST.to_string(),
-                PACKET_TYPE_SCREEN_READY.to_string(),
-                PACKET_TYPE_SCREEN_FRAME.to_string(),
-                PACKET_TYPE_SCREEN_STOP.to_string(),
-                PACKET_TYPE_SCREEN_ERROR.to_string(),
-            ],
-            outgoing_capabilities: vec![
-                PACKET_TYPE_PING.to_string(),
-                PACKET_TYPE_MOUSEPAD_REQUEST.to_string(),
-                PACKET_TYPE_SHARE_REQUEST.to_string(),
-                PACKET_TYPE_CLIPBOARD.to_string(),
-                PACKET_TYPE_CLIPBOARD_CONNECT.to_string(),
-                PACKET_TYPE_LOCK.to_string(),
-                PACKET_TYPE_LOCK_REQUEST.to_string(),
-                PACKET_TYPE_FINDMYPHONE_REQUEST.to_string(),
-                PACKET_TYPE_MPRIS.to_string(),
-                PACKET_TYPE_MPRIS_REQUEST.to_string(),
-                PACKET_TYPE_SFTP.to_string(),
-                PACKET_TYPE_SFTP_REQUEST.to_string(),
-                PACKET_TYPE_BATTERY.to_string(),
-                PACKET_TYPE_NOTIFICATION.to_string(),
-                PACKET_TYPE_NOTIFICATION_REQUEST.to_string(),
-                PACKET_TYPE_NOTIFICATION_REPLY.to_string(),
-                PACKET_TYPE_NOTIFICATION_ACTION.to_string(),
-                PACKET_TYPE_SYSTEMVOLUME.to_string(),
-                PACKET_TYPE_SYSTEMVOLUME_REQUEST.to_string(),
-                PACKET_TYPE_RUNCOMMAND.to_string(),
-                PACKET_TYPE_RUNCOMMAND_REQUEST.to_string(),
-                PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE.to_string(),
-                PACKET_TYPE_SHARE_REQUEST_UPDATE.to_string(),
-                PACKET_TYPE_SCREEN_REQUEST.to_string(),
-                PACKET_TYPE_SCREEN_READY.to_string(),
-                PACKET_TYPE_SCREEN_FRAME.to_string(),
-                PACKET_TYPE_SCREEN_STOP.to_string(),
-                PACKET_TYPE_SCREEN_ERROR.to_string(),
-            ],
+            incoming_capabilities,
+            outgoing_capabilities,
         }
     }
 
@@ -113,6 +47,10 @@ impl DeviceInfo {
         if !is_valid_device_id(&id) || name.is_empty() {
             return None;
         }
+        let protocol_version = packet.get_i64("protocolVersion").unwrap_or(-1);
+        if protocol_version != PROTOCOL_VERSION {
+            return None;
+        }
         Some(Self {
             id,
             name,
@@ -120,7 +58,7 @@ impl DeviceInfo {
                 .get_str("deviceType")
                 .unwrap_or("unknown")
                 .to_string(),
-            protocol_version: packet.get_i64("protocolVersion").unwrap_or(-1),
+            protocol_version,
             incoming_capabilities: string_array(packet.body.get("incomingCapabilities")),
             outgoing_capabilities: string_array(packet.body.get("outgoingCapabilities")),
         })
@@ -167,106 +105,26 @@ mod tests {
 
         assert_eq!(parsed.id, local.id);
         assert_eq!(parsed.name, "DeskLink");
-        assert_eq!(parsed.protocol_version, 8);
+        assert_eq!(parsed.protocol_version, 9);
         assert!(parsed
             .incoming_capabilities
-            .contains(&"kdeconnect.ping".into()));
+            .contains(&"desklink.ping".to_string()));
     }
 
     #[test]
-    fn local_identity_advertises_v2_capabilities() {
+    fn local_identity_advertises_screen_control_without_legacy_frame_packets() {
         let local = DeviceInfo::local("0123456789abcdef0123456789abcdef".into(), "DeskLink".into());
-
-        for capability in [
-            PACKET_TYPE_PING,
-            PACKET_TYPE_MOUSEPAD_REQUEST,
-            PACKET_TYPE_SHARE_REQUEST,
-            PACKET_TYPE_CLIPBOARD,
-            PACKET_TYPE_CLIPBOARD_CONNECT,
-            PACKET_TYPE_LOCK,
-            PACKET_TYPE_LOCK_REQUEST,
-            PACKET_TYPE_MPRIS,
-            PACKET_TYPE_MPRIS_REQUEST,
-            PACKET_TYPE_SFTP,
-            PACKET_TYPE_BATTERY,
-            PACKET_TYPE_NOTIFICATION,
-            PACKET_TYPE_NOTIFICATION_REQUEST,
-            PACKET_TYPE_NOTIFICATION_REPLY,
-            PACKET_TYPE_NOTIFICATION_ACTION,
-            PACKET_TYPE_SYSTEMVOLUME,
-            PACKET_TYPE_SYSTEMVOLUME_REQUEST,
-            PACKET_TYPE_RUNCOMMAND,
-            PACKET_TYPE_RUNCOMMAND_REQUEST,
-            PACKET_TYPE_FINDMYPHONE_REQUEST,
-            PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE,
-            PACKET_TYPE_SHARE_REQUEST_UPDATE,
-        ] {
-            assert!(
-                local
-                    .incoming_capabilities
-                    .contains(&capability.to_string()),
-                "missing incoming capability {capability}"
-            );
-        }
-
-        for capability in [
-            PACKET_TYPE_PING,
-            PACKET_TYPE_MOUSEPAD_REQUEST,
-            PACKET_TYPE_SHARE_REQUEST,
-            PACKET_TYPE_CLIPBOARD,
-            PACKET_TYPE_CLIPBOARD_CONNECT,
-            PACKET_TYPE_LOCK,
-            PACKET_TYPE_LOCK_REQUEST,
-            PACKET_TYPE_FINDMYPHONE_REQUEST,
-            PACKET_TYPE_MPRIS,
-            PACKET_TYPE_MPRIS_REQUEST,
-            PACKET_TYPE_SFTP,
-            PACKET_TYPE_SFTP_REQUEST,
-            PACKET_TYPE_BATTERY,
-            PACKET_TYPE_NOTIFICATION,
-            PACKET_TYPE_NOTIFICATION_REQUEST,
-            PACKET_TYPE_NOTIFICATION_REPLY,
-            PACKET_TYPE_NOTIFICATION_ACTION,
-            PACKET_TYPE_SYSTEMVOLUME,
-            PACKET_TYPE_SYSTEMVOLUME_REQUEST,
-            PACKET_TYPE_RUNCOMMAND,
-            PACKET_TYPE_RUNCOMMAND_REQUEST,
-            PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE,
-            PACKET_TYPE_SHARE_REQUEST_UPDATE,
-        ] {
-            assert!(
-                local
-                    .outgoing_capabilities
-                    .contains(&capability.to_string()),
-                "missing outgoing capability {capability}"
-            );
-        }
-    }
-
-    #[test]
-    fn local_identity_advertises_desklink_screen_capabilities() {
-        let local = DeviceInfo::local("0123456789abcdef0123456789abcdef".into(), "DeskLink".into());
-
-        for capability in [
-            PACKET_TYPE_SCREEN_REQUEST,
-            PACKET_TYPE_SCREEN_READY,
-            PACKET_TYPE_SCREEN_FRAME,
-            PACKET_TYPE_SCREEN_STOP,
-            PACKET_TYPE_SCREEN_ERROR,
-        ] {
-            assert!(
-                local
-                    .incoming_capabilities
-                    .contains(&capability.to_string()),
-                "missing incoming screen capability {capability}"
-            );
-            assert!(
-                local
-                    .outgoing_capabilities
-                    .contains(&capability.to_string()),
-                "missing outgoing screen capability {capability}"
-            );
-        }
+        let (incoming, outgoing) = desktop_capabilities();
+        assert_eq!(local.incoming_capabilities, incoming);
+        assert_eq!(local.outgoing_capabilities, outgoing);
+        assert!(local
+            .incoming_capabilities
+            .iter()
+            .any(|capability| capability == "desklink.screen.ready"));
+        assert!(!local
+            .incoming_capabilities
+            .iter()
+            .any(|capability| capability == "desklink.screen.frame"));
     }
 
     #[test]

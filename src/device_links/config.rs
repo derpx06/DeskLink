@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use openssl::asn1::Asn1Time;
@@ -28,6 +31,20 @@ struct StoredConfig {
     device_id: String,
     device_name: String,
     trusted_devices: HashMap<String, TrustedDevice>,
+    #[serde(default)]
+    commands: HashMap<String, ConfiguredCommand>,
+    #[serde(default)]
+    preferences: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConfiguredCommand {
+    pub name: String,
+    pub executable: String,
+    #[serde(default)]
+    pub arguments: Vec<String>,
+    #[serde(default)]
+    pub enabled: bool,
 }
 
 pub struct Config {
@@ -59,6 +76,8 @@ impl Config {
                 device_id,
                 device_name,
                 trusted_devices: HashMap::new(),
+                commands: HashMap::new(),
+                preferences: HashMap::new(),
             }
         };
 
@@ -89,31 +108,74 @@ impl Config {
 
     pub fn save(&self) -> Result<(), String> {
         fs::create_dir_all(&self.base_dir).map_err(|err| err.to_string())?;
-        fs::write(
-            self.base_dir.join("config.json"),
-            serde_json::to_vec_pretty(&self.stored).map_err(|err| err.to_string())?,
-        )
-        .map_err(|err| err.to_string())?;
-        fs::write(
-            self.base_dir.join("privateKey.pem"),
-            self.key
+        #[cfg(unix)]
+        fs::set_permissions(&self.base_dir, fs::Permissions::from_mode(0o700))
+            .map_err(|err| err.to_string())?;
+
+        atomic_write(
+            &self.base_dir.join("config.json"),
+            &serde_json::to_vec_pretty(&self.stored).map_err(|err| err.to_string())?,
+        )?;
+        atomic_write(
+            &self.base_dir.join("privateKey.pem"),
+            &self
+                .key
                 .private_key_to_pem_pkcs8()
                 .map_err(|err| err.to_string())?,
-        )
-        .map_err(|err| err.to_string())?;
-        fs::write(
-            self.base_dir.join("certificate.pem"),
-            self.certificate.to_pem().map_err(|err| err.to_string())?,
-        )
-        .map_err(|err| err.to_string())?;
+        )?;
+        atomic_write(
+            &self.base_dir.join("certificate.pem"),
+            &self.certificate.to_pem().map_err(|err| err.to_string())?,
+        )?;
         Ok(())
     }
 
     pub fn local_device_info(&self) -> DeviceInfo {
-        DeviceInfo::local(
+        let mut info = DeviceInfo::local(
             self.stored.device_id.clone(),
             self.stored.device_name.clone(),
+        );
+        if self.stored.commands.values().any(|command| command.enabled) {
+            info.incoming_capabilities
+                .push(crate::device_links::packet::PACKET_TYPE_RUNCOMMAND_REQUEST.to_string());
+            info.outgoing_capabilities
+                .push(crate::device_links::packet::PACKET_TYPE_RUNCOMMAND.to_string());
+        }
+        // WebRTC signaling is an opt-in control capability. It is never a
+        // public feature capability and must not be advertised until the
+        // packet reader has a concrete paired-session handler.
+        if self.webrtc_enabled() {
+            info.incoming_capabilities
+                .push(crate::protocol::desklink_v9::PACKET_TYPE_WEBRTC_SIGNAL_V1.to_string());
+            info.outgoing_capabilities
+                .push(crate::protocol::desklink_v9::PACKET_TYPE_WEBRTC_SIGNAL_V1.to_string());
+        }
+        info
+    }
+
+    pub fn webrtc_enabled(&self) -> bool {
+        self.stored
+            .preferences
+            .get("webrtc.enabled")
+            .is_none_or(|value| value == "true")
+    }
+
+    pub fn webrtc_ice_servers(
+        &self,
+    ) -> Result<crate::device_links::webrtc::transport::IceServerConfig, String> {
+        crate::device_links::webrtc::transport::IceServerConfig::parse(
+            self.stored
+                .preferences
+                .get("webrtc.stun.servers")
+                .map(String::as_str)
+                .unwrap_or_default(),
+            self.stored
+                .preferences
+                .get("webrtc.turn.servers")
+                .map(String::as_str)
+                .unwrap_or_default(),
         )
+        .map_err(|error| error.to_string())
     }
 
     pub fn key(&self) -> &PKey<Private> {
@@ -122,6 +184,20 @@ impl Config {
 
     pub fn certificate(&self) -> &X509 {
         &self.certificate
+    }
+
+    pub fn transfer_state_dir(&self) -> PathBuf {
+        self.base_dir.join("transfers")
+    }
+
+    pub fn download_directory(&self) -> PathBuf {
+        self.stored
+            .preferences
+            .get("downloads.directory")
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+            .or_else(dirs::download_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 
     pub fn is_trusted(&self, device_id: &str) -> bool {
@@ -164,6 +240,103 @@ impl Config {
         self.stored.trusted_devices.remove(device_id);
         self.save()
     }
+
+    pub fn commands(&self) -> &HashMap<String, ConfiguredCommand> {
+        &self.stored.commands
+    }
+
+    #[cfg(test)]
+    pub fn preferences(&self) -> &HashMap<String, String> {
+        &self.stored.preferences
+    }
+
+    pub fn set_preference(&mut self, key: &str, value: &str) -> Result<(), String> {
+        const ALLOWED_KEYS: &[&str] = &[
+            "network.discovery",
+            "clipboard.enabled",
+            "downloads.directory",
+            "security.require-pairing",
+            "webrtc.enabled",
+            "webrtc.signaling.endpoint",
+            "webrtc.stun.servers",
+            "webrtc.turn.servers",
+        ];
+        if !ALLOWED_KEYS.contains(&key) {
+            return Err(format!("Unknown DeskLink preference: {key}"));
+        }
+        if key == "downloads.directory" && value.len() > 4096 {
+            return Err("Download directory preference is too long".to_string());
+        }
+        if value.len() > 256 {
+            return Err("Preference value is too long".to_string());
+        }
+        if key == "webrtc.signaling.endpoint" && !value.is_empty() && !value.starts_with("wss://") {
+            return Err("WebRTC signaling endpoint must use wss://".to_string());
+        }
+        if key == "webrtc.stun.servers" || key == "webrtc.turn.servers" {
+            let stun = if key == "webrtc.stun.servers" {
+                value
+            } else {
+                self.stored
+                    .preferences
+                    .get("webrtc.stun.servers")
+                    .map(String::as_str)
+                    .unwrap_or_default()
+            };
+            let turn = if key == "webrtc.turn.servers" {
+                value
+            } else {
+                self.stored
+                    .preferences
+                    .get("webrtc.turn.servers")
+                    .map(String::as_str)
+                    .unwrap_or_default()
+            };
+            crate::device_links::webrtc::transport::IceServerConfig::parse(stun, turn)
+                .map_err(|error| error.to_string())?;
+        }
+        self.stored
+            .preferences
+            .insert(key.to_string(), value.to_string());
+        self.save()
+    }
+
+    pub fn execute_command(&self, key: &str) -> Result<(), String> {
+        let command = self
+            .stored
+            .commands
+            .get(key)
+            .ok_or_else(|| "Command is not configured".to_string())?;
+        if !command.enabled || command.executable.is_empty() {
+            return Err("Command is disabled".to_string());
+        }
+        std::process::Command::new(&command.executable)
+            .args(&command.arguments)
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("Could not start command: {error}"))
+    }
+}
+
+fn atomic_write(path: &PathBuf, contents: &[u8]) -> Result<(), String> {
+    let temporary = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|err| err.to_string())?;
+        #[cfg(unix)]
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|err| err.to_string())?;
+        file.write_all(contents).map_err(|err| err.to_string())?;
+        file.sync_all().map_err(|err| err.to_string())?;
+        fs::rename(&temporary, path).map_err(|err| err.to_string())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn config_dir() -> PathBuf {
@@ -217,6 +390,44 @@ mod tests {
         let second = Config::load_from_dir(dir.clone()).unwrap();
         assert_eq!(second.local_device_info().id, first_id);
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn preferences_are_allowlisted_and_persisted() {
+        let dir = std::env::temp_dir().join(format!("desklink-preferences-{}", Uuid::new_v4()));
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        config.set_preference("clipboard.enabled", "false").unwrap();
+        assert_eq!(
+            config.preferences().get("clipboard.enabled"),
+            Some(&"false".to_string())
+        );
+        assert!(config
+            .set_preference("arbitrary.command", "rm -rf /")
+            .is_err());
+
+        let reloaded = Config::load_from_dir(dir.clone()).unwrap();
+        assert_eq!(
+            reloaded.preferences().get("clipboard.enabled"),
+            Some(&"false".to_string())
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn webrtc_signaling_endpoint_requires_explicit_secure_websocket() {
+        let dir =
+            std::env::temp_dir().join(format!("desklink-webrtc-preferences-{}", Uuid::new_v4()));
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        config
+            .set_preference(
+                "webrtc.signaling.endpoint",
+                "wss://example.invalid/signaling",
+            )
+            .unwrap();
+        assert!(config
+            .set_preference("webrtc.signaling.endpoint", "https://example.invalid")
+            .is_err());
         let _ = fs::remove_dir_all(dir);
     }
 }
