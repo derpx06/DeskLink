@@ -131,18 +131,34 @@ mod tests {
         assert!(local
             .incoming_capabilities
             .contains(&PACKET_TYPE_PING.to_string()));
-        assert!(!local
+        assert!(local
             .incoming_capabilities
-            .contains(&"desklink.mousepad.request".to_string()));
+            .contains(&"desklink.clipboard".to_string()));
+        assert!(local
+            .incoming_capabilities
+            .contains(&"desklink.notification".to_string()));
         assert!(local
             .outgoing_capabilities
             .contains(&"desklink.findmyphone.request".to_string()));
-        assert!(!local
+        assert!(local
             .outgoing_capabilities
             .contains(&"desklink.lock.request".to_string()));
+        assert!(local
+            .outgoing_capabilities
+            .contains(&"desklink.mousepad.request".to_string()));
+
+        // The desktop consumes remote input and lock state but cannot service
+        // them, and the Android application implements MPRIS, volume and
+        // run-command in the opposite direction only. None may be advertised.
+        assert!(!local
+            .incoming_capabilities
+            .contains(&"desklink.mousepad.request".to_string()));
         assert!(!local
             .outgoing_capabilities
             .contains(&"desklink.systemvolume.request".to_string()));
+        assert!(!local
+            .outgoing_capabilities
+            .contains(&"desklink.mpris.request".to_string()));
     }
 
     #[test]

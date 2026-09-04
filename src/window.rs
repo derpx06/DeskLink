@@ -66,6 +66,14 @@ mod imp {
         pub selected_device_id: RefCell<Option<String>>,
         pub notified_pair_requests: RefCell<HashSet<String>>,
         pub notified_remote_notifications: RefCell<HashSet<String>>,
+        /// Set while `refresh_devices` is rebuilding the sidebar.
+        ///
+        /// `ListBox::select_row` emits `row-selected` synchronously, and that
+        /// handler calls `refresh_devices` again. The nested call cleared and
+        /// rebuilt the list, then returned into the outer loop, which carried
+        /// on appending rows from its now-stale vector — leaving duplicated
+        /// entries and rendering the detail pane twice.
+        pub refreshing: std::cell::Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -183,9 +191,17 @@ impl DesklinkWindow {
 
     fn refresh_devices(&self) {
         let imp = self.imp();
+        if imp.refreshing.get() {
+            return;
+        }
         let Some(daemon) = imp.daemon.borrow().clone() else {
             return;
         };
+        imp.refreshing.set(true);
+        // RAII rather than a set at the end: `refresh_devices` returns early
+        // from several places, and any missed reset would wedge the sidebar
+        // permanently.
+        let _guard = RefreshGuard(&imp.refreshing);
 
         let errors = daemon.drain_errors();
         if let Some(error) = errors.last() {
@@ -245,6 +261,15 @@ impl DesklinkWindow {
             })
             .cloned()
             .collect();
+
+        // Runs before the snapshot short-circuit below, and before either
+        // empty-list early return. These effects are driven by `recent_devices`,
+        // which the search filter does not touch — running them after the
+        // snapshot check meant a pair request or a phone notification from a
+        // device the user had filtered out was dropped entirely, and the whole
+        // backlog then fired at once when the search box was cleared. It is
+        // also the only place the error banner is ever hidden.
+        self.mirror_device_side_effects(&recent_devices, errors.is_empty());
 
         let query = imp.search_entry.text().trim().to_lowercase();
         let filtered_devices: Vec<_> = recent_devices
@@ -313,6 +338,26 @@ impl DesklinkWindow {
             return;
         }
 
+        let selected_id = imp.selected_device_id.borrow().clone();
+        for device in &filtered_devices {
+            let row = device_sidebar_row(&daemon, device.clone());
+            let is_selected = selected_id.as_deref() == Some(device.id.as_str());
+            imp.devices_list.append(&row);
+            if is_selected {
+                imp.devices_list.select_row(Some(&row));
+            }
+        }
+        self.render_selected_device(&daemon, &filtered_devices);
+    }
+
+    /// Desktop-notification mirroring and error-banner state.
+    ///
+    /// Kept out of the list-rendering path deliberately: these depend on what
+    /// the daemon reports, not on what the sidebar happens to be showing, so
+    /// they must survive both the snapshot short-circuit and the search filter.
+    fn mirror_device_side_effects(&self, recent_devices: &[DeviceView], errors_empty: bool) {
+        let imp = self.imp();
+
         let current_pair_requests = recent_devices
             .iter()
             .filter(|device| matches!(device.status, DeviceStatus::PairRequestedByPeer))
@@ -325,11 +370,14 @@ impl DesklinkWindow {
             .iter()
             .filter(|device| matches!(device.status, DeviceStatus::PairRequestedByPeer))
         {
-            if imp
+            // The borrow is resolved to a bool before the notification call.
+            // Holding a `RefMut` across `send_app_notification` risked a panic
+            // if GIO ever pumped the main loop and re-entered this timeout.
+            let is_new = imp
                 .notified_pair_requests
                 .borrow_mut()
-                .insert(device.id.clone())
-            {
+                .insert(device.id.clone());
+            if is_new {
                 let body = device
                     .verification_key
                     .as_ref()
@@ -356,7 +404,7 @@ impl DesklinkWindow {
             })
             .collect::<std::collections::HashSet<_>>();
 
-        if errors.is_empty()
+        if errors_empty
             && recent_devices
                 .iter()
                 .all(|device| device.last_error.is_none())
@@ -370,11 +418,11 @@ impl DesklinkWindow {
         for device in recent_devices.iter() {
             for notification in &device.notifications {
                 let unique_id = format!("{}:{}", device.id, notification.id);
-                if imp
+                let is_new = imp
                     .notified_remote_notifications
                     .borrow_mut()
-                    .insert(unique_id.clone())
-                {
+                    .insert(unique_id.clone());
+                if is_new {
                     let title = if notification.title.is_empty() {
                         format!("{} on {}", notification.app_name, device.name)
                     } else {
@@ -393,17 +441,6 @@ impl DesklinkWindow {
                 }
             }
         }
-
-        let selected_id = imp.selected_device_id.borrow().clone();
-        for device in &filtered_devices {
-            let row = device_sidebar_row(&daemon, device.clone());
-            let is_selected = selected_id.as_deref() == Some(device.id.as_str());
-            imp.devices_list.append(&row);
-            if is_selected {
-                imp.devices_list.select_row(Some(&row));
-            }
-        }
-        self.render_selected_device(&daemon, &filtered_devices);
     }
 
     fn show_detail_empty(&self, title: &str, description: &str) {
@@ -537,7 +574,8 @@ impl DesklinkWindow {
             move |_| daemon.send(DaemonCommand::Discover)
         });
 
-        populate_discovery_list(&list, &daemon);
+        let discovery_snapshot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        populate_discovery_list(&list, &daemon, &discovery_snapshot);
         let weak_list = list.downgrade();
         let weak_window = window.downgrade();
         glib::timeout_add_seconds_local(1, move || {
@@ -547,7 +585,7 @@ impl DesklinkWindow {
             if weak_window.upgrade().is_none() {
                 return glib::ControlFlow::Break;
             }
-            populate_discovery_list(&list, &daemon);
+            populate_discovery_list(&list, &daemon, &discovery_snapshot);
             glib::ControlFlow::Continue
         });
 
@@ -555,12 +593,38 @@ impl DesklinkWindow {
     }
 }
 
-fn populate_discovery_list(list: &gtk::ListBox, daemon: &DaemonHandle) {
+/// Rebuilds the "Pair New Device" list, but only when its contents changed.
+///
+/// This used to tear down and rebuild every row once a second unconditionally.
+/// A tick landing between mouse-down and mouse-up destroyed the "Request Pair"
+/// button mid-click, so the press was silently lost and the user had to try
+/// again with no feedback; scroll position and the spinner also reset every
+/// second. `refresh_devices` already guards itself this way.
+///
+/// Paired devices are filtered out: they belong in the sidebar, and rendering
+/// them here built a full feature card for each one, in a dialog whose entire
+/// purpose is pairing something new.
+fn populate_discovery_list(
+    list: &gtk::ListBox,
+    daemon: &DaemonHandle,
+    last_snapshot: &std::cell::RefCell<Option<String>>,
+) {
+    let devices: Vec<_> = daemon
+        .devices()
+        .into_iter()
+        .filter(|device| !device.trusted)
+        .collect();
+
+    let snapshot = serde_json::to_string(&devices).unwrap_or_default();
+    if last_snapshot.borrow().as_ref() == Some(&snapshot) {
+        return;
+    }
+    last_snapshot.replace(Some(snapshot));
+
     while let Some(child) = list.first_child() {
         list.remove(&child);
     }
 
-    let devices = daemon.devices();
     if devices.is_empty() {
         let row = adw::ActionRow::builder()
             .title("Searching for devices")
@@ -573,6 +637,15 @@ fn populate_discovery_list(list: &gtk::ListBox, daemon: &DaemonHandle) {
 
     for device in devices {
         list.append(&device_row(daemon, device));
+    }
+}
+
+/// Clears the re-entrancy flag however `refresh_devices` exits.
+struct RefreshGuard<'a>(&'a std::cell::Cell<bool>);
+
+impl Drop for RefreshGuard<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
     }
 }
 
@@ -594,12 +667,27 @@ fn device_row(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget {
     }
 }
 
+/// How a device's reachability should read, and the CSS class that goes with it.
+///
+/// Both the sidebar row and the detail pane call this. The detail pane used to
+/// hardcode a green "● Connected" literal, so a device that was unreachable, or
+/// stuck mid-handover, showed as fully connected in the pane while the sidebar
+/// row beside it correctly said otherwise. Deriving both from one function is
+/// what keeps them from disagreeing again.
+fn device_status_presentation(device: &DeviceView) -> (&'static str, &'static str) {
+    match &device.status {
+        // Reachable over the bootstrap link but still negotiating the encrypted
+        // feature transport. Features work, so this is not a warning state, but
+        // calling it plain "Connected" hid a stuck handover completely.
+        DeviceStatus::Paired if !device.feature_transport_ready => ("Connecting", "warning"),
+        DeviceStatus::Paired => ("Connected", "success"),
+        DeviceStatus::Unreachable => ("Unavailable", "error"),
+        other => (other.label(), "dim-label"),
+    }
+}
+
 fn device_sidebar_row(daemon: &DaemonHandle, device: DeviceView) -> adw::ActionRow {
-    let status = match &device.status {
-        DeviceStatus::Paired => "Connected",
-        DeviceStatus::Unreachable => "Unavailable",
-        _ => device.status.label(),
-    };
+    let (status, _) = device_status_presentation(&device);
     let row = adw::ActionRow::builder()
         .title(&device.name)
         .subtitle(format!("{} · {status}", device.device_type))
@@ -712,9 +800,10 @@ fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget 
         .valign(gtk::Align::Center)
         .build();
 
+    let (status_text, status_class) = device_status_presentation(&device);
     let status_pill = gtk::Label::builder()
-        .label("● Connected")
-        .css_classes(["caption", "success"])
+        .label(format!("● {status_text}"))
+        .css_classes(["caption", status_class])
         .valign(gtk::Align::Center)
         .build();
     right.append(&status_pill);
@@ -1965,5 +2054,41 @@ mod tests {
 
         assert!(can_send_feature(&device, PACKET_TYPE_PING));
         assert!(!can_send_feature(&device, PACKET_TYPE_MOUSEPAD_REQUEST));
+    }
+
+    /// The detail pane used to render a hardcoded green "● Connected" for every
+    /// paired device, so an unreachable phone read as connected right next to a
+    /// sidebar row that said otherwise. Both now derive from this function.
+    #[test]
+    fn status_presentation_never_reports_an_unreachable_device_as_connected() {
+        let info = DeviceInfo {
+            id: "0123456789abcdef0123456789abcdef".to_string(),
+            name: "Phone".to_string(),
+            device_type: "phone".to_string(),
+            protocol_version: 9,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+        };
+        let mut device = DeviceView::from_info(&info, "127.0.0.1".to_string(), true);
+
+        device.status = DeviceStatus::Unreachable;
+        assert_eq!(
+            device_status_presentation(&device),
+            ("Unavailable", "error")
+        );
+
+        // Paired but the WebRTC handover has not finished.
+        device.status = DeviceStatus::Paired;
+        device.feature_transport_ready = false;
+        assert_eq!(
+            device_status_presentation(&device),
+            ("Connecting", "warning")
+        );
+
+        device.feature_transport_ready = true;
+        assert_eq!(
+            device_status_presentation(&device),
+            ("Connected", "success")
+        );
     }
 }

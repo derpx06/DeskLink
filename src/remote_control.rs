@@ -8,50 +8,68 @@ use std::rc::Rc;
 
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 
-pub fn show_remote_control_dialog(
-    daemon: DaemonHandle,
-    device_id: String,
-    parent: &impl IsA<gtk::Window>,
-) {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(
-        "
-        .trackpad-box {
-            background-color: alpha(@theme_bg_color, 0.4);
-            border: 1px solid alpha(@theme_fg_color, 0.12);
-            border-radius: 16px;
-            margin: 20px;
-            transition: border-color 0.25s ease, background-color 0.25s ease;
-        }
-        .trackpad-box:focus {
-            background-color: alpha(@theme_selected_bg_color, 0.06);
-            border: 2px solid @theme_selected_bg_color;
-        }
-        .status-pill {
-            background-color: alpha(@theme_fg_color, 0.06);
-            border-radius: 12px;
-            padding: 6px 14px;
-            font-size: 0.82rem;
-            font-weight: bold;
-            color: alpha(@theme_fg_color, 0.7);
-        }
-        .status-pill.active {
-            background-color: alpha(@theme_selected_bg_color, 0.15);
-            color: @theme_selected_bg_color;
-        }
-        .remote-entry {
-            border-radius: 10px;
-            padding: 8px 12px;
-        }
+/// Roughly 60 Hz. Fast enough that the pointer feels direct, slow enough that
+/// one gesture cannot queue thousands of packets.
+const MOTION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Installs this dialog's stylesheet on the default display, once per process.
+///
+/// A fresh `CssProvider` used to be added on every dialog open and never
+/// removed, so each open stacked another identical stylesheet on the display
+/// that every widget's style recalculation then had to walk. The CSS is static,
+/// so registering it once is both simpler and correct.
+fn install_remote_control_css() {
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INSTALLED.get_or_init(|| {
+        let Some(display) = gdk::Display::default() else {
+            return;
+        };
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(
+            "
+    .trackpad-box {
+        background-color: alpha(@theme_bg_color, 0.4);
+        border: 1px solid alpha(@theme_fg_color, 0.12);
+        border-radius: 16px;
+        margin: 20px;
+        transition: border-color 0.25s ease, background-color 0.25s ease;
+    }
+    .trackpad-box:focus {
+        background-color: alpha(@theme_selected_bg_color, 0.06);
+        border: 2px solid @theme_selected_bg_color;
+    }
+    .status-pill {
+        background-color: alpha(@theme_fg_color, 0.06);
+        border-radius: 12px;
+        padding: 6px 14px;
+        font-size: 0.82rem;
+        font-weight: bold;
+        color: alpha(@theme_fg_color, 0.7);
+    }
+    .status-pill.active {
+        background-color: alpha(@theme_selected_bg_color, 0.15);
+        color: @theme_selected_bg_color;
+    }
+    .remote-entry {
+        border-radius: 10px;
+        padding: 8px 12px;
+    }
     ",
-    );
-    if let Some(display) = gdk::Display::default() {
+        );
         gtk::style_context_add_provider_for_display(
             &display,
             &provider,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
-    }
+    });
+}
+
+pub fn show_remote_control_dialog(
+    daemon: DaemonHandle,
+    device_id: String,
+    parent: &impl IsA<gtk::Window>,
+) {
+    install_remote_control_css();
 
     let window = adw::Window::builder()
         .transient_for(parent)
@@ -126,21 +144,50 @@ pub fn show_remote_control_dialog(
 
     let lx = last_x.clone();
     let ly = last_y.clone();
+    // Pointer motion arrives at display refresh rate. Sending one packet per
+    // event floods the link and, when a send fails, produces one error per
+    // event. Accumulate movement and emit at most one packet per interval;
+    // deltas are relative, so coalescing them loses no information.
+    let pending_dx = Rc::new(Cell::new(0.0_f64));
+    let pending_dy = Rc::new(Cell::new(0.0_f64));
+    let motion_dx = pending_dx.clone();
+    let motion_dy = pending_dy.clone();
     motion.connect_motion(move |_, x, y| {
         let delta_x = x - lx.get();
         let delta_y = y - ly.get();
         lx.set(x);
         ly.set(y);
+        motion_dx.set(motion_dx.get() + delta_x);
+        motion_dy.set(motion_dy.get() + delta_y);
+    });
 
-        if delta_x.abs() > 0.0001 || delta_y.abs() > 0.0001 {
+    let flush_dx = pending_dx.clone();
+    let flush_dy = pending_dy.clone();
+    let flush_daemon = daemon_clone.clone();
+    let flush_id = id_clone.clone();
+    let flush_window = window.downgrade();
+    glib::timeout_add_local(MOTION_INTERVAL, move || {
+        if flush_window.upgrade().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        let delta_x = flush_dx.get();
+        let delta_y = flush_dy.get();
+        // Consume the accumulator only when a packet is actually emitted.
+        // Clearing it unconditionally discarded every sub-threshold tick, so
+        // motion slower than the threshold per interval — a slow, deliberate
+        // drag — accumulated to nothing and the remote pointer never moved.
+        if delta_x.abs() >= 1.0 || delta_y.abs() >= 1.0 {
+            flush_dx.set(0.0);
+            flush_dy.set(0.0);
             let mut payload = Map::new();
             payload.insert("dx".to_string(), Value::from(delta_x));
             payload.insert("dy".to_string(), Value::from(delta_y));
-            daemon_clone.send(DaemonCommand::SendMousepadRequest(
-                id_clone.to_string(),
+            flush_daemon.send(DaemonCommand::SendMousepadRequest(
+                flush_id.to_string(),
                 payload,
             ));
         }
+        glib::ControlFlow::Continue
     });
     trackpad_area.add_controller(motion);
 

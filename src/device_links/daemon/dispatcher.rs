@@ -126,7 +126,11 @@ impl SharedPacketDispatcher {
         if !paired {
             return Err(DispatchError::UnpairedFeature);
         }
-        if source == PacketSource::LanBootstrap {
+        // LAN carries paired features only until the authenticated WebRTC
+        // handover has taken over. Once `feature_ready` is reached the socket
+        // is bootstrap-only, so a feature packet arriving there is either a
+        // stale write or an attempt to bypass the authenticated transport.
+        if source == PacketSource::LanBootstrap && feature_ready {
             return Err(DispatchError::FeatureOnLanAfterHandover);
         }
         if source == PacketSource::WebRtc && !feature_ready {
@@ -223,8 +227,26 @@ mod tests {
         assert_eq!(error, DispatchError::BootstrapOnWebRtc);
     }
 
+    /// Before the authenticated handover, the pinned-TLS bootstrap link is a
+    /// valid carrier for ordinary feature packets. Without this the product has
+    /// no working transport at all on a network where ICE cannot complete.
     #[test]
-    fn rejects_lan_features_before_handover() {
+    fn accepts_lan_features_before_handover() {
+        let manager = DeviceManager::new();
+        let binding = paired_binding(&manager, vec![PACKET_TYPE_CLIPBOARD.to_string()]);
+
+        assert!(SharedPacketDispatcher::authorize(
+            PacketSource::LanBootstrap,
+            &binding,
+            &manager,
+            &local(),
+            &NetworkPacket::new(PACKET_TYPE_CLIPBOARD),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn rejects_lan_features_the_peer_never_advertised() {
         let manager = DeviceManager::new();
         let binding = paired_binding(&manager, Vec::new());
 
@@ -237,7 +259,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert_eq!(error, DispatchError::FeatureOnLanAfterHandover);
+        assert_eq!(error, DispatchError::UnsupportedByPeer);
     }
 
     #[test]

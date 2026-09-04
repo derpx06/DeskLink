@@ -22,7 +22,7 @@ const UDP_PORT: u16 = 1716;
 /// already entered a blocking TLS handshake. Its eventual timeout is stale:
 /// publishing it would overwrite the healthy authoritative session in the UI.
 fn should_publish_outgoing_failure(sessions: &DeviceManager, device_id: &str) -> bool {
-    sessions.current_binding(device_id).is_none()
+    sessions.wants_bootstrap_connection(device_id)
 }
 
 impl DaemonWorker {
@@ -137,7 +137,10 @@ fn handle_identity_packet(
         return;
     }
 
-    if sessions.current_binding(&info.id).is_some() {
+    // A closed link stays installed while a WebRTC transport outlives it, so
+    // ask about the socket rather than the binding: otherwise a device whose
+    // socket died is never offered a replacement connection.
+    if !sessions.wants_bootstrap_connection(&info.id) {
         return;
     }
     let paired = config

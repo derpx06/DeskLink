@@ -154,12 +154,12 @@ impl DesklinkApplication {
         let page = adw::PreferencesPage::new();
         let network_group = adw::PreferencesGroup::builder()
             .title("Connection")
-            .description("DeskLink uses the KDE Connect LAN protocol on ports 1716-1764.")
+            .description("DeskLink Protocol v9 over the local network, on ports 1716-1764.")
             .build();
 
         let discovery_row = adw::ActionRow::builder()
             .title("Device Discovery")
-            .subtitle("Broadcast identity packets and listen for nearby KDE Connect devices.")
+            .subtitle("Broadcast identity packets and listen for nearby DeskLink devices.")
             .build();
         let discover = gtk::Button::builder()
             .label("Discover Now")

@@ -17,19 +17,39 @@ use uuid::Uuid;
 use crate::device_links::config::Config;
 use crate::device_links::core::{DeviceManager, FeatureTransportSnapshot, SessionBinding};
 use crate::device_links::daemon::handle::DaemonEvent;
-use crate::device_links::daemon::network::send_packet;
 use crate::device_links::daemon::state::clear_error;
 use crate::device_links::device::DeviceView;
 use crate::device_links::features::{is_webrtc_feature, webrtc_capabilities};
 use crate::device_links::packet::NetworkPacket;
 
 use super::file_protocol::{FileControl, FILE_CHUNK_MESSAGE_TYPE, FILE_CONTROL_MESSAGE_TYPE};
+use super::ice::IceServerConfig;
 use super::transfer_manager::{TransferEvent, WebRtcTransferManager};
 use super::{
     AuthenticationTranscript, DesktopWebRtcPeer, HandoverControlKind, HandoverControlMessage,
     PeerEvent, SignalingMessageType, WebRtcChannel, WebRtcEnvelope, WebRtcPacketBridge,
     WebRtcSignalingMessage, WebRtcWireBinding, HANDOVER_MESSAGE_TYPE,
 };
+use crate::device_links::daemon::state::mark_error;
+
+/// ICE configuration for one attempt against `binding`'s peer.
+///
+/// The local address is whatever the link reports about itself. For the LAN
+/// bootstrap that is the TLS socket's address, which by construction has a
+/// working route to this peer. A transport that is *not* the L3 path the media
+/// will take — Bluetooth, or a relayed link — reports `None`, and must: a host
+/// candidate with no route to the peer costs ICE its full timeout before it is
+/// abandoned. See [`IceServerConfig::local_ip`] for why this matters far more
+/// than STUN here.
+fn ice_config_for(binding: &SessionBinding, config: &Arc<Mutex<Config>>) -> IceServerConfig {
+    let mut ice = config
+        .lock()
+        .ok()
+        .map(|config| config.ice_servers())
+        .unwrap_or_default();
+    ice.local_ip = binding.link.local_ip();
+    ice
+}
 
 /// Starts the deterministic desktop-initiated negotiation, or asks the
 /// deterministic remote initiator to rebuild its peer after this desktop
@@ -68,7 +88,7 @@ pub(crate) fn start_initiator(
     let wire = WebRtcWireBinding::from_attempt(local_device_id, remote_device_id, &attempt_id)?;
     let transfer_manager = new_transfer_manager(&config)?;
     let (sender, receiver) = mpsc::channel();
-    let peer = DesktopWebRtcPeer::new(true, sender)?;
+    let peer = DesktopWebRtcPeer::new(true, sender, &ice_config_for(&binding, &config))?;
     let replaced = sessions
         .install_webrtc_peer(
             &binding,
@@ -323,7 +343,7 @@ fn install_responder(
     let wire = WebRtcWireBinding::from_attempt(local_device_id, remote_device_id, &attempt_id)?;
     let transfer_manager = new_transfer_manager(&config)?;
     let (sender, receiver) = mpsc::channel();
-    let peer = DesktopWebRtcPeer::new(false, sender)?;
+    let peer = DesktopWebRtcPeer::new(false, sender, &ice_config_for(&binding, &config))?;
     let replaced = sessions
         .install_webrtc_peer(
             &binding,
@@ -365,146 +385,402 @@ fn spawn_event_worker(
     transfer_manager: Arc<WebRtcTransferManager>,
 ) -> Result<(), String> {
     thread::spawn(move || {
-        while let Ok(event) = receiver.recv() {
+        // Held for the worker's whole life; see `PeerWorkerGuard`.
+        let _guard = PeerWorkerGuard {
+            binding: binding.clone(),
+            attempt_id: attempt_id.clone(),
+            sessions: Arc::clone(&sessions),
+        };
+        let mut disconnected_since: Option<std::time::Instant> = None;
+        loop {
+            // A timed receive lets the transient-disconnect grace window expire
+            // even when the peer has gone completely silent.
+            let event = match receiver.recv_timeout(std::time::Duration::from_millis(500)) {
+                Ok(event) => Some(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             if !sessions.is_current(&binding)
                 || sessions.active_webrtc_peer(&binding, &attempt_id).is_err()
             {
                 break;
             }
-            match event {
-                PeerEvent::LocalDescription { message_type, sdp } => {
-                    if let Err(error) =
-                        sessions.with_webrtc_handover(&binding, &attempt_id, |handover| {
-                            match message_type {
-                                SignalingMessageType::Offer => handover.record_offer(sdp.clone()),
-                                SignalingMessageType::Answer => handover.record_answer(sdp.clone()),
-                                _ => unreachable!("peer only creates SDP offers and answers"),
-                            }
-                        })
-                    {
-                        eprintln!("[DeskLink] WebRTC local SDP rejected: {error}");
-                        break;
-                    }
-                    let mut payload = Map::new();
-                    payload.insert("sdp".to_string(), Value::String(sdp));
-                    if let Err(error) = send_signed_signal(
-                        &binding,
-                        &wire,
-                        &attempt_id,
-                        message_type,
-                        payload,
-                        &config,
-                    ) {
-                        eprintln!("[DeskLink] WebRTC local description failed: {error}");
-                        break;
-                    }
-                }
-                PeerEvent::IceCandidate {
-                    sdp_m_line_index,
-                    candidate,
-                } => {
-                    let mut payload = Map::new();
-                    payload.insert(
-                        "sdpMLineIndex".to_string(),
-                        Value::from(i64::from(sdp_m_line_index)),
-                    );
-                    payload.insert("candidate".to_string(), Value::String(candidate));
-                    if let Err(error) = send_signed_signal(
-                        &binding,
-                        &wire,
-                        &attempt_id,
-                        SignalingMessageType::IceCandidate,
-                        payload,
-                        &config,
-                    ) {
-                        eprintln!("[DeskLink] WebRTC ICE signaling failed: {error}");
-                        break;
-                    }
-                }
-                PeerEvent::EndOfCandidates => {
-                    let _ = send_signed_signal(
-                        &binding,
-                        &wire,
-                        &attempt_id,
-                        SignalingMessageType::EndOfCandidates,
-                        Map::new(),
-                        &config,
-                    );
-                }
-                PeerEvent::Envelope { channel, bytes } => {
-                    if let Err(error) = handle_peer_envelope(
-                        &binding,
-                        &attempt_id,
-                        &wire,
-                        channel,
-                        &bytes,
-                        &sessions,
-                        &config,
-                        &devices,
-                        &events,
-                        &transfer_manager,
-                    ) {
-                        eprintln!("[DeskLink] Rejected WebRTC data-channel message: {error}");
-                    }
-                }
-                PeerEvent::Binary { channel, bytes } => {
-                    // Android wraps file data in an authenticated envelope,
-                    // including when the underlying data channel is binary.
-                    // Raw chunks have no generation/replay binding and are
-                    // therefore rejected rather than falling back to a TLS
-                    // payload socket.
-                    eprintln!(
-                        "[DeskLink] Rejected raw WebRTC binary payload on {} ({} bytes)",
-                        channel.label(),
-                        bytes.len(),
-                    );
-                }
-                PeerEvent::Error(error) => eprintln!("[DeskLink] WebRTC peer error: {error}"),
-                PeerEvent::ConnectionChanged(state) => {
-                    eprintln!("[DeskLink] WebRTC peer state: {state}");
-                    if is_terminal_peer_state(&state) {
-                        let reason = format!("WebRTC peer entered terminal state: {state}");
-                        match sessions.clear_webrtc_if_current(
-                            &binding,
-                            &attempt_id,
-                            reason.clone(),
-                        ) {
-                            Ok(Some(peer)) => {
-                                peer.close();
-                                eprintln!("[DeskLink] WebRTC peer cleared; starting a fresh signed attempt");
-                                if let Err(error) = start_initiator(
-                                    binding.clone(),
-                                    Arc::clone(&sessions),
-                                    Arc::clone(&config),
-                                    Arc::clone(&devices),
-                                    Arc::clone(&events),
-                                ) {
-                                    eprintln!("[DeskLink] WebRTC recovery attempt failed: {error}");
+            if let Some(event) = event {
+                match event {
+                    PeerEvent::LocalDescription { message_type, sdp } => {
+                        if let Err(error) =
+                            sessions.with_webrtc_handover(&binding, &attempt_id, |handover| {
+                                match message_type {
+                                    SignalingMessageType::Offer => {
+                                        handover.record_offer(sdp.clone())
+                                    }
+                                    SignalingMessageType::Answer => {
+                                        handover.record_answer(sdp.clone())
+                                    }
+                                    _ => unreachable!("peer only creates SDP offers and answers"),
                                 }
-                            }
-                            Ok(None) => {}
-                            Err(error) => {
-                                eprintln!("[DeskLink] Ignored stale WebRTC peer failure: {error}")
+                            })
+                        {
+                            eprintln!("[DeskLink] WebRTC local SDP rejected: {error}");
+                            break;
+                        }
+                        let mut payload = Map::new();
+                        payload.insert("sdp".to_string(), Value::String(sdp));
+                        if let Err(error) = send_signed_signal(
+                            &binding,
+                            &wire,
+                            &attempt_id,
+                            message_type,
+                            payload,
+                            &config,
+                        ) {
+                            eprintln!("[DeskLink] WebRTC local description failed: {error}");
+                            if is_fatal_signaling_error(&error) {
+                                break;
                             }
                         }
                     }
-                }
-                PeerEvent::ChannelOpened(WebRtcChannel::Control) => {
-                    if let Err(error) = begin_handover(&binding, &attempt_id, &wire, &sessions) {
-                        eprintln!("[DeskLink] Could not start WebRTC authentication: {error}");
+                    PeerEvent::IceCandidate {
+                        sdp_m_line_index,
+                        candidate,
+                    } => {
+                        let mut payload = Map::new();
+                        payload.insert(
+                            "sdpMLineIndex".to_string(),
+                            Value::from(i64::from(sdp_m_line_index)),
+                        );
+                        payload.insert("candidate".to_string(), Value::String(candidate));
+                        if let Err(error) = send_signed_signal(
+                            &binding,
+                            &wire,
+                            &attempt_id,
+                            SignalingMessageType::IceCandidate,
+                            payload,
+                            &config,
+                        ) {
+                            eprintln!("[DeskLink] WebRTC ICE signaling failed: {error}");
+                            if is_fatal_signaling_error(&error) {
+                                break;
+                            }
+                        }
                     }
+                    PeerEvent::EndOfCandidates => {
+                        let _ = send_signed_signal(
+                            &binding,
+                            &wire,
+                            &attempt_id,
+                            SignalingMessageType::EndOfCandidates,
+                            Map::new(),
+                            &config,
+                        );
+                    }
+                    PeerEvent::Envelope { channel, bytes } => {
+                        if let Err(error) = handle_peer_envelope(
+                            &binding,
+                            &attempt_id,
+                            &wire,
+                            channel,
+                            &bytes,
+                            &sessions,
+                            &config,
+                            &devices,
+                            &events,
+                            &transfer_manager,
+                        ) {
+                            eprintln!("[DeskLink] Rejected WebRTC data-channel message: {error}");
+                        }
+                    }
+                    PeerEvent::Binary { channel, bytes } => {
+                        // Android wraps file data in an authenticated envelope,
+                        // including when the underlying data channel is binary.
+                        // Raw chunks have no generation/replay binding and are
+                        // therefore rejected rather than falling back to a TLS
+                        // payload socket.
+                        eprintln!(
+                            "[DeskLink] Rejected raw WebRTC binary payload on {} ({} bytes)",
+                            channel.label(),
+                            bytes.len(),
+                        );
+                    }
+                    PeerEvent::ScreenStream(stream) => {
+                        eprintln!(
+                            "[DeskLink] Screen stream received from {}",
+                            binding.device_id
+                        );
+                        super::screen::publish_stream(&binding.device_id, stream);
+                    }
+                    PeerEvent::Error(error) => eprintln!("[DeskLink] WebRTC peer error: {error}"),
+                    PeerEvent::ConnectionChanged(state) => {
+                        eprintln!("[DeskLink] WebRTC peer state: {state}");
+                        match classify_peer_state(&state) {
+                            PeerStateAction::Ignore => {
+                                if state.to_ascii_lowercase().contains("connected") {
+                                    disconnected_since = None;
+                                }
+                            }
+                            PeerStateAction::WaitForRecovery => {
+                                if disconnected_since.is_none() {
+                                    eprintln!(
+                                    "[DeskLink] WebRTC peer disconnected; waiting {}s for it to recover",
+                                    TRANSIENT_DISCONNECT_GRACE.as_secs()
+                                );
+                                    disconnected_since = Some(std::time::Instant::now());
+                                }
+                            }
+                            PeerStateAction::Rebuild => {
+                                rebuild_peer(
+                                    &binding,
+                                    &attempt_id,
+                                    format!("WebRTC peer entered terminal state: {state}"),
+                                    &sessions,
+                                    &config,
+                                    &devices,
+                                    &events,
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    PeerEvent::ChannelOpened(WebRtcChannel::Control) => {
+                        if let Err(error) = begin_handover(&binding, &attempt_id, &wire, &sessions)
+                        {
+                            eprintln!("[DeskLink] Could not start WebRTC authentication: {error}");
+                        }
+                    }
+                    PeerEvent::ChannelOpened(_) => {}
+                    PeerEvent::Closed => break,
                 }
-                PeerEvent::ChannelOpened(_) => {}
-                PeerEvent::Closed => break,
+            }
+
+            // Evaluated every iteration, after any event has been applied.
+            // Checking it only when the receive times out let a peer that keeps
+            // emitting events — a failing SCTP association produces a steady
+            // stream of channel errors — defer the window forever, so a dead
+            // peer was never rebuilt. Applying the event first is what lets a
+            // recovery notification on the expiry tick clear the timer instead
+            // of being discarded with the peer it reported healthy.
+            if expired(disconnected_since) {
+                rebuild_peer(
+                    &binding,
+                    &attempt_id,
+                    "WebRTC peer did not recover from a transient disconnect".to_string(),
+                    &sessions,
+                    &config,
+                    &devices,
+                    &events,
+                );
+                break;
             }
         }
+
+        // Nothing services this peer's events once the worker exits, so it must
+        // not be left installed. An orphaned peer is worse than no peer: every
+        // inbound feature is dropped in silence, and because the handover still
+        // reports feature-ready, `wants_bootstrap_connection` stays false — so
+        // discovery never dials a replacement and an inbound socket is
+        // discarded too. The device then reads as connected forever.
+        //
+        // Doing it here rather than at each `break` makes that structurally
+        // impossible instead of a property of every exit path remembering to.
+        // Exits that already cleared their attempt get `StaleBinding` back,
+        // which is a no-op.
     });
     Ok(())
 }
 
-fn is_terminal_peer_state(state: &str) -> bool {
+/// Releases a WebRTC peer when its event worker stops, however it stops.
+///
+/// Nothing services a peer's events once the worker is gone, so it must not be
+/// left installed. An orphaned peer is worse than no peer: every inbound
+/// feature is dropped in silence, and because the handover still reports
+/// feature-ready, `wants_bootstrap_connection` stays false — so discovery never
+/// dials a replacement and an inbound socket is discarded too. The device then
+/// reads as connected forever.
+///
+/// This is a `Drop` guard rather than a statement after the loop so the
+/// guarantee also covers an unwinding panic. It is not hypothetical:
+/// `thread::spawn` panics when the process hits its thread limit, and the lock
+/// handler spawns from inside this worker.
+///
+/// Exits that already cleared their own attempt get `StaleBinding` back here,
+/// which is a no-op — including after `rebuild_peer`, whose scheduled retry
+/// therefore cannot be cancelled by this.
+struct PeerWorkerGuard {
+    binding: SessionBinding,
+    attempt_id: String,
+    sessions: Arc<DeviceManager>,
+}
+
+impl Drop for PeerWorkerGuard {
+    fn drop(&mut self) {
+        super::screen::clear_stream(&self.binding.device_id);
+        if let Ok(Some(peer)) = self.sessions.clear_webrtc_if_current(
+            &self.binding,
+            &self.attempt_id,
+            "The WebRTC event worker ended".to_string(),
+        ) {
+            eprintln!("[DeskLink] WebRTC worker ended; released its peer");
+            peer.close();
+        }
+    }
+}
+
+/// Clears a dead peer and schedules one backed-off replacement attempt.
+///
+/// The wait happens on a detached thread so a GStreamer callback thread is
+/// never blocked, and the attempt is re-validated against the current session
+/// generation after the delay: a socket replacement during the wait supersedes
+/// this recovery rather than racing it.
+#[allow(clippy::too_many_arguments)]
+fn rebuild_peer(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    reason: String,
+    sessions: &Arc<DeviceManager>,
+    config: &Arc<Mutex<Config>>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
+) {
+    match sessions.clear_webrtc_if_current(binding, attempt_id, reason.clone()) {
+        Ok(Some(peer)) => peer.close(),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("[DeskLink] Ignored stale WebRTC peer failure: {error}");
+            return;
+        }
+    }
+
+    // The counter lives on the session, not on this worker: each rebuild ends
+    // its worker and starts a new one, so a worker-local counter would reset
+    // the backoff to zero on every single failure.
+    let recovery_attempt = sessions
+        .with_session(binding, |session| {
+            let attempt = session.webrtc_recovery_attempt;
+            session.webrtc_recovery_attempt = attempt.saturating_add(1);
+            attempt
+        })
+        .unwrap_or(0);
+    let Some(delay) = recovery_delay(recovery_attempt) else {
+        // The ladder is exhausted. Stop dialling and say so, rather than
+        // retrying every 30 seconds forever behind a UI that reads
+        // "Connecting". Inbound offers are still accepted — the phone may well
+        // be the deterministic initiator — and one resets this counter.
+        eprintln!(
+            "[DeskLink] {reason}; giving up after {} attempts. Waiting for the peer to offer.",
+            recovery_attempt
+        );
+        mark_error(
+            devices,
+            &binding.device_id,
+            "Could not establish a direct connection. This network may block peer-to-peer traffic."
+                .to_string(),
+        );
+        return;
+    };
+    eprintln!(
+        "[DeskLink] {reason}; rebuilding the WebRTC peer in {}ms (attempt {})",
+        delay.as_millis(),
+        recovery_attempt + 1
+    );
+
+    let binding = binding.clone();
+    let sessions = Arc::clone(sessions);
+    let config = Arc::clone(config);
+    let devices = Arc::clone(devices);
+    let events = Arc::clone(events);
+    thread::spawn(move || {
+        thread::sleep(delay);
+        if !sessions.is_current(&binding) {
+            eprintln!("[DeskLink] WebRTC recovery superseded by a newer session generation");
+            return;
+        }
+        if sessions
+            .active_webrtc_attempt(&binding)
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return;
+        }
+        if let Err(error) = start_initiator(binding, sessions, config, devices, events) {
+            eprintln!("[DeskLink] WebRTC recovery attempt failed: {error}");
+        }
+    });
+}
+
+/// How the desktop should react to a `webrtcbin` connection-state change.
+///
+/// `disconnected` is explicitly transient in WebRTC and appears routinely when
+/// the phone turns its screen off or switches Wi-Fi power state. Treating it as
+/// terminal tore the peer down on every blip and started a fresh signed attempt
+/// while Android was still inside its own grace window, which is what made the
+/// two ends flap against each other. The Android application waits
+/// `TRANSIENT_DISCONNECT_GRACE` before rebuilding; this mirrors that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerStateAction {
+    Ignore,
+    WaitForRecovery,
+    Rebuild,
+}
+
+pub(crate) const TRANSIENT_DISCONNECT_GRACE: std::time::Duration =
+    std::time::Duration::from_secs(12);
+
+/// Bounded reconnect backoff, matching `WebRtcRecoveryPolicy` on Android.
+/// Rebuilding immediately and unconditionally allocated a fresh GStreamer
+/// pipeline and seven data channels per failure, so a peer that could not be
+/// reached at all span the CPU instead of settling into a retry cadence.
+const RECOVERY_BACKOFF_MILLIS: [u64; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
+
+/// The delay before retry `attempt`, or `None` once the ladder is exhausted.
+///
+/// Previously this clamped to the last rung and retried every 30 seconds
+/// forever. Nothing ever concluded that the connection was not going to happen,
+/// so `feature_transport_ready` stayed false indefinitely and the UI sat on
+/// "Connecting" for as long as the application ran — the state the user
+/// reported. Returning `None` is what lets the caller surface an honest
+/// terminal state instead.
+///
+/// This bounds *initiation only*. The desktop must keep accepting inbound
+/// offers afterwards: the phone is the deterministic initiator whenever its
+/// device id sorts lower, and `WebRtcRecoveryPolicy` on Android never gives up
+/// on attempt count. An inbound offer resets the ladder.
+pub(crate) fn recovery_delay(attempt: u32) -> Option<std::time::Duration> {
+    RECOVERY_BACKOFF_MILLIS
+        .get(attempt as usize)
+        .map(|millis| std::time::Duration::from_millis(*millis))
+}
+
+/// Whether a failed bootstrap signal should end this peer's event worker.
+///
+/// Losing the bootstrap socket while an authenticated WebRTC transport is
+/// retained is a designed state, and a late ICE candidate written into that
+/// closed socket fails as a matter of course. Ending the worker for it left the
+/// peer installed with nothing servicing its events: inbound features were
+/// dropped silently, and because `has_ready_webrtc` still reported true,
+/// discovery refused to dial a replacement and inbound sockets were discarded —
+/// wedged until the application restarted.
+///
+/// The peer itself is still healthy in that state, so the worker keeps running
+/// and the ordinary disconnect paths remain responsible for tearing it down.
+fn is_fatal_signaling_error(error: &str) -> bool {
+    !error.contains("Session link is closed")
+        && !error.contains("Session link has no network stream")
+}
+
+fn expired(since: Option<std::time::Instant>) -> bool {
+    since.is_some_and(|since| since.elapsed() >= TRANSIENT_DISCONNECT_GRACE)
+}
+
+pub(crate) fn classify_peer_state(state: &str) -> PeerStateAction {
     let state = state.to_ascii_lowercase();
-    state.contains("failed") || state.contains("disconnected") || state.contains("closed")
+    if state.contains("failed") || state.contains("closed") {
+        PeerStateAction::Rebuild
+    } else if state.contains("disconnected") {
+        PeerStateAction::WaitForRecovery
+    } else {
+        PeerStateAction::Ignore
+    }
 }
 
 fn new_transfer_manager(config: &Arc<Mutex<Config>>) -> Result<Arc<WebRtcTransferManager>, String> {
@@ -576,6 +852,17 @@ fn handle_peer_envelope(
         );
     }
     if channel != WebRtcChannel::Control {
+        // The envelope declares its own channel, and the bridge checks that
+        // against the packet type. Neither check looks at the channel the bytes
+        // actually arrived on, so an envelope claiming the reliable events
+        // channel could be delivered over the unordered zero-retransmit input
+        // channel. Bind the two together before decoding.
+        if envelope.channel != channel.label() {
+            return Err(
+                "DeskLink WebRTC envelope arrived on a different channel than it declares"
+                    .to_string(),
+            );
+        }
         let packet = WebRtcPacketBridge::decode(wire, &envelope)?;
         sessions
             .accept_webrtc_envelope(binding, attempt_id, envelope.message_id.clone())
@@ -596,7 +883,8 @@ fn handle_peer_envelope(
         .map_err(|error| error.to_string())?;
     let message = HandoverControlMessage::from_json(&payload)?;
     message.validate(wire, attempt_id, now_millis())?;
-    let local_is_initiator = wire.sender_device_id < wire.peer_device_id;
+    let local_is_initiator =
+        crate::device_links::local_goes_first(&wire.sender_device_id, &wire.peer_device_id);
 
     match message.kind {
         HandoverControlKind::Hello => {
@@ -761,6 +1049,12 @@ fn handle_peer_envelope(
                 .map_err(|error| error.to_string())?
             {
                 clear_error(devices, &binding.device_id);
+                // A completed handover means the backoff ladder has served its
+                // purpose. The next unrelated failure starts from the top again
+                // instead of inheriting a 30-second delay.
+                let _ = sessions.with_session(binding, |session| {
+                    session.webrtc_recovery_attempt = 0;
+                });
                 eprintln!(
                     "[DeskLink] WebRTC feature transport ready for {}",
                     binding.device_id
@@ -776,10 +1070,19 @@ fn handle_peer_envelope(
             Err("Remote DeskLink WebRTC peer entered degraded state".to_string())
         }
         HandoverControlKind::Close => {
-            sessions
-                .active_webrtc_peer(binding, attempt_id)
-                .map_err(|error| error.to_string())?
-                .close();
+            // Clear the session state as well as closing the peer. Closing
+            // alone left `webrtc_handover` installed and feature-ready with no
+            // worker to service it, which then blocked discovery from ever
+            // offering a replacement connection.
+            match sessions.clear_webrtc_if_current(
+                binding,
+                attempt_id,
+                "The paired device closed the WebRTC session".to_string(),
+            ) {
+                Ok(Some(peer)) => peer.close(),
+                Ok(None) => {}
+                Err(error) => eprintln!("[DeskLink] Ignored a stale WebRTC close: {error}"),
+            }
             Ok(())
         }
     }
@@ -974,7 +1277,8 @@ fn authentication_transcript(
     let timestamp = runtime.authentication_timestamp.ok_or_else(|| {
         "DeskLink WebRTC authentication is missing its challenge timestamp".to_string()
     })?;
-    let local_is_initiator = wire.sender_device_id < wire.peer_device_id;
+    let local_is_initiator =
+        crate::device_links::local_goes_first(&wire.sender_device_id, &wire.peer_device_id);
     Ok(AuthenticationTranscript {
         session_attempt_id: attempt_id.to_string(),
         initiator_device_id: if local_is_initiator {
@@ -1096,8 +1400,22 @@ fn send_signed_signal(
         .sign(config.key())?
         .to_network_packet()
     };
-    eprintln!("[DL-WRTC-BOOT] sending {:?} bootstrap signal", message_type);
-    send_packet(binding.link.stream()?, &packet)
+    // Report the *outcome*, not the intention. Logging "sending" before the
+    // write made a signal that never left the machine look identical to one the
+    // peer acknowledged, which is why a stuck handover was undiagnosable from
+    // the log alone.
+    let result = binding.link.send_packet(&packet);
+    match &result {
+        Ok(()) => eprintln!(
+            "[DL-WRTC-BOOT] sent {message_type:?} to {} on session {} generation {}",
+            binding.device_id, binding.session_id, binding.generation
+        ),
+        Err(error) => eprintln!(
+            "[DL-WRTC-BOOT] FAILED to send {message_type:?} to {}: {error}",
+            binding.device_id
+        ),
+    }
+    result
 }
 
 fn local_and_remote_device_ids(
@@ -1121,7 +1439,27 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{offer_attempt_disposition, OfferAttemptDisposition};
+    use super::{
+        offer_attempt_disposition, recovery_delay, OfferAttemptDisposition, RECOVERY_BACKOFF_MILLIS,
+    };
+
+    /// The backoff used to clamp at its last rung and retry every 30 seconds
+    /// for the life of the process, so a connection that could never succeed
+    /// presented as "Connecting" forever. Exhausting the ladder must terminate
+    /// initiation so the UI can say something true.
+    #[test]
+    fn recovery_backoff_gives_up_instead_of_retrying_forever() {
+        let delays: Vec<_> = (0..RECOVERY_BACKOFF_MILLIS.len() as u32)
+            .map(|attempt| recovery_delay(attempt).expect("ladder rung"))
+            .collect();
+
+        // Strictly increasing, so each failure costs more than the last.
+        assert!(delays.windows(2).all(|pair| pair[0] < pair[1]));
+
+        let past_the_end = RECOVERY_BACKOFF_MILLIS.len() as u32;
+        assert_eq!(recovery_delay(past_the_end), None);
+        assert_eq!(recovery_delay(u32::MAX), None);
+    }
 
     #[test]
     fn stale_offer_cannot_replace_the_current_attempt() {

@@ -11,7 +11,6 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use openssl::hash::{hash, MessageDigest};
 use serde::{Deserialize, Serialize};
 
 use super::file_protocol::{
@@ -801,11 +800,29 @@ fn sync_directory(path: &Path) -> Result<(), String> {
         .map_err(|error| format!("Could not persist DeskLink transfer directory: {error}"))
 }
 
+/// Hashes a completed download in bounded chunks.
+///
+/// Transfers are allowed up to `MAX_TRANSFER_BYTES` (4 GiB), so reading the
+/// whole file in to verify it undid the streaming the rest of this module is
+/// built around and allocated the entire transfer at the last step.
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let bytes = fs::read(path).map_err(|error| format!("Could not hash DeskLink file: {error}"))?;
-    let digest = hash(MessageDigest::sha256(), &bytes)
-        .map_err(|error| format!("Could not hash DeskLink file: {error}"))?;
-    Ok(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+    let mut file =
+        File::open(path).map_err(|error| format!("Could not hash DeskLink file: {error}"))?;
+    let mut hasher = openssl::sha::Sha256::new();
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let count = std::io::Read::read(&mut file, &mut buffer)
+            .map_err(|error| format!("Could not hash DeskLink file: {error}"))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher
+        .finish()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 #[cfg(test)]

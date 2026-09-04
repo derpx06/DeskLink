@@ -9,7 +9,7 @@ use std::time::Duration;
 use super::handle::DaemonEvent;
 use super::network::read_ssl_packet;
 use super::packet_handler::packet_read_loop;
-use super::state::mark_status;
+use super::state::{mark_status, upsert_device};
 use super::validation::{
     enforce_unpaired_link_limit, validate_certificate_device_id, validate_pinned_certificate,
 };
@@ -18,6 +18,10 @@ use crate::device_links::core::{DeviceManager, SessionBinding, SessionLink};
 use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::PACKET_TYPE_WEBRTC_SIGNAL_V1;
+
+/// Idle read timeout on an established device link. It also bounds how long a
+/// feature send can wait for the stream mutex the reader holds.
+pub(super) const READ_TIMEOUT: Duration = Duration::from_millis(50);
 
 pub(super) fn finish_secure_link(
     initial_info: DeviceInfo,
@@ -69,7 +73,18 @@ pub(super) fn finish_secure_link(
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())?
         .is_trusted(&secure_info.id);
-    let mut view = DeviceView::from_info(
+    // Merge, never replace. `insert` here rebuilt the `DeviceView` from the
+    // identity packet, which zeroes notifications, battery, volume, media,
+    // commands and sftp state — so a Wi-Fi roam blanked every summary chip.
+    // Worse, the emptied notification set made the UI's dedup table prune
+    // itself, and the phone's next resync re-delivered every already-seen
+    // notification as a fresh desktop popup.
+    //
+    // Status is deliberately not set: `reconcile_connection_status` owns
+    // reachability, and asserting it from a handshake path is what previously
+    // left dead devices reading as connected.
+    upsert_device(
+        &devices,
         &secure_info,
         stream
             .get_ref()
@@ -78,15 +93,6 @@ pub(super) fn finish_secure_link(
             .unwrap_or_else(|_| "unknown".to_string()),
         paired,
     );
-    view.status = if paired {
-        DeviceStatus::Paired
-    } else {
-        DeviceStatus::Connected
-    };
-    devices
-        .lock()
-        .map_err(|_| "Device lock poisoned".to_string())?
-        .insert(secure_info.id.clone(), view);
 
     // Keep the TLS stream in one mode for its entire lifetime.  Toggling an
     // OpenSSL stream between nonblocking and blocking mode from the reader
@@ -95,30 +101,49 @@ pub(super) fn finish_secure_link(
     // blocked" error during WebRTC signaling.  A short read timeout keeps
     // shutdown responsive without changing the socket mode underneath the
     // active TLS stream.
+    //
+    // The timeout also bounds write latency. The reader holds the stream mutex
+    // across each blocking read, so a feature send waits for at most one
+    // timeout before it can acquire the lock. At 250ms that was longer than a
+    // frame of remote-input motion; 50ms keeps the pointer responsive while
+    // still leaving the reader mostly parked.
     stream
         .get_ref()
         .set_nonblocking(false)
         .map_err(|err| err.to_string())?;
     stream
         .get_ref()
-        .set_read_timeout(Some(Duration::from_millis(250)))
+        .set_read_timeout(Some(READ_TIMEOUT))
         .map_err(|err| err.to_string())?;
     stream
         .get_ref()
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| err.to_string())?;
     let link = SessionLink::new(
-        Arc::new(Mutex::new(stream)),
+        Arc::new(super::network::TlsLinkTransport::new(Arc::new(Mutex::new(
+            stream,
+        )))),
         cert_pem,
         local_public_der,
         remote_public_der,
         secure_info,
     );
-    if sessions.has_ready_webrtc(&initial_info.id) {
-        // Android may refresh the short-lived LAN bootstrap socket while its
-        // authenticated WebRTC peer is healthy.  This socket cannot become a
-        // second session: closing it preserves the existing generation and
-        // avoids tearing down all paired features for a discovery refresh.
+    // Android may refresh the short-lived LAN bootstrap socket while its
+    // authenticated WebRTC peer is healthy.  That socket must not become a
+    // second session: discarding it preserves the existing generation and
+    // avoids tearing down all paired features for a discovery refresh.
+    //
+    // **But only while the retained bootstrap link is still open.** Once the
+    // phone has closed the old socket, keeping it and discarding the fresh one
+    // leaves this side with no signalling channel at all — and the moment the
+    // WebRTC peer fails, the restart request it needs to send has nowhere to
+    // go. That produced a device stuck on "Connecting" indefinitely: the
+    // handover had completed, the peer had since failed, and every
+    // `RestartRequest` died with "Session link is closed" against a socket the
+    // peer had already replaced.
+    if sessions.has_ready_webrtc(&initial_info.id)
+        && sessions.has_live_bootstrap_link(&initial_info.id)
+    {
         eprintln!(
             "[DL-WRTC-BOOT] ignoring refreshed bootstrap socket for {}; retaining feature-ready WebRTC session",
             initial_info.id

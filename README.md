@@ -1,36 +1,66 @@
 # DeskLink
 
-DeskLink is a Rust/GTK GNOME client for the KDE Connect LAN protocol. It is a
-production-focused GNOME client, not a full replacement for `kdeconnect-kde`.
+DeskLink is a Rust/GTK GNOME client for DeskLink Protocol v9. It pairs with the
+DeskLink Android application over the local network. It is a production-focused
+GNOME client, not a full replacement for `kdeconnect-kde`, and v9 does not
+promise interoperability with KDE Connect peers.
+
+## Transport
+
+Discovery, identity, pairing, and signed WebRTC signaling use TLS with pinned
+certificates on the DeskLink port range. Paired features prefer the
+authenticated WebRTC data channels once the handover completes, and use the
+pinned-TLS link until then, so features keep working on networks where ICE
+cannot establish. File bytes are the exception: they only ever travel on the
+bounded WebRTC file-data channel.
 
 ## Implemented features
 
-- LAN discovery and TLS device links on the KDE Connect port range.
-- Pair, accept, reject, and unpair device flows.
+Every entry below has a working handler in this application *and* in the
+DeskLink Android application. The active set is defined in
+`src/device_links/features/registry.rs`, and the matching Android set is
+`WebRtcFeatureProfile`. The two are compared for exact equality during the
+handover, so they must be edited together.
+
+Received from the phone:
+
 - Ping.
-- File send and receive through KDE Connect payload transfer packets.
-- Text and URL sharing.
+- Battery status.
+- Clipboard content.
+- Shared text and URLs.
+- Notification mirroring, with in-memory notification state.
+- SFTP browsing responses.
+- Find-this-device requests.
+- Lock and unlock requests for this session.
+
+Sent to the phone:
+
+- Ping and find-my-phone requests.
 - Clipboard synchronization while paired.
-- Remote input receive and send through `kdeconnect.mousepad.request`.
-- Lock request and lock status replies.
-- Find phone requests.
-- Battery status display.
-- Phone notification mirroring with in-memory notification state.
-- MPRIS media command packets, player/status refresh, and richer incoming
-  status display.
-- System volume status and request packets.
-- Remote command list and execution request packets for commands advertised by
-  the paired device.
-- SFTP browsing request and response display.
-- GNOME UI for discovery, paired-device actions, preferences, shortcuts, and
-  remote-control input.
+- Text and URL sharing.
+- Remote input through `desklink.mousepad.request`.
+- Lock requests.
+- Notification dismiss, reply, and action.
+- SFTP browsing requests.
+- File transfer, over the WebRTC file-data channel.
+
+Plus the GNOME UI for discovery, paired-device actions, preferences, shortcuts,
+and remote-control input.
 
 ## Not implemented
 
-The upstream KDE desktop client has many plugins that are intentionally outside
-this scope, including SMS, contacts, telephony, virtual monitor, presenter,
-digitizer, full mounted SFTP filesystem integration, and full shared-input-device
-capture.
+MPRIS media control, system volume control, and remote command execution are
+present in this application's UI and packet layer but are **not** advertised as
+capabilities. The DeskLink Android application implements those three plugins in
+the opposite direction only — the phone controls the desktop — and has no
+receiver for the requests this client would send. Advertising them would produce
+nothing but rejected packets. They need an Android receiver plugin, or a desktop
+MPRIS/PulseAudio backend to answer the phone's requests, before they can be
+enabled.
+
+Also outside this scope, as in the upstream KDE desktop client: SMS, contacts,
+telephony, virtual monitor, presenter, digitizer, full mounted SFTP filesystem
+integration, and full shared-input-device capture.
 
 ## Verification
 

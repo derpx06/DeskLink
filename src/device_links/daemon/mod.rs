@@ -8,6 +8,14 @@ use super::config::Config;
 use super::core::DeviceManager;
 use super::device::DeviceView;
 
+/// Wall-clock seconds, for the pairing deadline comparison.
+fn unix_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default()
+}
+
 pub use commands::DaemonCommand;
 pub use handle::{DaemonEvent, DaemonHandle};
 
@@ -21,7 +29,10 @@ pub mod handle;
 pub mod handshake;
 pub mod network;
 pub mod packet_handler;
+pub mod pairing_commands;
 pub mod state;
+#[cfg(test)]
+pub mod test_peer;
 pub mod validation;
 
 pub(super) struct DaemonWorker {
@@ -86,10 +97,35 @@ impl DaemonWorker {
         })
     }
 
+    /// Keeps the device view's reachability honest.
+    ///
+    /// Connection status used to be written opportunistically from discovery,
+    /// the handshake and each disconnect handler, so any missed path left a
+    /// stale "Connected" on screen. This reconciles the whole view against the
+    /// session manager once a second, which makes a dropped link visible even
+    /// when no handler observed the drop.
+    fn start_status_reconciler(&self) {
+        let devices = Arc::clone(&self.devices);
+        let sessions = Arc::clone(&self.sessions);
+        let shutdown = Arc::clone(&self.shutdown);
+        thread::spawn(move || {
+            while !shutdown.load(Ordering::Acquire) {
+                // A pairing negotiation nobody answered is abandoned on the
+                // same tick, so the prompt clears without waiting for the
+                // device to go unreachable — and the peer is told, so it stops
+                // waiting too.
+                pairing_commands::expire_pairings(&sessions, &devices, unix_secs());
+                state::reconcile_connection_status(&devices, &sessions.connection_snapshot());
+                thread::sleep(std::time::Duration::from_millis(1000));
+            }
+        });
+    }
+
     pub(super) fn run(self) -> Result<(), String> {
         self.start_udp_listener()?;
         self.start_broadcaster();
         self.start_clipboard_listener();
+        self.start_status_reconciler();
 
         while let Ok(command) = self.command_rx.recv() {
             eprintln!("[Daemon] Received command: {:?}", command);

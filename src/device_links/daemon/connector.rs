@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
+use std::io::{BufReader, Read};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -50,6 +50,38 @@ pub(super) fn incoming_tcp_loop(
     }
 }
 
+/// Largest identity packet accepted before TLS, matching
+/// `MAX_IDENTITY_PACKET_SIZE` in the Android `LanLinkProvider`.
+const MAX_IDENTITY_PACKET_BYTES: usize = 512 * 1024;
+
+/// Reads one newline-delimited identity packet from an unauthenticated peer.
+///
+/// This runs before the TLS handshake, so the peer is anonymous and the read
+/// must be bounded. An unbounded `read_until` let a peer that connects and
+/// never sends a newline grow this buffer until the process was killed. Android
+/// has always bounded the same read; the desktop did not.
+fn read_identity_line(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, String> {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        let read = reader.read(&mut byte).map_err(|err| err.to_string())?;
+        if read == 0 {
+            return Err("Connection closed".to_string());
+        }
+        if byte[0] == b'\n' {
+            if line.is_empty() {
+                continue; // Keep-alive
+            }
+            line.push(byte[0]);
+            return Ok(line);
+        }
+        line.push(byte[0]);
+        if line.len() >= MAX_IDENTITY_PACKET_BYTES {
+            return Err("Identity packet is too large".to_string());
+        }
+    }
+}
+
 fn accept_incoming_device(
     stream: TcpStream,
     config: Arc<Mutex<Config>>,
@@ -68,21 +100,9 @@ fn accept_incoming_device(
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| err.to_string())?;
+    super::network::enable_keepalive(&stream);
     let mut reader = BufReader::new(stream.try_clone().map_err(|err| err.to_string())?);
-    let mut line = Vec::new();
-    loop {
-        line.clear();
-        reader
-            .read_until(b'\n', &mut line)
-            .map_err(|err| err.to_string())?;
-        if line.is_empty() {
-            return Err("Connection closed".to_string());
-        }
-        if line.len() == 1 && line[0] == b'\n' {
-            continue; // Keep-alive
-        }
-        break;
-    }
+    let line = read_identity_line(&mut reader)?;
     let packet = NetworkPacket::deserialize(&line).map_err(|err| err.to_string())?;
     let info = DeviceInfo::from_identity_packet(&packet)
         .ok_or_else(|| "Invalid identity packet".to_string())?;
