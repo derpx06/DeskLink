@@ -16,6 +16,50 @@ fn unix_secs() -> i64 {
         .unwrap_or_default()
 }
 
+/// Probe a bootstrap link that has been silent this long.
+///
+/// Only silence is probed, so an active link never sends one of these.
+pub(super) const HEARTBEAT_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Declare a peer gone after this much silence — three missed probes.
+///
+/// Sits deliberately below Android's 120s idle reaper, so the two sides agree
+/// a link is dead at roughly the same moment instead of one of them quietly
+/// tearing down a link the other still believes in. That disagreement is the
+/// livelock: it has been observed in both directions, once with the desktop
+/// discarding 170 of the phone's fresh sockets while holding a dead one, and
+/// once with the phone refusing to dial a desktop that was idle and waiting.
+pub(super) const HEARTBEAT_DEAD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One pass of the liveness contract: probe the quiet, bury the silent.
+fn run_liveness_tick(
+    sessions: &Arc<DeviceManager>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+) {
+    let tick = sessions.liveness_tick(std::time::Instant::now(), HEARTBEAT_IDLE, HEARTBEAT_DEAD);
+
+    for binding in tick.probe {
+        let packet = super::packet::NetworkPacket::new(super::packet::PACKET_TYPE_HEARTBEAT);
+        // Best effort: a send failure here is itself evidence, and the dead
+        // branch below will act on it once the silence budget runs out.
+        let _ = binding.link.send_packet(&packet);
+    }
+
+    for binding in tick.dead {
+        eprintln!(
+            "[Daemon] No traffic from {} in {}s; treating the link as dead",
+            binding.device_id,
+            HEARTBEAT_DEAD.as_secs()
+        );
+        handshake::handle_disconnect(
+            &binding,
+            devices,
+            sessions,
+            "The peer stopped responding".to_string(),
+        );
+    }
+}
+
 pub use commands::DaemonCommand;
 pub use handle::{DaemonEvent, DaemonHandle};
 
@@ -115,6 +159,7 @@ impl DaemonWorker {
                 // device to go unreachable — and the peer is told, so it stops
                 // waiting too.
                 pairing_commands::expire_pairings(&sessions, &devices, unix_secs());
+                run_liveness_tick(&sessions, &devices);
                 state::reconcile_connection_status(&devices, &sessions.connection_snapshot());
                 thread::sleep(std::time::Duration::from_millis(1000));
             }

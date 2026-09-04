@@ -99,6 +99,16 @@ pub struct DeviceSession {
     pub reconnect_attempt: u32,
     pub reconnect_scheduled: bool,
     pub next_reconnect_at: Option<Instant>,
+    /// When a packet was last received from this peer, of any kind.
+    ///
+    /// The only evidence that a link is alive. Everything else — `is_closed()`,
+    /// the socket being `ESTABLISHED`, a feature-ready handover — is this side's
+    /// own opinion, and all three have been observed to be confidently wrong
+    /// about a peer that had gone.
+    ///
+    /// Updated by *any* inbound packet, not only heartbeats, so a busy link
+    /// needs no probing at all.
+    pub last_inbound_at: Instant,
     /// When this side last told the peer it is not paired.
     ///
     /// Damped, because a peer that believes it is still paired will happily

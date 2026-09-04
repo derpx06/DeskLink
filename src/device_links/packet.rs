@@ -7,6 +7,19 @@ use serde_json::{Map, Value};
 pub const PROTOCOL_VERSION: i64 = 9;
 pub const PACKET_TYPE_IDENTITY: &str = "desklink.identity";
 pub const PACKET_TYPE_PAIR: &str = "desklink.pair";
+/// Liveness probe for the pinned-TLS bootstrap link.
+///
+/// Deliberately not a request/response pair. Both ends probe only when the
+/// link has been *quiet*, so any real traffic already proves liveness and an
+/// active link pays nothing — a heartbeat is simply the traffic of last resort.
+/// That also means it needs no sequence number, no echo and no body.
+///
+/// It exists because `is_closed()` on one side and `visibleDevices` on the
+/// other are flags that nothing independently verifies. Both sides have been
+/// observed holding a link to a process that no longer existed: once with the
+/// desktop discarding 170 of the phone's fresh sockets, and once with the phone
+/// refusing to dial a desktop that was sitting idle waiting for it.
+pub const PACKET_TYPE_HEARTBEAT: &str = "desklink.heartbeat";
 pub const PACKET_TYPE_PING: &str = "desklink.ping";
 pub const PACKET_TYPE_MOUSEPAD_REQUEST: &str = "desklink.mousepad.request";
 pub const PACKET_TYPE_MOUSEPAD_ECHO: &str = "desklink.mousepad.echo";

@@ -119,10 +119,11 @@ pub(super) fn finish_secure_link(
         .get_ref()
         .set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| err.to_string())?;
+    let transport: Arc<dyn crate::device_links::core::LinkTransport> = Arc::new(
+        super::network::TlsLinkTransport::new(Arc::new(Mutex::new(stream))),
+    );
     let link = SessionLink::new(
-        Arc::new(super::network::TlsLinkTransport::new(Arc::new(Mutex::new(
-            stream,
-        )))),
+        Arc::clone(&transport),
         cert_pem,
         local_public_der,
         remote_public_der,
@@ -141,8 +142,23 @@ pub(super) fn finish_secure_link(
     // handover had completed, the peer had since failed, and every
     // `RestartRequest` died with "Session link is closed" against a socket the
     // peer had already replaced.
+    // A retained link must also have been *heard from*. `has_live_bootstrap_link`
+    // reads `is_closed()`, a flag that only flips when this side's own reader
+    // sees EOF — so a peer that vanished without a FIN leaves it `false`
+    // forever, and this guard then refuses every replacement the peer offers.
+    //
+    // That is the livelock, and it has been observed in both directions: once
+    // with the desktop discarding 170 fresh sockets while holding a dead one,
+    // and once with the phone refusing to dial a desktop idling in wait. The
+    // newcomer wins against a silent incumbent, which is the liveness override
+    // Syncthing still lacks (issue #9337) and the reason a zombie cannot block
+    // its own replacement here.
+    let incumbent_is_answering = sessions
+        .silence(&initial_info.id)
+        .is_some_and(|silence| silence < super::HEARTBEAT_IDLE * 2);
     if sessions.has_ready_webrtc(&initial_info.id)
         && sessions.has_live_bootstrap_link(&initial_info.id)
+        && incumbent_is_answering
     {
         eprintln!(
             "[DL-WRTC-BOOT] ignoring refreshed bootstrap socket for {}; retaining feature-ready WebRTC session",
@@ -151,6 +167,41 @@ pub(super) fn finish_secure_link(
         link.close();
         return Ok(());
     }
+
+    // The incumbent is closed (or silent) but its WebRTC feature transport is
+    // still healthy. Adopt the replacement socket into the existing session
+    // rather than registering a new one: `register_link` bumps the generation
+    // and clears the peer and handover unconditionally, so re-registering here
+    // destroyed a *working* transport every time the phone refreshed its
+    // bootstrap socket -- and the handover that followed dropped its own
+    // bootstrap socket, which brought the phone straight back here. That loop
+    // is what pinned the UI on "Connecting" forever while battery and
+    // notifications kept arriving over the link underneath it.
+    //
+    // Android already treats a replacement LAN connection as signaling
+    // capacity only (`onConnectionReceived`'s retained binding); this is the
+    // desktop half of the same rule.
+    if let Some(binding) = sessions.adopt_bootstrap_link(&initial_info.id, &transport) {
+        eprintln!(
+            "[DL-WRTC-BOOT] adopted a replacement bootstrap socket for {} (session {}, generation {}); kept the feature-ready WebRTC transport",
+            binding.device_id, binding.session_id, binding.generation
+        );
+        let read_devices = Arc::clone(&devices);
+        let read_sessions = Arc::clone(&sessions);
+        let read_config = Arc::clone(&config);
+        let read_events = Arc::clone(&events);
+        thread::spawn(move || {
+            packet_read_loop(
+                binding,
+                read_devices,
+                read_sessions,
+                read_config,
+                read_events,
+            )
+        });
+        return Ok(());
+    }
+
     let registration = sessions
         .register_link(initial_info.id.clone(), link, paired)
         .map_err(|error| error.to_string())?;

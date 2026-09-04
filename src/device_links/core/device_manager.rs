@@ -7,6 +7,7 @@ use crate::device_links::pairing::PairingHandler;
 use crate::device_links::webrtc::transfer_manager::WebRtcTransferManager;
 use crate::device_links::webrtc::{DesktopWebRtcPeer, HandoverRuntime, WebRtcWireBinding};
 
+use super::LinkTransport;
 use super::{
     ConnectionGeneration, DeviceSession, ReplayCache, SessionBinding, SessionId, SessionLink,
     SessionState,
@@ -84,6 +85,13 @@ pub struct DisconnectResult {
     pub webrtc: Option<Arc<DesktopWebRtcPeer>>,
 }
 
+/// The outcome of one liveness pass: who to probe, and who has gone.
+#[derive(Default)]
+pub struct LivenessTick {
+    pub probe: Vec<SessionBinding>,
+    pub dead: Vec<SessionBinding>,
+}
+
 /// A reachability reading for one device, taken under the session lock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceConnection {
@@ -156,6 +164,106 @@ impl DeviceManager {
         true
     }
 
+    /// Records that a packet arrived from this peer — any packet, not only a
+    /// heartbeat. This is what makes a busy link cost nothing to keep alive.
+    pub fn note_inbound(&self, device_id: &str) {
+        if let Some(session) = self.reconciler_sessions().get_mut(device_id) {
+            session.last_inbound_at = Instant::now();
+        }
+    }
+
+    /// How long this peer has been silent, if there is a session for it.
+    pub fn silence(&self, device_id: &str) -> Option<std::time::Duration> {
+        self.reconciler_sessions()
+            .get(device_id)
+            .map(|session| session.last_inbound_at.elapsed())
+    }
+
+    /// One liveness pass over every session.
+    ///
+    /// Returns the links to probe and the links whose peer has been silent long
+    /// enough to be declared gone. Both are bindings rather than ids so the
+    /// caller can send and disconnect without re-taking the lock — sends must
+    /// never happen under it.
+    ///
+    /// `now` is a parameter for the same reason `expire_pairing`'s is: it makes
+    /// a thirty-second budget testable in a microsecond instead of thirty
+    /// seconds, and the ground rules forbid a test that sleeps.
+    pub fn liveness_tick(
+        &self,
+        now: Instant,
+        idle: std::time::Duration,
+        dead: std::time::Duration,
+    ) -> LivenessTick {
+        let mut tick = LivenessTick::default();
+        for session in self.reconciler_sessions().values() {
+            if session.state == SessionState::Terminated {
+                continue;
+            }
+            let Some(binding) = session.binding() else {
+                continue;
+            };
+            if binding.link.is_closed() {
+                continue;
+            }
+            let silence = now.saturating_duration_since(session.last_inbound_at);
+            if silence >= dead {
+                tick.dead.push(binding);
+            } else if silence >= idle {
+                tick.probe.push(binding);
+            }
+        }
+        tick
+    }
+
+    /// Adopt a replacement bootstrap socket into the existing session.
+    ///
+    /// Returns the *unchanged* binding when adopted, so the caller starts a
+    /// reader on the same generation the WebRTC peer and handover are already
+    /// bound to. Returns `None` when the session must go through
+    /// [`DeviceManager::register_link`] instead.
+    ///
+    /// Two conditions, both load-bearing:
+    ///
+    /// * **A feature-ready WebRTC transport.** Without one there is nothing to
+    ///   preserve, and a full re-registration is the correct, simpler answer.
+    /// * **A closed incumbent.** A live socket still owns a reader thread
+    ///   blocked inside `read_byte`; swapping underneath it would leave two
+    ///   readers framing one stream, which is a worse failure than the rebuild
+    ///   this avoids. `establish_secure_link`'s refresh guard already discards
+    ///   the newcomer while the incumbent is both open and answering, so the
+    ///   only case that reaches here is the one this exists for.
+    pub fn adopt_bootstrap_link(
+        &self,
+        device_id: &str,
+        transport: &Arc<dyn LinkTransport>,
+    ) -> Option<SessionBinding> {
+        let mut sessions = self.sessions.lock().ok()?;
+        let session = sessions.get_mut(device_id)?;
+        if session.state == SessionState::Terminated {
+            return None;
+        }
+        if !session
+            .webrtc_handover
+            .as_ref()
+            .is_some_and(HandoverRuntime::features_ready)
+        {
+            return None;
+        }
+        let link = session.active_link.as_ref()?;
+        if !link.is_closed() {
+            return None;
+        }
+        link.adopt(Arc::clone(transport));
+        session.state = SessionState::Ready;
+        session.last_disconnect_reason = None;
+        // The adopted socket has, by definition, just completed a handshake.
+        // Carrying the old one's staleness clock over would have the liveness
+        // tick bury it before its first packet.
+        session.last_inbound_at = Instant::now();
+        session.binding()
+    }
+
     pub fn register_link(
         &self,
         device_id: String,
@@ -219,6 +327,10 @@ impl DeviceManager {
                 session.reconnect_attempt = 0;
                 session.reconnect_scheduled = false;
                 session.next_reconnect_at = None;
+                // A new link has, by definition, just been heard from. Without
+                // this the staleness clock would carry over from the socket
+                // this one replaced and immediately declare the fresh link dead.
+                session.last_inbound_at = now;
                 let binding = session
                     .binding()
                     .expect("registered session always has a link");
@@ -251,6 +363,7 @@ impl DeviceManager {
                     reconnect_scheduled: false,
                     next_reconnect_at: None,
                     last_not_paired_notice: None,
+                    last_inbound_at: now,
                 };
                 let binding = session.binding().expect("new session always has a link");
                 sessions.insert(device_id, session);
@@ -905,6 +1018,26 @@ impl Default for DeviceManager {
 mod tests {
     use super::*;
 
+    fn mark_features_ready(manager: &DeviceManager, binding: &SessionBinding) {
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let wire =
+            WebRtcWireBinding::from_attempt("desktop", &binding.device_id, &attempt_id).unwrap();
+        manager
+            .with_session(binding, |session| {
+                let mut handover = HandoverRuntime::new(attempt_id.clone(), wire);
+                handover.record_offer("offer".to_string()).unwrap();
+                handover.record_answer("answer".to_string()).unwrap();
+                handover.mark_local_authenticated().unwrap();
+                handover.mark_remote_authenticated().unwrap();
+                handover.mark_local_capabilities_confirmed().unwrap();
+                handover.mark_remote_capabilities_confirmed().unwrap();
+                handover.mark_local_feature_ready().unwrap();
+                handover.mark_remote_feature_ready().unwrap();
+                session.webrtc_handover = Some(handover);
+            })
+            .unwrap();
+    }
+
     fn link(device_id: &str) -> SessionLink {
         SessionLink::test_placeholder(device_id)
     }
@@ -1075,6 +1208,88 @@ mod tests {
         assert!(
             !manager.has_live_bootstrap_link("phone-1"),
             "a refreshed socket must now be adopted, or signalling has nowhere to go"
+        );
+    }
+
+    /// The other half of the rule above: once the retained socket is dead, the
+    /// replacement must be *adopted*, not registered.
+    ///
+    /// `register_link` bumps the generation and calls `clear_webrtc_state`
+    /// unconditionally, so registering here tore down a working, authenticated
+    /// transport every time the phone refreshed its bootstrap socket. The
+    /// handover that followed dropped its own bootstrap socket, which brought
+    /// the phone straight back — a loop that pinned the UI on "Connecting"
+    /// while battery and notifications kept arriving over the link underneath.
+    #[test]
+    fn a_replacement_socket_is_adopted_without_disturbing_a_ready_webrtc_transport() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        mark_features_ready(&manager, &binding);
+        binding.link.close();
+
+        let replacement: Arc<dyn LinkTransport> =
+            Arc::new(crate::device_links::core::link_transport::DeadTransport);
+        let adopted = manager
+            .adopt_bootstrap_link("phone-1", &replacement)
+            .expect("a closed link with a ready WebRTC transport is adoptable");
+
+        assert_eq!(
+            adopted.generation, binding.generation,
+            "adoption must not bump the generation the WebRTC peer is bound to"
+        );
+        assert!(
+            Arc::ptr_eq(&adopted.link, &binding.link),
+            "the link identity every WebRTC callback compares against must survive"
+        );
+        assert!(
+            manager.is_current(&binding),
+            "the old binding stays current"
+        );
+        assert!(
+            manager.has_ready_webrtc("phone-1"),
+            "the working transport must not be torn down by a socket refresh"
+        );
+        assert!(
+            manager.has_live_bootstrap_link("phone-1"),
+            "signalling must have somewhere to go again"
+        );
+    }
+
+    /// Adoption is for preserving something. With no feature-ready transport
+    /// there is nothing to preserve and a plain registration is correct — and
+    /// a live incumbent still owns a reader thread, so swapping underneath it
+    /// would leave two readers framing one stream.
+    #[test]
+    fn adoption_is_refused_without_a_ready_transport_or_against_a_live_socket() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        let replacement: Arc<dyn LinkTransport> =
+            Arc::new(crate::device_links::core::link_transport::DeadTransport);
+
+        binding.link.close();
+        assert!(
+            manager
+                .adopt_bootstrap_link("phone-1", &replacement)
+                .is_none(),
+            "no WebRTC transport to preserve"
+        );
+
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        mark_features_ready(&manager, &binding);
+        assert!(
+            manager
+                .adopt_bootstrap_link("phone-1", &replacement)
+                .is_none(),
+            "a live incumbent still owns its reader thread"
         );
     }
 

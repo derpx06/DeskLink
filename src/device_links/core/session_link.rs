@@ -1,6 +1,6 @@
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use super::link_transport::{LinkTransport, ReadOutcome};
 use crate::device_links::device_info::DeviceInfo;
@@ -8,7 +8,9 @@ use crate::device_links::packet::NetworkPacket;
 use crate::device_links::pairing::PairingHandler;
 
 pub struct SessionLink {
-    transport: Arc<dyn LinkTransport>,
+    /// Swappable so a replacement socket can be adopted in place. See
+    /// [`SessionLink::adopt`].
+    transport: Mutex<Arc<dyn LinkTransport>>,
     pub certificate_pem: String,
     pub local_public_der: Vec<u8>,
     pub remote_public_der: Vec<u8>,
@@ -25,7 +27,7 @@ impl SessionLink {
         info: DeviceInfo,
     ) -> Self {
         Self {
-            transport,
+            transport: Mutex::new(transport),
             certificate_pem,
             local_public_der,
             remote_public_der,
@@ -47,11 +49,43 @@ impl SessionLink {
     /// routine transport transition from a real feature failure; an
     /// implementation inventing its own wording would surface as a UI banner
     /// once per second from the clipboard poller.
-    fn transport(&self) -> Result<&Arc<dyn LinkTransport>, String> {
+    fn transport(&self) -> Result<Arc<dyn LinkTransport>, String> {
         if self.is_closed() {
             return Err("Session link is closed".to_string());
         }
-        Ok(&self.transport)
+        // Cloned, not borrowed: reads block for as long as the peer is quiet,
+        // and holding this lock across one would stall every sender.
+        Ok(Arc::clone(&self.carrier()))
+    }
+
+    fn carrier(&self) -> Arc<dyn LinkTransport> {
+        Arc::clone(
+            &self
+                .transport
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
+    /// Take over a replacement socket without changing this link's identity.
+    ///
+    /// A `SessionBinding` is keyed on this `Arc<SessionLink>`, so re-creating
+    /// the link for a replacement socket makes every WebRTC callback bound to
+    /// it stale -- and `register_link` then clears the peer and handover it was
+    /// serving. That destroyed a *working* transport every time the phone
+    /// refreshed its bootstrap socket: the handover ran again, its own
+    /// bootstrap socket dropped again, and the device sat on "Connecting"
+    /// forever. Android has kept its `retainedBinding` across exactly this
+    /// event since `onConnectionReceived` learned to; this is the desktop half.
+    ///
+    /// The caller must ensure the outgoing socket is closed, so that no reader
+    /// thread is still framing packets out of it.
+    pub fn adopt(&self, transport: Arc<dyn LinkTransport>) {
+        *self
+            .transport
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = transport;
+        self.closed.store(false, Ordering::Release);
     }
 
     pub fn send_packet(&self, packet: &NetworkPacket) -> Result<(), String> {
@@ -77,7 +111,7 @@ impl SessionLink {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        self.transport.shutdown();
+        self.carrier().shutdown();
     }
 
     /// Whether this link has been closed.
@@ -98,7 +132,7 @@ impl SessionLink {
     #[cfg(test)]
     pub fn for_test(device_id: &str, transport: Arc<dyn LinkTransport>) -> Self {
         Self {
-            transport,
+            transport: Mutex::new(transport),
             certificate_pem: String::new(),
             local_public_der: Vec::new(),
             remote_public_der: Vec::new(),

@@ -22,7 +22,7 @@ use super::pairing_commands::PairingContext;
 use super::state::reconcile_connection_status;
 use crate::device_links::config::Config;
 use crate::device_links::core::test_link::TestNetwork;
-use crate::device_links::core::{DeviceManager, SessionBinding, SessionLink};
+use crate::device_links::core::{DeviceManager, LivenessTick, SessionBinding, SessionLink};
 use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::{NetworkPacket, PROTOCOL_VERSION};
@@ -354,6 +354,25 @@ impl TestPeer {
         super::pairing_commands::expire_pairings(&self.sessions, &self.devices, now_secs)
     }
 
+    /// One liveness pass, as if `after` had elapsed since now.
+    ///
+    /// The budget is thirty seconds of silence; stepping the clock is what lets
+    /// that be asserted in a microsecond, and the ground rules forbid a test
+    /// that sleeps.
+    pub(crate) fn liveness(&self, after: std::time::Duration) -> LivenessTick {
+        self.sessions.liveness_tick(
+            std::time::Instant::now() + after,
+            super::HEARTBEAT_IDLE,
+            super::HEARTBEAT_DEAD,
+        )
+    }
+
+    /// How long this peer has been silent, as the socket-replacement guard
+    /// measures it.
+    pub(crate) fn silence(&self) -> std::time::Duration {
+        self.sessions.silence(&self.peer_id).expect("session")
+    }
+
     pub(crate) fn errors(&self) -> Vec<String> {
         self.errors.lock().unwrap().clone()
     }
@@ -566,6 +585,105 @@ mod tests {
             "reject must clear the persisted trust, not just the session"
         );
         assert_eq!(phone.pair_state(), PairState::NotPaired);
+    }
+
+    /// **The liveness contract: probe the quiet, bury the silent.**
+    ///
+    /// A link is only ever declared dead on evidence — silence — rather than on
+    /// this side's own opinion of the socket. `is_closed()` flips only when our
+    /// reader sees EOF, so a peer that vanishes without a FIN leaves it `false`
+    /// indefinitely, which is what let both sides hold links to processes that
+    /// no longer existed.
+    #[test]
+    fn a_silent_peer_is_probed_then_declared_dead() {
+        use std::time::Duration;
+
+        let net = TestNetwork::new();
+        let (desktop, _phone) = peer_pair(&net, "desktop-1", "phone-1");
+
+        // Fresh link: nothing to do.
+        let quiet = desktop.liveness(Duration::from_secs(1));
+        assert!(quiet.probe.is_empty() && quiet.dead.is_empty());
+
+        // Quiet long enough to be worth a probe, but not yet gone.
+        let idle = desktop.liveness(crate::device_links::daemon::HEARTBEAT_IDLE);
+        assert_eq!(idle.probe.len(), 1, "a quiet link is probed");
+        assert!(idle.dead.is_empty(), "and not yet buried");
+
+        // Silent past the budget: three missed probes.
+        let gone = desktop.liveness(crate::device_links::daemon::HEARTBEAT_DEAD);
+        assert!(gone.probe.is_empty());
+        assert_eq!(gone.dead.len(), 1, "silence past the budget is death");
+        assert_eq!(gone.dead[0].device_id, desktop.peer_id());
+    }
+
+    /// A heartbeat is consumed as liveness and never dispatched as a feature.
+    ///
+    /// It arrives on an **unpaired** session here on purpose. Anything reaching
+    /// the feature path in that state is answered with `pair:false`, so a
+    /// heartbeat that fell through would tell a perfectly good peer it was not
+    /// paired — turning the mechanism that exists to keep links alive into one
+    /// that tears pairings down, once every ten seconds.
+    #[test]
+    fn a_heartbeat_is_liveness_and_never_a_feature_packet() {
+        use crate::device_links::packet::PACKET_TYPE_HEARTBEAT;
+
+        let net = TestNetwork::new();
+        let (mut desktop, phone) = peer_pair(&net, "desktop-1", "phone-1");
+        assert_eq!(desktop.pair_state(), PairState::NotPaired);
+
+        for _ in 0..3 {
+            phone
+                .binding
+                .link
+                .send_packet(&NetworkPacket::new(PACKET_TYPE_HEARTBEAT))
+                .expect("phone sends");
+            net.advance(0);
+            desktop.pump();
+        }
+
+        assert!(
+            desktop.errors().is_empty(),
+            "a heartbeat is not a rejected feature"
+        );
+        let answered = net
+            .sent_by(0)
+            .into_iter()
+            .filter(|packet| packet.get_bool("pair") == Some(false))
+            .count();
+        assert_eq!(answered, 0, "and must never provoke a not-paired notice");
+    }
+
+    /// **The livelock.** A retained link that has gone silent must not be able
+    /// to block the replacement the peer is offering.
+    ///
+    /// Observed in both directions on real hardware: once with the desktop
+    /// discarding 170 fresh sockets while holding a dead one, and once with the
+    /// phone refusing to dial a desktop that sat idle waiting for it.
+    #[test]
+    fn a_silent_incumbent_stops_looking_alive_to_the_replacement_guard() {
+        let net = TestNetwork::new();
+        let (desktop, _phone) = peer_pair(&net, "desktop-1", "phone-1");
+
+        // The guard keeps a retained link only while the incumbent is still
+        // answering, measured the same way here as in `finish_secure_link`.
+        let threshold = crate::device_links::daemon::HEARTBEAT_IDLE * 2;
+        assert!(
+            desktop.silence() < threshold,
+            "a fresh link counts as answering"
+        );
+
+        // The socket is still open as far as this side can tell — which is
+        // precisely the state that used to be indistinguishable from healthy.
+        assert!(!desktop.binding.link.is_closed());
+        assert!(
+            desktop
+                .liveness(crate::device_links::daemon::HEARTBEAT_DEAD)
+                .dead
+                .len()
+                == 1,
+            "yet silence alone is enough to convict it"
+        );
     }
 
     /// **C1/C2 — a one-sided unpair converges the next time the peer speaks.**

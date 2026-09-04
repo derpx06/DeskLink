@@ -19,12 +19,12 @@ use crate::device_links::core::{DeviceManager, ReadOutcome, SessionBinding};
 use crate::device_links::device::DeviceView;
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
-    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST,
-    PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST,
-    PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PAIR, PACKET_TYPE_PING,
-    PACKET_TYPE_RUNCOMMAND, PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP,
-    PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME,
-    PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_WEBRTC_SIGNAL_V1,
+    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_HEARTBEAT, PACKET_TYPE_LOCK,
+    PACKET_TYPE_LOCK_REQUEST, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS,
+    PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_REQUEST,
+    PACKET_TYPE_PAIR, PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND, PACKET_TYPE_RUNCOMMAND_REQUEST,
+    PACKET_TYPE_SFTP, PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST,
+    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
 use crate::device_links::pairing::{needs_pair_reconfirmation, PairState};
 
@@ -197,6 +197,24 @@ pub(super) fn apply_lan_packet(
     let config = Arc::clone(config);
     let events = Arc::clone(events);
     let device_id = binding.device_id.clone();
+
+    // Any packet is proof of life, recorded before anything can reject it: a
+    // peer that is talking to us is alive even when what it says is refused.
+    //
+    // This lives in the dispatch rather than in the framing loop deliberately.
+    // Putting it in the loop made liveness a property of one particular reader,
+    // so every other path that dispatches a packet — the two-peer harness, and
+    // any future transport — silently lost it.
+    sessions.note_inbound(&device_id);
+
+    // A heartbeat is liveness and nothing else: it carries no body, expects no
+    // reply, and must never reach the feature path. Falling through would let
+    // `notify_peer_not_paired` answer it with `pair:false` and tell a perfectly
+    // healthy peer it was unpaired, once every ten seconds — the mechanism that
+    // keeps links alive turned into one that tears pairings down.
+    if packet.packet_type == PACKET_TYPE_HEARTBEAT {
+        return;
+    }
 
     let local_info = match config.lock() {
         Ok(config) => config.local_device_info(),
