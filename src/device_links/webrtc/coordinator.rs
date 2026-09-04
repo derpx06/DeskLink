@@ -224,7 +224,18 @@ pub(crate) fn handle_signaling_packet(
                 .ok_or_else(|| "Missing DeskLink WebRTC ICE candidate".to_string())?;
             peer.add_ice_candidate(index, candidate)
         }
-        SignalingMessageType::EndOfCandidates => Ok(()),
+        SignalingMessageType::EndOfCandidates => {
+            // Forwarded, not dropped. The peer telling us it has finished
+            // gathering is the only thing that lets our ICE agent conclude its
+            // check list; discarding it left a peer whose candidates all failed
+            // sitting in `checking` forever instead of reaching `failed`.
+            //
+            // Index 0 because the session is max-bundle: every media section
+            // shares one ICE component, so there is exactly one gathering
+            // agent to tell.
+            peer.end_of_candidates(0);
+            Ok(())
+        }
         SignalingMessageType::IceRestart => Err(
             "DeskLink WebRTC ICE restart is not enabled until authenticated handover is active"
                 .to_string(),

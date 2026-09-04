@@ -175,6 +175,22 @@ impl DesktopWebRtcPeer {
         Ok(())
     }
 
+    /// Tells the local ICE agent that the peer has finished gathering.
+    ///
+    /// `webrtcbin` learns this from `add-ice-candidate` with a **NULL**
+    /// candidate — which is why it cannot go through [`Self::add_ice_candidate`],
+    /// whose empty-string rejection would swallow it.
+    ///
+    /// Without this the agent has no reason to conclude its connectivity check
+    /// list, so a peer whose candidates all fail sits in `checking` rather than
+    /// transitioning to `failed`. That matters far more than it sounds: nothing
+    /// in this transport times out a connecting peer, so "never reaches failed"
+    /// means "never recovers".
+    pub fn end_of_candidates(&self, sdp_m_line_index: u32) {
+        self.webrtcbin
+            .emit_by_name::<()>("add-ice-candidate", &[&sdp_m_line_index, &None::<String>]);
+    }
+
     pub fn send_text(&self, channel: WebRtcChannel, text: &str) -> Result<(), String> {
         if text.len() > MAX_ENVELOPE_BYTES {
             return Err("DeskLink WebRTC envelope is too large".to_string());
@@ -612,6 +628,24 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
+
+    /// End-of-candidates is signalled by a **NULL** candidate, and
+    /// `emit_by_name` panics on a signature it cannot marshal — so this is
+    /// pinned against a real `webrtcbin` rather than assumed. The same class of
+    /// mistake against the `ice-agent` property once killed the peer's event
+    /// worker on every negotiation.
+    #[test]
+    fn end_of_candidates_marshals_a_null_candidate_to_a_real_webrtcbin() {
+        let (sender, _receiver) = mpsc::channel();
+        let peer = DesktopWebRtcPeer::new(true, sender, &IceServerConfig::default()).unwrap();
+
+        peer.end_of_candidates(0);
+
+        // And the empty-string path stays rejected, so the two cannot be
+        // confused: `add_ice_candidate` must never be the way this is sent.
+        assert!(peer.add_ice_candidate(0, "").is_err());
+        peer.close();
+    }
 
     #[test]
     fn initiator_creates_each_cross_platform_channel_once() {
