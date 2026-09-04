@@ -393,7 +393,7 @@ fn channel_options(channel: WebRtcChannel) -> gst::Structure {
 /// `get-transceiver` returning `None` is the only termination signal and a
 /// runaway loop here would hang a GStreamer promise callback.
 fn ensure_video_nack(webrtcbin: &gst::Element) {
-    for index in 0u32..MAX_TRANSCEIVERS {
+    for index in 0i32..MAX_TRANSCEIVERS {
         let Some(transceiver) = webrtcbin
             .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>("get-transceiver", &[&index])
         else {
@@ -412,7 +412,12 @@ fn ensure_video_nack(webrtcbin: &gst::Element) {
 
 /// A max-bundle session has one media section per kind; this is slack, not a
 /// budget.
-const MAX_TRANSCEIVERS: u32 = 16;
+///
+/// `i32` because `get-transceiver` takes a **`gint`**. Passing `guint` panics
+/// inside the GStreamer callback with "Incompatible argument type in argument 0"
+/// and aborts the process — the same shape as the `ice-agent` property mistake,
+/// and equally invisible until the signal actually fires.
+const MAX_TRANSCEIVERS: i32 = 16;
 
 fn pad_carries_video(pad: &gst::Pad) -> bool {
     // `property` panics when the property is absent, and only webrtcbin's own
@@ -696,6 +701,27 @@ mod tests {
     use std::sync::mpsc;
 
     use super::*;
+
+    /// `get-transceiver` takes a **`gint`**, and `emit_by_name` panics on a
+    /// mismatched argument type — inside a GStreamer promise callback, where a
+    /// panic aborts the process rather than surfacing.
+    ///
+    /// This shipped as `0u32..` and took the daemon down with "Incompatible
+    /// argument type in argument 0 for signal 'get-transceiver' (expected gint,
+    /// got guint)" the first time a remote description arrived. Nothing in the
+    /// type system catches it: the values are marshalled dynamically. Only
+    /// firing the signal for real does.
+    #[test]
+    fn ensure_video_nack_marshals_its_index_to_a_real_webrtcbin() {
+        let (sender, _receiver) = mpsc::channel();
+        let peer = DesktopWebRtcPeer::new(true, sender, &IceServerConfig::default()).unwrap();
+
+        // The initiator has a video transceiver, so this walks a populated list
+        // and then runs off the end — both paths the promise callback takes.
+        ensure_video_nack(&peer.webrtcbin);
+
+        peer.close();
+    }
 
     /// End-of-candidates is signalled by a **NULL** candidate, and
     /// `emit_by_name` panics on a signature it cannot marshal — so this is
