@@ -13,6 +13,20 @@ use super::{SignalingMessageType, WebRtcChannel, MAX_ENVELOPE_BYTES};
 
 static GST_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
+const JITTER_BUFFER_PROPERTY: &str = "latency";
+
+/// Milliseconds of jitter buffering, against a 200ms default.
+///
+/// Both peers are on the same LAN and the session is interactive — a mirror you
+/// are clicking on — so smoothing for hundreds of milliseconds of reordering
+/// buys nothing and costs everything. 40ms still absorbs ordinary WiFi jitter.
+///
+/// Deliberately not paired with `sync=false` on the sink: that renders frames on
+/// arrival and trades away exactly the smooth scrolling this feature exists to
+/// provide. Lower the buffer first, and only reach for `sync=false` if a
+/// measurement says the pipeline clock is still adding delay.
+const JITTER_BUFFER_LATENCY_MS: u32 = 40;
+
 #[derive(Debug, Clone)]
 pub enum PeerEvent {
     LocalDescription {
@@ -65,6 +79,22 @@ impl DesktopWebRtcPeer {
             .build()
             .map_err(|error| format!("DeskLink WebRTC is unavailable: {error}"))?;
         webrtcbin.set_property("bundle-policy", gst_webrtc::WebRTCBundlePolicy::MaxBundle);
+        // The jitter buffer defaults to 200ms — on its own more than the entire
+        // rest of a realistic 60-90ms glass-to-glass budget for a LAN mirror.
+        //
+        // It must be set **before** the pipeline reaches Playing: the internal
+        // jitterbuffers read it at construction, so setting it later appears to
+        // work and silently does nothing. Guarded because `set_property` panics
+        // on an absent property, and that exact mistake against `ice-agent`
+        // once killed the peer's event worker on every negotiation.
+        if webrtcbin.has_property(JITTER_BUFFER_PROPERTY, None) {
+            webrtcbin.set_property(JITTER_BUFFER_PROPERTY, JITTER_BUFFER_LATENCY_MS);
+        } else {
+            eprintln!(
+                "[DeskLink] webrtcbin exposes no `{JITTER_BUFFER_PROPERTY}`; \
+                 using the default jitter buffer"
+            );
+        }
         // Before the pipeline starts: candidate gathering begins as soon as the
         // element goes to Playing, so restricting it afterwards would be too
         // late for the first negotiation.
@@ -151,6 +181,9 @@ impl DesktopWebRtcPeer {
                 ));
                 return;
             }
+            // The remote description is what creates the answerer's
+            // transceivers, so this is the earliest point they exist.
+            ensure_video_nack(&webrtcbin);
             if response_to_offer {
                 let _ = request_local_description(
                     &webrtcbin,
@@ -346,6 +379,41 @@ fn channel_options(channel: WebRtcChannel) -> gst::Structure {
 /// — which is the common case — the old fallback tested
 /// `"application/x-rtp".starts_with("video/")`, returned false, and the video
 /// stream was silently dropped.
+/// Ensures every video transceiver asks for retransmission of lost packets.
+///
+/// [`DesktopWebRtcPeer::add_screen_transceiver`] sets `do-nack` on the section
+/// the **offerer** creates. The answerer's transceiver is created by
+/// `webrtcbin` when it applies the offer, and nothing ever set it there — so in
+/// the half of all pairings where the phone is the deterministic initiator, the
+/// desktop viewer sat waiting for a keyframe it never requested. The same blank
+/// window, from the opposite role.
+///
+/// Idempotent and cheap, so it runs on every remote description rather than
+/// trying to work out which side created what. The index is bounded because
+/// `get-transceiver` returning `None` is the only termination signal and a
+/// runaway loop here would hang a GStreamer promise callback.
+fn ensure_video_nack(webrtcbin: &gst::Element) {
+    for index in 0u32..MAX_TRANSCEIVERS {
+        let Some(transceiver) = webrtcbin
+            .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>("get-transceiver", &[&index])
+        else {
+            return;
+        };
+        if transceiver.kind() != gst_webrtc::WebRTCKind::Video {
+            continue;
+        }
+        // Guarded: `set_property` panics on an absent property, and this one is
+        // reached on transceivers this code did not create.
+        if transceiver.find_property("do-nack").is_some() {
+            transceiver.set_property("do-nack", true);
+        }
+    }
+}
+
+/// A max-bundle session has one media section per kind; this is slack, not a
+/// budget.
+const MAX_TRANSCEIVERS: u32 = 16;
+
 fn pad_carries_video(pad: &gst::Pad) -> bool {
     // `property` panics when the property is absent, and only webrtcbin's own
     // source pads carry this one.
