@@ -18,6 +18,15 @@ pub(super) fn get_last_clipboard() -> &'static Mutex<String> {
     LAST_CLIPBOARD.get_or_init(|| Mutex::new(String::new()))
 }
 
+/// Publishes clipboard text received from a paired device.
+///
+/// On X11 the selection has no backing store: the owning process must stay
+/// alive to answer paste requests. The previous implementation dropped its
+/// `Clipboard` after a five second sleep, so anything pasted later came back
+/// empty. `arboard`'s `wait()` keeps ownership until another application takes
+/// the selection, which is exactly the required lifetime. Wayland has a real
+/// clipboard manager and needs no such handling, and `set_text` is enough
+/// there; both paths are covered by keeping the owner thread alive.
 pub(super) fn set_clipboard_text_from_remote(content: &str) {
     if let Ok(mut last) = get_last_clipboard().lock() {
         *last = content.to_string();
@@ -25,10 +34,19 @@ pub(super) fn set_clipboard_text_from_remote(content: &str) {
 
     let content = content.to_string();
     thread::spawn(move || {
-        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-            let _ = clipboard.set_text(content);
-            thread::sleep(Duration::from_secs(5));
+        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+            return;
+        };
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use arboard::SetExtLinux;
+            // Blocks until ownership is lost, keeping the text pasteable.
+            if clipboard.set().wait().text(content.clone()).is_ok() {
+                return;
+            }
         }
+        let _ = clipboard.set_text(content);
+        thread::sleep(Duration::from_secs(5));
     });
 }
 
@@ -82,6 +100,18 @@ impl DaemonWorker {
                         })
                         .unwrap_or(false);
                     if !paired || !sessions.is_current(&binding) {
+                        continue;
+                    }
+                    // Skip a device with no usable transport instead of
+                    // retrying it every second. The send would fail on a closed
+                    // socket, and because the attempt is only recorded on
+                    // success the same text would be retried forever.
+                    let has_transport = !binding.link.is_closed()
+                        || sessions
+                            .feature_transport_snapshot(&binding)
+                            .map(|snapshot| snapshot.web_rtc_ready)
+                            .unwrap_or(false);
+                    if !has_transport {
                         continue;
                     }
                     let result =

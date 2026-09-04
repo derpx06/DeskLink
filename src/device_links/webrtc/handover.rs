@@ -21,28 +21,9 @@ pub enum HandoverState {
 }
 
 impl HandoverState {
-    pub const fn receive(self, message: HandoverMessage) -> Self {
-        match (self, message) {
-            (Self::Negotiating, HandoverMessage::Authenticated) => Self::Authenticated,
-            (Self::Authenticated, HandoverMessage::Capabilities) => Self::CapabilitiesConfirmed,
-            (Self::CapabilitiesConfirmed, HandoverMessage::FeatureReady) => Self::FeatureReady,
-            (Self::FeatureReady, HandoverMessage::Degraded) => Self::Authenticated,
-            _ => Self::Failed,
-        }
-    }
-
     pub const fn features_allowed(self) -> bool {
         matches!(self, Self::FeatureReady)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandoverMessage {
-    Authenticated,
-    Capabilities,
-    FeatureReady,
-    Degraded,
-    Close,
 }
 
 /// Mutable, per-peer state for the post-DTLS handover.  This belongs to the
@@ -450,16 +431,33 @@ mod tests {
         PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap()
     }
 
+    /// The handover advances only through `HandoverRuntime`, which requires
+    /// each step's precondition to already hold. This replaces a parallel
+    /// `HandoverState::receive` transition table that nothing ever called — a
+    /// second, silently divergent description of the same protocol.
     #[test]
     fn handover_state_requires_the_complete_sequence() {
-        assert_eq!(
-            HandoverState::Negotiating.receive(HandoverMessage::Authenticated),
-            HandoverState::Authenticated
-        );
-        assert_eq!(
-            HandoverState::Authenticated.receive(HandoverMessage::FeatureReady),
-            HandoverState::Failed
-        );
+        let wire = binding("desktop", "phone");
+        let mut runtime = HandoverRuntime::new("attempt".to_string(), wire);
+
+        // Authentication cannot be claimed before SDP negotiation completes.
+        assert!(runtime.mark_local_authenticated().is_err());
+        runtime.record_offer("offer".to_string()).unwrap();
+        runtime.record_answer("answer".to_string()).unwrap();
+        runtime.mark_local_authenticated().unwrap();
+        assert_eq!(runtime.state, HandoverState::Negotiating);
+
+        // Capabilities cannot be confirmed until both peers are authenticated.
+        assert!(runtime.mark_local_capabilities_confirmed().is_err());
+        runtime.mark_remote_authenticated().unwrap();
+        assert_eq!(runtime.state, HandoverState::Authenticated);
+
+        // Feature-ready cannot be claimed until both peers confirmed.
+        assert!(runtime.mark_local_feature_ready().is_err());
+        runtime.mark_local_capabilities_confirmed().unwrap();
+        runtime.mark_remote_capabilities_confirmed().unwrap();
+        assert_eq!(runtime.state, HandoverState::CapabilitiesConfirmed);
+        assert!(!runtime.features_ready());
     }
 
     #[test]

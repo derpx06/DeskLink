@@ -1,13 +1,14 @@
-use openssl::ssl::SslStream;
-use std::net::{Shutdown, TcpStream};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
+use super::link_transport::{LinkTransport, ReadOutcome};
 use crate::device_links::device_info::DeviceInfo;
+use crate::device_links::packet::NetworkPacket;
 use crate::device_links::pairing::PairingHandler;
 
 pub struct SessionLink {
-    stream: Option<Arc<Mutex<SslStream<TcpStream>>>>,
+    transport: Arc<dyn LinkTransport>,
     pub certificate_pem: String,
     pub local_public_der: Vec<u8>,
     pub remote_public_der: Vec<u8>,
@@ -17,14 +18,14 @@ pub struct SessionLink {
 
 impl SessionLink {
     pub fn new(
-        stream: Arc<Mutex<SslStream<TcpStream>>>,
+        transport: Arc<dyn LinkTransport>,
         certificate_pem: String,
         local_public_der: Vec<u8>,
         remote_public_der: Vec<u8>,
         info: DeviceInfo,
     ) -> Self {
         Self {
-            stream: Some(stream),
+            transport,
             certificate_pem,
             local_public_der,
             remote_public_der,
@@ -33,10 +34,39 @@ impl SessionLink {
         }
     }
 
-    pub fn stream(&self) -> Result<&Arc<Mutex<SslStream<TcpStream>>>, String> {
-        self.stream
-            .as_ref()
-            .ok_or_else(|| "Session link has no network stream".to_string())
+    /// The live carrier for this link.
+    ///
+    /// A closed link is reported as an error rather than handed out. The
+    /// session deliberately keeps a closed link installed while an
+    /// authenticated WebRTC transport survives the loss of the bootstrap
+    /// socket, so without this check pairing packets and signed signaling were
+    /// written into a dead stream and silently lost.
+    ///
+    /// **This is the only place allowed to produce `"Session link is closed"`.**
+    /// `transport::should_surface_send_error` matches that text to tell a
+    /// routine transport transition from a real feature failure; an
+    /// implementation inventing its own wording would surface as a UI banner
+    /// once per second from the clipboard poller.
+    fn transport(&self) -> Result<&Arc<dyn LinkTransport>, String> {
+        if self.is_closed() {
+            return Err("Session link is closed".to_string());
+        }
+        Ok(&self.transport)
+    }
+
+    pub fn send_packet(&self, packet: &NetworkPacket) -> Result<(), String> {
+        self.transport()?.send_packet(packet)
+    }
+
+    pub fn read_byte(&self) -> Result<ReadOutcome, String> {
+        self.transport()?.read_byte()
+    }
+
+    /// The local address to seed ICE host candidates from, when this link is
+    /// the same L3 path the media will take. `None` otherwise, and on a closed
+    /// link.
+    pub fn local_ip(&self) -> Option<IpAddr> {
+        self.transport().ok()?.local_ip()
     }
 
     pub fn verification_key(&self, timestamp: i64) -> String {
@@ -47,21 +77,28 @@ impl SessionLink {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Some(stream) = &self.stream {
-            if let Ok(stream) = stream.lock() {
-                let _ = stream.get_ref().shutdown(Shutdown::Both);
-            }
-        }
+        self.transport.shutdown();
     }
 
+    /// Whether this link has been closed.
+    ///
+    /// Deliberately the local flag rather than a question for the transport:
+    /// `has_live_bootstrap_link` drives `wants_bootstrap_connection` and
+    /// therefore discovery, so a transport reporting "closed" for a transient
+    /// condition would make the daemon redial in a loop.
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
     pub fn test_placeholder(device_id: &str) -> Self {
+        Self::for_test(device_id, Arc::new(super::link_transport::DeadTransport))
+    }
+
+    #[cfg(test)]
+    pub fn for_test(device_id: &str, transport: Arc<dyn LinkTransport>) -> Self {
         Self {
-            stream: None,
+            transport,
             certificate_pem: String::new(),
             local_public_der: Vec::new(),
             remote_public_der: Vec::new(),
@@ -69,7 +106,7 @@ impl SessionLink {
                 id: device_id.to_string(),
                 name: device_id.to_string(),
                 device_type: "phone".to_string(),
-                protocol_version: 9,
+                protocol_version: crate::device_links::packet::PROTOCOL_VERSION,
                 incoming_capabilities: Vec::new(),
                 outgoing_capabilities: Vec::new(),
             },

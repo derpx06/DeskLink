@@ -1,8 +1,7 @@
 use super::discovery::broadcast_identity;
-use super::network::send_packet;
-use super::state::{mark_error, push_error, update_pair_state};
+use super::pairing_commands::PairingContext;
+use super::state::{mark_error, push_error};
 use super::DaemonWorker;
-use crate::device_links::core::{DeviceSession, SessionBinding};
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK_REQUEST,
     PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION_ACTION,
@@ -10,8 +9,8 @@ use crate::device_links::packet::{
     PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST,
     PACKET_TYPE_SYSTEMVOLUME_REQUEST,
 };
-use crate::device_links::pairing::PairState;
 use crate::device_links::transport::{should_surface_send_error, FeatureTransport};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum DaemonCommand {
@@ -99,91 +98,31 @@ impl DaemonWorker {
         }
         false
     }
+    /// The pairing commands live on [`PairingContext`] so they can run without
+    /// a `DaemonWorker`, and therefore without sockets.
+    fn pairing(&self) -> PairingContext {
+        PairingContext {
+            sessions: Arc::clone(&self.sessions),
+            devices: Arc::clone(&self.devices),
+            config: Arc::clone(&self.config),
+            errors: Arc::clone(&self.errors),
+        }
+    }
+
     fn send_pair_request(&self, device_id: &str) {
-        self.with_link(device_id, |session, binding| {
-            let packet = session.pairing.request_packet();
-            send_packet(binding.link.stream()?, &packet)?;
-            if session.pairing.state == PairState::Paired {
-                self.config
-                    .lock()
-                    .map_err(|_| "Config lock poisoned".to_string())?
-                    .trust_device(&binding.link.info, binding.link.certificate_pem.clone())?;
-                update_pair_state(&self.devices, device_id, PairState::Paired, None);
-                return Ok(());
-            }
-            update_pair_state(
-                &self.devices,
-                device_id,
-                session.pairing.state,
-                Some(binding.link.verification_key(session.pairing.timestamp())),
-            );
-            Ok(())
-        });
+        self.pairing().send_pair_request(device_id);
     }
 
     fn accept_pair(&self, device_id: &str) {
-        self.with_link(device_id, |session, binding| {
-            let packet = session.pairing.accept_packet();
-            send_packet(binding.link.stream()?, &packet)?;
-            self.config
-                .lock()
-                .map_err(|_| "Config lock poisoned".to_string())?
-                .trust_device(&binding.link.info, binding.link.certificate_pem.clone())?;
-            update_pair_state(&self.devices, device_id, PairState::Paired, None);
-            Ok(())
-        });
+        self.pairing().accept_pair(device_id);
     }
 
     fn reject_pair(&self, device_id: &str) {
-        self.revoke_pairing(device_id, "Pairing request was rejected", false);
+        self.pairing().reject_pair(device_id);
     }
 
     fn unpair(&self, device_id: &str) {
-        self.revoke_pairing(device_id, "Device was unpaired", true);
-    }
-
-    fn revoke_pairing(&self, device_id: &str, reason: &str, remove_trust: bool) {
-        let result = self
-            .sessions
-            .current_binding(device_id)
-            .ok_or_else(|| "Device is not connected".to_string())
-            .and_then(|binding| {
-                let (packet, peer) = self
-                    .sessions
-                    .revoke_pairing(&binding, reason.to_string())
-                    .map_err(|error| error.to_string())?;
-
-                // The pairing packet remains bootstrap traffic.  The local
-                // revocation is already committed even if this final packet
-                // cannot be delivered, so a stale peer cannot survive.
-                let send_result = binding
-                    .link
-                    .stream()
-                    .and_then(|stream| send_packet(stream, &packet));
-                if let Some(peer) = peer {
-                    peer.close();
-                }
-                send_result
-            });
-
-        if remove_trust {
-            if let Err(error) = self
-                .config
-                .lock()
-                .map_err(|_| "Config lock poisoned".to_string())
-                .and_then(|mut config| config.untrust_device(device_id))
-            {
-                mark_error(&self.devices, device_id, error.clone());
-                push_error(&self.errors, error);
-                return;
-            }
-        }
-
-        update_pair_state(&self.devices, device_id, PairState::NotPaired, None);
-        if let Err(error) = result {
-            mark_error(&self.devices, device_id, error.clone());
-            push_error(&self.errors, error);
-        }
+        self.pairing().unpair(device_id);
     }
 
     fn send_ping(&self, device_id: &str) {
@@ -357,26 +296,6 @@ impl DaemonWorker {
             } else {
                 eprintln!("[DeskLink] Feature send deferred during WebRTC recovery: {error}");
             }
-        }
-    }
-
-    pub(super) fn with_link(
-        &self,
-        device_id: &str,
-        f: impl FnOnce(&mut DeviceSession, &SessionBinding) -> Result<(), String>,
-    ) {
-        let result = self
-            .sessions
-            .current_binding(device_id)
-            .ok_or_else(|| "Device is not connected".to_string())
-            .and_then(|binding| {
-                self.sessions
-                    .with_session(&binding, |session| f(session, &binding))
-                    .map_err(|error| error.to_string())?
-            });
-        if let Err(error) = result {
-            mark_error(&self.devices, device_id, error.clone());
-            push_error(&self.errors, error);
         }
     }
 }

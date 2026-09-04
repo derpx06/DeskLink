@@ -8,11 +8,12 @@ use gst_webrtc::{
     WebRTCDataChannel, WebRTCDataChannelState, WebRTCSDPType, WebRTCSessionDescription,
 };
 
+use super::ice::IceServerConfig;
 use super::{SignalingMessageType, WebRtcChannel, MAX_ENVELOPE_BYTES};
 
 static GST_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum PeerEvent {
     LocalDescription {
         message_type: SignalingMessageType,
@@ -33,6 +34,8 @@ pub enum PeerEvent {
         bytes: Vec<u8>,
     },
     ConnectionChanged(String),
+    /// An inbound screen stream is decoding and ready to be displayed.
+    ScreenStream(super::screen::ScreenStream),
     Error(String),
     Closed,
 }
@@ -51,13 +54,21 @@ pub struct DesktopWebRtcPeer {
 }
 
 impl DesktopWebRtcPeer {
-    pub fn new(initiator: bool, events: Sender<PeerEvent>) -> Result<Self, String> {
+    pub fn new(
+        initiator: bool,
+        events: Sender<PeerEvent>,
+        ice: &IceServerConfig,
+    ) -> Result<Self, String> {
         ensure_gstreamer()?;
         let pipeline = gst::Pipeline::new();
         let webrtcbin = gst::ElementFactory::make("webrtcbin")
             .build()
             .map_err(|error| format!("DeskLink WebRTC is unavailable: {error}"))?;
         webrtcbin.set_property("bundle-policy", gst_webrtc::WebRTCBundlePolicy::MaxBundle);
+        // Before the pipeline starts: candidate gathering begins as soon as the
+        // element goes to Playing, so restricting it afterwards would be too
+        // late for the first negotiation.
+        ice.apply_to(&webrtcbin);
         pipeline
             .add(&webrtcbin)
             .map_err(|error| format!("Could not build DeskLink WebRTC pipeline: {error}"))?;
@@ -67,6 +78,7 @@ impl DesktopWebRtcPeer {
         let closed = Arc::new(AtomicBool::new(false));
         install_webrtcbin_callbacks(
             &webrtcbin,
+            &pipeline,
             Arc::clone(&channels),
             events.clone(),
             initiator,
@@ -89,6 +101,7 @@ impl DesktopWebRtcPeer {
         };
         if initiator {
             peer.create_local_channels()?;
+            peer.add_screen_transceiver()?;
         }
         Ok(peer)
     }
@@ -217,6 +230,32 @@ impl DesktopWebRtcPeer {
         let _ = self.events.send(PeerEvent::Closed);
     }
 
+    /// Adds the bidirectional video section used for screen sharing.
+    ///
+    /// Only the offerer does this. The answerer's transceiver is created by
+    /// `webrtcbin` when it applies an offer that carries video, so adding one
+    /// here as well would produce a second, unmatched m-line.
+    ///
+    /// The section is `sendrecv` and present from the first offer even when
+    /// neither side is sharing yet. Adding media later would require
+    /// renegotiation, and only the deterministic initiator may offer — so a
+    /// responder that wanted to start sharing would have no way to ask.
+    fn add_screen_transceiver(&self) -> Result<(), String> {
+        let caps = super::screen::video_caps();
+        let transceiver = self
+            .webrtcbin
+            .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
+                "add-transceiver",
+                &[&gst_webrtc::WebRTCRTPTransceiverDirection::Sendrecv, &caps],
+            )
+            .ok_or_else(|| "Could not add the DeskLink screen media section".to_string())?;
+        // Without this the sender stalls waiting for a keyframe it never asks
+        // for, and a viewer joining mid-stream sees nothing until the encoder
+        // happens to emit one.
+        transceiver.set_property("do-nack", true);
+        Ok(())
+    }
+
     fn create_local_channels(&self) -> Result<(), String> {
         for channel in WebRtcChannel::ALL {
             let options = channel_options(channel);
@@ -279,8 +318,45 @@ fn channel_options(channel: WebRtcChannel) -> gst::Structure {
     builder.build()
 }
 
+/// Whether a newly added pad carries video.
+///
+/// Data channels and any future audio section appear on the same signal, and
+/// building a video decode chain for them would fail in a confusing place.
+/// Whether a `webrtcbin` source pad carries the video track.
+///
+/// The pad's own transceiver is asked first. Caps alone are not enough:
+/// `webrtcbin`'s `src_%u` template caps are a bare `application/x-rtp` with no
+/// `media` field, so when `current_caps()` is still `None` at `pad-added` time
+/// — which is the common case — the old fallback tested
+/// `"application/x-rtp".starts_with("video/")`, returned false, and the video
+/// stream was silently dropped.
+fn pad_carries_video(pad: &gst::Pad) -> bool {
+    // `property` panics when the property is absent, and only webrtcbin's own
+    // source pads carry this one.
+    if pad.find_property("transceiver").is_some() {
+        if let Some(transceiver) =
+            pad.property::<Option<gst_webrtc::WebRTCRTPTransceiver>>("transceiver")
+        {
+            return transceiver.kind() == gst_webrtc::WebRTCKind::Video;
+        }
+    }
+
+    pad.current_caps()
+        .or_else(|| pad.query_caps(None).into())
+        .and_then(|caps| {
+            caps.structure(0).map(|structure| {
+                structure
+                    .get::<&str>("media")
+                    .map(|media| media == "video")
+                    .unwrap_or_else(|_| structure.name().starts_with("video/"))
+            })
+        })
+        .unwrap_or(false)
+}
+
 fn install_webrtcbin_callbacks(
     webrtcbin: &gst::Element,
+    pipeline: &gst::Pipeline,
     channels: Arc<Mutex<HashMap<WebRtcChannel, WebRTCDataChannel>>>,
     events: Sender<PeerEvent>,
     initiator: bool,
@@ -332,6 +408,29 @@ fn install_webrtcbin_callbacks(
         None
     });
 
+    // Inbound media. `webrtcbin` exposes a received stream as a new source pad
+    // once it has been negotiated; until then there is nothing to attach to.
+    let media_events = events.clone();
+    let media_pipeline = pipeline.clone();
+    webrtcbin.connect_pad_added(move |_, pad| {
+        if pad.direction() != gst::PadDirection::Src {
+            return;
+        }
+        if !pad_carries_video(pad) {
+            return;
+        }
+        match super::screen::attach_incoming_video(&media_pipeline, pad) {
+            Ok(stream) => {
+                let _ = media_events.send(PeerEvent::ScreenStream(stream));
+            }
+            Err(error) => {
+                let _ = media_events.send(PeerEvent::Error(format!(
+                    "Could not display the paired device's screen: {error}"
+                )));
+            }
+        }
+    });
+
     let state_events = events.clone();
     // `webrtcbin` emits state changes from its streaming/GLib worker.  The
     // `_local` variant wraps this closure in a ThreadGuard and aborts the
@@ -366,10 +465,14 @@ fn install_data_channel(
         let mut channels = channels
             .lock()
             .map_err(|_| "DeskLink WebRTC channel lock poisoned".to_string())?;
-        if channels.insert(channel_kind, channel.clone()).is_some() {
+        // Check before inserting. Inserting first displaced the working channel
+        // and then closed the *new* one, so a duplicate label left the map
+        // holding a closed entry and permanently broke that channel.
+        if channels.contains_key(&channel_kind) {
             channel.close();
             return Err(format!("Duplicate DeskLink WebRTC data channel: {label}"));
         }
+        channels.insert(channel_kind, channel.clone());
     }
 
     let open_events = events.clone();
@@ -513,7 +616,7 @@ mod tests {
     #[test]
     fn initiator_creates_each_cross_platform_channel_once() {
         let (sender, _receiver) = mpsc::channel();
-        let peer = DesktopWebRtcPeer::new(true, sender).unwrap();
+        let peer = DesktopWebRtcPeer::new(true, sender, &IceServerConfig::default()).unwrap();
         let channels = peer.channels.lock().unwrap();
 
         assert_eq!(channels.len(), WebRtcChannel::ALL.len());

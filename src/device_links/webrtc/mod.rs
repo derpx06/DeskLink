@@ -3,14 +3,17 @@
 pub(crate) mod coordinator;
 pub(crate) mod file_protocol;
 mod handover;
+pub(crate) mod ice;
 mod peer_connection;
+pub(crate) mod remote_session;
+pub(crate) mod screen;
 mod signaling;
 pub(crate) mod transfer_manager;
 
 #[allow(unused_imports)]
 pub use handover::{
-    AuthenticationTranscript, HandoverControlKind, HandoverControlMessage, HandoverMessage,
-    HandoverRuntime, HandoverState, HANDOVER_MESSAGE_TYPE,
+    AuthenticationTranscript, HandoverControlKind, HandoverControlMessage, HandoverRuntime,
+    HandoverState, HANDOVER_MESSAGE_TYPE,
 };
 #[allow(unused_imports)]
 pub use peer_connection::{DesktopWebRtcPeer, PeerEvent};

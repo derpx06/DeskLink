@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use super::handle::DaemonEvent;
+use crate::device_links::core::DeviceConnection;
 use crate::device_links::device::{
     BatteryStatus, DeviceNotification, DeviceStatus, DeviceView, MediaStatus, RemoteCommand,
     SftpStatus, SystemVolumeStatus, VolumeSink,
@@ -26,12 +28,85 @@ pub(super) fn upsert_device(
                 device.protocol_version = info.protocol_version;
                 device.incoming_capabilities = info.incoming_capabilities.clone();
                 device.outgoing_capabilities = info.outgoing_capabilities.clone();
-                if paired {
-                    device.status = DeviceStatus::Paired;
-                    device.trusted = true;
-                }
+                // Trust is a stored fact, so it is safe to refresh here.
+                // Reachability is not: a UDP broadcast only proves the peer is
+                // powered on. Setting `Paired` here made a device with a dead
+                // TCP link keep reporting "Connected" indefinitely, because
+                // every discovery beacon overwrote the real disconnect.
+                //
+                // Assigned, not raised. `if paired { … = true }` could only ever
+                // add trust, so a view that a pairing command had just set to
+                // `false` was silently re-trusted by the next discovery beacon —
+                // and nothing else would lower it. `reconcile_connection_status`
+                // overrides this from the live session within a second anyway;
+                // this keeps the interim value honest rather than optimistic.
+                device.trusted = paired;
             })
             .or_insert_with(|| DeviceView::from_info(info, address, paired));
+    }
+}
+
+/// Rewrites every device's reachability from the authoritative session state.
+///
+/// Pairing-negotiation states are left alone: they describe a user-facing
+/// dialog, not a transport, and reconciling them would cancel a pair prompt the
+/// user is still looking at.
+pub(crate) fn reconcile_connection_status(
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    connections: &[DeviceConnection],
+) {
+    let Ok(mut devices) = devices.lock() else {
+        return;
+    };
+    let by_id: HashMap<&str, &DeviceConnection> = connections
+        .iter()
+        .map(|connection| (connection.device_id.as_str(), connection))
+        .collect();
+
+    for (device_id, device) in devices.iter_mut() {
+        let connection = by_id.get(device_id.as_str());
+        let reachable = connection.is_some_and(|connection| connection.is_reachable());
+        device.feature_transport_ready = connection
+            .is_some_and(|connection| connection.feature_transport_ready && connection.paired);
+
+        let awaiting_pair_decision = matches!(
+            device.status,
+            DeviceStatus::PairRequested | DeviceStatus::PairRequestedByPeer
+        );
+        // A pending pair prompt is a user-facing dialog, not a transport, so it
+        // is not overwritten while the device is still reachable. It is cleared
+        // once the device goes away: pairing cannot complete without a link, and
+        // this reconciler is the only thing that notices a peer that vanished
+        // without a clean disconnect — leaving the prompt would strand the row
+        // on "Pair request" forever.
+        if awaiting_pair_decision && reachable {
+            continue;
+        }
+
+        // `connection.paired` is the session's pairing state — the same value
+        // the dispatcher authorises features from, and the only authority on
+        // this device's pairing while a session exists. `device.trusted` is a
+        // *cached copy* that discovery, the handshake and every pairing command
+        // write independently, so reading it here re-asserted whatever they had
+        // got wrong, once a second, forever, instead of correcting it.
+        //
+        // With no session there is nothing live to consult and the stored flag,
+        // which came from the config trust store, is the only authority there
+        // is. Assigning it back makes `trusted` a projection rather than a
+        // fifth place pairing is remembered — and, unlike `upsert_device`, this
+        // can lower it as well as raise it.
+        let paired = connection.map_or(device.trusted, |connection| connection.paired);
+        device.trusted = paired;
+
+        device.status = match (reachable, paired) {
+            (true, true) => DeviceStatus::Paired,
+            (true, false) => DeviceStatus::Connected,
+            (false, true) => DeviceStatus::Unreachable,
+            (false, false) => DeviceStatus::Discovered,
+        };
+        if !reachable {
+            device.verification_key = None;
+        }
     }
 }
 
@@ -61,7 +136,7 @@ pub(super) fn mark_status(
     }
 }
 
-pub(super) fn mark_error(
+pub(crate) fn mark_error(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     device_id: &str,
     error: String,
@@ -81,9 +156,42 @@ pub(crate) fn clear_error(devices: &Arc<Mutex<HashMap<String, DeviceView>>>, dev
     }
 }
 
+/// Newest errors the UI has not drained yet.
+///
+/// The UI only ever displays the most recent entry, and producers can be very
+/// fast — remote-control pointer motion emits one failure per motion event — so
+/// this is a bounded ring rather than an unbounded log.
+const MAX_PENDING_ERRORS: usize = 32;
+
 pub(super) fn push_error(errors: &Arc<Mutex<Vec<String>>>, error: String) {
     if let Ok(mut errors) = errors.lock() {
+        // Repeating the same message adds nothing and hides what came before.
+        if errors.last().is_some_and(|last| last == &error) {
+            return;
+        }
         errors.push(error);
+        if errors.len() > MAX_PENDING_ERRORS {
+            let excess = errors.len() - MAX_PENDING_ERRORS;
+            errors.drain(..excess);
+        }
+    }
+}
+
+/// Feature events the UI has not drained yet.
+///
+/// Every event becomes a desktop notification with a unique id — so they stack
+/// rather than replace — plus a four-second toast. An unbounded queue meant a
+/// peer sending a hundred pings in a second produced a hundred stacked
+/// notifications and several minutes of toasts with no way to dismiss them.
+const MAX_PENDING_EVENTS: usize = 16;
+
+pub(super) fn push_event(events: &Arc<Mutex<Vec<DaemonEvent>>>, event: DaemonEvent) {
+    if let Ok(mut events) = events.lock() {
+        events.push(event);
+        if events.len() > MAX_PENDING_EVENTS {
+            let excess = events.len() - MAX_PENDING_EVENTS;
+            events.drain(..excess);
+        }
     }
 }
 
@@ -451,6 +559,118 @@ mod tests {
         let devices = Arc::new(Mutex::new(HashMap::new()));
         upsert_device(&devices, &info, "127.0.0.1".to_string(), true);
         (devices, info)
+    }
+
+    fn connection(device_id: &str, linked: bool, ready: bool) -> DeviceConnection {
+        DeviceConnection {
+            device_id: device_id.to_string(),
+            linked,
+            paired: true,
+            feature_transport_ready: ready,
+        }
+    }
+
+    /// The reported symptom: the app kept showing "Connected" for a paired
+    /// device whose link was gone, because every discovery beacon rewrote the
+    /// status back to `Paired`.
+    #[test]
+    fn a_paired_device_with_no_session_is_reported_unreachable() {
+        let (devices, info) = test_devices();
+        reconcile_connection_status(&devices, &[connection(&info.id, true, true)]);
+        assert_eq!(
+            devices.lock().unwrap().get(&info.id).unwrap().status,
+            DeviceStatus::Paired
+        );
+
+        // The link drops and no handler observed it.
+        reconcile_connection_status(&devices, &[]);
+
+        let devices = devices.lock().unwrap();
+        let device = devices.get(&info.id).unwrap();
+        assert_eq!(device.status, DeviceStatus::Unreachable);
+        assert!(!device.feature_transport_ready);
+        assert!(device.trusted, "trust must survive a disconnect");
+    }
+
+    #[test]
+    fn discovery_alone_never_reports_a_paired_device_as_connected() {
+        let (devices, info) = test_devices();
+        reconcile_connection_status(&devices, &[]);
+
+        // A discovery beacon arrives from a powered-on but unconnected phone.
+        upsert_device(&devices, &info, "192.168.1.20".to_string(), true);
+
+        let devices = devices.lock().unwrap();
+        let device = devices.get(&info.id).unwrap();
+        assert_eq!(device.status, DeviceStatus::Unreachable);
+        assert!(device.trusted);
+        assert_eq!(device.address, "192.168.1.20");
+    }
+
+    /// Losing the bootstrap socket while the authenticated WebRTC transport is
+    /// alive is not a disconnect, and must not be reported as one.
+    #[test]
+    fn a_retained_webrtc_transport_keeps_the_device_reachable() {
+        let (devices, info) = test_devices();
+
+        reconcile_connection_status(&devices, &[connection(&info.id, false, true)]);
+
+        let devices = devices.lock().unwrap();
+        let device = devices.get(&info.id).unwrap();
+        assert_eq!(device.status, DeviceStatus::Paired);
+        assert!(device.feature_transport_ready);
+    }
+
+    /// The inverse: a live bootstrap link before handover is reachable, but the
+    /// feature transport must not be advertised as ready.
+    #[test]
+    fn a_bootstrap_only_link_is_reachable_but_not_feature_ready() {
+        let (devices, info) = test_devices();
+
+        reconcile_connection_status(&devices, &[connection(&info.id, true, false)]);
+
+        let devices = devices.lock().unwrap();
+        let device = devices.get(&info.id).unwrap();
+        assert_eq!(device.status, DeviceStatus::Paired);
+        assert!(!device.feature_transport_ready);
+    }
+
+    #[test]
+    fn reconciliation_leaves_a_pending_pair_prompt_alone_while_reachable() {
+        let (devices, info) = test_devices();
+        update_pair_state(
+            &devices,
+            &info.id,
+            PairState::RequestedByPeer,
+            Some("ABCD1234".to_string()),
+        );
+
+        reconcile_connection_status(&devices, &[connection(&info.id, true, false)]);
+
+        let devices = devices.lock().unwrap();
+        let device = devices.get(&info.id).unwrap();
+        assert_eq!(device.status, DeviceStatus::PairRequestedByPeer);
+        assert_eq!(device.verification_key.as_deref(), Some("ABCD1234"));
+    }
+
+    /// Pairing cannot complete without a link, so a prompt for a device that
+    /// disappeared must be cleared rather than left on screen forever.
+    #[test]
+    fn a_pair_prompt_is_cleared_once_the_device_disappears() {
+        let (devices, info) = test_devices();
+        update_pair_state(
+            &devices,
+            &info.id,
+            PairState::RequestedByPeer,
+            Some("ABCD1234".to_string()),
+        );
+
+        reconcile_connection_status(&devices, &[]);
+
+        let devices = devices.lock().unwrap();
+        let device = devices.get(&info.id).unwrap();
+        assert_ne!(device.status, DeviceStatus::PairRequestedByPeer);
+        assert_eq!(device.verification_key, None);
     }
 
     #[test]

@@ -28,6 +28,15 @@ struct StoredConfig {
     device_id: String,
     device_name: String,
     trusted_devices: HashMap<String, TrustedDevice>,
+    /// ICE servers, empty by default.
+    ///
+    /// Operation on a local network must never need one, so nothing is shipped
+    /// preconfigured — not even a public STUN server. These matter only once
+    /// the two devices are on different networks.
+    #[serde(default)]
+    ice_stun_servers: Vec<String>,
+    #[serde(default)]
+    ice_turn_servers: Vec<String>,
 }
 
 pub struct Config {
@@ -59,6 +68,8 @@ impl Config {
                 device_id,
                 device_name,
                 trusted_devices: HashMap::new(),
+                ice_stun_servers: Vec::new(),
+                ice_turn_servers: Vec::new(),
             }
         };
 
@@ -70,20 +81,26 @@ impl Config {
         } else {
             generate_key().map_err(|err| err.to_string())?
         };
-        let certificate = if cert_path.exists() {
-            let certificate_bytes = fs::read(&cert_path).map_err(|err| err.to_string())?;
-            match X509::from_pem(&certificate_bytes) {
-                Ok(certificate) => certificate,
-                Err(_) => {
-                    // A truncated or malformed local certificate must not prevent
-                    // DeskLink from starting. The private key and device ID remain
-                    // authoritative, so rebuild only the certificate and keep all
-                    // pairing/configuration state untouched.
-                    generate_certificate(&key, &stored.device_id).map_err(|err| err.to_string())?
-                }
-            }
+        let stored_certificate = if cert_path.exists() {
+            fs::read(&cert_path)
+                .ok()
+                .and_then(|bytes| X509::from_pem(&bytes).ok())
         } else {
-            generate_certificate(&key, &stored.device_id).map_err(|err| err.to_string())?
+            None
+        };
+        // A truncated or malformed local certificate must not prevent DeskLink
+        // from starting. The private key and device ID remain authoritative, so
+        // rebuild only the certificate and keep all pairing/configuration state
+        // untouched.
+        //
+        // The same is true when the certificate is well-formed but no longer
+        // matches the private key — which happens whenever the key file is lost
+        // or restored independently of the certificate. Keeping the mismatched
+        // pair made every TLS handshake fail permanently, and `save()` then
+        // wrote the broken pair straight back to disk.
+        let certificate = match stored_certificate {
+            Some(certificate) if certificate_matches_key(&certificate, &key) => certificate,
+            _ => generate_certificate(&key, &stored.device_id).map_err(|err| err.to_string())?,
         };
 
         let config = Self {
@@ -103,13 +120,13 @@ impl Config {
             serde_json::to_vec_pretty(&self.stored).map_err(|err| err.to_string())?,
         )
         .map_err(|err| err.to_string())?;
-        fs::write(
-            self.base_dir.join("privateKey.pem"),
-            self.key
+        write_private_key(
+            &self.base_dir.join("privateKey.pem"),
+            &self
+                .key
                 .private_key_to_pem_pkcs8()
                 .map_err(|err| err.to_string())?,
-        )
-        .map_err(|err| err.to_string())?;
+        )?;
         fs::write(
             self.base_dir.join("certificate.pem"),
             self.certificate.to_pem().map_err(|err| err.to_string())?,
@@ -138,6 +155,27 @@ impl Config {
     /// never move identities or pairing records.
     pub fn transfer_state_dir(&self) -> PathBuf {
         self.base_dir.join("webrtc-transfers")
+    }
+
+    /// ICE servers for the WebRTC peer.
+    ///
+    /// Environment variables win over the stored lists so a deployment can set
+    /// them without editing config.json, using the same comma/newline grammar
+    /// as the Android preferences. A malformed list is reported and ignored
+    /// rather than failing the connection: local operation needs no server, so
+    /// a bad remote-access setting must not break the LAN path.
+    pub fn ice_servers(&self) -> crate::device_links::webrtc::ice::IceServerConfig {
+        let stun = std::env::var("DESKLINK_STUN_SERVERS")
+            .unwrap_or_else(|_| self.stored.ice_stun_servers.join(","));
+        let turn = std::env::var("DESKLINK_TURN_SERVERS")
+            .unwrap_or_else(|_| self.stored.ice_turn_servers.join(","));
+        match crate::device_links::webrtc::ice::IceServerConfig::parse(&stun, &turn) {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("[DeskLink] Ignoring the configured ICE servers: {error}");
+                crate::device_links::webrtc::ice::IceServerConfig::default()
+            }
+        }
     }
 
     pub fn is_trusted(&self, device_id: &str) -> bool {
@@ -180,6 +218,47 @@ impl Config {
         self.stored.trusted_devices.remove(device_id);
         self.save()
     }
+}
+
+/// Confirms the stored certificate actually certifies the stored private key.
+/// Comparing the public halves in DER is exact and avoids a signature check.
+fn certificate_matches_key(certificate: &X509, key: &PKey<Private>) -> bool {
+    match (
+        certificate
+            .public_key()
+            .and_then(|public| public.public_key_to_der()),
+        key.public_key_to_der(),
+    ) {
+        (Ok(certificate_public), Ok(key_public)) => certificate_public == key_public,
+        _ => false,
+    }
+}
+
+/// Writes the device private key so only the owning user can read it.
+///
+/// `fs::write` alone creates the file at 0644 under a typical umask, which left
+/// the key that authenticates every pairing and signs every handover transcript
+/// world-readable. The mode is applied before the bytes are written so the key
+/// is never briefly readable on first creation.
+fn write_private_key(path: &std::path::Path, pem: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|err| err.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // An existing file keeps its old mode when reopened, so tighten it too.
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+    file.write_all(pem).map_err(|err| err.to_string())?;
+    file.sync_all().map_err(|err| err.to_string())
 }
 
 fn config_dir() -> PathBuf {
@@ -232,6 +311,47 @@ mod tests {
 
         let second = Config::load_from_dir(dir.clone()).unwrap();
         assert_eq!(second.local_device_info().id, first_id);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_certificate_that_no_longer_matches_the_key_is_rebuilt() {
+        let dir = std::env::temp_dir().join(format!("desklink-mismatch-{}", Uuid::new_v4()));
+        let first = Config::load_from_dir(dir.clone()).unwrap();
+        let first_id = first.local_device_info().id;
+        let stale_certificate = first.certificate().to_pem().unwrap();
+        drop(first);
+
+        // Losing the key while the certificate survives is the realistic case:
+        // a partial restore, or a key wiped by a permissions repair.
+        fs::remove_file(dir.join("privateKey.pem")).unwrap();
+
+        let repaired = Config::load_from_dir(dir.clone()).unwrap();
+        assert_eq!(repaired.local_device_info().id, first_id);
+        assert_ne!(repaired.certificate().to_pem().unwrap(), stale_certificate);
+        assert!(certificate_matches_key(
+            repaired.certificate(),
+            repaired.key()
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_private_key_is_not_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("desklink-perm-{}", Uuid::new_v4()));
+        let config = Config::load_from_dir(dir.clone()).unwrap();
+        drop(config);
+
+        let mode = fs::metadata(dir.join("privateKey.pem"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0, "group and other must have no access");
 
         let _ = fs::remove_dir_all(dir);
     }

@@ -104,6 +104,10 @@ pub struct DeviceView {
     pub outgoing_capabilities: Vec<String>,
     pub status: DeviceStatus,
     pub trusted: bool,
+    /// True only while an authenticated WebRTC feature transport is installed.
+    /// `status` answers "is this device reachable at all"; this answers "is the
+    /// paired feature path fully negotiated", which the two used to conflate.
+    pub feature_transport_ready: bool,
     pub verification_key: Option<String>,
     pub last_error: Option<String>,
     pub media_status: Option<MediaStatus>,
@@ -125,11 +129,11 @@ impl DeviceView {
             incoming_capabilities: info.incoming_capabilities.clone(),
             outgoing_capabilities: info.outgoing_capabilities.clone(),
             trusted: paired,
-            status: if paired {
-                DeviceStatus::Paired
-            } else {
-                DeviceStatus::Discovered
-            },
+            // Discovery proves the device exists, never that it is connected.
+            // Reachability is reconciled from the session manager, which is the
+            // only component that knows whether a link is actually alive.
+            status: DeviceStatus::Discovered,
+            feature_transport_ready: false,
             verification_key: None,
             last_error: None,
             media_status: None,

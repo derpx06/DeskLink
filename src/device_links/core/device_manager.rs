@@ -8,8 +8,12 @@ use crate::device_links::webrtc::transfer_manager::WebRtcTransferManager;
 use crate::device_links::webrtc::{DesktopWebRtcPeer, HandoverRuntime, WebRtcWireBinding};
 
 use super::{
-    ConnectionGeneration, DeviceSession, SessionBinding, SessionId, SessionLink, SessionState,
+    ConnectionGeneration, DeviceSession, ReplayCache, SessionBinding, SessionId, SessionLink,
+    SessionState,
 };
+
+/// Identifiers retained per attempt for replay rejection.
+const REPLAY_CACHE_CAPACITY: usize = 4096;
 
 /// Immutable transport data copied from the authoritative session while its
 /// lock is held.  Callers must perform network I/O only after obtaining this
@@ -80,6 +84,24 @@ pub struct DisconnectResult {
     pub webrtc: Option<Arc<DesktopWebRtcPeer>>,
 }
 
+/// A reachability reading for one device, taken under the session lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceConnection {
+    pub device_id: String,
+    /// A bootstrap link exists and its socket has not been closed.
+    pub linked: bool,
+    pub paired: bool,
+    pub feature_transport_ready: bool,
+}
+
+impl DeviceConnection {
+    /// A device is reachable over the bootstrap link, the authenticated WebRTC
+    /// transport, or both. Losing only one of the two is not a disconnect.
+    pub fn is_reachable(&self) -> bool {
+        self.linked || self.feature_transport_ready
+    }
+}
+
 pub struct DeviceManager {
     next_session_id: AtomicU64,
     sessions: Mutex<HashMap<String, DeviceSession>>,
@@ -91,6 +113,47 @@ impl DeviceManager {
             next_session_id: AtomicU64::new(1),
             sessions: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Whether to tell the peer that this side does not consider it paired,
+    /// recording the notice so the next one is damped.
+    ///
+    /// This is the self-healing half of unpairing, and it is why DeskLink needs
+    /// no durable "owes an unpair" queue. When a peer misses a `pair:false` —
+    /// because it was offline, or the send failed — it keeps behaving as paired
+    /// and sends a clipboard update or a notification. That packet is refused,
+    /// this fires, and the two sides converge on first use. Upstream KDE
+    /// Connect has done it this way for years (`core/device.cpp`); the desktop
+    /// was the only side missing it, so a one-sided unpair left the phone
+    /// believing it was paired indefinitely.
+    ///
+    /// Refuses unless the session really is `NotPaired`, so it can never be
+    /// reached through a rejection that was about something else — a WebRTC
+    /// transport that is merely not ready yet, say — and turned into a
+    /// spurious unpair.
+    pub fn claim_not_paired_notice(
+        &self,
+        binding: &SessionBinding,
+        interval: std::time::Duration,
+    ) -> bool {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return false;
+        };
+        let Some(session) = sessions.get_mut(&binding.device_id) else {
+            return false;
+        };
+        if session.pairing.state != crate::device_links::pairing::PairState::NotPaired {
+            return false;
+        }
+        let now = Instant::now();
+        if session
+            .last_not_paired_notice
+            .is_some_and(|last| now.duration_since(last) < interval)
+        {
+            return false;
+        }
+        session.last_not_paired_notice = Some(now);
+        true
     }
 
     pub fn register_link(
@@ -122,6 +185,29 @@ impl DeviceManager {
                 session.connection_generation = session.connection_generation.saturating_add(1);
                 session.cancellation = Arc::new(AtomicBool::new(false));
                 session.clear_webrtc_state();
+
+                // A pairing negotiation belongs to the link that started it.
+                //
+                // The verification key the user is comparing is derived from
+                // *that* link's certificate, and nothing recomputes it when a
+                // link is replaced. So letting a new link inherit `Requested`
+                // or `RequestedByPeer` lets whoever opened it collect an
+                // acceptance the user granted to somebody else, and have its
+                // own certificate written to the trust store — while both
+                // screens still show the honest peer's key. That is
+                // CVE-2020-26164, and on a LAN the device id it needs is
+                // broadcast in cleartext.
+                //
+                // Abandoning is the safe direction: the user re-initiates and
+                // compares a key that belongs to the link in front of them.
+                if matches!(
+                    session.pairing.state,
+                    crate::device_links::pairing::PairState::Requested
+                        | crate::device_links::pairing::PairState::RequestedByPeer
+                ) {
+                    session.pairing = PairingHandler::new(false);
+                }
+
                 if initially_paired
                     && session.pairing.state != crate::device_links::pairing::PairState::Paired
                 {
@@ -155,14 +241,16 @@ impl DeviceManager {
                     transfer_manager: None,
                     webrtc_attempt_id: None,
                     webrtc_handover: None,
-                    seen_webrtc_request_ids: Default::default(),
-                    seen_webrtc_message_ids: Default::default(),
+                    webrtc_recovery_attempt: 0,
+                    seen_webrtc_request_ids: ReplayCache::with_capacity(REPLAY_CACHE_CAPACITY),
+                    seen_webrtc_message_ids: ReplayCache::with_capacity(REPLAY_CACHE_CAPACITY),
                     cancellation: Arc::new(AtomicBool::new(false)),
                     connected_at: Some(now),
                     last_disconnect_reason: None,
                     reconnect_attempt: 0,
                     reconnect_scheduled: false,
                     next_reconnect_at: None,
+                    last_not_paired_notice: None,
                 };
                 let binding = session.binding().expect("new session always has a link");
                 sessions.insert(device_id, session);
@@ -200,6 +288,43 @@ impl DeviceManager {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether this device still has a usable bootstrap socket.
+    ///
+    /// A session deliberately keeps its link installed after the socket closes
+    /// while an authenticated WebRTC transport survives, because the WebRTC
+    /// callbacks are generation-bound to a binding holding that exact link. So
+    /// "a binding exists" does not mean "a connection exists", and discovery
+    /// must not use the former to decide whether to reconnect: doing so refused
+    /// every replacement connection for a device whose socket had died, and if
+    /// its WebRTC peer later failed as well the device was wedged offline until
+    /// the application restarted.
+    /// Whether a replacement bootstrap connection would be accepted at all.
+    ///
+    /// `finish_secure_link` discards a new socket while a feature-ready WebRTC
+    /// peer exists, so discovery must not keep dialling one: without this it
+    /// performed a full TCP connect, TLS handshake and certificate validation on
+    /// every beacon purely to have the result thrown away — and reported an
+    /// error banner for each failure, on a device the UI showed as connected.
+    pub fn wants_bootstrap_connection(&self, device_id: &str) -> bool {
+        !self.has_live_bootstrap_link(device_id) && !self.has_ready_webrtc(device_id)
+    }
+
+    pub fn has_live_bootstrap_link(&self, device_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| {
+                sessions.get(device_id).map(|session| {
+                    session.state != SessionState::Terminated
+                        && session
+                            .active_link
+                            .as_ref()
+                            .is_some_and(|link| !link.is_closed())
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// Returns whether a device already has a mutually feature-ready WebRTC
@@ -403,6 +528,13 @@ impl DeviceManager {
             // Do not cancel the generation or clear peer/handover state.  The
             // retained Arc is returned only so the caller can close the dead
             // bootstrap socket without doing I/O under the session lock.
+            //
+            // The link is deliberately *kept* on the session: WebRTC callbacks
+            // are generation-bound to a binding that holds this exact Arc, and
+            // taking it here would make every one of them stale. `SessionLink`
+            // records its own closed flag instead, so `connection_snapshot` and
+            // the signaling path can both tell that the socket is gone while
+            // the binding identity stays intact.
             session.state = SessionState::Ready;
             session.last_disconnect_reason = None;
             return DisconnectResult {
@@ -568,14 +700,8 @@ impl DeviceManager {
             if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
                 return Err(SessionError::StaleBinding);
             }
-            if !session.seen_webrtc_request_ids.insert(request_id) {
+            if !session.seen_webrtc_request_ids.accept(request_id) {
                 return Err(SessionError::ReplayDetected);
-            }
-            while session.seen_webrtc_request_ids.len() > 4096 {
-                let Some(oldest) = session.seen_webrtc_request_ids.iter().next().cloned() else {
-                    break;
-                };
-                session.seen_webrtc_request_ids.remove(&oldest);
             }
             session
                 .active_webrtc
@@ -598,14 +724,8 @@ impl DeviceManager {
             if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
                 return Err(SessionError::StaleBinding);
             }
-            if !session.seen_webrtc_message_ids.insert(message_id) {
+            if !session.seen_webrtc_message_ids.accept(message_id) {
                 return Err(SessionError::ReplayDetected);
-            }
-            while session.seen_webrtc_message_ids.len() > 4096 {
-                let Some(oldest) = session.seen_webrtc_message_ids.iter().next().cloned() else {
-                    break;
-                };
-                session.seen_webrtc_message_ids.remove(&oldest);
             }
             Ok(())
         })?
@@ -687,6 +807,75 @@ impl DeviceManager {
             peer.close();
         }
         links
+    }
+
+    /// One authoritative reachability reading per known device session.
+    ///
+    /// The device view used to be mutated from many places — discovery,
+    /// handshake, disconnect handlers — and any of them could leave a stale
+    /// "connected" behind. This is the single source the UI reconciles against.
+    /// Abandons every pairing negotiation whose deadline has passed.
+    ///
+    /// Returns the affected device ids so the caller can clear their prompts.
+    /// Driven from the status reconciler, which already ticks once a second —
+    /// a pairing timeout does not need a thread of its own.
+    pub fn expire_pairing(&self, now_secs: i64) -> Vec<String> {
+        let mut sessions = self.reconciler_sessions();
+        sessions
+            .values_mut()
+            .filter_map(|session| {
+                if session.pairing.expire_if_due(now_secs) {
+                    Some(session.device_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// The session map for the 1 Hz reconciler, **recovering a poisoned lock**.
+    ///
+    /// Everywhere else a poisoned mutex becomes `SessionError::Poisoned` and the
+    /// caller gives up, which is right for a one-shot command the user can
+    /// retry. It is wrong here. `expire_pairing` and `connection_snapshot` are
+    /// the reconciler's only inputs, and both used to answer "nothing" on a
+    /// poisoned lock — so a single panic anywhere under this mutex silently and
+    /// **permanently** stopped pairing timeouts from firing and froze every
+    /// device's status at whatever it happened to be. The app kept running and
+    /// kept lying.
+    ///
+    /// Recovering is safe: Rust poisons a mutex to warn that an invariant
+    /// *might* be broken, not because the memory is unusable, and these two
+    /// readers only copy fields out. A stale reading beats no readings forever.
+    fn reconciler_sessions(&self) -> std::sync::MutexGuard<'_, HashMap<String, DeviceSession>> {
+        self.sessions.lock().unwrap_or_else(|poisoned| {
+            eprintln!(
+                "[Daemon] Recovered a poisoned session lock; status reconciliation continues"
+            );
+            poisoned.into_inner()
+        })
+    }
+
+    pub fn connection_snapshot(&self) -> Vec<DeviceConnection> {
+        self.reconciler_sessions()
+            .values()
+            .map(|session| DeviceConnection {
+                device_id: session.device_id.clone(),
+                // A link the reader has already closed must not count as
+                // reachable, otherwise the retained-bootstrap path keeps
+                // reporting a live connection over a dead socket.
+                linked: session.state != SessionState::Terminated
+                    && session
+                        .active_link
+                        .as_ref()
+                        .is_some_and(|link| !link.is_closed()),
+                paired: session.pairing.state == crate::device_links::pairing::PairState::Paired,
+                feature_transport_ready: session
+                    .webrtc_handover
+                    .as_ref()
+                    .is_some_and(HandoverRuntime::features_ready),
+            })
+            .collect()
     }
 
     pub fn unpaired_session_count(&self) -> usize {
@@ -837,6 +1026,58 @@ mod tests {
         assert!(manager.is_current(&reconnected));
     }
 
+    /// The desktop discards a refreshed bootstrap socket while its WebRTC peer
+    /// is feature-ready, so a discovery refresh does not tear down every paired
+    /// feature. That is right only while the retained link is still open.
+    ///
+    /// Once the phone has closed the old socket, keeping it and discarding the
+    /// fresh one leaves this side with **no signalling channel** — and when the
+    /// WebRTC peer subsequently fails, the `RestartRequest` it must send dies
+    /// with "Session link is closed" against a socket the peer already
+    /// replaced. Observed on hardware as a device stuck on "Connecting"
+    /// forever. `finish_secure_link` therefore requires both conditions.
+    #[test]
+    fn a_refreshed_socket_is_only_discarded_while_the_retained_link_is_open() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        let wire = WebRtcWireBinding::from_attempt("desktop", "phone-1", &attempt_id).unwrap();
+        manager
+            .with_session(&binding, |session| {
+                let mut handover = HandoverRuntime::new(attempt_id.clone(), wire);
+                handover.record_offer("offer".to_string()).unwrap();
+                handover.record_answer("answer".to_string()).unwrap();
+                handover.mark_local_authenticated().unwrap();
+                handover.mark_remote_authenticated().unwrap();
+                handover.mark_local_capabilities_confirmed().unwrap();
+                handover.mark_remote_capabilities_confirmed().unwrap();
+                handover.mark_local_feature_ready().unwrap();
+                handover.mark_remote_feature_ready().unwrap();
+                session.webrtc_handover = Some(handover);
+            })
+            .unwrap();
+
+        // Healthy: WebRTC is ready and the bootstrap socket is alive, so a
+        // refresh is redundant and is correctly thrown away.
+        assert!(manager.has_ready_webrtc("phone-1"));
+        assert!(manager.has_live_bootstrap_link("phone-1"));
+
+        // The phone replaces its short-lived socket. WebRTC is still ready, but
+        // the retained link is now dead.
+        binding.link.close();
+        assert!(
+            manager.has_ready_webrtc("phone-1"),
+            "the authenticated WebRTC transport survives the bootstrap socket"
+        );
+        assert!(
+            !manager.has_live_bootstrap_link("phone-1"),
+            "a refreshed socket must now be adopted, or signalling has nowhere to go"
+        );
+    }
+
     #[test]
     fn bootstrap_disconnect_preserves_feature_ready_generation() {
         let manager = DeviceManager::new();
@@ -877,6 +1118,58 @@ mod tests {
                 .unwrap(),
             binding.generation,
         );
+    }
+
+    /// Discovery decides whether to reconnect from `has_live_bootstrap_link`,
+    /// not from the presence of a binding. A session keeps a closed link
+    /// installed while WebRTC outlives the socket, and using binding presence
+    /// meant such a device was never offered a replacement connection — so once
+    /// its WebRTC peer failed too, it stayed offline until a restart.
+    #[test]
+    fn a_closed_bootstrap_link_does_not_count_as_a_live_connection() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        assert!(manager.has_live_bootstrap_link("phone-1"));
+
+        binding.link.close();
+
+        assert!(!manager.has_live_bootstrap_link("phone-1"));
+        // The binding itself deliberately survives so WebRTC callbacks that are
+        // generation-bound to it stay valid.
+        assert!(manager.current_binding("phone-1").is_some());
+    }
+
+    #[test]
+    fn an_unknown_device_has_no_live_bootstrap_link() {
+        let manager = DeviceManager::new();
+        assert!(!manager.has_live_bootstrap_link("phone-1"));
+    }
+
+    /// The reconciler reads reachability from here, so a closed socket with no
+    /// WebRTC transport must read as unreachable.
+    #[test]
+    fn connection_snapshot_reports_a_closed_socket_as_unreachable() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+
+        let snapshot = manager.connection_snapshot();
+        assert_eq!(snapshot.len(), 1);
+        assert!(snapshot[0].linked);
+        assert!(snapshot[0].paired);
+        assert!(snapshot[0].is_reachable());
+
+        binding.link.close();
+
+        let snapshot = manager.connection_snapshot();
+        assert!(!snapshot[0].linked);
+        assert!(!snapshot[0].feature_transport_ready);
+        assert!(!snapshot[0].is_reachable());
     }
 
     #[test]

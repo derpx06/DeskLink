@@ -17,7 +17,16 @@ use crate::device_links::packet::PROTOCOL_VERSION;
 
 const MAX_UNPAIRED_CONNECTIONS: usize = 42;
 const MIN_CONNECTION_INTERVAL: Duration = Duration::from_millis(500);
+/// Matches `MAX_RATE_LIMIT_ENTRIES` in the Android `LanLinkProvider`.
+const MAX_RATE_LIMIT_ENTRIES: usize = 255;
 
+/// Rate-limits repeated connection attempts from one discovery beacon.
+///
+/// The key comes from an unauthenticated UDP packet, so it is fully
+/// attacker-controlled. The map is therefore capped and pruned: without that, a
+/// stream of spoofed identities grew it without bound. Entries older than the
+/// throttle interval are useless, so pruning them first keeps the cap from
+/// evicting devices that are genuinely active.
 pub(super) fn should_throttle_connection(
     last_connections: &Arc<Mutex<HashMap<String, Instant>>>,
     device_id: &str,
@@ -31,6 +40,25 @@ pub(super) fn should_throttle_connection(
         .is_some_and(|last| now.duration_since(*last) < MIN_CONNECTION_INTERVAL)
     {
         return true;
+    }
+
+    if last_connections.len() >= MAX_RATE_LIMIT_ENTRIES {
+        last_connections.retain(|_, last| now.duration_since(*last) < MIN_CONNECTION_INTERVAL);
+    }
+    while last_connections.len() >= MAX_RATE_LIMIT_ENTRIES {
+        // Every entry is still inside its throttle window, which only happens
+        // under a flood of spoofed identities. Evict the oldest rather than
+        // refusing the new attempt: refusing would let anyone on the network
+        // lock out every real device by broadcasting enough fake beacons, which
+        // is a worse failure than the unbounded growth this cap replaced.
+        let Some(oldest) = last_connections
+            .iter()
+            .min_by_key(|(_, last)| **last)
+            .map(|(id, _)| id.clone())
+        else {
+            break;
+        };
+        last_connections.remove(&oldest);
     }
     last_connections.insert(device_id.to_string(), now);
     false
@@ -108,7 +136,7 @@ pub(super) fn connect_to_device(
     // Discovery and an inbound connection can race. If the peer became
     // authoritative after discovery scheduled this worker, do not create a
     // duplicate TLS handshake that will be discarded by Android.
-    if sessions.current_binding(&initial_info.id).is_some() {
+    if !sessions.wants_bootstrap_connection(&initial_info.id) {
         return Ok(());
     }
     let mut stream =
@@ -122,6 +150,7 @@ pub(super) fn connect_to_device(
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| err.to_string())?;
+    super::network::enable_keepalive(&stream);
     let mut identity = config
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())?
@@ -129,7 +158,7 @@ pub(super) fn connect_to_device(
         .to_identity_packet(0);
     identity.set("targetDeviceId", initial_info.id.clone());
     identity.set("targetProtocolVersion", PROTOCOL_VERSION);
-    if sessions.current_binding(&initial_info.id).is_some() {
+    if !sessions.wants_bootstrap_connection(&initial_info.id) {
         return Ok(());
     }
     stream
