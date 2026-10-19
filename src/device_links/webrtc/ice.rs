@@ -5,7 +5,7 @@
 //! not on the same network, which is a later, opt-in capability.
 //!
 //! The change that actually makes local ICE reliable is not a server at all —
-//! see [`IceServerConfig::local_ip`].
+//! see [`IceServerConfig::local_ips`].
 
 use std::net::IpAddr;
 
@@ -33,8 +33,14 @@ pub(crate) struct IceServerConfig {
     /// address has a working route to this peer by construction, so restricting
     /// gathering to it collapses the search to one candidate and one check.
     ///
-    /// `None` off-LAN, where restricting would be wrong.
-    pub local_ip: Option<IpAddr>,
+    /// Off the LAN (a relay-bootstrapped peer) these are instead the
+    /// default-route addresses, IPv6 and IPv4: the paths the internet will
+    /// actually use, still excluding the virtual bridges. Empty means gather
+    /// everywhere.
+    pub local_ips: Vec<IpAddr>,
+    /// Debug only: relay-only ICE (`DESKLINK_ICE_RELAY_ONLY=1`), to exercise
+    /// TURN on one network.
+    pub relay_only: bool,
 }
 
 impl IceServerConfig {
@@ -54,7 +60,7 @@ impl IceServerConfig {
         let config = Self {
             stun_servers: split(stun),
             turn_servers: split(turn),
-            local_ip: None,
+            ..Self::default()
         };
         config.validate()?;
         Ok(config)
@@ -106,7 +112,10 @@ impl IceServerConfig {
             }
         }
 
-        if let Some(local_ip) = self.local_ip {
+        if self.relay_only {
+            webrtcbin.set_property_from_str("ice-transport-policy", "relay");
+        }
+        for local_ip in &self.local_ips {
             // `ice-agent`, not `ice`. The agent has never been exposed under
             // the latter name, and `property()` *panics* on a name webrtcbin
             // does not have — which took down the peer's event worker on every
@@ -126,6 +135,7 @@ impl IceServerConfig {
                 eprintln!(
                     "[DeskLink] webrtcbin exposes no `{ICE_AGENT_PROPERTY}`; gathering on all interfaces"
                 );
+                break;
             }
         }
     }
@@ -175,7 +185,7 @@ mod tests {
 
         // And the restriction path itself must not panic.
         let config = IceServerConfig {
-            local_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+            local_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
             ..IceServerConfig::default()
         };
         config.apply_to(&webrtcbin);

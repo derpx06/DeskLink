@@ -25,6 +25,7 @@ mod phone_files;
 mod protocol;
 mod remote_control;
 mod transfers;
+mod tray;
 mod window;
 
 use self::application::DesklinkApplication;

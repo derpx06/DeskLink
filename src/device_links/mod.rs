@@ -1,4 +1,5 @@
 pub mod config;
+pub mod connection_log;
 pub mod core;
 pub mod daemon;
 pub mod device;
@@ -8,6 +9,8 @@ pub mod packet;
 pub mod pairing;
 pub mod pairing_qr;
 pub mod pty;
+pub mod relay_link;
+pub mod session_lock;
 pub mod transport;
 pub mod webrtc;
 

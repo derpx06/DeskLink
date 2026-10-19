@@ -175,6 +175,9 @@ pub struct ControlMessage {
     /// `screen-ready`: how many screens are shared (the phone offers a
     /// switch when there is more than one).
     pub screen_count: Option<i32>,
+    /// `request-view` / `request-control`: the session password, when the
+    /// desktop has one set. See `session_lock`.
+    pub password: Option<String>,
 }
 
 impl ControlMessage {
@@ -205,6 +208,7 @@ impl ControlMessage {
             screen_rotation: None,
             editable: None,
             screen_count: None,
+            password: None,
         }
     }
 
@@ -262,6 +266,9 @@ impl ControlMessage {
         if let Some(count) = self.screen_count {
             root.insert("screenCount".into(), Value::from(count));
         }
+        if let Some(password) = &self.password {
+            root.insert("password".into(), Value::from(password.clone()));
+        }
         serde_json::to_vec(&Value::Object(root)).unwrap_or_default()
     }
 
@@ -306,6 +313,7 @@ impl ControlMessage {
             screen_rotation: number("screenRotation").map(|value| value as i32),
             editable: object.get("editable").and_then(Value::as_bool),
             screen_count: number("screenCount").map(|value| value.clamp(0, 16) as i32),
+            password: optional_text("password"),
         })
     }
 
@@ -349,6 +357,11 @@ impl ControlMessage {
             .is_some_and(|reason| reason.len() > 1024)
         {
             return Err("Remote-session reason is too long".to_string());
+        }
+        if self.password.as_ref().is_some_and(|password| {
+            password.len() > crate::device_links::session_lock::MAX_PASSWORD_BYTES
+        }) {
+            return Err("Remote-session password is too long".to_string());
         }
         if let (Some(width), Some(height)) = (self.screen_width, self.screen_height) {
             if !(1..=8192).contains(&width) || !(1..=8192).contains(&height) {

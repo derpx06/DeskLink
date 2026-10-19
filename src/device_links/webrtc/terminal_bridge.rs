@@ -21,6 +21,7 @@
 //! one entry point and it checks before touching a bridge or the registry;
 //! [`revoke_device`] is the way back out.
 
+use crate::device_links::connection_log::{self, ConnectionEvent};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Once, OnceLock};
@@ -31,7 +32,7 @@ use portable_pty::CommandBuilder;
 use super::terminal_protocol::{
     ChunkKind, TerminalAction, TerminalChunk, TerminalControl, TerminalSessionInfo,
     MAX_TERMINAL_CHUNK_BYTES, TERMINAL_CHUNK_MESSAGE_TYPE, TERMINAL_CONTROL_MESSAGE_TYPE,
-    TERMINAL_NOT_ALLOWED,
+    TERMINAL_ENDED, TERMINAL_NOT_ALLOWED,
 };
 use super::{WebRtcChannel, WebRtcEnvelope, WebRtcWireBinding};
 use crate::device_links::config::terminal_access_allowed;
@@ -83,6 +84,13 @@ fn audit(what: &str, device_id: &str, terminal_id: Option<&str>) {
         "[DeskLink] Terminal {what} device={device_id:?} terminal={:?}",
         terminal_id.unwrap_or("-")
     );
+    match what {
+        "attach" => connection_log::record(device_id, ConnectionEvent::TerminalAttached),
+        "detach" | "revoke-detach" => {
+            connection_log::record(device_id, ConnectionEvent::TerminalDetached)
+        }
+        _ => {}
+    }
 }
 
 /// A client's view of one session.
@@ -519,6 +527,11 @@ impl TerminalBridge {
     /// sessions themselves are untouched: they belong to the desktop user and
     /// keep running.
     pub(crate) fn revoke(&mut self, registry: &mut TerminalRegistry) {
+        self.end(registry, TERMINAL_NOT_ALLOWED);
+    }
+
+    /// Like [`Self::revoke`], but `reason` says why; access is not involved.
+    pub(crate) fn end(&mut self, registry: &mut TerminalRegistry, reason: &str) {
         self.outbox.clear();
         self.outbox_bytes = 0;
         for (id, attachment) in std::mem::take(&mut self.attached) {
@@ -526,11 +539,11 @@ impl TerminalBridge {
             audit("revoke-detach", self.device(), Some(&id));
             let mut closed = TerminalControl::new(TerminalAction::Closed, &self.wire);
             closed.terminal_id = Some(id);
-            closed.error = Some(TERMINAL_NOT_ALLOWED.to_string());
+            closed.error = Some(reason.to_string());
             self.queue_always(TerminalEvent::SendControl(closed));
         }
         registry.release_writer(&self.wire.peer_device_id);
-        let error = error_event(&self.wire, None, TERMINAL_NOT_ALLOWED.to_string());
+        let error = error_event(&self.wire, None, reason.to_string());
         self.queue_always(error);
         audit("revoke", self.device(), None);
     }
@@ -714,6 +727,20 @@ pub(crate) fn process_envelope(
             if !terminal_access_allowed(&wire.peer_device_id) {
                 return with_open_bridge(wire, |bridge| bridge.deny(control.terminal_id.clone()));
             }
+            // Leaving is always allowed; everything else needs the session
+            // password when one is set. Checked outside every lock: hashing
+            // takes a moment.
+            if control.action != TerminalAction::Detach {
+                if let Err(reason) = crate::device_links::session_lock::check(
+                    &wire.peer_device_id,
+                    wire.generation,
+                    control.password.as_deref(),
+                ) {
+                    return with_open_bridge(wire, |bridge| {
+                        bridge.refuse(control.terminal_id.clone(), &reason)
+                    });
+                }
+            }
             with_bridge(wire, |bridge, registry| {
                 bridge.handle_control(&control, registry)
             })
@@ -723,7 +750,12 @@ pub(crate) fn process_envelope(
             // Dropped without a reply: a phone typing into a terminal it has no
             // right to has already been told, and an answer per keystroke chunk
             // would only feed the channel a flood.
-            if !terminal_access_allowed(&wire.peer_device_id) {
+            if !terminal_access_allowed(&wire.peer_device_id)
+                || !crate::device_links::session_lock::is_unlocked(
+                    &wire.peer_device_id,
+                    wire.generation,
+                )
+            {
                 return Ok(());
             }
             with_bridge(wire, |bridge, registry| {
@@ -760,6 +792,18 @@ pub(crate) fn revoke_device(device_id: &str) {
     };
     match open.get_mut(device_id) {
         Some(bridge) => bridge.revoke(&mut registry),
+        None => registry.release_writer(device_id),
+    }
+}
+
+/// Detaches `device_id` from every terminal it watches, keeping its access:
+/// "End phone sessions" at the desk. The sessions keep running.
+pub(crate) fn end_device_sessions(device_id: &str) {
+    let (Ok(mut open), Ok(mut registry)) = (bridges().lock(), registry().lock()) else {
+        return;
+    };
+    match open.get_mut(device_id) {
+        Some(bridge) => bridge.end(&mut registry, TERMINAL_ENDED),
         None => registry.release_writer(device_id),
     }
 }
@@ -845,6 +889,8 @@ fn sessions_event(wire: &WebRtcWireBinding, registry: &mut TerminalRegistry) -> 
             })
             .collect(),
     );
+    let launchers = crate::device_links::pty::launchers::installed();
+    message.launchers = (!launchers.is_empty()).then_some(launchers);
     TerminalEvent::SendControl(message)
 }
 

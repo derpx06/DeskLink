@@ -93,6 +93,15 @@ pub struct SftpStatus {
     pub error: Option<String>,
 }
 
+/// A phone's use of this computer's screen.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DesktopSession {
+    #[default]
+    None,
+    Viewing,
+    Controlling,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceView {
     pub id: String,
@@ -116,6 +125,9 @@ pub struct DeviceView {
     /// How many terminals this device is watching right now.
     #[serde(default)]
     pub terminal_sessions_attached: usize,
+    /// What this device is doing with this computer's screen right now.
+    #[serde(default)]
+    pub desktop_session: DesktopSession,
     pub verification_key: Option<String>,
     pub last_error: Option<String>,
     pub media_status: Option<MediaStatus>,
@@ -144,6 +156,7 @@ impl DeviceView {
             feature_transport_ready: false,
             terminal_access: false,
             terminal_sessions_attached: 0,
+            desktop_session: DesktopSession::None,
             verification_key: None,
             last_error: None,
             media_status: None,

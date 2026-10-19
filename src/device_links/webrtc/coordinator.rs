@@ -4,6 +4,7 @@
 //! `webrtcbin` events back into those signed records. Feature envelopes are
 //! deliberately handled by the shared dispatcher, not here.
 
+use crate::device_links::connection_log::{self, ConnectionEvent};
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -158,9 +159,42 @@ fn ice_config_for(binding: &SessionBinding, config: &Arc<Mutex<Config>>) -> IceS
         .ok()
         .map(|config| config.ice_servers())
         .unwrap_or_default();
-    ice.local_ip = binding.link.local_ip();
+    let settings = crate::device_links::config::app_settings();
+    match binding.link.local_ip() {
+        Some(ip) => ice.local_ips = vec![ip],
+        // Bootstrapped through the relay: the internet path, with STUN for
+        // the public address and, if allowed, TURN for when nothing direct
+        // works.
+        None => {
+            use crate::device_links::relay_link::{client, route};
+            ice.local_ips = route::default_route_addresses();
+            let relay_servers = if settings.use_turn {
+                client::ice_servers_for(&binding.device_id)
+            } else {
+                Vec::new()
+            };
+            let (stun, turn) = client::webrtcbin_uris(&relay_servers);
+            if ice.stun_servers.is_empty() {
+                ice.stun_servers = stun;
+            }
+            if ice.stun_servers.is_empty() {
+                ice.stun_servers.push(DEFAULT_STUN_SERVER.to_string());
+            }
+            ice.turn_servers.extend(turn);
+        }
+    }
+    if !settings.use_turn {
+        ice.turn_servers.clear();
+    }
+    ice.relay_only =
+        cfg!(debug_assertions) && std::env::var("DESKLINK_ICE_RELAY_ONLY").as_deref() == Ok("1");
     ice
 }
+
+/// STUN for relay-bootstrapped peers when neither the relay nor the user
+/// supplied one: the same provider as the default TURN service. Never used on
+/// the LAN, which needs no server.
+const DEFAULT_STUN_SERVER: &str = "stun://stun.cloudflare.com:3478";
 
 /// Starts the deterministic desktop-initiated negotiation, or asks the
 /// deterministic remote initiator to rebuild its peer after this desktop
@@ -1380,12 +1414,41 @@ fn authorize_desktop_remote_input(
     Ok(actions)
 }
 
+/// What `device_id` is doing with this computer's screen, for the UI.
+pub(crate) fn desktop_session(device_id: &str) -> crate::device_links::device::DesktopSession {
+    use crate::device_links::device::DesktopSession;
+    let sharing = desktop_portal_services()
+        .lock()
+        .is_ok_and(|services| services.contains_key(device_id));
+    match (sharing, peer_input_active(device_id)) {
+        (false, _) => DesktopSession::None,
+        (true, false) => DesktopSession::Viewing,
+        (true, true) => DesktopSession::Controlling,
+    }
+}
+
+/// "End phone sessions": stops `device_id` viewing or controlling this screen
+/// and detaches its terminals. Pairing and consent are untouched; the phone
+/// may start again.
+pub(crate) fn end_phone_sessions(device_id: &str) {
+    let viewing = desktop_portal_services()
+        .lock()
+        .is_ok_and(|services| services.contains_key(device_id));
+    let terminals = super::terminal_bridge::attached_count(device_id) > 0;
+    if viewing || terminals {
+        connection_log::record(device_id, ConnectionEvent::SessionsEnded);
+    }
+    stop_desktop_portal_session(device_id);
+    super::terminal_bridge::end_device_sessions(device_id);
+}
+
 fn stop_desktop_portal_session(device_id: &str) {
     let service = desktop_portal_services()
         .lock()
         .ok()
         .and_then(|mut services| services.remove(device_id));
     if let Some(service) = service {
+        connection_log::record(device_id, ConnectionEvent::ScreenSessionEnded);
         // Cancelling too: a worker still waiting on the consent dialog never
         // reads the `Stop` command until that dialog is answered.
         service
@@ -2275,13 +2338,34 @@ fn handle_peer_envelope(
                 super::screen::clear_stream(&wire.peer_device_id);
                 return Ok(());
             }
-            if let Err(error) = start_desktop_portal_session(
+            if let Err(reason) = crate::device_links::session_lock::check(
+                &wire.peer_device_id,
+                wire.generation,
+                message.password.as_deref(),
+            ) {
+                let mut denied = remote_session::ControlMessage::new(
+                    remote_session::ControlKind::ViewDenied,
+                    attempt_id,
+                    wire,
+                    &message.remote_session_id,
+                    sequence,
+                    now_millis(),
+                );
+                denied.reason = Some(reason);
+                send_remote_session_message(&peer, wire, &denied)?;
+                return Ok(());
+            }
+            let started = start_desktop_portal_session(
                 wire.peer_device_id.clone(),
                 message.remote_session_id.clone(),
                 attempt_id.to_string(),
                 wire.clone(),
                 peer.clone(),
-            ) {
+            );
+            if started.is_ok() {
+                connection_log::record(&wire.peer_device_id, ConnectionEvent::ScreenViewStarted);
+            }
+            if let Err(error) = started {
                 let mut denied = remote_session::ControlMessage::new(
                     remote_session::ControlKind::ViewDenied,
                     attempt_id,
@@ -2314,6 +2398,13 @@ fn handle_peer_envelope(
                 .map_err(|error| error.to_string())?;
             let lease_id = Uuid::new_v4().to_string();
             let expires_at = now_millis() + remote_session::LEASE_LIFETIME.as_millis() as i64;
+            // Checked before the session lock: hashing takes a moment, and the
+            // GTK main loop takes that lock too.
+            let unlocked = crate::device_links::session_lock::check(
+                &wire.peer_device_id,
+                wire.generation,
+                message.password.as_deref(),
+            );
             let response = {
                 let mut open = remote_session::sessions()
                     .lock()
@@ -2328,7 +2419,7 @@ fn handle_peer_envelope(
                             .is_some_and(|service| service.can_control)
                     })
                     .unwrap_or(false);
-                let grant = can_control && authorization.is_ok();
+                let grant = can_control && authorization.is_ok() && unlocked.is_ok();
                 if !grant {
                     eprintln!(
                         "[DeskLink] Denying phone control for {}: portal_can_control={}, session_authorized={}, reason={}",
@@ -2339,6 +2430,10 @@ fn handle_peer_envelope(
                     );
                 }
                 if grant {
+                    connection_log::record(
+                        &wire.peer_device_id,
+                        ConnectionEvent::ScreenControlStarted,
+                    );
                     session.grant_peer_control(
                         lease_id.clone(),
                         wire.peer_device_id.clone(),
@@ -2366,17 +2461,18 @@ fn handle_peer_envelope(
                     response.owner_device_id = Some(wire.peer_device_id.clone());
                     response.lease_expires_at = Some(expires_at);
                 } else {
-                    response.reason = Some(authorization.err().unwrap_or_else(|| {
-                        if can_control {
-                            "The approved desktop-control session is not active".to_string()
-                        } else {
-                            // The portal was approved for the picture only.
-                            "The computer shared its screen without control. Reopen the \
+                    response.reason =
+                        Some(unlocked.err().or(authorization.err()).unwrap_or_else(|| {
+                            if can_control {
+                                "The approved desktop-control session is not active".to_string()
+                            } else {
+                                // The portal was approved for the picture only.
+                                "The computer shared its screen without control. Reopen the \
                              screen and, on the computer, turn on \"Allow remote interaction\" \
                              before sharing."
-                                .to_string()
-                        }
-                    }));
+                                    .to_string()
+                            }
+                        }));
                     let _ = session.accept(&response, now_millis());
                 }
                 response
@@ -3448,6 +3544,7 @@ mod tests {
             screen_rotation: None,
             editable: None,
             screen_count: None,
+            password: None,
         }
     }
 

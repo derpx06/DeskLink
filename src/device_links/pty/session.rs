@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use uuid::Uuid;
 
+use super::launchers;
 use super::ring::{OutputRing, RING_BYTES};
 
 /// Bytes taken from the PTY per read. Matches what sshx and RustDesk use; large
@@ -193,9 +194,20 @@ impl PtySession {
         // emulator does: $SHELL if it is executable, else the password
         // database, with `-basename` as argv[0] so profile scripts run and the
         // user's PATH additions actually exist.
-        let command = restricted(command.unwrap_or_else(CommandBuilder::new_default_prog));
+        let mut command = restricted(command.unwrap_or_else(CommandBuilder::new_default_prog));
 
         let title = describe(&command);
+        // A bare name ("claude") runs from the login shell's PATH, and the
+        // program gets that PATH too, so it can find its own helpers.
+        if !command.is_default_prog() {
+            let program = command.get_argv().first().cloned().unwrap_or_default();
+            if let (Some(resolved), Some(path)) =
+                (launchers::resolve(&program), launchers::login_path())
+            {
+                command.get_argv_mut()[0] = resolved.into_os_string();
+                command.env("PATH", path);
+            }
+        }
         let child = pair
             .slave
             .spawn_command(command)

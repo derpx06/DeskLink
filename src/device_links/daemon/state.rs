@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::handle::DaemonEvent;
+use crate::device_links::connection_log::{self, ConnectionEvent};
 use crate::device_links::core::DeviceConnection;
 use crate::device_links::device::{
     BatteryStatus, DeviceNotification, DeviceStatus, DeviceView, MediaStatus, RemoteCommand,
@@ -78,8 +79,20 @@ pub(crate) fn reconcile_connection_status(
     for (device_id, device) in devices.iter_mut() {
         let connection = by_id.get(device_id.as_str());
         let reachable = connection.is_some_and(|connection| connection.is_reachable());
-        device.feature_transport_ready = connection
+        let ready = connection
             .is_some_and(|connection| connection.feature_transport_ready && connection.paired);
+        if ready != device.feature_transport_ready {
+            connection_log::remember_name(device_id, &device.name);
+            connection_log::record(
+                device_id,
+                if ready {
+                    ConnectionEvent::Connected
+                } else {
+                    ConnectionEvent::Disconnected
+                },
+            );
+        }
+        device.feature_transport_ready = ready;
 
         let awaiting_pair_decision = matches!(
             device.status,

@@ -12,7 +12,7 @@ use super::validation::{connect_to_device, should_throttle_connection};
 use super::DaemonWorker;
 use crate::device_links::config::Config;
 use crate::device_links::core::DeviceManager;
-use crate::device_links::device::DeviceView;
+use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_IDENTITY};
 
@@ -77,6 +77,7 @@ impl DaemonWorker {
         let config = Arc::clone(&self.config);
         let errors = Arc::clone(&self.errors);
         let shutdown = Arc::clone(&self.shutdown);
+        let devices = Arc::clone(&self.devices);
         let tcp_port = self.tcp_port;
         thread::spawn(move || {
             // Burst at 0, 1, 3 and 7 s, then every 15 s. A single startup
@@ -87,6 +88,7 @@ impl DaemonWorker {
                 if let Err(error) = broadcast_identity(&config, tcp_port) {
                     push_error(&errors, error);
                 }
+                beacon_unreachable_paired(&config, &devices, tcp_port);
                 let wait_ms = BEACON_BURST_GAPS_MS.get(sent).copied().unwrap_or(15_000);
                 sent = sent.saturating_add(1);
                 for _ in 0..wait_ms / 250 {
@@ -176,6 +178,47 @@ pub(super) fn broadcast_identity(config: &Arc<Mutex<Config>>, tcp_port: u16) -> 
         )
         .map_err(|err| err.to_string())?;
     Ok(())
+}
+
+/// Sends the identity beacon straight to each paired device that is not
+/// reachable, at the address it was last seen on. Access points that filter
+/// broadcast (and multicast) still pass unicast, and the phone dials back on
+/// any beacon it hears.
+// ponytail: last addresses live in memory only; persist them if cold starts
+// on broadcast-filtering networks turn out to matter.
+fn beacon_unreachable_paired(
+    config: &Arc<Mutex<Config>>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    tcp_port: u16,
+) {
+    let targets: Vec<std::net::IpAddr> = devices
+        .lock()
+        .map(|devices| {
+            devices
+                .values()
+                .filter(|device| device.trusted && device.status == DeviceStatus::Unreachable)
+                .filter_map(|device| device.address.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    if targets.is_empty() {
+        return;
+    }
+    let Ok(packet) = config.lock().map_err(|_| ()).and_then(|config| {
+        config
+            .local_device_info()
+            .to_identity_packet(tcp_port)
+            .serialize_line()
+            .map_err(|_| ())
+    }) else {
+        return;
+    };
+    let Ok(socket) = UdpSocket::bind(("0.0.0.0", 0)) else {
+        return;
+    };
+    for ip in targets {
+        let _ = socket.send_to(&packet, (ip, UDP_PORT));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

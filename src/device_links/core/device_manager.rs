@@ -460,6 +460,24 @@ impl DeviceManager {
         !self.has_live_bootstrap_link(device_id) && !self.has_ready_webrtc(device_id)
     }
 
+    /// Whether `device_id`'s live bootstrap link is a relay link (it has no
+    /// local address, unlike a LAN socket).
+    pub fn bootstrap_is_relay(&self, device_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| {
+                let session = sessions.get(device_id)?;
+                let link = session.active_link.as_ref()?;
+                Some(
+                    session.state != SessionState::Terminated
+                        && !link.is_closed()
+                        && link.local_ip().is_none(),
+                )
+            })
+            .unwrap_or(false)
+    }
+
     pub fn has_live_bootstrap_link(&self, device_id: &str) -> bool {
         self.sessions
             .lock()

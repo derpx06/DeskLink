@@ -919,7 +919,7 @@ mod tests {
 
         // Both users are shown the same code, computed from the two real keys.
         assert_eq!(desktop.verification_key(), phone.verification_key());
-        assert_eq!(desktop.verification_key().len(), 8);
+        assert_eq!(desktop.verification_key().len(), 6);
 
         phone.accept();
         assert_eq!(phone.pair_state(), PairState::Paired);

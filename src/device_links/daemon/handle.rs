@@ -9,8 +9,8 @@ use super::DaemonWorker;
 use crate::device_links::config::terminal_access_allowed;
 use crate::device_links::device::DeviceView;
 use crate::device_links::webrtc::file_browser::{self, BrowserRequest, BrowserResponse};
-use crate::device_links::webrtc::terminal_bridge;
 use crate::device_links::webrtc::transfer_board::{self, Finished, TransferRow};
+use crate::device_links::webrtc::{coordinator, terminal_bridge};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DaemonEvent {
@@ -94,6 +94,7 @@ impl DaemonHandle {
         for device in &mut devices {
             device.terminal_access = terminal_access_allowed(&device.id);
             device.terminal_sessions_attached = terminal_bridge::attached_count(&device.id);
+            device.desktop_session = coordinator::desktop_session(&device.id);
         }
         devices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         devices

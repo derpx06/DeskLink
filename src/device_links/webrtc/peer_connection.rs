@@ -1262,7 +1262,7 @@ a=max-message-size:262144\r\n";
     /// other, everything else is handed to the test.
     pub(crate) fn loopback() -> Loopback {
         let ice = IceServerConfig {
-            local_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+            local_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
             ..IceServerConfig::default()
         };
         let (offerer_tx, offerer_raw) = mpsc::channel();

@@ -21,6 +21,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use super::session::{PtySession, Resync};
@@ -85,6 +86,13 @@ pub(crate) fn parse_attach(line: &str) -> Option<(String, u16, u16)> {
 
 /// Starts accepting desk clients. Called once, at startup.
 pub(crate) fn start_server() {
+    // The login-shell probe can take a moment; pay it now, not in the first
+    // session list the phone asks for.
+    let _ = thread::Builder::new()
+        .name("desklink-login-path".into())
+        .spawn(|| {
+            super::launchers::login_path();
+        });
     let path = socket_path();
     let Some(dir) = path.parent() else { return };
     if std::fs::create_dir_all(dir).is_err()

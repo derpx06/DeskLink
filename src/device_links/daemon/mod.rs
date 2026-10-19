@@ -74,6 +74,7 @@ pub mod handshake;
 pub mod network;
 pub mod packet_handler;
 pub mod pairing_commands;
+mod power;
 pub mod state;
 #[cfg(test)]
 pub mod test_peer;
@@ -152,8 +153,18 @@ impl DaemonWorker {
         let devices = Arc::clone(&self.devices);
         let sessions = Arc::clone(&self.sessions);
         let shutdown = Arc::clone(&self.shutdown);
+        let config = Arc::clone(&self.config);
+        let errors = Arc::clone(&self.errors);
         thread::spawn(move || {
+            let mut stay_awake = power::StayAwake::default();
             while !shutdown.load(Ordering::Acquire) {
+                let wanted = super::config::app_settings().stay_awake
+                    && config
+                        .lock()
+                        .is_ok_and(|config| config.has_trusted_devices());
+                if let Err(error) = stay_awake.apply(wanted) {
+                    state::push_error(&errors, error);
+                }
                 // A pairing negotiation nobody answered is abandoned on the
                 // same tick, so the prompt clears without waiting for the
                 // device to go unreachable — and the peer is told, so it stops
@@ -172,9 +183,25 @@ impl DaemonWorker {
         self.start_mdns_advertiser();
         self.start_clipboard_listener();
         self.start_status_reconciler();
+        crate::device_links::relay_link::client::start(
+            crate::device_links::relay_link::client::Context {
+                config: Arc::clone(&self.config),
+                devices: Arc::clone(&self.devices),
+                sessions: Arc::clone(&self.sessions),
+                events: Arc::clone(&self.events),
+                shutdown: Arc::clone(&self.shutdown),
+                relay_url: None,
+            },
+        );
 
         while let Ok(command) = self.command_rx.recv() {
-            eprintln!("[Daemon] Received command: {:?}", command);
+            match &command {
+                // Never log a password.
+                DaemonCommand::SetSessionPassword(_) => {
+                    eprintln!("[Daemon] Received command: SetSessionPassword(<redacted>)")
+                }
+                other => eprintln!("[Daemon] Received command: {other:?}"),
+            }
             if self.handle_command(command) {
                 break;
             }

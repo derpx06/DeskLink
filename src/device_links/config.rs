@@ -43,6 +43,83 @@ struct StoredConfig {
     ice_stun_servers: Vec<String>,
     #[serde(default)]
     ice_turn_servers: Vec<String>,
+    #[serde(default)]
+    settings: AppSettings,
+}
+
+/// App-wide preferences, changed from the Preferences window.
+///
+/// Every field defaults so a config written before it existed still loads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AppSettings {
+    /// Keep the computer awake, lid closed included, while a phone is paired,
+    /// so it stays reachable from that phone.
+    pub stay_awake: bool,
+    /// Asked of a phone before it may use the screen or terminals. `None`
+    /// means pairing alone is enough.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_password: Option<crate::device_links::session_lock::PasswordHash>,
+    /// Reach paired phones through the DeskLink relay when they are not on
+    /// this network.
+    pub relay_enabled: bool,
+    /// A self-hosted relay (`wss://host/v1`); empty means the built-in one.
+    pub relay_url: String,
+    /// Allow media through a TURN server when no direct path exists. Off
+    /// means direct paths only, user-configured TURN servers included.
+    pub use_turn: bool,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            stay_awake: false,
+            session_password: None,
+            relay_enabled: true,
+            relay_url: String::new(),
+            use_turn: true,
+        }
+    }
+}
+
+/// The relay used when the user has not set one. Release builds set
+/// `DESKLINK_RELAY_URL` at build time to the deployed server
+/// (relay/deploy/DEPLOY.md).
+pub const DEFAULT_RELAY_URL: &str = match option_env!("DESKLINK_RELAY_URL") {
+    Some(url) => url,
+    None => "wss://relay.desklink.example/v1",
+};
+
+impl AppSettings {
+    pub fn relay_url(&self) -> &str {
+        if self.relay_url.trim().is_empty() {
+            DEFAULT_RELAY_URL
+        } else {
+            self.relay_url.trim()
+        }
+    }
+}
+
+/// The current [`AppSettings`], readable without a [`Config`]: the UI and the
+/// peer workers need them, the daemon worker owns the `Config`. Same mirror
+/// rule as terminal consent: only `Config` writes it, in the call that
+/// persists the change.
+fn settings_mirror() -> &'static Mutex<AppSettings> {
+    static MIRROR: OnceLock<Mutex<AppSettings>> = OnceLock::new();
+    MIRROR.get_or_init(Default::default)
+}
+
+pub fn app_settings() -> AppSettings {
+    settings_mirror()
+        .lock()
+        .map(|settings| settings.clone())
+        .unwrap_or_default()
+}
+
+fn mirror_settings(settings: &AppSettings) {
+    if let Ok(mut mirror) = settings_mirror().lock() {
+        *mirror = settings.clone();
+    }
 }
 
 /// Devices currently allowed a terminal, readable without a [`Config`].
@@ -137,6 +214,7 @@ impl Config {
                 trusted_devices: HashMap::new(),
                 ice_stun_servers: Vec::new(),
                 ice_turn_servers: Vec::new(),
+                settings: AppSettings::default(),
             }
         };
 
@@ -173,6 +251,7 @@ impl Config {
         for device in stored.trusted_devices.values() {
             mirror_terminal_access(&device.id, device.terminal_access);
         }
+        mirror_settings(&stored.settings);
         let config = Self {
             base_dir,
             stored,
@@ -254,6 +333,27 @@ impl Config {
         }
     }
 
+    /// Applies `change` to the settings and persists them. On a failed save
+    /// nothing changes, on disk or in memory.
+    pub fn update_settings(&mut self, change: impl FnOnce(&mut AppSettings)) -> Result<(), String> {
+        let previous = self.stored.settings.clone();
+        change(&mut self.stored.settings);
+        if let Err(error) = self.save() {
+            self.stored.settings = previous;
+            return Err(error);
+        }
+        mirror_settings(&self.stored.settings);
+        Ok(())
+    }
+
+    pub fn trusted_devices(&self) -> impl Iterator<Item = &TrustedDevice> {
+        self.stored.trusted_devices.values()
+    }
+
+    pub fn has_trusted_devices(&self) -> bool {
+        !self.stored.trusted_devices.is_empty()
+    }
+
     pub fn is_trusted(&self, device_id: &str) -> bool {
         self.stored.trusted_devices.contains_key(device_id)
     }
@@ -329,7 +429,12 @@ impl Config {
                 terminal_access,
             },
         );
-        self.save_or_restore(&info.id, previous)
+        self.save_or_restore(&info.id, previous)?;
+        if !same_identity {
+            // The relay's allow list is built from the trust store.
+            crate::device_links::relay_link::client::reset();
+        }
+        Ok(())
     }
 
     /// Saves, or puts the device's previous record back if the save fails.
@@ -364,7 +469,9 @@ impl Config {
         mirror_terminal_access(device_id, false);
         // Remote control of this desktop is a property of the pairing too.
         set_remote_desktop_token(device_id, None);
-        self.save_or_restore(device_id, previous)
+        self.save_or_restore(device_id, previous)?;
+        crate::device_links::relay_link::client::reset();
+        Ok(())
     }
 }
 
@@ -579,6 +686,41 @@ mod tests {
         let reloaded = Config::load_from_dir(dir.clone()).unwrap();
         assert!(!reloaded.stored.trusted_devices[&id].terminal_access);
         assert!(!terminal_access_allowed(&id));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Settings default off, survive a restart, and load from a config that
+    /// predates them. (The process-wide mirror is shared by every test that
+    /// loads a config, so this checks what was persisted, not the mirror.)
+    #[test]
+    fn settings_persist_and_default_off_for_configs_that_predate_them() {
+        let dir = std::env::temp_dir().join(format!("desklink-settings-{}", Uuid::new_v4()));
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        assert!(!config.stored.settings.stay_awake);
+        config
+            .update_settings(|settings| settings.stay_awake = true)
+            .unwrap();
+        drop(config);
+        assert!(
+            Config::load_from_dir(dir.clone())
+                .unwrap()
+                .stored
+                .settings
+                .stay_awake
+        );
+
+        let path = dir.join("config.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("settings");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(
+            !Config::load_from_dir(dir.clone())
+                .unwrap()
+                .stored
+                .settings
+                .stay_awake
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

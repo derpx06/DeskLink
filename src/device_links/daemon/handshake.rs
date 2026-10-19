@@ -73,6 +73,9 @@ pub(super) fn finish_secure_link(
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())?
         .is_trusted(&secure_info.id);
+    if paired && crate::device_links::relay_link::client::force_relay() {
+        return Err("LAN links are disabled for testing (DESKLINK_FORCE_RELAY)".to_string());
+    }
     // Merge, never replace. `insert` here rebuilt the `DeviceView` from the
     // identity packet, which zeroes notifications, battery, volume, media,
     // commands and sftp state — so a Wi-Fi roam blanked every summary chip.
@@ -129,6 +132,41 @@ pub(super) fn finish_secure_link(
         remote_public_der,
         secure_info,
     );
+    // A relay link is standby capacity: a working LAN socket always replaces
+    // it, even while it is live and answering.
+    let supersede_live = sessions.bootstrap_is_relay(&initial_info.id);
+    attach_bootstrap_link(
+        &initial_info.id,
+        link,
+        transport,
+        paired,
+        supersede_live,
+        config,
+        devices,
+        sessions,
+        events,
+    )
+}
+
+/// Installs an authenticated bootstrap link — a LAN TLS socket or a relay
+/// link — as `device_id`'s signaling channel, starting its reader and, for a
+/// paired WebRTC peer, the negotiation.
+///
+/// `supersede_live` skips the rule that keeps a live, answering incumbent:
+/// set when the incumbent is a relay link and a LAN socket arrives, and when
+/// a relay link must take over because the peer is signaling through it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attach_bootstrap_link(
+    device_id: &str,
+    link: SessionLink,
+    transport: Arc<dyn crate::device_links::core::LinkTransport>,
+    paired: bool,
+    supersede_live: bool,
+    config: Arc<Mutex<Config>>,
+    devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    sessions: Arc<DeviceManager>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
+) -> Result<(), String> {
     // Android may refresh the short-lived LAN bootstrap socket while its
     // authenticated WebRTC peer is healthy.  That socket must not become a
     // second session: discarding it preserves the existing generation and
@@ -154,26 +192,27 @@ pub(super) fn finish_secure_link(
     // Syncthing still lacks (issue #9337) and the reason a zombie cannot block
     // its own replacement here.
     let incumbent_is_answering = sessions
-        .silence(&initial_info.id)
+        .silence(device_id)
         .is_some_and(|silence| silence < super::HEARTBEAT_IDLE * 2);
     // A new restart epoch means the peer's previous process — and with it the
     // WebRTC peer this session holds — is gone. Neither keep the old socket
     // nor adopt into the old session: register, which clears the dead peer.
-    let restarted = sessions.peer_restarted(&initial_info.id, link.info.instance_id.as_deref());
+    let restarted = sessions.peer_restarted(device_id, link.info.instance_id.as_deref());
     if restarted {
         eprintln!(
             "[DL-WRTC-BOOT] {} restarted (new instance); replacing its session",
-            initial_info.id
+            device_id
         );
     }
     if !restarted
-        && sessions.has_ready_webrtc(&initial_info.id)
-        && sessions.has_live_bootstrap_link(&initial_info.id)
+        && !supersede_live
+        && sessions.has_ready_webrtc(device_id)
+        && sessions.has_live_bootstrap_link(device_id)
         && incumbent_is_answering
     {
         eprintln!(
             "[DL-WRTC-BOOT] ignoring refreshed bootstrap socket for {}; retaining feature-ready WebRTC session",
-            initial_info.id
+            device_id
         );
         link.close();
         return Ok(());
@@ -192,10 +231,10 @@ pub(super) fn finish_secure_link(
     // Android already treats a replacement LAN connection as signaling
     // capacity only (`onConnectionReceived`'s retained binding); this is the
     // desktop half of the same rule.
-    let adopted = if restarted {
+    let adopted = if restarted || supersede_live {
         None
     } else {
-        sessions.adopt_bootstrap_link(&initial_info.id, &transport)
+        sessions.adopt_bootstrap_link(device_id, &transport)
     };
     if let Some(binding) = adopted {
         eprintln!(
@@ -219,7 +258,7 @@ pub(super) fn finish_secure_link(
     }
 
     let registration = sessions
-        .register_link(initial_info.id.clone(), link, paired)
+        .register_link(device_id.to_string(), link, paired)
         .map_err(|error| error.to_string())?;
     if let Some(replaced) = registration.replaced_link {
         replaced.close();

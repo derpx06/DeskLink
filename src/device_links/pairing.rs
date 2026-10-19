@@ -236,12 +236,20 @@ impl PairingHandler {
         bytes.extend(second);
         bytes.extend(timestamp.to_string().as_bytes());
         let digest = hash(MessageDigest::sha256(), &bytes).expect("sha256 is available");
-        hex_upper(&digest)[..8].to_string()
+        six_digits(&digest)
     }
 
     pub fn timestamp(&self) -> i64 {
         self.timestamp
     }
+}
+
+/// A six-digit code both screens show during pairing: the first four digest
+/// bytes, big-endian, mod 10^6, zero-padded. Digits read aloud and compare more
+/// reliably than hex, and the code is never truncated on either side.
+fn six_digits(digest: &[u8]) -> String {
+    let value = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]);
+    format!("{:06}", value % 1_000_000)
 }
 
 /// Whether an incoming pair packet needs an acknowledgement sent back.
@@ -271,10 +279,6 @@ fn unix_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default()
-}
-
-fn hex_upper(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 #[cfg(test)]
@@ -488,7 +492,9 @@ mod tests {
         let first = PairingHandler::verification_key(b"aaa", b"bbb", 42);
         let second = PairingHandler::verification_key(b"bbb", b"aaa", 42);
         assert_eq!(first, second);
-        assert_eq!(first.len(), 8);
+        // Pinned on Android too (PairingHandlerTest): the first four digest
+        // bytes, big-endian, mod 10^6.
+        assert_eq!(first, "087037");
     }
 
     #[test]

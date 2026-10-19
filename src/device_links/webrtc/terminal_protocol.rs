@@ -32,6 +32,9 @@ pub const TERMINAL_CHUNK_MESSAGE_TYPE: &str = "desklink.terminal.chunk.v1";
 /// attached to. A phone should show "ask for terminal access on the computer"
 /// rather than retry.
 pub const TERMINAL_NOT_ALLOWED: &str = "terminal-not-allowed";
+/// The desk ended this phone's terminal sessions ("End phone sessions").
+/// Access is unchanged; the phone may attach again.
+pub const TERMINAL_ENDED: &str = "terminal-ended";
 
 /// Terminal **data** bytes per frame — what a [`TerminalChunk`] may carry.
 ///
@@ -126,6 +129,14 @@ pub struct TerminalControl {
     pub command: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sessions: Option<Vec<TerminalSessionInfo>>,
+    /// Agent CLIs installed at the desk (`"claude"`, `"codex"`), sent with
+    /// `Sessions` so the phone can offer them as one-tap sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launchers: Option<Vec<String>>,
+    /// The session password, from a phone, when the desktop has one set.
+    /// See `session_lock`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_status: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -146,6 +157,8 @@ impl TerminalControl {
             offset: None,
             command: None,
             sessions: None,
+            launchers: None,
+            password: None,
             exit_status: None,
             error: None,
         }
@@ -198,6 +211,11 @@ impl TerminalControl {
         validate_dimensions(self.rows, self.cols)?;
         if let Some(command) = &self.command {
             validate_command(command)?;
+        }
+        if self.password.as_ref().is_some_and(|password| {
+            password.len() > crate::device_links::session_lock::MAX_PASSWORD_BYTES
+        }) {
+            return Err("DeskLink terminal password is too long".to_string());
         }
         if self.error.as_ref().is_some_and(|error| error.len() > 1024) {
             return Err("DeskLink terminal error is too long".to_string());

@@ -42,6 +42,22 @@ pub enum DaemonCommand {
     SendLockRequest(String, bool),
     /// Allow or stop a paired phone opening terminals on this computer.
     SetTerminalAccess(String, bool),
+    /// Keep this computer awake while a phone is paired.
+    SetStayAwake(bool),
+    /// Relay on/off and its address ("" = the built-in one).
+    SetRelay {
+        enabled: bool,
+        url: String,
+    },
+    /// Allow TURN when no direct path exists.
+    SetUseTurn(bool),
+    /// The network changed: reconnect the relay now.
+    NetworkChanged,
+    /// Set, change (`Some`) or remove (`None`) the session password.
+    SetSessionPassword(Option<String>),
+    /// Stop phones viewing/controlling this screen and detach their
+    /// terminals: one device, or every device with `None`.
+    EndPhoneSessions(Option<String>),
     SendFindPhone(String),
     SendMprisAction(String, String, String),
     RequestMprisStatus(String, Option<String>),
@@ -117,6 +133,22 @@ impl DaemonWorker {
             DaemonCommand::SendShareText(id, text) => self.send_share_text(&id, &text),
             DaemonCommand::SendLockRequest(id, lock) => self.send_lock_request(&id, lock),
             DaemonCommand::SetTerminalAccess(id, allowed) => self.set_terminal_access(&id, allowed),
+            DaemonCommand::EndPhoneSessions(device_id) => self.end_phone_sessions(device_id),
+            DaemonCommand::SetSessionPassword(password) => self.set_session_password(password),
+            DaemonCommand::SetRelay { enabled, url } => {
+                self.update_settings(|settings| {
+                    settings.relay_enabled = enabled;
+                    settings.relay_url = url;
+                });
+                crate::device_links::relay_link::client::reset();
+            }
+            DaemonCommand::SetUseTurn(on) => {
+                self.update_settings(|settings| settings.use_turn = on)
+            }
+            DaemonCommand::NetworkChanged => crate::device_links::relay_link::client::reset(),
+            DaemonCommand::SetStayAwake(on) => {
+                self.update_settings(|settings| settings.stay_awake = on)
+            }
             DaemonCommand::SendFindPhone(id) => self.send_find_phone(&id),
             DaemonCommand::SendMprisAction(id, player, action) => {
                 self.send_mpris_action(&id, &player, &action)
@@ -253,6 +285,53 @@ impl DaemonWorker {
                 device_id,
                 format!("Could not change terminal access: {error}"),
             );
+        }
+    }
+
+    fn end_phone_sessions(&self, device_id: Option<String>) {
+        let ids: Vec<String> = match device_id {
+            Some(id) => vec![id],
+            None => self
+                .devices
+                .lock()
+                .map(|devices| devices.keys().cloned().collect())
+                .unwrap_or_default(),
+        };
+        for id in ids {
+            crate::device_links::webrtc::coordinator::end_phone_sessions(&id);
+        }
+    }
+
+    fn set_session_password(&self, password: Option<String>) {
+        use crate::device_links::session_lock;
+        let hash = match password.as_deref().map(session_lock::hash_password) {
+            Some(Err(error)) => {
+                push_error(&self.errors, format!("Could not set the password: {error}"));
+                return;
+            }
+            Some(Ok(hash)) => Some(hash),
+            None => None,
+        };
+        let locking = hash.is_some();
+        self.update_settings(|settings| settings.session_password = hash);
+        // Phones that proved the old password must prove the new one — and
+        // phones already in must not stay in on the strength of the old rule.
+        if let Ok(mut lock) = session_lock::shared().lock() {
+            lock.relock_all();
+        }
+        if locking {
+            self.end_phone_sessions(None);
+        }
+    }
+
+    fn update_settings(&self, change: impl FnOnce(&mut crate::device_links::config::AppSettings)) {
+        let saved = self
+            .config
+            .lock()
+            .map_err(|_| "Config lock poisoned".to_string())
+            .and_then(|mut config| config.update_settings(change));
+        if let Err(error) = saved {
+            push_error(&self.errors, format!("Could not save the setting: {error}"));
         }
     }
 

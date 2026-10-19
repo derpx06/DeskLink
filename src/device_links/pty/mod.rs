@@ -5,6 +5,7 @@
 //! build keeps building while the phone is in a pocket.
 
 pub(crate) mod desk;
+pub(crate) mod launchers;
 pub(crate) mod registry;
 pub(crate) mod ring;
 pub(crate) mod session;
