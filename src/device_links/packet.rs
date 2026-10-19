@@ -7,6 +7,9 @@ use serde_json::{Map, Value};
 pub const PROTOCOL_VERSION: i64 = 9;
 pub const PACKET_TYPE_IDENTITY: &str = "desklink.identity";
 pub const PACKET_TYPE_PAIR: &str = "desklink.pair";
+/// QR pairing proof (phone → desktop), LAN bootstrap only. See `pairing_qr`.
+/// Must match `DeskLinkProtocol.PACKET_TYPE_PAIR_QR` on Android.
+pub const PACKET_TYPE_PAIR_QR: &str = "desklink.pair.qr";
 /// Liveness probe for the pinned-TLS bootstrap link.
 ///
 /// Deliberately not a request/response pair. Both ends probe only when the

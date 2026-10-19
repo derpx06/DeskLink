@@ -134,7 +134,13 @@ impl WebRtcSignalingMessage {
             return Err("Malformed DeskLink WebRTC signaling message".to_string());
         }
         if now.abs_diff(self.timestamp) > MAX_AGE_MILLIS as u64 {
-            return Err("Expired DeskLink WebRTC signaling message".to_string());
+            // Almost always a clock problem, not an attack: say so, because
+            // the user can fix it and nothing else will tell them.
+            return Err(
+                "Expired DeskLink WebRTC signaling message: the two devices' clocks differ by \
+                 more than 5 minutes; enable automatic time on both"
+                    .to_string(),
+            );
         }
         self.canonical_payload()?;
         Ok(())

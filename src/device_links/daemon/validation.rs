@@ -136,11 +136,21 @@ pub(super) fn connect_to_device(
     // Discovery and an inbound connection can race. If the peer became
     // authoritative after discovery scheduled this worker, do not create a
     // duplicate TLS handshake that will be discarded by Android.
-    if !sessions.wants_bootstrap_connection(&initial_info.id) {
+    // A beacon from a restarted peer must be dialled even though this side
+    // still holds a session for its dead previous process.
+    let wanted = || {
+        sessions.wants_bootstrap_connection(&initial_info.id)
+            || sessions.peer_restarted(&initial_info.id, initial_info.instance_id.as_deref())
+    };
+    if !wanted() {
         return Ok(());
     }
-    let mut stream =
-        TcpStream::connect((address.ip(), remote_port)).map_err(|err| err.to_string())?;
+    // Without a timeout a peer that vanished costs ~2 minutes of SYN retries.
+    let mut stream = TcpStream::connect_timeout(
+        &std::net::SocketAddr::new(address.ip(), remote_port),
+        Duration::from_secs(3),
+    )
+    .map_err(|err| err.to_string())?;
     // Keep the transport blocking for the complete TLS handshake. The packet
     // reader switches it to non-blocking only after the secure identity
     // exchange has completed.
@@ -158,7 +168,7 @@ pub(super) fn connect_to_device(
         .to_identity_packet(0);
     identity.set("targetDeviceId", initial_info.id.clone());
     identity.set("targetProtocolVersion", PROTOCOL_VERSION);
-    if !sessions.wants_bootstrap_connection(&initial_info.id) {
+    if !wanted() {
         return Ok(());
     }
     stream

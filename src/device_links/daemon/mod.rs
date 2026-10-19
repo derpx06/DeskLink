@@ -169,6 +169,7 @@ impl DaemonWorker {
     pub(super) fn run(self) -> Result<(), String> {
         self.start_udp_listener()?;
         self.start_broadcaster();
+        self.start_mdns_advertiser();
         self.start_clipboard_listener();
         self.start_status_reconciler();
 

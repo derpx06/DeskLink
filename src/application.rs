@@ -48,6 +48,9 @@ mod imp {
             self.parent_constructed();
             let obj = self.obj();
             self.daemon.replace(Some(DaemonHandle::start()));
+            // The desk side of shared terminals (it leaves a running
+            // instance's socket alone if this launch is a second one).
+            crate::device_links::pty::desk::start_server();
             obj.setup_gactions();
             obj.set_accels_for_action("app.quit", &["<control>q"]);
             obj.set_accels_for_action("app.shortcuts", &["<control>question"]);

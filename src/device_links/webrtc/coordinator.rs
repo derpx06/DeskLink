@@ -24,6 +24,10 @@ use crate::device_links::packet::NetworkPacket;
 
 use super::file_protocol::{FileControl, FILE_CHUNK_MESSAGE_TYPE, FILE_CONTROL_MESSAGE_TYPE};
 use super::ice::IceServerConfig;
+use super::remote_desktop_portal::{input_actions, PortalInputAction, RemoteDesktopPortal};
+use super::remote_session;
+use super::terminal_bridge::{self, TerminalEvent};
+use super::terminal_protocol::{TERMINAL_CHUNK_MESSAGE_TYPE, TERMINAL_CONTROL_MESSAGE_TYPE};
 use super::transfer_manager::{TransferEvent, WebRtcTransferManager};
 use super::{
     AuthenticationTranscript, DesktopWebRtcPeer, HandoverControlKind, HandoverControlMessage,
@@ -31,6 +35,113 @@ use super::{
     WebRtcSignalingMessage, WebRtcWireBinding, HANDOVER_MESSAGE_TYPE,
 };
 use crate::device_links::daemon::state::mark_error;
+
+/// Merges runs of pointer motion, keeping everything else in order: the latest
+/// absolute position wins, relative moves and scrolls add up. A click or key
+/// ends a run, so motion is never reordered across it.
+pub(crate) fn coalesce_motion(actions: Vec<PortalInputAction>) -> Vec<PortalInputAction> {
+    let mut merged: Vec<PortalInputAction> = Vec::with_capacity(actions.len());
+    for action in actions {
+        match (merged.last_mut(), action) {
+            (
+                Some(PortalInputAction::AbsoluteMotion(x, y)),
+                PortalInputAction::AbsoluteMotion(nx, ny),
+            ) => {
+                (*x, *y) = (nx, ny);
+            }
+            (
+                Some(PortalInputAction::RelativeMotion(dx, dy)),
+                PortalInputAction::RelativeMotion(ndx, ndy),
+            ) => {
+                (*dx, *dy) = (*dx + ndx, *dy + ndy);
+            }
+            (Some(PortalInputAction::Scroll(dx, dy)), PortalInputAction::Scroll(ndx, ndy)) => {
+                (*dx, *dy) = (*dx + ndx, *dy + ndy);
+            }
+            (_, action) => merged.push(action),
+        }
+    }
+    merged
+}
+
+enum DesktopPortalCommand {
+    Input(Vec<PortalInputAction>),
+    /// Show (and control) the next shared screen.
+    SwitchScreen,
+    Stop,
+}
+
+struct DesktopPortalService {
+    /// Distinguishes this share from a later one for the same device, so a worker
+    /// that is only now finishing can tell whether the registry entry is still
+    /// its own before it removes anything.
+    id: u64,
+    sender: mpsc::Sender<DesktopPortalCommand>,
+    can_control: bool,
+    /// Set when the share is released or replaced. A worker still waiting on
+    /// the GNOME consent dialog gives up, instead of starting a capture nobody
+    /// asked for.
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+}
+
+static NEXT_PORTAL_SERVICE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn desktop_portal_services() -> &'static Mutex<HashMap<String, DesktopPortalService>> {
+    static SERVICES: std::sync::OnceLock<Mutex<HashMap<String, DesktopPortalService>>> =
+        std::sync::OnceLock::new();
+    SERVICES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Removes `device_id`'s registry entry — but only if it is still `id`'s.
+///
+/// A worker finishing after a newer share has registered used to remove *that*
+/// share's entry by device id, which ended the new capture right after the user
+/// had approved it.
+fn remove_service_if_current(device_id: &str, id: u64) -> bool {
+    let Ok(mut services) = desktop_portal_services().lock() else {
+        return false;
+    };
+    if services
+        .get(device_id)
+        .is_some_and(|service| service.id == id)
+    {
+        services.remove(device_id);
+        true
+    } else {
+        false
+    }
+}
+
+/// Runs when a portal worker ends, **however** it ends: every early return and
+/// an unwinding panic included. The scattered per-return cleanup it replaces
+/// missed the paths that left the registry entry behind, after which every later
+/// share for the device failed as "already active".
+struct PortalWorkerCleanup {
+    device_id: String,
+    id: u64,
+    peer: Arc<DesktopWebRtcPeer>,
+}
+
+impl Drop for PortalWorkerCleanup {
+    fn drop(&mut self) {
+        remove_service_if_current(&self.device_id, self.id);
+        self.peer.stop_desktop_screen_capture_for(self.id);
+    }
+}
+
+/// A share whose capture produces nothing for this long is rebuilt. The
+/// source re-sends its last frame every 500 ms even on a still desktop, so
+/// silence means the stream died (PipeWire errors, a failed negotiation) and
+/// the phone would otherwise wait for a picture forever.
+const CAPTURE_STALL: std::time::Duration = std::time::Duration::from_secs(3);
+/// Rebuilds in a row without a frame before the share is reported failed.
+const CAPTURE_RESTARTS: u32 = 3;
+/// Scroll steps closer together than this are one gesture.
+const SCROLL_FINISH_AFTER: std::time::Duration = std::time::Duration::from_millis(150);
+
+fn desktop_capture_needed(direction: remote_session::ScreenDirection) -> bool {
+    direction == remote_session::ScreenDirection::DesktopToPhone
+}
 
 /// ICE configuration for one attempt against `binding`'s peer.
 ///
@@ -99,6 +210,9 @@ pub(crate) fn start_initiator(
         )
         .map_err(|error| error.to_string())?;
     if let Some(replaced) = replaced {
+        // The new peer cannot be feature-ready yet, so only the replaced
+        // peer's device-keyed state goes; its superseded worker skips this.
+        reset_device_webrtc_state(&binding.device_id);
         replaced.close();
     }
     spawn_event_worker(
@@ -151,6 +265,29 @@ pub(crate) fn handle_signaling_packet(
         .map_err(|error| error.to_string())?;
     if !message.verify(&remote_key) {
         return Err("Invalid paired identity signature on DeskLink WebRTC signaling".to_string());
+    }
+
+    // Restart requests are handled before the attempt-bound peer lookup: they
+    // carry the *sender's* attempt, which by definition no longer matches ours.
+    // Refusing them is what left a desktop initiator whose recovery ladder had
+    // run out unreachable forever while the LAN link stayed healthy.
+    if matches!(
+        message.message_type,
+        SignalingMessageType::IceRestart | SignalingMessageType::RestartRequest
+    ) {
+        if local_device_id >= message.from_device_id {
+            // This side answers; the initiator rebuilds on its own.
+            return Ok(());
+        }
+        // A late request about an attempt that has since been replaced must not
+        // kill the healthy newer one.
+        let active = sessions
+            .active_webrtc_attempt(binding)
+            .map_err(|error| error.to_string())?;
+        if active.is_some_and(|active| active != message.session_attempt_id) {
+            return Ok(());
+        }
+        return restart_as_initiator(binding, sessions, config, devices, events);
     }
 
     let peer = match message.message_type {
@@ -236,18 +373,45 @@ pub(crate) fn handle_signaling_packet(
             peer.end_of_candidates(0);
             Ok(())
         }
-        SignalingMessageType::IceRestart => Err(
-            "DeskLink WebRTC ICE restart is not enabled until authenticated handover is active"
-                .to_string(),
-        ),
-        SignalingMessageType::RestartRequest => {
-            Err("Unexpected DeskLink WebRTC restart request on the responder".to_string())
+        SignalingMessageType::IceRestart | SignalingMessageType::RestartRequest => {
+            unreachable!("restart requests are handled before the peer lookup")
         }
         SignalingMessageType::Close => {
             peer.close();
             Ok(())
         }
     }
+}
+
+/// Drops the current peer, resets the backoff ladder and offers afresh. Used
+/// when the responder asks for a restart: it cannot rebuild on its own.
+fn restart_as_initiator(
+    binding: &SessionBinding,
+    sessions: Arc<DeviceManager>,
+    config: Arc<Mutex<Config>>,
+    devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
+) -> Result<(), String> {
+    let replaced = sessions
+        .with_session(binding, |session| {
+            // Cap rather than reset: zeroing on every request meant a network
+            // where ICE can never succeed retried forever without the ladder
+            // ever reaching "unavailable". At the cap it retries every 30 s.
+            session.webrtc_recovery_attempt = session
+                .webrtc_recovery_attempt
+                .min(RECOVERY_BACKOFF_MILLIS.len() as u32 - 1);
+            session.clear_webrtc_state()
+        })
+        .map_err(|error| error.to_string())?;
+    if let Some(peer) = replaced {
+        reset_device_webrtc_state(&binding.device_id);
+        peer.close();
+    }
+    eprintln!(
+        "[DeskLink] Restarting WebRTC for {} at the peer's request",
+        binding.device_id
+    );
+    start_initiator(binding.clone(), sessions, config, devices, events)
 }
 
 /// Sends a paired feature through the authenticated WebRTC transport once the
@@ -315,6 +479,922 @@ pub(crate) fn send_feature_packet(
     peer.send_text(WebRtcPacketBridge::channel_for(packet), &text)
 }
 
+/// Refuses to view the phone while this desktop's own screen is being shared to
+/// it. One session per device serves both directions, so starting would
+/// overwrite the live share's session id while its capture keeps streaming.
+fn ensure_phone_view_allowed(device_id: &str) -> Result<(), String> {
+    let sharing = desktop_portal_services()
+        .lock()
+        .map(|services| services.contains_key(device_id))
+        .unwrap_or(false);
+    if sharing {
+        Err("The phone is viewing this desktop. Stop that before viewing the phone".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// What to do about a request that expired without an answer.
+#[derive(Debug, PartialEq, Eq)]
+enum ExpiredRequest {
+    /// The phone asked to see this desktop and our consent dialog is still open.
+    CancelDesktopShare,
+    /// We asked to see the phone's screen and it never answered.
+    ReleasePhoneView,
+    Nothing,
+}
+
+fn expired_request_action(
+    previous: remote_session::SessionState,
+    direction: Option<remote_session::ScreenDirection>,
+) -> ExpiredRequest {
+    match (previous, direction) {
+        (
+            remote_session::SessionState::RequestingView,
+            Some(remote_session::ScreenDirection::DesktopToPhone),
+        ) => ExpiredRequest::CancelDesktopShare,
+        (
+            remote_session::SessionState::RequestingView,
+            Some(remote_session::ScreenDirection::PhoneToDesktop),
+        ) => ExpiredRequest::ReleasePhoneView,
+        _ => ExpiredRequest::Nothing,
+    }
+}
+
+/// Ends any remote-session request that has waited too long, so nothing stays
+/// "requesting" forever on either side.
+fn expire_remote_requests(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    sessions: &Arc<DeviceManager>,
+) {
+    let expired = remote_session::sessions().lock().ok().and_then(|mut open| {
+        open.get_mut(&wire.peer_device_id).map(|session| {
+            let direction = session.direction();
+            let id = session.remote_session_id().map(str::to_string);
+            (
+                session.expire_pending(std::time::Instant::now()),
+                direction,
+                id,
+            )
+        })
+    });
+    let Some((Some(previous), direction, id)) = expired else {
+        return;
+    };
+    eprintln!("[DeskLink] Remote-session request timed out while {previous:?}");
+    match expired_request_action(previous, direction) {
+        ExpiredRequest::CancelDesktopShare => {
+            stop_desktop_portal_session(&wire.peer_device_id);
+            super::screen::clear_stream(&wire.peer_device_id);
+        }
+        ExpiredRequest::ReleasePhoneView => {
+            let (Some(id), Ok(peer)) = (id, sessions.active_webrtc_peer(binding, attempt_id))
+            else {
+                return;
+            };
+            let release = remote_session::ControlMessage::new(
+                remote_session::ControlKind::Release,
+                attempt_id,
+                wire,
+                &id,
+                remote_session::sessions()
+                    .lock()
+                    .ok()
+                    .and_then(|open| open.get(&wire.peer_device_id).map(|s| s.next_sequence()))
+                    .unwrap_or(1),
+                now_millis(),
+            );
+            let _ = send_remote_session_message(&peer, wire, &release);
+        }
+        ExpiredRequest::Nothing => {}
+    }
+}
+
+/// Begins a desktop-driven phone session: request the phone's screen first,
+/// then request an input lease only after its capture reports `screen-ready`.
+pub(crate) fn start_phone_remote_control(
+    sessions: &Arc<DeviceManager>,
+    transport: &FeatureTransportSnapshot,
+) -> Result<(), String> {
+    if !transport.web_rtc_ready || !sessions.is_current(&transport.binding) {
+        return Err("DeskLink remote control needs a ready WebRTC session".to_string());
+    }
+    let wire = transport
+        .web_rtc_wire
+        .as_ref()
+        .ok_or_else(|| "DeskLink remote control has no authenticated wire binding".to_string())?;
+    ensure_phone_view_allowed(&wire.peer_device_id)?;
+    let attempt_id = sessions
+        .active_webrtc_attempt(&transport.binding)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "DeskLink remote control has no active WebRTC attempt".to_string())?;
+    let (session_id, sequence) = {
+        let mut open = remote_session::sessions()
+            .lock()
+            .map_err(|_| "DeskLink remote-session lock poisoned".to_string())?;
+        let session = open.entry(wire.peer_device_id.clone()).or_default();
+        let id = session.begin_view(remote_session::ScreenDirection::PhoneToDesktop);
+        (id, session.next_sequence())
+    };
+    let mut message = remote_session::ControlMessage::new(
+        remote_session::ControlKind::RequestView,
+        &attempt_id,
+        wire,
+        &session_id,
+        sequence,
+        now_millis(),
+    );
+    message.direction = Some(remote_session::ScreenDirection::PhoneToDesktop);
+    let peer = transport
+        .web_rtc_peer
+        .as_ref()
+        .ok_or_else(|| "DeskLink remote control has no active WebRTC peer".to_string())?;
+    if let Err(error) = send_remote_session_message(peer, wire, &message) {
+        if let Ok(mut open) = remote_session::sessions().lock() {
+            if let Some(session) = open.get_mut(&wire.peer_device_id) {
+                session.stop();
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Asks the phone for control again while its screen is being viewed. The
+/// phone refuses while its accessibility service is not running, and control
+/// used to be asked for only once (at screen-ready): enabling the service
+/// afterwards changed nothing and the window sat on "requesting control".
+pub(crate) fn request_phone_control(
+    sessions: &Arc<DeviceManager>,
+    transport: &FeatureTransportSnapshot,
+) -> Result<(), String> {
+    if !transport.web_rtc_ready || !sessions.is_current(&transport.binding) {
+        return Err("DeskLink remote control needs a ready WebRTC session".to_string());
+    }
+    let wire = transport
+        .web_rtc_wire
+        .as_ref()
+        .ok_or_else(|| "DeskLink remote control has no authenticated wire binding".to_string())?;
+    let attempt_id = sessions
+        .active_webrtc_attempt(&transport.binding)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "DeskLink remote control has no active WebRTC attempt".to_string())?;
+    let message = {
+        let mut open = remote_session::sessions()
+            .lock()
+            .map_err(|_| "DeskLink remote-session lock poisoned".to_string())?;
+        let Some(session) = open.get_mut(&wire.peer_device_id) else {
+            return Ok(());
+        };
+        if session.state() != remote_session::SessionState::Viewing
+            || session.direction() != Some(remote_session::ScreenDirection::PhoneToDesktop)
+        {
+            return Ok(());
+        }
+        let Some(session_id) = session.remote_session_id().map(str::to_string) else {
+            return Ok(());
+        };
+        session.begin_control()?;
+        remote_session::ControlMessage::new(
+            remote_session::ControlKind::RequestControl,
+            &attempt_id,
+            wire,
+            &session_id,
+            session.next_sequence(),
+            now_millis(),
+        )
+    };
+    let peer = transport
+        .web_rtc_peer
+        .as_ref()
+        .ok_or_else(|| "DeskLink remote control has no active WebRTC peer".to_string())?;
+    send_remote_session_message(peer, wire, &message)
+}
+
+pub(crate) fn stamp_remote_input(
+    device_id: &str,
+    packet: &mut NetworkPacket,
+) -> Result<(), String> {
+    let mut open = remote_session::sessions()
+        .lock()
+        .map_err(|_| "DeskLink remote-session lock poisoned".to_string())?;
+    open.get_mut(device_id)
+        .ok_or_else(|| "DeskLink remote-control session has not started".to_string())?
+        .stamp_input(packet)
+}
+
+pub(crate) fn has_remote_control_lease(device_id: &str) -> bool {
+    remote_session::sessions()
+        .lock()
+        .ok()
+        .and_then(|sessions| {
+            sessions
+                .get(device_id)
+                .map(|session| session.heartbeat_lease(now_millis()).is_some())
+        })
+        .unwrap_or(false)
+}
+
+fn send_remote_heartbeat(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    sessions: &Arc<DeviceManager>,
+) -> Result<(), String> {
+    let now = now_millis();
+    let message = {
+        let mut open = remote_session::sessions()
+            .lock()
+            .map_err(|_| "DeskLink remote-session lock poisoned".to_string())?;
+        let Some(session) = open.get_mut(&wire.peer_device_id) else {
+            return Ok(());
+        };
+        let Some(lease) = session.heartbeat_lease(now).cloned() else {
+            return Ok(());
+        };
+        let session_id = session
+            .remote_session_id()
+            .ok_or_else(|| "DeskLink remote-control session has no id".to_string())?
+            .to_string();
+        let mut message = remote_session::ControlMessage::new(
+            remote_session::ControlKind::Heartbeat,
+            attempt_id,
+            wire,
+            &session_id,
+            session.next_sequence(),
+            now,
+        );
+        message.lease_id = Some(lease.id);
+        message.owner_device_id = Some(wire.sender_device_id.clone());
+        message
+    };
+    let peer = sessions
+        .active_webrtc_peer(binding, attempt_id)
+        .map_err(|error| error.to_string())?;
+    send_remote_session_message(&peer, wire, &message)?;
+    if let Ok(mut open) = remote_session::sessions().lock() {
+        if let Some(session) = open.get_mut(&wire.peer_device_id) {
+            session.accept(&message, now)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn stop_phone_remote_control(
+    sessions: &Arc<DeviceManager>,
+    transport: &FeatureTransportSnapshot,
+) -> Result<(), String> {
+    let Some(wire) = transport.web_rtc_wire.as_ref() else {
+        return Ok(());
+    };
+    let Some(attempt_id) = sessions
+        .active_webrtc_attempt(&transport.binding)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    let message = {
+        let mut open = remote_session::sessions()
+            .lock()
+            .map_err(|_| "DeskLink remote-session lock poisoned".to_string())?;
+        let Some(session) = open.get_mut(&wire.peer_device_id) else {
+            return Ok(());
+        };
+        // This ends the desktop's view of the *phone*. When the session is the
+        // phone viewing this desktop, releasing it here would end that share's
+        // session state while its portal capture kept streaming.
+        if session.direction() == Some(remote_session::ScreenDirection::DesktopToPhone) {
+            return Ok(());
+        }
+        let Some(session_id) = session.remote_session_id().map(str::to_string) else {
+            session.stop();
+            return Ok(());
+        };
+        remote_session::ControlMessage::new(
+            remote_session::ControlKind::Release,
+            &attempt_id,
+            wire,
+            &session_id,
+            session.next_sequence(),
+            now_millis(),
+        )
+    };
+    let send_result = if transport.web_rtc_ready {
+        if let Some(peer) = &transport.web_rtc_peer {
+            send_remote_session_message(peer, wire, &message)
+        } else {
+            Ok(())
+        }
+    } else {
+        Ok(())
+    };
+    if let Ok(mut open) = remote_session::sessions().lock() {
+        if let Some(session) = open.get_mut(&wire.peer_device_id) {
+            session.stop();
+        }
+    }
+    super::screen::clear_stream(&wire.peer_device_id);
+    send_result
+}
+
+fn send_remote_session_message(
+    peer: &DesktopWebRtcPeer,
+    wire: &WebRtcWireBinding,
+    message: &remote_session::ControlMessage,
+) -> Result<(), String> {
+    let payload = message.to_json();
+    let envelope = WebRtcEnvelope::create(
+        wire,
+        WebRtcChannel::Control,
+        remote_session::MESSAGE_TYPE,
+        &payload,
+        now_millis(),
+    )?;
+    let text = String::from_utf8(envelope.to_json()?)
+        .map_err(|_| "DeskLink remote-session envelope was not UTF-8".to_string())?;
+    peer.send_text(WebRtcChannel::Control, &text)
+}
+
+fn start_desktop_portal_session(
+    device_id: String,
+    session_id: String,
+    attempt_id: String,
+    wire: WebRtcWireBinding,
+    peer: Arc<DesktopWebRtcPeer>,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+
+    let id = NEXT_PORTAL_SERVICE_ID.fetch_add(1, Ordering::Relaxed);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (sender, receiver) = mpsc::channel();
+    {
+        let mut services = desktop_portal_services()
+            .lock()
+            .map_err(|_| "Desktop portal service registry lock poisoned".to_string())?;
+        // A newer request supersedes an earlier share for this phone — a retry,
+        // or an older phone build that never released the previous one. Refusing
+        // it as "already active" left every later request denied.
+        if let Some(previous) = services.remove(&device_id) {
+            previous.cancel.store(true, Ordering::Release);
+            let _ = previous.sender.send(DesktopPortalCommand::Stop);
+        }
+        services.insert(
+            device_id.clone(),
+            DesktopPortalService {
+                id,
+                sender,
+                can_control: false,
+                cancel: Arc::clone(&cancel),
+            },
+        );
+    }
+    let worker_device_id = device_id.clone();
+    let spawned = thread::Builder::new()
+        .name(format!("desklink-portal-{device_id}"))
+        .spawn(move || {
+            run_desktop_portal_worker(
+                worker_device_id,
+                id,
+                session_id,
+                attempt_id,
+                wire,
+                peer,
+                cancel,
+                receiver,
+            )
+        });
+    if let Err(error) = spawned {
+        remove_service_if_current(&device_id, id);
+        return Err(format!(
+            "Could not start the desktop portal worker: {error}"
+        ));
+    }
+    Ok(())
+}
+
+/// One desktop-screen share: consent, capture, input dispatch, teardown.
+#[allow(clippy::too_many_arguments)]
+fn run_desktop_portal_worker(
+    device_id: String,
+    id: u64,
+    session_id: String,
+    attempt_id: String,
+    wire: WebRtcWireBinding,
+    peer: Arc<DesktopWebRtcPeer>,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    receiver: mpsc::Receiver<DesktopPortalCommand>,
+) {
+    use std::sync::atomic::Ordering;
+
+    // Declared first, so it runs last: after every lock and portal handle below
+    // has been released, on every way out of this function.
+    let _cleanup = PortalWorkerCleanup {
+        device_id: device_id.clone(),
+        id,
+        peer: Arc::clone(&peer),
+    };
+
+    #[allow(clippy::type_complexity)]
+    let setup =
+        (|| -> Result<(RemoteDesktopPortal, i32, i32, bool, std::os::fd::OwnedFd), String> {
+            let stored_grant = crate::device_links::config::remote_desktop_token(&device_id);
+            let (portal, source) =
+                RemoteDesktopPortal::start("", &cancel, stored_grant.as_deref())?;
+            // Tokens are single-use: keep the fresh one (if it carries control).
+            crate::device_links::config::set_remote_desktop_token(
+                &device_id,
+                source.token_to_remember(),
+            );
+            let can_control = source.granted_device_types & 3 == 3;
+            if cancel.load(Ordering::Acquire) {
+                // Approved in the instant the share was released or replaced.
+                return Err("The desktop share was cancelled".to_string());
+            }
+            // One PipeWire connection serves every shared screen; a copy is kept
+            // for switching between them.
+            let switch_fd = source
+                .fd
+                .try_clone()
+                .map_err(|error| format!("Could not keep the PipeWire connection: {error}"))?;
+            peer.start_desktop_screen_capture(
+                id,
+                source.fd,
+                source.node_id,
+                source.pipewire_serial,
+                source.width,
+                source.height,
+                30,
+            )?;
+            Ok((portal, source.width, source.height, can_control, switch_fd))
+        })();
+    let (portal, width, height, can_control, switch_fd) = match setup {
+        Ok(ready) => ready,
+        Err(error) => {
+            // Released or replaced: nobody is waiting for an answer to *this*
+            // request, and a denial quoting its id would only confuse the phone.
+            if cancel.load(Ordering::Acquire) || !remove_service_if_current(&device_id, id) {
+                return;
+            }
+            eprintln!(
+                "[DeskLink] Desktop screen/control portal setup failed for {device_id}: {error}"
+            );
+            let now = now_millis();
+            let denied = remote_session::sessions().lock().ok().and_then(|mut open| {
+                open.get_mut(&device_id).map(|session| {
+                    let mut denied = remote_session::ControlMessage::new(
+                        remote_session::ControlKind::ViewDenied,
+                        &attempt_id,
+                        &wire,
+                        &session_id,
+                        session.next_sequence(),
+                        now,
+                    );
+                    denied.reason = Some(error);
+                    let _ = session.accept(&denied, now);
+                    denied
+                })
+            });
+            if let Some(denied) = denied {
+                let _ = send_remote_session_message(&peer, &wire, &denied);
+            }
+            return;
+        }
+    };
+    eprintln!(
+        "[DeskLink] Desktop portal granted screen {width}x{height} (1 of {} shared) and input-device mask {} for {device_id}",
+        portal.stream_count(),
+        if can_control { 3 } else { 0 }
+    );
+    {
+        // One health line a few seconds in: a share that sends nothing is
+        // otherwise invisible from this side.
+        let (peer, device_id) = (Arc::clone(&peer), device_id.clone());
+        let _ = thread::Builder::new()
+            .name("desklink-share-health".into())
+            .spawn(move || {
+                thread::sleep(std::time::Duration::from_secs(3));
+                eprintln!(
+                    "[DeskLink] Desktop share to {device_id}: {} RTP packet groups after 3 s",
+                    peer.desktop_screen_frames_sent()
+                );
+            });
+    }
+    // Record what the portal granted — on this share's entry only.
+    match desktop_portal_services().lock() {
+        Ok(mut services) => match services
+            .get_mut(&device_id)
+            .filter(|service| service.id == id)
+        {
+            Some(service) => service.can_control = can_control,
+            None => return, // superseded while consent was pending
+        },
+        Err(_) => return,
+    }
+
+    // Move to `viewing` and learn the sequence for the announcement — but only
+    // if this share is still the session's current one.
+    let sequence = {
+        let Ok(mut open) = remote_session::sessions().lock() else {
+            return;
+        };
+        let Some(session) = open.get_mut(&device_id) else {
+            return;
+        };
+        if session.remote_session_id() != Some(session_id.as_str()) {
+            return;
+        }
+        let mut local_ready = remote_session::ControlMessage::new(
+            remote_session::ControlKind::ScreenReady,
+            &attempt_id,
+            &wire,
+            &session_id,
+            session.next_sequence(),
+            now_millis(),
+        );
+        local_ready.direction = Some(remote_session::ScreenDirection::DesktopToPhone);
+        if let Err(error) = session.accept(&local_ready, now_millis()) {
+            eprintln!("[DeskLink] Could not activate desktop screen session: {error}");
+            return;
+        }
+        local_ready.sequence
+    };
+    let mut ready = remote_session::ControlMessage::new(
+        remote_session::ControlKind::ScreenReady,
+        &attempt_id,
+        &wire,
+        &session_id,
+        sequence,
+        now_millis(),
+    );
+    ready.direction = Some(remote_session::ScreenDirection::DesktopToPhone);
+    // The desktop's own coordinate space: the phone maps its taps into this, not
+    // into the (downscaled) picture it decodes.
+    ready.screen_width = Some(width);
+    ready.screen_height = Some(height);
+    ready.screen_count = Some(portal.stream_count() as i32);
+    if send_remote_session_message(&peer, &wire, &ready).is_err() {
+        return;
+    }
+    // (Re)starts capture of `stream` on the share's PipeWire connection.
+    let capture = |stream: super::remote_desktop_portal::PortalStream| -> Result<(), String> {
+        let fd = switch_fd
+            .try_clone()
+            .map_err(|error| format!("Could not reuse the PipeWire connection: {error}"))?;
+        peer.start_desktop_screen_capture(
+            id,
+            fd,
+            stream.node_id,
+            stream.pipewire_serial,
+            stream.width,
+            stream.height,
+            30,
+        )
+    };
+    // Moves the share to the next screen and tells the phone its new size.
+    let switch_screen = || {
+        let next = portal.next_stream();
+        if let Err(error) = capture(next) {
+            eprintln!("[DeskLink] Could not switch screens: {error}");
+            return;
+        }
+        let sequence = remote_session::sessions().lock().ok().and_then(|mut open| {
+            open.get_mut(&device_id)
+                .map(|session| session.next_sequence())
+        });
+        if let Some(sequence) = sequence {
+            let mut ready = remote_session::ControlMessage::new(
+                remote_session::ControlKind::ScreenReady,
+                &attempt_id,
+                &wire,
+                &session_id,
+                sequence,
+                now_millis(),
+            );
+            ready.direction = Some(remote_session::ScreenDirection::DesktopToPhone);
+            ready.screen_width = Some(next.width);
+            ready.screen_height = Some(next.height);
+            ready.screen_count = Some(portal.stream_count() as i32);
+            let _ = send_remote_session_message(&peer, &wire, &ready);
+        }
+        eprintln!(
+            "[DeskLink] Desktop share for {device_id} switched to a {}x{} screen",
+            next.width, next.height
+        );
+    };
+
+    // While the phone can type here, tell it when a text input takes focus,
+    // so its keyboard comes up on its own. Lives as long as this share.
+    let _text_focus = can_control.then(|| {
+        let (peer, wire, attempt_id, session_id, device_id) = (
+            Arc::clone(&peer),
+            wire.clone(),
+            attempt_id.clone(),
+            session_id.clone(),
+            device_id.clone(),
+        );
+        super::text_focus::TextFocusWatcher::start(move |editable| {
+            let message = remote_session::sessions().lock().ok().and_then(|mut open| {
+                let session = open.get_mut(&device_id)?;
+                let mut message = remote_session::ControlMessage::new(
+                    remote_session::ControlKind::InputFocus,
+                    &attempt_id,
+                    &wire,
+                    &session_id,
+                    session.next_sequence(),
+                    now_millis(),
+                );
+                message.editable = Some(editable);
+                Some(message)
+            });
+            if let Some(message) = message {
+                let _ = send_remote_session_message(&peer, &wire, &message);
+            }
+        })
+    });
+
+    let mut held_inputs = std::collections::HashSet::<(bool, i32)>::new();
+    let mut portal_revoked = false;
+    let mut no_video = false;
+    let mut last_frames = 0u64;
+    let mut last_progress = std::time::Instant::now();
+    let mut restarts = 0u32;
+    let mut scroll_open: Option<std::time::Instant> = None;
+    'serve: loop {
+        // A scroll gesture ends when its steps stop coming.
+        if scroll_open.is_some_and(|last| last.elapsed() >= SCROLL_FINISH_AFTER) {
+            let _ = portal.pointer_axis(0.0, 0.0, true);
+            scroll_open = None;
+        }
+        // Capture watchdog; see `CAPTURE_STALL`.
+        let frames = peer.desktop_screen_frames_sent();
+        if frames != last_frames {
+            last_frames = frames;
+            last_progress = std::time::Instant::now();
+            restarts = 0;
+        } else if last_progress.elapsed() >= CAPTURE_STALL {
+            if restarts >= CAPTURE_RESTARTS {
+                no_video = true;
+                break;
+            }
+            restarts += 1;
+            eprintln!(
+                "[DeskLink] Desktop share to {device_id} produced no video for {:?}; rebuilding the capture ({restarts} of {CAPTURE_RESTARTS})",
+                CAPTURE_STALL
+            );
+            if let Err(error) = capture(portal.active()) {
+                eprintln!("[DeskLink] Could not rebuild the desktop capture: {error}");
+            }
+            last_frames = peer.desktop_screen_frames_sent();
+            last_progress = std::time::Instant::now();
+        }
+        let wait = if scroll_open.is_some() {
+            SCROLL_FINISH_AFTER
+        } else {
+            std::time::Duration::from_millis(500)
+        };
+        match receiver.recv_timeout(wait) {
+            Ok(DesktopPortalCommand::Input(mut actions)) => {
+                // Each portal call is a blocking D-Bus round trip, while touch
+                // motion arrives at 120-240 Hz: one call per event let the
+                // cursor fall ever further behind the finger. Take everything
+                // queued meanwhile and merge consecutive motion.
+                let mut stop_after = false;
+                let mut switch_after = false;
+                loop {
+                    match receiver.try_recv() {
+                        Ok(DesktopPortalCommand::Input(more)) => actions.extend(more),
+                        Ok(DesktopPortalCommand::SwitchScreen) => switch_after = true,
+                        Ok(DesktopPortalCommand::Stop) => {
+                            stop_after = true;
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Positions go in the screen's real pixels; learn them from the
+                // capture once it has negotiated (see `pointer_move`).
+                if !portal.knows_active_pixels() {
+                    if let Some(size) = peer.desktop_screen_source_size() {
+                        eprintln!(
+                            "[DeskLink] Phone input mapped onto {}x{} screen pixels",
+                            size.0, size.1
+                        );
+                        portal.set_active_pixels(size);
+                    }
+                }
+                if actions
+                    .iter()
+                    .any(|action| matches!(action, PortalInputAction::Scroll(..)))
+                {
+                    scroll_open = Some(std::time::Instant::now());
+                }
+                for action in coalesce_motion(actions) {
+                    let held = match &action {
+                        PortalInputAction::Button { evdev_code, .. } => Some((false, *evdev_code)),
+                        PortalInputAction::Key { keysym, .. } => Some((true, *keysym)),
+                        _ => None,
+                    };
+                    let pressed = match &action {
+                        PortalInputAction::Button { pressed, .. }
+                        | PortalInputAction::Key { pressed, .. } => Some(*pressed),
+                        _ => None,
+                    };
+                    let described = format!("{action:?}");
+                    if let Err(error) = portal.apply(action) {
+                        eprintln!(
+                            "[DeskLink] Portal input dispatch failed for {described}: {error}"
+                        );
+                        // A revoked session is what makes every call fail; without
+                        // this check it is noticed only after 500 ms of idle, which
+                        // continuous motion never allows.
+                        if portal.is_session_closed() {
+                            portal_revoked = true;
+                            break 'serve;
+                        }
+                        break;
+                    }
+                    if let (Some(held), Some(pressed)) = (held, pressed) {
+                        if pressed {
+                            held_inputs.insert(held);
+                        } else {
+                            held_inputs.remove(&held);
+                        }
+                    }
+                }
+                // Held keys and buttons are released whenever the phone no longer
+                // holds input — not only when a lease *expires*: a pause, a stale
+                // heartbeat, a replaced request all clear the lease first, and the
+                // expiry check then sees nothing to release. A drag would leave
+                // the mouse button stuck down.
+                if !held_inputs.is_empty() && !peer_input_active(&device_id) {
+                    release_held_portal_inputs(&portal, &mut held_inputs);
+                }
+                if switch_after {
+                    switch_screen();
+                }
+                if stop_after {
+                    break;
+                }
+            }
+            Ok(DesktopPortalCommand::SwitchScreen) => switch_screen(),
+            Ok(DesktopPortalCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if portal.is_session_closed() {
+                    portal_revoked = true;
+                    break;
+                }
+                if !held_inputs.is_empty() && !peer_input_active(&device_id) {
+                    release_held_portal_inputs(&portal, &mut held_inputs);
+                }
+                // Let a silent phone-owned lease lapse.
+                if let Ok(mut open) = remote_session::sessions().lock() {
+                    if let Some(session) = open.get_mut(&device_id) {
+                        session.expire_peer_input_lease(now_millis());
+                    }
+                }
+            }
+        }
+    }
+    release_held_portal_inputs(&portal, &mut held_inputs);
+    if portal_revoked || no_video {
+        let sequence = remote_session::sessions()
+            .lock()
+            .ok()
+            .and_then(|mut sessions| {
+                sessions.get_mut(&device_id).map(|session| {
+                    session.stop();
+                    session.next_sequence()
+                })
+            })
+            .unwrap_or(1);
+        let mut stopped = remote_session::ControlMessage::new(
+            remote_session::ControlKind::ScreenError,
+            &attempt_id,
+            &wire,
+            &session_id,
+            sequence,
+            now_millis(),
+        );
+        stopped.reason = Some(if no_video {
+            "The desktop is not producing any video".to_string()
+        } else {
+            "Desktop screen/control permission was revoked locally".to_string()
+        });
+        let _ = send_remote_session_message(&peer, &wire, &stopped);
+    }
+    portal.release_all();
+    // `_cleanup` removes this share's registry entry and stops its capture.
+}
+
+/// Whether the phone currently holds a valid input lease for `device_id`.
+fn peer_input_active(device_id: &str) -> bool {
+    remote_session::sessions()
+        .lock()
+        .ok()
+        .and_then(|open| {
+            open.get(device_id)
+                .map(|session| session.state() == remote_session::SessionState::PeerControlling)
+        })
+        .unwrap_or(false)
+}
+
+fn release_held_portal_inputs(
+    portal: &RemoteDesktopPortal,
+    held_inputs: &mut std::collections::HashSet<(bool, i32)>,
+) {
+    for (is_key, code) in held_inputs.drain() {
+        let action = if is_key {
+            PortalInputAction::Key {
+                keysym: code,
+                pressed: false,
+            }
+        } else {
+            PortalInputAction::Button {
+                evdev_code: code,
+                pressed: false,
+            }
+        };
+        let _ = portal.apply(action);
+    }
+}
+
+pub(crate) fn dispatch_desktop_remote_input(
+    binding: &SessionBinding,
+    packet: &NetworkPacket,
+) -> Result<(), String> {
+    let sender = desktop_portal_services()
+        .lock()
+        .map_err(|_| "Desktop portal service registry lock poisoned".to_string())?
+        .get(&binding.device_id)
+        .map(|service| service.sender.clone())
+        .ok_or_else(|| "No approved desktop-control portal session is active".to_string())?;
+    let actions = {
+        let mut sessions = remote_session::sessions()
+            .lock()
+            .map_err(|_| "DeskLink remote-session lock poisoned".to_string())?;
+        let session = sessions
+            .get_mut(&binding.device_id)
+            .ok_or_else(|| "DeskLink remote session has not started".to_string())?;
+        authorize_desktop_remote_input(session, packet, &binding.device_id, now_millis())?
+    };
+    sender
+        .send(DesktopPortalCommand::Input(actions))
+        .map_err(|_| "Desktop portal worker has stopped".to_string())
+}
+
+/// Debug builds: feeds a mousepad body into the active share as if the phone
+/// had sent it, skipping the lease, so the GNOME side can be measured alone.
+#[cfg(debug_assertions)]
+pub(crate) fn debug_inject_desktop_input(device_id: &str, body: &str) -> Result<(), String> {
+    let command = if body == "switch" {
+        DesktopPortalCommand::SwitchScreen
+    } else {
+        let mut packet = NetworkPacket::new("desklink.mousepad.request");
+        packet.body = serde_json::from_str(body).map_err(|error| error.to_string())?;
+        DesktopPortalCommand::Input(input_actions(&packet)?)
+    };
+    desktop_portal_services()
+        .lock()
+        .map_err(|_| "registry lock poisoned".to_string())?
+        .get(device_id)
+        .ok_or("no active share")?
+        .sender
+        .send(command)
+        .map_err(|_| "share worker stopped".to_string())
+}
+
+fn authorize_desktop_remote_input(
+    session: &mut remote_session::RemoteSession,
+    packet: &NetworkPacket,
+    owner_device_id: &str,
+    now: i64,
+) -> Result<Vec<PortalInputAction>, String> {
+    // A syntactically invalid input must not refresh the lease. Parse the
+    // complete action batch first, then consume its sequence and extend expiry.
+    let actions = input_actions(packet)?;
+    session.verify_peer_input(packet, owner_device_id, now)?;
+    #[cfg(debug_assertions)]
+    eprintln!("[DeskLink] Phone input -> {actions:?}");
+    Ok(actions)
+}
+
+fn stop_desktop_portal_session(device_id: &str) {
+    let service = desktop_portal_services()
+        .lock()
+        .ok()
+        .and_then(|mut services| services.remove(device_id));
+    if let Some(service) = service {
+        // Cancelling too: a worker still waiting on the consent dialog never
+        // reads the `Stop` command until that dialog is answered.
+        service
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        let _ = service.sender.send(DesktopPortalCommand::Stop);
+    }
+}
+
 /// Starts a desktop-originated transfer through the current authenticated
 /// WebRTC peer. It has no LAN fallback once feature-ready is active.
 pub(crate) fn start_file_transfer(
@@ -338,6 +1418,33 @@ pub(crate) fn start_file_transfer(
         .as_ref()
         .ok_or_else(|| "DeskLink WebRTC file transfer manager is unavailable".to_string())?;
     send_transfer_events(peer, wire, manager.start_send(wire, source)?)
+}
+
+/// Ends a running file transfer at the user's request and tells the peer.
+///
+/// The transfer is over locally whether or not the peer is still listening: a
+/// cancelled transfer is never resumed, so its state goes either way.
+pub(crate) fn cancel_file_transfer(
+    sessions: &DeviceManager,
+    transport: &FeatureTransportSnapshot,
+    transfer_id: &str,
+) -> Result<(), String> {
+    if !sessions.is_current(&transport.binding) {
+        return Err("DeskLink WebRTC file transport is unavailable".to_string());
+    }
+    let wire = transport
+        .web_rtc_wire
+        .as_ref()
+        .ok_or_else(|| "DeskLink WebRTC file transfer has no wire binding".to_string())?;
+    let manager = transport
+        .transfer_manager
+        .as_ref()
+        .ok_or_else(|| "DeskLink WebRTC file transfer manager is unavailable".to_string())?;
+    let events = manager.cancel_transfer(wire, transfer_id)?;
+    match transport.web_rtc_peer.as_ref() {
+        Some(peer) => send_transfer_events(peer, wire, events),
+        None => Ok(()),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -365,6 +1472,9 @@ fn install_responder(
         )
         .map_err(|error| error.to_string())?;
     if let Some(replaced) = replaced {
+        // The new peer cannot be feature-ready yet, so only the replaced
+        // peer's device-keyed state goes; its superseded worker skips this.
+        reset_device_webrtc_state(&binding.device_id);
         replaced.close();
     }
     spawn_event_worker(
@@ -403,6 +1513,16 @@ fn spawn_event_worker(
             sessions: Arc::clone(&sessions),
         };
         let mut disconnected_since: Option<std::time::Instant> = None;
+        let mut next_remote_heartbeat =
+            std::time::Instant::now() + remote_session::HEARTBEAT_INTERVAL;
+        // Data-channel liveness clocks; see `PEER_DEAD_AFTER`. They only count
+        // once the handover is feature-ready, so slow ICE is not mistaken for
+        // a dead peer — the ICE state machine owns that phase.
+        let mut last_inbound = std::time::Instant::now();
+        let mut last_probe = std::time::Instant::now();
+        let mut was_ready = false;
+        let mut ever_ready = false;
+        let started = std::time::Instant::now();
         loop {
             // A timed receive lets the transient-disconnect grace window expire
             // even when the peer has gone completely silent.
@@ -416,9 +1536,96 @@ fn spawn_event_worker(
             {
                 break;
             }
+            expire_remote_requests(&binding, &attempt_id, &wire, &sessions);
+            if std::time::Instant::now() >= next_remote_heartbeat {
+                if let Err(error) = send_remote_heartbeat(&binding, &attempt_id, &wire, &sessions) {
+                    eprintln!("[DeskLink] Remote-control heartbeat failed: {error}");
+                }
+                next_remote_heartbeat =
+                    std::time::Instant::now() + remote_session::HEARTBEAT_INTERVAL;
+            }
+            if matches!(
+                event,
+                Some(PeerEvent::Envelope { .. } | PeerEvent::Binary { .. })
+            ) {
+                last_inbound = std::time::Instant::now();
+            }
+            let ready = sessions
+                .webrtc_features_ready(&binding, &attempt_id)
+                .unwrap_or(false);
+            if ready && !was_ready {
+                // Start the silence budget at the moment features go live.
+                last_inbound = std::time::Instant::now();
+            }
+            was_ready = ready;
+            ever_ready |= ready;
+            // Nothing else ends a negotiation that stalls before feature-ready:
+            // a lost offer or answer, a failed set-description or a lost hello
+            // left webrtcbin in `checking` forever while LAN heartbeats kept
+            // the session looking healthy. Rebuilding sends `RestartRequest`
+            // when this side is the responder, so either role recovers.
+            if !ever_ready && started.elapsed() >= NEGOTIATION_TIMEOUT {
+                rebuild_peer(
+                    &binding,
+                    &attempt_id,
+                    format!(
+                        "WebRTC negotiation not feature-ready after {}s",
+                        NEGOTIATION_TIMEOUT.as_secs()
+                    ),
+                    &sessions,
+                    &config,
+                    &devices,
+                    &events,
+                );
+                break;
+            }
+            if ready {
+                match liveness(last_inbound.elapsed(), last_probe.elapsed()) {
+                    Liveness::Fine => {}
+                    Liveness::Probe => {
+                        last_probe = std::time::Instant::now();
+                        if let Err(error) =
+                            send_keepalive(&binding, &attempt_id, &wire, &sessions, false)
+                        {
+                            eprintln!("[DeskLink] WebRTC heartbeat failed: {error}");
+                        }
+                    }
+                    Liveness::Dead => {
+                        rebuild_peer(
+                            &binding,
+                            &attempt_id,
+                            format!(
+                                "WebRTC peer silent for {}s on every data channel",
+                                PEER_DEAD_AFTER.as_secs()
+                            ),
+                            &sessions,
+                            &config,
+                            &devices,
+                            &events,
+                        );
+                        break;
+                    }
+                }
+            }
             if let Some(event) = event {
                 match event {
                     PeerEvent::LocalDescription { message_type, sdp } => {
+                        #[cfg(debug_assertions)]
+                        for line in sdp.lines().filter(|line| {
+                            line.starts_with("m=")
+                                || line.starts_with("a=extmap")
+                                || line.starts_with("a=rtcp-fb")
+                                || line.starts_with("a=rtpmap")
+                                || line.starts_with("a=sendrecv")
+                                || line.starts_with("a=recvonly")
+                                || line.starts_with("a=sendonly")
+                                || line.starts_with("a=inactive")
+                                || line.starts_with("a=msid")
+                                || line.starts_with("a=ssrc")
+                                || line.starts_with("a=mid")
+                        }) {
+                            eprintln!("[DL-SDP] local {message_type:?}: {line}");
+                        }
                         if let Err(error) =
                             sessions.with_webrtc_handover(&binding, &attempt_id, |handover| {
                                 match message_type {
@@ -520,6 +1727,9 @@ fn spawn_event_worker(
                         );
                         super::screen::publish_stream(&binding.device_id, stream);
                     }
+                    // Most peer errors are not fatal (an oversized candidate, an
+                    // empty message); a negotiation that truly cannot finish is
+                    // caught by NEGOTIATION_TIMEOUT instead.
                     PeerEvent::Error(error) => eprintln!("[DeskLink] WebRTC peer error: {error}"),
                     PeerEvent::ConnectionChanged(state) => {
                         eprintln!("[DeskLink] WebRTC peer state: {state}");
@@ -557,6 +1767,17 @@ fn spawn_event_worker(
                         {
                             eprintln!("[DeskLink] Could not start WebRTC authentication: {error}");
                         }
+                    }
+                    PeerEvent::ChannelOpened(WebRtcChannel::Terminal) => {
+                        // Terminal output gets its own thread; this worker is a
+                        // single thread with a 500 ms timeout serving every
+                        // other channel too.
+                        spawn_terminal_pump(
+                            binding.clone(),
+                            attempt_id.clone(),
+                            wire.clone(),
+                            Arc::clone(&sessions),
+                        );
                     }
                     PeerEvent::ChannelOpened(_) => {}
                     PeerEvent::Closed => break,
@@ -599,6 +1820,30 @@ fn spawn_event_worker(
     Ok(())
 }
 
+/// Ends everything keyed by device rather than by attempt: desktop screen
+/// share, the remote-control session, an open phone-file dialog and transfer
+/// rows. Run when a peer goes away for good, and when a new peer replaces a
+/// live one (the replaced worker skips it, see `PeerWorkerGuard`).
+fn reset_device_webrtc_state(device_id: &str) {
+    stop_desktop_portal_session(device_id);
+    super::screen::clear_stream(device_id);
+    super::screen::forget_parked(device_id);
+    // The session state must not outlive its peer: a stale `Controlling`
+    // lease survived a rebuild, and this side's own heartbeats kept it alive
+    // while the UI read "Control active".
+    if let Ok(mut open) = remote_session::sessions().lock() {
+        if let Some(session) = open.get_mut(device_id) {
+            session.stop();
+        }
+    }
+    // A phone-file reply can never arrive on a peer that no longer exists;
+    // tell the open dialog now rather than after its timeout.
+    super::file_browser::reset(device_id, "The connection to the phone was interrupted");
+    // Transfers ride this peer; the user should not be left watching a
+    // progress bar that will never move.
+    super::transfer_board::finish_device(device_id, "The connection to the phone was interrupted");
+}
+
 /// Releases a WebRTC peer when its event worker stops, however it stops.
 ///
 /// Nothing services a peer's events once the worker is gone, so it must not be
@@ -624,7 +1869,18 @@ struct PeerWorkerGuard {
 
 impl Drop for PeerWorkerGuard {
     fn drop(&mut self) {
-        super::screen::clear_stream(&self.binding.device_id);
+        // The teardown below is keyed by device, not attempt. When a fresh
+        // offer has already installed a newer peer, running it would tear down
+        // that peer's screen share, remote session and transfers — so a
+        // superseded worker only releases its own (already replaced) peer.
+        let superseded = matches!(
+            self.sessions.active_webrtc_attempt(&self.binding),
+            Ok(Some(ref active)) if active != &self.attempt_id
+        );
+        if superseded {
+            return;
+        }
+        reset_device_webrtc_state(&self.binding.device_id);
         if let Ok(Some(peer)) = self.sessions.clear_webrtc_if_current(
             &self.binding,
             &self.attempt_id,
@@ -737,6 +1993,76 @@ pub(crate) enum PeerStateAction {
 pub(crate) const TRANSIENT_DISCONNECT_GRACE: std::time::Duration =
     std::time::Duration::from_secs(12);
 
+/// How long a fresh peer may take to reach feature-ready before it is rebuilt.
+/// The measured LAN path is under 1 s; 10 s leaves room for a slow phone.
+pub(crate) const NEGOTIATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Data-channel liveness, mirrored by `startLivenessLocked` on Android. Once the
+/// handover is feature-ready, a side that has heard nothing on any data
+/// channel for `PEER_PROBE_AFTER` sends a `desklink.heartbeat`; the other side
+/// answers with `reply: true`. Silence for `PEER_DEAD_AFTER` means the peer is
+/// gone — typically its process restarted — and it is rebuilt at once instead
+/// of waiting ~25 s for ICE consent freshness to notice.
+pub(crate) const PEER_PROBE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
+pub(crate) const PEER_DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// What the worker should do about data-channel silence right now.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    Fine,
+    Probe,
+    Dead,
+}
+
+pub(crate) fn liveness(silence: std::time::Duration, since_probe: std::time::Duration) -> Liveness {
+    if silence >= PEER_DEAD_AFTER {
+        Liveness::Dead
+    } else if silence >= PEER_PROBE_AFTER && since_probe >= PEER_PROBE_AFTER {
+        Liveness::Probe
+    } else {
+        Liveness::Fine
+    }
+}
+
+/// Sends, in order, the features queued while WebRTC was not ready.
+fn flush_pending_features(binding: &SessionBinding, sessions: &Arc<DeviceManager>) {
+    let pending = sessions.take_pending_features(binding);
+    if pending.is_empty() {
+        return;
+    }
+    match crate::device_links::transport::FeatureTransport::for_binding(sessions, binding) {
+        Ok(transport) => {
+            for packet in pending {
+                if let Err(error) = transport.send(&packet) {
+                    eprintln!("[DeskLink] Queued {} not sent: {error}", packet.packet_type);
+                }
+            }
+        }
+        Err(error) => eprintln!("[DeskLink] Queued features not sent: {error}"),
+    }
+}
+
+/// Sends a data-channel heartbeat; `reply` marks an answer, which is never
+/// answered in turn.
+fn send_keepalive(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    sessions: &DeviceManager,
+    reply: bool,
+) -> Result<(), String> {
+    let peer = sessions
+        .active_webrtc_peer(binding, attempt_id)
+        .map_err(|error| error.to_string())?;
+    let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT);
+    if reply {
+        packet.set("reply", true);
+    }
+    let envelope = WebRtcPacketBridge::encode(wire, &packet, now_millis())?;
+    let text = String::from_utf8(envelope.to_json()?)
+        .map_err(|_| "DeskLink heartbeat serialization was not UTF-8".to_string())?;
+    peer.send_text(WebRtcPacketBridge::channel_for(&packet), &text)
+}
+
 /// Bounded reconnect backoff, matching `WebRtcRecoveryPolicy` on Android.
 /// Rebuilding immediately and unconditionally allocated a fresh GStreamer
 /// pipeline and seven data channels per failure, so a peer that could not be
@@ -755,7 +2081,8 @@ const RECOVERY_BACKOFF_MILLIS: [u64; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 3
 /// This bounds *initiation only*. The desktop must keep accepting inbound
 /// offers afterwards: the phone is the deterministic initiator whenever its
 /// device id sorts lower, and `WebRtcRecoveryPolicy` on Android never gives up
-/// on attempt count. An inbound offer resets the ladder.
+/// on attempt count. A new or adopted bootstrap link, or a restart request
+/// from the responder, resets the ladder.
 pub(crate) fn recovery_delay(attempt: u32) -> Option<std::time::Duration> {
     RECOVERY_BACKOFF_MILLIS
         .get(attempt as usize)
@@ -848,6 +2175,11 @@ fn handle_peer_envelope(
     transfer_manager: &Arc<WebRtcTransferManager>,
 ) -> Result<(), String> {
     let envelope = WebRtcEnvelope::from_json(bytes)?;
+    if envelope.message_type == super::file_browser::FILE_BROWSER_MESSAGE_TYPE {
+        return super::file_browser::handle_envelope(
+            binding, attempt_id, wire, channel, envelope, sessions,
+        );
+    }
     if matches!(
         envelope.message_type.as_str(),
         FILE_CONTROL_MESSAGE_TYPE | FILE_CHUNK_MESSAGE_TYPE
@@ -861,6 +2193,9 @@ fn handle_peer_envelope(
             sessions,
             transfer_manager,
         );
+    }
+    if channel == WebRtcChannel::Terminal {
+        return handle_terminal_envelope(binding, attempt_id, wire, envelope, sessions);
     }
     if channel != WebRtcChannel::Control {
         // The envelope declares its own channel, and the bridge checks that
@@ -878,9 +2213,226 @@ fn handle_peer_envelope(
         sessions
             .accept_webrtc_envelope(binding, attempt_id, envelope.message_id.clone())
             .map_err(|error| error.to_string())?;
+        if packet.packet_type == crate::device_links::packet::PACKET_TYPE_HEARTBEAT {
+            // Liveness only: arriving at all refreshed the worker's clock.
+            return if packet.get_bool("reply").unwrap_or(false) {
+                Ok(())
+            } else {
+                send_keepalive(binding, attempt_id, wire, sessions, true)
+            };
+        }
         return crate::device_links::daemon::packet_handler::dispatch_webrtc_feature_packet(
             binding, packet, devices, sessions, config, events,
         );
+    }
+    if envelope.message_type == remote_session::MESSAGE_TYPE {
+        // Android has always sent this on the control channel; the desktop used
+        // to reject every non-handover control message, so the screen control
+        // plane was dead on this side while `remote_session` sat unreferenced.
+        if envelope.channel != WebRtcChannel::Control.label() {
+            return Err("DeskLink remote-session control arrived on the wrong channel".to_string());
+        }
+        let payload = envelope.validate(wire)?;
+        sessions
+            .accept_webrtc_envelope(binding, attempt_id, envelope.message_id.clone())
+            .map_err(|error| error.to_string())?;
+        let message = remote_session::ControlMessage::from_json(&payload)?;
+        if message.kind != remote_session::ControlKind::Heartbeat {
+            eprintln!(
+                "[DeskLink] Remote session {:?} from {}{}",
+                message.kind,
+                wire.peer_device_id,
+                message
+                    .reason
+                    .as_deref()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            );
+        }
+        let now = now_millis();
+        message.validate(wire, attempt_id, now)?;
+        if message.kind == remote_session::ControlKind::RequestView {
+            let sequence = {
+                let mut open = remote_session::sessions()
+                    .lock()
+                    .map_err(|_| "DeskLink remote-session lock poisoned".to_string())?;
+                let session = open.entry(wire.peer_device_id.clone()).or_default();
+                session.accept(&message, now)?;
+                session.next_sequence()
+            };
+            let peer = sessions
+                .active_webrtc_peer(binding, attempt_id)
+                .map_err(|error| error.to_string())?;
+            let direction = message
+                .direction
+                .ok_or_else(|| "DeskLink screen request has no direction".to_string())?;
+            if !desktop_capture_needed(direction) {
+                // The phone is sharing its own screen. The Android coordinator
+                // handles its local MediaProjection consent and sends the
+                // corresponding view-granted/screen-ready controls; desktop
+                // portal capture would invert the requested session direction.
+                stop_desktop_portal_session(&wire.peer_device_id);
+                super::screen::clear_stream(&wire.peer_device_id);
+                return Ok(());
+            }
+            if let Err(error) = start_desktop_portal_session(
+                wire.peer_device_id.clone(),
+                message.remote_session_id.clone(),
+                attempt_id.to_string(),
+                wire.clone(),
+                peer.clone(),
+            ) {
+                let mut denied = remote_session::ControlMessage::new(
+                    remote_session::ControlKind::ViewDenied,
+                    attempt_id,
+                    wire,
+                    &message.remote_session_id,
+                    sequence,
+                    now_millis(),
+                );
+                denied.reason = Some(error);
+                send_remote_session_message(&peer, wire, &denied)?;
+            }
+            return Ok(());
+        }
+        if message.kind == remote_session::ControlKind::SwitchScreen {
+            // The share's worker owns the portal; hand it the request.
+            if let Ok(services) = desktop_portal_services().lock() {
+                if let Some(service) = services.get(&wire.peer_device_id) {
+                    let _ = service.sender.send(DesktopPortalCommand::SwitchScreen);
+                }
+            }
+            return Ok(());
+        }
+        if matches!(
+            message.kind,
+            remote_session::ControlKind::RequestControl
+                | remote_session::ControlKind::TakeoverRequest
+        ) {
+            let peer = sessions
+                .active_webrtc_peer(binding, attempt_id)
+                .map_err(|error| error.to_string())?;
+            let lease_id = Uuid::new_v4().to_string();
+            let expires_at = now_millis() + remote_session::LEASE_LIFETIME.as_millis() as i64;
+            let response = {
+                let mut open = remote_session::sessions()
+                    .lock()
+                    .map_err(|_| "DeskLink remote-session lock poisoned".to_string())?;
+                let session = open.entry(wire.peer_device_id.clone()).or_default();
+                let authorization = session.accept(&message, now);
+                let can_control = desktop_portal_services()
+                    .lock()
+                    .map(|services| {
+                        services
+                            .get(&wire.peer_device_id)
+                            .is_some_and(|service| service.can_control)
+                    })
+                    .unwrap_or(false);
+                let grant = can_control && authorization.is_ok();
+                if !grant {
+                    eprintln!(
+                        "[DeskLink] Denying phone control for {}: portal_can_control={}, session_authorized={}, reason={}",
+                        wire.peer_device_id,
+                        can_control,
+                        authorization.is_ok(),
+                        authorization.as_ref().err().map_or("portal input devices not granted", String::as_str)
+                    );
+                }
+                if grant {
+                    session.grant_peer_control(
+                        lease_id.clone(),
+                        wire.peer_device_id.clone(),
+                        expires_at,
+                    )?;
+                }
+                let mut response = remote_session::ControlMessage::new(
+                    if grant {
+                        if message.kind == remote_session::ControlKind::TakeoverRequest {
+                            remote_session::ControlKind::TakeoverGranted
+                        } else {
+                            remote_session::ControlKind::ControlGranted
+                        }
+                    } else {
+                        remote_session::ControlKind::ControlDenied
+                    },
+                    attempt_id,
+                    wire,
+                    &message.remote_session_id,
+                    session.next_sequence(),
+                    now_millis(),
+                );
+                if grant {
+                    response.lease_id = Some(lease_id);
+                    response.owner_device_id = Some(wire.peer_device_id.clone());
+                    response.lease_expires_at = Some(expires_at);
+                } else {
+                    response.reason = Some(authorization.err().unwrap_or_else(|| {
+                        if can_control {
+                            "The approved desktop-control session is not active".to_string()
+                        } else {
+                            // The portal was approved for the picture only.
+                            "The computer shared its screen without control. Reopen the \
+                             screen and, on the computer, turn on \"Allow remote interaction\" \
+                             before sharing."
+                                .to_string()
+                        }
+                    }));
+                    let _ = session.accept(&response, now_millis());
+                }
+                response
+            };
+            send_remote_session_message(&peer, wire, &response)?;
+            return Ok(());
+        }
+        // Recorded under the session lock, acted on after it: stopping a capture
+        // or clearing the preview changes GStreamer element state, which can wait
+        // on the GTK main loop — and the main loop takes this same lock.
+        let teardown;
+        let request_control = {
+            let mut open = remote_session::sessions()
+                .lock()
+                .map_err(|_| "DeskLink remote-session lock poisoned".to_string())?;
+            let session = open.entry(wire.peer_device_id.clone()).or_default();
+            session.accept(&message, now)?;
+            teardown = matches!(
+                message.kind,
+                remote_session::ControlKind::Release
+                    | remote_session::ControlKind::ScreenStopped
+                    | remote_session::ControlKind::ScreenError
+            );
+            if message.kind == remote_session::ControlKind::ScreenReady
+                && message.direction == Some(remote_session::ScreenDirection::PhoneToDesktop)
+            {
+                // A second view of the phone arrives on the pad the first one
+                // parked; show it again (the first view comes via pad-added).
+                super::screen::resume_parked(&wire.peer_device_id);
+                if let (Some(width), Some(height)) = (message.screen_width, message.screen_height) {
+                    session.set_phone_screen(width, height);
+                }
+                session.begin_control()?;
+                Some(remote_session::ControlMessage::new(
+                    remote_session::ControlKind::RequestControl,
+                    attempt_id,
+                    wire,
+                    &message.remote_session_id,
+                    session.next_sequence(),
+                    now_millis(),
+                ))
+            } else {
+                None
+            }
+        };
+        if teardown {
+            super::screen::clear_stream(&wire.peer_device_id);
+            stop_desktop_portal_session(&wire.peer_device_id);
+        }
+        if let Some(request) = request_control {
+            let peer = sessions
+                .active_webrtc_peer(binding, attempt_id)
+                .map_err(|error| error.to_string())?;
+            send_remote_session_message(&peer, wire, &request)?;
+        }
+        return Ok(());
     }
     if envelope.message_type != HANDOVER_MESSAGE_TYPE {
         return Err("Unsupported DeskLink WebRTC control message type".to_string());
@@ -1070,6 +2622,19 @@ fn handle_peer_envelope(
                     "[DeskLink] WebRTC feature transport ready for {}",
                     binding.device_id
                 );
+                flush_pending_features(binding, sessions);
+                // A send a lost connection interrupted carries on where the
+                // phone stopped; the phone does the same for its own sends.
+                let resumed = transfer_manager.resume_sends(wire);
+                if !resumed.is_empty() {
+                    let sent = sessions
+                        .active_webrtc_peer(binding, attempt_id)
+                        .map_err(|error| error.to_string())
+                        .and_then(|peer| send_transfer_events(&peer, wire, resumed));
+                    if let Err(error) = sent {
+                        eprintln!("[DeskLink] Could not resume interrupted file sends: {error}");
+                    }
+                }
             }
             Ok(())
         }
@@ -1166,6 +2731,147 @@ fn handle_file_envelope(
         .active_webrtc_peer(binding, attempt_id)
         .map_err(|error| error.to_string())?;
     send_transfer_events(&peer, wire, events)
+}
+
+/// Queue ceiling for terminal output on one peer.
+///
+/// libwebrtc tears a data channel down with `RESOURCE_EXHAUSTED` around 16 MiB
+/// of queued data, which would take the whole peer connection with it — not
+/// just the terminal. Staying two orders of magnitude below that leaves room
+/// for the other channels sharing the transport.
+const TERMINAL_HIGH_WATER: u64 = 256 * 1024;
+
+/// Interval between output pushes. Mosh measured ~8 ms as the point where a
+/// higher rate stops being perceptible, and coalescing at that interval keeps a
+/// flooding program from turning into a message storm.
+const TERMINAL_PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// Handles one `desklink-terminal-v1` envelope.
+///
+/// Everything that matters — the handover and binding gates, the user's
+/// per-device consent, the replay cache — lives in
+/// [`terminal_bridge::process_envelope`], where it can be tested without a peer
+/// connection. Replies are queued on the peer's bridge and go out through
+/// [`run_terminal_pump`], the only thing that sends terminal data, so they are
+/// ordered with the output and subject to the same backpressure.
+fn handle_terminal_envelope(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    envelope: WebRtcEnvelope,
+    sessions: &Arc<DeviceManager>,
+) -> Result<(), String> {
+    terminal_bridge::process_envelope(binding, attempt_id, wire, envelope, sessions)
+}
+
+/// Encodes `events` and sends them on the terminal channel, in order.
+///
+/// A message that cannot be encoded — too large for an envelope, say — is
+/// dropped and logged: it is one bad message, and stopping the pump for it
+/// would silence the terminal for good. A message that cannot be *sent* ends
+/// the pump, because the channel itself is gone.
+fn send_terminal_events(
+    peer: &DesktopWebRtcPeer,
+    wire: &WebRtcWireBinding,
+    events: Vec<TerminalEvent>,
+) -> Result<(), String> {
+    for event in events {
+        let frame = match terminal_frame(wire, event) {
+            Ok(frame) => frame,
+            Err(error) => {
+                eprintln!("[DeskLink] Dropped an unsendable terminal message: {error}");
+                continue;
+            }
+        };
+        peer.send_text(WebRtcChannel::Terminal, &frame)?;
+    }
+    Ok(())
+}
+
+fn terminal_frame(wire: &WebRtcWireBinding, event: TerminalEvent) -> Result<String, String> {
+    let (message_type, payload) = match event {
+        TerminalEvent::SendControl(control) => (TERMINAL_CONTROL_MESSAGE_TYPE, control.to_json()?),
+        TerminalEvent::SendChunk(chunk) => (TERMINAL_CHUNK_MESSAGE_TYPE, chunk.encode()?),
+    };
+    let envelope = WebRtcEnvelope::create(
+        wire,
+        WebRtcChannel::Terminal,
+        message_type,
+        &payload,
+        now_millis(),
+    )?;
+    String::from_utf8(envelope.to_json()?)
+        .map_err(|_| "DeskLink terminal envelope was not UTF-8".to_string())
+}
+
+/// Pushes terminal output to one peer until its connection is replaced.
+///
+/// A dedicated thread on purpose. The peer event worker is a single thread with
+/// a 500 ms timeout serving SDP, ICE, file chunks and handover; interactive
+/// terminal output there would both feel slow and starve the rest.
+///
+/// The bridge is claimed *here*, on the worker thread, before the pump thread
+/// exists: a message on this connection cannot then arrive ahead of it. The
+/// claim's token is what lets the thread's own cleanup end only its own
+/// attachments — a phone that reconnects gets a new bridge and a new token, and
+/// this thread noticing a moment later must not tear that down.
+fn spawn_terminal_pump(
+    binding: SessionBinding,
+    attempt_id: String,
+    wire: WebRtcWireBinding,
+    sessions: Arc<DeviceManager>,
+) {
+    let token = terminal_bridge::begin(&wire);
+    thread::spawn(move || {
+        run_terminal_pump(&binding, &attempt_id, &wire, &sessions, token);
+        // Whatever ended the pump, this connection is no longer receiving output
+        // and no longer holds the right to type. Leaving the lease behind would
+        // lock the next client out of a session nobody is driving.
+        terminal_bridge::end(&wire.peer_device_id, token);
+    });
+}
+
+fn run_terminal_pump(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    sessions: &Arc<DeviceManager>,
+    token: u64,
+) {
+    loop {
+        thread::sleep(TERMINAL_PUMP_INTERVAL);
+        if !sessions.is_current(binding) {
+            break;
+        }
+        let Ok(peer) = sessions.active_webrtc_peer(binding, attempt_id) else {
+            break;
+        };
+        // Read the queue depth first and send only what fits under the ceiling.
+        // Stopping here is what makes the PTY reader stop too: the ring stops
+        // being drained, the kernel buffer fills, and the writing program
+        // blocks in `write(2)` instead of us buffering it. Replies and screen
+        // snapshots are charged against the same budget.
+        let buffered = peer.buffered_amount(WebRtcChannel::Terminal);
+        let budget = usize::try_from(TERMINAL_HIGH_WATER.saturating_sub(buffered))
+            .unwrap_or(usize::MAX)
+            .min(terminal_bridge::DEFAULT_PUMP_BUDGET);
+        if budget == 0 {
+            continue;
+        }
+        // `None`: a newer connection from this device has claimed the bridge.
+        let Some(events) = terminal_bridge::pump_once(&wire.peer_device_id, token, budget) else {
+            break;
+        };
+        if events.is_empty() {
+            continue;
+        }
+        if let Err(error) = send_terminal_events(&peer, wire, events) {
+            if crate::device_links::transport::should_surface_send_error(&error) {
+                eprintln!("[DeskLink] Terminal pump stopped: {error}");
+            }
+            break;
+        }
+    }
 }
 
 fn send_transfer_events(
@@ -1355,10 +3061,12 @@ enum OfferAttemptDisposition {
     ReuseCurrent,
 }
 
-/// A random attempt ID has no trustworthy chronological ordering.  Once a
-/// generation owns an offer, a different offer can only be a delayed/stale
-/// record; a socket replacement creates a new session generation before a
-/// legitimate restart is accepted.
+/// A different attempt id is a restart, not a stale record: the only party
+/// that can produce a validly signed offer is the paired initiator, and it
+/// sends exactly one offer per attempt over one ordered TLS stream, so a
+/// newer offer cannot be overtaken by an older one. Rejecting it — the
+/// previous rule — is what left a restarted phone locked out for ~25 s while
+/// this side clung to the dead peer of its previous process.
 fn offer_attempt_disposition(
     active_attempt: Option<&str>,
     received_attempt: &str,
@@ -1369,7 +3077,7 @@ fn offer_attempt_disposition(
     match active_attempt {
         None => Ok(OfferAttemptDisposition::InstallNew),
         Some(active) if active == received_attempt => Ok(OfferAttemptDisposition::ReuseCurrent),
-        Some(_) => Err("Rejected stale DeskLink WebRTC offer for a replaced attempt".to_string()),
+        Some(_) => Ok(OfferAttemptDisposition::InstallNew),
     }
 }
 
@@ -1451,8 +3159,333 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        offer_attempt_disposition, recovery_delay, OfferAttemptDisposition, RECOVERY_BACKOFF_MILLIS,
+        authorize_desktop_remote_input, coalesce_motion, desktop_capture_needed,
+        desktop_portal_services, ensure_phone_view_allowed, expired_request_action, liveness,
+        offer_attempt_disposition, recovery_delay, remove_service_if_current,
+        stop_desktop_portal_session, DesktopPortalCommand, DesktopPortalService, ExpiredRequest,
+        Liveness, OfferAttemptDisposition, RECOVERY_BACKOFF_MILLIS,
     };
+    use crate::device_links::packet::NetworkPacket;
+    use crate::device_links::webrtc::remote_session::SessionState;
+    use crate::device_links::webrtc::remote_session::{
+        ControlKind, ControlMessage, RemoteSession, ScreenDirection,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc};
+
+    fn register_share(
+        device: &str,
+        id: u64,
+    ) -> (Arc<AtomicBool>, mpsc::Receiver<DesktopPortalCommand>) {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = mpsc::channel();
+        desktop_portal_services().lock().unwrap().insert(
+            device.to_string(),
+            DesktopPortalService {
+                id,
+                sender,
+                can_control: false,
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        (cancel, receiver)
+    }
+
+    /// A worker that is only now finishing must not remove the entry of the
+    /// share that replaced it — that ended the new capture right after the user
+    /// approved it.
+    #[test]
+    fn a_finishing_worker_removes_only_its_own_registry_entry() {
+        let device = "test-device-own-entry";
+        let _ = register_share(device, 41);
+        let _ = register_share(device, 42); // a newer share for the same phone
+
+        assert!(!remove_service_if_current(device, 41), "41 was replaced");
+        assert!(desktop_portal_services()
+            .lock()
+            .unwrap()
+            .contains_key(device));
+
+        assert!(remove_service_if_current(device, 42));
+        assert!(!desktop_portal_services()
+            .lock()
+            .unwrap()
+            .contains_key(device));
+    }
+
+    /// A worker still waiting on the GNOME dialog never reads the `Stop`
+    /// command, so stopping must cancel it as well.
+    #[test]
+    fn stopping_a_share_cancels_a_worker_waiting_on_the_consent_dialog() {
+        let device = "test-device-cancel";
+        let (cancel, receiver) = register_share(device, 7);
+
+        stop_desktop_portal_session(device);
+
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DesktopPortalCommand::Stop)
+        ));
+        assert!(!desktop_portal_services()
+            .lock()
+            .unwrap()
+            .contains_key(device));
+    }
+
+    /// One session per device serves both directions. Starting to view the
+    /// phone while the desktop is being shared would overwrite the live share's
+    /// session id while its capture keeps streaming.
+    #[test]
+    fn viewing_the_phone_is_refused_while_the_desktop_is_being_shared() {
+        let device = "test-device-conflict";
+        assert!(ensure_phone_view_allowed(device).is_ok());
+
+        let _ = register_share(device, 9);
+        assert!(ensure_phone_view_allowed(device).is_err());
+
+        stop_desktop_portal_session(device);
+        assert!(ensure_phone_view_allowed(device).is_ok());
+    }
+
+    #[test]
+    fn an_expired_view_request_is_cleaned_up_on_the_side_that_owns_it() {
+        assert_eq!(
+            expired_request_action(
+                SessionState::RequestingView,
+                Some(ScreenDirection::DesktopToPhone)
+            ),
+            ExpiredRequest::CancelDesktopShare
+        );
+        assert_eq!(
+            expired_request_action(
+                SessionState::RequestingView,
+                Some(ScreenDirection::PhoneToDesktop)
+            ),
+            ExpiredRequest::ReleasePhoneView
+        );
+        // A control request that timed out only falls back to the view.
+        assert_eq!(
+            expired_request_action(
+                SessionState::RequestingControl,
+                Some(ScreenDirection::PhoneToDesktop)
+            ),
+            ExpiredRequest::Nothing
+        );
+    }
+
+    /// A real file, both directions, over real ICE/DTLS/SCTP data channels: the
+    /// two transfer managers are driven exactly as `handle_file_envelope` drives
+    /// them, and every envelope crosses a live connection. The unit tests in
+    /// `transfer_manager` cannot see transport problems (ordering, message size,
+    /// backpressure); this can.
+    fn transfer_over_loopback(offerer_sends: bool, size: usize) {
+        use super::send_transfer_events;
+        use crate::device_links::webrtc::file_protocol::{
+            FileControl, FILE_CHUNK_MESSAGE_TYPE, FILE_CONTROL_MESSAGE_TYPE,
+        };
+        use crate::device_links::webrtc::peer_connection::tests as net;
+        use crate::device_links::webrtc::transfer_manager::{TransferEvent, WebRtcTransferManager};
+        use crate::device_links::webrtc::{
+            PeerEvent, WebRtcChannel, WebRtcEnvelope, WebRtcWireBinding,
+        };
+
+        let pair = net::loopback();
+        let all = [
+            WebRtcChannel::Control,
+            WebRtcChannel::FileControl,
+            WebRtcChannel::FileData,
+        ];
+        net::wait_for_channels(&pair.offerer_events, &all);
+        net::wait_for_channels(&pair.answerer_events, &all);
+
+        let (sender_peer, receiver_peer, sender_events, receiver_events) = if offerer_sends {
+            (
+                &pair.offerer,
+                &pair.answerer,
+                &pair.offerer_events,
+                &pair.answerer_events,
+            )
+        } else {
+            (
+                &pair.answerer,
+                &pair.offerer,
+                &pair.answerer_events,
+                &pair.offerer_events,
+            )
+        };
+        let wire_sender = WebRtcWireBinding {
+            sender_device_id: "sender".into(),
+            peer_device_id: "receiver".into(),
+            session_id: 11,
+            generation: 1,
+        };
+        let wire_receiver = WebRtcWireBinding {
+            sender_device_id: "receiver".into(),
+            peer_device_id: "sender".into(),
+            session_id: 11,
+            generation: 1,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "desklink-loopback-{}-{size}-{offerer_sends}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("payload.bin");
+        // Deterministic, incompressible-looking bytes.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let bytes: Vec<u8> = (0..size)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 33) as u8
+            })
+            .collect();
+        std::fs::write(&source, &bytes).unwrap();
+
+        let sender =
+            WebRtcTransferManager::new(root.join("sender-state"), root.join("sender-out")).unwrap();
+        let receiver =
+            WebRtcTransferManager::new(root.join("receiver-state"), root.join("receiver-out"))
+                .unwrap();
+
+        let first = sender.start_send(&wire_sender, &source).unwrap();
+        send_transfer_events(sender_peer, &wire_sender, first).unwrap();
+
+        let mut published = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        while published.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the transfer did not finish in time"
+            );
+            for (events, manager, wire, peer) in [
+                (receiver_events, &receiver, &wire_receiver, receiver_peer),
+                (sender_events, &sender, &wire_sender, sender_peer),
+            ] {
+                let Ok(PeerEvent::Envelope { bytes, .. }) =
+                    events.recv_timeout(std::time::Duration::from_millis(5))
+                else {
+                    continue;
+                };
+                let envelope = WebRtcEnvelope::from_json(&bytes).unwrap();
+                let payload = envelope.validate(wire).unwrap();
+                let out = match envelope.message_type.as_str() {
+                    FILE_CONTROL_MESSAGE_TYPE => manager
+                        .handle_control(wire, FileControl::from_json(&payload).unwrap())
+                        .unwrap(),
+                    FILE_CHUNK_MESSAGE_TYPE => manager.handle_chunk(wire, &payload).unwrap(),
+                    other => panic!("unexpected message type {other}"),
+                };
+                for event in &out {
+                    if let TransferEvent::Completed { path, .. } = event {
+                        published = Some(path.clone());
+                    }
+                }
+                send_transfer_events(peer, wire, out).unwrap();
+            }
+        }
+
+        let arrived = std::fs::read(published.unwrap()).unwrap();
+        assert_eq!(arrived.len(), bytes.len());
+        assert!(arrived == bytes, "the file arrived corrupted");
+        pair.offerer.close();
+        pair.answerer.close();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_file_crosses_a_live_connection_from_the_offerer() {
+        transfer_over_loopback(true, 2 * 1024 * 1024 + 123);
+    }
+
+    /// `cargo test --release transfer_throughput -- --ignored --nocapture`:
+    /// real webrtcbin on both ends, so this measures the protocol and stack,
+    /// not Wi-Fi.
+    #[test]
+    #[ignore]
+    fn transfer_throughput_over_loopback() {
+        let size = 64 * 1024 * 1024;
+        let started = std::time::Instant::now();
+        transfer_over_loopback(true, size);
+        let seconds = started.elapsed().as_secs_f64();
+        eprintln!(
+            "[bench] {} MiB in {seconds:.2}s = {:.1} MB/s",
+            size >> 20,
+            size as f64 / seconds / 1e6
+        );
+    }
+
+    #[test]
+    fn a_file_crosses_a_live_connection_from_the_answerer() {
+        transfer_over_loopback(false, 2 * 1024 * 1024 + 123);
+    }
+
+    #[test]
+    fn an_empty_and_a_one_byte_file_cross_a_live_connection() {
+        transfer_over_loopback(true, 1);
+    }
+
+    fn session_control(kind: ControlKind, session_id: &str) -> ControlMessage {
+        ControlMessage {
+            kind,
+            session_attempt_id: "attempt".to_string(),
+            device_id: "phone".to_string(),
+            session_id: 1,
+            connection_generation: 1,
+            remote_session_id: session_id.to_string(),
+            sequence: 1,
+            timestamp: 1_000,
+            lease_id: None,
+            direction: Some(ScreenDirection::DesktopToPhone),
+            owner_device_id: None,
+            lease_expires_at: None,
+            reason: None,
+            screen_width: None,
+            screen_height: None,
+            screen_rotation: None,
+            editable: None,
+            screen_count: None,
+        }
+    }
+
+    #[test]
+    fn malformed_input_does_not_refresh_the_peer_control_lease() {
+        let mut session = RemoteSession::new();
+        let session_id = session.begin_view(ScreenDirection::DesktopToPhone);
+        session
+            .accept(
+                &session_control(ControlKind::ScreenReady, &session_id),
+                1_001,
+            )
+            .unwrap();
+        session
+            .accept(
+                &session_control(ControlKind::RequestControl, &session_id),
+                1_002,
+            )
+            .unwrap();
+        session
+            .grant_peer_control("lease".to_string(), "phone".to_string(), 100_000)
+            .unwrap();
+
+        let mut packet = NetworkPacket::new("desklink.mousepad.request");
+        packet.set(super::remote_session::FIELD_REMOTE_SESSION_ID, session_id);
+        packet.set(super::remote_session::FIELD_LEASE_ID, "lease");
+        packet.set(super::remote_session::FIELD_INPUT_SEQUENCE, 1i64);
+        packet.set("x", 25);
+
+        assert!(authorize_desktop_remote_input(&mut session, &packet, "phone", 5_000).is_err());
+        assert_eq!(session.peer_input_lease().unwrap().expires_at, 100_000);
+    }
+
+    #[test]
+    fn only_desktop_to_phone_requests_need_desktop_capture() {
+        assert!(desktop_capture_needed(ScreenDirection::DesktopToPhone));
+        assert!(!desktop_capture_needed(ScreenDirection::PhoneToDesktop));
+    }
 
     /// The backoff used to clamp at its last rung and retry every 30 seconds
     /// for the life of the process, so a connection that could never succeed
@@ -1473,11 +3506,64 @@ mod tests {
     }
 
     #[test]
-    fn stale_offer_cannot_replace_the_current_attempt() {
+    fn motion_is_coalesced_without_crossing_clicks() {
+        use super::super::remote_desktop_portal::PortalInputAction as A;
+        let merged = coalesce_motion(vec![
+            A::AbsoluteMotion(1.0, 1.0),
+            A::AbsoluteMotion(2.0, 2.0),
+            A::Button {
+                evdev_code: 272,
+                pressed: true,
+            },
+            A::RelativeMotion(1.0, 0.0),
+            A::RelativeMotion(2.0, 3.0),
+            A::Scroll(0.0, 1.0),
+            A::Scroll(0.0, 1.0),
+            A::Button {
+                evdev_code: 272,
+                pressed: false,
+            },
+        ]);
+        assert_eq!(
+            merged,
+            vec![
+                A::AbsoluteMotion(2.0, 2.0),
+                A::Button {
+                    evdev_code: 272,
+                    pressed: true
+                },
+                A::RelativeMotion(3.0, 3.0),
+                A::Scroll(0.0, 2.0),
+                A::Button {
+                    evdev_code: 272,
+                    pressed: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn liveness_probes_after_five_seconds_and_declares_dead_after_fifteen() {
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        assert_eq!(liveness(s(4), s(60)), Liveness::Fine);
+        assert_eq!(liveness(s(5), s(60)), Liveness::Probe);
+        // One probe per interval, not one per 500 ms worker tick.
+        assert_eq!(liveness(s(7), s(2)), Liveness::Fine);
+        assert_eq!(liveness(s(14), s(5)), Liveness::Probe);
+        assert_eq!(liveness(s(15), s(0)), Liveness::Dead);
+    }
+
+    #[test]
+    fn a_fresh_offer_replaces_the_current_attempt() {
         assert_eq!(
             offer_attempt_disposition(Some("current"), "current").unwrap(),
             OfferAttemptDisposition::ReuseCurrent
         );
-        assert!(offer_attempt_disposition(Some("current"), "delayed").is_err());
+        // A fresh signed offer replaces the peer: the initiator restarted.
+        assert_eq!(
+            offer_attempt_disposition(Some("current"), "fresh").unwrap(),
+            OfferAttemptDisposition::InstallNew
+        );
     }
 }

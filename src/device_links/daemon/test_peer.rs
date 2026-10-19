@@ -138,6 +138,7 @@ impl TestPeer {
             protocol_version: PROTOCOL_VERSION,
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
+            instance_id: None,
         };
         devices.lock().unwrap().insert(
             peer_id.to_string(),
@@ -247,7 +248,7 @@ impl TestPeer {
     }
 
     pub(crate) fn accept(&self) {
-        self.commands().accept_pair(&self.peer_id);
+        self.commands().accept_pair(&self.peer_id, None);
     }
 
     pub(crate) fn reject(&self) {
@@ -292,9 +293,6 @@ impl TestPeer {
                 &self.sessions,
                 &self.config,
                 &self.events,
-                // No input device: remote input must never be synthesised by a
-                // test run.
-                &mut None,
             );
             applied += 1;
         }

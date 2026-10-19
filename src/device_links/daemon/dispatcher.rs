@@ -26,7 +26,7 @@ pub(crate) enum DispatchError {
     StaleSession,
     UnpairedFeature,
     BootstrapOnWebRtc,
-    FeatureOnLanAfterHandover,
+    FeatureOnLan,
     PayloadOnLan,
     PayloadOnWebRtc,
     FeatureNotEnabled,
@@ -42,8 +42,8 @@ impl std::fmt::Display for DispatchError {
             Self::BootstrapOnWebRtc => {
                 "DeskLink rejected identity, pairing, or signaling from WebRTC"
             }
-            Self::FeatureOnLanAfterHandover => {
-                "DeskLink rejected LAN feature traffic after WebRTC handover"
+            Self::FeatureOnLan => {
+                "DeskLink rejected a paired feature on the LAN link; features travel over WebRTC only"
             }
             Self::PayloadOnWebRtc => {
                 "DeskLink rejected a legacy payload packet on the WebRTC event bridge"
@@ -79,7 +79,10 @@ impl SharedPacketDispatcher {
     ) -> Result<(), DispatchError> {
         let is_bootstrap = matches!(
             packet.packet_type.as_str(),
-            PACKET_TYPE_IDENTITY | PACKET_TYPE_PAIR | PACKET_TYPE_WEBRTC_SIGNAL_V1
+            PACKET_TYPE_IDENTITY
+                | PACKET_TYPE_PAIR
+                | crate::device_links::packet::PACKET_TYPE_PAIR_QR
+                | PACKET_TYPE_WEBRTC_SIGNAL_V1
         );
         if is_bootstrap {
             return if source == PacketSource::LanBootstrap {
@@ -126,12 +129,13 @@ impl SharedPacketDispatcher {
         if !paired {
             return Err(DispatchError::UnpairedFeature);
         }
-        // LAN carries paired features only until the authenticated WebRTC
-        // handover has taken over. Once `feature_ready` is reached the socket
-        // is bootstrap-only, so a feature packet arriving there is either a
-        // stale write or an attempt to bypass the authenticated transport.
-        if source == PacketSource::LanBootstrap && feature_ready {
-            return Err(DispatchError::FeatureOnLanAfterHandover);
+        // LAN is bootstrap-only, always. It used to carry features until the
+        // handover finished, but each side judged "finished" by its own state:
+        // after a phone restart the phone sent over LAN while this side still
+        // held the old peer, and every notification was dropped here. Both
+        // apps now queue features until WebRTC is ready instead.
+        if source == PacketSource::LanBootstrap {
+            return Err(DispatchError::FeatureOnLan);
         }
         if source == PacketSource::WebRtc && !feature_ready {
             return Err(DispatchError::UnpairedFeature);
@@ -227,39 +231,23 @@ mod tests {
         assert_eq!(error, DispatchError::BootstrapOnWebRtc);
     }
 
-    /// Before the authenticated handover, the pinned-TLS bootstrap link is a
-    /// valid carrier for ordinary feature packets. Without this the product has
-    /// no working transport at all on a network where ICE cannot complete.
+    /// WebRTC is the only feature transport, before the handover too.
     #[test]
-    fn accepts_lan_features_before_handover() {
+    fn rejects_lan_features_before_handover() {
         let manager = DeviceManager::new();
         let binding = paired_binding(&manager, vec![PACKET_TYPE_CLIPBOARD.to_string()]);
 
-        assert!(SharedPacketDispatcher::authorize(
-            PacketSource::LanBootstrap,
-            &binding,
-            &manager,
-            &local(),
-            &NetworkPacket::new(PACKET_TYPE_CLIPBOARD),
-        )
-        .is_ok());
-    }
-
-    #[test]
-    fn rejects_lan_features_the_peer_never_advertised() {
-        let manager = DeviceManager::new();
-        let binding = paired_binding(&manager, Vec::new());
-
-        let error = SharedPacketDispatcher::authorize(
-            PacketSource::LanBootstrap,
-            &binding,
-            &manager,
-            &local(),
-            &NetworkPacket::new(PACKET_TYPE_CLIPBOARD),
-        )
-        .unwrap_err();
-
-        assert_eq!(error, DispatchError::UnsupportedByPeer);
+        assert_eq!(
+            SharedPacketDispatcher::authorize(
+                PacketSource::LanBootstrap,
+                &binding,
+                &manager,
+                &local(),
+                &NetworkPacket::new(PACKET_TYPE_CLIPBOARD),
+            )
+            .unwrap_err(),
+            DispatchError::FeatureOnLan
+        );
     }
 
     #[test]
@@ -290,7 +278,7 @@ mod tests {
                 &packet,
             )
             .unwrap_err(),
-            DispatchError::FeatureOnLanAfterHandover
+            DispatchError::FeatureOnLan
         );
         assert!(SharedPacketDispatcher::authorize(
             PacketSource::WebRtc,
@@ -366,7 +354,7 @@ mod tests {
                 &packet,
             )
             .unwrap_err(),
-            DispatchError::FeatureOnLanAfterHandover
+            DispatchError::FeatureOnLan
         );
     }
 

@@ -156,7 +156,18 @@ pub(super) fn finish_secure_link(
     let incumbent_is_answering = sessions
         .silence(&initial_info.id)
         .is_some_and(|silence| silence < super::HEARTBEAT_IDLE * 2);
-    if sessions.has_ready_webrtc(&initial_info.id)
+    // A new restart epoch means the peer's previous process — and with it the
+    // WebRTC peer this session holds — is gone. Neither keep the old socket
+    // nor adopt into the old session: register, which clears the dead peer.
+    let restarted = sessions.peer_restarted(&initial_info.id, link.info.instance_id.as_deref());
+    if restarted {
+        eprintln!(
+            "[DL-WRTC-BOOT] {} restarted (new instance); replacing its session",
+            initial_info.id
+        );
+    }
+    if !restarted
+        && sessions.has_ready_webrtc(&initial_info.id)
         && sessions.has_live_bootstrap_link(&initial_info.id)
         && incumbent_is_answering
     {
@@ -181,7 +192,12 @@ pub(super) fn finish_secure_link(
     // Android already treats a replacement LAN connection as signaling
     // capacity only (`onConnectionReceived`'s retained binding); this is the
     // desktop half of the same rule.
-    if let Some(binding) = sessions.adopt_bootstrap_link(&initial_info.id, &transport) {
+    let adopted = if restarted {
+        None
+    } else {
+        sessions.adopt_bootstrap_link(&initial_info.id, &transport)
+    };
+    if let Some(binding) = adopted {
         eprintln!(
             "[DL-WRTC-BOOT] adopted a replacement bootstrap socket for {} (session {}, generation {}); kept the feature-ready WebRTC transport",
             binding.device_id, binding.session_id, binding.generation
@@ -267,8 +283,21 @@ fn schedule_webrtc_bootstrap(
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     events: Arc<Mutex<Vec<DaemonEvent>>>,
 ) {
+    // When the phone is the initiator (its id sorts lower) it offers on every
+    // fresh link by itself, and each `RestartRequest` makes it discard the
+    // offer it already has in flight — four of them cost a slow phone up to
+    // four offers. So the responder asks once, only if nothing arrived in 3 s.
+    let desktop_initiates = config
+        .lock()
+        .map(|config| config.local_device_info().id < binding.device_id)
+        .unwrap_or(true);
+    let delays: &'static [u64] = if desktop_initiates {
+        &[250, 1_000, 2_000, 4_000]
+    } else {
+        &[3_000]
+    };
     thread::spawn(move || {
-        for delay in [250_u64, 1_000, 2_000, 4_000] {
+        for &delay in delays {
             thread::sleep(Duration::from_millis(delay));
             if !sessions.is_current(&binding) {
                 eprintln!(

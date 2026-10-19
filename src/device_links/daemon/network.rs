@@ -144,6 +144,63 @@ impl LinkTransport for TlsLinkTransport {
     }
 }
 
+/// Bound on unauthenticated connections being handshaken at once, in either
+/// direction. Each holds a thread and a socket; without a cap any LAN host
+/// could open thousands and exhaust both before proving anything.
+const MAX_PREAUTH_HANDSHAKES: usize = 16;
+static PREAUTH_HANDSHAKES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// At most this many of those slots per remote address. TLS gives no absolute
+/// deadline (its reads time out individually), so without a per-host bound
+/// one host dribbling bytes could hold every slot and lock out the phone.
+const MAX_PREAUTH_HANDSHAKES_PER_HOST: usize = 3;
+static PREAUTH_BY_HOST: std::sync::Mutex<Vec<(IpAddr, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// A claimed handshake slot, released on drop however the handshake ends.
+pub(super) struct HandshakeSlot(IpAddr);
+
+impl HandshakeSlot {
+    pub(super) fn claim(host: IpAddr) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        let mut by_host = PREAUTH_BY_HOST.lock().ok()?;
+        let held = by_host
+            .iter()
+            .find(|(ip, _)| *ip == host)
+            .map_or(0, |(_, count)| *count);
+        if held >= MAX_PREAUTH_HANDSHAKES_PER_HOST {
+            return None;
+        }
+        PREAUTH_HANDSHAKES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_PREAUTH_HANDSHAKES).then_some(count + 1)
+            })
+            .ok()?;
+        match by_host.iter_mut().find(|(ip, _)| *ip == host) {
+            Some((_, count)) => *count += 1,
+            None => by_host.push((host, 1)),
+        }
+        Some(Self(host))
+    }
+}
+
+impl Drop for HandshakeSlot {
+    fn drop(&mut self) {
+        PREAUTH_HANDSHAKES.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        if let Ok(mut by_host) = PREAUTH_BY_HOST.lock() {
+            if let Some(index) = by_host.iter().position(|(ip, _)| *ip == self.0) {
+                by_host[index].1 -= 1;
+                if by_host[index].1 == 0 {
+                    by_host.swap_remove(index);
+                }
+            }
+        }
+    }
+}
+
+/// Packets from a peer that is not paired yet are identity, pairing and
+/// signaling only; the largest legitimate one (signed SDP) is well under this.
+pub(super) const MAX_UNPAIRED_PACKET_BYTES: usize = 256 * 1024;
+
 pub(super) fn read_ssl_packet(stream: &mut SslStream<TcpStream>) -> Result<NetworkPacket, String> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
@@ -160,7 +217,8 @@ pub(super) fn read_ssl_packet(stream: &mut SslStream<TcpStream>) -> Result<Netwo
             }
             break;
         }
-        if line.len() > 32 * 1024 * 1024 {
+        // Only the secure identity is read here, before anything is trusted.
+        if line.len() > MAX_UNPAIRED_PACKET_BYTES {
             return Err("Packet is too large".to_string());
         }
     }
@@ -196,4 +254,25 @@ pub(super) fn ssl_connector(config: &Arc<Mutex<Config>>) -> Result<SslConnector,
         .map_err(|err| err.to_string())?;
     builder.set_verify_callback(SslVerifyMode::PEER, |_preverify_ok, _ctx| true);
     Ok(builder.build())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preauth_handshakes_are_capped_and_slots_are_released() {
+        let host: IpAddr = "192.0.2.7".parse().unwrap();
+        let slots: Vec<_> = std::iter::from_fn(|| HandshakeSlot::claim(host))
+            .take(64)
+            .collect();
+        // One host can never take more than its share.
+        assert_eq!(slots.len(), MAX_PREAUTH_HANDSHAKES_PER_HOST);
+        assert!(HandshakeSlot::claim(host).is_none());
+        // Another host is not locked out by it.
+        let other = HandshakeSlot::claim("192.0.2.8".parse().unwrap());
+        assert!(other.is_some());
+        drop(slots);
+        assert!(HandshakeSlot::claim(host).is_some());
+    }
 }

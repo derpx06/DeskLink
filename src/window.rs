@@ -20,7 +20,7 @@
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use gtk::{gio, glib};
+use gtk::{gdk, gio, glib};
 
 use crate::device_links::daemon::{DaemonCommand, DaemonEvent, DaemonHandle};
 use crate::device_links::device::{DeviceNotification, DeviceStatus, DeviceView, VolumeSink};
@@ -31,6 +31,7 @@ use crate::device_links::packet::{
     PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP_REQUEST,
     PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
 };
+use crate::device_links::webrtc::transfer_board::{Finished, Outcome};
 
 mod imp {
     use super::*;
@@ -74,6 +75,11 @@ mod imp {
         /// on appending rows from its now-stale vector — leaving duplicated
         /// entries and rendering the detail pane twice.
         pub refreshing: std::cell::Cell<bool>,
+        /// The transfers window is on screen.
+        pub transfers_open: std::cell::Cell<bool>,
+        /// The user closed it while transfers were still running; it stays
+        /// closed until the next batch of transfers starts.
+        pub transfers_dismissed: std::cell::Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -106,6 +112,26 @@ mod imp {
                 .bidirectional()
                 .sync_create()
                 .build();
+
+            // "Show in folder" on a received-file toast.
+            self.obj()
+                .add_action_entries([gio::ActionEntry::builder("show-download")
+                    .parameter_type(Some(glib::VariantTy::STRING))
+                    .activate(|window: &super::DesklinkWindow, _, parameter| {
+                        if let Some(path) = parameter.and_then(|value| value.get::<String>()) {
+                            gtk::FileLauncher::new(Some(&gio::File::for_path(path)))
+                                .open_containing_folder(
+                                    Some(window),
+                                    gio::Cancellable::NONE,
+                                    |result| {
+                                        if let Err(error) = result {
+                                            eprintln!("[UI] Could not show the download: {error}");
+                                        }
+                                    },
+                                );
+                        }
+                    })
+                    .build()]);
 
             let window = self.obj().downgrade();
             self.search_entry.connect_search_changed(move |_| {
@@ -175,6 +201,102 @@ impl DesklinkWindow {
     }
 
     pub fn set_daemon(&self, daemon: DaemonHandle) {
+        // Debug builds only: lets `tools/device_e2e.sh` drive desktop-initiated
+        // features over the window's exported D-Bus action group, e.g.
+        // `gdbus call --session --dest derx06.desklink.com
+        //   --object-path /derx06/desklink/com/window/1
+        //   --method org.gtk.Actions.Activate e2e "[<'ping ID'>]" {}`
+        #[cfg(debug_assertions)]
+        {
+            let e2e_daemon = daemon.clone();
+            self.add_action_entries([gio::ActionEntry::builder("e2e")
+                .parameter_type(Some(glib::VariantTy::STRING))
+                .activate(move |win: &Self, _, parameter| {
+                    let Some(line) = parameter.and_then(|value| value.get::<String>()) else {
+                        return;
+                    };
+                    let mut parts = line.splitn(3, ' ');
+                    let (verb, id) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                    let (id, arg) = (id.to_string(), parts.next().unwrap_or("").to_string());
+                    if verb == "desk-terminal" {
+                        let result = crate::device_links::pty::desk::new_desk_session();
+                        eprintln!("[E2E] desk-terminal: {result:?}");
+                        return;
+                    }
+                    if verb == "desktop-selftest" {
+                        let _ = std::thread::Builder::new()
+                            .name("desklink-share-selftest".into())
+                            .spawn(move || {
+                                let result =
+                                    crate::device_links::webrtc::screen::desktop_share_selftest(
+                                        &id,
+                                    );
+                                eprintln!("[E2E] desktop-selftest: {result:?}");
+                            });
+                        return;
+                    }
+                    // "desk-input ID {mousepad body}": as if the phone sent it.
+                    if verb == "desk-input" {
+                        let result =
+                            crate::device_links::webrtc::debug_inject_desktop_input(&id, &arg);
+                        eprintln!("[E2E] desk-input {arg}: {result:?}");
+                        return;
+                    }
+                    if verb == "remote-window" {
+                        crate::remote_control::show_remote_control_dialog(
+                            e2e_daemon.clone(),
+                            id,
+                            win,
+                        );
+                        return;
+                    }
+                    let command = match verb {
+                        "ping" => DaemonCommand::SendPing(id),
+                        "find-phone" => DaemonCommand::SendFindPhone(id),
+                        "lock-phone" => DaemonCommand::SendLockRequest(id, true),
+                        "send-file" => DaemonCommand::SendFile(id, arg.into()),
+                        "share-text" => DaemonCommand::SendShareText(id, arg),
+                        "notifications" => DaemonCommand::RequestNotifications(id),
+                        "browse-files" => DaemonCommand::SendSftpRequest(id),
+                        "terminal-access" => DaemonCommand::SetTerminalAccess(id, arg == "on"),
+                        "view-phone" => DaemonCommand::StartPhoneRemoteControl(id),
+                        // "type TEXT" / "key N": the phone window's keyboard path.
+                        "type" => {
+                            let mut payload = serde_json::Map::new();
+                            payload.insert("key".into(), arg.clone().into());
+                            DaemonCommand::SendMousepadRequest(id, payload)
+                        }
+                        "key" => {
+                            let mut payload = serde_json::Map::new();
+                            payload.insert(
+                                "specialKey".into(),
+                                arg.parse::<i64>().unwrap_or(0).into(),
+                            );
+                            DaemonCommand::SendMousepadRequest(id, payload)
+                        }
+                        "stop-phone" => DaemonCommand::StopPhoneRemoteControl(id),
+                        // "tap X Y" on the phone, through the real lease path.
+                        "tap" => {
+                            let mut parts = arg.split(' ').filter_map(|v| v.parse::<i64>().ok());
+                            let (Some(x), Some(y)) = (parts.next(), parts.next()) else {
+                                return;
+                            };
+                            let mut payload = serde_json::Map::new();
+                            payload.insert("singleclick".into(), true.into());
+                            payload.insert("x".into(), x.into());
+                            payload.insert("y".into(), y.into());
+                            DaemonCommand::SendMousepadRequest(id, payload)
+                        }
+                        _ => {
+                            eprintln!("[E2E] unknown command: {line}");
+                            return;
+                        }
+                    };
+                    eprintln!("[E2E] {verb}");
+                    e2e_daemon.send(command);
+                })
+                .build()]);
+        }
         self.imp().daemon.replace(Some(daemon));
         self.refresh_devices();
 
@@ -239,6 +361,8 @@ impl DesklinkWindow {
                 }
             }
         }
+
+        self.follow_transfers(&daemon);
 
         let devices = daemon.devices();
         let recent_devices: Vec<_> = devices
@@ -494,6 +618,72 @@ impl DesklinkWindow {
         application.send_notification(Some(id), &notification);
     }
 
+    /// Shows the transfers window while files are moving and tells the user how
+    /// each one ended.
+    fn follow_transfers(&self, daemon: &DaemonHandle) {
+        let imp = self.imp();
+        let finished = daemon.take_finished_transfers();
+        if !finished.is_empty() {
+            let names: std::collections::HashMap<String, String> = daemon
+                .devices()
+                .into_iter()
+                .map(|device| (device.id, device.name))
+                .collect();
+            for done in &finished {
+                let device = names
+                    .get(&done.device_id)
+                    .map_or("your device", String::as_str);
+                self.announce_transfer(done, device);
+            }
+        }
+        if daemon.transfer_rows().is_empty() {
+            imp.transfers_dismissed.set(false);
+        } else if !imp.transfers_open.get() && !imp.transfers_dismissed.get() {
+            imp.transfers_open.set(true);
+            let window = self.downgrade();
+            crate::transfers::show(daemon.clone(), self.upcast_ref(), move || {
+                if let Some(window) = window.upgrade() {
+                    window.imp().transfers_open.set(false);
+                    window.imp().transfers_dismissed.set(true);
+                }
+            });
+        }
+    }
+
+    fn announce_transfer(&self, done: &Finished, device: &str) {
+        let name = &done.name;
+        let (message, notify) = match &done.outcome {
+            Outcome::Received(_) => (format!("Received {name} from {device}"), true),
+            Outcome::Sent => (format!("Sent {name} to {device}"), false),
+            Outcome::Cancelled => (format!("Cancelled {name}"), false),
+            Outcome::Failed(reason) => {
+                let what = if done.incoming { "receive" } else { "send" };
+                (format!("Could not {what} {name}: {reason}"), true)
+            }
+        };
+        // Names and reasons come from the peer; toasts read markup by default.
+        let toast = adw::Toast::new(&message);
+        toast.set_use_markup(false);
+        toast.set_timeout(if matches!(done.outcome, Outcome::Received(_)) {
+            10
+        } else {
+            5
+        });
+        if let Outcome::Received(path) = &done.outcome {
+            toast.set_button_label(Some("Show in folder"));
+            toast.set_action_name(Some("win.show-download"));
+            toast.set_action_target_value(Some(&path.to_string_lossy().to_string().to_variant()));
+        }
+        self.imp().toast_overlay.add_toast(toast);
+        if notify {
+            self.send_app_notification(
+                &format!("desklink-transfer-{}", done.id),
+                "DeskLink",
+                &message,
+            );
+        }
+    }
+
     fn show_feature_toast(&self, message: &str) {
         let toast = adw::Toast::new(message);
         toast.set_timeout(4);
@@ -565,6 +755,7 @@ impl DesklinkWindow {
             .build();
 
         content.append(&heading);
+        content.append(&qr_pairing_section(&daemon, &window));
         content.append(&scroll);
         toolbar.set_content(Some(&content));
         window.set_content(Some(&toolbar));
@@ -971,19 +1162,26 @@ fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget 
                 move |btn| {
                     if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
                         let file_dialog = gtk::FileDialog::builder()
-                            .title("Select File to Send")
+                            .title("Select Files to Send")
                             .build();
 
                         let daemon = daemon.clone();
                         let id = id.clone();
-                        file_dialog.open(Some(&root), gio::Cancellable::NONE, move |result| {
-                            if let Ok(file) = result {
-                                if let Some(path) = file.path() {
-                                    eprintln!("[UI] Selected file to send: {:?}", path);
-                                    daemon.send(DaemonCommand::SendFile(id.clone(), path));
+                        file_dialog.open_multiple(
+                            Some(&root),
+                            gio::Cancellable::NONE,
+                            move |result| {
+                                let Ok(files) = result else {
+                                    return;
+                                };
+                                for file in files.iter::<gio::File>().flatten() {
+                                    if let Some(path) = file.path() {
+                                        eprintln!("[UI] Selected file to send: {:?}", path);
+                                        daemon.send(DaemonCommand::SendFile(id.clone(), path));
+                                    }
                                 }
-                            }
-                        });
+                            },
+                        );
                     }
                 }
             },
@@ -1089,18 +1287,30 @@ fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget 
             },
         ));
     }
-    if can_send_feature(&device, PACKET_TYPE_SFTP_REQUEST) {
+    if device.feature_transport_ready || can_send_feature(&device, PACKET_TYPE_SFTP_REQUEST) {
         row2.append(&plugin_tile_active(
             "Browse Files",
             "folder-remote-symbolic",
-            "Request phone storage access",
+            "Browse, download and manage the folders your phone shares",
             {
                 let daemon = daemon.clone();
                 let id = device.id.clone();
                 let browsing_device = device.clone();
                 move |btn| {
-                    daemon.send(DaemonCommand::SendSftpRequest(id.clone()));
-                    if let Some(root) = btn.root().and_downcast::<gtk::Window>() {
+                    let Some(root) = btn.root().and_downcast::<gtk::Window>() else {
+                        return;
+                    };
+                    if browsing_device.feature_transport_ready {
+                        crate::phone_files::show(
+                            daemon.clone(),
+                            id.clone(),
+                            &browsing_device.name,
+                            &root,
+                        );
+                    } else {
+                        // Until the WebRTC handover finishes only the legacy
+                        // SFTP request is available.
+                        daemon.send(DaemonCommand::SendSftpRequest(id.clone()));
                         show_file_browsing_dialog(browsing_device.clone(), &root);
                     }
                 }
@@ -1189,7 +1399,218 @@ fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget 
     grid_card.append(&row3);
 
     outer.append(&grid_card);
+    outer.append(&terminal_access_section(daemon, &device));
+    outer.append(&remote_control_section(&device));
     outer.upcast()
+}
+
+/// The consent switch for phone-driven terminals, and — while the phone is
+/// using them — a visible indicator.
+///
+/// A terminal is a shell on this computer, so it is **off until the user turns
+/// it on here**, per phone, and turning it off cuts the phone off at once. The
+/// indicator is text with an icon, not colour alone, and both rows have
+/// accessible names and descriptions.
+fn terminal_access_section(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
+    let section = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(0)
+        .build();
+    section.append(
+        &gtk::Label::builder()
+            .label("Terminal")
+            .xalign(0.0)
+            .margin_top(20)
+            .margin_bottom(8)
+            .css_classes(["heading"])
+            .build(),
+    );
+
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+
+    const WARNING: &str = "Lets this phone run commands on this computer";
+    // `active` is set before the handler is connected, so building the row
+    // from persisted state does not itself send a command.
+    let switch = adw::SwitchRow::builder()
+        .title("Allow terminal access from this phone")
+        .subtitle(WARNING)
+        .active(device.terminal_access)
+        .build();
+    gtk::prelude::AccessibleExtManual::update_property(
+        &switch,
+        &[gtk::accessible::Property::Description(WARNING)],
+    );
+    {
+        let daemon = daemon.clone();
+        let id = device.id.clone();
+        switch.connect_active_notify(move |row| {
+            eprintln!("[UI] Terminal access for {id} set to {}", row.is_active());
+            daemon.send(DaemonCommand::SetTerminalAccess(
+                id.clone(),
+                row.is_active(),
+            ));
+        });
+    }
+    list.append(&switch);
+
+    // A terminal started here is shared: it opens in a window on this
+    // computer and appears in the phone's session list.
+    let shared = adw::ActionRow::builder()
+        .title("New shared terminal")
+        .subtitle("Opens here and appears on this phone, live in both")
+        .activatable(true)
+        .build();
+    shared.add_suffix(
+        &gtk::Image::builder()
+            .icon_name("utilities-terminal-symbolic")
+            .valign(gtk::Align::Center)
+            .build(),
+    );
+    shared.connect_activated(|_| {
+        if let Err(error) = crate::device_links::pty::desk::new_desk_session() {
+            eprintln!("[UI] Could not start a shared terminal: {error}");
+        }
+    });
+    list.append(&shared);
+
+    if device.terminal_sessions_attached > 0 {
+        let count = device.terminal_sessions_attached;
+        let plural = if count == 1 { "session" } else { "sessions" };
+        let indicator = adw::ActionRow::builder()
+            .title(format!("Phone has terminal access ({count} {plural})"))
+            .subtitle("This phone is connected to a terminal on this computer")
+            .activatable(false)
+            .build();
+        indicator.add_prefix(
+            &gtk::Image::builder()
+                .icon_name("utilities-terminal-symbolic")
+                .valign(gtk::Align::Center)
+                .build(),
+        );
+        list.append(&indicator);
+    }
+
+    section.append(&list);
+    section
+}
+
+/// Approve, while at the desk, the phone controlling this computer — so later
+/// sessions from the phone start without anyone here to click Share.
+fn remote_control_section(device: &DeviceView) -> gtk::Box {
+    const APPROVED: &str =
+        "Approved: this phone can view and control this computer without asking here, until DeskLink restarts";
+    const NOT_APPROVED: &str =
+        "Each session from this phone asks here first. Approve now so it can connect on its own";
+    const WAITING: &str =
+        "Choose the screen, turn on \u{201c}Allow Remote Interaction\u{201d}, then Share";
+    const VIEW_ONLY: &str =
+        "Shared without remote interaction, so not remembered. Try again with \u{201c}Allow Remote Interaction\u{201d} on";
+
+    let section = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    section.append(
+        &gtk::Label::builder()
+            .label("Remote control")
+            .xalign(0.0)
+            .margin_top(20)
+            .margin_bottom(8)
+            .css_classes(["heading"])
+            .build(),
+    );
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    let approved = crate::device_links::config::remote_desktop_token(&device.id).is_some();
+    let row = adw::ActionRow::builder()
+        .title("Control this computer from this phone")
+        .subtitle(if approved { APPROVED } else { NOT_APPROVED })
+        .subtitle_lines(3)
+        .build();
+    let approve = gtk::Button::builder()
+        .label(if approved {
+            "Approve again"
+        } else {
+            "Approve…"
+        })
+        .valign(gtk::Align::Center)
+        .css_classes(["suggested-action"])
+        .build();
+    let forget = gtk::Button::builder()
+        .label("Forget")
+        .valign(gtk::Align::Center)
+        .visible(approved)
+        .build();
+    gtk::prelude::AccessibleExtManual::update_property(
+        &forget,
+        &[gtk::accessible::Property::Description(
+            "Stop this phone controlling the computer without asking",
+        )],
+    );
+    row.add_suffix(&forget);
+    row.add_suffix(&approve);
+    {
+        let (row, forget) = (row.downgrade(), forget.downgrade());
+        let id = device.id.clone();
+        approve.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            if let Some(row) = row.upgrade() {
+                row.set_subtitle(WAITING);
+            }
+            let (row, forget, button, id) =
+                (row.clone(), forget.clone(), button.downgrade(), id.clone());
+            glib::spawn_future_local(async move {
+                let outcome = gio::spawn_blocking(move || {
+                    crate::device_links::webrtc::preauthorize_remote_control(&id)
+                })
+                .await
+                .unwrap_or_else(|_| Err("The approval was interrupted".to_string()));
+                let granted = matches!(outcome, Ok(true));
+                if let Some(row) = row.upgrade() {
+                    row.set_subtitle(match &outcome {
+                        Ok(true) => APPROVED,
+                        Ok(false) => VIEW_ONLY,
+                        Err(_) => NOT_APPROVED,
+                    });
+                }
+                if let Err(error) = outcome {
+                    eprintln!("[UI] Remote-control approval did not complete: {error}");
+                }
+                if let Some(forget) = forget.upgrade() {
+                    forget.set_visible(granted);
+                }
+                if let Some(button) = button.upgrade() {
+                    button.set_sensitive(true);
+                    button.set_label(if granted {
+                        "Approve again"
+                    } else {
+                        "Approve…"
+                    });
+                }
+            });
+        });
+    }
+    {
+        let (row, approve) = (row.downgrade(), approve.downgrade());
+        let id = device.id.clone();
+        forget.connect_clicked(move |button| {
+            crate::device_links::config::set_remote_desktop_token(&id, None);
+            button.set_visible(false);
+            if let Some(row) = row.upgrade() {
+                row.set_subtitle(NOT_APPROVED);
+            }
+            if let Some(approve) = approve.upgrade() {
+                approve.set_label("Approve…");
+            }
+        });
+    }
+    list.append(&row);
+    section.append(&list);
+    section
 }
 
 fn device_summary_parts(device: &DeviceView) -> Vec<(&'static str, String)> {
@@ -1999,9 +2420,10 @@ fn unpaired_device_row(daemon: &DaemonHandle, device: DeviceView) -> adw::Action
             let accept = command_button("Accept", "object-select-symbolic", {
                 let daemon = daemon.clone();
                 let id = device.id.clone();
+                let shown_key = device.verification_key.clone();
                 move || {
                     eprintln!("[UI] Accept clicked for {}", id);
-                    daemon.send(DaemonCommand::AcceptPair(id.clone()));
+                    daemon.send(DaemonCommand::AcceptPair(id.clone(), shown_key.clone()));
                 }
             });
             accept.add_css_class("suggested-action");
@@ -2035,6 +2457,103 @@ fn command_button(label: &str, icon_name: &str, action: impl Fn() + 'static) -> 
     button
 }
 
+/// "Scan to pair": shows a live QR code from `pairing_qr`. A scanned code is
+/// consumed, so a fresh one appears for the next phone; closing the dialog
+/// withdraws it so no code outlives the window that showed it.
+fn qr_pairing_section(daemon: &DaemonHandle, window: &adw::Window) -> gtk::Box {
+    let section = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .halign(gtk::Align::Center)
+        .build();
+    let picture = gtk::Picture::builder()
+        .width_request(220)
+        .height_request(220)
+        .can_shrink(false)
+        .build();
+    gtk::prelude::AccessibleExtManual::update_property(
+        &picture,
+        &[gtk::accessible::Property::Label("Pairing QR code")],
+    );
+    section.append(&picture);
+    section.append(
+        &gtk::Label::builder()
+            .label("Scan this with the DeskLink app to pair. No code to compare.")
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["dim-label"])
+            .build(),
+    );
+
+    daemon.send(DaemonCommand::StartQrPairing);
+    let shown = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+    // Set on close, so a tick racing the close can never start a code that no
+    // window shows (it would stay live for 5 minutes).
+    let closed = std::rc::Rc::new(std::cell::Cell::new(false));
+    let tick_closed = std::rc::Rc::clone(&closed);
+    let weak_picture = picture.downgrade();
+    let poll_daemon = daemon.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+        let Some(picture) = weak_picture.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        if tick_closed.get() {
+            return glib::ControlFlow::Break;
+        }
+        match crate::device_links::pairing_qr::current_uri() {
+            Some(uri) if shown.borrow().as_deref() != Some(uri.as_str()) => {
+                if let Some(texture) = qr_texture(&uri) {
+                    picture.set_paintable(Some(&texture));
+                }
+                *shown.borrow_mut() = Some(uri);
+            }
+            Some(_) => {}
+            None => {
+                // Used or expired: offer a new one.
+                if shown.borrow_mut().take().is_some() {
+                    poll_daemon.send(DaemonCommand::StartQrPairing);
+                }
+            }
+        }
+        glib::ControlFlow::Continue
+    });
+    window.connect_close_request({
+        let daemon = daemon.clone();
+        move |_| {
+            closed.set(true);
+            daemon.send(DaemonCommand::CancelQrPairing);
+            glib::Propagation::Proceed
+        }
+    });
+    section
+}
+
+/// Rasterises a QR code: 6 px per module and the standard 4-module quiet zone.
+fn qr_texture(uri: &str) -> Option<gdk::MemoryTexture> {
+    const SCALE: usize = 6;
+    const QUIET: usize = 4;
+    let (width, dark) = crate::device_links::pairing_qr::modules(uri).ok()?;
+    let side = (width + 2 * QUIET) * SCALE;
+    let mut pixels = vec![255u8; side * side * 3];
+    for (index, is_dark) in dark.iter().enumerate() {
+        if !is_dark {
+            continue;
+        }
+        let (row, column) = (index / width + QUIET, index % width + QUIET);
+        for y in row * SCALE..(row + 1) * SCALE {
+            let start = (y * side + column * SCALE) * 3;
+            pixels[start..start + SCALE * 3].fill(0);
+        }
+    }
+    Some(gdk::MemoryTexture::new(
+        side as i32,
+        side as i32,
+        gdk::MemoryFormat::R8g8b8,
+        &glib::Bytes::from_owned(pixels),
+        side * 3,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2049,6 +2568,7 @@ mod tests {
             protocol_version: 9,
             incoming_capabilities: vec![PACKET_TYPE_PING.to_string()],
             outgoing_capabilities: Vec::new(),
+            instance_id: None,
         };
         let device = DeviceView::from_info(&info, "127.0.0.1".to_string(), true);
 
@@ -2068,6 +2588,7 @@ mod tests {
             protocol_version: 9,
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
+            instance_id: None,
         };
         let mut device = DeviceView::from_info(&info, "127.0.0.1".to_string(), true);
 

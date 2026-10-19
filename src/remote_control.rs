@@ -1,23 +1,25 @@
+//! The phone's screen in a window, scrcpy-style: the live picture fills it,
+//! and the mouse acts on the phone directly where it points — click to tap,
+//! drag to swipe, hold to long-press, scroll to scroll — with the keyboard
+//! typing into the phone. Right click is Back, middle click is Home, and the
+//! header carries Back / Home / Recents.
+
 use adw::prelude::*;
 use gtk::gdk;
 use gtk::gdk::Key;
 use gtk::glib;
 use serde_json::{Map, Value};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
+use crate::device_links::webrtc::remote_session::SessionState;
 
-/// Roughly 60 Hz. Fast enough that the pointer feels direct, slow enough that
-/// one gesture cannot queue thousands of packets.
-const MOTION_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+/// A press that moves less than this (in window pixels) is a tap, not a swipe.
+const TAP_SLOP: f64 = 8.0;
+/// A still press held this long is a long-press.
+const LONG_PRESS: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Installs this dialog's stylesheet on the default display, once per process.
-///
-/// A fresh `CssProvider` used to be added on every dialog open and never
-/// removed, so each open stacked another identical stylesheet on the display
-/// that every widget's style recalculation then had to walk. The CSS is static,
-/// so registering it once is both simpler and correct.
 fn install_remote_control_css() {
     static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     INSTALLED.get_or_init(|| {
@@ -27,32 +29,15 @@ fn install_remote_control_css() {
         let provider = gtk::CssProvider::new();
         provider.load_from_string(
             "
-    .trackpad-box {
-        background-color: alpha(@theme_bg_color, 0.4);
-        border: 1px solid alpha(@theme_fg_color, 0.12);
-        border-radius: 16px;
-        margin: 20px;
-        transition: border-color 0.25s ease, background-color 0.25s ease;
-    }
-    .trackpad-box:focus {
-        background-color: alpha(@theme_selected_bg_color, 0.06);
-        border: 2px solid @theme_selected_bg_color;
-    }
+    .phone-screen { background-color: black; }
     .status-pill {
-        background-color: alpha(@theme_fg_color, 0.06);
+        background-color: alpha(black, 0.65);
         border-radius: 12px;
         padding: 6px 14px;
-        font-size: 0.82rem;
+        margin: 12px;
+        font-size: 0.85rem;
         font-weight: bold;
-        color: alpha(@theme_fg_color, 0.7);
-    }
-    .status-pill.active {
-        background-color: alpha(@theme_selected_bg_color, 0.15);
-        color: @theme_selected_bg_color;
-    }
-    .remote-entry {
-        border-radius: 10px;
-        padding: 8px 12px;
+        color: white;
     }
     ",
         );
@@ -64,297 +49,491 @@ fn install_remote_control_css() {
     });
 }
 
+/// Where the video is drawn inside a widget when scaled to fit (letterboxed),
+/// and where a point on the widget falls on the phone's own screen. `None`
+/// outside the picture (the black bars).
+pub(crate) fn map_to_phone(
+    point: (f64, f64),
+    widget: (f64, f64),
+    video: (f64, f64),
+    phone: (i32, i32),
+) -> Option<(i32, i32)> {
+    let (ww, wh) = widget;
+    let (vw, vh) = video;
+    if ww <= 0.0 || wh <= 0.0 || vw <= 0.0 || vh <= 0.0 || phone.0 <= 0 || phone.1 <= 0 {
+        return None;
+    }
+    let scale = (ww / vw).min(wh / vh);
+    let (dw, dh) = (vw * scale, vh * scale);
+    let (ox, oy) = ((ww - dw) / 2.0, (wh - dh) / 2.0);
+    let fx = (point.0 - ox) / dw;
+    let fy = (point.1 - oy) / dh;
+    if !(0.0..=1.0).contains(&fx) || !(0.0..=1.0).contains(&fy) {
+        return None;
+    }
+    let x = (fx * f64::from(phone.0)).round() as i32;
+    let y = (fy * f64::from(phone.1)).round() as i32;
+    Some((x.clamp(0, phone.0 - 1), y.clamp(0, phone.1 - 1)))
+}
+
+/// What a finished left-button press means: a drag that moved is a swipe
+/// (already streaming), a still one is a tap or, if held, a long-press.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Press {
+    Tap,
+    Hold,
+    SwipeEnded,
+}
+
+pub(crate) fn classify_press(moved: bool, held: std::time::Duration) -> Press {
+    if moved {
+        Press::SwipeEnded
+    } else if held >= LONG_PRESS {
+        Press::Hold
+    } else {
+        Press::Tap
+    }
+}
+
+fn action(name: &str) -> Map<String, Value> {
+    let mut payload = Map::new();
+    payload.insert(name.to_string(), Value::Bool(true));
+    payload
+}
+
+fn at(mut payload: Map<String, Value>, (x, y): (i32, i32)) -> Map<String, Value> {
+    payload.insert("x".to_string(), Value::from(x));
+    payload.insert("y".to_string(), Value::from(y));
+    payload
+}
+
 pub fn show_remote_control_dialog(
     daemon: DaemonHandle,
     device_id: String,
     parent: &impl IsA<gtk::Window>,
 ) {
     install_remote_control_css();
+    let device = Rc::new(device_id);
 
+    // Phone-shaped by default; the picture keeps its aspect when resized.
     let window = adw::Window::builder()
         .transient_for(parent)
-        .modal(true)
-        .default_width(800)
-        .default_height(600)
-        .title("Remote Control")
+        .modal(false)
+        .default_width(420)
+        .default_height(860)
+        .title("Phone Screen")
         .build();
 
-    let content_vbox = gtk::Box::new(gtk::Orientation::Vertical, 0);
-
+    let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
-    content_vbox.append(&header);
+    let send = {
+        let daemon = daemon.clone();
+        let device = Rc::clone(&device);
+        Rc::new(move |payload: Map<String, Value>| {
+            if remote_control_lease_active(device.as_str()) {
+                daemon.send(DaemonCommand::SendMousepadRequest(
+                    device.to_string(),
+                    payload,
+                ));
+            }
+        })
+    };
+    for (icon, tooltip, name) in [
+        ("go-previous-symbolic", "Back", "backclick"),
+        ("go-home-symbolic", "Home", "middleclick"),
+        ("view-app-grid-symbolic", "Recents", "forwardclick"),
+    ] {
+        let button = gtk::Button::builder()
+            .icon_name(icon)
+            .tooltip_text(tooltip)
+            .build();
+        let send = Rc::clone(&send);
+        button.connect_clicked(move |_| send(action(name)));
+        header.pack_start(&button);
+    }
+    // Some phones (ColorOS) black out the status bar in any screen capture, so
+    // its essentials — time, battery, charging — are shown here instead.
+    let title = adw::WindowTitle::new("Phone Screen", "");
+    header.set_title_widget(Some(&title));
+    toolbar.add_top_bar(&header);
 
-    let trackpad_area = gtk::Box::builder()
+    let picture = gtk::Picture::builder()
+        .content_fit(gtk::ContentFit::Contain)
+        .can_shrink(true)
         .hexpand(true)
         .vexpand(true)
-        .css_classes(["trackpad-box"])
         .focusable(true)
+        .css_classes(["phone-screen"])
         .build();
-
-    let trackpad_vbox = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(16)
-        .halign(gtk::Align::Center)
-        .valign(gtk::Align::Center)
-        .build();
-
-    let status_label = gtk::Label::builder()
-        .label("⚪ Click trackpad to type directly")
+    gtk::prelude::AccessibleExtManual::update_property(
+        &picture,
+        &[gtk::accessible::Property::Label("Phone screen")],
+    );
+    let status = gtk::Label::builder()
         .css_classes(["status-pill"])
-        .halign(gtk::Align::Center)
-        .build();
-
-    let trackpad_icon = gtk::Image::builder()
-        .icon_name("input-touchpad-symbolic")
-        .pixel_size(96)
-        .halign(gtk::Align::Center)
-        .opacity(0.5)
-        .build();
-
-    let label = gtk::Label::builder()
-        .label("<b>Virtual Trackpad</b>\n\nHover mouse here to move cursor\nClick / tap to select or right-click\nScroll to scroll page")
-        .use_markup(true)
+        .wrap(true)
         .justify(gtk::Justification::Center)
         .halign(gtk::Align::Center)
+        .valign(gtk::Align::Start)
         .build();
+    let overlay = gtk::Overlay::builder().child(&picture).build();
+    overlay.add_overlay(&status);
+    toolbar.set_content(Some(&overlay));
 
-    trackpad_vbox.append(&status_label);
-    trackpad_vbox.append(&trackpad_icon);
-    trackpad_vbox.append(&label);
+    daemon.send(DaemonCommand::StartPhoneRemoteControl(device.to_string()));
+    let last_start = Rc::new(Cell::new(std::time::Instant::now()));
+    let last_control_request = Rc::new(Cell::new(std::time::Instant::now()));
 
-    trackpad_area.append(&trackpad_vbox);
-    content_vbox.append(&trackpad_area);
+    // State, picture and status, refreshed ~30 times a second.
+    {
+        let device = Rc::clone(&device);
+        let daemon = daemon.clone();
+        let picture = picture.downgrade();
+        let status = status.downgrade();
+        let last_start = Rc::clone(&last_start);
+        let last_control_request = Rc::clone(&last_control_request);
+        let title = title.downgrade();
+        let tick = Cell::new(0u32);
+        glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
+            let (Some(picture), Some(status)) = (picture.upgrade(), status.upgrade()) else {
+                return glib::ControlFlow::Break;
+            };
+            tick.set(tick.get().wrapping_add(1));
+            if tick.get() % 30 == 1 {
+                if let Some(title) = title.upgrade() {
+                    if let Some(view) = daemon.devices().into_iter().find(|d| d.id == *device) {
+                        title.set_title(&view.name);
+                        title.set_subtitle(&phone_status_line(
+                            view.battery_status.as_ref(),
+                            &glib::DateTime::now_local()
+                                .and_then(|now| now.format("%H:%M"))
+                                .map(|time| time.to_string())
+                                .unwrap_or_default(),
+                        ));
+                    }
+                }
+            }
+            let state = session_state(device.as_str());
+            if matches!(
+                state,
+                None | Some(SessionState::Idle | SessionState::Stopped)
+            ) && last_start.get().elapsed() >= std::time::Duration::from_secs(3)
+            {
+                daemon.send(DaemonCommand::StartPhoneRemoteControl(device.to_string()));
+                last_start.set(std::time::Instant::now());
+            }
+            // Viewing but not controlling: the phone refused (usually its
+            // accessibility service is off) or the request was lost. Keep
+            // asking, so turning the service on is all the user has to do.
+            if state == Some(SessionState::Viewing)
+                && last_control_request.get().elapsed() >= std::time::Duration::from_secs(2)
+            {
+                daemon.send(DaemonCommand::RequestPhoneControl(device.to_string()));
+                last_control_request.set(std::time::Instant::now());
+            }
+            let denial = session_control_denial(device.as_str()).map(|reason| {
+                format!("{reason} — on the phone: Settings → Accessibility → DeskLink → On")
+            });
+            let paintable = crate::device_links::webrtc::screen::stream_for(device.as_str())
+                .and_then(|stream| stream.paintable());
+            if picture.paintable() != paintable {
+                picture.set_paintable(paintable.as_ref());
+            }
+            #[cfg(debug_assertions)]
+            save_frame_on_request(&picture);
+            let text = match state {
+                Some(SessionState::RequestingView) => Some("Approve screen sharing on the phone…"),
+                Some(SessionState::Viewing) | Some(SessionState::RequestingControl)
+                    if denial.is_some() =>
+                {
+                    denial.as_deref()
+                }
+                Some(SessionState::Viewing) | Some(SessionState::RequestingControl) => {
+                    Some("Asking the phone for control…")
+                }
+                Some(SessionState::Controlling) if paintable.is_none() => {
+                    Some("Allow screen sharing on the phone (check its notifications)…")
+                }
+                Some(SessionState::Controlling) => None,
+                Some(SessionState::PausedLocked) => Some("Phone is locked · unlock it to continue"),
+                Some(SessionState::Stopped) => Some("Screen stopped · reconnecting…"),
+                _ => Some("Connecting to the phone…"),
+            };
+            status.set_visible(text.is_some());
+            if let Some(text) = text {
+                status.set_label(text);
+            }
+            glib::ControlFlow::Continue
+        });
+    }
 
-    let device_id_rc = Rc::new(device_id);
+    {
+        let daemon = daemon.clone();
+        let device = Rc::clone(&device);
+        window.connect_close_request(move |_| {
+            daemon.send(DaemonCommand::StopPhoneRemoteControl(device.to_string()));
+            glib::Propagation::Proceed
+        });
+    }
 
-    // 1. Mouse Movement (EventControllerMotion)
-    let motion = gtk::EventControllerMotion::new();
-    let daemon_clone = daemon.clone();
-    let id_clone = device_id_rc.clone();
+    // Window point → phone pixel, using the picture's current layout.
+    let to_phone = {
+        let picture = picture.downgrade();
+        let device = Rc::clone(&device);
+        Rc::new(move |x: f64, y: f64| -> Option<(i32, i32)> {
+            let picture = picture.upgrade()?;
+            let paintable = picture.paintable()?;
+            let phone = session_phone_screen(device.as_str())?;
+            map_to_phone(
+                (x, y),
+                (f64::from(picture.width()), f64::from(picture.height())),
+                (
+                    f64::from(paintable.intrinsic_width()),
+                    f64::from(paintable.intrinsic_height()),
+                ),
+                phone,
+            )
+        })
+    };
 
-    let last_x = Rc::new(Cell::new(0.0));
-    let last_y = Rc::new(Cell::new(0.0));
-
-    let lx = last_x.clone();
-    let ly = last_y.clone();
-    motion.connect_enter(move |_, x, y| {
-        lx.set(x);
-        ly.set(y);
-    });
-
-    let lx = last_x.clone();
-    let ly = last_y.clone();
-    // Pointer motion arrives at display refresh rate. Sending one packet per
-    // event floods the link and, when a send fails, produces one error per
-    // event. Accumulate movement and emit at most one packet per interval;
-    // deltas are relative, so coalescing them loses no information.
-    let pending_dx = Rc::new(Cell::new(0.0_f64));
-    let pending_dy = Rc::new(Cell::new(0.0_f64));
-    let motion_dx = pending_dx.clone();
-    let motion_dy = pending_dy.clone();
-    motion.connect_motion(move |_, x, y| {
-        let delta_x = x - lx.get();
-        let delta_y = y - ly.get();
-        lx.set(x);
-        ly.set(y);
-        motion_dx.set(motion_dx.get() + delta_x);
-        motion_dy.set(motion_dy.get() + delta_y);
-    });
-
-    let flush_dx = pending_dx.clone();
-    let flush_dy = pending_dy.clone();
-    let flush_daemon = daemon_clone.clone();
-    let flush_id = id_clone.clone();
-    let flush_window = window.downgrade();
-    glib::timeout_add_local(MOTION_INTERVAL, move || {
-        if flush_window.upgrade().is_none() {
-            return glib::ControlFlow::Break;
+    // Left button: tap, long-press, or a swipe that follows the pointer.
+    {
+        let drag = gtk::GestureDrag::builder()
+            .button(gdk::BUTTON_PRIMARY)
+            .build();
+        let start = Rc::new(Cell::new((0.0, 0.0)));
+        let pressed_at = Rc::new(Cell::new(std::time::Instant::now()));
+        let swiping = Rc::new(Cell::new(false));
+        let last = Rc::new(RefCell::new(None::<(i32, i32)>));
+        {
+            let (start, pressed_at, swiping, picture) = (
+                Rc::clone(&start),
+                Rc::clone(&pressed_at),
+                Rc::clone(&swiping),
+                picture.clone(),
+            );
+            drag.connect_drag_begin(move |_, x, y| {
+                picture.grab_focus();
+                start.set((x, y));
+                pressed_at.set(std::time::Instant::now());
+                swiping.set(false);
+            });
         }
-        let delta_x = flush_dx.get();
-        let delta_y = flush_dy.get();
-        // Consume the accumulator only when a packet is actually emitted.
-        // Clearing it unconditionally discarded every sub-threshold tick, so
-        // motion slower than the threshold per interval — a slow, deliberate
-        // drag — accumulated to nothing and the remote pointer never moved.
-        if delta_x.abs() >= 1.0 || delta_y.abs() >= 1.0 {
-            flush_dx.set(0.0);
-            flush_dy.set(0.0);
+        {
+            let (start, swiping, last, to_phone, send) = (
+                Rc::clone(&start),
+                Rc::clone(&swiping),
+                Rc::clone(&last),
+                Rc::clone(&to_phone),
+                Rc::clone(&send),
+            );
+            drag.connect_drag_update(move |_, dx, dy| {
+                let (sx, sy) = start.get();
+                if !swiping.get() {
+                    if dx.hypot(dy) < TAP_SLOP {
+                        return;
+                    }
+                    let Some(origin) = to_phone(sx, sy) else {
+                        return;
+                    };
+                    swiping.set(true);
+                    send(at(action("singlehold"), origin));
+                }
+                if let Some(point) = to_phone(sx + dx, sy + dy) {
+                    if *last.borrow() != Some(point) {
+                        *last.borrow_mut() = Some(point);
+                        send(at(Map::new(), point));
+                    }
+                }
+            });
+        }
+        {
+            let (start, pressed_at, swiping, last, to_phone, send) = (
+                Rc::clone(&start),
+                Rc::clone(&pressed_at),
+                Rc::clone(&swiping),
+                Rc::clone(&last),
+                Rc::clone(&to_phone),
+                Rc::clone(&send),
+            );
+            drag.connect_drag_end(move |_, dx, dy| {
+                let (sx, sy) = start.get();
+                last.borrow_mut().take();
+                match classify_press(swiping.get(), pressed_at.get().elapsed()) {
+                    Press::SwipeEnded => {
+                        if let Some(point) = to_phone(sx + dx, sy + dy) {
+                            send(at(Map::new(), point));
+                        }
+                        send(action("singlerelease"));
+                    }
+                    Press::Hold => {
+                        if let Some(point) = to_phone(sx, sy) {
+                            send(at(action("singlehold"), point));
+                            send(action("singlerelease"));
+                        }
+                    }
+                    Press::Tap => {
+                        if let Some(point) = to_phone(sx, sy) {
+                            send(at(action("singleclick"), point));
+                        }
+                    }
+                }
+                swiping.set(false);
+            });
+        }
+        picture.add_controller(drag);
+    }
+
+    // Right click is Back, middle click is Home — scrcpy's mapping.
+    {
+        let click = gtk::GestureClick::builder().button(0).build();
+        let send = Rc::clone(&send);
+        click.connect_pressed(move |gesture, _, _, _| match gesture.current_button() {
+            gdk::BUTTON_SECONDARY => send(action("backclick")),
+            gdk::BUTTON_MIDDLE => send(action("middleclick")),
+            _ => {}
+        });
+        picture.add_controller(click);
+    }
+
+    // Scroll where the pointer is.
+    {
+        let pointer = Rc::new(Cell::new((0.0, 0.0)));
+        let motion = gtk::EventControllerMotion::new();
+        {
+            let pointer = Rc::clone(&pointer);
+            motion.connect_motion(move |_, x, y| pointer.set((x, y)));
+        }
+        picture.add_controller(motion);
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        let (send, to_phone) = (Rc::clone(&send), Rc::clone(&to_phone));
+        scroll.connect_scroll(move |_, dx, dy| {
+            let (x, y) = pointer.get();
+            let Some(point) = to_phone(x, y) else {
+                return glib::Propagation::Proceed;
+            };
+            send(at(Map::new(), point));
+            let mut payload = action("scroll");
+            payload.insert("dx".to_string(), Value::from(-dx * 3.0));
+            payload.insert("dy".to_string(), Value::from(-dy * 3.0));
+            send(payload);
+            glib::Propagation::Stop
+        });
+        picture.add_controller(scroll);
+    }
+
+    // Typing goes straight to the phone.
+    {
+        let keys = gtk::EventControllerKey::new();
+        let send = Rc::clone(&send);
+        keys.connect_key_pressed(move |_, keyval, _, state| {
             let mut payload = Map::new();
-            payload.insert("dx".to_string(), Value::from(delta_x));
-            payload.insert("dy".to_string(), Value::from(delta_y));
-            flush_daemon.send(DaemonCommand::SendMousepadRequest(
-                flush_id.to_string(),
-                payload,
-            ));
-        }
-        glib::ControlFlow::Continue
-    });
-    trackpad_area.add_controller(motion);
-
-    // 2. Mouse Clicks (GestureClick)
-    let click = gtk::GestureClick::new();
-    click.set_button(0); // Listen to all buttons
-    let daemon_clone = daemon.clone();
-    let id_clone = device_id_rc.clone();
-    let trackpad_weak = trackpad_area.downgrade();
-    click.connect_pressed(move |click, _, _, _| {
-        if let Some(trackpad) = trackpad_weak.upgrade() {
-            trackpad.grab_focus();
-        }
-        let button = click.current_button();
-        if let Some(payload) = click_payload(button) {
-            daemon_clone.send(DaemonCommand::SendMousepadRequest(
-                id_clone.to_string(),
-                payload,
-            ));
-        }
-    });
-
-    trackpad_area.add_controller(click);
-
-    // 3. Scroll (EventControllerScroll)
-    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
-    let daemon_clone = daemon.clone();
-    let id_clone = device_id_rc.clone();
-    scroll.connect_scroll(move |_, dx, dy| {
-        let mut payload = Map::new();
-        payload.insert("scroll".to_string(), Value::Bool(true));
-        payload.insert("dx".to_string(), Value::from(-dx * 3.0));
-        payload.insert("dy".to_string(), Value::from(-dy * 3.0));
-        daemon_clone.send(DaemonCommand::SendMousepadRequest(
-            id_clone.to_string(),
-            payload,
-        ));
-        glib::Propagation::Proceed
-    });
-    trackpad_area.add_controller(scroll);
-
-    // 4. Keyboard Input (EventControllerKey)
-    let key_controller = gtk::EventControllerKey::new();
-    let daemon_clone = daemon.clone();
-    let id_clone = device_id_rc.clone();
-    let trackpad_weak = trackpad_area.downgrade();
-    key_controller.connect_key_pressed(move |_, keyval, _keycode, state| {
-        if let Some(trackpad) = trackpad_weak.upgrade() {
-            if !trackpad.is_focus() {
+            payload.insert(
+                "shift".to_string(),
+                Value::Bool(state.contains(gdk::ModifierType::SHIFT_MASK)),
+            );
+            payload.insert(
+                "ctrl".to_string(),
+                Value::Bool(state.contains(gdk::ModifierType::CONTROL_MASK)),
+            );
+            payload.insert(
+                "alt".to_string(),
+                Value::Bool(state.contains(gdk::ModifierType::ALT_MASK)),
+            );
+            payload.insert(
+                "super".to_string(),
+                Value::Bool(state.contains(gdk::ModifierType::SUPER_MASK)),
+            );
+            let special = map_gdk_key_to_special(keyval);
+            if special > 0 {
+                payload.insert("specialKey".to_string(), Value::from(special));
+            } else if let Some(text) = keyval.to_unicode().filter(|c| !c.is_control()) {
+                payload.insert("key".to_string(), Value::String(text.to_string()));
+            } else {
                 return glib::Propagation::Proceed;
             }
-        }
+            send(payload);
+            glib::Propagation::Stop
+        });
+        window.add_controller(keys);
+    }
 
-        let mut payload = Map::new();
-        let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
-        let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
-        let alt = state.contains(gdk::ModifierType::ALT_MASK);
-        let super_mod = state.contains(gdk::ModifierType::SUPER_MASK);
-
-        payload.insert("shift".to_string(), Value::Bool(shift));
-        payload.insert("ctrl".to_string(), Value::Bool(ctrl));
-        payload.insert("alt".to_string(), Value::Bool(alt));
-        payload.insert("super".to_string(), Value::Bool(super_mod));
-
-        let special_key = map_gdk_key_to_special(keyval);
-        if special_key > 0 {
-            payload.insert("specialKey".to_string(), Value::from(special_key));
-        } else if let Some(text) = keyval.to_unicode() {
-            if !text.is_control() {
-                payload.insert("key".to_string(), Value::String(text.to_string()));
-            }
-        }
-
-        if payload.contains_key("specialKey") || payload.contains_key("key") {
-            daemon_clone.send(DaemonCommand::SendMousepadRequest(
-                id_clone.to_string(),
-                payload,
-            ));
-        }
-        glib::Propagation::Proceed
-    });
-    window.add_controller(key_controller);
-
-    // Focus tracking for trackpad_area
-    let focus_controller = gtk::EventControllerFocus::new();
-    let status_weak = status_label.downgrade();
-    focus_controller.connect_enter(move |_| {
-        if let Some(status) = status_weak.upgrade() {
-            status.set_label("🟢 Keyboard Input Active");
-            status.add_css_class("active");
-        }
-    });
-
-    let status_weak2 = status_label.downgrade();
-    focus_controller.connect_leave(move |_| {
-        if let Some(status) = status_weak2.upgrade() {
-            status.set_label("⚪ Click trackpad to type directly");
-            status.remove_css_class("active");
-        }
-    });
-    trackpad_area.add_controller(focus_controller);
-
-    // 5. Beautiful text entry HBox with a send button
-    let bottom_hbox = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(12)
-        .margin_start(20)
-        .margin_end(20)
-        .margin_bottom(20)
-        .build();
-
-    let entry = gtk::Entry::builder()
-        .placeholder_text("Type text here and press Enter to send...")
-        .hexpand(true)
-        .css_classes(["remote-entry"])
-        .primary_icon_name("input-keyboard-symbolic")
-        .build();
-
-    let send_btn = gtk::Button::builder()
-        .icon_name("mail-send-symbolic")
-        .css_classes(["suggested-action"])
-        .tooltip_text("Send text to device")
-        .build();
-
-    bottom_hbox.append(&entry);
-    bottom_hbox.append(&send_btn);
-    content_vbox.append(&bottom_hbox);
-
-    let daemon_clone = daemon.clone();
-    let id_clone = device_id_rc.clone();
-    let entry_weak = entry.downgrade();
-    entry.connect_activate(move |_| {
-        if let Some(entry) = entry_weak.upgrade() {
-            let text = entry.text().to_string();
-            if !text.is_empty() {
-                let mut payload = Map::new();
-                payload.insert("key".to_string(), Value::String(text));
-                daemon_clone.send(DaemonCommand::SendMousepadRequest(
-                    id_clone.to_string(),
-                    payload,
-                ));
-                entry.set_text("");
-            }
-        }
-    });
-
-    let daemon_clone2 = daemon.clone();
-    let id_clone2 = device_id_rc.clone();
-    let entry_weak2 = entry.downgrade();
-    send_btn.connect_clicked(move |_| {
-        if let Some(entry) = entry_weak2.upgrade() {
-            let text = entry.text().to_string();
-            if !text.is_empty() {
-                let mut payload = Map::new();
-                payload.insert("key".to_string(), Value::String(text));
-                daemon_clone2.send(DaemonCommand::SendMousepadRequest(
-                    id_clone2.to_string(),
-                    payload,
-                ));
-                entry.set_text("");
-            }
-        }
-    });
-
-    window.set_content(Some(&content_vbox));
+    window.set_content(Some(&toolbar));
     window.present();
-    trackpad_area.grab_focus();
+    picture.grab_focus();
+}
+
+/// Debug builds only: `touch $DESKLINK_FRAME_DIR/request` and the window
+/// writes what it shows to `frame.png` there — the device test harness's eyes.
+#[cfg(debug_assertions)]
+fn save_frame_on_request(picture: &gtk::Picture) {
+    let Ok(dir) = std::env::var("DESKLINK_FRAME_DIR") else {
+        return;
+    };
+    let request = std::path::Path::new(&dir).join("request");
+    if std::fs::remove_file(&request).is_err() {
+        return;
+    }
+    let (Some(paintable), Some(native)) = (picture.paintable(), picture.native()) else {
+        return;
+    };
+    let Some(renderer) = native.renderer() else {
+        return;
+    };
+    let (width, height) = (paintable.intrinsic_width(), paintable.intrinsic_height());
+    let snapshot = gtk::Snapshot::new();
+    paintable.snapshot(&snapshot, f64::from(width), f64::from(height));
+    if let Some(node) = snapshot.to_node() {
+        let texture = renderer.render_texture(node, None);
+        let _ = texture.save_to_png(std::path::Path::new(&dir).join("frame.png"));
+    }
+}
+
+fn phone_status_line(
+    battery: Option<&crate::device_links::device::BatteryStatus>,
+    time: &str,
+) -> String {
+    match battery.filter(|battery| battery.current_charge >= 0) {
+        Some(battery) => format!(
+            "{time} · Battery {}%{}",
+            battery.current_charge,
+            if battery.is_charging {
+                " ⚡ charging"
+            } else {
+                ""
+            }
+        ),
+        None => time.to_string(),
+    }
+}
+
+fn session_state(device_id: &str) -> Option<SessionState> {
+    crate::device_links::webrtc::remote_session::sessions()
+        .lock()
+        .ok()?
+        .get(device_id)
+        .map(|session| session.state())
+}
+
+fn session_control_denial(device_id: &str) -> Option<String> {
+    crate::device_links::webrtc::remote_session::sessions()
+        .lock()
+        .ok()?
+        .get(device_id)?
+        .control_denial()
+        .map(str::to_string)
+}
+
+fn session_phone_screen(device_id: &str) -> Option<(i32, i32)> {
+    crate::device_links::webrtc::remote_session::sessions()
+        .lock()
+        .ok()?
+        .get(device_id)?
+        .phone_screen()
+}
+
+fn remote_control_lease_active(device_id: &str) -> bool {
+    crate::device_links::webrtc::coordinator::has_remote_control_lease(device_id)
 }
 
 fn map_gdk_key_to_special(keyval: Key) -> i32 {
@@ -390,41 +569,90 @@ fn map_gdk_key_to_special(keyval: Key) -> i32 {
     }
 }
 
-fn click_payload(button: u32) -> Option<Map<String, Value>> {
-    let key = match button {
-        gdk::BUTTON_PRIMARY => "singleclick",
-        gdk::BUTTON_SECONDARY => "rightclick",
-        gdk::BUTTON_MIDDLE => "middleclick",
-        _ => return None,
-    };
-
-    let mut payload = Map::new();
-    payload.insert(key.to_string(), Value::Bool(true));
-    Some(payload)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn payload_has_only_bool(payload: Map<String, Value>, key: &str) {
-        assert_eq!(payload.len(), 1);
-        assert_eq!(payload.get(key), Some(&Value::Bool(true)));
+    #[test]
+    fn a_point_maps_through_the_letterbox_to_phone_pixels() {
+        // 576x1280 video of a 1080x2400 phone, shown in a 1000x1000 widget:
+        // scaled to 450x1000, centred with 275 px bars either side.
+        let video = (576.0, 1280.0);
+        let phone = (1080, 2400);
+        let widget = (1000.0, 1000.0);
+        assert_eq!(
+            map_to_phone((500.0, 500.0), widget, video, phone),
+            Some((540, 1200))
+        );
+        assert_eq!(
+            map_to_phone((275.0, 0.0), widget, video, phone),
+            Some((0, 0))
+        );
+        assert_eq!(
+            map_to_phone((725.0, 1000.0), widget, video, phone),
+            Some((1079, 2399))
+        );
+        // The black bars are not the phone.
+        assert_eq!(map_to_phone((100.0, 500.0), widget, video, phone), None);
+        assert_eq!(map_to_phone((900.0, 500.0), widget, video, phone), None);
+        // Nothing to map onto yet.
+        assert_eq!(
+            map_to_phone((500.0, 500.0), widget, (0.0, 0.0), phone),
+            None
+        );
     }
 
     #[test]
-    fn primary_click_sends_singleclick_not_drag_hold() {
-        let payload = click_payload(gdk::BUTTON_PRIMARY).unwrap();
-
-        assert!(!payload.contains_key("singlehold"));
-        assert!(!payload.contains_key("singlerelease"));
-        payload_has_only_bool(payload, "singleclick");
+    fn the_header_shows_time_and_battery_like_the_phones_status_bar() {
+        use crate::device_links::device::BatteryStatus;
+        let battery = |charge, charging| BatteryStatus {
+            current_charge: charge,
+            is_charging: charging,
+            battery_quantity: None,
+            threshold_event: None,
+        };
+        assert_eq!(
+            phone_status_line(Some(&battery(22, true)), "14:39"),
+            "14:39 · Battery 22% ⚡ charging"
+        );
+        assert_eq!(
+            phone_status_line(Some(&battery(80, false)), "14:39"),
+            "14:39 · Battery 80%"
+        );
+        assert_eq!(
+            phone_status_line(Some(&battery(-1, false)), "14:39"),
+            "14:39"
+        );
+        assert_eq!(phone_status_line(None, "14:39"), "14:39");
     }
 
     #[test]
-    fn secondary_and_middle_clicks_match_android_mouse_receiver_fields() {
-        payload_has_only_bool(click_payload(gdk::BUTTON_SECONDARY).unwrap(), "rightclick");
-        payload_has_only_bool(click_payload(gdk::BUTTON_MIDDLE).unwrap(), "middleclick");
-        assert!(click_payload(8).is_none());
+    fn a_press_is_a_tap_a_long_press_or_the_end_of_a_swipe() {
+        use std::time::Duration;
+        assert_eq!(
+            classify_press(false, Duration::from_millis(120)),
+            Press::Tap
+        );
+        assert_eq!(
+            classify_press(false, Duration::from_millis(700)),
+            Press::Hold
+        );
+        assert_eq!(
+            classify_press(true, Duration::from_millis(120)),
+            Press::SwipeEnded
+        );
+    }
+
+    #[test]
+    fn taps_and_swipes_use_the_android_receivers_absolute_fields() {
+        let tap = at(action("singleclick"), (10, 20));
+        assert_eq!(tap.get("singleclick"), Some(&Value::Bool(true)));
+        assert_eq!(
+            (tap.get("x"), tap.get("y")),
+            (Some(&Value::from(10)), Some(&Value::from(20)))
+        );
+        // A move during a swipe is just a position.
+        let step = at(Map::new(), (5, 6));
+        assert_eq!(step.len(), 2);
     }
 }

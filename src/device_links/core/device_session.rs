@@ -116,7 +116,17 @@ pub struct DeviceSession {
     /// turn a stale pairing into a packet storm. Android damps the identical
     /// notice at 5s (`PairingHandler.notifyPeerNotPaired`).
     pub last_not_paired_notice: Option<Instant>,
+    /// Features sent while WebRTC was not ready, flushed in order once it is.
+    /// LAN never carries features, so this is what keeps an early clipboard
+    /// or ping from being lost during the handover.
+    pub pending_features: VecDeque<(Instant, crate::device_links::packet::NetworkPacket)>,
 }
+
+/// Oldest-first eviction bound for `pending_features`.
+pub const PENDING_FEATURE_LIMIT: usize = 64;
+/// A queued feature older than this is dropped, not delivered: "Lock phone" or
+/// "Find phone" must not fire hours later when the phone finally reconnects.
+pub const PENDING_FEATURE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl DeviceSession {
     pub fn binding(&self) -> Option<SessionBinding> {
@@ -134,6 +144,8 @@ impl DeviceSession {
     /// handover attempt behind: a later re-pair would otherwise see a peer as
     /// already installed and skip negotiation.
     pub fn clear_webrtc_state(&mut self) -> Option<Arc<DesktopWebRtcPeer>> {
+        // Not `pending_features`: a rebuild must not lose what the user sent
+        // while the peer was down. Unpair clears it in `revoke_pairing`.
         self.webrtc_attempt_id = None;
         self.webrtc_handover = None;
         self.transfer_manager = None;

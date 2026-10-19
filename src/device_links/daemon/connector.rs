@@ -28,19 +28,50 @@ pub(super) fn incoming_tcp_loop(
     while !shutdown.load(Ordering::Acquire) {
         match listener.accept() {
             Ok((stream, _)) => {
+                let Some(slot) = stream
+                    .peer_addr()
+                    .ok()
+                    .and_then(|addr| super::network::HandshakeSlot::claim(addr.ip()))
+                else {
+                    // Dropping the stream closes it: at capacity, refuse rather
+                    // than queue an unauthenticated connection.
+                    continue;
+                };
                 let config = Arc::clone(&config);
                 let devices = Arc::clone(&devices);
                 let sessions = Arc::clone(&sessions);
                 let errors = Arc::clone(&errors);
                 let events = Arc::clone(&events);
-                thread::spawn(move || {
+                let spawned = thread::Builder::new().spawn(move || {
+                    let _slot = slot;
+                    let peer = stream
+                        .peer_addr()
+                        .map_or_else(|_| "unknown".to_string(), |addr| addr.to_string());
                     if let Err(error) =
                         accept_incoming_device(stream, config, devices, sessions, events)
                     {
-                        eprintln!("[DL-WRTC-BOOT] incoming bootstrap connection rejected: {error}");
-                        push_error(&errors, error);
+                        // A KDE Connect client (GSConnect, kdeconnectd) on the LAN
+                        // retries forever; say so once per address, not per try.
+                        if !error.contains("kdeconnect.identity") || first_sighting(&peer) {
+                            eprintln!(
+                                "[DL-WRTC-BOOT] incoming bootstrap connection from {peer} rejected: {error}"
+                            );
+                        }
+                        // Anyone on the LAN can open this port, so a rejected
+                        // unauthenticated connection is noise, not news: it is
+                        // logged, never shown. The one exception is a paired
+                        // device presenting a different certificate, which may
+                        // be someone impersonating it.
+                        if error.contains("Trusted device certificate changed") {
+                            push_error(&errors, error);
+                        }
                     }
                 });
+                // `thread::spawn` panics at the thread limit, which killed this
+                // accept loop — and with it every future connection.
+                if let Err(error) = spawned {
+                    eprintln!("[DL-WRTC-BOOT] could not start a handshake thread: {error}");
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(50));
@@ -60,10 +91,36 @@ const MAX_IDENTITY_PACKET_BYTES: usize = 512 * 1024;
 /// must be bounded. An unbounded `read_until` let a peer that connects and
 /// never sends a newline grow this buffer until the process was killed. Android
 /// has always bounded the same read; the desktop did not.
+/// True the first time an address is seen (bounded; for log damping only).
+fn first_sighting(peer: &str) -> bool {
+    static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let host = peer
+        .rsplit_once(':')
+        .map_or(peer, |(host, _)| host)
+        .to_string();
+    let Ok(mut seen) = SEEN.lock() else {
+        return true;
+    };
+    if seen.contains(&host) {
+        return false;
+    }
+    if seen.len() >= 64 {
+        seen.remove(0);
+    }
+    seen.push(host);
+    true
+}
+
 fn read_identity_line(reader: &mut BufReader<TcpStream>) -> Result<Vec<u8>, String> {
     let mut line = Vec::new();
     let mut byte = [0u8; 1];
+    // The socket's 10 s timeout is per read, so a peer dripping one byte every
+    // 9 s held this thread for hours. Bound the whole line too.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
+        if std::time::Instant::now() > deadline {
+            return Err("Identity packet took too long".to_string());
+        }
         let read = reader.read(&mut byte).map_err(|err| err.to_string())?;
         if read == 0 {
             return Err("Connection closed".to_string());
@@ -105,7 +162,7 @@ fn accept_incoming_device(
     let line = read_identity_line(&mut reader)?;
     let packet = NetworkPacket::deserialize(&line).map_err(|err| err.to_string())?;
     let info = DeviceInfo::from_identity_packet(&packet)
-        .ok_or_else(|| "Invalid identity packet".to_string())?;
+        .ok_or_else(|| format!("Invalid identity packet (type {})", packet.packet_type))?;
     let local_id = config
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())?

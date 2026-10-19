@@ -143,6 +143,7 @@ impl SessionLink {
                 protocol_version: crate::device_links::packet::PROTOCOL_VERSION,
                 incoming_capabilities: Vec::new(),
                 outgoing_capabilities: Vec::new(),
+                instance_id: None,
             },
             closed: AtomicBool::new(false),
         }

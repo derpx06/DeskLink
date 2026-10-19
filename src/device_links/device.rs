@@ -108,6 +108,14 @@ pub struct DeviceView {
     /// `status` answers "is this device reachable at all"; this answers "is the
     /// paired feature path fully negotiated", which the two used to conflate.
     pub feature_transport_ready: bool,
+    /// The user's "Allow terminal access" choice for this device. Filled in from
+    /// the persisted setting each time the daemon hands out views, never cached
+    /// here, so what the switch shows is what is enforced.
+    #[serde(default)]
+    pub terminal_access: bool,
+    /// How many terminals this device is watching right now.
+    #[serde(default)]
+    pub terminal_sessions_attached: usize,
     pub verification_key: Option<String>,
     pub last_error: Option<String>,
     pub media_status: Option<MediaStatus>,
@@ -134,6 +142,8 @@ impl DeviceView {
             // only component that knows whether a link is actually alive.
             status: DeviceStatus::Discovered,
             feature_transport_ready: false,
+            terminal_access: false,
+            terminal_sessions_attached: 0,
             verification_key: None,
             last_error: None,
             media_status: None,

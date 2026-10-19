@@ -21,8 +21,10 @@
 mod application;
 mod config;
 mod device_links;
+mod phone_files;
 mod protocol;
 mod remote_control;
+mod transfers;
 mod window;
 
 use self::application::DesklinkApplication;
@@ -34,6 +36,14 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 
 fn main() -> glib::ExitCode {
+    // `desklink --attach-terminal <id>`: the client a desk terminal window
+    // runs to show a shared session. No GTK, no second app instance.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() == 3 && args[1] == "--attach-terminal" {
+        let status = device_links::pty::desk::run_client(&args[2]);
+        return glib::ExitCode::from(status.clamp(0, 255));
+    }
+
     // Set up gettext translations
     bindtextdomain(GETTEXT_PACKAGE, LOCALEDIR).expect("Unable to bind the text domain");
     bind_textdomain_codeset(GETTEXT_PACKAGE, "UTF-8")

@@ -11,7 +11,7 @@ use crate::device_links::packet::{
 /// WebRTC transport. Each entry has a matching arm in
 /// `packet_handler::dispatch_webrtc_feature_packet` and a DeskLink Android
 /// plugin that actually sends it.
-const DESKTOP_INCOMING: [&str; 13] = [
+const DESKTOP_INCOMING: [&str; 14] = [
     PACKET_TYPE_BATTERY,
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
@@ -21,6 +21,10 @@ const DESKTOP_INCOMING: [&str; 13] = [
     // by our outgoing advertisement, so without this its request was rejected
     // and the button silently did nothing.
     PACKET_TYPE_LOCK_REQUEST,
+    // Android's mousepad plugin is loaded only when the peer advertises this
+    // receive capability. The WebRTC dispatcher validates a host-approved
+    // portal lease before any input can reach the desktop.
+    PACKET_TYPE_MOUSEPAD_REQUEST,
     PACKET_TYPE_NOTIFICATION,
     PACKET_TYPE_PING,
     // Screen sharing. `desklink.screen.frame` is deliberately absent on both
@@ -164,12 +168,12 @@ mod tests {
     fn feature_registry_does_not_advertise_unavailable_handlers() {
         let registry = FeatureRegistry::desktop();
 
-        // The desktop consumes clipboard and battery, but has no receiver for
-        // remote input: mousepad is an outgoing-only capability here.
+        // The desktop consumes clipboard, battery, and authenticated remote
+        // input only while a host-approved portal lease is active.
         assert!(registry
             .incoming_capabilities()
             .contains(&"desklink.clipboard".to_string()));
-        assert!(!registry
+        assert!(registry
             .incoming_capabilities()
             .contains(&"desklink.mousepad.request".to_string()));
         assert!(registry
@@ -203,6 +207,7 @@ mod tests {
                 "desklink.clipboard.connect".to_string(),
                 "desklink.findmyphone.request".to_string(),
                 "desklink.lock.request".to_string(),
+                "desklink.mousepad.request".to_string(),
                 "desklink.notification".to_string(),
                 "desklink.ping".to_string(),
                 "desklink.screen.error".to_string(),

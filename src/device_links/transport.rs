@@ -68,16 +68,11 @@ impl FeatureTransport {
         self.snapshot.web_rtc_ready && self.sessions.is_current(&self.snapshot.binding)
     }
 
-    /// Sends a paired feature over the authenticated WebRTC transport, falling
-    /// back to the pinned-TLS bootstrap link while the handover is still in
-    /// progress.
-    ///
-    /// The fallback is deliberate and bounded. LAN is already mutually
-    /// authenticated with pinned certificates, so it is a safe carrier for
-    /// ordinary feature packets; without it every feature would be dead on any
-    /// network where ICE cannot complete. File bytes are excluded — they stay
-    /// on the bounded WebRTC file-data channel, because the legacy TCP payload
-    /// socket has been removed on both platforms.
+    /// Sends a paired feature over the authenticated WebRTC transport, or
+    /// queues it until the handover completes. LAN never carries features:
+    /// when it did, the two apps disagreed about which transport was live and
+    /// packets were dropped in silence. The queue is flushed in order by
+    /// `flush_pending_features` once WebRTC is ready.
     pub(crate) fn send(&self, packet: &NetworkPacket) -> Result<(), String> {
         if self.is_ready() {
             return crate::device_links::webrtc::coordinator::send_feature_packet(
@@ -86,19 +81,11 @@ impl FeatureTransport {
                 packet,
             );
         }
-        self.send_over_bootstrap(packet)
-    }
-
-    fn send_over_bootstrap(&self, packet: &NetworkPacket) -> Result<(), String> {
         if packet.payload_size.is_some() || packet.payload_transfer_info.is_some() {
             return Err(
                 "DeskLink file transfer requires an authenticated WebRTC file channel".to_string(),
             );
         }
-        // Apply the same outgoing contract the WebRTC path applies. Testing the
-        // union of both directions would let an incoming-only type through here
-        // and not there, so the two send paths would disagree about what is
-        // legal and the peer would silently drop it as unadvertised.
         let registry = crate::device_links::features::FeatureRegistry::desktop();
         if !registry
             .outgoing_capabilities()
@@ -110,22 +97,20 @@ impl FeatureTransport {
                 packet.packet_type
             ));
         }
-        if !self.sessions.is_current(&self.snapshot.binding) {
-            return Err("Connection was replaced by a newer session generation".to_string());
+        let queued = self
+            .sessions
+            .queue_feature(&self.snapshot.binding, packet.clone())
+            .map_err(|error| error.to_string())?;
+        if queued {
+            return Ok(());
         }
-        let link = &self.snapshot.binding.link;
-        if !link
-            .info
-            .incoming_capabilities
-            .iter()
-            .any(|capability| capability == &packet.packet_type)
-        {
-            return Err(format!(
-                "The paired device does not accept {}",
-                packet.packet_type
-            ));
+        // The handover finished after this handle's snapshot was taken: send
+        // on a fresh one rather than queueing behind a flush that already ran.
+        let fresh = Self::for_binding(&self.sessions, &self.snapshot.binding)?;
+        if !fresh.is_ready() {
+            return Err("WebRTC feature transport is not ready".to_string());
         }
-        link.send_packet(packet)
+        fresh.send(packet)
     }
 
     pub(crate) fn send_file(&self, path: &Path) -> Result<(), String> {
@@ -133,6 +118,60 @@ impl FeatureTransport {
             &self.sessions,
             &self.snapshot,
             path,
+        )
+    }
+
+    pub(crate) fn cancel_transfer(&self, transfer_id: &str) -> Result<(), String> {
+        crate::device_links::webrtc::coordinator::cancel_file_transfer(
+            &self.sessions,
+            &self.snapshot,
+            transfer_id,
+        )
+    }
+
+    /// Sends a phone-file browser request on the WebRTC file-control channel.
+    /// There is no LAN fallback: the phone's files are only offered over the
+    /// authenticated peer connection.
+    pub(crate) fn send_phone_file_request(&self, payload: &[u8]) -> Result<(), String> {
+        if !self.is_ready() {
+            return Err("DeskLink WebRTC feature transport is not ready".to_string());
+        }
+        crate::device_links::webrtc::file_browser::send_request(&self.snapshot, payload)
+    }
+
+    pub(crate) fn start_phone_remote_control(&self) -> Result<(), String> {
+        crate::device_links::webrtc::coordinator::start_phone_remote_control(
+            &self.sessions,
+            &self.snapshot,
+        )
+    }
+
+    pub(crate) fn request_phone_control(&self) -> Result<(), String> {
+        crate::device_links::webrtc::coordinator::request_phone_control(
+            &self.sessions,
+            &self.snapshot,
+        )
+    }
+
+    pub(crate) fn stop_phone_remote_control(&self) -> Result<(), String> {
+        crate::device_links::webrtc::coordinator::stop_phone_remote_control(
+            &self.sessions,
+            &self.snapshot,
+        )
+    }
+
+    pub(crate) fn send_remote_input(&self, mut packet: NetworkPacket) -> Result<(), String> {
+        if !self.is_ready() {
+            return Err("DeskLink remote control needs a ready WebRTC session".to_string());
+        }
+        crate::device_links::webrtc::coordinator::stamp_remote_input(
+            &self.snapshot.binding.device_id,
+            &mut packet,
+        )?;
+        crate::device_links::webrtc::coordinator::send_feature_packet(
+            &self.sessions,
+            &self.snapshot,
+            &packet,
         )
     }
 }
@@ -159,13 +198,20 @@ mod tests {
             .unwrap();
         let transport = FeatureTransport::for_device(&sessions, "phone-1").unwrap();
 
-        // WebRTC is not ready, so the send falls through to the bootstrap link.
-        // The placeholder has no socket, which is how far this test can drive it.
+        // WebRTC is not ready, so the send is queued rather than written to
+        // LAN, and comes back out in order for the flush on feature-ready.
         assert!(!transport.is_ready());
-        assert!(transport
+        let mut second = NetworkPacket::new(PACKET_TYPE_PING);
+        second.set("message", "second");
+        transport
             .send(&NetworkPacket::new(PACKET_TYPE_PING))
-            .unwrap_err()
-            .contains("no network stream"));
+            .unwrap();
+        transport.send(&second).unwrap();
+        let binding = sessions.current_binding("phone-1").unwrap();
+        let queued = sessions.take_pending_features(&binding);
+        assert_eq!(queued.len(), 2);
+        assert_eq!(queued[1].get_str("message"), Some("second"));
+        assert!(sessions.take_pending_features(&binding).is_empty());
     }
 
     #[test]

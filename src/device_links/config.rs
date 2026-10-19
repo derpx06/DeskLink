@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use openssl::asn1::Asn1Time;
 use openssl::bn::{BigNum, MsbOption};
@@ -21,6 +22,11 @@ pub struct TrustedDevice {
     pub device_type: String,
     pub protocol_version: i64,
     pub certificate_pem: String,
+    /// Whether this phone may open terminals on this computer. **Off unless the
+    /// user turned it on**, and absent in configs written before the feature
+    /// existed, which therefore load as off.
+    #[serde(default)]
+    pub terminal_access: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +43,67 @@ struct StoredConfig {
     ice_stun_servers: Vec<String>,
     #[serde(default)]
     ice_turn_servers: Vec<String>,
+}
+
+/// Devices currently allowed a terminal, readable without a [`Config`].
+///
+/// The terminal bridge enforces consent on the peer worker thread and the UI's
+/// once-a-second poll shows it; neither owns the `Config` the daemon worker
+/// holds. This is a mirror, not a second source of truth: every `Config`
+/// method that changes a device's consent — trusting, untrusting, the setting
+/// itself, loading from disk — updates it in the same call, so it cannot drift
+/// from what was persisted. Anything unknown, or a poisoned lock, reads as
+/// *not allowed*.
+fn terminal_access_mirror() -> &'static Mutex<HashSet<String>> {
+    static MIRROR: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    MIRROR.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn mirror_terminal_access(device_id: &str, allowed: bool) {
+    if let Ok(mut mirror) = terminal_access_mirror().lock() {
+        if allowed {
+            mirror.insert(device_id.to_string());
+        } else {
+            mirror.remove(device_id);
+        }
+    }
+}
+
+/// May `device_id` open terminals on this computer right now?
+pub fn terminal_access_allowed(device_id: &str) -> bool {
+    terminal_access_mirror()
+        .lock()
+        .is_ok_and(|mirror| mirror.contains(device_id))
+}
+
+/// GNOME remote-desktop restore tokens, one per paired device.
+///
+/// A token lets a later session resume a grant the user approved at this
+/// desktop without the consent dialog — the difference between controlling
+/// the computer from the phone alone and needing someone at the desk to click
+/// Share. GNOME honours it only while this process runs (see
+/// `PERSIST_FOR_SESSION`), so it lives in memory: on disk it would outlive the
+/// grant and make the UI claim an approval that no longer exists. It belongs
+/// to the pairing: unpairing or a new certificate removes it. Single-use: the
+/// portal hands back a fresh one on every start.
+fn remote_desktop_tokens() -> &'static Mutex<HashMap<String, String>> {
+    static TOKENS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    TOKENS.get_or_init(Default::default)
+}
+
+/// The remembered remote-control grant for `device_id`, if any.
+pub(crate) fn remote_desktop_token(device_id: &str) -> Option<String> {
+    remote_desktop_tokens().lock().ok()?.get(device_id).cloned()
+}
+
+/// Remembers (or with `None`, forgets) the grant for `device_id`.
+pub(crate) fn set_remote_desktop_token(device_id: &str, token: Option<&str>) {
+    if let Ok(mut tokens) = remote_desktop_tokens().lock() {
+        match token {
+            Some(token) => tokens.insert(device_id.to_string(), token.to_string()),
+            None => tokens.remove(device_id),
+        };
+    }
 }
 
 pub struct Config {
@@ -103,6 +170,9 @@ impl Config {
             _ => generate_certificate(&key, &stored.device_id).map_err(|err| err.to_string())?,
         };
 
+        for device in stored.trusted_devices.values() {
+            mirror_terminal_access(&device.id, device.terminal_access);
+        }
         let config = Self {
             base_dir,
             stored,
@@ -113,25 +183,31 @@ impl Config {
         Ok(config)
     }
 
+    /// Every write is atomic (temp file, fsync, rename, directory fsync), and
+    /// the key and certificate are only written when they differ from disk.
+    /// `save` runs on every pair and unpair; truncating in place meant a crash
+    /// mid-write left a half-written config.json or private key, `load` then
+    /// failed, and DeskLink never started again without losing every pairing.
     pub fn save(&self) -> Result<(), String> {
         fs::create_dir_all(&self.base_dir).map_err(|err| err.to_string())?;
-        fs::write(
-            self.base_dir.join("config.json"),
-            serde_json::to_vec_pretty(&self.stored).map_err(|err| err.to_string())?,
-        )
-        .map_err(|err| err.to_string())?;
-        write_private_key(
+        write_atomic(
+            &self.base_dir.join("config.json"),
+            &serde_json::to_vec_pretty(&self.stored).map_err(|err| err.to_string())?,
+            0o644,
+        )?;
+        write_atomic_if_changed(
             &self.base_dir.join("privateKey.pem"),
             &self
                 .key
                 .private_key_to_pem_pkcs8()
                 .map_err(|err| err.to_string())?,
+            0o600,
         )?;
-        fs::write(
-            self.base_dir.join("certificate.pem"),
-            self.certificate.to_pem().map_err(|err| err.to_string())?,
-        )
-        .map_err(|err| err.to_string())?;
+        write_atomic_if_changed(
+            &self.base_dir.join("certificate.pem"),
+            &self.certificate.to_pem().map_err(|err| err.to_string())?,
+            0o644,
+        )?;
         Ok(())
     }
 
@@ -196,11 +272,52 @@ impl Config {
             .map(|device| device.protocol_version)
     }
 
+    /// Lets `device_id` open terminals on this computer, or stops it.
+    ///
+    /// Fails for a device that is not paired: consent is a property of a trust
+    /// record. It fails *closed* — if the setting cannot be written, a grant is
+    /// not applied, and a revocation still is: the person who turned it off
+    /// must not find it still on because the disk was full.
+    pub fn set_terminal_access(&mut self, device_id: &str, allowed: bool) -> Result<(), String> {
+        self.stored
+            .trusted_devices
+            .get_mut(device_id)
+            .ok_or_else(|| "That device is not paired".to_string())?
+            .terminal_access = allowed;
+        let saved = self.save();
+        let effective = allowed && saved.is_ok();
+        if let Some(device) = self.stored.trusted_devices.get_mut(device_id) {
+            device.terminal_access = effective;
+        }
+        mirror_terminal_access(device_id, effective);
+        saved
+    }
+
     pub fn trust_device(
         &mut self,
         info: &DeviceInfo,
         certificate_pem: String,
     ) -> Result<(), String> {
+        // Re-confirming an existing pairing is not a new grant, and must not
+        // quietly revoke one either: the same certificate is the same trust, so
+        // the choice carries over. A different certificate is a different
+        // device identity behind the same id, and consent starts again from off.
+        let terminal_access = self
+            .stored
+            .trusted_devices
+            .get(&info.id)
+            .is_some_and(|existing| {
+                existing.certificate_pem == certificate_pem && existing.terminal_access
+            });
+        let previous = self.stored.trusted_devices.get(&info.id).cloned();
+        let same_identity = previous
+            .as_ref()
+            .is_some_and(|existing| existing.certificate_pem == certificate_pem);
+        if !same_identity {
+            // A new identity does not inherit remote control of this desktop.
+            set_remote_desktop_token(&info.id, None);
+        }
+        mirror_terminal_access(&info.id, terminal_access);
         self.stored.trusted_devices.insert(
             info.id.clone(),
             TrustedDevice {
@@ -209,14 +326,45 @@ impl Config {
                 device_type: info.device_type.clone(),
                 protocol_version: info.protocol_version,
                 certificate_pem,
+                terminal_access,
             },
         );
-        self.save()
+        self.save_or_restore(&info.id, previous)
+    }
+
+    /// Saves, or puts the device's previous record back if the save fails.
+    /// Memory must agree with disk: the trust store is what decides pairing on
+    /// every new link, so a record kept only in memory paired a device whose
+    /// pairing would vanish on restart (and the reverse for an unpair).
+    fn save_or_restore(
+        &mut self,
+        device_id: &str,
+        previous: Option<TrustedDevice>,
+    ) -> Result<(), String> {
+        let saved = self.save();
+        if saved.is_err() {
+            match previous {
+                Some(record) => {
+                    mirror_terminal_access(device_id, record.terminal_access);
+                    self.stored
+                        .trusted_devices
+                        .insert(device_id.to_string(), record);
+                }
+                None => {
+                    mirror_terminal_access(device_id, false);
+                    self.stored.trusted_devices.remove(device_id);
+                }
+            }
+        }
+        saved
     }
 
     pub fn untrust_device(&mut self, device_id: &str) -> Result<(), String> {
-        self.stored.trusted_devices.remove(device_id);
-        self.save()
+        let previous = self.stored.trusted_devices.remove(device_id);
+        mirror_terminal_access(device_id, false);
+        // Remote control of this desktop is a property of the pairing too.
+        set_remote_desktop_token(device_id, None);
+        self.save_or_restore(device_id, previous)
     }
 }
 
@@ -240,25 +388,46 @@ fn certificate_matches_key(certificate: &X509, key: &PKey<Private>) -> bool {
 /// the key that authenticates every pairing and signs every handover transcript
 /// world-readable. The mode is applied before the bytes are written so the key
 /// is never briefly readable on first creation.
-fn write_private_key(path: &std::path::Path, pem: &[u8]) -> Result<(), String> {
+fn write_atomic_if_changed(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+    if fs::read(path).is_ok_and(|current| current == bytes) {
+        return Ok(());
+    }
+    write_atomic(path, bytes, mode)
+}
+
+/// Replaces `path` so a reader — or a crash — only ever sees the old file or
+/// the complete new one. The mode is set at creation, so a private key is
+/// never readable by others even for a moment.
+fn write_atomic(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     use std::io::Write;
 
+    let tmp = path.with_extension("tmp");
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(mode);
     }
-    let mut file = options.open(path).map_err(|err| err.to_string())?;
+    #[cfg(not(unix))]
+    let _ = mode;
+    let mut file = options.open(&tmp).map_err(|err| err.to_string())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        // An existing file keeps its old mode when reopened, so tighten it too.
-        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+        // A leftover temp file keeps its old mode when reopened; tighten it.
+        let _ = file.set_permissions(fs::Permissions::from_mode(mode));
     }
-    file.write_all(pem).map_err(|err| err.to_string())?;
-    file.sync_all().map_err(|err| err.to_string())
+    file.write_all(bytes).map_err(|err| err.to_string())?;
+    file.sync_all().map_err(|err| err.to_string())?;
+    drop(file);
+    fs::rename(&tmp, path).map_err(|err| err.to_string())?;
+    if let Some(dir) = path.parent() {
+        if let Ok(dir) = fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 fn config_dir() -> PathBuf {
@@ -373,6 +542,146 @@ mod tests {
             .unwrap()
             .starts_with(b"-----BEGIN CERTIFICATE-----"));
 
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn trusted_config(dir: &std::path::Path, id: &str, certificate: &str) -> Config {
+        let mut config = Config::load_from_dir(dir.to_path_buf()).unwrap();
+        config
+            .trust_device(
+                &DeviceInfo::local(id.to_string(), "Test phone".to_string()),
+                certificate.to_string(),
+            )
+            .unwrap();
+        config
+    }
+
+    /// Terminal access is a shell on this computer. It must be something the
+    /// user turned on, never something a pairing or an old config implies.
+    #[test]
+    fn terminal_access_is_off_by_default_and_for_configs_that_predate_it() {
+        let dir = std::env::temp_dir().join(format!("desklink-term-default-{}", Uuid::new_v4()));
+        let id = format!("phone-{}", Uuid::new_v4().simple());
+        let config = trusted_config(&dir, &id, "cert-a");
+        assert!(!terminal_access_allowed(&id));
+        drop(config);
+
+        // A config.json written before the field existed has no such key.
+        let path = dir.join("config.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        json["trusted_devices"][&id]
+            .as_object_mut()
+            .unwrap()
+            .remove("terminal_access");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+
+        let reloaded = Config::load_from_dir(dir.clone()).unwrap();
+        assert!(!reloaded.stored.trusted_devices[&id].terminal_access);
+        assert!(!terminal_access_allowed(&id));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn terminal_access_persists_across_a_restart_and_can_be_revoked() {
+        let dir = std::env::temp_dir().join(format!("desklink-term-persist-{}", Uuid::new_v4()));
+        let id = format!("phone-{}", Uuid::new_v4().simple());
+        let mut config = trusted_config(&dir, &id, "cert-a");
+
+        config.set_terminal_access(&id, true).unwrap();
+        assert!(terminal_access_allowed(&id));
+        drop(config);
+
+        // Simulate a fresh process: the mirror forgets, the file remembers.
+        mirror_terminal_access(&id, false);
+        let mut reloaded = Config::load_from_dir(dir.clone()).unwrap();
+        assert!(terminal_access_allowed(&id), "consent was not persisted");
+
+        reloaded.set_terminal_access(&id, false).unwrap();
+        assert!(!terminal_access_allowed(&id));
+        drop(reloaded);
+        let again = Config::load_from_dir(dir.clone()).unwrap();
+        assert!(!again.stored.trusted_devices[&id].terminal_access);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn terminal_access_cannot_be_granted_to_an_unpaired_device() {
+        let dir = std::env::temp_dir().join(format!("desklink-term-unpaired-{}", Uuid::new_v4()));
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        assert!(config.set_terminal_access("never-paired", true).is_err());
+        assert!(!terminal_access_allowed("never-paired"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A remembered desktop grant follows the pairing exactly like terminal
+    /// consent: kept on re-confirmation, gone on unpair or a new certificate.
+    #[test]
+    fn a_remembered_desktop_grant_belongs_to_the_pairing() {
+        let dir = std::env::temp_dir().join(format!("desklink-rd-grant-{}", Uuid::new_v4()));
+        let id = format!("phone-{}", Uuid::new_v4().simple());
+        let info = DeviceInfo::local(id.clone(), "Test phone".to_string());
+        let mut config = trusted_config(&dir, &id, "cert-a");
+
+        set_remote_desktop_token(&id, Some("t1"));
+        set_remote_desktop_token(&id, Some("t2"));
+        assert_eq!(
+            remote_desktop_token(&id).as_deref(),
+            Some("t2"),
+            "a fresh token replaces the used one"
+        );
+
+        config.trust_device(&info, "cert-a".to_string()).unwrap();
+        assert_eq!(
+            remote_desktop_token(&id).as_deref(),
+            Some("t2"),
+            "re-confirming dropped the grant"
+        );
+
+        config.trust_device(&info, "cert-b".to_string()).unwrap();
+        assert_eq!(
+            remote_desktop_token(&id),
+            None,
+            "a new certificate inherited desktop control"
+        );
+
+        set_remote_desktop_token(&id, Some("t3"));
+        config.untrust_device(&id).unwrap();
+        assert_eq!(
+            remote_desktop_token(&id),
+            None,
+            "unpairing kept desktop control"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Re-confirming a pairing keeps the user's choice; unpairing, or a new
+    /// certificate behind the same id, resets it to off.
+    #[test]
+    fn consent_survives_reconfirmation_but_not_unpairing_or_a_new_certificate() {
+        let dir = std::env::temp_dir().join(format!("desklink-term-trust-{}", Uuid::new_v4()));
+        let id = format!("phone-{}", Uuid::new_v4().simple());
+        let info = DeviceInfo::local(id.clone(), "Test phone".to_string());
+        let mut config = trusted_config(&dir, &id, "cert-a");
+        config.set_terminal_access(&id, true).unwrap();
+
+        config.trust_device(&info, "cert-a".to_string()).unwrap();
+        assert!(
+            terminal_access_allowed(&id),
+            "re-confirming revoked consent"
+        );
+
+        config.trust_device(&info, "cert-b".to_string()).unwrap();
+        assert!(
+            !terminal_access_allowed(&id),
+            "a new certificate inherited consent"
+        );
+
+        config.set_terminal_access(&id, true).unwrap();
+        config.untrust_device(&id).unwrap();
+        assert!(!terminal_access_allowed(&id));
+        config.trust_device(&info, "cert-b".to_string()).unwrap();
+        assert!(!terminal_access_allowed(&id), "a re-pair inherited consent");
         let _ = fs::remove_dir_all(dir);
     }
 }

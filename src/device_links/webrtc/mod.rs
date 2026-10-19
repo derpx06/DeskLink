@@ -1,13 +1,23 @@
 #![allow(dead_code)] // Wired into the live GStreamer transport in the next slice.
 
 pub(crate) mod coordinator;
+pub(crate) mod file_browser;
 pub(crate) mod file_protocol;
 mod handover;
 pub(crate) mod ice;
 mod peer_connection;
+mod remote_desktop_portal;
+// The one portal entry point the UI may call: asking for consent, not input.
+#[cfg(debug_assertions)]
+pub(crate) use coordinator::debug_inject_desktop_input;
+pub(crate) use remote_desktop_portal::preauthorize_remote_control;
 pub(crate) mod remote_session;
 pub(crate) mod screen;
 mod signaling;
+pub(crate) mod terminal_bridge;
+pub(crate) mod terminal_protocol;
+mod text_focus;
+pub(crate) mod transfer_board;
 pub(crate) mod transfer_manager;
 
 #[allow(unused_imports)]

@@ -12,6 +12,9 @@ use crate::device_links::packet::NetworkPacket;
 use crate::device_links::pairing::PairState;
 use serde_json::Value;
 
+/// Unpaired devices shown at once; more than any real LAN needs.
+const MAX_UNTRUSTED_VIEWS: usize = 32;
+
 pub(super) fn upsert_device(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     info: &DeviceInfo,
@@ -19,6 +22,15 @@ pub(super) fn upsert_device(
     paired: bool,
 ) {
     if let Ok(mut devices) = devices.lock() {
+        // Discovery beacons are unauthenticated: without a bound, spoofed ids
+        // grew this map (and the UI list cloned from it each second) forever.
+        // Known and trusted devices are always kept.
+        if !paired
+            && !devices.contains_key(&info.id)
+            && devices.values().filter(|device| !device.trusted).count() >= MAX_UNTRUSTED_VIEWS
+        {
+            return;
+        }
         devices
             .entry(info.id.clone())
             .and_modify(|device| {

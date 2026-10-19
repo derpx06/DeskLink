@@ -1,4 +1,3 @@
-use enigo::{Axis, Button, Coordinate, Direction, Enigo, Keyboard, Mouse, Settings};
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
@@ -151,8 +150,6 @@ static CACHED_LOCK_STATE: Mutex<Option<(std::time::Instant, bool)>> = Mutex::new
 /// socket: the loop keeps framing and I/O, this keeps every decision. A pure
 /// move — no branch was added, removed or reordered.
 ///
-/// `enigo` is borrowed rather than constructed here so a caller with no input
-/// device (the two-peer test harness) can pass `&mut None` and never touch one.
 /// How long to wait before repeating a "not paired" notice to the same peer.
 ///
 /// Mirrors Android's `notPairedNoticeIntervalMillis`. A peer that still thinks
@@ -189,7 +186,6 @@ pub(super) fn apply_lan_packet(
     sessions: &Arc<DeviceManager>,
     config: &Arc<Mutex<Config>>,
     events: &Arc<Mutex<Vec<DaemonEvent>>>,
-    enigo_opt: &mut Option<Enigo>,
 ) {
     let binding = binding.clone();
     let devices = Arc::clone(devices);
@@ -238,6 +234,20 @@ pub(super) fn apply_lan_packet(
     }
 
     if packet.packet_type == PACKET_TYPE_WEBRTC_SIGNAL_V1 {
+        // Signaling is the only thing a peer that still believes it is paired
+        // sends now that features never travel over LAN. Answering it here is
+        // what tells a peer that missed our unpair, which would otherwise read
+        // "Connecting" forever — and refusing it here, before the coordinator,
+        // means an unpaired peer can never make this side build a pipeline.
+        let paired = sessions
+            .with_session(&binding, |session| {
+                session.pairing.state == PairState::Paired
+            })
+            .unwrap_or(false);
+        if !paired {
+            notify_peer_not_paired(&binding, &sessions);
+            return;
+        }
         if let Err(error) = crate::device_links::webrtc::coordinator::handle_signaling_packet(
             &binding,
             &packet,
@@ -247,7 +257,15 @@ pub(super) fn apply_lan_packet(
             Arc::clone(&events),
         ) {
             eprintln!("[Daemon] Rejected DeskLink WebRTC signaling: {error}");
+            if error.contains("clocks differ") {
+                crate::device_links::daemon::state::mark_error(&devices, &device_id, error);
+            }
         }
+        return;
+    }
+
+    if packet.packet_type == crate::device_links::packet::PACKET_TYPE_PAIR_QR {
+        handle_qr_pairing_proof(&binding, &packet, &sessions, &config, &devices, &events);
         return;
     }
 
@@ -292,10 +310,26 @@ pub(super) fn apply_lan_packet(
                 "[Daemon] Pairing state transitioned from {:?} to {:?}",
                 previous_state, state
             );
+            let mut state = state;
             if state == PairState::Paired {
-                if let Ok(mut config) = config.lock() {
-                    let _ = config
-                        .trust_device(&binding.link.info, binding.link.certificate_pem.clone());
+                // Same rule as `accept_pair`: never `Paired` without a saved
+                // trust record. Ignoring this error left the session paired
+                // with nothing on disk, so the pairing vanished on restart.
+                let trusted = config
+                    .lock()
+                    .map_err(|_| "Config lock poisoned".to_string())
+                    .and_then(|mut config| {
+                        config
+                            .trust_device(&binding.link.info, binding.link.certificate_pem.clone())
+                    });
+                if let Err(error) = trusted {
+                    eprintln!(
+                        "[Daemon] Could not save trust for {device_id}: {error}; pairing reverted"
+                    );
+                    let _ = sessions.with_session(&binding, |session| {
+                        session.pairing = crate::device_links::pairing::PairingHandler::new(false);
+                    });
+                    state = PairState::NotPaired;
                 }
             } else if previous_state == PairState::Paired && state == PairState::NotPaired {
                 // A remote unpair invalidates the signed WebRTC
@@ -318,259 +352,121 @@ pub(super) fn apply_lan_packet(
                 }
             }
             update_pair_state(&devices, &device_id, state, verification_key);
-            if state == PairState::Paired
-                && binding
-                    .link
-                    .info
-                    .incoming_capabilities
-                    .iter()
-                    .any(|capability| capability == PACKET_TYPE_WEBRTC_SIGNAL_V1)
-            {
-                if let Err(error) = crate::device_links::webrtc::coordinator::start_initiator(
-                    binding.clone(),
-                    Arc::clone(&sessions),
-                    Arc::clone(&config),
-                    Arc::clone(&devices),
-                    Arc::clone(&events),
-                ) {
-                    eprintln!("[Daemon] DeskLink WebRTC negotiation unavailable: {error}");
-                }
+            if state == PairState::Paired {
+                start_webrtc_after_pairing(&binding, &sessions, &config, &devices, &events);
             }
-        }
-    } else if packet.packet_type == PACKET_TYPE_PING {
-        eprintln!(
-            "[Daemon] Ping received from {}: {:?}",
-            device_id,
-            packet.get_str("message")
-        );
-        push_event(
-            &events,
-            DaemonEvent::PingReceived {
-                device_id: device_id.clone(),
-                device_name: binding.link.info.name.clone(),
-                message: packet.get_str("message").map(str::to_string),
-            },
-        );
-    } else if packet.packet_type == PACKET_TYPE_BATTERY {
-        update_battery_status(&devices, &device_id, &packet);
-    } else if packet.packet_type == PACKET_TYPE_FINDMYPHONE_REQUEST {
-        eprintln!(
-            "[Daemon] Received find-this-device request from {}",
-            device_id
-        );
-        let _ = std::process::Command::new("canberra-gtk-play")
-            .args(["-i", "bell"])
-            .spawn();
-        push_event(
-            &events,
-            DaemonEvent::FindPhoneReceived {
-                device_id: device_id.clone(),
-                device_name: binding.link.info.name.clone(),
-            },
-        );
-    } else if packet.packet_type == PACKET_TYPE_MOUSEPAD_REQUEST {
-        let dx = packet
-            .body
-            .get("dx")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let dy = packet
-            .body
-            .get("dy")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(0.0);
-        let x = packet.body.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let y = packet.body.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let singleclick = packet.get_bool("singleclick").unwrap_or(false);
-        let doubleclick = packet.get_bool("doubleclick").unwrap_or(false);
-        let middleclick = packet.get_bool("middleclick").unwrap_or(false);
-        let rightclick = packet.get_bool("rightclick").unwrap_or(false);
-        let singlehold = packet.get_bool("singlehold").unwrap_or(false);
-        let singlerelease = packet.get_bool("singlerelease").unwrap_or(false);
-        let scroll = packet.get_bool("scroll").unwrap_or(false);
-        let key = packet.get_str("key");
-        let special_key = packet.get_i64("specialKey").unwrap_or(0);
-
-        eprintln!(
-            "[Daemon] Received remote input request: dx={:?}, dy={:?}, x={:?}, y={:?}, scroll={:?}, key={:?}, specialKey={:?}",
-            dx, dy, x, y, scroll, key, special_key
-        );
-
-        if let Some(ref mut enigo) = enigo_opt {
-            if scroll {
-                if dy != 0.0 {
-                    let _ = enigo.scroll(dy as i32, Axis::Vertical);
-                }
-                if dx != 0.0 {
-                    let _ = enigo.scroll(dx as i32, Axis::Horizontal);
-                }
-            } else if singleclick {
-                let _ = enigo.button(Button::Left, Direction::Click);
-            } else if doubleclick {
-                let _ = enigo.button(Button::Left, Direction::Click);
-                let _ = enigo.button(Button::Left, Direction::Click);
-            } else if middleclick {
-                let _ = enigo.button(Button::Middle, Direction::Click);
-            } else if rightclick {
-                let _ = enigo.button(Button::Right, Direction::Click);
-            } else if singlehold {
-                let _ = enigo.button(Button::Left, Direction::Press);
-            } else if singlerelease {
-                let _ = enigo.button(Button::Left, Direction::Release);
-            } else if key.is_some() || special_key > 0 {
-                let ctrl = packet.get_bool("ctrl").unwrap_or(false);
-                let alt = packet.get_bool("alt").unwrap_or(false);
-                let shift = packet.get_bool("shift").unwrap_or(false);
-                let super_key = packet.get_bool("super").unwrap_or(false);
-
-                if ctrl {
-                    let _ = enigo.key(enigo::Key::Control, Direction::Press);
-                }
-                if alt {
-                    let _ = enigo.key(enigo::Key::Alt, Direction::Press);
-                }
-                if shift {
-                    let _ = enigo.key(enigo::Key::Shift, Direction::Press);
-                }
-                if super_key {
-                    let _ = enigo.key(enigo::Key::Meta, Direction::Press);
-                }
-
-                if special_key > 0 {
-                    let enigo_key = match special_key {
-                        1 => Some(enigo::Key::Backspace),
-                        2 => Some(enigo::Key::Tab),
-                        3 => Some(enigo::Key::Return),
-                        4 => Some(enigo::Key::LeftArrow),
-                        5 => Some(enigo::Key::UpArrow),
-                        6 => Some(enigo::Key::RightArrow),
-                        7 => Some(enigo::Key::DownArrow),
-                        8 => Some(enigo::Key::PageUp),
-                        9 => Some(enigo::Key::PageDown),
-                        10 => Some(enigo::Key::Home),
-                        11 => Some(enigo::Key::End),
-                        12 => Some(enigo::Key::Return),
-                        13 => Some(enigo::Key::Delete),
-                        14 => Some(enigo::Key::Escape),
-                        21 => Some(enigo::Key::F1),
-                        22 => Some(enigo::Key::F2),
-                        23 => Some(enigo::Key::F3),
-                        24 => Some(enigo::Key::F4),
-                        25 => Some(enigo::Key::F5),
-                        26 => Some(enigo::Key::F6),
-                        27 => Some(enigo::Key::F7),
-                        28 => Some(enigo::Key::F8),
-                        29 => Some(enigo::Key::F9),
-                        30 => Some(enigo::Key::F10),
-                        31 => Some(enigo::Key::F11),
-                        32 => Some(enigo::Key::F12),
-                        _ => None,
-                    };
-                    if let Some(ek) = enigo_key {
-                        let _ = enigo.key(ek, Direction::Click);
-                    }
-                } else if let Some(k) = key {
-                    let _ = enigo.text(k);
-                }
-
-                if ctrl {
-                    let _ = enigo.key(enigo::Key::Control, Direction::Release);
-                }
-                if alt {
-                    let _ = enigo.key(enigo::Key::Alt, Direction::Release);
-                }
-                if shift {
-                    let _ = enigo.key(enigo::Key::Shift, Direction::Release);
-                }
-                if super_key {
-                    let _ = enigo.key(enigo::Key::Meta, Direction::Release);
-                }
-            } else if dx != 0.0 || dy != 0.0 {
-                let _ = enigo.move_mouse(dx as i32, dy as i32, Coordinate::Rel);
-            }
-        }
-    } else if packet.packet_type == PACKET_TYPE_CLIPBOARD
-        || packet.packet_type == PACKET_TYPE_CLIPBOARD_CONNECT
-    {
-        if let Some(content) = packet.get_str("content") {
-            eprintln!("[Daemon] Received clipboard content: {:?}", content);
-            set_clipboard_text_from_remote(content);
-        }
-    } else if packet.packet_type == PACKET_TYPE_SHARE_REQUEST {
-        if packet.payload_size.is_some() || packet.payload_transfer_info.is_some() {
-            // SharedPacketDispatcher rejects this before reaching
-            // the handler.  Keep this guard as defense in depth
-            // for future LAN reader call sites.
-            eprintln!("[Daemon] Rejected legacy LAN file payload; WebRTC file-data is required");
-        } else if let Some(text) = packet.get_str("text") {
-            eprintln!("[Daemon] Received shared text: {:?}", text);
-            set_clipboard_text_from_remote(text);
-        } else if let Some(url) = packet.get_str("url") {
-            eprintln!("[Daemon] Received shared URL: {:?}", url);
-            std::process::Command::new("xdg-open").arg(url).spawn().ok();
-        }
-    } else if packet.packet_type == PACKET_TYPE_MPRIS {
-        update_media_from_packet(&devices, &device_id, &packet);
-    } else if packet.packet_type == PACKET_TYPE_NOTIFICATION {
-        if packet.get_bool("isCancel").unwrap_or(false) {
-            if let Some(id) = packet.get_str("id") {
-                remove_notification(&devices, &device_id, id);
-            }
-        } else {
-            upsert_notification(&devices, &device_id, &packet);
-        }
-    } else if packet.packet_type == PACKET_TYPE_NOTIFICATION_REQUEST {
-        if let Some(cancel_id) = packet.get_str("cancel") {
-            remove_notification(&devices, &device_id, cancel_id);
-        }
-    } else if packet.packet_type == PACKET_TYPE_SYSTEMVOLUME {
-        update_volume_status(&devices, &device_id, &packet);
-    } else if packet.packet_type == PACKET_TYPE_SYSTEMVOLUME_REQUEST {
-        if packet.get_bool("requestSinks").unwrap_or(false) {
-            let mut reply = NetworkPacket::new(PACKET_TYPE_SYSTEMVOLUME);
-            reply.set("sinkList", serde_json::Value::Array(Vec::new()));
-            let _ = binding.link.send_packet(&reply);
-        }
-    } else if packet.packet_type == PACKET_TYPE_RUNCOMMAND {
-        update_remote_commands(&devices, &device_id, &packet);
-    } else if packet.packet_type == PACKET_TYPE_RUNCOMMAND_REQUEST {
-        if packet.get_bool("requestCommandList").unwrap_or(false) {
-            let mut reply = NetworkPacket::new(PACKET_TYPE_RUNCOMMAND);
-            reply.set("commandList", "{}");
-            reply.set("canAddCommand", false);
-            let _ = binding.link.send_packet(&reply);
-        }
-    } else if packet.packet_type == PACKET_TYPE_SFTP {
-        update_sftp_status(&devices, &device_id, &packet);
-    } else if packet.packet_type == PACKET_TYPE_LOCK
-        || packet.packet_type == PACKET_TYPE_LOCK_REQUEST
-    {
-        if packet.body.contains_key("requestLocked") {
-            eprintln!("[Daemon] Received requestLocked query");
-            let mut reply = NetworkPacket::new(PACKET_TYPE_LOCK);
-            reply.set("isLocked", is_desktop_locked());
-            let _ = binding.link.send_packet(&reply);
-        }
-        if let Some(requested_lock) = apply_lock_request(&packet) {
-            // Sampling the result means waiting for the screensaver
-            // to settle. This reader owns one device, so the wait is
-            // contained here — `apply_lock_request` itself must stay
-            // non-blocking because the WebRTC path calls it from the
-            // single worker that also carries SDP, ICE and file
-            // chunks for every feature.
-            thread::sleep(LOCK_SETTLE_DELAY);
-            let locked = sample_desktop_lock_state();
-            if requested_lock {
-                let mut acknowledgement = NetworkPacket::new(PACKET_TYPE_LOCK);
-                acknowledgement.set("lockResult", locked);
-                let _ = binding.link.send_packet(&acknowledgement);
-            }
-            let mut state = NetworkPacket::new(PACKET_TYPE_LOCK);
-            state.set("isLocked", locked);
-            let _ = binding.link.send_packet(&state);
         }
     } else {
+        // Unreachable for features: `authorize` refuses every non-bootstrap
+        // type on LAN. The old feature arms here (xdg-open, lock, clipboard…)
+        // were deleted so a future change to `authorize` cannot silently
+        // re-expose them on the unauthenticated-handover path.
         eprintln!("[Daemon] Unhandled packet type: {}", packet.packet_type);
+    }
+}
+
+fn start_webrtc_after_pairing(
+    binding: &SessionBinding,
+    sessions: &Arc<DeviceManager>,
+    config: &Arc<Mutex<Config>>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
+) {
+    if !binding
+        .link
+        .info
+        .incoming_capabilities
+        .iter()
+        .any(|capability| capability == PACKET_TYPE_WEBRTC_SIGNAL_V1)
+    {
+        return;
+    }
+    if let Err(error) = crate::device_links::webrtc::coordinator::start_initiator(
+        binding.clone(),
+        Arc::clone(sessions),
+        Arc::clone(config),
+        Arc::clone(devices),
+        Arc::clone(events),
+    ) {
+        eprintln!("[Daemon] DeskLink WebRTC negotiation unavailable: {error}");
+    }
+}
+
+/// A phone that scanned this desktop's QR code proves it here. Valid ⇒ paired
+/// immediately, with the same trust record the prompt flow writes; anything
+/// else ⇒ `pair:false`. Nothing is compared or accepted by the user: the
+/// scanned fingerprint and one-time secret are the authentication.
+fn handle_qr_pairing_proof(
+    binding: &SessionBinding,
+    packet: &NetworkPacket,
+    sessions: &Arc<DeviceManager>,
+    config: &Arc<Mutex<Config>>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
+) {
+    use crate::device_links::pairing_qr;
+    let device_id = &binding.device_id;
+    let verified = (|| -> Result<(), String> {
+        // The phone's fingerprint comes from the certificate this link really
+        // presented, never from anything the phone claims.
+        let phone_der = openssl::x509::X509::from_pem(binding.link.certificate_pem.as_bytes())
+            .and_then(|certificate| certificate.to_der())
+            .map_err(|error| error.to_string())?;
+        let (desktop_id, desktop_der) = {
+            let config = config
+                .lock()
+                .map_err(|_| "Config lock poisoned".to_string())?;
+            let der = config
+                .certificate()
+                .to_der()
+                .map_err(|error| error.to_string())?;
+            (config.local_device_info().id, der)
+        };
+        pairing_qr::verify(
+            &desktop_id,
+            device_id,
+            &pairing_qr::fingerprint(&desktop_der)?,
+            &pairing_qr::fingerprint(&phone_der)?,
+            packet.get_str("mac").unwrap_or_default(),
+        )
+    })()
+    .and_then(|()| {
+        let _ = sessions.with_session(binding, |session| {
+            session.pairing = crate::device_links::pairing::PairingHandler::new(true);
+        });
+        let trusted = config
+            .lock()
+            .map_err(|_| "Config lock poisoned".to_string())
+            .and_then(|mut config| {
+                config.trust_device(&binding.link.info, binding.link.certificate_pem.clone())
+            });
+        if trusted.is_err() {
+            let _ = sessions.with_session(binding, |session| {
+                session.pairing = crate::device_links::pairing::PairingHandler::new(false);
+            });
+        }
+        trusted
+    });
+    // A bad proof from a device that is already paired must not answer
+    // pair:false: the phone takes that as an unpair, so a stale or mistyped
+    // scan would silently destroy a working pairing.
+    let already_paired = sessions
+        .with_session(binding, |session| {
+            session.pairing.state == PairState::Paired
+        })
+        .unwrap_or(false);
+    if verified.is_ok() || !already_paired {
+        let mut reply = NetworkPacket::new(PACKET_TYPE_PAIR);
+        reply.set("pair", verified.is_ok());
+        let _ = binding.link.send_packet(&reply);
+    }
+    match verified {
+        Ok(()) => {
+            eprintln!("[Daemon] Paired with {device_id} by QR code");
+            update_pair_state(devices, device_id, PairState::Paired, None);
+            start_webrtc_after_pairing(binding, sessions, config, devices, events);
+        }
+        Err(error) => eprintln!("[Daemon] QR pairing from {device_id} refused: {error}"),
     }
 }
 
@@ -588,7 +484,6 @@ pub(super) fn packet_read_loop(
         );
         return;
     }
-    let mut enigo_opt = Enigo::new(&Settings::default()).ok();
     let mut line = Vec::new();
 
     loop {
@@ -612,7 +507,21 @@ pub(super) fn packet_read_loop(
             }
             Ok(ReadOutcome::Byte(value)) => {
                 line.push(value);
-                if line.len() > 32 * 1024 * 1024 {
+                // An unpaired peer only sends identity, pairing and signaling,
+                // all small; letting it stream 32 MiB lines (times every such
+                // peer) was a memory-exhaustion vector before any trust.
+                let limit = if line.len() > super::network::MAX_UNPAIRED_PACKET_BYTES
+                    && sessions
+                        .with_session(&binding, |session| {
+                            session.pairing.state != PairState::Paired
+                        })
+                        .unwrap_or(true)
+                {
+                    super::network::MAX_UNPAIRED_PACKET_BYTES
+                } else {
+                    32 * 1024 * 1024
+                };
+                if line.len() > limit {
                     eprintln!(
                         "[Daemon] Read line too long for {}. Disconnecting.",
                         device_id
@@ -646,15 +555,7 @@ pub(super) fn packet_read_loop(
                     break;
                 }
 
-                apply_lan_packet(
-                    &binding,
-                    packet,
-                    &devices,
-                    &sessions,
-                    &config,
-                    &events,
-                    &mut enigo_opt,
-                );
+                apply_lan_packet(&binding, packet, &devices, &sessions, &config, &events);
             }
             Ok(ReadOutcome::Idle) => {
                 // Yield briefly so a concurrent feature send can take the
@@ -700,6 +601,12 @@ pub(crate) fn dispatch_webrtc_feature_packet(
     .map_err(|error| error.to_string())?;
 
     let device_id = &binding.device_id;
+    // Type only, never the body: clipboard and notification text stay out of
+    // the journal. This line is what the device E2E script asserts on.
+    eprintln!(
+        "[Daemon] WebRTC feature {} from {device_id}",
+        packet.packet_type
+    );
     match packet.packet_type.as_str() {
         PACKET_TYPE_PING => {
             eprintln!("[Daemon] WebRTC ping received from {device_id}");
@@ -787,10 +694,11 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             );
             Ok(())
         }
-        PACKET_TYPE_MOUSEPAD_REQUEST => Err(
-            "DeskLink WebRTC remote input requires a granted GNOME RemoteDesktop portal lease"
-                .to_string(),
-        ),
+        PACKET_TYPE_MOUSEPAD_REQUEST => {
+            crate::device_links::webrtc::coordinator::dispatch_desktop_remote_input(
+                binding, &packet,
+            )
+        }
         PACKET_TYPE_LOCK | PACKET_TYPE_LOCK_REQUEST => {
             // Answer the same two questions the LAN reader answers, so the
             // phone's lock control behaves identically on both transports
@@ -934,4 +842,37 @@ pub(crate) fn apply_lock_request(packet: &NetworkPacket) -> Option<bool> {
     }
 
     Some(requested_lock)
+}
+
+#[cfg(test)]
+mod tests {
+    /// A paired peer must never be able to drive this machine's keyboard or
+    /// pointer over the LAN bootstrap link. Input is permitted only on the
+    /// authenticated WebRTC path, behind a portal lease the local user approved.
+    ///
+    /// The LAN arm used to inject input directly. This pins its absence: the
+    /// input-synthesis crate may not be a dependency, and no code line in the
+    /// LAN dispatcher may mention it.
+    #[test]
+    fn the_lan_path_has_no_input_injector() {
+        let injector = concat!("en", "igo");
+
+        let manifest = include_str!("../../../Cargo.toml");
+        assert!(
+            !manifest.contains(injector),
+            "the input injector crate must not be a dependency"
+        );
+
+        let source = include_str!("packet_handler.rs");
+        let offending: Vec<&str> = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .filter(|line| line.contains(injector))
+            .filter(|line| !line.contains("concat!"))
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "LAN input injector is back: {offending:?}"
+        );
+    }
 }

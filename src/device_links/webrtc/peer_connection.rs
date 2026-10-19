@@ -21,11 +21,50 @@ const JITTER_BUFFER_PROPERTY: &str = "latency";
 /// are clicking on — so smoothing for hundreds of milliseconds of reordering
 /// buys nothing and costs everything. 40ms still absorbs ordinary WiFi jitter.
 ///
-/// Deliberately not paired with `sync=false` on the sink: that renders frames on
-/// arrival and trades away exactly the smooth scrolling this feature exists to
-/// provide. Lower the buffer first, and only reach for `sync=false` if a
-/// measurement says the pipeline clock is still adding delay.
+/// The sink renders without clock sync (`attach_incoming_video`): measured on
+/// a phone mirror, clock sync let the display fall 3–5 s behind as the phone's
+/// timestamps drifted, so this buffer is the only smoothing left.
 const JITTER_BUFFER_LATENCY_MS: u32 = 40;
+
+/// Floor for the regular RTCP interval of each RTP session.
+///
+/// GStreamer follows RFC 4585 strictly: one *early* RTCP packet per regular
+/// interval, everything else waits for the next regular report — and with the
+/// default bandwidth-derived interval that wait was seconds. Measured on a
+/// phone mirror: retransmission requests "not sent early, sending with next
+/// regular RTCP", 95 of them expiring unanswered, and 3–5 s freezes because
+/// the keyframe request queued behind them too. libwebrtc sends NACK/PLI
+/// immediately; a 20 ms floor gets within one frame of that.
+const RTCP_MIN_INTERVAL_NS: u64 = 20_000_000;
+/// RTCP budget in bytes per second, so the bandwidth rule does not stretch the
+/// interval back out. It is a ceiling, not traffic: at 8 kB/s compound reports
+/// carrying feedback still came out at a 280 ms interval, with early NACKs
+/// refused inside it. Real use stays a few percent of the video stream.
+const RTCP_BYTES_PER_SECOND: f64 = 64_000.0;
+
+/// Makes every RTP session `webrtcbin` creates send feedback promptly.
+/// Sessions only exist after negotiation, so this hooks their first SSRC.
+fn enable_immediate_rtcp_feedback(webrtcbin: &gst::Element) {
+    let Some(rtpbin) = webrtcbin
+        .downcast_ref::<gst::Bin>()
+        .and_then(|bin| bin.by_name("rtpbin"))
+    else {
+        eprintln!("[DeskLink] webrtcbin has no rtpbin; RTCP feedback keeps its default timing");
+        return;
+    };
+    rtpbin.connect("on-new-ssrc", false, |values| {
+        let rtpbin = values[0].get::<gst::Element>().ok()?;
+        let session_id = values[1].get::<u32>().ok()?;
+        let session = rtpbin.emit_by_name::<Option<gst::Element>>("get-session", &[&session_id])?;
+        if session.has_property("rtcp-min-interval", None) {
+            session.set_property("rtcp-min-interval", RTCP_MIN_INTERVAL_NS);
+        }
+        if session.has_property("rtcp-fraction", None) {
+            session.set_property("rtcp-fraction", RTCP_BYTES_PER_SECOND);
+        }
+        None
+    });
+}
 
 #[derive(Debug, Clone)]
 pub enum PeerEvent {
@@ -58,6 +97,14 @@ pub enum PeerEvent {
 /// merely exposes authenticated data-channel and negotiation events to the
 /// session coordinator, which remains the sole owner of session validity.
 pub struct DesktopWebRtcPeer {
+    /// The SSRC every desktop-screen share on this peer sends with. The
+    /// stream is not signalled by SSRC (see [`without_video_ssrcs`]), so the
+    /// phone binds its picture to the first one it sees; a second share under
+    /// a fresh random SSRC never reached the screen — "waiting for the first
+    /// picture" whenever Remote input was reopened.
+    screen_ssrc: u32,
+    /// Where the next share's sequence numbers continue from.
+    screen_next_seqnum: Mutex<Option<u16>>,
     pipeline: gst::Pipeline,
     webrtcbin: gst::Element,
     channels: Arc<Mutex<HashMap<WebRtcChannel, WebRTCDataChannel>>>,
@@ -65,6 +112,12 @@ pub struct DesktopWebRtcPeer {
     initiator: bool,
     offer_requested: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
+    /// The active capture and the worker that owns it: a worker that is only now
+    /// finishing must never stop the capture a newer share has started.
+    desktop_screen_capture: Mutex<Option<(u64, super::screen::DesktopScreenCapture)>>,
+    /// Captures that could not be wound down while the connection was not ready
+    /// (see `DesktopScreenCapture::stop`); `close` releases them.
+    retired_captures: Mutex<Vec<super::screen::DesktopScreenCapture>>,
 }
 
 impl DesktopWebRtcPeer {
@@ -75,6 +128,7 @@ impl DesktopWebRtcPeer {
     ) -> Result<Self, String> {
         ensure_gstreamer()?;
         let pipeline = gst::Pipeline::new();
+        log_pipeline_problems(&pipeline);
         let webrtcbin = gst::ElementFactory::make("webrtcbin")
             .build()
             .map_err(|error| format!("DeskLink WebRTC is unavailable: {error}"))?;
@@ -95,6 +149,7 @@ impl DesktopWebRtcPeer {
                  using the default jitter buffer"
             );
         }
+        enable_immediate_rtcp_feedback(&webrtcbin);
         // Before the pipeline starts: candidate gathering begins as soon as the
         // element goes to Playing, so restricting it afterwards would be too
         // late for the first negotiation.
@@ -106,15 +161,7 @@ impl DesktopWebRtcPeer {
         let channels = Arc::new(Mutex::new(HashMap::new()));
         let offer_requested = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
-        install_webrtcbin_callbacks(
-            &webrtcbin,
-            &pipeline,
-            Arc::clone(&channels),
-            events.clone(),
-            initiator,
-            Arc::clone(&offer_requested),
-            Arc::clone(&closed),
-        )?;
+        install_webrtcbin_callbacks(&webrtcbin, &pipeline, Arc::clone(&channels), events.clone())?;
 
         pipeline
             .set_state(gst::State::Playing)
@@ -127,7 +174,19 @@ impl DesktopWebRtcPeer {
             events,
             initiator,
             offer_requested,
+            screen_next_seqnum: Mutex::new(None),
+            screen_ssrc: loop {
+                // Non-zero: 0 is what the unlinked sender advertised.
+                let mut bytes = [0u8; 4];
+                let _ = openssl::rand::rand_bytes(&mut bytes);
+                let ssrc = u32::from_ne_bytes(bytes);
+                if ssrc != 0 {
+                    break ssrc;
+                }
+            },
             closed,
+            desktop_screen_capture: Mutex::new(None),
+            retired_captures: Mutex::new(Vec::new()),
         };
         if initiator {
             peer.create_local_channels()?;
@@ -183,7 +242,7 @@ impl DesktopWebRtcPeer {
             }
             // The remote description is what creates the answerer's
             // transceivers, so this is the earliest point they exist.
-            ensure_video_nack(&webrtcbin);
+            configure_video_transceivers(&webrtcbin);
             if response_to_offer {
                 let _ = request_local_description(
                     &webrtcbin,
@@ -222,6 +281,144 @@ impl DesktopWebRtcPeer {
     pub fn end_of_candidates(&self, sdp_m_line_index: u32) {
         self.webrtcbin
             .emit_by_name::<()>("add-ice-candidate", &[&sdp_m_line_index, &None::<String>]);
+    }
+
+    /// Starts the portal-approved desktop screen track on the video m-line
+    /// negotiated during the initial offer/answer exchange.
+    /// Starts the capture for `owner`, replacing any earlier one.
+    ///
+    /// A share that is starting while the previous one is still winding down
+    /// (a retry, or a release followed at once by a new request) must not fail
+    /// with "already active": the earlier capture is stopped first.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_desktop_screen_capture(
+        &self,
+        owner: u64,
+        pipewire_fd: std::os::fd::OwnedFd,
+        node_id: u32,
+        pipewire_serial: Option<u64>,
+        width: i32,
+        height: i32,
+        fps: i32,
+    ) -> Result<(), String> {
+        let previous = self
+            .desktop_screen_capture
+            .lock()
+            .map_err(|_| "DeskLink desktop screen track lock poisoned".to_string())?
+            .take();
+        if let Some((_, previous)) = previous {
+            self.stop_or_retire(previous);
+        }
+        let created = super::screen::DesktopScreenCapture::attach(
+            &self.pipeline,
+            &self.webrtcbin,
+            pipewire_fd,
+            node_id,
+            pipewire_serial,
+            width,
+            height,
+            fps,
+            Some(super::screen::RtpContinuity {
+                ssrc: self.screen_ssrc,
+                next_seqnum: self.screen_next_seqnum.lock().ok().and_then(|next| *next),
+            }),
+        )?;
+        *self
+            .desktop_screen_capture
+            .lock()
+            .map_err(|_| "DeskLink desktop screen track lock poisoned".to_string())? =
+            Some((owner, created));
+        Ok(())
+    }
+
+    /// Stops whatever capture is active.
+    pub fn stop_desktop_screen_capture(&self) {
+        let capture = self
+            .desktop_screen_capture
+            .lock()
+            .ok()
+            .and_then(|mut capture| capture.take());
+        if let Some((_, capture)) = capture {
+            self.stop_or_retire(capture);
+        }
+    }
+
+    /// Stops the capture only if `owner` started it. A worker that finishes
+    /// after a newer share has begun must leave that share alone.
+    pub fn stop_desktop_screen_capture_for(&self, owner: u64) {
+        let capture = self
+            .desktop_screen_capture
+            .lock()
+            .ok()
+            .and_then(|mut capture| {
+                if capture
+                    .as_ref()
+                    .is_some_and(|(current, _)| *current == owner)
+                {
+                    capture.take()
+                } else {
+                    None
+                }
+            });
+        if let Some((_, capture)) = capture {
+            self.stop_or_retire(capture);
+        }
+    }
+
+    /// The active capture's source size in real pixels, once negotiated.
+    pub fn desktop_screen_source_size(&self) -> Option<(i32, i32)> {
+        self.desktop_screen_capture.lock().ok().and_then(|capture| {
+            capture
+                .as_ref()
+                .and_then(|(_, capture)| capture.source_size())
+        })
+    }
+
+    /// RTP packets the active capture has produced, zero when there is none.
+    pub fn desktop_screen_frames_sent(&self) -> u64 {
+        self.desktop_screen_capture
+            .lock()
+            .ok()
+            .and_then(|capture| capture.as_ref().map(|(_, capture)| capture.frames_sent()))
+            .unwrap_or(0)
+    }
+
+    fn stop_or_retire(&self, capture: super::screen::DesktopScreenCapture) {
+        if let (Some(next), Ok(mut slot)) = (capture.next_seqnum(), self.screen_next_seqnum.lock())
+        {
+            *slot = Some(next);
+        }
+        if let Err(parked) = capture.stop() {
+            eprintln!(
+                "[DeskLink] Screen capture is parked behind a connection that is not ready; \
+                 it will be released when the peer closes"
+            );
+            if let Ok(mut retired) = self.retired_captures.lock() {
+                retired.push(parked);
+            }
+        }
+    }
+
+    /// Bytes already queued on `channel` and not yet handed to the network.
+    ///
+    /// The only real backpressure signal available. libwebrtc destroys a data
+    /// channel with `RESOURCE_EXHAUSTED` once ~16 MiB is queued, so a producer
+    /// that can outrun the link — a terminal running `yes` — must consult this
+    /// and stop reading its source rather than queueing without bound.
+    ///
+    /// An unknown or closed channel reports `u64::MAX` so callers treat it as
+    /// fully congested and send nothing.
+    pub fn buffered_amount(&self, channel: WebRtcChannel) -> u64 {
+        let Ok(channels) = self.channels.lock() else {
+            return u64::MAX;
+        };
+        let Some(channel) = channels.get(&channel) else {
+            return u64::MAX;
+        };
+        if channel.ready_state() != WebRTCDataChannelState::Open {
+            return u64::MAX;
+        }
+        channel.property::<u64>("buffered-amount")
     }
 
     pub fn send_text(&self, channel: WebRtcChannel, text: &str) -> Result<(), String> {
@@ -275,7 +472,22 @@ impl DesktopWebRtcPeer {
         }
         let promise = gst::Promise::new();
         self.webrtcbin.emit_by_name::<()>("close", &[&promise]);
+        // The whole pipeline goes to NULL *before* the screen capture is touched.
+        // `webrtcbin` is the downstream end, so it shuts down first, and that is
+        // what frees a capture thread parked inside it; stopping the capture
+        // first would wait on that thread forever whenever the connection was
+        // still coming up or recovering.
         let _ = self.pipeline.set_state(gst::State::Null);
+        if let Ok(mut capture) = self.desktop_screen_capture.lock() {
+            if let Some((_, capture)) = capture.take() {
+                capture.abandon();
+            }
+        }
+        if let Ok(mut retired) = self.retired_captures.lock() {
+            for capture in retired.drain(..) {
+                capture.abandon();
+            }
+        }
         let _ = self.events.send(PeerEvent::Closed);
     }
 
@@ -379,8 +591,81 @@ fn channel_options(channel: WebRtcChannel) -> gst::Structure {
 /// — which is the common case — the old fallback tested
 /// `"application/x-rtp".starts_with("video/")`, returned false, and the video
 /// stream was silently dropped.
-/// Ensures every video transceiver asks for retransmission of lost packets.
+/// Logs errors and warnings any element in `pipeline` posts.
 ///
+/// Nothing else consumes the bus, so a failing source or encoder — a PipeWire
+/// stream the compositor tore down, a caps mismatch — used to be completely
+/// silent: the share "started", no picture arrived, and there was no line in any
+/// log to say why. Messages are dropped after logging so the bus queue cannot
+/// grow without bound.
+fn log_pipeline_problems(pipeline: &gst::Pipeline) {
+    let Some(bus) = pipeline.bus() else {
+        return;
+    };
+    bus.set_sync_handler(|_, message| {
+        match message.view() {
+            gst::MessageView::Error(error) => eprintln!(
+                "[DeskLink] GStreamer error from {}: {} ({})",
+                error
+                    .src()
+                    .map(|source| source.path_string().to_string())
+                    .unwrap_or_default(),
+                error.error(),
+                error.debug().unwrap_or_default()
+            ),
+            gst::MessageView::Warning(warning) => eprintln!(
+                "[DeskLink] GStreamer warning from {}: {} ({})",
+                warning
+                    .src()
+                    .map(|source| source.path_string().to_string())
+                    .unwrap_or_default(),
+                warning.error(),
+                warning.debug().unwrap_or_default()
+            ),
+            _ => {}
+        }
+        gst::BusSyncReply::Drop
+    });
+}
+
+/// The description as the phone should see it: the video section without
+/// `a=ssrc` / `a=ssrc-group` lines.
+///
+/// `webrtcbin` writes them before any capture is linked, declaring the screen
+/// stream's SSRC as **0** (`a=ssrc-group:FID 0 <rtx>`). libwebrtc then binds
+/// the receiving track to SSRC 0, and the real stream — arriving later under
+/// its true SSRC — is decoded into a default sink no track is connected to:
+/// frames decoded, `onTrack` never fired, a phone showing only "waiting for
+/// the first picture". Without SSRCs the stream is matched by its section and
+/// payload types (libwebrtc's unsignaled path) and reaches the track.
+fn without_video_ssrcs(sdp: &str) -> String {
+    let mut in_video = false;
+    let mut out = String::with_capacity(sdp.len());
+    for line in sdp.split_inclusive('\n') {
+        if line.starts_with("m=") {
+            in_video = line.starts_with("m=video");
+        }
+        if in_video && (line.starts_with("a=ssrc:") || line.starts_with("a=ssrc-group:")) {
+            continue;
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Prepares every video transceiver for what this desktop does with it: send
+/// its own screen, and ask for retransmission of lost packets.
+///
+/// **Direction.** A transceiver `webrtcbin` creates while applying a remote
+/// offer starts out receive-only, so the answer to the phone's `sendrecv` offer
+/// said `a=recvonly` and the desktop could *never* send a frame — in exactly the
+/// pairings where the phone is the deterministic initiator (its device id sorts
+/// lower), which is the paired pair this was found on. The initiator's own
+/// transceiver is added `sendrecv` already; the answerer's must be raised to
+/// match **before** the answer is created, which is why this runs on every
+/// remote description right ahead of `create-answer`.
+///
+/// **NACK.**
 /// [`DesktopWebRtcPeer::add_screen_transceiver`] sets `do-nack` on the section
 /// the **offerer** creates. The answerer's transceiver is created by
 /// `webrtcbin` when it applies the offer, and nothing ever set it there — so in
@@ -392,7 +677,14 @@ fn channel_options(channel: WebRtcChannel) -> gst::Structure {
 /// trying to work out which side created what. The index is bounded because
 /// `get-transceiver` returning `None` is the only termination signal and a
 /// runaway loop here would hang a GStreamer promise callback.
-fn ensure_video_nack(webrtcbin: &gst::Element) {
+fn configure_video_transceivers(webrtcbin: &gst::Element) {
+    // Answering: accept only the codecs this desktop wants, with TWCC under
+    // the id the offer chose. (The offerer's transceiver carries its caps.)
+    let answer_caps = webrtcbin
+        .property::<Option<gst_webrtc::WebRTCSessionDescription>>("remote-description")
+        .filter(|remote| remote.type_() == gst_webrtc::WebRTCSDPType::Offer)
+        .and_then(|remote| remote.sdp().as_text().ok())
+        .map(|sdp| super::screen::answer_video_caps(super::screen::twcc_extmap_id(&sdp)));
     for index in 0i32..MAX_TRANSCEIVERS {
         let Some(transceiver) = webrtcbin
             .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>("get-transceiver", &[&index])
@@ -404,8 +696,19 @@ fn ensure_video_nack(webrtcbin: &gst::Element) {
         }
         // Guarded: `set_property` panics on an absent property, and this one is
         // reached on transceivers this code did not create.
+        if transceiver.find_property("direction").is_some() {
+            transceiver.set_property(
+                "direction",
+                gst_webrtc::WebRTCRTPTransceiverDirection::Sendrecv,
+            );
+        }
         if transceiver.find_property("do-nack").is_some() {
             transceiver.set_property("do-nack", true);
+        }
+        if let Some(caps) = &answer_caps {
+            if transceiver.find_property("codec-preferences").is_some() {
+                transceiver.set_property("codec-preferences", caps);
+            }
         }
     }
 }
@@ -448,26 +751,18 @@ fn install_webrtcbin_callbacks(
     pipeline: &gst::Pipeline,
     channels: Arc<Mutex<HashMap<WebRtcChannel, WebRTCDataChannel>>>,
     events: Sender<PeerEvent>,
-    initiator: bool,
-    offer_requested: Arc<AtomicBool>,
-    closed: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let negotiation_element = webrtcbin.clone();
-    let negotiation_events = events.clone();
-    let negotiation_requested = Arc::clone(&offer_requested);
-    let negotiation_closed = Arc::clone(&closed);
-    webrtcbin.connect("on-negotiation-needed", false, move |_| {
-        if initiator && !negotiation_closed.load(Ordering::Acquire) {
-            let _ = request_local_description(
-                &negotiation_element,
-                SignalingMessageType::Offer,
-                &negotiation_events,
-                &negotiation_requested,
-                false,
-            );
-        }
-        None
-    });
+    // `on-negotiation-needed` deliberately does nothing.
+    //
+    // It fires as soon as the *first* channel or transceiver is created, and it
+    // used to build the offer right there: while the other six channels and the
+    // video section were still being added. Whatever the race produced was the
+    // offer — in the loopback test, an SDP with **no media sections at all** —
+    // and the latch then swallowed the coordinator's own `create_offer()`. The
+    // desktop-initiator path (whenever the phone's id sorts higher) therefore
+    // could never connect. Everything is negotiated up front, so the offer is
+    // requested exactly once, explicitly, after construction has finished.
+    webrtcbin.connect("on-negotiation-needed", false, |_| None);
 
     let ice_events = events.clone();
     webrtcbin.connect("on-ice-candidate", false, move |values| {
@@ -667,7 +962,7 @@ fn request_local_description(
             } else {
                 let _ = events_after_set.send(PeerEvent::LocalDescription {
                     message_type: message_type_after_set,
-                    sdp,
+                    sdp: without_video_ssrcs(&sdp),
                 });
             }
         });
@@ -697,10 +992,638 @@ fn local_description_promise_field(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::mpsc;
+    use std::sync::Arc;
 
     use super::*;
+
+    /// What libwebrtc (Android) offers when the phone is the initiator: one
+    /// `sendrecv` VP8 video section — the phone attaches a track in both roles —
+    /// plus the data-channel section. Hand-written from a real offer's shape so
+    /// the desktop's *answerer* role can be exercised without a phone.
+    const PHONE_OFFER: &str = "v=0\r\n\
+o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1\r\n\
+a=extmap-allow-mixed\r\n\
+a=msid-semantic: WMS desklink-screen\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:Zx4l\r\n\
+a=ice-pwd:Ye1kU7eZ1cTnL7l3fJQ7t0q2\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 4B:1C:3E:8A:0D:52:97:6F:B3:21:E4:7A:C8:19:5D:F0:2A:66:B1:93:0E:D7:48:AC:35:7B:E2:19:84:CF:60:1D\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=extmap:1 urn:ietf:params:rtp-hdrext:toffset\r\n\
+a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\r\n\
+a=extmap:3 urn:3gpp:video-orientation\r\n\
+a=extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\r\n\
+a=sendrecv\r\n\
+a=msid:desklink-screen 6f5d7f10-5c2e-4c0e-9a55-1f2e0b1d3c44\r\n\
+a=rtcp-mux\r\n\
+a=rtcp-rsize\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtcp-fb:96 goog-remb\r\n\
+a=rtcp-fb:96 transport-cc\r\n\
+a=rtcp-fb:96 ccm fir\r\n\
+a=rtcp-fb:96 nack\r\n\
+a=rtcp-fb:96 nack pli\r\n\
+a=rtpmap:97 rtx/90000\r\n\
+a=fmtp:97 apt=96\r\n\
+a=ssrc-group:FID 1111111111 2222222222\r\n\
+a=ssrc:1111111111 cname:desklinkphone\r\n\
+a=ssrc:1111111111 msid:desklink-screen 6f5d7f10-5c2e-4c0e-9a55-1f2e0b1d3c44\r\n\
+a=ssrc:2222222222 cname:desklinkphone\r\n\
+a=ssrc:2222222222 msid:desklink-screen 6f5d7f10-5c2e-4c0e-9a55-1f2e0b1d3c44\r\n\
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:Zx4l\r\n\
+a=ice-pwd:Ye1kU7eZ1cTnL7l3fJQ7t0q2\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 4B:1C:3E:8A:0D:52:97:6F:B3:21:E4:7A:C8:19:5D:F0:2A:66:B1:93:0E:D7:48:AC:35:7B:E2:19:84:CF:60:1D\r\n\
+a=setup:actpass\r\n\
+a=mid:1\r\n\
+a=sctp-port:5000\r\n\
+a=max-message-size:262144\r\n";
+
+    /// Blocks until the peer produces its local answer.
+    fn wait_for_answer(receiver: &mpsc::Receiver<PeerEvent>) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match receiver.recv_timeout(remaining) {
+                Ok(PeerEvent::LocalDescription {
+                    message_type: SignalingMessageType::Answer,
+                    sdp,
+                }) => return sdp,
+                Ok(PeerEvent::Error(error)) => panic!("negotiation failed: {error}"),
+                Ok(_) => {}
+                Err(_) => panic!("no answer was produced within 15s"),
+            }
+        }
+    }
+
+    /// An answerer with the phone's offer applied and answered — the state the
+    /// desktop is in when a screen share starts.
+    fn answered_peer(offer: &str) -> DesktopWebRtcPeer {
+        let (sender, receiver) = mpsc::channel();
+        let peer = DesktopWebRtcPeer::new(false, sender, &IceServerConfig::default()).unwrap();
+        peer.set_remote_description(SignalingMessageType::Offer, offer)
+            .unwrap();
+        wait_for_answer(&receiver);
+        // Keep draining so the peer's event sender never blocks or errors.
+        std::thread::spawn(move || while receiver.recv().is_ok() {});
+        peer
+    }
+
+    fn test_source() -> gst::Element {
+        gst::ElementFactory::make("videotestsrc")
+            .property("is-live", true)
+            .build()
+            .expect("videotestsrc")
+    }
+
+    fn wait_for_frames(capture: &super::super::screen::DesktopScreenCapture) -> u64 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && capture.frames_sent() == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        capture.frames_sent()
+    }
+
+    /// The whole desktop video path except PipeWire: source → scale → VP8 → RTP
+    /// → the section the phone's offer negotiated. This is the path that has
+    /// never carried a frame; a chain that "attaches" to a fresh, unnegotiated
+    /// transceiver reports success and sends nothing.
+    #[test]
+    fn the_screen_chain_binds_to_the_negotiated_section_and_produces_rtp() {
+        let peer = answered_peer(PHONE_OFFER);
+
+        let capture = super::super::screen::DesktopScreenCapture::attach_source(
+            &peer.pipeline,
+            &peer.webrtcbin,
+            test_source(),
+            None,
+            1920,
+            1080,
+            30,
+            None,
+        )
+        .expect("the chain must attach to the answered video section");
+
+        assert!(
+            wait_for_frames(&capture) > 0,
+            "the encoder chain produced no RTP"
+        );
+        assert_eq!(capture.payload_type(), 96);
+        // No connection in a unit test, so the chain parks inside `webrtcbin`:
+        // `stop` must hand it back instead of hanging, and `close` frees it.
+        assert!(capture.stop().is_err());
+        peer.close();
+    }
+
+    /// libwebrtc hands out dynamic payload types; VP8 is not always 96. Sending
+    /// with the wrong one is a stream the phone silently ignores.
+    #[test]
+    fn the_screen_chain_uses_the_payload_type_the_phone_offered() {
+        let offer = PHONE_OFFER
+            .replace("SAVPF 96 97", "SAVPF 100 101")
+            .replace("a=rtpmap:96", "a=rtpmap:100")
+            .replace("a=rtcp-fb:96", "a=rtcp-fb:100")
+            .replace("a=rtpmap:97", "a=rtpmap:101")
+            .replace("a=fmtp:97 apt=96", "a=fmtp:101 apt=100");
+        let peer = answered_peer(&offer);
+
+        let capture = super::super::screen::DesktopScreenCapture::attach_source(
+            &peer.pipeline,
+            &peer.webrtcbin,
+            test_source(),
+            None,
+            1280,
+            720,
+            30,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(capture.payload_type(), 100);
+        let _ = capture.stop();
+        peer.close();
+    }
+
+    // ---- Two real peers connected over loopback --------------------------------
+    //
+    // Both ends are desktop code, so this proves the desktop's own transport, not
+    // cross-stack interop. But it is real ICE, DTLS and SCTP on real `webrtcbin`s,
+    // which is what the single-peer tests above cannot reach: with a connected
+    // transport nothing parks, so this is where the *connected* shutdown path and
+    // steady-state media flow are actually exercised.
+
+    /// The far side builds a decode chain for the incoming track and frames
+    /// actually decode and reach its display — a track alone is not a picture.
+    fn assert_far_side_decodes(
+        events: &mpsc::Receiver<PeerEvent>,
+    ) -> super::super::screen::ScreenStream {
+        // The far side reports either a working decode chain or *why* it could
+        // not build one; silence would mean nothing arrived at all.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut outcome = None;
+        while outcome.is_none() && std::time::Instant::now() < deadline {
+            match events.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok(PeerEvent::ScreenStream(stream)) => outcome = Some(Ok(stream)),
+                Ok(PeerEvent::Error(error)) if error.contains("screen") => {
+                    outcome = Some(Err(error))
+                }
+                _ => {}
+            }
+        }
+        match outcome {
+            Some(Ok(stream)) => {
+                // A track is not a picture: the frames must decode and reach
+                // the display, through the same codec negotiation as a phone.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while stream.frames_shown() < 5 && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                assert!(
+                    stream.frames_shown() >= 5,
+                    "the far side decoded {} frames",
+                    stream.frames_shown()
+                );
+                stream
+            }
+            Some(Err(error)) => panic!("far side got the track but could not display it: {error}"),
+            None => panic!("the far side never received the video track"),
+        }
+    }
+
+    /// Reopening Remote input starts a second share on the same connection.
+    /// It must reach the picture the far side already shows: with a fresh
+    /// SSRC per share it was a stranger to a phone that had bound its picture
+    /// to the first one, and the phone sat on "waiting for the first picture".
+    #[test]
+    fn a_second_share_on_the_same_connection_reaches_the_same_picture() {
+        let pair = loopback();
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let share = |next_seqnum| {
+            super::super::screen::DesktopScreenCapture::attach_source(
+                &pair.answerer.pipeline,
+                &pair.answerer.webrtcbin,
+                test_source(),
+                None,
+                1280,
+                720,
+                30,
+                Some(super::super::screen::RtpContinuity {
+                    ssrc: pair.answerer.screen_ssrc,
+                    next_seqnum,
+                }),
+            )
+            .unwrap()
+        };
+        let first = share(None);
+        let stream = assert_far_side_decodes(&pair.offerer_events);
+        let next = first.next_seqnum();
+        assert!(
+            next.is_some(),
+            "a share that sent packets knows where to continue"
+        );
+        assert!(first.stop().is_ok());
+
+        let before = stream.frames_shown();
+        let second = share(next);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while stream.frames_shown() < before + 10 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            stream.frames_shown() >= before + 10,
+            "the second share never reached the far side's picture ({} -> {})",
+            before,
+            stream.frames_shown()
+        );
+        assert!(second.stop().is_ok());
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
+    pub(crate) struct Loopback {
+        pub(crate) offerer: Arc<DesktopWebRtcPeer>,
+        pub(crate) answerer: Arc<DesktopWebRtcPeer>,
+        pub(crate) offerer_events: mpsc::Receiver<PeerEvent>,
+        pub(crate) answerer_events: mpsc::Receiver<PeerEvent>,
+    }
+
+    /// Wires two peers together: signalling events from each are applied to the
+    /// other, everything else is handed to the test.
+    pub(crate) fn loopback() -> Loopback {
+        let ice = IceServerConfig {
+            local_ip: Some(std::net::IpAddr::from([127, 0, 0, 1])),
+            ..IceServerConfig::default()
+        };
+        let (offerer_tx, offerer_raw) = mpsc::channel();
+        let (answerer_tx, answerer_raw) = mpsc::channel();
+        let offerer = Arc::new(DesktopWebRtcPeer::new(true, offerer_tx, &ice).unwrap());
+        let answerer = Arc::new(DesktopWebRtcPeer::new(false, answerer_tx, &ice).unwrap());
+        let (offerer_app_tx, offerer_events) = mpsc::channel();
+        let (answerer_app_tx, answerer_events) = mpsc::channel();
+
+        let to = Arc::clone(&answerer);
+        std::thread::spawn(move || {
+            while let Ok(event) = offerer_raw.recv() {
+                if std::env::var("LOOPBACK_TRACE").is_ok() {
+                    eprintln!("OFFERER event: {:?}", event);
+                }
+                match event {
+                    PeerEvent::LocalDescription { message_type, sdp } => {
+                        let _ = to.set_remote_description(message_type, &sdp);
+                    }
+                    PeerEvent::IceCandidate {
+                        sdp_m_line_index,
+                        candidate,
+                    } => {
+                        let _ = to.add_ice_candidate(sdp_m_line_index, &candidate);
+                    }
+                    PeerEvent::EndOfCandidates => to.end_of_candidates(0),
+                    other => {
+                        let _ = offerer_app_tx.send(other);
+                    }
+                }
+            }
+        });
+        let to = Arc::clone(&offerer);
+        std::thread::spawn(move || {
+            while let Ok(event) = answerer_raw.recv() {
+                if std::env::var("LOOPBACK_TRACE").is_ok() {
+                    eprintln!("ANSWERER event: {:?}", event);
+                }
+                match event {
+                    PeerEvent::LocalDescription { message_type, sdp } => {
+                        let _ = to.set_remote_description(message_type, &sdp);
+                    }
+                    PeerEvent::IceCandidate {
+                        sdp_m_line_index,
+                        candidate,
+                    } => {
+                        let _ = to.add_ice_candidate(sdp_m_line_index, &candidate);
+                    }
+                    PeerEvent::EndOfCandidates => to.end_of_candidates(0),
+                    other => {
+                        let _ = answerer_app_tx.send(other);
+                    }
+                }
+            }
+        });
+
+        offerer.create_offer().unwrap();
+        Loopback {
+            offerer,
+            answerer,
+            offerer_events,
+            answerer_events,
+        }
+    }
+
+    /// Waits until every channel in `channels` is open on the peer whose events
+    /// are `events`. Open notifications arrive in any order, so waiting for them
+    /// one at a time loses the ones that came early.
+    pub(crate) fn wait_for_channels(
+        events: &mpsc::Receiver<PeerEvent>,
+        channels: &[WebRtcChannel],
+    ) {
+        let mut pending: Vec<WebRtcChannel> = channels.to_vec();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !pending.is_empty() {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match events.recv_timeout(remaining) {
+                Ok(PeerEvent::ChannelOpened(opened)) => pending.retain(|c| *c != opened),
+                Ok(PeerEvent::Error(error)) => panic!("peer error while connecting: {error}"),
+                Ok(_) => {}
+                Err(_) => panic!("{pending:?} never opened over loopback"),
+            }
+        }
+    }
+
+    /// Waits until `channel` is open on the peer whose events are `events`.
+    pub(crate) fn wait_for_channel(events: &mpsc::Receiver<PeerEvent>, channel: WebRtcChannel) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match events.recv_timeout(remaining) {
+                Ok(PeerEvent::ChannelOpened(opened)) if opened == channel => return,
+                Ok(PeerEvent::Error(error)) => panic!("peer error while connecting: {error}"),
+                Ok(_) => {}
+                Err(_) => panic!("{channel:?} never opened over loopback"),
+            }
+        }
+    }
+
+    /// Waits for the next `Envelope` on `channel`.
+    fn next_envelope(events: &mpsc::Receiver<PeerEvent>, channel: WebRtcChannel) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match events.recv_timeout(remaining) {
+                Ok(PeerEvent::Envelope {
+                    channel: got,
+                    bytes,
+                }) if got == channel => return bytes,
+                Ok(_) => {}
+                Err(_) => panic!("no message arrived on {channel:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn two_peers_connect_over_loopback_and_carry_data_both_ways() {
+        let pair = loopback();
+        wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+
+        pair.offerer
+            .send_text(WebRtcChannel::Control, "offerer says hello")
+            .unwrap();
+        assert_eq!(
+            next_envelope(&pair.answerer_events, WebRtcChannel::Control),
+            b"offerer says hello"
+        );
+        pair.answerer
+            .send_text(WebRtcChannel::Control, "answerer replies")
+            .unwrap();
+        assert_eq!(
+            next_envelope(&pair.offerer_events, WebRtcChannel::Control),
+            b"answerer replies"
+        );
+
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
+    /// Screen video from the *answerer* — the role the desktop plays when the
+    /// phone is the initiator — over a real connection: it keeps flowing (nothing
+    /// is parked), and stopping the share is clean instead of handed back.
+    #[test]
+    fn the_answerer_streams_screen_video_over_a_live_connection_and_stops_cleanly() {
+        let pair = loopback();
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+
+        let capture = super::super::screen::DesktopScreenCapture::attach_source(
+            &pair.answerer.pipeline,
+            &pair.answerer.webrtcbin,
+            test_source(),
+            None,
+            1280,
+            720,
+            30,
+            None,
+        )
+        .expect("the answerer must be able to attach its screen to the negotiated section");
+
+        assert!(wait_for_frames(&capture) > 0, "no video produced");
+        let early = capture.frames_sent();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        assert!(
+            capture.frames_sent() > early + 10,
+            "video stalled once past the first packets (parked behind the transport?): {} -> {}",
+            early,
+            capture.frames_sent()
+        );
+        // The phone-is-initiator case: the offerer must see the picture.
+        assert_far_side_decodes(&pair.offerer_events);
+
+        assert!(
+            capture.stop().is_ok(),
+            "on a live connection nothing is parked, so stopping must complete"
+        );
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
+    /// The other role: the desktop as *offerer* (its id sorts lower), streaming to
+    /// the phone. The far side must actually receive it — a decode chain is built
+    /// for the incoming track — not just see the sender report packets.
+    #[test]
+    fn the_offerer_streams_screen_video_and_the_far_side_starts_receiving_it() {
+        let pair = loopback();
+        wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+
+        let capture = super::super::screen::DesktopScreenCapture::attach_source(
+            &pair.offerer.pipeline,
+            &pair.offerer.webrtcbin,
+            test_source(),
+            None,
+            1280,
+            720,
+            30,
+            None,
+        )
+        .expect("the offerer must be able to attach its screen to its own video section");
+        assert!(wait_for_frames(&capture) > 0, "no video produced");
+
+        assert_far_side_decodes(&pair.answerer_events);
+
+        assert!(
+            capture.stop().is_ok(),
+            "a live connection must stop cleanly"
+        );
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
+    /// Closing a peer that is mid-share must return promptly, connected or not.
+    #[test]
+    fn closing_a_connected_peer_with_an_active_share_does_not_hang() {
+        let pair = loopback();
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let _capture = super::super::screen::DesktopScreenCapture::attach_source(
+            &pair.answerer.pipeline,
+            &pair.answerer.webrtcbin,
+            test_source(),
+            None,
+            1280,
+            720,
+            30,
+            None,
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        let started = std::time::Instant::now();
+        pair.answerer.close();
+        pair.offerer.close();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "close took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A chain nothing is flowing through has nothing parked in `webrtcbin`, so
+    /// `stop` winds it down completely rather than handing it back.
+    #[test]
+    fn a_quiet_capture_stops_cleanly_and_leaves_the_peer_usable() {
+        let peer = answered_peer(PHONE_OFFER);
+        let silent = gst::ElementFactory::make("appsrc")
+            .property("is-live", true)
+            .build()
+            .expect("appsrc");
+        let capture = super::super::screen::DesktopScreenCapture::attach_source(
+            &peer.pipeline,
+            &peer.webrtcbin,
+            silent,
+            None,
+            1280,
+            720,
+            30,
+            None,
+        )
+        .unwrap();
+
+        assert!(capture.stop().is_ok(), "an idle chain must stop cleanly");
+        peer.close();
+    }
+
+    /// A second share on the same peer must reuse the section's pad and still
+    /// carry media. (The first share here ends cleanly — an idle chain — because
+    /// a chain left *parked* in a connection that never came up holds the pad's
+    /// stream lock; a real share only starts on a ready connection, and a lost
+    /// one rebuilds the peer.)
+    #[test]
+    fn a_second_share_reuses_the_same_section_and_carries_media() {
+        let peer = answered_peer(PHONE_OFFER);
+        let attach = |source: gst::Element| {
+            super::super::screen::DesktopScreenCapture::attach_source(
+                &peer.pipeline,
+                &peer.webrtcbin,
+                source,
+                None,
+                1280,
+                720,
+                30,
+                None,
+            )
+            .unwrap()
+        };
+        let silent = || {
+            gst::ElementFactory::make("appsrc")
+                .property("is-live", true)
+                .build()
+                .expect("appsrc")
+        };
+
+        let first = attach(silent());
+        assert!(first.stop().is_ok());
+
+        let second = attach(test_source());
+        assert!(
+            wait_for_frames(&second) > 0,
+            "the second share produced nothing"
+        );
+        let _parked = second.stop();
+        peer.close();
+    }
+
+    /// The section of `sdp` that starts at the first line beginning `m=<kind>`.
+    fn media_section<'a>(sdp: &'a str, kind: &str) -> &'a str {
+        let start = sdp
+            .find(&format!("m={kind} "))
+            .unwrap_or_else(|| panic!("no m={kind} section in:\n{sdp}"));
+        let rest = &sdp[start..];
+        let end = rest[1..].find("\nm=").map_or(rest.len(), |i| i + 2);
+        &rest[..end]
+    }
+
+    /// The paired phone (device id sorts lower) is the WebRTC initiator, so the
+    /// desktop is the **answerer** — and it is the desktop that has to send the
+    /// screen video. An answerer's transceiver is created by the remote offer,
+    /// not by us; if it answers `recvonly` the phone gets an m-line that can
+    /// never carry a frame, however healthy everything else looks.
+    #[test]
+    fn an_answerer_will_send_screen_video_when_the_phone_offers_sendrecv() {
+        let (sender, receiver) = mpsc::channel();
+        let peer = DesktopWebRtcPeer::new(false, sender, &IceServerConfig::default()).unwrap();
+        peer.set_remote_description(SignalingMessageType::Offer, PHONE_OFFER)
+            .unwrap();
+
+        let answer = wait_for_answer(&receiver);
+        peer.close();
+
+        let video = media_section(&answer, "video");
+        assert!(
+            video.contains("a=sendrecv"),
+            "the desktop must answer sendrecv to be able to send its screen; answered:\n{video}"
+        );
+        assert!(
+            video.contains("VP8/90000"),
+            "the answer must keep the negotiated VP8 codec:\n{video}"
+        );
+        // Without TWCC the phone's congestion control is loss-only and its
+        // pacer holds every packet ~100 ms; the offer's id must be echoed.
+        assert!(
+            video.contains(
+                "a=extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
+            ),
+            "the answer must negotiate transport-wide congestion control:\n{video}"
+        );
+    }
+
+    #[test]
+    fn the_phone_is_never_told_the_screen_streams_ssrc() {
+        let sdp = "v=0\r\nm=video 9 X 100 96\r\na=mid:0\r\na=ssrc-group:FID 0 3880827048\r\n\
+                   a=ssrc:3880827048 msid:user@host webrtctransceiver0\r\na=sendrecv\r\n\
+                   m=application 9 Y webrtc-datachannel\r\na=ssrc:7 cname:keep\r\n";
+        let out = without_video_ssrcs(sdp);
+        assert!(!out.contains("a=ssrc-group"), "{out}");
+        assert!(!out.contains("a=ssrc:3880827048"), "{out}");
+        assert!(out.contains("a=sendrecv\r\n") && out.contains("a=mid:0\r\n"));
+        // Other sections are untouched, line endings included.
+        assert!(out.contains("a=ssrc:7 cname:keep\r\n"));
+        assert_eq!(without_video_ssrcs("v=0\r\n"), "v=0\r\n");
+    }
 
     /// `get-transceiver` takes a **`gint`**, and `emit_by_name` panics on a
     /// mismatched argument type — inside a GStreamer promise callback, where a
@@ -712,13 +1635,13 @@ mod tests {
     /// type system catches it: the values are marshalled dynamically. Only
     /// firing the signal for real does.
     #[test]
-    fn ensure_video_nack_marshals_its_index_to_a_real_webrtcbin() {
+    fn configure_video_transceivers_marshals_its_index_to_a_real_webrtcbin() {
         let (sender, _receiver) = mpsc::channel();
         let peer = DesktopWebRtcPeer::new(true, sender, &IceServerConfig::default()).unwrap();
 
         // The initiator has a video transceiver, so this walks a populated list
         // and then runs off the end — both paths the promise callback takes.
-        ensure_video_nack(&peer.webrtcbin);
+        configure_video_transceivers(&peer.webrtcbin);
 
         peer.close();
     }

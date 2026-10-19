@@ -79,20 +79,87 @@ impl DaemonWorker {
         let shutdown = Arc::clone(&self.shutdown);
         let tcp_port = self.tcp_port;
         thread::spawn(move || {
+            // Burst at 0, 1, 3 and 7 s, then every 15 s. A single startup
+            // beacon is easily lost or lands before the phone's listener is
+            // up, and the next one 15 s later was most of a cold start.
+            let mut sent: usize = 0;
             while !shutdown.load(Ordering::Acquire) {
                 if let Err(error) = broadcast_identity(&config, tcp_port) {
                     push_error(&errors, error);
                 }
-                for _ in 0..30 {
+                let wait_ms = BEACON_BURST_GAPS_MS.get(sent).copied().unwrap_or(15_000);
+                sent = sent.saturating_add(1);
+                for _ in 0..wait_ms / 250 {
                     if shutdown.load(Ordering::Acquire) {
                         break;
                     }
-                    thread::sleep(Duration::from_millis(500));
+                    thread::sleep(Duration::from_millis(250));
                 }
             }
         });
     }
 }
+
+impl DaemonWorker {
+    /// Advertises `_desklink._udp` over mDNS, the path Android already browses
+    /// (`MdnsDiscovery.kt`). Many access points filter broadcast but pass
+    /// multicast, so this is a second, independent way to be found. Uses its
+    /// own responder rather than Avahi, which is off on many desktops.
+    /// Best effort: discovery still works by broadcast if this fails.
+    pub(super) fn start_mdns_advertiser(&self) {
+        let Ok(info) = self.config.lock().map(|config| config.local_device_info()) else {
+            return;
+        };
+        let shutdown = Arc::clone(&self.shutdown);
+        let spawned = thread::Builder::new()
+            .name("desklink-mdns".to_string())
+            .spawn(move || {
+                let daemon = match mdns_sd::ServiceDaemon::new() {
+                    Ok(daemon) => daemon,
+                    Err(error) => {
+                        eprintln!("[Daemon] mDNS advertising unavailable: {error}");
+                        return;
+                    }
+                };
+                let protocol = info.protocol_version.to_string();
+                let properties = [
+                    ("id", info.id.as_str()),
+                    ("name", info.name.as_str()),
+                    ("type", info.device_type.as_str()),
+                    ("protocol", protocol.as_str()),
+                ];
+                let service = mdns_sd::ServiceInfo::new(
+                    MDNS_SERVICE_TYPE,
+                    &info.id,
+                    &format!("{}.local.", info.id),
+                    "",
+                    UDP_PORT,
+                    &properties[..],
+                )
+                .map(mdns_sd::ServiceInfo::enable_addr_auto);
+                match service
+                    .map_err(|error| error.to_string())
+                    .and_then(|service| daemon.register(service).map_err(|error| error.to_string()))
+                {
+                    Ok(()) => eprintln!("[Daemon] Advertising {MDNS_SERVICE_TYPE} over mDNS"),
+                    Err(error) => eprintln!("[Daemon] mDNS advertising failed: {error}"),
+                }
+                while !shutdown.load(Ordering::Acquire) {
+                    thread::sleep(Duration::from_millis(500));
+                }
+                let _ = daemon.shutdown();
+            });
+        if let Err(error) = spawned {
+            eprintln!("[Daemon] could not start mDNS advertising: {error}");
+        }
+    }
+}
+
+/// Must match `DeskLinkProtocol.MDNS_SERVICE_TYPE` on Android.
+const MDNS_SERVICE_TYPE: &str = "_desklink._udp.local.";
+
+/// Gaps after each of the first beacons; afterwards every 15 s.
+const BEACON_BURST_GAPS_MS: [u64; 3] = [1_000, 2_000, 4_000];
 
 pub(super) fn broadcast_identity(config: &Arc<Mutex<Config>>, tcp_port: u16) -> Result<(), String> {
     let socket = UdpSocket::bind(("0.0.0.0", 0)).map_err(|err| err.to_string())?;
@@ -140,7 +207,11 @@ fn handle_identity_packet(
     // A closed link stays installed while a WebRTC transport outlives it, so
     // ask about the socket rather than the binding: otherwise a device whose
     // socket died is never offered a replacement connection.
-    if !sessions.wants_bootstrap_connection(&info.id) {
+    // ...unless this beacon comes from a restarted process: then the socket
+    // and WebRTC peer this side holds are the dead previous instance's.
+    if !sessions.wants_bootstrap_connection(&info.id)
+        && !sessions.peer_restarted(&info.id, info.instance_id.as_deref())
+    {
         return;
     }
     let paired = config
@@ -183,7 +254,11 @@ fn handle_identity_packet(
     let sessions = Arc::clone(sessions);
     let events = Arc::clone(events);
 
-    thread::spawn(move || {
+    let Some(slot) = super::network::HandshakeSlot::claim(address.ip()) else {
+        return;
+    };
+    let spawned = thread::Builder::new().spawn(move || {
+        let _slot = slot;
         if let Err(error) = connect_to_device(
             info.clone(),
             address,
@@ -207,6 +282,9 @@ fn handle_identity_packet(
             }
         }
     });
+    if let Err(error) = spawned {
+        eprintln!("[Daemon] could not start an outgoing connection thread: {error}");
+    }
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use super::state::{mark_error, push_error, update_pair_state};
 use crate::device_links::config::Config;
-use crate::device_links::core::{DeviceManager, DeviceSession, SessionBinding};
+use crate::device_links::core::{DeviceManager, SessionBinding};
 use crate::device_links::device::DeviceView;
 use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_PAIR};
 use crate::device_links::pairing::{PairState, PairingHandler};
@@ -81,29 +81,6 @@ fn report(
     push_error(errors, error);
 }
 
-/// Keeps the pairing state and its side effects in agreement.
-///
-/// `request_packet` and `accept_packet` advance the state machine *as they build
-/// the packet*, so the state moved before anything was sent. When the send then
-/// failed the `?` returned early and the side effects — persisting trust,
-/// updating the device view — were skipped, leaving the session claiming
-/// `Paired` while the trust store was empty and the UI still showed a prompt.
-///
-/// Reverting on failure is what upstream does (`pairinghandler.cpp:120-125`):
-/// the state never enters a negotiation the link could not carry. The whole
-/// handler is restored, not just `state`, so the timestamp and deadline cannot
-/// be left behind either.
-fn commit_or_revert<T>(
-    session: &mut DeviceSession,
-    snapshot: PairingHandler,
-    outcome: Result<T, String>,
-) -> Result<T, String> {
-    if outcome.is_err() {
-        session.pairing = snapshot;
-    }
-    outcome
-}
-
 pub(crate) struct PairingContext {
     pub(crate) sessions: Arc<DeviceManager>,
     pub(crate) devices: Arc<Mutex<HashMap<String, DeviceView>>>,
@@ -113,56 +90,144 @@ pub(crate) struct PairingContext {
 
 impl PairingContext {
     pub(crate) fn send_pair_request(&self, device_id: &str) {
-        self.with_link(device_id, |session, binding| {
-            let snapshot = session.pairing.clone();
-            let packet = session.pairing.request_packet()?;
-            commit_or_revert(session, snapshot.clone(), binding.link.send_packet(&packet))?;
-            if session.pairing.state == PairState::Paired {
-                self.config
-                    .lock()
-                    .map_err(|_| "Config lock poisoned".to_string())?
-                    .trust_device(&binding.link.info, binding.link.certificate_pem.clone())?;
+        let result = self.transition(device_id, |pairing| pairing.request_packet());
+        let Some((binding, snapshot, _, state)) = self.finish(device_id, result) else {
+            return;
+        };
+        if state == PairState::Paired {
+            // The peer had already accepted: this request was the acknowledgement.
+            if self.persist_trust(device_id, &binding, snapshot, state) {
                 update_pair_state(&self.devices, device_id, PairState::Paired, None);
-                return Ok(());
             }
-            update_pair_state(
-                &self.devices,
-                device_id,
-                session.pairing.state,
-                Some(binding.link.verification_key(session.pairing.timestamp())),
-            );
-            Ok(())
-        });
+            return;
+        }
+        let timestamp = self
+            .sessions
+            .with_session(&binding, |session| session.pairing.timestamp())
+            .unwrap_or_default();
+        update_pair_state(
+            &self.devices,
+            device_id,
+            state,
+            Some(binding.link.verification_key(timestamp)),
+        );
     }
 
-    pub(crate) fn accept_pair(&self, device_id: &str) {
-        self.with_link(device_id, |session, binding| {
-            let snapshot = session.pairing.clone();
-            let packet = session.pairing.accept_packet()?;
-            commit_or_revert(session, snapshot.clone(), binding.link.send_packet(&packet))?;
-
-            // Persisting trust can still fail. Revert rather than leave the
-            // session `Paired` against an empty trust store: the dispatcher
-            // authorises features from the *session*, so that split admitted a
-            // peer this device had not recorded as trusted, and every reconnect
-            // then arrived with `initially_paired = false` while the live
-            // session insisted otherwise.
-            //
-            // The peer, which did receive the acceptance, finds out the next
-            // time it sends anything — `notify_peer_not_paired` answers it with
-            // `pair:false`. That is the same self-healing path a missed unpair
-            // uses, which is why no queue is needed here either.
-            let trusted = self
-                .config
-                .lock()
-                .map_err(|_| "Config lock poisoned".to_string())
-                .and_then(|mut config| {
-                    config.trust_device(&binding.link.info, binding.link.certificate_pem.clone())
+    pub(crate) fn accept_pair(&self, device_id: &str, shown_key: Option<&str>) {
+        // The acceptance is for the key the user compared. The UI refreshes
+        // once a second, so a link replaced in between would otherwise collect
+        // an approval granted to a different certificate.
+        if let Some(shown_key) = shown_key {
+            let current = self
+                .sessions
+                .current_binding(device_id)
+                .and_then(|binding| {
+                    self.sessions
+                        .with_session(&binding, |session| {
+                            binding.link.verification_key(session.pairing.timestamp())
+                        })
+                        .ok()
                 });
-            commit_or_revert(session, snapshot, trusted)?;
-
+            if current.as_deref() != Some(shown_key) {
+                report(
+                    &self.devices,
+                    &self.errors,
+                    device_id,
+                    "The pairing key changed before it was accepted; compare the new key"
+                        .to_string(),
+                );
+                return;
+            }
+        }
+        let result = self.transition(device_id, |pairing| pairing.accept_packet());
+        let Some((binding, snapshot, _, state)) = self.finish(device_id, result) else {
+            return;
+        };
+        // Persisting trust can still fail. Revert rather than leave the
+        // session `Paired` against an empty trust store: the dispatcher
+        // authorises features from the *session*, so that split admitted a
+        // peer this device had not recorded as trusted, and every reconnect
+        // then arrived with `initially_paired = false` while the live
+        // session insisted otherwise.
+        //
+        // The peer, which did receive the acceptance, finds out the next
+        // time it sends anything — `notify_peer_not_paired` answers it with
+        // `pair:false`. That is the same self-healing path a missed unpair
+        // uses, which is why no queue is needed here either.
+        if self.persist_trust(device_id, &binding, snapshot, state) {
             update_pair_state(&self.devices, device_id, PairState::Paired, None);
-            Ok(())
+        }
+    }
+
+    /// Advances the pairing state and builds its packet under the session
+    /// lock, then sends it *outside* the lock. The lock is global — every
+    /// reader, liveness tick and WebRTC worker takes it — and a TLS write can
+    /// block for its full 10 s timeout, which froze all of them. A failed send
+    /// reverts the state, unless something else moved it in the meantime.
+    #[allow(clippy::type_complexity)]
+    fn transition(
+        &self,
+        device_id: &str,
+        build: impl FnOnce(&mut PairingHandler) -> Result<NetworkPacket, String>,
+    ) -> Result<(SessionBinding, PairingHandler, NetworkPacket, PairState), String> {
+        let binding = self
+            .sessions
+            .current_binding(device_id)
+            .ok_or_else(|| "Device is not connected".to_string())?;
+        let (snapshot, packet, state) = self
+            .sessions
+            .with_session(&binding, |session| {
+                let snapshot = session.pairing.clone();
+                let packet = build(&mut session.pairing)?;
+                Ok::<_, String>((snapshot, packet, session.pairing.state))
+            })
+            .map_err(|error| error.to_string())??;
+        if let Err(error) = binding.link.send_packet(&packet) {
+            self.revert(&binding, snapshot, state);
+            return Err(error);
+        }
+        Ok((binding, snapshot, packet, state))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn finish(
+        &self,
+        device_id: &str,
+        result: Result<(SessionBinding, PairingHandler, NetworkPacket, PairState), String>,
+    ) -> Option<(SessionBinding, PairingHandler, NetworkPacket, PairState)> {
+        result
+            .map_err(|error| report(&self.devices, &self.errors, device_id, error))
+            .ok()
+    }
+
+    /// Records trust for a session that reached `Paired`, reverting on failure.
+    fn persist_trust(
+        &self,
+        device_id: &str,
+        binding: &SessionBinding,
+        snapshot: PairingHandler,
+        state: PairState,
+    ) -> bool {
+        let trusted = self
+            .config
+            .lock()
+            .map_err(|_| "Config lock poisoned".to_string())
+            .and_then(|mut config| {
+                config.trust_device(&binding.link.info, binding.link.certificate_pem.clone())
+            });
+        if let Err(error) = trusted {
+            self.revert(binding, snapshot, state);
+            report(&self.devices, &self.errors, device_id, error);
+            return false;
+        }
+        true
+    }
+
+    fn revert(&self, binding: &SessionBinding, snapshot: PairingHandler, expected: PairState) {
+        let _ = self.sessions.with_session(binding, |session| {
+            if session.pairing.state == expected {
+                session.pairing = snapshot;
+            }
         });
     }
 
@@ -184,6 +249,17 @@ impl PairingContext {
     }
 
     fn revoke_pairing(&self, device_id: &str, reason: &str, remove_trust: bool) {
+        // Terminals outlive the WebRTC peer, so closing the peer below would
+        // leave the phone's attachments and write leases behind.
+        crate::device_links::webrtc::terminal_bridge::revoke_device(device_id);
+        // Offline: nothing to tell the peer, but the session must not keep
+        // `Paired` for it to resume on reconnect.
+        let offline = self.sessions.current_binding(device_id).is_none();
+        if offline {
+            if let Some(peer) = self.sessions.forget_pairing(device_id) {
+                peer.close();
+            }
+        }
         let result = self
             .sessions
             .current_binding(device_id)
@@ -217,26 +293,9 @@ impl PairingContext {
         }
 
         update_pair_state(&self.devices, device_id, PairState::NotPaired, None);
-        if let Err(error) = result {
-            report(&self.devices, &self.errors, device_id, error);
-        }
-    }
-
-    pub(crate) fn with_link(
-        &self,
-        device_id: &str,
-        f: impl FnOnce(&mut DeviceSession, &SessionBinding) -> Result<(), String>,
-    ) {
-        let result = self
-            .sessions
-            .current_binding(device_id)
-            .ok_or_else(|| "Device is not connected".to_string())
-            .and_then(|binding| {
-                self.sessions
-                    .with_session(&binding, |session| f(session, &binding))
-                    .map_err(|error| error.to_string())?
-            });
-        if let Err(error) = result {
+        // Unpairing a device that is not connected succeeded: it is told the
+        // next time it reaches us (it gets pair:false for its signaling).
+        if let Err(error) = if offline { Ok(()) } else { result } {
             report(&self.devices, &self.errors, device_id, error);
         }
     }

@@ -6,7 +6,11 @@ use std::thread;
 use super::commands::DaemonCommand;
 use super::state::push_error;
 use super::DaemonWorker;
+use crate::device_links::config::terminal_access_allowed;
 use crate::device_links::device::DeviceView;
+use crate::device_links::webrtc::file_browser::{self, BrowserRequest, BrowserResponse};
+use crate::device_links::webrtc::terminal_bridge;
+use crate::device_links::webrtc::transfer_board::{self, Finished, TransferRow};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DaemonEvent {
@@ -84,6 +88,13 @@ impl DaemonHandle {
             .lock()
             .map(|devices| devices.values().cloned().collect())
             .unwrap_or_default();
+        // Terminal consent is read at the moment of asking, from the same place
+        // the gate reads it, rather than cached on the view where a missed
+        // update would leave the switch showing something that is not enforced.
+        for device in &mut devices {
+            device.terminal_access = terminal_access_allowed(&device.id);
+            device.terminal_sessions_attached = terminal_bridge::attached_count(&device.id);
+        }
         devices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         devices
     }
@@ -97,6 +108,39 @@ impl DaemonHandle {
 
     pub fn send(&self, command: DaemonCommand) {
         let _ = self.command_tx.send(command);
+    }
+
+    /// Asks the phone for files. Returns the request's ID, which the matching
+    /// entry from [`Self::take_phone_file_replies`] carries.
+    ///
+    /// The request is validated and registered here, on the caller's thread, so
+    /// a bad name fails immediately instead of after a round trip.
+    pub fn browse_phone(
+        &self,
+        device_id: &str,
+        request: &BrowserRequest,
+    ) -> Result<String, String> {
+        let (request_id, payload) = file_browser::begin_request(device_id, request)?;
+        self.send(DaemonCommand::SendPhoneFileRequest(
+            device_id.to_string(),
+            request_id.clone(),
+            payload,
+        ));
+        Ok(request_id)
+    }
+
+    pub fn take_phone_file_replies(&self, device_id: &str) -> Vec<BrowserResponse> {
+        file_browser::take_replies(device_id)
+    }
+
+    /// Every file transfer in progress, for a progress view.
+    pub fn transfer_rows(&self) -> Vec<TransferRow> {
+        transfer_board::rows()
+    }
+
+    /// Transfers that ended since the last call; each is reported once.
+    pub fn take_finished_transfers(&self) -> Vec<Finished> {
+        transfer_board::take_finished()
     }
 
     pub fn drain_events(&self) -> Vec<DaemonEvent> {

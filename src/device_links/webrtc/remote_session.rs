@@ -16,9 +16,10 @@
 //!   by a heartbeat or by inbound input. Whoever holds the lease sends the
 //!   heartbeat — when this desktop is driving the phone, that is this desktop.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value};
 use uuid::Uuid;
@@ -33,6 +34,12 @@ pub const LEASE_LIFETIME: Duration = Duration::from_secs(30);
 /// How often the lease owner refreshes it. A third of the lifetime leaves room
 /// for two lost heartbeats before the peer expires us.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+/// How long a request for the other side's screen may go unanswered. Long
+/// enough for a person to read and approve a consent screen; short enough that
+/// a request nobody answers does not read as "requesting" forever.
+pub const VIEW_REQUEST_TIMEOUT: Duration = Duration::from_secs(150);
+/// How long a request for control (or the host's decision on one) may wait.
+pub const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Widest clock skew the peer tolerates on a control message.
 const MAX_AGE: Duration = Duration::from_secs(60);
 
@@ -82,6 +89,11 @@ pub enum ControlKind {
     ScreenError,
     PauseLocked,
     Resume,
+    /// Desktop → phone report: a text input on the desktop gained or lost
+    /// keyboard focus, so the phone can raise or drop its keyboard.
+    InputFocus,
+    /// Phone → desktop: show the next shared screen.
+    SwitchScreen,
 }
 
 impl ControlKind {
@@ -102,6 +114,8 @@ impl ControlKind {
             Self::ScreenError => "screen-error",
             Self::PauseLocked => "pause-locked",
             Self::Resume => "resume",
+            Self::InputFocus => "input-focus",
+            Self::SwitchScreen => "switch-screen",
         }
     }
 
@@ -122,6 +136,8 @@ impl ControlKind {
             "screen-error" => Self::ScreenError,
             "pause-locked" => Self::PauseLocked,
             "resume" => Self::Resume,
+            "input-focus" => Self::InputFocus,
+            "switch-screen" => Self::SwitchScreen,
             _ => return None,
         })
     }
@@ -154,6 +170,11 @@ pub struct ControlMessage {
     pub screen_width: Option<i32>,
     pub screen_height: Option<i32>,
     pub screen_rotation: Option<i32>,
+    /// `input-focus`: whether the focused element takes typing.
+    pub editable: Option<bool>,
+    /// `screen-ready`: how many screens are shared (the phone offers a
+    /// switch when there is more than one).
+    pub screen_count: Option<i32>,
 }
 
 impl ControlMessage {
@@ -182,6 +203,8 @@ impl ControlMessage {
             screen_width: None,
             screen_height: None,
             screen_rotation: None,
+            editable: None,
+            screen_count: None,
         }
     }
 
@@ -233,6 +256,12 @@ impl ControlMessage {
                 root.insert("screenRotation".into(), Value::from(rotation));
             }
         }
+        if let Some(editable) = self.editable {
+            root.insert("editable".into(), Value::from(editable));
+        }
+        if let Some(count) = self.screen_count {
+            root.insert("screenCount".into(), Value::from(count));
+        }
         serde_json::to_vec(&Value::Object(root)).unwrap_or_default()
     }
 
@@ -246,6 +275,10 @@ impl ControlMessage {
         let text = |key: &str| object.get(key).and_then(Value::as_str).map(str::to_string);
         let number = |key: &str| object.get(key).and_then(Value::as_i64);
         let optional_text = |key: &str| text(key).filter(|value| !value.is_empty());
+
+        if number("remoteSessionVersion") != Some(VERSION) {
+            return Err("Unsupported remote-session control version".to_string());
+        }
 
         let kind = text("kind")
             .and_then(|kind| ControlKind::parse(&kind))
@@ -271,6 +304,8 @@ impl ControlMessage {
             screen_width: number("screenWidth").map(|value| value as i32),
             screen_height: number("screenHeight").map(|value| value as i32),
             screen_rotation: number("screenRotation").map(|value| value as i32),
+            editable: object.get("editable").and_then(Value::as_bool),
+            screen_count: number("screenCount").map(|value| value.clamp(0, 16) as i32),
         })
     }
 
@@ -355,6 +390,45 @@ pub struct ControlLease {
     pub expires_at: i64,
 }
 
+/// A host-approved lease for input arriving from the paired phone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerInputLease {
+    pub id: String,
+    pub owner_device_id: String,
+    pub expires_at: i64,
+    sequence_window: InputSequenceWindow,
+}
+
+/// Accepts a small amount of cross-channel reordering while rejecting replayed
+/// input. Pointer motion and discrete actions intentionally use different
+/// WebRTC data channels, so arrival order is not a reliable sequence order.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct InputSequenceWindow {
+    highest: i64,
+    seen: HashSet<i64>,
+}
+
+impl InputSequenceWindow {
+    const WIDTH: i64 = 128;
+
+    fn accept(&mut self, sequence: i64) -> bool {
+        if sequence <= 0 {
+            return false;
+        }
+        if sequence > self.highest {
+            self.highest = sequence;
+            self.seen.insert(sequence);
+            let oldest = self.highest.saturating_sub(Self::WIDTH - 1);
+            self.seen.retain(|seen| *seen >= oldest);
+            return true;
+        }
+        if self.highest - sequence >= Self::WIDTH {
+            return false;
+        }
+        self.seen.insert(sequence)
+    }
+}
+
 /// What this desktop is currently doing with the paired device's screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
@@ -362,6 +436,8 @@ pub enum SessionState {
     RequestingView,
     Viewing,
     RequestingControl,
+    AuthorizingPeerControl,
+    PeerControlling,
     Controlling,
     PausedLocked,
     Stopped,
@@ -377,7 +453,16 @@ pub struct RemoteSession {
     remote_session_id: Option<String>,
     direction: Option<ScreenDirection>,
     lease: Option<ControlLease>,
+    peer_input_lease: Option<PeerInputLease>,
     sequence: AtomicI64,
+    /// When `state` was entered, for [`Self::expire_pending`].
+    state_since: Instant,
+    /// The phone's screen in its own pixels, from its `screen-ready`: taps on
+    /// the desktop's view are mapped into this space.
+    phone_screen: Option<(i32, i32)>,
+    /// Why the phone last refused control (e.g. its accessibility service is
+    /// off), so the window can say so instead of "requesting" forever.
+    control_denial: Option<String>,
 }
 
 impl Default for RemoteSession {
@@ -393,9 +478,27 @@ impl RemoteSession {
             remote_session_id: None,
             direction: None,
             lease: None,
+            peer_input_lease: None,
             // The peer requires `sequence > 0` and strictly increasing, so the
             // first value handed out must be 1.
             sequence: AtomicI64::new(0),
+            state_since: Instant::now(),
+            phone_screen: None,
+            control_denial: None,
+        }
+    }
+
+    pub fn control_denial(&self) -> Option<&str> {
+        self.control_denial.as_deref()
+    }
+
+    pub fn phone_screen(&self) -> Option<(i32, i32)> {
+        self.phone_screen
+    }
+
+    pub fn set_phone_screen(&mut self, width: i32, height: i32) {
+        if width > 0 && height > 0 {
+            self.phone_screen = Some((width, height));
         }
     }
 
@@ -415,6 +518,27 @@ impl RemoteSession {
         self.lease.as_ref()
     }
 
+    pub fn peer_input_lease(&self) -> Option<&PeerInputLease> {
+        self.peer_input_lease.as_ref()
+    }
+
+    /// Revokes a silent phone-owned input lease without ending the screen view.
+    pub fn expire_peer_input_lease(&mut self, now: i64) -> bool {
+        if self
+            .peer_input_lease
+            .as_ref()
+            .is_some_and(|lease| lease.expires_at <= now)
+        {
+            self.peer_input_lease = None;
+            if self.state == SessionState::PeerControlling {
+                self.set_state(SessionState::Viewing);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// The next value for a control message or an input packet.
     pub fn next_sequence(&self) -> i64 {
         self.sequence.fetch_add(1, Ordering::SeqCst) + 1
@@ -426,7 +550,8 @@ impl RemoteSession {
         self.remote_session_id = Some(id.clone());
         self.direction = Some(direction);
         self.lease = None;
-        self.state = SessionState::RequestingView;
+        self.peer_input_lease = None;
+        self.set_state(SessionState::RequestingView);
         id
     }
 
@@ -437,41 +562,77 @@ impl RemoteSession {
         ) {
             return Err("Remote control needs an active view".to_string());
         }
-        self.state = SessionState::RequestingControl;
+        self.set_state(SessionState::RequestingControl);
         Ok(())
     }
 
     /// Applies a validated inbound message.
     ///
-    /// A denial deliberately keeps `remote_session_id`: the peer does not clear
-    /// its own on denial, and dropping ours would make every later message
-    /// quote an id it rejects as stale — leaving the two ends unable to talk
-    /// without a full restart.
+    /// A *control* denial keeps `remote_session_id` and the view, so control can
+    /// be asked for again. A view denial or screen error ends the session on both
+    /// sides, and messages that end a session are honoured only for the current
+    /// one, so the two ends cannot fall out of step on a stale id.
     pub fn accept(&mut self, message: &ControlMessage, now: i64) -> Result<(), String> {
-        if !matches!(
+        let mismatched =
+            self.remote_session_id.as_deref() != Some(message.remote_session_id.as_str());
+        match message.kind {
+            // The desktop reports its own focus; a phone claiming it is not a
+            // report about anything this side can act on.
+            ControlKind::InputFocus => {
+                return Err("input-focus is reported by the desktop only".to_string());
+            }
+            // A request starts a session, and a heartbeat is checked against the
+            // lease it quotes.
+            ControlKind::RequestView | ControlKind::Heartbeat => {}
+            // A message that *ends* a session is honoured only for the session
+            // that is current. A delayed release, denial or error for one this
+            // side already left must not stop the new one (and so its portal
+            // capture). With nothing active there is nothing to disturb.
+            ControlKind::Release
+            | ControlKind::ScreenStopped
+            | ControlKind::ViewDenied
+            | ControlKind::ControlDenied
+            | ControlKind::ScreenError => {
+                if self.remote_session_id.is_some() && mismatched {
+                    return Err("Remote-session id is stale".to_string());
+                }
+            }
+            _ => {
+                if mismatched {
+                    return Err("Remote-session id is stale".to_string());
+                }
+            }
+        }
+
+        if matches!(
             message.kind,
-            ControlKind::RequestView
-                | ControlKind::Release
-                | ControlKind::ScreenStopped
-                | ControlKind::Heartbeat
-                | ControlKind::ViewDenied
-                | ControlKind::ControlDenied
-                | ControlKind::ScreenError
-        ) && self.remote_session_id.as_deref() != Some(message.remote_session_id.as_str())
-        {
-            return Err("Remote-session id is stale".to_string());
+            ControlKind::ControlGranted | ControlKind::TakeoverGranted
+        ) && !matches!(
+            self.state,
+            SessionState::RequestingControl | SessionState::Controlling
+        ) {
+            return Err("Remote-control lease was not requested".to_string());
         }
 
         match message.kind {
+            // Refused above; never applied.
+            ControlKind::InputFocus => {}
+            // A request about the current desktop share; changes no state.
+            ControlKind::SwitchScreen => {
+                if mismatched || self.direction != Some(ScreenDirection::DesktopToPhone) {
+                    return Err("Switching screens needs a desktop share in progress".to_string());
+                }
+            }
             ControlKind::RequestView => {
                 self.remote_session_id = Some(message.remote_session_id.clone());
                 self.direction = message.direction;
                 self.lease = None;
-                self.state = SessionState::RequestingView;
+                self.peer_input_lease = None;
+                self.set_state(SessionState::RequestingView);
             }
             ControlKind::ViewGranted | ControlKind::ScreenReady => {
                 self.direction = message.direction.or(self.direction);
-                self.state = SessionState::Viewing;
+                self.set_state(SessionState::Viewing);
             }
             ControlKind::ControlGranted | ControlKind::TakeoverGranted => {
                 let id = message
@@ -482,37 +643,173 @@ impl RemoteSession {
                     .lease_expires_at
                     .ok_or_else(|| "A granted lease needs an expiry".to_string())?;
                 self.lease = Some(ControlLease { id, expires_at });
-                self.state = SessionState::Controlling;
+                self.peer_input_lease = None;
+                self.control_denial = None;
+                self.set_state(SessionState::Controlling);
             }
             ControlKind::Heartbeat => {
                 if let Some(lease) = &mut self.lease {
+                    lease.expires_at = now + LEASE_LIFETIME.as_millis() as i64;
+                } else if let Some(lease) = &mut self.peer_input_lease {
+                    if lease.expires_at <= now {
+                        self.peer_input_lease = None;
+                        self.set_state(SessionState::Viewing);
+                        return Err("Peer input lease has expired".to_string());
+                    }
+                    if message.lease_id.as_deref() != Some(lease.id.as_str())
+                        || message.owner_device_id.as_deref()
+                            != Some(lease.owner_device_id.as_str())
+                        || !lease.sequence_window.accept(message.sequence)
+                    {
+                        return Err("Peer input lease heartbeat is stale or mismatched".to_string());
+                    }
                     lease.expires_at = now + LEASE_LIFETIME.as_millis() as i64;
                 }
             }
             ControlKind::PauseLocked => {
                 self.lease = None;
-                self.state = SessionState::PausedLocked;
+                self.peer_input_lease = None;
+                self.set_state(SessionState::PausedLocked);
             }
             ControlKind::Resume => self.state = SessionState::Viewing,
-            ControlKind::ViewDenied | ControlKind::ControlDenied | ControlKind::ScreenError => {
+            // A denied view or a screen error ends the session: there is no
+            // view left to show. (Mapping these to `Viewing` left the desktop's
+            // dialog reading "Screen connected" after the phone said no.)
+            ControlKind::ViewDenied | ControlKind::ScreenError => self.stop(),
+            // Failing to grant *control* must not take a working view with it.
+            ControlKind::ControlDenied => {
                 self.lease = None;
-                self.state = SessionState::Viewing;
+                self.peer_input_lease = None;
+                self.control_denial = Some(
+                    message
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "The phone refused control".to_string()),
+                );
+                self.set_state(SessionState::Viewing);
             }
             ControlKind::Release | ControlKind::ScreenStopped => self.stop(),
             ControlKind::RequestControl | ControlKind::TakeoverRequest => {
-                // The desktop is the controller, not a control target: it has
-                // no input injection surface to lend the phone.
-                return Err("This desktop does not grant remote control".to_string());
+                // A phone may ask to control this desktop only while viewing
+                // the desktop's screen. The caller must still obtain a local
+                // GNOME portal grant before it creates an input lease.
+                if self.state == SessionState::Viewing
+                    && self.direction == Some(ScreenDirection::DesktopToPhone)
+                {
+                    self.set_state(SessionState::AuthorizingPeerControl);
+                } else {
+                    return Err("Phone control needs an active desktop-screen session".to_string());
+                }
             }
         }
         Ok(())
     }
 
+    fn set_state(&mut self, state: SessionState) {
+        if self.state != state {
+            self.state_since = Instant::now();
+        }
+        self.state = state;
+    }
+
+    /// Ends a request the other side never answered, returning the state it was
+    /// stuck in.
+    ///
+    /// An unanswered *view* request ends the session. An unanswered *control*
+    /// request only drops back to the view it was made on, so the user can ask
+    /// again instead of losing the picture.
+    pub fn expire_pending(&mut self, now: Instant) -> Option<SessionState> {
+        let waited = now.saturating_duration_since(self.state_since);
+        let previous = self.state;
+        match previous {
+            SessionState::RequestingView if waited >= VIEW_REQUEST_TIMEOUT => self.stop(),
+            SessionState::RequestingControl | SessionState::AuthorizingPeerControl
+                if waited >= CONTROL_REQUEST_TIMEOUT =>
+            {
+                self.lease = None;
+                self.peer_input_lease = None;
+                self.set_state(SessionState::Viewing);
+            }
+            _ => return None,
+        }
+        Some(previous)
+    }
+
     pub fn stop(&mut self) {
-        self.state = SessionState::Stopped;
+        self.set_state(SessionState::Stopped);
         self.remote_session_id = None;
         self.direction = None;
         self.lease = None;
+        self.peer_input_lease = None;
+    }
+
+    /// Converts a pending host authorization into a revocable peer-owned lease.
+    /// Call only after the platform portal has granted keyboard/pointer access.
+    pub fn grant_peer_control(
+        &mut self,
+        lease_id: String,
+        owner_device_id: String,
+        expires_at: i64,
+    ) -> Result<(), String> {
+        if self.state != SessionState::AuthorizingPeerControl
+            || self.direction != Some(ScreenDirection::DesktopToPhone)
+        {
+            return Err("Phone control has no host-approved desktop-screen request".to_string());
+        }
+        if lease_id.is_empty() || owner_device_id.is_empty() || expires_at <= 0 {
+            return Err("Peer input lease is malformed".to_string());
+        }
+        self.lease = None;
+        self.peer_input_lease = Some(PeerInputLease {
+            id: lease_id,
+            owner_device_id,
+            expires_at,
+            sequence_window: InputSequenceWindow::default(),
+        });
+        self.set_state(SessionState::PeerControlling);
+        Ok(())
+    }
+
+    /// Validates a phone input packet before it can reach the portal adapter.
+    /// The lease sequence is advanced only after all credentials pass.
+    pub fn verify_peer_input(
+        &mut self,
+        packet: &crate::device_links::packet::NetworkPacket,
+        owner_device_id: &str,
+        now: i64,
+    ) -> Result<(), String> {
+        if self.state != SessionState::PeerControlling {
+            return Err("DeskLink has no active host-approved input lease".to_string());
+        }
+        let session_id = self
+            .remote_session_id
+            .as_deref()
+            .ok_or_else(|| "DeskLink remote input has no active session".to_string())?;
+        let lease = self
+            .peer_input_lease
+            .as_mut()
+            .ok_or_else(|| "DeskLink remote input has no active lease".to_string())?;
+        if lease.owner_device_id != owner_device_id {
+            return Err("DeskLink remote input came from a different device".to_string());
+        }
+        if lease.expires_at <= now {
+            self.peer_input_lease = None;
+            self.set_state(SessionState::Viewing);
+            return Err("DeskLink remote-input lease has expired".to_string());
+        }
+        if packet.get_str(FIELD_REMOTE_SESSION_ID) != Some(session_id)
+            || packet.get_str(FIELD_LEASE_ID) != Some(lease.id.as_str())
+        {
+            return Err("DeskLink remote input session or lease mismatch".to_string());
+        }
+        let sequence = packet
+            .get_i64(FIELD_INPUT_SEQUENCE)
+            .ok_or_else(|| "DeskLink remote input has no sequence".to_string())?;
+        if !lease.sequence_window.accept(sequence) {
+            return Err("Replayed DeskLink remote input".to_string());
+        }
+        lease.expires_at = now + LEASE_LIFETIME.as_millis() as i64;
+        Ok(())
     }
 
     /// Whether a heartbeat is due, and the lease it should quote.
@@ -535,6 +832,18 @@ impl RemoteSession {
         &self,
         packet: &mut crate::device_links::packet::NetworkPacket,
     ) -> Result<(), String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        self.stamp_input_at(packet, now)
+    }
+
+    pub fn stamp_input_at(
+        &self,
+        packet: &mut crate::device_links::packet::NetworkPacket,
+        now: i64,
+    ) -> Result<(), String> {
         if self.state != SessionState::Controlling {
             return Err("DeskLink remote control is not active".to_string());
         }
@@ -546,6 +855,9 @@ impl RemoteSession {
             .lease
             .as_ref()
             .ok_or_else(|| "DeskLink remote control has no lease".to_string())?;
+        if lease.expires_at <= now {
+            return Err("DeskLink remote-control lease has expired".to_string());
+        }
         packet.set(FIELD_REMOTE_SESSION_ID, session_id.clone());
         packet.set(FIELD_LEASE_ID, lease.id.clone());
         packet.set(FIELD_INPUT_SEQUENCE, self.next_sequence());
@@ -586,6 +898,25 @@ mod tests {
         )
     }
 
+    /// The desktop reports text focus with `editable`; the field survives the
+    /// wire, and a phone sending the report is refused, not acted on.
+    #[test]
+    fn input_focus_reports_round_trip_and_are_desktop_only() {
+        let id = Uuid::new_v4().to_string();
+        let mut report = message(ControlKind::InputFocus, &id);
+        report.editable = Some(true);
+        let parsed = ControlMessage::from_json(&report.to_json()).unwrap();
+        assert_eq!(parsed.kind, ControlKind::InputFocus);
+        assert_eq!(parsed.editable, Some(true));
+        assert_eq!(
+            ControlKind::parse("input-focus"),
+            Some(ControlKind::InputFocus)
+        );
+
+        let mut session = RemoteSession::new();
+        assert!(session.accept(&parsed, 1_000).is_err());
+    }
+
     #[test]
     fn optional_fields_are_omitted_rather_than_emitted_empty() {
         let json = message(ControlKind::Release, &Uuid::new_v4().to_string()).to_json();
@@ -612,6 +943,18 @@ mod tests {
         let parsed = ControlMessage::from_json(&original.to_json()).unwrap();
 
         assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn unsupported_remote_session_versions_are_rejected() {
+        let mut value: Value = serde_json::from_slice(
+            &message(ControlKind::Release, &Uuid::new_v4().to_string()).to_json(),
+        )
+        .unwrap();
+        value["remoteSessionVersion"] = Value::from(VERSION + 1);
+
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(ControlMessage::from_json(&bytes).is_err());
     }
 
     #[test]
@@ -663,12 +1006,15 @@ mod tests {
     #[test]
     fn one_counter_serves_control_messages_and_input() {
         let mut session = RemoteSession::new();
-        session.begin_view(ScreenDirection::DesktopToPhone);
+        let session_id = session.begin_view(ScreenDirection::PhoneToDesktop);
+        assert_eq!(session.direction(), Some(ScreenDirection::PhoneToDesktop));
+        session
+            .accept(&message(ControlKind::ScreenReady, &session_id), 1_000)
+            .unwrap();
+        session.begin_control().unwrap();
+        assert_eq!(session.state(), SessionState::RequestingControl);
         let granted = {
-            let mut granted = message(
-                ControlKind::ControlGranted,
-                session.remote_session_id().unwrap(),
-            );
+            let mut granted = message(ControlKind::ControlGranted, &session_id);
             granted.lease_id = Some("lease-1".to_string());
             granted.lease_expires_at = Some(90_000);
             granted
@@ -678,7 +1024,7 @@ mod tests {
         let first = session.next_sequence();
         let mut packet =
             crate::device_links::packet::NetworkPacket::new("desklink.mousepad.request");
-        session.stamp_input(&mut packet).unwrap();
+        session.stamp_input_at(&mut packet, 1_000).unwrap();
         let stamped = packet.get_i64(FIELD_INPUT_SEQUENCE).unwrap();
         let third = session.next_sequence();
 
@@ -697,6 +1043,191 @@ mod tests {
 
         session.begin_view(ScreenDirection::DesktopToPhone);
         assert!(session.stamp_input(&mut packet).is_err());
+    }
+
+    #[test]
+    fn input_is_refused_after_the_control_lease_expires() {
+        let mut session = RemoteSession::new();
+        let id = session.begin_view(ScreenDirection::PhoneToDesktop);
+        session
+            .accept(&message(ControlKind::ScreenReady, &id), 1_000)
+            .unwrap();
+        session.begin_control().unwrap();
+        let mut grant = message(ControlKind::ControlGranted, &id);
+        grant.lease_id = Some("lease-1".to_string());
+        grant.lease_expires_at = Some(2_000);
+        session.accept(&grant, 1_000).unwrap();
+
+        let mut packet =
+            crate::device_links::packet::NetworkPacket::new("desklink.mousepad.request");
+        assert!(session.stamp_input_at(&mut packet, 2_000).is_err());
+    }
+
+    #[test]
+    fn an_unsolicited_control_grant_cannot_activate_input() {
+        let mut session = RemoteSession::new();
+        let id = session.begin_view(ScreenDirection::PhoneToDesktop);
+        session
+            .accept(&message(ControlKind::ScreenReady, &id), 1_000)
+            .unwrap();
+        let mut grant = message(ControlKind::ControlGranted, &id);
+        grant.lease_id = Some("lease-1".to_string());
+        grant.lease_expires_at = Some(31_000);
+
+        assert!(session.accept(&grant, 1_000).is_err());
+        assert_eq!(session.state(), SessionState::Viewing);
+    }
+
+    #[test]
+    fn a_phone_may_request_control_when_the_desktop_is_sharing_its_screen() {
+        let mut session = RemoteSession::new();
+        let session_id = Uuid::new_v4().to_string();
+        let mut request_view = message(ControlKind::RequestView, &session_id);
+        request_view.direction = Some(ScreenDirection::DesktopToPhone);
+        session.accept(&request_view, 1_000).unwrap();
+
+        let mut screen_ready = message(ControlKind::ScreenReady, &session_id);
+        screen_ready.direction = Some(ScreenDirection::DesktopToPhone);
+        session.accept(&screen_ready, 1_001).unwrap();
+
+        let mut request_control = message(ControlKind::RequestControl, &session_id);
+        request_control.direction = Some(ScreenDirection::DesktopToPhone);
+        let result = session.accept(&request_control, 1_002);
+
+        assert!(
+            result.is_ok(),
+            "phone control request should enter host authorization: {result:?}"
+        );
+        assert_eq!(session.state(), SessionState::AuthorizingPeerControl);
+    }
+
+    #[test]
+    fn phone_control_is_not_authorized_during_a_phone_screen_session() {
+        let mut session = RemoteSession::new();
+        let session_id = Uuid::new_v4().to_string();
+        let mut request_view = message(ControlKind::RequestView, &session_id);
+        request_view.direction = Some(ScreenDirection::PhoneToDesktop);
+        session.accept(&request_view, 1_000).unwrap();
+
+        let mut screen_ready = message(ControlKind::ScreenReady, &session_id);
+        screen_ready.direction = Some(ScreenDirection::PhoneToDesktop);
+        session.accept(&screen_ready, 1_001).unwrap();
+
+        let mut request_control = message(ControlKind::RequestControl, &session_id);
+        request_control.direction = Some(ScreenDirection::PhoneToDesktop);
+
+        assert!(session.accept(&request_control, 1_002).is_err());
+        assert_eq!(session.state(), SessionState::Viewing);
+    }
+
+    #[test]
+    fn phone_input_requires_an_explicit_peer_owned_lease_and_strict_sequence() {
+        let mut session = RemoteSession::new();
+        let id = Uuid::new_v4().to_string();
+        let mut request_view = message(ControlKind::RequestView, &id);
+        request_view.direction = Some(ScreenDirection::DesktopToPhone);
+        session.accept(&request_view, 1_000).unwrap();
+        let mut ready = message(ControlKind::ScreenReady, &id);
+        ready.direction = Some(ScreenDirection::DesktopToPhone);
+        session.accept(&ready, 1_001).unwrap();
+        let mut request = message(ControlKind::RequestControl, &id);
+        request.direction = Some(ScreenDirection::DesktopToPhone);
+        session.accept(&request, 1_002).unwrap();
+
+        let mut packet =
+            crate::device_links::packet::NetworkPacket::new("desklink.mousepad.request");
+        packet.set(FIELD_REMOTE_SESSION_ID, id.clone());
+        packet.set(FIELD_LEASE_ID, "lease-from-host");
+        packet.set(FIELD_INPUT_SEQUENCE, 1i64);
+        assert!(session
+            .verify_peer_input(&packet, "phone-device", 1_003)
+            .is_err());
+
+        session
+            .grant_peer_control(
+                "lease-from-host".to_string(),
+                "phone-device".to_string(),
+                31_003,
+            )
+            .unwrap();
+        assert_eq!(session.state(), SessionState::PeerControlling);
+        assert!(session
+            .verify_peer_input(&packet, "phone-device", 1_003)
+            .is_ok());
+        assert!(session
+            .verify_peer_input(&packet, "phone-device", 1_004)
+            .is_err());
+        assert!(session
+            .verify_peer_input(&packet, "other-device", 1_004)
+            .is_err());
+
+        packet.set(FIELD_INPUT_SEQUENCE, 2i64);
+        assert!(session
+            .verify_peer_input(&packet, "phone-device", 31_003)
+            .is_err());
+    }
+
+    #[test]
+    fn unique_input_reordered_across_webrtc_channels_is_accepted_once() {
+        let mut session = RemoteSession::new();
+        let id = Uuid::new_v4().to_string();
+        let mut request_view = message(ControlKind::RequestView, &id);
+        request_view.direction = Some(ScreenDirection::DesktopToPhone);
+        session.accept(&request_view, 1_000).unwrap();
+        let mut ready = message(ControlKind::ScreenReady, &id);
+        ready.direction = Some(ScreenDirection::DesktopToPhone);
+        session.accept(&ready, 1_001).unwrap();
+        let mut request = message(ControlKind::RequestControl, &id);
+        request.direction = Some(ScreenDirection::DesktopToPhone);
+        session.accept(&request, 1_002).unwrap();
+        session
+            .grant_peer_control("lease".to_string(), "phone-device".to_string(), 31_002)
+            .unwrap();
+
+        let mut packet =
+            crate::device_links::packet::NetworkPacket::new("desklink.mousepad.request");
+        packet.set(FIELD_REMOTE_SESSION_ID, id);
+        packet.set(FIELD_LEASE_ID, "lease");
+        packet.set(FIELD_INPUT_SEQUENCE, 4i64);
+        assert!(session
+            .verify_peer_input(&packet, "phone-device", 1_003)
+            .is_ok());
+
+        packet.set(FIELD_INPUT_SEQUENCE, 3i64);
+        assert!(session
+            .verify_peer_input(&packet, "phone-device", 1_004)
+            .is_ok());
+
+        packet.set(FIELD_INPUT_SEQUENCE, 4i64);
+        assert!(session
+            .verify_peer_input(&packet, "phone-device", 1_005)
+            .is_err());
+    }
+
+    #[test]
+    fn expired_peer_input_lease_cannot_be_revived_by_a_late_heartbeat() {
+        let mut session = RemoteSession::new();
+        let id = Uuid::new_v4().to_string();
+        let mut request_view = message(ControlKind::RequestView, &id);
+        request_view.direction = Some(ScreenDirection::DesktopToPhone);
+        session.accept(&request_view, 1_000).unwrap();
+        let mut ready = message(ControlKind::ScreenReady, &id);
+        ready.direction = Some(ScreenDirection::DesktopToPhone);
+        session.accept(&ready, 1_001).unwrap();
+        let mut request = message(ControlKind::RequestControl, &id);
+        request.direction = Some(ScreenDirection::DesktopToPhone);
+        session.accept(&request, 1_002).unwrap();
+        session
+            .grant_peer_control("lease".to_string(), "phone-device".to_string(), 2_000)
+            .unwrap();
+
+        let mut heartbeat = message(ControlKind::Heartbeat, &id);
+        heartbeat.lease_id = Some("lease".to_string());
+        heartbeat.owner_device_id = Some("phone-device".to_string());
+        heartbeat.sequence = 2;
+        assert!(session.accept(&heartbeat, 2_000).is_err());
+        assert_eq!(session.state(), SessionState::Viewing);
+        assert!(session.peer_input_lease().is_none());
     }
 
     /// The peer does not clear its own session id when it denies, so neither
@@ -731,6 +1262,10 @@ mod tests {
         assert!(session.heartbeat_lease(1_000).is_none());
 
         let id = session.begin_view(ScreenDirection::DesktopToPhone);
+        session
+            .accept(&message(ControlKind::ScreenReady, &id), 1_000)
+            .unwrap();
+        session.begin_control().unwrap();
         let mut granted = message(ControlKind::ControlGranted, &id);
         granted.lease_id = Some("lease-1".to_string());
         granted.lease_expires_at = Some(31_000);
@@ -754,5 +1289,112 @@ mod tests {
             .unwrap_err();
 
         assert!(error.contains("stale"));
+    }
+
+    /// A denied view is not a view. Mapping it to `Viewing` left the desktop's
+    /// dialog reading "Screen connected · requesting control…" forever.
+    #[test]
+    fn a_view_denial_or_screen_error_ends_the_session() {
+        for kind in [ControlKind::ViewDenied, ControlKind::ScreenError] {
+            let mut session = RemoteSession::new();
+            let id = session.begin_view(ScreenDirection::PhoneToDesktop);
+
+            session.accept(&message(kind, &id), 1_000).unwrap();
+
+            assert_eq!(session.state(), SessionState::Stopped, "{kind:?}");
+            assert_eq!(session.remote_session_id(), None, "{kind:?}");
+        }
+    }
+
+    /// A delayed release, denial or error for a session this side has already
+    /// left must not stop the one it is in — and so must not tear down that
+    /// session's portal capture either.
+    #[test]
+    fn a_late_terminal_message_for_another_session_changes_nothing() {
+        for kind in [
+            ControlKind::Release,
+            ControlKind::ScreenStopped,
+            ControlKind::ScreenError,
+            ControlKind::ViewDenied,
+            ControlKind::ControlDenied,
+        ] {
+            let mut session = RemoteSession::new();
+            let current = session.begin_view(ScreenDirection::DesktopToPhone);
+
+            let error = session
+                .accept(&message(kind, &Uuid::new_v4().to_string()), 1_000)
+                .unwrap_err();
+
+            assert!(error.contains("stale"), "{kind:?}: {error}");
+            assert_eq!(session.remote_session_id(), Some(current.as_str()));
+            assert_eq!(session.state(), SessionState::RequestingView, "{kind:?}");
+        }
+    }
+
+    /// With nothing active there is nothing for a stale message to disturb, so a
+    /// duplicate release stays a harmless no-op.
+    #[test]
+    fn a_release_with_no_session_is_a_harmless_no_op() {
+        let mut session = RemoteSession::new();
+        session
+            .accept(
+                &message(ControlKind::Release, &Uuid::new_v4().to_string()),
+                1_000,
+            )
+            .unwrap();
+        assert_eq!(session.state(), SessionState::Stopped);
+    }
+
+    /// Nothing may stay in a "requesting" state forever: the other side can be
+    /// silent (a phone whose consent screen nobody answers).
+    #[test]
+    fn an_unanswered_request_expires_and_a_live_view_never_does() {
+        let mut session = RemoteSession::new();
+        let start = std::time::Instant::now();
+        session.begin_view(ScreenDirection::PhoneToDesktop);
+        assert_eq!(
+            session
+                .expire_pending(start + VIEW_REQUEST_TIMEOUT - std::time::Duration::from_secs(1)),
+            None,
+            "still within its allowance"
+        );
+        assert_eq!(
+            session
+                .expire_pending(start + VIEW_REQUEST_TIMEOUT + std::time::Duration::from_secs(1)),
+            Some(SessionState::RequestingView)
+        );
+        assert_eq!(session.state(), SessionState::Stopped);
+
+        let mut viewing = RemoteSession::new();
+        let id = viewing.begin_view(ScreenDirection::PhoneToDesktop);
+        viewing
+            .accept(&message(ControlKind::ScreenReady, &id), 1_000)
+            .unwrap();
+        assert_eq!(
+            viewing
+                .expire_pending(std::time::Instant::now() + std::time::Duration::from_secs(86_400)),
+            None
+        );
+        assert_eq!(viewing.state(), SessionState::Viewing);
+    }
+
+    /// An unanswered control request falls back to the view, so the user can ask
+    /// again — it must not take the whole view down with it.
+    #[test]
+    fn an_unanswered_control_request_falls_back_to_the_view() {
+        let mut session = RemoteSession::new();
+        let id = session.begin_view(ScreenDirection::PhoneToDesktop);
+        session
+            .accept(&message(ControlKind::ScreenReady, &id), 1_000)
+            .unwrap();
+        session.begin_control().unwrap();
+
+        let expired = session.expire_pending(
+            std::time::Instant::now() + CONTROL_REQUEST_TIMEOUT + std::time::Duration::from_secs(1),
+        );
+
+        assert_eq!(expired, Some(SessionState::RequestingControl));
+        assert_eq!(session.state(), SessionState::Viewing);
+        assert_eq!(session.remote_session_id(), Some(id.as_str()));
     }
 }

@@ -256,6 +256,9 @@ impl DeviceManager {
         }
         link.adopt(Arc::clone(transport));
         session.state = SessionState::Ready;
+        // A working socket is fresh evidence the peer is reachable, so a
+        // recovery ladder exhausted while it was away starts over.
+        session.webrtc_recovery_attempt = 0;
         session.last_disconnect_reason = None;
         // The adopted socket has, by definition, just completed a handshake.
         // Carrying the old one's staleness clock over would have the liveness
@@ -316,15 +319,27 @@ impl DeviceManager {
                     session.pairing = PairingHandler::new(false);
                 }
 
-                if initially_paired
-                    && session.pairing.state != crate::device_links::pairing::PairState::Paired
+                // The trust store is the authority on every new link, in both
+                // directions. Upgrading only meant a phone unpaired while it
+                // was offline came back `Paired` on its next connection — and
+                // with no stored certificate to pin, *any* certificate whose
+                // CN matched its broadcast id was accepted as that phone.
+                let paired =
+                    session.pairing.state == crate::device_links::pairing::PairState::Paired;
+                if initially_paired != paired
+                    && !matches!(
+                        session.pairing.state,
+                        crate::device_links::pairing::PairState::Requested
+                            | crate::device_links::pairing::PairState::RequestedByPeer
+                    )
                 {
-                    session.pairing = PairingHandler::new(true);
+                    session.pairing = PairingHandler::new(initially_paired);
                 }
                 session.state = SessionState::Ready;
                 session.connected_at = Some(now);
                 session.last_disconnect_reason = None;
                 session.reconnect_attempt = 0;
+                session.webrtc_recovery_attempt = 0;
                 session.reconnect_scheduled = false;
                 session.next_reconnect_at = None;
                 // A new link has, by definition, just been heard from. Without
@@ -363,6 +378,7 @@ impl DeviceManager {
                     reconnect_scheduled: false,
                     next_reconnect_at: None,
                     last_not_paired_notice: None,
+                    pending_features: Default::default(),
                     last_inbound_at: now,
                 };
                 let binding = session.binding().expect("new session always has a link");
@@ -401,6 +417,26 @@ impl DeviceManager {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether `instance_id` shows the peer restarted since its current link
+    /// was established. Unknown on either side (older builds) means no.
+    pub fn peer_restarted(&self, device_id: &str, instance_id: Option<&str>) -> bool {
+        let Some(instance_id) = instance_id else {
+            return false;
+        };
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| {
+                sessions.get(device_id).and_then(|session| {
+                    session
+                        .active_link
+                        .as_ref()
+                        .and_then(|link| link.info.instance_id.clone())
+                })
+            })
+            .is_some_and(|current| current != instance_id)
     }
 
     /// Whether this device still has a usable bootstrap socket.
@@ -752,6 +788,66 @@ impl DeviceManager {
         })?
     }
 
+    /// Drops the pairing state of a device that has no live link, so an unpair
+    /// done while it was offline cannot be undone by its session on return.
+    /// Returns the session's WebRTC peer, if any, for the caller to close
+    /// outside this lock — a revoked pairing must not leave a peer running.
+    pub fn forget_pairing(&self, device_id: &str) -> Option<Arc<DesktopWebRtcPeer>> {
+        let mut sessions = self.sessions.lock().ok()?;
+        let session = sessions.get_mut(device_id)?;
+        session.pairing = PairingHandler::new(false);
+        session.pending_features.clear();
+        session.clear_webrtc_state()
+    }
+
+    /// Holds a feature until WebRTC is ready, evicting the oldest past
+    /// `PENDING_FEATURE_LIMIT`. Returns `false` without queueing when the
+    /// handover is already feature-ready: the check and the push share one
+    /// lock, so a packet can never land in the queue after the flush ran.
+    pub fn queue_feature(
+        &self,
+        binding: &SessionBinding,
+        packet: crate::device_links::packet::NetworkPacket,
+    ) -> Result<bool, SessionError> {
+        self.with_session(binding, |session| {
+            if session
+                .webrtc_handover
+                .as_ref()
+                .is_some_and(HandoverRuntime::features_ready)
+            {
+                return false;
+            }
+            if session.pending_features.len() >= super::device_session::PENDING_FEATURE_LIMIT {
+                session.pending_features.pop_front();
+            }
+            session.pending_features.push_back((Instant::now(), packet));
+            true
+        })
+    }
+
+    /// Drains the queue, dropping anything older than `PENDING_FEATURE_MAX_AGE`.
+    pub fn take_pending_features(
+        &self,
+        binding: &SessionBinding,
+    ) -> Vec<crate::device_links::packet::NetworkPacket> {
+        self.with_session(binding, |session| {
+            session
+                .pending_features
+                .drain(..)
+                .filter(|(queued_at, packet)| {
+                    let fresh =
+                        queued_at.elapsed() <= super::device_session::PENDING_FEATURE_MAX_AGE;
+                    if !fresh {
+                        eprintln!("[DeskLink] Dropped stale queued {}", packet.packet_type);
+                    }
+                    fresh
+                })
+                .map(|(_, packet)| packet)
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
     /// Revokes the local pairing state and every WebRTC object derived from
     /// it.  The returned peer is deliberately closed by the caller only after
     /// the session lock has been released, because peer callbacks can trigger
@@ -770,6 +866,7 @@ impl DeviceManager {
         self.with_session(binding, |session| {
             let packet = session.pairing.reject_packet();
             session.last_disconnect_reason = Some(reason);
+            session.pending_features.clear();
             (packet, session.clear_webrtc_state())
         })
     }
@@ -1103,23 +1200,30 @@ mod tests {
     }
 
     #[test]
-    fn pairing_state_survives_transport_replacement() {
+    fn pairing_state_follows_the_trust_store_across_transport_replacement() {
         let manager = DeviceManager::new();
+        let paired = |binding: &SessionBinding| {
+            manager
+                .with_session(binding, |session| {
+                    session.pairing.state == crate::device_links::pairing::PairState::Paired
+                })
+                .unwrap()
+        };
         let first = manager
             .register_link("phone-1".to_string(), link("phone-1"), true)
             .unwrap();
         let second = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap();
+        assert!(paired(&second.binding));
+        assert_eq!(first.binding.session_id, second.binding.session_id);
+
+        // Unpaired while it was away: the next link must not resume `Paired`,
+        // or any certificate claiming this id would be accepted unpinned.
+        let third = manager
             .register_link("phone-1".to_string(), link("phone-1"), false)
             .unwrap();
-
-        let paired = manager
-            .with_session(&second.binding, |session| {
-                session.pairing.state == crate::device_links::pairing::PairState::Paired
-            })
-            .unwrap();
-
-        assert!(paired);
-        assert_eq!(first.binding.session_id, second.binding.session_id);
+        assert!(!paired(&third.binding));
     }
 
     #[test]
@@ -1510,6 +1614,88 @@ mod tests {
                 .accept_webrtc_envelope(&binding, "attempt", "message-1".to_string())
                 .unwrap_err(),
             SessionError::ReplayDetected
+        );
+    }
+
+    #[test]
+    fn a_feature_is_not_queued_once_the_handover_is_ready() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone".to_string(), link("phone"), true)
+            .unwrap()
+            .binding;
+        let ping = crate::device_links::packet::NetworkPacket::new("desklink.ping");
+        assert!(manager.queue_feature(&binding, ping.clone()).unwrap());
+        mark_features_ready(&manager, &binding);
+        // Ready: the caller must send directly, so nothing strands in the queue.
+        assert!(!manager.queue_feature(&binding, ping).unwrap());
+        assert_eq!(manager.take_pending_features(&binding).len(), 1);
+    }
+
+    #[test]
+    fn stale_queued_features_are_dropped_not_delivered() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone".to_string(), link("phone"), true)
+            .unwrap()
+            .binding;
+        manager
+            .with_session(&binding, |session| {
+                let old = Instant::now()
+                    - super::super::device_session::PENDING_FEATURE_MAX_AGE
+                    - std::time::Duration::from_secs(1);
+                session.pending_features.push_back((
+                    old,
+                    crate::device_links::packet::NetworkPacket::new("desklink.lock.request"),
+                ));
+            })
+            .unwrap();
+        manager
+            .queue_feature(
+                &binding,
+                crate::device_links::packet::NetworkPacket::new("desklink.ping"),
+            )
+            .unwrap();
+        let taken = manager.take_pending_features(&binding);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].packet_type, "desklink.ping");
+    }
+
+    #[test]
+    fn a_new_instance_id_means_the_peer_restarted() {
+        let manager = DeviceManager::new();
+        let mut first = link("phone");
+        first.info.instance_id = Some("epoch-a".to_string());
+        manager
+            .register_link("phone".to_string(), first, true)
+            .unwrap();
+
+        assert!(!manager.peer_restarted("phone", Some("epoch-a")));
+        assert!(manager.peer_restarted("phone", Some("epoch-b")));
+        // An older build that sends no epoch never counts as a restart.
+        assert!(!manager.peer_restarted("phone", None));
+        assert!(!manager.peer_restarted("unknown", Some("epoch-b")));
+    }
+
+    #[test]
+    fn a_new_link_resets_an_exhausted_recovery_ladder() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone".to_string(), link("phone"), true)
+            .unwrap()
+            .binding;
+        manager
+            .with_session(&binding, |session| session.webrtc_recovery_attempt = 6)
+            .unwrap();
+        let replaced = manager
+            .register_link("phone".to_string(), link("phone"), true)
+            .unwrap()
+            .binding;
+        assert_eq!(
+            manager
+                .with_session(&replaced, |session| session.webrtc_recovery_attempt)
+                .unwrap(),
+            0
         );
     }
 }

@@ -13,6 +13,17 @@ pub struct DeviceInfo {
     pub protocol_version: i64,
     pub incoming_capabilities: Vec<String>,
     pub outgoing_capabilities: Vec<String>,
+    /// Random per process start ("restart epoch"). A peer presenting a
+    /// different one has restarted, so any WebRTC peer of its previous process
+    /// is dead and must be dropped at once rather than after the 15 s silence
+    /// budget. Optional on the wire: older builds omit it.
+    pub instance_id: Option<String>,
+}
+
+/// This process's restart epoch; see [`DeviceInfo::instance_id`].
+pub fn process_instance_id() -> &'static str {
+    static INSTANCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    INSTANCE.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
 }
 
 impl DeviceInfo {
@@ -38,6 +49,7 @@ impl DeviceInfo {
             protocol_version: PROTOCOL_VERSION,
             incoming_capabilities,
             outgoing_capabilities,
+            instance_id: Some(process_instance_id().to_string()),
         }
     }
 
@@ -50,6 +62,9 @@ impl DeviceInfo {
         packet.set("incomingCapabilities", self.incoming_capabilities.clone());
         packet.set("outgoingCapabilities", self.outgoing_capabilities.clone());
         packet.set("tcpPort", i64::from(tcp_port));
+        if let Some(instance_id) = &self.instance_id {
+            packet.set("instanceId", instance_id.clone());
+        }
         packet
     }
 
@@ -72,6 +87,10 @@ impl DeviceInfo {
             protocol_version: packet.get_i64("protocolVersion").unwrap_or(-1),
             incoming_capabilities: string_array(packet.body.get("incomingCapabilities")),
             outgoing_capabilities: string_array(packet.body.get("outgoingCapabilities")),
+            instance_id: packet
+                .get_str("instanceId")
+                .filter(|id| !id.is_empty() && id.len() <= 64)
+                .map(str::to_string),
         })
     }
 }
@@ -119,6 +138,8 @@ mod tests {
         assert_eq!(parsed.id, local.id);
         assert_eq!(parsed.name, "DeskLink");
         assert_eq!(parsed.protocol_version, 9);
+        // The restart epoch survives the round trip and is this process's.
+        assert_eq!(parsed.instance_id.as_deref(), Some(process_instance_id()));
         assert!(parsed
             .incoming_capabilities
             .contains(&"desklink.ping".into()));
@@ -147,10 +168,10 @@ mod tests {
             .outgoing_capabilities
             .contains(&"desklink.mousepad.request".to_string()));
 
-        // The desktop consumes remote input and lock state but cannot service
-        // them, and the Android application implements MPRIS, volume and
-        // run-command in the opposite direction only. None may be advertised.
-        assert!(!local
+        // Remote input is handled only under a portal-approved control lease.
+        // MPRIS, volume and run-command remain phone-to-desktop capabilities
+        // that the Android application implements in the opposite direction.
+        assert!(local
             .incoming_capabilities
             .contains(&"desklink.mousepad.request".to_string()));
         assert!(!local

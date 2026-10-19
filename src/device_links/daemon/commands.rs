@@ -10,20 +10,38 @@ use crate::device_links::packet::{
     PACKET_TYPE_SYSTEMVOLUME_REQUEST,
 };
 use crate::device_links::transport::{should_surface_send_error, FeatureTransport};
+use crate::device_links::webrtc::file_browser;
+use crate::device_links::webrtc::terminal_bridge;
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum DaemonCommand {
     Discover,
     RequestPair(String),
-    AcceptPair(String),
+    /// Device id and the verification key the user was shown when accepting.
+    AcceptPair(String, Option<String>),
     RejectPair(String),
     Unpair(String),
+    /// Show a fresh QR pairing code (see `pairing_qr`); the UI reads it back
+    /// with `pairing_qr::current_uri`.
+    StartQrPairing,
+    CancelQrPairing,
     SendPing(String),
     SendMousepadRequest(String, serde_json::Map<String, serde_json::Value>),
+    StartPhoneRemoteControl(String),
+    StopPhoneRemoteControl(String),
+    /// Ask again for control of a phone whose screen is being viewed.
+    RequestPhoneControl(String),
+    /// A phone-file browser request that has already been registered with
+    /// [`file_browser::begin_request`]: device ID, request ID, wire bytes.
+    SendPhoneFileRequest(String, String, Vec<u8>),
     SendFile(String, std::path::PathBuf),
+    /// Stops a running file transfer: the device and the transfer's id.
+    CancelTransfer(String, String),
     SendShareText(String, String),
     SendLockRequest(String, bool),
+    /// Allow or stop a paired phone opening terminals on this computer.
+    SetTerminalAccess(String, bool),
     SendFindPhone(String),
     SendMprisAction(String, String, String),
     RequestMprisStatus(String, Option<String>),
@@ -50,9 +68,30 @@ impl DaemonWorker {
                 }
             }
             DaemonCommand::RequestPair(device_id) => self.send_pair_request(&device_id),
-            DaemonCommand::AcceptPair(device_id) => {
+            DaemonCommand::StartQrPairing => {
+                let started = self
+                    .config
+                    .lock()
+                    .map_err(|_| "Config lock poisoned".to_string())
+                    .and_then(|config| {
+                        let der = config.certificate().to_der().map_err(|e| e.to_string())?;
+                        Ok((config.local_device_info().id, der))
+                    })
+                    .and_then(|(id, der)| {
+                        let host = lan_address().map(|ip| format!("{ip}:{}", self.tcp_port));
+                        crate::device_links::pairing_qr::start(&id, &der, host)
+                    });
+                if let Err(error) = started {
+                    push_error(
+                        &self.errors,
+                        format!("Could not create a pairing code: {error}"),
+                    );
+                }
+            }
+            DaemonCommand::CancelQrPairing => crate::device_links::pairing_qr::cancel(),
+            DaemonCommand::AcceptPair(device_id, shown_key) => {
                 eprintln!("[Daemon] Running accept_pair for {}", device_id);
-                self.accept_pair(&device_id);
+                self.accept_pair(&device_id, shown_key.as_deref());
             }
             DaemonCommand::RejectPair(device_id) => {
                 eprintln!("[Daemon] Running reject_pair for {}", device_id);
@@ -63,9 +102,21 @@ impl DaemonWorker {
             DaemonCommand::SendMousepadRequest(id, payload) => {
                 self.send_mousepad_request(&id, payload)
             }
+            DaemonCommand::StartPhoneRemoteControl(id) => self.start_phone_remote_control(&id),
+            DaemonCommand::StopPhoneRemoteControl(id) => self.stop_phone_remote_control(&id),
+            DaemonCommand::RequestPhoneControl(id) => {
+                self.with_feature_transport(&id, |transport| transport.request_phone_control());
+            }
+            DaemonCommand::SendPhoneFileRequest(id, request_id, payload) => {
+                self.send_phone_file_request(&id, &request_id, &payload)
+            }
             DaemonCommand::SendFile(id, path) => self.send_file(&id, path),
+            DaemonCommand::CancelTransfer(id, transfer_id) => {
+                self.cancel_transfer(&id, &transfer_id)
+            }
             DaemonCommand::SendShareText(id, text) => self.send_share_text(&id, &text),
             DaemonCommand::SendLockRequest(id, lock) => self.send_lock_request(&id, lock),
+            DaemonCommand::SetTerminalAccess(id, allowed) => self.set_terminal_access(&id, allowed),
             DaemonCommand::SendFindPhone(id) => self.send_find_phone(&id),
             DaemonCommand::SendMprisAction(id, player, action) => {
                 self.send_mpris_action(&id, &player, &action)
@@ -113,8 +164,8 @@ impl DaemonWorker {
         self.pairing().send_pair_request(device_id);
     }
 
-    fn accept_pair(&self, device_id: &str) {
-        self.pairing().accept_pair(device_id);
+    fn accept_pair(&self, device_id: &str, shown_key: Option<&str>) {
+        self.pairing().accept_pair(device_id, shown_key);
     }
 
     fn reject_pair(&self, device_id: &str) {
@@ -140,8 +191,28 @@ impl DaemonWorker {
     ) {
         self.with_feature_transport(device_id, |transport| {
             let packet = NetworkPacket::with_body(PACKET_TYPE_MOUSEPAD_REQUEST, payload);
-            transport.send(&packet)
+            transport.send_remote_input(packet)
         });
+    }
+
+    fn start_phone_remote_control(&self, device_id: &str) {
+        self.with_feature_transport(device_id, |transport| {
+            transport.start_phone_remote_control()
+        });
+    }
+
+    fn stop_phone_remote_control(&self, device_id: &str) {
+        self.with_feature_transport(device_id, |transport| transport.stop_phone_remote_control());
+    }
+
+    /// A failure here belongs in the file dialog that asked, not in the global
+    /// error banner, so it is routed back as that request's reply.
+    fn send_phone_file_request(&self, device_id: &str, request_id: &str, payload: &[u8]) {
+        let result = FeatureTransport::for_device(&self.sessions, device_id)
+            .and_then(|transport| transport.send_phone_file_request(payload));
+        if let Err(error) = result {
+            file_browser::fail_request(device_id, request_id, &error);
+        }
     }
 
     fn send_share_text(&self, device_id: &str, text: &str) {
@@ -157,6 +228,32 @@ impl DaemonWorker {
             packet.set("setLocked", lock);
             transport.send(&packet)
         });
+    }
+
+    /// Persists the "Allow terminal access" choice and, when it is being taken
+    /// away, cuts the phone off from every terminal immediately.
+    ///
+    /// The setting is written first: once it reads *off*, no new request can get
+    /// past the gate, and the revocation then only has to clear what is already
+    /// attached. A failure is shown on the device rather than swallowed, and
+    /// also refreshes the card so its switch cannot keep saying "on".
+    fn set_terminal_access(&self, device_id: &str, allowed: bool) {
+        eprintln!("[DeskLink] Terminal access device={device_id:?} allowed={allowed}");
+        let saved = self
+            .config
+            .lock()
+            .map_err(|_| "Config lock poisoned".to_string())
+            .and_then(|mut config| config.set_terminal_access(device_id, allowed));
+        if !allowed {
+            terminal_bridge::revoke_device(device_id);
+        }
+        if let Err(error) = saved {
+            mark_error(
+                &self.devices,
+                device_id,
+                format!("Could not change terminal access: {error}"),
+            );
+        }
     }
 
     fn send_find_phone(&self, device_id: &str) {
@@ -451,6 +548,15 @@ fn build_remote_command_execute_packet(key: &str) -> Result<NetworkPacket, Strin
     let mut packet = NetworkPacket::new(PACKET_TYPE_RUNCOMMAND_REQUEST);
     packet.set("key", key);
     Ok(packet)
+}
+
+/// The address other LAN devices reach this desktop on: the source address of
+/// the default route. `connect` on UDP only selects a route; nothing is sent.
+fn lan_address() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    socket.connect(("192.0.2.1", 9)).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
 }
 
 #[cfg(test)]
