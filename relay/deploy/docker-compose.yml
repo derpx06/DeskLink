@@ -1,0 +1,55 @@
+# Run from this directory:  docker compose up -d
+# With self-hosted TURN:    docker compose --profile coturn up -d
+#
+# Everything uses host networking. Caddy then sees real client IPv4 and IPv6
+# addresses (Docker's IPv6-to-IPv4 port proxy would replace every IPv6 client
+# with the bridge gateway), and the relay sees Caddy as 127.0.0.1, which is
+# the default trusted proxy.
+
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      RELAY_DOMAIN: ${RELAY_DOMAIN:?set RELAY_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - relay
+
+  relay:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: desklink-relay:latest
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      DESKLINK_RELAY_CF_TOKEN: ${DESKLINK_RELAY_CF_TOKEN:-}
+      DESKLINK_RELAY_TURN_SECRET: ${DESKLINK_RELAY_TURN_SECRET:-}
+    volumes:
+      - ./config.toml:/etc/desklink-relay/config.toml:ro
+      - relay_state:/var/lib/desklink-relay
+
+  coturn:
+    profiles: ["coturn"]
+    image: coturn/coturn:4
+    restart: unless-stopped
+    network_mode: host
+    # The secret comes from .env so it never sits in the tracked conf. It is
+    # visible in the host's process list; the droplet has no other users.
+    command:
+      - "-c"
+      - "/etc/coturn/turnserver.conf"
+      - "--static-auth-secret=${DESKLINK_RELAY_TURN_SECRET:-}"
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - ./coturn-certs:/etc/coturn/certs:ro
+
+volumes:
+  caddy_data:
+  caddy_config:
+  relay_state:

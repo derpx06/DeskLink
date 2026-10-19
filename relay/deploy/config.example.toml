@@ -1,0 +1,58 @@
+# DeskLink relay configuration. Copy to deploy/config.toml and edit.
+# Secrets belong in deploy/.env, not here:
+#   DESKLINK_RELAY_CF_TOKEN     overrides cloudflare.api_token
+#   DESKLINK_RELAY_TURN_SECRET  overrides coturn.static_secret
+
+# Plain WebSocket; Caddy terminates TLS on the same host and proxies here.
+listen = "127.0.0.1:8080"
+
+# Must equal the DNS name the apps connect to (wss://<public_host>/v1).
+# It is part of the string every client signs, so a mismatch fails all logins.
+public_host = "relay.example.com"
+
+# X-Forwarded-For is believed only from these peers.
+trusted_proxies = ["127.0.0.1", "::1"]
+
+# "cloudflare", "coturn" or "none".
+turn_backend = "cloudflare"
+
+# TURN quota counters (pseudonymised, one UTC day). Back this file up; nothing
+# else on the server is state.
+state_file = "/var/lib/desklink-relay/state.json"
+
+[cloudflare]
+key_id = "your-cloudflare-turn-key-id"
+# api_token comes from DESKLINK_RELAY_CF_TOKEN.
+
+[coturn]
+# static_secret comes from DESKLINK_RELAY_TURN_SECRET.
+urls = [
+  "turn:relay.example.com:3478?transport=udp",
+  "turn:relay.example.com:3478?transport=tcp",
+  "turns:relay.example.com:5349?transport=tcp",
+]
+ttl = 3600
+
+# Defaults shown. IPv4 numbers are generous for mobile CGNAT; an IPv6 /64 is
+# one subscriber and gets the strict numbers.
+[limits]
+msgs_per_sec = 20.0
+msgs_burst = 100.0
+bytes_per_sec = 262144.0
+max_frame_bytes = 524288
+connections_per_ipv4 = 64
+connections_per_ipv6_64 = 8
+auths_per_min_ipv4 = 300.0
+auths_per_min_ipv6_64 = 30.0
+# Whole-/48 totals on top of the /64 numbers, so a routed /48 or /56 cannot
+# multiply its limits by rotating /64s.
+connections_per_ipv6_48 = 32
+auths_per_min_ipv6_48 = 120.0
+global_connections = 10000
+# Sockets that have not authenticated yet may hold at most this fraction of
+# global_connections; the rest is reserved for authenticated devices.
+unauthenticated_share = 0.5
+turn_per_pair_per_day = 20
+# Per IPv4 address or IPv6 /64, and per IPv6 /48.
+turn_per_network_per_day = 48
+turn_per_ipv6_48_per_day = 192

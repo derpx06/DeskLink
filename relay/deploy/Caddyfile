@@ -1,0 +1,14 @@
+# Caddy obtains and renews the certificate for $RELAY_DOMAIN automatically.
+# Caddy replaces any client-supplied X-Forwarded-For with the real client
+# address, which is what the relay's per-network limits key on.
+{$RELAY_DOMAIN} {
+	# Metrics are for the host only (curl 127.0.0.1:8080/metrics).
+	@metrics path /metrics
+	respond @metrics 404
+
+	reverse_proxy 127.0.0.1:8080 {
+		# Keep WebSockets open across config reloads instead of dropping
+		# every phone at once.
+		stream_close_delay 5m
+	}
+}

@@ -1,0 +1,6 @@
+/target/
+# Deployment secrets and host state: never commit.
+/deploy/.env
+/deploy/config.toml
+/deploy/coturn-certs/
+state.json*
