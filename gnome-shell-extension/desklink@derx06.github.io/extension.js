@@ -36,7 +36,6 @@ const ShellProxy = Gio.DBusProxy.makeProxyWrapper(`<node>
 const ACTIONS = [
     ['ring', 'Ring'],
     ['send-files', 'Send files…'],
-    ['browse-files', 'Browse files'],
     ['new-terminal', 'New terminal'],
     ['end-sessions', 'End sessions'],
 ];

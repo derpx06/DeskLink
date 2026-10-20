@@ -11,6 +11,7 @@ pub mod pairing_qr;
 pub mod pty;
 pub mod relay_link;
 pub mod session_lock;
+pub mod transfer_log;
 pub mod transport;
 pub mod webrtc;
 

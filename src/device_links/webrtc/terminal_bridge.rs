@@ -827,6 +827,35 @@ pub(crate) fn attached_count(device_id: &str) -> usize {
         .unwrap_or(0)
 }
 
+/// The devices attached to session `terminal_id` right now, for the desk's
+/// terminal tiles. Local only: the phone is never told.
+pub(crate) fn attached_devices(terminal_id: &str) -> Vec<String> {
+    let mut devices: Vec<String> = bridges()
+        .lock()
+        .map(|open| {
+            open.iter()
+                .filter(|(_, bridge)| bridge.attached.contains_key(terminal_id))
+                .map(|(device, _)| device.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    #[cfg(debug_assertions)]
+    if let Ok(fake) = DEBUG_ATTACHED.lock() {
+        devices.extend(
+            fake.iter()
+                .filter(|(terminal, _)| terminal == terminal_id)
+                .map(|(_, device)| device.clone()),
+        );
+    }
+    devices.sort();
+    devices
+}
+
+/// Debug builds only: (terminal, device) attachments shown without a phone,
+/// for screenshots.
+#[cfg(debug_assertions)]
+pub(crate) static DEBUG_ATTACHED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
 /// Starts the background sweep that closes forgotten sessions, once.
 fn ensure_idle_reaper() {
     static STARTED: Once = Once::new();

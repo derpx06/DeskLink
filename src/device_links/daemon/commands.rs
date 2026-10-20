@@ -44,6 +44,10 @@ pub enum DaemonCommand {
     SetTerminalAccess(String, bool),
     /// Keep this computer awake while a phone is paired.
     SetStayAwake(bool),
+    /// Share the clipboard with paired phones.
+    SetClipboardSync(bool),
+    /// Show a phone's notifications here (device id, shown).
+    SetShowNotifications(String, bool),
     /// The user answered "Not now" to the top-bar extension offer.
     SetShellExtensionPromptDismissed(bool),
     /// Relay on/off and its address ("" = the built-in one).
@@ -154,6 +158,16 @@ impl DaemonWorker {
             DaemonCommand::SetStayAwake(on) => {
                 self.update_settings(|settings| settings.stay_awake = on)
             }
+            DaemonCommand::SetClipboardSync(on) => {
+                self.update_settings(|settings| settings.clipboard_sync = on)
+            }
+            DaemonCommand::SetShowNotifications(id, shown) => self.update_settings(|settings| {
+                if shown {
+                    settings.hidden_notifications.remove(&id);
+                } else {
+                    settings.hidden_notifications.insert(id);
+                }
+            }),
             DaemonCommand::SetShellExtensionPromptDismissed(on) => {
                 self.update_settings(|settings| settings.shell_extension_prompt_dismissed = on)
             }

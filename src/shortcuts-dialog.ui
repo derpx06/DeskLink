@@ -12,7 +12,7 @@
         </child>
         <child>
           <object class="AdwShortcutsItem">
-            <property name="title" translatable="yes" context="shortcut window">Search Devices</property>
+            <property name="title" translatable="yes" context="shortcut window">Search Terminals</property>
             <property name="action-name">win.toggle-search</property>
           </object>
         </child>

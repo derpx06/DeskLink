@@ -72,7 +72,11 @@ enum DesktopPortalCommand {
     Input(Vec<PortalInputAction>),
     /// Show (and control) the next shared screen.
     SwitchScreen,
-    Stop,
+    /// Ends the share. With a reason, the phone is told it ended (a
+    /// `screen-error`) and its session and input lease end with it, so it
+    /// leaves the desk screen instead of waiting on a frozen picture.
+    /// Without one (a newer share replaces this one) nothing is sent.
+    Stop(Option<String>),
 }
 
 struct DesktopPortalService {
@@ -584,7 +588,7 @@ fn expire_remote_requests(
     debug_log!("[DeskLink] Remote-session request timed out while {previous:?}");
     match expired_request_action(previous, direction) {
         ExpiredRequest::CancelDesktopShare => {
-            stop_desktop_portal_session(&wire.peer_device_id);
+            stop_desktop_portal_session(&wire.peer_device_id, None);
             super::screen::clear_stream(&wire.peer_device_id);
         }
         ExpiredRequest::ReleasePhoneView => {
@@ -908,7 +912,7 @@ fn start_desktop_portal_session(
         // it as "already active" left every later request denied.
         if let Some(previous) = services.remove(&device_id) {
             previous.cancel.store(true, Ordering::Release);
-            let _ = previous.sender.send(DesktopPortalCommand::Stop);
+            let _ = previous.sender.send(DesktopPortalCommand::Stop(None));
         }
         services.insert(
             device_id.clone(),
@@ -1218,6 +1222,8 @@ fn run_desktop_portal_worker(
     let mut held_inputs = std::collections::HashSet::<(bool, i32)>::new();
     let mut portal_revoked = false;
     let mut no_video = false;
+    // Why the desk ended the share, when it did: the phone is told.
+    let mut stopped_here: Option<String> = None;
     let mut last_frames = 0u64;
     let mut last_progress = std::time::Instant::now();
     let mut restarts = 0u32;
@@ -1267,7 +1273,8 @@ fn run_desktop_portal_worker(
                     match receiver.try_recv() {
                         Ok(DesktopPortalCommand::Input(more)) => actions.extend(more),
                         Ok(DesktopPortalCommand::SwitchScreen) => switch_after = true,
-                        Ok(DesktopPortalCommand::Stop) => {
+                        Ok(DesktopPortalCommand::Stop(reason)) => {
+                            stopped_here = reason;
                             stop_after = true;
                             break;
                         }
@@ -1341,7 +1348,11 @@ fn run_desktop_portal_worker(
                 }
             }
             Ok(DesktopPortalCommand::SwitchScreen) => switch_screen(),
-            Ok(DesktopPortalCommand::Stop) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(DesktopPortalCommand::Stop(reason)) => {
+                stopped_here = reason;
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if portal.is_session_closed() {
                     portal_revoked = true;
@@ -1360,7 +1371,14 @@ fn run_desktop_portal_worker(
         }
     }
     release_held_portal_inputs(&*portal, &mut held_inputs);
-    if portal_revoked || no_video {
+    let told = if no_video {
+        Some("The desktop is not producing any video".to_string())
+    } else if portal_revoked {
+        Some("Desktop screen/control permission was revoked locally".to_string())
+    } else {
+        stopped_here
+    };
+    if let Some(reason) = told {
         let sequence = remote_session::sessions()
             .lock()
             .ok()
@@ -1371,23 +1389,32 @@ fn run_desktop_portal_worker(
                 })
             })
             .unwrap_or(1);
-        let mut stopped = remote_session::ControlMessage::new(
-            remote_session::ControlKind::ScreenError,
-            &attempt_id,
-            &wire,
-            &session_id,
-            sequence,
-            now_millis(),
-        );
-        stopped.reason = Some(if no_video {
-            "The desktop is not producing any video".to_string()
-        } else {
-            "Desktop screen/control permission was revoked locally".to_string()
-        });
+        let stopped = screen_stopped(&attempt_id, &wire, &session_id, sequence, reason);
         let _ = send_remote_session_message(&peer, &wire, &stopped);
     }
     portal.release_all();
     // `_cleanup` removes this share's registry entry and stops its capture.
+}
+
+/// The `screen-error` that tells the phone its view of this screen ended,
+/// and why.
+fn screen_stopped(
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    session_id: &str,
+    sequence: i64,
+    reason: String,
+) -> remote_session::ControlMessage {
+    let mut stopped = remote_session::ControlMessage::new(
+        remote_session::ControlKind::ScreenError,
+        attempt_id,
+        wire,
+        session_id,
+        sequence,
+        now_millis(),
+    );
+    stopped.reason = Some(reason);
+    stopped
 }
 
 /// Whether the phone currently holds a valid input lease for `device_id`.
@@ -1506,11 +1533,23 @@ pub(crate) fn end_phone_sessions(device_id: &str) {
     if viewing || terminals {
         connection_log::record(device_id, ConnectionEvent::SessionsEnded);
     }
-    stop_desktop_portal_session(device_id);
+    stop_desktop_portal_session(device_id, Some(SESSIONS_ENDED_AT_DESK));
     super::terminal_bridge::end_device_sessions(device_id);
 }
 
-fn stop_desktop_portal_session(device_id: &str) {
+/// What the phone is told when the desk ends its view of the screen.
+const SESSIONS_ENDED_AT_DESK: &str = "Sessions were ended at the desk";
+const SHARING_STOPPED_AT_DESK: &str = "Sharing was stopped at the desk";
+
+/// Stops `device_id` viewing or controlling this screen, leaving its
+/// terminals attached: "Stop Sharing" at the desk.
+pub(crate) fn end_screen_session(device_id: &str) {
+    stop_desktop_portal_session(device_id, Some(SHARING_STOPPED_AT_DESK));
+}
+
+/// Ends `device_id`'s share of this screen. `tell` is the reason the phone
+/// is given; `None` stops it without a word (the request already expired).
+fn stop_desktop_portal_session(device_id: &str, tell: Option<&str>) {
     let service = desktop_portal_services()
         .lock()
         .ok()
@@ -1522,7 +1561,9 @@ fn stop_desktop_portal_session(device_id: &str) {
         service
             .cancel
             .store(true, std::sync::atomic::Ordering::Release);
-        let _ = service.sender.send(DesktopPortalCommand::Stop);
+        let _ = service
+            .sender
+            .send(DesktopPortalCommand::Stop(tell.map(str::to_string)));
     }
 }
 
@@ -1956,7 +1997,7 @@ fn spawn_event_worker(
 /// rows. Run when a peer goes away for good, and when a new peer replaces a
 /// live one (the replaced worker skips it, see `PeerWorkerGuard`).
 fn reset_device_webrtc_state(device_id: &str) {
-    stop_desktop_portal_session(device_id);
+    stop_desktop_portal_session(device_id, None);
     super::screen::clear_stream(device_id);
     super::screen::forget_parked(device_id);
     // The session state must not outlive its peer: a stale `Controlling`
@@ -2402,7 +2443,7 @@ fn handle_peer_envelope(
                 // handles its local MediaProjection consent and sends the
                 // corresponding view-granted/screen-ready controls; desktop
                 // portal capture would invert the requested session direction.
-                stop_desktop_portal_session(&wire.peer_device_id);
+                stop_desktop_portal_session(&wire.peer_device_id, None);
                 super::screen::clear_stream(&wire.peer_device_id);
                 return Ok(());
             }
@@ -2589,7 +2630,7 @@ fn handle_peer_envelope(
         };
         if teardown {
             super::screen::clear_stream(&wire.peer_device_id);
-            stop_desktop_portal_session(&wire.peer_device_id);
+            stop_desktop_portal_session(&wire.peer_device_id, None);
         }
         if let Some(request) = request_control {
             let peer = sessions
@@ -3325,16 +3366,18 @@ fn now_millis() -> i64 {
 mod tests {
     use super::{
         apply_own_denial, authorize_desktop_remote_input, coalesce_motion, desktop_capture_needed,
-        desktop_portal_services, ensure_phone_view_allowed, expired_request_action, liveness,
-        offer_attempt_disposition, recovery_delay, remote_session, remove_service_if_current,
-        stop_desktop_portal_session, DesktopPortalCommand, DesktopPortalService, ExpiredRequest,
-        Liveness, OfferAttemptDisposition, RECOVERY_BACKOFF_MILLIS,
+        desktop_portal_services, end_screen_session, ensure_phone_view_allowed,
+        expired_request_action, liveness, offer_attempt_disposition, recovery_delay,
+        remote_session, remove_service_if_current, screen_stopped, stop_desktop_portal_session,
+        DesktopPortalCommand, DesktopPortalService, ExpiredRequest, Liveness,
+        OfferAttemptDisposition, RECOVERY_BACKOFF_MILLIS, SHARING_STOPPED_AT_DESK,
     };
     use crate::device_links::packet::NetworkPacket;
     use crate::device_links::webrtc::remote_session::SessionState;
     use crate::device_links::webrtc::remote_session::{
         ControlKind, ControlMessage, RemoteSession, ScreenDirection,
     };
+    use crate::device_links::webrtc::WebRtcWireBinding;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{mpsc, Arc};
 
@@ -3385,17 +3428,47 @@ mod tests {
         let device = "test-device-cancel";
         let (cancel, receiver) = register_share(device, 7);
 
-        stop_desktop_portal_session(device);
+        stop_desktop_portal_session(device, None);
 
         assert!(cancel.load(Ordering::Acquire));
         assert!(matches!(
             receiver.try_recv(),
-            Ok(DesktopPortalCommand::Stop)
+            Ok(DesktopPortalCommand::Stop(None))
         ));
         assert!(!desktop_portal_services()
             .lock()
             .unwrap()
             .contains_key(device));
+    }
+
+    /// "Stop Sharing" at the desk tells the phone, so it leaves the desk
+    /// screen instead of waiting on a frozen picture.
+    #[test]
+    fn stopping_a_share_at_the_desk_tells_the_phone_why() {
+        let device = "test-device-stop-told";
+        let (_cancel, receiver) = register_share(device, 9);
+        end_screen_session(device);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(DesktopPortalCommand::Stop(Some(reason))) if reason == SHARING_STOPPED_AT_DESK
+        ));
+
+        let wire = WebRtcWireBinding {
+            sender_device_id: "desk".into(),
+            peer_device_id: device.into(),
+            session_id: 3,
+            generation: 1,
+        };
+        let message = screen_stopped(
+            "attempt",
+            &wire,
+            "remote-1",
+            4,
+            SHARING_STOPPED_AT_DESK.to_string(),
+        );
+        assert_eq!(message.kind, remote_session::ControlKind::ScreenError);
+        assert_eq!(message.reason.as_deref(), Some(SHARING_STOPPED_AT_DESK));
+        assert_eq!(message.remote_session_id, "remote-1");
     }
 
     /// One session per device serves both directions. Starting to view the
@@ -3409,7 +3482,7 @@ mod tests {
         let _ = register_share(device, 9);
         assert!(ensure_phone_view_allowed(device).is_err());
 
-        stop_desktop_portal_session(device);
+        stop_desktop_portal_session(device, None);
         assert!(ensure_phone_view_allowed(device).is_ok());
     }
 

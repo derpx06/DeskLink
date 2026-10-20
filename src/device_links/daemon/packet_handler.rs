@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use super::clipboard::set_clipboard_text_from_remote;
+use super::clipboard::{clipboard_from_phone, set_clipboard_text_from_remote};
 use super::dispatcher::{PacketSource, SharedPacketDispatcher};
 use super::handle::DaemonEvent;
 use super::handshake::handle_disconnect;
@@ -636,7 +636,10 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             let content = packet
                 .get_str("content")
                 .ok_or_else(|| "DeskLink WebRTC clipboard packet has no content".to_string())?;
-            set_clipboard_text_from_remote(content);
+            // Off here means off both ways: the phone's copies are dropped.
+            if crate::device_links::config::app_settings().clipboard_sync {
+                clipboard_from_phone(content, &binding.link.info.name);
+            }
             Ok(())
         }
         PACKET_TYPE_SHARE_REQUEST => {

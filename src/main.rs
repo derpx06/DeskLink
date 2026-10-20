@@ -39,12 +39,11 @@ mod application;
 mod autostart;
 mod config;
 mod device_links;
-mod phone_files;
+mod link_glyph;
 mod protocol;
 mod remote_control;
 mod shell_dbus;
 mod terminal_previews;
-mod transfers;
 mod tray;
 mod window;
 

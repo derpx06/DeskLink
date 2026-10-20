@@ -88,7 +88,7 @@ fn shell_device(device: &DeviceView) -> ShellDevice {
 fn actions(device: &DeviceView) -> Vec<&'static str> {
     let mut actions = vec!["open"];
     if device.feature_transport_ready {
-        actions.extend(["ring", "send-files", "browse-files", "new-terminal"]);
+        actions.extend(["ring", "send-files", "new-terminal"]);
     }
     // Ending is local (stop sharing, detach terminals), so it does not wait
     // for the feature transport.
@@ -254,11 +254,6 @@ fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str
                         }
                     }
                 });
-        }
-        ("browse-files", Some(id), Some(daemon)) => {
-            if let (Some(window), Some(device)) = (main_window(app), device) {
-                crate::phone_files::show(daemon, id, &device.name, &window);
-            }
         }
         ("pair-new", _, _) => {
             if let Some(window) = main_window(app) {
@@ -482,14 +477,7 @@ mod tests {
         assert_eq!(dict.lookup::<u32>("terminals").unwrap(), Some(2));
         assert_eq!(
             dict.lookup::<Vec<String>>("actions").unwrap().unwrap(),
-            [
-                "open",
-                "ring",
-                "send-files",
-                "browse-files",
-                "new-terminal",
-                "end-sessions"
-            ]
+            ["open", "ring", "send-files", "new-terminal", "end-sessions"]
         );
 
         let idle = shell_device(&phone());

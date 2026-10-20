@@ -151,7 +151,19 @@ pub fn progress(id: &str, done: u64) {
 }
 
 pub fn finish(id: &str, outcome: Outcome) {
+    let received = match &outcome {
+        Outcome::Received(path) => board()
+            .rows
+            .iter()
+            .find(|row| row.id == id)
+            .map(|row| (row.device_id.clone(), row.name.clone(), path.clone())),
+        _ => None,
+    };
     board().finish(id, outcome);
+    // Outside the board's lock: this writes a file.
+    if let Some((device_id, name, path)) = received {
+        crate::device_links::transfer_log::record_received(&device_id, &name, &path);
+    }
 }
 
 pub fn record(finished: Finished) {

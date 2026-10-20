@@ -56,6 +56,7 @@ mod imp {
             // instance's socket alone if this launch is a second one).
             crate::device_links::pty::desk::start_server();
             crate::device_links::connection_log::prune();
+            crate::device_links::transfer_log::prune();
             obj.report_previous_crash();
             obj.setup_gactions();
             self.hold.replace(Some(obj.hold()));
@@ -186,8 +187,8 @@ impl DesklinkApplication {
             .is_some_and(|tray| tray.hosted())
     }
 
-    /// The main window, never one of the Phone Screen, Phone Files or File
-    /// Transfers windows that `active_window()` can return.
+    /// The main window, never the Phone Screen window that `active_window()`
+    /// can return.
     fn main_window(&self) -> DesklinkWindow {
         if let Some(window) = self
             .windows()
@@ -297,94 +298,6 @@ impl DesklinkApplication {
         });
     }
 
-    /// Relay on/off, its address, TURN, and the relay's current state.
-    fn away_from_home_group(
-        &self,
-        settings: &crate::device_links::config::AppSettings,
-    ) -> adw::PreferencesGroup {
-        use crate::device_links::daemon::DaemonCommand;
-        let group = adw::PreferencesGroup::builder()
-            .title("Away From Home")
-            .description(
-                "When your phone is on another network, it meets this computer through the \
-                 DeskLink server. What they exchange is end-to-end encrypted.",
-            )
-            .build();
-        let enabled = adw::SwitchRow::builder()
-            .title("Connect Away From Home")
-            .active(settings.relay_enabled)
-            .build();
-        let url = adw::EntryRow::builder()
-            .title("Server (leave empty for the DeskLink server)")
-            .text(settings.relay_url.as_str())
-            .show_apply_button(true)
-            .build();
-        let turn = adw::SwitchRow::builder()
-            .title("Relay Media When Needed")
-            .subtitle(
-                "Use a TURN server when no direct path exists. Off means direct connections only.",
-            )
-            .active(settings.use_turn)
-            .build();
-        let status = adw::ActionRow::builder().title("Status").build();
-        let status_label = gtk::Label::builder().css_classes(["dim-label"]).build();
-        status.add_suffix(&status_label);
-
-        if let Some(daemon) = self.daemon_handle() {
-            // Weak: the closure is connected on these very rows.
-            let send_relay = {
-                let daemon = daemon.clone();
-                let enabled = enabled.downgrade();
-                let url = url.downgrade();
-                move || {
-                    let (Some(enabled), Some(url)) = (enabled.upgrade(), url.upgrade()) else {
-                        return;
-                    };
-                    daemon.send(DaemonCommand::SetRelay {
-                        enabled: enabled.is_active(),
-                        url: url.text().trim().to_string(),
-                    })
-                }
-            };
-            enabled.connect_active_notify({
-                let send_relay = send_relay.clone();
-                move |_| send_relay()
-            });
-            url.connect_apply(move |_| send_relay());
-            turn.connect_active_notify(move |row| {
-                daemon.send(DaemonCommand::SetUseTurn(row.is_active()))
-            });
-        }
-
-        let update = move |label: &gtk::Label| {
-            use crate::device_links::relay_link::client::{status, RelayStatus};
-            label.set_label(&match status() {
-                RelayStatus::Off => "Off".to_string(),
-                RelayStatus::Connecting => "Connecting…".to_string(),
-                RelayStatus::Online => "Ready".to_string(),
-                RelayStatus::Unavailable(reason) => format!("Unavailable: {reason}"),
-                RelayStatus::UpdateRequired => {
-                    "Update DeskLink to connect away from home".to_string()
-                }
-            });
-        };
-        update(&status_label);
-        let weak = status_label.downgrade();
-        glib::timeout_add_seconds_local(1, move || match weak.upgrade() {
-            Some(label) => {
-                update(&label);
-                glib::ControlFlow::Continue
-            }
-            None => glib::ControlFlow::Break,
-        });
-
-        group.add(&enabled);
-        group.add(&url);
-        group.add(&turn);
-        group.add(&status);
-        group
-    }
-
     /// Reconnects the relay whenever the network changes (debounced: one
     /// switch fires several signals).
     fn watch_network(&self) {
@@ -437,17 +350,33 @@ impl DesklinkApplication {
         self.send_notification(Some("crash-report"), &notification);
     }
 
+    /// The Connection History page, or a dialog while no phone is paired.
     fn show_history(&self) {
-        let Some(parent) = self.window_for_dialog() else {
+        let window = self.main_window();
+        window.present();
+        if window.show_page("history") || window.visible_dialog().is_some() {
             return;
-        };
+        }
         let dialog = adw::Dialog::builder()
             .title("Connection History")
             .content_width(520)
             .content_height(620)
-            .child(&with_header(&history_content(&self.device_types())))
+            .child(&with_header(
+                &gtk::ScrolledWindow::builder()
+                    .hscrollbar_policy(gtk::PolicyType::Never)
+                    .child(
+                        &adw::Clamp::builder()
+                            .child(&crate::window::history::history_content(
+                                &self.device_types(),
+                                None,
+                                usize::MAX,
+                            ))
+                            .build(),
+                    )
+                    .build(),
+            ))
             .build();
-        dialog.present(Some(&parent));
+        dialog.present(Some(&window));
     }
 
     fn show_about(&self) {
@@ -468,229 +397,17 @@ impl DesklinkApplication {
         about.present(Some(&window));
     }
 
+    /// The Preferences page, or the computer-wide part as a dialog while no
+    /// phone is paired.
     fn show_preferences(&self) {
-        use crate::device_links::daemon::DaemonCommand;
-        let Some(parent) = self.window_for_dialog() else {
+        let window = self.main_window();
+        window.present();
+        if window.show_page("preferences") || window.visible_dialog().is_some() {
             return;
-        };
-        let dialog = adw::PreferencesDialog::builder()
-            .search_enabled(true)
-            .content_width(720)
-            .build();
-        let settings = crate::device_links::config::app_settings();
-
-        // ── General ─────────────────────────────────────────────────────────
-        let general = adw::PreferencesPage::builder()
-            .title("General")
-            .icon_name("preferences-system-symbolic")
-            .build();
-
-        let look = adw::PreferencesGroup::builder().title("Appearance").build();
-        let choices = ["system", "light", "dark"];
-        let appearance = adw::ComboRow::builder()
-            .title("Style")
-            .model(&gtk::StringList::new(&["System", "Light", "Dark"]))
-            .selected(
-                choices
-                    .iter()
-                    .position(|choice| *choice == load_appearance())
-                    .unwrap_or(0) as u32,
-            )
-            .build();
-        appearance.connect_selected_notify(move |row| {
-            let choice = choices
-                .get(row.selected() as usize)
-                .copied()
-                .unwrap_or("system");
-            save_appearance(choice);
-            adw::StyleManager::default().set_color_scheme(appearance_scheme(choice));
-        });
-        look.add(&appearance);
-        general.add(&look);
-
-        let startup_group = adw::PreferencesGroup::builder().title("Background").build();
-        let start_at_login = adw::SwitchRow::builder()
-            .title("Start at Login")
-            .subtitle("Keeps this computer reachable after a restart")
-            .active(settings.start_at_login.unwrap_or(true))
-            .build();
+        }
         if let Some(daemon) = self.daemon_handle() {
-            start_at_login.connect_active_notify(move |row| {
-                daemon.send(DaemonCommand::SetStartAtLogin(row.is_active()));
-            });
+            crate::window::prefs::show_dialog(&window, &daemon);
         }
-        startup_group.add(&start_at_login);
-        general.add(&startup_group);
-
-        let network_group = adw::PreferencesGroup::builder().title("Connection").build();
-
-        let discovery_row = adw::ActionRow::builder()
-            .title("Device Discovery")
-            .subtitle("Look for phones on this network")
-            .build();
-        let discover = gtk::Button::builder()
-            .label("Discover Now")
-            .valign(gtk::Align::Center)
-            .build();
-        if let Some(daemon) = self.daemon_handle() {
-            discover.connect_clicked(move |button| {
-                daemon.send(DaemonCommand::Discover);
-                if let Some(dialog) = button
-                    .ancestor(adw::PreferencesDialog::static_type())
-                    .and_downcast::<adw::PreferencesDialog>()
-                {
-                    dialog.add_toast(adw::Toast::new("Searching the network…"));
-                }
-            });
-        }
-        discovery_row.add_suffix(&discover);
-        network_group.add(&discovery_row);
-
-        let clipboard_row = adw::ActionRow::builder().title("Clipboard Sync").build();
-        clipboard_row.add_suffix(
-            &gtk::Label::builder()
-                .label("Automatic")
-                .css_classes(["dim-label"])
-                .build(),
-        );
-        network_group.add(&clipboard_row);
-
-        let downloads_row = adw::ActionRow::builder()
-            .title("Received Files")
-            .subtitle("Saved in Downloads")
-            .build();
-        network_group.add(&downloads_row);
-        general.add(&network_group);
-
-        let advanced = adw::PreferencesGroup::builder().title("Advanced").build();
-        advanced.add(
-            &adw::ActionRow::builder()
-                .title("Network Ports")
-                .subtitle("1716–1764, DeskLink protocol v9")
-                .css_classes(["property"])
-                .build(),
-        );
-        general.add(&advanced);
-        dialog.add(&general);
-
-        // ── Remote Access ───────────────────────────────────────────────────
-        let access = adw::PreferencesPage::builder()
-            .title("Remote Access")
-            .icon_name("preferences-desktop-remote-desktop-symbolic")
-            .build();
-        let access_group = adw::PreferencesGroup::builder()
-            .title("Remote Access")
-            .build();
-        let stay_awake = adw::SwitchRow::builder()
-            .title("Stay Awake for Your Phone")
-            .subtitle("Don't sleep while a phone is paired, even with the lid closed")
-            .active(settings.stay_awake)
-            .build();
-        if let Some(daemon) = self.daemon_handle() {
-            stay_awake.connect_active_notify(move |row| {
-                daemon.send(DaemonCommand::SetStayAwake(row.is_active()));
-            });
-        }
-        access_group.add(&stay_awake);
-
-        let password_row = adw::ActionRow::builder()
-            .title("Session Password")
-            .subtitle(password_subtitle(settings.session_password.is_some()))
-            .build();
-        let set_password = gtk::Button::builder()
-            .label(if settings.session_password.is_some() {
-                "Change…"
-            } else {
-                "Set…"
-            })
-            .valign(gtk::Align::Center)
-            .build();
-        let remove_password = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .tooltip_text("Remove the session password")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat"])
-            .visible(settings.session_password.is_some())
-            .build();
-        remove_password.update_property(&[gtk::accessible::Property::Label(
-            "Remove the session password",
-        )]);
-        if let Some(daemon) = self.daemon_handle() {
-            // Weak references: both buttons live inside the row they update.
-            let row = password_row.downgrade();
-            let remove = remove_password.downgrade();
-            let daemon_for_set = daemon.clone();
-            set_password.connect_clicked(move |button| {
-                let Some(parent) = row.upgrade() else {
-                    return;
-                };
-                let (row, remove, button) = (row.clone(), remove.clone(), button.downgrade());
-                let daemon = daemon_for_set.clone();
-                ask_for_password(&parent, move |password| {
-                    daemon.send(DaemonCommand::SetSessionPassword(Some(password)));
-                    if let Some(row) = row.upgrade() {
-                        row.set_subtitle(password_subtitle(true));
-                    }
-                    if let Some(button) = button.upgrade() {
-                        button.set_label("Change…");
-                    }
-                    if let Some(remove) = remove.upgrade() {
-                        remove.set_visible(true);
-                    }
-                });
-            });
-            let row = password_row.downgrade();
-            let set = set_password.downgrade();
-            remove_password.connect_clicked(move |remove| {
-                daemon.send(DaemonCommand::SetSessionPassword(None));
-                if let Some(row) = row.upgrade() {
-                    row.set_subtitle(password_subtitle(false));
-                }
-                if let Some(set) = set.upgrade() {
-                    set.set_label("Set…");
-                }
-                remove.set_visible(false);
-            });
-        }
-        password_row.add_suffix(&remove_password);
-        password_row.add_suffix(&set_password);
-        access_group.add(&password_row);
-        access.add(&access_group);
-
-        let history_group = adw::PreferencesGroup::new();
-        let history_row = adw::ActionRow::builder()
-            .title("Connection History")
-            .subtitle("The last 30 days")
-            .activatable(true)
-            .build();
-        history_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-        {
-            let dialog = dialog.downgrade();
-            let types = self.device_types();
-            history_row.connect_activated(move |_| {
-                if let Some(dialog) = dialog.upgrade() {
-                    dialog.push_subpage(
-                        &adw::NavigationPage::builder()
-                            .title("Connection History")
-                            .child(&with_header(&history_content(&types)))
-                            .build(),
-                    );
-                }
-            });
-        }
-        history_group.add(&history_row);
-        access.add(&history_group);
-        dialog.add(&access);
-
-        // ── Away From Home ──────────────────────────────────────────────────
-        let away = adw::PreferencesPage::builder()
-            .title("Away From Home")
-            .icon_name("desklink-globe-symbolic")
-            .build();
-        away.add(&self.away_from_home_group(&settings));
-        dialog.add(&away);
-
-        dialog.present(Some(&parent));
     }
 
     /// The stock shortcuts dialog from `shortcuts-dialog.ui` where libadwaita
@@ -717,7 +434,7 @@ impl DesklinkApplication {
             .build();
         for (title, shortcut) in [
             ("Pair New Device", "Ctrl+N"),
-            ("Search Devices", "Ctrl+F"),
+            ("Search Terminals", "Ctrl+F"),
             ("Connection History", "Ctrl+H"),
             ("Preferences", "Ctrl+,"),
             ("Show Shortcuts", "Ctrl+?"),
@@ -750,63 +467,106 @@ impl DesklinkApplication {
     }
 }
 
-/// The palette, light and dark: (name, light, dark). libadwaita's own
-/// colours come first, then DeskLink's tokens used by `style.css`.
+/// The palette, light and dark: (name, light, dark), from the DeskLink design
+/// (`dl` / `dd`). libadwaita's own colours come first, then DeskLink's tokens
+/// used by `style.css`.
 const PALETTE: &[(&str, &str, &str)] = &[
-    ("window_bg_color", "#f6f6f4", "#0b0c0e"),
-    ("window_fg_color", "#121317", "#ededef"),
-    ("view_bg_color", "#ffffff", "#131418"),
-    ("view_fg_color", "#121317", "#ededef"),
-    ("card_bg_color", "#ffffff", "#131418"),
-    ("card_fg_color", "#121317", "#ededef"),
-    ("headerbar_bg_color", "#f6f6f4", "#0b0c0e"),
-    ("headerbar_fg_color", "#121317", "#ededef"),
-    ("headerbar_backdrop_color", "#f6f6f4", "#0b0c0e"),
-    ("sidebar_bg_color", "#efefec", "#0f1013"),
-    ("sidebar_fg_color", "#121317", "#ededef"),
-    ("sidebar_backdrop_color", "#f2f2f0", "#0f1013"),
-    ("popover_bg_color", "#ffffff", "#1a1c21"),
-    ("popover_fg_color", "#121317", "#ededef"),
-    ("dialog_bg_color", "#ffffff", "#131418"),
-    ("dialog_fg_color", "#121317", "#ededef"),
-    ("accent_bg_color", "#3b6cf6", "#6e8cff"),
-    ("accent_fg_color", "#ffffff", "#0b0c0e"),
-    ("accent_color", "#2f5be0", "#6e8cff"),
-    ("success_bg_color", "#13a57a", "#34d1a0"),
-    ("success_fg_color", "#ffffff", "#0b0c0e"),
-    ("success_color", "#13a57a", "#34d1a0"),
+    ("window_bg_color", "#f7f7f5", "#1c1c1f"),
+    ("window_fg_color", "#18181b", "#f2f2f3"),
+    ("view_bg_color", "#ffffff", "#26262a"),
+    ("view_fg_color", "#18181b", "#f2f2f3"),
+    ("card_bg_color", "#ffffff", "#26262a"),
+    ("card_fg_color", "#18181b", "#f2f2f3"),
+    ("headerbar_bg_color", "#f7f7f5", "#1c1c1f"),
+    ("headerbar_fg_color", "#18181b", "#f2f2f3"),
+    ("headerbar_backdrop_color", "#f7f7f5", "#1c1c1f"),
+    ("sidebar_bg_color", "#f0f0ed", "#232326"),
+    ("sidebar_fg_color", "#18181b", "#f2f2f3"),
+    ("sidebar_backdrop_color", "#f0f0ed", "#232326"),
+    ("popover_bg_color", "#ffffff", "#26262a"),
+    ("popover_fg_color", "#18181b", "#f2f2f3"),
+    ("dialog_bg_color", "#ffffff", "#26262a"),
+    ("dialog_fg_color", "#18181b", "#f2f2f3"),
+    ("accent_bg_color", "#3b63e6", "#7c95ff"),
+    ("accent_fg_color", "#ffffff", "#0d0e10"),
+    ("accent_color", "#2f55d4", "#98abff"),
+    ("success_bg_color", "#0f9b72", "#3fd1a2"),
+    ("success_fg_color", "#ffffff", "#0d0e10"),
+    ("success_color", "#0b7a5a", "#3fd1a2"),
     ("warning_bg_color", "#c98a00", "#ffc24d"),
-    ("warning_fg_color", "#ffffff", "#0b0c0e"),
-    ("warning_color", "#c98a00", "#ffc24d"),
-    ("error_bg_color", "#d93636", "#ff5c5c"),
-    ("error_fg_color", "#ffffff", "#0b0c0e"),
-    ("error_color", "#d93636", "#ff5c5c"),
-    ("destructive_bg_color", "#d93636", "#ff5c5c"),
-    ("destructive_fg_color", "#ffffff", "#0b0c0e"),
-    ("destructive_color", "#d93636", "#ff5c5c"),
+    ("warning_fg_color", "#ffffff", "#0d0e10"),
+    ("warning_color", "#9a6a00", "#ffc24d"),
+    ("error_bg_color", "#c93030", "#ff6b6b"),
+    ("error_fg_color", "#ffffff", "#0d0e10"),
+    ("error_color", "#c93030", "#ff6b6b"),
+    ("destructive_bg_color", "#c93030", "#ff6b6b"),
+    ("destructive_fg_color", "#ffffff", "#0d0e10"),
+    ("destructive_color", "#c93030", "#ff6b6b"),
 ];
 
-/// DeskLink's own tokens: (name, light, dark).
+/// DeskLink's own tokens: (name, light, dark). The design's names are in the
+/// comments. `text_faint` is darker than the design's `t3` (#9a9aa2 /
+/// #71717a), which read at under 3:1: every text colour here meets 4.5:1 on
+/// the surfaces it is used on (see the contrast test).
 const TOKENS: &[(&str, &str, &str)] = &[
-    ("surface_2", "#f0f0ee", "#1a1c21"),
-    ("hairline", "#e4e4e0", "#262931"),
-    ("hairline_strong", "#d6d6d1", "#33363f"),
-    ("text_dim", "#5e616a", "#9a9ca4"),
-    ("text_faint", "#8c8f97", "#6b6e77"),
-    // The terminal stays dark in both styles: it is the hero object.
-    ("terminal_bg", "#0b0c0e", "#050506"),
-    ("terminal_fg", "#e6e6e6", "#e6e6e6"),
-    ("mint", "#13a57a", "#34d1a0"),
-    ("coral", "#e8573f", "#ff7a62"),
-    ("amber", "#c98a00", "#ffc24d"),
-    ("card_shadow_near", "rgba(0,0,0,0.05)", "transparent"),
-    ("card_shadow_far", "rgba(0,0,0,0.06)", "transparent"),
+    // k: the soft fill of buttons, chips and icon squares.
+    ("surface_2", "rgba(0,0,0,0.055)", "rgba(255,255,255,0.08)"),
+    // l, b: hairlines and dashed edges.
+    ("hairline", "rgba(0,0,0,0.07)", "rgba(255,255,255,0.07)"),
     (
-        "glow_color",
-        "rgba(59,108,246,0.07)",
-        "rgba(110,140,255,0.12)",
+        "hairline_strong",
+        "rgba(0,0,0,0.14)",
+        "rgba(255,255,255,0.16)",
     ),
+    // t2, t3.
+    ("text_dim", "#6b6b73", "#a1a1aa"),
+    ("text_faint", "#6c6c74", "#8c8c95"),
+    // m, o, ot, ob, obr: connected, and the other device in use.
+    ("mint", "#0f9b72", "#3fd1a2"),
+    ("coral", "#e5533d", "#ff7c66"),
+    ("coral_text", "#c2412b", "#ff9a88"),
+    ("coral_bg", "#fcefec", "#33221f"),
+    (
+        "coral_border",
+        "rgba(229,83,61,0.25)",
+        "rgba(255,124,102,0.3)",
+    ),
+    ("amber", "#9a6a00", "#ffc24d"),
+    // av, avt: notification avatars.
+    ("avatar_bg", "#e8ecf9", "#28305a"),
+    ("avatar_fg", "#2f55d4", "#dfe5ff"),
+    // rd, rdb: End Session, Unpair.
+    ("danger", "#c93030", "#ff6b6b"),
+    (
+        "danger_bg",
+        "rgba(211,58,58,0.09)",
+        "rgba(255,107,107,0.12)",
+    ),
+    // sh: a card's edge and its soft shadow.
+    ("card_edge", "rgba(0,0,0,0.06)", "rgba(255,255,255,0.06)"),
+    ("card_shadow_near", "rgba(0,0,0,0.04)", "transparent"),
+    // The terminal stays dark in both styles: it is the hero object.
+    ("terminal_bg", "#0e0f11", "#0e0f11"),
+    ("terminal_fg", "#d9dbe0", "#d9dbe0"),
+    ("terminal_lines", "#8b9099", "#8b9099"),
+    ("terminal_dim", "#7c818b", "#7c818b"),
+    ("terminal_prompt", "#86d3a8", "#86d3a8"),
+    ("terminal_coral", "#ff9a88", "#ff9a88"),
 ];
+
+/// A token's colour in the current style, for widgets that draw themselves
+/// (the link glyph, the battery ring). Unknown names are opaque grey.
+pub(crate) fn token_color(name: &str) -> gtk::gdk::RGBA {
+    let dark = adw::StyleManager::default().is_dark();
+    PALETTE
+        .iter()
+        .chain(TOKENS)
+        .find(|(token, _, _)| *token == name)
+        .and_then(|(_, light, dark_value)| {
+            gtk::gdk::RGBA::parse(if dark { *dark_value } else { *light }).ok()
+        })
+        .unwrap_or(gtk::gdk::RGBA::new(0.5, 0.5, 0.5, 1.0))
+}
 
 /// The CSS for one style. libadwaita 1.5 reads named colours; 1.6+ reads CSS
 /// variables (`--window-bg-color`), so those are set too when present. In
@@ -826,8 +586,9 @@ fn palette_css(dark: bool, modern: bool, contrast: bool) -> String {
     }
     for (name, light, dark_value) in TOKENS {
         let value = match *name {
-            "hairline" | "hairline_strong" if contrast => "alpha(currentColor, 0.6)",
-            "card_shadow_near" | "card_shadow_far" | "glow_color" if contrast => "transparent",
+            "hairline" | "hairline_strong" | "card_edge" if contrast => "alpha(currentColor, 0.6)",
+            "text_dim" | "text_faint" if contrast => "alpha(currentColor, 0.85)",
+            "card_shadow_near" if contrast => "transparent",
             _ => pick(light, dark_value),
         };
         css.push_str(&format!("@define-color {name} {value};\n"));
@@ -915,7 +676,7 @@ fn appearance_path() -> Option<std::path::PathBuf> {
 }
 
 /// "system", "light" or "dark".
-fn load_appearance() -> String {
+pub(crate) fn load_appearance() -> String {
     appearance_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .map(|text| text.trim().to_string())
@@ -923,7 +684,7 @@ fn load_appearance() -> String {
         .unwrap_or_else(|| "system".to_string())
 }
 
-fn save_appearance(choice: &str) {
+pub(crate) fn save_appearance(choice: &str) {
     if let Some(path) = appearance_path() {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -934,7 +695,7 @@ fn save_appearance(choice: &str) {
     }
 }
 
-fn appearance_scheme(choice: &str) -> adw::ColorScheme {
+pub(crate) fn appearance_scheme(choice: &str) -> adw::ColorScheme {
     match choice {
         "light" => adw::ColorScheme::ForceLight,
         "dark" => adw::ColorScheme::ForceDark,
@@ -943,166 +704,11 @@ fn appearance_scheme(choice: &str) -> adw::ColorScheme {
 }
 
 /// `content` under a plain header bar, for a dialog or a pushed subpage.
-fn with_header(content: &impl IsA<gtk::Widget>) -> adw::ToolbarView {
+pub(crate) fn with_header(content: &impl IsA<gtk::Widget>) -> adw::ToolbarView {
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&adw::HeaderBar::new());
     toolbar.set_content(Some(content));
     toolbar
-}
-
-/// Connection history grouped by day, newest first, with a time for each.
-/// `types` maps device ids to their type, for each row's device glyph.
-fn history_content(types: &std::collections::HashMap<String, String>) -> gtk::Widget {
-    use crate::device_links::connection_log;
-    let entries = connection_log::recent();
-    if entries.is_empty() {
-        return adw::StatusPage::builder()
-            .icon_name("document-open-recent-symbolic")
-            .title("No Activity Yet")
-            .description("Connections from your phones are listed here for 30 days.")
-            .vexpand(true)
-            .build()
-            .upcast();
-    }
-    let now = glib::DateTime::now_local().ok();
-    let page = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(24)
-        .margin_top(12)
-        .margin_bottom(24)
-        .margin_start(12)
-        .margin_end(12)
-        .build();
-    let mut group: Option<(String, adw::PreferencesGroup)> = None;
-    for entry in entries {
-        let Some(when) = glib::DateTime::from_unix_local(entry.ts as i64).ok() else {
-            continue;
-        };
-        let day = now
-            .as_ref()
-            .map(|now| day_label(now, &when))
-            .unwrap_or_default();
-        if group.as_ref().is_none_or(|(shown, _)| *shown != day) {
-            let next = adw::PreferencesGroup::builder().title(&day).build();
-            page.append(&next);
-            group = Some((day, next));
-        }
-        let device = if entry.device_name.is_empty() {
-            entry.device_id.clone()
-        } else {
-            entry.device_name.clone()
-        };
-        // Title: what happened. Subtitle: which device, and how it was connected.
-        let mut subtitle = device;
-        if let Some(path) = entry
-            .path
-            .as_deref()
-            .and_then(crate::device_links::device::connection_path_label)
-        {
-            subtitle = format!("{subtitle} · {path}");
-        }
-        let row = adw::ActionRow::builder()
-            .title(entry.event.label())
-            .subtitle(subtitle)
-            .use_markup(false)
-            .build();
-        // Colour is for failures only.
-        let failed = matches!(
-            entry.event,
-            crate::device_links::connection_log::ConnectionEvent::PasswordRejected
-        );
-        row.add_prefix(
-            &gtk::Image::builder()
-                .icon_name(event_icon(entry.event))
-                .css_classes([if failed { "error" } else { "dim-label" }])
-                .build(),
-        );
-        if let Some(kind) = types.get(&entry.device_id) {
-            row.add_suffix(
-                &gtk::Image::builder()
-                    .icon_name(crate::window::device_type_icon(kind))
-                    .tooltip_text(crate::window::device_type_label(kind))
-                    .css_classes(["dim-label"])
-                    .build(),
-            );
-        }
-        let time = now
-            .as_ref()
-            .map(|now| time_label(now, &when))
-            .unwrap_or_default();
-        row.add_suffix(
-            &gtk::Label::builder()
-                .label(time)
-                .tooltip_text(
-                    when.format("%e %B %Y, %H:%M")
-                        .map(|text| text.trim().to_string())
-                        .unwrap_or_default(),
-                )
-                .css_classes(["dim-label", "caption", "numeric"])
-                .build(),
-        );
-        if let Some((_, group)) = &group {
-            group.add(&row);
-        }
-    }
-    gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vexpand(true)
-        .child(&adw::Clamp::builder().child(&page).build())
-        .build()
-        .upcast()
-}
-
-/// The icon for a history event; a rejected password is the one in red.
-fn event_icon(event: crate::device_links::connection_log::ConnectionEvent) -> &'static str {
-    use crate::device_links::connection_log::ConnectionEvent::*;
-    match event {
-        Connected => "network-transmit-receive-symbolic",
-        Disconnected => "network-offline-symbolic",
-        ScreenViewStarted | ScreenControlStarted => "screen-shared-symbolic",
-        ScreenSessionEnded => "video-display-symbolic",
-        TerminalAttached | TerminalDetached => "utilities-terminal-symbolic",
-        PasswordRejected => "dialog-warning-symbolic",
-        SessionsEnded => "process-stop-symbolic",
-        Route => "network-workgroup-symbolic",
-    }
-}
-
-/// "Today", "Yesterday", a weekday within the week, else the date.
-fn day_label(now: &glib::DateTime, when: &glib::DateTime) -> String {
-    let midnight = |time: &glib::DateTime| {
-        let (year, month, day) = time.ymd();
-        glib::DateTime::from_local(year, month, day, 0, 0, 0.0).ok()
-    };
-    let days = match (midnight(now), midnight(when)) {
-        // Rounded, so a day with a daylight-saving change still counts as one.
-        (Some(today), Some(then)) => (today.difference(&then).as_seconds() + 43_200) / 86_400,
-        _ => i64::MAX,
-    };
-    let format = match days {
-        0 => return "Today".to_string(),
-        1 => return "Yesterday".to_string(),
-        2..=6 => "%A",
-        _ => "%e %B",
-    };
-    when.format(format)
-        .map(|text| text.trim().to_string())
-        .unwrap_or_default()
-}
-
-/// "Just now", "12 min ago" and "3 h ago" for the last few hours, else the
-/// clock time.
-fn time_label(now: &glib::DateTime, when: &glib::DateTime) -> String {
-    let seconds = now.difference(when).as_seconds();
-    match seconds {
-        ..60 => "Just now".to_string(),
-        60..3600 => format!("{} min ago", seconds / 60),
-        3600..14400 => format!("{} h ago", seconds / 3600),
-        _ => when
-            .format("%H:%M")
-            .map(|text| text.to_string())
-            .unwrap_or_default(),
-    }
 }
 
 /// The indicator's line for `device`, if it is using this computer.
@@ -1127,100 +733,119 @@ pub(crate) fn session_line(device: &crate::device_links::device::DeviceView) -> 
     Some(format!("{} — {what}", device.name))
 }
 
-fn password_subtitle(set: bool) -> &'static str {
-    if set {
-        "Phones ask for it before using the screen or a terminal"
-    } else {
-        "Not set"
-    }
-}
-
-/// Asks for a new session password twice; `done` gets it when both match.
-fn ask_for_password(parent: &impl IsA<gtk::Widget>, done: impl Fn(String) + 'static) {
-    let entry = adw::PasswordEntryRow::builder()
-        .title("New password")
-        .build();
-    let confirm = adw::PasswordEntryRow::builder()
-        .title("Confirm password")
-        .activates_default(true)
-        .build();
-    let list = gtk::ListBox::builder()
-        .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["boxed-list"])
-        .build();
-    list.append(&entry);
-    list.append(&confirm);
-
-    let dialog = adw::AlertDialog::new(
-        Some("Session Password"),
-        Some("Your phone asks for this once per connection before it can view or control the screen or open a terminal."),
-    );
-    dialog.add_responses(&[("cancel", "Cancel"), ("ok", "Set Password")]);
-    dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("ok"));
-    dialog.set_close_response("cancel");
-    dialog.set_response_enabled("ok", false);
-    dialog.set_extra_child(Some(&list));
-
-    // Weak: `check` is connected on the entries and enables the dialog.
-    let check = {
-        let dialog = dialog.downgrade();
-        let entry = entry.downgrade();
-        let confirm = confirm.downgrade();
-        move || {
-            let (Some(dialog), Some(entry), Some(confirm)) =
-                (dialog.upgrade(), entry.upgrade(), confirm.upgrade())
-            else {
-                return;
-            };
-            let password = entry.text();
-            let usable = !password.is_empty()
-                && password.len() <= crate::device_links::session_lock::MAX_PASSWORD_BYTES
-                && password == confirm.text();
-            dialog.set_response_enabled("ok", usable);
-        }
-    };
-    entry.connect_changed({
-        let check = check.clone();
-        move |_| check()
-    });
-    confirm.connect_changed(move |_| check());
-
-    dialog.choose(parent, gio::Cancellable::NONE, move |response| {
-        if response == "ok" {
-            done(entry.text().to_string());
-        }
-    });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn at(year: i32, month: i32, day: i32, hour: i32, minute: i32) -> glib::DateTime {
-        glib::DateTime::from_local(year, month, day, hour, minute, 0.0).unwrap()
+    /// "#rrggbb" or "rgba(r,g,b,a)" as linear-light-ready 0..1 channels and alpha.
+    fn parse(colour: &str) -> ([f64; 3], f64) {
+        if let Some(hex) = colour.strip_prefix('#') {
+            let channel =
+                |at: usize| f64::from(u8::from_str_radix(&hex[at..at + 2], 16).unwrap()) / 255.0;
+            return ([channel(0), channel(2), channel(4)], 1.0);
+        }
+        let inner = colour.trim_start_matches("rgba(").trim_end_matches(')');
+        let parts: Vec<f64> = inner
+            .split(',')
+            .map(|part| part.trim().parse().unwrap())
+            .collect();
+        (
+            [parts[0] / 255.0, parts[1] / 255.0, parts[2] / 255.0],
+            parts[3],
+        )
     }
 
-    #[test]
-    fn history_days_read_as_today_yesterday_then_dates() {
-        let now = at(2026, 10, 20, 9, 0);
-        assert_eq!(day_label(&now, &at(2026, 10, 20, 0, 5)), "Today");
-        assert_eq!(day_label(&now, &at(2026, 10, 19, 23, 50)), "Yesterday");
-        assert_eq!(day_label(&now, &at(2026, 10, 16, 12, 0)), "Friday");
-        assert_eq!(day_label(&now, &at(2026, 10, 1, 12, 0)), "1 October");
-        // Across a new year, yesterday is still yesterday.
-        assert_eq!(
-            day_label(&at(2027, 1, 1, 9, 0), &at(2026, 12, 31, 22, 0)),
-            "Yesterday"
-        );
+    fn colour(name: &str, dark: bool) -> &'static str {
+        let (_, light, dark_value) = PALETTE
+            .iter()
+            .chain(TOKENS)
+            .find(|(token, _, _)| *token == name)
+            .unwrap_or_else(|| panic!("no token {name}"));
+        if dark {
+            dark_value
+        } else {
+            light
+        }
     }
 
+    /// `name` painted over `under` (an opaque colour).
+    fn composite(name: &str, under: [f64; 3], dark: bool) -> [f64; 3] {
+        let (rgb, alpha) = parse(colour(name, dark));
+        [0, 1, 2].map(|i| rgb[i] * alpha + under[i] * (1.0 - alpha))
+    }
+
+    fn luminance(rgb: [f64; 3]) -> f64 {
+        let linear = |c: f64| {
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(rgb[0]) + 0.7152 * linear(rgb[1]) + 0.0722 * linear(rgb[2])
+    }
+
+    fn contrast(a: [f64; 3], b: [f64; 3]) -> f64 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    /// WCAG AA: every text colour reads at 4.5:1 or more on each surface it
+    /// is used on, light and dark.
     #[test]
-    fn recent_history_times_are_relative_and_older_ones_are_clock_times() {
-        let now = at(2026, 10, 20, 15, 0);
-        assert_eq!(time_label(&now, &at(2026, 10, 20, 14, 59)), "1 min ago");
-        assert_eq!(time_label(&now, &now), "Just now");
-        assert_eq!(time_label(&now, &at(2026, 10, 20, 12, 30)), "2 h ago");
-        assert_eq!(time_label(&now, &at(2026, 10, 20, 8, 5)), "08:05");
+    fn every_text_colour_meets_4_5_to_1_on_its_surfaces() {
+        let text = [
+            "window_fg_color",
+            "text_dim",
+            "text_faint",
+            "accent_color",
+            "coral_text",
+            "danger",
+        ];
+        let surfaces = ["window_bg_color", "sidebar_bg_color", "card_bg_color"];
+        for dark in [false, true] {
+            let solid = |name: &str| parse(colour(name, dark)).0;
+            let card = solid("card_bg_color");
+            let mut pairs: Vec<(String, [f64; 3], String, [f64; 3])> = Vec::new();
+            for fg in text {
+                for bg in surfaces {
+                    pairs.push((fg.into(), solid(fg), bg.into(), solid(bg)));
+                }
+            }
+            // Buttons and chips: a soft fill on a card.
+            let chip = composite("surface_2", card, dark);
+            for fg in ["window_fg_color", "text_dim", "accent_color", "coral_text"] {
+                pairs.push((fg.into(), solid(fg), "surface_2 on card".into(), chip));
+            }
+            for (fg, bg) in [
+                ("accent_fg_color", "accent_bg_color"),
+                ("destructive_fg_color", "destructive_bg_color"),
+                ("avatar_fg", "avatar_bg"),
+                ("window_fg_color", "coral_bg"),
+                ("text_dim", "coral_bg"),
+                ("coral_text", "coral_bg"),
+                ("terminal_fg", "terminal_bg"),
+                ("terminal_lines", "terminal_bg"),
+                ("terminal_dim", "terminal_bg"),
+                ("terminal_prompt", "terminal_bg"),
+                ("terminal_coral", "terminal_bg"),
+            ] {
+                pairs.push((fg.into(), solid(fg), bg.into(), solid(bg)));
+            }
+            pairs.push((
+                "danger".into(),
+                solid("danger"),
+                "danger_bg on card".into(),
+                composite("danger_bg", card, dark),
+            ));
+            for (fg, fg_rgb, bg, bg_rgb) in pairs {
+                let ratio = contrast(fg_rgb, bg_rgb);
+                assert!(
+                    ratio >= 4.5,
+                    "{fg} on {bg} ({}) is {ratio:.2}:1",
+                    if dark { "dark" } else { "light" }
+                );
+            }
+        }
     }
 }

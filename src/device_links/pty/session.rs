@@ -159,6 +159,8 @@ pub(crate) struct PtySession {
     /// sets the size: a phone's keyboard or layout changing kept squeezing the
     /// desk window to the phone's shape.
     desk_windows: AtomicU64,
+    /// When it was started, for the desk's terminal details.
+    started: std::time::SystemTime,
 }
 
 impl std::fmt::Debug for PtySession {
@@ -263,6 +265,7 @@ impl PtySession {
             exited_seen: OnceLock::new(),
             size: Mutex::new((rows, cols)),
             desk_windows: AtomicU64::new(0),
+            started: std::time::SystemTime::now(),
         };
         spawn_reader(reader, output, head, eof);
         Ok(session)
@@ -274,6 +277,10 @@ impl PtySession {
 
     pub(crate) fn title(&self) -> &str {
         &self.title
+    }
+
+    pub(crate) fn started(&self) -> std::time::SystemTime {
+        self.started
     }
 
     pub(crate) fn desk_window_opened(&self) {

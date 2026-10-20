@@ -73,6 +73,12 @@ pub struct AppSettings {
     pub start_at_login: Option<bool>,
     /// The user declined the offer to show DeskLink in the GNOME top bar.
     pub shell_extension_prompt_dismissed: bool,
+    /// Share the clipboard with paired phones, both ways.
+    pub clipboard_sync: bool,
+    /// Phones whose notifications are not shown here; every phone's are by
+    /// default.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub hidden_notifications: std::collections::BTreeSet<String>,
 }
 
 impl Default for AppSettings {
@@ -85,6 +91,8 @@ impl Default for AppSettings {
             use_turn: true,
             start_at_login: None,
             shell_extension_prompt_dismissed: false,
+            clipboard_sync: true,
+            hidden_notifications: Default::default(),
         }
     }
 }
@@ -98,6 +106,11 @@ pub const DEFAULT_RELAY_URL: &str = match option_env!("DESKLINK_RELAY_URL") {
 };
 
 impl AppSettings {
+    /// Whether `device_id`'s notifications are shown on this computer.
+    pub fn shows_notifications(&self, device_id: &str) -> bool {
+        !self.hidden_notifications.contains(device_id)
+    }
+
     pub fn relay_url(&self) -> &str {
         if self.relay_url.trim().is_empty() {
             DEFAULT_RELAY_URL
@@ -591,6 +604,22 @@ fn generate_certificate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Settings written before clipboard sync and notification mirroring had
+    /// switches load with both on, and the defaults stay out of the file.
+    #[test]
+    fn clipboard_and_notifications_default_on_for_older_settings() {
+        let old: AppSettings = serde_json::from_str(r#"{"stay_awake":true}"#).unwrap();
+        assert!(old.clipboard_sync);
+        assert!(old.shows_notifications("phone"));
+        let written = serde_json::to_string(&AppSettings::default()).unwrap();
+        assert!(!written.contains("hidden_notifications"), "{written}");
+
+        let mut hidden = AppSettings::default();
+        hidden.hidden_notifications.insert("phone".into());
+        assert!(!hidden.shows_notifications("phone"));
+        assert!(hidden.shows_notifications("tablet"));
+    }
 
     #[test]
     fn local_identity_is_stable_after_reload() {

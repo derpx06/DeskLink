@@ -82,7 +82,7 @@ fn log_path() -> Option<PathBuf> {
     )
 }
 
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -102,7 +102,7 @@ pub fn remember_name(device_id: &str, device_name: &str) {
     }
 }
 
-fn name_of(device_id: &str) -> String {
+pub(crate) fn name_of(device_id: &str) -> String {
     NAMES
         .lock()
         .ok()
@@ -129,6 +129,11 @@ pub fn record_with_path(device_id: &str, event: ConnectionEvent, path: Option<&s
 }
 
 fn append(path: &PathBuf, entry: &ConnectionEntry) {
+    append_line(path, entry);
+}
+
+/// Appends `entry` as one JSON line; shared with the received-files log.
+pub(crate) fn append_line(path: &PathBuf, entry: &impl Serialize) {
     let Ok(mut line) = serde_json::to_vec(entry) else {
         return;
     };
@@ -144,23 +149,79 @@ fn append(path: &PathBuf, entry: &ConnectionEntry) {
 
 /// Every entry from the last [`RETENTION`], newest first.
 pub fn recent() -> Vec<ConnectionEntry> {
+    static CACHE: LogCache<ConnectionEntry> = Mutex::new(None);
+    let now = now();
     log_path()
-        .map(|path| read(&path, now()))
+        .map(|path| cached(&CACHE, &path, now, || read(&path, now)))
         .unwrap_or_default()
 }
 
 fn read(path: &PathBuf, now: u64) -> Vec<ConnectionEntry> {
+    read_lines(path, now, |entry: &ConnectionEntry| entry.ts)
+}
+
+/// The entries of a JSON-lines log from the last [`RETENTION`], newest
+/// first; `ts` gives each one's Unix seconds. Unreadable lines are skipped.
+pub(crate) fn read_lines<T: serde::de::DeserializeOwned>(
+    path: &PathBuf,
+    now: u64,
+    ts: impl Fn(&T) -> u64,
+) -> Vec<T> {
     let _guard = FILE_LOCK.lock();
+    read_unlocked(path, now, ts)
+}
+
+/// [`read_lines`] for a caller already holding `FILE_LOCK`.
+fn read_unlocked<T: serde::de::DeserializeOwned>(
+    path: &PathBuf,
+    now: u64,
+    ts: impl Fn(&T) -> u64,
+) -> Vec<T> {
     let Ok(text) = fs::read_to_string(path) else {
         return Vec::new();
     };
     let oldest = now.saturating_sub(RETENTION.as_secs());
-    let mut entries: Vec<ConnectionEntry> = text
+    let mut entries: Vec<T> = text
         .lines()
         .filter_map(|line| serde_json::from_str(line).ok())
-        .filter(|entry: &ConnectionEntry| entry.ts >= oldest)
+        .filter(|entry| ts(entry) >= oldest)
         .collect();
     entries.reverse();
+    entries
+}
+
+/// When a log file last changed, as far as a reader can tell: its
+/// modification time and length, and the day (so entries still age out).
+type Stamp = (Option<SystemTime>, u64, u64);
+
+/// A log's entries as last read, and the file's [`Stamp`] then.
+pub(crate) type LogCache<T> = Mutex<Option<(Stamp, Vec<T>)>>;
+
+/// The log at `path`, re-read only when the file has changed since the
+/// cached copy: the window asks once a second, and a month of history is
+/// not worth parsing that often.
+pub(crate) fn cached<T: Clone>(
+    cache: &LogCache<T>,
+    path: &PathBuf,
+    now: u64,
+    read: impl FnOnce() -> Vec<T>,
+) -> Vec<T> {
+    let meta = fs::metadata(path).ok();
+    let stamp = (
+        meta.as_ref().and_then(|meta| meta.modified().ok()),
+        meta.map_or(0, |meta| meta.len()),
+        now / 86_400,
+    );
+    let Ok(mut cache) = cache.lock() else {
+        return read();
+    };
+    if let Some((cached, entries)) = cache.as_ref() {
+        if *cached == stamp {
+            return entries.clone();
+        }
+    }
+    let entries = read();
+    *cache = Some((stamp, entries.clone()));
     entries
 }
 
@@ -172,7 +233,19 @@ pub fn prune() {
 }
 
 fn prune_file(path: &PathBuf, now: u64) {
-    let mut kept = read(path, now);
+    prune_lines(path, now, |entry: &ConnectionEntry| entry.ts);
+}
+
+/// Rewrites a JSON-lines log without entries older than [`RETENTION`].
+/// The lock is held from the read to the rename, so an entry appended
+/// meanwhile cannot be lost.
+pub(crate) fn prune_lines<T: Serialize + serde::de::DeserializeOwned>(
+    path: &PathBuf,
+    now: u64,
+    ts: impl Fn(&T) -> u64,
+) {
+    let _guard = FILE_LOCK.lock();
+    let mut kept: Vec<T> = read_unlocked(path, now, ts);
     kept.reverse();
     let mut text = String::new();
     for entry in kept {
@@ -181,7 +254,6 @@ fn prune_file(path: &PathBuf, now: u64) {
             text.push('\n');
         }
     }
-    let _guard = FILE_LOCK.lock();
     let temporary = path.with_extension("jsonl.tmp");
     if fs::write(&temporary, text).is_ok() {
         let _ = fs::rename(&temporary, path);

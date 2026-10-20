@@ -1,4 +1,4 @@
-//! The device page's "Terminals" section: what each shared terminal at this
+//! The Terminals page: what each shared terminal at this
 //! computer is showing, read from the PTY session's own screen model, and
 //! starting a new shell, Claude Code or Codex session at the desk.
 //!
@@ -15,16 +15,43 @@ pub(crate) const PREVIEW_LINES: usize = 5;
 /// `DESK_OWNER`), so agent sessions count against the desk's own cap.
 const DESK_OWNER: &str = "desk";
 
-/// Every live session at this computer, in a stable order.
+/// Every live session at this computer, newest first.
 pub(crate) fn sessions() -> Vec<SessionInfo> {
-    registry()
-        .lock()
-        .map(|registry| registry.list())
-        .unwrap_or_default()
+    let Ok(registry) = registry().lock() else {
+        return Vec::new();
+    };
+    let mut sessions = registry.list();
+    let started = |info: &SessionInfo| registry.get(&info.id).map(|session| session.started());
+    sessions.sort_by_cached_key(|info| std::cmp::Reverse(started(info)));
+    sessions
+}
+
+/// When session `id` started, as local "HH:MM".
+pub(crate) fn started(id: &str) -> Option<String> {
+    let started = registry().lock().ok()?.get(id)?.started();
+    let seconds = started
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let local = gtk::glib::DateTime::from_unix_local(seconds as i64).ok()?;
+    Some(local.format("%H:%M").ok()?.to_string())
+}
+
+/// Ends session `id` and everything running in it.
+pub(crate) fn close(id: &str) {
+    if let Ok(mut registry) = registry().lock() {
+        registry.close(id);
+    }
 }
 
 /// The last lines `id` is showing, and whether it printed anything lately.
 pub(crate) fn preview(info: &SessionInfo) -> (Vec<String>, bool) {
+    screen_lines(info, PREVIEW_LINES)
+}
+
+/// The last `count` lines `id` is showing, and whether it printed anything
+/// lately.
+pub(crate) fn screen_lines(info: &SessionInfo, count: usize) -> (Vec<String>, bool) {
     let Some(session) = registry()
         .lock()
         .ok()
@@ -41,7 +68,7 @@ pub(crate) fn preview(info: &SessionInfo) -> (Vec<String>, bool) {
     };
     let mut parser = vt100::Parser::new(info.rows.max(1), info.cols.max(1), 0);
     parser.process(&data);
-    (last_lines(&parser.screen().contents(), PREVIEW_LINES), live)
+    (last_lines(&parser.screen().contents(), count), live)
 }
 
 /// The last `count` lines of a screen, without the blank rows below the
