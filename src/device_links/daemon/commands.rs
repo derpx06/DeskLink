@@ -51,6 +51,8 @@ pub enum DaemonCommand {
     },
     /// Allow TURN when no direct path exists.
     SetUseTurn(bool),
+    /// Start DeskLink in the background at login.
+    SetStartAtLogin(bool),
     /// The network changed: reconnect the relay now.
     NetworkChanged,
     /// Set, change (`Some`) or remove (`None`) the session password.
@@ -145,6 +147,7 @@ impl DaemonWorker {
             DaemonCommand::SetUseTurn(on) => {
                 self.update_settings(|settings| settings.use_turn = on)
             }
+            DaemonCommand::SetStartAtLogin(on) => self.set_start_at_login(on),
             DaemonCommand::NetworkChanged => crate::device_links::relay_link::client::reset(),
             DaemonCommand::SetStayAwake(on) => {
                 self.update_settings(|settings| settings.stay_awake = on)
@@ -321,6 +324,16 @@ impl DaemonWorker {
         }
         if locking {
             self.end_phone_sessions(None);
+        }
+    }
+
+    pub(super) fn set_start_at_login(&self, on: bool) {
+        match crate::autostart::set(on) {
+            Ok(()) => self.update_settings(|settings| settings.start_at_login = Some(on)),
+            Err(error) => push_error(
+                &self.errors,
+                format!("Could not change starting at login: {error}"),
+            ),
         }
     }
 

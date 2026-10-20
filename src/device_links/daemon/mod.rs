@@ -226,6 +226,10 @@ impl DaemonWorker {
         self.start_mdns_advertiser();
         self.start_clipboard_listener();
         self.start_status_reconciler();
+        // First run: start at login unless the user already decided.
+        if super::config::app_settings().start_at_login.is_none() {
+            self.set_start_at_login(true);
+        }
         crate::device_links::relay_link::client::start(
             crate::device_links::relay_link::client::Context {
                 config: Arc::clone(&self.config),

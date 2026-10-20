@@ -36,6 +36,7 @@ pub(crate) fn debug_logging() -> bool {
 }
 
 mod application;
+mod autostart;
 mod config;
 mod device_links;
 mod phone_files;

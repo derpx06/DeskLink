@@ -68,6 +68,9 @@ pub struct AppSettings {
     /// Allow media through a TURN server when no direct path exists. Off
     /// means direct paths only, user-configured TURN servers included.
     pub use_turn: bool,
+    /// Start in the background at login. `None` until decided: the first run
+    /// turns it on, as a connection app is useless after a reboot otherwise.
+    pub start_at_login: Option<bool>,
 }
 
 impl Default for AppSettings {
@@ -78,6 +81,7 @@ impl Default for AppSettings {
             relay_enabled: true,
             relay_url: String::new(),
             use_turn: true,
+            start_at_login: None,
         }
     }
 }
