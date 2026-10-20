@@ -1024,12 +1024,19 @@ mod tests {
             .collect()
     }
 
-    fn pump_until_output(bridge: &mut TerminalBridge, registry: &mut TerminalRegistry) -> Vec<u8> {
+    /// Pumps until the output contains `needle` (or ten seconds pass),
+    /// returning all output seen. Stopping at the first output instead raced
+    /// the terminal's echo of the typed line against the program's reply.
+    fn pump_until_text(
+        bridge: &mut TerminalBridge,
+        registry: &mut TerminalRegistry,
+        needle: &str,
+    ) -> Vec<u8> {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut seen = Vec::new();
         while Instant::now() < deadline {
             seen.extend(output_of(&bridge.pump(DEFAULT_PUMP_BUDGET, registry)));
-            if !seen.is_empty() {
+            if String::from_utf8_lossy(&seen).contains(needle) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1098,7 +1105,7 @@ mod tests {
         ));
 
         poke(&mut bridge, &mut registry, &id);
-        let seen = pump_until_output(&mut bridge, &mut registry);
+        let seen = pump_until_text(&mut bridge, &mut registry, "bridge-hello");
         assert!(
             String::from_utf8_lossy(&seen).contains("bridge-hello"),
             "output never streamed: {seen:?}"
@@ -1332,7 +1339,7 @@ mod tests {
             .handle_chunk(&input(&id, b"yes\n"), &mut registry)
             .unwrap();
 
-        let seen = pump_until_output(&mut first, &mut registry);
+        let seen = pump_until_text(&mut first, &mut registry, "got:");
         let text = String::from_utf8_lossy(&seen);
         assert!(
             text.contains("got:yes"),
@@ -1377,7 +1384,7 @@ mod tests {
             .handle_chunk(&input(&id, b"mine\n"), &mut registry)
             .unwrap();
         assert!(registry.is_writer(&id, "phone-2"));
-        let seen = pump_until_output(&mut second, &mut registry);
+        let seen = pump_until_text(&mut second, &mut registry, "got:");
         assert!(
             String::from_utf8_lossy(&seen).contains("got:mine"),
             "the second phone's input did not land: {seen:?}"
