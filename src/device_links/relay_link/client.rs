@@ -714,6 +714,14 @@ impl Client {
                 .ok()?,
         );
         let transport = Arc::new(RelayLinkTransport::new(fp, self.outbound_tx.clone()));
+        // The relay path never passes discovery or the LAN handshake, which
+        // is where a device's row and capabilities are normally refreshed.
+        crate::device_links::daemon::state::upsert_device(
+            &self.context.devices,
+            &info,
+            String::new(),
+            true,
+        );
         let link = SessionLink::new(
             Arc::clone(&transport) as Arc<dyn crate::device_links::core::LinkTransport>,
             peer.certificate_pem.clone(),

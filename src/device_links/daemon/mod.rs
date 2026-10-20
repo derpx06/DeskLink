@@ -131,6 +131,19 @@ impl DaemonWorker {
         command_rx: Receiver<DaemonCommand>,
     ) -> Result<Self, String> {
         let config = Arc::new(Mutex::new(Config::load()?));
+        if let Ok(config) = config.lock() {
+            state::seed_trusted_devices(
+                &devices,
+                config.trusted_devices().map(|device| {
+                    (
+                        device.id.clone(),
+                        device.name.clone(),
+                        device.device_type.clone(),
+                        device.protocol_version,
+                    )
+                }),
+            );
+        }
         let tcp_listener = network::bind_tcp_listener()?;
         let tcp_port = tcp_listener
             .local_addr()

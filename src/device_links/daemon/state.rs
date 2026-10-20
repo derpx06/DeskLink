@@ -16,7 +16,7 @@ use serde_json::Value;
 /// Unpaired devices shown at once; more than any real LAN needs.
 const MAX_UNTRUSTED_VIEWS: usize = 32;
 
-pub(super) fn upsert_device(
+pub(crate) fn upsert_device(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     info: &DeviceInfo,
     address: String,
@@ -56,6 +56,28 @@ pub(super) fn upsert_device(
                 device.trusted = paired;
             })
             .or_insert_with(|| DeviceView::from_info(info, address, paired));
+    }
+}
+
+/// Lists every paired device from the trust store, so a phone that is away is
+/// shown (as offline) from startup, and one that reconnects only through the
+/// relay — which never passes discovery or the LAN handshake — still has a row
+/// for its battery, notifications, history and session controls.
+pub(super) fn seed_trusted_devices(
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    trusted: impl Iterator<Item = (String, String, String, i64)>,
+) {
+    for (id, name, device_type, protocol_version) in trusted {
+        let info = DeviceInfo {
+            id,
+            name,
+            device_type,
+            protocol_version,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+        };
+        upsert_device(devices, &info, String::new(), true);
     }
 }
 
@@ -574,6 +596,29 @@ fn parse_sftp_directories(packet: &NetworkPacket) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A paired phone that is away must still have a row from startup — the
+    /// relay never passes discovery, so nothing else would create it.
+    #[test]
+    fn paired_devices_are_listed_from_the_trust_store_at_startup() {
+        let devices = Arc::new(Mutex::new(HashMap::new()));
+        seed_trusted_devices(
+            &devices,
+            [(
+                "phone0000000000000000000000000000".to_string(),
+                "Pixel".to_string(),
+                "phone".to_string(),
+                9,
+            )]
+            .into_iter(),
+        );
+        let devices = devices.lock().unwrap();
+        let view = &devices["phone0000000000000000000000000000"];
+        assert!(view.trusted);
+        assert_eq!(view.name, "Pixel");
+        assert_eq!(view.device_type, "phone");
+        assert!(!view.feature_transport_ready);
+    }
     use serde_json::json;
 
     fn test_devices() -> (Arc<Mutex<HashMap<String, DeviceView>>>, DeviceInfo) {
