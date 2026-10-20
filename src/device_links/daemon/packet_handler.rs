@@ -769,6 +769,12 @@ pub(crate) fn apply_lock_request(packet: &NetworkPacket) -> Option<bool> {
     // `desklink.lock.request` is accepted, and a status-shaped body arriving
     // under that type would otherwise still be obeyed.
     let requested_lock = packet.get_bool("setLocked")?;
+    // Unlocking is never taken from a packet: any paired phone could open this
+    // desktop. Unlock with the phone needs its own opt-in and checks.
+    if !requested_lock {
+        debug_log!("[Daemon] Ignoring a request to unlock this desktop");
+        return None;
+    }
 
     // One lock operation per settle window, process-wide.
     //
@@ -797,47 +803,30 @@ pub(crate) fn apply_lock_request(packet: &NetworkPacket) -> Option<bool> {
     }
     debug_log!("[Daemon] Received setLocked command: {requested_lock}");
 
-    let command = if requested_lock {
-        "lock-session"
-    } else {
-        "unlock-session"
-    };
-    let _ = std::process::Command::new("loginctl").arg(command).spawn();
-
-    if requested_lock {
-        for args in [
-            [
-                "--session",
-                "--dest=org.freedesktop.ScreenSaver",
-                "--type=method_call",
-                "/ScreenSaver",
-                "org.freedesktop.ScreenSaver.Lock",
-            ],
-            [
-                "--session",
-                "--dest=org.gnome.ScreenSaver",
-                "--type=method_call",
-                "/org/gnome/ScreenSaver",
-                "org.gnome.ScreenSaver.Lock",
-            ],
-        ] {
-            let _ = std::process::Command::new("dbus-send").args(args).spawn();
-        }
-        let _ = std::process::Command::new("xdg-screensaver")
-            .arg("lock")
-            .spawn();
-    } else {
-        let _ = std::process::Command::new("dbus-send")
-            .args([
-                "--session",
-                "--dest=org.gnome.ScreenSaver",
-                "--type=method_call",
-                "/org/gnome/ScreenSaver",
-                "org.gnome.ScreenSaver.SetActive",
-                "boolean:false",
-            ])
-            .spawn();
+    let _ = std::process::Command::new("loginctl")
+        .arg("lock-session")
+        .spawn();
+    for args in [
+        [
+            "--session",
+            "--dest=org.freedesktop.ScreenSaver",
+            "--type=method_call",
+            "/ScreenSaver",
+            "org.freedesktop.ScreenSaver.Lock",
+        ],
+        [
+            "--session",
+            "--dest=org.gnome.ScreenSaver",
+            "--type=method_call",
+            "/org/gnome/ScreenSaver",
+            "org.gnome.ScreenSaver.Lock",
+        ],
+    ] {
+        let _ = std::process::Command::new("dbus-send").args(args).spawn();
     }
+    let _ = std::process::Command::new("xdg-screensaver")
+        .arg("lock")
+        .spawn();
 
     Some(requested_lock)
 }
@@ -888,6 +877,15 @@ fn spawn_player(program: &str, args: &[&str]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_request_to_unlock_is_refused() {
+        let mut packet = crate::device_links::packet::NetworkPacket::new(
+            crate::device_links::packet::PACKET_TYPE_LOCK_REQUEST,
+        );
+        packet.set("setLocked", false);
+        assert_eq!(super::apply_lock_request(&packet), None);
+    }
+
     #[test]
     fn find_device_notifies_even_with_no_sound_player() {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
