@@ -189,7 +189,15 @@ fn watch(stop: &AtomicBool, on_change: &dyn Fn(bool)) -> Result<(), String> {
                 },
             );
 
+            // Focus that was already somewhere when control began sends no
+            // event: a terminal focused before the phone took over never
+            // raised the keyboard. Report where it is now, then follow events.
             let mut reported: Option<bool> = None;
+            if let Some((sender, path)) = current_focus(&a11y) {
+                let editable = element_takes_typing(&a11y, &sender, &path);
+                reported = Some(editable);
+                on_change(editable);
+            }
             while !stop.load(Ordering::Acquire) {
                 while context.pending() {
                     context.iteration(false);
@@ -211,13 +219,91 @@ fn watch(stop: &AtomicBool, on_change: &dyn Fn(bool)) -> Result<(), String> {
         .map_err(|error| error.to_string())?
 }
 
+/// `ATSPI_STATE_ACTIVE` and `ATSPI_STATE_FOCUSED`, in `GetState`'s first word.
+const STATE_ACTIVE: u32 = 1;
+const STATE_FOCUSED: u32 = 12;
+/// Upper bound on elements visited looking for the current focus, so a huge
+/// tree (a long document, a big list) cannot stall the watcher.
+const FOCUS_SEARCH_LIMIT: usize = 3_000;
+
+/// The focused element of the active window, found by walking the
+/// accessibility tree: AT-SPI has no call that returns it directly.
+fn current_focus(a11y: &gio::DBusConnection) -> Option<(String, String)> {
+    let root = (
+        REGISTRY.to_string(),
+        "/org/a11y/atspi/accessible/root".to_string(),
+    );
+    let windows: Vec<_> = children(a11y, &root.0, &root.1)
+        .into_iter()
+        .flat_map(|(app, path)| children(a11y, &app, &path))
+        .filter(|(sender, path)| state_word(a11y, sender, path) & (1 << STATE_ACTIVE) != 0)
+        .collect();
+    let mut pending = windows;
+    let mut visited = 0;
+    while let Some((sender, path)) = pending.pop() {
+        visited += 1;
+        if visited > FOCUS_SEARCH_LIMIT {
+            return None;
+        }
+        if state_word(a11y, &sender, &path) & (1 << STATE_FOCUSED) != 0 {
+            return Some((sender, path));
+        }
+        pending.extend(children(a11y, &sender, &path));
+    }
+    None
+}
+
+fn children(a11y: &gio::DBusConnection, sender: &str, path: &str) -> Vec<(String, String)> {
+    a11y.call_sync(
+        Some(sender),
+        path,
+        "org.a11y.atspi.Accessible",
+        "GetChildren",
+        None,
+        None,
+        gio::DBusCallFlags::NONE,
+        300,
+        None::<&gio::Cancellable>,
+    )
+    .ok()
+    .and_then(|reply| {
+        reply
+            .child_value(0)
+            .get::<Vec<(String, glib::variant::ObjectPath)>>()
+    })
+    .map(|list| {
+        list.into_iter()
+            .map(|(sender, path)| (sender, path.as_str().to_string()))
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn state_word(a11y: &gio::DBusConnection, sender: &str, path: &str) -> u32 {
+    a11y.call_sync(
+        Some(sender),
+        path,
+        "org.a11y.atspi.Accessible",
+        "GetState",
+        None,
+        None,
+        gio::DBusCallFlags::NONE,
+        300,
+        None::<&gio::Cancellable>,
+    )
+    .ok()
+    .and_then(|reply| reply.child_value(0).get::<Vec<u32>>())
+    .and_then(|words| words.first().copied())
+    .unwrap_or(0)
+}
+
 fn element_takes_typing(a11y: &gio::DBusConnection, sender: &str, path: &str) -> bool {
-    let call = |method: &str| {
-        a11y.call_sync(
+    let role = a11y
+        .call_sync(
             Some(sender),
             path,
             "org.a11y.atspi.Accessible",
-            method,
+            "GetRole",
             None,
             None,
             gio::DBusCallFlags::NONE,
@@ -225,15 +311,9 @@ fn element_takes_typing(a11y: &gio::DBusConnection, sender: &str, path: &str) ->
             None::<&gio::Cancellable>,
         )
         .ok()
-    };
-    let state = call("GetState")
-        .and_then(|reply| reply.child_value(0).get::<Vec<u32>>())
-        .and_then(|words| words.first().copied())
-        .unwrap_or(0);
-    let role = call("GetRole")
         .and_then(|reply| reply.child_value(0).get::<u32>())
         .unwrap_or(0);
-    takes_typing(role, state)
+    takes_typing(role, state_word(a11y, sender, path))
 }
 
 #[cfg(test)]
