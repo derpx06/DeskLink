@@ -72,6 +72,11 @@ mod imp {
     }
 
     impl ApplicationImpl for DesklinkApplication {
+        fn startup(&self) {
+            self.parent_startup();
+            install_brand_styles();
+        }
+
         // We connect to the activate callback to create a window when the application
         // has been launched. Additionally, this callback notifies us when the user
         // tries to launch a "second instance" of the application. When they try
@@ -152,6 +157,19 @@ impl DesklinkApplication {
             end_sessions_action,
             history_action,
         ]);
+    }
+
+    /// Each known device's type, by id.
+    fn device_types(&self) -> std::collections::HashMap<String, String> {
+        self.daemon_handle()
+            .map(|daemon| {
+                daemon
+                    .devices()
+                    .into_iter()
+                    .map(|device| (device.id, device.device_type))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub(crate) fn daemon_handle(&self) -> Option<DaemonHandle> {
@@ -295,11 +313,6 @@ impl DesklinkApplication {
             .title("Connect Away From Home")
             .active(settings.relay_enabled)
             .build();
-        enabled.add_prefix(&crate::window::badge(
-            "network-server-symbolic",
-            "blue",
-            true,
-        ));
         let url = adw::EntryRow::builder()
             .title("Server (leave empty for the DeskLink server)")
             .text(settings.relay_url.as_str())
@@ -312,17 +325,7 @@ impl DesklinkApplication {
             )
             .active(settings.use_turn)
             .build();
-        turn.add_prefix(&crate::window::badge(
-            "network-transmit-receive-symbolic",
-            "purple",
-            true,
-        ));
         let status = adw::ActionRow::builder().title("Status").build();
-        status.add_prefix(&crate::window::badge(
-            "network-workgroup-symbolic",
-            "slate",
-            true,
-        ));
         let status_label = gtk::Label::builder().css_classes(["dim-label"]).build();
         status.add_suffix(&status_label);
 
@@ -441,7 +444,7 @@ impl DesklinkApplication {
             .title("Connection History")
             .content_width(520)
             .content_height(620)
-            .child(&with_header(&history_content()))
+            .child(&with_header(&history_content(&self.device_types())))
             .build();
         dialog.present(Some(&parent));
     }
@@ -484,14 +487,9 @@ impl DesklinkApplication {
         let startup_group = adw::PreferencesGroup::builder().title("Background").build();
         let start_at_login = adw::SwitchRow::builder()
             .title("Start at Login")
-            .subtitle("Run in the background so your phone can reach this computer after a restart")
+            .subtitle("Keeps this computer reachable after a restart")
             .active(settings.start_at_login.unwrap_or(true))
             .build();
-        start_at_login.add_prefix(&crate::window::badge(
-            "system-reboot-symbolic",
-            "green",
-            true,
-        ));
         if let Some(daemon) = self.daemon_handle() {
             start_at_login.connect_active_notify(move |row| {
                 daemon.send(DaemonCommand::SetStartAtLogin(row.is_active()));
@@ -500,21 +498,12 @@ impl DesklinkApplication {
         startup_group.add(&start_at_login);
         general.add(&startup_group);
 
-        let network_group = adw::PreferencesGroup::builder()
-            .title("Connection")
-            .description("DeskLink Protocol v9 over the local network, on ports 1716-1764.")
-            .build();
+        let network_group = adw::PreferencesGroup::builder().title("Connection").build();
 
         let discovery_row = adw::ActionRow::builder()
             .title("Device Discovery")
-            .subtitle("Broadcast identity packets and listen for nearby DeskLink devices.")
+            .subtitle("Look for phones on this network")
             .build();
-
-        discovery_row.add_prefix(&crate::window::badge(
-            "network-wireless-symbolic",
-            "blue",
-            true,
-        ));
         let discover = gtk::Button::builder()
             .label("Discover Now")
             .valign(gtk::Align::Center)
@@ -533,33 +522,31 @@ impl DesklinkApplication {
         discovery_row.add_suffix(&discover);
         network_group.add(&discovery_row);
 
-        let clipboard_row = adw::ActionRow::builder()
-            .title("Clipboard Sync")
-            .subtitle("Enabled automatically for paired devices while DeskLink is running.")
-            .build();
-
-        clipboard_row.add_prefix(&crate::window::badge("edit-paste-symbolic", "blue", true));
+        let clipboard_row = adw::ActionRow::builder().title("Clipboard Sync").build();
         clipboard_row.add_suffix(
-            &gtk::Image::builder()
-                .icon_name("object-select-symbolic")
-                .tooltip_text("On")
-                .css_classes(["success"])
+            &gtk::Label::builder()
+                .label("Automatic")
+                .css_classes(["dim-label"])
                 .build(),
         );
         network_group.add(&clipboard_row);
 
         let downloads_row = adw::ActionRow::builder()
             .title("Received Files")
-            .subtitle("Incoming files are saved to your Downloads folder with automatic renaming.")
+            .subtitle("Saved in Downloads")
             .build();
-
-        downloads_row.add_prefix(&crate::window::badge(
-            "folder-download-symbolic",
-            "green",
-            true,
-        ));
         network_group.add(&downloads_row);
         general.add(&network_group);
+
+        let advanced = adw::PreferencesGroup::builder().title("Advanced").build();
+        advanced.add(
+            &adw::ActionRow::builder()
+                .title("Network Ports")
+                .subtitle("1716–1764, DeskLink protocol v9")
+                .css_classes(["property"])
+                .build(),
+        );
+        general.add(&advanced);
         dialog.add(&general);
 
         // ── Remote Access ───────────────────────────────────────────────────
@@ -569,18 +556,12 @@ impl DesklinkApplication {
             .build();
         let access_group = adw::PreferencesGroup::builder()
             .title("Remote Access")
-            .description("What your paired phones may do with this computer.")
             .build();
         let stay_awake = adw::SwitchRow::builder()
             .title("Stay Awake for Your Phone")
-            .subtitle("Don't sleep, even with the lid closed, while a phone is paired.")
+            .subtitle("Don't sleep while a phone is paired, even with the lid closed")
             .active(settings.stay_awake)
             .build();
-        stay_awake.add_prefix(&crate::window::badge(
-            "weather-clear-night-symbolic",
-            "purple",
-            true,
-        ));
         if let Some(daemon) = self.daemon_handle() {
             stay_awake.connect_active_notify(move |row| {
                 daemon.send(DaemonCommand::SetStayAwake(row.is_active()));
@@ -592,12 +573,6 @@ impl DesklinkApplication {
             .title("Session Password")
             .subtitle(password_subtitle(settings.session_password.is_some()))
             .build();
-
-        password_row.add_prefix(&crate::window::badge(
-            "dialog-password-symbolic",
-            "orange",
-            true,
-        ));
         let set_password = gtk::Button::builder()
             .label(if settings.session_password.is_some() {
                 "Change…"
@@ -661,23 +636,19 @@ impl DesklinkApplication {
         let history_group = adw::PreferencesGroup::new();
         let history_row = adw::ActionRow::builder()
             .title("Connection History")
-            .subtitle("Which phones connected, and what they did, for the last 30 days.")
+            .subtitle("The last 30 days")
             .activatable(true)
             .build();
-        history_row.add_prefix(&crate::window::badge(
-            "document-open-recent-symbolic",
-            "slate",
-            true,
-        ));
         history_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
         {
             let dialog = dialog.downgrade();
+            let types = self.device_types();
             history_row.connect_activated(move |_| {
                 if let Some(dialog) = dialog.upgrade() {
                     dialog.push_subpage(
                         &adw::NavigationPage::builder()
                             .title("Connection History")
-                            .child(&with_header(&history_content()))
+                            .child(&with_header(&history_content(&types)))
                             .build(),
                     );
                 }
@@ -690,7 +661,7 @@ impl DesklinkApplication {
         // ── Away From Home ──────────────────────────────────────────────────
         let away = adw::PreferencesPage::builder()
             .title("Away From Home")
-            .icon_name("network-server-symbolic")
+            .icon_name("desklink-globe-symbolic")
             .build();
         away.add(&self.away_from_home_group(&settings));
         dialog.add(&away);
@@ -755,6 +726,68 @@ impl DesklinkApplication {
     }
 }
 
+/// The brand accent for libadwaita 1.6+ (whose colours are CSS variables;
+/// `style.css` sets the 1.5 named colours), plus the dark and high-contrast
+/// adjustments, swapped as the style changes. Loaded in code because
+/// libadwaita 1.5 has no colour-scheme media queries and later versions
+/// deprecate `style-dark.css`.
+fn install_brand_styles() {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let provider = |css: &str| {
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(css);
+        provider
+    };
+    let modern = adw::minor_version() >= 6;
+    if modern {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider(
+                ":root { --accent-bg-color: #3b6cf6; --accent-fg-color: #ffffff; \
+                 --accent-color: #2c5bd6; }",
+            ),
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+    let dark = provider(if modern {
+        "@define-color accent_color #8eacff; :root { --accent-color: #8eacff; }"
+    } else {
+        "@define-color accent_color #8eacff;"
+    });
+    // The device circle gets a real edge when contrast matters more.
+    let contrast =
+        provider(".device-glyph { box-shadow: inset 0 0 0 1px alpha(currentColor, 0.6); }");
+    let shown = std::rc::Rc::new(std::cell::Cell::new((false, false)));
+    let update = move |manager: &adw::StyleManager| {
+        let wanted = (manager.is_dark(), manager.is_high_contrast());
+        let (was_dark, was_contrast) = shown.replace(wanted);
+        for (provider, now, before) in [
+            (&dark, wanted.0, was_dark),
+            (&contrast, wanted.1, was_contrast),
+        ] {
+            if now && !before {
+                gtk::style_context_add_provider_for_display(
+                    &display,
+                    provider,
+                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+                );
+            } else if before && !now {
+                gtk::style_context_remove_provider_for_display(&display, provider);
+            }
+        }
+    };
+    let manager = adw::StyleManager::default();
+    update(&manager);
+    let update = std::rc::Rc::new(update);
+    manager.connect_dark_notify({
+        let update = update.clone();
+        move |manager| update(manager)
+    });
+    manager.connect_high_contrast_notify(move |manager| update(manager));
+}
+
 /// `content` under a plain header bar, for a dialog or a pushed subpage.
 fn with_header(content: &impl IsA<gtk::Widget>) -> adw::ToolbarView {
     let toolbar = adw::ToolbarView::new();
@@ -764,14 +797,15 @@ fn with_header(content: &impl IsA<gtk::Widget>) -> adw::ToolbarView {
 }
 
 /// Connection history grouped by day, newest first, with a time for each.
-fn history_content() -> gtk::Widget {
+/// `types` maps device ids to their type, for each row's device glyph.
+fn history_content(types: &std::collections::HashMap<String, String>) -> gtk::Widget {
     use crate::device_links::connection_log;
     let entries = connection_log::recent();
     if entries.is_empty() {
         return adw::StatusPage::builder()
             .icon_name("document-open-recent-symbolic")
-            .title("No Connections Yet")
-            .description("Phones that connect to this computer are listed here for 30 days.")
+            .title("No Activity Yet")
+            .description("Connections from your phones are listed here for 30 days.")
             .vexpand(true)
             .build()
             .upcast();
@@ -804,21 +838,40 @@ fn history_content() -> gtk::Widget {
         } else {
             entry.device_name.clone()
         };
-        let mut event = entry.event.label().to_string();
+        // Title: what happened. Subtitle: which device, and how it was connected.
+        let mut subtitle = device;
         if let Some(path) = entry
             .path
             .as_deref()
             .and_then(crate::device_links::device::connection_path_label)
         {
-            event = format!("{event} · {path}");
+            subtitle = format!("{subtitle} · {path}");
         }
         let row = adw::ActionRow::builder()
-            .title(device)
-            .subtitle(event)
+            .title(entry.event.label())
+            .subtitle(subtitle)
             .use_markup(false)
             .build();
-        let (icon, hue) = event_icon(entry.event);
-        row.add_prefix(&crate::window::badge(icon, hue, true));
+        // Colour is for failures only.
+        let failed = matches!(
+            entry.event,
+            crate::device_links::connection_log::ConnectionEvent::PasswordRejected
+        );
+        row.add_prefix(
+            &gtk::Image::builder()
+                .icon_name(event_icon(entry.event))
+                .css_classes([if failed { "error" } else { "dim-label" }])
+                .build(),
+        );
+        if let Some(kind) = types.get(&entry.device_id) {
+            row.add_suffix(
+                &gtk::Image::builder()
+                    .icon_name(crate::window::device_type_icon(kind))
+                    .tooltip_text(crate::window::device_type_label(kind))
+                    .css_classes(["dim-label"])
+                    .build(),
+            );
+        }
         let time = now
             .as_ref()
             .map(|now| time_label(now, &when))
@@ -846,21 +899,18 @@ fn history_content() -> gtk::Widget {
         .upcast()
 }
 
-/// The badge icon and hue for a history event.
-fn event_icon(
-    event: crate::device_links::connection_log::ConnectionEvent,
-) -> (&'static str, &'static str) {
+/// The icon for a history event; a rejected password is the one in red.
+fn event_icon(event: crate::device_links::connection_log::ConnectionEvent) -> &'static str {
     use crate::device_links::connection_log::ConnectionEvent::*;
     match event {
-        Connected => ("network-transmit-receive-symbolic", "green"),
-        Disconnected => ("network-offline-symbolic", "slate"),
-        ScreenViewStarted | ScreenControlStarted => ("screen-shared-symbolic", "blue"),
-        ScreenSessionEnded => ("video-display-symbolic", "slate"),
-        TerminalAttached => ("utilities-terminal-symbolic", "purple"),
-        TerminalDetached => ("utilities-terminal-symbolic", "slate"),
-        PasswordRejected => ("dialog-warning-symbolic", "red"),
-        SessionsEnded => ("process-stop-symbolic", "orange"),
-        Route => ("network-workgroup-symbolic", "teal"),
+        Connected => "network-transmit-receive-symbolic",
+        Disconnected => "network-offline-symbolic",
+        ScreenViewStarted | ScreenControlStarted => "screen-shared-symbolic",
+        ScreenSessionEnded => "video-display-symbolic",
+        TerminalAttached | TerminalDetached => "utilities-terminal-symbolic",
+        PasswordRejected => "dialog-warning-symbolic",
+        SessionsEnded => "process-stop-symbolic",
+        Route => "network-workgroup-symbolic",
     }
 }
 
@@ -925,9 +975,9 @@ pub(crate) fn session_line(device: &crate::device_links::device::DeviceView) -> 
 
 fn password_subtitle(set: bool) -> &'static str {
     if set {
-        "On. Phones ask for it before viewing the screen or opening a terminal."
+        "Phones ask for it before using the screen or a terminal"
     } else {
-        "Off. Pairing alone lets your phones view the screen and open terminals."
+        "Not set"
     }
 }
 

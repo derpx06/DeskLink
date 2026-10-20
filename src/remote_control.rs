@@ -130,10 +130,16 @@ pub fn show_remote_control_dialog(
     header.set_title_widget(Some(&title));
     // How the phone is connected: local network, direct, or relayed.
     let route = gtk::Label::builder()
-        .css_classes(["chip", "caption"])
+        .css_classes(["caption", "dim-label"])
         .valign(gtk::Align::Center)
         .visible(false)
         .build();
+    // Which kind of device this is: phone, tablet, …
+    let kind = gtk::Image::builder()
+        .icon_name("desklink-device-phone-symbolic")
+        .valign(gtk::Align::Center)
+        .build();
+    header.pack_start(&kind);
     header.pack_start(&route);
     toolbar.add_top_bar(&header);
 
@@ -216,14 +222,38 @@ pub fn show_remote_control_dialog(
         &picture,
         &[gtk::accessible::Property::Label("Phone screen")],
     );
+    // A note over the picture once there is one ("Asking the phone for
+    // control…"); before that, a centred spinner with the same words.
     let status = gtk::Label::builder()
-        .css_classes(["osd", "status-pill"])
+        .css_classes(["osd", "toolbar"])
         .wrap(true)
         .justify(gtk::Justification::Center)
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Start)
+        .margin_top(12)
         .build();
+    let loading = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    loading.append(
+        &gtk::Spinner::builder()
+            .spinning(true)
+            .width_request(32)
+            .height_request(32)
+            .build(),
+    );
+    let loading_label = gtk::Label::builder()
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .max_width_chars(32)
+        .css_classes(["dim-label"])
+        .build();
+    loading.append(&loading_label);
     let overlay = gtk::Overlay::builder().child(&picture).build();
+    overlay.add_overlay(&loading);
     overlay.add_overlay(&status);
     toolbar.set_content(Some(&overlay));
 
@@ -237,10 +267,13 @@ pub fn show_remote_control_dialog(
         let daemon = daemon.clone();
         let picture = picture.downgrade();
         let status = status.downgrade();
+        let loading = loading.downgrade();
+        let loading_label = loading_label.downgrade();
         let last_start = Rc::clone(&last_start);
         let last_control_request = Rc::clone(&last_control_request);
         let title = title.downgrade();
         let route = route.downgrade();
+        let kind = kind.downgrade();
         let tick = Cell::new(0u32);
         glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
             let (Some(picture), Some(status)) = (picture.upgrade(), status.upgrade()) else {
@@ -251,6 +284,14 @@ pub fn show_remote_control_dialog(
                 if let Some(title) = title.upgrade() {
                     if let Some(view) = daemon.devices().into_iter().find(|d| d.id == *device) {
                         title.set_title(&view.name);
+                        if let Some(kind) = kind.upgrade() {
+                            kind.set_icon_name(Some(crate::window::device_type_icon(
+                                &view.device_type,
+                            )));
+                            kind.set_tooltip_text(Some(&crate::window::device_type_label(
+                                &view.device_type,
+                            )));
+                        }
                         if let Some(route) = route.upgrade() {
                             let text = view
                                 .connection_path
@@ -313,9 +354,22 @@ pub fn show_remote_control_dialog(
                 Some(SessionState::Controlling) => None,
                 Some(SessionState::PausedLocked) => Some("Phone is locked · unlock it to continue"),
                 Some(SessionState::Stopped) => Some("Screen stopped · reconnecting…"),
-                _ => Some("Connecting to the phone…"),
+                _ => None,
             };
-            status.set_visible(text.is_some());
+            let connecting = format!(
+                "Connecting to {}…",
+                title
+                    .upgrade()
+                    .map(|title| title.title().to_string())
+                    .filter(|name| !name.is_empty() && name != "Phone Screen")
+                    .unwrap_or_else(|| "the phone".to_string())
+            );
+            let waiting = paintable.is_none();
+            if let (Some(loading), Some(label)) = (loading.upgrade(), loading_label.upgrade()) {
+                loading.set_visible(waiting);
+                label.set_label(text.unwrap_or(&connecting));
+            }
+            status.set_visible(!waiting && text.is_some());
             if let Some(text) = text {
                 status.set_label(text);
             }

@@ -4,5 +4,13 @@
     <file preprocess="xml-stripblanks">window.ui</file>
     <file preprocess="xml-stripblanks">shortcuts-dialog.ui</file>
     <file>style.css</file>
+    <file alias="icons/scalable/devices/desklink-device-phone-symbolic.svg">icons/desklink-device-phone-symbolic.svg</file>
+    <file alias="icons/scalable/devices/desklink-device-tablet-symbolic.svg">icons/desklink-device-tablet-symbolic.svg</file>
+    <file alias="icons/scalable/devices/desklink-device-laptop-symbolic.svg">icons/desklink-device-laptop-symbolic.svg</file>
+    <file alias="icons/scalable/devices/desklink-device-desktop-symbolic.svg">icons/desklink-device-desktop-symbolic.svg</file>
+    <file alias="icons/scalable/devices/desklink-device-tv-symbolic.svg">icons/desklink-device-tv-symbolic.svg</file>
+    <file alias="icons/scalable/devices/desklink-device-generic-symbolic.svg">icons/desklink-device-generic-symbolic.svg</file>
+    <file alias="icons/scalable/actions/desklink-ring-symbolic.svg">icons/desklink-ring-symbolic.svg</file>
+    <file alias="icons/scalable/actions/desklink-globe-symbolic.svg">icons/desklink-globe-symbolic.svg</file>
   </gresource>
 </gresources>
