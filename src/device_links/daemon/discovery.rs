@@ -143,7 +143,7 @@ impl DaemonWorker {
                     .map_err(|error| error.to_string())
                     .and_then(|service| daemon.register(service).map_err(|error| error.to_string()))
                 {
-                    Ok(()) => eprintln!("[Daemon] Advertising {MDNS_SERVICE_TYPE} over mDNS"),
+                    Ok(()) => debug_log!("[Daemon] Advertising {MDNS_SERVICE_TYPE} over mDNS"),
                     Err(error) => eprintln!("[Daemon] mDNS advertising failed: {error}"),
                 }
                 while !shutdown.load(Ordering::Acquire) {
