@@ -66,6 +66,14 @@ pub struct ConnectionEntry {
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 fn log_path() -> Option<PathBuf> {
+    // Unit tests run the real daemon paths: they must never write the
+    // person's history.
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join(format!(
+            "desklink-test-connections-{}.jsonl",
+            std::process::id()
+        )));
+    }
     Some(
         dirs::state_dir()
             .or_else(dirs::data_local_dir)?
