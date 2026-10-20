@@ -105,6 +105,8 @@ struct Attachment {
     next: u64,
     /// The size this peer was last told the session has.
     told_size: (u16, u16),
+    /// Whether the phone was last told a desk window shows this session.
+    told_desk_window: bool,
     /// The size this peer's screen wants, from its last `Resize`.
     viewport: Option<(u16, u16)>,
 }
@@ -274,12 +276,14 @@ impl TerminalBridge {
                 registry.claim_writer(id, &self.wire.peer_device_id);
                 session.touch();
                 audit("attach", self.device(), Some(id));
+                let desk_window = session.desk_sets_size();
                 self.attached.insert(
                     id.to_string(),
                     Attachment {
                         session,
                         next,
                         told_size: (rows, cols),
+                        told_desk_window: desk_window,
                         viewport: None,
                     },
                 );
@@ -444,10 +448,14 @@ impl TerminalBridge {
 
         // A desk window (or this phone) changed the size: the list carries
         // it, and goes ahead of the output drawn for it.
+        // So does a desk window opening or closing: the phone answers the
+        // program's terminal queries only while no desk window does.
         let size = session.size();
-        if size != attachment.told_size {
+        let desk_window = session.desk_sets_size();
+        if size != attachment.told_size || desk_window != attachment.told_desk_window {
             if let Some(attachment) = self.attached.get_mut(id) {
                 attachment.told_size = size;
+                attachment.told_desk_window = desk_window;
             }
             let list = sessions_event(&self.wire, registry);
             remaining = remaining.saturating_sub(list.cost());
@@ -886,6 +894,7 @@ fn sessions_event(wire: &WebRtcWireBinding, registry: &mut TerminalRegistry) -> 
                 rows: info.rows,
                 cols: info.cols,
                 exit_status: info.exit_status,
+                desk_window: info.desk_window,
             })
             .collect(),
     );
@@ -1740,6 +1749,7 @@ mod tests {
                     rows: 1000,
                     cols: 1000,
                     exit_status: Some(u32::MAX),
+                    desk_window: true,
                 })
                 .collect(),
         );

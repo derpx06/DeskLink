@@ -97,6 +97,12 @@ pub struct TerminalSessionInfo {
     pub cols: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_status: Option<u32>,
+    /// A terminal window at the desk is showing this session too. That window
+    /// answers the program's terminal queries (cursor position, colours,
+    /// keyboard modes), so the phone must not: two answers reached the program
+    /// as typed keys. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub desk_window: bool,
 }
 
 /// A `desklink.terminal.control.v1` message.
@@ -381,6 +387,27 @@ fn validate_command(command: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desk_window_is_sent_only_when_true() {
+        let mut info = TerminalSessionInfo {
+            terminal_id: "t1".into(),
+            title: "Shell".into(),
+            rows: 24,
+            cols: 80,
+            exit_status: None,
+            desk_window: false,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("deskWindow"), "{json}");
+        info.desk_window = true;
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"deskWindow\":true"), "{json}");
+        let older: TerminalSessionInfo =
+            serde_json::from_str(r#"{"terminalId":"t1","title":"Shell","rows":24,"cols":80}"#)
+                .unwrap();
+        assert!(!older.desk_window);
+    }
 
     fn wire() -> WebRtcWireBinding {
         WebRtcWireBinding {

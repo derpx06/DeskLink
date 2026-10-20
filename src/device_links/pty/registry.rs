@@ -43,6 +43,8 @@ pub(crate) struct SessionInfo {
     /// `Some` once the program has exited; the row stays until it is reaped so
     /// the client can show *why* a session ended rather than having it vanish.
     pub(crate) exit_status: Option<u32>,
+    /// A terminal window at the desk is showing this session.
+    pub(crate) desk_window: bool,
 }
 
 #[derive(Default)]
@@ -232,6 +234,7 @@ fn describe(session: &PtySession) -> SessionInfo {
         rows,
         cols,
         exit_status: session.exit_status(),
+        desk_window: session.desk_sets_size(),
     }
 }
 
