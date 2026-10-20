@@ -1,2 +1,5 @@
 /target/
 /builddir/
+/flatpak/cargo-sources.json
+/build-flatpak/
+/.flatpak-builder/

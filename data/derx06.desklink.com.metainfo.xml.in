@@ -5,28 +5,71 @@
   <project_license>GPL-3.0-or-later</project_license>
 
   <name>DeskLink</name>
-  <summary>Connect GNOME with your phone</summary>
+  <summary>Use your phone and computer together</summary>
   <description>
     <p>
-      DeskLink is a GNOME client for the KDE Connect LAN protocol. It can pair
-      with compatible devices, share files and text, synchronize the clipboard,
-      send remote input, mirror phone notifications, show battery and media
-      status, request lock state changes, ring a paired phone, and send media,
-      volume, file browsing, and remote command requests.
+      DeskLink connects your Android phone to your GNOME desktop. Pair once by
+      scanning a code, and the two work as one: see your phone on your screen,
+      control your computer from your phone, and move text, files and
+      notifications between them.
     </p>
+    <ul>
+      <li>See your phone’s screen on the desktop, with low latency</li>
+      <li>Control your computer’s mouse and keyboard from the phone, with your approval</li>
+      <li>Shared terminals, including one tap to start Claude Code or Codex on your computer</li>
+      <li>Phone notifications on the desktop, with replies</li>
+      <li>Clipboard sync in both directions</li>
+      <li>File transfer, and browsing the phone’s files from the desktop</li>
+      <li>A presentation remote for your slides</li>
+      <li>Works away from home through the DeskLink relay, with end-to-end encrypted signaling</li>
+    </ul>
     <p>
-      This is a focused GNOME client and does not implement every upstream KDE
-      Connect desktop plugin.
+      There is no account. Devices pair directly with each other, and features
+      travel over encrypted, authenticated WebRTC connections. DeskLink needs
+      the DeskLink Android app on the phone.
     </p>
   </description>
 
-  <developer id="com.desklink">
-    <name>manas</name>
+  <developer id="derx06.desklink">
+    <name translate="no">manas</name>
   </developer>
+
+  <url type="homepage">https://github.com/derpx06/DeskLink</url>
+  <url type="bugtracker">https://github.com/derpx06/DeskLink/issues</url>
+  <url type="vcs-browser">https://github.com/derpx06/DeskLink</url>
 
   <translation type="gettext">desklink</translation>
   <launchable type="desktop-id">derx06.desklink.com.desktop</launchable>
+  <provides>
+    <binary>desklink</binary>
+  </provides>
+
   <content_rating type="oars-1.1" />
+
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <supports>
+    <internet>always</internet>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </supports>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Paired phones and what they can do</caption>
+      <image>https://raw.githubusercontent.com/derpx06/DeskLink/master/data/screenshots/devices.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>The phone’s screen on the desktop</caption>
+      <image>https://raw.githubusercontent.com/derpx06/DeskLink/master/data/screenshots/screen.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Browsing the phone’s files</caption>
+      <image>https://raw.githubusercontent.com/derpx06/DeskLink/master/data/screenshots/files.png</image>
+    </screenshot>
+  </screenshots>
 
   <branding>
     <color type="primary" scheme_preference="light">#3584e4</color>
@@ -34,13 +77,16 @@
   </branding>
 
   <releases>
-    <release version="0.1.0" date="2026-07-02">
+    <release version="1.0.0" date="2026-10-19">
       <description translate="no">
-        <p>GNOME client for core KDE Connect LAN protocol features.</p>
+        <p>First public release.</p>
         <ul>
-          <li>Pair and manage nearby devices.</li>
-          <li>Share files, text, URLs, clipboard content, notifications, and remote input.</li>
-          <li>Handle battery, media, volume, remote command, and SFTP browsing packets.</li>
+          <li>Phone screen on the desktop, and remote control of the computer from the phone</li>
+          <li>Shared terminals, with one tap to start Claude Code or Codex</li>
+          <li>Notifications with replies, clipboard sync, file transfer and a phone file browser</li>
+          <li>Presentation remote</li>
+          <li>Away from home through the DeskLink relay, with end-to-end encrypted signaling</li>
+          <li>Optional session password, stay-awake while paired, and connection history</li>
         </ul>
       </description>
     </release>

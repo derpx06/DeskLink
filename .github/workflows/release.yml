@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+# The relay the app uses away from home unless the user sets their own
+# (relay/deploy/DEPLOY.md). Set it under Settings > Secrets and variables >
+# Actions > Variables; a release without it would ship a placeholder address.
+env:
+  DESKLINK_RELAY_URL: ${{ vars.DESKLINK_RELAY_URL }}
+
+jobs:
+  binaries:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel rust meson gtk4 libadwaita openssl libnice \
+            gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
+            gst-plugin-pipewire gst-plugin-gtk4 gst-libav \
+            desktop-file-utils appstream
+
+      - uses: actions/checkout@v4
+
+      - name: Check the tag and the relay address
+        run: |
+          grep -q "version: '${GITHUB_REF_NAME#v}'" meson.build
+          test -n "$DESKLINK_RELAY_URL"
+
+      - name: Build the app tarball
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          stage="$PWD/stage/desklink-$version-x86_64"
+          meson setup build --prefix=/usr
+          meson compile -C build
+          meson test -C build --print-errorlogs
+          meson install -C build --destdir "$stage"
+          install -Dm644 COPYING "$stage/usr/share/licenses/desklink/COPYING"
+          tar -C stage -czf "desklink-$version-x86_64.tar.gz" "desklink-$version-x86_64"
+
+      - name: Build the relay binary
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          cargo build --release --locked --manifest-path relay/Cargo.toml
+          install -m755 relay/target/release/desklink-relay "desklink-relay-$version-x86_64"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: |
+            desklink-*-x86_64.tar.gz
+            desklink-relay-*-x86_64
+
+  flatpak:
+    runs-on: ubuntu-latest
+    container:
+      # Must carry the manifest's runtime (GNOME 51).
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-51
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate cargo sources and a manifest for this checkout
+        run: |
+          dnf install -y git python3-aiohttp python3-tomlkit
+          git clone --depth 1 https://github.com/flatpak/flatpak-builder-tools /tmp/fbt
+          python3 /tmp/fbt/cargo/flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
+          python3 - <<'PY'
+          import json, os
+          m = json.load(open("derx06.desklink.com.json"))
+          m["build-options"]["env"]["DESKLINK_RELAY_URL"] = os.environ["DESKLINK_RELAY_URL"]
+          m["modules"][0]["sources"][0] = {"type": "dir", "path": ".", "skip": [".flatpak-builder", "build-flatpak", "repo", "target"]}
+          json.dump(m, open("ci-manifest.json", "w"), indent=2)
+          PY
+
+      - name: Build the bundle
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak-builder --user --install-deps-from=flathub --repo=repo --force-clean build-flatpak ci-manifest.json
+          flatpak build-bundle repo "desklink-$version-x86_64.flatpak" derx06.desklink.com
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flatpak
+          path: desklink-*-x86_64.flatpak
+
+  publish:
+    needs: [binaries, flatpak]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Checksums
+        run: sha256sum desklink-* > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            desklink-*
+            SHA256SUMS

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    # Arch has GStreamer 1.28 (the `v1_28` feature), GTK 4.16+ and libadwaita 1.6+;
+    # no hosted Ubuntu image does yet.
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel rust meson gtk4 libadwaita openssl libnice \
+            gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
+            gst-plugin-pipewire gst-plugin-gtk4 gst-libav \
+            desktop-file-utils appstream
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            relay/target
+          key: cargo-${{ hashFiles('Cargo.lock', 'relay/Cargo.lock') }}
+          restore-keys: cargo-
+
+      - name: Desktop app
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+
+      - name: Relay
+        working-directory: relay
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets --locked -- -D warnings
+          cargo test --locked
+
+      - name: Validate desktop and AppStream metadata
+        run: |
+          cp data/derx06.desklink.com.desktop.in /tmp/derx06.desklink.com.desktop
+          desktop-file-validate /tmp/derx06.desklink.com.desktop
+          appstreamcli validate --no-net --explain data/derx06.desklink.com.metainfo.xml.in

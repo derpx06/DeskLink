@@ -1,7 +1,7 @@
 {
     "id" : "derx06.desklink.com",
     "runtime" : "org.gnome.Platform",
-    "runtime-version" : "48",
+    "runtime-version" : "51",
     "sdk" : "org.gnome.Sdk",
     "sdk-extensions" : [
         "org.freedesktop.Sdk.Extension.rust-stable"
@@ -10,18 +10,22 @@
     "finish-args" : [
         "--share=network",
         "--share=ipc",
+        "--socket=wayland",
         "--socket=fallback-x11",
         "--device=dri",
-        "--socket=wayland"
+        "--talk-name=org.freedesktop.Flatpak",
+        "--system-talk-name=org.freedesktop.login1",
+        "--talk-name=org.freedesktop.ScreenSaver",
+        "--talk-name=org.gnome.ScreenSaver",
+        "--talk-name=org.kde.StatusNotifierWatcher",
+        "--filesystem=xdg-download"
     ],
     "build-options" : {
         "append-path" : "/usr/lib/sdk/rust-stable/bin",
-        "build-args" : [
-            "--share=network"
-        ],
         "env" : {
-            "RUST_BACKTRACE" : "1",
-            "RUST_LOG" : "desklink=debug"
+            "CARGO_HOME" : "/run/build/desklink/cargo",
+            "CARGO_NET_OFFLINE" : "true",
+            "DESKLINK_RELAY_URL" : "wss://relay.example.com/v1"
         }
     },
     "cleanup" : [
@@ -43,8 +47,10 @@
             "sources" : [
                 {
                     "type" : "git",
-                    "url" : "file:///home/manas/Documents/phone_connect"
-                }
+                    "url" : "https://github.com/derpx06/DeskLink.git",
+                    "tag" : "v1.0.0"
+                },
+                "flatpak/cargo-sources.json"
             ]
         }
     ]

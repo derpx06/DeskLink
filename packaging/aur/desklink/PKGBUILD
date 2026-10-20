@@ -1,0 +1,60 @@
+# Maintainer: derpx06 <manaskhairnar1511@gmail.com>
+
+pkgname=desklink
+# The relay the app uses away from home unless the user sets their own.
+# Set it to the deployed server (relay/deploy/DEPLOY.md) before publishing.
+_relay_url='wss://relay.example.com/v1'
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Use your Android phone and GNOME desktop together'
+arch=('x86_64' 'aarch64')
+url='https://github.com/derpx06/DeskLink'
+license=('GPL-3.0-or-later')
+depends=(
+  'gcc-libs'
+  'glib2'
+  'glibc'
+  'gst-libav'            # avdec_h264 for the phone's H.264 screen stream
+  'gst-plugin-gtk4'      # gtk4paintablesink
+  'gst-plugin-pipewire'  # desktop screen capture
+  'gst-plugins-bad'      # webrtcbin, DTLS/SRTP/SCTP
+  'gst-plugins-base'
+  'gst-plugins-good'     # VP8, RTP
+  'gstreamer'
+  'gtk4'
+  'hicolor-icon-theme'
+  'libadwaita'
+  'libnice'              # ICE for webrtcbin
+  'openssl'
+)
+makedepends=('cargo' 'meson')
+checkdepends=('appstream' 'desktop-file-utils')
+optdepends=(
+  'xdg-desktop-portal-gnome: screen sharing and remote control on GNOME'
+  'gst-plugin-va: hardware video decoding'
+)
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Replace with the real checksum (updpkgsums) once the v$pkgver tag is published.
+sha256sums=('SKIP')
+
+prepare() {
+  cd "DeskLink-$pkgver"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_NET_OFFLINE=true
+  export DESKLINK_RELAY_URL="$_relay_url"
+  arch-meson "DeskLink-$pkgver" build
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --print-errorlogs
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}

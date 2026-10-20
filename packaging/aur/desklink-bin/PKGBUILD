@@ -1,0 +1,40 @@
+# Maintainer: derpx06 <manaskhairnar1511@gmail.com>
+
+pkgname=desklink-bin
+_pkgname=desklink
+pkgver=1.0.0
+pkgrel=1
+pkgdesc='Use your Android phone and GNOME desktop together (prebuilt)'
+arch=('x86_64')
+url='https://github.com/derpx06/DeskLink'
+license=('GPL-3.0-or-later')
+depends=(
+  'gcc-libs'
+  'glib2'
+  'glibc'
+  'gst-libav'
+  'gst-plugin-gtk4'
+  'gst-plugin-pipewire'
+  'gst-plugins-bad'
+  'gst-plugins-base'
+  'gst-plugins-good'
+  'gstreamer'
+  'gtk4'
+  'hicolor-icon-theme'
+  'libadwaita'
+  'libnice'
+  'openssl'
+)
+optdepends=(
+  'xdg-desktop-portal-gnome: screen sharing and remote control on GNOME'
+  'gst-plugin-va: hardware video decoding'
+)
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+source_x86_64=("$url/releases/download/v$pkgver/$_pkgname-$pkgver-x86_64.tar.gz")
+# Replace with the real checksum (updpkgsums) once the v$pkgver release is published.
+sha256sums_x86_64=('SKIP')
+
+package() {
+  cp -a "$_pkgname-$pkgver-$CARCH/usr" "$pkgdir/"
+}
