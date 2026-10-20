@@ -56,15 +56,33 @@ pub(crate) fn installed() -> Vec<String> {
             }
         }
     }
-    let found: Vec<String> = KNOWN_LAUNCHERS
-        .iter()
-        .filter(|name| resolve(OsStr::new(name)).is_some())
-        .map(|name| name.to_string())
-        .collect();
+    let found: Vec<String> = if super::host::in_flatpak() {
+        installed_on_host()
+    } else {
+        KNOWN_LAUNCHERS
+            .iter()
+            .filter(|name| resolve(OsStr::new(name)).is_some())
+            .map(|name| name.to_string())
+            .collect()
+    };
     if let Ok(mut cache) = CACHE.lock() {
         *cache = Some((Instant::now(), found.clone()));
     }
     found
+}
+
+/// Inside a Flatpak the host's files are not visible, so the host's login
+/// shell is asked instead. Only exact known names are believed: a profile
+/// that prints a banner cannot invent a launcher.
+fn installed_on_host() -> Vec<String> {
+    let argv = super::host::host_probe(super::host::PROBE_INSTALLED, KNOWN_LAUNCHERS);
+    let output = run_with_timeout(&argv).unwrap_or_default();
+    let text = String::from_utf8_lossy(&output);
+    KNOWN_LAUNCHERS
+        .iter()
+        .filter(|name| text.lines().any(|line| line.trim() == **name))
+        .map(|name| name.to_string())
+        .collect()
 }
 
 fn search(program: &OsStr, path: &OsStr) -> Option<PathBuf> {
@@ -86,8 +104,16 @@ fn is_executable(path: &Path) -> bool {
 fn probe_login_path() -> Option<OsString> {
     let shell = std::env::var_os("SHELL").filter(|shell| !shell.is_empty())?;
     let script = format!("printf '\\n{MARKER}%s{MARKER}\\n' \"$PATH\"");
-    let mut child = Command::new(shell)
-        .args(["-l", "-i", "-c", &script])
+    let argv: Vec<OsString> = [shell, "-l".into(), "-i".into(), "-c".into(), script.into()].to_vec();
+    parse_probe(&run_with_timeout(&argv)?)
+}
+
+/// Runs `argv` with no input and returns its standard output, or `None` if
+/// it could not start or outlived [`PROBE_TIMEOUT`] (it is then killed).
+fn run_with_timeout(argv: &[OsString]) -> Option<Vec<u8>> {
+    let (program, args) = argv.split_first()?;
+    let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -111,7 +137,7 @@ fn probe_login_path() -> Option<OsString> {
             }
         }
     }
-    parse_probe(&reader.join().ok()?)
+    reader.join().ok()
 }
 
 fn parse_probe(output: &[u8]) -> Option<OsString> {

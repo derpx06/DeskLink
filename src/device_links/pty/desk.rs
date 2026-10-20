@@ -34,11 +34,9 @@ const EXIT: u8 = 3;
 const MAX_FRAME: usize = 256 * 1024;
 
 fn socket_path() -> PathBuf {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("desklink-{}", unsafe { libc::getuid() }))
-        });
+    let base = super::host::runtime_dir().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("desklink-{}", unsafe { libc::getuid() }))
+    });
     base.join("desklink").join("terminal.sock")
 }
 
@@ -258,7 +256,9 @@ pub(crate) fn open_on_desktop(id: &str) {
     };
     let exe = exe.to_string_lossy().into_owned();
     let title = "DeskLink terminal";
-    let client = [exe.as_str(), "--attach-terminal", id];
+    let client = super::host::attach_client(&exe, id);
+    let client: Vec<&str> = client.iter().map(String::as_str).collect();
+    let in_flatpak = super::host::in_flatpak();
     let attempts: [(&str, Vec<&str>); 7] = [
         ("kgx", [&["--title", title, "--"][..], &client].concat()),
         ("ptyxis", [&["--new-window", "--"][..], &client].concat()),
@@ -272,13 +272,32 @@ pub(crate) fn open_on_desktop(id: &str) {
         ("xterm", [&["-e"][..], &client].concat()),
     ];
     for (program, args) in attempts {
-        if let Ok(mut child) = std::process::Command::new(program)
-            .args(args)
+        // Inside a Flatpak the terminal app is the host's. `flatpak-spawn`
+        // itself always starts, so a missing host program shows up as a quick
+        // failing exit instead of a spawn error.
+        let mut command = if in_flatpak {
+            let mut command = std::process::Command::new("flatpak-spawn");
+            command.args(["--host", program]).args(&args);
+            command
+        } else {
+            let mut command = std::process::Command::new(program);
+            command.args(&args);
+            command
+        };
+        if let Ok(mut child) = command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
         {
+            if in_flatpak {
+                std::thread::sleep(Duration::from_millis(800));
+                if let Ok(Some(status)) = child.try_wait() {
+                    if !status.success() {
+                        continue;
+                    }
+                }
+            }
             let _ = std::thread::Builder::new()
                 .name("desklink-terminal-window".into())
                 .spawn(move || {

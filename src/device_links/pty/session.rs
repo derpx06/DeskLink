@@ -197,9 +197,24 @@ impl PtySession {
         let mut command = restricted(command.unwrap_or_else(CommandBuilder::new_default_prog));
 
         let title = describe(&command);
-        // A bare name ("claude") runs from the login shell's PATH, and the
-        // program gets that PATH too, so it can find its own helpers.
-        if !command.is_default_prog() {
+        // In a Flatpak, the shell and any program run on the host instead.
+        if super::host::in_flatpak() {
+            let argv = if command.is_default_prog() {
+                super::host::host_login_shell()
+            } else {
+                super::host::host_command(command.get_argv())
+            };
+            let env: Vec<(OsString, OsString)> = command
+                .iter_full_env_as_str()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect();
+            command = CommandBuilder::from_argv(argv);
+            for (key, value) in env {
+                command.env(key, value);
+            }
+        } else if !command.is_default_prog() {
+            // A bare name ("claude") runs from the login shell's PATH, and the
+            // program gets that PATH too, so it can find its own helpers.
             let program = command.get_argv().first().cloned().unwrap_or_default();
             if let (Some(resolved), Some(path)) =
                 (launchers::resolve(&program), launchers::login_path())

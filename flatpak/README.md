@@ -71,11 +71,15 @@ of the tag, temporarily replace the git source with
 
 ## Known sandbox caveats
 
-- **Shared terminals** spawn the user's login shell. Inside the sandbox that
-  is the runtime's shell, not the host's, until the app runs it through
-  `flatpak-spawn --host` when `/.flatpak-info` exists. The desk terminal
-  window (`desklink --attach-terminal`) and the `$XDG_RUNTIME_DIR/desklink/terminal.sock`
-  socket need the same treatment. This is an app TODO, not a packaging one.
+- **Shared terminals run on the host.** Inside the sandbox (`/.flatpak-info`
+  exists) the app starts shells and agent CLIs with `flatpak-spawn --host
+  --watch-bus setsid --ctty --wait`, so the phone gets the user's real login
+  shell with job control, and asks the host's login shell which agents are
+  installed. The desk terminal window is the host's terminal app running
+  `flatpak run --command=desklink derx06.desklink.com --attach-terminal <id>`;
+  the session socket lives in `$XDG_RUNTIME_DIR/app/derx06.desklink.com/`, which
+  every instance of the app shares (`src/device_links/pty/host.rs`). This is why
+  the manifest needs `--talk-name=org.freedesktop.Flatpak`.
 - **Separate state.** The sandboxed app keeps its configuration, pairing
   records and certificate under `~/.var/app/derx06.desklink.com/config/desklink/`,
   not `~/.config/desklink/`. Phones paired with a non-Flatpak install have to
