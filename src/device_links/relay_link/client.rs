@@ -223,7 +223,15 @@ impl Client {
             set_status(RelayStatus::Connecting);
             match self.session() {
                 Ok(()) => {}
-                Err(Stop::Replaced) => {}
+                // Another DeskLink with this identity connected: reconnecting
+                // would knock it off in turn, forever. Wait for a reset.
+                Err(Stop::Replaced) => {
+                    self.stopped = true;
+                    set_status(RelayStatus::Unavailable(
+                        "another DeskLink on this computer is connected".into(),
+                    ));
+                    continue;
+                }
                 Err(Stop::UpdateRequired) => {
                     self.stopped = true;
                     set_status(RelayStatus::UpdateRequired);
