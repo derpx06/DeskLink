@@ -51,3 +51,25 @@
   box-shadow: none;
 }
 .floating-toolbar { margin: 18px; }
+
+/* Feature cards: icon badge left, title and description right. */
+.feature-card {
+  padding: 12px 14px;
+  min-height: 52px;
+}
+.feature-card:disabled { opacity: 0.55; }
+
+/* The cards' icon badge: one accent hue in a soft vertical tone. */
+.feature-badge {
+  border-radius: 10px;
+  background-image: linear-gradient(to bottom,
+                                    alpha(@accent_bg_color, 0.12),
+                                    alpha(@accent_bg_color, 0.22));
+  color: @accent_color;
+}
+
+/* The active session stands out with a plain accent tint. */
+.session-card {
+  padding: 12px 14px;
+  background-color: mix(@card_bg_color, @accent_bg_color, 0.08);
+}

@@ -1687,8 +1687,10 @@ fn device_page(
         }
     }
 
+    // Wide enough for three feature cards to a line.
     adw::Clamp::builder()
-        .maximum_size(600)
+        .maximum_size(720)
+        .tightening_threshold(600)
         .child(&page)
         .build()
         .upcast()
@@ -1794,26 +1796,38 @@ fn toast_from(widget: &impl IsA<gtk::Widget>, message: &str) {
     }
 }
 
-/// The device's features as a plain list, with its active session, if any,
-/// as the first row. Ring, Lock and Ping are in the header bar.
-fn features_group(
-    daemon: &DaemonHandle,
-    device: &DeviceView,
-    since: Option<&str>,
-) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder()
-        .title(device_type_label(&device.device_type))
+/// The device's features as a grid of cards — three to a line when wide,
+/// two when medium, one when narrow — under its active session, if any.
+/// Ring, Lock and Ping are in the header bar.
+fn features_group(daemon: &DaemonHandle, device: &DeviceView, since: Option<&str>) -> gtk::Box {
+    let section = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
         .build();
     if let Some(title) = session_title(device) {
-        group.add(&session_row(daemon, device, &title, since));
+        section.append(&session_card(daemon, device, &title, since));
     }
+    let grid = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .homogeneous(true)
+        .min_children_per_line(1)
+        .max_children_per_line(3)
+        .column_spacing(12)
+        .row_spacing(12)
+        .build();
+    let group = CardGrid(&grid);
     let id = device.id.clone();
     let name = device.name.clone();
 
     if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
-        let row = feature_row(
+        let ready = device.feature_transport_ready;
+        let card = feature_card(
             &format!("{} Screen", device_type_label(&device.device_type)),
-            None,
+            if ready {
+                "See and control your phone"
+            } else {
+                "Available once connected"
+            },
             "video-display-symbolic",
             {
                 let (daemon, id) = (daemon.clone(), id.clone());
@@ -1829,16 +1843,16 @@ fn features_group(
             },
         );
         // The phone's screen needs the encrypted connection to be up.
-        if !device.feature_transport_ready {
-            row.set_sensitive(false);
-            row.set_subtitle("Available once connected");
+        if !ready {
+            card.set_sensitive(false);
+            card.set_tooltip_text(Some("Available once the connection is ready"));
         }
-        group.add(&row);
+        group.add(&card);
     }
     if can_send_feature(device, PACKET_TYPE_SHARE_REQUEST) {
-        group.add(&feature_row(
+        group.add(&feature_card(
             "Send Files",
-            None,
+            "Pick files to send",
             "document-send-symbolic",
             {
                 let (daemon, id) = (daemon.clone(), id.clone());
@@ -1867,45 +1881,55 @@ fn features_group(
         ));
     }
     if device.feature_transport_ready || can_send_feature(device, PACKET_TYPE_SFTP_REQUEST) {
-        group.add(&feature_row("Browse Files", None, "folder-symbolic", {
-            let (daemon, id) = (daemon.clone(), id.clone());
-            let browsing_device = device.clone();
-            move |widget| {
-                let Some(root) = widget.root().and_downcast::<gtk::Window>() else {
-                    return;
-                };
-                if browsing_device.feature_transport_ready {
-                    crate::phone_files::show(
-                        daemon.clone(),
-                        id.clone(),
-                        &browsing_device.name,
-                        &root,
-                    );
-                } else {
-                    // Until the WebRTC handover finishes only the legacy
-                    // SFTP request is available.
-                    daemon.send(DaemonCommand::SendSftpRequest(id.clone()));
-                    show_file_browsing_dialog(browsing_device.clone(), widget);
+        group.add(&feature_card(
+            "Browse Files",
+            "Open your phone's storage",
+            "folder-symbolic",
+            {
+                let (daemon, id) = (daemon.clone(), id.clone());
+                let browsing_device = device.clone();
+                move |widget| {
+                    let Some(root) = widget.root().and_downcast::<gtk::Window>() else {
+                        return;
+                    };
+                    if browsing_device.feature_transport_ready {
+                        crate::phone_files::show(
+                            daemon.clone(),
+                            id.clone(),
+                            &browsing_device.name,
+                            &root,
+                        );
+                    } else {
+                        // Until the WebRTC handover finishes only the legacy
+                        // SFTP request is available.
+                        daemon.send(DaemonCommand::SendSftpRequest(id.clone()));
+                        show_file_browsing_dialog(browsing_device.clone(), widget);
+                    }
                 }
-            }
-        }));
+            },
+        ));
     }
     if can_send_feature(device, PACKET_TYPE_SHARE_REQUEST) {
-        group.add(&feature_row("Share Text", None, "edit-paste-symbolic", {
-            let (daemon, id, name) = (daemon.clone(), id.clone(), name.clone());
-            move |widget| show_share_text_dialog(daemon.clone(), id.clone(), &name, widget)
-        }));
+        group.add(&feature_card(
+            "Share Text",
+            "Send text or a link",
+            "edit-paste-symbolic",
+            {
+                let (daemon, id, name) = (daemon.clone(), id.clone(), name.clone());
+                move |widget| show_share_text_dialog(daemon.clone(), id.clone(), &name, widget)
+            },
+        ));
     }
     if can_send_feature(device, PACKET_TYPE_NOTIFICATION_REQUEST) {
         let unread = device.notifications.len();
         let subtitle = match unread {
-            0 => None,
-            1 => Some("1 notification".to_string()),
-            count => Some(format!("{count} notifications")),
+            0 => "Mirror and reply".to_string(),
+            1 => "1 notification".to_string(),
+            count => format!("{count} notifications"),
         };
-        group.add(&feature_row(
+        group.add(&feature_card(
             "Notifications",
-            subtitle.as_deref(),
+            &subtitle,
             "preferences-system-notifications-symbolic",
             {
                 let (daemon, id) = (daemon.clone(), id.clone());
@@ -1919,9 +1943,9 @@ fn features_group(
     }
     // A terminal started here is shared: it opens in a window on this
     // computer and appears in the phone's session list.
-    group.add(&feature_row(
+    group.add(&feature_card(
         "Terminal",
-        Some("Shell, Claude Code or Codex, shared with this device"),
+        "Shell, Claude Code or Codex",
         "utilities-terminal-symbolic",
         |widget| {
             if let Err(error) = crate::device_links::pty::desk::new_desk_session() {
@@ -1931,19 +1955,29 @@ fn features_group(
         },
     ));
     if can_send_feature(device, PACKET_TYPE_MPRIS_REQUEST) {
-        group.add(&feature_row("Media", None, "multimedia-player-symbolic", {
-            let (daemon, id) = (daemon.clone(), id.clone());
-            let media_device = device.clone();
-            move |widget| {
-                daemon.send(DaemonCommand::RequestMprisStatus(id.clone(), None));
-                show_media_control_dialog(daemon.clone(), id.clone(), media_device.clone(), widget);
-            }
-        }));
+        group.add(&feature_card(
+            "Media",
+            "Play, pause and skip",
+            "multimedia-player-symbolic",
+            {
+                let (daemon, id) = (daemon.clone(), id.clone());
+                let media_device = device.clone();
+                move |widget| {
+                    daemon.send(DaemonCommand::RequestMprisStatus(id.clone(), None));
+                    show_media_control_dialog(
+                        daemon.clone(),
+                        id.clone(),
+                        media_device.clone(),
+                        widget,
+                    );
+                }
+            },
+        ));
     }
     if can_send_feature(device, PACKET_TYPE_SYSTEMVOLUME_REQUEST) {
-        group.add(&feature_row(
+        group.add(&feature_card(
             "Volume",
-            None,
+            "Phone volume",
             "audio-volume-high-symbolic",
             {
                 let (daemon, id) = (daemon.clone(), id.clone());
@@ -1956,52 +1990,150 @@ fn features_group(
         ));
     }
     if can_send_feature(device, PACKET_TYPE_RUNCOMMAND_REQUEST) {
-        group.add(&feature_row("Commands", None, "system-run-symbolic", {
-            let (daemon, id) = (daemon.clone(), id.clone());
-            let device = device.clone();
-            move |widget| {
-                daemon.send(DaemonCommand::RequestRemoteCommands(id.clone()));
-                show_remote_commands_dialog(daemon.clone(), device.clone(), widget);
-            }
-        }));
+        group.add(&feature_card(
+            "Commands",
+            "Run the phone's commands",
+            "system-run-symbolic",
+            {
+                let (daemon, id) = (daemon.clone(), id.clone());
+                let device = device.clone();
+                move |widget| {
+                    daemon.send(DaemonCommand::RequestRemoteCommands(id.clone()));
+                    show_remote_commands_dialog(daemon.clone(), device.clone(), widget);
+                }
+            },
+        ));
     }
-    group
+    section.append(&grid);
+    section
 }
 
-/// A feature: its icon, its name, a subtitle only when it says something, and
-/// a chevron because activating it opens something.
-fn feature_row(
+/// Adds cards to the grid; Tab goes straight to each card, not to the
+/// FlowBox's wrapper around it.
+struct CardGrid<'a>(&'a gtk::FlowBox);
+
+impl CardGrid<'_> {
+    fn add(&self, card: &gtk::Button) {
+        self.0.append(card);
+        if let Some(child) = card.parent() {
+            child.set_focusable(false);
+        }
+    }
+}
+
+/// The feature's icon badge: one accent hue, a soft vertical tone.
+fn feature_badge(icon: &str) -> gtk::Box {
+    let badge = gtk::Box::builder()
+        .width_request(40)
+        .height_request(40)
+        .valign(gtk::Align::Center)
+        .css_classes(["feature-badge"])
+        .build();
+    // Explicitly not expanding: the centred icon inside expands.
+    badge.set_hexpand(false);
+    badge.append(
+        &gtk::Image::builder()
+            .icon_name(icon)
+            .hexpand(true)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .build(),
+    );
+    badge
+}
+
+/// A feature card: icon badge on the left, a bold title and a one-line dim
+/// description on the right.
+fn feature_card(
     title: &str,
-    subtitle: Option<&str>,
+    description: &str,
     icon: &str,
     action: impl Fn(&gtk::Widget) + 'static,
-) -> adw::ActionRow {
-    let row = adw::ActionRow::builder()
-        .title(title)
-        .activatable(true)
+) -> gtk::Button {
+    let content = gtk::Box::builder().spacing(12).build();
+    content.append(&feature_badge(icon));
+    let text = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
         .build();
-    if let Some(subtitle) = subtitle {
-        row.set_subtitle(subtitle);
-    }
-    row.add_prefix(&gtk::Image::from_icon_name(icon));
-    row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-    row.connect_activated(move |row| action(row.upcast_ref()));
-    row
+    // A short natural width lets three cards share a line; the words are
+    // ellipsized only when a card really is that narrow.
+    text.append(
+        &gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(10)
+            .css_classes(["heading"])
+            .build(),
+    );
+    text.append(
+        &gtk::Label::builder()
+            .label(description)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(10)
+            .css_classes(["caption", "dim-label"])
+            .build(),
+    );
+    content.append(&text);
+    let card = gtk::Button::builder()
+        .child(&content)
+        .tooltip_text(description)
+        .css_classes(["card", "feature-card"])
+        .build();
+    card.update_property(&[
+        gtk::accessible::Property::Label(title),
+        gtk::accessible::Property::Description(description),
+    ]);
+    card.connect_clicked(move |card| action(card.upcast_ref()));
+    card
 }
 
 /// "Controlling the screen · 2 terminals", "Since 14:02", and End, which asks
-/// before cutting the phone off.
-fn session_row(
+/// before cutting the phone off: a full-width accent-tinted card.
+fn session_card(
     daemon: &DaemonHandle,
     device: &DeviceView,
     title: &str,
     since: Option<&str>,
-) -> adw::ActionRow {
-    let row = adw::ActionRow::builder().title(title).build();
+) -> gtk::Box {
+    use crate::device_links::device::DesktopSession;
+    let card = gtk::Box::builder()
+        .spacing(12)
+        .css_classes(["card", "session-card"])
+        .build();
+    card.append(&feature_badge(match device.desktop_session {
+        DesktopSession::None => "utilities-terminal-symbolic",
+        _ => "screen-shared-symbolic",
+    }));
+    let text = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
+    text.append(
+        &gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["heading"])
+            .build(),
+    );
     if let Some(since) = since {
-        row.set_subtitle(&format!("Since {since}"));
+        text.append(
+            &gtk::Label::builder()
+                .label(format!("Since {since}"))
+                .xalign(0.0)
+                .css_classes(["caption", "dim-label", "numeric"])
+                .build(),
+        );
     }
-    row.add_prefix(&gtk::Image::from_icon_name("screen-shared-symbolic"));
+    card.append(&text);
+    card.update_property(&[gtk::accessible::Property::Label(title)]);
     let end = gtk::Button::builder()
         .label("End")
         .valign(gtk::Align::Center)
@@ -2026,8 +2158,8 @@ fn session_row(
             }
         });
     });
-    row.add_suffix(&end);
-    row
+    card.append(&end);
+    card
 }
 
 /// The newest notifications inline, with a way to see them all.

@@ -756,9 +756,11 @@ fn install_brand_styles() {
     } else {
         "@define-color accent_color #8eacff;"
     });
-    // The device circle gets a real edge when contrast matters more.
-    let contrast =
-        provider(".device-glyph { box-shadow: inset 0 0 0 1px alpha(currentColor, 0.6); }");
+    // Tinted shapes get a real edge when contrast matters more.
+    let contrast = provider(
+        ".device-glyph, .feature-badge, .session-card { \
+         box-shadow: inset 0 0 0 1px alpha(currentColor, 0.6); }",
+    );
     let shown = std::rc::Rc::new(std::cell::Cell::new((false, false)));
     let update = move |manager: &adw::StyleManager| {
         let wanted = (manager.is_dark(), manager.is_high_contrast());
