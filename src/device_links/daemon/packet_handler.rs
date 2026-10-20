@@ -465,6 +465,13 @@ fn handle_qr_pairing_proof(
         Ok(()) => {
             debug_log!("[Daemon] Paired with {device_id} by QR code");
             update_pair_state(devices, device_id, PairState::Paired, None);
+            super::state::push_event(
+                events,
+                DaemonEvent::PairedByQr {
+                    device_id: device_id.clone(),
+                    device_name: binding.link.info.name.clone(),
+                },
+            );
             start_webrtc_after_pairing(binding, sessions, config, devices, events);
         }
         Err(error) => eprintln!("[Daemon] QR pairing from {device_id} refused: {error}"),

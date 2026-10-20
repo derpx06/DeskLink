@@ -471,6 +471,21 @@ impl DesklinkWindow {
                     );
                     self.show_feature_toast(&format!("Find Phone request from {device_name}"));
                 }
+                DaemonEvent::PairedByQr {
+                    device_id,
+                    device_name,
+                } => {
+                    // The scan is done: leave "Pair New Device" for the phone
+                    // it just paired. The page renders later in this refresh.
+                    if let Some(dialog) = self.visible_dialog() {
+                        if dialog.title() == "Pair New Device" {
+                            dialog.close();
+                        }
+                    }
+                    imp.selected_device_id.replace(Some(device_id));
+                    imp.split_view.set_show_content(true);
+                    self.show_feature_toast(&format!("Paired with {device_name}"));
+                }
             }
         }
 

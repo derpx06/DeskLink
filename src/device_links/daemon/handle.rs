@@ -23,6 +23,12 @@ pub enum DaemonEvent {
         device_id: String,
         device_name: String,
     },
+    /// A phone scanned the pairing QR code and is now paired. Nothing was
+    /// asked at the desk, so this is the only sign the scan worked.
+    PairedByQr {
+        device_id: String,
+        device_name: String,
+    },
 }
 
 struct DaemonStopGuard(Sender<DaemonCommand>);
