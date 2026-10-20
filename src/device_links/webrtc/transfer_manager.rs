@@ -562,7 +562,7 @@ impl WebRtcTransferManager {
             // Best effort: the peer is told either way.
             let _ = self.cancel(wire, transfer_id, token);
         }
-        eprintln!("[DeskLink] Ending file transfer {transfer_id}: {reason}");
+        debug_log!("[DeskLink] Ending file transfer {transfer_id}: {reason}");
         let reason: String = reason.chars().take(256).collect();
         match offer {
             // Nothing was listed for a refused offer, but the user should still
@@ -834,7 +834,7 @@ impl WebRtcTransferManager {
         acknowledge: bool,
     ) -> Result<Vec<TransferEvent>, String> {
         if let Err(reason) = self.verify_part(checkpoint) {
-            eprintln!(
+            debug_log!(
                 "[DeskLink] Discarding incoming transfer {}: {reason}",
                 checkpoint.transfer_id
             );

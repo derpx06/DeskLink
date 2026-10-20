@@ -80,7 +80,7 @@ impl TerminalEvent {
 /// Identifiers are printed with `{:?}` so a device id can never forge a second
 /// log line.
 fn audit(what: &str, device_id: &str, terminal_id: Option<&str>) {
-    eprintln!(
+    debug_log!(
         "[DeskLink] Terminal {what} device={device_id:?} terminal={:?}",
         terminal_id.unwrap_or("-")
     );

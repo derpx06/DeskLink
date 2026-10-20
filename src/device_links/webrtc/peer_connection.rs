@@ -49,7 +49,7 @@ fn enable_immediate_rtcp_feedback(webrtcbin: &gst::Element) {
         .downcast_ref::<gst::Bin>()
         .and_then(|bin| bin.by_name("rtpbin"))
     else {
-        eprintln!("[DeskLink] webrtcbin has no rtpbin; RTCP feedback keeps its default timing");
+        debug_log!("[DeskLink] webrtcbin has no rtpbin; RTCP feedback keeps its default timing");
         return;
     };
     rtpbin.connect("on-new-ssrc", false, |values| {
@@ -144,7 +144,7 @@ impl DesktopWebRtcPeer {
         if webrtcbin.has_property(JITTER_BUFFER_PROPERTY, None) {
             webrtcbin.set_property(JITTER_BUFFER_PROPERTY, JITTER_BUFFER_LATENCY_MS);
         } else {
-            eprintln!(
+            debug_log!(
                 "[DeskLink] webrtcbin exposes no `{JITTER_BUFFER_PROPERTY}`; \
                  using the default jitter buffer"
             );
@@ -389,7 +389,7 @@ impl DesktopWebRtcPeer {
             *slot = Some(next);
         }
         if let Err(parked) = capture.stop() {
-            eprintln!(
+            debug_log!(
                 "[DeskLink] Screen capture is parked behind a connection that is not ready; \
                  it will be released when the peer closes"
             );
@@ -1276,7 +1276,7 @@ a=max-message-size:262144\r\n";
         std::thread::spawn(move || {
             while let Ok(event) = offerer_raw.recv() {
                 if std::env::var("LOOPBACK_TRACE").is_ok() {
-                    eprintln!("OFFERER event: {:?}", event);
+                    debug_log!("OFFERER event: {:?}", event);
                 }
                 match event {
                     PeerEvent::LocalDescription { message_type, sdp } => {
@@ -1299,7 +1299,7 @@ a=max-message-size:262144\r\n";
         std::thread::spawn(move || {
             while let Ok(event) = answerer_raw.recv() {
                 if std::env::var("LOOPBACK_TRACE").is_ok() {
-                    eprintln!("ANSWERER event: {:?}", event);
+                    debug_log!("ANSWERER event: {:?}", event);
                 }
                 match event {
                     PeerEvent::LocalDescription { message_type, sdp } => {

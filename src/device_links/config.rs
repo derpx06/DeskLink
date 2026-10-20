@@ -320,10 +320,17 @@ impl Config {
     /// rather than failing the connection: local operation needs no server, so
     /// a bad remote-access setting must not break the LAN path.
     pub fn ice_servers(&self) -> crate::device_links::webrtc::ice::IceServerConfig {
-        let stun = std::env::var("DESKLINK_STUN_SERVERS")
-            .unwrap_or_else(|_| self.stored.ice_stun_servers.join(","));
-        let turn = std::env::var("DESKLINK_TURN_SERVERS")
-            .unwrap_or_else(|_| self.stored.ice_turn_servers.join(","));
+        // Debug builds only: in a release, an environment variable must not be
+        // able to route media through a server the user never chose.
+        let env = |name: &str| {
+            cfg!(debug_assertions)
+                .then(|| std::env::var(name).ok())
+                .flatten()
+        };
+        let stun =
+            env("DESKLINK_STUN_SERVERS").unwrap_or_else(|| self.stored.ice_stun_servers.join(","));
+        let turn =
+            env("DESKLINK_TURN_SERVERS").unwrap_or_else(|| self.stored.ice_turn_servers.join(","));
         match crate::device_links::webrtc::ice::IceServerConfig::parse(&stun, &turn) {
             Ok(config) => config,
             Err(error) => {

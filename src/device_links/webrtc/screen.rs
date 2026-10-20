@@ -550,7 +550,7 @@ impl DesktopScreenCapture {
             source,
             scale,
             convert,
-            rate,
+            rate.clone(),
             filter,
             queue,
             encoder.clone(),
@@ -598,7 +598,7 @@ impl DesktopScreenCapture {
                     payloader.set_property("seqnum-offset", i32::from(next));
                 }
             }
-            eprintln!(
+            debug_log!(
                 "[DeskLink] Screen chain bound to {} as VP8 pt {payload_type}{}",
                 sink_pad.name(),
                 if negotiated.is_some() {
@@ -648,7 +648,7 @@ impl DesktopScreenCapture {
         };
         match build() {
             Ok((sink_pad, payload_type)) => Ok(Self {
-                rate_control_stop: spawn_bitrate_controller(webrtcbin, &encoder),
+                rate_control_stop: spawn_bitrate_controller(webrtcbin, &encoder, &rate),
                 pipeline: pipeline.clone(),
                 webrtcbin: webrtcbin.clone(),
                 elements,
@@ -809,20 +809,58 @@ pub(crate) fn next_bitrate(current: u32, fraction_lost: f64) -> u32 {
     next.clamp(MIN_BITRATE, MAX_BITRATE)
 }
 
+/// Frame rate under sustained loss at the bitrate floor, and normally.
+const REDUCED_FPS: i32 = 15;
+const FULL_FPS: i32 = 30;
+/// Seconds of a condition before the frame rate changes, so it never flaps.
+const FPS_HOLD_SECONDS: u32 = 5;
+
+/// The second rung after bitrate: when even the lowest bitrate still loses
+/// packets, fewer frames give each one more bits (text stays sharp, motion
+/// gets choppier); when the link is clean again with room to spare, the full
+/// rate returns. Counts consecutive seconds of each condition in `streak`.
+pub(crate) fn next_fps(current: i32, bitrate: u32, fraction_lost: f64, streak: &mut u32) -> i32 {
+    let wants_lower = current == FULL_FPS && bitrate == MIN_BITRATE && fraction_lost > 0.02;
+    let wants_higher =
+        current == REDUCED_FPS && bitrate >= START_BITRATE / 2 && fraction_lost < 0.02;
+    if wants_lower || wants_higher {
+        *streak += 1;
+    } else {
+        *streak = 0;
+    }
+    if *streak < FPS_HOLD_SECONDS {
+        return current;
+    }
+    *streak = 0;
+    if wants_lower {
+        REDUCED_FPS
+    } else {
+        FULL_FPS
+    }
+}
+
 /// Once a second, reads the peer-reported loss from `webrtcbin` stats and
-/// steers the encoder. Holds only weak references, so it ends with the
-/// pipeline; the returned flag ends it with the capture.
-fn spawn_bitrate_controller(webrtcbin: &gst::Element, encoder: &gst::Element) -> Arc<AtomicBool> {
+/// steers the encoder's bitrate, then the frame rate (through `videorate`'s
+/// `max-rate`, which needs no caps change). Holds only weak references, so it
+/// ends with the pipeline; the returned flag ends it with the capture.
+fn spawn_bitrate_controller(
+    webrtcbin: &gst::Element,
+    encoder: &gst::Element,
+    rate: &gst::Element,
+) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
-    let (webrtcbin, encoder, flag) = (
+    let (webrtcbin, encoder, rate, flag) = (
         webrtcbin.downgrade(),
         encoder.downgrade(),
+        rate.downgrade(),
         Arc::clone(&stop),
     );
     let spawned = std::thread::Builder::new()
         .name("desklink-screen-rate".to_string())
         .spawn(move || {
             let mut bitrate = START_BITRATE;
+            let mut fps = FULL_FPS;
+            let mut streak = 0;
             while !flag.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let (Some(webrtcbin), Some(encoder)) = (webrtcbin.upgrade(), encoder.upgrade())
@@ -836,6 +874,13 @@ fn spawn_bitrate_controller(webrtcbin: &gst::Element, encoder: &gst::Element) ->
                 if next != bitrate {
                     bitrate = next;
                     encoder.set_property("target-bitrate", bitrate as i32);
+                }
+                let next = next_fps(fps, bitrate, lost, &mut streak);
+                if next != fps {
+                    fps = next;
+                    if let Some(rate) = rate.upgrade() {
+                        set_if_present(&rate, "max-rate", &fps.to_string());
+                    }
                 }
             }
         });
@@ -925,9 +970,10 @@ fn encoder_chain(
     encoder.set_property("deadline", 1i64);
     encoder.set_property("cpu-used", 8i32);
     encoder.set_property("target-bitrate", START_BITRATE as i32);
-    // A keyframe every 2 s bounds how long a lost packet can freeze the
-    // picture if a keyframe request goes unanswered.
-    encoder.set_property("keyframe-max-dist", fps * 2);
+    // Keyframes come on the decoder's request (throttled); this is only the
+    // safety net for a request that never arrives. Every 2 s was a burst of
+    // screen-sized keyframes on a link that was already struggling.
+    encoder.set_property("keyframe-max-dist", fps * 10);
     // Low-latency rate control: libvpx defaults buffer 4–6 s of data,
     // which lets bursts queue instead of shrinking quality.
     set_if_present(&encoder, "threads", "4");
@@ -1186,6 +1232,35 @@ mod tests {
         // Sustained heavy loss reaches the floor in a handful of seconds.
         let floor = (0..10).fold(START_BITRATE, |rate, _| next_bitrate(rate, 0.5));
         assert_eq!(floor, MIN_BITRATE);
+    }
+
+    #[test]
+    fn frame_rate_drops_only_after_sustained_loss_at_the_floor_and_recovers() {
+        let mut streak = 0;
+        // Loss above the floor is the bitrate's job, not the frame rate's.
+        for _ in 0..10 {
+            assert_eq!(
+                next_fps(FULL_FPS, START_BITRATE, 0.3, &mut streak),
+                FULL_FPS
+            );
+        }
+        let mut fps = FULL_FPS;
+        for second in 1..=FPS_HOLD_SECONDS {
+            fps = next_fps(fps, MIN_BITRATE, 0.3, &mut streak);
+            let expected = if second < FPS_HOLD_SECONDS {
+                FULL_FPS
+            } else {
+                REDUCED_FPS
+            };
+            assert_eq!(fps, expected);
+        }
+        // A clean second in between resets the count: no flapping.
+        assert_eq!(next_fps(fps, START_BITRATE, 0.0, &mut streak), REDUCED_FPS);
+        assert_eq!(next_fps(fps, START_BITRATE, 0.3, &mut streak), REDUCED_FPS);
+        for _ in 0..FPS_HOLD_SECONDS {
+            fps = next_fps(fps, START_BITRATE, 0.0, &mut streak);
+        }
+        assert_eq!(fps, FULL_FPS);
     }
     use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_SCREEN_REQUEST};
 

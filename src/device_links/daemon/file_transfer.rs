@@ -47,7 +47,7 @@ fn preparer() -> &'static Sender<SendJob> {
                         let message = format!(
                             "DeskLink WebRTC file transfer for {device_id} failed: {error}"
                         );
-                        eprintln!("[Daemon] {message}");
+                        debug_log!("[Daemon] {message}");
                         push_error(&errors, message);
                     }
                     // Whatever happened, the placeholder goes; a transfer that
@@ -70,7 +70,7 @@ impl DaemonWorker {
             Err(error) => {
                 let message =
                     format!("DeskLink file transfer for {device_id} was not started: {error}");
-                eprintln!("[Daemon] {message}");
+                debug_log!("[Daemon] {message}");
                 push_error(&self.errors, message);
                 return;
             }
@@ -79,7 +79,7 @@ impl DaemonWorker {
             let message = format!(
                 "DeskLink file transfer for {device_id} requires an authenticated WebRTC file channel"
             );
-            eprintln!("[Daemon] {message}");
+            debug_log!("[Daemon] {message}");
             push_error(&self.errors, message);
             return;
         }
@@ -116,7 +116,7 @@ impl DaemonWorker {
             .and_then(|transport| transport.cancel_transfer(transfer_id));
         if let Err(error) = result {
             let message = format!("Could not cancel the file transfer: {error}");
-            eprintln!("[Daemon] {message}");
+            debug_log!("[Daemon] {message}");
             push_error(&self.errors, message);
         }
     }

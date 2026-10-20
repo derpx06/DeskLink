@@ -198,9 +198,9 @@ impl DaemonWorker {
             match &command {
                 // Never log a password.
                 DaemonCommand::SetSessionPassword(_) => {
-                    eprintln!("[Daemon] Received command: SetSessionPassword(<redacted>)")
+                    debug_log!("[Daemon] Received command: SetSessionPassword(<redacted>)")
                 }
-                other => eprintln!("[Daemon] Received command: {other:?}"),
+                other => debug_log!("[Daemon] Received command: {other:?}"),
             }
             if self.handle_command(command) {
                 break;

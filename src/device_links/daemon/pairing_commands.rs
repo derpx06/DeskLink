@@ -33,7 +33,7 @@ pub(crate) fn expire_pairings(
 ) -> Vec<String> {
     let expired = sessions.expire_pairing(now_secs);
     for device_id in &expired {
-        eprintln!("[Daemon] Pairing request for {device_id} timed out");
+        debug_log!("[Daemon] Pairing request for {device_id} timed out");
         if let Some(binding) = sessions.current_binding(device_id) {
             let mut packet = NetworkPacket::new(PACKET_TYPE_PAIR);
             packet.set("pair", false);

@@ -607,7 +607,7 @@ impl Client {
                 peer.identity = info;
                 // A new session replaces whatever the old one carried.
                 detach(peer);
-                eprintln!("[DeskLink] Relay link with {} established", peer.device_id);
+                debug_log!("[DeskLink] Relay link with {} established", peer.device_id);
                 self.attach_if_needed(peer, false);
             }
             Event::Packet(bytes) => {
@@ -704,7 +704,7 @@ impl Client {
         );
         match attached {
             Ok(()) => {
-                eprintln!(
+                debug_log!(
                     "[DL-WRTC-BOOT] relay link is now the bootstrap link for {}",
                     peer.device_id
                 );

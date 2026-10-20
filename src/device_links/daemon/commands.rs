@@ -106,7 +106,7 @@ impl DaemonWorker {
             }
             DaemonCommand::CancelQrPairing => crate::device_links::pairing_qr::cancel(),
             DaemonCommand::AcceptPair(device_id, shown_key) => {
-                eprintln!("[Daemon] Running accept_pair for {}", device_id);
+                debug_log!("[Daemon] Running accept_pair for {}", device_id);
                 self.accept_pair(&device_id, shown_key.as_deref());
             }
             DaemonCommand::RejectPair(device_id) => {
@@ -270,7 +270,7 @@ impl DaemonWorker {
     /// attached. A failure is shown on the device rather than swallowed, and
     /// also refreshes the card so its switch cannot keep saying "on".
     fn set_terminal_access(&self, device_id: &str, allowed: bool) {
-        eprintln!("[DeskLink] Terminal access device={device_id:?} allowed={allowed}");
+        debug_log!("[DeskLink] Terminal access device={device_id:?} allowed={allowed}");
         let saved = self
             .config
             .lock()

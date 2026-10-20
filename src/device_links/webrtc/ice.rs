@@ -98,7 +98,7 @@ impl IceServerConfig {
         if let Some(stun) = self.stun_servers.first() {
             webrtcbin.set_property("stun-server", stun);
             if self.stun_servers.len() > 1 {
-                eprintln!(
+                debug_log!(
                     "[DeskLink] webrtcbin accepts one STUN server; ignoring {} more",
                     self.stun_servers.len() - 1
                 );
@@ -132,7 +132,7 @@ impl IceServerConfig {
                     );
                 }
             } else {
-                eprintln!(
+                debug_log!(
                     "[DeskLink] webrtcbin exposes no `{ICE_AGENT_PROPERTY}`; gathering on all interfaces"
                 );
                 break;

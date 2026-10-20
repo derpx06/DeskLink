@@ -99,7 +99,7 @@ fn read_desktop_lock_state() -> bool {
                 thread::sleep(Duration::from_millis(10));
             }
             Ok(None) => {
-                eprintln!("[Daemon] loginctl did not answer in time; assuming unlocked");
+                debug_log!("[Daemon] loginctl did not answer in time; assuming unlocked");
                 let _ = child.kill();
                 let _ = child.wait();
                 return false;
@@ -169,7 +169,7 @@ fn notify_peer_not_paired(binding: &SessionBinding, sessions: &Arc<DeviceManager
     }
     let mut packet = NetworkPacket::new(PACKET_TYPE_PAIR);
     packet.set("pair", false);
-    eprintln!(
+    debug_log!(
         "[Daemon] Telling {} it is not paired with this device",
         binding.device_id
     );
@@ -270,7 +270,7 @@ pub(super) fn apply_lan_packet(
     }
 
     if packet.packet_type == PACKET_TYPE_PAIR {
-        eprintln!(
+        debug_log!(
             "[Daemon] Received pair packet from device {}: pair={:?}, timestamp={:?}",
             device_id,
             packet.get_bool("pair"),
@@ -298,7 +298,7 @@ pub(super) fn apply_lan_packet(
         });
         if let Ok((previous_state, state, verification_key, reconfirm)) = pairing {
             if reconfirm {
-                eprintln!(
+                debug_log!(
                     "[Daemon] Re-confirming an existing pairing for {}",
                     device_id
                 );
@@ -306,9 +306,10 @@ pub(super) fn apply_lan_packet(
                 acknowledgement.set("pair", true);
                 let _ = binding.link.send_packet(&acknowledgement);
             }
-            eprintln!(
+            debug_log!(
                 "[Daemon] Pairing state transitioned from {:?} to {:?}",
-                previous_state, state
+                previous_state,
+                state
             );
             let mut state = state;
             if state == PairState::Paired {
@@ -361,7 +362,7 @@ pub(super) fn apply_lan_packet(
         // type on LAN. The old feature arms here (xdg-open, lock, clipboard…)
         // were deleted so a future change to `authorize` cannot silently
         // re-expose them on the unauthenticated-handover path.
-        eprintln!("[Daemon] Unhandled packet type: {}", packet.packet_type);
+        debug_log!("[Daemon] Unhandled packet type: {}", packet.packet_type);
     }
 }
 
@@ -462,7 +463,7 @@ fn handle_qr_pairing_proof(
     }
     match verified {
         Ok(()) => {
-            eprintln!("[Daemon] Paired with {device_id} by QR code");
+            debug_log!("[Daemon] Paired with {device_id} by QR code");
             update_pair_state(devices, device_id, PairState::Paired, None);
             start_webrtc_after_pairing(binding, sessions, config, devices, events);
         }
@@ -498,7 +499,7 @@ pub(super) fn packet_read_loop(
                     &sessions,
                     "Peer closed the connection".to_string(),
                 ) {
-                    eprintln!(
+                    debug_log!(
                         "[Daemon] Active link closed for {}. Marked unreachable.",
                         device_id
                     );
@@ -522,7 +523,7 @@ pub(super) fn packet_read_loop(
                     32 * 1024 * 1024
                 };
                 if line.len() > limit {
-                    eprintln!(
+                    debug_log!(
                         "[Daemon] Read line too long for {}. Disconnecting.",
                         device_id
                     );
@@ -545,7 +546,7 @@ pub(super) fn packet_read_loop(
                 };
 
                 if packet.packet_type == PACKET_TYPE_WEBRTC_SIGNAL_V1 {
-                    eprintln!(
+                    debug_log!(
                         "[DL-WRTC-BOOT] received signed bootstrap signal from {}",
                         device_id
                     );
@@ -603,13 +604,13 @@ pub(crate) fn dispatch_webrtc_feature_packet(
     let device_id = &binding.device_id;
     // Type only, never the body: clipboard and notification text stay out of
     // the journal. This line is what the device E2E script asserts on.
-    eprintln!(
+    debug_log!(
         "[Daemon] WebRTC feature {} from {device_id}",
         packet.packet_type
     );
     match packet.packet_type.as_str() {
         PACKET_TYPE_PING => {
-            eprintln!("[Daemon] WebRTC ping received from {device_id}");
+            debug_log!("[Daemon] WebRTC ping received from {device_id}");
             push_event(
                 events,
                 DaemonEvent::PingReceived {
@@ -792,12 +793,12 @@ pub(crate) fn apply_lock_request(packet: &NetworkPacket) -> Option<bool> {
         let now = std::time::Instant::now();
         let mut last = LAST_LOCK_ACTION.lock().ok()?;
         if last.is_some_and(|last| now.duration_since(last) < LOCK_MIN_INTERVAL) {
-            eprintln!("[Daemon] Ignoring a lock request received too soon after the last one");
+            debug_log!("[Daemon] Ignoring a lock request received too soon after the last one");
             return None;
         }
         *last = Some(now);
     }
-    eprintln!("[Daemon] Received setLocked command: {requested_lock}");
+    debug_log!("[Daemon] Received setLocked command: {requested_lock}");
 
     let command = if requested_lock {
         "lock-session"

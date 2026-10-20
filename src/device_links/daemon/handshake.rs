@@ -199,7 +199,7 @@ pub(crate) fn attach_bootstrap_link(
     // nor adopt into the old session: register, which clears the dead peer.
     let restarted = sessions.peer_restarted(device_id, link.info.instance_id.as_deref());
     if restarted {
-        eprintln!(
+        debug_log!(
             "[DL-WRTC-BOOT] {} restarted (new instance); replacing its session",
             device_id
         );
@@ -210,7 +210,7 @@ pub(crate) fn attach_bootstrap_link(
         && sessions.has_live_bootstrap_link(device_id)
         && incumbent_is_answering
     {
-        eprintln!(
+        debug_log!(
             "[DL-WRTC-BOOT] ignoring refreshed bootstrap socket for {}; retaining feature-ready WebRTC session",
             device_id
         );
@@ -237,7 +237,7 @@ pub(crate) fn attach_bootstrap_link(
         sessions.adopt_bootstrap_link(device_id, &transport)
     };
     if let Some(binding) = adopted {
-        eprintln!(
+        debug_log!(
             "[DL-WRTC-BOOT] adopted a replacement bootstrap socket for {} (session {}, generation {}); kept the feature-ready WebRTC transport",
             binding.device_id, binding.session_id, binding.generation
         );
@@ -268,9 +268,11 @@ pub(crate) fn attach_bootstrap_link(
     }
 
     let binding = registration.binding;
-    eprintln!(
+    debug_log!(
         "[DL-WRTC-BOOT] secure bootstrap link ready for {} (session {}, generation {})",
-        binding.device_id, binding.session_id, binding.generation
+        binding.device_id,
+        binding.session_id,
+        binding.generation
     );
     let remote_supports_webrtc = paired
         && binding
@@ -279,7 +281,7 @@ pub(crate) fn attach_bootstrap_link(
             .incoming_capabilities
             .iter()
             .any(|capability| capability == PACKET_TYPE_WEBRTC_SIGNAL_V1);
-    eprintln!(
+    debug_log!(
         "[DL-WRTC-BOOT] peer WebRTC signaling capability: {}",
         remote_supports_webrtc
     );
@@ -339,7 +341,7 @@ fn schedule_webrtc_bootstrap(
         for &delay in delays {
             thread::sleep(Duration::from_millis(delay));
             if !sessions.is_current(&binding) {
-                eprintln!(
+                debug_log!(
                     "[DL-WRTC-BOOT] bootstrap scheduler stopped for stale generation {}",
                     binding.generation
                 );
@@ -380,7 +382,7 @@ pub(super) fn handle_disconnect(
         link.close();
     }
     if result.feature_transport_retained {
-        eprintln!(
+        debug_log!(
             "[DL-WRTC-BOOT] bootstrap link closed for {}; retained authenticated WebRTC feature transport",
             binding.device_id
         );

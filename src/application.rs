@@ -56,6 +56,7 @@ mod imp {
             // instance's socket alone if this launch is a second one).
             crate::device_links::pty::desk::start_server();
             crate::device_links::connection_log::prune();
+            obj.report_previous_crash();
             obj.setup_gactions();
             self.hold.replace(Some(obj.hold()));
             obj.start_session_indicator();
@@ -338,6 +339,38 @@ impl DesklinkApplication {
                 }
             })));
         });
+    }
+
+    /// Mentions a crash report written since the last start, once.
+    fn report_previous_crash(&self) {
+        let Some(dir) = crate::crash_dir() else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
+        let seen = dir.join("crash-reported");
+        let reported_up_to = std::fs::metadata(&seen)
+            .and_then(|meta| meta.modified())
+            .ok();
+        let newest = entries
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("crash-1"))
+            .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+            .max();
+        let Some(newest) = newest else {
+            return;
+        };
+        if reported_up_to.is_some_and(|reported| reported >= newest) {
+            return;
+        }
+        let _ = std::fs::write(&seen, b"");
+        let notification = gio::Notification::new("DeskLink stopped unexpectedly");
+        notification.set_body(Some(&format!(
+            "A crash report was saved in {}. Attaching it to a bug report helps fix this.",
+            dir.display()
+        )));
+        self.send_notification(Some("crash-report"), &notification);
     }
 
     fn show_history(&self) {

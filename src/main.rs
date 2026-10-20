@@ -18,6 +18,23 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+/// Diagnostics: always in debug builds, and in release builds only with
+/// `DESKLINK_DEBUG=1`. Errors a user should see stay `eprintln!`.
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if $crate::debug_logging() {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+pub(crate) fn debug_logging() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        cfg!(debug_assertions) || std::env::var("DESKLINK_DEBUG").as_deref() == Ok("1")
+    })
+}
+
 mod application;
 mod config;
 mod device_links;
@@ -44,6 +61,8 @@ fn main() -> glib::ExitCode {
         let status = device_links::pty::desk::run_client(&args[2]);
         return glib::ExitCode::from(status.clamp(0, 255));
     }
+
+    install_crash_reporter();
 
     // Set up gettext translations
     bindtextdomain(GETTEXT_PACKAGE, LOCALEDIR).expect("Unable to bind the text domain");
@@ -73,4 +92,37 @@ fn load_resources() -> Result<gio::Resource, glib::Error> {
         "/desklink.gresource"
     )));
     gio::Resource::from_data(&bytes)
+}
+
+/// Where crash reports go: `$XDG_STATE_HOME/desklink/crash-<unix time>.txt`.
+pub(crate) fn crash_dir() -> Option<std::path::PathBuf> {
+    Some(
+        dirs::state_dir()
+            .or_else(dirs::data_local_dir)?
+            .join("desklink"),
+    )
+}
+
+/// Writes every panic, with a backtrace, to a file the user can attach to a
+/// bug report (nothing is sent anywhere), then runs the default hook. The next
+/// start mentions it (`application.rs`).
+fn install_crash_reporter() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Some(dir) = crash_dir() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs())
+                .unwrap_or_default();
+            let report = format!(
+                "DeskLink {} crashed\nthread: {}\n{info}\n\n{}\n",
+                config::VERSION,
+                std::thread::current().name().unwrap_or("unnamed"),
+                std::backtrace::Backtrace::force_capture()
+            );
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join(format!("crash-{now}.txt")), report);
+        }
+        default(info);
+    }));
 }

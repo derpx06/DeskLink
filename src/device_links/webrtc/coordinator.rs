@@ -280,9 +280,10 @@ pub(crate) fn handle_signaling_packet(
         return Err("Stale DeskLink session rejected WebRTC signaling".to_string());
     }
     let message = WebRtcSignalingMessage::from_network_packet(packet)?;
-    eprintln!(
+    debug_log!(
         "[DL-WRTC-BOOT] handling {:?} from {}",
-        message.message_type, message.from_device_id
+        message.message_type,
+        message.from_device_id
     );
     let local_device_id = config
         .lock()
@@ -441,7 +442,7 @@ fn restart_as_initiator(
         reset_device_webrtc_state(&binding.device_id);
         peer.close();
     }
-    eprintln!(
+    debug_log!(
         "[DeskLink] Restarting WebRTC for {} at the peer's request",
         binding.device_id
     );
@@ -577,7 +578,7 @@ fn expire_remote_requests(
     let Some((Some(previous), direction, id)) = expired else {
         return;
     };
-    eprintln!("[DeskLink] Remote-session request timed out while {previous:?}");
+    debug_log!("[DeskLink] Remote-session request timed out while {previous:?}");
     match expired_request_action(previous, direction) {
         ExpiredRequest::CancelDesktopShare => {
             stop_desktop_portal_session(&wire.peer_device_id);
@@ -996,7 +997,7 @@ fn run_desktop_portal_worker(
             return;
         }
     };
-    eprintln!(
+    debug_log!(
         "[DeskLink] Desktop portal granted screen {width}x{height} (1 of {} shared) and input-device mask {} for {device_id}",
         portal.stream_count(),
         if can_control { 3 } else { 0 }
@@ -1009,7 +1010,7 @@ fn run_desktop_portal_worker(
             .name("desklink-share-health".into())
             .spawn(move || {
                 thread::sleep(std::time::Duration::from_secs(3));
-                eprintln!(
+                debug_log!(
                     "[DeskLink] Desktop share to {device_id}: {} RTP packet groups after 3 s",
                     peer.desktop_screen_frames_sent()
                 );
@@ -1112,9 +1113,10 @@ fn run_desktop_portal_worker(
             ready.screen_count = Some(portal.stream_count() as i32);
             let _ = send_remote_session_message(&peer, &wire, &ready);
         }
-        eprintln!(
+        debug_log!(
             "[DeskLink] Desktop share for {device_id} switched to a {}x{} screen",
-            next.width, next.height
+            next.width,
+            next.height
         );
     };
 
@@ -1173,7 +1175,7 @@ fn run_desktop_portal_worker(
                 break;
             }
             restarts += 1;
-            eprintln!(
+            debug_log!(
                 "[DeskLink] Desktop share to {device_id} produced no video for {:?}; rebuilding the capture ({restarts} of {CAPTURE_RESTARTS})",
                 CAPTURE_STALL
             );
@@ -1211,9 +1213,10 @@ fn run_desktop_portal_worker(
                 // capture once it has negotiated (see `pointer_move`).
                 if !portal.knows_active_pixels() {
                     if let Some(size) = peer.desktop_screen_source_size() {
-                        eprintln!(
+                        debug_log!(
                             "[DeskLink] Phone input mapped onto {}x{} screen pixels",
-                            size.0, size.1
+                            size.0,
+                            size.1
                         );
                         portal.set_active_pixels(size);
                     }
@@ -1410,7 +1413,7 @@ fn authorize_desktop_remote_input(
     let actions = input_actions(packet)?;
     session.verify_peer_input(packet, owner_device_id, now)?;
     #[cfg(debug_assertions)]
-    eprintln!("[DeskLink] Phone input -> {actions:?}");
+    debug_log!("[DeskLink] Phone input -> {actions:?}");
     Ok(actions)
 }
 
@@ -1687,7 +1690,7 @@ fn spawn_event_worker(
                                 || line.starts_with("a=ssrc")
                                 || line.starts_with("a=mid")
                         }) {
-                            eprintln!("[DL-SDP] local {message_type:?}: {line}");
+                            debug_log!("[DL-SDP] local {message_type:?}: {line}");
                         }
                         if let Err(error) =
                             sessions.with_webrtc_handover(&binding, &attempt_id, |handover| {
@@ -1784,7 +1787,7 @@ fn spawn_event_worker(
                         );
                     }
                     PeerEvent::ScreenStream(stream) => {
-                        eprintln!(
+                        debug_log!(
                             "[DeskLink] Screen stream received from {}",
                             binding.device_id
                         );
@@ -1795,7 +1798,7 @@ fn spawn_event_worker(
                     // caught by NEGOTIATION_TIMEOUT instead.
                     PeerEvent::Error(error) => eprintln!("[DeskLink] WebRTC peer error: {error}"),
                     PeerEvent::ConnectionChanged(state) => {
-                        eprintln!("[DeskLink] WebRTC peer state: {state}");
+                        debug_log!("[DeskLink] WebRTC peer state: {state}");
                         match classify_peer_state(&state) {
                             PeerStateAction::Ignore => {
                                 if state.to_ascii_lowercase().contains("connected") {
@@ -1804,7 +1807,7 @@ fn spawn_event_worker(
                             }
                             PeerStateAction::WaitForRecovery => {
                                 if disconnected_since.is_none() {
-                                    eprintln!(
+                                    debug_log!(
                                     "[DeskLink] WebRTC peer disconnected; waiting {}s for it to recover",
                                     TRANSIENT_DISCONNECT_GRACE.as_secs()
                                 );
@@ -1949,7 +1952,7 @@ impl Drop for PeerWorkerGuard {
             &self.attempt_id,
             "The WebRTC event worker ended".to_string(),
         ) {
-            eprintln!("[DeskLink] WebRTC worker ended; released its peer");
+            debug_log!("[DeskLink] WebRTC worker ended; released its peer");
             peer.close();
         }
     }
@@ -1995,7 +1998,7 @@ fn rebuild_peer(
         // retrying every 30 seconds forever behind a UI that reads
         // "Connecting". Inbound offers are still accepted — the phone may well
         // be the deterministic initiator — and one resets this counter.
-        eprintln!(
+        debug_log!(
             "[DeskLink] {reason}; giving up after {} attempts. Waiting for the peer to offer.",
             recovery_attempt
         );
@@ -2007,7 +2010,7 @@ fn rebuild_peer(
         );
         return;
     };
-    eprintln!(
+    debug_log!(
         "[DeskLink] {reason}; rebuilding the WebRTC peer in {}ms (attempt {})",
         delay.as_millis(),
         recovery_attempt + 1
@@ -2021,7 +2024,7 @@ fn rebuild_peer(
     thread::spawn(move || {
         thread::sleep(delay);
         if !sessions.is_current(&binding) {
-            eprintln!("[DeskLink] WebRTC recovery superseded by a newer session generation");
+            debug_log!("[DeskLink] WebRTC recovery superseded by a newer session generation");
             return;
         }
         if sessions
@@ -2301,7 +2304,7 @@ fn handle_peer_envelope(
             .map_err(|error| error.to_string())?;
         let message = remote_session::ControlMessage::from_json(&payload)?;
         if message.kind != remote_session::ControlKind::Heartbeat {
-            eprintln!(
+            debug_log!(
                 "[DeskLink] Remote session {:?} from {}{}",
                 message.kind,
                 wire.peer_device_id,
@@ -2421,7 +2424,7 @@ fn handle_peer_envelope(
                     .unwrap_or(false);
                 let grant = can_control && authorization.is_ok() && unlocked.is_ok();
                 if !grant {
-                    eprintln!(
+                    debug_log!(
                         "[DeskLink] Denying phone control for {}: portal_can_control={}, session_authorized={}, reason={}",
                         wire.peer_device_id,
                         can_control,
@@ -2714,7 +2717,7 @@ fn handle_peer_envelope(
                 let _ = sessions.with_session(binding, |session| {
                     session.webrtc_recovery_attempt = 0;
                 });
-                eprintln!(
+                debug_log!(
                     "[DeskLink] WebRTC feature transport ready for {}",
                     binding.device_id
                 );
@@ -3003,7 +3006,7 @@ fn send_transfer_events(
                 peer.send_text(WebRtcChannel::FileData, &text)?;
             }
             TransferEvent::Completed { transfer_id, path } => {
-                eprintln!(
+                debug_log!(
                     "[DeskLink] WebRTC transfer {transfer_id} completed at {}",
                     path.display()
                 );

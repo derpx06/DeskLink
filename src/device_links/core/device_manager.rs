@@ -856,7 +856,7 @@ impl DeviceManager {
                     let fresh =
                         queued_at.elapsed() <= super::device_session::PENDING_FEATURE_MAX_AGE;
                     if !fresh {
-                        eprintln!("[DeskLink] Dropped stale queued {}", packet.packet_type);
+                        debug_log!("[DeskLink] Dropped stale queued {}", packet.packet_type);
                     }
                     fresh
                 })

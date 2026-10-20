@@ -220,7 +220,7 @@ impl DesklinkWindow {
                     let (id, arg) = (id.to_string(), parts.next().unwrap_or("").to_string());
                     if verb == "desk-terminal" {
                         let result = crate::device_links::pty::desk::new_desk_session();
-                        eprintln!("[E2E] desk-terminal: {result:?}");
+                        debug_log!("[E2E] desk-terminal: {result:?}");
                         return;
                     }
                     if verb == "desktop-selftest" {
@@ -231,7 +231,7 @@ impl DesklinkWindow {
                                     crate::device_links::webrtc::screen::desktop_share_selftest(
                                         &id,
                                     );
-                                eprintln!("[E2E] desktop-selftest: {result:?}");
+                                debug_log!("[E2E] desktop-selftest: {result:?}");
                             });
                         return;
                     }
@@ -239,7 +239,7 @@ impl DesklinkWindow {
                     if verb == "desk-input" {
                         let result =
                             crate::device_links::webrtc::debug_inject_desktop_input(&id, &arg);
-                        eprintln!("[E2E] desk-input {arg}: {result:?}");
+                        debug_log!("[E2E] desk-input {arg}: {result:?}");
                         return;
                     }
                     if verb == "remote-window" {
@@ -288,11 +288,11 @@ impl DesklinkWindow {
                             DaemonCommand::SendMousepadRequest(id, payload)
                         }
                         _ => {
-                            eprintln!("[E2E] unknown command: {line}");
+                            debug_log!("[E2E] unknown command: {line}");
                             return;
                         }
                     };
-                    eprintln!("[E2E] {verb}");
+                    debug_log!("[E2E] {verb}");
                     e2e_daemon.send(command);
                 })
                 .build()]);
@@ -1009,7 +1009,7 @@ fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget 
         let daemon = daemon.clone();
         let id = device.id.clone();
         unpair_btn.connect_clicked(move |_| {
-            eprintln!("[UI] Unpair clicked for {}", id);
+            debug_log!("[UI] Unpair clicked for {}", id);
             daemon.send(DaemonCommand::Unpair(id.clone()));
         });
     }
@@ -1176,7 +1176,7 @@ fn paired_device_card(daemon: &DaemonHandle, device: DeviceView) -> gtk::Widget 
                                 };
                                 for file in files.iter::<gio::File>().flatten() {
                                     if let Some(path) = file.path() {
-                                        eprintln!("[UI] Selected file to send: {:?}", path);
+                                        debug_log!("[UI] Selected file to send: {:?}", path);
                                         daemon.send(DaemonCommand::SendFile(id.clone(), path));
                                     }
                                 }
@@ -1447,7 +1447,7 @@ fn terminal_access_section(daemon: &DaemonHandle, device: &DeviceView) -> gtk::B
         let daemon = daemon.clone();
         let id = device.id.clone();
         switch.connect_active_notify(move |row| {
-            eprintln!("[UI] Terminal access for {id} set to {}", row.is_active());
+            debug_log!("[UI] Terminal access for {id} set to {}", row.is_active());
             daemon.send(DaemonCommand::SetTerminalAccess(
                 id.clone(),
                 row.is_active(),
@@ -2422,7 +2422,7 @@ fn unpaired_device_row(daemon: &DaemonHandle, device: DeviceView) -> adw::Action
                 let id = device.id.clone();
                 let shown_key = device.verification_key.clone();
                 move || {
-                    eprintln!("[UI] Accept clicked for {}", id);
+                    debug_log!("[UI] Accept clicked for {}", id);
                     daemon.send(DaemonCommand::AcceptPair(id.clone(), shown_key.clone()));
                 }
             });
