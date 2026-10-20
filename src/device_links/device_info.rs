@@ -45,7 +45,7 @@ impl DeviceInfo {
         Self {
             id,
             name,
-            device_type: "desktop".to_string(),
+            device_type: local_device_type().to_string(),
             protocol_version: PROTOCOL_VERSION,
             incoming_capabilities,
             outgoing_capabilities,
@@ -95,6 +95,23 @@ impl DeviceInfo {
     }
 }
 
+/// "laptop" or "desktop" for this machine, so the phone shows the right
+/// icon. Read from the firmware's SMBIOS chassis type, the same source
+/// `hostnamectl` uses; anything unreadable counts as a desktop.
+fn local_device_type() -> &'static str {
+    let chassis = std::fs::read_to_string("/sys/class/dmi/id/chassis_type").unwrap_or_default();
+    device_type_for_chassis(chassis.trim().parse().unwrap_or(0))
+}
+
+/// SMBIOS chassis types: 8 portable, 9 laptop, 10 notebook, 11 hand held,
+/// 14 sub notebook, 30 tablet, 31 convertible, 32 detachable.
+fn device_type_for_chassis(chassis: u32) -> &'static str {
+    match chassis {
+        8 | 9 | 10 | 11 | 14 | 30 | 31 | 32 => "laptop",
+        _ => "desktop",
+    }
+}
+
 fn string_array(value: Option<&Value>) -> Vec<String> {
     value
         .and_then(Value::as_array)
@@ -125,6 +142,16 @@ fn is_valid_device_id(id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn laptops_and_convertibles_report_as_laptops() {
+        for chassis in [8, 9, 10, 14, 31, 32] {
+            assert_eq!(super::device_type_for_chassis(chassis), "laptop");
+        }
+        for chassis in [0, 3, 4, 7, 13, 35] {
+            assert_eq!(super::device_type_for_chassis(chassis), "desktop");
+        }
+    }
+
     use crate::device_links::packet::PACKET_TYPE_PING;
 
     use super::*;
