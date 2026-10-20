@@ -6,11 +6,12 @@
 //! GDBus rather than pulling in a tray crate: two small interfaces, and it
 //! runs on the GTK main loop like everything else here.
 //!
-//! When no watcher exists (stock GNOME without a tray extension) nothing is
-//! shown, and the application falls back to a notification with an
-//! "End session" button whenever a session starts.
+//! The item owns `org.kde.StatusNotifierItem-<pid>-1` and counts as shown
+//! only while the watcher reports a registered host. Without one (stock GNOME
+//! without a tray extension) the application falls back to a notification
+//! with an "End session" button whenever a session starts.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -23,6 +24,8 @@ const MENU_PATH: &str = "/MenuBar";
 const ITEM_INTERFACE: &str = "org.kde.StatusNotifierItem";
 const MENU_INTERFACE: &str = "com.canonical.dbusmenu";
 const WATCHER: &str = "org.kde.StatusNotifierWatcher";
+const WATCHER_PATH: &str = "/StatusNotifierWatcher";
+const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
 const IDLE_ICON: &str = "derx06.desklink.com-symbolic";
 const ACTIVE_ICON: &str = "screen-shared-symbolic";
@@ -101,7 +104,15 @@ pub struct Tray {
     connection: gio::DBusConnection,
     state: Rc<RefCell<State>>,
     /// Whether a host is showing us; the fallback notification is used if not.
-    hosted: Rc<RefCell<bool>>,
+    hosted: Hosted,
+}
+
+/// Registered with the watcher, and the watcher has at least one host: only
+/// then is the item actually on screen somewhere.
+#[derive(Clone, Default)]
+struct Hosted {
+    registered: Rc<Cell<bool>>,
+    host: Rc<Cell<bool>>,
 }
 
 impl Tray {
@@ -150,30 +161,53 @@ impl Tray {
             .build()
             .map_err(|error| error.to_string())?;
 
-        let hosted = Rc::new(RefCell::new(false));
-        let appeared_hosted = Rc::clone(&hosted);
-        let vanished_hosted = Rc::clone(&hosted);
+        // Hosts look for items under this name; the object paths stay as they are.
+        let service = item_bus_name(std::process::id());
+        let _owner = gio::bus_own_name_on_connection(
+            &connection,
+            &service,
+            gio::BusNameOwnerFlags::NONE,
+            |_, _| {},
+            |_, name| debug_log!("[Tray] Could not own {name}; registering by unique name"),
+        );
+
+        let hosted = Hosted::default();
+        // Any change in which hosts exist: ask the watcher again rather than
+        // trusting the signal's sender or contents.
+        for (interface, arg0) in [(WATCHER, None), (PROPERTIES, Some(WATCHER))] {
+            let hosted = hosted.clone();
+            connection.signal_subscribe(
+                None,
+                Some(interface),
+                None,
+                Some(WATCHER_PATH),
+                arg0,
+                gio::DBusSignalFlags::NONE,
+                move |connection, _, _, _, member, _| {
+                    if member != "StatusNotifierItemRegistered"
+                        && member != "StatusNotifierItemUnregistered"
+                    {
+                        refresh_host(connection, &hosted);
+                    }
+                },
+            );
+        }
+
+        let appeared = hosted.clone();
+        let vanished = hosted.clone();
         // Watching lasts as long as the process; the tray is never torn down.
         let _watch = gio::bus_watch_name_on_connection(
             &connection,
             WATCHER,
             gio::BusNameWatcherFlags::NONE,
             move |connection, _, _| {
-                let service = connection.unique_name().map(|name| name.to_string());
-                let registered = connection.call_sync(
-                    Some(WATCHER),
-                    "/StatusNotifierWatcher",
-                    WATCHER,
-                    "RegisterStatusNotifierItem",
-                    Some(&(service.unwrap_or_default(),).to_variant()),
-                    None,
-                    gio::DBusCallFlags::NONE,
-                    2000,
-                    None::<&gio::Cancellable>,
-                );
-                *appeared_hosted.borrow_mut() = registered.is_ok();
+                register(&connection, &service, &appeared);
+                refresh_host(&connection, &appeared);
             },
-            move |_, _| *vanished_hosted.borrow_mut() = false,
+            move |_, _| {
+                vanished.registered.set(false);
+                vanished.host.set(false);
+            },
         );
 
         Ok(Self {
@@ -185,7 +219,7 @@ impl Tray {
 
     /// Whether a tray host is showing the item.
     pub fn hosted(&self) -> bool {
-        *self.hosted.borrow()
+        self.hosted.registered.get() && self.hosted.host.get()
     }
 
     /// Shows `lines` (one per active session). Signals only on change.
@@ -223,6 +257,68 @@ impl Tray {
             );
         }
     }
+}
+
+/// `org.kde.StatusNotifierItem-<pid>-<n>`, the name hosts expect an item under.
+fn item_bus_name(pid: u32) -> String {
+    format!("{ITEM_INTERFACE}-{pid}-1")
+}
+
+/// Registers with the watcher by well-known name, falling back to the unique
+/// name when that was refused (e.g. a sandbox that may not own it).
+fn register(connection: &gio::DBusConnection, service: &str, hosted: &Hosted) {
+    let registered = hosted.registered.clone();
+    let retry = connection.clone();
+    register_as(connection, service, move |ok| {
+        let unique = retry.unique_name();
+        match unique {
+            Some(unique) if !ok => {
+                register_as(&retry, &unique, move |ok| registered.set(ok));
+            }
+            _ => registered.set(ok),
+        }
+    });
+}
+
+fn register_as(connection: &gio::DBusConnection, service: &str, done: impl FnOnce(bool) + 'static) {
+    connection.call(
+        Some(WATCHER),
+        WATCHER_PATH,
+        WATCHER,
+        "RegisterStatusNotifierItem",
+        Some(&(service,).to_variant()),
+        None,
+        gio::DBusCallFlags::NONE,
+        2000,
+        None::<&gio::Cancellable>,
+        move |reply| done(reply.is_ok()),
+    );
+}
+
+/// Reads `IsStatusNotifierHostRegistered` from the watcher.
+fn refresh_host(connection: &gio::DBusConnection, hosted: &Hosted) {
+    let host = hosted.host.clone();
+    connection.call(
+        Some(WATCHER),
+        WATCHER_PATH,
+        PROPERTIES,
+        "Get",
+        Some(&(WATCHER, "IsStatusNotifierHostRegistered").to_variant()),
+        Some(glib::VariantTy::new("(v)").expect("valid type")),
+        gio::DBusCallFlags::NONE,
+        2000,
+        None::<&gio::Cancellable>,
+        move |reply| host.set(reply.ok().as_ref().is_some_and(host_registered)),
+    );
+}
+
+/// The `(v)` reply of `Properties.Get` for the host flag.
+fn host_registered(reply: &Variant) -> bool {
+    reply
+        .try_child_value(0)
+        .and_then(|value| value.as_variant())
+        .and_then(|value| value.get::<bool>())
+        .unwrap_or(false)
 }
 
 fn status(state: &State) -> &'static str {
@@ -409,5 +505,15 @@ mod tests {
             item_property("ToolTip", &busy).type_().as_str(),
             "(sa(iiay)ss)"
         );
+    }
+
+    #[test]
+    fn the_item_is_named_by_pid_and_hosting_is_read_from_the_watcher_reply() {
+        assert_eq!(item_bus_name(4242), "org.kde.StatusNotifierItem-4242-1");
+        let reply = |value: Variant| Variant::tuple_from_iter([Variant::from_variant(&value)]);
+        assert!(host_registered(&reply(true.to_variant())));
+        assert!(!host_registered(&reply(false.to_variant())));
+        assert!(!host_registered(&reply("yes".to_variant())));
+        assert!(!host_registered(&().to_variant()));
     }
 }

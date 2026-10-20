@@ -44,6 +44,8 @@ pub enum DaemonCommand {
     SetTerminalAccess(String, bool),
     /// Keep this computer awake while a phone is paired.
     SetStayAwake(bool),
+    /// The user answered "Not now" to the top-bar extension offer.
+    SetShellExtensionPromptDismissed(bool),
     /// Relay on/off and its address ("" = the built-in one).
     SetRelay {
         enabled: bool,
@@ -151,6 +153,9 @@ impl DaemonWorker {
             DaemonCommand::NetworkChanged => crate::device_links::relay_link::client::reset(),
             DaemonCommand::SetStayAwake(on) => {
                 self.update_settings(|settings| settings.stay_awake = on)
+            }
+            DaemonCommand::SetShellExtensionPromptDismissed(on) => {
+                self.update_settings(|settings| settings.shell_extension_prompt_dismissed = on)
             }
             DaemonCommand::SendFindPhone(id) => self.send_find_phone(&id),
             DaemonCommand::SendMprisAction(id, player, action) => {

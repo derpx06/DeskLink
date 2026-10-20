@@ -1,0 +1,7 @@
+{
+  "uuid": "desklink@derx06.github.io",
+  "name": "DeskLink",
+  "description": "Shows your DeskLink phone in the top bar: battery, connection and active screen or terminal sessions, with quick actions to ring it, send files, browse its files or end sessions. Needs the DeskLink app.",
+  "url": "https://github.com/derpx06/DeskLink",
+  "shell-version": ["45", "46", "47", "48", "49", "50", "51"]
+}

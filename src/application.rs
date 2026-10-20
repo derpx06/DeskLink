@@ -63,6 +63,11 @@ mod imp {
             obj.watch_network();
             obj.set_accels_for_action("app.quit", &["<control>q"]);
             obj.set_accels_for_action("app.shortcuts", &["<control>question"]);
+            obj.set_accels_for_action("app.preferences", &["<control>comma"]);
+            obj.set_accels_for_action("app.history", &["<control>h"]);
+            obj.set_accels_for_action("win.pair-new", &["<control>n"]);
+            obj.set_accels_for_action("win.toggle-search", &["<control>f"]);
+            obj.set_accels_for_action("window.close", &["<control>w"]);
         }
     }
 
@@ -77,6 +82,17 @@ mod imp {
 
             // Ask the window manager/compositor to present the window
             window.present();
+        }
+
+        // Before the name is owned, so top-bar clients find it with the name.
+        fn dbus_register(
+            &self,
+            connection: &gio::DBusConnection,
+            object_path: &str,
+        ) -> Result<(), glib::Error> {
+            self.parent_dbus_register(connection, object_path)?;
+            crate::shell_dbus::export(&self.obj(), connection);
+            Ok(())
         }
     }
 
@@ -138,21 +154,45 @@ impl DesklinkApplication {
         ]);
     }
 
-    fn daemon_handle(&self) -> Option<DaemonHandle> {
+    pub(crate) fn daemon_handle(&self) -> Option<DaemonHandle> {
         self.imp().daemon.borrow().clone()
     }
 
-    fn main_window(&self) -> gtk::Window {
-        self.active_window().unwrap_or_else(|| {
-            let window = DesklinkWindow::new(self);
-            if let Some(daemon) = self.daemon_handle() {
-                window.set_daemon(daemon);
-            }
-            // Closing hides: the window's poll keeps delivering pings,
-            // find-my-phone and errors, and reopening is instant.
-            window.set_hide_on_close(true);
-            window.upcast()
-        })
+    /// Whether a tray host is showing DeskLink's StatusNotifierItem.
+    pub(crate) fn tray_hosted(&self) -> bool {
+        self.imp()
+            .tray
+            .borrow()
+            .as_ref()
+            .is_some_and(|tray| tray.hosted())
+    }
+
+    /// The main window, never one of the Phone Screen, Phone Files or File
+    /// Transfers windows that `active_window()` can return.
+    fn main_window(&self) -> DesklinkWindow {
+        if let Some(window) = self
+            .windows()
+            .into_iter()
+            .find_map(|window| window.downcast::<DesklinkWindow>().ok())
+        {
+            return window;
+        }
+        let window = DesklinkWindow::new(self);
+        if let Some(daemon) = self.daemon_handle() {
+            window.set_daemon(daemon);
+        }
+        // Closing hides: the window's poll keeps delivering pings,
+        // find-my-phone and errors, and reopening is instant.
+        window.set_hide_on_close(true);
+        window
+    }
+
+    /// The main window, unless a dialog is already up on it: accelerators
+    /// must not stack a second Preferences (or History, …) over the first.
+    fn window_for_dialog(&self) -> Option<DesklinkWindow> {
+        let window = self.main_window();
+        window.present();
+        window.visible_dialog().is_none().then_some(window)
     }
 
     /// Shows what phones are doing here — in the top bar when a tray host
@@ -211,7 +251,8 @@ impl DesklinkApplication {
                 .tray
                 .borrow()
                 .as_ref()
-                .is_some_and(|tray| tray.hosted());
+                .is_some_and(|tray| tray.hosted())
+                || crate::shell_dbus::extension_active();
             if !hosted {
                 for (device, line) in &active {
                     if notified.insert(device.id.clone()) {
@@ -254,6 +295,11 @@ impl DesklinkApplication {
             .title("Connect Away From Home")
             .active(settings.relay_enabled)
             .build();
+        enabled.add_prefix(&crate::window::badge(
+            "network-server-symbolic",
+            "blue",
+            true,
+        ));
         let url = adw::EntryRow::builder()
             .title("Server (leave empty for the DeskLink server)")
             .text(settings.relay_url.as_str())
@@ -266,16 +312,30 @@ impl DesklinkApplication {
             )
             .active(settings.use_turn)
             .build();
+        turn.add_prefix(&crate::window::badge(
+            "network-transmit-receive-symbolic",
+            "purple",
+            true,
+        ));
         let status = adw::ActionRow::builder().title("Status").build();
+        status.add_prefix(&crate::window::badge(
+            "network-workgroup-symbolic",
+            "slate",
+            true,
+        ));
         let status_label = gtk::Label::builder().css_classes(["dim-label"]).build();
         status.add_suffix(&status_label);
 
         if let Some(daemon) = self.daemon_handle() {
+            // Weak: the closure is connected on these very rows.
             let send_relay = {
                 let daemon = daemon.clone();
-                let enabled = enabled.clone();
-                let url = url.clone();
+                let enabled = enabled.downgrade();
+                let url = url.downgrade();
                 move || {
+                    let (Some(enabled), Some(url)) = (enabled.upgrade(), url.upgrade()) else {
+                        return;
+                    };
                     daemon.send(DaemonCommand::SetRelay {
                         enabled: enabled.is_active(),
                         url: url.text().trim().to_string(),
@@ -374,68 +434,22 @@ impl DesklinkApplication {
     }
 
     fn show_history(&self) {
-        use crate::device_links::connection_log;
-        let parent = self.main_window();
-        let window = adw::Window::builder()
-            .transient_for(&parent)
-            .modal(true)
-            .default_width(520)
-            .default_height(560)
-            .title("Connection History")
-            .build();
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
-
-        let entries = connection_log::recent();
-        let content: gtk::Widget = if entries.is_empty() {
-            adw::StatusPage::builder()
-                .icon_name("document-open-recent-symbolic")
-                .title("No Connections Yet")
-                .description("Phones that connect to this computer are listed here for 30 days.")
-                .build()
-                .upcast()
-        } else {
-            let list = gtk::ListBox::builder()
-                .selection_mode(gtk::SelectionMode::None)
-                .css_classes(["boxed-list"])
-                .build();
-            for entry in entries {
-                let when = glib::DateTime::from_unix_local(entry.ts as i64)
-                    .and_then(|time| time.format("%e %b, %H:%M"))
-                    .map(|text| text.to_string())
-                    .unwrap_or_default();
-                let device = if entry.device_name.is_empty() {
-                    entry.device_id.clone()
-                } else {
-                    entry.device_name.clone()
-                };
-                list.append(
-                    &adw::ActionRow::builder()
-                        .title(glib::markup_escape_text(entry.event.label()).as_str())
-                        .subtitle(glib::markup_escape_text(&format!("{device} · {when}")).as_str())
-                        .build(),
-                );
-            }
-            let clamp = adw::Clamp::builder()
-                .child(&list)
-                .margin_top(12)
-                .margin_bottom(12)
-                .margin_start(12)
-                .margin_end(12)
-                .build();
-            gtk::ScrolledWindow::builder()
-                .child(&clamp)
-                .vexpand(true)
-                .build()
-                .upcast()
+        let Some(parent) = self.window_for_dialog() else {
+            return;
         };
-        toolbar.set_content(Some(&content));
-        window.set_content(Some(&toolbar));
-        window.present();
+        let dialog = adw::Dialog::builder()
+            .title("Connection History")
+            .content_width(520)
+            .content_height(620)
+            .child(&with_header(&history_content()))
+            .build();
+        dialog.present(Some(&parent));
     }
 
     fn show_about(&self) {
-        let window = self.main_window();
+        let Some(window) = self.window_for_dialog() else {
+            return;
+        };
         let about = adw::AboutDialog::builder()
             .application_name("DeskLink")
             .application_icon("derx06.desklink.com")
@@ -451,19 +465,41 @@ impl DesklinkApplication {
     }
 
     fn show_preferences(&self) {
-        let parent = self.main_window();
-        let window = adw::Window::builder()
-            .transient_for(&parent)
-            .modal(true)
-            .default_width(520)
-            .default_height(360)
-            .title("Preferences")
+        use crate::device_links::daemon::DaemonCommand;
+        let Some(parent) = self.window_for_dialog() else {
+            return;
+        };
+        let dialog = adw::PreferencesDialog::builder()
+            .search_enabled(true)
+            .content_width(720)
+            .build();
+        let settings = crate::device_links::config::app_settings();
+
+        // ── General ─────────────────────────────────────────────────────────
+        let general = adw::PreferencesPage::builder()
+            .title("General")
+            .icon_name("preferences-system-symbolic")
             .build();
 
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
+        let startup_group = adw::PreferencesGroup::builder().title("Background").build();
+        let start_at_login = adw::SwitchRow::builder()
+            .title("Start at Login")
+            .subtitle("Run in the background so your phone can reach this computer after a restart")
+            .active(settings.start_at_login.unwrap_or(true))
+            .build();
+        start_at_login.add_prefix(&crate::window::badge(
+            "system-reboot-symbolic",
+            "green",
+            true,
+        ));
+        if let Some(daemon) = self.daemon_handle() {
+            start_at_login.connect_active_notify(move |row| {
+                daemon.send(DaemonCommand::SetStartAtLogin(row.is_active()));
+            });
+        }
+        startup_group.add(&start_at_login);
+        general.add(&startup_group);
 
-        let page = adw::PreferencesPage::new();
         let network_group = adw::PreferencesGroup::builder()
             .title("Connection")
             .description("DeskLink Protocol v9 over the local network, on ports 1716-1764.")
@@ -473,14 +509,25 @@ impl DesklinkApplication {
             .title("Device Discovery")
             .subtitle("Broadcast identity packets and listen for nearby DeskLink devices.")
             .build();
+
+        discovery_row.add_prefix(&crate::window::badge(
+            "network-wireless-symbolic",
+            "blue",
+            true,
+        ));
         let discover = gtk::Button::builder()
             .label("Discover Now")
             .valign(gtk::Align::Center)
-            .css_classes(["suggested-action"])
             .build();
         if let Some(daemon) = self.daemon_handle() {
-            discover.connect_clicked(move |_| {
-                daemon.send(crate::device_links::daemon::DaemonCommand::Discover);
+            discover.connect_clicked(move |button| {
+                daemon.send(DaemonCommand::Discover);
+                if let Some(dialog) = button
+                    .ancestor(adw::PreferencesDialog::static_type())
+                    .and_downcast::<adw::PreferencesDialog>()
+                {
+                    dialog.add_toast(adw::Toast::new("Searching the network…"));
+                }
             });
         }
         discovery_row.add_suffix(&discover);
@@ -490,9 +537,12 @@ impl DesklinkApplication {
             .title("Clipboard Sync")
             .subtitle("Enabled automatically for paired devices while DeskLink is running.")
             .build();
+
+        clipboard_row.add_prefix(&crate::window::badge("edit-paste-symbolic", "blue", true));
         clipboard_row.add_suffix(
             &gtk::Image::builder()
-                .icon_name("emblem-ok-symbolic")
+                .icon_name("object-select-symbolic")
+                .tooltip_text("On")
                 .css_classes(["success"])
                 .build(),
         );
@@ -502,24 +552,38 @@ impl DesklinkApplication {
             .title("Received Files")
             .subtitle("Incoming files are saved to your Downloads folder with automatic renaming.")
             .build();
+
+        downloads_row.add_prefix(&crate::window::badge(
+            "folder-download-symbolic",
+            "green",
+            true,
+        ));
         network_group.add(&downloads_row);
+        general.add(&network_group);
+        dialog.add(&general);
 
-        page.add(&network_group);
-
-        let settings = crate::device_links::config::app_settings();
+        // ── Remote Access ───────────────────────────────────────────────────
+        let access = adw::PreferencesPage::builder()
+            .title("Remote Access")
+            .icon_name("preferences-desktop-remote-desktop-symbolic")
+            .build();
         let access_group = adw::PreferencesGroup::builder()
             .title("Remote Access")
+            .description("What your paired phones may do with this computer.")
             .build();
         let stay_awake = adw::SwitchRow::builder()
             .title("Stay Awake for Your Phone")
             .subtitle("Don't sleep, even with the lid closed, while a phone is paired.")
             .active(settings.stay_awake)
             .build();
+        stay_awake.add_prefix(&crate::window::badge(
+            "weather-clear-night-symbolic",
+            "purple",
+            true,
+        ));
         if let Some(daemon) = self.daemon_handle() {
             stay_awake.connect_active_notify(move |row| {
-                daemon.send(crate::device_links::daemon::DaemonCommand::SetStayAwake(
-                    row.is_active(),
-                ));
+                daemon.send(DaemonCommand::SetStayAwake(row.is_active()));
             });
         }
         access_group.add(&stay_awake);
@@ -528,6 +592,12 @@ impl DesklinkApplication {
             .title("Session Password")
             .subtitle(password_subtitle(settings.session_password.is_some()))
             .build();
+
+        password_row.add_prefix(&crate::window::badge(
+            "dialog-password-symbolic",
+            "orange",
+            true,
+        ));
         let set_password = gtk::Button::builder()
             .label(if settings.session_password.is_some() {
                 "Change…"
@@ -543,97 +613,301 @@ impl DesklinkApplication {
             .css_classes(["flat"])
             .visible(settings.session_password.is_some())
             .build();
+        remove_password.update_property(&[gtk::accessible::Property::Label(
+            "Remove the session password",
+        )]);
         if let Some(daemon) = self.daemon_handle() {
-            let row = password_row.clone();
-            let remove = remove_password.clone();
+            // Weak references: both buttons live inside the row they update.
+            let row = password_row.downgrade();
+            let remove = remove_password.downgrade();
             let daemon_for_set = daemon.clone();
             set_password.connect_clicked(move |button| {
-                let row = row.clone();
-                let remove = remove.clone();
-                let button = button.clone();
+                let Some(parent) = row.upgrade() else {
+                    return;
+                };
+                let (row, remove, button) = (row.clone(), remove.clone(), button.downgrade());
                 let daemon = daemon_for_set.clone();
-                let parent = row.clone();
                 ask_for_password(&parent, move |password| {
-                    daemon.send(
-                        crate::device_links::daemon::DaemonCommand::SetSessionPassword(Some(
-                            password,
-                        )),
-                    );
-                    row.set_subtitle(password_subtitle(true));
-                    button.set_label("Change…");
-                    remove.set_visible(true);
+                    daemon.send(DaemonCommand::SetSessionPassword(Some(password)));
+                    if let Some(row) = row.upgrade() {
+                        row.set_subtitle(password_subtitle(true));
+                    }
+                    if let Some(button) = button.upgrade() {
+                        button.set_label("Change…");
+                    }
+                    if let Some(remove) = remove.upgrade() {
+                        remove.set_visible(true);
+                    }
                 });
             });
-            let row = password_row.clone();
-            let set = set_password.clone();
+            let row = password_row.downgrade();
+            let set = set_password.downgrade();
             remove_password.connect_clicked(move |remove| {
-                daemon.send(crate::device_links::daemon::DaemonCommand::SetSessionPassword(None));
-                row.set_subtitle(password_subtitle(false));
-                set.set_label("Set…");
+                daemon.send(DaemonCommand::SetSessionPassword(None));
+                if let Some(row) = row.upgrade() {
+                    row.set_subtitle(password_subtitle(false));
+                }
+                if let Some(set) = set.upgrade() {
+                    set.set_label("Set…");
+                }
                 remove.set_visible(false);
             });
         }
         password_row.add_suffix(&remove_password);
         password_row.add_suffix(&set_password);
         access_group.add(&password_row);
+        access.add(&access_group);
 
+        let history_group = adw::PreferencesGroup::new();
         let history_row = adw::ActionRow::builder()
             .title("Connection History")
             .subtitle("Which phones connected, and what they did, for the last 30 days.")
             .activatable(true)
-            .action_name("app.history")
             .build();
+        history_row.add_prefix(&crate::window::badge(
+            "document-open-recent-symbolic",
+            "slate",
+            true,
+        ));
         history_row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-        access_group.add(&history_row);
-        page.add(&access_group);
-        page.add(&self.away_from_home_group(&settings));
+        {
+            let dialog = dialog.downgrade();
+            history_row.connect_activated(move |_| {
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.push_subpage(
+                        &adw::NavigationPage::builder()
+                            .title("Connection History")
+                            .child(&with_header(&history_content()))
+                            .build(),
+                    );
+                }
+            });
+        }
+        history_group.add(&history_row);
+        access.add(&history_group);
+        dialog.add(&access);
 
-        toolbar.set_content(Some(&page));
-        window.set_content(Some(&toolbar));
-        window.present();
+        // ── Away From Home ──────────────────────────────────────────────────
+        let away = adw::PreferencesPage::builder()
+            .title("Away From Home")
+            .icon_name("network-server-symbolic")
+            .build();
+        away.add(&self.away_from_home_group(&settings));
+        dialog.add(&away);
+
+        dialog.present(Some(&parent));
     }
 
+    /// The stock shortcuts dialog from `shortcuts-dialog.ui` where libadwaita
+    /// has one (1.8); before that, the same shortcuts in a plain list.
     fn show_shortcuts(&self) {
-        let parent = self.main_window();
-        let window = adw::Window::builder()
-            .transient_for(&parent)
-            .modal(true)
-            .default_width(420)
-            .default_height(260)
-            .title("Keyboard Shortcuts")
-            .build();
-
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&adw::HeaderBar::new());
+        let Some(parent) = self.window_for_dialog() else {
+            return;
+        };
+        if adw::minor_version() >= 8 {
+            let builder = gtk::Builder::new();
+            match builder.add_from_resource("/derx06/desklink/com/shortcuts-dialog.ui") {
+                Ok(()) => {
+                    if let Some(dialog) = builder.object::<adw::Dialog>("shortcuts_dialog") {
+                        dialog.present(Some(&parent));
+                        return;
+                    }
+                }
+                Err(error) => eprintln!("[UI] No shortcuts dialog: {error}"),
+            }
+        }
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
-            .margin_top(20)
-            .margin_bottom(20)
-            .margin_start(20)
-            .margin_end(20)
             .css_classes(["boxed-list"])
             .build();
-
-        for (title, shortcut) in [("Show Shortcuts", "Ctrl+?"), ("Quit", "Ctrl+Q")] {
+        for (title, shortcut) in [
+            ("Pair New Device", "Ctrl+N"),
+            ("Search Devices", "Ctrl+F"),
+            ("Connection History", "Ctrl+H"),
+            ("Preferences", "Ctrl+,"),
+            ("Show Shortcuts", "Ctrl+?"),
+            ("Close Window", "Ctrl+W"),
+            ("Quit", "Ctrl+Q"),
+        ] {
             let row = adw::ActionRow::builder().title(title).build();
             row.add_suffix(
                 &gtk::Label::builder()
                     .label(shortcut)
                     .valign(gtk::Align::Center)
-                    .css_classes(["caption", "monospace"])
+                    .css_classes(["dim-label", "monospace"])
                     .build(),
             );
             list.append(&row);
         }
+        let content = adw::Clamp::builder()
+            .child(&list)
+            .margin_top(12)
+            .margin_bottom(24)
+            .margin_start(12)
+            .margin_end(12)
+            .build();
+        adw::Dialog::builder()
+            .title("Keyboard Shortcuts")
+            .content_width(420)
+            .child(&with_header(&content))
+            .build()
+            .present(Some(&parent));
+    }
+}
 
-        toolbar.set_content(Some(&list));
-        window.set_content(Some(&toolbar));
-        window.present();
+/// `content` under a plain header bar, for a dialog or a pushed subpage.
+fn with_header(content: &impl IsA<gtk::Widget>) -> adw::ToolbarView {
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&adw::HeaderBar::new());
+    toolbar.set_content(Some(content));
+    toolbar
+}
+
+/// Connection history grouped by day, newest first, with a time for each.
+fn history_content() -> gtk::Widget {
+    use crate::device_links::connection_log;
+    let entries = connection_log::recent();
+    if entries.is_empty() {
+        return adw::StatusPage::builder()
+            .icon_name("document-open-recent-symbolic")
+            .title("No Connections Yet")
+            .description("Phones that connect to this computer are listed here for 30 days.")
+            .vexpand(true)
+            .build()
+            .upcast();
+    }
+    let now = glib::DateTime::now_local().ok();
+    let page = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(24)
+        .margin_top(12)
+        .margin_bottom(24)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    let mut group: Option<(String, adw::PreferencesGroup)> = None;
+    for entry in entries {
+        let Some(when) = glib::DateTime::from_unix_local(entry.ts as i64).ok() else {
+            continue;
+        };
+        let day = now
+            .as_ref()
+            .map(|now| day_label(now, &when))
+            .unwrap_or_default();
+        if group.as_ref().is_none_or(|(shown, _)| *shown != day) {
+            let next = adw::PreferencesGroup::builder().title(&day).build();
+            page.append(&next);
+            group = Some((day, next));
+        }
+        let device = if entry.device_name.is_empty() {
+            entry.device_id.clone()
+        } else {
+            entry.device_name.clone()
+        };
+        let mut event = entry.event.label().to_string();
+        if let Some(path) = entry.path.as_deref().and_then(path_label) {
+            event = format!("{event} · {path}");
+        }
+        let row = adw::ActionRow::builder()
+            .title(device)
+            .subtitle(event)
+            .use_markup(false)
+            .build();
+        let (icon, hue) = event_icon(entry.event);
+        row.add_prefix(&crate::window::badge(icon, hue, true));
+        let time = now
+            .as_ref()
+            .map(|now| time_label(now, &when))
+            .unwrap_or_default();
+        row.add_suffix(
+            &gtk::Label::builder()
+                .label(time)
+                .tooltip_text(
+                    when.format("%e %B %Y, %H:%M")
+                        .map(|text| text.trim().to_string())
+                        .unwrap_or_default(),
+                )
+                .css_classes(["dim-label", "caption", "numeric"])
+                .build(),
+        );
+        if let Some((_, group)) = &group {
+            group.add(&row);
+        }
+    }
+    gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&adw::Clamp::builder().child(&page).build())
+        .build()
+        .upcast()
+}
+
+fn path_label(path: &str) -> Option<&'static str> {
+    match path {
+        "lan" => Some("Local network"),
+        "direct" => Some("Direct over the internet"),
+        "turn" => Some("Through a TURN relay"),
+        _ => None,
+    }
+}
+
+/// The badge icon and hue for a history event.
+fn event_icon(
+    event: crate::device_links::connection_log::ConnectionEvent,
+) -> (&'static str, &'static str) {
+    use crate::device_links::connection_log::ConnectionEvent::*;
+    match event {
+        Connected => ("network-transmit-receive-symbolic", "green"),
+        Disconnected => ("network-offline-symbolic", "slate"),
+        ScreenViewStarted | ScreenControlStarted => ("screen-shared-symbolic", "blue"),
+        ScreenSessionEnded => ("video-display-symbolic", "slate"),
+        TerminalAttached => ("utilities-terminal-symbolic", "purple"),
+        TerminalDetached => ("utilities-terminal-symbolic", "slate"),
+        PasswordRejected => ("dialog-warning-symbolic", "red"),
+        SessionsEnded => ("process-stop-symbolic", "orange"),
+        Route => ("network-workgroup-symbolic", "teal"),
+    }
+}
+
+/// "Today", "Yesterday", a weekday within the week, else the date.
+fn day_label(now: &glib::DateTime, when: &glib::DateTime) -> String {
+    let midnight = |time: &glib::DateTime| {
+        let (year, month, day) = time.ymd();
+        glib::DateTime::from_local(year, month, day, 0, 0, 0.0).ok()
+    };
+    let days = match (midnight(now), midnight(when)) {
+        // Rounded, so a day with a daylight-saving change still counts as one.
+        (Some(today), Some(then)) => (today.difference(&then).as_seconds() + 43_200) / 86_400,
+        _ => i64::MAX,
+    };
+    let format = match days {
+        0 => return "Today".to_string(),
+        1 => return "Yesterday".to_string(),
+        2..=6 => "%A",
+        _ => "%e %B",
+    };
+    when.format(format)
+        .map(|text| text.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// "Just now", "12 min ago" and "3 h ago" for the last few hours, else the
+/// clock time.
+fn time_label(now: &glib::DateTime, when: &glib::DateTime) -> String {
+    let seconds = now.difference(when).as_seconds();
+    match seconds {
+        ..60 => "Just now".to_string(),
+        60..3600 => format!("{} min ago", seconds / 60),
+        3600..14400 => format!("{} h ago", seconds / 3600),
+        _ => when
+            .format("%H:%M")
+            .map(|text| text.to_string())
+            .unwrap_or_default(),
     }
 }
 
 /// The indicator's line for `device`, if it is using this computer.
-fn session_line(device: &crate::device_links::device::DeviceView) -> Option<String> {
+pub(crate) fn session_line(device: &crate::device_links::device::DeviceView) -> Option<String> {
     use crate::device_links::device::DesktopSession;
     let screen = match device.desktop_session {
         DesktopSession::None => None,
@@ -689,11 +963,17 @@ fn ask_for_password(parent: &impl IsA<gtk::Widget>, done: impl Fn(String) + 'sta
     dialog.set_response_enabled("ok", false);
     dialog.set_extra_child(Some(&list));
 
+    // Weak: `check` is connected on the entries and enables the dialog.
     let check = {
-        let dialog = dialog.clone();
-        let entry = entry.clone();
-        let confirm = confirm.clone();
+        let dialog = dialog.downgrade();
+        let entry = entry.downgrade();
+        let confirm = confirm.downgrade();
         move || {
+            let (Some(dialog), Some(entry), Some(confirm)) =
+                (dialog.upgrade(), entry.upgrade(), confirm.upgrade())
+            else {
+                return;
+            };
             let password = entry.text();
             let usable = !password.is_empty()
                 && password.len() <= crate::device_links::session_lock::MAX_PASSWORD_BYTES
@@ -712,4 +992,36 @@ fn ask_for_password(parent: &impl IsA<gtk::Widget>, done: impl Fn(String) + 'sta
             done(entry.text().to_string());
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(year: i32, month: i32, day: i32, hour: i32, minute: i32) -> glib::DateTime {
+        glib::DateTime::from_local(year, month, day, hour, minute, 0.0).unwrap()
+    }
+
+    #[test]
+    fn history_days_read_as_today_yesterday_then_dates() {
+        let now = at(2026, 10, 20, 9, 0);
+        assert_eq!(day_label(&now, &at(2026, 10, 20, 0, 5)), "Today");
+        assert_eq!(day_label(&now, &at(2026, 10, 19, 23, 50)), "Yesterday");
+        assert_eq!(day_label(&now, &at(2026, 10, 16, 12, 0)), "Friday");
+        assert_eq!(day_label(&now, &at(2026, 10, 1, 12, 0)), "1 October");
+        // Across a new year, yesterday is still yesterday.
+        assert_eq!(
+            day_label(&at(2027, 1, 1, 9, 0), &at(2026, 12, 31, 22, 0)),
+            "Yesterday"
+        );
+    }
+
+    #[test]
+    fn recent_history_times_are_relative_and_older_ones_are_clock_times() {
+        let now = at(2026, 10, 20, 15, 0);
+        assert_eq!(time_label(&now, &at(2026, 10, 20, 14, 59)), "1 min ago");
+        assert_eq!(time_label(&now, &now), "Just now");
+        assert_eq!(time_label(&now, &at(2026, 10, 20, 12, 30)), "2 h ago");
+        assert_eq!(time_label(&now, &at(2026, 10, 20, 8, 5)), "08:05");
+    }
 }

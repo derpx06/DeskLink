@@ -2,6 +2,9 @@
 name = "desklink"
 version = "1.0.0"
 edition = "2021"
+# Debian 13's rustc. Cargo.lock pins idna_adapter 1.1 and image 0.25.6 to stay
+# under it; check before `cargo update` raises them.
+rust-version = "1.85"
 
 [dependencies]
 arboard = "3.6.1"
@@ -9,8 +12,11 @@ base64 = "0.22"
 # Relay protocol types only (no server code).
 desklink-relay = { path = "relay", default-features = false }
 dirs = "6"
+# Bundled gtk4paintablesink, registered only where the distro ships none
+# (Ubuntu 24.04 has no gstreamer1.0-gtk4 package).
+gst-plugin-gtk4 = { version = "0.13", features = ["gtk_v4_12"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
-gtk = { version = "0.9", package = "gtk4", features = ["gnome_47"] }
+gtk = { version = "0.9", package = "gtk4", features = ["v4_12"] }
 hostname = "0.4"
 libc = "0.2"
 mdns-sd = { version = "0.21", default-features = false }
@@ -25,16 +31,18 @@ socket2 = { version = "0.6", features = ["all"] }
 tungstenite = { version = "0.30", features = ["native-tls"] }
 uuid = { version = "1", features = ["v4"] }
 vt100 = "0.16"
+# X11 fallback for sharing the desktop where no ScreenCast portal exists.
+x11rb = { version = "0.13", features = ["xtest"] }
 
 [dependencies.gst]
 package = "gstreamer"
 version = "0.23.6"
-features = ["v1_28"]
 
 [dependencies.gst-webrtc]
 package = "gstreamer-webrtc"
 version = "0.23.5"
-features = ["v1_26"]
+# WebRTCICE and send_data_full/send_string_full; the floor is GStreamer 1.22.
+features = ["v1_22"]
 
 [dependencies.gst-sdp]
 package = "gstreamer-sdp"
@@ -43,7 +51,7 @@ version = "0.23.5"
 [dependencies.adw]
 package = "libadwaita"
 version = "0.7"
-features = ["v1_6"]
+features = ["v1_5"]
 
 [dev-dependencies]
 # The full relay, to test the client against a real server.

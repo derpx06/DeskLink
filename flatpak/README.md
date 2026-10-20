@@ -63,8 +63,13 @@ of the tag, temporarily replace the git source with
 - **`--system-talk-name=org.freedesktop.login1`** holds the stay-awake
   inhibitor and locks the session on the phone's request.
 - **ScreenSaver names** are used to lock the screen.
-- **`org.kde.StatusNotifierWatcher`** registers the tray item. The item uses
-  the connection's unique name, so no `--own-name` is needed.
+- **`org.kde.StatusNotifierWatcher`** registers the tray item under
+  `org.kde.StatusNotifierItem-<pid>-1`; the app is PID 2 in the sandbox, hence
+  `--own-name=org.kde.StatusNotifierItem-2-1`. Without it the item falls back
+  to the connection's unique name.
+- **`--talk-name=org.gnome.Shell.Extensions`** offers (once, on GNOME without
+  a tray host) to enable or install the DeskLink top-bar extension. GNOME
+  shows its own confirmation.
 - **`--filesystem=xdg-download`** is where received files are saved.
 - Notifications, screen casting and remote input go through portals and need
   no permission.

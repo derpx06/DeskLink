@@ -42,6 +42,7 @@ mod device_links;
 mod phone_files;
 mod protocol;
 mod remote_control;
+mod shell_dbus;
 mod transfers;
 mod tray;
 mod window;

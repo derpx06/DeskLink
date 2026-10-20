@@ -198,7 +198,7 @@ impl DaemonWorker {
             let mut tick: u32 = 0;
             while !shutdown.load(Ordering::Acquire) {
                 tick = tick.wrapping_add(1);
-                if tick.is_multiple_of(5) {
+                if tick % 5 == 0 {
                     refresh_connection_paths(&devices, &sessions);
                 }
                 let wanted = super::config::app_settings().stay_awake

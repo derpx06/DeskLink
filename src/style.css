@@ -1,0 +1,177 @@
+/* Loaded automatically by AdwApplication from the resource base path. Only what
+ * libadwaita's own style classes do not cover. */
+
+/* A small coloured dot beside a device's status, always next to its text. */
+.status-dot {
+  min-width: 8px;
+  min-height: 8px;
+  border-radius: 999px;
+  background-color: alpha(currentColor, 0.4);
+}
+.status-dot.connected { background-color: @success_color; }
+.status-dot.connecting { background-color: @warning_color; }
+.status-dot.offline { background-color: @error_color; }
+
+/* Pills under a device's name: status, connection path, battery. */
+.chip {
+  padding: 4px 12px;
+  border-radius: 999px;
+  background-color: alpha(currentColor, 0.08);
+  font-size: 0.9em;
+  font-weight: 600;
+}
+.chip.success { background-color: alpha(@success_color, 0.14); }
+.chip.warning { background-color: alpha(@warning_color, 0.16); }
+.chip.error { background-color: alpha(@error_color, 0.14); }
+
+/* Icon badges: a tinted rounded square behind a symbolic icon, one hue per
+ * action. Each icon colour is mixed with the window's text colour, which
+ * darkens it on light backgrounds and lightens it on dark ones — so one rule
+ * reads well in both styles (libadwaita 1.5 has no colour-scheme media query,
+ * and style-dark.css is deprecated in later versions). */
+@define-color badge_blue mix(@blue_3, @window_fg_color, 0.25);
+@define-color badge_green mix(@green_4, @window_fg_color, 0.25);
+@define-color badge_yellow mix(@yellow_5, @window_fg_color, 0.2);
+@define-color badge_orange mix(@orange_4, @window_fg_color, 0.2);
+@define-color badge_red mix(@red_3, @window_fg_color, 0.2);
+@define-color badge_purple mix(@purple_2, @window_fg_color, 0.3);
+@define-color badge_brown mix(@brown_2, @window_fg_color, 0.35);
+@define-color badge_teal mix(mix(@blue_3, @green_4, 0.5), @window_fg_color, 0.25);
+@define-color badge_slate alpha(@window_fg_color, 0.75);
+
+.badge {
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: 13px;
+  background-color: alpha(currentColor, 0.1);
+}
+.badge.small {
+  min-width: 32px;
+  min-height: 32px;
+  border-radius: 9px;
+}
+.badge.blue { color: @badge_blue; background-color: alpha(@blue_3, 0.17); }
+.badge.green { color: @badge_green; background-color: alpha(@green_4, 0.17); }
+.badge.yellow { color: @badge_yellow; background-color: alpha(@yellow_4, 0.22); }
+.badge.orange { color: @badge_orange; background-color: alpha(@orange_3, 0.17); }
+.badge.red { color: @badge_red; background-color: alpha(@red_3, 0.14); }
+.badge.purple { color: @badge_purple; background-color: alpha(@purple_3, 0.16); }
+.badge.brown { color: @badge_brown; background-color: alpha(@brown_3, 0.18); }
+.badge.teal { color: @badge_teal; background-color: alpha(mix(@blue_3, @green_4, 0.5), 0.18); }
+.badge.slate { color: @badge_slate; background-color: alpha(@badge_slate, 0.1); }
+.badge.accent { color: @accent_color; background-color: alpha(@accent_bg_color, 0.16); }
+
+/* Quick-action cards: icon badge on the left, title and a hint beside it. */
+.action-card {
+  padding: 12px 14px;
+  border-radius: 14px;
+}
+.action-card .hint { font-size: 0.9em; }
+.action-card:disabled { opacity: 0.5; }
+
+/* The device header: a soft accent wash so the page has depth. */
+.device-hero {
+  padding: 28px 18px 22px 18px;
+  border-radius: 18px;
+  background-image: linear-gradient(to bottom,
+                                    alpha(@accent_bg_color, 0.16),
+                                    alpha(@accent_bg_color, 0.03));
+}
+
+/* "Pixel 8 is controlling the screen": stands out from the plain rows. */
+.session-card {
+  padding: 14px 16px;
+  border-radius: 14px;
+  background-color: alpha(@accent_bg_color, 0.12);
+  border: 1px solid alpha(@accent_color, 0.3);
+}
+.session-card .session-label {
+  color: @accent_color;
+  font-weight: 700;
+  font-size: 0.85em;
+}
+.live-dot {
+  min-width: 10px;
+  min-height: 10px;
+  border-radius: 999px;
+  background-color: @success_color;
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+@keyframes live-pulse {
+  0% { opacity: 1; }
+  50% { opacity: 0.3; }
+  100% { opacity: 1; }
+}
+
+/* Sidebar avatar's online/offline badge, ringed in the sidebar colour. */
+.status-dot.ring {
+  min-width: 10px;
+  min-height: 10px;
+  border: 2px solid @sidebar_bg_color;
+}
+row:selected .status-dot.ring { border-color: mix(@sidebar_bg_color, currentColor, 0.1); }
+
+.sidebar-badge {
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background-color: @accent_bg_color;
+  color: @accent_fg_color;
+  font-size: 0.8em;
+  font-weight: 700;
+}
+
+/* The six-digit pairing code, read aloud and compared across two screens. */
+.pairing-code {
+  font-size: 2.6em;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  font-feature-settings: "tnum";
+}
+
+/* QR codes need their light quiet zone in dark mode too. */
+.qr-frame {
+  background-color: white;
+  border-radius: 18px;
+  padding: 8px;
+}
+
+/* Phone screen viewer: an immersive black surface. */
+.remote-window,
+.remote-window .phone-screen {
+  background-color: black;
+  color: white;
+}
+.remote-window headerbar {
+  background-color: transparent;
+  color: white;
+  box-shadow: none;
+}
+.floating-toolbar {
+  border-radius: 999px;
+  padding: 6px;
+  margin: 18px;
+}
+.status-pill {
+  border-radius: 999px;
+  padding: 8px 16px;
+  margin: 12px;
+  font-weight: 600;
+}
+
+/* A file transfer's progress bar spans the row under its text. */
+.transfer-row progressbar trough,
+.transfer-row progressbar progress {
+  min-height: 6px;
+}
+
+.padded-card {
+  padding: 24px;
+}
+
+/* On the viewer's black surface the OSD tint needs to be light to show. */
+.remote-window .floating-toolbar,
+.remote-window .status-pill {
+  background-color: alpha(white, 0.12);
+  color: white;
+}

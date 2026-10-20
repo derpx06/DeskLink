@@ -71,6 +71,8 @@ pub struct AppSettings {
     /// Start in the background at login. `None` until decided: the first run
     /// turns it on, as a connection app is useless after a reboot otherwise.
     pub start_at_login: Option<bool>,
+    /// The user declined the offer to show DeskLink in the GNOME top bar.
+    pub shell_extension_prompt_dismissed: bool,
 }
 
 impl Default for AppSettings {
@@ -82,6 +84,7 @@ impl Default for AppSettings {
             relay_url: String::new(),
             use_turn: true,
             start_at_login: None,
+            shell_extension_prompt_dismissed: false,
         }
     }
 }

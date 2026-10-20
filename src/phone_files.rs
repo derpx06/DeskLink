@@ -222,7 +222,12 @@ struct Ui {
     window: adw::Window,
     title: adw::WindowTitle,
     list: gtk::ListBox,
-    status: gtk::Label,
+    /// A message over the listing; when there is no listing it is shown as
+    /// the whole page instead.
+    banner: adw::Banner,
+    stack: gtk::Stack,
+    status_page: adw::StatusPage,
+    retry: gtk::Button,
     spinner: gtk::Spinner,
     up: gtk::Button,
     refresh: gtk::Button,
@@ -241,49 +246,68 @@ pub fn show(daemon: DaemonHandle, device_id: String, device_name: &str, parent: 
     let window = adw::Window::builder()
         .transient_for(parent)
         .modal(true)
-        .default_width(620)
-        .default_height(520)
+        .default_width(640)
+        .default_height(600)
         .title(format!("{device_name} files"))
         .build();
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
     let title = adw::WindowTitle::new("Phone files", "");
     header.set_title_widget(Some(&title));
-    let up = icon_button("go-up-symbolic", "Up one folder");
+    let up = icon_button("go-up-symbolic", "Up One Folder");
     let refresh = icon_button("view-refresh-symbolic", "Refresh");
-    let new_folder = icon_button("folder-new-symbolic", "New folder");
+    let new_folder = icon_button("folder-new-symbolic", "New Folder");
     header.pack_start(&up);
-    header.pack_start(&refresh);
     header.pack_end(&new_folder);
-    let spinner = gtk::Spinner::new();
+    header.pack_end(&refresh);
+    let spinner = gtk::Spinner::builder().spinning(true).build();
     header.pack_end(&spinner);
     toolbar.add_top_bar(&header);
+    let banner = adw::Banner::builder().use_markup(false).build();
+    toolbar.add_top_bar(&banner);
 
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(18)
-        .margin_start(18)
-        .margin_end(18)
-        .build();
-    let status = gtk::Label::builder()
-        .xalign(0.0)
-        .wrap(true)
-        .visible(false)
-        .build();
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
+        .valign(gtk::Align::Start)
         .css_classes(["boxed-list"])
         .build();
-    let scroller = gtk::ScrolledWindow::builder()
-        .vexpand(true)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .child(&list)
+    let retry = gtk::Button::builder()
+        .label("Try Again")
+        .halign(gtk::Align::Center)
+        .css_classes(["pill"])
         .build();
-    content.append(&status);
-    content.append(&scroller);
-    toolbar.set_content(Some(&content));
+    let status_page = adw::StatusPage::builder().child(&retry).build();
+    let stack = gtk::Stack::builder()
+        .transition_type(gtk::StackTransitionType::Crossfade)
+        .build();
+    stack.add_named(
+        &gtk::ScrolledWindow::builder()
+            .vexpand(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .child(
+                &adw::Clamp::builder()
+                    .margin_top(12)
+                    .margin_bottom(24)
+                    .margin_start(12)
+                    .margin_end(12)
+                    .child(&list)
+                    .build(),
+            )
+            .build(),
+        Some("list"),
+    );
+    stack.add_named(&status_page, Some("status"));
+    stack.add_named(
+        &gtk::Spinner::builder()
+            .spinning(true)
+            .width_request(48)
+            .height_request(48)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .build(),
+        Some("loading"),
+    );
+    toolbar.set_content(Some(&stack));
     window.set_content(Some(&toolbar));
 
     let ctx = Rc::new(Ctx {
@@ -294,7 +318,10 @@ pub fn show(daemon: DaemonHandle, device_id: String, device_name: &str, parent: 
             window: window.clone(),
             title,
             list,
-            status,
+            banner,
+            stack,
+            status_page,
+            retry: retry.clone(),
             spinner,
             up: up.clone(),
             refresh: refresh.clone(),
@@ -312,6 +339,10 @@ pub fn show(daemon: DaemonHandle, device_id: String, device_name: &str, parent: 
         move |_| with_ctx(&weak, go_up)
     });
     refresh.connect_clicked({
+        let weak = weak.clone();
+        move |_| with_ctx(&weak, reload)
+    });
+    retry.connect_clicked({
         let weak = weak.clone();
         move |_| with_ctx(&weak, reload)
     });
@@ -578,61 +609,63 @@ fn render(ctx: &Rc<Ctx>) {
     let ui = &ctx.ui;
     let busy = model.busy();
     let in_folder = !model.trail.is_empty();
+    let listing = !model.entries.is_empty();
 
     ui.title.set_title(&model.title());
     ui.title.set_subtitle(&model.path_text());
-    ui.spinner.set_spinning(busy);
-    ui.spinner.set_visible(busy);
+    ui.spinner.set_visible(busy && listing);
     ui.up.set_sensitive(!busy && in_folder);
     ui.refresh.set_sensitive(!busy);
     ui.new_folder.set_sensitive(!busy && in_folder);
 
-    match &model.notice {
-        Some(Notice::Info(message)) => {
-            ui.status.set_label(message);
-            ui.status.set_css_classes(&["dim-label"]);
-            ui.status.set_visible(true);
+    let message = match &model.notice {
+        Some(Notice::Info(message) | Notice::Error(message)) => Some(message.as_str()),
+        None => None,
+    };
+    ui.banner.set_title(message.unwrap_or_default());
+    ui.banner.set_revealed(listing && message.is_some());
+
+    if !listing {
+        if busy {
+            ui.stack.set_visible_child_name("loading");
+        } else {
+            let failed = matches!(model.notice, Some(Notice::Error(_)));
+            let (icon, title) = match (failed, in_folder) {
+                (true, _) => ("dialog-warning-symbolic", "Could Not Load Files"),
+                (false, true) => ("folder-symbolic", "Folder Is Empty"),
+                (false, false) => ("folder-remote-symbolic", "No Shared Folders"),
+            };
+            ui.status_page.set_icon_name(Some(icon));
+            ui.status_page.set_title(title);
+            ui.status_page.set_description(
+                message
+                    .map(|message| glib::markup_escape_text(message).to_string())
+                    .as_deref(),
+            );
+            ui.retry.set_visible(failed);
+            ui.stack.set_visible_child_name("status");
         }
-        Some(Notice::Error(message)) => {
-            ui.status.set_label(message);
-            ui.status.set_css_classes(&["error"]);
-            ui.status.set_visible(true);
-        }
-        None => ui.status.set_visible(false),
+    } else {
+        ui.stack.set_visible_child_name("list");
     }
 
     ui.list.remove_all();
-    if model.entries.is_empty() && !busy && model.notice.is_none() {
-        ui.list.append(
-            &gtk::Label::builder()
-                .label("This folder is empty")
-                .margin_top(24)
-                .margin_bottom(24)
-                .css_classes(["dim-label"])
-                .build(),
-        );
-    }
     let weak = Rc::downgrade(ctx);
     for entry in &model.entries {
         ui.list.append(&entry_row(&weak, entry, busy));
     }
     if model.next_offset.is_some() {
-        let more = gtk::Button::builder()
-            .label("Show more")
-            .css_classes(["flat"])
+        let more = adw::ActionRow::builder()
+            .title("Show More")
+            .activatable(true)
             .sensitive(!busy)
             .build();
-        more.connect_clicked({
+        more.add_suffix(&gtk::Image::from_icon_name("go-down-symbolic"));
+        more.connect_activated({
             let weak = weak.clone();
             move |_| with_ctx(&weak, load_more)
         });
-        ui.list.append(
-            &gtk::ListBoxRow::builder()
-                .activatable(false)
-                .selectable(false)
-                .child(&more)
-                .build(),
-        );
+        ui.list.append(&more);
     }
 }
 
@@ -641,11 +674,13 @@ fn entry_row(weak: &Weak<Ctx>, entry: &BrowserEntry, busy: bool) -> adw::ActionR
         .title(glib::markup_escape_text(&entry.name))
         .subtitle(glib::markup_escape_text(&entry_subtitle(entry)))
         .build();
-    row.add_prefix(&gtk::Image::from_icon_name(if entry.directory {
-        "folder-symbolic"
+    let icon = if entry.directory {
+        gio::ThemedIcon::new("folder-symbolic").upcast::<gio::Icon>()
     } else {
-        "text-x-generic-symbolic"
-    }));
+        let (content_type, _) = gio::content_type_guess(Some(&entry.name), &[]);
+        gio::content_type_get_symbolic_icon(&content_type)
+    };
+    row.add_prefix(&gtk::Image::builder().gicon(&icon).pixel_size(24).build());
 
     if entry.directory && entry.readable {
         row.set_activatable(!busy);
@@ -668,14 +703,17 @@ fn entry_row(weak: &Weak<Ctx>, entry: &BrowserEntry, busy: bool) -> adw::ActionR
     if entry.writable && entry.parent_id.is_some() {
         row.add_suffix(&entry_menu(weak, entry, busy));
     }
+    if entry.directory && entry.readable {
+        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+    }
     row
 }
 
 fn entry_menu(weak: &Weak<Ctx>, entry: &BrowserEntry, busy: bool) -> gtk::MenuButton {
     let popover = gtk::Popover::new();
+    popover.add_css_class("menu");
     let actions = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
         .build();
     let rename = gtk::Button::builder()
         .label("Rename…")
@@ -683,7 +721,7 @@ fn entry_menu(weak: &Weak<Ctx>, entry: &BrowserEntry, busy: bool) -> gtk::MenuBu
         .build();
     let delete = gtk::Button::builder()
         .label("Delete…")
-        .css_classes(["flat", "destructive-action"])
+        .css_classes(["flat", "error"])
         .build();
     {
         let weak = weak.clone();

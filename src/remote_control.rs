@@ -20,35 +20,6 @@ const TAP_SLOP: f64 = 8.0;
 /// A still press held this long is a long-press.
 const LONG_PRESS: std::time::Duration = std::time::Duration::from_millis(500);
 
-fn install_remote_control_css() {
-    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    INSTALLED.get_or_init(|| {
-        let Some(display) = gdk::Display::default() else {
-            return;
-        };
-        let provider = gtk::CssProvider::new();
-        provider.load_from_string(
-            "
-    .phone-screen { background-color: black; }
-    .status-pill {
-        background-color: alpha(black, 0.65);
-        border-radius: 12px;
-        padding: 6px 14px;
-        margin: 12px;
-        font-size: 0.85rem;
-        font-weight: bold;
-        color: white;
-    }
-    ",
-        );
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    });
-}
-
 /// Where the video is drawn inside a widget when scaled to fit (letterboxed),
 /// and where a point on the widget falls on the phone's own screen. `None`
 /// outside the picture (the black bars).
@@ -107,12 +78,26 @@ fn at(mut payload: Map<String, Value>, (x, y): (i32, i32)) -> Map<String, Value>
     payload
 }
 
+thread_local! {
+    static OPEN_WINDOWS: RefCell<std::collections::HashMap<String, glib::WeakRef<adw::Window>>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
 pub fn show_remote_control_dialog(
     daemon: DaemonHandle,
     device_id: String,
     parent: &impl IsA<gtk::Window>,
 ) {
-    install_remote_control_css();
+    // One window per phone: a second would start the session again, and
+    // closing either would stop the other's.
+    if let Some(open) = OPEN_WINDOWS.with(|open| {
+        open.borrow()
+            .get(&device_id)
+            .and_then(|window| window.upgrade())
+    }) {
+        open.present();
+        return;
+    }
     let device = Rc::new(device_id);
 
     // Phone-shaped by default; the picture keeps its aspect when resized.
@@ -120,8 +105,9 @@ pub fn show_remote_control_dialog(
         .transient_for(parent)
         .modal(false)
         .default_width(420)
-        .default_height(860)
+        .default_height(900)
         .title("Phone Screen")
+        .css_classes(["remote-window"])
         .build();
 
     let toolbar = adw::ToolbarView::new();
@@ -138,24 +124,85 @@ pub fn show_remote_control_dialog(
             }
         })
     };
-    for (icon, tooltip, name) in [
-        ("go-previous-symbolic", "Back", "backclick"),
-        ("go-home-symbolic", "Home", "middleclick"),
-        ("view-app-grid-symbolic", "Recents", "forwardclick"),
-    ] {
-        let button = gtk::Button::builder()
-            .icon_name(icon)
-            .tooltip_text(tooltip)
-            .build();
-        let send = Rc::clone(&send);
-        button.connect_clicked(move |_| send(action(name)));
-        header.pack_start(&button);
-    }
     // Some phones (ColorOS) black out the status bar in any screen capture, so
     // its essentials — time, battery, charging — are shown here instead.
     let title = adw::WindowTitle::new("Phone Screen", "");
     header.set_title_widget(Some(&title));
+    // How the phone is connected: local network, direct, or relayed.
+    let route = gtk::Label::builder()
+        .css_classes(["chip", "caption"])
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    header.pack_start(&route);
     toolbar.add_top_bar(&header);
+
+    // The phone's navigation keys in a floating pill under the picture, where
+    // they never cover the phone's own screen.
+    let keys = gtk::Box::builder()
+        .spacing(6)
+        .halign(gtk::Align::Center)
+        .css_classes(["toolbar", "osd", "floating-toolbar"])
+        .build();
+    for (icon, tooltip, name) in [
+        ("go-previous-symbolic", "Back (right click)", "backclick"),
+        ("go-home-symbolic", "Home (middle click)", "middleclick"),
+        ("view-app-grid-symbolic", "Recent Apps", "forwardclick"),
+    ] {
+        let button = gtk::Button::builder()
+            .icon_name(icon)
+            .tooltip_text(tooltip)
+            .css_classes(["circular"])
+            .build();
+        button.update_property(&[gtk::accessible::Property::Label(tooltip)]);
+        let send = Rc::clone(&send);
+        button.connect_clicked(move |_| send(action(name)));
+        keys.append(&button);
+    }
+    keys.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    let fullscreen = gtk::Button::builder()
+        .icon_name("view-fullscreen-symbolic")
+        .tooltip_text("Full Screen")
+        .css_classes(["circular"])
+        .build();
+    fullscreen.update_property(&[gtk::accessible::Property::Label("Full Screen")]);
+    {
+        let window = window.downgrade();
+        fullscreen.connect_clicked(move |_| {
+            if let Some(window) = window.upgrade() {
+                if window.is_fullscreen() {
+                    window.unfullscreen();
+                } else {
+                    window.fullscreen();
+                }
+            }
+        });
+    }
+    keys.append(&fullscreen);
+    toolbar.add_bottom_bar(&keys);
+    {
+        let (toolbar, fullscreen) = (toolbar.downgrade(), fullscreen.downgrade());
+        window.connect_fullscreened_notify(move |window| {
+            let full = window.is_fullscreen();
+            if let Some(toolbar) = toolbar.upgrade() {
+                toolbar.set_reveal_top_bars(!full);
+            }
+            if let Some(button) = fullscreen.upgrade() {
+                let label = if full {
+                    "Leave Full Screen"
+                } else {
+                    "Full Screen"
+                };
+                button.set_icon_name(if full {
+                    "view-restore-symbolic"
+                } else {
+                    "view-fullscreen-symbolic"
+                });
+                button.set_tooltip_text(Some(label));
+                button.update_property(&[gtk::accessible::Property::Label(label)]);
+            }
+        });
+    }
 
     let picture = gtk::Picture::builder()
         .content_fit(gtk::ContentFit::Contain)
@@ -170,7 +217,7 @@ pub fn show_remote_control_dialog(
         &[gtk::accessible::Property::Label("Phone screen")],
     );
     let status = gtk::Label::builder()
-        .css_classes(["status-pill"])
+        .css_classes(["osd", "status-pill"])
         .wrap(true)
         .justify(gtk::Justification::Center)
         .halign(gtk::Align::Center)
@@ -193,6 +240,7 @@ pub fn show_remote_control_dialog(
         let last_start = Rc::clone(&last_start);
         let last_control_request = Rc::clone(&last_control_request);
         let title = title.downgrade();
+        let route = route.downgrade();
         let tick = Cell::new(0u32);
         glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
             let (Some(picture), Some(status)) = (picture.upgrade(), status.upgrade()) else {
@@ -203,6 +251,11 @@ pub fn show_remote_control_dialog(
                 if let Some(title) = title.upgrade() {
                     if let Some(view) = daemon.devices().into_iter().find(|d| d.id == *device) {
                         title.set_title(&view.name);
+                        if let Some(route) = route.upgrade() {
+                            let text = route_label(view.connection_path.as_deref());
+                            route.set_visible(text.is_some());
+                            route.set_label(text.unwrap_or_default());
+                        }
                         title.set_subtitle(&phone_status_line(
                             view.battery_status.as_ref(),
                             &glib::DateTime::now_local()
@@ -271,10 +324,15 @@ pub fn show_remote_control_dialog(
         let daemon = daemon.clone();
         let device = Rc::clone(&device);
         window.connect_close_request(move |_| {
+            OPEN_WINDOWS.with(|open| open.borrow_mut().remove(device.as_str()));
             daemon.send(DaemonCommand::StopPhoneRemoteControl(device.to_string()));
             glib::Propagation::Proceed
         });
     }
+    OPEN_WINDOWS.with(|open| {
+        open.borrow_mut()
+            .insert(device.to_string(), window.downgrade())
+    });
 
     // Window point → phone pixel, using the picture's current layout.
     let to_phone = {
@@ -306,14 +364,17 @@ pub fn show_remote_control_dialog(
         let swiping = Rc::new(Cell::new(false));
         let last = Rc::new(RefCell::new(None::<(i32, i32)>));
         {
-            let (start, pressed_at, swiping, picture) = (
+            let (start, pressed_at, swiping) = (
                 Rc::clone(&start),
                 Rc::clone(&pressed_at),
                 Rc::clone(&swiping),
-                picture.clone(),
             );
-            drag.connect_drag_begin(move |_, x, y| {
-                picture.grab_focus();
+            // The gesture's own widget, not a captured `picture`: the
+            // gesture is attached to the picture, so that would be a cycle.
+            drag.connect_drag_begin(move |gesture, x, y| {
+                if let Some(picture) = gesture.widget() {
+                    picture.grab_focus();
+                }
                 start.set((x, y));
                 pressed_at.set(std::time::Instant::now());
                 swiping.set(false);
@@ -504,6 +565,16 @@ fn phone_status_line(
             }
         ),
         None => time.to_string(),
+    }
+}
+
+/// The header's pill: how the phone is connected.
+fn route_label(path: Option<&str>) -> Option<&'static str> {
+    match path? {
+        "lan" => Some("Local network"),
+        "direct" => Some("Direct"),
+        "turn" => Some("TURN relay"),
+        _ => None,
     }
 }
 

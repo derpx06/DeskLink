@@ -22,6 +22,11 @@ fn main() {
             .display()
     );
 
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("src").join("style.css").display()
+    );
+
     let status = Command::new("glib-compile-resources")
         .arg("--target")
         .arg(&output)

@@ -16,3 +16,9 @@ gnome.post_install(
     gtk_update_icon_cache: true,
   update_desktop_database: true,
 )
+
+# The GNOME Shell extension (gnome-shell-extension/README.md), for GNOME
+# users of distribution packages; the app offers to enable it.
+install_subdir('gnome-shell-extension/desklink@derx06.github.io',
+  install_dir: get_option('datadir') / 'gnome-shell' / 'extensions',
+)

@@ -3,11 +3,41 @@
   <object class="AdwShortcutsDialog" id="shortcuts_dialog">
     <child>
       <object class="AdwShortcutsSection">
-        <property name="title" translatable="yes">Shortcuts</property>
+        <property name="title" translatable="yes">General</property>
+        <child>
+          <object class="AdwShortcutsItem">
+            <property name="title" translatable="yes" context="shortcut window">Pair New Device</property>
+            <property name="action-name">win.pair-new</property>
+          </object>
+        </child>
+        <child>
+          <object class="AdwShortcutsItem">
+            <property name="title" translatable="yes" context="shortcut window">Search Devices</property>
+            <property name="action-name">win.toggle-search</property>
+          </object>
+        </child>
+        <child>
+          <object class="AdwShortcutsItem">
+            <property name="title" translatable="yes" context="shortcut window">Connection History</property>
+            <property name="action-name">app.history</property>
+          </object>
+        </child>
+        <child>
+          <object class="AdwShortcutsItem">
+            <property name="title" translatable="yes" context="shortcut window">Preferences</property>
+            <property name="action-name">app.preferences</property>
+          </object>
+        </child>
         <child>
           <object class="AdwShortcutsItem">
             <property name="title" translatable="yes" context="shortcut window">Show Shortcuts</property>
             <property name="action-name">app.shortcuts</property>
+          </object>
+        </child>
+        <child>
+          <object class="AdwShortcutsItem">
+            <property name="title" translatable="yes" context="shortcut window">Close Window</property>
+            <property name="action-name">window.close</property>
           </object>
         </child>
         <child>
