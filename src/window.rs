@@ -61,15 +61,15 @@ mod imp {
         #[template_child]
         pub search_entry: TemplateChild<gtk::SearchEntry>,
         #[template_child]
-        pub ring_button: TemplateChild<gtk::Button>,
-        #[template_child]
-        pub lock_button: TemplateChild<gtk::Button>,
-        #[template_child]
-        pub ping_button: TemplateChild<gtk::Button>,
-        #[template_child]
         pub detail_body: TemplateChild<gtk::Box>,
         #[template_child]
         pub detail_scroll: TemplateChild<gtk::ScrolledWindow>,
+        #[template_child]
+        pub content_header: TemplateChild<adw::HeaderBar>,
+        #[template_child]
+        pub narrow_breakpoint: TemplateChild<adw::Breakpoint>,
+        /// The window is phone-narrow: the feature cards go one to a line.
+        pub narrow: std::cell::Cell<bool>,
         #[template_child]
         pub toast_overlay: TemplateChild<adw::ToastOverlay>,
         pub daemon: RefCell<Option<DaemonHandle>>,
@@ -154,7 +154,30 @@ mod imp {
                 .bidirectional()
                 .sync_create()
                 .build();
-            self.welcome_body.append(&pairing_steps());
+            welcome_content(&self.welcome_body);
+            let window = self.obj().downgrade();
+            self.narrow_breakpoint.connect_apply(move |_| {
+                if let Some(window) = window.upgrade() {
+                    window.imp().narrow.set(true);
+                    window.apply_grid_columns();
+                }
+            });
+            let window = self.obj().downgrade();
+            self.narrow_breakpoint.connect_unapply(move |_| {
+                if let Some(window) = window.upgrade() {
+                    window.imp().narrow.set(false);
+                    window.apply_grid_columns();
+                }
+            });
+            // The device's name joins the header once the hero scrolls away.
+            let header = self.content_header.downgrade();
+            self.detail_scroll
+                .vadjustment()
+                .connect_value_changed(move |adjustment| {
+                    if let Some(header) = header.upgrade() {
+                        header.set_show_title(adjustment.value() > 96.0);
+                    }
+                });
             self.devices_list.set_placeholder(Some(
                 &gtk::Label::builder()
                     .label("No matching devices")
@@ -189,6 +212,22 @@ mod imp {
                     .activate(|window: &super::DesklinkWindow, _, parameter| {
                         if let Some(raw) = parameter.and_then(|value| value.get::<String>()) {
                             window.show_error_details(&raw);
+                        }
+                    })
+                    .build(),
+                // "shell", "claude" or "codex": a new shared terminal here.
+                gio::ActionEntry::builder("new-terminal")
+                    .parameter_type(Some(glib::VariantTy::STRING))
+                    .activate(|window: &super::DesklinkWindow, _, parameter| {
+                        let program = parameter
+                            .and_then(|value| value.get::<String>())
+                            .filter(|program| program != "shell");
+                        match crate::terminal_previews::start(program.as_deref()) {
+                            Ok(_) => window.refresh_soon(),
+                            Err(error) => {
+                                eprintln!("[UI] Could not start a terminal: {error}");
+                                window.show_feature_toast("Could not start a terminal");
+                            }
                         }
                     })
                     .build(),
@@ -256,19 +295,6 @@ mod imp {
                     window.show_error_details(&raw);
                 }
             });
-
-            for (button, action) in [
-                (&*self.ring_button, QuickAction::Ring),
-                (&*self.lock_button, QuickAction::Lock),
-                (&*self.ping_button, QuickAction::Ping),
-            ] {
-                let window = self.obj().downgrade();
-                button.connect_clicked(move |_| {
-                    if let Some(window) = window.upgrade() {
-                        window.quick_action(action);
-                    }
-                });
-            }
         }
     }
     impl WidgetImpl for DesklinkWindow {}
@@ -443,6 +469,7 @@ impl DesklinkWindow {
         let _guard = RefreshGuard(&imp.refreshing);
 
         let errors = daemon.drain_errors();
+        self.refresh_terminal_previews();
 
         for event in daemon.drain_events() {
             match event {
@@ -580,7 +607,6 @@ impl DesklinkWindow {
             imp.notified_pair_requests.borrow_mut().clear();
             imp.notified_remote_notifications.borrow_mut().clear();
             imp.main_stack.set_visible_child_name("welcome");
-            self.show_quick_actions(None);
             self.sync_sidebar(&[]);
             imp.detail_snapshot.replace(None);
             return;
@@ -832,6 +858,7 @@ impl DesklinkWindow {
                 .build();
             let avatar = device_avatar(device, 64);
             avatar.set_halign(gtk::Align::Center);
+            avatar.add_css_class("glyph-squircle");
             extra.append(&avatar);
             extra.append(&pairing_code_label(key));
             dialog.set_extra_child(Some(&extra));
@@ -878,7 +905,6 @@ impl DesklinkWindow {
         }
         imp.detail_snapshot.replace(shown);
         imp.content_page.set_title(title);
-        self.show_quick_actions(None);
         let body = &imp.detail_body;
         while let Some(child) = body.first_child() {
             body.remove(&child);
@@ -906,16 +932,22 @@ impl DesklinkWindow {
         };
         let imp = self.imp();
         imp.content_page.set_title(&device.name);
-        self.show_quick_actions(Some(device));
         // Everything the page is drawn from; the page is rebuilt only when
         // this changes, so a switch being toggled is not torn down under the
         // pointer every second.
         let approving = imp.approving.borrow().contains(&device.id);
         let approved = crate::device_links::config::remote_desktop_token(&device.id).is_some();
         let since = imp.session_since.borrow().get(&device.id).cloned();
+        // The terminals section is rebuilt when sessions come or go; their
+        // output is refreshed in place by `refresh_terminal_previews`.
+        let terminals: Vec<_> = crate::terminal_previews::sessions()
+            .into_iter()
+            .map(|info| (info.id, info.title, info.exit_status))
+            .collect();
         let snapshot = (
             device.id.clone(),
-            serde_json::to_string(&(device, approving, approved, &since)).unwrap_or_default(),
+            serde_json::to_string(&(device, approving, approved, &since, &terminals))
+                .unwrap_or_default(),
         );
         let previous = imp.detail_snapshot.replace(Some(snapshot.clone()));
         if previous.as_ref() == Some(&snapshot) {
@@ -936,6 +968,7 @@ impl DesklinkWindow {
             body.remove(&child);
         }
         body.append(&device_page(daemon, device, approving, since.as_deref()));
+        self.apply_grid_columns();
 
         scroll.set_value(offset);
         let body = body.downgrade();
@@ -950,25 +983,61 @@ impl DesklinkWindow {
         });
     }
 
-    /// Ring, Lock and Ping in the header bar, for the shown device's features.
-    fn show_quick_actions(&self, device: Option<&DeviceView>) {
-        let imp = self.imp();
-        let can = |packet_type| {
-            device.is_some_and(|device| {
-                matches!(device.status, DeviceStatus::Paired)
-                    && can_send_feature(device, packet_type)
-            })
-        };
-        imp.ring_button
-            .set_visible(can(PACKET_TYPE_FINDMYPHONE_REQUEST));
-        imp.lock_button.set_visible(can(PACKET_TYPE_LOCK_REQUEST));
-        imp.ping_button.set_visible(can(PACKET_TYPE_PING));
-        if let Some(device) = device {
-            let kind = device_type_label(&device.device_type);
-            imp.ring_button
-                .set_tooltip_text(Some(&format!("Ring {kind}")));
-            imp.lock_button
-                .set_tooltip_text(Some(&format!("Lock {kind}")));
+    /// Feature cards two to a line at least, unless the window is
+    /// phone-narrow; FlowBox alone would pick one column too early.
+    fn apply_grid_columns(&self) {
+        let columns = if self.imp().narrow.get() { 1 } else { 2 };
+        let mut stack = vec![self.imp().detail_body.get().upcast::<gtk::Widget>()];
+        while let Some(widget) = stack.pop() {
+            if widget.widget_name() == "feature-grid" {
+                if let Some(grid) = widget.downcast_ref::<gtk::FlowBox>() {
+                    grid.set_min_children_per_line(columns);
+                }
+            }
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                child = next.next_sibling();
+                stack.push(next);
+            }
+        }
+    }
+
+    /// Puts each shown terminal tile's latest output in place, without
+    /// rebuilding the page.
+    fn refresh_terminal_previews(&self) {
+        let body = self.imp().detail_body.get().upcast::<gtk::Widget>();
+        let mut tiles = Vec::new();
+        let mut stack = vec![body];
+        while let Some(widget) = stack.pop() {
+            let name = widget.widget_name();
+            if name.starts_with("terminal-lines:") || name.starts_with("terminal-dot:") {
+                tiles.push(widget.clone());
+            }
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                child = next.next_sibling();
+                stack.push(next);
+            }
+        }
+        if tiles.is_empty() {
+            return;
+        }
+        for info in crate::terminal_previews::sessions() {
+            let (lines, live) = crate::terminal_previews::preview(&info);
+            for widget in &tiles {
+                let name = widget.widget_name();
+                if name == format!("terminal-lines:{}", info.id) {
+                    if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                        let text = preview_text(&lines, info.exit_status);
+                        if label.label() != text {
+                            label.set_label(&text);
+                        }
+                    }
+                } else if name == format!("terminal-dot:{}", info.id) {
+                    widget.set_css_classes(&["dot", if live { "mint" } else { "faint" }]);
+                    widget.set_tooltip_text(Some(if live { "Active" } else { "Idle" }));
+                }
+            }
         }
     }
 
@@ -1318,22 +1387,80 @@ impl Drop for RefreshGuard<'_> {
     }
 }
 
-/// "How to pair" under the welcome page's button: three numbered steps.
-fn pairing_steps() -> adw::Clamp {
-    let group = adw::PreferencesGroup::builder()
-        .title("How to Pair")
+/// The welcome page: a headline, what DeskLink does, the one action, and a
+/// terminal card showing what pairing looks like.
+fn welcome_content(body: &gtk::Box) {
+    let icon = gtk::Image::builder()
+        .icon_name("derx06.desklink.com")
+        .pixel_size(96)
+        .halign(gtk::Align::Start)
         .build();
-    for title in [
-        "Install DeskLink on your phone",
-        "Connect both to the same Wi-Fi",
-        "Scan the code",
+    body.append(&icon);
+    let text = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .build();
+    text.append(
+        &gtk::Label::builder()
+            .label("Your phone and your computer, one terminal away")
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["welcome-headline"])
+            .build(),
+    );
+    text.append(
+        &gtk::Label::builder()
+            .label(
+                "Share files, notifications and the clipboard, see either screen, and run \
+                 shells, Claude Code or Codex here from your phone.",
+            )
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["text-dim"])
+            .build(),
+    );
+    body.append(&text);
+    body.append(
+        &gtk::Button::builder()
+            .label("Pair a Phone…")
+            .halign(gtk::Align::Start)
+            .action_name("win.pair-new")
+            .css_classes(["pill", "suggested-action"])
+            .build(),
+    );
+
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .margin_top(12)
+        .css_classes(["terminal-card"])
+        .build();
+    for (prompt, line, class) in [
+        ("$", "desklink pair", "terminal-prompt"),
+        (" ", "Scan the code with the DeskLink app…", "text-faint"),
+        ("✓", "Paired with Pixel 8", "terminal-prompt"),
     ] {
-        group.add(&adw::ActionRow::builder().title(title).build());
+        let row = gtk::Box::builder().spacing(10).build();
+        row.append(
+            &gtk::Label::builder()
+                .label(prompt)
+                .css_classes(["mono", class])
+                .build(),
+        );
+        row.append(
+            &gtk::Label::builder()
+                .label(line)
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["mono"])
+                .build(),
+        );
+        card.append(&row);
     }
-    adw::Clamp::builder()
-        .maximum_size(420)
-        .child(&group)
-        .build()
+    card.update_property(&[gtk::accessible::Property::Label(
+        "Pairing: run desklink pair, scan the code with the DeskLink app, paired",
+    )]);
+    body.append(&card);
 }
 
 const OFFLINE: &str = "Offline. DeskLink will reconnect automatically.";
@@ -1445,18 +1572,6 @@ fn device_avatar(device: &DeviceView, size: i32) -> gtk::Box {
     circle
 }
 
-/// The small green dot shown before "Connected", and nowhere else.
-fn status_dot(small: bool) -> gtk::Box {
-    let dot = gtk::Box::builder()
-        .valign(gtk::Align::Center)
-        .css_classes(["status-dot"])
-        .build();
-    if small {
-        dot.add_css_class("small");
-    }
-    dot
-}
-
 /// How a device's reachability should read, and the CSS class that goes with it.
 ///
 /// Both the sidebar row and the detail pane call this. The detail pane used to
@@ -1504,12 +1619,17 @@ fn spaced_code(code: &str) -> String {
     }
 }
 
-fn pairing_code_label(code: &str) -> gtk::Label {
+/// The code in mono, in a raised card.
+fn pairing_code_label(code: &str) -> gtk::Box {
+    let card = gtk::Box::builder()
+        .halign(gtk::Align::Center)
+        .css_classes(["code-card"])
+        .build();
     let label = gtk::Label::builder()
         .label(spaced_code(code))
-        .halign(gtk::Align::Center)
-        .css_classes(["title-1", "numeric", "pairing-code"])
+        .css_classes(["mono", "pairing-code"])
         .build();
+    card.append(&label);
     label.update_property(&[gtk::accessible::Property::Label(&format!(
         "Verification code {}",
         code.chars()
@@ -1517,7 +1637,7 @@ fn pairing_code_label(code: &str) -> gtk::Label {
             .collect::<Vec<_>>()
             .join(" ")
     ))]);
-    label
+    card
 }
 
 /// What a sidebar row shows; the row is redrawn only when this changes.
@@ -1552,8 +1672,13 @@ fn fill_sidebar_row(row: &gtk::ListBoxRow, device: &DeviceView) {
         .margin_top(6)
         .margin_bottom(6)
         .build();
-    let avatar = device_avatar(device, 32);
+    let avatar = device_avatar(device, 36);
     avatar.set_valign(gtk::Align::Center);
+    avatar.add_css_class("glyph-squircle");
+    avatar.add_css_class("small");
+    if device_status_presentation(device).1 == "offline" {
+        avatar.add_css_class("offline");
+    }
     content.append(&avatar);
 
     let text = gtk::Box::builder()
@@ -1567,20 +1692,35 @@ fn fill_sidebar_row(row: &gtk::ListBoxRow, device: &DeviceView) {
             .label(&device.name)
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["device-name"])
             .build(),
     );
-    // A small dot before a plain dim status, like GNOME Settings' rows.
+    // "● Connected · LAN" in mono, the dot mint only when connected.
     let (status, kind) = device_status_presentation(device);
     let status_line = gtk::Box::builder().spacing(6).build();
     if kind == "connected" {
-        status_line.append(&status_dot(true));
+        status_line.append(
+            &gtk::Box::builder()
+                .valign(gtk::Align::Center)
+                .css_classes(["dot", "mint"])
+                .build(),
+        );
+    }
+    let mut meta = status.to_string();
+    if kind == "connected" {
+        match device.connection_path.as_deref() {
+            Some("lan") => meta.push_str(" · LAN"),
+            Some("direct") => meta.push_str(" · Internet"),
+            Some("turn") => meta.push_str(" · Relay"),
+            _ => {}
+        }
     }
     status_line.append(
         &gtk::Label::builder()
-            .label(status)
+            .label(meta)
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            .css_classes(["caption", "dim-label"])
+            .css_classes(["caption", "mono", "text-dim"])
             .build(),
     );
     text.append(&status_line);
@@ -1656,8 +1796,9 @@ fn can_send_feature(device: &DeviceView, packet_type: &str) -> bool {
             .any(|capability| capability == packet_type)
 }
 
-/// The device pane: a header, then plain grouped lists for what fits the
-/// device's state. `since` is when its active session started, if any.
+/// The device pane: the hero band, then — for a connected device — its
+/// terminals, its features and its lists, each under a small section title.
+/// `since` is when its active session started, if any.
 fn device_page(
     daemon: &DaemonHandle,
     device: &DeviceView,
@@ -1666,17 +1807,21 @@ fn device_page(
 ) -> gtk::Widget {
     let page = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(24)
+        .spacing(32)
         .margin_top(24)
         .margin_bottom(36)
-        .margin_start(12)
-        .margin_end(12)
+        .margin_start(24)
+        .margin_end(24)
         .build();
-    page.append(&device_hero(device));
+    page.append(&device_hero(daemon, device));
 
     match &device.status {
         DeviceStatus::Paired => {
-            page.append(&features_group(daemon, device, since));
+            if let Some(title) = session_title(device) {
+                page.append(&session_banner(daemon, device, &title, since));
+            }
+            page.append(&terminals_section());
+            page.append(&section("Features", &features_group(daemon, device)));
             if can_send_feature(device, PACKET_TYPE_NOTIFICATION_REQUEST) {
                 page.append(&notifications_group(daemon, device));
             }
@@ -1704,73 +1849,184 @@ fn device_page(
 
     // Wide enough for three feature cards to a line.
     adw::Clamp::builder()
-        .maximum_size(720)
+        .maximum_size(760)
         .tightening_threshold(600)
         .child(&page)
         .build()
         .upcast()
 }
 
-/// The header, directly on the page: the device glyph, its name, and one dim
-/// line of status ("Connected · Local network · 82% charging").
-fn device_hero(device: &DeviceView) -> gtk::Box {
-    let hero = gtk::Box::builder()
+/// A small dim section title above `content`, with an optional widget at
+/// its end (e.g. "New session").
+fn section_with(
+    title: &str,
+    end: Option<&gtk::Widget>,
+    content: &impl IsA<gtk::Widget>,
+) -> gtk::Box {
+    let section = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .margin_bottom(12)
+        .spacing(12)
         .build();
-    let avatar = device_avatar(device, 64);
-    avatar.set_margin_bottom(12);
-    hero.append(&avatar);
-    hero.append(
+    let header = gtk::Box::builder().spacing(12).build();
+    header.append(
+        &gtk::Label::builder()
+            .label(title)
+            .xalign(0.0)
+            .hexpand(true)
+            .valign(gtk::Align::Center)
+            .css_classes(["section-title"])
+            .build(),
+    );
+    if let Some(end) = end {
+        header.append(end);
+    }
+    section.append(&header);
+    section.append(content);
+    section
+}
+
+fn section(title: &str, content: &impl IsA<gtk::Widget>) -> gtk::Box {
+    section_with(title, None, content)
+}
+
+/// The hero band: the device glyph on a soft glow, the name large, a status
+/// pill and mono details, and the quick actions (Ring, Lock, Ping, Send
+/// Files) at its end — or under it in a narrow window.
+fn device_hero(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
+    let band = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(18)
+        .css_classes(["hero-band"])
+        .build();
+    // Identity and actions share a line when there is room for both.
+    let line = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .min_children_per_line(1)
+        .max_children_per_line(2)
+        .column_spacing(18)
+        .row_spacing(18)
+        .build();
+
+    let identity = gtk::Box::builder().spacing(18).build();
+    let glyph = device_avatar(device, 56);
+    glyph.add_css_class("glyph-squircle");
+    identity.append(&glyph);
+    let text = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .valign(gtk::Align::Center)
+        .build();
+    text.append(
         &gtk::Label::builder()
             .label(&device.name)
+            .xalign(0.0)
             .wrap(true)
-            .justify(gtk::Justification::Center)
-            .css_classes(["title-1"])
+            .css_classes(["hero-name"])
             .build(),
     );
-    let line = gtk::Box::builder()
-        .spacing(6)
-        .halign(gtk::Align::Center)
-        .margin_top(4)
+    // The pill and the details share a line, or wrap under each other.
+    let status = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .max_children_per_line(2)
+        .column_spacing(10)
+        .row_spacing(6)
         .build();
-    match device_status_presentation(device).1 {
-        // The only green on the page: a small dot before "Connected".
-        "connected" => line.append(&status_dot(false)),
-        "connecting" => line.append(&gtk::Spinner::builder().spinning(true).build()),
-        _ => {}
+    status.append(&status_pill(device));
+    let meta = status_meta(device);
+    if !meta.is_empty() {
+        status.append(
+            &gtk::Label::builder()
+                .label(meta)
+                .valign(gtk::Align::Center)
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["mono", "text-dim", "caption"])
+                .build(),
+        );
     }
-    line.append(
-        &gtk::Label::builder()
-            .label(status_summary(device))
-            .wrap(true)
-            .justify(gtk::Justification::Center)
-            .css_classes(["dim-label", "numeric"])
-            .build(),
-    );
-    hero.append(&line);
+    let mut child = status.first_child();
+    while let Some(wrapper) = child {
+        wrapper.set_focusable(false);
+        wrapper.set_halign(gtk::Align::Start);
+        child = wrapper.next_sibling();
+    }
+    text.append(&status);
+    identity.append(&text);
+    line.append(&identity);
+
+    let actions = quick_actions(daemon, device);
+    if actions.first_child().is_some() {
+        line.append(&actions);
+    }
+    let mut child = line.first_child();
+    let mut first = true;
+    while let Some(wrapper) = child {
+        wrapper.set_focusable(false);
+        // The identity takes the spare width, pushing the actions to the end.
+        wrapper.set_hexpand(first);
+        if !first {
+            wrapper.set_halign(gtk::Align::End);
+            wrapper.set_valign(gtk::Align::Center);
+        }
+        first = false;
+        child = wrapper.next_sibling();
+    }
+    band.append(&line);
 
     if let Some(error) = &device.last_error {
-        hero.append(
+        band.append(
             &gtk::Label::builder()
                 .label(friendly_error(error).0)
                 .tooltip_text(error)
                 .wrap(true)
-                .justify(gtk::Justification::Center)
-                .margin_top(6)
+                .xalign(0.0)
                 .css_classes(["caption", "error"])
                 .build(),
         );
     }
-    hero
+    band
 }
 
-/// "Connected · Local network · 82% charging".
-fn status_summary(device: &DeviceView) -> String {
-    let mut parts = vec![device_status_presentation(device).0.to_string()];
+/// "● Connected" in its colour.
+fn status_pill(device: &DeviceView) -> gtk::Box {
+    let (text, kind) = device_status_presentation(device);
+    let pill = gtk::Box::builder()
+        .spacing(6)
+        .valign(gtk::Align::Center)
+        .css_classes(["status-pill", kind])
+        .build();
+    if kind == "connecting" {
+        pill.append(
+            &gtk::Spinner::builder()
+                .spinning(true)
+                .width_request(10)
+                .height_request(10)
+                .build(),
+        );
+    } else {
+        pill.append(
+            &gtk::Box::builder()
+                .valign(gtk::Align::Center)
+                .css_classes(["dot"])
+                .build(),
+        );
+    }
+    pill.append(&gtk::Label::new(Some(text)));
+    pill
+}
+
+/// The mono details beside the pill: "LAN · 192.168.1.42 · 82%".
+fn status_meta(device: &DeviceView) -> String {
+    let mut parts = Vec::new();
     if matches!(device.status, DeviceStatus::Paired) {
-        if let Some((_, text)) = connection_path_presentation(device.connection_path.as_deref()) {
-            parts.push(text.to_string());
+        match device.connection_path.as_deref() {
+            Some("lan") => parts.push("LAN".to_string()),
+            Some("direct") => parts.push("Internet".to_string()),
+            Some("turn") => parts.push("Relay".to_string()),
+            _ => {}
+        }
+        if !device.address.is_empty() {
+            parts.push(device.address.clone());
         }
     }
     if let Some(battery) = device
@@ -1785,6 +2041,276 @@ fn status_summary(device: &DeviceView) -> String {
         });
     }
     parts.join(" · ")
+}
+
+/// Ring, Lock, Ping and Send Files as round buttons, for what the device
+/// supports.
+fn quick_actions(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
+    let actions = gtk::Box::builder().spacing(8).build();
+    if !matches!(device.status, DeviceStatus::Paired) {
+        return actions;
+    }
+    let kind = device_type_label(&device.device_type);
+    let add = |icon: &str, tooltip: String, action: QuickAction| {
+        let button = gtk::Button::builder()
+            .icon_name(icon)
+            .tooltip_text(&tooltip)
+            .valign(gtk::Align::Center)
+            .css_classes(["pill-button", "icon"])
+            .build();
+        button.update_property(&[gtk::accessible::Property::Label(&tooltip)]);
+        button.connect_clicked(move |button| {
+            if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {
+                window.quick_action(action);
+            }
+        });
+        actions.append(&button);
+    };
+    if can_send_feature(device, PACKET_TYPE_FINDMYPHONE_REQUEST) {
+        add(
+            "desklink-ring-symbolic",
+            format!("Ring {kind}"),
+            QuickAction::Ring,
+        );
+    }
+    if can_send_feature(device, PACKET_TYPE_LOCK_REQUEST) {
+        add(
+            "system-lock-screen-symbolic",
+            format!("Lock {kind}"),
+            QuickAction::Lock,
+        );
+    }
+    if can_send_feature(device, PACKET_TYPE_PING) {
+        add(
+            "network-transmit-receive-symbolic",
+            "Ping".to_string(),
+            QuickAction::Ping,
+        );
+    }
+    if can_send_feature(device, PACKET_TYPE_SHARE_REQUEST) {
+        let send = gtk::Button::builder()
+            .icon_name("document-send-symbolic")
+            .tooltip_text("Send Files")
+            .valign(gtk::Align::Center)
+            .css_classes(["pill-button", "icon"])
+            .build();
+        send.update_property(&[gtk::accessible::Property::Label("Send Files")]);
+        let (daemon, id) = (daemon.clone(), device.id.clone());
+        send.connect_clicked(move |button| pick_and_send_files(&daemon, &id, button));
+        actions.append(&send);
+    }
+    actions
+}
+
+/// Asks for files and sends each to `id`.
+fn pick_and_send_files(daemon: &DaemonHandle, id: &str, widget: &impl IsA<gtk::Widget>) {
+    let Some(root) = widget.root().and_downcast::<gtk::Window>() else {
+        return;
+    };
+    let dialog = gtk::FileDialog::builder()
+        .title("Select Files to Send")
+        .build();
+    let (daemon, id) = (daemon.clone(), id.to_string());
+    dialog.open_multiple(Some(&root), gio::Cancellable::NONE, move |result| {
+        let Ok(files) = result else {
+            return;
+        };
+        for file in files.iter::<gio::File>().flatten() {
+            if let Some(path) = file.path() {
+                debug_log!("[UI] Selected file to send: {:?}", path);
+                daemon.send(DaemonCommand::SendFile(id.clone(), path));
+            }
+        }
+    });
+}
+
+/// The terminals at this computer, newest output last: a dark preview tile
+/// per session, refreshed in place each second by the window, or — with
+/// none — one tile inviting a first session.
+fn terminals_section() -> gtk::Box {
+    let sessions = crate::terminal_previews::sessions();
+    let new = new_session_button();
+    let content: gtk::Widget = if sessions.is_empty() {
+        empty_terminal_tile().upcast()
+    } else {
+        let grid = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .homogeneous(true)
+            .min_children_per_line(1)
+            .max_children_per_line(2)
+            .column_spacing(12)
+            .row_spacing(12)
+            .build();
+        for info in &sessions {
+            let tile = terminal_tile(info);
+            grid.append(&tile);
+            if let Some(child) = tile.parent() {
+                child.set_focusable(false);
+            }
+        }
+        grid.upcast()
+    };
+    section_with("Terminals", Some(new.upcast_ref()), &content)
+}
+
+/// "New Session" (a shell); its menu also offers the installed agents.
+fn new_session_button() -> adw::SplitButton {
+    let menu = gio::Menu::new();
+    menu.append(Some("Shell"), Some("win.new-terminal::shell"));
+    let agents = crate::terminal_previews::installed_agents();
+    if agents.iter().any(|agent| agent == "claude") {
+        menu.append(Some("Claude Code"), Some("win.new-terminal::claude"));
+    }
+    if agents.iter().any(|agent| agent == "codex") {
+        menu.append(Some("Codex"), Some("win.new-terminal::codex"));
+    }
+    adw::SplitButton::builder()
+        .label("New Session")
+        .menu_model(&menu)
+        .action_name("win.new-terminal")
+        .action_target(&"shell".to_variant())
+        .tooltip_text("Start a shared terminal here")
+        .valign(gtk::Align::Center)
+        .build()
+}
+
+/// One session's tile: agent chip, title, live dot, and its last lines.
+/// The window keeps the lines label and refreshes it each second.
+fn terminal_tile(info: &crate::device_links::pty::registry::SessionInfo) -> gtk::Button {
+    let tile = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    let head = gtk::Box::builder()
+        .spacing(8)
+        .css_classes(["terminal-head"])
+        .build();
+    head.append(
+        &gtk::Label::builder()
+            .label(crate::terminal_previews::agent_chip(&info.title))
+            .valign(gtk::Align::Center)
+            .css_classes(["agent-chip", "mono"])
+            .build(),
+    );
+    head.append(
+        &gtk::Label::builder()
+            .label(crate::terminal_previews::display_title(&info.title))
+            .xalign(0.0)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .css_classes(["terminal-title"])
+            .build(),
+    );
+    head.append(
+        &gtk::Label::builder()
+            .label(format!("{}×{}", info.cols, info.rows))
+            .css_classes(["mono", "caption", "text-faint"])
+            .build(),
+    );
+    let (lines, live) = crate::terminal_previews::preview(info);
+    let dot = gtk::Box::builder()
+        .valign(gtk::Align::Center)
+        .css_classes(["dot", if live { "mint" } else { "faint" }])
+        .tooltip_text(if live { "Active" } else { "Idle" })
+        .build();
+    head.append(&dot);
+    tile.append(&head);
+
+    let lines_label = gtk::Label::builder()
+        .label(preview_text(&lines, info.exit_status))
+        .xalign(0.0)
+        .yalign(1.0)
+        .lines(crate::terminal_previews::PREVIEW_LINES as i32)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .height_request(84)
+        .css_classes(["mono", "terminal-lines"])
+        .build();
+    // The text fades towards the top edge of the preview.
+    let fade = gtk::Box::builder()
+        .valign(gtk::Align::Start)
+        .css_classes(["terminal-fade"])
+        .build();
+    let preview = gtk::Overlay::builder().child(&lines_label).build();
+    preview.add_overlay(&fade);
+    preview.set_can_target(false);
+    tile.append(&preview);
+
+    let button = gtk::Button::builder()
+        .child(&tile)
+        .tooltip_text("Open in a window")
+        .css_classes(["terminal-tile"])
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label(&format!(
+        "{} terminal",
+        crate::terminal_previews::display_title(&info.title)
+    ))]);
+    let id = info.id.clone();
+    button.connect_clicked(move |_| crate::device_links::pty::desk::open_on_desktop(&id));
+    // The window refreshes these from the session each second.
+    lines_label.set_widget_name(&format!("terminal-lines:{}", info.id));
+    dot.set_widget_name(&format!("terminal-dot:{}", info.id));
+    button
+}
+
+/// What a tile shows: its last lines, or why the session ended.
+fn preview_text(lines: &[String], exit_status: Option<u32>) -> String {
+    match exit_status {
+        Some(status) => format!("Exited ({status})"),
+        None if lines.is_empty() => " ".to_string(),
+        None => lines.join("\n"),
+    }
+}
+
+/// No sessions yet: a dark tile with a blinking cursor and the three ways to
+/// start one.
+fn empty_terminal_tile() -> gtk::Box {
+    let tile = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(18)
+        .css_classes(["terminal-card"])
+        .build();
+    let prompt = gtk::Box::builder().spacing(8).build();
+    prompt.append(
+        &gtk::Label::builder()
+            .label("$")
+            .css_classes(["mono", "terminal-prompt"])
+            .build(),
+    );
+    prompt.append(
+        &gtk::Box::builder()
+            .valign(gtk::Align::Center)
+            .css_classes(["terminal-cursor"])
+            .build(),
+    );
+    tile.append(&prompt);
+    tile.append(
+        &gtk::Label::builder()
+            .label("Start Claude Code, Codex or a shell. The phone sees it too.")
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["terminal-title"])
+            .build(),
+    );
+    let buttons = gtk::Box::builder().spacing(8).build();
+    let agents = crate::terminal_previews::installed_agents();
+    for (label, program) in [
+        ("Shell", "shell"),
+        ("Claude Code", "claude"),
+        ("Codex", "codex"),
+    ] {
+        if program != "shell" && !agents.iter().any(|agent| agent == program) {
+            continue;
+        }
+        buttons.append(
+            &gtk::Button::builder()
+                .label(label)
+                .action_name("win.new-terminal")
+                .action_target(&program.to_variant())
+                .css_classes(["pill-button"])
+                .build(),
+        );
+    }
+    tile.append(&buttons);
+    tile
 }
 
 /// "Controlling the screen · 2 terminals": what the phone is doing here.
@@ -1814,14 +2340,7 @@ fn toast_from(widget: &impl IsA<gtk::Widget>, message: &str) {
 /// The device's features as a grid of cards — three to a line when wide,
 /// two when medium, one when narrow — under its active session, if any.
 /// Ring, Lock and Ping are in the header bar.
-fn features_group(daemon: &DaemonHandle, device: &DeviceView, since: Option<&str>) -> gtk::Box {
-    let section = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .build();
-    if let Some(title) = session_title(device) {
-        section.append(&session_card(daemon, device, &title, since));
-    }
+fn features_group(daemon: &DaemonHandle, device: &DeviceView) -> gtk::FlowBox {
     let grid = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .homogeneous(true)
@@ -1830,6 +2349,7 @@ fn features_group(daemon: &DaemonHandle, device: &DeviceView, since: Option<&str
         .column_spacing(12)
         .row_spacing(12)
         .build();
+    grid.set_widget_name("feature-grid");
     let group = CardGrid(&grid);
     let id = device.id.clone();
     let name = device.name.clone();
@@ -1839,7 +2359,7 @@ fn features_group(daemon: &DaemonHandle, device: &DeviceView, since: Option<&str
         let card = feature_card(
             &format!("{} Screen", device_type_label(&device.device_type)),
             if ready {
-                "See and control your phone"
+                "View and control it"
             } else {
                 "Available once connected"
             },
@@ -1898,7 +2418,7 @@ fn features_group(daemon: &DaemonHandle, device: &DeviceView, since: Option<&str
     if device.feature_transport_ready || can_send_feature(device, PACKET_TYPE_SFTP_REQUEST) {
         group.add(&feature_card(
             "Browse Files",
-            "Open your phone's storage",
+            "Open its storage",
             "folder-symbolic",
             {
                 let (daemon, id) = (daemon.clone(), id.clone());
@@ -1937,14 +2457,9 @@ fn features_group(daemon: &DaemonHandle, device: &DeviceView, since: Option<&str
     }
     if can_send_feature(device, PACKET_TYPE_NOTIFICATION_REQUEST) {
         let unread = device.notifications.len();
-        let subtitle = match unread {
-            0 => "Mirror and reply".to_string(),
-            1 => "1 notification".to_string(),
-            count => format!("{count} notifications"),
-        };
-        group.add(&feature_card(
+        let card = feature_card(
             "Notifications",
-            &subtitle,
+            "Mirror and reply",
             "preferences-system-notifications-symbolic",
             {
                 let (daemon, id) = (daemon.clone(), id.clone());
@@ -1954,21 +2469,12 @@ fn features_group(daemon: &DaemonHandle, device: &DeviceView, since: Option<&str
                     show_notifications_dialog(daemon.clone(), device.clone(), widget);
                 }
             },
-        ));
+        );
+        if unread > 0 {
+            add_count_badge(&card, unread);
+        }
+        group.add(&card);
     }
-    // A terminal started here is shared: it opens in a window on this
-    // computer and appears in the phone's session list.
-    group.add(&feature_card(
-        "Terminal",
-        "Shell, Claude Code or Codex",
-        "utilities-terminal-symbolic",
-        |widget| {
-            if let Err(error) = crate::device_links::pty::desk::new_desk_session() {
-                eprintln!("[UI] Could not start a shared terminal: {error}");
-                toast_from(widget, "Could not start a shared terminal");
-            }
-        },
-    ));
     if can_send_feature(device, PACKET_TYPE_MPRIS_REQUEST) {
         group.add(&feature_card(
             "Media",
@@ -2019,8 +2525,7 @@ fn features_group(daemon: &DaemonHandle, device: &DeviceView, since: Option<&str
             },
         ));
     }
-    section.append(&grid);
-    section
+    grid
 }
 
 /// Adds cards to the grid; Tab goes straight to each card, not to the
@@ -2036,11 +2541,25 @@ impl CardGrid<'_> {
     }
 }
 
-/// The feature's icon badge: one accent hue, a soft vertical tone.
+/// A count at the end of a feature card ("2").
+fn add_count_badge(card: &gtk::Button, count: usize) {
+    if let Some(content) = card.child().and_downcast::<gtk::Box>() {
+        content.append(
+            &gtk::Label::builder()
+                .label(count.to_string())
+                .valign(gtk::Align::Center)
+                .tooltip_text(format!("{count} notifications"))
+                .css_classes(["count-badge", "numeric"])
+                .build(),
+        );
+    }
+}
+
+/// The feature's icon badge: a squircle in a light accent tint.
 fn feature_badge(icon: &str) -> gtk::Box {
     let badge = gtk::Box::builder()
-        .width_request(40)
-        .height_request(40)
+        .width_request(36)
+        .height_request(36)
         .valign(gtk::Align::Center)
         .css_classes(["feature-badge"])
         .build();
@@ -2080,8 +2599,8 @@ fn feature_card(
             .label(title)
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            .max_width_chars(10)
-            .css_classes(["heading"])
+            .max_width_chars(9)
+            .css_classes(["title"])
             .build(),
     );
     text.append(
@@ -2089,8 +2608,8 @@ fn feature_card(
             .label(description)
             .xalign(0.0)
             .ellipsize(gtk::pango::EllipsizeMode::End)
-            .max_width_chars(10)
-            .css_classes(["caption", "dim-label"])
+            .max_width_chars(9)
+            .css_classes(["caption", "text-dim"])
             .build(),
     );
     content.append(&text);
@@ -2107,9 +2626,9 @@ fn feature_card(
     card
 }
 
-/// "Controlling the screen · 2 terminals", "Since 14:02", and End, which asks
-/// before cutting the phone off: a full-width accent-tinted card.
-fn session_card(
+/// "Controlling the screen · 2 terminals · since 21:57", and End, which asks
+/// before cutting the phone off: a full-width accent-tinted banner.
+fn session_banner(
     daemon: &DaemonHandle,
     device: &DeviceView,
     title: &str,
@@ -2117,41 +2636,32 @@ fn session_card(
 ) -> gtk::Box {
     use crate::device_links::device::DesktopSession;
     let card = gtk::Box::builder()
-        .spacing(12)
-        .css_classes(["card", "session-card"])
+        .spacing(14)
+        .css_classes(["session-banner"])
         .build();
     card.append(&feature_badge(match device.desktop_session {
         DesktopSession::None => "utilities-terminal-symbolic",
         _ => "screen-shared-symbolic",
     }));
-    let text = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
-        .hexpand(true)
-        .valign(gtk::Align::Center)
-        .build();
-    text.append(
+    let text = match since {
+        Some(since) => format!("{title} · since {since}"),
+        None => title.to_string(),
+    };
+    card.append(
         &gtk::Label::builder()
-            .label(title)
+            .label(&text)
             .xalign(0.0)
+            .hexpand(true)
             .wrap(true)
-            .css_classes(["heading"])
+            .valign(gtk::Align::Center)
+            .css_classes(["mono"])
             .build(),
     );
-    if let Some(since) = since {
-        text.append(
-            &gtk::Label::builder()
-                .label(format!("Since {since}"))
-                .xalign(0.0)
-                .css_classes(["caption", "dim-label", "numeric"])
-                .build(),
-        );
-    }
-    card.append(&text);
-    card.update_property(&[gtk::accessible::Property::Label(title)]);
+    card.update_property(&[gtk::accessible::Property::Label(&text)]);
     let end = gtk::Button::builder()
         .label("End")
         .valign(gtk::Align::Center)
+        .css_classes(["outline-button"])
         .tooltip_text("End the phone's sessions on this computer")
         .build();
     let (daemon, id, name) = (daemon.clone(), device.id.clone(), device.name.clone());

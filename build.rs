@@ -31,6 +31,10 @@ fn main() {
         "cargo:rerun-if-changed={}",
         manifest_dir.join("src").join("icons").display()
     );
+    println!(
+        "cargo:rerun-if-changed={}",
+        manifest_dir.join("src").join("fonts").display()
+    );
 
     let status = Command::new("glib-compile-resources")
         .arg("--target")

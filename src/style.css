@@ -1,36 +1,230 @@
-/* Loaded automatically by AdwApplication from the resource base path. Flat
- * and minimal: every surface is one solid libadwaita colour, and colour has
- * three meanings only — the accent (primary action, switches, selection),
- * green (the small "connected" dot) and red (errors, destructive confirms).
- * Dark and high-contrast adjustments are loaded by application.rs. */
+/* Loaded automatically by AdwApplication from the resource base path.
+ *
+ * The palette — light and dark tokens for libadwaita's named colours and our
+ * own (surface_2, hairline, terminal_bg, mint, …) — is loaded by
+ * application.rs, which swaps it as the style changes (libadwaita 1.5 has no
+ * colour-scheme media queries). The fallbacks below only keep the rules valid
+ * before it loads. */
+@define-color surface_2 alpha(currentColor, 0.05);
+@define-color hairline alpha(currentColor, 0.12);
+@define-color hairline_strong alpha(currentColor, 0.2);
+@define-color text_dim alpha(currentColor, 0.7);
+@define-color text_faint alpha(currentColor, 0.5);
+@define-color terminal_bg #0b0c0e;
+@define-color terminal_fg #e6e6e6;
+@define-color mint #13a57a;
+@define-color coral #e8573f;
+@define-color amber #c98a00;
+@define-color card_shadow_near transparent;
+@define-color card_shadow_far transparent;
+@define-color glow_color transparent;
 
-/* The brand accent (libadwaita 1.5 named colours; 1.6+ also gets the CSS
- * variables, from application.rs). */
-@define-color accent_bg_color #3b6cf6;
-@define-color accent_fg_color #ffffff;
-@define-color accent_color #2c5bd6;
+/* Technical text: addresses, paths, codes, sizes, terminal output. */
+.mono {
+  font-family: "JetBrains Mono", monospace;
+  font-feature-settings: "tnum";
+}
 
-/* The connected dot. */
-.status-dot {
+/* Section titles: small, dim, sentence case. */
+.section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: @text_dim;
+}
+.text-dim { color: @text_dim; }
+.text-faint { color: @text_faint; }
+
+/* Surfaces: lists and cards share one shape. */
+.boxed-list,
+.surface-card {
+  border-radius: 16px;
+  background-color: @card_bg_color;
+  box-shadow: 0 0 0 1px @hairline, 0 1px 2px @card_shadow_near, 0 8px 24px @card_shadow_far;
+}
+.boxed-list > row:first-child { border-top-left-radius: 16px; border-top-right-radius: 16px; }
+.boxed-list > row:last-child { border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; }
+
+/* ── Hero band ─────────────────────────────────────────────────────────── */
+.hero-band {
+  padding: 24px;
+  border-radius: 20px;
+  background-color: @card_bg_color;
+  background-image: radial-gradient(circle farthest-side at 15% 30%, @glow_color, transparent);
+  box-shadow: 0 0 0 1px @hairline, 0 1px 2px @card_shadow_near, 0 8px 24px @card_shadow_far;
+}
+.hero-name {
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+}
+.glyph-squircle {
+  border-radius: 14px;
+  background-color: @surface_2;
+  box-shadow: inset 0 0 0 1px @hairline;
+  color: @window_fg_color;
+}
+.glyph-squircle.small { border-radius: 10px; }
+.glyph-squircle.offline { color: @text_faint; }
+
+/* "● Connected": the state as a pill in its colour. */
+.status-pill {
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-weight: 600;
+  font-size: 13px;
+  background-color: alpha(@text_faint, 0.14);
+  color: @text_dim;
+}
+.status-pill.connected { background-color: alpha(@mint, 0.12); color: @mint; }
+.status-pill.connecting { background-color: alpha(@accent_bg_color, 0.12); color: @accent_color; }
+.status-pill.attention { background-color: alpha(@amber, 0.14); color: @amber; }
+.dot {
+  min-width: 7px;
+  min-height: 7px;
+  border-radius: 999px;
+  background-color: currentColor;
+}
+.dot.mint { background-color: @mint; }
+.dot.faint { background-color: @text_faint; }
+
+/* Round icon buttons in the hero. */
+.pill-button {
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0 12px;
+  border-radius: 999px;
+  background-color: @surface_2;
+  box-shadow: inset 0 0 0 1px @hairline;
+  transition: background-color 120ms, box-shadow 120ms;
+}
+.pill-button:hover { box-shadow: inset 0 0 0 1px @hairline_strong; }
+.pill-button.icon { padding: 0; }
+
+/* An outlined button: End, Reject. */
+.outline-button {
+  background-color: transparent;
+  box-shadow: inset 0 0 0 1px @hairline_strong;
+}
+
+/* ── Terminals ─────────────────────────────────────────────────────────── */
+.terminal-tile {
+  padding: 0;
+  border-radius: 14px;
+  background-color: @terminal_bg;
+  color: @terminal_fg;
+  box-shadow: inset 0 0 0 1px @hairline;
+  transition: box-shadow 120ms;
+}
+.terminal-tile:hover { box-shadow: inset 0 0 0 1px @hairline_strong; }
+.terminal-tile:active { box-shadow: inset 0 0 0 1px @accent_bg_color; }
+.terminal-head {
+  padding: 12px 14px 0 14px;
+}
+.terminal-title {
+  font-weight: 600;
+  color: @terminal_fg;
+}
+.agent-chip {
+  padding: 1px 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  background-color: alpha(@terminal_fg, 0.1);
+  color: @terminal_fg;
+}
+.terminal-lines {
+  padding: 8px 14px 12px 14px;
+  font-size: 11px;
+  color: alpha(@terminal_fg, 0.85);
+}
+/* The preview fades out towards its top edge. */
+.terminal-fade {
+  min-height: 28px;
+  background-image: linear-gradient(to bottom, @terminal_bg, alpha(@terminal_bg, 0));
+}
+.terminal-prompt { color: @mint; }
+.terminal-cursor {
   min-width: 8px;
-  min-height: 8px;
-  border-radius: 999px;
-  background-color: @success_color;
+  min-height: 16px;
+  background-color: @coral;
+  animation: blink 1.1s steps(1) infinite;
 }
-.status-dot.small {
-  min-width: 6px;
-  min-height: 6px;
-}
-
-/* A device: its type's glyph on a plain neutral circle. */
-.device-glyph {
-  border-radius: 999px;
-  background-color: alpha(@view_fg_color, 0.08);
-  color: alpha(@view_fg_color, 0.8);
+@keyframes blink {
+  0% { opacity: 1; }
+  50% { opacity: 0; }
 }
 
-/* The pairing code reads as two groups of three. */
-.pairing-code { letter-spacing: 0.06em; }
+/* ── Feature cards ─────────────────────────────────────────────────────── */
+.feature-card {
+  padding: 16px;
+  border-radius: 16px;
+  background-color: @card_bg_color;
+  box-shadow: 0 0 0 1px @hairline, 0 1px 2px @card_shadow_near, 0 8px 24px @card_shadow_far;
+  transition: box-shadow 120ms, background-color 120ms;
+}
+.feature-card:hover {
+  background-color: mix(@card_bg_color, @surface_2, 0.5);
+  box-shadow: 0 0 0 1px @hairline_strong, 0 1px 2px @card_shadow_near, 0 8px 24px @card_shadow_far;
+}
+.feature-card:active { box-shadow: 0 0 0 1px @accent_bg_color; }
+.feature-card:disabled { opacity: 0.55; }
+.feature-card .title { font-size: 15px; font-weight: 600; }
+.feature-badge {
+  border-radius: 10px;
+  background-color: alpha(@accent_bg_color, 0.14);
+  color: @accent_color;
+}
+.count-badge {
+  min-width: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background-color: @accent_bg_color;
+  color: @accent_fg_color;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+/* The active session: accent-tinted, accent edge. */
+.session-banner {
+  padding: 14px 18px;
+  border-radius: 16px;
+  background-color: alpha(@accent_bg_color, 0.1);
+  box-shadow: inset 0 0 0 1px alpha(@accent_bg_color, 0.6);
+}
+
+/* ── Sidebar ───────────────────────────────────────────────────────────── */
+.device-name { font-size: 15px; font-weight: 600; }
+.navigation-sidebar > row:selected {
+  background-color: @surface_2;
+  box-shadow: inset 2px 0 @accent_bg_color;
+}
+
+/* ── Welcome ───────────────────────────────────────────────────────────── */
+.welcome-headline {
+  font-size: 32px;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+}
+.terminal-card {
+  padding: 18px;
+  border-radius: 16px;
+  background-color: @terminal_bg;
+  color: @terminal_fg;
+  box-shadow: inset 0 0 0 1px @hairline;
+}
+
+/* ── Pairing ───────────────────────────────────────────────────────────── */
+.pairing-code {
+  font-size: 40px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+}
+.code-card {
+  padding: 12px 24px;
+  border-radius: 16px;
+  background-color: @surface_2;
+  box-shadow: inset 0 0 0 1px @hairline;
+}
 
 /* QR codes need their light quiet zone in dark mode too. */
 .qr-frame {
@@ -39,7 +233,7 @@
   padding: 12px;
 }
 
-/* Phone screen viewer: black. */
+/* ── Phone screen viewer ───────────────────────────────────────────────── */
 .remote-window,
 .remote-window .phone-screen {
   background-color: black;
@@ -52,24 +246,10 @@
 }
 .floating-toolbar { margin: 18px; }
 
-/* Feature cards: icon badge left, title and description right. */
-.feature-card {
-  padding: 12px 14px;
-  min-height: 52px;
+/* Group titles read like the section titles above the cards. */
+preferencesgroup .heading {
+  font-size: 13px;
+  font-weight: 600;
+  color: @text_dim;
 }
-.feature-card:disabled { opacity: 0.55; }
-
-/* The cards' icon badge: one accent hue in a soft vertical tone. */
-.feature-badge {
-  border-radius: 10px;
-  background-image: linear-gradient(to bottom,
-                                    alpha(@accent_bg_color, 0.12),
-                                    alpha(@accent_bg_color, 0.22));
-  color: @accent_color;
-}
-
-/* The active session stands out with a plain accent tint. */
-.session-card {
-  padding: 12px 14px;
-  background-color: mix(@card_bg_color, @accent_bg_color, 0.08);
-}
+.session-banner label { font-size: 14px; }

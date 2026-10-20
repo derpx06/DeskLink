@@ -74,6 +74,7 @@ mod imp {
     impl ApplicationImpl for DesklinkApplication {
         fn startup(&self) {
             self.parent_startup();
+            register_bundled_fonts();
             install_brand_styles();
         }
 
@@ -484,6 +485,29 @@ impl DesklinkApplication {
             .icon_name("preferences-system-symbolic")
             .build();
 
+        let look = adw::PreferencesGroup::builder().title("Appearance").build();
+        let choices = ["system", "light", "dark"];
+        let appearance = adw::ComboRow::builder()
+            .title("Style")
+            .model(&gtk::StringList::new(&["System", "Light", "Dark"]))
+            .selected(
+                choices
+                    .iter()
+                    .position(|choice| *choice == load_appearance())
+                    .unwrap_or(0) as u32,
+            )
+            .build();
+        appearance.connect_selected_notify(move |row| {
+            let choice = choices
+                .get(row.selected() as usize)
+                .copied()
+                .unwrap_or("system");
+            save_appearance(choice);
+            adw::StyleManager::default().set_color_scheme(appearance_scheme(choice));
+        });
+        look.add(&appearance);
+        general.add(&look);
+
         let startup_group = adw::PreferencesGroup::builder().title("Background").build();
         let start_at_login = adw::SwitchRow::builder()
             .title("Start at Login")
@@ -726,61 +750,117 @@ impl DesklinkApplication {
     }
 }
 
-/// The brand accent for libadwaita 1.6+ (whose colours are CSS variables;
-/// `style.css` sets the 1.5 named colours), plus the dark and high-contrast
-/// adjustments, swapped as the style changes. Loaded in code because
-/// libadwaita 1.5 has no colour-scheme media queries and later versions
-/// deprecate `style-dark.css`.
+/// The palette, light and dark: (name, light, dark). libadwaita's own
+/// colours come first, then DeskLink's tokens used by `style.css`.
+const PALETTE: &[(&str, &str, &str)] = &[
+    ("window_bg_color", "#f6f6f4", "#0b0c0e"),
+    ("window_fg_color", "#121317", "#ededef"),
+    ("view_bg_color", "#ffffff", "#131418"),
+    ("view_fg_color", "#121317", "#ededef"),
+    ("card_bg_color", "#ffffff", "#131418"),
+    ("card_fg_color", "#121317", "#ededef"),
+    ("headerbar_bg_color", "#f6f6f4", "#0b0c0e"),
+    ("headerbar_fg_color", "#121317", "#ededef"),
+    ("headerbar_backdrop_color", "#f6f6f4", "#0b0c0e"),
+    ("sidebar_bg_color", "#efefec", "#0f1013"),
+    ("sidebar_fg_color", "#121317", "#ededef"),
+    ("sidebar_backdrop_color", "#f2f2f0", "#0f1013"),
+    ("popover_bg_color", "#ffffff", "#1a1c21"),
+    ("popover_fg_color", "#121317", "#ededef"),
+    ("dialog_bg_color", "#ffffff", "#131418"),
+    ("dialog_fg_color", "#121317", "#ededef"),
+    ("accent_bg_color", "#3b6cf6", "#6e8cff"),
+    ("accent_fg_color", "#ffffff", "#0b0c0e"),
+    ("accent_color", "#2f5be0", "#6e8cff"),
+    ("success_bg_color", "#13a57a", "#34d1a0"),
+    ("success_fg_color", "#ffffff", "#0b0c0e"),
+    ("success_color", "#13a57a", "#34d1a0"),
+    ("warning_bg_color", "#c98a00", "#ffc24d"),
+    ("warning_fg_color", "#ffffff", "#0b0c0e"),
+    ("warning_color", "#c98a00", "#ffc24d"),
+    ("error_bg_color", "#d93636", "#ff5c5c"),
+    ("error_fg_color", "#ffffff", "#0b0c0e"),
+    ("error_color", "#d93636", "#ff5c5c"),
+    ("destructive_bg_color", "#d93636", "#ff5c5c"),
+    ("destructive_fg_color", "#ffffff", "#0b0c0e"),
+    ("destructive_color", "#d93636", "#ff5c5c"),
+];
+
+/// DeskLink's own tokens: (name, light, dark).
+const TOKENS: &[(&str, &str, &str)] = &[
+    ("surface_2", "#f0f0ee", "#1a1c21"),
+    ("hairline", "#e4e4e0", "#262931"),
+    ("hairline_strong", "#d6d6d1", "#33363f"),
+    ("text_dim", "#5e616a", "#9a9ca4"),
+    ("text_faint", "#8c8f97", "#6b6e77"),
+    // The terminal stays dark in both styles: it is the hero object.
+    ("terminal_bg", "#0b0c0e", "#050506"),
+    ("terminal_fg", "#e6e6e6", "#e6e6e6"),
+    ("mint", "#13a57a", "#34d1a0"),
+    ("coral", "#e8573f", "#ff7a62"),
+    ("amber", "#c98a00", "#ffc24d"),
+    ("card_shadow_near", "rgba(0,0,0,0.05)", "transparent"),
+    ("card_shadow_far", "rgba(0,0,0,0.06)", "transparent"),
+    (
+        "glow_color",
+        "rgba(59,108,246,0.07)",
+        "rgba(110,140,255,0.12)",
+    ),
+];
+
+/// The CSS for one style. libadwaita 1.5 reads named colours; 1.6+ reads CSS
+/// variables (`--window-bg-color`), so those are set too when present. In
+/// high contrast libadwaita's own colours are kept and only our tokens are
+/// set, with stronger edges.
+fn palette_css(dark: bool, modern: bool, contrast: bool) -> String {
+    let pick =
+        |light: &'static str, dark_value: &'static str| if dark { dark_value } else { light };
+    let mut css = String::new();
+    let mut root = String::new();
+    if !contrast {
+        for (name, light, dark_value) in PALETTE {
+            let value = pick(light, dark_value);
+            css.push_str(&format!("@define-color {name} {value};\n"));
+            root.push_str(&format!("--{}: {value}; ", name.replace('_', "-")));
+        }
+    }
+    for (name, light, dark_value) in TOKENS {
+        let value = match *name {
+            "hairline" | "hairline_strong" if contrast => "alpha(currentColor, 0.6)",
+            "card_shadow_near" | "card_shadow_far" | "glow_color" if contrast => "transparent",
+            _ => pick(light, dark_value),
+        };
+        css.push_str(&format!("@define-color {name} {value};\n"));
+    }
+    if modern && !root.is_empty() {
+        css.push_str(&format!(":root {{ {root}}}\n"));
+    }
+    css
+}
+
+/// Loads the palette for the current style and keeps it in step: light,
+/// dark or high contrast, as the system or the Appearance setting changes.
 fn install_brand_styles() {
     let Some(display) = gtk::gdk::Display::default() else {
         return;
     };
-    let provider = |css: &str| {
-        let provider = gtk::CssProvider::new();
-        provider.load_from_string(css);
-        provider
-    };
     let modern = adw::minor_version() >= 6;
-    if modern {
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &provider(
-                ":root { --accent-bg-color: #3b6cf6; --accent-fg-color: #ffffff; \
-                 --accent-color: #2c5bd6; }",
-            ),
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-    }
-    let dark = provider(if modern {
-        "@define-color accent_color #8eacff; :root { --accent-color: #8eacff; }"
-    } else {
-        "@define-color accent_color #8eacff;"
-    });
-    // Tinted shapes get a real edge when contrast matters more.
-    let contrast = provider(
-        ".device-glyph, .feature-badge, .session-card { \
-         box-shadow: inset 0 0 0 1px alpha(currentColor, 0.6); }",
+    let palette = gtk::CssProvider::new();
+    // Above `style.css`, whose token fallbacks this replaces.
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &palette,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
     );
-    let shown = std::rc::Rc::new(std::cell::Cell::new((false, false)));
     let update = move |manager: &adw::StyleManager| {
-        let wanted = (manager.is_dark(), manager.is_high_contrast());
-        let (was_dark, was_contrast) = shown.replace(wanted);
-        for (provider, now, before) in [
-            (&dark, wanted.0, was_dark),
-            (&contrast, wanted.1, was_contrast),
-        ] {
-            if now && !before {
-                gtk::style_context_add_provider_for_display(
-                    &display,
-                    provider,
-                    gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
-                );
-            } else if before && !now {
-                gtk::style_context_remove_provider_for_display(&display, provider);
-            }
-        }
+        palette.load_from_string(&palette_css(
+            manager.is_dark(),
+            modern,
+            manager.is_high_contrast(),
+        ));
     };
     let manager = adw::StyleManager::default();
+    manager.set_color_scheme(appearance_scheme(&load_appearance()));
     update(&manager);
     let update = std::rc::Rc::new(update);
     manager.connect_dark_notify({
@@ -788,6 +868,78 @@ fn install_brand_styles() {
         move |manager| update(manager)
     });
     manager.connect_high_contrast_notify(move |manager| update(manager));
+}
+
+/// Makes the bundled JetBrains Mono (SIL OFL 1.1, licence beside it in the
+/// resources) available to this process, for `.mono` text. Fontconfig needs
+/// a file, so the font is copied once into DeskLink's cache directory.
+fn register_bundled_fonts() {
+    #[link(name = "fontconfig")]
+    extern "C" {
+        fn FcConfigAppFontAddFile(
+            config: *mut std::ffi::c_void,
+            file: *const std::os::raw::c_uchar,
+        ) -> std::os::raw::c_int;
+    }
+    let Ok(bytes) = gio::resources_lookup_data(
+        "/derx06/desklink/com/fonts/JetBrainsMono.ttf",
+        gio::ResourceLookupFlags::NONE,
+    ) else {
+        return;
+    };
+    let Some(dir) = dirs::cache_dir().map(|dir| dir.join("desklink")) else {
+        return;
+    };
+    let path = dir.join("JetBrainsMono.ttf");
+    let current = std::fs::metadata(&path).is_ok_and(|meta| meta.len() == bytes.len() as u64);
+    if !current
+        && (std::fs::create_dir_all(&dir).is_err() || std::fs::write(&path, &*bytes).is_err())
+    {
+        eprintln!("[UI] Could not cache the bundled monospace font");
+        return;
+    }
+    let Ok(file) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return;
+    };
+    // SAFETY: a null config means fontconfig's current one; the path is a
+    // valid NUL-terminated string that outlives the call, which copies it.
+    let added = unsafe { FcConfigAppFontAddFile(std::ptr::null_mut(), file.as_ptr().cast()) };
+    if added == 0 {
+        eprintln!("[UI] Fontconfig did not accept the bundled monospace font");
+    }
+}
+
+/// Where the Appearance choice is kept: `~/.config/desklink/appearance`.
+fn appearance_path() -> Option<std::path::PathBuf> {
+    Some(dirs::config_dir()?.join("desklink").join("appearance"))
+}
+
+/// "system", "light" or "dark".
+fn load_appearance() -> String {
+    appearance_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|text| text.trim().to_string())
+        .filter(|choice| matches!(choice.as_str(), "light" | "dark"))
+        .unwrap_or_else(|| "system".to_string())
+}
+
+fn save_appearance(choice: &str) {
+    if let Some(path) = appearance_path() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Err(error) = std::fs::write(&path, choice) {
+            eprintln!("[UI] Could not save the appearance: {error}");
+        }
+    }
+}
+
+fn appearance_scheme(choice: &str) -> adw::ColorScheme {
+    match choice {
+        "light" => adw::ColorScheme::ForceLight,
+        "dark" => adw::ColorScheme::ForceDark,
+        _ => adw::ColorScheme::Default,
+    }
 }
 
 /// `content` under a plain header bar, for a dialog or a pushed subpage.

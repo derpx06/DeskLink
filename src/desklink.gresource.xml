@@ -4,6 +4,8 @@
     <file preprocess="xml-stripblanks">window.ui</file>
     <file preprocess="xml-stripblanks">shortcuts-dialog.ui</file>
     <file>style.css</file>
+    <file>fonts/JetBrainsMono.ttf</file>
+    <file>fonts/JetBrainsMono-OFL.txt</file>
     <file alias="icons/scalable/devices/desklink-device-phone-symbolic.svg">icons/desklink-device-phone-symbolic.svg</file>
     <file alias="icons/scalable/devices/desklink-device-tablet-symbolic.svg">icons/desklink-device-tablet-symbolic.svg</file>
     <file alias="icons/scalable/devices/desklink-device-laptop-symbolic.svg">icons/desklink-device-laptop-symbolic.svg</file>

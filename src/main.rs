@@ -43,6 +43,7 @@ mod phone_files;
 mod protocol;
 mod remote_control;
 mod shell_dbus;
+mod terminal_previews;
 mod transfers;
 mod tray;
 mod window;

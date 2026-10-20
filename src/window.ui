@@ -14,6 +14,13 @@
         <setter object="split_view" property="collapsed">True</setter>
       </object>
     </child>
+    <child>
+      <object class="AdwBreakpoint" id="narrow_breakpoint">
+        <condition>max-width: 480sp</condition>
+        <!-- Only one breakpoint applies at a time, so this repeats the collapse. -->
+        <setter object="split_view" property="collapsed">True</setter>
+      </object>
+    </child>
     <property name="content">
       <object class="AdwToastOverlay" id="toast_overlay">
         <property name="child">
@@ -38,26 +45,22 @@
                       </object>
                     </child>
                     <property name="content">
-                      <object class="AdwStatusPage">
-                        <property name="icon-name">derx06.desklink.com-symbolic</property>
-                        <property name="title" translatable="yes">Welcome to DeskLink</property>
-                        <property name="description" translatable="yes">Install DeskLink on your phone and pair it with this computer to share files, notifications, the clipboard and screens.</property>
+                      <object class="GtkScrolledWindow">
+                        <property name="hscrollbar-policy">never</property>
                         <property name="child">
-                          <object class="GtkBox" id="welcome_body">
-                            <property name="orientation">vertical</property>
-                            <property name="spacing">36</property>
-                            <child>
-                          <object class="GtkButton">
-                            <property name="label" translatable="yes">_Pair a Phone…</property>
-                            <property name="use-underline">True</property>
-                            <property name="halign">center</property>
-                            <property name="action-name">win.pair-new</property>
-                            <style>
-                              <class name="pill"/>
-                              <class name="suggested-action"/>
-                            </style>
-                          </object>
-                            </child>
+                          <object class="AdwClamp">
+                            <property name="maximum-size">560</property>
+                            <property name="child">
+                              <object class="GtkBox" id="welcome_body">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">24</property>
+                                <property name="valign">center</property>
+                                <property name="margin-top">24</property>
+                                <property name="margin-bottom">36</property>
+                                <property name="margin-start">24</property>
+                                <property name="margin-end">24</property>
+                              </object>
+                            </property>
                           </object>
                         </property>
                       </object>
@@ -143,37 +146,8 @@
                         <property name="child">
                           <object class="AdwToolbarView">
                             <child type="top">
-                              <object class="AdwHeaderBar">
-                                <child type="end">
-                                  <object class="GtkButton" id="ping_button">
-                                    <property name="icon-name">network-transmit-receive-symbolic</property>
-                                    <property name="tooltip-text" translatable="yes">Ping</property>
-                                    <property name="visible">False</property>
-                                    <accessibility>
-                                      <property name="label" translatable="yes">Ping</property>
-                                    </accessibility>
-                                  </object>
-                                </child>
-                                <child type="end">
-                                  <object class="GtkButton" id="lock_button">
-                                    <property name="icon-name">system-lock-screen-symbolic</property>
-                                    <property name="tooltip-text" translatable="yes">Lock</property>
-                                    <property name="visible">False</property>
-                                    <accessibility>
-                                      <property name="label" translatable="yes">Lock</property>
-                                    </accessibility>
-                                  </object>
-                                </child>
-                                <child type="end">
-                                  <object class="GtkButton" id="ring_button">
-                                    <property name="icon-name">desklink-ring-symbolic</property>
-                                    <property name="tooltip-text" translatable="yes">Ring</property>
-                                    <property name="visible">False</property>
-                                    <accessibility>
-                                      <property name="label" translatable="yes">Ring</property>
-                                    </accessibility>
-                                  </object>
-                                </child>
+                              <object class="AdwHeaderBar" id="content_header">
+                                <property name="show-title">False</property>
                               </object>
                             </child>
                             <child type="top">
