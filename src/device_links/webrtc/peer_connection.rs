@@ -394,20 +394,10 @@ impl DesktopWebRtcPeer {
         }
     }
 
-    /// Bytes already queued on `channel` and not yet handed to the network.
-    ///
-    /// The only real backpressure signal available. libwebrtc destroys a data
-    /// channel with `RESOURCE_EXHAUSTED` once ~16 MiB is queued, so a producer
-    /// that can outrun the link — a terminal running `yes` — must consult this
-    /// and stop reading its source rather than queueing without bound.
-    ///
-    /// An unknown or closed channel reports `u64::MAX` so callers treat it as
-    /// fully congested and send nothing.
-    /// How the selected ICE pair reaches the peer: `"turn"` when either end
-    /// is a relay candidate, `"direct"` when either is server-reflexive or
-    /// peer-reflexive (through a NAT, over the internet), otherwise `"lan"`.
+    /// How the selected ICE pair reaches the peer, per [`path_label`].
+    /// `via_relay` is whether the bootstrap link is the relay.
     /// `None` until a pair is selected.
-    pub fn path(&self) -> Option<&'static str> {
+    pub fn path(&self, via_relay: bool) -> Option<&'static str> {
         let promise = gst::Promise::new();
         self.webrtcbin
             .emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
@@ -434,9 +424,18 @@ impl DesktopWebRtcPeer {
             .filter_map(|key| field(pair, key))
             .filter_map(|id| by_id(&id).and_then(|candidate| field(candidate, "candidate-type")))
             .collect();
-        Some(path_label(&types))
+        Some(path_label(&types, via_relay))
     }
 
+    /// Bytes already queued on `channel` and not yet handed to the network.
+    ///
+    /// The only real backpressure signal available. libwebrtc destroys a data
+    /// channel with `RESOURCE_EXHAUSTED` once ~16 MiB is queued, so a producer
+    /// that can outrun the link — a terminal running `yes` — must consult this
+    /// and stop reading its source rather than queueing without bound.
+    ///
+    /// An unknown or closed channel reports `u64::MAX` so callers treat it as
+    /// fully congested and send nothing.
     pub fn buffered_amount(&self, channel: WebRtcChannel) -> u64 {
         let Ok(channels) = self.channels.lock() else {
             return u64::MAX;
@@ -1042,16 +1041,23 @@ fn local_description_promise_field(
     }
 }
 
-fn path_label(candidate_types: &[String]) -> &'static str {
+/// The connection-path rule, identical on both apps. `candidate_types` is
+/// the selected pair's `[local, remote]` candidate types:
+/// - either is `relay` → `"turn"`;
+/// - both are `host`/`prflx` and the bootstrap link is not the relay → `"lan"`;
+/// - anything else, including an unknown or incomplete pair → `"direct"`.
+fn path_label(candidate_types: &[String], via_relay: bool) -> &'static str {
     if candidate_types.iter().any(|kind| kind == "relay") {
         "turn"
-    } else if candidate_types
-        .iter()
-        .any(|kind| kind == "srflx" || kind == "prflx")
+    } else if !via_relay
+        && candidate_types.len() == 2
+        && candidate_types
+            .iter()
+            .all(|kind| kind == "host" || kind == "prflx")
     {
-        "direct"
-    } else {
         "lan"
+    } else {
+        "direct"
     }
 }
 
@@ -1061,6 +1067,25 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn path_label_follows_the_shared_rule() {
+        let label = |types: &[&str], via_relay| {
+            let types: Vec<String> = types.iter().map(|kind| kind.to_string()).collect();
+            path_label(&types, via_relay)
+        };
+        assert_eq!(label(&["relay", "host"], false), "turn");
+        assert_eq!(label(&["host", "relay"], true), "turn");
+        assert_eq!(label(&["host", "host"], false), "lan");
+        assert_eq!(label(&["host", "prflx"], false), "lan");
+        assert_eq!(label(&["prflx", "prflx"], false), "lan");
+        assert_eq!(label(&["host", "host"], true), "direct");
+        assert_eq!(label(&["host", "srflx"], false), "direct");
+        assert_eq!(label(&["srflx", "srflx"], false), "direct");
+        assert_eq!(label(&["host"], false), "direct");
+        assert_eq!(label(&[], false), "direct");
+        assert_eq!(label(&["", ""], false), "direct");
+    }
 
     /// What libwebrtc (Android) offers when the phone is the initiator: one
     /// `sendrecv` VP8 video section — the phone attaches a track in both roles —

@@ -23,7 +23,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use desklink_relay::protocol::{
     auth_sign_input, ClientMessage, ErrorCode, IceServer, ServerMessage, CLOSE_REPLACED,
-    CLOSE_UPGRADE_REQUIRED, PROTOCOL_VERSION,
+    CLOSE_UPGRADE_REQUIRED, MAX_ALLOW, PROTOCOL_VERSION,
 };
 use openssl::hash::MessageDigest;
 use openssl::sign::Signer;
@@ -306,7 +306,7 @@ impl Client {
         send(
             &mut socket,
             &ClientMessage::Allow {
-                fps: peers.keys().cloned().collect(),
+                fps: allow_list(peers.keys().cloned().collect()),
             },
         )?;
         set_status(RelayStatus::Online);
@@ -631,16 +631,26 @@ impl Client {
                 self.attach_if_needed(peer, false);
             }
             Event::Packet(bytes) => {
+                let Ok(packet) = NetworkPacket::deserialize(&bytes) else {
+                    return Ok(());
+                };
+                // The same rule as outbound (docs/RELAY.md §3): a proven peer
+                // still may not push features or pairing through the relay.
+                if !allowed_on_relay(&packet) {
+                    debug_log!(
+                        "[DeskLink] Dropped {} from {}: not allowed on a relay link",
+                        packet.packet_type,
+                        peer.device_id
+                    );
+                    return Ok(());
+                }
                 if let Some(transport) = peer.attached.as_ref().filter(|t| !t.is_closed()) {
                     transport.deliver(&bytes);
                     return Ok(());
                 }
                 // The peer is signaling through the relay, so its LAN path is
                 // gone even if this side has not noticed yet: take over now.
-                let Ok(packet) = NetworkPacket::deserialize(&bytes) else {
-                    return Ok(());
-                };
-                if allowed_on_relay(&packet) && packet.packet_type != PACKET_TYPE_HEARTBEAT {
+                if packet.packet_type != PACKET_TYPE_HEARTBEAT {
                     if let Some(transport) = self.attach_if_needed(peer, true) {
                         transport.deliver(&bytes);
                     }
@@ -763,21 +773,52 @@ fn after_scheme(url: &str) -> Option<&str> {
     })
 }
 
+/// The URL's host (IPv6 literals without brackets, any `user@` dropped) and
+/// its port text, if any.
+fn host_and_port(url: &str) -> Option<(&str, Option<&str>)> {
+    let authority = after_scheme(url)?.split(['/', '?', '#']).next()?;
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(bracketed) => {
+            let (host, after) = bracketed.split_once(']')?;
+            (host, after.strip_prefix(':'))
+        }
+        None => match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        },
+    };
+    (!host.is_empty()).then_some((host, port))
+}
+
+/// The bare host the auth signature covers (docs/RELAY.md §1).
 fn host_of(url: &str) -> Option<String> {
-    let rest = after_scheme(url)?;
-    let authority = rest.split('/').next()?;
-    let host = authority
-        .rsplit_once(':')
-        .map_or(authority, |(host, _)| host);
-    (!host.is_empty()).then(|| host.trim_matches(['[', ']']).to_string())
+    host_and_port(url).map(|(host, _)| host.to_string())
 }
 
 fn port_of(url: &str) -> u16 {
-    after_scheme(url)
-        .and_then(|rest| rest.split('/').next())
-        .and_then(|authority| authority.rsplit_once(':'))
-        .and_then(|(_, port)| port.parse().ok())
+    host_and_port(url)
+        .and_then(|(_, port)| port?.parse().ok())
         .unwrap_or(if url.starts_with("ws://") { 80 } else { 443 })
+}
+
+/// The relay accepts at most `MAX_ALLOW` fingerprints and closes the socket
+/// on more, so send a stable first `MAX_ALLOW` rather than none at all.
+fn allow_list(mut fps: Vec<String>) -> Vec<String> {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    if fps.len() > MAX_ALLOW {
+        WARNED.call_once(|| {
+            eprintln!(
+                "[DeskLink] {} paired devices, but the relay allows {MAX_ALLOW}; the rest cannot connect away from home",
+                fps.len()
+            );
+        });
+        fps.sort();
+        fps.truncate(MAX_ALLOW);
+    }
+    fps
 }
 
 fn connect(url: &str, host: &str) -> Result<Socket, String> {
@@ -921,6 +962,33 @@ mod tests {
         );
         assert_eq!(port_of("wss://relay.example:8443/v1"), 8443);
         assert_eq!(host_of("http://relay.example/v1"), None);
+        assert_eq!(host_of("wss://[::1]:8443/v1").as_deref(), Some("::1"));
+        assert_eq!(port_of("wss://[::1]:8443/v1"), 8443);
+        assert_eq!(
+            host_of("wss://[2001:db8::1]/v1").as_deref(),
+            Some("2001:db8::1")
+        );
+        assert_eq!(port_of("wss://[2001:db8::1]/v1"), 443);
+        assert_eq!(
+            host_of("wss://user@relay.example:8443/v1").as_deref(),
+            Some("relay.example")
+        );
+        assert_eq!(port_of("wss://user:pw@relay.example:8443/v1"), 8443);
+        assert_eq!(
+            host_of("wss://relay.example?x=1").as_deref(),
+            Some("relay.example")
+        );
+        assert_eq!(host_of("wss:///v1"), None);
+    }
+
+    #[test]
+    fn the_allow_list_never_exceeds_what_the_relay_accepts() {
+        let few: Vec<String> = (0..3).map(|n| n.to_string()).collect();
+        assert_eq!(allow_list(few.clone()), few);
+        let many: Vec<String> = (0..MAX_ALLOW + 5).map(|n| format!("{n:03}")).collect();
+        let sent = allow_list(many.into_iter().rev().collect());
+        assert_eq!(sent.len(), MAX_ALLOW);
+        assert_eq!(sent.first().map(String::as_str), Some("000"));
     }
 
     /// Two desktops that trust each other, a real relay on loopback, no LAN

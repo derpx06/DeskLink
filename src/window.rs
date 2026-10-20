@@ -1375,12 +1375,14 @@ fn status_dot(class: &str) -> gtk::Box {
 
 /// How the connection reaches the phone, for the pill on the device page.
 fn connection_path_presentation(path: Option<&str>) -> Option<(&'static str, &'static str)> {
-    match path? {
-        "lan" => Some(("network-wireless-symbolic", "Local network")),
-        "direct" => Some(("web-browser-symbolic", "Direct over the internet")),
-        "turn" => Some(("network-server-symbolic", "Through a TURN relay")),
-        _ => None,
-    }
+    let path = path?;
+    let text = crate::device_links::device::connection_path_label(path)?;
+    let icon = match path {
+        "lan" => "network-wireless-symbolic",
+        "direct" => "web-browser-symbolic",
+        _ => "network-server-symbolic",
+    };
+    Some((icon, text))
 }
 
 /// The themed battery icon closest to `charge`.
@@ -3716,11 +3718,11 @@ mod tests {
         );
         assert_eq!(
             connection_path_presentation(Some("direct")).map(|(_, text)| text),
-            Some("Direct over the internet")
+            Some("Over the internet")
         );
         assert_eq!(
             connection_path_presentation(Some("turn")).map(|(_, text)| text),
-            Some("Through a TURN relay")
+            Some("Through a relay server")
         );
         assert_eq!(connection_path_presentation(Some("carrier-pigeon")), None);
         assert_eq!(connection_path_presentation(None), None);

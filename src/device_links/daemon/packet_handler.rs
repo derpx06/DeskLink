@@ -682,17 +682,7 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             Ok(())
         }
         PACKET_TYPE_FINDMYPHONE_REQUEST => {
-            std::process::Command::new("canberra-gtk-play")
-                .args(["-i", "bell"])
-                .spawn()
-                .map_err(|error| format!("Could not play DeskLink find-device sound: {error}"))?;
-            push_event(
-                events,
-                DaemonEvent::FindPhoneReceived {
-                    device_id: device_id.clone(),
-                    device_name: binding.link.info.name.clone(),
-                },
-            );
+            find_device_received(events, device_id, &binding.link.info.name, spawn_player);
             Ok(())
         }
         PACKET_TYPE_MOUSEPAD_REQUEST => {
@@ -845,8 +835,68 @@ pub(crate) fn apply_lock_request(packet: &NetworkPacket) -> Option<bool> {
     Some(requested_lock)
 }
 
+/// The phone asked this computer to make itself known. The notification is
+/// the part that matters, so it goes out first; the sound is best effort and
+/// tries each player in turn, since none of them is guaranteed installed.
+fn find_device_received(
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
+    device_id: &str,
+    device_name: &str,
+    mut spawn: impl FnMut(&str, &[&str]) -> std::io::Result<()>,
+) {
+    push_event(
+        events,
+        DaemonEvent::FindPhoneReceived {
+            device_id: device_id.to_string(),
+            device_name: device_name.to_string(),
+        },
+    );
+    if spawn("canberra-gtk-play", &["-i", "bell"]).is_ok() {
+        return;
+    }
+    let Some(sound) = [
+        "/usr/share/sounds/freedesktop/stereo/bell.oga",
+        "/usr/share/sounds/freedesktop/stereo/complete.oga",
+    ]
+    .into_iter()
+    .find(|file| std::path::Path::new(file).exists()) else {
+        return;
+    };
+    let _ = spawn("paplay", &[sound]).or_else(|_| spawn("pw-play", &[sound]));
+}
+
+/// Starts `program` and reaps it in the background.
+fn spawn_player(program: &str, args: &[&str]) -> std::io::Result<()> {
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn find_device_notifies_even_with_no_sound_player() {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut tried = Vec::new();
+        super::find_device_received(&events, "phone", "Pixel", |program, _| {
+            tried.push(program.to_string());
+            Err(std::io::ErrorKind::NotFound.into())
+        });
+        assert!(matches!(
+            events.lock().unwrap().as_slice(),
+            [super::DaemonEvent::FindPhoneReceived { device_id, device_name }]
+                if device_id == "phone" && device_name == "Pixel"
+        ));
+        assert_eq!(tried.first().map(String::as_str), Some("canberra-gtk-play"));
+    }
+
     /// A paired peer must never be able to drive this machine's keyboard or
     /// pointer over the LAN bootstrap link. Input is permitted only on the
     /// authenticated WebRTC path, behind a portal lease the local user approved.

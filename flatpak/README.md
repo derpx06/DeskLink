@@ -38,8 +38,9 @@ of the tag, temporarily replace the git source with
 2. Add `"commit": "<full sha of v1.0.0>"` next to `"tag"` in the manifest.
    Flathub requires both. JSON has no comments, so this file is the reminder.
 3. Set `DESKLINK_RELAY_URL` in the manifest's build `env` to the deployed
-   relay (`relay/deploy/DEPLOY.md`). It is baked in as the default relay and
-   is the placeholder `wss://relay.example.com/v1` until then.
+   relay (`relay/deploy/DEPLOY.md`). Release builds always set it: it is baked
+   in as the default relay, and the manifest's `wss://relay.desklink.example/v1`
+   is the same placeholder the source falls back to without it.
 4. Generate `cargo-sources.json` from that tag's `Cargo.lock` (above).
 5. Make sure the screenshot URLs in the metainfo resolve
    (`data/screenshots/*.png` on `master`; see the top-level README).
@@ -70,6 +71,9 @@ of the tag, temporarily replace the git source with
 - **`--talk-name=org.gnome.Shell.Extensions`** offers (once, on GNOME without
   a tray host) to enable or install the DeskLink top-bar extension. GNOME
   shows its own confirmation.
+- **`--talk-name=org.a11y.Bus`** reaches the accessibility bus (its address
+  and the `org.a11y.Status` properties) to watch which text field has focus,
+  so the phone's keyboard opens when the desktop expects typing.
 - **`--filesystem=xdg-download`** is where received files are saved.
 - Notifications, screen casting and remote input go through portals and need
   no permission.

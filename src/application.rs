@@ -805,7 +805,11 @@ fn history_content() -> gtk::Widget {
             entry.device_name.clone()
         };
         let mut event = entry.event.label().to_string();
-        if let Some(path) = entry.path.as_deref().and_then(path_label) {
+        if let Some(path) = entry
+            .path
+            .as_deref()
+            .and_then(crate::device_links::device::connection_path_label)
+        {
             event = format!("{event} · {path}");
         }
         let row = adw::ActionRow::builder()
@@ -840,15 +844,6 @@ fn history_content() -> gtk::Widget {
         .child(&adw::Clamp::builder().child(&page).build())
         .build()
         .upcast()
-}
-
-fn path_label(path: &str) -> Option<&'static str> {
-    match path {
-        "lan" => Some("Local network"),
-        "direct" => Some("Direct over the internet"),
-        "turn" => Some("Through a TURN relay"),
-        _ => None,
-    }
 }
 
 /// The badge icon and hue for a history event.

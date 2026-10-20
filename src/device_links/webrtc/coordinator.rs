@@ -837,6 +837,38 @@ pub(crate) fn stop_phone_remote_control(
     send_result
 }
 
+/// Refuses a `request-view` and ends this side's session for it, so a denied
+/// request does not linger as `RequestingView` until it times out.
+fn deny_view(
+    peer: &DesktopWebRtcPeer,
+    wire: &WebRtcWireBinding,
+    attempt_id: &str,
+    remote_session_id: &str,
+    sequence: i64,
+    reason: String,
+) -> Result<(), String> {
+    let mut denied = remote_session::ControlMessage::new(
+        remote_session::ControlKind::ViewDenied,
+        attempt_id,
+        wire,
+        remote_session_id,
+        sequence,
+        now_millis(),
+    );
+    denied.reason = Some(reason);
+    apply_own_denial(&wire.peer_device_id, &denied);
+    send_remote_session_message(peer, wire, &denied)
+}
+
+/// Applies a denial this side sent to its own copy of the session.
+fn apply_own_denial(device_id: &str, denial: &remote_session::ControlMessage) {
+    if let Ok(mut open) = remote_session::sessions().lock() {
+        if let Some(session) = open.get_mut(device_id) {
+            let _ = session.accept(denial, now_millis());
+        }
+    }
+}
+
 fn send_remote_session_message(
     peer: &DesktopWebRtcPeer,
     wire: &WebRtcWireBinding,
@@ -2379,17 +2411,14 @@ fn handle_peer_envelope(
                 wire.generation,
                 message.password.as_deref(),
             ) {
-                let mut denied = remote_session::ControlMessage::new(
-                    remote_session::ControlKind::ViewDenied,
-                    attempt_id,
+                return deny_view(
+                    &peer,
                     wire,
+                    attempt_id,
                     &message.remote_session_id,
                     sequence,
-                    now_millis(),
+                    reason,
                 );
-                denied.reason = Some(reason);
-                send_remote_session_message(&peer, wire, &denied)?;
-                return Ok(());
             }
             let started = start_desktop_portal_session(
                 wire.peer_device_id.clone(),
@@ -2402,16 +2431,14 @@ fn handle_peer_envelope(
                 connection_log::record(&wire.peer_device_id, ConnectionEvent::ScreenViewStarted);
             }
             if let Err(error) = started {
-                let mut denied = remote_session::ControlMessage::new(
-                    remote_session::ControlKind::ViewDenied,
-                    attempt_id,
+                return deny_view(
+                    &peer,
                     wire,
+                    attempt_id,
                     &message.remote_session_id,
                     sequence,
-                    now_millis(),
+                    error,
                 );
-                denied.reason = Some(error);
-                send_remote_session_message(&peer, wire, &denied)?;
             }
             return Ok(());
         }
@@ -2447,6 +2474,7 @@ fn handle_peer_envelope(
                     .map_err(|_| "DeskLink remote-session lock poisoned".to_string())?;
                 let session = open.entry(wire.peer_device_id.clone()).or_default();
                 let authorization = session.accept(&message, now);
+                let authorized = authorization.is_ok();
                 let can_control = desktop_portal_services()
                     .lock()
                     .map(|services| {
@@ -2509,7 +2537,12 @@ fn handle_peer_envelope(
                                     .to_string()
                             }
                         }));
-                    let _ = session.accept(&response, now_millis());
+                    // Back to the view the request was made on. A request
+                    // that was itself refused changed nothing, and applying
+                    // the denial then would invent a view that is not there.
+                    if authorized {
+                        let _ = session.accept(&response, now_millis());
+                    }
                 }
                 response
             };
@@ -3291,9 +3324,9 @@ fn now_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        authorize_desktop_remote_input, coalesce_motion, desktop_capture_needed,
+        apply_own_denial, authorize_desktop_remote_input, coalesce_motion, desktop_capture_needed,
         desktop_portal_services, ensure_phone_view_allowed, expired_request_action, liveness,
-        offer_attempt_disposition, recovery_delay, remove_service_if_current,
+        offer_attempt_disposition, recovery_delay, remote_session, remove_service_if_current,
         stop_desktop_portal_session, DesktopPortalCommand, DesktopPortalService, ExpiredRequest,
         Liveness, OfferAttemptDisposition, RECOVERY_BACKOFF_MILLIS,
     };
@@ -3627,6 +3660,28 @@ mod tests {
 
         assert!(authorize_desktop_remote_input(&mut session, &packet, "phone", 5_000).is_err());
         assert_eq!(session.peer_input_lease().unwrap().expires_at, 100_000);
+    }
+
+    #[test]
+    fn a_denied_view_request_leaves_no_session_behind() {
+        let device = "test-device-denied-view";
+        remote_session::sessions()
+            .lock()
+            .unwrap()
+            .entry(device.to_string())
+            .or_default()
+            .accept(&session_control(ControlKind::RequestView, "denied"), 1_000)
+            .unwrap();
+        assert_eq!(
+            remote_session::sessions().lock().unwrap()[device].state(),
+            SessionState::RequestingView
+        );
+
+        apply_own_denial(device, &session_control(ControlKind::ViewDenied, "denied"));
+
+        let open = remote_session::sessions().lock().unwrap();
+        assert_eq!(open[device].state(), SessionState::Stopped);
+        assert_eq!(open[device].remote_session_id(), None);
     }
 
     #[test]

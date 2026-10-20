@@ -20,6 +20,7 @@
         "--talk-name=org.kde.StatusNotifierWatcher",
         "--own-name=org.kde.StatusNotifierItem-2-1",
         "--talk-name=org.gnome.Shell.Extensions",
+        "--talk-name=org.a11y.Bus",
         "--filesystem=xdg-download"
     ],
     "build-options" : {
@@ -27,7 +28,7 @@
         "env" : {
             "CARGO_HOME" : "/run/build/desklink/cargo",
             "CARGO_NET_OFFLINE" : "true",
-            "DESKLINK_RELAY_URL" : "wss://relay.example.com/v1"
+            "DESKLINK_RELAY_URL" : "wss://relay.desklink.example/v1"
         }
     },
     "cleanup" : [

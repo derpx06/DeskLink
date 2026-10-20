@@ -252,7 +252,10 @@ pub fn show_remote_control_dialog(
                     if let Some(view) = daemon.devices().into_iter().find(|d| d.id == *device) {
                         title.set_title(&view.name);
                         if let Some(route) = route.upgrade() {
-                            let text = route_label(view.connection_path.as_deref());
+                            let text = view
+                                .connection_path
+                                .as_deref()
+                                .and_then(crate::device_links::device::connection_path_label);
                             route.set_visible(text.is_some());
                             route.set_label(text.unwrap_or_default());
                         }
@@ -565,16 +568,6 @@ fn phone_status_line(
             }
         ),
         None => time.to_string(),
-    }
-}
-
-/// The header's pill: how the phone is connected.
-fn route_label(path: Option<&str>) -> Option<&'static str> {
-    match path? {
-        "lan" => Some("Local network"),
-        "direct" => Some("Direct"),
-        "turn" => Some("TURN relay"),
-        _ => None,
     }
 }
 

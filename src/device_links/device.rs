@@ -142,6 +142,18 @@ pub struct DeviceView {
     pub sftp_status: Option<SftpStatus>,
 }
 
+/// The user-facing words for a `connection_path`, the one mapping every
+/// surface uses (device page, history, remote-control header; the GNOME
+/// Shell extension mirrors it). `None` for an unknown path.
+pub fn connection_path_label(path: &str) -> Option<&'static str> {
+    match path {
+        "lan" => Some("Local network"),
+        "direct" => Some("Over the internet"),
+        "turn" => Some("Through a relay server"),
+        _ => None,
+    }
+}
+
 impl DeviceView {
     pub fn from_info(info: &DeviceInfo, address: String, paired: bool) -> Self {
         Self {

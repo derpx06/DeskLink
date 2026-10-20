@@ -16,7 +16,7 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -44,19 +44,57 @@ pub(crate) fn resolve(program: &OsStr) -> Option<PathBuf> {
     search(program, login_path()?)
 }
 
-/// Which of [`KNOWN_LAUNCHERS`] this machine can run. Cached for a minute:
-/// it is asked on every session list, under the terminal locks, and a `PATH`
-/// on a slow mount must not stall those.
+/// Which of [`KNOWN_LAUNCHERS`] this machine can run, as last seen. It is
+/// asked on every session list, under the terminal locks, so it never
+/// probes: it returns the cached answer at once (empty until the first probe
+/// finishes) and refreshes a stale one on a background thread.
 pub(crate) fn installed() -> Vec<String> {
-    static CACHE: std::sync::Mutex<Option<(Instant, Vec<String>)>> = std::sync::Mutex::new(None);
-    if let Ok(cache) = CACHE.lock() {
-        if let Some((at, found)) = cache.as_ref() {
-            if at.elapsed() < Duration::from_secs(60) {
-                return found.clone();
-            }
-        }
+    static CACHE: Mutex<LauncherCache> = Mutex::new(LauncherCache::EMPTY);
+    cached_or_refresh(&CACHE, probe_installed)
+}
+
+/// How long a launcher probe is believed.
+const LAUNCHERS_FRESH: Duration = Duration::from_secs(60);
+
+struct LauncherCache {
+    at: Option<Instant>,
+    found: Vec<String>,
+    refreshing: bool,
+}
+
+impl LauncherCache {
+    const EMPTY: Self = Self {
+        at: None,
+        found: Vec::new(),
+        refreshing: false,
+    };
+}
+
+fn cached_or_refresh(
+    cache: &'static Mutex<LauncherCache>,
+    probe: fn() -> Vec<String>,
+) -> Vec<String> {
+    let mut state = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    let stale = state.at.is_none_or(|at| at.elapsed() >= LAUNCHERS_FRESH);
+    if stale && !state.refreshing {
+        state.refreshing = true;
+        let spawned = thread::Builder::new()
+            .name("desklink-launchers".into())
+            .spawn(move || {
+                let found = probe();
+                *cache.lock().unwrap_or_else(PoisonError::into_inner) = LauncherCache {
+                    at: Some(Instant::now()),
+                    found,
+                    refreshing: false,
+                };
+            });
+        state.refreshing = spawned.is_ok();
     }
-    let found: Vec<String> = if super::host::in_flatpak() {
+    state.found.clone()
+}
+
+fn probe_installed() -> Vec<String> {
+    if super::host::in_flatpak() {
         installed_on_host()
     } else {
         KNOWN_LAUNCHERS
@@ -64,11 +102,7 @@ pub(crate) fn installed() -> Vec<String> {
             .filter(|name| resolve(OsStr::new(name)).is_some())
             .map(|name| name.to_string())
             .collect()
-    };
-    if let Ok(mut cache) = CACHE.lock() {
-        *cache = Some((Instant::now(), found.clone()));
     }
-    found
 }
 
 /// Inside a Flatpak the host's files are not visible, so the host's login
@@ -182,6 +216,31 @@ mod tests {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(search(OsStr::new("fake-agent"), &path), None);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_launcher_list_never_waits_for_a_slow_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static CACHE: Mutex<LauncherCache> = Mutex::new(LauncherCache::EMPTY);
+        static PROBES: AtomicUsize = AtomicUsize::new(0);
+        fn slow_probe() -> Vec<String> {
+            PROBES.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(300));
+            vec!["claude".to_string()]
+        }
+
+        let started = Instant::now();
+        assert!(cached_or_refresh(&CACHE, slow_probe).is_empty());
+        assert!(cached_or_refresh(&CACHE, slow_probe).is_empty());
+        assert!(started.elapsed() < Duration::from_millis(200));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while cached_or_refresh(&CACHE, slow_probe).is_empty() {
+            assert!(Instant::now() < deadline, "the refresh never landed");
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(cached_or_refresh(&CACHE, slow_probe), vec!["claude"]);
+        assert_eq!(PROBES.load(Ordering::SeqCst), 1, "one refresh at a time");
     }
 
     #[test]

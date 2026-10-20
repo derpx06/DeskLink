@@ -43,8 +43,8 @@ const ACTIONS = [
 
 const PATHS = {
     lan: 'Local network',
-    direct: 'Away from home',
-    turn: 'Via TURN',
+    direct: 'Over the internet',
+    turn: 'Through a relay server',
 };
 
 function appIcon() {

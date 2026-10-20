@@ -425,6 +425,8 @@ mod tests {
             "sessions",
             "exitStatus",
             "error",
+            "launchers",
+            "password",
         ] {
             assert!(!json.contains(absent), "{absent} should have been omitted");
         }

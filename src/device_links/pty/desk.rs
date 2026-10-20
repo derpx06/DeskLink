@@ -85,11 +85,13 @@ pub(crate) fn parse_attach(line: &str) -> Option<(String, u16, u16)> {
 /// Starts accepting desk clients. Called once, at startup.
 pub(crate) fn start_server() {
     // The login-shell probe can take a moment; pay it now, not in the first
-    // session list the phone asks for.
+    // session list the phone asks for. `installed` starts its own refresh in
+    // the background, so the first list already has launchers.
     let _ = thread::Builder::new()
         .name("desklink-login-path".into())
         .spawn(|| {
             super::launchers::login_path();
+            super::launchers::installed();
         });
     let path = socket_path();
     let Some(dir) = path.parent() else { return };

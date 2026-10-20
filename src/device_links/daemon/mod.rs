@@ -42,15 +42,9 @@ fn refresh_connection_paths(
         .map(|devices| devices.keys().cloned().collect())
         .unwrap_or_default();
     for id in ids {
-        let path = sessions.ready_peer(&id).and_then(|(peer, via_relay)| {
-            peer.path().map(|path| {
-                if via_relay && path == "lan" {
-                    "direct"
-                } else {
-                    path
-                }
-            })
-        });
+        let path = sessions
+            .ready_peer(&id)
+            .and_then(|(peer, via_relay)| peer.path(via_relay));
         let changed = devices.lock().ok().and_then(|mut devices| {
             let device = devices.get_mut(&id)?;
             let path = path.map(str::to_string);

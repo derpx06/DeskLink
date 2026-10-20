@@ -175,8 +175,8 @@ pub struct ControlMessage {
     /// `screen-ready`: how many screens are shared (the phone offers a
     /// switch when there is more than one).
     pub screen_count: Option<i32>,
-    /// `request-view` / `request-control`: the session password, when the
-    /// desktop has one set. See `session_lock`.
+    /// `request-view` / `request-control` / `takeover-request`: the session
+    /// password, when the desktop has one set. See `session_lock`.
     pub password: Option<String>,
 }
 
