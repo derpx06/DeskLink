@@ -87,10 +87,12 @@ pub(crate) fn host_probe(script: &str, args: &[&str]) -> Vec<OsString> {
 /// `flatpak run --command=desklink` is a second instance).
 pub(crate) fn runtime_dir() -> Option<PathBuf> {
     let base = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
-    Some(match std::env::var_os("FLATPAK_ID").filter(|_| in_flatpak()) {
-        Some(app_id) => base.join("app").join(app_id),
-        None => base,
-    })
+    Some(
+        match std::env::var_os("FLATPAK_ID").filter(|_| in_flatpak()) {
+            Some(app_id) => base.join("app").join(app_id),
+            None => base,
+        },
+    )
 }
 
 /// The command a host terminal window runs to show session `id`.
@@ -136,13 +138,18 @@ mod tests {
     fn a_hostile_name_is_an_argument_not_shell_text() {
         let argv = strings(&host_command(&["$(rm -rf ~)".into()]));
         assert_eq!(argv.last().unwrap(), "$(rm -rf ~)");
-        assert!(!argv.iter().any(|arg| arg.contains("rm -rf") && arg.contains("exec")));
+        assert!(!argv
+            .iter()
+            .any(|arg| arg.contains("rm -rf") && arg.contains("exec")));
     }
 
     #[test]
     fn the_probe_passes_names_as_arguments() {
         let argv = strings(&host_probe(PROBE_INSTALLED, &["claude", "codex"]));
         assert_eq!(&argv[..2], ["flatpak-spawn", "--host"]);
-        assert_eq!(&argv[argv.len() - 3..], [PROBE_INSTALLED, "claude", "codex"]);
+        assert_eq!(
+            &argv[argv.len() - 3..],
+            [PROBE_INSTALLED, "claude", "codex"]
+        );
     }
 }

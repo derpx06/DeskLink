@@ -67,9 +67,8 @@ pub fn set(enabled: bool) -> Result<(), String> {
 }
 
 fn which(program: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|dir| dir.join(program).is_file())
-    })
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
 }
 
 /// `org.freedesktop.portal.Background.RequestBackground`. Fire and forget:

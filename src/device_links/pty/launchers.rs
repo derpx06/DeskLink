@@ -104,7 +104,8 @@ fn is_executable(path: &Path) -> bool {
 fn probe_login_path() -> Option<OsString> {
     let shell = std::env::var_os("SHELL").filter(|shell| !shell.is_empty())?;
     let script = format!("printf '\\n{MARKER}%s{MARKER}\\n' \"$PATH\"");
-    let argv: Vec<OsString> = [shell, "-l".into(), "-i".into(), "-c".into(), script.into()].to_vec();
+    let argv: Vec<OsString> =
+        [shell, "-l".into(), "-i".into(), "-c".into(), script.into()].to_vec();
     parse_probe(&run_with_timeout(&argv)?)
 }
 
