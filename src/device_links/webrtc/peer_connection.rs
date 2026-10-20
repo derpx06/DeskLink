@@ -290,13 +290,10 @@ impl DesktopWebRtcPeer {
     /// A share that is starting while the previous one is still winding down
     /// (a retry, or a release followed at once by a new request) must not fail
     /// with "already active": the earlier capture is stopped first.
-    #[allow(clippy::too_many_arguments)]
-    pub fn start_desktop_screen_capture(
+    pub(crate) fn start_desktop_screen_capture(
         &self,
         owner: u64,
-        pipewire_fd: std::os::fd::OwnedFd,
-        node_id: u32,
-        pipewire_serial: Option<u64>,
+        source: super::screen::DesktopSource,
         width: i32,
         height: i32,
         fps: i32,
@@ -312,9 +309,7 @@ impl DesktopWebRtcPeer {
         let created = super::screen::DesktopScreenCapture::attach(
             &self.pipeline,
             &self.webrtcbin,
-            pipewire_fd,
-            node_id,
-            pipewire_serial,
+            source,
             width,
             height,
             fps,
@@ -536,7 +531,7 @@ impl DesktopWebRtcPeer {
     /// renegotiation, and only the deterministic initiator may offer — so a
     /// responder that wanted to start sharing would have no way to ask.
     fn add_screen_transceiver(&self) -> Result<(), String> {
-        let caps = super::screen::video_caps();
+        let caps = super::screen::video_caps(super::screen::h264_decoder_available());
         let transceiver = self
             .webrtcbin
             .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
@@ -580,8 +575,25 @@ impl Drop for DesktopWebRtcPeer {
 
 fn ensure_gstreamer() -> Result<(), String> {
     GST_INIT
-        .get_or_init(|| gst::init().map_err(|error| error.to_string()))
+        .get_or_init(|| {
+            gst::init().map_err(|error| error.to_string())?;
+            register_bundled_paintable_sink();
+            Ok(())
+        })
         .clone()
+}
+
+/// The phone's screen is shown through `gtk4paintablesink`, which some
+/// distributions (Ubuntu 24.04) do not package. The distro's own build is
+/// preferred when present; otherwise the copy compiled into DeskLink is
+/// registered so the viewer works everywhere.
+fn register_bundled_paintable_sink() {
+    if gst::ElementFactory::find("gtk4paintablesink").is_some() {
+        return;
+    }
+    if let Err(error) = gstgtk4::plugin_register_static() {
+        eprintln!("DeskLink could not register its bundled gtk4paintablesink: {error}");
+    }
 }
 
 fn validate_file_data(bytes: &[u8]) -> Result<(), String> {
@@ -718,7 +730,12 @@ fn configure_video_transceivers(webrtcbin: &gst::Element) {
         .property::<Option<gst_webrtc::WebRTCSessionDescription>>("remote-description")
         .filter(|remote| remote.type_() == gst_webrtc::WebRTCSDPType::Offer)
         .and_then(|remote| remote.sdp().as_text().ok())
-        .map(|sdp| super::screen::answer_video_caps(super::screen::twcc_extmap_id(&sdp)));
+        .map(|sdp| {
+            super::screen::answer_video_caps(
+                super::screen::twcc_extmap_id(&sdp),
+                super::screen::h264_decoder_available(),
+            )
+        });
     for index in 0i32..MAX_TRANSCEIVERS {
         let Some(transceiver) = webrtcbin
             .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>("get-transceiver", &[&index])

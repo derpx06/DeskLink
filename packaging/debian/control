@@ -1,0 +1,43 @@
+Source: desklink
+Section: net
+Priority: optional
+Maintainer: derpx06 <manaskhairnar1511@gmail.com>
+Build-Depends: debhelper-compat (= 13),
+               meson (>= 1.0.0),
+               cargo (>= 1.85) | cargo-1.85,
+               rustc (>= 1.85) | rustc-1.85,
+               pkgconf,
+               gettext,
+               libglib2.0-dev-bin,
+               libgtk-4-dev (>= 4.12),
+               libadwaita-1-dev,
+               libgstreamer1.0-dev (>= 1.22),
+               libgstreamer-plugins-base1.0-dev,
+               libgstreamer-plugins-bad1.0-dev,
+               libssl-dev,
+               desktop-file-utils,
+Standards-Version: 4.7.0
+Homepage: https://github.com/derpx06/DeskLink
+Vcs-Browser: https://github.com/derpx06/DeskLink
+Vcs-Git: https://github.com/derpx06/DeskLink.git
+Rules-Requires-Root: no
+
+Package: desklink
+Architecture: any
+Depends: ${shlibs:Depends},
+         ${misc:Depends},
+         gstreamer1.0-plugins-base,
+         gstreamer1.0-plugins-good,
+         gstreamer1.0-plugins-bad,
+         gstreamer1.0-nice,
+         gstreamer1.0-pipewire,
+         xdg-desktop-portal,
+Recommends: gstreamer1.0-libav,
+            xdg-desktop-portal-gnome | xdg-desktop-portal-backend,
+Description: use an Android phone and a Linux desktop together
+ DeskLink pairs a Linux desktop with the DeskLink Android app over the local
+ network: notifications, clipboard, file transfer, shared terminals, and
+ viewing or controlling either screen from the other device.
+ .
+ gstreamer1.0-libav provides the H.264 decoder for phones that encode their
+ screen in hardware; without it the phone's screen is sent as VP8.

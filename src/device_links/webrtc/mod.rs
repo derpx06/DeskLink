@@ -19,6 +19,7 @@ pub(crate) mod terminal_protocol;
 mod text_focus;
 pub(crate) mod transfer_board;
 pub(crate) mod transfer_manager;
+mod x11_desktop;
 
 #[allow(unused_imports)]
 pub use handover::{

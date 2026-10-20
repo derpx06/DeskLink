@@ -24,11 +24,6 @@ pub const ROLE_PHONE_SCREEN: &str = "phone-screen";
 /// Body value of `role` for "send me the desktop's screen".
 pub const ROLE_DESKTOP_SCREEN: &str = "desktop-screen";
 
-/// Caps for the negotiated video section.
-///
-/// VP8 matches what the Android application encodes with, and it is the codec
-/// both `webrtcbin` and libwebrtc always have available. Pinning it here keeps
-/// the two ends from negotiating something only one of them can decode.
 /// Codecs for the screen section, in preference order.
 ///
 /// H.264 first because it is what phones encode in **hardware**: nearly every
@@ -37,7 +32,22 @@ pub const ROLE_DESKTOP_SCREEN: &str = "desktop-screen";
 /// latency at the source. A phone without a hardware H.264 encoder never
 /// offers it and stays on VP8. The desktop always sends VP8, which stays
 /// negotiated for that direction.
-pub(crate) fn video_caps() -> gst::Caps {
+///
+/// H.264 is offered only when `h264` says this desktop can decode it
+/// ([`h264_decoder_available`]): distributions that ship no H.264 decoder
+/// (Fedora without RPM Fusion, Debian without gstreamer1.0-libav) would
+/// otherwise agree to a stream they then cannot show.
+pub(crate) fn video_caps(h264: bool) -> gst::Caps {
+    let vp8 = gst::Caps::builder("application/x-rtp")
+        .field("media", "video")
+        .field("encoding-name", "VP8")
+        .field("payload", 96i32)
+        .field("clock-rate", 90_000i32)
+        .field(format!("extmap-{TWCC_OFFER_ID}"), TWCC_URI)
+        .build();
+    if !h264 {
+        return vp8;
+    }
     let mut caps = gst::Caps::builder("application/x-rtp")
         .field("media", "video")
         .field("encoding-name", "H264")
@@ -48,19 +58,23 @@ pub(crate) fn video_caps() -> gst::Caps {
         .field("level-asymmetry-allowed", "1")
         .field(format!("extmap-{TWCC_OFFER_ID}"), TWCC_URI)
         .build();
-    caps.merge(
-        gst::Caps::builder("application/x-rtp")
-            .field("media", "video")
-            .field("encoding-name", "VP8")
-            .field("payload", 96i32)
-            .field("clock-rate", 90_000i32)
-            .field(format!("extmap-{TWCC_OFFER_ID}"), TWCC_URI)
-            .build(),
-    );
+    caps.merge(vp8);
     caps
 }
 
 const H264_PAYLOAD: i32 = 102;
+
+/// Whether any decoder `decodebin` would use accepts `video/x-h264`
+/// (avdec_h264, openh264dec, vah264dec, nvh264dec, v4l2slh264dec, ...).
+pub(crate) fn h264_decoder_available() -> bool {
+    let h264 = gst::Caps::new_empty_simple("video/x-h264");
+    gst::ElementFactory::factories_with_type(
+        gst::ElementFactoryType::DECODER | gst::ElementFactoryType::MEDIA_VIDEO,
+        gst::Rank::MARGINAL,
+    )
+    .iter()
+    .any(|factory| factory.can_sink_any_caps(&h264))
+}
 
 /// Transport-wide congestion control: the sender stamps every packet and the
 /// receiver reports arrival times back. Without it libwebrtc has no delay
@@ -95,8 +109,9 @@ pub(crate) fn twcc_extmap_id(sdp: &str) -> Option<u32> {
 /// What the desktop accepts when it **answers** a phone's offer: hardware
 /// H.264 first, VP8 (which the desktop sends) second, nothing else — and TWCC
 /// under the offer's id. Without explicit preferences `webrtcbin` echoed every
-/// offered codec and dropped every header extension.
-pub(crate) fn answer_video_caps(twcc_id: Option<u32>) -> gst::Caps {
+/// offered codec and dropped every header extension. H.264 only when `h264`
+/// (a decoder exists), as in [`video_caps`].
+pub(crate) fn answer_video_caps(twcc_id: Option<u32>, h264: bool) -> gst::Caps {
     let codec = |name: &str| {
         let mut builder = gst::Caps::builder("application/x-rtp")
             .field("media", "video")
@@ -110,6 +125,9 @@ pub(crate) fn answer_video_caps(twcc_id: Option<u32>) -> gst::Caps {
         }
         builder.build()
     };
+    if !h264 {
+        return codec("VP8");
+    }
     let mut caps = codec("H264");
     caps.merge(codec("VP8"));
     caps
@@ -495,28 +513,44 @@ pub(crate) struct DesktopScreenCapture {
     rate_control_stop: Arc<AtomicBool>,
 }
 
+/// Where a desktop share's frames come from.
+pub(crate) enum DesktopSource {
+    /// A portal-approved PipeWire stream.
+    PipeWire {
+        fd: OwnedFd,
+        node_id: u32,
+        serial: Option<u64>,
+    },
+    /// The X11 root window, for desktops without a portal (`x11_desktop`).
+    X11,
+}
+
 impl DesktopScreenCapture {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn attach(
         pipeline: &gst::Pipeline,
         webrtcbin: &gst::Element,
-        pipewire_fd: OwnedFd,
-        node_id: u32,
-        pipewire_serial: Option<u64>,
+        source: DesktopSource,
         width: i32,
         height: i32,
         fps: i32,
         continuity: Option<RtpContinuity>,
     ) -> Result<Self, String> {
-        if node_id == 0 {
-            return Err("GNOME portal returned invalid screen stream metadata".to_string());
-        }
-        let source = pipewire_source(&pipewire_fd, node_id, pipewire_serial)?;
+        let (source, pipewire_fd) = match source {
+            DesktopSource::PipeWire { node_id: 0, .. } => {
+                return Err("GNOME portal returned invalid screen stream metadata".to_string());
+            }
+            DesktopSource::PipeWire {
+                fd,
+                node_id,
+                serial,
+            } => (pipewire_source(&fd, node_id, serial)?, Some(fd)),
+            DesktopSource::X11 => (x11_source()?, None),
+        };
         Self::attach_source(
             pipeline,
             webrtcbin,
             source,
-            Some(pipewire_fd),
+            pipewire_fd,
             width,
             height,
             fps,
@@ -997,7 +1031,7 @@ fn encoder_chain(
 /// and one pointer nudge through the portal. Blocks for a few seconds.
 #[cfg(debug_assertions)]
 pub(crate) fn desktop_share_selftest(device_id: &str) -> Result<String, String> {
-    use super::remote_desktop_portal::RemoteDesktopPortal;
+    use super::remote_desktop_portal::{DesktopSession, RemoteDesktopPortal};
     gst::init().map_err(|error| error.to_string())?;
     let cancel = std::sync::atomic::AtomicBool::new(false);
     let stored = crate::device_links::config::remote_desktop_token(device_id);
@@ -1118,6 +1152,18 @@ fn pipewire_source(
     // answer a viewer's request with, a black picture. Re-send the last frame.
     set_if_present(&source, "keepalive-time", "500");
     Ok(source)
+}
+
+/// The X11 root window as a frame source. Damage tracking is off: it costs
+/// a round trip per damaged rectangle and the encoder wants whole frames.
+fn x11_source() -> Result<gst::Element, String> {
+    gst::ElementFactory::make("ximagesrc")
+        .property("use-damage", false)
+        .property("show-pointer", true)
+        .build()
+        .map_err(|error| {
+            format!("DeskLink screen capture on X11 needs GStreamer ximagesrc (gst-plugins-good): {error}")
+        })
 }
 
 /// The unlinked sink pad `webrtcbin` already holds for the negotiated video
@@ -1294,7 +1340,7 @@ mod tests {
     #[test]
     fn the_answer_accepts_h264_then_vp8_with_the_offers_twcc_id() {
         gst::init().unwrap();
-        let caps = answer_video_caps(Some(4));
+        let caps = answer_video_caps(Some(4), true);
         let names: Vec<_> = caps
             .iter()
             .map(|s| s.get::<&str>("encoding-name").unwrap().to_string())
@@ -1305,9 +1351,23 @@ mod tests {
             .all(|s| s.get::<&str>("extmap-4").unwrap() == TWCC_URI));
         // No payload numbers: the offer's must win in the intersection.
         assert!(caps.iter().all(|s| !s.has_field("payload")));
-        assert!(answer_video_caps(None)
+        assert!(answer_video_caps(None, true)
             .iter()
             .all(|s| !s.has_field("extmap-4")));
+    }
+
+    #[test]
+    fn without_an_h264_decoder_only_vp8_is_offered_or_answered() {
+        gst::init().unwrap();
+        let names = |caps: gst::Caps| -> Vec<String> {
+            caps.iter()
+                .map(|s| s.get::<&str>("encoding-name").unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(names(video_caps(false)), ["VP8"]);
+        assert_eq!(names(answer_video_caps(Some(4), false)), ["VP8"]);
+        // The registry probe itself must not panic, whatever is installed.
+        let _ = h264_decoder_available();
     }
 
     #[test]
@@ -1316,7 +1376,7 @@ mod tests {
         // the library initialised even though it starts no pipeline.
         gst::init().unwrap();
 
-        let caps = video_caps();
+        let caps = video_caps(true);
         let names: Vec<_> = caps
             .iter()
             .map(|s| s.get::<&str>("encoding-name").unwrap().to_string())

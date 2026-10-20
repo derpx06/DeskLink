@@ -7,13 +7,12 @@ pkgrel=1
 pkgdesc='Use your Android phone and GNOME desktop together (prebuilt)'
 arch=('x86_64')
 url='https://github.com/derpx06/DeskLink'
-license=('GPL-3.0-or-later')
+license=('GPL-3.0-or-later' 'GPL-2.0-or-later')  # app; GNOME Shell extension
 depends=(
   'gcc-libs'
   'glib2'
   'glibc'
   'gst-libav'
-  'gst-plugin-gtk4'
   'gst-plugin-pipewire'
   'gst-plugins-bad'
   'gst-plugins-base'
@@ -26,6 +25,7 @@ depends=(
   'openssl'
 )
 optdepends=(
+  'gst-plugin-gtk4: system video sink (a copy is bundled otherwise)'
   'xdg-desktop-portal-gnome: screen sharing and remote control on GNOME'
   'gst-plugin-va: hardware video decoding'
 )

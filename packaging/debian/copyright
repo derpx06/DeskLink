@@ -1,0 +1,37 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: DeskLink
+Upstream-Contact: derpx06 <manaskhairnar1511@gmail.com>
+Source: https://github.com/derpx06/DeskLink
+
+Files: *
+Copyright: 2026 manas (derpx06)
+License: GPL-3.0-or-later
+
+Files: data/derx06.desklink.com.metainfo.xml.in
+Copyright: 2026 manas (derpx06)
+License: CC0-1.0
+ To the extent possible under law, the author has waived all copyright and
+ related or neighboring rights to this file.
+ .
+ On Debian systems, the complete text of the CC0 1.0 Universal license can be
+ found in "/usr/share/common-licenses/CC0-1.0".
+
+Files: vendor/*
+Copyright: The authors of the vendored Rust crates
+License: various
+ Each crate under vendor/ carries its own license file (MIT, Apache-2.0,
+ BSD, ISC, Unicode-3.0, Zlib or MPL-2.0, as listed in its Cargo.toml).
+
+License: GPL-3.0-or-later
+ This program is free software: you can redistribute it and/or modify
+ it under the terms of the GNU General Public License as published by
+ the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ .
+ This program is distributed in the hope that it will be useful,
+ but WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ .
+ On Debian systems, the complete text of the GNU General Public License
+ version 3 can be found in "/usr/share/common-licenses/GPL-3".

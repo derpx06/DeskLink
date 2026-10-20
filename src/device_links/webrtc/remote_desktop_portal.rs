@@ -207,6 +207,54 @@ pub(crate) enum PortalInputAction {
     TypeText { text: String, modifiers: u32 },
 }
 
+/// What a desktop share needs from the system whose screen it shares: the
+/// XDG portal session ([`RemoteDesktopPortal`]) or, on X11 desktops without
+/// one, [`super::x11_desktop::X11Desktop`]. Every call comes from the share's
+/// worker thread, after the coordinator has checked the phone's input lease.
+pub(crate) trait DesktopSession {
+    /// The screen being shown and controlled.
+    fn active(&self) -> PortalStream;
+    /// How many screens are shared.
+    fn stream_count(&self) -> usize;
+    /// Makes the next shared screen the active one and returns it.
+    fn next_stream(&self) -> PortalStream;
+    fn knows_active_pixels(&self) -> bool;
+    /// Records the active screen's real pixel size (from the capture).
+    fn set_active_pixels(&self, size: (i32, i32));
+    /// Whether the session ended underneath the share (revoked, X server gone).
+    fn is_session_closed(&self) -> bool;
+    fn pointer_motion(&self, dx: f64, dy: f64) -> Result<(), String>;
+    /// `(x, y)` in the active screen's logical coordinates.
+    fn pointer_motion_absolute(&self, x: f64, y: f64) -> Result<(), String>;
+    fn pointer_button(&self, evdev_button: i32, pressed: bool) -> Result<(), String>;
+    fn pointer_axis(&self, dx: f64, dy: f64, finish: bool) -> Result<(), String>;
+    fn keyboard_keysym(&self, keysym: i32, pressed: bool) -> Result<(), String>;
+
+    fn apply(&self, action: PortalInputAction) -> Result<(), String> {
+        match action {
+            PortalInputAction::RelativeMotion(dx, dy) => self.pointer_motion(dx, dy),
+            PortalInputAction::AbsoluteMotion(x, y) => self.pointer_motion_absolute(x, y),
+            PortalInputAction::Button {
+                evdev_code,
+                pressed,
+            } => self.pointer_button(evdev_code, pressed),
+            // One open gesture while the fingers move; the service loop
+            // finishes it once they stop (see `SCROLL_FINISH_AFTER`). Finishing
+            // every step made each one a separate fling.
+            PortalInputAction::Scroll(dx, dy) => self.pointer_axis(dx, dy, false),
+            PortalInputAction::Key { keysym, pressed } => self.keyboard_keysym(keysym, pressed),
+            PortalInputAction::TypeText { text, modifiers } => type_text(self, &text, modifiers),
+        }
+    }
+
+    fn release_all(&self) {
+        // The service loop tracks keys/buttons it pressed and passes explicit
+        // releases. This neutral motion/axis finish ensures a final scroll
+        // gesture is closed when a lease or transport disappears.
+        let _ = self.pointer_axis(0.0, 0.0, true);
+    }
+}
+
 impl RemoteDesktopPortal {
     /// Creates one portal session, selects a single monitor, and asks the host
     /// to approve screen capture plus keyboard/pointer control.
@@ -398,35 +446,66 @@ impl RemoteDesktopPortal {
             .map_err(|error| error.to_string())?
     }
 
-    pub(crate) fn active(&self) -> PortalStream {
+    pub(crate) fn keyboard_keycode(&self, keycode: i32, pressed: bool) -> Result<(), String> {
+        self.notify(
+            "NotifyKeyboardKeycode",
+            tuple([
+                object_path(&self.session_handle)?,
+                options(|_| {}),
+                keycode.to_variant(),
+                u32::from(pressed).to_variant(),
+            ]),
+        )
+    }
+
+    fn notify(&self, method: &str, parameters: glib::Variant) -> Result<(), String> {
+        self.connection
+            .call_sync(
+                Some(PORTAL_BUS),
+                PORTAL_PATH,
+                REMOTE_INTERFACE,
+                method,
+                Some(&parameters),
+                None,
+                gio::DBusCallFlags::NONE,
+                2_000,
+                None::<&gio::Cancellable>,
+            )
+            .map(|_| ())
+            .map_err(|error| format!("Desktop portal rejected {method}: {error}"))
+    }
+}
+
+impl DesktopSession for RemoteDesktopPortal {
+    fn active(&self) -> PortalStream {
         self.streams[self.active_stream.get().min(self.streams.len() - 1)]
     }
 
     /// How many screens the user shared.
-    pub(crate) fn stream_count(&self) -> usize {
+    fn stream_count(&self) -> usize {
         self.streams.len()
     }
 
     /// Makes the next shared screen the active one and returns it.
-    pub(crate) fn next_stream(&self) -> PortalStream {
+    fn next_stream(&self) -> PortalStream {
         self.active_stream
             .set((self.active_stream.get() + 1) % self.streams.len());
         self.active_pixels.set(None);
         self.active()
     }
 
-    pub(crate) fn knows_active_pixels(&self) -> bool {
+    fn knows_active_pixels(&self) -> bool {
         self.active_pixels.get().is_some()
     }
 
     /// Records the active screen's real pixel size (from the capture).
-    pub(crate) fn set_active_pixels(&self, size: (i32, i32)) {
+    fn set_active_pixels(&self, size: (i32, i32)) {
         if size.0 > 0 && size.1 > 0 {
             self.active_pixels.set(Some(size));
         }
     }
 
-    pub(crate) fn pointer_motion(&self, dx: f64, dy: f64) -> Result<(), String> {
+    fn pointer_motion(&self, dx: f64, dy: f64) -> Result<(), String> {
         self.notify(
             "NotifyPointerMotion",
             tuple([
@@ -438,14 +517,14 @@ impl RemoteDesktopPortal {
         )
     }
 
-    pub(crate) fn is_session_closed(&self) -> bool {
+    fn is_session_closed(&self) -> bool {
         while self.context.pending() {
             self.context.iteration(false);
         }
         self.session_closed.get()
     }
 
-    pub(crate) fn pointer_motion_absolute(&self, x: f64, y: f64) -> Result<(), String> {
+    fn pointer_motion_absolute(&self, x: f64, y: f64) -> Result<(), String> {
         let stream = self.active();
         let ((x, y), nudge) = pointer_move(
             x,
@@ -469,7 +548,7 @@ impl RemoteDesktopPortal {
         Ok(())
     }
 
-    pub(crate) fn pointer_button(&self, evdev_button: i32, pressed: bool) -> Result<(), String> {
+    fn pointer_button(&self, evdev_button: i32, pressed: bool) -> Result<(), String> {
         self.notify(
             "NotifyPointerButton",
             tuple([
@@ -481,7 +560,7 @@ impl RemoteDesktopPortal {
         )
     }
 
-    pub(crate) fn pointer_axis(&self, dx: f64, dy: f64, finish: bool) -> Result<(), String> {
+    fn pointer_axis(&self, dx: f64, dy: f64, finish: bool) -> Result<(), String> {
         self.notify(
             "NotifyPointerAxis",
             tuple([
@@ -493,19 +572,7 @@ impl RemoteDesktopPortal {
         )
     }
 
-    pub(crate) fn keyboard_keycode(&self, keycode: i32, pressed: bool) -> Result<(), String> {
-        self.notify(
-            "NotifyKeyboardKeycode",
-            tuple([
-                object_path(&self.session_handle)?,
-                options(|_| {}),
-                keycode.to_variant(),
-                u32::from(pressed).to_variant(),
-            ]),
-        )
-    }
-
-    pub(crate) fn keyboard_keysym(&self, keysym: i32, pressed: bool) -> Result<(), String> {
+    fn keyboard_keysym(&self, keysym: i32, pressed: bool) -> Result<(), String> {
         self.notify(
             "NotifyKeyboardKeysym",
             tuple([
@@ -515,47 +582,6 @@ impl RemoteDesktopPortal {
                 u32::from(pressed).to_variant(),
             ]),
         )
-    }
-
-    pub(crate) fn apply(&self, action: PortalInputAction) -> Result<(), String> {
-        match action {
-            PortalInputAction::RelativeMotion(dx, dy) => self.pointer_motion(dx, dy),
-            PortalInputAction::AbsoluteMotion(x, y) => self.pointer_motion_absolute(x, y),
-            PortalInputAction::Button {
-                evdev_code,
-                pressed,
-            } => self.pointer_button(evdev_code, pressed),
-            // One open gesture while the fingers move; the service loop
-            // finishes it once they stop (see `SCROLL_FINISH_AFTER`). Finishing
-            // every step made each one a separate fling.
-            PortalInputAction::Scroll(dx, dy) => self.pointer_axis(dx, dy, false),
-            PortalInputAction::Key { keysym, pressed } => self.keyboard_keysym(keysym, pressed),
-            PortalInputAction::TypeText { text, modifiers } => type_text(self, &text, modifiers),
-        }
-    }
-
-    pub(crate) fn release_all(&self) {
-        // The service loop tracks keys/buttons it pressed and passes explicit
-        // releases. This neutral motion/axis finish ensures a final scroll
-        // gesture is closed when a lease or transport disappears.
-        let _ = self.pointer_axis(0.0, 0.0, true);
-    }
-
-    fn notify(&self, method: &str, parameters: glib::Variant) -> Result<(), String> {
-        self.connection
-            .call_sync(
-                Some(PORTAL_BUS),
-                PORTAL_PATH,
-                REMOTE_INTERFACE,
-                method,
-                Some(&parameters),
-                None,
-                gio::DBusCallFlags::NONE,
-                2_000,
-                None::<&gio::Cancellable>,
-            )
-            .map(|_| ())
-            .map_err(|error| format!("Desktop portal rejected {method}: {error}"))
     }
 }
 
@@ -573,12 +599,46 @@ impl Drop for RemoteDesktopPortal {
 /// control (not just the picture) was granted; only then is it remembered.
 /// Blocks until the dialog is answered; run it off the UI thread.
 pub(crate) fn preauthorize_remote_control(device_id: &str) -> Result<bool, String> {
+    if super::x11_desktop::wanted() {
+        // No portal, so no dialog: this click at the desk is the approval.
+        let desk = super::x11_desktop::X11Desktop::connect()?;
+        crate::device_links::config::set_remote_desktop_token(
+            device_id,
+            Some(super::x11_desktop::DESK_APPROVAL),
+        );
+        return Ok(desk.can_control());
+    }
     let cancel = AtomicBool::new(false);
     let (portal, source) = RemoteDesktopPortal::start("", &cancel, None)?;
     let token = source.token_to_remember();
     crate::device_links::config::set_remote_desktop_token(device_id, token);
     drop(portal);
     Ok(token.is_some())
+}
+
+/// Whether the desktop portal offers RemoteDesktop and ScreenCast at all. The
+/// portals of Cinnamon, MATE and XFCE do not export them.
+pub(crate) fn portal_available() -> bool {
+    let Ok(connection) = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) else {
+        return false;
+    };
+    [REMOTE_INTERFACE, SCREEN_INTERFACE]
+        .into_iter()
+        .all(|interface| {
+            connection
+                .call_sync(
+                    Some(PORTAL_BUS),
+                    PORTAL_PATH,
+                    "org.freedesktop.DBus.Properties",
+                    "Get",
+                    Some(&(interface, "version").to_variant()),
+                    None,
+                    gio::DBusCallFlags::NONE,
+                    2_000,
+                    None::<&gio::Cancellable>,
+                )
+                .is_ok()
+        })
 }
 
 pub(crate) fn input_actions(
@@ -725,7 +785,11 @@ fn special_key_to_keysym(key: i64) -> Option<i32> {
     })
 }
 
-fn type_text(portal: &RemoteDesktopPortal, text: &str, modifier_mask: u32) -> Result<(), String> {
+fn type_text(
+    portal: &(impl DesktopSession + ?Sized),
+    text: &str,
+    modifier_mask: u32,
+) -> Result<(), String> {
     let modifiers = modifier_keysyms(modifier_mask);
     for keysym in text_keysyms(text) {
         for modifier in &modifiers {

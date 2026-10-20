@@ -11,8 +11,7 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # Arch has GStreamer 1.28 (the `v1_28` feature), GTK 4.16+ and libadwaita 1.6+;
-    # no hosted Ubuntu image does yet.
+    # The newest libraries; the `floor` job below covers the oldest supported.
     container: archlinux:latest
     steps:
       - name: Install dependencies
@@ -53,3 +52,59 @@ jobs:
           cp data/derx06.desklink.com.desktop.in /tmp/derx06.desklink.com.desktop
           desktop-file-validate /tmp/derx06.desklink.com.desktop
           appstreamcli validate --no-net --explain data/derx06.desklink.com.metainfo.xml.in
+
+  # The oldest distributions DeskLink supports natively. Arch (above) tracks the
+  # newest libraries; these keep the code building against the floors:
+  # GTK 4.12+, GStreamer 1.22+ (webrtc), libadwaita 1.5+.
+  floor:
+    name: floor (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # GTK 4.18, libadwaita 1.7, GStreamer 1.26, and Debian's own Rust
+          # 1.85 (the `rust-version` floor).
+          - image: debian:trixie
+            rust: apt
+          # GTK 4.14, libadwaita 1.5 (the `adw` feature floor), GStreamer 1.24;
+          # its packaged Rust is too old, so rustup.
+          - image: ubuntu:24.04
+            rust: rustup
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl git pkg-config gettext \
+            libglib2.0-dev-bin libgtk-4-dev libadwaita-1-dev libssl-dev \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            libgstreamer-plugins-bad1.0-dev \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-nice gstreamer1.0-libav
+          if [ "${{ matrix.rust }}" = apt ]; then
+            apt-get install -y --no-install-recommends cargo rustc
+          else
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.image }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.image }}-
+
+      - name: Build and test
+        run: |
+          cargo build --locked
+          cargo test --locked

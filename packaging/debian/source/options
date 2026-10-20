@@ -1,0 +1,5 @@
+# Keep dpkg-source's default exclusions, plus local build output.
+tar-ignore
+tar-ignore = "target"
+tar-ignore = "builddir*"
+tar-ignore = "graphify-out"

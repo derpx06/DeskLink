@@ -25,8 +25,11 @@ use crate::device_links::packet::NetworkPacket;
 
 use super::file_protocol::{FileControl, FILE_CHUNK_MESSAGE_TYPE, FILE_CONTROL_MESSAGE_TYPE};
 use super::ice::IceServerConfig;
-use super::remote_desktop_portal::{input_actions, PortalInputAction, RemoteDesktopPortal};
+use super::remote_desktop_portal::{
+    input_actions, DesktopSession, PortalInputAction, RemoteDesktopPortal,
+};
 use super::remote_session;
+use super::screen::DesktopSource;
 use super::terminal_bridge::{self, TerminalEvent};
 use super::terminal_protocol::{TERMINAL_CHUNK_MESSAGE_TYPE, TERMINAL_CONTROL_MESSAGE_TYPE};
 use super::transfer_manager::{TransferEvent, WebRtcTransferManager};
@@ -933,7 +936,30 @@ fn run_desktop_portal_worker(
 
     #[allow(clippy::type_complexity)]
     let setup =
-        (|| -> Result<(RemoteDesktopPortal, i32, i32, bool, std::os::fd::OwnedFd), String> {
+        (|| -> Result<(Box<dyn DesktopSession>, i32, i32, bool, Option<std::os::fd::OwnedFd>), String> {
+            if super::x11_desktop::wanted() {
+                // No portal, so no dialog here: only a phone approved at this
+                // desk (Remote Control → Approve…) may share it.
+                if crate::device_links::config::remote_desktop_token(&device_id).as_deref()
+                    != Some(super::x11_desktop::DESK_APPROVAL)
+                {
+                    return Err("This X11 desktop has no screen-sharing portal to ask permission with. \
+                                Approve this phone in DeskLink on the computer first \
+                                (device page → Remote Control → Approve…)"
+                        .to_string());
+                }
+                let desk = super::x11_desktop::X11Desktop::connect()?;
+                let screen = desk.active();
+                peer.start_desktop_screen_capture(
+                    id,
+                    DesktopSource::X11,
+                    screen.width,
+                    screen.height,
+                    30,
+                )?;
+                let can_control = desk.can_control();
+                return Ok((Box::new(desk), screen.width, screen.height, can_control, None));
+            }
             let stored_grant = crate::device_links::config::remote_desktop_token(&device_id);
             let (portal, source) =
                 RemoteDesktopPortal::start("", &cancel, stored_grant.as_deref())?;
@@ -955,14 +981,22 @@ fn run_desktop_portal_worker(
                 .map_err(|error| format!("Could not keep the PipeWire connection: {error}"))?;
             peer.start_desktop_screen_capture(
                 id,
-                source.fd,
-                source.node_id,
-                source.pipewire_serial,
+                DesktopSource::PipeWire {
+                    fd: source.fd,
+                    node_id: source.node_id,
+                    serial: source.pipewire_serial,
+                },
                 source.width,
                 source.height,
                 30,
             )?;
-            Ok((portal, source.width, source.height, can_control, switch_fd))
+            Ok((
+                Box::new(portal),
+                source.width,
+                source.height,
+                can_control,
+                Some(switch_fd),
+            ))
         })();
     let (portal, width, height, can_control, switch_fd) = match setup {
         Ok(ready) => ready,
@@ -1074,18 +1108,17 @@ fn run_desktop_portal_worker(
     }
     // (Re)starts capture of `stream` on the share's PipeWire connection.
     let capture = |stream: super::remote_desktop_portal::PortalStream| -> Result<(), String> {
-        let fd = switch_fd
-            .try_clone()
-            .map_err(|error| format!("Could not reuse the PipeWire connection: {error}"))?;
-        peer.start_desktop_screen_capture(
-            id,
-            fd,
-            stream.node_id,
-            stream.pipewire_serial,
-            stream.width,
-            stream.height,
-            30,
-        )
+        let source = match &switch_fd {
+            Some(fd) => DesktopSource::PipeWire {
+                fd: fd
+                    .try_clone()
+                    .map_err(|error| format!("Could not reuse the PipeWire connection: {error}"))?,
+                node_id: stream.node_id,
+                serial: stream.pipewire_serial,
+            },
+            None => DesktopSource::X11,
+        };
+        peer.start_desktop_screen_capture(id, source, stream.width, stream.height, 30)
     };
     // Moves the share to the next screen and tells the phone its new size.
     let switch_screen = || {
@@ -1266,7 +1299,7 @@ fn run_desktop_portal_worker(
                 // expiry check then sees nothing to release. A drag would leave
                 // the mouse button stuck down.
                 if !held_inputs.is_empty() && !peer_input_active(&device_id) {
-                    release_held_portal_inputs(&portal, &mut held_inputs);
+                    release_held_portal_inputs(&*portal, &mut held_inputs);
                 }
                 if switch_after {
                     switch_screen();
@@ -1283,7 +1316,7 @@ fn run_desktop_portal_worker(
                     break;
                 }
                 if !held_inputs.is_empty() && !peer_input_active(&device_id) {
-                    release_held_portal_inputs(&portal, &mut held_inputs);
+                    release_held_portal_inputs(&*portal, &mut held_inputs);
                 }
                 // Let a silent phone-owned lease lapse.
                 if let Ok(mut open) = remote_session::sessions().lock() {
@@ -1294,7 +1327,7 @@ fn run_desktop_portal_worker(
             }
         }
     }
-    release_held_portal_inputs(&portal, &mut held_inputs);
+    release_held_portal_inputs(&*portal, &mut held_inputs);
     if portal_revoked || no_video {
         let sequence = remote_session::sessions()
             .lock()
@@ -1338,7 +1371,7 @@ fn peer_input_active(device_id: &str) -> bool {
 }
 
 fn release_held_portal_inputs(
-    portal: &RemoteDesktopPortal,
+    portal: &dyn DesktopSession,
     held_inputs: &mut std::collections::HashSet<(bool, i32)>,
 ) {
     for (is_key, code) in held_inputs.drain() {

@@ -1,0 +1,26 @@
+<!--
+  openSUSE Build Service source services. Run `osc service manualrun` after
+  changing the revision: it checks out the tag, and vendors Cargo.lock
+  *without* updating it (the lock pins crates to Debian 13's rustc 1.85).
+-->
+<services>
+  <service name="obs_scm" mode="manual">
+    <param name="url">https://github.com/derpx06/DeskLink.git</param>
+    <param name="scm">git</param>
+    <param name="revision">v1.0.0</param>
+    <param name="versionformat">@PARENT_TAG@</param>
+    <param name="versionrewrite-pattern">v(.*)</param>
+    <param name="filename">desklink</param>
+  </service>
+  <service name="tar" mode="buildtime"/>
+  <service name="recompress" mode="buildtime">
+    <param name="file">*.tar</param>
+    <param name="compression">gz</param>
+  </service>
+  <service name="set_version" mode="manual"/>
+  <service name="cargo_vendor" mode="manual">
+    <param name="src">desklink</param>
+    <param name="compression">gz</param>
+    <param name="update">false</param>
+  </service>
+</services>

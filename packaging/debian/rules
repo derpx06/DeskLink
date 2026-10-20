@@ -1,0 +1,27 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+
+# Ubuntu 24.04's default rustc is too old; its versioned toolchain is not.
+RUST_TOOLCHAIN := /usr/lib/rust-1.85/bin
+ifneq ($(wildcard $(RUST_TOOLCHAIN)),)
+export PATH := $(RUST_TOOLCHAIN):$(PATH)
+endif
+
+%:
+	dh $@ --buildsystem=meson
+
+# Offline builds (OBS, sbuild) use the vendored crates in vendor/, made with
+# `cargo vendor` (see packaging/README.md). Without vendor/, cargo downloads.
+override_dh_auto_configure:
+	mkdir -p $(CARGO_HOME)
+	if [ -d vendor ]; then \
+	  printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "%s/vendor"\n\n[net]\noffline = true\n' \
+	    "$(CURDIR)" > $(CARGO_HOME)/config.toml; \
+	fi
+	dh_auto_configure
+
+override_dh_auto_clean:
+	dh_auto_clean
+	rm -rf $(CARGO_HOME)
