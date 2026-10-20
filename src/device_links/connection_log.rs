@@ -29,6 +29,8 @@ pub enum ConnectionEvent {
     TerminalDetached,
     PasswordRejected,
     SessionsEnded,
+    /// The connection's path was learned or changed (see `path`).
+    Route,
 }
 
 impl ConnectionEvent {
@@ -43,6 +45,7 @@ impl ConnectionEvent {
             Self::TerminalDetached => "Left a terminal",
             Self::PasswordRejected => "Wrong session password",
             Self::SessionsEnded => "Sessions ended from this computer",
+            Self::Route => "Connection path",
         }
     }
 }
@@ -101,12 +104,16 @@ fn name_of(device_id: &str) -> String {
 
 /// Appends one entry. Best effort: history is never worth failing a session.
 pub fn record(device_id: &str, event: ConnectionEvent) {
+    record_with_path(device_id, event, None);
+}
+
+pub fn record_with_path(device_id: &str, event: ConnectionEvent, path: Option<&str>) {
     let entry = ConnectionEntry {
         ts: now(),
         device_id: device_id.to_string(),
         device_name: name_of(device_id),
         event,
-        path: None,
+        path: path.map(str::to_string),
     };
     if let Some(path) = log_path() {
         append(&path, &entry);

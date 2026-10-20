@@ -2360,6 +2360,12 @@ fn unpaired_device_row(daemon: &DaemonHandle, device: DeviceView) -> adw::Action
         device.device_type.clone(),
         device.status.label().to_string(),
     ];
+    match device.connection_path.as_deref() {
+        Some("lan") => subtitle_parts.push("Local network".to_string()),
+        Some("direct") => subtitle_parts.push("Direct over the internet".to_string()),
+        Some("turn") => subtitle_parts.push("Through a TURN relay".to_string()),
+        _ => {}
+    }
     if let Some(key) = &device.verification_key {
         subtitle_parts.push(format!("Key: {key}"));
     }

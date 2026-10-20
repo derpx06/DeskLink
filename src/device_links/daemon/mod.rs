@@ -31,6 +31,44 @@ pub(super) const HEARTBEAT_IDLE: std::time::Duration = std::time::Duration::from
 /// once with the phone refusing to dial a desktop that was idle and waiting.
 pub(super) const HEARTBEAT_DEAD: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Reads each connected device's ICE path into its view, logging changes.
+/// Every few seconds, off the UI thread: reading stats waits on webrtcbin.
+fn refresh_connection_paths(
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    sessions: &Arc<DeviceManager>,
+) {
+    let ids: Vec<String> = devices
+        .lock()
+        .map(|devices| devices.keys().cloned().collect())
+        .unwrap_or_default();
+    for id in ids {
+        let path = sessions.ready_peer(&id).and_then(|(peer, via_relay)| {
+            peer.path().map(|path| {
+                if via_relay && path == "lan" {
+                    "direct"
+                } else {
+                    path
+                }
+            })
+        });
+        let changed = devices.lock().ok().and_then(|mut devices| {
+            let device = devices.get_mut(&id)?;
+            let path = path.map(str::to_string);
+            (device.connection_path != path).then(|| {
+                device.connection_path = path.clone();
+                path
+            })
+        });
+        if let Some(Some(path)) = changed {
+            super::connection_log::record_with_path(
+                &id,
+                super::connection_log::ConnectionEvent::Route,
+                Some(&path),
+            );
+        }
+    }
+}
+
 /// One pass of the liveness contract: probe the quiet, bury the silent.
 fn run_liveness_tick(
     sessions: &Arc<DeviceManager>,
@@ -157,7 +195,12 @@ impl DaemonWorker {
         let errors = Arc::clone(&self.errors);
         thread::spawn(move || {
             let mut stay_awake = power::StayAwake::default();
+            let mut tick: u32 = 0;
             while !shutdown.load(Ordering::Acquire) {
+                tick = tick.wrapping_add(1);
+                if tick.is_multiple_of(5) {
+                    refresh_connection_paths(&devices, &sessions);
+                }
                 let wanted = super::config::app_settings().stay_awake
                     && config
                         .lock()

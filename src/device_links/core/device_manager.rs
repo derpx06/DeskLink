@@ -740,6 +740,26 @@ impl DeviceManager {
         })?
     }
 
+    /// The feature-ready WebRTC peer for `device_id`, and whether its
+    /// bootstrap link is the relay (so a host-to-host pair is an internet
+    /// IPv6 path, not the LAN).
+    pub fn ready_peer(&self, device_id: &str) -> Option<(Arc<DesktopWebRtcPeer>, bool)> {
+        let sessions = self.sessions.lock().ok()?;
+        let session = sessions.get(device_id)?;
+        if !session
+            .webrtc_handover
+            .as_ref()
+            .is_some_and(HandoverRuntime::features_ready)
+        {
+            return None;
+        }
+        let via_relay = session
+            .active_link
+            .as_ref()
+            .is_some_and(|link| link.local_ip().is_none());
+        Some((Arc::clone(session.active_webrtc.as_ref()?), via_relay))
+    }
+
     pub fn active_webrtc_peer(
         &self,
         binding: &SessionBinding,

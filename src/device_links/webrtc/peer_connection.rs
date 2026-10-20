@@ -408,6 +408,40 @@ impl DesktopWebRtcPeer {
     ///
     /// An unknown or closed channel reports `u64::MAX` so callers treat it as
     /// fully congested and send nothing.
+    /// How the selected ICE pair reaches the peer: `"turn"` when either end
+    /// is a relay candidate, `"direct"` when either is server-reflexive or
+    /// peer-reflexive (through a NAT, over the internet), otherwise `"lan"`.
+    /// `None` until a pair is selected.
+    pub fn path(&self) -> Option<&'static str> {
+        let promise = gst::Promise::new();
+        self.webrtcbin
+            .emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+        if promise.wait() != gst::PromiseResult::Replied {
+            return None;
+        }
+        let reply = promise.get_reply()?;
+        let stats: Vec<gst::Structure> = reply
+            .iter()
+            .filter_map(|(_, value)| value.get::<gst::Structure>().ok())
+            .collect();
+        let field = |stats: &gst::Structure, name: &str| stats.get::<String>(name).ok();
+        let by_id = |id: &str| {
+            stats
+                .iter()
+                .find(|entry| field(entry, "id").as_deref() == Some(id))
+        };
+        let pair_id = stats
+            .iter()
+            .find_map(|entry| field(entry, "selected-candidate-pair-id"))?;
+        let pair = by_id(&pair_id)?;
+        let types: Vec<String> = ["local-candidate-id", "remote-candidate-id"]
+            .iter()
+            .filter_map(|key| field(pair, key))
+            .filter_map(|id| by_id(&id).and_then(|candidate| field(candidate, "candidate-type")))
+            .collect();
+        Some(path_label(&types))
+    }
+
     pub fn buffered_amount(&self, channel: WebRtcChannel) -> u64 {
         let Ok(channels) = self.channels.lock() else {
             return u64::MAX;
@@ -988,6 +1022,19 @@ fn local_description_promise_field(
         SignalingMessageType::Offer => Ok("offer"),
         SignalingMessageType::Answer => Ok("answer"),
         _ => Err("Invalid local DeskLink WebRTC description type".to_string()),
+    }
+}
+
+fn path_label(candidate_types: &[String]) -> &'static str {
+    if candidate_types.iter().any(|kind| kind == "relay") {
+        "turn"
+    } else if candidate_types
+        .iter()
+        .any(|kind| kind == "srflx" || kind == "prflx")
+    {
+        "direct"
+    } else {
+        "lan"
     }
 }
 

@@ -128,6 +128,10 @@ pub struct DeviceView {
     /// What this device is doing with this computer's screen right now.
     #[serde(default)]
     pub desktop_session: DesktopSession,
+    /// How the WebRTC connection reaches the device: `"lan"`, `"direct"`
+    /// (over the internet) or `"turn"`; `None` while not connected.
+    #[serde(default)]
+    pub connection_path: Option<String>,
     pub verification_key: Option<String>,
     pub last_error: Option<String>,
     pub media_status: Option<MediaStatus>,
@@ -157,6 +161,7 @@ impl DeviceView {
             terminal_access: false,
             terminal_sessions_attached: 0,
             desktop_session: DesktopSession::None,
+            connection_path: None,
             verification_key: None,
             last_error: None,
             media_status: None,

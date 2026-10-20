@@ -3522,6 +3522,21 @@ mod tests {
         transfer_over_loopback(false, 2 * 1024 * 1024 + 123);
     }
 
+    /// `cargo test --release transfer_throughput -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn transfer_throughput() {
+        let size = 200 * 1024 * 1024;
+        let started = std::time::Instant::now();
+        transfer_over_loopback(true, size);
+        let seconds = started.elapsed().as_secs_f64();
+        eprintln!(
+            "THROUGHPUT {:.1} MB/s ({} MiB in {seconds:.1} s)",
+            size as f64 / seconds / 1e6,
+            size >> 20
+        );
+    }
+
     #[test]
     fn an_empty_and_a_one_byte_file_cross_a_live_connection() {
         transfer_over_loopback(true, 1);
