@@ -251,6 +251,20 @@ impl DesklinkWindow {
                         return;
                     }
                     let command = match verb {
+                        "request-pair" => DaemonCommand::RequestPair(id),
+                        // Accepts with the key the desktop is showing, as a
+                        // user comparing codes would.
+                        "accept-pair" => {
+                            let key = e2e_daemon
+                                .devices()
+                                .into_iter()
+                                .find(|device| device.id == id)
+                                .and_then(|device| device.verification_key);
+                            match key {
+                                Some(key) => DaemonCommand::AcceptPair(id, Some(key)),
+                                None => return,
+                            }
+                        }
                         "ping" => DaemonCommand::SendPing(id),
                         "find-phone" => DaemonCommand::SendFindPhone(id),
                         "lock-phone" => DaemonCommand::SendLockRequest(id, true),

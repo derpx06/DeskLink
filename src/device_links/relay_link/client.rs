@@ -59,6 +59,8 @@ const HANDSHAKE_SPACING: Duration = Duration::from_secs(2);
 const TURN_TIMEOUT: Duration = Duration::from_secs(2);
 /// A handshake not finished by then (a lost frame) is started again.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Online this long counts as a working relay: the reconnect ladder restarts.
+const STABLE_ONLINE: Duration = Duration::from_secs(60);
 
 /// What the Preferences window shows.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -308,7 +310,10 @@ impl Client {
             },
         )?;
         set_status(RelayStatus::Online);
-        self.rung = 0;
+        // The ladder starts over only once the connection has proved stable:
+        // a relay that welcomes and then drops us must still run out of rungs
+        // instead of being retried every second forever.
+        let online_since = Instant::now();
 
         let mut last_inbound = Instant::now();
         let mut last_ping = Instant::now();
@@ -362,6 +367,9 @@ impl Client {
             }
             if last_tick.elapsed() >= Duration::from_secs(1) {
                 last_tick = Instant::now();
+                if self.rung > 0 && online_since.elapsed() >= STABLE_ONLINE {
+                    self.rung = 0;
+                }
                 if let Err(stop) = self.restart_stalled(&mut socket, &mut peers) {
                     break Err(stop);
                 }
@@ -554,6 +562,10 @@ impl Client {
                         );
                         peer.identity = None;
                         detach(peer);
+                        // Drop the session now: if the restart below is
+                        // rate-limited, the stall check must see an
+                        // unestablished link, not a dead "established" one.
+                        peer.link.reset();
                         self.start_link(socket, &from, peer)?;
                     }
                 }
