@@ -297,13 +297,15 @@ fn poll(bus: &gio::DBusConnection) {
             .last_playing
             .retain(|bus_name, _| players.iter().any(|player| &player.bus_name == bus_name));
         let current = active(&players, &shown.last_playing).cloned();
+        let art = current.as_ref().and_then(current_art);
         // What the phone shows, without the position: a change sends now.
         let key = format!(
-            "{:?}|{:?}",
+            "{:?}|{:?}|{:?}",
             players.iter().map(|p| &p.name).collect::<Vec<_>>(),
             current
                 .as_ref()
-                .map(|p| (&p.name, &p.title, &p.artist, p.playing, p.volume, p.can_seek))
+                .map(|p| (&p.name, &p.title, &p.artist, p.playing, p.volume, p.can_seek)),
+            art.as_ref().map(|art| &art.id)
         );
         let position_due = current.as_ref().is_some_and(|player| player.playing)
             && shown
@@ -315,31 +317,88 @@ fn poll(bus: &gio::DBusConnection) {
         } else {
             shown.key = Some(key);
             shown.position_sent = Some(now);
-            Some(state_packet(&players, current.as_ref()))
+            Some((state_packet(&players, current.as_ref()), art))
         }
     };
-    if let Some(packet) = packet {
+    if let Some((packet, art)) = packet {
         for device in super::desk_features::ready_devices() {
-            super::desk_features::send(&device, &packet);
+            send_with_art(&device, packet.clone(), art.as_deref());
         }
     }
 }
 
 /// Sends `device_id` the current state (on connect, or when it asks).
 pub(crate) fn send_state_to(device_id: &str) {
-    let packet = {
+    let (packet, art) = {
         let Ok(shown) = SHOWN.lock() else {
             return;
         };
         let Some(shown) = shown.as_ref() else {
             return;
         };
-        state_packet(&shown.players, active(&shown.players, &shown.last_playing))
+        let current = active(&shown.players, &shown.last_playing);
+        (
+            state_packet(&shown.players, current),
+            current.and_then(current_art),
+        )
     };
+    send_with_art(device_id, packet, art.as_deref());
+}
+
+/// The art id each phone was last sent the picture for.
+static ART_SENT: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
+
+/// `player`'s artwork, when ready (reading it starts here; once done, the
+/// next poll pushes it).
+fn current_art(player: &Player) -> Option<std::sync::Arc<super::media_art::Art>> {
+    super::media_art::art_for(player.art_url.as_deref()?, || {
+        if let Ok(mut shown) = SHOWN.lock() {
+            if let Some(shown) = shown.as_mut() {
+                shown.key = None;
+            }
+        }
+    })
+}
+
+/// Adds the artwork to `packet`: the picture itself only when `include_data`
+/// (the phone does not have this id yet), else just its id.
+pub(crate) fn add_art(
+    packet: &mut NetworkPacket,
+    art: Option<&super::media_art::Art>,
+    include_data: bool,
+) {
+    if let Some(art) = art {
+        packet.set("albumArtId", art.id.as_str());
+        if include_data {
+            packet.set("albumArtData", art.data.as_str());
+        }
+    }
+}
+
+/// Sends `packet` with the artwork, the picture only if this phone has not
+/// been sent it.
+fn send_with_art(device_id: &str, mut packet: NetworkPacket, art: Option<&super::media_art::Art>) {
+    let include_data = art.is_some_and(|art| {
+        ART_SENT.lock().is_ok_and(|mut sent| {
+            let sent = sent.get_or_insert_with(HashMap::new);
+            let new = sent.get(device_id) != Some(&art.id);
+            sent.insert(device_id.to_string(), art.id.clone());
+            new
+        })
+    });
+    add_art(&mut packet, art, include_data);
     super::desk_features::send(device_id, &packet);
 }
 
-/// A phone's `desklink.mpris.request` for the desk's players.
+/// A phone (re)connected: it gets the picture again with the next state.
+pub(crate) fn forget_art_sent(device_id: &str) {
+    if let Ok(mut sent) = ART_SENT.lock() {
+        if let Some(sent) = sent.as_mut() {
+            sent.remove(device_id);
+        }
+    }
+}
+
 /// The player a request acts on: the one it names; else (or when that one
 /// has gone) the one playing, else the one that played last, else the first.
 fn target<'a>(

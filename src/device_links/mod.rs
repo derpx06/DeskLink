@@ -7,6 +7,7 @@ pub mod device;
 pub mod device_info;
 pub mod features;
 pub(crate) mod logind;
+pub(crate) mod media_art;
 pub(crate) mod mpris;
 pub mod packet;
 pub mod pairing;

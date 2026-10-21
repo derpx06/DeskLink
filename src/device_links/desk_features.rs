@@ -158,6 +158,7 @@ pub(crate) fn on_feature_ready(device_id: &str) {
         if terminal_gate(&device_id).is_ok() {
             send(&device_id, &command_list_packet(&settings.run_commands));
         }
+        super::mpris::forget_art_sent(&device_id);
         super::mpris::send_state_to(&device_id);
     });
 }
