@@ -378,6 +378,15 @@ impl DesktopWebRtcPeer {
             .unwrap_or(0)
     }
 
+    /// Whether the active capture is scaled by `vapostproc`.
+    pub fn desktop_screen_va_scaled(&self) -> bool {
+        self.desktop_screen_capture
+            .lock()
+            .ok()
+            .and_then(|capture| capture.as_ref().map(|(_, capture)| capture.va_scaled()))
+            .unwrap_or(false)
+    }
+
     fn stop_or_retire(&self, capture: super::screen::DesktopScreenCapture) {
         if let (Some(next), Ok(mut slot)) = (capture.next_seqnum(), self.screen_next_seqnum.lock())
         {
@@ -668,15 +677,21 @@ fn log_pipeline_problems(pipeline: &gst::Pipeline) {
     };
     bus.set_sync_handler(|_, message| {
         match message.view() {
-            gst::MessageView::Error(error) => eprintln!(
-                "[DeskLink] GStreamer error from {}: {} ({})",
-                error
+            gst::MessageView::Error(error) => {
+                let source = error
                     .src()
                     .map(|source| source.path_string().to_string())
-                    .unwrap_or_default(),
-                error.error(),
-                error.debug().unwrap_or_default()
-            ),
+                    .unwrap_or_default();
+                eprintln!(
+                    "[DeskLink] GStreamer error from {source}: {} ({})",
+                    error.error(),
+                    error.debug().unwrap_or_default()
+                );
+                // The share's scaler: the watchdog's rebuild scales in software.
+                if source.contains("vapostproc") {
+                    super::screen::va_scaler_failed("element error");
+                }
+            }
             gst::MessageView::Warning(warning) => eprintln!(
                 "[DeskLink] GStreamer warning from {}: {} ({})",
                 warning

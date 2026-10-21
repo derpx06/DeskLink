@@ -43,13 +43,12 @@ fn known_endpoints() -> &'static Mutex<HashMap<String, (DeviceInfo, u16)>> {
     KNOWN.get_or_init(Default::default)
 }
 
-/// Records `info`'s listening port from an identity packet, when it has one,
-/// and (with `ip`, where it was seen) remembers the address across restarts.
-pub(super) fn remember_endpoint(
-    info: &DeviceInfo,
-    packet: &NetworkPacket,
-    ip: Option<std::net::IpAddr>,
-) {
+/// Records a paired phone's listening port from an identity packet (a
+/// beacon, or an incoming connection's first line). Identities are
+/// unauthenticated, so strangers' are not kept: the map would grow with
+/// every spoofed id. The address is remembered across restarts only once a
+/// paired link authenticates (`persist_paired_endpoint`).
+pub(super) fn remember_endpoint(info: &DeviceInfo, packet: &NetworkPacket, trusted: bool) {
     let Some(port) = packet
         .get_i64("tcpPort")
         .and_then(|port| u16::try_from(port).ok())
@@ -57,12 +56,46 @@ pub(super) fn remember_endpoint(
     else {
         return;
     };
+    if !trusted {
+        return;
+    }
     if let Ok(mut known) = known_endpoints().lock() {
         known.insert(info.id.clone(), (info.clone(), port));
     }
-    if let Some(ip) = ip.filter(|ip| !ip.is_loopback() && !ip.is_unspecified()) {
-        persist_endpoint(&info.id, SocketAddr::new(ip, port));
+}
+
+/// Most phones `endpoints.json` remembers.
+const MAX_PERSISTED_ENDPOINTS: usize = 32;
+
+/// After a paired link authenticated from `ip`: remembers where the phone
+/// listens (that address and the port it announced), for the first dial
+/// after a restart. Only paired phones are kept (`trusted`), at most
+/// [`MAX_PERSISTED_ENDPOINTS`], written off the caller's thread.
+pub(super) fn persist_paired_endpoint(
+    device_id: &str,
+    ip: std::net::IpAddr,
+    trusted: std::collections::HashSet<String>,
+) {
+    if ip.is_loopback() || ip.is_unspecified() {
+        return;
     }
+    let Some(port) = known_endpoints()
+        .lock()
+        .ok()
+        .and_then(|known| known.get(device_id).map(|(_, port)| *port))
+    else {
+        return;
+    };
+    let device_id = device_id.to_string();
+    let _ = thread::Builder::new()
+        .name("desklink-endpoints".into())
+        .spawn(move || {
+            // One writer at a time: two links authenticating together must
+            // not interleave read-modify-write.
+            static WRITING: Mutex<()> = Mutex::new(());
+            let _writing = WRITING.lock();
+            persist_endpoint(&device_id, SocketAddr::new(ip, port), &trusted);
+        });
 }
 
 /// Where each paired phone was last reachable, kept across restarts so the
@@ -91,15 +124,19 @@ pub(super) fn persisted_endpoints() -> HashMap<String, SocketAddr> {
         .unwrap_or_default()
 }
 
-fn persist_endpoint(device_id: &str, address: SocketAddr) {
+fn persist_endpoint(
+    device_id: &str,
+    address: SocketAddr,
+    trusted: &std::collections::HashSet<String>,
+) {
     let Some(path) = endpoints_path() else {
         return;
     };
-    let mut all = persisted_endpoints();
-    if all.get(device_id) == Some(&address) {
+    let before = persisted_endpoints();
+    let all = updated_endpoints(before.clone(), device_id, address, trusted);
+    if all == before {
         return;
     }
-    all.insert(device_id.to_string(), address);
     let written = serde_json::to_string(&all)
         .map_err(|error| error.to_string())
         .and_then(|text| {
@@ -111,6 +148,26 @@ fn persist_endpoint(device_id: &str, address: SocketAddr) {
     if let Err(error) = written {
         eprintln!("[Daemon] Could not remember {device_id}'s address: {error}");
     }
+}
+
+/// `all` with `device_id` at `address`, pruned to paired phones and capped.
+fn updated_endpoints(
+    mut all: HashMap<String, SocketAddr>,
+    device_id: &str,
+    address: SocketAddr,
+    trusted: &std::collections::HashSet<String>,
+) -> HashMap<String, SocketAddr> {
+    all.retain(|id, _| trusted.contains(id));
+    if trusted.contains(device_id) {
+        all.insert(device_id.to_string(), address);
+    }
+    while all.len() > MAX_PERSISTED_ENDPOINTS {
+        let Some(extra) = all.keys().find(|id| *id != device_id).cloned() else {
+            break;
+        };
+        all.remove(&extra);
+    }
+    all
 }
 
 /// How often paired phones without a bootstrap link are redialled.
@@ -467,7 +524,7 @@ fn handle_identity_packet(
         return;
     }
     upsert_device(devices, &info, address.ip().to_string(), paired);
-    remember_endpoint(&info, &packet, Some(address.ip()));
+    remember_endpoint(&info, &packet, paired);
 
     let Some(remote_port) = packet
         .get_i64("tcpPort")
@@ -551,11 +608,11 @@ mod tests {
         let mut beacon = NetworkPacket::new(PACKET_TYPE_IDENTITY);
         beacon.set("tcpPort", 1716);
         for id in ["linked", "unlinked", "stranger", "relay-only"] {
-            remember_endpoint(&info(id), &beacon, None);
+            remember_endpoint(&info(id), &beacon, true);
         }
         let mut odd = NetworkPacket::new(PACKET_TYPE_IDENTITY);
         odd.set("tcpPort", 22);
-        remember_endpoint(&info("no-port"), &odd, None);
+        remember_endpoint(&info("no-port"), &odd, true);
         let known = known_endpoints().lock().unwrap().clone();
         // `wants` is the session's view: here only "linked" has a live socket.
         let mut persisted = HashMap::new();
@@ -580,6 +637,49 @@ mod tests {
         );
     }
     use crate::device_links::core::SessionLink;
+
+    /// Only paired phones are remembered, strangers' identities are not
+    /// kept even in memory, and the file stays bounded.
+    #[test]
+    fn only_paired_phones_endpoints_are_kept_and_the_file_is_bounded() {
+        let info = |id: &str| DeviceInfo {
+            id: id.to_string(),
+            name: id.to_string(),
+            device_type: "phone".to_string(),
+            protocol_version: crate::device_links::packet::PROTOCOL_VERSION,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+        };
+        let mut beacon = NetworkPacket::new(PACKET_TYPE_IDENTITY);
+        beacon.set("tcpPort", 1716);
+        remember_endpoint(&info("spoofed-stranger"), &beacon, false);
+        assert!(!known_endpoints()
+            .lock()
+            .unwrap()
+            .contains_key("spoofed-stranger"));
+
+        let address: SocketAddr = "10.0.0.9:1716".parse().unwrap();
+        let mut trusted: std::collections::HashSet<String> =
+            ["phone".to_string(), "kept".to_string()].into();
+        let mut all = HashMap::new();
+        all.insert("unpaired-since".to_string(), address);
+        all.insert("kept".to_string(), address);
+        let updated = updated_endpoints(all, "phone", address, &trusted);
+        let mut ids: Vec<_> = updated.keys().cloned().collect();
+        ids.sort();
+        assert_eq!(ids, ["kept", "phone"], "pruned to paired phones");
+        assert!(
+            updated_endpoints(HashMap::new(), "stranger", address, &trusted).is_empty(),
+            "never a stranger"
+        );
+        let many: HashMap<String, SocketAddr> =
+            (0..100).map(|n| (format!("p{n}"), address)).collect();
+        trusted.extend(many.keys().cloned());
+        let capped = updated_endpoints(many, "phone", address, &trusted);
+        assert_eq!(capped.len(), MAX_PERSISTED_ENDPOINTS);
+        assert!(capped.contains_key("phone"), "the one just seen stays");
+    }
 
     #[test]
     fn stale_outgoing_failure_is_not_published_after_an_inbound_link_wins() {

@@ -145,11 +145,6 @@ pub(super) fn connect_to_device(
     if !wanted() {
         return Ok(());
     }
-    // One connection being set up per phone: discovery, the redialer and an
-    // inbound socket for the same phone must not race (see `DeviceFlight`).
-    let Some(_flight) = super::network::DeviceFlight::claim(&initial_info.id) else {
-        return Ok(());
-    };
     // Without a timeout a peer that vanished costs ~2 minutes of SYN retries.
     let mut stream = TcpStream::connect_timeout(
         &std::net::SocketAddr::new(address.ip(), remote_port),
@@ -166,6 +161,7 @@ pub(super) fn connect_to_device(
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|err| err.to_string())?;
     super::network::enable_keepalive(&stream);
+    let deadline = super::network::HandshakeDeadline::arm(&stream, super::network::HANDSHAKE_LIMIT);
     let mut identity = config
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())?
@@ -182,5 +178,13 @@ pub(super) fn connect_to_device(
 
     let acceptor = ssl_acceptor(&config)?;
     let ssl_stream = acceptor.accept(stream).map_err(|err| err.to_string())?;
-    finish_secure_link(initial_info, ssl_stream, config, devices, sessions, events)
+    finish_secure_link(
+        initial_info,
+        ssl_stream,
+        deadline,
+        config,
+        devices,
+        sessions,
+        events,
+    )
 }

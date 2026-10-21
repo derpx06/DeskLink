@@ -167,7 +167,6 @@ fn accept_incoming_device(
     let packet = NetworkPacket::deserialize(&line).map_err(|err| err.to_string())?;
     let info = DeviceInfo::from_identity_packet(&packet)
         .ok_or_else(|| format!("Invalid identity packet (type {})", packet.packet_type))?;
-    super::discovery::remember_endpoint(&info, &packet, stream.peer_addr().ok().map(|a| a.ip()));
     let local_id = config
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())?
@@ -179,6 +178,11 @@ fn accept_incoming_device(
     {
         return Err("Connection targeted another device".to_string());
     }
+    let trusted = config
+        .lock()
+        .map(|config| config.is_trusted(&info.id))
+        .unwrap_or(false);
+    super::discovery::remember_endpoint(&info, &packet, trusted);
     upsert_device(
         &devices,
         &info,
@@ -186,17 +190,16 @@ fn accept_incoming_device(
             .peer_addr()
             .map(|addr| addr.ip().to_string())
             .unwrap_or_else(|_| "unknown".to_string()),
-        config
-            .lock()
-            .map(|config| config.is_trusted(&info.id))
-            .unwrap_or(false),
+        trusted,
     );
-    // A dial of ours to the same phone is under way: that one goes ahead.
-    let _flight = super::network::DeviceFlight::claim(&info.id)
-        .ok_or_else(|| format!("A connection to {} is already being set up", info.id))?;
+    // One deadline for TLS and the secure identity: per-read timeouts let a
+    // peer dribbling bytes hold this connection for minutes.
+    let deadline = super::network::HandshakeDeadline::arm(&stream, super::network::HANDSHAKE_LIMIT);
     let connector = ssl_connector(&config)?;
     let ssl_stream = connector
         .connect(&info.id, stream)
         .map_err(|err| err.to_string())?;
-    finish_secure_link(info, ssl_stream, config, devices, sessions, events)
+    finish_secure_link(
+        info, ssl_stream, deadline, config, devices, sessions, events,
+    )
 }

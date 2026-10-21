@@ -346,6 +346,38 @@ fn start_webrtc_after_pairing(
 /// immediately, with the same trust record the prompt flow writes; anything
 /// else ⇒ `pair:false`. Nothing is compared or accepted by the user: the
 /// scanned fingerprint and one-time secret are the authentication.
+/// Checks a `desklink.pair.qr` proof from `link` against the live code
+/// (consuming it on success).
+pub(super) fn check_qr_proof(
+    link: &crate::device_links::core::SessionLink,
+    packet: &NetworkPacket,
+    config: &Arc<Mutex<Config>>,
+) -> Result<(), String> {
+    use crate::device_links::pairing_qr;
+    // The phone's fingerprint comes from the certificate this link really
+    // presented, never from anything the phone claims.
+    let phone_der = openssl::x509::X509::from_pem(link.certificate_pem.as_bytes())
+        .and_then(|certificate| certificate.to_der())
+        .map_err(|error| error.to_string())?;
+    let (desktop_id, desktop_der) = {
+        let config = config
+            .lock()
+            .map_err(|_| "Config lock poisoned".to_string())?;
+        let der = config
+            .certificate()
+            .to_der()
+            .map_err(|error| error.to_string())?;
+        (config.local_device_info().id, der)
+    };
+    pairing_qr::verify(
+        &desktop_id,
+        &link.info.id,
+        &pairing_qr::fingerprint(&desktop_der)?,
+        &pairing_qr::fingerprint(&phone_der)?,
+        packet.get_str("mac").unwrap_or_default(),
+    )
+}
+
 fn handle_qr_pairing_proof(
     binding: &SessionBinding,
     packet: &NetworkPacket,
@@ -354,33 +386,8 @@ fn handle_qr_pairing_proof(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     events: &Arc<Mutex<Vec<DaemonEvent>>>,
 ) {
-    use crate::device_links::pairing_qr;
     let device_id = &binding.device_id;
-    let verified = (|| -> Result<(), String> {
-        // The phone's fingerprint comes from the certificate this link really
-        // presented, never from anything the phone claims.
-        let phone_der = openssl::x509::X509::from_pem(binding.link.certificate_pem.as_bytes())
-            .and_then(|certificate| certificate.to_der())
-            .map_err(|error| error.to_string())?;
-        let (desktop_id, desktop_der) = {
-            let config = config
-                .lock()
-                .map_err(|_| "Config lock poisoned".to_string())?;
-            let der = config
-                .certificate()
-                .to_der()
-                .map_err(|error| error.to_string())?;
-            (config.local_device_info().id, der)
-        };
-        pairing_qr::verify(
-            &desktop_id,
-            device_id,
-            &pairing_qr::fingerprint(&desktop_der)?,
-            &pairing_qr::fingerprint(&phone_der)?,
-            packet.get_str("mac").unwrap_or_default(),
-        )
-    })()
-    .and_then(|()| {
+    let verified = check_qr_proof(&binding.link, packet, config).and_then(|()| {
         let _ = sessions.with_session(binding, |session| {
             session.pairing = crate::device_links::pairing::PairingHandler::new(true);
         });

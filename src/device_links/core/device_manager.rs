@@ -124,6 +124,9 @@ pub enum Adoption {
     },
     /// Nothing to preserve: register it as a new generation.
     Register,
+    /// It presents a different certificate from the session's link: never
+    /// swapped into a session another certificate authenticated.
+    Refuse,
 }
 
 pub struct DeviceManager {
@@ -260,6 +263,7 @@ impl DeviceManager {
         &self,
         device_id: &str,
         transport: &Arc<dyn LinkTransport>,
+        certificate_pem: &str,
         answering_within: std::time::Duration,
     ) -> Adoption {
         let Ok(mut sessions) = self.sessions.lock() else {
@@ -279,6 +283,12 @@ impl DeviceManager {
         let Some(link) = session.active_link.clone() else {
             return Adoption::Register;
         };
+        // The swap keeps the link's identity — its certificate among it — so
+        // only a socket that authenticated with that same certificate may
+        // carry it.
+        if link.certificate_pem != certificate_pem {
+            return Adoption::Refuse;
+        }
         // Decided under the same lock as the swap: two sockets arriving
         // together cannot both be adopted, nor one kept and one adopted.
         if !link.is_closed() && session.last_inbound_at.elapsed() < answering_within {
@@ -455,6 +465,27 @@ impl DeviceManager {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Whether `device_id` has a paired session whose WebRTC feature
+    /// transport is ready: what an unpaired link claiming its id must never
+    /// replace.
+    pub fn holds_paired_transport(&self, device_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| {
+                let session = sessions.get(device_id)?;
+                Some(
+                    session.state != SessionState::Terminated
+                        && session.pairing.state == crate::device_links::pairing::PairState::Paired
+                        && session
+                            .webrtc_handover
+                            .as_ref()
+                            .is_some_and(HandoverRuntime::features_ready),
+                )
+            })
+            .unwrap_or(false)
     }
 
     /// Whether `instance_id` shows the peer restarted since its current link
@@ -1500,7 +1531,12 @@ mod tests {
         let epoch = binding.link.epoch();
         // Open and still answering: the newcomer is redundant.
         assert!(matches!(
-            manager.adopt_or_keep("phone-1", &replacement, std::time::Duration::from_secs(20)),
+            manager.adopt_or_keep(
+                "phone-1",
+                &replacement,
+                &binding.link.certificate_pem,
+                std::time::Duration::from_secs(20)
+            ),
             Adoption::Keep
         ));
         let (adopted, _old, adopted_epoch) =
@@ -1521,12 +1557,42 @@ mod tests {
         assert!(manager.has_ready_webrtc("phone-1"));
     }
 
+    /// A socket with another certificate is never swapped into the session,
+    /// silent incumbent or not.
+    #[test]
+    fn adoption_needs_the_sessions_own_certificate() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        mark_features_ready(&manager, &binding);
+        binding.link.close();
+        let replacement: Arc<dyn LinkTransport> =
+            Arc::new(crate::device_links::core::link_transport::DeadTransport);
+        assert!(matches!(
+            manager.adopt_or_keep(
+                "phone-1",
+                &replacement,
+                "-----BEGIN CERTIFICATE-----forged",
+                std::time::Duration::ZERO
+            ),
+            Adoption::Refuse
+        ));
+        assert!(manager.is_current(&binding), "the session is untouched");
+        assert!(manager.holds_paired_transport("phone-1"));
+        assert!(
+            adopt(&manager, &replacement).is_some(),
+            "its own certificate is"
+        );
+    }
+
     /// Adopts with no answering window (the incumbent counts as silent).
     fn adopt(
         manager: &DeviceManager,
         transport: &Arc<dyn LinkTransport>,
     ) -> Option<(SessionBinding, Arc<dyn LinkTransport>, u64)> {
-        match manager.adopt_or_keep("phone-1", transport, std::time::Duration::ZERO) {
+        match manager.adopt_or_keep("phone-1", transport, "", std::time::Duration::ZERO) {
             Adoption::Adopted {
                 binding,
                 replaced,

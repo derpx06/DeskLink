@@ -25,9 +25,11 @@ use crate::device_links::packet::PACKET_TYPE_WEBRTC_SIGNAL_V1;
 /// second per link.
 pub(super) const READ_TIMEOUT: Duration = Duration::from_millis(20);
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finish_secure_link(
     initial_info: DeviceInfo,
     mut stream: SslStream<TcpStream>,
+    deadline: super::network::HandshakeDeadline,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     sessions: Arc<DeviceManager>,
@@ -50,6 +52,8 @@ pub(super) fn finish_secure_link(
     {
         return Err("Secure identity changed during handshake".to_string());
     }
+    // TLS and the secure identity are done in time.
+    drop(deadline);
 
     let cert = stream
         .ssl()
@@ -69,11 +73,11 @@ pub(super) fn finish_secure_link(
         .public_key_to_der()
         .map_err(|err| err.to_string())?;
     let pinned = validate_pinned_certificate(&config, &secure_info.id, &cert);
-    let new_certificate = certificate_admission(
-        pinned,
-        crate::device_links::pairing_qr::current_uri().is_some(),
-    )?;
-    enforce_unpaired_link_limit(&config, &sessions, &secure_info.id)?;
+    let qr_code = crate::device_links::pairing_qr::current_uri();
+    let new_certificate = certificate_admission(pinned, qr_code.is_some())?;
+    if !new_certificate {
+        enforce_unpaired_link_limit(&config, &sessions, &secure_info.id)?;
+    }
 
     // A link presenting a new certificate is never paired, whatever the trust
     // store says about its device id; only a valid QR proof (or a pairing the
@@ -86,26 +90,11 @@ pub(super) fn finish_secure_link(
     if paired && crate::device_links::relay_link::client::force_relay() {
         return Err("LAN links are disabled for testing (DESKLINK_FORCE_RELAY)".to_string());
     }
-    // Merge, never replace. `insert` here rebuilt the `DeviceView` from the
-    // identity packet, which zeroes notifications, battery, volume, media,
-    // and commands — so a Wi-Fi roam blanked every summary chip.
-    // Worse, the emptied notification set made the UI's dedup table prune
-    // itself, and the phone's next resync re-delivered every already-seen
-    // notification as a fresh desktop popup.
-    //
-    // Status is deliberately not set: `reconcile_connection_status` owns
-    // reachability, and asserting it from a handshake path is what previously
-    // left dead devices reading as connected.
-    upsert_device(
-        &devices,
-        &secure_info,
-        stream
-            .get_ref()
-            .peer_addr()
-            .map(|addr| addr.ip().to_string())
-            .unwrap_or_else(|_| "unknown".to_string()),
-        paired,
-    );
+    let address = stream
+        .get_ref()
+        .peer_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
 
     // Keep the TLS stream in one mode for its entire lifetime.  Toggling an
     // OpenSSL stream between nonblocking and blocking mode from the reader
@@ -140,11 +129,57 @@ pub(super) fn finish_secure_link(
         cert_pem,
         local_public_der,
         remote_public_der,
-        secure_info,
+        secure_info.clone(),
     );
+    if new_certificate {
+        // Kept out of the device's session entirely: see `admit_qr_only`.
+        return admit_qr_only(
+            link,
+            transport,
+            address,
+            qr_code.unwrap_or_default(),
+            QrContext {
+                config,
+                devices,
+                sessions,
+                events,
+            },
+        );
+    }
+
+    // Merge, never replace. `insert` here rebuilt the `DeviceView` from the
+    // identity packet, which zeroes notifications, battery, volume, media,
+    // and commands — so a Wi-Fi roam blanked every summary chip.
+    // Worse, the emptied notification set made the UI's dedup table prune
+    // itself, and the phone's next resync re-delivered every already-seen
+    // notification as a fresh desktop popup.
+    //
+    // Status is deliberately not set: `reconcile_connection_status` owns
+    // reachability, and asserting it from a handshake path is what previously
+    // left dead devices reading as connected.
+    if paired {
+        if let (Ok(ip), Ok(config)) = (address.parse(), config.lock()) {
+            let trusted = config
+                .trusted_devices()
+                .map(|device| device.id.clone())
+                .collect();
+            super::discovery::persist_paired_endpoint(&secure_info.id, ip, trusted);
+        }
+    }
+    upsert_device(&devices, &secure_info, address, paired);
+
     // A relay link is standby capacity: a working LAN socket always replaces
     // it, even while it is live and answering.
     let supersede_live = sessions.bootstrap_is_relay(&initial_info.id);
+    // One connection attached per phone at a time — claimed only now that
+    // the certificate is validated, so an unauthenticated peer claiming the
+    // phone's id cannot hold it through a slow handshake.
+    let _flight = super::network::DeviceFlight::claim(&initial_info.id).ok_or_else(|| {
+        format!(
+            "A connection to {} is already being set up",
+            initial_info.id
+        )
+    })?;
     attach_bootstrap_link(
         &initial_info.id,
         link,
@@ -170,7 +205,7 @@ pub(super) fn certificate_admission(
     match pinned {
         Ok(()) => Ok(false),
         Err(_) if qr_live => {
-            debug_log!("[Daemon] Certificate changed; admitted unpaired while a QR code is shown");
+            debug_log!("[Daemon] Certificate changed; admitted QR-only while a QR code is shown");
             Ok(true)
         }
         Err(error) => Err(error),
@@ -223,6 +258,15 @@ pub(crate) fn attach_bootstrap_link(
     // A new restart epoch means the peer's previous process — and with it the
     // WebRTC peer this session holds — is gone. Neither keep the old socket
     // nor adopt into the old session: register, which clears the dead peer.
+    // An unpaired link never replaces a paired, feature-ready session: it
+    // could only be a stranger claiming the phone's id (the phone itself
+    // presents its pinned certificate, which makes it paired).
+    if !paired && sessions.holds_paired_transport(device_id) {
+        link.close();
+        return Err(format!(
+            "Refused an unpaired link for {device_id}: its paired session is live"
+        ));
+    }
     let restarted = sessions.peer_restarted(device_id, link.info.instance_id.as_deref());
     if restarted {
         debug_log!(
@@ -243,10 +287,16 @@ pub(crate) fn attach_bootstrap_link(
     // notifications kept arriving over the link underneath it. Android treats
     // a replacement LAN connection the same way (`onConnectionReceived`'s
     // retained binding). Keep-or-adopt is decided under the session lock.
-    let adoption = if restarted || supersede_live {
+    // Only a paired link is adopted: adoption keeps the session's pairing.
+    let adoption = if restarted || supersede_live || !paired {
         crate::device_links::core::Adoption::Register
     } else {
-        sessions.adopt_or_keep(device_id, &transport, super::HEARTBEAT_IDLE * 2)
+        sessions.adopt_or_keep(
+            device_id,
+            &transport,
+            &link.certificate_pem,
+            super::HEARTBEAT_IDLE * 2,
+        )
     };
     match adoption {
         crate::device_links::core::Adoption::Keep => {
@@ -284,6 +334,12 @@ pub(crate) fn attach_bootstrap_link(
                 )
             });
             return Ok(());
+        }
+        crate::device_links::core::Adoption::Refuse => {
+            link.close();
+            return Err(format!(
+                "Refused a link for {device_id}: its certificate is not the session's"
+            ));
         }
         crate::device_links::core::Adoption::Register => {}
     }
@@ -342,6 +398,191 @@ pub(crate) fn attach_bootstrap_link(
             Arc::clone(&events),
         );
     }
+    Ok(())
+}
+
+/// What a QR-only link needs to become the phone's link.
+pub(crate) struct QrContext {
+    pub(crate) config: Arc<Mutex<Config>>,
+    pub(crate) devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    pub(crate) sessions: Arc<DeviceManager>,
+    pub(crate) events: Arc<Mutex<Vec<DaemonEvent>>>,
+}
+
+/// QR-only links open at once; more are refused.
+const MAX_QR_ONLY_LINKS: usize = 4;
+/// How long a QR-only link may take to send its proof.
+const QR_ONLY_DEADLINE: Duration = Duration::from_secs(30);
+static QR_ONLY_LINKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A link whose certificate differs from the one stored for its device id,
+/// admitted because a QR code is on screen (a reinstalled phone re-pairing).
+///
+/// It is **QR-only**: never registered into the device's session — so it
+/// cannot displace, adopt into or unpair the phone that id belongs to — and
+/// it reads nothing but `desklink.pair.qr`. `desklink.pair` (either way),
+/// features and signaling are dropped. It is closed when the code expires,
+/// is consumed or replaced, after [`QR_ONLY_DEADLINE`], or on a bad proof.
+/// A valid proof stores its certificate and makes it the phone's link.
+fn admit_qr_only(
+    link: SessionLink,
+    transport: Arc<dyn crate::device_links::core::LinkTransport>,
+    address: String,
+    code: String,
+    context: QrContext,
+) -> Result<(), String> {
+    use std::sync::atomic::Ordering;
+    if QR_ONLY_LINKS.fetch_add(1, Ordering::AcqRel) >= MAX_QR_ONLY_LINKS {
+        QR_ONLY_LINKS.fetch_sub(1, Ordering::AcqRel);
+        link.close();
+        return Err("Too many links are waiting to pair by QR code".to_string());
+    }
+    debug_log!(
+        "[Daemon] Certificate changed for {}; admitted QR-only while a code is shown",
+        link.info.id
+    );
+    thread::spawn(move || {
+        struct Slot;
+        impl Drop for Slot {
+            fn drop(&mut self) {
+                QR_ONLY_LINKS.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _slot = Slot;
+        let deadline = std::time::Instant::now() + QR_ONLY_DEADLINE;
+        serve_qr_only(link, transport, address, &code, deadline, context);
+    });
+    Ok(())
+}
+
+/// What one packet on a QR-only link did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum QrOnly {
+    /// Not a proof: dropped.
+    Ignored,
+    /// A bad proof (answered `pair:false`): the link is closed.
+    Refused,
+    /// A valid proof; the certificate is stored.
+    Proven,
+}
+
+pub(super) fn serve_qr_only(
+    link: SessionLink,
+    transport: Arc<dyn crate::device_links::core::LinkTransport>,
+    address: String,
+    code: &str,
+    deadline: std::time::Instant,
+    context: QrContext,
+) {
+    use crate::device_links::core::ReadOutcome;
+    let mut line = Vec::new();
+    while std::time::Instant::now() < deadline
+        && crate::device_links::pairing_qr::current_uri().as_deref() == Some(code)
+    {
+        match link.read_byte_at(0) {
+            Ok(ReadOutcome::Byte(byte)) => {
+                line.push(byte);
+                if line.len() > super::network::MAX_UNPAIRED_PACKET_BYTES {
+                    break;
+                }
+                if byte != b'\n' {
+                    continue;
+                }
+                let parsed = crate::device_links::packet::NetworkPacket::deserialize(&line);
+                line.clear();
+                let Ok(packet) = parsed else { continue };
+                match qr_only_packet(&link, &packet, &context.config) {
+                    QrOnly::Ignored => {}
+                    QrOnly::Refused => break,
+                    QrOnly::Proven => {
+                        if let Err(error) = promote_qr_link(link, transport, address, context) {
+                            eprintln!("[Daemon] QR pairing could not attach the link: {error}");
+                        }
+                        return;
+                    }
+                }
+            }
+            Ok(ReadOutcome::Idle) => thread::sleep(Duration::from_millis(5)),
+            Ok(ReadOutcome::Closed) | Err(_) => break,
+        }
+    }
+    link.close();
+}
+
+/// One packet on a QR-only link: only a proof is read.
+pub(crate) fn qr_only_packet(
+    link: &SessionLink,
+    packet: &crate::device_links::packet::NetworkPacket,
+    config: &Arc<Mutex<Config>>,
+) -> QrOnly {
+    use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_PAIR, PACKET_TYPE_PAIR_QR};
+    if packet.packet_type != PACKET_TYPE_PAIR_QR {
+        debug_log!(
+            "[Daemon] Dropped {} on a QR-only link for {}",
+            packet.packet_type,
+            link.info.id
+        );
+        return QrOnly::Ignored;
+    }
+    let proven = super::packet_handler::check_qr_proof(link, packet, config).and_then(|()| {
+        config
+            .lock()
+            .map_err(|_| "Config lock poisoned".to_string())?
+            .trust_device(&link.info, link.certificate_pem.clone())
+    });
+    match proven {
+        Ok(()) => QrOnly::Proven,
+        Err(error) => {
+            eprintln!("[Daemon] QR pairing from {} refused: {error}", link.info.id);
+            // This link is not the paired phone's: telling it "not paired"
+            // touches no pairing.
+            let mut reply = NetworkPacket::new(PACKET_TYPE_PAIR);
+            reply.set("pair", false);
+            let _ = link.send_packet(&reply);
+            QrOnly::Refused
+        }
+    }
+}
+
+/// Makes a proven QR-only link the phone's paired link, replacing whatever
+/// session its old certificate had.
+pub(crate) fn promote_qr_link(
+    link: SessionLink,
+    transport: Arc<dyn crate::device_links::core::LinkTransport>,
+    address: String,
+    context: QrContext,
+) -> Result<(), String> {
+    use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_PAIR};
+    let mut reply = NetworkPacket::new(PACKET_TYPE_PAIR);
+    reply.set("pair", true);
+    let _ = link.send_packet(&reply);
+    let info = link.info.clone();
+    upsert_device(&context.devices, &info, address, true);
+    attach_bootstrap_link(
+        &info.id,
+        link,
+        transport,
+        true,
+        true,
+        context.config,
+        Arc::clone(&context.devices),
+        context.sessions,
+        Arc::clone(&context.events),
+    )?;
+    super::state::update_pair_state(
+        &context.devices,
+        &info.id,
+        crate::device_links::pairing::PairState::Paired,
+        None,
+    );
+    debug_log!("[Daemon] Paired with {} by QR code", info.id);
+    super::state::push_event(
+        &context.events,
+        DaemonEvent::PairedByQr {
+            device_id: info.id.clone(),
+            device_name: info.name,
+        },
+    );
     Ok(())
 }
 

@@ -297,6 +297,35 @@ impl Drop for DeviceFlight {
     }
 }
 
+/// The TLS handshake and the secure identity, together.
+pub(super) const HANDSHAKE_LIMIT: Duration = Duration::from_secs(5);
+
+/// Shuts a socket down unless dropped within `limit`: one deadline for the
+/// TLS handshake and secure identity, which OpenSSL reads with only the
+/// socket's per-read timeout.
+pub(super) struct HandshakeDeadline {
+    _done: std::sync::mpsc::Sender<()>,
+}
+
+impl HandshakeDeadline {
+    pub(super) fn arm(stream: &TcpStream, limit: Duration) -> Self {
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        if let Ok(socket) = stream.try_clone() {
+            let _ = std::thread::Builder::new()
+                .name("desklink-handshake-deadline".into())
+                .spawn(move || {
+                    // Dropping the guard ends the wait with `Disconnected`.
+                    if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+                        wait.recv_timeout(limit)
+                    {
+                        let _ = socket.shutdown(std::net::Shutdown::Both);
+                    }
+                });
+        }
+        Self { _done: done }
+    }
+}
+
 /// Packets from a peer that is not paired yet are identity, pairing and
 /// signaling only; the largest legitimate one (signed SDP) is well under this.
 pub(super) const MAX_UNPAIRED_PACKET_BYTES: usize = 256 * 1024;
@@ -386,6 +415,29 @@ mod tests {
             !local_interfaces().is_empty(),
             "this machine has at least loopback"
         );
+    }
+
+    #[test]
+    fn a_handshake_past_its_deadline_is_cut_off_and_one_on_time_is_not() {
+        use std::io::Read;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let slow = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        slow.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let _deadline = HandshakeDeadline::arm(&slow, Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        let mut byte = [0u8; 1];
+        // The peer never sends: only the deadline ends this read.
+        assert_eq!((&slow).read(&mut byte).unwrap_or(0), 0);
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let on_time = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        drop(HandshakeDeadline::arm(&on_time, Duration::from_millis(50)));
+        std::thread::sleep(Duration::from_millis(150));
+        std::io::Write::write_all(&mut peer, b"x").unwrap();
+        assert_eq!((&on_time).read(&mut byte).unwrap(), 1, "still open");
     }
 
     #[test]

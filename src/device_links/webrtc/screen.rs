@@ -551,6 +551,8 @@ pub(crate) struct DesktopScreenCapture {
     _pipewire_fd: Option<OwnedFd>,
     /// Stops the adaptive bitrate controller; see [`spawn_bitrate_controller`].
     rate_control_stop: Arc<AtomicBool>,
+    /// Scaled by `vapostproc`: if it sends nothing, VA is blamed.
+    va_scaled: bool,
 }
 
 /// Where a desktop share's frames come from.
@@ -620,6 +622,9 @@ impl DesktopScreenCapture {
         let request = request.served(width, height);
         let (scale, convert, rate, filter, queue, encoder, payloader) =
             encoder_chain(width, height, request)?;
+        let va_scaled = scale
+            .factory()
+            .is_some_and(|factory| factory.name() == "vapostproc");
 
         // Scale before converting: colour conversion then runs on the small
         // frame, not the full-resolution one.
@@ -758,6 +763,7 @@ impl DesktopScreenCapture {
                 frames,
                 payload_type,
                 _pipewire_fd: pipewire_fd,
+                va_scaled,
             }),
             Err(error) => {
                 for element in &elements {
@@ -767,6 +773,11 @@ impl DesktopScreenCapture {
                 Err(error)
             }
         }
+    }
+
+    /// Whether `vapostproc` scales this chain.
+    pub(crate) fn va_scaled(&self) -> bool {
+        self.va_scaled
     }
 
     /// RTP buffers produced so far.
@@ -1086,12 +1097,30 @@ fn set_if_present(element: &gst::Element, name: &str, value: &str) {
     }
 }
 
+/// Set once VA-API scaling failed in a real share: the probe below feeds it
+/// system memory, while a share feeds it what PipeWire hands over (possibly
+/// DMA-BUF), which can still fail. Every later chain this run then scales in
+/// software.
+static VA_SCALER_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// A share's VA-scaled chain errored or produced nothing: scale in software
+/// from now on (the capture watchdog rebuilds the chain).
+pub(crate) fn va_scaler_failed(why: &str) {
+    if !VA_SCALER_FAILED.swap(true, Ordering::AcqRel) {
+        eprintln!("[DeskLink] VA-API scaling failed in a share ({why}); using the software scaler");
+    }
+}
+
 /// Whether VA-API post-processing can scale here: `vapostproc` exists and a
 /// tiny test pipeline through it negotiates to system-memory I420 (it fails
-/// on drivers without a usable video-processing entry point). Checked once;
-/// `DESKLINK_SCREEN_SOFTWARE=1` forces the software scaler.
+/// on drivers without a usable video-processing entry point), and no share
+/// has seen it fail. Probed once; `DESKLINK_SCREEN_SOFTWARE=1` forces the
+/// software scaler.
 fn va_scaler_works() -> bool {
     static WORKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if VA_SCALER_FAILED.load(Ordering::Acquire) {
+        return false;
+    }
     *WORKS.get_or_init(|| {
         if std::env::var("DESKLINK_SCREEN_SOFTWARE").as_deref() == Ok("1")
             || gst::ElementFactory::find("vapostproc").is_none()
@@ -1624,6 +1653,26 @@ mod tests {
     /// Sharp and prompt: Lanczos (or VA) scaling to the phone's size, a frame
     /// rate cap that only drops, caps that do not pin the rate, and VP8 tuned
     /// for screens.
+    /// Once a share's VA scaler failed, every later chain scales in
+    /// software.
+    #[test]
+    fn a_failed_va_scaler_is_not_used_again() {
+        if gst::init().is_err() {
+            return;
+        }
+        va_scaler_failed("test");
+        assert!(!va_scaler_works());
+        let request = ScreenRequest::from_parts(Some(1280), Some(30)).served(1920, 1080);
+        let (scale, ..) = encoder_chain(1920, 1080, request).unwrap();
+        assert_eq!(
+            scale
+                .factory()
+                .map(|factory| factory.name().to_string())
+                .as_deref(),
+            Some("videoscale")
+        );
+    }
+
     #[test]
     fn the_encoder_chain_is_tuned_for_screens() {
         gst::init().unwrap();

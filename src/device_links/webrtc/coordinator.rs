@@ -1460,6 +1460,12 @@ fn run_desktop_portal_worker(
                 "[DeskLink] Desktop share to {device_id} produced no video for {:?}; rebuilding the capture ({restarts} of {CAPTURE_RESTARTS})",
                 CAPTURE_STALL
             );
+            // Nothing ever came out of a VA-scaled chain: the scaler is the
+            // likeliest cause (the share feeds it PipeWire's buffers, which
+            // the startup probe cannot), so the rebuild scales in software.
+            if peer.desktop_screen_frames_sent() == 0 && peer.desktop_screen_va_scaled() {
+                super::screen::va_scaler_failed("no frames");
+            }
             if let Err(error) = capture(portal.active()) {
                 eprintln!("[DeskLink] Could not rebuild the desktop capture: {error}");
             }

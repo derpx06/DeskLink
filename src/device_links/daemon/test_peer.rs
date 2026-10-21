@@ -193,25 +193,6 @@ impl TestPeer {
         self.relink_with_certificate(pem);
     }
 
-    /// Rebuilds the link presenting `certificate_pem` as `finish_secure_link`
-    /// admits a changed certificate during a QR scan: never paired.
-    pub(crate) fn relink_unpaired_with_certificate(&mut self, certificate_pem: String) {
-        self.net.reconnect(self.end);
-        self.line.clear();
-        let session_link = SessionLink::new(
-            Arc::new(self.net.end(self.end)),
-            certificate_pem,
-            self.local_public_der.clone(),
-            self.remote_public_der.clone(),
-            self.info.clone(),
-        );
-        self.binding = self
-            .sessions
-            .register_link(self.peer_id.clone(), session_link, false)
-            .expect("re-register link")
-            .binding;
-    }
-
     /// Rebuilds the link presenting an arbitrary certificate.
     ///
     /// This is the pairing-hijack vector: a second connection claiming the same
@@ -1047,17 +1028,33 @@ mod tests {
         );
     }
 
-    /// A reinstalled phone has a new certificate. While a QR code is on
-    /// screen its link is admitted *unpaired*; only a valid proof from that
-    /// link replaces the stored certificate, and a bad one changes nothing.
-    #[test]
-    fn a_reinstalled_phone_re_pairs_by_qr_and_only_a_valid_proof_moves_trust() {
+    /// Marks the session's WebRTC feature transport ready, as a finished
+    /// handover would.
+    fn mark_ready(peer: &TestPeer) {
+        use crate::device_links::webrtc::{HandoverRuntime, WebRtcWireBinding};
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let wire = WebRtcWireBinding::from_attempt("desktop", peer.peer_id(), &attempt).unwrap();
+        peer.sessions
+            .with_session(&peer.binding, |session| {
+                let mut handover = HandoverRuntime::new(attempt.clone(), wire);
+                handover.record_offer("offer".into()).unwrap();
+                handover.record_answer("answer".into()).unwrap();
+                handover.mark_local_authenticated().unwrap();
+                handover.mark_remote_authenticated().unwrap();
+                handover.mark_local_capabilities_confirmed().unwrap();
+                handover.mark_remote_capabilities_confirmed().unwrap();
+                handover.mark_local_feature_ready().unwrap();
+                handover.mark_remote_feature_ready().unwrap();
+                session.webrtc_handover = Some(handover);
+            })
+            .unwrap();
+    }
+
+    /// A desktop paired with its phone over a feature-ready transport, a QR
+    /// code on screen, and the desk's id and certificate for proofs.
+    fn paired_desk_showing_a_code(net: &Arc<TestNetwork>) -> (TestPeer, TestPeer, String, Vec<u8>) {
         use crate::device_links::pairing_qr;
-        let _one_code = pairing_qr::TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let net = TestNetwork::new();
-        let (mut desktop, mut phone) = peer_pair(&net, "desktop-1", "phone-1");
+        let (mut desktop, mut phone) = peer_pair(net, "desktop-1", "phone-1");
         desktop.request_pair();
         net.advance(0);
         phone.pump();
@@ -1065,10 +1062,7 @@ mod tests {
         net.advance(0);
         desktop.pump();
         assert!(desktop.is_trusted());
-        let old = desktop.trusted_certificate().expect("stored certificate");
-
-        // The reinstalled phone: a new certificate for the same device id,
-        // admitted as finish_secure_link does while a QR code is live.
+        mark_ready(&desktop);
         let desk_der = desktop
             .config
             .lock()
@@ -1078,59 +1072,234 @@ mod tests {
             .unwrap();
         let desk_id = desktop.local_id();
         pairing_qr::start(&desk_id, &desk_der, None, &[], 1716).unwrap();
-        let new_pem = foreign_certificate_pem();
-        desktop.relink_unpaired_with_certificate(new_pem.clone());
-        assert_eq!(
-            desktop.pair_state(),
-            PairState::NotPaired,
-            "a stranger until proven"
+        (desktop, phone, desk_id, desk_der)
+    }
+
+    /// A link claiming the phone's id with `certificate_pem`, on a wire of
+    /// its own: what `finish_secure_link` admits QR-only.
+    fn claimed_link(
+        desktop: &TestPeer,
+        certificate_pem: &str,
+    ) -> (
+        SessionLink,
+        Arc<dyn crate::device_links::core::LinkTransport>,
+    ) {
+        let wire = TestNetwork::new();
+        let transport: Arc<dyn crate::device_links::core::LinkTransport> = Arc::new(wire.end(0));
+        let link = SessionLink::new(
+            Arc::clone(&transport),
+            certificate_pem.to_string(),
+            desktop.local_public_der.clone(),
+            desktop.remote_public_der.clone(),
+            desktop.info.clone(),
         );
+        (link, transport)
+    }
 
-        let proof_packet = |mac: String| {
-            let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_PAIR_QR);
-            packet.set("mac", mac);
-            packet
-        };
-        let send = |packet: NetworkPacket| {
-            apply_lan_packet(
-                &desktop.binding,
-                packet,
-                &desktop.devices,
-                &desktop.sessions,
-                &desktop.config,
-                &desktop.events,
-            )
-        };
-        // A forged proof: nothing moves.
-        send(proof_packet("AAAA".into()));
-        assert_eq!(desktop.trusted_certificate().as_deref(), Some(old.as_str()));
-        assert_ne!(desktop.pair_state(), PairState::Paired);
-
-        // The real proof, over the certificate this link presented.
+    fn qr_proof(desk_id: &str, desk_der: &[u8], phone_id: &str, phone_pem: &str) -> NetworkPacket {
+        use crate::device_links::pairing_qr;
+        use base64::Engine;
         let secret = pairing_qr::live_secret().expect("code still live");
-        let phone_der = openssl::x509::X509::from_pem(new_pem.as_bytes())
+        let phone_der = openssl::x509::X509::from_pem(phone_pem.as_bytes())
             .unwrap()
             .to_der()
             .unwrap();
         let mac = pairing_qr::proof(
             &secret,
-            &desk_id,
-            &desktop.peer_id(),
-            &pairing_qr::fingerprint(&desk_der).unwrap(),
+            desk_id,
+            phone_id,
+            &pairing_qr::fingerprint(desk_der).unwrap(),
             &pairing_qr::fingerprint(&phone_der).unwrap(),
         )
         .unwrap();
-        use base64::Engine;
-        send(proof_packet(
+        let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_PAIR_QR);
+        packet.set(
+            "mac",
             base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac),
-        ));
-        assert_eq!(desktop.pair_state(), PairState::Paired);
+        );
+        packet
+    }
+
+    fn context(peer: &TestPeer) -> super::super::handshake::QrContext {
+        super::super::handshake::QrContext {
+            config: Arc::clone(&peer.config),
+            devices: Arc::clone(&peer.devices),
+            sessions: Arc::clone(&peer.sessions),
+            events: Arc::clone(&peer.events),
+        }
+    }
+
+    /// A stranger claiming the paired phone's id with its own certificate,
+    /// while a QR code is on screen, is admitted QR-only: it cannot unpair
+    /// the phone, raise a pairing prompt under its name, or displace its
+    /// session — through the QR-only link or the normal attach path.
+    #[test]
+    fn a_forged_link_with_a_new_certificate_cannot_unpair_prompt_or_displace() {
+        use super::super::handshake::{attach_bootstrap_link, qr_only_packet, QrOnly};
+        use crate::device_links::packet::{PACKET_TYPE_PAIR, PACKET_TYPE_WEBRTC_SIGNAL_V1};
+        use crate::device_links::pairing_qr;
+        let _one_code = pairing_qr::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let net = TestNetwork::new();
+        let (desktop, _phone, _desk_id, _desk_der) = paired_desk_showing_a_code(&net);
+        let stored = desktop.trusted_certificate().expect("stored certificate");
+        let forged = foreign_certificate_pem();
+        let (attacker, transport) = claimed_link(&desktop, &forged);
+
+        let untouched = |desktop: &TestPeer| {
+            assert!(desktop.is_trusted(), "still trusted");
+            assert_eq!(
+                desktop.trusted_certificate().as_deref(),
+                Some(stored.as_str())
+            );
+            assert_eq!(desktop.pair_state(), PairState::Paired);
+            assert!(
+                desktop.sessions.is_current(&desktop.binding),
+                "not displaced"
+            );
+            assert!(desktop.sessions.holds_paired_transport(&desktop.peer_id()));
+            assert_ne!(
+                desktop.status(),
+                DeviceStatus::PairRequestedByPeer,
+                "no prompt"
+            );
+        };
+
+        for packet in [
+            {
+                let mut unpair = NetworkPacket::new(PACKET_TYPE_PAIR);
+                unpair.set("pair", false);
+                unpair
+            },
+            {
+                let mut request = NetworkPacket::new(PACKET_TYPE_PAIR);
+                request.set("pair", true);
+                request.set("timestamp", 1_700_000_000i64);
+                request
+            },
+            NetworkPacket::new(PACKET_TYPE_WEBRTC_SIGNAL_V1),
+            NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_CLIPBOARD),
+        ] {
+            assert_eq!(
+                qr_only_packet(&attacker, &packet, &desktop.config),
+                QrOnly::Ignored
+            );
+            untouched(&desktop);
+        }
+
+        // A forged proof is refused and moves nothing.
+        let mut bad = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_PAIR_QR);
+        bad.set("mac", "AAAA");
+        assert_eq!(
+            qr_only_packet(&attacker, &bad, &desktop.config),
+            QrOnly::Refused
+        );
+        untouched(&desktop);
+
+        // The normal attach path refuses an unpaired link over the live,
+        // paired session instead of registering it.
+        assert!(attach_bootstrap_link(
+            &desktop.peer_id(),
+            attacker,
+            transport,
+            false,
+            false,
+            Arc::clone(&desktop.config),
+            Arc::clone(&desktop.devices),
+            Arc::clone(&desktop.sessions),
+            Arc::clone(&desktop.events),
+        )
+        .is_err());
+        untouched(&desktop);
+        pairing_qr::cancel();
+    }
+
+    /// A reinstalled phone has a new certificate. While a QR code is on
+    /// screen its link is admitted QR-only; a valid proof from that link
+    /// stores the new certificate and makes it the phone's paired link.
+    #[test]
+    fn a_reinstalled_phone_re_pairs_by_qr_and_only_a_valid_proof_moves_trust() {
+        use super::super::handshake::{promote_qr_link, qr_only_packet, QrOnly};
+        use crate::device_links::pairing_qr;
+        let _one_code = pairing_qr::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let net = TestNetwork::new();
+        let (desktop, _phone, desk_id, desk_der) = paired_desk_showing_a_code(&net);
+        let old_binding = desktop.binding.clone();
+        let new_pem = foreign_certificate_pem();
+        let (link, transport) = claimed_link(&desktop, &new_pem);
+
+        let proof = qr_proof(&desk_id, &desk_der, &desktop.peer_id(), &new_pem);
+        assert_eq!(
+            qr_only_packet(&link, &proof, &desktop.config),
+            QrOnly::Proven
+        );
         assert_eq!(
             desktop.trusted_certificate().as_deref(),
             Some(new_pem.as_str()),
             "the proof moved trust to the new certificate"
         );
+        assert!(pairing_qr::current_uri().is_none(), "the code is consumed");
+        promote_qr_link(link, transport, "test".into(), context(&desktop)).unwrap();
+        assert!(
+            !desktop.sessions.is_current(&old_binding),
+            "it replaced the old link"
+        );
+        let binding = desktop
+            .sessions
+            .current_binding(&desktop.peer_id())
+            .expect("the new link's session");
+        assert_eq!(binding.link.certificate_pem, new_pem);
+        assert_eq!(
+            desktop
+                .sessions
+                .with_session(&binding, |session| session.pairing.state)
+                .unwrap(),
+            PairState::Paired
+        );
+        assert!(desktop
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, DaemonEvent::PairedByQr { .. })));
+        binding.link.close();
+    }
+
+    /// A QR-only link lives only as long as its code: withdrawn (or
+    /// expired, or consumed), the link is closed.
+    #[test]
+    fn a_qr_only_link_is_closed_when_its_code_ends() {
+        use crate::device_links::pairing_qr;
+        let _one_code = pairing_qr::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let net = TestNetwork::new();
+        let (desktop, _phone, _desk_id, _desk_der) = paired_desk_showing_a_code(&net);
+        let code = pairing_qr::current_uri().expect("live code");
+        let forged = foreign_certificate_pem();
+        let (link, transport) = claimed_link(&desktop, &forged);
+        let context = context(&desktop);
+        let server = std::thread::spawn(move || {
+            super::super::handshake::serve_qr_only(
+                link,
+                transport,
+                "test".into(),
+                &code,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                context,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!server.is_finished(), "open while the code is live");
         pairing_qr::cancel();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !server.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(server.is_finished(), "the code ended, so did the link");
     }
 
     #[test]
