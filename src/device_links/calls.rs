@@ -18,11 +18,18 @@ pub(crate) const ACTIONS: [&str; 7] = [
 /// More calls than any phone holds at once; the rest are ignored.
 const MAX_CALLS: usize = 4;
 
+/// Bidirectional marks a dialer wraps names and numbers in (LRM/RLM, the
+/// embeddings and isolates): invisible, but they showed as boxes and broke
+/// matching a number.
+fn is_bidi_mark(c: char) -> bool {
+    matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+}
+
 fn clean(value: Option<&Value>, max_chars: usize) -> Option<String> {
     let text: String = value?
         .as_str()?
         .chars()
-        .filter(|c| !c.is_control())
+        .filter(|c| !c.is_control() && !is_bidi_mark(*c))
         .take(max_chars)
         .collect();
     let text = text.trim().to_string();
@@ -285,6 +292,26 @@ mod tests {
             parse_status(&packet(json!({"missed": {"callId": "9"}}))),
             None
         );
+    }
+
+    #[test]
+    fn bidi_marks_are_stripped_from_names_and_numbers() {
+        let status = parse_status(&packet(json!({
+            "calls": [{
+                "callId": "1", "state": "ringing", "incoming": true,
+                "contactName": "\u{2068}Mara\u{2069}",
+                "number": "\u{202A}+1 555 0100\u{202C}\u{200E}"
+            }]
+        })))
+        .unwrap()
+        .unwrap();
+        let call = status.primary();
+        assert_eq!(call.contact_name.as_deref(), Some("Mara"));
+        assert_eq!(call.number.as_deref(), Some("+1 555 0100"));
+        let missed = parse_missed(&packet(
+            json!({"missed": {"callId": "2", "number": "\u{200F}112"}}),
+        ));
+        assert_eq!(missed.unwrap().number.as_deref(), Some("112"));
     }
 
     #[test]

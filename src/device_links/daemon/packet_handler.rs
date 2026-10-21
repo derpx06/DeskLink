@@ -706,6 +706,13 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             if let Some(status) = calls::parse_status(&packet) {
                 let in_call = update_call_status(devices, device_id, status);
                 calls::hold_media(device_id, in_call);
+                // The card, the bar and the notification follow within a frame.
+                push_event(
+                    events,
+                    DaemonEvent::CallChanged {
+                        device_id: device_id.clone(),
+                    },
+                );
             } else if let Some(missed) = calls::parse_missed(&packet) {
                 push_event(
                     events,

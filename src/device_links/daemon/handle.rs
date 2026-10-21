@@ -37,6 +37,8 @@ pub enum DaemonEvent {
         caller: Option<String>,
         number: Option<String>,
     },
+    /// The phone's calls changed (a snapshot arrived): shown at once.
+    CallChanged { device_id: String },
     /// The phone's camera stopped or could not start, in the user's words.
     CameraNotice { device_id: String, message: String },
     /// The phone refused a call request, in the user's words.

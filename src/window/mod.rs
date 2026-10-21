@@ -541,6 +541,8 @@ impl DesklinkWindow {
         }
         self.imp().daemon.replace(Some(daemon));
         self.refresh_devices();
+        // Events (a call ringing, a ping) refresh at once, not at the tick.
+        crate::device_links::daemon::state::set_ui_wake(refresh_open_windows);
 
         let weak = self.downgrade();
         glib::timeout_add_seconds_local(1, move || {
@@ -654,6 +656,8 @@ impl DesklinkWindow {
                 } => calls::missed(self, &device_id, &device_name, caller, number),
                 DaemonEvent::CallRefused { message } => self.show_feature_toast(&message),
                 DaemonEvent::CameraNotice { message, .. } => self.show_feature_toast(&message),
+                // Handled by this refresh itself (the call card and notification).
+                DaemonEvent::CallChanged { .. } => {}
             }
         }
 
@@ -1213,6 +1217,15 @@ enum QuickAction {
     Ping,
     /// Send this computer's clipboard text to the phone now.
     Clipboard,
+}
+
+/// Refreshes every open DeskLink window soon (on the main loop).
+fn refresh_open_windows() {
+    for window in gtk::Window::list_toplevels() {
+        if let Ok(window) = window.downcast::<DesklinkWindow>() {
+            window.refresh_soon();
+        }
+    }
 }
 
 /// Clears the re-entrancy flag however `refresh_devices` exits.

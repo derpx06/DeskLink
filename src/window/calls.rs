@@ -286,9 +286,20 @@ pub(super) fn notify(win: &DesklinkWindow, devices: &[DeviceView]) {
             Some((device, call))
         })
         .collect();
+    // Keyed by what it says too: the caller's name often arrives a moment
+    // after the ring, and the notification must then say who it is.
+    let key = |device: &DeviceView, call: &PhoneCall| {
+        format!(
+            "{}:{}:{}:{}",
+            device.id,
+            call.call_id,
+            call.caller(),
+            call.number.as_deref().unwrap_or_default()
+        )
+    };
     let keys: std::collections::HashSet<String> = ringing
         .iter()
-        .map(|(device, call)| format!("{}:{}", device.id, call.call_id))
+        .map(|(device, call)| key(device, call))
         .collect();
     let ended: Vec<String> = imp
         .notified_calls
@@ -305,8 +316,7 @@ pub(super) fn notify(win: &DesklinkWindow, devices: &[DeviceView]) {
     }
     let banner_elsewhere = crate::shell_dbus::client_handles("calls");
     for (device, call) in ringing {
-        let key = format!("{}:{}", device.id, call.call_id);
-        if !imp.notified_calls.borrow_mut().insert(key) || banner_elsewhere {
+        if !imp.notified_calls.borrow_mut().insert(key(device, call)) || banner_elsewhere {
             continue;
         }
         let notification = gio::Notification::new(&call.caller());

@@ -246,6 +246,33 @@ pub(crate) fn push_event(events: &Arc<Mutex<Vec<DaemonEvent>>>, event: DaemonEve
             events.drain(..excess);
         }
     }
+    wake_ui();
+}
+
+/// What the window registers to be refreshed at once (see [`wake_ui`]).
+static UI_WAKE: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
+
+/// Called once by the window: `refresh` runs on the main loop when an
+/// event arrives.
+pub(crate) fn set_ui_wake(refresh: fn()) {
+    let _ = UI_WAKE.set(refresh);
+}
+
+/// Has the window handle an event now instead of at its next 1 s tick, so a
+/// ringing call (or a ping) shows within a frame. Coalesced: one refresh per
+/// burst.
+fn wake_ui() {
+    static PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(refresh) = UI_WAKE.get().copied() else {
+        return;
+    };
+    if PENDING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    gtk::glib::MainContext::default().invoke(move || {
+        PENDING.store(false, std::sync::atomic::Ordering::Release);
+        refresh();
+    });
 }
 
 pub(super) fn update_media_from_packet(
