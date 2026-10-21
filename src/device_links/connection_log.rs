@@ -133,6 +133,47 @@ pub fn record_with_path(device_id: &str, event: ConnectionEvent, path: Option<&s
     write_entry(device_id, event, path, None);
 }
 
+/// The devices last logged as connected (feature-ready).
+static READY: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+
+/// Whether a readiness change is news: `ready` differs from what was last
+/// logged for `device_id`. Updates the record.
+fn ready_edge(
+    logged: &mut std::collections::HashSet<String>,
+    device_id: &str,
+    ready: bool,
+) -> bool {
+    if ready {
+        logged.insert(device_id.to_string())
+    } else {
+        logged.remove(device_id)
+    }
+}
+
+/// Logs `Connected`/`Disconnected` on a feature-ready edge. Called where the
+/// transition happens — the handover reaching feature-ready, a peer being
+/// cleared or replaced — so a sub-second rebuild is logged too; the 1 Hz
+/// reconcile only catches what those missed.
+pub fn note_ready(device_id: &str, ready: bool) {
+    let news = READY.lock().is_ok_and(|mut logged| {
+        ready_edge(
+            logged.get_or_insert_with(Default::default),
+            device_id,
+            ready,
+        )
+    });
+    if news {
+        record(
+            device_id,
+            if ready {
+                ConnectionEvent::Connected
+            } else {
+                ConnectionEvent::Disconnected
+            },
+        );
+    }
+}
+
 /// Records `event` with what changed or why.
 pub fn record_detail(device_id: &str, event: ConnectionEvent, detail: &str) {
     write_entry(device_id, event, None, Some(detail));
@@ -344,6 +385,19 @@ mod tests {
         assert_eq!(text.lines().count(), 2);
         assert!(text.contains("\"screen-control-started\""));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_rebuild_is_logged_once_each_way() {
+        let mut logged = std::collections::HashSet::new();
+        assert!(ready_edge(&mut logged, "phone", true), "connected");
+        assert!(!ready_edge(&mut logged, "phone", true), "no repeat");
+        assert!(ready_edge(&mut logged, "phone", false), "peer cleared");
+        assert!(
+            !ready_edge(&mut logged, "phone", false),
+            "reconcile repeats nothing"
+        );
+        assert!(ready_edge(&mut logged, "phone", true), "rebuilt");
     }
 
     #[test]

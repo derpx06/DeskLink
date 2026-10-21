@@ -177,15 +177,24 @@ impl Page {
             return;
         }
         let notifications = &device.notifications;
-        self.count.set_label(&match notifications.len() {
+        let mut count = match notifications.len() {
             0 => "None".to_string(),
             count => format!("{count} new"),
-        });
+        };
+        if let Some(seen) = super::last_seen_words(device) {
+            count.push_str(&format!(" · {seen}"));
+        }
+        self.count.set_label(&count);
         self.empty.set_visible(notifications.is_empty());
+        // Dismiss, reply and actions go to the phone: none while the link
+        // is down (the list is what it last reported).
+        let ready = device.feature_transport_ready;
+        self.list.set_sensitive(ready);
         self.clear.set_sensitive(
-            notifications
-                .iter()
-                .any(|notification| notification.is_clearable),
+            ready
+                && notifications
+                    .iter()
+                    .any(|notification| notification.is_clearable),
         );
 
         let mut cards = self.cards.borrow_mut();

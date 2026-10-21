@@ -735,6 +735,13 @@ impl DeviceManager {
             if session.pairing.state != crate::device_links::pairing::PairState::Paired {
                 return Err(SessionError::NotPaired);
             }
+            if session
+                .webrtc_handover
+                .as_ref()
+                .is_some_and(HandoverRuntime::features_ready)
+            {
+                crate::device_links::connection_log::note_ready(&session.device_id, false);
+            }
             let replaced = session.active_webrtc.replace(Arc::new(peer));
             session.transfer_manager = Some(transfer_manager);
             session.webrtc_handover = Some(HandoverRuntime::new(attempt_id.clone(), wire_binding));

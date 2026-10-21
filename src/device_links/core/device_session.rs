@@ -144,6 +144,13 @@ impl DeviceSession {
     /// handover attempt behind: a later re-pair would otherwise see a peer as
     /// already installed and skip negotiation.
     pub fn clear_webrtc_state(&mut self) -> Option<Arc<DesktopWebRtcPeer>> {
+        if self
+            .webrtc_handover
+            .as_ref()
+            .is_some_and(HandoverRuntime::features_ready)
+        {
+            crate::device_links::connection_log::note_ready(&self.device_id, false);
+        }
         // Not `pending_features`: a rebuild must not lose what the user sent
         // while the peer was down. Unpair clears it in `revoke_pairing`.
         self.webrtc_attempt_id = None;

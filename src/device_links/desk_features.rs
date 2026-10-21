@@ -153,11 +153,11 @@ pub(crate) fn on_feature_ready(device_id: &str) {
     run_later(move || {
         let settings = super::config::app_settings();
         send(&device_id, &settings_packet(&settings, &device_id));
-        // Commands only to a phone that may run them; one that still has a
-        // password to prove asks again after proving it.
-        if terminal_gate(&device_id).is_ok() {
-            send(&device_id, &command_list_packet(&settings.run_commands));
-        }
+        // The list, or why not: always answered.
+        send(
+            &device_id,
+            &command_state_packet(terminal_gate(&device_id), &settings.run_commands),
+        );
         super::mpris::forget_art_sent(&device_id);
         super::mpris::send_state_to(&device_id);
     });
@@ -175,6 +175,7 @@ pub(crate) fn settings_packet(settings: &AppSettings, device_id: &str) -> Networ
     packet.set("relay", settings.relay_wanted());
     packet.set("commandAlerts", settings.alerts_commands_to(device_id));
     packet.set("unlockNearby", settings.unlocks_from(device_id));
+    packet.set("sessionPasswordSet", settings.session_password.is_some());
     packet
 }
 
@@ -335,15 +336,38 @@ pub(crate) fn command_list_packet(commands: &[RunCommand]) -> NetworkPacket {
     packet
 }
 
-/// Sends the desk's commands (after an edit) to every connected phone that
-/// may run them.
-pub(crate) fn push_command_list() {
-    let commands = super::config::app_settings().run_commands;
-    for device_id in ready_devices() {
-        if terminal_gate(&device_id).is_ok() {
-            send(&device_id, &command_list_packet(&commands));
+/// What a phone is told about the desk's commands: the list when it may
+/// run them, else `{error}` (`terminal-off`, `locked`) — never nothing, so a
+/// phone never keeps a list it may no longer use.
+pub(crate) fn command_state_packet(
+    gate: Result<(), &'static str>,
+    commands: &[RunCommand],
+) -> NetworkPacket {
+    match gate {
+        Ok(()) => command_list_packet(commands),
+        Err(code) => {
+            let mut refused = NetworkPacket::new(PACKET_TYPE_RUNCOMMAND);
+            refused.set("error", code);
+            refused
         }
     }
+}
+
+/// Tells every connected phone the desk's commands, or why not: after an
+/// edit, a Terminal Access change, or the session password set or removed.
+pub(crate) fn push_command_list() {
+    for device_id in ready_devices() {
+        push_command_list_to(&device_id);
+    }
+}
+
+/// [`push_command_list`] for one phone (it just proved the password).
+pub(crate) fn push_command_list_to(device_id: &str) {
+    let commands = super::config::app_settings().run_commands;
+    send(
+        device_id,
+        &command_state_packet(terminal_gate(device_id), &commands),
+    );
 }
 
 /// What a `desklink.runcommand.request` gets: a reply (the list, or why
@@ -353,10 +377,8 @@ fn runcommand_reply(
     commands: &[RunCommand],
     packet: &NetworkPacket,
 ) -> (Option<NetworkPacket>, Option<RunCommand>) {
-    if let Err(code) = gate {
-        let mut refused = NetworkPacket::new(PACKET_TYPE_RUNCOMMAND);
-        refused.set("error", code);
-        return (Some(refused), None);
+    if gate.is_err() {
+        return (Some(command_state_packet(gate, commands)), None);
     }
     let list = packet
         .get_bool("requestCommandList")
@@ -577,6 +599,7 @@ mod tests {
             "relay",
             "commandAlerts",
             "unlockNearby",
+            "sessionPasswordSet",
         ] {
             assert!(packet.body.contains_key(key), "{key}");
         }
@@ -715,6 +738,35 @@ mod tests {
         let (reply, run) = runcommand_reply(gate(true, true), &commands, &packet);
         assert!(reply.unwrap().body.contains_key("commandList"));
         assert_eq!(run.map(|command| command.name), Some("Deploy".to_string()));
+    }
+
+    #[test]
+    fn a_phone_always_hears_the_commands_or_why_not() {
+        let commands = [RunCommand {
+            id: "a1".into(),
+            name: "Deploy".into(),
+            command: "make deploy".into(),
+        }];
+        let allowed = command_state_packet(gate(true, true), &commands);
+        assert!(allowed.body.contains_key("commandList"));
+        assert!(!allowed.body.contains_key("error"));
+        for (access, unlocked, code) in [(false, true, "terminal-off"), (true, false, "locked")] {
+            let refused = command_state_packet(gate(access, unlocked), &commands);
+            assert_eq!(refused.packet_type, "desklink.runcommand");
+            assert_eq!(refused.get_str("error"), Some(code));
+            assert!(!refused.body.contains_key("commandList"));
+        }
+        let mut settings = AppSettings::default();
+        assert_eq!(
+            settings_packet(&settings, "phone").get_bool("sessionPasswordSet"),
+            Some(false)
+        );
+        settings.session_password =
+            Some(crate::device_links::session_lock::hash_password("secret").unwrap());
+        assert_eq!(
+            settings_packet(&settings, "phone").get_bool("sessionPasswordSet"),
+            Some(true)
+        );
     }
 
     #[test]

@@ -115,8 +115,12 @@ fn shell_device(device: &DeviceView, settings: &AppSettings) -> ShellDevice {
             DeviceStatus::Discovered | DeviceStatus::Unreachable
         ),
         ready: device.feature_transport_ready,
-        battery: battery.map_or(-1, |battery| battery.current_charge.clamp(0, 100) as i32),
-        charging: battery.is_some_and(|battery| battery.is_charging),
+        // Only a live reading: a stale one would read as current in the top bar.
+        battery: battery
+            .filter(|_| device.feature_transport_ready)
+            .map_or(-1, |battery| battery.current_charge.clamp(0, 100) as i32),
+        charging: device.feature_transport_ready
+            && battery.is_some_and(|battery| battery.is_charging),
         path: device.connection_path.clone().unwrap_or_default(),
         screen: match device.desktop_session {
             DesktopSession::None => "",

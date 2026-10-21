@@ -62,6 +62,10 @@ pub struct DeviceNotification {
     pub is_clearable: bool,
     pub request_reply_id: Option<String>,
     pub actions: Vec<String>,
+    /// Sent again on a resync (`silent: true`): shown in the list, never
+    /// popped up.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub silent: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,6 +125,11 @@ pub struct DeviceView {
     /// The selected ICE pair's round-trip time, in milliseconds, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<u32>,
+    /// When the feature link was last lost (Unix seconds), while it stays
+    /// lost: the phone-owned caches (battery, media, notifications) are then
+    /// stale — kept, shown as "last seen", never acted on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen: Option<u64>,
     pub verification_key: Option<String>,
     pub last_error: Option<String>,
     pub media_status: Option<MediaStatus>,
@@ -162,6 +171,7 @@ impl DeviceView {
             desktop_session: DesktopSession::None,
             connection_path: None,
             rtt_ms: None,
+            last_seen: None,
             verification_key: None,
             last_error: None,
             media_status: None,

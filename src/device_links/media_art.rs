@@ -3,7 +3,8 @@
 //! (`albumArtData`, base64) with a stable id (`albumArtId`) the phone caches.
 //!
 //! Only `file://` and `http(s)://` are read: the URL comes from whatever
-//! player is running. HTTP goes through GIO (gvfs), bounded by
+//! player is running. HTTP goes through GStreamer's `souphttpsrc` (already
+//! required for the screen share; nothing extra to install), bounded by
 //! [`FETCH_TIMEOUT`]; every source is capped at [`MAX_SOURCE_BYTES`].
 
 use std::collections::VecDeque;
@@ -87,39 +88,104 @@ pub(crate) fn art_for(url: &str, ready: impl FnOnce() + Send + 'static) -> Optio
     None
 }
 
-/// Reads `url` through GIO: at most [`MAX_SOURCE_BYTES`], within
+/// Reads `url`: at most [`MAX_SOURCE_BYTES`], an http(s) one within
 /// [`FETCH_TIMEOUT`].
 fn read_source(url: &str) -> Result<Vec<u8>, String> {
-    let cancel = gio::Cancellable::new();
-    {
-        let cancel = cancel.clone();
-        let _ = std::thread::Builder::new()
-            .name("desklink-album-art-timeout".into())
-            .spawn(move || {
-                std::thread::sleep(FETCH_TIMEOUT);
-                cancel.cancel();
-            });
+    if url.to_ascii_lowercase().starts_with("file://") {
+        let path = gio::File::for_uri(url).path().ok_or("not a local file")?;
+        let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+        return read_capped(file);
     }
-    let stream = gio::File::for_uri(url)
-        .read(Some(&cancel))
-        .map_err(|error| error.to_string())?;
-    read_capped(stream.upcast_ref(), &cancel)
+    fetch_http(url)
 }
 
-/// Everything in `stream`, or an error once it passes [`MAX_SOURCE_BYTES`].
-fn read_capped(stream: &gio::InputStream, cancel: &gio::Cancellable) -> Result<Vec<u8>, String> {
+/// Everything `source` holds, or an error past [`MAX_SOURCE_BYTES`].
+fn read_capped(source: impl std::io::Read) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    let mut buffer = vec![0u8; 64 * 1024];
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(source, MAX_SOURCE_BYTES as u64 + 1),
+        &mut bytes,
+    )
+    .map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_SOURCE_BYTES {
+        return Err("album art is larger than 2 MB".to_string());
+    }
+    Ok(bytes)
+}
+
+/// Fetches an http(s) URL with `souphttpsrc ! fakesink`, collecting the
+/// buffers; gives up past the size cap or the deadline.
+fn fetch_http(url: &str) -> Result<Vec<u8>, String> {
+    use gst::prelude::*;
+    gst::init().map_err(|error| error.to_string())?;
+    let source = gst::ElementFactory::make("souphttpsrc")
+        .property("location", url)
+        .property("timeout", FETCH_TIMEOUT.as_secs() as u32)
+        .build()
+        .map_err(|error| format!("souphttpsrc unavailable: {error}"))?;
+    let sink = gst::ElementFactory::make("fakesink")
+        .property("signal-handoffs", true)
+        .property("sync", false)
+        .build()
+        .map_err(|error| error.to_string())?;
+    let pipeline = gst::Pipeline::new();
+    pipeline
+        .add_many([&source, &sink])
+        .map_err(|error| error.to_string())?;
+    source.link(&sink).map_err(|error| error.to_string())?;
+    let bytes = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let too_big = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let (bytes, too_big) = (Arc::clone(&bytes), Arc::clone(&too_big));
+        sink.connect("handoff", false, move |values| {
+            let buffer = values
+                .get(1)
+                .and_then(|value| value.get::<gst::Buffer>().ok());
+            if let (Some(buffer), Ok(mut bytes)) = (buffer, bytes.lock()) {
+                if let Ok(map) = buffer.map_readable() {
+                    if bytes.len() + map.len() > MAX_SOURCE_BYTES {
+                        too_big.store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        bytes.extend_from_slice(&map);
+                    }
+                }
+            }
+            None
+        });
+    }
+    let finish = |result: Result<Vec<u8>, String>| {
+        let _ = pipeline.set_state(gst::State::Null);
+        result
+    };
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|error| error.to_string())?;
+    let bus = pipeline.bus().ok_or("no bus")?;
+    let deadline = std::time::Instant::now() + FETCH_TIMEOUT;
     loop {
-        let read = stream
-            .read(&mut buffer[..], Some(cancel))
-            .map_err(|error| error.to_string())?;
-        if read == 0 {
-            return Ok(bytes);
+        if too_big.load(std::sync::atomic::Ordering::Relaxed) {
+            return finish(Err("album art is larger than 2 MB".to_string()));
         }
-        bytes.extend_from_slice(&buffer[..read]);
-        if bytes.len() > MAX_SOURCE_BYTES {
-            return Err("album art is larger than 2 MB".to_string());
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return finish(Err("album art took longer than 3 s".to_string()));
+        }
+        let waited = gst::ClockTime::from_mseconds(left.as_millis().min(100) as u64);
+        match bus.timed_pop_filtered(waited, &[gst::MessageType::Eos, gst::MessageType::Error]) {
+            Some(message) => match message.view() {
+                gst::MessageView::Eos(_) if too_big.load(std::sync::atomic::Ordering::Relaxed) => {
+                    return finish(Err("album art is larger than 2 MB".to_string()));
+                }
+                gst::MessageView::Eos(_) => {
+                    let collected = std::mem::take(&mut *bytes.lock().map_err(|_| "poisoned")?);
+                    return finish(Ok(collected));
+                }
+                gst::MessageView::Error(error) => {
+                    return finish(Err(error.error().to_string()));
+                }
+                _ => {}
+            },
+            None => continue,
         }
     }
 }
@@ -241,17 +307,60 @@ mod tests {
         assert_eq!((decoded.width(), decoded.height()), (320, 240));
     }
 
+    /// One HTTP response from a local server, then the fetch result.
+    fn fetch_from(body: Vec<u8>, hang: bool) -> Result<Vec<u8>, String> {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!(
+            "http://127.0.0.1:{}/cover.jpg",
+            listener.local_addr().unwrap().port()
+        );
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            if hang {
+                std::thread::sleep(FETCH_TIMEOUT + Duration::from_secs(1));
+                return;
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+        });
+        let fetched = fetch_http(&url);
+        let _ = server.join();
+        fetched
+    }
+
+    #[test]
+    fn http_art_is_fetched_with_a_size_cap_and_a_deadline() {
+        if gst::init().is_err() || gst::ElementFactory::find("souphttpsrc").is_none() {
+            eprintln!("souphttpsrc not installed; skipping");
+            return;
+        }
+        assert_eq!(fetch_from(vec![9u8; 1000], false).unwrap(), vec![9u8; 1000]);
+        assert!(
+            fetch_from(vec![0u8; MAX_SOURCE_BYTES + 1], false).is_err(),
+            "over 2 MB"
+        );
+        let started = std::time::Instant::now();
+        assert!(
+            fetch_from(Vec::new(), true).is_err(),
+            "a server that never answers"
+        );
+        assert!(started.elapsed() < FETCH_TIMEOUT + Duration::from_secs(2));
+    }
+
     #[test]
     fn sources_past_two_megabytes_are_refused() {
-        let cancel = gio::Cancellable::new();
-        let small = gio::MemoryInputStream::from_bytes(&gtk::glib::Bytes::from(&[7u8; 1000][..]));
-        assert_eq!(
-            read_capped(small.upcast_ref(), &cancel).unwrap().len(),
-            1000
-        );
+        assert_eq!(read_capped(&[7u8; 1000][..]).unwrap().len(), 1000);
+        let exact = vec![0u8; MAX_SOURCE_BYTES];
+        assert_eq!(read_capped(&exact[..]).unwrap().len(), MAX_SOURCE_BYTES);
         let big = vec![0u8; MAX_SOURCE_BYTES + 1];
-        let big = gio::MemoryInputStream::from_bytes(&gtk::glib::Bytes::from(&big[..]));
-        assert!(read_capped(big.upcast_ref(), &cancel).is_err());
+        assert!(read_capped(&big[..]).is_err());
     }
 
     #[test]

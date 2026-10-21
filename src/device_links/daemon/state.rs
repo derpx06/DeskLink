@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::handle::DaemonEvent;
-use crate::device_links::connection_log::{self, ConnectionEvent};
+use crate::device_links::connection_log;
 use crate::device_links::core::DeviceConnection;
 use crate::device_links::device::{
     BatteryStatus, DeviceNotification, DeviceStatus, DeviceView, MediaStatus, SystemVolumeStatus,
@@ -52,8 +52,9 @@ pub(crate) fn upsert_device(
                 // `false` was silently re-trusted by the next discovery beacon —
                 // and nothing else would lower it. `reconcile_connection_status`
                 // overrides this from the live session within a second anyway;
-                // this keeps the interim value honest rather than optimistic.
-                device.trusted = paired;
+                // `trusted` is not written here: a beacon is not an authority on
+                // pairing, and `reconcile_connection_status` projects it from
+                // the session (or the trust store) every second.
             })
             .or_insert_with(|| DeviceView::from_info(info, address, paired));
     }
@@ -103,16 +104,16 @@ pub(crate) fn reconcile_connection_status(
         let reachable = connection.is_some_and(|connection| connection.is_reachable());
         let ready = connection
             .is_some_and(|connection| connection.feature_transport_ready && connection.paired);
-        if ready != device.feature_transport_ready {
-            connection_log::remember_name(device_id, &device.name);
-            connection_log::record(
-                device_id,
-                if ready {
-                    ConnectionEvent::Connected
-                } else {
-                    ConnectionEvent::Disconnected
-                },
-            );
+        connection_log::remember_name(device_id, &device.name);
+        // The log is written where the transition happens; this only
+        // catches one those paths missed (and repeats nothing).
+        connection_log::note_ready(device_id, ready);
+        // Phone-owned caches (battery, media, notifications) go stale on
+        // the edge: kept, shown as "last seen", acted on only once ready.
+        if device.feature_transport_ready && !ready {
+            device.last_seen = Some(connection_log::now());
+        } else if ready {
+            device.last_seen = None;
         }
         device.feature_transport_ready = ready;
 
@@ -252,7 +253,11 @@ pub(super) fn update_media_from_packet(
             return;
         };
 
-        let mut media = device.media_status.clone().unwrap_or_else(|| MediaStatus {
+        // A `playerList` is the phone's whole media state: it replaces what
+        // was cached, so nothing from a player that is gone lingers.
+        let replace = packet.body.contains_key("playerList");
+        let cached = device.media_status.clone().filter(|_| !replace);
+        let mut media = cached.unwrap_or_else(|| MediaStatus {
             player: String::new(),
             player_list: Vec::new(),
             title: String::new(),
@@ -322,13 +327,36 @@ pub(super) fn update_battery_status(
 ) {
     if let Ok(mut devices) = devices.lock() {
         if let Some(device) = devices.get_mut(device_id) {
+            let charge = packet.get_i64("currentCharge").unwrap_or(-1).clamp(-1, 100);
+            // `-1`: the phone has no battery to report (or turned it off).
+            if charge < 0 {
+                device.battery_status = None;
+                return;
+            }
             device.battery_status = Some(BatteryStatus {
-                current_charge: packet.get_i64("currentCharge").unwrap_or(-1).clamp(-1, 100),
+                current_charge: charge,
                 is_charging: packet.get_bool("isCharging").unwrap_or(false),
                 battery_quantity: packet.get_i64("batteryQuantity"),
                 threshold_event: packet.get_i64("thresholdEvent"),
                 charge_time_remaining: packet.get_i64("chargeTimeRemaining").filter(|ms| *ms >= 0),
             });
+        }
+    }
+}
+
+/// `desklink.notification {snapshot: true, ids}`: the phone's full list of
+/// ids. Every cached notification not in it is dropped; the bodies follow.
+pub(super) fn replace_notifications(
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    device_id: &str,
+    packet: &NetworkPacket,
+) {
+    let ids = string_vec(packet.body.get("ids")).unwrap_or_default();
+    if let Ok(mut devices) = devices.lock() {
+        if let Some(device) = devices.get_mut(device_id) {
+            device
+                .notifications
+                .retain(|notification| ids.contains(&notification.id));
         }
     }
 }
@@ -362,6 +390,7 @@ pub(super) fn upsert_notification(
             .get_str("requestReplyId")
             .map(|value| sanitize_text(value, 240)),
         actions: string_vec(packet.body.get("actions")).unwrap_or_default(),
+        silent: packet.get_bool("silent").unwrap_or(false),
     };
 
     if let Ok(mut devices) = devices.lock() {
@@ -726,6 +755,123 @@ mod tests {
         packet.body.remove("chargeTimeRemaining");
         update_battery_status(&devices, &info.id, &packet);
         assert_eq!(remaining(&devices), None, "older phones omit it");
+    }
+
+    fn notification(id: &str) -> NetworkPacket {
+        let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_NOTIFICATION);
+        packet.set("id", id);
+        packet.set("appName", "Chat");
+        packet
+    }
+
+    #[test]
+    fn a_notification_snapshot_replaces_the_list_and_resyncs_are_silent() {
+        let (devices, info) = test_devices();
+        for id in ["n1", "n2", "n3"] {
+            upsert_notification(&devices, &info.id, &notification(id));
+        }
+        let mut snapshot =
+            NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_NOTIFICATION);
+        snapshot.set("snapshot", true);
+        snapshot.set("ids", json!(["n2", "n4"]));
+        replace_notifications(&devices, &info.id, &snapshot);
+        let ids = |devices: &Arc<Mutex<HashMap<String, DeviceView>>>| {
+            devices.lock().unwrap()[&info.id]
+                .notifications
+                .iter()
+                .map(|n| (n.id.clone(), n.silent))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&devices),
+            [("n2".to_string(), false)],
+            "dismissed while away"
+        );
+        let mut resent = notification("n4");
+        resent.set("silent", true);
+        upsert_notification(&devices, &info.id, &resent);
+        assert_eq!(
+            ids(&devices),
+            [("n4".to_string(), true), ("n2".to_string(), false)],
+            "a resync is kept, marked silent"
+        );
+        // An empty snapshot (the feature turned off) clears everything.
+        snapshot.set("ids", json!([]));
+        replace_notifications(&devices, &info.id, &snapshot);
+        assert!(ids(&devices).is_empty());
+    }
+
+    #[test]
+    fn a_player_list_replaces_the_phones_media() {
+        let (devices, info) = test_devices();
+        let mut first = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_MPRIS);
+        first.set("playerList", json!(["Spotify"]));
+        first.set("player", "Spotify");
+        first.set("title", "Old song");
+        first.set("isPlaying", true);
+        update_media_from_packet(&devices, &info.id, &first);
+        let mut replaced = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_MPRIS);
+        replaced.set("playerList", json!(["Podcasts"]));
+        update_media_from_packet(&devices, &info.id, &replaced);
+        let devices = devices.lock().unwrap();
+        let media = devices[&info.id].media_status.as_ref().unwrap();
+        assert_eq!(media.player, "Podcasts");
+        assert!(
+            media.title.is_empty() && !media.is_playing,
+            "nothing of Spotify lingers"
+        );
+    }
+
+    #[test]
+    fn a_battery_of_minus_one_clears_it() {
+        let (devices, info) = test_devices();
+        let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_BATTERY);
+        packet.set("currentCharge", 50);
+        update_battery_status(&devices, &info.id, &packet);
+        assert!(devices.lock().unwrap()[&info.id].battery_status.is_some());
+        packet.set("currentCharge", -1);
+        update_battery_status(&devices, &info.id, &packet);
+        assert!(devices.lock().unwrap()[&info.id].battery_status.is_none());
+    }
+
+    #[test]
+    fn losing_the_link_marks_the_phones_state_stale_once() {
+        let (devices, info) = test_devices();
+        let connection = |ready: bool| DeviceConnection {
+            device_id: info.id.clone(),
+            linked: ready,
+            paired: true,
+            feature_transport_ready: ready,
+        };
+        reconcile_connection_status(&devices, &[connection(true)]);
+        assert_eq!(devices.lock().unwrap()[&info.id].last_seen, None);
+        reconcile_connection_status(&devices, &[connection(false)]);
+        let seen = devices.lock().unwrap()[&info.id].last_seen;
+        assert!(seen.is_some(), "stale from the edge");
+        reconcile_connection_status(&devices, &[connection(false)]);
+        assert_eq!(
+            devices.lock().unwrap()[&info.id].last_seen,
+            seen,
+            "kept, not moved"
+        );
+        reconcile_connection_status(&devices, &[connection(true)]);
+        assert_eq!(
+            devices.lock().unwrap()[&info.id].last_seen,
+            None,
+            "live again"
+        );
+    }
+
+    #[test]
+    fn a_beacon_never_changes_trust() {
+        let (devices, info) = test_devices();
+        upsert_device(&devices, &info, "10.0.0.9".to_string(), false);
+        let devices = devices.lock().unwrap();
+        assert!(
+            devices[&info.id].trusted,
+            "only the session or trust store decides"
+        );
+        assert_eq!(devices[&info.id].address, "10.0.0.9");
     }
 
     #[test]

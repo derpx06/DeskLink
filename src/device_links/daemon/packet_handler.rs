@@ -8,8 +8,8 @@ use super::dispatcher::{PacketSource, SharedPacketDispatcher};
 use super::handle::DaemonEvent;
 use super::handshake::handle_disconnect;
 use super::state::{
-    push_event, remove_notification, update_battery_status, update_media_from_packet,
-    update_pair_state, update_volume_status, upsert_notification,
+    push_event, remove_notification, replace_notifications, update_battery_status,
+    update_media_from_packet, update_pair_state, update_volume_status, upsert_notification,
 };
 use crate::device_links::config::Config;
 use crate::device_links::core::{DeviceManager, ReadOutcome, SessionBinding};
@@ -611,7 +611,9 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             Ok(())
         }
         PACKET_TYPE_NOTIFICATION => {
-            if packet.get_bool("isCancel").unwrap_or(false) {
+            if packet.get_bool("snapshot").unwrap_or(false) {
+                replace_notifications(devices, device_id, &packet);
+            } else if packet.get_bool("isCancel").unwrap_or(false) {
                 let id = packet
                     .get_str("id")
                     .ok_or_else(|| "DeskLink WebRTC notification cancel has no id".to_string())?;

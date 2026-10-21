@@ -308,6 +308,10 @@ impl DaemonWorker {
         if !allowed {
             terminal_bridge::revoke_device(device_id);
         }
+        // The phone hears its commands, or the refusal, at once.
+        crate::device_links::desk_features::run_later(
+            crate::device_links::desk_features::push_command_list,
+        );
         if let Err(error) = saved {
             mark_error(
                 &self.devices,
@@ -332,6 +336,15 @@ impl DaemonWorker {
     }
 
     fn set_session_password(&self, password: Option<String>) {
+        self.set_session_password_only(password);
+        // Set: the phones must prove it before running commands; removed:
+        // they may again. Either way they are told.
+        crate::device_links::desk_features::run_later(
+            crate::device_links::desk_features::push_command_list,
+        );
+    }
+
+    fn set_session_password_only(&self, password: Option<String>) {
         use crate::device_links::session_lock;
         let hash = match password.as_deref().map(session_lock::hash_password) {
             Some(Err(error)) => {
@@ -384,17 +397,20 @@ impl DaemonWorker {
     }
 
     fn send_mpris_action(&self, device_id: &str, player: &str, action: &str) {
-        self.with_feature_transport(device_id, |transport| {
+        let sent = self.with_feature_transport(device_id, |transport| {
             let packet = build_mpris_action_packet(player, action);
             transport.send(&packet)
         });
-        // Shown at once; the phone's next state report confirms or corrects it.
+        // Shown at once, but only for a send that went: the phone's next
+        // state report confirms or corrects it.
         if let Ok(mut devices) = self.devices.lock() {
-            if let Some(media) = devices
+            if let Some(device) = devices
                 .get_mut(device_id)
-                .and_then(|device| device.media_status.as_mut())
+                .filter(|device| sent && device.feature_transport_ready)
             {
-                media.is_playing = optimistic_playing(media.is_playing, action);
+                if let Some(media) = device.media_status.as_mut() {
+                    media.is_playing = optimistic_playing(media.is_playing, action);
+                }
             }
         }
     }
@@ -471,21 +487,68 @@ impl DaemonWorker {
     /// Builds a generation-checked transport snapshot under the session lock,
     /// then runs the caller after the lock has been released.  Feature sends
     /// therefore cannot block link replacement, shutdown, or ICE recovery.
+    /// Runs a user's command against `device_id`'s feature transport.
+    /// Whether it was sent (or queued for the moment the link is ready).
+    ///
+    /// A command the user asked for is answered: "not connected" reaches the
+    /// UI instead of the log. Only a session being replaced underneath the
+    /// send stays quiet — that is recovery, and the device page shows it.
     fn with_feature_transport(
         &self,
         device_id: &str,
         f: impl FnOnce(&FeatureTransport) -> Result<(), String>,
-    ) {
+    ) -> bool {
         let result = FeatureTransport::for_device(&self.sessions, device_id)
             .and_then(|transport| f(&transport));
-        if let Err(error) = result {
-            if should_surface_send_error(&error) {
-                mark_error(&self.devices, device_id, error.clone());
-                push_error(&self.errors, error);
-            } else {
+        let Err(error) = result else {
+            return true;
+        };
+        match command_failure(&error) {
+            CommandFailure::Recovering => {
                 eprintln!("[DeskLink] Feature send deferred during WebRTC recovery: {error}");
             }
+            CommandFailure::NotConnected => {
+                let name = self
+                    .devices
+                    .lock()
+                    .ok()
+                    .and_then(|devices| devices.get(device_id).map(|device| device.name.clone()))
+                    .unwrap_or_else(|| "The phone".to_string());
+                push_error(
+                    &self.errors,
+                    format!("{name} is not connected. Try again once it is."),
+                );
+            }
+            CommandFailure::Failed => {
+                mark_error(&self.devices, device_id, error.clone());
+                push_error(&self.errors, error);
+            }
         }
+        false
+    }
+}
+
+/// How a failed user command is reported.
+#[derive(Debug, PartialEq, Eq)]
+enum CommandFailure {
+    /// The session is being replaced (or the WebRTC handover is in
+    /// progress): recovery, not a failure. Logged.
+    Recovering,
+    /// No link to the phone: the user is told so.
+    NotConnected,
+    /// Anything else, shown as it is.
+    Failed,
+}
+
+fn command_failure(error: &str) -> CommandFailure {
+    if error.contains("replaced by a newer session generation")
+        || error.contains("Stale DeskLink session")
+    {
+        CommandFailure::Recovering
+    } else if !should_surface_send_error(error) {
+        CommandFailure::NotConnected
+    } else {
+        CommandFailure::Failed
     }
 }
 
@@ -643,6 +706,26 @@ fn optimistic_playing(playing: bool, action: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_command_is_reported_and_recovery_is_not() {
+        assert_eq!(
+            command_failure("Device is not connected"),
+            CommandFailure::NotConnected
+        );
+        assert_eq!(
+            command_failure("Session link is closed"),
+            CommandFailure::NotConnected
+        );
+        assert_eq!(
+            command_failure("Binding was replaced by a newer session generation"),
+            CommandFailure::Recovering
+        );
+        assert_eq!(
+            command_failure("Could not encode the packet"),
+            CommandFailure::Failed
+        );
+    }
 
     #[test]
     fn play_pause_flips_at_once_and_other_actions_do_not() {

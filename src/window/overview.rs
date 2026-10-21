@@ -207,7 +207,12 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
             &format!("{}%", battery.current_charge),
             &["mono", "battery-percent"],
         ));
-        if battery.is_charging {
+        if let Some(seen) = super::last_seen_words(device) {
+            words.append(&text(
+                &format!(" · {seen}"),
+                &["text-dim", "caption-strong"],
+            ));
+        } else if battery.is_charging {
             words.append(&text(
                 &charging_words(battery.charge_time_remaining),
                 &["text-dim", "caption-strong"],
@@ -425,6 +430,10 @@ fn link_to_send(typed: &str) -> Option<String> {
 
 /// The phone's music while it plays: track, progress and controls.
 fn now_playing_bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Box> {
+    // Not while the link is down: what the phone last said is stale.
+    if !device.feature_transport_ready {
+        return None;
+    }
     // Paused too: hiding the bar on Pause left no button to play again.
     let media = device
         .media_status
@@ -991,11 +1000,14 @@ pub(super) fn clipboard_switch(daemon: &DaemonHandle, on: bool) -> gtk::Switch {
 
 fn notifications_card(device: &DeviceView) -> gtk::Box {
     let shown = crate::device_links::config::app_settings().shows_notifications(&device.id);
-    let words = match (shown, device.notifications.len()) {
+    let mut words = match (shown, device.notifications.len()) {
         (false, _) => "Hidden on this computer".to_string(),
         (true, 0) => "None".to_string(),
         (true, count) => format!("{count} new"),
     };
+    if let Some(seen) = super::last_seen_words(device).filter(|_| shown) {
+        words.push_str(&format!(" · {seen}"));
+    }
     let bottom: gtk::Widget = match device.notifications.first().filter(|_| shown) {
         Some(newest) => {
             let row = gtk::Box::builder().spacing(12).build();
@@ -1018,6 +1030,8 @@ fn notifications_card(device: &DeviceView) -> gtk::Box {
             row.append(&words);
             if newest.request_reply_id.is_some() {
                 let reply = icon_button("mail-reply-sender-symbolic", "Reply", &["soft-button"]);
+                // Replies go to the phone: only while it is connected.
+                reply.set_sensitive(device.feature_transport_ready);
                 let id = newest.id.clone();
                 reply.connect_clicked(move |button| {
                     if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {

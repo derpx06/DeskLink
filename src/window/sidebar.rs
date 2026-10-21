@@ -221,7 +221,12 @@ impl Sidebar {
             !crate::device_links::webrtc::terminal_bridge::attached_devices(&info.id).is_empty()
         });
         let shown = crate::device_links::config::app_settings().shows_notifications(&device.id);
-        let unread = if shown { device.notifications.len() } else { 0 };
+        // No badge for a stale list (the link is down).
+        let unread = if shown && device.feature_transport_ready {
+            device.notifications.len()
+        } else {
+            0
+        };
         let key = format!("{}\n{shared}\n{unread}\n{}", sessions.len(), device.trusted);
         if *self.rows_key.borrow() == key {
             return;

@@ -3185,6 +3185,7 @@ fn handle_peer_envelope(
                     binding.device_id
                 );
                 flush_pending_features(binding, sessions);
+                crate::device_links::connection_log::note_ready(&binding.device_id, true);
                 crate::device_links::desk_features::on_feature_ready(&binding.device_id);
                 // A send a lost connection interrupted carries on where the
                 // phone stopped; the phone does the same for its own sends.

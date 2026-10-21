@@ -950,8 +950,8 @@ impl DesklinkWindow {
                     .borrow_mut()
                     .insert(unique_id.clone());
                 // Hidden: marked as seen, so turning mirroring back on does
-                // not replay the backlog.
-                if !is_new || !shown {
+                // not replay the backlog. A resync (`silent`) never pops.
+                if !pops_up(is_new, shown, notification.silent) {
                     continue;
                 }
                 let title = if notification.title.is_empty() {
@@ -1187,6 +1187,26 @@ impl Drop for RefreshGuard<'_> {
 }
 
 /// "14:02" for `time`, or nothing.
+/// Whether a phone notification is announced here (toast or desktop
+/// notification): new, mirrored, and not a resync (`silent`).
+fn pops_up(is_new: bool, shown: bool, silent: bool) -> bool {
+    is_new && shown && !silent
+}
+
+/// "last seen 14:02" (or "last seen 3 Oct 14:02") while the phone's link is
+/// down and what it last reported is stale; `None` while it is live.
+pub(super) fn last_seen_words(device: &DeviceView) -> Option<String> {
+    if device.feature_transport_ready {
+        return None;
+    }
+    let seen = glib::DateTime::from_unix_local(device.last_seen? as i64).ok()?;
+    let today = glib::DateTime::now_local()
+        .ok()
+        .is_some_and(|now| now.ymd() == seen.ymd());
+    let format = if today { "%H:%M" } else { "%-d %b %H:%M" };
+    Some(format!("last seen {}", seen.format(format).ok()?))
+}
+
 fn clock_time(time: Option<glib::DateTime>) -> String {
     time.and_then(|time| time.format("%H:%M").ok())
         .map(|text| text.to_string())
@@ -1961,6 +1981,7 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
             is_clearable: true,
             request_reply_id: Some("r1".into()),
             actions: vec![],
+            silent: false,
         },
         DeviceNotification {
             id: "2".into(),
@@ -1971,6 +1992,7 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
             is_clearable: true,
             request_reply_id: None,
             actions: vec![],
+            silent: false,
         },
         DeviceNotification {
             id: "3".into(),
@@ -1981,6 +2003,7 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
             is_clearable: true,
             request_reply_id: None,
             actions: vec!["Snooze".into()],
+            silent: false,
         },
     ];
     match kind {
@@ -2024,6 +2047,17 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resynced_notifications_never_pop_up() {
+        assert!(pops_up(true, true, false));
+        assert!(
+            !pops_up(true, true, true),
+            "silent: a resync after reconnecting"
+        );
+        assert!(!pops_up(false, true, false), "already announced");
+        assert!(!pops_up(true, false, false), "hidden for this phone");
+    }
     use crate::device_links::device_info::DeviceInfo;
     use crate::device_links::packet::{PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_PING};
 

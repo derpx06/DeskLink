@@ -294,23 +294,26 @@ impl DaemonWorker {
                     if !has_transport {
                         continue;
                     }
+                    // Sent only over a ready link, never queued: the copy is
+                    // latest-wins, and one queued then dropped was marked sent
+                    // and never retried.
                     let result =
                         FeatureTransport::for_binding(&sessions, &binding).and_then(|transport| {
+                            if !transport.is_ready() {
+                                return Ok(false);
+                            }
                             let mut packet = NetworkPacket::new(PACKET_TYPE_CLIPBOARD);
                             packet.set("content", current_text.clone());
-                            transport.send(&packet)
+                            transport.send(&packet).map(|()| true)
                         });
+                    if let Ok(mut sent) = LAST_SENT_BY_DEVICE
+                        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+                        .lock()
+                    {
+                        remember_if_sent(&mut sent, &binding.device_id, &current_text, &result);
+                    }
                     match result {
-                            Ok(()) => {
-                                if let Ok(mut sent) = LAST_SENT_BY_DEVICE
-                                    .get_or_init(|| {
-                                        Mutex::new(std::collections::HashMap::new())
-                                    })
-                                    .lock()
-                                {
-                                    sent.insert(binding.device_id.clone(), current_text.clone());
-                                }
-                            }
+                            Ok(_) => {}
                             Err(error) if should_surface_send_error(&error) => {
                                 push_error(
                                     &errors,
@@ -329,9 +332,37 @@ impl DaemonWorker {
     }
 }
 
+/// Records `text` as sent to `device_id` only when it really went.
+fn remember_if_sent(
+    sent: &mut std::collections::HashMap<String, String>,
+    device_id: &str,
+    text: &str,
+    result: &Result<bool, String>,
+) {
+    if matches!(result, Ok(true)) {
+        sent.insert(device_id.to_string(), text.to_string());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_copy_counts_as_sent_only_after_a_real_send() {
+        let mut sent = std::collections::HashMap::new();
+        remember_if_sent(&mut sent, "phone", "a", &Ok(false));
+        assert!(sent.is_empty(), "not ready: tried again later");
+        remember_if_sent(
+            &mut sent,
+            "phone",
+            "a",
+            &Err("Session link is closed".into()),
+        );
+        assert!(sent.is_empty(), "failed: tried again later");
+        remember_if_sent(&mut sent, "phone", "a", &Ok(true));
+        assert_eq!(sent.get("phone").map(String::as_str), Some("a"));
+    }
 
     fn item(text: &str) -> ClipboardItem {
         ClipboardItem {
