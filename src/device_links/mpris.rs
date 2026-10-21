@@ -211,6 +211,20 @@ fn read_player(bus: &gio::DBusConnection, bus_name: &str) -> Option<Player> {
     })
 }
 
+/// `playerctld` re-exports whichever player is active: listing it as well
+/// showed every player twice, and acting through it raced the real one.
+const PROXIES: [&str; 1] = ["org.mpris.MediaPlayer2.playerctld"];
+
+/// The MPRIS players among the session bus's names, proxies left out.
+fn player_names(names: &[String]) -> Vec<&str> {
+    names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| name.starts_with("org.mpris.MediaPlayer2."))
+        .filter(|name| !PROXIES.contains(name))
+        .collect()
+}
+
 fn players(bus: &gio::DBusConnection) -> Vec<Player> {
     let Ok(reply) = bus.call_sync(
         Some("org.freedesktop.DBus"),
@@ -229,9 +243,8 @@ fn players(bus: &gio::DBusConnection) -> Vec<Player> {
         .child_value(0)
         .get::<Vec<String>>()
         .unwrap_or_default();
-    let mut players: Vec<Player> = names
-        .iter()
-        .filter(|name| name.starts_with("org.mpris.MediaPlayer2."))
+    let mut players: Vec<Player> = player_names(&names)
+        .into_iter()
         .filter_map(|name| read_player(bus, name))
         .collect();
     players.sort_by(|a, b| a.name.cmp(&b.name));
@@ -327,17 +340,38 @@ pub(crate) fn send_state_to(device_id: &str) {
 }
 
 /// A phone's `desklink.mpris.request` for the desk's players.
+/// The player a request acts on: the one it names; else (or when that one
+/// has gone) the one playing, else the one that played last, else the first.
+fn target<'a>(
+    players: &'a [Player],
+    requested: Option<&str>,
+    last_playing: &HashMap<String, Instant>,
+) -> Option<&'a Player> {
+    if let Some(name) = requested {
+        if let Some(player) = players.iter().find(|player| player.name == name) {
+            return Some(player);
+        }
+        debug_log!(
+            "[DeskLink] Media request for {name:?}, which is not running; using the active player"
+        );
+    }
+    active(players, last_playing).or(players.first())
+}
+
+/// A phone's `desklink.mpris.request` for the desk's players. After a
+/// change the phone gets the new state at once, and again a moment later:
+/// players apply some changes asynchronously.
 pub(crate) fn handle_request(device_id: &str, packet: &NetworkPacket) -> Result<(), String> {
     let bus = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
         .map_err(|error| error.to_string())?;
     let players = players(&bus);
-    let target = match packet.get_str("player") {
-        Some(name) => players.iter().find(|player| player.name == name),
-        None => players
-            .iter()
-            .find(|player| player.playing)
-            .or(players.first()),
-    };
+    let last_playing = SHOWN
+        .lock()
+        .ok()
+        .and_then(|shown| shown.as_ref().map(|shown| shown.last_playing.clone()))
+        .unwrap_or_default();
+    let target = target(&players, packet.get_str("player"), &last_playing);
+    let mut changed = false;
     if let (Some(player), Some(action)) = (target, packet.get_str("action")) {
         if !matches!(
             action,
@@ -346,9 +380,11 @@ pub(crate) fn handle_request(device_id: &str, packet: &NetworkPacket) -> Result<
             return Err(format!("Unknown media action {action}"));
         }
         call(&bus, &player.bus_name, action, None)?;
+        changed = true;
     }
     if let (Some(player), Some(offset_us)) = (target, packet.get_i64("Seek")) {
         call(&bus, &player.bus_name, "Seek", Some(offset_us.to_variant()))?;
+        changed = true;
     }
     if let (Some(player), Some(position_ms)) = (target, packet.get_i64("SetPosition")) {
         if let Some(track) = &player.track_id {
@@ -360,6 +396,7 @@ pub(crate) fn handle_request(device_id: &str, packet: &NetworkPacket) -> Result<
                 "SetPosition",
                 Some((path, position_ms.max(0).saturating_mul(1000)).to_variant()),
             )?;
+            changed = true;
         }
     }
     if let (Some(player), Some(volume)) = (target, packet.get_i64("setVolume")) {
@@ -376,16 +413,34 @@ pub(crate) fn handle_request(device_id: &str, packet: &NetworkPacket) -> Result<
             gio::Cancellable::NONE,
         )
         .map_err(|error| error.to_string())?;
+        changed = true;
     }
-    // Reply with the state when asked, or after a change so the phone shows
-    // it without waiting for the next read.
+    // The state now (asked for, or just changed), not at the next poll.
+    refresh_and_send(&bus, device_id);
+    if changed {
+        std::thread::sleep(SETTLE);
+        refresh_and_send(&bus, device_id);
+    }
+    Ok(())
+}
+
+/// How long after a change the state is read again.
+const SETTLE: Duration = Duration::from_millis(300);
+
+/// Reads the players now and sends `device_id` their state; the next poll
+/// tells the other phones.
+fn refresh_and_send(bus: &gio::DBusConnection, device_id: &str) {
+    let players = self::players(bus);
     if let Ok(mut shown) = SHOWN.lock() {
         let shown = shown.get_or_insert_with(Shown::default);
-        shown.players = self::players(&bus);
+        let now = Instant::now();
+        for player in players.iter().filter(|player| player.playing) {
+            shown.last_playing.insert(player.bus_name.clone(), now);
+        }
+        shown.players = players;
         shown.key = None;
     }
     send_state_to(device_id);
-    Ok(())
 }
 
 fn call(
@@ -426,6 +481,55 @@ mod tests {
             position_ms: 1000,
             ..Player::default()
         }
+    }
+
+    #[test]
+    fn the_playerctld_proxy_is_not_a_player() {
+        let names: Vec<String> = [
+            "org.freedesktop.DBus",
+            "org.mpris.MediaPlayer2.spotify",
+            "org.mpris.MediaPlayer2.playerctld",
+            "org.mpris.MediaPlayer2.firefox.instance_1_42",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert_eq!(
+            player_names(&names),
+            [
+                "org.mpris.MediaPlayer2.spotify",
+                "org.mpris.MediaPlayer2.firefox.instance_1_42"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_request_for_a_player_that_is_gone_goes_to_the_active_one() {
+        let players = [player("Spotify", false), player("Firefox", true)];
+        let none = HashMap::new();
+        let name = |found: Option<&Player>| found.map(|player| player.name.clone());
+        assert_eq!(
+            name(target(&players, Some("Spotify"), &none)),
+            Some("Spotify".into())
+        );
+        assert_eq!(
+            name(target(&players, Some("VLC"), &none)),
+            Some("Firefox".into()),
+            "playing"
+        );
+        assert_eq!(name(target(&players, None, &none)), Some("Firefox".into()));
+        let paused = [player("Spotify", false), player("Firefox", false)];
+        let mut last = HashMap::new();
+        last.insert("org.mpris.MediaPlayer2.Spotify".to_string(), Instant::now());
+        assert_eq!(
+            name(target(&paused, Some("VLC"), &last)),
+            Some("Spotify".into()),
+            "last active"
+        );
+        assert_eq!(
+            name(target(&paused, Some("VLC"), &HashMap::new())),
+            Some("Firefox".into())
+        );
+        assert!(target(&[], Some("VLC"), &none).is_none());
     }
 
     #[test]

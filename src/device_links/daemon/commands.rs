@@ -388,6 +388,15 @@ impl DaemonWorker {
             let packet = build_mpris_action_packet(player, action);
             transport.send(&packet)
         });
+        // Shown at once; the phone's next state report confirms or corrects it.
+        if let Ok(mut devices) = self.devices.lock() {
+            if let Some(media) = devices
+                .get_mut(device_id)
+                .and_then(|device| device.media_status.as_mut())
+            {
+                media.is_playing = optimistic_playing(media.is_playing, action);
+            }
+        }
     }
 
     fn request_mpris_status(&self, device_id: &str, player: Option<String>) {
@@ -620,9 +629,29 @@ fn lan_address() -> Option<std::net::IpAddr> {
     (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
 }
 
+/// What a play/pause action will make of `playing`, shown before the phone
+/// confirms it.
+fn optimistic_playing(playing: bool, action: &str) -> bool {
+    match action {
+        "PlayPause" => !playing,
+        "Play" => true,
+        "Pause" | "Stop" => false,
+        _ => playing,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn play_pause_flips_at_once_and_other_actions_do_not() {
+        assert!(!optimistic_playing(true, "PlayPause"));
+        assert!(optimistic_playing(false, "PlayPause"));
+        assert!(optimistic_playing(false, "Play"));
+        assert!(!optimistic_playing(true, "Pause"));
+        assert!(optimistic_playing(true, "Next"));
+    }
     use crate::device_links::packet::{
         PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_REPLY,
         PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_SHARE_REQUEST,

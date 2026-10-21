@@ -425,10 +425,11 @@ fn link_to_send(typed: &str) -> Option<String> {
 
 /// The phone's music while it plays: track, progress and controls.
 fn now_playing_bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Box> {
+    // Paused too: hiding the bar on Pause left no button to play again.
     let media = device
         .media_status
         .as_ref()
-        .filter(|media| media.is_playing)?;
+        .filter(|media| media.is_playing || !media.title.is_empty())?;
     let bar = gtk::Box::builder()
         .spacing(16)
         .css_classes(["dl-card", "now-playing"])
@@ -448,10 +449,15 @@ fn now_playing_bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Bo
         },
         &["heading"],
     ));
-    let source = if media.artist.is_empty() {
-        format!("playing on {}", device.name)
+    let state = if media.is_playing {
+        "playing"
     } else {
-        format!("{} · playing on {}", media.artist, device.name)
+        "paused"
+    };
+    let source = if media.artist.is_empty() {
+        format!("{state} on {}", device.name)
+    } else {
+        format!("{} · {state} on {}", media.artist, device.name)
     };
     words.append(&ellipsized(&source, &["caption", "text-dim"]));
     bar.append(&words);
@@ -476,7 +482,12 @@ fn now_playing_bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Bo
         progress.append(&text(&time(length), &["mono", "caption", "text-faint"]));
     }
     bar.append(&progress);
-    bar.append(&media_controls(daemon, device, &media.player, true));
+    bar.append(&media_controls(
+        daemon,
+        device,
+        &media.player,
+        media.is_playing,
+    ));
     Some(bar)
 }
 
