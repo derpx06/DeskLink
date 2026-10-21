@@ -11,7 +11,7 @@
 //! are made on a worker thread ([`crate::thumbnails`]).
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -109,6 +109,11 @@ pub(super) struct Page {
     history: gtk::FlowBox,
     empty: gtk::Label,
     history_key: RefCell<String>,
+    /// The presence check asked for last; a reply to an older one is
+    /// dropped. With it, the entries and device name it was asked for.
+    generation: Cell<u64>,
+    pending: RefCell<(Vec<LoggedFile>, String)>,
+    window: glib::WeakRef<DesklinkWindow>,
     /// The selected device: id and name.
     device: Rc<RefCell<(String, String)>>,
 }
@@ -137,6 +142,8 @@ fn add_card(grid: &gtk::FlowBox, card: &impl IsA<gtk::Widget>) {
 
 impl Page {
     pub(super) fn new(win: &DesklinkWindow) -> Self {
+        crate::thumbnails::set_delivery(deliver);
+        WINDOW.with(|window| window.replace(win.downgrade()));
         let zone = gtk::Box::builder()
             .spacing(16)
             .height_request(120)
@@ -265,6 +272,9 @@ impl Page {
             history,
             empty,
             history_key: RefCell::default(),
+            generation: Cell::new(0),
+            pending: RefCell::default(),
+            window: win.downgrade(),
             device,
         }
     }
@@ -274,7 +284,12 @@ impl Page {
         self.history_key.replace(String::new());
     }
 
-    pub(super) fn update(&self, win: &DesklinkWindow, _daemon: &DaemonHandle, device: &DeviceView) {
+    pub(super) fn update(
+        &self,
+        _win: &DesklinkWindow,
+        _daemon: &DaemonHandle,
+        device: &DeviceView,
+    ) {
         self.device
             .replace((device.id.clone(), device.name.clone()));
         self.zone_title
@@ -283,40 +298,61 @@ impl Page {
         self.choose
             .set_tooltip_text(super::unavailable_reason(device).as_deref());
 
-        // The 50 newest are listed, and only they decide a redraw.
+        // The 50 newest are listed, and only they decide a redraw. Whether
+        // each is still there is asked of the worker (a stat on a network
+        // mount can hang), and the grid is drawn when it answers.
         let entries: Vec<_> = crate::device_links::transfer_log::recent()
             .into_iter()
             .filter(|entry| entry.device_id == device.id)
             .take(50)
             .collect();
-        let present: Vec<bool> = entries.iter().map(|entry| entry.path.is_file()).collect();
         let minute = super::clock_time(glib::DateTime::now_local().ok());
-        let key =
-            serde_json::to_string(&(&entries, &present, &device.name, minute)).unwrap_or_default();
+        let key = serde_json::to_string(&(&entries, &device.name, minute)).unwrap_or_default();
         if *self.history_key.borrow() == key {
             return;
         }
         self.history_key.replace(key);
+        let generation = self.generation.get() + 1;
+        self.generation.set(generation);
+        let paths = entries.iter().map(|entry| entry.path.clone()).collect();
+        self.pending.replace((entries, device.name.clone()));
+        crate::thumbnails::check_presence(generation, paths);
+    }
+
+    /// Draws the history once the worker says which files are still there.
+    fn draw(&self, generation: u64, files: &[crate::thumbnails::Presence]) {
+        let Some(win) = self.window.upgrade() else {
+            return;
+        };
+        if generation != self.generation.get() {
+            return;
+        }
+        let (entries, device) = self.pending.borrow().clone();
+        if files.len() != entries.len() {
+            return;
+        }
+        // Thumbnails kept in memory: only those still listed.
+        let keys: HashSet<&String> = files.iter().filter_map(|file| file.key.as_ref()).collect();
+        SHOWN.with(|shown| shown.borrow_mut().retain(|key, _| keys.contains(key)));
         self.history.remove_all();
         self.empty.set_visible(entries.is_empty());
         self.empty.set_label(&format!(
-            "Nothing sent to or received from {} in the last 30 days.",
-            device.name
+            "Nothing sent to or received from {device} in the last 30 days."
         ));
         // What the viewer pages through: the files still there.
         let viewable: Rc<Vec<LoggedFile>> = Rc::new(
             entries
                 .iter()
-                .zip(&present)
-                .filter(|(_, here)| **here)
+                .zip(files)
+                .filter(|(_, file)| file.exists)
                 .map(|(entry, _)| entry.clone())
                 .collect(),
         );
-        for (entry, here) in entries.iter().zip(&present) {
-            let card: gtk::Widget = if *here {
-                file_card(win, entry, &device.name, &viewable).upcast()
+        for (entry, file) in entries.iter().zip(files) {
+            let card: gtk::Widget = if file.exists {
+                file_card(&win, entry, file.key.as_deref(), &device, &viewable).upcast()
             } else {
-                missing_card(win, entry, &device.name).upcast()
+                missing_card(&win, entry, &device).upcast()
             };
             add_card(&self.history, &card);
         }
@@ -419,36 +455,98 @@ fn type_icon(name: &str) -> gtk::Box {
     icon
 }
 
+/// A card waiting for its thumbnail.
+type Waiter = (
+    glib::WeakRef<gtk::Overlay>,
+    glib::WeakRef<gtk::Box>,
+    String,
+    FileKind,
+);
+
 thread_local! {
     /// Thumbnails made this run, by cache key: a page redraw shows them at
-    /// once instead of loading them again.
+    /// once instead of loading them again. Pruned to the listed files.
     static SHOWN: RefCell<HashMap<String, (gtk::gdk::Texture, Option<Duration>)>> =
         RefCell::default();
+    /// Keys with no preview to be had: the typed icon, without asking again.
+    static FAILED: RefCell<HashSet<String>> = RefCell::default();
+    /// Cards waiting, by key. A key here has been asked for once already, so
+    /// a redraw while it is being made never queues it twice.
+    static WAITING: RefCell<HashMap<String, Vec<Waiter>>> = RefCell::default();
+    static WINDOW: RefCell<glib::WeakRef<DesklinkWindow>> = RefCell::default();
 }
 
-/// The memory key of `path` as it is now, if it is still there.
-fn memory_key(path: &std::path::Path) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    Some(crate::thumbnails::cache_key(
-        path,
-        meta.modified().ok()?,
-        meta.len(),
-    ))
+/// The thumbnail worker's replies, on the main thread.
+fn deliver(reply: crate::thumbnails::Reply) {
+    use crate::thumbnails::Reply;
+    match reply {
+        Reply::Presence { generation, files } => {
+            if let Some(window) = WINDOW.with(|window| window.borrow().upgrade()) {
+                if let Some(page) = window.imp().transfers.borrow().as_ref() {
+                    page.draw(generation, &files);
+                }
+            }
+        }
+        Reply::Thumbnail {
+            key,
+            texture,
+            duration,
+        } => {
+            SHOWN.with(|shown| {
+                shown
+                    .borrow_mut()
+                    .insert(key.clone(), (texture.clone(), duration))
+            });
+            for (overlay, shimmer, _, kind) in waiters(&key) {
+                if let Some(shimmer) = shimmer.upgrade() {
+                    overlay.remove_overlay(&shimmer);
+                }
+                show_thumbnail(&overlay, &texture, duration, kind);
+            }
+        }
+        Reply::Failed { key } => {
+            FAILED.with(|failed| failed.borrow_mut().insert(key.clone()));
+            for (overlay, shimmer, name, _) in waiters(&key) {
+                if let Some(shimmer) = shimmer.upgrade() {
+                    overlay.remove_overlay(&shimmer);
+                }
+                overlay.add_overlay(&type_icon(&name));
+            }
+        }
+    }
 }
 
-/// Shows `path`'s thumbnail in `overlay`: a shimmer now, the picture once a
+/// The cards still on screen that waited for `key`.
+fn waiters(key: &str) -> Vec<(gtk::Overlay, glib::WeakRef<gtk::Box>, String, FileKind)> {
+    WAITING
+        .with(|waiting| waiting.borrow_mut().remove(key))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(overlay, shimmer, name, kind)| {
+            Some((overlay.upgrade()?, shimmer, name, kind))
+        })
+        .collect()
+}
+
+/// Shows a thumbnail in `overlay`: a shimmer now, the picture once the
 /// worker has made it (or a typed icon if it cannot be).
-fn fill_preview(overlay: &gtk::Overlay, path: &std::path::Path, name: &str, kind: FileKind) {
-    if !matches!(kind, FileKind::Image | FileKind::Video) {
+fn fill_preview(
+    overlay: &gtk::Overlay,
+    key: Option<&str>,
+    path: &std::path::Path,
+    name: &str,
+    kind: FileKind,
+) {
+    let Some(key) = key.filter(|_| matches!(kind, FileKind::Image | FileKind::Video)) else {
         overlay.add_overlay(&type_icon(name));
         return;
-    }
-    let key = memory_key(path);
-    let known = key
-        .as_ref()
-        .and_then(|key| SHOWN.with(|shown| shown.borrow().get(key).cloned()));
-    if let Some((texture, duration)) = known {
+    };
+    if let Some((texture, duration)) = SHOWN.with(|shown| shown.borrow().get(key).cloned()) {
         show_thumbnail(overlay, &texture, duration, kind);
+        return;
+    }
+    if FAILED.with(|failed| failed.borrow().contains(key)) {
+        overlay.add_overlay(&type_icon(name));
         return;
     }
     let shimmer = gtk::Box::builder()
@@ -458,40 +556,20 @@ fn fill_preview(overlay: &gtk::Overlay, path: &std::path::Path, name: &str, kind
         .accessible_role(gtk::AccessibleRole::Presentation)
         .build();
     overlay.add_overlay(&shimmer);
-    let (overlay, shimmer, path, name) = (
-        overlay.downgrade(),
-        shimmer.downgrade(),
-        path.to_path_buf(),
-        name.to_string(),
-    );
-    glib::spawn_future_local(async move {
-        let made = {
-            let path = path.clone();
-            gio::spawn_blocking(move || {
-                crate::thumbnails::thumbnail(&path).map(|thumb| (thumb.texture, thumb.duration))
-            })
-            .await
-        };
-        let Some(overlay) = overlay.upgrade() else {
-            return;
-        };
-        if let Some(shimmer) = shimmer.upgrade() {
-            overlay.remove_overlay(&shimmer);
-        }
-        match made {
-            Ok(Ok((texture, duration))) => {
-                if let Some(key) = key {
-                    SHOWN.with(|shown| shown.borrow_mut().insert(key, (texture.clone(), duration)));
-                }
-                show_thumbnail(&overlay, &texture, duration, kind);
-            }
-            Ok(Err(error)) => {
-                debug_log!("[UI] No thumbnail for {}: {error}", path.display());
-                overlay.add_overlay(&type_icon(&name));
-            }
-            Err(_) => overlay.add_overlay(&type_icon(&name)),
-        }
+    let first = WAITING.with(|waiting| {
+        let mut waiting = waiting.borrow_mut();
+        let entry = waiting.entry(key.to_string()).or_default();
+        entry.push((
+            overlay.downgrade(),
+            shimmer.downgrade(),
+            name.to_string(),
+            kind,
+        ));
+        entry.len() == 1
     });
+    if first {
+        crate::thumbnails::request(key, path, kind);
+    }
 }
 
 /// The picture, and for a video a play badge and its length.
@@ -542,6 +620,7 @@ pub(super) fn clock(duration: Duration) -> String {
 fn file_card(
     win: &DesklinkWindow,
     entry: &LoggedFile,
+    key: Option<&str>,
     device: &str,
     viewable: &Rc<Vec<LoggedFile>>,
 ) -> gtk::Button {
@@ -550,7 +629,7 @@ fn file_card(
         .orientation(gtk::Orientation::Vertical)
         .build();
     let (preview, _) = preview_area();
-    fill_preview(&preview, &entry.path, &entry.name, kind);
+    fill_preview(&preview, key, &entry.path, &entry.name, kind);
     card.append(&preview);
     card.append(&card_words(entry, device));
     let button = gtk::Button::builder()

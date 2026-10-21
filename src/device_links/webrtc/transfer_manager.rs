@@ -1142,6 +1142,7 @@ impl WebRtcTransferManager {
                 &checkpoint.device_id,
                 &checkpoint.filename,
                 source,
+                checkpoint.total_size,
             );
         }
         Ok(vec![TransferEvent::Completed {

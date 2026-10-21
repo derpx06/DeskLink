@@ -52,22 +52,24 @@ fn log_path() -> Option<PathBuf> {
 
 /// Records a file received from `device_id`, now at `path`.
 pub fn record_received(device_id: &str, name: &str, path: &std::path::Path) {
-    record(device_id, name, path, true);
+    let size = std::fs::metadata(path).map_or(0, |meta| meta.len());
+    record(device_id, name, path, size, true);
 }
 
-/// Records a file at `path` sent to `device_id`.
-pub fn record_sent(device_id: &str, name: &str, path: &std::path::Path) {
-    record(device_id, name, path, false);
+/// Records a file at `path` sent to `device_id`: `size` bytes as sent (the
+/// file may have changed since).
+pub fn record_sent(device_id: &str, name: &str, path: &std::path::Path, size: u64) {
+    record(device_id, name, path, size, false);
 }
 
-fn record(device_id: &str, name: &str, path: &std::path::Path, incoming: bool) {
+fn record(device_id: &str, name: &str, path: &std::path::Path, size: u64, incoming: bool) {
     let entry = LoggedFile {
         ts: now(),
         device_id: device_id.to_string(),
         device_name: name_of(device_id),
         name: name.to_string(),
         path: path.to_path_buf(),
-        size: std::fs::metadata(path).map_or(0, |meta| meta.len()),
+        size,
         incoming,
     };
     if let Some(log) = log_path() {

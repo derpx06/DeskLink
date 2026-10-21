@@ -1701,7 +1701,12 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 .unwrap_or_default();
             if let Some(device) = device {
                 if verb == "fake-sent" {
-                    crate::device_links::transfer_log::record_sent(&device.id, &name, &path);
+                    crate::device_links::transfer_log::record_sent(
+                        &device.id,
+                        &name,
+                        &path,
+                        std::fs::metadata(&path).map_or(0, |meta| meta.len()),
+                    );
                 } else {
                     crate::device_links::transfer_log::record_received(&device.id, &name, &path);
                 }

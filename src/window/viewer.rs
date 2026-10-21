@@ -37,6 +37,8 @@ struct Viewer {
     next: gtk::Button,
     toasts: adw::ToastOverlay,
     state: RefCell<State>,
+    /// Bumped by every page turn: a decode for an earlier page is dropped.
+    shown: Rc<std::cell::Cell<u64>>,
 }
 
 thread_local! {
@@ -94,6 +96,7 @@ pub(super) fn show(win: &DesklinkWindow, items: &[LoggedFile], index: usize, dev
         previous: previous.clone(),
         next: next.clone(),
         toasts,
+        shown: Rc::default(),
         state: RefCell::new(State {
             items: items.to_vec(),
             index: index.min(items.len() - 1),
@@ -131,14 +134,19 @@ pub(super) fn show(win: &DesklinkWindow, items: &[LoggedFile], index: usize, dev
     }
 
     // Left/Right page; Space plays and pauses a video. Escape is the
-    // dialog's own.
+    // dialog's own. In the bubble phase, and never while a button or a
+    // slider (the video's seek bar) has focus: those keys are theirs.
     let keys = gtk::EventControllerKey::new();
-    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.set_propagation_phase(gtk::PropagationPhase::Bubble);
     let weak = Rc::downgrade(&viewer);
     keys.connect_key_pressed(move |_, key, _, _| {
         let Some(viewer) = weak.upgrade() else {
             return glib::Propagation::Proceed;
         };
+        let focus = viewer.dialog.root().and_then(|root| root.focus());
+        if focus.is_some_and(|focus| focus.is::<gtk::Button>() || focus.is::<gtk::Range>()) {
+            return glib::Propagation::Proceed;
+        }
         match key {
             gdk::Key::Left => viewer.step(-1),
             gdk::Key::Right => viewer.step(1),
@@ -249,6 +257,7 @@ impl Viewer {
             self.dialog.close();
             return;
         };
+        self.shown.set(self.shown.get() + 1);
         {
             let mut state = self.state.borrow_mut();
             if let Some(stream) = state.stream.take() {
@@ -312,21 +321,45 @@ impl Viewer {
             .build();
         self.area.append(&scroller);
         self.state.borrow_mut().picture = Some(picture.clone());
-        // Decoded on a worker: a large photo must not stall the window.
-        let (path, picture, spinner) =
-            (file.path.clone(), picture.downgrade(), spinner.downgrade());
-        let dialog = self.dialog.downgrade();
+        // Decoded on a worker: a large photo must not stall the window. Held
+        // back a moment, so paging quickly decodes only where it stops.
+        let (path, picture, spinner, area) = (
+            file.path.clone(),
+            picture.downgrade(),
+            spinner.downgrade(),
+            self.area.downgrade(),
+        );
+        let (shown, page) = (Rc::clone(&self.shown), self.shown.get());
         glib::spawn_future_local(async move {
+            glib::timeout_future(std::time::Duration::from_millis(150)).await;
+            if shown.get() != page {
+                return;
+            }
             let loaded = gio::spawn_blocking(move || gdk::Texture::from_filename(&path)).await;
+            if shown.get() != page {
+                return;
+            }
             if let Some(spinner) = spinner.upgrade() {
                 spinner.set_visible(false);
             }
-            let (Some(picture), Some(_dialog)) = (picture.upgrade(), dialog.upgrade()) else {
-                return;
-            };
-            match loaded {
-                Ok(Ok(texture)) => picture.set_paintable(Some(&texture)),
-                _ => picture.set_alternative_text(Some("This image could not be opened")),
+            match (loaded, picture.upgrade()) {
+                (Ok(Ok(texture)), Some(picture)) => picture.set_paintable(Some(&texture)),
+                (_, Some(_)) => {
+                    if let Some(area) = area.upgrade() {
+                        while let Some(child) = area.first_child() {
+                            area.remove(&child);
+                        }
+                        area.append(
+                            &adw::StatusPage::builder()
+                                .icon_name("image-missing-symbolic")
+                                .title("Can't open this image")
+                                .description("It may be damaged, or in a format this computer can't show. Try Open With….")
+                                .hexpand(true)
+                                .build(),
+                        );
+                    }
+                }
+                _ => {}
             }
         });
     }

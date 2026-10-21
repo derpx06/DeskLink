@@ -2,8 +2,10 @@
 //! each is, and a small picture of it — an image scaled down, or a video's
 //! frame at about one second with its length.
 //!
-//! [`thumbnail`] blocks (decoding, GStreamer) and is only ever run on a
-//! worker thread. Results are kept as PNGs under
+//! Everything that touches the files — checking they are still there,
+//! decoding, GStreamer — runs on one dedicated worker thread ([`request`],
+//! [`check_presence`]); replies come back on the main thread. Results are kept
+//! as PNGs under
 //! `$XDG_CACHE_HOME/desklink/thumbnails`, named by [`cache_key`], so a file is
 //! decoded once until it changes. [`kind_of`] and [`cache_key`] have no
 //! GTK in them and are unit-tested.
@@ -72,58 +74,260 @@ fn cache_dir() -> Option<PathBuf> {
     Some(dirs::cache_dir()?.join("desklink").join("thumbnails"))
 }
 
-/// A file's preview, ready to show.
-pub(crate) struct Thumbnail {
-    pub(crate) texture: gdk::Texture,
-    /// A video's length.
-    pub(crate) duration: Option<Duration>,
+/// How long one decode may take before the worker gives up on it and moves
+/// on. A file on a stalled network mount must not hold up every other card.
+const DECODE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What the worker hands back to the main thread.
+pub(crate) enum Reply {
+    /// A preview for the file with cache key `key`, and a video's length.
+    Thumbnail {
+        key: String,
+        texture: gdk::Texture,
+        duration: Option<Duration>,
+    },
+    /// No preview can be made (unreadable, unsupported, too slow): show the
+    /// typed icon. Remembered on disk, so it is not tried again.
+    Failed { key: String },
+    /// Which of a list's files are still there, and their cache keys.
+    Presence {
+        generation: u64,
+        files: Vec<Presence>,
+    },
 }
 
-/// The preview of the image or video at `path`, from the cache or made now.
-/// Blocks: call it from a worker thread.
-pub(crate) fn thumbnail(path: &Path) -> Result<Thumbnail, String> {
-    let meta = std::fs::metadata(path).map_err(|error| error.to_string())?;
-    let key = cache_key(
-        path,
-        meta.modified().map_err(|error| error.to_string())?,
-        meta.len(),
-    );
-    let dir = cache_dir().ok_or("No cache directory")?;
-    let (png, secs) = (
+/// One file of a presence check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Presence {
+    pub(crate) exists: bool,
+    /// The cache key, for a file that is there.
+    pub(crate) key: Option<String>,
+}
+
+enum Job {
+    Thumbnail {
+        key: String,
+        path: PathBuf,
+        kind: FileKind,
+    },
+    Presence {
+        generation: u64,
+        paths: Vec<PathBuf>,
+    },
+}
+
+/// Where replies go: a function run on the main thread.
+static DELIVER: std::sync::OnceLock<fn(Reply)> = std::sync::OnceLock::new();
+
+/// Sets the main-thread function replies are given to. Called once.
+pub(crate) fn set_delivery(deliver: fn(Reply)) {
+    let _ = DELIVER.set(deliver);
+}
+
+fn deliver(reply: Reply) {
+    if let Some(deliver) = DELIVER.get().copied() {
+        glib::MainContext::default().invoke(move || deliver(reply));
+    }
+}
+
+/// The one worker thread every file check and decode runs on, so none of
+/// them occupies GLib's shared pool (where the viewer's decodes run).
+fn worker() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
+    static WORKER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> =
+        std::sync::OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (sender, jobs) = std::sync::mpsc::channel::<Job>();
+        let _ = std::thread::Builder::new()
+            .name("desklink-thumbnails".into())
+            .spawn(move || {
+                for job in jobs {
+                    match job {
+                        Job::Thumbnail { key, path, kind } => deliver(make(key, &path, kind)),
+                        Job::Presence { generation, paths } => deliver(Reply::Presence {
+                            generation,
+                            files: paths.iter().map(|path| presence(path)).collect(),
+                        }),
+                    }
+                }
+            });
+        std::sync::Mutex::new(sender)
+    })
+}
+
+fn send(job: Job) {
+    if let Ok(sender) = worker().lock() {
+        let _ = sender.send(job);
+    }
+}
+
+/// Asks for `path`'s preview; the reply comes to the delivery function.
+pub(crate) fn request(key: &str, path: &Path, kind: FileKind) {
+    send(Job::Thumbnail {
+        key: key.to_string(),
+        path: path.to_path_buf(),
+        kind,
+    });
+}
+
+/// Asks which of `paths` are still there (off the main thread: a stat on a
+/// network mount can hang).
+pub(crate) fn check_presence(generation: u64, paths: Vec<PathBuf>) {
+    send(Job::Presence { generation, paths });
+}
+
+/// Whether `path` is on a FUSE mount (gvfs, a phone over MTP, sshfs):
+/// reading those can stall for as long as the far end likes.
+fn on_fuse(path: &Path) -> bool {
+    const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
+    let Ok(name) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    // SAFETY: `name` is a valid NUL-terminated path and `stats` a zeroed
+    // struct statfs that the call fills in.
+    unsafe {
+        let mut stats: libc::statfs = std::mem::zeroed();
+        libc::statfs(name.as_ptr(), &mut stats) == 0
+            && i64::from(stats.f_type as u32 as i32) == FUSE_SUPER_MAGIC
+    }
+}
+
+fn presence(path: &Path) -> Presence {
+    // ponytail: a gvfs path counts as present without a stat; a probe with
+    // its own watchdog if those turn out common.
+    if path.starts_with("/run/user") && path.components().any(|part| part.as_os_str() == "gvfs") {
+        return Presence {
+            exists: true,
+            key: None,
+        };
+    }
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => Presence {
+            exists: true,
+            key: meta
+                .modified()
+                .ok()
+                .map(|modified| cache_key(path, modified, meta.len())),
+        },
+        _ => Presence {
+            exists: false,
+            key: None,
+        },
+    }
+}
+
+/// The preview for `key`, from the cache or made now with a watchdog.
+fn make(key: String, path: &Path, kind: FileKind) -> Reply {
+    let Some(dir) = cache_dir() else {
+        return Reply::Failed { key };
+    };
+    let (png, secs, none) = (
         dir.join(format!("{key}.png")),
         dir.join(format!("{key}.secs")),
+        dir.join(format!("{key}.none")),
     );
-    let duration = || {
-        std::fs::read_to_string(&secs)
+    // Checked when the job's turn comes: an earlier job may have made it.
+    if let Ok(pixbuf) = Pixbuf::from_file(&png) {
+        let duration = std::fs::read_to_string(&secs)
             .ok()
             .and_then(|text| text.trim().parse().ok())
-            .map(Duration::from_secs)
-    };
-    if let Ok(pixbuf) = Pixbuf::from_file(&png) {
-        return Ok(Thumbnail {
+            .map(Duration::from_secs);
+        return Reply::Thumbnail {
+            key,
             texture: texture(&pixbuf),
-            duration: duration(),
-        });
+            duration,
+        };
     }
-    // ponytail: one decode at a time; a pool if a big grid feels slow.
-    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _turn = ONE_AT_A_TIME.lock();
-    let (pixbuf, length) = match kind_of(path) {
-        FileKind::Image => (image(path)?, None),
-        FileKind::Video => video_frame(path)?,
-        _ => return Err("No preview for this kind of file".into()),
+    if none.exists() || on_fuse(path) || !matches!(kind, FileKind::Image | FileKind::Video) {
+        return Reply::Failed { key };
+    }
+    let (done, made) = std::sync::mpsc::channel();
+    let source = path.to_path_buf();
+    // ponytail: a decode that never returns leaks its thread; it is given up
+    // on after DECODE_TIMEOUT so later cards still get theirs.
+    let spawned = std::thread::Builder::new()
+        .name("desklink-decode".into())
+        .spawn(move || {
+            let result = match kind {
+                FileKind::Image => image(&source).map(|pixbuf| (pixbuf, None)),
+                _ => video_frame(&source),
+            }
+            .map(|(pixbuf, length)| {
+                (
+                    pixbuf.read_pixel_bytes(),
+                    pixbuf.width(),
+                    pixbuf.height(),
+                    pixbuf.rowstride(),
+                    pixbuf.has_alpha(),
+                    length,
+                )
+            });
+            let _ = done.send(result);
+        });
+    let result = match spawned {
+        Ok(_) => made
+            .recv_timeout(DECODE_TIMEOUT)
+            .unwrap_or_else(|_| Err("The preview took too long".into())),
+        Err(error) => Err(error.to_string()),
     };
     let _ = std::fs::create_dir_all(&dir);
-    if let Err(error) = pixbuf.savev(&png, "png", &[]) {
-        eprintln!("[UI] Could not cache a thumbnail: {error}");
+    match result {
+        Ok((bytes, width, height, stride, alpha, length)) => {
+            let pixbuf = Pixbuf::from_bytes(
+                &bytes,
+                gtk::gdk_pixbuf::Colorspace::Rgb,
+                alpha,
+                8,
+                width,
+                height,
+                stride,
+            );
+            if let Err(error) = pixbuf.savev(&png, "png", &[]) {
+                eprintln!("[UI] Could not cache a thumbnail: {error}");
+            }
+            if let Some(length) = length {
+                let _ = std::fs::write(&secs, length.as_secs().to_string());
+            }
+            Reply::Thumbnail {
+                key,
+                texture: texture(&pixbuf),
+                duration: length,
+            }
+        }
+        Err(error) => {
+            debug_log!("[UI] No preview for {}: {error}", path.display());
+            let _ = std::fs::write(&none, error);
+            Reply::Failed { key }
+        }
     }
-    if let Some(length) = length {
-        let _ = std::fs::write(&secs, length.as_secs().to_string());
+}
+
+/// Drops cached previews unused for the retention period. Run once at
+/// startup, beside the transfer log's own prune.
+pub(crate) fn prune() {
+    let Some(dir) = cache_dir() else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("desklink-thumbnail-prune".into())
+        .spawn(move || prune_dir(&dir, std::time::SystemTime::now()));
+}
+
+fn prune_dir(dir: &Path, now: std::time::SystemTime) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let retention = crate::device_links::connection_log::RETENTION;
+    for entry in entries.flatten() {
+        let old = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > retention);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
-    Ok(Thumbnail {
-        texture: texture(&pixbuf),
-        duration: length,
-    })
 }
 
 fn texture(pixbuf: &Pixbuf) -> gdk::Texture {
@@ -159,6 +363,11 @@ fn video_frame(path: &Path) -> Result<(Pixbuf, Option<Duration>), String> {
         .property("uri", uri.as_str())
         .build()
         .map_err(|error| error.to_string())?;
+    // Phone videos are often stored sideways with a rotation tag.
+    if let Ok(flip) = gst::ElementFactory::make("videoflip").build() {
+        flip.set_property_from_str("video-direction", "auto");
+        playbin.set_property("video-filter", &flip);
+    }
     for sink in ["video-sink", "audio-sink"] {
         let fake = gst::ElementFactory::make("fakesink")
             .build()
@@ -263,6 +472,40 @@ mod tests {
         assert_ne!(key, cache_key(path, then + Duration::from_secs(1), 1234));
         assert_ne!(key, cache_key(path, then, 1235));
         assert_ne!(key, cache_key(Path::new("/home/me/b.jpg"), then, 1234));
+    }
+
+    #[test]
+    fn previews_unused_for_thirty_days_are_pruned() {
+        let dir = std::env::temp_dir().join(format!("desklink-prune-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("abc.png");
+        std::fs::write(&file, b"x").unwrap();
+        let now = std::time::SystemTime::now();
+        prune_dir(&dir, now);
+        assert!(file.exists(), "a fresh preview stays");
+        prune_dir(
+            &dir,
+            now + crate::device_links::connection_log::RETENTION + Duration::from_secs(60),
+        );
+        assert!(!file.exists(), "an old one goes");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_file_that_is_gone_is_reported_missing() {
+        let gone = presence(Path::new("/nonexistent/desklink/photo.jpg"));
+        assert_eq!(
+            gone,
+            Presence {
+                exists: false,
+                key: None
+            }
+        );
+        let here = std::env::temp_dir().join(format!("desklink-here-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&here, b"x").unwrap();
+        let found = presence(&here);
+        assert!(found.exists && found.key.is_some());
+        let _ = std::fs::remove_file(here);
     }
 
     #[test]

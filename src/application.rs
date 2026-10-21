@@ -57,6 +57,7 @@ mod imp {
             crate::device_links::pty::desk::start_server();
             crate::device_links::connection_log::prune();
             crate::device_links::transfer_log::prune();
+            crate::thumbnails::prune();
             obj.report_previous_crash();
             obj.setup_gactions();
             self.hold.replace(Some(obj.hold()));

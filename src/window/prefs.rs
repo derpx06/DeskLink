@@ -303,6 +303,7 @@ fn away_from_home_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::P
         .show_apply_button(true)
         .build();
     let turn = adw::SwitchRow::builder()
+        .sensitive(settings.relay_configured())
         .title("Relay Media When Needed")
         .subtitle(
             "Use a TURN server when no direct path exists. Off means direct connections only.",
@@ -335,9 +336,18 @@ fn away_from_home_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::P
     // An address makes the switch usable; entering one turns it on.
     {
         let enabled = enabled.downgrade();
+        let turn = turn.downgrade();
         url.connect_changed(move |url| {
+            let usable = built_in || !url.text().trim().is_empty();
+            if let Some(turn) = turn.upgrade() {
+                turn.set_sensitive(usable);
+            }
             if let Some(enabled) = enabled.upgrade() {
-                enabled.set_sensitive(built_in || !url.text().trim().is_empty());
+                enabled.set_sensitive(usable);
+                // No address left: off, and saved so (with the empty address).
+                if !usable && enabled.is_active() {
+                    enabled.set_active(false);
+                }
             }
         });
     }
