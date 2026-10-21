@@ -184,6 +184,11 @@ pub struct ControlMessage {
     /// `request-view` / `request-control` / `takeover-request`: the session
     /// password, when the desktop has one set. See `session_lock`.
     pub password: Option<String>,
+    /// `request-view` (desktop to phone): the phone's own landscape long
+    /// side and the frame rate it wants (contract V1). Older phones omit
+    /// both.
+    pub max_dimension: Option<i64>,
+    pub fps: Option<i64>,
 }
 
 impl ControlMessage {
@@ -214,6 +219,8 @@ impl ControlMessage {
             screen_rotation: None,
             editable: None,
             screen_count: None,
+            max_dimension: None,
+            fps: None,
             password: None,
         }
     }
@@ -275,6 +282,12 @@ impl ControlMessage {
         if let Some(password) = &self.password {
             root.insert("password".into(), Value::from(password.clone()));
         }
+        if let Some(max_dimension) = self.max_dimension {
+            root.insert("maxDimension".into(), Value::from(max_dimension));
+        }
+        if let Some(fps) = self.fps {
+            root.insert("fps".into(), Value::from(fps));
+        }
         serde_json::to_vec(&Value::Object(root)).unwrap_or_default()
     }
 
@@ -320,6 +333,8 @@ impl ControlMessage {
             editable: object.get("editable").and_then(Value::as_bool),
             screen_count: number("screenCount").map(|value| value.clamp(0, 16) as i32),
             password: optional_text("password"),
+            max_dimension: number("maxDimension"),
+            fps: number("fps"),
         })
     }
 

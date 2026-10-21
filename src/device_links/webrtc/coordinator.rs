@@ -1072,6 +1072,7 @@ fn start_desktop_portal_session(
     attempt_id: String,
     wire: WebRtcWireBinding,
     peer: Arc<DesktopWebRtcPeer>,
+    request: super::screen::ScreenRequest,
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
 
@@ -1123,6 +1124,7 @@ fn start_desktop_portal_session(
                 cancel,
                 receiver,
                 (done_sender, previous_done),
+                request,
             )
         });
     if let Err(error) = spawned {
@@ -1146,6 +1148,7 @@ fn run_desktop_portal_worker(
     cancel: Arc<std::sync::atomic::AtomicBool>,
     receiver: mpsc::Receiver<DesktopPortalCommand>,
     (done, previous_done): (mpsc::Sender<()>, Option<mpsc::Receiver<()>>),
+    request: super::screen::ScreenRequest,
 ) {
     use std::sync::atomic::Ordering;
 
@@ -1181,7 +1184,7 @@ fn run_desktop_portal_worker(
                     DesktopSource::X11,
                     screen.width,
                     screen.height,
-                    30,
+                    request,
                 )?;
                 let can_control = desk.can_control();
                 return Ok((Box::new(desk), screen.width, screen.height, can_control, None));
@@ -1226,7 +1229,7 @@ fn run_desktop_portal_worker(
                 },
                 source.width,
                 source.height,
-                30,
+                request,
             )?;
             Ok((
                 Box::new(portal),
@@ -1361,7 +1364,7 @@ fn run_desktop_portal_worker(
             },
             None => DesktopSource::X11,
         };
-        peer.start_desktop_screen_capture(id, source, stream.width, stream.height, 30)
+        peer.start_desktop_screen_capture(id, source, stream.width, stream.height, request)
     };
     // Moves the share to the next screen and tells the phone its new size.
     let switch_screen = || {
@@ -2916,12 +2919,17 @@ fn handle_peer_envelope(
                     reason,
                 );
             }
+            // The phone's own size and rate (contract V1); older phones ask
+            // nothing and get the fallback.
+            let request =
+                super::screen::ScreenRequest::from_parts(message.max_dimension, message.fps);
             let started = start_desktop_portal_session(
                 wire.peer_device_id.clone(),
                 message.remote_session_id.clone(),
                 attempt_id.to_string(),
                 wire.clone(),
                 peer.clone(),
+                request,
             );
             if started.is_ok() {
                 connection_log::record(&wire.peer_device_id, ConnectionEvent::ScreenViewStarted);
@@ -4164,6 +4172,8 @@ mod tests {
             screen_rotation: None,
             editable: None,
             screen_count: None,
+            max_dimension: None,
+            fps: None,
             password: None,
         }
     }

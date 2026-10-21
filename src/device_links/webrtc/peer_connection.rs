@@ -296,7 +296,7 @@ impl DesktopWebRtcPeer {
         source: super::screen::DesktopSource,
         width: i32,
         height: i32,
-        fps: i32,
+        request: super::screen::ScreenRequest,
     ) -> Result<(), String> {
         let previous = self
             .desktop_screen_capture
@@ -312,7 +312,7 @@ impl DesktopWebRtcPeer {
             source,
             width,
             height,
-            fps,
+            request,
             Some(super::screen::RtpContinuity {
                 ssrc: self.screen_ssrc,
                 next_seqnum: self.screen_next_seqnum.lock().ok().and_then(|next| *next),
@@ -717,6 +717,37 @@ fn without_video_ssrcs(sdp: &str) -> String {
     out
 }
 
+/// The H.264 level this desk decodes, written into its description
+/// (contract V2): constrained baseline level 4.0 (`42e028`), so the phone may
+/// send up to 1920 px. `webrtcbin` echoes the offer's level (3.1 from
+/// libwebrtc, 1280 px), and constraining it through codec preferences would
+/// fail the caps intersection, so the text is changed instead; H.264's
+/// `level-asymmetry-allowed` lets each side state its own receive level.
+pub(crate) const H264_RECEIVE_LEVEL: &str = "42e028";
+
+fn with_h264_receive_level(sdp: &str) -> String {
+    let mut in_video = false;
+    let mut out = String::with_capacity(sdp.len());
+    for line in sdp.split_inclusive('\n') {
+        if line.starts_with("m=") {
+            in_video = line.starts_with("m=video");
+        }
+        if in_video && line.starts_with("a=fmtp:") {
+            if let Some(at) = line.find("profile-level-id=42e0") {
+                let start = at + "profile-level-id=".len();
+                if line.len() >= start + 6 {
+                    out.push_str(&line[..start]);
+                    out.push_str(H264_RECEIVE_LEVEL);
+                    out.push_str(&line[start + 6..]);
+                    continue;
+                }
+            }
+        }
+        out.push_str(line);
+    }
+    out
+}
+
 /// Prepares every video transceiver for what this desktop does with it: send
 /// its own screen, and ask for retransmission of lost packets.
 ///
@@ -1031,7 +1062,7 @@ fn request_local_description(
             } else {
                 let _ = events_after_set.send(PeerEvent::LocalDescription {
                     message_type: message_type_after_set,
-                    sdp: without_video_ssrcs(&sdp),
+                    sdp: without_video_ssrcs(&with_h264_receive_level(&sdp)),
                 });
             }
         });
@@ -1259,7 +1290,7 @@ a=max-message-size:262144\r\n";
             None,
             1920,
             1080,
-            30,
+            super::super::screen::ScreenRequest::FALLBACK,
             None,
         )
         .expect("the chain must attach to the answered video section");
@@ -1294,7 +1325,7 @@ a=max-message-size:262144\r\n";
             None,
             1280,
             720,
-            30,
+            super::super::screen::ScreenRequest::FALLBACK,
             None,
         )
         .unwrap();
@@ -1386,7 +1417,7 @@ a=max-message-size:262144\r\n";
                 None,
                 640,
                 360,
-                30,
+                super::super::screen::ScreenRequest::FALLBACK,
                 Some(super::super::screen::RtpContinuity {
                     ssrc: pair.answerer.screen_ssrc,
                     next_seqnum: None,
@@ -1433,7 +1464,7 @@ a=max-message-size:262144\r\n";
                 None,
                 1280,
                 720,
-                30,
+                super::super::screen::ScreenRequest::FALLBACK,
                 Some(super::super::screen::RtpContinuity {
                     ssrc: pair.answerer.screen_ssrc,
                     next_seqnum,
@@ -1634,7 +1665,7 @@ a=max-message-size:262144\r\n";
             None,
             1280,
             720,
-            30,
+            super::super::screen::ScreenRequest::FALLBACK,
             None,
         )
         .expect("the answerer must be able to attach its screen to the negotiated section");
@@ -1674,7 +1705,7 @@ a=max-message-size:262144\r\n";
             None,
             1280,
             720,
-            30,
+            super::super::screen::ScreenRequest::FALLBACK,
             None,
         )
         .expect("the offerer must be able to attach its screen to its own video section");
@@ -1702,7 +1733,7 @@ a=max-message-size:262144\r\n";
             None,
             1280,
             720,
-            30,
+            super::super::screen::ScreenRequest::FALLBACK,
             None,
         )
         .unwrap();
@@ -1734,7 +1765,7 @@ a=max-message-size:262144\r\n";
             None,
             1280,
             720,
-            30,
+            super::super::screen::ScreenRequest::FALLBACK,
             None,
         )
         .unwrap();
@@ -1759,7 +1790,7 @@ a=max-message-size:262144\r\n";
                 None,
                 1280,
                 720,
-                30,
+                super::super::screen::ScreenRequest::FALLBACK,
                 None,
             )
             .unwrap()
@@ -1839,6 +1870,22 @@ a=max-message-size:262144\r\n";
         // Other sections are untouched, line endings included.
         assert!(out.contains("a=ssrc:7 cname:keep\r\n"));
         assert_eq!(without_video_ssrcs("v=0\r\n"), "v=0\r\n");
+    }
+
+    #[test]
+    fn the_desk_states_its_own_h264_receive_level() {
+        let sdp = "v=0\r\nm=audio 9 X 111\r\na=fmtp:111 profile-level-id=42e01f\r\n\
+                   m=video 9 X 102 96\r\na=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n\
+                   a=fmtp:96 x-google-start-bitrate=800\r\n";
+        let out = with_h264_receive_level(sdp);
+        assert!(out.contains(
+            "a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e028\r\n"
+        ));
+        assert!(
+            out.contains("a=fmtp:111 profile-level-id=42e01f"),
+            "only the video section"
+        );
+        assert!(out.contains("a=fmtp:96 x-google-start-bitrate=800"));
     }
 
     /// `get-transceiver` takes a **`gint`**, and `emit_by_name` panics on a

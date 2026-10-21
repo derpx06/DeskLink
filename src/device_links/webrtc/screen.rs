@@ -54,7 +54,10 @@ pub(crate) fn video_caps(h264: bool) -> gst::Caps {
         .field("payload", H264_PAYLOAD)
         .field("clock-rate", 90_000i32)
         .field("packetization-mode", "1")
-        .field("profile-level-id", "42e01f")
+        .field(
+            "profile-level-id",
+            super::peer_connection::H264_RECEIVE_LEVEL,
+        )
         .field("level-asymmetry-allowed", "1")
         .field(format!("extmap-{TWCC_OFFER_ID}"), TWCC_URI)
         .build();
@@ -144,7 +147,7 @@ pub(crate) fn stream_dimensions(
     if !(1..=8192).contains(&width) || !(1..=8192).contains(&height) {
         return Err("Desktop screen dimensions are invalid".to_string());
     }
-    let max_dimension = max_dimension.clamp(320, 1920);
+    let max_dimension = max_dimension.clamp(MIN_DIMENSION as i32, MAX_DIMENSION as i32);
     let scale = (max_dimension as f64 / width.max(height) as f64).min(1.0);
     let scaled_width = ((width as f64 * scale).round() as i32).max(2) & !1;
     let scaled_height = ((height as f64 * scale).round() as i32).max(2) & !1;
@@ -190,6 +193,22 @@ impl ScreenStreamInner {
         let _ = self.pipeline.remove_many(self.elements.iter());
         park_pad(&self.pipeline, &self.source_pad);
     }
+}
+
+/// Whether `decodebin` chose a VA-API decoder (whose DMABuf output the GTK
+/// sink takes without a copy), unless turned off for a regression hunt.
+fn zero_copy_wanted(decodebin: &gst::Element) -> bool {
+    if cfg!(test) || std::env::var("DESKLINK_SCREEN_COPY").as_deref() == Ok("1") {
+        return false;
+    }
+    let Some(bin) = decodebin.downcast_ref::<gst::Bin>() else {
+        return false;
+    };
+    bin.iterate_recurse().into_iter().flatten().any(|element| {
+        element.factory().is_some_and(|factory| {
+            factory.name().starts_with("va") && factory.has_type(gst::ElementFactoryType::DECODER)
+        })
+    })
 }
 
 /// Gives an inbound video pad a harmless consumer. The phone keeps sending
@@ -399,10 +418,6 @@ pub(crate) fn attach_incoming_video(
     // failing stream leaked a whole decode chain each time. The work is done in
     // a closure so there is exactly one cleanup path.
     let build = || -> Result<(), String> {
-        convert
-            .link(&sink)
-            .map_err(|error| format!("Could not link the DeskLink screen sink: {error}"))?;
-
         for element in [&convert, &sink] {
             element
                 .sync_state_with_parent()
@@ -435,16 +450,41 @@ pub(crate) fn attach_incoming_video(
             }
         });
 
-        let convert_for_decode = convert.clone();
-        decode.connect_pad_added(move |_, decoded| {
-            let Some(target) = convert_for_decode.static_pad("sink") else {
-                return;
+        // Zero-copy when the decoder is VA-API: its frames go to the sink as
+        // DMABuf (GTK imports them; no download to system memory and upload
+        // again). A software decoder's frames go through `videoconvert`.
+        // `DESKLINK_SCREEN_COPY=1` forces the converting path.
+        let (convert_for_decode, sink_for_decode) = (convert.clone(), sink.clone());
+        decode.connect_pad_added(move |bin, decoded| {
+            let direct = zero_copy_wanted(bin);
+            let linked = if direct {
+                sink_for_decode
+                    .static_pad("sink")
+                    .ok_or_else(|| "no sink pad".to_string())
+                    .and_then(|target| decoded.link(&target).map_err(|error| error.to_string()))
+            } else {
+                convert_for_decode
+                    .link(&sink_for_decode)
+                    .map_err(|error| error.to_string())
+                    .and_then(|()| {
+                        let target = convert_for_decode
+                            .static_pad("sink")
+                            .ok_or_else(|| "no convert pad".to_string())?;
+                        decoded.link(&target).map_err(|error| error.to_string())
+                    })
             };
-            if target.is_linked() {
-                return;
-            }
-            if let Err(error) = decoded.link(&target) {
-                eprintln!("[DeskLink] Could not link a decoded screen stream: {error}");
+            match linked {
+                Ok(_) => debug_log!(
+                    "[DeskLink] Phone screen decoded {}",
+                    if direct {
+                        "by VA-API straight to the display (DMABuf)"
+                    } else {
+                        "through videoconvert"
+                    }
+                ),
+                Err(error) => {
+                    eprintln!("[DeskLink] Could not link a decoded screen stream: {error}")
+                }
             }
         });
 
@@ -532,7 +572,7 @@ impl DesktopScreenCapture {
         source: DesktopSource,
         width: i32,
         height: i32,
-        fps: i32,
+        request: ScreenRequest,
         continuity: Option<RtpContinuity>,
     ) -> Result<Self, String> {
         let (source, pipewire_fd) = match source {
@@ -555,7 +595,7 @@ impl DesktopScreenCapture {
             pipewire_fd,
             width,
             height,
-            fps,
+            request,
             continuity,
         )
     }
@@ -571,15 +611,15 @@ impl DesktopScreenCapture {
         pipewire_fd: Option<OwnedFd>,
         width: i32,
         height: i32,
-        fps: i32,
+        request: ScreenRequest,
         continuity: Option<RtpContinuity>,
     ) -> Result<Self, String> {
         if !(1..=8192).contains(&width) || !(1..=8192).contains(&height) {
             return Err("The desktop portal returned invalid screen stream metadata".to_string());
         }
+        let request = request.served(width, height);
         let (scale, convert, rate, filter, queue, encoder, payloader) =
-            encoder_chain(width, height, fps)?;
-        let caps_filter = filter.clone();
+            encoder_chain(width, height, request)?;
 
         // Scale before converting: colour conversion then runs on the small
         // frame, not the full-resolution one.
@@ -587,7 +627,7 @@ impl DesktopScreenCapture {
             source,
             scale,
             convert,
-            rate,
+            rate.clone(),
             filter,
             queue,
             encoder.clone(),
@@ -624,9 +664,13 @@ impl DesktopScreenCapture {
                 webrtcbin.release_request_pad(&sink_pad);
                 Err(message)
             };
-            // The payload type is whatever was negotiated for VP8, not a number
-            // we assume libwebrtc will hand out.
-            let negotiated = negotiated_vp8_payload(webrtcbin);
+            // The payload type is whatever was negotiated for the codec, not a
+            // number we assume libwebrtc will hand out.
+            let codec = if h264_experiment() { "H264" } else { "VP8" };
+            let negotiated = negotiated_payload(webrtcbin, codec);
+            if codec == "H264" && negotiated.is_none() {
+                return fail("The phone did not negotiate H.264 (experiment)".to_string());
+            }
             let payload_type = negotiated.unwrap_or(DEFAULT_VP8_PAYLOAD);
             payloader.set_property("pt", payload_type);
             if let Some(continuity) = continuity {
@@ -636,7 +680,7 @@ impl DesktopScreenCapture {
                 }
             }
             debug_log!(
-                "[DeskLink] Screen chain bound to {} as VP8 pt {payload_type}{}",
+                "[DeskLink] Screen chain bound to {} as {codec} pt {payload_type}{}",
                 sink_pad.name(),
                 if negotiated.is_some() {
                     ""
@@ -701,7 +745,12 @@ impl DesktopScreenCapture {
         };
         match build() {
             Ok((sink_pad, payload_type)) => Ok(Self {
-                rate_control_stop: spawn_bitrate_controller(webrtcbin, &encoder, &caps_filter),
+                rate_control_stop: spawn_bitrate_controller(
+                    webrtcbin,
+                    &encoder,
+                    &rate,
+                    request.fps,
+                ),
                 pipeline: pipeline.clone(),
                 webrtcbin: webrtcbin.clone(),
                 elements,
@@ -846,36 +895,59 @@ const DEFAULT_VP8_PAYLOAD: u32 = 96;
 /// Encoder bitrate bounds and start point for the desktop screen.
 const START_BITRATE: u32 = 2_500_000;
 const MIN_BITRATE: u32 = 400_000;
-const MAX_BITRATE: u32 = 8_000_000;
+const MAX_BITRATE: u32 = 12_000_000;
 
-/// AIMD on the loss the phone reports in its RTCP receiver reports: back off
-/// hard under loss, probe up gently when clean. The encoder used to sit at a
-/// fixed 2 Mbps, so a weak link built latency instead of dropping quality.
-pub(crate) fn next_bitrate(current: u32, fraction_lost: f64) -> u32 {
-    let next = if fraction_lost > 0.10 {
-        current / 10 * 7
-    } else if fraction_lost < 0.02 {
-        current / 10 * 11
-    } else {
-        current
-    };
-    next.clamp(MIN_BITRATE, MAX_BITRATE)
+/// What the phone's receiver reports say about the link, once a second.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct LinkReport {
+    /// 0..1.
+    pub(crate) loss: f64,
+    pub(crate) rtt_ms: Option<f64>,
+    pub(crate) jitter_ms: Option<f64>,
 }
 
-/// Frame rate under sustained loss at the bitrate floor, and normally.
-const REDUCED_FPS: i32 = 15;
-const FULL_FPS: i32 = 30;
+/// Rate control on loss *and* delay: a queue building up (round trip above
+/// the link's own baseline, or jitter) backs off before packets are lost.
+/// Steps are small and smooth, except under real loss. `baseline_ms` is the
+/// lowest round trip seen lately.
+pub(crate) fn next_bitrate(current: u32, report: &LinkReport, baseline_ms: f64) -> u32 {
+    let queueing = report
+        .rtt_ms
+        .is_some_and(|rtt| rtt > baseline_ms * 1.5 + 20.0)
+        || report.jitter_ms.is_some_and(|jitter| jitter > 30.0);
+    let factor = if report.loss > 0.10 {
+        0.75
+    } else if report.loss > 0.02 {
+        0.92
+    } else if queueing {
+        0.90
+    } else {
+        1.05
+    };
+    ((f64::from(current) * factor) as u32).clamp(MIN_BITRATE, MAX_BITRATE)
+}
+
 /// Seconds of a condition before the frame rate changes, so it never flaps.
 const FPS_HOLD_SECONDS: u32 = 5;
 
 /// The second rung after bitrate: when even the lowest bitrate still loses
 /// packets, fewer frames give each one more bits (text stays sharp, motion
 /// gets choppier); when the link is clean again with room to spare, the full
-/// rate returns. Counts consecutive seconds of each condition in `streak`.
-pub(crate) fn next_fps(current: i32, bitrate: u32, fraction_lost: f64, streak: &mut u32) -> i32 {
-    let wants_lower = current == FULL_FPS && bitrate == MIN_BITRATE && fraction_lost > 0.02;
-    let wants_higher =
-        current == REDUCED_FPS && bitrate >= START_BITRATE / 2 && fraction_lost < 0.02;
+/// rate (`full`, what the phone asked for) returns. Counts consecutive
+/// seconds of each condition in `streak`.
+pub(crate) fn next_fps(
+    current: i32,
+    full: i32,
+    bitrate: u32,
+    fraction_lost: f64,
+    streak: &mut u32,
+) -> i32 {
+    let reduced = (full / 2).max(10).min(full);
+    let wants_lower = current == full && bitrate == MIN_BITRATE && fraction_lost > 0.02;
+    let wants_higher = current == reduced
+        && current != full
+        && bitrate >= START_BITRATE / 2
+        && fraction_lost < 0.02;
     if wants_lower || wants_higher {
         *streak += 1;
     } else {
@@ -886,57 +958,78 @@ pub(crate) fn next_fps(current: i32, bitrate: u32, fraction_lost: f64, streak: &
     }
     *streak = 0;
     if wants_lower {
-        REDUCED_FPS
+        reduced
     } else {
-        FULL_FPS
+        full
     }
 }
 
-/// Once a second, reads the peer-reported loss from `webrtcbin` stats and
-/// steers the encoder's bitrate, then the frame rate — through the caps
-/// filter's `framerate`, which `videorate` follows. (Lowering `videorate`'s
-/// `max-rate` under caps that pin 30/1 failed with `not-negotiated`.) Holds
-/// only weak references, so it ends with the pipeline; the returned flag ends
-/// it with the capture.
+/// Once a second, reads the phone's receiver reports from `webrtcbin` stats
+/// and steers the encoder's bitrate, then the frame rate through
+/// `videorate`'s `max-rate` (no caps pin the rate, so nothing has to
+/// renegotiate). Debug builds log a stats line every 2 s. Holds only weak
+/// references, so it ends with the pipeline; the returned flag ends it with
+/// the capture.
 fn spawn_bitrate_controller(
     webrtcbin: &gst::Element,
     encoder: &gst::Element,
-    filter: &gst::Element,
+    rate: &gst::Element,
+    full_fps: i32,
 ) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
-    let (webrtcbin, encoder, filter, flag) = (
+    let (webrtcbin, encoder, rate, flag) = (
         webrtcbin.downgrade(),
         encoder.downgrade(),
-        filter.downgrade(),
+        rate.downgrade(),
         Arc::clone(&stop),
     );
     let spawned = std::thread::Builder::new()
         .name("desklink-screen-rate".to_string())
         .spawn(move || {
             let mut bitrate = START_BITRATE;
-            let mut fps = FULL_FPS;
+            let mut fps = full_fps;
             let mut streak = 0;
+            let mut baseline_ms = f64::MAX;
+            let mut tick = 0u64;
+            let mut last_bytes = 0u64;
             while !flag.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
+                tick += 1;
                 let (Some(webrtcbin), Some(encoder)) = (webrtcbin.upgrade(), encoder.upgrade())
                 else {
                     break;
                 };
-                let Some(lost) = peer_reported_loss(&webrtcbin) else {
+                let Some((report, bytes_sent)) = link_report(&webrtcbin) else {
                     continue;
                 };
-                let next = next_bitrate(bitrate, lost);
+                if let Some(rtt) = report.rtt_ms {
+                    // The baseline follows a link that got slower for good.
+                    baseline_ms = (baseline_ms * 1.01).min(rtt);
+                }
+                let next = next_bitrate(bitrate, &report, baseline_ms);
                 if next != bitrate {
                     bitrate = next;
-                    encoder.set_property("target-bitrate", bitrate as i32);
+                    set_encoder_bitrate(&encoder, bitrate);
                 }
-                let next = next_fps(fps, bitrate, lost, &mut streak);
+                let next = next_fps(fps, full_fps, bitrate, report.loss, &mut streak);
                 if next != fps {
                     fps = next;
-                    if let Some(filter) = filter.upgrade() {
-                        let caps = filter.property::<gst::Caps>("caps");
-                        filter.set_property("caps", with_framerate(&caps, fps));
+                    if let Some(rate) = rate.upgrade() {
+                        set_if_present(&rate, "max-rate", &fps.to_string());
                     }
+                }
+                if cfg!(debug_assertions) && tick % 2 == 0 {
+                    let kbps = bytes_sent.saturating_sub(last_bytes) * 8 / 2 / 1000;
+                    debug_log!(
+                        "[DeskLink] screen-stats: sent {kbps} kbps, target {} kbps, fps cap {fps}, loss {:.1}%, rtt {} ms, jitter {} ms",
+                        bitrate / 1000,
+                        report.loss * 100.0,
+                        report.rtt_ms.map_or("?".to_string(), |rtt| format!("{rtt:.0}")),
+                        report.jitter_ms.map_or("?".to_string(), |jitter| format!("{jitter:.0}"))
+                    );
+                }
+                if tick % 2 == 0 {
+                    last_bytes = bytes_sent;
                 }
             }
         });
@@ -946,28 +1039,45 @@ fn spawn_bitrate_controller(
     stop
 }
 
-/// The worst `fraction-lost` any remote-inbound-rtp stats entry reports.
-fn peer_reported_loss(webrtcbin: &gst::Element) -> Option<f64> {
+/// The phone's receiver reports (the worst of them) and the bytes sent so
+/// far, from `webrtcbin` stats.
+fn link_report(webrtcbin: &gst::Element) -> Option<(LinkReport, u64)> {
     let promise = gst::Promise::new();
     webrtcbin.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
     if promise.wait() != gst::PromiseResult::Replied {
         return None;
     }
-    promise
-        .get_reply()?
+    let reply = promise.get_reply()?;
+    let mut report = LinkReport::default();
+    let mut bytes = 0u64;
+    let mut any = false;
+    for stats in reply
         .iter()
         .filter_map(|(_, value)| value.get::<gst::Structure>().ok())
-        .filter_map(|stats| stats.get::<f64>("fraction-lost").ok())
-        .reduce(f64::max)
-}
-
-/// `caps` with its frame rate set to `fps`/1, everything else kept.
-fn with_framerate(caps: &gst::Caps, fps: i32) -> gst::Caps {
-    let mut caps = caps.copy();
-    if let Some(structure) = caps.make_mut().structure_mut(0) {
-        structure.set("framerate", gst::Fraction::new(fps, 1));
+    {
+        match stats.name().as_str() {
+            "remote-inbound-rtp" => {
+                any = true;
+                if let Ok(lost) = stats.get::<f64>("fraction-lost") {
+                    report.loss = report.loss.max(lost);
+                }
+                if let Ok(rtt) = stats.get::<f64>("round-trip-time") {
+                    let ms = rtt * 1000.0;
+                    report.rtt_ms = Some(report.rtt_ms.map_or(ms, |known: f64| known.max(ms)));
+                }
+                if let Ok(jitter) = stats.get::<f64>("jitter") {
+                    let ms = jitter * 1000.0;
+                    report.jitter_ms =
+                        Some(report.jitter_ms.map_or(ms, |known: f64| known.max(ms)));
+                }
+            }
+            "outbound-rtp" => {
+                bytes += stats.get::<u64>("bytes-sent").unwrap_or(0);
+            }
+            _ => {}
+        }
     }
-    caps
+    any.then_some((report, bytes))
 }
 
 fn set_if_present(element: &gst::Element, name: &str, value: &str) {
@@ -976,13 +1086,73 @@ fn set_if_present(element: &gst::Element, name: &str, value: &str) {
     }
 }
 
-/// Everything between a frame source and RTP: scale, convert, constant rate,
-/// leaky queue, low-latency VP8, payloader — in that order.
+/// Whether VA-API post-processing can scale here: `vapostproc` exists and a
+/// tiny test pipeline through it negotiates to system-memory I420 (it fails
+/// on drivers without a usable video-processing entry point). Checked once;
+/// `DESKLINK_SCREEN_SOFTWARE=1` forces the software scaler.
+fn va_scaler_works() -> bool {
+    static WORKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *WORKS.get_or_init(|| {
+        if std::env::var("DESKLINK_SCREEN_SOFTWARE").as_deref() == Ok("1")
+            || gst::ElementFactory::find("vapostproc").is_none()
+        {
+            return false;
+        }
+        let Ok(pipeline) = gst::parse::launch(
+            "videotestsrc num-buffers=2 ! video/x-raw,width=320,height=200 ! vapostproc ! \
+             video/x-raw,format=NV12,width=160,height=100 ! videoconvert ! \
+             video/x-raw,format=I420 ! fakesink",
+        ) else {
+            return false;
+        };
+        let worked = pipeline.set_state(gst::State::Playing).is_ok()
+            && pipeline.bus().is_some_and(|bus| {
+                bus.timed_pop_filtered(
+                    gst::ClockTime::from_seconds(3),
+                    &[gst::MessageType::Eos, gst::MessageType::Error],
+                )
+                .is_some_and(|message| matches!(message.view(), gst::MessageView::Eos(_)))
+            });
+        let _ = pipeline.set_state(gst::State::Null);
+        worked
+    })
+}
+
+/// Debug builds, `DESKLINK_SCREEN_H264=1`: send the desk's screen as VA-API
+/// hardware H.264 instead of software VP8 — an experiment to measure against
+/// VP8 (Phase 1c), off unless asked for, and only where VA can encode.
+pub(crate) fn h264_experiment() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("DESKLINK_SCREEN_H264").as_deref() == Ok("1")
+        && (gst::ElementFactory::find("vah264lpenc").is_some()
+            || gst::ElementFactory::find("vah264enc").is_some())
+        && gst::ElementFactory::find("rtph264pay").is_some()
+}
+
+/// Sets the encoder's bitrate, whichever unit it takes: VP8's
+/// `target-bitrate` in bit/s, VA H.264's `bitrate` in kbit/s.
+fn set_encoder_bitrate(encoder: &gst::Element, bits_per_second: u32) {
+    if encoder.has_property("target-bitrate", None) {
+        encoder.set_property("target-bitrate", bits_per_second as i32);
+    } else if encoder.has_property("bitrate", None) {
+        set_if_present(encoder, "bitrate", &(bits_per_second / 1000).to_string());
+    }
+}
+
+/// Everything between a frame source and RTP: scale, convert, frame-rate
+/// cap, leaky queue, low-latency VP8, payloader — in that order.
+///
+/// Sharp text first (Phase 1c): the picture is scaled with Lanczos (or VA-API
+/// post-processing when the GPU has it) to the phone's own long side; the
+/// rate cap only ever drops frames, so the last frame of a change goes out
+/// at once; and VP8 is tuned the way remote-desktop products tune it for
+/// screens — a quality floor, no noise filter, and refinement of a still
+/// picture (the source resends it every 200 ms) instead of skipping it.
 #[allow(clippy::type_complexity)]
 fn encoder_chain(
     width: i32,
     height: i32,
-    fps: i32,
+    request: ScreenRequest,
 ) -> Result<
     (
         gst::Element,
@@ -995,12 +1165,10 @@ fn encoder_chain(
     ),
     String,
 > {
-    // Keep desktop encoding bounded on high-resolution displays. The
-    // `width`/`height` arguments remain the compositor's logical geometry
-    // for pointer mapping; only the encoded video is scaled, preserving
-    // its aspect ratio.
-    let (capture_width, capture_height) = stream_dimensions(width, height, 1280)?;
-    let fps = fps.clamp(1, 30);
+    // `width`/`height` stay the compositor's logical geometry for pointer
+    // mapping; only the encoded video is scaled, keeping the aspect ratio.
+    let (capture_width, capture_height) = stream_dimensions(width, height, request.max_dimension)?;
+    let fps = request.fps.clamp(1, MAX_FPS as i32);
 
     let make = |factory: &str, what: &str| {
         gst::ElementFactory::make(factory)
@@ -1008,9 +1176,23 @@ fn encoder_chain(
             .map_err(|error| format!("DeskLink screen capture needs GStreamer {what}: {error}"))
     };
     let convert = make("videoconvert", "videoconvert")?;
-    let scale = make("videoscale", "videoscale")?;
-    // Constant frame rate downstream of a source that only emits on change.
+    set_if_present(&convert, "n-threads", "4");
+    let scale = if va_scaler_works() {
+        let scale = make("vapostproc", "vapostproc")?;
+        set_if_present(&scale, "scale-method", "hq");
+        scale
+    } else {
+        let scale = make("videoscale", "videoscale")?;
+        set_if_present(&scale, "method", "lanczos");
+        set_if_present(&scale, "n-threads", "4");
+        scale
+    };
+    // A cap, never a constant rate: drops frames above `fps`, never repeats
+    // or holds one back (a held last frame of a change was up to 500 ms).
     let rate = make("videorate", "videorate")?;
+    set_if_present(&rate, "drop-only", "true");
+    set_if_present(&rate, "max-rate", &fps.to_string());
+    set_if_present(&rate, "skip-to-first", "true");
     let filter = make("capsfilter", "capsfilter")?;
     // One frame, leaky: if the encoder falls behind, the *newest* frame
     // wins instead of a queue of stale ones adding latency.
@@ -1019,25 +1201,54 @@ fn encoder_chain(
     queue.set_property("max-size-bytes", 0u32);
     queue.set_property("max-size-time", 0u64);
     queue.set_property_from_str("leaky", "downstream");
+    if h264_experiment() {
+        let encoder =
+            make("vah264lpenc", "vah264lpenc").or_else(|_| make("vah264enc", "vah264enc"))?;
+        let payloader = make("rtph264pay", "rtph264pay")?;
+        filter.set_property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("format", "NV12")
+                .field("width", capture_width)
+                .field("height", capture_height)
+                .build(),
+        );
+        // Low-latency hardware H.264 for the phone's hardware decoder: CBR,
+        // no B-frames, one reference, a small coded-picture buffer.
+        set_if_present(&encoder, "rate-control", "cbr");
+        set_if_present(&encoder, "b-frames", "0");
+        set_if_present(&encoder, "ref-frames", "1");
+        set_if_present(&encoder, "target-usage", "7");
+        set_if_present(&encoder, "key-int-max", &(fps * 10).to_string());
+        set_encoder_bitrate(&encoder, START_BITRATE);
+        set_if_present(
+            &encoder,
+            "cpb-size",
+            &(START_BITRATE / 1000 / 4).to_string(),
+        );
+        set_if_present(&payloader, "aggregate-mode", "zero-latency");
+        set_if_present(&payloader, "config-interval", "-1");
+        debug_log!("[DeskLink] Screen experiment: VA-API H.264 to the phone");
+        return Ok((scale, convert, rate, filter, queue, encoder, payloader));
+    }
     let encoder = make("vp8enc", "vp8enc")?;
     let payloader = make("rtpvp8pay", "rtpvp8pay")?;
 
+    // Size and format only: a pinned frame rate is what made the adaptive
+    // frame rate fail to renegotiate.
     filter.set_property(
         "caps",
         gst::Caps::builder("video/x-raw")
             .field("format", "I420")
             .field("width", capture_width)
             .field("height", capture_height)
-            .field("framerate", gst::Fraction::new(fps, 1))
             .build(),
     );
-    set_if_present(&rate, "skip-to-first", "true");
     encoder.set_property("deadline", 1i64);
-    encoder.set_property("cpu-used", 8i32);
+    encoder.set_property("cpu-used", 5i32);
     encoder.set_property("target-bitrate", START_BITRATE as i32);
     // Keyframes come on the decoder's request (throttled); this is only the
-    // safety net for a request that never arrives. Every 2 s was a burst of
-    // screen-sized keyframes on a link that was already struggling.
+    // safety net for a request that never arrives.
     encoder.set_property("keyframe-max-dist", fps * 10);
     // Low-latency rate control: libvpx defaults buffer 4–6 s of data,
     // which lets bursts queue instead of shrinking quality.
@@ -1045,11 +1256,17 @@ fn encoder_chain(
     set_if_present(&encoder, "buffer-size", "150");
     set_if_present(&encoder, "buffer-initial-size", "100");
     set_if_present(&encoder, "buffer-optimal-size", "120");
-    // Real-time rate control, and the tuning libvpx recommends for screen
-    // content: skip blocks that did not change.
     set_if_present(&encoder, "end-usage", "cbr");
     set_if_present(&encoder, "error-resilient", "default");
-    set_if_present(&encoder, "static-threshold", "100");
+    // Screen content: a quality floor so text never smears, a ceiling high
+    // enough that a large change goes out fast, keyframes kept from
+    // bursting, and no noise filter (it blurs glyphs). Static blocks are
+    // encoded, not skipped, so a still picture keeps sharpening.
+    set_if_present(&encoder, "min-quantizer", "10");
+    set_if_present(&encoder, "max-quantizer", "50");
+    set_if_present(&encoder, "max-intra-bitrate", "300");
+    set_if_present(&encoder, "noise-sensitivity", "0");
+    set_if_present(&encoder, "static-threshold", "0");
     // libwebrtc's VP8 depacketiser recovers from loss with 15-bit picture
     // ids; without them a lost packet costs a visible stall.
     set_if_present(&payloader, "picture-id-mode", "15-bit");
@@ -1076,7 +1293,7 @@ pub(crate) fn desktop_share_selftest(device_id: &str) -> Result<String, String> 
     let pipeline = gst::Pipeline::new();
     let capture = pipewire_source(&source.fd, source.node_id, source.pipewire_serial)?;
     let (scale, convert, rate, filter, queue, encoder, payloader) =
-        encoder_chain(source.width, source.height, 30)?;
+        encoder_chain(source.width, source.height, ScreenRequest::FALLBACK)?;
     let sink = gst::ElementFactory::make("fakesink")
         .property("sync", false)
         .build()
@@ -1181,7 +1398,9 @@ fn pipewire_source(
     // A compositor sends a frame only when something changes, so a static
     // desktop would produce no frames at all: nothing to encode, no keyframe to
     // answer a viewer's request with, a black picture. Re-send the last frame.
-    set_if_present(&source, "keepalive-time", "500");
+    // A still screen is resent every 200 ms, so the encoder keeps refining
+    // it (top-off) rather than leaving the first, coarse version up.
+    set_if_present(&source, "keepalive-time", "200");
     Ok(source)
 }
 
@@ -1231,7 +1450,7 @@ fn negotiated_video_mline(webrtcbin: &gst::Element) -> Option<u32> {
 /// Reading it from the SDP is deterministic where the sink pad's caps are not
 /// (they only carry a payload *range*). An answerer must reuse the offerer's
 /// payload type, and an offerer's own list is what the answerer maps to.
-fn negotiated_vp8_payload(webrtcbin: &gst::Element) -> Option<u32> {
+fn negotiated_payload(webrtcbin: &gst::Element, wanted: &str) -> Option<u32> {
     let description =
         webrtcbin.property::<Option<gst_webrtc::WebRTCSessionDescription>>("local-description")?;
     let sdp = description.sdp();
@@ -1251,7 +1470,7 @@ fn negotiated_vp8_payload(webrtcbin: &gst::Element) -> Option<u32> {
             if codec
                 .split('/')
                 .next()
-                .is_some_and(|name| name.eq_ignore_ascii_case("VP8"))
+                .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
             {
                 return payload
                     .parse::<u32>()
@@ -1271,101 +1490,188 @@ pub struct ScreenRequest {
 }
 
 impl ScreenRequest {
+    /// What the desk serves when the phone asked nothing (older phones):
+    /// 1280 px, 30 fps.
+    pub(crate) const FALLBACK: Self = Self {
+        max_dimension: 1280,
+        fps: 30,
+    };
+
+    /// The phone's `maxDimension` (its real landscape long side) and `fps`,
+    /// each when given, clamped to what this desk serves (contract V1).
+    pub(crate) fn from_parts(max_dimension: Option<i64>, fps: Option<i64>) -> Self {
+        Self {
+            max_dimension: max_dimension
+                .unwrap_or(i64::from(Self::FALLBACK.max_dimension))
+                .clamp(MIN_DIMENSION, MAX_DIMENSION) as i32,
+            fps: fps
+                .unwrap_or(i64::from(Self::FALLBACK.fps))
+                .clamp(1, MAX_FPS) as i32,
+        }
+    }
+
+    /// What is served for a screen `width`×`height`: software VP8 cannot
+    /// keep up with 60 fps above 1920 px, so a larger picture runs at 30.
+    pub(crate) fn served(self, width: i32, height: i32) -> Self {
+        let long_side = self.max_dimension.min(width.max(height));
+        Self {
+            max_dimension: self.max_dimension,
+            fps: if long_side > 1920 {
+                self.fps.min(30)
+            } else {
+                self.fps
+            },
+        }
+    }
+
     /// Reads a request body, clamping to what this desktop will actually serve.
     ///
     /// The values arrive from the paired device, so they are bounds-checked
     /// rather than trusted: an unclamped `fps` or dimension would size a real
     /// encoder pipeline from a remote number.
     pub fn from_body(packet: &crate::device_links::packet::NetworkPacket) -> Self {
-        let max_dimension = packet
-            .get_i64("maxDimension")
-            .unwrap_or(1280)
-            .clamp(320, 1920) as i32;
-        let fps = packet.get_i64("fps").unwrap_or(15).clamp(1, 30) as i32;
-        Self { max_dimension, fps }
+        Self::from_parts(packet.get_i64("maxDimension"), packet.get_i64("fps"))
     }
 }
 
 impl Default for ScreenRequest {
     fn default() -> Self {
-        Self {
-            max_dimension: 1280,
-            fps: 15,
-        }
+        Self::FALLBACK
     }
 }
+
+/// The encoded picture's long side, at least and at most (contract V1).
+const MIN_DIMENSION: i64 = 640;
+const MAX_DIMENSION: i64 = 2560;
+/// The highest frame rate served.
+const MAX_FPS: i64 = 60;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_frame_rate_changes_in_the_caps_and_nothing_else_does() {
-        gst::init().unwrap();
-        let caps = gst::Caps::builder("video/x-raw")
-            .field("format", "I420")
-            .field("width", 1280)
-            .field("height", 800)
-            .field("framerate", gst::Fraction::new(30, 1))
-            .build();
-        let slower = with_framerate(&caps, 15);
-        let structure = slower.structure(0).unwrap();
-        assert_eq!(
-            structure.get::<gst::Fraction>("framerate").unwrap(),
-            gst::Fraction::new(15, 1)
+    fn the_rate_follows_loss_and_queueing_in_small_steps() {
+        let clean = LinkReport {
+            loss: 0.0,
+            rtt_ms: Some(20.0),
+            jitter_ms: Some(2.0),
+        };
+        let up = next_bitrate(START_BITRATE, &clean, 20.0);
+        assert!(
+            up > START_BITRATE && up <= START_BITRATE / 100 * 106,
+            "a small probe up"
         );
-        assert_eq!(structure.get::<i32>("width").unwrap(), 1280);
-        assert_eq!(structure.get::<&str>("format").unwrap(), "I420");
-        assert_eq!(
-            caps.structure(0)
-                .unwrap()
-                .get::<gst::Fraction>("framerate")
-                .unwrap(),
-            gst::Fraction::new(30, 1),
-            "the original is untouched"
+        let queueing = LinkReport {
+            rtt_ms: Some(120.0),
+            ..clean
+        };
+        assert!(
+            next_bitrate(START_BITRATE, &queueing, 20.0) < START_BITRATE,
+            "delay backs off before loss"
         );
-    }
-
-    #[test]
-    fn bitrate_backs_off_under_loss_probes_up_when_clean_and_stays_bounded() {
-        assert!(next_bitrate(START_BITRATE, 0.20) < START_BITRATE);
-        assert!(next_bitrate(START_BITRATE, 0.0) > START_BITRATE);
-        assert_eq!(next_bitrate(START_BITRATE, 0.05), START_BITRATE);
-        assert_eq!(next_bitrate(MIN_BITRATE, 0.5), MIN_BITRATE);
-        assert_eq!(next_bitrate(MAX_BITRATE, 0.0), MAX_BITRATE);
-        // Sustained heavy loss reaches the floor in a handful of seconds.
-        let floor = (0..10).fold(START_BITRATE, |rate, _| next_bitrate(rate, 0.5));
+        let jittery = LinkReport {
+            jitter_ms: Some(45.0),
+            ..clean
+        };
+        assert!(next_bitrate(START_BITRATE, &jittery, 20.0) < START_BITRATE);
+        let light_loss = LinkReport {
+            loss: 0.05,
+            ..clean
+        };
+        let heavy_loss = LinkReport {
+            loss: 0.20,
+            ..clean
+        };
+        let light = next_bitrate(START_BITRATE, &light_loss, 20.0);
+        let heavy = next_bitrate(START_BITRATE, &heavy_loss, 20.0);
+        assert!(
+            heavy < light && light < START_BITRATE,
+            "harder under real loss"
+        );
+        assert_eq!(next_bitrate(MIN_BITRATE, &heavy_loss, 20.0), MIN_BITRATE);
+        assert_eq!(next_bitrate(MAX_BITRATE, &clean, 20.0), MAX_BITRATE);
+        let floor = (0..20).fold(START_BITRATE, |rate, _| {
+            next_bitrate(rate, &heavy_loss, 20.0)
+        });
         assert_eq!(floor, MIN_BITRATE);
     }
 
     #[test]
     fn frame_rate_drops_only_after_sustained_loss_at_the_floor_and_recovers() {
+        let full = 60;
         let mut streak = 0;
         // Loss above the floor is the bitrate's job, not the frame rate's.
         for _ in 0..10 {
-            assert_eq!(
-                next_fps(FULL_FPS, START_BITRATE, 0.3, &mut streak),
-                FULL_FPS
-            );
+            assert_eq!(next_fps(full, full, START_BITRATE, 0.3, &mut streak), full);
         }
-        let mut fps = FULL_FPS;
+        let mut fps = full;
         for second in 1..=FPS_HOLD_SECONDS {
-            fps = next_fps(fps, MIN_BITRATE, 0.3, &mut streak);
-            let expected = if second < FPS_HOLD_SECONDS {
-                FULL_FPS
-            } else {
-                REDUCED_FPS
-            };
-            assert_eq!(fps, expected);
+            fps = next_fps(fps, full, MIN_BITRATE, 0.3, &mut streak);
+            assert_eq!(fps, if second < FPS_HOLD_SECONDS { full } else { 30 });
         }
         // A clean second in between resets the count: no flapping.
-        assert_eq!(next_fps(fps, START_BITRATE, 0.0, &mut streak), REDUCED_FPS);
-        assert_eq!(next_fps(fps, START_BITRATE, 0.3, &mut streak), REDUCED_FPS);
+        assert_eq!(next_fps(fps, full, START_BITRATE, 0.0, &mut streak), 30);
+        assert_eq!(next_fps(fps, full, START_BITRATE, 0.3, &mut streak), 30);
         for _ in 0..FPS_HOLD_SECONDS {
-            fps = next_fps(fps, START_BITRATE, 0.0, &mut streak);
+            fps = next_fps(fps, full, START_BITRATE, 0.0, &mut streak);
         }
-        assert_eq!(fps, FULL_FPS);
+        assert_eq!(fps, full);
+        // Already slow: nothing lower than 10.
+        assert_eq!(next_fps(10, 10, MIN_BITRATE, 0.5, &mut 99), 10);
     }
+
+    /// Sharp and prompt: Lanczos (or VA) scaling to the phone's size, a frame
+    /// rate cap that only drops, caps that do not pin the rate, and VP8 tuned
+    /// for screens.
+    #[test]
+    fn the_encoder_chain_is_tuned_for_screens() {
+        gst::init().unwrap();
+        let request = ScreenRequest::from_parts(Some(2400), Some(60)).served(2560, 1600);
+        assert_eq!(request.fps, 30, "software VP8 above 1920 px runs at 30");
+        let (scale, convert, rate, filter, _queue, encoder, _payloader) =
+            encoder_chain(2560, 1600, request).unwrap();
+        match scale
+            .factory()
+            .map(|factory| factory.name().to_string())
+            .as_deref()
+        {
+            Some("videoscale") => {
+                assert_eq!(scale.property::<u32>("n-threads"), 4);
+                let method = scale.property_value("method");
+                assert_eq!(
+                    gst::glib::EnumValue::from_value(&method).map(|(_, value)| value.nick()),
+                    Some("lanczos")
+                );
+            }
+            Some("vapostproc") => {}
+            other => panic!("unexpected scaler {other:?}"),
+        }
+        assert!(convert.has_property("n-threads", None));
+        assert!(rate.property::<bool>("drop-only"));
+        assert_eq!(rate.property::<i32>("max-rate"), 30);
+        let caps = filter.property::<gst::Caps>("caps");
+        let structure = caps.structure(0).unwrap();
+        assert!(
+            !structure.has_field("framerate"),
+            "the rate is never pinned"
+        );
+        assert_eq!(structure.get::<i32>("width").unwrap(), 2400);
+        assert_eq!(structure.get::<i32>("height").unwrap(), 1500);
+        assert_eq!(encoder.property::<i32>("min-quantizer"), 10);
+        assert_eq!(encoder.property::<i32>("max-quantizer"), 50);
+        assert_eq!(encoder.property::<i32>("noise-sensitivity"), 0);
+        assert_eq!(encoder.property::<i32>("static-threshold"), 0);
+        assert_eq!(encoder.property::<i32>("cpu-used"), 5);
+        // A phone that fits in 1920 gets its 60 fps.
+        assert_eq!(
+            ScreenRequest::from_parts(Some(1920), Some(60))
+                .served(2560, 1600)
+                .fps,
+            60
+        );
+    }
+
     use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_SCREEN_REQUEST};
 
     #[test]
@@ -1376,14 +1682,20 @@ mod tests {
 
         let request = ScreenRequest::from_body(&packet);
 
-        assert_eq!(request.max_dimension, 1920);
-        assert_eq!(request.fps, 30);
+        assert_eq!(request.max_dimension, 2560);
+        assert_eq!(request.fps, 60);
+        let small = ScreenRequest::from_parts(Some(100), Some(0));
+        assert_eq!((small.max_dimension, small.fps), (640, 1));
     }
 
     #[test]
     fn screen_request_falls_back_to_defaults() {
         let packet = NetworkPacket::new(PACKET_TYPE_SCREEN_REQUEST);
-        assert_eq!(ScreenRequest::from_body(&packet), ScreenRequest::default());
+        assert_eq!(ScreenRequest::from_body(&packet), ScreenRequest::FALLBACK);
+        assert_eq!(
+            ScreenRequest::from_parts(None, None),
+            ScreenRequest::FALLBACK
+        );
     }
 
     #[test]
@@ -1451,6 +1763,8 @@ mod tests {
     fn desktop_capture_dimensions_preserve_aspect_and_bound_encoding_cost() {
         assert_eq!(stream_dimensions(2560, 1600, 1280).unwrap(), (1280, 800));
         assert_eq!(stream_dimensions(1080, 2400, 1280).unwrap(), (576, 1280));
+        assert_eq!(stream_dimensions(2560, 1600, 2400).unwrap(), (2400, 1500));
+        assert_eq!(stream_dimensions(2560, 1600, 9999).unwrap(), (2560, 1600));
         assert!(stream_dimensions(0, 1080, 1280).is_err());
     }
 
