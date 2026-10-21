@@ -41,6 +41,8 @@ pub enum DaemonCommand {
     /// A call request (T2): the phone ("" = the connected one that can
     /// call), the action, and the number to dial.
     Telephony(String, String, Option<String>),
+    /// "Type on phone": keys for the phone's focused text field.
+    SendFocusedFieldKeys(String, serde_json::Map<String, serde_json::Value>),
     /// Send this computer's notifications to the phones.
     SetForwardNotifications(bool),
     /// Allow (or stop) one app's notifications going to the phones.
@@ -168,6 +170,9 @@ impl DaemonWorker {
             }
             DaemonCommand::Telephony(id, action, number) => {
                 self.send_telephony(&id, &action, number.as_deref())
+            }
+            DaemonCommand::SendFocusedFieldKeys(id, payload) => {
+                self.send_focused_field_keys(&id, payload)
             }
             DaemonCommand::SetForwardNotifications(on) => {
                 self.update_settings(|settings| settings.forward_notifications = on);
@@ -331,6 +336,25 @@ impl DaemonWorker {
         self.with_feature_transport(device_id, |transport| {
             let packet = NetworkPacket::with_body(PACKET_TYPE_MOUSEPAD_REQUEST, payload);
             transport.send_remote_input(packet)
+        });
+    }
+
+    /// Keys typed into the phone's focused field: only over a ready link,
+    /// never queued (late keys would land in whatever has focus by then).
+    fn send_focused_field_keys(
+        &self,
+        device_id: &str,
+        mut payload: serde_json::Map<String, serde_json::Value>,
+    ) {
+        payload.insert("target".into(), crate::type_on_phone::TARGET.into());
+        self.with_feature_transport(device_id, |transport| {
+            if !transport.is_ready() {
+                return Err("Session link is closed".to_string());
+            }
+            transport.send(&NetworkPacket::with_body(
+                PACKET_TYPE_MOUSEPAD_REQUEST,
+                payload,
+            ))
         });
     }
 

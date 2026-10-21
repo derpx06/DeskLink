@@ -262,6 +262,18 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         disable_with(&show, reason.as_deref());
         buttons.append(&show);
     }
+    // "Type on <phone>" (C2): a phone that reports its focused field.
+    if crate::type_on_phone::supported(device) {
+        let typing = icon_button("input-keyboard-symbolic", "Type", &["soft-button"]);
+        typing.set_tooltip_text(Some("Type on the phone with this keyboard (Ctrl+Shift+K)"));
+        let (daemon, id) = (daemon.clone(), device.id.clone());
+        typing.connect_clicked(move |button| {
+            let root = button.root().and_downcast::<gtk::Window>();
+            crate::type_on_phone::open(&daemon, &id, root.as_ref());
+        });
+        disable_with(&typing, reason.as_deref());
+        buttons.append(&typing);
+    }
     if can_send_feature(device, PACKET_TYPE_SHARE_REQUEST) {
         let send = icon_button(
             "document-send-symbolic",

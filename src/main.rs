@@ -51,6 +51,7 @@ mod shell_dbus;
 mod terminal_previews;
 mod thumbnails;
 mod tray;
+mod type_on_phone;
 mod window;
 
 use self::application::DesklinkApplication;

@@ -8,8 +8,8 @@ use super::dispatcher::{PacketSource, SharedPacketDispatcher};
 use super::handle::DaemonEvent;
 use super::state::{
     push_event, remove_notification, replace_notifications, update_battery_status,
-    update_call_status, update_media_from_packet, update_pair_state, update_volume_status,
-    upsert_notification,
+    update_call_status, update_keyboard_state, update_media_from_packet, update_pair_state,
+    update_volume_status, upsert_notification,
 };
 use crate::device_links::config::Config;
 use crate::device_links::core::{DeviceManager, ReadOutcome, SessionBinding};
@@ -659,9 +659,13 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         // The phone swiped away one of this computer's notifications (C1):
         // it is closed here too. Nothing else is asked this way.
         PACKET_TYPE_NOTIFICATION_REQUEST => {
+            // The phone asks once on load (`request: true`): the snapshot.
             match packet.get_str("cancel") {
                 Some(id) => crate::device_links::desk_notifications::close_from_phone(id),
-                None => debug_log!("[Notifications] Ignored a notification request without cancel"),
+                None if packet.get_bool("request") == Some(true) => {
+                    crate::device_links::desk_notifications::send_snapshot(Some(device_id))
+                }
+                None => debug_log!("[Notifications] Ignored a notification request"),
             }
             Ok(())
         }
@@ -693,6 +697,11 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         }
         PACKET_TYPE_FINDMYPHONE_REQUEST => {
             find_device_received(events, device_id, &binding.link.info.name, spawn_player);
+            Ok(())
+        }
+        // A report of the phone's focus ("Type on phone"), never an input.
+        crate::device_links::packet::PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE => {
+            update_keyboard_state(devices, device_id, packet.get_bool("state"));
             Ok(())
         }
         PACKET_TYPE_MOUSEPAD_REQUEST => {

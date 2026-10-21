@@ -297,6 +297,14 @@ mod imp {
                         window.show_discovery_dialog(true)
                     })
                     .build(),
+                // Ctrl+Shift+K: type on the selected phone.
+                gio::ActionEntry::builder("type-on-phone")
+                    .activate(|window: &super::DesklinkWindow, _, _| {
+                        if let (Some(daemon), Some(id)) = (window.daemon(), window.selected_id()) {
+                            crate::type_on_phone::open(&daemon, &id, Some(window.upcast_ref()));
+                        }
+                    })
+                    .build(),
                 // A page by name, e.g. from a card's "View All".
                 gio::ActionEntry::builder("show-page")
                     .parameter_type(Some(glib::VariantTy::STRING))

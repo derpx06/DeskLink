@@ -212,6 +212,10 @@ pub struct DeviceView {
     /// The phone's calls; `None` when it has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_status: Option<CallStatus>,
+    /// Whether a text field has focus on the phone ("Type on phone", C2);
+    /// `None` until it says, and while its link is down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard_focused: Option<bool>,
 }
 
 /// The user-facing words for a `connection_path`, the one mapping every
@@ -255,6 +259,7 @@ impl DeviceView {
             notifications: Vec::new(),
             volume_status: None,
             call_status: None,
+            keyboard_focused: None,
         }
     }
 

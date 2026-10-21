@@ -168,6 +168,12 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
                 .icon("media-skip-forward-symbolic"),
         );
     }
+    if crate::type_on_phone::supported(phone) {
+        menu.push(
+            TrayEntry::action("Type on Phone…", format!("type:{}", phone.id))
+                .icon("input-keyboard-symbolic"),
+        );
+    }
     let unread = phone.notifications.len();
     if unread > 0 && settings.shows_notifications(&phone.id) {
         menu.push(
@@ -318,6 +324,7 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
             None,
         )),
         "lock" => daemon.send(DaemonCommand::SendLockRequest(target, true)),
+        "type" => crate::type_on_phone::open(&daemon, &target, None),
         "send-clipboard" => daemon.send(DaemonCommand::SendClipboard(target)),
         "send-files" => {
             let name = daemon

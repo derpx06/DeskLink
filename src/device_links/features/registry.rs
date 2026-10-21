@@ -4,21 +4,21 @@ use std::sync::Mutex;
 use crate::device_links::packet::{
     PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
     PACKET_TYPE_DIGITIZER, PACKET_TYPE_DIGITIZER_SESSION, PACKET_TYPE_FINDMYPHONE_REQUEST,
-    PACKET_TYPE_HANDOFF, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST, PACKET_TYPE_MOUSEPAD_REQUEST,
-    PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION,
-    PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_REPLY,
-    PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND,
-    PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SCREEN_ERROR, PACKET_TYPE_SCREEN_READY,
-    PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP, PACKET_TYPE_SETTINGS,
-    PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_TELEPHONY,
-    PACKET_TYPE_TELEPHONY_REQUEST, PACKET_TYPE_UNLOCK_REQUEST,
+    PACKET_TYPE_HANDOFF, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST,
+    PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS,
+    PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_ACTION,
+    PACKET_TYPE_NOTIFICATION_REPLY, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING,
+    PACKET_TYPE_RUNCOMMAND, PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SCREEN_ERROR,
+    PACKET_TYPE_SCREEN_READY, PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP,
+    PACKET_TYPE_SETTINGS, PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_REQUEST,
+    PACKET_TYPE_TELEPHONY, PACKET_TYPE_TELEPHONY_REQUEST, PACKET_TYPE_UNLOCK_REQUEST,
 };
 
 /// Packets the desktop can act on when they arrive over the authenticated
 /// WebRTC transport. Each entry has a matching arm in
 /// `packet_handler::dispatch_webrtc_feature_packet` and a DeskLink Android
 /// plugin that actually sends it.
-const DESKTOP_INCOMING: [&str; 22] = [
+const DESKTOP_INCOMING: [&str; 23] = [
     PACKET_TYPE_BATTERY,
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
@@ -33,6 +33,8 @@ const DESKTOP_INCOMING: [&str; 22] = [
     // receive capability. The WebRTC dispatcher validates a host-approved
     // portal lease before any input can reach the desktop.
     PACKET_TYPE_MOUSEPAD_REQUEST,
+    // "Type on phone" (C2): whether a text field has focus there.
+    PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE,
     // The phone's music (state), and the phone controlling the desk's players.
     PACKET_TYPE_MPRIS,
     PACKET_TYPE_MPRIS_REQUEST,
@@ -109,7 +111,7 @@ const DESKTOP_OUTGOING: [&str; 23] = [
 /// control plane is `desklink.remote-session.v1` on the control channel, and
 /// the screen packet types exist only so the Android application loads its
 /// screen plugin (see `DESKTOP_INCOMING`). They never cross the wire.
-const WEBRTC_PROFILE: [&str; 25] = [
+const WEBRTC_PROFILE: [&str; 26] = [
     PACKET_TYPE_BATTERY,
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
@@ -119,6 +121,7 @@ const WEBRTC_PROFILE: [&str; 25] = [
     PACKET_TYPE_HANDOFF,
     PACKET_TYPE_LOCK,
     PACKET_TYPE_LOCK_REQUEST,
+    PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE,
     PACKET_TYPE_MOUSEPAD_REQUEST,
     PACKET_TYPE_MPRIS,
     PACKET_TYPE_MPRIS_REQUEST,
@@ -291,6 +294,7 @@ mod tests {
                 "desklink.digitizer.session",
                 "desklink.findmyphone.request",
                 "desklink.lock.request",
+                "desklink.mousepad.keyboardstate",
                 "desklink.mousepad.request",
                 "desklink.mpris",
                 "desklink.mpris.request",
@@ -358,6 +362,7 @@ mod tests {
                 "desklink.handoff",
                 "desklink.lock",
                 "desklink.lock.request",
+                "desklink.mousepad.keyboardstate",
                 "desklink.mousepad.request",
                 "desklink.mpris",
                 "desklink.mpris.request",

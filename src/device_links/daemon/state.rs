@@ -116,6 +116,7 @@ pub(crate) fn reconcile_connection_status(
             // link, and would ring here forever. Paused players stay paused
             // until the phone's next snapshot (sent on feature-ready).
             device.call_status = None;
+            device.keyboard_focused = None;
         } else if ready {
             device.last_seen = None;
         }
@@ -356,6 +357,20 @@ pub(super) fn update_battery_status(
 
 /// `desklink.telephony {calls, muted, silenced}`: the phone's calls now.
 /// Returns whether it is in a call.
+/// `desklink.mousepad.keyboardstate {state}`: a text field has focus on
+/// the phone, or not.
+pub(super) fn update_keyboard_state(
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    device_id: &str,
+    focused: Option<bool>,
+) {
+    if let Ok(mut devices) = devices.lock() {
+        if let Some(device) = devices.get_mut(device_id) {
+            device.keyboard_focused = focused;
+        }
+    }
+}
+
 pub(super) fn update_call_status(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     device_id: &str,
