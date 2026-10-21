@@ -160,6 +160,8 @@ pub(crate) fn on_feature_ready(device_id: &str) {
         );
         super::mpris::forget_art_sent(&device_id);
         super::mpris::send_state_to(&device_id);
+        // This computer's notifications (C1): the snapshot, then bodies.
+        super::desk_notifications::send_snapshot(Some(&device_id));
     });
 }
 

@@ -5,6 +5,7 @@ pub mod connection_log;
 pub mod core;
 pub mod daemon;
 pub(crate) mod desk_features;
+pub(crate) mod desk_notifications;
 pub mod device;
 pub mod device_info;
 pub mod features;

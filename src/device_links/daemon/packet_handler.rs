@@ -656,13 +656,14 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             }
             Ok(())
         }
+        // The phone swiped away one of this computer's notifications (C1):
+        // it is closed here too. Nothing else is asked this way.
         PACKET_TYPE_NOTIFICATION_REQUEST => {
-            if let Some(cancel_id) = packet.get_str("cancel") {
-                remove_notification(devices, device_id, cancel_id);
-                Ok(())
-            } else {
-                Err("DeskLink WebRTC notification request needs a response handler".to_string())
+            match packet.get_str("cancel") {
+                Some(id) => crate::device_links::desk_notifications::close_from_phone(id),
+                None => debug_log!("[Notifications] Ignored a notification request without cancel"),
             }
+            Ok(())
         }
         PACKET_TYPE_SYSTEMVOLUME => {
             update_volume_status(devices, device_id, &packet);

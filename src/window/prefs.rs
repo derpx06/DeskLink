@@ -64,6 +64,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         &settings.run_commands,
         settings.relay_enabled,
         top_bar_key(),
+        settings.forward_notifications,
+        &settings.forward_apps,
+        crate::device_links::desk_notifications::seen_apps(),
         settings.call_audio,
         settings.call_audio_devices.get(&device.id),
         &bonded,
@@ -117,6 +120,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     page.append(&connection);
 
     page.append(&calls_group(win, daemon, &settings, device, bonded));
+    page.append(&forward_group(daemon, &settings));
 
     page.append(&run_commands_group(win, daemon, &settings, &device.name));
 
@@ -152,6 +156,54 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>, daemon: &DaemonHandle)
     page.add(&top_bar_group(daemon, &settings));
     dialog.add(&page);
     dialog.present(Some(parent));
+}
+
+/// Notifications to Phone (C1): this computer's notifications on the
+/// phones, off by default and only from the apps ticked here (the apps seen
+/// since DeskLink started, and those already chosen).
+fn forward_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Notifications to Phone")
+        .description("Only from the apps you choose. The phone's own are never sent back.")
+        .build();
+    let on = adw::SwitchRow::builder()
+        .title("Send this computer's notifications")
+        .active(settings.forward_notifications)
+        .build();
+    with_icon(&on, "preferences-system-notifications-symbolic");
+    let sender = daemon.clone();
+    on.connect_active_notify(move |row| {
+        sender.send(DaemonCommand::SetForwardNotifications(row.is_active()))
+    });
+    group.add(&on);
+    if !settings.forward_notifications {
+        return group;
+    }
+    let mut apps = crate::device_links::desk_notifications::seen_apps();
+    for key in &settings.forward_apps {
+        apps.entry(key.clone()).or_insert_with(|| key.clone());
+    }
+    if apps.is_empty() {
+        let row = adw::ActionRow::builder()
+            .title("No notifications yet")
+            .subtitle("Apps appear here once they show a notification")
+            .build();
+        group.add(&row);
+    }
+    for (key, name) in apps {
+        let row = adw::SwitchRow::builder()
+            .title(&name)
+            .subtitle(if name == key { "" } else { key.as_str() })
+            .use_markup(false)
+            .active(settings.forward_apps.contains(&key))
+            .build();
+        let sender = daemon.clone();
+        row.connect_active_notify(move |row| {
+            sender.send(DaemonCommand::SetForwardApp(key.clone(), row.is_active()))
+        });
+        group.add(&row);
+    }
+    group
 }
 
 /// Calls: answered here by default; with the experimental switch, also heard

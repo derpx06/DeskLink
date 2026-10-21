@@ -215,6 +215,9 @@ impl DaemonWorker {
             Arc::clone(&devices),
         );
         if !cfg!(test) {
+            if crate::device_links::config::app_settings().forward_notifications {
+                crate::device_links::desk_notifications::start();
+            }
             crate::device_links::mpris::start();
             crate::device_links::pty::jobs::start_watch();
         }

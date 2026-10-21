@@ -41,6 +41,10 @@ pub enum DaemonCommand {
     /// A call request (T2): the phone ("" = the connected one that can
     /// call), the action, and the number to dial.
     Telephony(String, String, Option<String>),
+    /// Send this computer's notifications to the phones.
+    SetForwardNotifications(bool),
+    /// Allow (or stop) one app's notifications going to the phones.
+    SetForwardApp(String, bool),
     /// Preferences → Calls: Bluetooth call audio (experimental).
     SetCallAudio(bool),
     /// The Bluetooth address the user confirmed is this phone; `None`
@@ -164,6 +168,20 @@ impl DaemonWorker {
             }
             DaemonCommand::Telephony(id, action, number) => {
                 self.send_telephony(&id, &action, number.as_deref())
+            }
+            DaemonCommand::SetForwardNotifications(on) => {
+                self.update_settings(|settings| settings.forward_notifications = on);
+                crate::device_links::desk_notifications::send_snapshot(None);
+            }
+            DaemonCommand::SetForwardApp(app, on) => {
+                self.update_settings(|settings| {
+                    if on {
+                        settings.forward_apps.insert(app);
+                    } else {
+                        settings.forward_apps.remove(&app);
+                    }
+                });
+                crate::device_links::desk_notifications::send_snapshot(None);
             }
             DaemonCommand::SetCallAudio(on) => {
                 self.update_settings(|settings| settings.call_audio = on)

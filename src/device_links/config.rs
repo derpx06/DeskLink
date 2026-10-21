@@ -105,6 +105,12 @@ pub struct AppSettings {
     /// phone (by DeskLink device id).
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub call_audio_devices: std::collections::BTreeMap<String, String>,
+    /// Preferences → Notifications to Phone: send this computer's
+    /// notifications to the phones (off by default), only from these apps
+    /// (app id, desktop entry or name).
+    pub forward_notifications: bool,
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub forward_apps: std::collections::BTreeSet<String>,
 }
 
 /// A command a phone may run here, in a shared terminal.
@@ -136,6 +142,8 @@ impl Default for AppSettings {
             recent_folders: Vec::new(),
             call_audio: false,
             call_audio_devices: Default::default(),
+            forward_notifications: false,
+            forward_apps: Default::default(),
         }
     }
 }

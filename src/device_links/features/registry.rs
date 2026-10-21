@@ -18,7 +18,7 @@ use crate::device_links::packet::{
 /// WebRTC transport. Each entry has a matching arm in
 /// `packet_handler::dispatch_webrtc_feature_packet` and a DeskLink Android
 /// plugin that actually sends it.
-const DESKTOP_INCOMING: [&str; 21] = [
+const DESKTOP_INCOMING: [&str; 22] = [
     PACKET_TYPE_BATTERY,
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
@@ -37,6 +37,8 @@ const DESKTOP_INCOMING: [&str; 21] = [
     PACKET_TYPE_MPRIS,
     PACKET_TYPE_MPRIS_REQUEST,
     PACKET_TYPE_NOTIFICATION,
+    // The phone dismissing one of this computer's notifications (C1).
+    PACKET_TYPE_NOTIFICATION_REQUEST,
     PACKET_TYPE_PING,
     // The phone asking for the desk's command list, or running one.
     PACKET_TYPE_RUNCOMMAND_REQUEST,
@@ -59,7 +61,7 @@ const DESKTOP_INCOMING: [&str; 21] = [
 /// Packets the desktop can construct from a command path, and that a DeskLink
 /// Android plugin can consume. `desklink.systemvolume.request` is absent: the
 /// phone has no receiver for it.
-const DESKTOP_OUTGOING: [&str; 22] = [
+const DESKTOP_OUTGOING: [&str; 23] = [
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
     PACKET_TYPE_FINDMYPHONE_REQUEST,
@@ -73,6 +75,8 @@ const DESKTOP_OUTGOING: [&str; 22] = [
     // The desk's players (state), and the desk controlling the phone's.
     PACKET_TYPE_MPRIS,
     PACKET_TYPE_MPRIS_REQUEST,
+    // This computer's notifications on the phone (C1).
+    PACKET_TYPE_NOTIFICATION,
     PACKET_TYPE_NOTIFICATION_ACTION,
     PACKET_TYPE_NOTIFICATION_REPLY,
     PACKET_TYPE_NOTIFICATION_REQUEST,
@@ -291,6 +295,7 @@ mod tests {
                 "desklink.mpris",
                 "desklink.mpris.request",
                 "desklink.notification",
+                "desklink.notification.request",
                 "desklink.ping",
                 "desklink.runcommand.request",
                 "desklink.screen.error",
@@ -315,6 +320,7 @@ mod tests {
                 "desklink.mousepad.request",
                 "desklink.mpris",
                 "desklink.mpris.request",
+                "desklink.notification",
                 "desklink.notification.action",
                 "desklink.notification.reply",
                 "desklink.notification.request",
