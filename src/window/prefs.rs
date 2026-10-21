@@ -897,7 +897,7 @@ pub(super) fn approve_remote_control(window: &DesklinkWindow, id: &str) {
 /// set by hand would be lost.
 fn remote_control_row(device: &DeviceView, approving: bool) -> adw::ActionRow {
     const APPROVED: &str = "Approved until DeskLink restarts";
-    const NOT_APPROVED: &str = "GNOME asks you to approve each time";
+    const NOT_APPROVED: &str = "The desktop asks you to approve each time";
     const WAITING: &str =
         "Choose the screen, turn on \u{201c}Allow Remote Interaction\u{201d}, then Share";
 

@@ -501,23 +501,11 @@ fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str
                 eprintln!("[Shell] Could not start a terminal: {error}");
             }
         }
-        ("send-files", Some(id), Some(daemon)) => {
-            let window = main_window(app);
+        ("send-files", Some(id), Some(_)) => {
             let name = device
                 .map(|device| device.name.as_str())
                 .unwrap_or_default();
-            gtk::FileDialog::builder()
-                .title(format!("Send Files to {name}"))
-                .modal(true)
-                .build()
-                .open_multiple(window.as_ref(), gio::Cancellable::NONE, move |files| {
-                    let Ok(files) = files else { return };
-                    for file in files.iter::<gio::File>().flatten() {
-                        if let Some(path) = file.path() {
-                            daemon.send(DaemonCommand::SendFile(id.clone(), path));
-                        }
-                    }
-                });
+            pick_and_send_files(app, &id, name);
         }
         ("pair-new", _, _) => {
             if let Some(window) = main_window(app) {
@@ -536,6 +524,27 @@ fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str
     }
 }
 
+/// Asks for files in DeskLink's own dialog and sends them to `device_id`.
+pub(crate) fn pick_and_send_files(app: &DesklinkApplication, device_id: &str, name: &str) {
+    let Some(daemon) = app.daemon_handle() else {
+        return;
+    };
+    let window = main_window(app);
+    let id = device_id.to_string();
+    gtk::FileDialog::builder()
+        .title(format!("Send Files to {name}"))
+        .modal(true)
+        .build()
+        .open_multiple(window.as_ref(), gio::Cancellable::NONE, move |files| {
+            let Ok(files) = files else { return };
+            for file in files.iter::<gio::File>().flatten() {
+                if let Some(path) = file.path() {
+                    daemon.send(DaemonCommand::SendFile(id.clone(), path));
+                }
+            }
+        });
+}
+
 /// Presents the main window (creating it if needed) and returns it.
 fn main_window(app: &DesklinkApplication) -> Option<gtk::Window> {
     app.activate();
@@ -548,7 +557,7 @@ const SHELL_EXTENSIONS_PATH: &str = "/org/gnome/Shell/Extensions";
 /// `ExtensionState.ACTIVE` (called `ENABLED` before GNOME 46).
 const EXTENSION_ACTIVE: f64 = 1.0;
 
-fn is_gnome(current_desktop: &str) -> bool {
+pub(crate) fn is_gnome(current_desktop: &str) -> bool {
     current_desktop
         .split(':')
         .any(|desktop| desktop.eq_ignore_ascii_case("GNOME"))

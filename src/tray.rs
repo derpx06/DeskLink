@@ -1,4 +1,8 @@
-//! The top-bar indicator: what phones are doing here, and a way to stop them.
+//! The tray indicator: the always-available surface on any desktop. Its menu
+//! has everything the GNOME extension offers — each phone with Ring, Lock,
+//! Send Files and Send Clipboard, Keep Awake, what is live here with End,
+//! End Everything, Lock & Hand Off, recent files and the phone's
+//! notifications — built by the application ([`TrayEntry`]).
 //!
 //! A StatusNotifierItem with a `com.canonical.dbusmenu` menu, registered with
 //! `org.kde.StatusNotifierWatcher` — the protocol the GNOME AppIndicator /
@@ -29,13 +33,6 @@ const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
 const IDLE_ICON: &str = "derx06.desklink.com-symbolic";
 const ACTIVE_ICON: &str = "screen-shared-symbolic";
-
-const ID_END: i32 = 1001;
-const ID_OPEN: i32 = 1002;
-const ID_QUIT: i32 = 1003;
-const ID_HAND_OFF: i32 = 1004;
-/// Session lines take ids from here up; they are labels, not actions.
-const ID_FIRST_LINE: i32 = 1;
 
 const XML: &str = r#"<node>
   <interface name="org.kde.StatusNotifierItem">
@@ -89,17 +86,51 @@ const XML: &str = r#"<node>
 
 /// What the menu acts on. Called on the main loop.
 pub struct TrayActions {
+    /// The item itself was clicked.
     pub open: Box<dyn Fn()>,
-    pub end_sessions: Box<dyn Fn()>,
-    /// Lock this computer and offer the newest terminal to the phones.
-    pub lock_hand_off: Box<dyn Fn()>,
-    pub quit: Box<dyn Fn()>,
+    /// A menu entry was chosen: its action name (see [`TrayEntry`]).
+    pub run: Box<dyn Fn(&str)>,
+}
+
+/// One menu entry.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TrayEntry {
+    /// Words only, greyed.
+    Label(String),
+    Separator,
+    /// Runs `action` (an application-defined name, e.g. `ring:<device>`).
+    Action {
+        label: String,
+        action: String,
+        enabled: bool,
+    },
+    /// A check item.
+    Toggle {
+        label: String,
+        action: String,
+        on: bool,
+    },
+    Submenu {
+        label: String,
+        children: Vec<TrayEntry>,
+    },
+}
+
+impl TrayEntry {
+    pub fn action(label: impl Into<String>, action: impl Into<String>) -> Self {
+        Self::Action {
+            label: label.into(),
+            action: action.into(),
+            enabled: true,
+        }
+    }
 }
 
 #[derive(Default)]
 struct State {
     /// One line per active session, e.g. "Pixel 8 — controlling the screen".
     lines: Vec<String>,
+    entries: Vec<TrayEntry>,
     revision: u32,
 }
 
@@ -225,16 +256,18 @@ impl Tray {
         self.hosted.registered.get() && self.hosted.host.get()
     }
 
-    /// Shows `lines` (one per active session). Signals only on change.
-    pub fn update(&self, lines: Vec<String>) {
+    /// Shows `lines` (one per active session; the icon and tooltip) and the
+    /// menu `entries`. Signals only on change.
+    pub fn update(&self, lines: Vec<String>, entries: Vec<TrayEntry>) {
         let was_active;
         {
             let mut state = self.state.borrow_mut();
-            if state.lines == lines {
+            if state.lines == lines && state.entries == entries {
                 return;
             }
             was_active = !state.lines.is_empty();
             state.lines = lines;
+            state.entries = entries;
             state.revision = state.revision.wrapping_add(1);
         }
         let state = self.state.borrow();
@@ -366,56 +399,90 @@ fn item_property(name: &str, state: &State) -> Variant {
     }
 }
 
-fn props(label: Option<&str>, enabled: bool, separator: bool) -> HashMap<String, Variant> {
-    let mut props = HashMap::new();
-    if separator {
-        props.insert("type".to_string(), "separator".to_variant());
-    }
-    if let Some(label) = label {
-        props.insert("label".to_string(), label.to_variant());
-    }
-    if !enabled {
-        props.insert("enabled".to_string(), false.to_variant());
-    }
-    props
+/// The menu, numbered depth-first from 1: each entry's id, properties,
+/// action (if any) and children's ids.
+struct Numbered {
+    id: i32,
+    props: HashMap<String, Variant>,
+    action: Option<String>,
+    children: Vec<Numbered>,
 }
 
-/// The menu as `(id, properties)` pairs, top to bottom.
-fn items(state: &State) -> Vec<(i32, HashMap<String, Variant>)> {
-    let mut items = Vec::new();
-    if state.lines.is_empty() {
-        items.push((
-            ID_FIRST_LINE,
-            props(Some("No phone is using this computer"), false, false),
-        ));
-    }
-    for (index, line) in state.lines.iter().enumerate() {
-        items.push((
-            ID_FIRST_LINE + index as i32,
-            props(Some(line), false, false),
-        ));
-    }
-    items.push((900, props(None, true, true)));
-    items.push((
-        ID_END,
-        props(
-            Some("End All Phone Sessions"),
-            !state.lines.is_empty(),
-            false,
-        ),
-    ));
-    items.push((ID_HAND_OFF, props(Some("Lock & Hand Off"), true, false)));
-    items.push((ID_OPEN, props(Some("Open DeskLink"), true, false)));
-    items.push((901, props(None, true, true)));
-    items.push((ID_QUIT, props(Some("Quit DeskLink"), true, false)));
+fn number(entries: &[TrayEntry], next: &mut i32) -> Vec<Numbered> {
+    entries
+        .iter()
+        .map(|entry| {
+            let id = *next;
+            *next += 1;
+            let mut props = HashMap::new();
+            let mut action = None;
+            let mut children = Vec::new();
+            match entry {
+                TrayEntry::Label(label) => {
+                    props.insert("label".to_string(), label.to_variant());
+                    props.insert("enabled".to_string(), false.to_variant());
+                }
+                TrayEntry::Separator => {
+                    props.insert("type".to_string(), "separator".to_variant());
+                }
+                TrayEntry::Action {
+                    label,
+                    action: name,
+                    enabled,
+                } => {
+                    props.insert("label".to_string(), label.to_variant());
+                    if !enabled {
+                        props.insert("enabled".to_string(), false.to_variant());
+                    }
+                    action = Some(name.clone());
+                }
+                TrayEntry::Toggle {
+                    label,
+                    action: name,
+                    on,
+                } => {
+                    props.insert("label".to_string(), label.to_variant());
+                    props.insert("toggle-type".to_string(), "checkmark".to_variant());
+                    props.insert("toggle-state".to_string(), i32::from(*on).to_variant());
+                    action = Some(name.clone());
+                }
+                TrayEntry::Submenu {
+                    label,
+                    children: inner,
+                } => {
+                    props.insert("label".to_string(), label.to_variant());
+                    props.insert("children-display".to_string(), "submenu".to_variant());
+                    children = number(inner, next);
+                }
+            }
+            Numbered {
+                id,
+                props,
+                action,
+                children,
+            }
+        })
+        .collect()
+}
+
+fn numbered(state: &State) -> Vec<Numbered> {
+    number(&state.entries, &mut 1)
+}
+
+fn flatten(items: &[Numbered]) -> Vec<&Numbered> {
     items
+        .iter()
+        .flat_map(|item| std::iter::once(item).chain(flatten(&item.children)))
+        .collect()
+}
+
+fn node(item: &Numbered) -> Variant {
+    let children: Vec<Variant> = item.children.iter().map(node).collect();
+    (item.id, item.props.clone(), children).to_variant()
 }
 
 fn layout(state: &State) -> Variant {
-    let children: Vec<Variant> = items(state)
-        .into_iter()
-        .map(|(id, props)| (id, props, Vec::<Variant>::new()).to_variant())
-        .collect();
+    let children: Vec<Variant> = numbered(state).iter().map(node).collect();
     let mut root = HashMap::new();
     root.insert("children-display".to_string(), "submenu".to_variant());
     (0i32, root, children).to_variant()
@@ -437,9 +504,11 @@ fn menu_call(
                 .try_child_value(0)
                 .and_then(|ids| ids.get())
                 .unwrap_or_default();
-            let found: Vec<(i32, HashMap<String, Variant>)> = items(state)
+            let items = numbered(state);
+            let found: Vec<(i32, HashMap<String, Variant>)> = flatten(&items)
                 .into_iter()
-                .filter(|(id, _)| wanted.is_empty() || wanted.contains(id))
+                .filter(|item| wanted.is_empty() || wanted.contains(&item.id))
+                .map(|item| (item.id, item.props.clone()))
                 .collect();
             Some((found,).to_variant())
         }
@@ -454,12 +523,13 @@ fn menu_call(
                 .and_then(|event| event.get())
                 .unwrap_or_default();
             if event == "clicked" {
-                match id {
-                    ID_END => (actions.end_sessions)(),
-                    ID_HAND_OFF => (actions.lock_hand_off)(),
-                    ID_OPEN => (actions.open)(),
-                    ID_QUIT => (actions.quit)(),
-                    _ => {}
+                let items = numbered(state);
+                if let Some(action) = flatten(&items)
+                    .into_iter()
+                    .find(|item| item.id == id)
+                    .and_then(|item| item.action.clone())
+                {
+                    (actions.run)(&action);
                 }
             }
             None
@@ -476,39 +546,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_layout_has_the_dbusmenu_shape_and_end_is_disabled_when_idle() {
-        let idle = State::default();
-        assert_eq!(layout(&idle).type_().as_str(), "(ia{sv}av)");
+    fn the_menu_has_the_dbusmenu_shape_and_clicks_run_their_action() {
+        let ran = Rc::new(RefCell::new(Vec::<String>::new()));
         let actions = TrayActions {
             open: Box::new(|| {}),
-            end_sessions: Box::new(|| {}),
-            lock_hand_off: Box::new(|| {}),
-            quit: Box::new(|| {}),
+            run: Box::new({
+                let ran = Rc::clone(&ran);
+                move |action| ran.borrow_mut().push(action.to_string())
+            }),
         };
-        let reply = menu_call("GetLayout", &().to_variant(), &idle, &actions).unwrap();
-        assert_eq!(reply.type_().as_str(), "(u(ia{sv}av))");
-        let ids = (Vec::<i32>::new(), Vec::<String>::new()).to_variant();
-        let reply = menu_call("GetGroupProperties", &ids, &idle, &actions).unwrap();
-        assert_eq!(reply.type_().as_str(), "(a(ia{sv}))");
-        let end = items(&idle)
-            .into_iter()
-            .find(|(id, _)| *id == ID_END)
-            .unwrap();
-        assert_eq!(end.1.get("enabled"), Some(&false.to_variant()));
-
-        let busy = State {
+        let state = State {
             lines: vec!["Pixel — controlling the screen".into()],
+            entries: vec![
+                TrayEntry::Label("Pixel · Connected".into()),
+                TrayEntry::action("Ring Pixel", "ring:p1"),
+                TrayEntry::Toggle {
+                    label: "Keep Awake".into(),
+                    action: "keep-awake-off".into(),
+                    on: true,
+                },
+                TrayEntry::Separator,
+                TrayEntry::Submenu {
+                    label: "Recent Files".into(),
+                    children: vec![TrayEntry::action("a.pdf", "open-file:/tmp/a.pdf")],
+                },
+                TrayEntry::Action {
+                    label: "End Everything".into(),
+                    action: "end-sessions:".into(),
+                    enabled: false,
+                },
+            ],
             revision: 1,
         };
-        let end = items(&busy)
-            .into_iter()
-            .find(|(id, _)| *id == ID_END)
-            .unwrap();
-        assert!(!end.1.contains_key("enabled"));
-        assert_eq!(item_property("Status", &busy).str(), Some("NeedsAttention"));
-        assert_eq!(item_property("IconName", &busy).str(), Some(ACTIVE_ICON));
+        assert_eq!(layout(&state).type_().as_str(), "(ia{sv}av)");
+        let reply = menu_call("GetLayout", &().to_variant(), &state, &actions).unwrap();
+        assert_eq!(reply.type_().as_str(), "(u(ia{sv}av))");
+        let ids = (Vec::<i32>::new(), Vec::<String>::new()).to_variant();
+        let reply = menu_call("GetGroupProperties", &ids, &state, &actions).unwrap();
+        assert_eq!(reply.type_().as_str(), "(a(ia{sv}))");
         assert_eq!(
-            item_property("ToolTip", &busy).type_().as_str(),
+            reply.child_value(0).n_children(),
+            7,
+            "the submenu's child too"
+        );
+
+        // Ids are depth-first: the file inside the submenu is 6.
+        let click = |id: i32| {
+            menu_call(
+                "Event",
+                &(id, "clicked", 0i32.to_variant(), 0u32).to_variant(),
+                &state,
+                &actions,
+            )
+        };
+        click(2);
+        click(6);
+        click(1); // a label: nothing
+        assert_eq!(*ran.borrow(), ["ring:p1", "open-file:/tmp/a.pdf"]);
+        let items = numbered(&state);
+        let toggle = flatten(&items)
+            .into_iter()
+            .find(|item| item.id == 3)
+            .unwrap();
+        assert_eq!(toggle.props.get("toggle-state"), Some(&1i32.to_variant()));
+
+        assert_eq!(
+            item_property("Status", &state).str(),
+            Some("NeedsAttention")
+        );
+        assert_eq!(item_property("IconName", &state).str(), Some(ACTIVE_ICON));
+        assert_eq!(
+            item_property("ToolTip", &state).type_().as_str(),
             "(sa(iiay)ss)"
         );
     }

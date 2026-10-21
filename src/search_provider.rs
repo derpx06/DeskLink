@@ -165,7 +165,7 @@ pub(crate) fn matching(candidates: &[Candidate], terms: &[String]) -> Vec<String
         .collect()
 }
 
-fn current(app: &DesklinkApplication) -> Vec<Candidate> {
+pub(crate) fn current(app: &DesklinkApplication) -> Vec<Candidate> {
     let terminals = crate::terminal_previews::sessions();
     let commands = crate::device_links::config::app_settings().run_commands;
     let transfers = crate::device_links::transfer_log::recent();
@@ -205,7 +205,7 @@ fn metas(candidates: &[Candidate], ids: &[String]) -> Variant {
 }
 
 /// Does what result `id` stands for.
-fn activate(app: &DesklinkApplication, id: &str) {
+pub(crate) fn activate(app: &DesklinkApplication, id: &str) {
     let Some((kind, rest)) = id.split_once(':') else {
         return;
     };
@@ -317,6 +317,10 @@ fn user_ini() -> Option<PathBuf> {
 /// Writes the provider description for this user when it is missing or
 /// different (GNOME reads it at its next start).
 pub fn install_description() {
+    // Only GNOME Shell reads these.
+    if !crate::shell_dbus::is_gnome(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default()) {
+        return;
+    }
     let Some(path) = user_ini() else {
         return;
     };

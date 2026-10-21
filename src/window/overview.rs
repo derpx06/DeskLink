@@ -300,6 +300,13 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
             Some(QuickAction::Ping),
         ),
         (
+            crate::device_links::packet::PACKET_TYPE_CLIPBOARD,
+            "edit-paste-symbolic",
+            "Clipboard",
+            format!("Send the clipboard to {}", device.name),
+            Some(QuickAction::Clipboard),
+        ),
+        (
             PACKET_TYPE_SHARE_REQUEST,
             "insert-link-symbolic",
             "Send link",

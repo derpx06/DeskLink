@@ -38,7 +38,9 @@ pub(crate) fn debug_logging() -> bool {
 mod application;
 mod autostart;
 mod config;
+mod desk_menu;
 mod device_links;
+mod kde;
 mod link_glyph;
 mod phone_mpris;
 mod protocol;

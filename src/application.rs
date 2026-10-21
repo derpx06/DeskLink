@@ -60,6 +60,7 @@ mod imp {
             crate::thumbnails::prune();
             // GNOME integration files this install provides for itself.
             crate::search_provider::install_description();
+            crate::kde::install_runner();
             crate::send_to::start(&obj);
             obj.report_previous_crash();
             obj.setup_gactions();
@@ -105,6 +106,7 @@ mod imp {
             crate::shell_dbus::export(&self.obj(), connection);
             crate::phone_mpris::start(&self.obj());
             crate::search_provider::export(&self.obj(), connection);
+            crate::kde::export(&self.obj(), connection);
             Ok(())
         }
     }
@@ -246,27 +248,11 @@ impl DesklinkApplication {
                     }
                 }
             }),
-            end_sessions: Box::new({
+            run: Box::new({
                 let app = app.clone();
-                move || {
+                move |action| {
                     if let Some(app) = app.upgrade() {
-                        app.activate_action("end-sessions", Some(&"".to_variant()));
-                    }
-                }
-            }),
-            lock_hand_off: Box::new({
-                let app = app.clone();
-                move || {
-                    if let Some(app) = app.upgrade() {
-                        app.activate_action("lock-hand-off", None);
-                    }
-                }
-            }),
-            quit: Box::new({
-                let app = app.clone();
-                move || {
-                    if let Some(app) = app.upgrade() {
-                        app.quit();
+                        crate::desk_menu::run(&app, action);
                     }
                 }
             }),
@@ -317,7 +303,18 @@ impl DesklinkApplication {
             }
             notified.retain(|id| active.iter().any(|(device, _)| &device.id == id));
             if let Some(tray) = app.imp().tray.borrow().as_ref() {
-                tray.update(active.into_iter().map(|(_, line)| line).collect());
+                let devices = daemon.devices();
+                let hand_off = devices.iter().any(|device| device.feature_transport_ready)
+                    && crate::terminal_previews::sessions()
+                        .iter()
+                        .any(|info| info.exit_status.is_none());
+                let menu = crate::desk_menu::entries(
+                    &devices,
+                    &crate::device_links::config::app_settings(),
+                    &crate::device_links::transfer_log::recent(),
+                    hand_off,
+                );
+                tray.update(active.into_iter().map(|(_, line)| line).collect(), menu);
             }
             glib::ControlFlow::Continue
         });

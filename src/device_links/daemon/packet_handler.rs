@@ -808,28 +808,45 @@ pub(crate) fn lock_desktop() {
         Ok(()) => return,
         Err(error) => debug_log!("[Daemon] logind could not lock the session: {error}"),
     }
-    // Without logind: ask the screensaver directly.
-    for args in [
-        [
-            "--session",
-            "--dest=org.freedesktop.ScreenSaver",
-            "--type=method_call",
+    // Without logind (or refused): the freedesktop screensaver interface
+    // every desktop's locker implements (KDE, Xfce, Cinnamon, MATE), then
+    // GNOME's own name. Over D-Bus in-process: no helper program needed.
+    let Ok(bus) = gtk::gio::bus_get_sync(gtk::gio::BusType::Session, gtk::gio::Cancellable::NONE)
+    else {
+        return;
+    };
+    for (name, path, interface) in [
+        (
+            "org.freedesktop.ScreenSaver",
             "/ScreenSaver",
-            "org.freedesktop.ScreenSaver.Lock",
-        ],
-        [
-            "--session",
-            "--dest=org.gnome.ScreenSaver",
-            "--type=method_call",
+            "org.freedesktop.ScreenSaver",
+        ),
+        (
+            "org.freedesktop.ScreenSaver",
+            "/org/freedesktop/ScreenSaver",
+            "org.freedesktop.ScreenSaver",
+        ),
+        (
+            "org.gnome.ScreenSaver",
             "/org/gnome/ScreenSaver",
-            "org.gnome.ScreenSaver.Lock",
-        ],
+            "org.gnome.ScreenSaver",
+        ),
     ] {
-        let _ = std::process::Command::new("dbus-send").args(args).spawn();
+        let locked = bus.call_sync(
+            Some(name),
+            path,
+            interface,
+            "Lock",
+            None,
+            None,
+            gtk::gio::DBusCallFlags::NONE,
+            2_000,
+            gtk::gio::Cancellable::NONE,
+        );
+        if locked.is_ok() {
+            return;
+        }
     }
-    let _ = std::process::Command::new("xdg-screensaver")
-        .arg("lock")
-        .spawn();
 }
 
 /// The phone asked this computer to make itself known. The notification is

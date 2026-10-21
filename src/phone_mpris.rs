@@ -384,7 +384,9 @@ pub fn start(app: &DesklinkApplication) {
                     Ok(export) => {
                         exports.insert(id, export);
                     }
-                    Err(error) => eprintln!("[DeskLink] Phone media not shown in GNOME: {error}"),
+                    Err(error) => eprintln!(
+                        "[DeskLink] Phone media not shown in the desktop media controls: {error}"
+                    ),
                 },
             }
         }

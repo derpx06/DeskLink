@@ -230,6 +230,52 @@ pub(crate) fn open_with_entry(exe: &Path) -> String {
     )
 }
 
+/// The Dolphin service menu (KDE's "right-click → Send to …").
+const SERVICE_MENU: &str = "derx06.desklink.com-send.desktop";
+
+/// Whether GNOME's Files is the file manager here: a GNOME-family desktop,
+/// or Nautilus installed.
+fn nautilus_wanted(current_desktop: &str, installed: bool) -> bool {
+    installed
+        || current_desktop.split(':').any(|desktop| {
+            ["GNOME", "Unity", "Budgie", "Pantheon"]
+                .iter()
+                .any(|family| desktop.eq_ignore_ascii_case(family))
+        })
+}
+
+/// Whether `program` is on `$PATH`.
+fn on_path(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(program).is_file()))
+}
+
+/// Dolphin's service menu: one "Send to <phone>" action per paired phone.
+pub(crate) fn dolphin_menu(exe: &Path, phones: &[(String, String)]) -> String {
+    let exe: String = exe
+        .to_string_lossy()
+        .chars()
+        .flat_map(|c| match c {
+            '"' | '`' | '$' | '\\' => vec!['\\', c],
+            c => vec![c],
+        })
+        .collect();
+    let ids: Vec<String> = (0..phones.len())
+        .map(|index| format!("phone{index}"))
+        .collect();
+    let mut menu = format!(
+        "[Desktop Entry]\nType=Service\nMimeType=application/octet-stream;\nActions={};\nX-KDE-Priority=TopLevel\nX-KDE-Submenu=Send to Phone\n",
+        ids.join(";")
+    );
+    for ((id, name), action) in phones.iter().zip(&ids) {
+        let name: String = name.chars().filter(|c| !c.is_control()).collect();
+        menu.push_str(&format!(
+            "\n[Desktop Action {action}]\nName=Send to {name}\nIcon=derx06.desklink.com\nExec=\"{exe}\" --send-files --to {id} -- %F\n"
+        ));
+    }
+    menu
+}
+
 /// Writes `content` to `path` when it differs; `executable` sets mode 0755.
 fn write_if_changed(path: &Path, content: &str, executable: bool) -> std::io::Result<()> {
     if std::fs::read_to_string(path).ok().as_deref() == Some(content) {
@@ -298,6 +344,11 @@ pub fn start(app: &DesklinkApplication) {
         eprintln!("[DeskLink] Could not add \"Send to Phone\" to Open With: {error}");
     }
     let scripts = data.join("nautilus").join("scripts");
+    let service_menu = data.join("kio").join("servicemenus").join(SERVICE_MENU);
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
+    // Each file manager's extra only where it is used.
+    let nautilus = nautilus_wanted(&desktop, on_path("nautilus"));
+    let dolphin = crate::kde::is_kde(&desktop) || on_path("dolphin");
     // The paired phones the scripts were last written for.
     let last = std::cell::RefCell::new(None::<Vec<(String, String)>>);
     let weak = app.downgrade();
@@ -316,8 +367,23 @@ pub fn start(app: &DesklinkApplication) {
             .collect();
         phones.sort();
         if last.borrow().as_ref() != Some(&phones) {
-            if let Err(error) = sync_scripts(&scripts, &exe, &phones) {
-                eprintln!("[DeskLink] Could not update the Files scripts: {error}");
+            if nautilus {
+                if let Err(error) = sync_scripts(&scripts, &exe, &phones) {
+                    eprintln!("[DeskLink] Could not update the Files scripts: {error}");
+                }
+            }
+            if dolphin {
+                let written = if phones.is_empty() {
+                    match std::fs::remove_file(&service_menu) {
+                        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error),
+                        _ => Ok(()),
+                    }
+                } else {
+                    write_if_changed(&service_menu, &dolphin_menu(&exe, &phones), true)
+                };
+                if let Err(error) = written {
+                    eprintln!("[DeskLink] Could not update the Dolphin menu: {error}");
+                }
             }
             last.replace(Some(phones));
         }
@@ -375,6 +441,22 @@ mod tests {
         assert!(entry.contains("Exec=\"/home/me/my \\\"bin\\\"/desklink\" --send-files %F\n"));
         assert!(entry.contains("MimeType=application/octet-stream;"));
         assert!(entry.contains("NoDisplay=true"));
+    }
+
+    #[test]
+    fn dolphin_gets_one_action_per_phone() {
+        let menu = dolphin_menu(
+            Path::new("/usr/bin/desklink"),
+            &[("p1".into(), "Pixel".into()), ("p2".into(), "Tab".into())],
+        );
+        assert!(menu.starts_with("[Desktop Entry]\nType=Service\n"));
+        assert!(menu.contains("Actions=phone0;phone1;\n"));
+        assert!(menu.contains(
+            "[Desktop Action phone1]\nName=Send to Tab\nIcon=derx06.desklink.com\nExec=\"/usr/bin/desklink\" --send-files --to p2 -- %F\n"
+        ));
+        assert!(nautilus_wanted("ubuntu:GNOME", false));
+        assert!(!nautilus_wanted("KDE", false));
+        assert!(nautilus_wanted("KDE", true), "installed anyway");
     }
 
     #[test]

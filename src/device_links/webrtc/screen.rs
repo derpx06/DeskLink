@@ -537,7 +537,9 @@ impl DesktopScreenCapture {
     ) -> Result<Self, String> {
         let (source, pipewire_fd) = match source {
             DesktopSource::PipeWire { node_id: 0, .. } => {
-                return Err("GNOME portal returned invalid screen stream metadata".to_string());
+                return Err(
+                    "The desktop portal returned invalid screen stream metadata".to_string()
+                );
             }
             DesktopSource::PipeWire {
                 fd,
@@ -573,7 +575,7 @@ impl DesktopScreenCapture {
         continuity: Option<RtpContinuity>,
     ) -> Result<Self, String> {
         if !(1..=8192).contains(&width) || !(1..=8192).contains(&height) {
-            return Err("GNOME portal returned invalid screen stream metadata".to_string());
+            return Err("The desktop portal returned invalid screen stream metadata".to_string());
         }
         let (scale, convert, rate, filter, queue, encoder, payloader) =
             encoder_chain(width, height, fps)?;

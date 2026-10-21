@@ -1009,6 +1009,10 @@ impl DesklinkWindow {
                 format!("Locking {name}"),
             ),
             QuickAction::Ping => (DaemonCommand::SendPing(id), "Ping sent".to_string()),
+            QuickAction::Clipboard => (
+                DaemonCommand::SendClipboard(id),
+                format!("Clipboard sent to {name}"),
+            ),
         };
         daemon.send(command);
         self.show_feature_toast(&message);
@@ -1180,6 +1184,8 @@ enum QuickAction {
     Ring,
     Lock,
     Ping,
+    /// Send this computer's clipboard text to the phone now.
+    Clipboard,
 }
 
 /// Clears the re-entrancy flag however `refresh_devices` exits.
