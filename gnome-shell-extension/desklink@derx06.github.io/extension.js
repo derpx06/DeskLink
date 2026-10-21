@@ -68,6 +68,10 @@ const ShellProxy = Gio.DBusProxy.makeProxyWrapper(`<node>
     <method name="OpenTransfer">
       <arg name="transfer_id" type="s" direction="in"/>
     </method>
+    <method name="Hello">
+      <arg name="version" type="u" direction="in"/>
+      <arg name="capabilities" type="as" direction="in"/>
+    </method>
   </interface>
 </node>`);
 
@@ -259,6 +263,13 @@ export default class DeskLinkExtension extends Extension {
             }
             this._proxy = proxy;
             this._quietNotifications = true;
+            // Tells DeskLink this extension shows the phones' notifications,
+            // so the app stops showing its own (an older extension does not
+            // say so, and the app keeps them).
+            proxy.HelloRemote(1, ['notifications', 'quick-settings'], (_result, error) => {
+                if (error)
+                    console.warn(`DeskLink: Hello failed: ${error.message}`);
+            });
             this._changedId = proxy.connect('g-properties-changed', () => this._sync());
             this._sync();
         }, cancellable, Gio.DBusProxyFlags.DO_NOT_AUTO_START);

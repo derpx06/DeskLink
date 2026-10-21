@@ -61,6 +61,10 @@ const XML: &str = r#"<node>
     <method name="OpenTransfer">
       <arg name="transfer_id" type="s" direction="in"/>
     </method>
+    <method name="Hello">
+      <arg name="version" type="u" direction="in"/>
+      <arg name="capabilities" type="as" direction="in"/>
+    </method>
   </interface>
 </node>"#;
 
@@ -325,15 +329,22 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
     let shown = Rc::clone(&properties);
     let registered = connection
         .register_object(PATH, &interface)
-        .method_call(move |_, _, _, _, method, params, invocation| {
-            let Some(app) = weak.upgrade() else {
-                return invocation.return_dbus_error(INVALID_ARGS, "DeskLink is quitting");
-            };
-            match call(&app, method, &params) {
-                Ok(()) => invocation.return_value(None),
-                Err(error) => invocation.return_dbus_error(INVALID_ARGS, &error),
-            }
-        })
+        .method_call(
+            move |connection, sender, _, _, method, params, invocation| {
+                let Some(app) = weak.upgrade() else {
+                    return invocation.return_dbus_error(INVALID_ARGS, "DeskLink is quitting");
+                };
+                if method == "Hello" {
+                    let (_, capabilities) = params.get::<(u32, Vec<String>)>().unwrap_or_default();
+                    client_said_hello(&connection, sender.unwrap_or_default(), capabilities);
+                    return invocation.return_value(None);
+                }
+                match call(&app, method, &params) {
+                    Ok(()) => invocation.return_value(None),
+                    Err(error) => invocation.return_dbus_error(INVALID_ARGS, &error),
+                }
+            },
+        )
         .property(move |_, _, _, _, name| {
             shown
                 .borrow()
@@ -595,6 +606,58 @@ fn is_active(info: &glib::VariantDict) -> bool {
 
 thread_local! {
     static EXTENSION_IS_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The top-bar client that said `Hello`: its bus name, what it handles, and
+/// the watch that forgets it when it goes.
+struct Client {
+    capabilities: Vec<String>,
+    /// Stops the watch (its id type is not nameable outside `gio`).
+    unwatch: Box<dyn FnOnce()>,
+}
+
+thread_local! {
+    static CLIENT: RefCell<Option<Client>> = const { RefCell::new(None) };
+}
+
+/// A top-bar client (the extension, on enable) says what it handles. Kept
+/// until its bus name goes away (Shell restart, extension disabled).
+fn client_said_hello(connection: &gio::DBusConnection, sender: &str, capabilities: Vec<String>) {
+    let watch = gio::bus_watch_name_on_connection(
+        connection,
+        sender,
+        gio::BusNameWatcherFlags::NONE,
+        |_, _, _| {},
+        |_, _| forget_client(),
+    );
+    let unwatch: Box<dyn FnOnce()> = Box::new(move || gio::bus_unwatch_name(watch));
+    let previous = CLIENT.with(|client| {
+        client.replace(Some(Client {
+            capabilities,
+            unwatch,
+        }))
+    });
+    if let Some(previous) = previous {
+        (previous.unwatch)();
+    }
+}
+
+fn forget_client() {
+    if let Some(previous) = CLIENT.with(|client| client.take()) {
+        (previous.unwatch)();
+    }
+}
+
+/// Whether a running top-bar client said it shows `capability` (e.g.
+/// `notifications`). An older extension says nothing, so the app keeps
+/// showing them itself until the new one is running.
+pub fn client_handles(capability: &str) -> bool {
+    CLIENT.with(|client| {
+        client
+            .borrow()
+            .as_ref()
+            .is_some_and(|client| client.capabilities.iter().any(|known| known == capability))
+    })
 }
 
 /// Whether DeskLink's top-bar extension is running, so it already shows

@@ -150,16 +150,7 @@ fn send(app: &DesklinkApplication, device: &str, paths: &[String]) {
         return;
     };
     let devices = daemon.devices();
-    let target = devices
-        .iter()
-        .filter(|candidate| candidate.trusted)
-        .find(|candidate| candidate.id == device)
-        .or_else(|| {
-            devices
-                .iter()
-                .find(|candidate| candidate.trusted && candidate.feature_transport_ready)
-        })
-        .or_else(|| devices.iter().find(|candidate| candidate.trusted));
+    let target = choose_phone(&devices, device);
     let notification = match target {
         Some(phone) => {
             for path in paths {
@@ -191,6 +182,21 @@ fn send(app: &DesklinkApplication, device: &str, paths: &[String]) {
     app.send_notification(Some("send-files"), &notification);
 }
 
+/// The phone to send to: the one named (and only it: a phone that is not
+/// paired, or gone, gets nothing), else the connected one, else any paired.
+fn choose_phone<'a>(
+    devices: &'a [crate::device_links::device::DeviceView],
+    named: &str,
+) -> Option<&'a crate::device_links::device::DeviceView> {
+    let paired = || devices.iter().filter(|candidate| candidate.trusted);
+    if !named.is_empty() {
+        return paired().find(|candidate| candidate.id == named);
+    }
+    paired()
+        .find(|candidate| candidate.feature_transport_ready)
+        .or_else(|| paired().next())
+}
+
 /// The command a script or entry runs: this binary, quoted for `sh`.
 fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))
@@ -216,17 +222,31 @@ pub(crate) fn script(exe: &Path, device_id: &str) -> String {
 }
 
 /// The Open With entry: `Exec` quoted per the Desktop Entry spec.
+/// `path` as one quoted `Exec` argument, per the Desktop Entry spec: `"`,
+/// `` ` ``, `$` and `\\` are escaped with a backslash inside the quotes, and
+/// then every backslash is doubled (string-value escaping applies first), so
+/// a literal backslash is four. `%` is a field code everywhere: `%%`.
+pub(crate) fn desktop_exec_quoted(path: &Path) -> String {
+    let mut quoted = String::from('"');
+    for c in path.to_string_lossy().chars() {
+        match c {
+            '"' | '`' | '$' => {
+                quoted.push_str("\\\\");
+                quoted.push(c);
+            }
+            '\\' => quoted.push_str("\\\\\\\\"),
+            '%' => quoted.push_str("%%"),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 pub(crate) fn open_with_entry(exe: &Path) -> String {
-    let exe: String = exe
-        .to_string_lossy()
-        .chars()
-        .flat_map(|c| match c {
-            '"' | '`' | '$' | '\\' => vec!['\\', c],
-            c => vec![c],
-        })
-        .collect();
+    let exe = desktop_exec_quoted(exe);
     format!(
-        "[Desktop Entry]\nType=Application\nName=Send to Phone\nComment=Send files to your phone with DeskLink\nIcon=derx06.desklink.com\nExec=\"{exe}\" --send-files %F\nTerminal=false\nNoDisplay=true\nMimeType={MIME_TYPES}\n"
+        "[Desktop Entry]\nType=Application\nName=Send to Phone\nComment=Send files to your phone with DeskLink\nIcon=derx06.desklink.com\nExec={exe} --send-files %F\nTerminal=false\nNoDisplay=true\nMimeType={MIME_TYPES}\n"
     )
 }
 
@@ -252,14 +272,7 @@ fn on_path(program: &str) -> bool {
 
 /// Dolphin's service menu: one "Send to <phone>" action per paired phone.
 pub(crate) fn dolphin_menu(exe: &Path, phones: &[(String, String)]) -> String {
-    let exe: String = exe
-        .to_string_lossy()
-        .chars()
-        .flat_map(|c| match c {
-            '"' | '`' | '$' | '\\' => vec!['\\', c],
-            c => vec![c],
-        })
-        .collect();
+    let exe = desktop_exec_quoted(exe);
     let ids: Vec<String> = (0..phones.len())
         .map(|index| format!("phone{index}"))
         .collect();
@@ -270,7 +283,7 @@ pub(crate) fn dolphin_menu(exe: &Path, phones: &[(String, String)]) -> String {
     for ((id, name), action) in phones.iter().zip(&ids) {
         let name: String = name.chars().filter(|c| !c.is_control()).collect();
         menu.push_str(&format!(
-            "\n[Desktop Action {action}]\nName=Send to {name}\nIcon=derx06.desklink.com\nExec=\"{exe}\" --send-files --to {id} -- %F\n"
+            "\n[Desktop Action {action}]\nName=Send to {name}\nIcon=derx06.desklink.com\nExec={exe} --send-files --to {id} -- %F\n"
         ));
     }
     menu
@@ -438,9 +451,59 @@ mod tests {
     #[test]
     fn the_open_with_entry_quotes_its_command() {
         let entry = open_with_entry(Path::new("/home/me/my \"bin\"/desklink"));
-        assert!(entry.contains("Exec=\"/home/me/my \\\"bin\\\"/desklink\" --send-files %F\n"));
+        assert!(
+            entry.contains("Exec=\"/home/me/my \\\\\"bin\\\\\"/desklink\" --send-files %F\n"),
+            "{entry}"
+        );
+        assert_eq!(
+            desktop_exec_quoted(Path::new("/a\\b/$c/100%/d`e")),
+            "\"/a\\\\\\\\b/\\\\$c/100%%/d\\\\`e\"",
+            "a backslash is four, a dollar two plus itself, a percent doubled"
+        );
         assert!(entry.contains("MimeType=application/octet-stream;"));
         assert!(entry.contains("NoDisplay=true"));
+    }
+
+    #[test]
+    fn a_named_phone_gets_the_files_or_nobody_does() {
+        let phone = |id: &str, trusted: bool, ready: bool| {
+            let info = crate::device_links::device_info::DeviceInfo {
+                id: id.into(),
+                name: id.into(),
+                device_type: "phone".into(),
+                protocol_version: 9,
+                incoming_capabilities: Vec::new(),
+                outgoing_capabilities: Vec::new(),
+                instance_id: None,
+            };
+            let mut device =
+                crate::device_links::device::DeviceView::from_info(&info, String::new(), trusted);
+            device.feature_transport_ready = ready;
+            device
+        };
+        let devices = [
+            phone("p1", true, true),
+            phone("p2", true, false),
+            phone("x", false, true),
+        ];
+        let id =
+            |found: Option<&crate::device_links::device::DeviceView>| found.map(|d| d.id.clone());
+        assert_eq!(
+            id(choose_phone(&devices, "p2")),
+            Some("p2".into()),
+            "the one named"
+        );
+        assert_eq!(
+            id(choose_phone(&devices, "gone")),
+            None,
+            "never another phone"
+        );
+        assert_eq!(id(choose_phone(&devices, "x")), None, "not paired");
+        assert_eq!(
+            id(choose_phone(&devices, "")),
+            Some("p1".into()),
+            "unnamed: the connected one"
+        );
     }
 
     #[test]

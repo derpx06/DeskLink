@@ -955,7 +955,7 @@ impl DesklinkWindow {
                 // With the top-bar extension on, it shows them as GNOME's
                 // own notifications: never twice.
                 if !pops_up(is_new, shown, notification.silent)
-                    || crate::shell_dbus::extension_active()
+                    || crate::shell_dbus::client_handles("notifications")
                 {
                     continue;
                 }

@@ -586,7 +586,7 @@ impl DaemonWorker {
             CommandFailure::Recovering => {
                 eprintln!("[DeskLink] Feature send deferred during WebRTC recovery: {error}");
             }
-            CommandFailure::NotConnected => {
+            failure @ (CommandFailure::NotConnected | CommandFailure::Unsupported) => {
                 let name = self
                     .devices
                     .lock()
@@ -595,7 +595,11 @@ impl DaemonWorker {
                     .unwrap_or_else(|| "The phone".to_string());
                 push_error(
                     &self.errors,
-                    format!("{name} is not connected. Try again once it is."),
+                    if failure == CommandFailure::Unsupported {
+                        format!("{name} doesn't support this yet (update DeskLink on the phone).")
+                    } else {
+                        format!("{name} is not connected. Try again once it is.")
+                    },
                 );
             }
             CommandFailure::Failed => {
@@ -615,6 +619,9 @@ enum CommandFailure {
     Recovering,
     /// No link to the phone: the user is told so.
     NotConnected,
+    /// The phone's DeskLink does not take this feature (an older build, or
+    /// the feature is off between the two): the user is told to update.
+    Unsupported,
     /// Anything else, shown as it is.
     Failed,
 }
@@ -624,6 +631,11 @@ fn command_failure(error: &str) -> CommandFailure {
         || error.contains("Stale DeskLink session")
     {
         CommandFailure::Recovering
+    } else if error.contains("is not enabled in the DeskLink")
+        || error.contains("DeskLink has no outgoing handler for")
+        || error.contains("does not accept")
+    {
+        CommandFailure::Unsupported
     } else if !should_surface_send_error(error) {
         CommandFailure::NotConnected
     } else {
@@ -803,6 +815,16 @@ mod tests {
         assert_eq!(
             command_failure("Could not encode the packet"),
             CommandFailure::Failed
+        );
+        assert_eq!(
+            command_failure(
+                "desklink.mpris.request is not enabled in the DeskLink WebRTC feature profile"
+            ),
+            CommandFailure::Unsupported
+        );
+        assert_eq!(
+            command_failure("The paired device does not accept desklink.x"),
+            CommandFailure::Unsupported
         );
     }
 

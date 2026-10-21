@@ -6,7 +6,6 @@ use std::time::Duration;
 use super::clipboard::{clipboard_from_phone, set_clipboard_text_from_remote};
 use super::dispatcher::{PacketSource, SharedPacketDispatcher};
 use super::handle::DaemonEvent;
-use super::handshake::handle_disconnect;
 use super::state::{
     push_event, remove_notification, replace_notifications, update_battery_status,
     update_media_from_packet, update_pair_state, update_volume_status, upsert_notification,
@@ -428,8 +427,11 @@ fn handle_qr_pairing_proof(
     }
 }
 
+/// Reads `binding`'s socket number `epoch` (see `SessionLink::epoch`) until
+/// it ends or the link adopts a newer one.
 pub(super) fn packet_read_loop(
     binding: SessionBinding,
+    epoch: u64,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
@@ -443,9 +445,8 @@ pub(super) fn packet_read_loop(
         return;
     }
     let mut line = Vec::new();
-    // The socket this reader serves. Once the link adopts a newer one, this
-    // reader's socket ending is not the link ending.
-    let epoch = binding.link.epoch();
+    // Once the link adopts a newer socket, this reader's socket ending is
+    // not the link ending.
     let superseded = || binding.link.epoch() != epoch;
 
     loop {
@@ -455,8 +456,9 @@ pub(super) fn packet_read_loop(
         match binding.link.read_byte_at(epoch) {
             Ok(ReadOutcome::Closed | ReadOutcome::Idle) | Err(_) if superseded() => break,
             Ok(ReadOutcome::Closed) => {
-                if handle_disconnect(
+                if super::handshake::handle_reader_disconnect(
                     &binding,
+                    epoch,
                     &devices,
                     &sessions,
                     "Peer closed the connection".to_string(),
@@ -489,8 +491,9 @@ pub(super) fn packet_read_loop(
                         "[Daemon] Read line too long for {}. Disconnecting.",
                         device_id
                     );
-                    handle_disconnect(
+                    super::handshake::handle_reader_disconnect(
                         &binding,
+                        epoch,
                         &devices,
                         &sessions,
                         "Packet exceeded the maximum size".to_string(),
@@ -526,7 +529,13 @@ pub(super) fn packet_read_loop(
                 thread::sleep(Duration::from_millis(5));
             }
             Err(error) => {
-                if handle_disconnect(&binding, &devices, &sessions, error.clone()) {
+                if super::handshake::handle_reader_disconnect(
+                    &binding,
+                    epoch,
+                    &devices,
+                    &sessions,
+                    error.clone(),
+                ) {
                     eprintln!("[Daemon] {error} for {device_id}. Marked unreachable.");
                 }
                 break;

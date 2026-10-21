@@ -220,9 +220,6 @@ pub(crate) fn attach_bootstrap_link(
     // newcomer wins against a silent incumbent, which is the liveness override
     // Syncthing still lacks (issue #9337) and the reason a zombie cannot block
     // its own replacement here.
-    let incumbent_is_answering = sessions
-        .silence(device_id)
-        .is_some_and(|silence| silence < super::HEARTBEAT_IDLE * 2);
     // A new restart epoch means the peer's previous process — and with it the
     // WebRTC peer this session holds — is gone. Neither keep the old socket
     // nor adopt into the old session: register, which clears the dead peer.
@@ -233,61 +230,62 @@ pub(crate) fn attach_bootstrap_link(
             device_id
         );
     }
-    if !restarted
-        && !supersede_live
-        && sessions.has_ready_webrtc(device_id)
-        && sessions.has_live_bootstrap_link(device_id)
-        && incumbent_is_answering
-    {
-        debug_log!(
-            "[DL-WRTC-BOOT] ignoring refreshed bootstrap socket for {}; retaining feature-ready WebRTC session",
-            device_id
-        );
-        link.close();
-        return Ok(());
-    }
 
     // The incumbent is closed, or open but silent (a frozen phone's old socket
     // while its new one arrives), and its WebRTC feature transport is still
-    // healthy. Adopt the replacement socket into the existing session
-    // rather than registering a new one: `register_link` bumps the generation
-    // and clears the peer and handover unconditionally, so re-registering here
+    // healthy: adopt the replacement socket into the existing session rather
+    // than registering a new one. `register_link` bumps the generation and
+    // clears the peer and handover unconditionally, so re-registering here
     // destroyed a *working* transport every time the phone refreshed its
     // bootstrap socket -- and the handover that followed dropped its own
     // bootstrap socket, which brought the phone straight back here. That loop
     // is what pinned the UI on "Connecting" forever while battery and
-    // notifications kept arriving over the link underneath it.
-    //
-    // Android already treats a replacement LAN connection as signaling
-    // capacity only (`onConnectionReceived`'s retained binding); this is the
-    // desktop half of the same rule.
-    let adopted = if restarted || supersede_live {
-        None
+    // notifications kept arriving over the link underneath it. Android treats
+    // a replacement LAN connection the same way (`onConnectionReceived`'s
+    // retained binding). Keep-or-adopt is decided under the session lock.
+    let adoption = if restarted || supersede_live {
+        crate::device_links::core::Adoption::Register
     } else {
-        sessions.adopt_bootstrap_link(device_id, &transport)
+        sessions.adopt_or_keep(device_id, &transport, super::HEARTBEAT_IDLE * 2)
     };
-    if let Some((binding, replaced)) = adopted {
-        // Outside the session lock: the old socket's reader wakes, sees the
-        // link carries a newer socket, and leaves quietly.
-        replaced.shutdown();
-        debug_log!(
-            "[DL-WRTC-BOOT] adopted a replacement bootstrap socket for {} (session {}, generation {}); kept the feature-ready WebRTC transport",
-            binding.device_id, binding.session_id, binding.generation
-        );
-        let read_devices = Arc::clone(&devices);
-        let read_sessions = Arc::clone(&sessions);
-        let read_config = Arc::clone(&config);
-        let read_events = Arc::clone(&events);
-        thread::spawn(move || {
-            packet_read_loop(
-                binding,
-                read_devices,
-                read_sessions,
-                read_config,
-                read_events,
-            )
-        });
-        return Ok(());
+    match adoption {
+        crate::device_links::core::Adoption::Keep => {
+            debug_log!(
+                "[DL-WRTC-BOOT] ignoring refreshed bootstrap socket for {}; retaining feature-ready WebRTC session",
+                device_id
+            );
+            link.close();
+            return Ok(());
+        }
+        crate::device_links::core::Adoption::Adopted {
+            binding,
+            replaced,
+            epoch,
+        } => {
+            // Outside the session lock: the old socket's reader wakes, sees the
+            // link carries a newer socket, and leaves quietly.
+            replaced.shutdown();
+            debug_log!(
+                "[DL-WRTC-BOOT] adopted a replacement bootstrap socket for {} (session {}, generation {}); kept the feature-ready WebRTC transport",
+                binding.device_id, binding.session_id, binding.generation
+            );
+            let read_devices = Arc::clone(&devices);
+            let read_sessions = Arc::clone(&sessions);
+            let read_config = Arc::clone(&config);
+            let read_events = Arc::clone(&events);
+            thread::spawn(move || {
+                packet_read_loop(
+                    binding,
+                    epoch,
+                    read_devices,
+                    read_sessions,
+                    read_config,
+                    read_events,
+                )
+            });
+            return Ok(());
+        }
+        crate::device_links::core::Adoption::Register => {}
     }
 
     let registration = sessions
@@ -323,9 +321,11 @@ pub(crate) fn attach_bootstrap_link(
     let read_config = Arc::clone(&config);
     let read_binding = binding.clone();
     let read_events = Arc::clone(&events);
+    // A link just registered carries its first socket: epoch 0.
     thread::spawn(move || {
         packet_read_loop(
             read_binding,
+            0,
             read_devices,
             read_sessions,
             read_config,
@@ -407,7 +407,35 @@ pub(super) fn handle_disconnect(
     sessions: &Arc<DeviceManager>,
     reason: String,
 ) -> bool {
-    let result = sessions.bootstrap_disconnected_if_current(binding, reason);
+    disconnected(
+        sessions.bootstrap_disconnected_if_current(binding, reason),
+        binding,
+        devices,
+    )
+}
+
+/// [`handle_disconnect`] for the reader of socket `epoch`: ignored once the
+/// link has adopted a newer socket, so a late end of the old one never
+/// closes the new one.
+pub(super) fn handle_reader_disconnect(
+    binding: &SessionBinding,
+    epoch: u64,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    sessions: &Arc<DeviceManager>,
+    reason: String,
+) -> bool {
+    disconnected(
+        sessions.reader_disconnected(binding, epoch, reason),
+        binding,
+        devices,
+    )
+}
+
+fn disconnected(
+    result: crate::device_links::core::DisconnectResult,
+    binding: &SessionBinding,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+) -> bool {
     if !result.was_current {
         return false;
     }

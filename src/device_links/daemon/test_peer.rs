@@ -678,8 +678,9 @@ mod tests {
                 Arc::clone(&desktop.events),
             );
             std::thread::spawn(move || {
+                let epoch = binding.link.epoch();
                 super::super::packet_handler::packet_read_loop(
-                    binding, devices, sessions, config, events,
+                    binding, epoch, devices, sessions, config, events,
                 )
             })
         };

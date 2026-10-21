@@ -110,6 +110,22 @@ impl DeviceConnection {
     }
 }
 
+/// What to do with a newly authenticated bootstrap socket for a session that
+/// may have a feature-ready WebRTC peer to preserve.
+pub enum Adoption {
+    /// The current socket is open and answering: the newcomer is redundant.
+    Keep,
+    /// Swapped into the existing session (same generation, same link, so the
+    /// WebRTC peer lives): read it from `epoch`, shut `replaced` down.
+    Adopted {
+        binding: SessionBinding,
+        replaced: Arc<dyn LinkTransport>,
+        epoch: u64,
+    },
+    /// Nothing to preserve: register it as a new generation.
+    Register,
+}
+
 pub struct DeviceManager {
     next_session_id: AtomicU64,
     sessions: Mutex<HashMap<String, DeviceSession>>,
@@ -240,25 +256,36 @@ impl DeviceManager {
     /// and returned for the caller to shut down once this lock is released.
     /// Its reader sees the link's epoch change and leaves without reporting a
     /// disconnect.
-    pub fn adopt_bootstrap_link(
+    pub fn adopt_or_keep(
         &self,
         device_id: &str,
         transport: &Arc<dyn LinkTransport>,
-    ) -> Option<(SessionBinding, Arc<dyn LinkTransport>)> {
-        let mut sessions = self.sessions.lock().ok()?;
-        let session = sessions.get_mut(device_id)?;
-        if session.state == SessionState::Terminated {
-            return None;
-        }
-        if !session
-            .webrtc_handover
-            .as_ref()
-            .is_some_and(HandoverRuntime::features_ready)
+        answering_within: std::time::Duration,
+    ) -> Adoption {
+        let Ok(mut sessions) = self.sessions.lock() else {
+            return Adoption::Register;
+        };
+        let Some(session) = sessions.get_mut(device_id) else {
+            return Adoption::Register;
+        };
+        if session.state == SessionState::Terminated
+            || !session
+                .webrtc_handover
+                .as_ref()
+                .is_some_and(HandoverRuntime::features_ready)
         {
-            return None;
+            return Adoption::Register;
         }
-        let link = session.active_link.as_ref()?;
+        let Some(link) = session.active_link.clone() else {
+            return Adoption::Register;
+        };
+        // Decided under the same lock as the swap: two sockets arriving
+        // together cannot both be adopted, nor one kept and one adopted.
+        if !link.is_closed() && session.last_inbound_at.elapsed() < answering_within {
+            return Adoption::Keep;
+        }
         let replaced = link.adopt(Arc::clone(transport));
+        let epoch = link.epoch();
         session.state = SessionState::Ready;
         // A working socket is fresh evidence the peer is reachable, so a
         // recovery ladder exhausted while it was away starts over.
@@ -268,7 +295,14 @@ impl DeviceManager {
         // Carrying the old one's staleness clock over would have the liveness
         // tick bury it before its first packet.
         session.last_inbound_at = Instant::now();
-        Some((session.binding()?, replaced))
+        match session.binding() {
+            Some(binding) => Adoption::Adopted {
+                binding,
+                replaced,
+                epoch,
+            },
+            None => Adoption::Register,
+        }
     }
 
     pub fn register_link(
@@ -506,6 +540,7 @@ impl DeviceManager {
     /// Returns whether a device already has a mutually feature-ready WebRTC
     /// peer.  A later LAN socket is only a bootstrap/signaling candidate in
     /// that state and must not replace the live feature generation.
+    #[cfg(test)]
     pub fn has_ready_webrtc(&self, device_id: &str) -> bool {
         self.sessions
             .lock()
@@ -660,6 +695,27 @@ impl DeviceManager {
         binding: &SessionBinding,
         reason: String,
     ) -> DisconnectResult {
+        self.bootstrap_disconnected(binding, reason, None)
+    }
+
+    /// [`Self::bootstrap_disconnected_if_current`] for the reader of socket
+    /// `epoch`: once the link carries a newer socket, that reader's socket
+    /// ending is not the link's (checked under the session lock).
+    pub fn reader_disconnected(
+        &self,
+        binding: &SessionBinding,
+        epoch: u64,
+        reason: String,
+    ) -> DisconnectResult {
+        self.bootstrap_disconnected(binding, reason, Some(epoch))
+    }
+
+    fn bootstrap_disconnected(
+        &self,
+        binding: &SessionBinding,
+        reason: String,
+        epoch: Option<u64>,
+    ) -> DisconnectResult {
         let Ok(mut sessions) = self.sessions.lock() else {
             return DisconnectResult {
                 was_current: false,
@@ -682,7 +738,8 @@ impl DeviceManager {
                 .active_link
                 .as_ref()
                 .is_some_and(|link| Arc::ptr_eq(link, &binding.link))
-            && Arc::ptr_eq(&session.cancellation, &binding.cancellation);
+            && Arc::ptr_eq(&session.cancellation, &binding.cancellation)
+            && epoch.is_none_or(|epoch| binding.link.epoch() == epoch);
         if !matches || session.state == SessionState::Terminated {
             return DisconnectResult {
                 was_current: false,
@@ -1390,8 +1447,7 @@ mod tests {
 
         let replacement: Arc<dyn LinkTransport> =
             Arc::new(crate::device_links::core::link_transport::DeadTransport);
-        let (adopted, _) = manager
-            .adopt_bootstrap_link("phone-1", &replacement)
+        let (adopted, _, _) = adopt(&manager, &replacement)
             .expect("a closed link with a ready WebRTC transport is adoptable");
 
         assert_eq!(
@@ -1432,9 +1488,7 @@ mod tests {
 
         binding.link.close();
         assert!(
-            manager
-                .adopt_bootstrap_link("phone-1", &replacement)
-                .is_none(),
+            adopt(&manager, &replacement).is_none(),
             "no WebRTC transport to preserve"
         );
 
@@ -1444,9 +1498,18 @@ mod tests {
             .binding;
         mark_features_ready(&manager, &binding);
         let epoch = binding.link.epoch();
-        let (adopted, _old) = manager
-            .adopt_bootstrap_link("phone-1", &replacement)
-            .expect("a silent live incumbent is swapped in place");
+        // Open and still answering: the newcomer is redundant.
+        assert!(matches!(
+            manager.adopt_or_keep("phone-1", &replacement, std::time::Duration::from_secs(20)),
+            Adoption::Keep
+        ));
+        let (adopted, _old, adopted_epoch) =
+            adopt(&manager, &replacement).expect("a silent live incumbent is swapped in place");
+        assert_eq!(
+            adopted_epoch,
+            binding.link.epoch(),
+            "the new reader's socket"
+        );
         assert!(Arc::ptr_eq(&adopted.link, &binding.link));
         assert_eq!(adopted.generation, binding.generation);
         assert_ne!(binding.link.epoch(), epoch, "the old reader sees it");
@@ -1456,6 +1519,51 @@ mod tests {
             "and never reads a byte of the new socket"
         );
         assert!(manager.has_ready_webrtc("phone-1"));
+    }
+
+    /// Adopts with no answering window (the incumbent counts as silent).
+    fn adopt(
+        manager: &DeviceManager,
+        transport: &Arc<dyn LinkTransport>,
+    ) -> Option<(SessionBinding, Arc<dyn LinkTransport>, u64)> {
+        match manager.adopt_or_keep("phone-1", transport, std::time::Duration::ZERO) {
+            Adoption::Adopted {
+                binding,
+                replaced,
+                epoch,
+            } => Some((binding, replaced, epoch)),
+            _ => None,
+        }
+    }
+
+    /// The old socket's reader ending after an adoption must not close the
+    /// new socket: its disconnect names its own (old) epoch.
+    #[test]
+    fn a_late_end_of_the_old_socket_never_closes_the_new_one() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        mark_features_ready(&manager, &binding);
+        let old_epoch = binding.link.epoch();
+        let replacement: Arc<dyn LinkTransport> =
+            Arc::new(crate::device_links::core::link_transport::DeadTransport);
+        let (_, _, new_epoch) = adopt(&manager, &replacement).unwrap();
+        let late = manager.reader_disconnected(&binding, old_epoch, "old socket ended".into());
+        assert!(!late.was_current, "the old reader is not the link");
+        assert!(!binding.link.is_closed() && manager.has_live_bootstrap_link("phone-1"));
+        let real = manager.reader_disconnected(&binding, new_epoch, "new socket ended".into());
+        assert!(real.was_current, "the current reader is");
+        // Two sockets adopted in turn: each reader has its own epoch.
+        let (_, _, first) = adopt(&manager, &replacement).unwrap();
+        let (_, _, second) = adopt(&manager, &replacement).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(
+            binding.link.read_byte_at(first).unwrap(),
+            crate::device_links::core::ReadOutcome::Closed,
+            "the earlier reader stops; only the latest reads"
+        );
     }
 
     #[test]

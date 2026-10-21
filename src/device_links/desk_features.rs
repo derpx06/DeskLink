@@ -378,7 +378,13 @@ fn runcommand_reply(
     packet: &NetworkPacket,
 ) -> (Option<NetworkPacket>, Option<RunCommand>) {
     if gate.is_err() {
-        return (Some(command_state_packet(gate, commands)), None);
+        // A refused tap names the command it refuses (`key`), so the phone
+        // can tell it from a state push.
+        let mut refused = command_state_packet(gate, commands);
+        if let Some(key) = packet.get_str("key") {
+            refused.set("key", key);
+        }
+        return (Some(refused), None);
     }
     let list = packet
         .get_bool("requestCommandList")
@@ -729,6 +735,7 @@ mod tests {
             let (reply, run) = runcommand_reply(gate(access, unlocked), &commands, &packet);
             let reply = reply.unwrap();
             assert_eq!(reply.get_str("error"), Some(code));
+            assert_eq!(reply.get_str("key"), Some("a1"), "the refused tap is named");
             assert!(
                 !reply.body.contains_key("commandList"),
                 "no list behind the gate"

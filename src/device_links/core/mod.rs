@@ -7,8 +7,8 @@ pub(crate) mod test_link;
 
 #[allow(unused_imports)]
 pub use device_manager::{
-    DeviceConnection, DeviceManager, DisconnectResult, FeatureTransportSnapshot, LivenessTick,
-    ReconnectLease, RegistrationResult, SessionError,
+    Adoption, DeviceConnection, DeviceManager, DisconnectResult, FeatureTransportSnapshot,
+    LivenessTick, ReconnectLease, RegistrationResult, SessionError,
 };
 pub use device_session::{
     ConnectionGeneration, DeviceSession, ReplayCache, SessionBinding, SessionId, SessionState,

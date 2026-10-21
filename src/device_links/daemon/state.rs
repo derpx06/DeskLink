@@ -253,10 +253,16 @@ pub(super) fn update_media_from_packet(
             return;
         };
 
-        // A `playerList` is the phone's whole media state: it replaces what
-        // was cached, so nothing from a player that is gone lingers.
-        let replace = packet.body.contains_key("playerList");
-        let cached = device.media_status.clone().filter(|_| !replace);
+        // A `playerList` is the phone's whole set of players: what was
+        // cached for a player that is no longer in it is dropped, so nothing
+        // from a player that is gone lingers. The current player's state is
+        // kept while it is still listed (a list alone says nothing about it).
+        let listed = string_vec(packet.body.get("playerList"));
+        let cached = device.media_status.clone().filter(|media| {
+            listed
+                .as_ref()
+                .is_none_or(|players| players.contains(&media.player))
+        });
         let mut media = cached.unwrap_or_else(|| MediaStatus {
             player: String::new(),
             player_list: Vec::new(),
@@ -820,6 +826,25 @@ mod tests {
             media.title.is_empty() && !media.is_playing,
             "nothing of Spotify lingers"
         );
+    }
+
+    #[test]
+    fn a_list_that_still_has_the_player_keeps_its_state() {
+        let (devices, info) = test_devices();
+        let mut first = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_MPRIS);
+        first.set("playerList", json!(["Spotify"]));
+        first.set("player", "Spotify");
+        first.set("title", "Song");
+        first.set("isPlaying", true);
+        update_media_from_packet(&devices, &info.id, &first);
+        let mut list = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_MPRIS);
+        list.set("playerList", json!(["Spotify", "Podcasts"]));
+        update_media_from_packet(&devices, &info.id, &list);
+        let devices = devices.lock().unwrap();
+        let media = devices[&info.id].media_status.as_ref().unwrap();
+        assert_eq!(media.title, "Song");
+        assert!(media.is_playing);
+        assert_eq!(media.player_list, ["Spotify", "Podcasts"]);
     }
 
     #[test]
