@@ -34,6 +34,7 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
+import {BatteryRing, fillMenu, sessionLine, shortStatus, statusLine, styleVariant} from './menu.js';
 import {PhoneCalls, PhoneNotifications} from './notifications.js';
 
 const BUS_NAME = 'derx06.desklink.com';
@@ -76,66 +77,8 @@ const ShellProxy = Gio.DBusProxy.makeProxyWrapper(`<node>
   </interface>
 </node>`);
 
-function lastSeen(device) {
-    if (!device.lastSeen)
-        return '';
-    const seen = GLib.DateTime.new_from_unix_local(device.lastSeen);
-    const now = GLib.DateTime.new_now_local();
-    const today = seen.get_ymd().join() === now.get_ymd().join();
-    return `last seen ${seen.format(today ? '%H:%M' : '%-d %b %H:%M')}`;
-}
-
-/// "Connected · 82% · charging", "last seen 14:02", "Connecting…".
-function statusLine(device) {
-    if (!device)
-        return 'No phone connected';
-    if (device.ready) {
-        const parts = ['Connected'];
-        if (device.battery >= 0)
-            parts.push(`${device.battery}%`);
-        if (device.charging)
-            parts.push('charging');
-        return parts.join(' · ');
-    }
-    if (device.reachable)
-        return 'Connecting…';
-    return lastSeen(device) || 'Not connected';
-}
-
-function sessionLine(device) {
-    const parts = [];
-    if (device.screen === 'control')
-        parts.push('controlling the screen');
-    else if (device.screen === 'view')
-        parts.push('viewing the screen');
-    if (device.terminals > 0)
-        parts.push(device.terminals === 1 ? '1 terminal' : `${device.terminals} terminals`);
-    return parts.join(' · ');
-}
-
 function centered(params) {
     return {y_align: Clutter.ActorAlign.CENTER, ...params};
-}
-
-/// A stock-styled button: icon over a label, accent when checked.
-function actionButton(icon, label, {name = label, checked = null, enabled = true, onClick}) {
-    const content = new St.BoxLayout({vertical: true, x_align: Clutter.ActorAlign.CENTER});
-    content.add_child(new St.Icon({icon_name: icon, style_class: 'popup-menu-icon'}));
-    content.add_child(new St.Label({text: label, style_class: 'desklink-action-label'}));
-    const button = new St.Button({
-        child: content,
-        style_class: 'button desklink-action',
-        can_focus: enabled,
-        reactive: enabled,
-        x_expand: true,
-        toggle_mode: checked !== null,
-        checked: !!checked,
-        accessible_name: checked === null ? name : `${name}, ${checked ? 'on' : 'off'}`,
-    });
-    if (!enabled)
-        button.add_style_pseudo_class('insensitive');
-    button.connect('clicked', onClick);
-    return button;
 }
 
 const DeskLinkToggle = GObject.registerClass(
@@ -157,20 +100,26 @@ class DeskLinkToggle extends QuickMenuToggle {
     }
 });
 
+/// The top bar: DeskLink's link glyph while a phone is connected, with a
+/// coral dot while a phone is using this computer.
 const DeskLinkIndicator = GObject.registerClass(
 class DeskLinkIndicator extends SystemIndicator {
-    _init() {
+    _init(path) {
         super._init();
         this._icon = this._addIndicator();
-        this._icon.icon_name = PHONE_ICON;
+        this._icon.gicon = Gio.FileIcon.new(Gio.File.new_for_path(`${path}/desklink-symbolic.svg`));
         this._icon.accessible_name = 'Phone connected';
         this._icon.visible = false;
+        this._dot = new St.Widget(centered({style_class: 'desklink-indicator-dot', visible: false}));
+        this.add_child(this._dot);
         this.toggle = new DeskLinkToggle();
         this.quickSettingsItems.push(this.toggle);
     }
 
-    showConnected(connected) {
+    showConnected(connected, live) {
         this._icon.visible = connected;
+        this._dot.visible = connected && live;
+        this._icon.accessible_name = live ? 'Phone connected, using this computer' : 'Phone connected';
     }
 });
 
@@ -219,8 +168,22 @@ export default class DeskLinkExtension extends Extension {
         this._calls = new PhoneCalls((method, args) => this._call(method, args));
         this._quietNotifications = true;
 
-        this._indicator = new DeskLinkIndicator();
+        this._indicator = new DeskLinkIndicator(this.path);
         this._indicator.toggle.connect('clicked', () => this._toggleClicked());
+        this._ring = new BatteryRing();
+        this._indicator.toggle.menu.addHeaderSuffix(this._ring);
+        // Durations and call timers move while the menu is open.
+        this._tickers = [];
+        this._seen = new Set();
+        this._tickId = 0;
+        this._indicator.toggle.menu.connect('open-state-changed', (_menu, open) => {
+            if (this._tickId)
+                GLib.source_remove(this._tickId);
+            this._tickId = open ? GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+                this._tickers.forEach(tick => tick());
+                return GLib.SOURCE_CONTINUE;
+            }) : 0;
+        });
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
 
         this._button = new DeskLinkButton();
@@ -236,6 +199,9 @@ export default class DeskLinkExtension extends Extension {
     }
 
     disable() {
+        if (this._tickId)
+            GLib.source_remove(this._tickId);
+        this._tickId = 0;
         Gio.bus_unwatch_name(this._watchId);
         this._watchId = 0;
         Main.sessionMode.disconnect(this._modeId);
@@ -321,8 +287,9 @@ export default class DeskLinkExtension extends Extension {
         const toggle = this._indicator.toggle;
         toggle.visible = running && !locked && devices.length > 0;
         toggle.checked = !!selected?.ready;
-        toggle._setTitle(selected?.name ?? 'DeskLink', statusLine(selected));
-        this._indicator.showConnected(running && !locked && devices.some(device => device.ready));
+        toggle._setTitle(selected?.name ?? 'DeskLink', shortStatus(selected));
+        this._indicator.showConnected(running && !locked && devices.some(device => device.ready),
+            live.length > 0);
         if (!locked)
             this._fillMenu(toggle.menu, devices, selected, desk, live);
 
@@ -337,83 +304,37 @@ export default class DeskLinkExtension extends Extension {
             this._invoke('', 'reconnect');
     }
 
-    _fillMenu(menu, devices, selected, desk, live) {
+    _fillMenu(menu, devices, selected, desk, live_) {
         const transfers = this._read('Transfers', []);
         // Rebuilt only when what it shows changed, so keyboard focus in an
         // open menu is not thrown away every second.
-        const menuKey = JSON.stringify([devices, selected?.id, desk, transfers]);
+        const menuKey = JSON.stringify([devices, selected?.id, desk, transfers, styleVariant()]);
         if (menuKey === this._menuKey)
             return;
         this._menuKey = menuKey;
-        menu.setHeader(PHONE_ICON, selected?.name ?? 'DeskLink', statusLine(selected));
-        menu.removeAll();
-
-        if (devices.length > 1) {
-            for (const device of devices) {
-                const item = new PopupMenu.PopupMenuItem(`${device.name} · ${statusLine(device)}`);
-                item.setOrnament(device.id === selected?.id
-                    ? PopupMenu.Ornament.CHECK : PopupMenu.Ornament.NONE);
-                item.connect('activate', () => {
-                    this._selected = device.id;
-                    this._menuKey = null;
-                    this._sync();
-                });
-                menu.addMenuItem(item);
-            }
-            menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        }
-
-        if (selected)
-            menu.addMenuItem(this._actions(selected, desk));
-
-        if (live.length > 0) {
-            menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Live now'));
-            for (const device of live)
-                menu.addMenuItem(this._liveRow(device));
-            menu.addAction('End Everything', () => this._invoke('', 'end-sessions'));
-        }
-
-        if (transfers.length > 0) {
-            menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Recent files'));
-            for (const file of transfers) {
-                const words = file.incoming ? `from ${file.deviceName}` : `to ${file.deviceName}`;
-                const item = new PopupMenu.PopupImageMenuItem(`${file.name} · ${words}`,
-                    file.incoming ? 'folder-download-symbolic' : 'document-send-symbolic');
-                item.connect('activate', () => this._call('OpenTransfer', [file.id]));
-                menu.addMenuItem(item);
-            }
-        }
-
-        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-        const handOff = menu.addAction('Lock & Hand Off', () => this._invoke('', 'lock-hand-off'));
-        handOff.setSensitive(!!desk.handOff);
-        menu.addAction('Open DeskLink', () => this._invoke(selected?.id ?? '', 'open'));
-    }
-
-    /// Ring, Lock, Send Files, Send clipboard and Keep Awake, in one row.
-    _actions(device, desk) {
-        const row = new PopupMenu.PopupBaseMenuItem({activate: false, hover: false, can_focus: false});
-        const box = new St.BoxLayout({style_class: 'desklink-actions', x_expand: true});
-        const can = action => device.ready && device.actions.includes(action);
-        const add = (icon, label, name, action) => box.add_child(actionButton(icon, label, {
-            name,
-            enabled: can(action),
-            onClick: () => this._invoke(device.id, action),
-        }));
-        add('audio-volume-high-symbolic', 'Ring', `Ring ${device.name}`, 'ring');
-        add('system-lock-screen-symbolic', 'Lock', `Lock ${device.name}`, 'lock');
-        add('document-send-symbolic', 'Files', `Send files to ${device.name}`, 'send-files');
-        add('edit-paste-symbolic', 'Clipboard', `Send the clipboard to ${device.name}`,
-            'send-clipboard');
-        if (desk.keepAwake !== undefined) {
-            box.add_child(actionButton('weather-clear-night-symbolic', 'Awake', {
-                name: 'Keep this computer awake',
-                checked: desk.keepAwake,
-                onClick: () => this._invoke('', desk.keepAwake ? 'keep-awake-off' : 'keep-awake-on'),
-            }));
-        }
-        row.add_child(box);
-        return row;
+        this._tickers = [];
+        const shown = new Set();
+        fillMenu(menu, {
+            devices, selected, desk, transfers,
+            ring: this._ring,
+            invoke: (id, action) => this._invoke(id, action),
+            call: (method, args) => this._call(method, args),
+            select: id => {
+                this._selected = id;
+                this._menuKey = null;
+                this._sync();
+            },
+            tick: fn => this._tickers.push(fn),
+            // New cards fade in (instantly when animations are off).
+            appear: (actor, key) => {
+                shown.add(key);
+                if (this._seen.has(key))
+                    return;
+                actor.opacity = 0;
+                actor.ease({opacity: 255, duration: 220, mode: Clutter.AnimationMode.EASE_OUT_QUAD});
+            },
+        });
+        this._seen = shown;
     }
 
     /// "Pixel · viewing the screen · 2 terminals" with an End button.

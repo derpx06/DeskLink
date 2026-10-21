@@ -32,7 +32,9 @@ pub const INTERFACE: &str = "derx06.desklink.com.Shell1";
 /// transfer methods.
 /// 4: `Devices[].call` and the `call-*` actions (a client that shows calls
 /// says `calls` in `Hello`).
-const VERSION: u32 = 4;
+/// 5: `Devices[].media` with the `media-play-pause` / `media-next` actions,
+/// and `Devices[].liveSince`.
+const VERSION: u32 = 5;
 const INVALID_ARGS: &str = "org.freedesktop.DBus.Error.InvalidArgs";
 
 const XML: &str = r#"<node>
@@ -138,7 +140,57 @@ struct ShellDevice {
     last_seen: u64,
     /// Its call now, live links only.
     call: Option<ShellCall>,
+    /// The phone's music now, live links only.
+    media: Option<ShellMedia>,
+    /// Since when it has been using this computer (Unix seconds); 0 not.
+    live_since: u64,
     actions: Vec<&'static str>,
+}
+
+/// The phone's music: `Devices[].media`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellMedia {
+    title: String,
+    artist: String,
+    playing: bool,
+}
+
+fn shell_media(device: &DeviceView) -> Option<ShellMedia> {
+    let media = device
+        .media_status
+        .as_ref()
+        .filter(|media| device.feature_transport_ready && !media.title.is_empty())?;
+    Some(ShellMedia {
+        title: media.title.clone(),
+        artist: media.artist.clone(),
+        playing: media.is_playing,
+    })
+}
+
+thread_local! {
+    /// When each device started using this computer, while it does.
+    static LIVE_SINCE: RefCell<std::collections::HashMap<String, u64>> = RefCell::default();
+}
+
+/// Fills `live_since`: the first time each device was seen live, kept while
+/// it stays live.
+fn stamp_live(devices: &mut [ShellDevice]) {
+    let now = crate::device_links::connection_log::now();
+    LIVE_SINCE.with(|since| {
+        let mut since = since.borrow_mut();
+        since.retain(|id, _| {
+            devices
+                .iter()
+                .any(|device| &device.id == id && is_live(device))
+        });
+        for device in devices.iter_mut().filter(|device| is_live(device)) {
+            device.live_since = *since.entry(device.id.clone()).or_insert(now);
+        }
+    });
+}
+
+fn is_live(device: &ShellDevice) -> bool {
+    !device.screen.is_empty() || device.terminals > 0
 }
 
 /// The call a client shows: `Devices[].call`.
@@ -211,6 +263,8 @@ fn shell_device(device: &DeviceView, settings: &AppSettings) -> ShellDevice {
         terminals: device.terminal_sessions_attached as u32,
         last_seen: device.last_seen.unwrap_or(0),
         call: shell_call(device),
+        media: shell_media(device),
+        live_since: 0,
         actions: actions(device, settings),
     }
 }
@@ -250,6 +304,9 @@ fn actions(device: &DeviceView, settings: &AppSettings) -> Vec<&'static str> {
             });
         }
     }
+    if shell_media(device).is_some() {
+        actions.extend(["media-play-pause", "media-next"]);
+    }
     // Ending is local (stop sharing, detach terminals), so it does not wait
     // for the feature transport.
     if device.desktop_session != DesktopSession::None || device.terminal_sessions_attached > 0 {
@@ -285,6 +342,14 @@ impl ShellDevice {
             entry.insert("silenced", call.silenced);
             dict.insert_value("call", &entry.end());
         }
+        if let Some(media) = &self.media {
+            let entry = glib::VariantDict::new(None);
+            entry.insert("title", &media.title);
+            entry.insert("artist", &media.artist);
+            entry.insert("playing", media.playing);
+            dict.insert_value("media", &entry.end());
+        }
+        dict.insert("liveSince", self.live_since);
         dict.insert("actions", &self.actions);
         dict.end()
     }
@@ -474,10 +539,11 @@ fn property_values(app: &DesklinkApplication) -> std::collections::HashMap<&'sta
         .daemon_handle()
         .map(|daemon| daemon.devices())
         .unwrap_or_default();
-    let devices: Vec<ShellDevice> = views
+    let mut devices: Vec<ShellDevice> = views
         .iter()
         .map(|device| shell_device(device, &settings))
         .collect();
+    stamp_live(&mut devices);
     std::collections::HashMap::from([
         ("Version", VERSION.to_variant()),
         ("Desk", desk(&devices).to_variant()),
@@ -565,6 +631,22 @@ fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str
     match (action, id, daemon) {
         ("ring", Some(id), Some(daemon)) => daemon.send(DaemonCommand::SendFindPhone(id)),
         ("lock", Some(id), Some(daemon)) => daemon.send(DaemonCommand::SendLockRequest(id, true)),
+        ("media-play-pause" | "media-next", Some(id), Some(daemon)) => {
+            let player = daemon
+                .devices()
+                .into_iter()
+                .find(|known| known.id == id)
+                .and_then(|known| known.media_status)
+                .map(|media| media.player);
+            if let Some(player) = player {
+                let verb = if action == "media-next" {
+                    "Next"
+                } else {
+                    "PlayPause"
+                };
+                daemon.send(DaemonCommand::SendMprisAction(id, player, verb.into()));
+            }
+        }
         ("send-clipboard", Some(id), Some(daemon)) => daemon.send(DaemonCommand::SendClipboard(id)),
         (
             "call-answer" | "call-decline" | "call-silence" | "call-end" | "call-mute"
@@ -857,7 +939,7 @@ pub fn extension_active() -> bool {
 }
 
 /// The extension, built into the app so any install can turn it on.
-const EXTENSION_FILES: [(&str, &str); 4] = [
+const EXTENSION_FILES: [(&str, &str); 6] = [
     (
         "metadata.json",
         include_str!("../gnome-shell-extension/desklink@derx06.github.io/metadata.json"),
@@ -873,6 +955,14 @@ const EXTENSION_FILES: [(&str, &str); 4] = [
     (
         "stylesheet.css",
         include_str!("../gnome-shell-extension/desklink@derx06.github.io/stylesheet.css"),
+    ),
+    (
+        "menu.js",
+        include_str!("../gnome-shell-extension/desklink@derx06.github.io/menu.js"),
+    ),
+    (
+        "desklink-symbolic.svg",
+        include_str!("../gnome-shell-extension/desklink@derx06.github.io/desklink-symbolic.svg"),
     ),
 ];
 
@@ -904,24 +994,28 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
         .collect()
 }
 
-/// Every extension DeskLink has shipped, by [`files_digest`] over the four
-/// files (computed from the git history of `gnome-shell-extension/`): a copy
-/// installed by hand, with no stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 7] = [
-    // be1b760, 2026-10-21: calls.
-    "3fa28f25e72b8b59f0af2879e0d0d9ff7990b22c15ec2984c4ffe926f85a541d",
+/// Every extension DeskLink has shipped, by [`files_digest`] over the
+/// `EXTENSION_FILES` names (a file a build lacked counts as empty), from the
+/// git history of `gnome-shell-extension/` with
+/// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
+/// stamp, is still ours and safe to update.
+const KNOWN_BUILDS: [&str; 8] = [
+    // The current build (top-bar redesign: menu.js, the glyph icon).
+    "299c2cbb85734c4379c74cf5afd4e6d3a73f3d9ab9fb4cc1738de0b165297da5",
+    // be1b760, 2026-10-21.
+    "fe350711d70ada59bc0428004409555265854e5c91d5cda444439823ac7707b2",
     // 9784a7d, 2026-10-21.
-    "e3e3df22d222169b4678303ac40a356ddf3d346556b1ea52f713a8b7d7737273",
-    // f798285, 2026-10-21: Quick Settings, notifications.
-    "2edaa8eff4cfd4081af2dc3d38b84e9fa88d34eb7e02f79980ec077e91ba2328",
+    "14c40f57d58fe269429b3969aa555fbfc85b0afe9787fbfb30feb621a4d1f0cb",
+    // f798285, 2026-10-21.
+    "befac3aedecccb11f26d2a19b4eeb9f6b59638b6d09387ad3a4a01cbbb548d78",
     // 1b78f08, 2026-10-21.
-    "9c43c50e6be20bb1dd47bf0ae9fdaafa4319346b1c0dff779e251563367f2718",
+    "09c6a14190617bb0c7c32ef7ef5f048d1a4e1abaed8b2b8146f658648d48d6cf",
     // ba03b84, 2026-10-21.
-    "40c37c1f492f1f2edae2088228e57ca7e3866958f4c244f738169beac9e118b9",
-    // 635fc5d, 2026-10-20 (extension.js 6911 bytes, metadata 398).
-    "abafaef4d727d3ce9ebc0f1343ab38d2ce8dd8bec5990a1ab24d7cd781d391f8",
-    // 1f8c0a4, 2026-10-20: the first.
-    "ffade2b6be57adece9c983324df114d8e4758b30694fb3467dae6531b77b08a2",
+    "9e3afd7a15663156d6377aed4acfbc9ac5f9ec9af11aee725831d8e380d5c2f4",
+    // 635fc5d, 2026-10-20.
+    "8598af7cdd26d69961816c7d215146566a4a975e83d3d6fbbd5e0de414225402",
+    // 1f8c0a4, 2026-10-20.
+    "85e45fc9fdd19dc3b711ca70df8ae7d1600bf2e252eccfd0e9a2550f99cc42af",
 ];
 
 /// Whether an installed copy (by digest) is DeskLink's own and may be
@@ -1433,7 +1527,7 @@ mod tests {
         );
         assert!(
             KNOWN_BUILDS
-                .contains(&"abafaef4d727d3ce9ebc0f1343ab38d2ce8dd8bec5990a1ab24d7cd781d391f8"),
+                .contains(&"8598af7cdd26d69961816c7d215146566a4a975e83d3d6fbbd5e0de414225402"),
             "the 2026-10-20 build (extension.js 6911 bytes)"
         );
     }

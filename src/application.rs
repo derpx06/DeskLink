@@ -370,7 +370,14 @@ impl DesklinkApplication {
                     &crate::device_links::transfer_log::recent(),
                     hand_off,
                 );
-                tray.update(active.into_iter().map(|(_, line)| line).collect(), menu);
+                let icon = crate::desk_menu::tray_icon(&devices);
+                tray.update(
+                    active.into_iter().map(|(_, line)| line).collect(),
+                    menu,
+                    icon,
+                    // DeskLink's own extension is in the top bar already.
+                    crate::shell_dbus::extension_active(),
+                );
             }
             glib::ControlFlow::Continue
         });

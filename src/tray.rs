@@ -31,8 +31,51 @@ const WATCHER: &str = "org.kde.StatusNotifierWatcher";
 const WATCHER_PATH: &str = "/StatusNotifierWatcher";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
-const IDLE_ICON: &str = "derx06.desklink.com-symbolic";
-const ACTIVE_ICON: &str = "screen-shared-symbolic";
+/// The tray icon: DeskLink's link glyph — a phone connected, none, or a
+/// phone using this computer (with a red dot).
+pub const ICON_CONNECTED: &str = "desklink-tray-connected-symbolic";
+pub const ICON_OFFLINE: &str = "desklink-tray-offline-symbolic";
+pub const ICON_LIVE: &str = "desklink-tray-live-symbolic";
+
+const GLYPH: &str = "M2.5 1H9.5A1.5 1.5 0 0 1 11 2.5V6.5A1.5 1.5 0 0 1 9.5 8H2.5A1.5 1.5 0 0 1 1 6.5V2.5A1.5 1.5 0 0 1 2.5 1ZM10.5 4H12.5A1.5 1.5 0 0 1 14 5.5V12.5A1.5 1.5 0 0 1 12.5 14H10.5A1.5 1.5 0 0 1 9 12.5V5.5A1.5 1.5 0 0 1 10.5 4ZM4.5 9H7.5A0.5 0.5 0 0 1 8 9.5V9.5A0.5 0.5 0 0 1 7.5 10H4.5A0.5 0.5 0 0 1 4 9.5V9.5A0.5 0.5 0 0 1 4.5 9Z";
+
+/// The three icons, as symbolic SVG (a host recolours them; `error` is the
+/// theme's red).
+fn icon_svg(name: &str) -> String {
+    let glyph = |opacity: &str| {
+        format!(r##"<path d="{GLYPH}" fill="#2e3436" fill-rule="evenodd" opacity="{opacity}"/>"##)
+    };
+    let body = match name {
+        ICON_OFFLINE => glyph("0.45"),
+        ICON_LIVE => format!(
+            r##"<mask id="m"><rect width="16" height="16" fill="#fff"/><circle cx="13" cy="3" r="3.5" fill="#000"/></mask><g mask="url(#m)">{}</g><circle class="error" cx="13" cy="3" r="2.5" fill="#e5533d"/>"##,
+            glyph("1")
+        ),
+        _ => glyph("1"),
+    };
+    format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">{body}</svg>"#
+    )
+}
+
+/// Writes the tray icons into the user's own icon theme
+/// (`$XDG_DATA_HOME/icons/hicolor/scalable/apps`) and returns that theme
+/// root for `IconThemePath`. A host already searching it (GNOME's
+/// AppIndicator) then looks the name up like any themed symbolic icon, so it
+/// is recoloured for the panel; a private path was drawn as a plain picture.
+fn install_icons() -> Option<std::path::PathBuf> {
+    let root = glib::user_data_dir().join("icons");
+    let dir = root.join("hicolor").join("scalable").join("apps");
+    std::fs::create_dir_all(&dir).ok()?;
+    for name in [ICON_CONNECTED, ICON_OFFLINE, ICON_LIVE] {
+        let svg = icon_svg(name);
+        let path = dir.join(format!("{name}.svg"));
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(svg.as_str()) {
+            std::fs::write(&path, &svg).ok()?;
+        }
+    }
+    Some(root)
+}
 
 const XML: &str = r#"<node>
   <interface name="org.kde.StatusNotifierItem">
@@ -41,6 +84,8 @@ const XML: &str = r#"<node>
     <property name="Title" type="s" access="read"/>
     <property name="Status" type="s" access="read"/>
     <property name="IconName" type="s" access="read"/>
+    <property name="IconThemePath" type="s" access="read"/>
+    <property name="AttentionIconName" type="s" access="read"/>
     <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
     <property name="ItemIsMenu" type="b" access="read"/>
     <property name="Menu" type="o" access="read"/>
@@ -49,6 +94,7 @@ const XML: &str = r#"<node>
     <method name="ContextMenu"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
     <method name="Scroll"><arg type="i" direction="in"/><arg type="s" direction="in"/></method>
     <signal name="NewIcon"/>
+    <signal name="NewAttentionIcon"/>
     <signal name="NewToolTip"/>
     <signal name="NewStatus"><arg type="s"/></signal>
   </interface>
@@ -92,27 +138,35 @@ pub struct TrayActions {
     pub run: Box<dyn Fn(&str)>,
 }
 
-/// One menu entry.
+/// One menu entry. `icon` is an icon name ("" none).
 #[derive(Debug, Clone, PartialEq)]
 pub enum TrayEntry {
     /// Words only, greyed.
     Label(String),
+    /// A section's heading: greyed, with an icon.
+    Header {
+        label: String,
+        icon: String,
+    },
     Separator,
     /// Runs `action` (an application-defined name, e.g. `ring:<device>`).
     Action {
         label: String,
         action: String,
         enabled: bool,
+        icon: String,
     },
     /// A check item.
     Toggle {
         label: String,
         action: String,
         on: bool,
+        icon: String,
     },
     Submenu {
         label: String,
         children: Vec<TrayEntry>,
+        icon: String,
     },
 }
 
@@ -122,7 +176,20 @@ impl TrayEntry {
             label: label.into(),
             action: action.into(),
             enabled: true,
+            icon: String::new(),
         }
+    }
+
+    /// The same entry with `name` as its icon.
+    pub fn icon(mut self, name: &str) -> Self {
+        match &mut self {
+            Self::Header { icon, .. }
+            | Self::Action { icon, .. }
+            | Self::Toggle { icon, .. }
+            | Self::Submenu { icon, .. } => *icon = name.to_string(),
+            Self::Label(_) | Self::Separator => {}
+        }
+        self
     }
 }
 
@@ -132,6 +199,13 @@ struct State {
     lines: Vec<String>,
     entries: Vec<TrayEntry>,
     revision: u32,
+    /// One of the `ICON_*` names.
+    icon: &'static str,
+    /// Where the icons were written.
+    theme_path: String,
+    /// Another DeskLink surface (the GNOME extension) shows the same:
+    /// hosts hide a passive item, so the top bar has one DeskLink, not two.
+    passive: bool,
 }
 
 pub struct Tray {
@@ -156,7 +230,13 @@ impl Tray {
         let connection = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>)
             .map_err(|error| error.to_string())?;
         let node = gio::DBusNodeInfo::for_xml(XML).map_err(|error| error.to_string())?;
-        let state = Rc::new(RefCell::new(State::default()));
+        let state = Rc::new(RefCell::new(State {
+            icon: ICON_OFFLINE,
+            theme_path: install_icons()
+                .map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            ..State::default()
+        }));
         let actions = Rc::new(actions);
 
         let item = node
@@ -256,18 +336,31 @@ impl Tray {
         self.hosted.registered.get() && self.hosted.host.get()
     }
 
-    /// Shows `lines` (one per active session; the icon and tooltip) and the
-    /// menu `entries`. Signals only on change.
-    pub fn update(&self, lines: Vec<String>, entries: Vec<TrayEntry>) {
-        let was_active;
+    /// Shows `lines` (one per active session; the tooltip), the menu
+    /// `entries` and the `icon` (an `ICON_*`). Signals only on change.
+    pub fn update(
+        &self,
+        lines: Vec<String>,
+        entries: Vec<TrayEntry>,
+        icon: &'static str,
+        passive: bool,
+    ) {
+        let (was_status, icon_changed);
         {
             let mut state = self.state.borrow_mut();
-            if state.lines == lines && state.entries == entries {
+            if state.lines == lines
+                && state.entries == entries
+                && state.icon == icon
+                && state.passive == passive
+            {
                 return;
             }
-            was_active = !state.lines.is_empty();
+            was_status = status(&state);
+            state.passive = passive;
+            icon_changed = state.icon != icon;
             state.lines = lines;
             state.entries = entries;
+            state.icon = icon;
             state.revision = state.revision.wrapping_add(1);
         }
         let state = self.state.borrow();
@@ -283,8 +376,12 @@ impl Tray {
             Some((state.revision, 0i32).to_variant()),
         );
         emit(ITEM_PATH, ITEM_INTERFACE, "NewToolTip", None);
-        if was_active == state.lines.is_empty() {
+        if icon_changed {
             emit(ITEM_PATH, ITEM_INTERFACE, "NewIcon", None);
+            // Hosts re-read the attention icon only on its own signal.
+            emit(ITEM_PATH, ITEM_INTERFACE, "NewAttentionIcon", None);
+        }
+        if was_status != status(&state) {
             emit(
                 ITEM_PATH,
                 ITEM_INTERFACE,
@@ -358,7 +455,9 @@ fn host_registered(reply: &Variant) -> bool {
 }
 
 fn status(state: &State) -> &'static str {
-    if state.lines.is_empty() {
+    if state.passive {
+        "Passive"
+    } else if state.lines.is_empty() {
         "Active"
     } else {
         "NeedsAttention"
@@ -371,12 +470,10 @@ fn item_property(name: &str, state: &State) -> Variant {
         "Id" => "desklink".to_variant(),
         "Title" => "DeskLink".to_variant(),
         "Status" => status(state).to_variant(),
-        "IconName" => if state.lines.is_empty() {
-            IDLE_ICON
-        } else {
-            ACTIVE_ICON
-        }
-        .to_variant(),
+        // Hosts show this one while `NeedsAttention` (a live session);
+        // without it GNOME's AppIndicator drew a placeholder.
+        "IconName" | "AttentionIconName" => state.icon.to_variant(),
+        "IconThemePath" => state.theme_path.to_variant(),
         "ToolTip" => {
             let body = if state.lines.is_empty() {
                 "No phone is using this computer".to_string()
@@ -384,7 +481,7 @@ fn item_property(name: &str, state: &State) -> Variant {
                 state.lines.join("\n")
             };
             (
-                IDLE_ICON,
+                state.icon,
                 Vec::<(i32, i32, Vec<u8>)>::new(),
                 "DeskLink",
                 body,
@@ -408,18 +505,61 @@ struct Numbered {
     children: Vec<Numbered>,
 }
 
-fn number(entries: &[TrayEntry], next: &mut i32) -> Vec<Numbered> {
+/// A label as dbusmenu shows it: `_` marks a mnemonic there, so a file
+/// name's underscores are doubled to stay visible.
+fn label_text(label: &str) -> Variant {
+    label.replace('_', "__").to_variant()
+}
+
+/// An id from what the entry is and where: hosts (GNOME's AppIndicator
+/// extension) cache properties by id and re-read only the layout on
+/// `LayoutUpdated`, so an id reused for a different entry showed the old
+/// one's check or separator. And an id that moved made AppIndicator (on
+/// GNOME 46+) drop the item (`menu.box.add` is gone), so a changed menu only
+/// ever adds and removes. Equal ones are told apart.
+fn stable_id(
+    entry: &TrayEntry,
+    parent: i32,
+    index: usize,
+    taken: &mut std::collections::HashSet<i32>,
+) -> i32 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (format!("{entry:?}"), parent, index).hash(&mut hasher);
+    // Positive and not 0 (the root).
+    let mut id = (hasher.finish() % 2_000_000_000) as i32 + 1;
+    while !taken.insert(id) {
+        id = id % 2_000_000_000 + 1;
+    }
+    id
+}
+
+fn number(
+    entries: &[TrayEntry],
+    parent: i32,
+    taken: &mut std::collections::HashSet<i32>,
+) -> Vec<Numbered> {
     entries
         .iter()
-        .map(|entry| {
-            let id = *next;
-            *next += 1;
+        .enumerate()
+        .map(|(index, entry)| {
+            let id = stable_id(entry, parent, index, taken);
             let mut props = HashMap::new();
             let mut action = None;
             let mut children = Vec::new();
+            let icon = match entry {
+                TrayEntry::Header { icon, .. }
+                | TrayEntry::Action { icon, .. }
+                | TrayEntry::Toggle { icon, .. }
+                | TrayEntry::Submenu { icon, .. } => icon.as_str(),
+                _ => "",
+            };
+            if !icon.is_empty() {
+                props.insert("icon-name".to_string(), icon.to_variant());
+            }
             match entry {
-                TrayEntry::Label(label) => {
-                    props.insert("label".to_string(), label.to_variant());
+                TrayEntry::Label(label) | TrayEntry::Header { label, .. } => {
+                    props.insert("label".to_string(), label_text(label));
                     props.insert("enabled".to_string(), false.to_variant());
                 }
                 TrayEntry::Separator => {
@@ -429,8 +569,9 @@ fn number(entries: &[TrayEntry], next: &mut i32) -> Vec<Numbered> {
                     label,
                     action: name,
                     enabled,
+                    ..
                 } => {
-                    props.insert("label".to_string(), label.to_variant());
+                    props.insert("label".to_string(), label_text(label));
                     if !enabled {
                         props.insert("enabled".to_string(), false.to_variant());
                     }
@@ -440,8 +581,9 @@ fn number(entries: &[TrayEntry], next: &mut i32) -> Vec<Numbered> {
                     label,
                     action: name,
                     on,
+                    ..
                 } => {
-                    props.insert("label".to_string(), label.to_variant());
+                    props.insert("label".to_string(), label_text(label));
                     props.insert("toggle-type".to_string(), "checkmark".to_variant());
                     props.insert("toggle-state".to_string(), i32::from(*on).to_variant());
                     action = Some(name.clone());
@@ -449,10 +591,11 @@ fn number(entries: &[TrayEntry], next: &mut i32) -> Vec<Numbered> {
                 TrayEntry::Submenu {
                     label,
                     children: inner,
+                    ..
                 } => {
-                    props.insert("label".to_string(), label.to_variant());
+                    props.insert("label".to_string(), label_text(label));
                     props.insert("children-display".to_string(), "submenu".to_variant());
-                    children = number(inner, next);
+                    children = number(inner, id, taken);
                 }
             }
             Numbered {
@@ -466,7 +609,7 @@ fn number(entries: &[TrayEntry], next: &mut i32) -> Vec<Numbered> {
 }
 
 fn numbered(state: &State) -> Vec<Numbered> {
-    number(&state.entries, &mut 1)
+    number(&state.entries, 0, &mut std::collections::HashSet::new())
 }
 
 fn flatten(items: &[Numbered]) -> Vec<&Numbered> {
@@ -564,19 +707,26 @@ mod tests {
                     label: "Keep Awake".into(),
                     action: "keep-awake-off".into(),
                     on: true,
+                    icon: String::new(),
                 },
                 TrayEntry::Separator,
                 TrayEntry::Submenu {
                     label: "Recent Files".into(),
-                    children: vec![TrayEntry::action("a.pdf", "open-file:/tmp/a.pdf")],
+                    children: vec![TrayEntry::action("my_file.pdf", "open-file:/tmp/a.pdf")
+                        .icon("x-office-document-symbolic")],
+                    icon: String::new(),
                 },
                 TrayEntry::Action {
                     label: "End Everything".into(),
                     action: "end-sessions:".into(),
                     enabled: false,
+                    icon: String::new(),
                 },
             ],
             revision: 1,
+            icon: ICON_LIVE,
+            theme_path: "/tmp/icons".into(),
+            passive: false,
         };
         assert_eq!(layout(&state).type_().as_str(), "(ia{sv}av)");
         let reply = menu_call("GetLayout", &().to_variant(), &state, &actions).unwrap();
@@ -591,6 +741,19 @@ mod tests {
         );
 
         // Ids are depth-first: the file inside the submenu is 6.
+        let items = numbered(&state);
+        let id_of = |action: &str| {
+            flatten(&items)
+                .into_iter()
+                .find(|item| item.action.as_deref() == Some(action))
+                .map(|item| item.id)
+                .unwrap()
+        };
+        let label_id = flatten(&items)
+            .into_iter()
+            .find(|item| item.action.is_none() && item.props.contains_key("label"))
+            .unwrap()
+            .id;
         let click = |id: i32| {
             menu_call(
                 "Event",
@@ -599,22 +762,60 @@ mod tests {
                 &actions,
             )
         };
-        click(2);
-        click(6);
-        click(1); // a label: nothing
+        click(id_of("ring:p1"));
+        click(id_of("open-file:/tmp/a.pdf"));
+        click(label_id); // a label: nothing
         assert_eq!(*ran.borrow(), ["ring:p1", "open-file:/tmp/a.pdf"]);
         let items = numbered(&state);
         let toggle = flatten(&items)
             .into_iter()
-            .find(|item| item.id == 3)
+            .find(|item| item.id == id_of("keep-awake-off"))
             .unwrap();
         assert_eq!(toggle.props.get("toggle-state"), Some(&1i32.to_variant()));
+        let file = flatten(&items)
+            .into_iter()
+            .find(|item| item.id == id_of("open-file:/tmp/a.pdf"))
+            .unwrap();
+        // Ids: unique, positive, and the same for the same menu.
+        let ids: std::collections::HashSet<i32> =
+            flatten(&items).into_iter().map(|item| item.id).collect();
+        assert_eq!(ids.len(), 7);
+        assert!(ids.iter().all(|id| *id > 0));
+        let again = numbered(&state);
+        let same: std::collections::HashSet<i32> =
+            flatten(&again).into_iter().map(|item| item.id).collect();
+        assert_eq!(same, ids);
+        assert_eq!(
+            file.props.get("label"),
+            Some(&"my__file.pdf".to_variant()),
+            "no mnemonic"
+        );
+        assert_eq!(
+            file.props.get("icon-name"),
+            Some(&"x-office-document-symbolic".to_variant())
+        );
 
         assert_eq!(
             item_property("Status", &state).str(),
             Some("NeedsAttention")
         );
-        assert_eq!(item_property("IconName", &state).str(), Some(ACTIVE_ICON));
+        assert_eq!(item_property("IconName", &state).str(), Some(ICON_LIVE));
+        assert_eq!(
+            item_property("AttentionIconName", &state).str(),
+            Some(ICON_LIVE)
+        );
+        assert_eq!(
+            item_property("IconThemePath", &state).str(),
+            Some("/tmp/icons")
+        );
+        for name in [ICON_CONNECTED, ICON_OFFLINE, ICON_LIVE] {
+            let svg = icon_svg(name);
+            assert!(svg.starts_with("<svg") && svg.contains(GLYPH), "{name}");
+        }
+        assert!(
+            icon_svg(ICON_LIVE).contains("class=\"error\""),
+            "the red dot"
+        );
         assert_eq!(
             item_property("ToolTip", &state).type_().as_str(),
             "(sa(iiay)ss)"

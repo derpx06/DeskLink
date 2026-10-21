@@ -57,7 +57,132 @@ fn call_line(status: &crate::device_links::device::CallStatus) -> String {
     }
 }
 
-/// The whole menu, from the phones, the settings and the recent files.
+/// The heading of a phone's section: "realme 14 5G · Connected · 82% ⚡".
+fn header_words(device: &DeviceView) -> String {
+    let mut words = format!("{} · ", device.name);
+    if device.feature_transport_ready {
+        words.push_str("Connected");
+        if let Some(battery) = device
+            .battery_status
+            .as_ref()
+            .filter(|battery| battery.current_charge >= 0)
+        {
+            words.push_str(&format!(" · {}%", battery.current_charge));
+            if battery.is_charging {
+                words.push_str(" ⚡");
+            }
+        }
+    } else {
+        words.push_str(&status_words(device));
+    }
+    words
+}
+
+fn device_icon(device: &DeviceView) -> &'static str {
+    match device.device_type.as_str() {
+        "tablet" => "tablet-symbolic",
+        "laptop" | "desktop" => "computer-symbolic",
+        _ => "phone-symbolic",
+    }
+}
+
+/// A file's symbolic icon by its type (from the name; nothing is read): the
+/// generic family ("image-x-generic"), which every icon theme has.
+fn file_icon(name: &str) -> String {
+    let (content_type, _) = gio::content_type_guess(Some(name), &[]);
+    let generic = gio::content_type_get_generic_icon_name(&content_type)
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| "text-x-generic".to_string());
+    format!("{generic}-symbolic")
+}
+
+fn call_icon(action: &str) -> &'static str {
+    match action {
+        "answer" => "call-start-symbolic",
+        "silence" => "audio-volume-muted-symbolic",
+        "mute" => "microphone-sensitivity-muted-symbolic",
+        "unmute" => "audio-input-microphone-symbolic",
+        _ => "call-stop-symbolic",
+    }
+}
+
+/// The tray icon: a phone using this computer, a phone connected, or none.
+pub(crate) fn tray_icon(devices: &[DeviceView]) -> &'static str {
+    let phones = || devices.iter().filter(|device| device.trusted);
+    if phones().any(|device| crate::application::session_line(device).is_some()) {
+        crate::tray::ICON_LIVE
+    } else if phones().any(|device| device.feature_transport_ready) {
+        crate::tray::ICON_CONNECTED
+    } else {
+        crate::tray::ICON_OFFLINE
+    }
+}
+
+/// A connected phone's entries: its call, actions, music, notifications.
+fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
+    let mut menu = Vec::new();
+    if let Some(status) = phone.call_status.as_ref() {
+        menu.push(TrayEntry::Label(call_line(status)));
+        for (action, label, ..) in crate::window::calls::buttons(status) {
+            menu.push(
+                TrayEntry::action(label, format!("call-{action}:{}", phone.id))
+                    .icon(call_icon(action)),
+            );
+        }
+    }
+    menu.push(
+        TrayEntry::action("Ring", format!("ring:{}", phone.id)).icon("audio-volume-high-symbolic"),
+    );
+    menu.push(
+        TrayEntry::action("Lock", format!("lock:{}", phone.id)).icon("system-lock-screen-symbolic"),
+    );
+    menu.push(
+        TrayEntry::action("Send Files…", format!("send-files:{}", phone.id))
+            .icon("document-send-symbolic"),
+    );
+    menu.push(
+        TrayEntry::action("Send Clipboard", format!("send-clipboard:{}", phone.id))
+            .icon("edit-paste-symbolic"),
+    );
+    if let Some(media) = phone
+        .media_status
+        .as_ref()
+        .filter(|media| !media.title.is_empty())
+    {
+        let playing = if media.artist.is_empty() {
+            media.title.clone()
+        } else {
+            format!("{} — {}", media.title, media.artist)
+        };
+        menu.push(
+            TrayEntry::action(playing, format!("media-play-pause:{}", phone.id)).icon(
+                if media.is_playing {
+                    "media-playback-pause-symbolic"
+                } else {
+                    "media-playback-start-symbolic"
+                },
+            ),
+        );
+        menu.push(
+            TrayEntry::action("Next Track", format!("media-next:{}", phone.id))
+                .icon("media-skip-forward-symbolic"),
+        );
+    }
+    let unread = phone.notifications.len();
+    if unread > 0 && settings.shows_notifications(&phone.id) {
+        menu.push(
+            TrayEntry::action(
+                format!("Notifications ({unread})"),
+                format!("notifications:{}", phone.id),
+            )
+            .icon("preferences-system-notifications-symbolic"),
+        );
+    }
+    menu
+}
+
+/// The whole menu: each phone (status, call, actions, music, notifications),
+/// what is live here, this computer's switches, recent files, the app.
 pub(crate) fn entries(
     devices: &[DeviceView],
     settings: &AppSettings,
@@ -67,65 +192,66 @@ pub(crate) fn entries(
     let mut menu = Vec::new();
     let phones: Vec<&DeviceView> = devices.iter().filter(|device| device.trusted).collect();
     if phones.is_empty() {
-        menu.push(TrayEntry::Label("No phone paired".into()));
+        menu.push(TrayEntry::Header {
+            label: "No phone paired".into(),
+            icon: "phone-symbolic".into(),
+        });
+        menu.push(TrayEntry::Separator);
     }
-    let mut live = false;
-    for phone in &phones {
-        menu.push(TrayEntry::Label(format!(
-            "{} · {}",
-            phone.name,
-            status_words(phone)
-        )));
-        if let Some(status) = phone
-            .call_status
-            .as_ref()
-            .filter(|_| phone.feature_transport_ready)
-        {
-            menu.push(TrayEntry::Label(call_line(status)));
-            for (action, label, ..) in crate::window::calls::buttons(status) {
-                menu.push(TrayEntry::action(
-                    label,
-                    format!("call-{action}:{}", phone.id),
-                ));
-            }
-        }
-        if phone.feature_transport_ready {
-            menu.push(TrayEntry::action(
-                format!("Ring {}", phone.name),
-                format!("ring:{}", phone.id),
-            ));
-            menu.push(TrayEntry::action(
-                format!("Lock {}", phone.name),
-                format!("lock:{}", phone.id),
-            ));
-            menu.push(TrayEntry::action(
-                format!("Send Files to {}…", phone.name),
-                format!("send-files:{}", phone.id),
-            ));
-            menu.push(TrayEntry::action(
-                format!("Send Clipboard to {}", phone.name),
-                format!("send-clipboard:{}", phone.id),
-            ));
-        }
-        let unread = phone.notifications.len();
-        if unread > 0 && settings.shows_notifications(&phone.id) {
-            menu.push(TrayEntry::action(
-                format!("Notifications ({unread})…"),
-                format!("notifications:{}", phone.id),
-            ));
-        }
-        if let Some(line) = crate::application::session_line(phone) {
-            live = true;
-            menu.push(TrayEntry::Label(line));
-            menu.push(TrayEntry::action(
-                format!("End What {} Is Doing Here", phone.name),
-                format!("end-sessions:{}", phone.id),
-            ));
+    // The first connected phone's actions are in the menu itself; any other
+    // phone's in its own submenu, so two phones still fit on screen.
+    let first_ready = phones
+        .iter()
+        .position(|phone| phone.feature_transport_ready);
+    for (index, phone) in phones.iter().enumerate() {
+        let header = header_words(phone);
+        let icon = device_icon(phone).to_string();
+        if !phone.feature_transport_ready {
+            menu.push(TrayEntry::Header {
+                label: header,
+                icon,
+            });
+        } else if Some(index) == first_ready {
+            menu.push(TrayEntry::Header {
+                label: header,
+                icon,
+            });
+            menu.extend(phone_section(phone, settings));
+        } else {
+            menu.push(TrayEntry::Submenu {
+                label: header,
+                children: phone_section(phone, settings),
+                icon,
+            });
         }
         menu.push(TrayEntry::Separator);
     }
+
+    let live: Vec<(&DeviceView, String)> = phones
+        .iter()
+        .filter_map(|phone| crate::application::session_line(phone).map(|line| (*phone, line)))
+        .collect();
+    for (phone, line) in &live {
+        menu.push(TrayEntry::Label(format!("● {line}")));
+        menu.push(
+            TrayEntry::action(
+                format!("End {}", phone.name),
+                format!("end-sessions:{}", phone.id),
+            )
+            .icon("process-stop-symbolic"),
+        );
+    }
+    if live.len() > 1 {
+        menu.push(
+            TrayEntry::action("End Everything", "end-sessions:").icon("process-stop-symbolic"),
+        );
+    }
+    if !live.is_empty() {
+        menu.push(TrayEntry::Separator);
+    }
+
     menu.push(TrayEntry::Toggle {
-        label: "Keep This Computer Awake".into(),
+        label: "Keep Awake".into(),
         action: if settings.stay_awake {
             "keep-awake-off"
         } else {
@@ -133,20 +259,26 @@ pub(crate) fn entries(
         }
         .into(),
         on: settings.stay_awake,
+        icon: "weather-clear-night-symbolic".into(),
     });
-    menu.push(TrayEntry::Action {
-        label: "End Everything".into(),
-        action: "end-sessions:".into(),
-        enabled: live,
+    menu.push(TrayEntry::Toggle {
+        label: "Clipboard Sync".into(),
+        action: if settings.clipboard_sync {
+            "clipboard-off"
+        } else {
+            "clipboard-on"
+        }
+        .into(),
+        on: settings.clipboard_sync,
+        icon: "edit-copy-symbolic".into(),
     });
-    menu.push(TrayEntry::Action {
-        label: "Lock & Hand Off".into(),
-        action: "lock-hand-off".into(),
-        enabled: hand_off,
-    });
+    if hand_off {
+        menu.push(TrayEntry::action("Lock & Hand Off", "lock-hand-off").icon("send-to-symbolic"));
+    }
     if !recent.is_empty() {
         menu.push(TrayEntry::Submenu {
             label: "Recent Files".into(),
+            icon: "document-open-recent-symbolic".into(),
             children: recent
                 .iter()
                 .take(RECENT)
@@ -159,13 +291,14 @@ pub(crate) fn entries(
                         },
                         format!("open-file:{}", file.path.to_string_lossy()),
                     )
+                    .icon(&file_icon(&file.name))
                 })
                 .collect(),
         });
     }
     menu.push(TrayEntry::Separator);
-    menu.push(TrayEntry::action("Open DeskLink", "open"));
-    menu.push(TrayEntry::action("Quit DeskLink", "quit"));
+    menu.push(TrayEntry::action("Open DeskLink", "open").icon("focus-windows-symbolic"));
+    menu.push(TrayEntry::action("Quit", "quit").icon("application-exit-symbolic"));
     menu
 }
 
@@ -205,6 +338,29 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
         "end-sessions" => app.activate_action("end-sessions", Some(&target.to_variant())),
         "keep-awake-on" | "keep-awake-off" => {
             daemon.send(DaemonCommand::SetStayAwake(verb == "keep-awake-on"))
+        }
+        "clipboard-on" | "clipboard-off" => {
+            daemon.send(DaemonCommand::SetClipboardSync(verb == "clipboard-on"))
+        }
+        "media-play-pause" | "media-next" => {
+            let player = daemon
+                .devices()
+                .into_iter()
+                .find(|device| device.id == target)
+                .and_then(|device| device.media_status)
+                .map(|media| media.player);
+            if let Some(player) = player {
+                let action = if verb == "media-next" {
+                    "Next"
+                } else {
+                    "PlayPause"
+                };
+                daemon.send(DaemonCommand::SendMprisAction(
+                    target,
+                    player,
+                    action.into(),
+                ));
+            }
         }
         "lock-hand-off" => app.activate_action("lock-hand-off", None),
         "open-file" => {
@@ -310,7 +466,7 @@ mod tests {
             "notifications:p1",
             "end-sessions:p1",
             "keep-awake-on",
-            "end-sessions:",
+            "clipboard-off",
             "lock-hand-off",
             "open-file:/tmp/a.pdf",
             "open",
@@ -327,9 +483,13 @@ mod tests {
                 .any(|action| action.ends_with(":p2") && action.starts_with("ring")),
             "not for a phone that is away"
         );
-        assert!(menu.contains(&TrayEntry::Label(
-            "Phone p1 · Connected · 82% · charging".into()
-        )));
+        assert!(menu.contains(&TrayEntry::Header {
+            label: "Phone p1 · Connected · 82% ⚡".into(),
+            icon: "phone-symbolic".into(),
+        }));
+        assert!(menu.contains(&TrayEntry::Label("● Phone p1 — using 1 terminal".into())));
+        assert_eq!(tray_icon(&[phone("p9", true)]), crate::tray::ICON_CONNECTED);
+        assert_eq!(tray_icon(&[phone("p9", false)]), crate::tray::ICON_OFFLINE);
     }
 
     #[test]
@@ -370,13 +530,34 @@ mod tests {
     }
 
     #[test]
-    fn nothing_live_means_end_everything_is_off() {
+    fn nothing_live_means_no_end_and_every_action_has_an_icon() {
         let menu = entries(&[phone("p1", true)], &AppSettings::default(), &[], false);
-        assert!(menu.contains(&TrayEntry::Action {
-            label: "End Everything".into(),
-            action: "end-sessions:".into(),
-            enabled: false,
+        let offered = actions(&menu);
+        assert!(!offered
+            .iter()
+            .any(|action| action.starts_with("end-sessions")));
+        assert!(!offered.contains(&"lock-hand-off".to_string()));
+        assert!(menu.iter().all(|entry| match entry {
+            TrayEntry::Action { icon, .. } | TrayEntry::Toggle { icon, .. } => !icon.is_empty(),
+            _ => true,
         }));
-        assert!(!actions(&menu).contains(&"lock-hand-off".to_string()));
+        // No label twice, no two separators in a row.
+        let labels: Vec<String> = menu
+            .iter()
+            .filter_map(|entry| match entry {
+                TrayEntry::Action { label, .. } | TrayEntry::Toggle { label, .. } => {
+                    Some(label.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let mut unique = labels.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), labels.len(), "{labels:?}");
+        assert!(!menu
+            .windows(2)
+            .any(|pair| pair[0] == TrayEntry::Separator && pair[1] == TrayEntry::Separator));
+        assert_eq!(file_icon("notes.pdf"), "x-office-document-symbolic");
     }
 }
