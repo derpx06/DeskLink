@@ -51,6 +51,10 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     // Only what the switches cannot show by themselves: a switch the user
     // just flipped already says so, and redrawing would move focus.
     let settings = crate::device_links::config::app_settings();
+    // Read only while Bluetooth call audio is on (BlueZ, about 1 ms).
+    let bonded = settings
+        .call_audio
+        .then(crate::device_links::call_audio::bonded_phones);
     let key = serde_json::to_string(&(
         &device.id,
         &device.name,
@@ -60,6 +64,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         &settings.run_commands,
         settings.relay_enabled,
         crate::shell_dbus::extension_active(),
+        settings.call_audio,
+        settings.call_audio_devices.get(&device.id),
+        &bonded,
     ))
     .unwrap_or_default();
     if !win.page_changed("preferences", key) {
@@ -109,6 +116,8 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     connection.add(&notifications);
     page.append(&connection);
 
+    page.append(&calls_group(win, daemon, &settings, device, bonded));
+
     page.append(&run_commands_group(win, daemon, &settings, &device.name));
 
     let look = adw::PreferencesGroup::builder().title("Appearance").build();
@@ -149,6 +158,150 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>, daemon: &DaemonHandle)
     page.add(&look);
     dialog.add(&page);
     dialog.present(Some(parent));
+}
+
+/// Calls: answered here by default; with the experimental switch, also heard
+/// and spoken here over Bluetooth once the user confirmed which bonded
+/// device is this phone.
+fn calls_group(
+    win: &DesklinkWindow,
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    device: &DeviceView,
+    bonded: Option<Option<Vec<crate::device_links::call_audio::BondedPhone>>>,
+) -> adw::PreferencesGroup {
+    use crate::device_links::call_audio;
+    let group = adw::PreferencesGroup::builder()
+        .title("Calls")
+        .description(format!(
+            "Answer, decline and end {}'s calls here. Turn on Calls in DeskLink on the phone.",
+            device.name
+        ))
+        .build();
+    let audio = adw::SwitchRow::builder()
+        .title("Use this computer's speaker and microphone")
+        .subtitle("Experimental · over Bluetooth")
+        .active(settings.call_audio)
+        .build();
+    with_icon(&audio, "audio-headset-symbolic");
+    let sender = daemon.clone();
+    audio.connect_active_notify(move |row| {
+        sender.send(DaemonCommand::SetCallAudio(row.is_active()))
+    });
+    group.add(&audio);
+    let Some(bonded) = bonded else {
+        return group;
+    };
+    let settings_button = |label: &str| {
+        let button = gtk::Button::builder()
+            .label(label)
+            .valign(gtk::Align::Center)
+            .css_classes(["soft-button"])
+            .build();
+        let win = win.downgrade();
+        button.connect_clicked(move |_| {
+            if !call_audio::open_bluetooth_settings() {
+                if let Some(win) = win.upgrade() {
+                    win.show_feature_toast("Open your Bluetooth settings to pair the phone");
+                }
+            }
+        });
+        button
+    };
+    let Some(phones) = bonded else {
+        let row = adw::ActionRow::builder()
+            .title("Bluetooth is off or not available")
+            .subtitle("Turn it on to hear calls here")
+            .build();
+        with_icon(&row, "bluetooth-disabled-symbolic");
+        row.add_suffix(&settings_button("Bluetooth Settings"));
+        group.add(&row);
+        return group;
+    };
+    let confirmed = settings
+        .call_audio_devices
+        .get(&device.id)
+        .and_then(|address| phones.iter().find(|phone| &phone.address == address));
+    if let Some(phone) = confirmed {
+        let row = adw::ActionRow::builder()
+            .title(&phone.name)
+            .subtitle(if phone.connected {
+                "Connected over Bluetooth · calls can use this computer"
+            } else {
+                "Not connected"
+            })
+            .use_markup(false)
+            .build();
+        with_icon(&row, "bluetooth-active-symbolic");
+        let (label, connect) = if phone.connected {
+            ("Return Calls to Phone", false)
+        } else {
+            ("Use This Computer", true)
+        };
+        let button = gtk::Button::builder()
+            .label(label)
+            .valign(gtk::Align::Center)
+            .css_classes(["soft-button"])
+            .build();
+        let (path, weak) = (phone.path.clone(), win.downgrade());
+        button.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            let (button, weak) = (button.downgrade(), weak.clone());
+            call_audio::use_for_calls(&path, connect, move |result| {
+                if let Some(button) = button.upgrade() {
+                    button.set_sensitive(true);
+                }
+                if let (Err(error), Some(win)) = (result, weak.upgrade()) {
+                    win.show_feature_toast(&format!("Bluetooth: {error}"));
+                }
+            });
+        });
+        row.add_suffix(&button);
+        let forget = gtk::Button::builder()
+            .icon_name("edit-delete-symbolic")
+            .tooltip_text("Not this device")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        forget.update_property(&[gtk::accessible::Property::Label("Not this device")]);
+        let (sender, id) = (daemon.clone(), device.id.clone());
+        forget.connect_clicked(move |_| {
+            sender.send(DaemonCommand::SetCallAudioDevice(id.clone(), None));
+        });
+        row.add_suffix(&forget);
+        group.add(&row);
+    } else if let Some(phone) = call_audio::likely_match(&phones, &device.name) {
+        let row = adw::ActionRow::builder()
+            .title(format!("Is “{}” {}?", phone.name, device.name))
+            .subtitle("Paired with this computer over Bluetooth")
+            .use_markup(false)
+            .build();
+        with_icon(&row, "bluetooth-active-symbolic");
+        let button = gtk::Button::builder()
+            .label("Yes, Use It")
+            .valign(gtk::Align::Center)
+            .css_classes(["suggested-action"])
+            .build();
+        let (sender, id, address) = (daemon.clone(), device.id.clone(), phone.address.clone());
+        button.connect_clicked(move |_| {
+            sender.send(DaemonCommand::SetCallAudioDevice(
+                id.clone(),
+                Some(address.clone()),
+            ));
+        });
+        row.add_suffix(&button);
+        group.add(&row);
+    } else {
+        let row = adw::ActionRow::builder()
+            .title(format!("{} is not paired over Bluetooth", device.name))
+            .subtitle("Pair it once in Bluetooth settings")
+            .use_markup(false)
+            .build();
+        with_icon(&row, "bluetooth-active-symbolic");
+        row.add_suffix(&settings_button("Pair over Bluetooth"));
+        group.add(&row);
+    }
+    group
 }
 
 fn with_icon(row: &impl IsA<adw::ActionRow>, icon: &str) {

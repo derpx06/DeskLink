@@ -1,3 +1,5 @@
+pub(crate) mod call_audio;
+pub(crate) mod calls;
 pub mod config;
 pub mod connection_log;
 pub mod core;

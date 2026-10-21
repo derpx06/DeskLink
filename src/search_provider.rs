@@ -60,7 +60,8 @@ const XML: &str = r#"<node>
 /// Something search can find.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Candidate {
-    /// `terminal:<id>`, `command:<id>`, `transfer:<path>`, `ring:<device>`.
+    /// `terminal:<id>`, `command:<id>`, `transfer:<path>`, `ring:<device>`,
+    /// `dial:<device>:<number>`.
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) description: String,
@@ -148,6 +149,60 @@ pub(crate) fn candidates(sources: &Sources) -> Vec<Candidate> {
     found
 }
 
+/// A typed phone number: "Call <number>" with the first phone that can
+/// (`callers`: connected phones taking call requests, id and name).
+pub(crate) fn dial_candidate(callers: &[(String, String)], terms: &[String]) -> Option<Candidate> {
+    let number = crate::device_links::calls::dial_number(&terms.join(" "))?;
+    let (id, name) = callers.first()?;
+    Some(Candidate::new(
+        format!("dial:{id}:{number}"),
+        format!("Call {number}"),
+        format!("With {name}"),
+        "call-start-symbolic",
+        "",
+    ))
+}
+
+/// The "Call" result a `dial:` id stands for, while that phone can still
+/// call.
+fn dial_from_id(callers: &[(String, String)], id: &str) -> Option<Candidate> {
+    let (device, number) = id.strip_prefix("dial:")?.split_once(':')?;
+    let caller = callers.iter().find(|(known, _)| known == device)?;
+    dial_candidate(std::slice::from_ref(caller), &[number.to_string()])
+        .filter(|candidate| candidate.id == id)
+}
+
+/// Connected phones that take call requests: id and name.
+fn callers(app: &DesklinkApplication) -> Vec<(String, String)> {
+    app.daemon_handle()
+        .map(|daemon| {
+            daemon
+                .devices()
+                .into_iter()
+                .filter(|device| device.trusted && device.feature_transport_ready)
+                .filter(|device| {
+                    device.incoming_capabilities.iter().any(|capability| {
+                        capability == crate::device_links::packet::PACKET_TYPE_TELEPHONY_REQUEST
+                    })
+                })
+                .map(|device| (device.id, device.name))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// What search shows for `terms`: every result there is, and the ids found
+/// (a number to call first).
+pub(crate) fn search(app: &DesklinkApplication, terms: &[String]) -> (Vec<Candidate>, Vec<String>) {
+    let mut all = current(app);
+    let mut found = matching(&all, terms);
+    if let Some(dial) = dial_candidate(&callers(app), terms) {
+        found.insert(0, dial.id.clone());
+        all.push(dial);
+    }
+    (all, found)
+}
+
 /// The ids of `candidates` that contain every term (case-insensitive).
 pub(crate) fn matching(candidates: &[Candidate], terms: &[String]) -> Vec<String> {
     let terms: Vec<String> = terms
@@ -209,6 +264,21 @@ pub(crate) fn activate(app: &DesklinkApplication, id: &str) {
     let Some((kind, rest)) = id.split_once(':') else {
         return;
     };
+    // The user typed the number and chose Call: no second question.
+    if kind == "dial" {
+        if let (Some(_), Some((device, number)), Some(daemon)) = (
+            dial_from_id(&callers(app), id),
+            rest.split_once(':'),
+            app.daemon_handle(),
+        ) {
+            daemon.send(DaemonCommand::Telephony(
+                device.to_string(),
+                "dial".to_string(),
+                Some(number.to_string()),
+            ));
+        }
+        return;
+    }
     // Only what search itself offered: the id is looked up again.
     if !current(app).iter().any(|candidate| candidate.id == id) {
         return;
@@ -263,22 +333,27 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
             match method {
                 "GetInitialResultSet" => {
                     let terms = params.get::<(Vec<String>,)>().unwrap_or_default().0;
-                    let found = matching(&current(&app), &terms);
+                    let (_, found) = search(&app, &terms);
                     invocation.return_value(Some(&(found,).to_variant()));
                 }
                 "GetSubsearchResultSet" => {
                     let (previous, terms) = params
                         .get::<(Vec<String>, Vec<String>)>()
                         .unwrap_or_default();
-                    let found: Vec<String> = matching(&current(&app), &terms)
+                    // A number typed further is a new "Call" result.
+                    let found: Vec<String> = search(&app, &terms)
+                        .1
                         .into_iter()
-                        .filter(|id| previous.contains(id))
+                        .filter(|id| previous.contains(id) || id.starts_with("dial:"))
                         .collect();
                     invocation.return_value(Some(&(found,).to_variant()));
                 }
                 "GetResultMetas" => {
                     let ids = params.get::<(Vec<String>,)>().unwrap_or_default().0;
-                    let metas = metas(&current(&app), &ids);
+                    let mut all = current(&app);
+                    let callers = callers(&app);
+                    all.extend(ids.iter().filter_map(|id| dial_from_id(&callers, id)));
+                    let metas = metas(&all, &ids);
                     invocation.return_value(Some(&Variant::tuple_from_iter([metas])));
                 }
                 "ActivateResult" => {
@@ -424,6 +499,31 @@ mod tests {
             assert!(ids(&[]).is_empty() && ids(&["  "]).is_empty());
             assert!(ids(&["nothing-like-this"]).is_empty());
         });
+    }
+
+    #[test]
+    fn a_typed_number_offers_a_call_with_the_phone() {
+        let callers = [("p1".to_string(), "Pixel".to_string())];
+        let terms =
+            |text: &str| -> Vec<String> { text.split_whitespace().map(str::to_string).collect() };
+        let call = dial_candidate(&callers, &terms("+1 555 0100")).unwrap();
+        assert_eq!(call.id, "dial:p1:+15550100");
+        assert_eq!(call.name, "Call +15550100");
+        assert_eq!(call.description, "With Pixel");
+        assert_eq!(dial_from_id(&callers, &call.id), Some(call));
+        assert!(dial_candidate(&callers, &terms("deploy")).is_none());
+        assert!(
+            dial_candidate(&[], &terms("5550100")).is_none(),
+            "no phone can call"
+        );
+        assert!(
+            dial_from_id(&callers, "dial:p2:5550100").is_none(),
+            "another phone"
+        );
+        assert!(
+            dial_from_id(&callers, "dial:p1:555-0100").is_none(),
+            "not as offered"
+        );
     }
 
     #[test]

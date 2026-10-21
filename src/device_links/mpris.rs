@@ -253,6 +253,33 @@ fn players(bus: &gio::DBusConnection) -> Vec<Player> {
     players
 }
 
+/// Pauses every player that is playing, for a phone call; returns their
+/// bus names, the only ones played again after it.
+pub(crate) fn pause_playing() -> Vec<String> {
+    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
+        return Vec::new();
+    };
+    players(&bus)
+        .into_iter()
+        .filter(|player| player.playing && player.can_pause)
+        .filter(|player| call(&bus, &player.bus_name, "Pause", None).is_ok())
+        .map(|player| player.bus_name)
+        .collect()
+}
+
+/// Plays `bus_names` again after a call (a player that quit is skipped).
+pub(crate) fn play(bus_names: &[String]) {
+    if bus_names.is_empty() {
+        return;
+    }
+    let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
+        return;
+    };
+    for name in bus_names {
+        let _ = call(&bus, name, "Play", None);
+    }
+}
+
 /// What was last sent, and when a playing track's position was.
 #[derive(Default)]
 struct Shown {

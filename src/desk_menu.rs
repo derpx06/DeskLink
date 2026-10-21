@@ -42,6 +42,21 @@ pub(crate) fn status_words(device: &DeviceView) -> String {
         .unwrap_or_else(|| "Not connected".to_string())
 }
 
+/// "Incoming call: Alice", "On a call with Alice" — no timer, so the menu
+/// is not rebuilt every second.
+fn call_line(status: &crate::device_links::device::CallStatus) -> String {
+    use crate::device_links::device::CallState;
+    let call = status.primary();
+    let caller = call.caller();
+    match call.state {
+        CallState::Ringing if call.incoming => format!("Incoming call: {caller}"),
+        CallState::Ringing | CallState::Dialing => format!("Calling {caller}…"),
+        CallState::Held => format!("On hold: {caller}"),
+        CallState::Talking if status.muted => format!("On a call with {caller} (muted)"),
+        CallState::Talking => format!("On a call with {caller}"),
+    }
+}
+
 /// The whole menu, from the phones, the settings and the recent files.
 pub(crate) fn entries(
     devices: &[DeviceView],
@@ -61,6 +76,19 @@ pub(crate) fn entries(
             phone.name,
             status_words(phone)
         )));
+        if let Some(status) = phone
+            .call_status
+            .as_ref()
+            .filter(|_| phone.feature_transport_ready)
+        {
+            menu.push(TrayEntry::Label(call_line(status)));
+            for (action, label, ..) in crate::window::calls::buttons(status) {
+                menu.push(TrayEntry::action(
+                    label,
+                    format!("call-{action}:{}", phone.id),
+                ));
+            }
+        }
         if phone.feature_transport_ready {
             menu.push(TrayEntry::action(
                 format!("Ring {}", phone.name),
@@ -150,6 +178,12 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
     let target = target.to_string();
     match verb {
         "ring" => daemon.send(DaemonCommand::SendFindPhone(target)),
+        "call-answer" | "call-decline" | "call-silence" | "call-end" | "call-mute"
+        | "call-unmute" => daemon.send(DaemonCommand::Telephony(
+            target,
+            verb.trim_start_matches("call-").to_string(),
+            None,
+        )),
         "lock" => daemon.send(DaemonCommand::SendLockRequest(target, true)),
         "send-clipboard" => daemon.send(DaemonCommand::SendClipboard(target)),
         "send-files" => {
@@ -296,6 +330,43 @@ mod tests {
         assert!(menu.contains(&TrayEntry::Label(
             "Phone p1 · Connected · 82% · charging".into()
         )));
+    }
+
+    #[test]
+    fn a_ringing_call_is_answered_from_the_menu_and_a_stale_one_is_not_shown() {
+        use crate::device_links::device::{CallState, CallStatus, PhoneCall};
+        let call = |state| CallStatus {
+            calls: vec![PhoneCall {
+                call_id: "c".into(),
+                state,
+                contact_name: Some("Alice".into()),
+                number: None,
+                started_at: None,
+                incoming: true,
+            }],
+            muted: false,
+            silenced: false,
+        };
+        let mut ringing = phone("p1", true);
+        ringing.call_status = Some(call(CallState::Ringing));
+        let menu = entries(&[ringing.clone()], &AppSettings::default(), &[], false);
+        assert!(menu.contains(&TrayEntry::Label("Incoming call: Alice".into())));
+        let offered = actions(&menu);
+        for wanted in ["call-answer:p1", "call-decline:p1", "call-silence:p1"] {
+            assert!(offered.iter().any(|action| action == wanted), "{wanted}");
+        }
+        ringing.call_status = Some(call(CallState::Talking));
+        let offered = actions(&entries(
+            &[ringing.clone()],
+            &AppSettings::default(),
+            &[],
+            false,
+        ));
+        assert!(offered.contains(&"call-mute:p1".to_string()));
+        assert!(offered.contains(&"call-end:p1".to_string()));
+        ringing.feature_transport_ready = false;
+        let offered = actions(&entries(&[ringing], &AppSettings::default(), &[], false));
+        assert!(!offered.iter().any(|action| action.starts_with("call-")));
     }
 
     #[test]

@@ -96,6 +96,24 @@ mod imp {
             window.present();
         }
 
+        // `tel:` links (the desktop file's `x-scheme-handler/tel`). Anything
+        // else just shows the window.
+        fn open(&self, files: &[gio::File], _hint: &str) {
+            let application = self.obj();
+            let numbers: Vec<String> = files
+                .iter()
+                .map(|file| file.uri().to_string())
+                .filter(|uri| {
+                    uri.get(..4)
+                        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("tel:"))
+                })
+                .collect();
+            match numbers.first() {
+                Some(number) => application.dial(number),
+                None => application.activate(),
+            }
+        }
+
         // Before the name is owned, so top-bar clients find it with the name.
         fn dbus_register(
             &self,
@@ -168,6 +186,35 @@ impl DesklinkApplication {
         let history_action = gio::ActionEntry::builder("history")
             .activate(move |app: &Self, _, _| app.show_history())
             .build();
+        // (device, action, number): a call button in a notification — the
+        // user's own tap, so it goes straight to the phone.
+        let call_action = gio::ActionEntry::builder("call")
+            .parameter_type(Some(glib::VariantTy::new("(sss)").expect("valid type")))
+            .activate(move |app: &Self, _, target| {
+                let Some((device, action, number)) =
+                    target.and_then(|target| target.get::<(String, String, String)>())
+                else {
+                    return;
+                };
+                if let Some(daemon) = app.daemon_handle() {
+                    daemon.send(crate::device_links::daemon::DaemonCommand::Telephony(
+                        device,
+                        action,
+                        Some(number).filter(|number| !number.is_empty()),
+                    ));
+                }
+            })
+            .build();
+        // A number from outside (`tel:` links, `desklink --dial`): asked
+        // first, in the window.
+        let dial_action = gio::ActionEntry::builder("dial")
+            .parameter_type(Some(glib::VariantTy::STRING))
+            .activate(move |app: &Self, _, target| {
+                if let Some(number) = target.and_then(|target| target.get::<String>()) {
+                    app.dial(&number);
+                }
+            })
+            .build();
         crate::send_to::add_action(self);
         self.add_action_entries([
             quit_action,
@@ -177,7 +224,16 @@ impl DesklinkApplication {
             end_sessions_action,
             lock_hand_off_action,
             history_action,
+            call_action,
+            dial_action,
         ]);
+    }
+
+    /// Shows the window and asks before calling `number` with the phone.
+    pub(crate) fn dial(&self, number: &str) {
+        let window = self.main_window();
+        window.present();
+        crate::window::confirm_dial(&window, number);
     }
 
     /// Each known device's type, by id.

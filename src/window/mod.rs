@@ -24,6 +24,8 @@
 //! dialogs, mirrored notifications, errors; each page lives in its own
 //! module and is redrawn only when what it shows has changed.
 
+pub(crate) mod calls;
+pub(crate) use calls::confirm_dial;
 mod clipboard;
 pub(crate) mod history;
 pub(crate) mod notifications;
@@ -94,6 +96,8 @@ mod imp {
         #[template_child]
         pub error_banner: TemplateChild<adw::Banner>,
         #[template_child]
+        pub call_bar: TemplateChild<gtk::Revealer>,
+        #[template_child]
         pub narrow_breakpoint: TemplateChild<adw::Breakpoint>,
         #[template_child]
         pub toast_overlay: TemplateChild<adw::ToastOverlay>,
@@ -126,6 +130,10 @@ mod imp {
         pub last_error_toast: RefCell<Option<(String, std::time::Instant)>>,
         pub notified_pair_requests: RefCell<HashSet<String>>,
         pub notified_remote_notifications: RefCell<HashSet<String>>,
+        /// Ringing calls ("device:callId") whose notification is up.
+        pub notified_calls: RefCell<HashSet<String>>,
+        /// What the call bar was last drawn from.
+        pub call_bar_key: RefCell<String>,
         /// The pairing dialog on screen for each incoming request, with the
         /// code it shows. A request whose code changes gets a fresh dialog, so
         /// Pair always confirms the code the user actually compared.
@@ -629,6 +637,13 @@ impl DesklinkWindow {
                         self,
                     );
                 }
+                DaemonEvent::MissedCall {
+                    device_id,
+                    device_name,
+                    caller,
+                    number,
+                } => calls::missed(self, &device_id, &device_name, caller, number),
+                DaemonEvent::CallRefused { message } => self.show_feature_toast(&message),
             }
         }
 
@@ -662,6 +677,7 @@ impl DesklinkWindow {
             imp.banner_since.set(None);
         }
         self.mirror_device_side_effects(&daemon, &devices, errors.is_empty());
+        calls::notify(self, &devices);
 
         let selected = imp.selected_device_id.borrow().clone();
         if selected
@@ -713,6 +729,7 @@ impl DesklinkWindow {
             sidebar.update(self, &devices, &device);
         }
         self.render_page(&daemon, &device);
+        calls::update_bar(self, &daemon, &devices);
     }
 
     /// Draws the page on show, if what it shows has changed.
@@ -2081,6 +2098,28 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
                 device.desktop_session = DesktopSession::Viewing;
             }
         }
+    }
+    // "ringing" / "talking": a call on the phone.
+    use crate::device_links::device::{CallState, CallStatus, PhoneCall};
+    let call = match kind {
+        "ringing" => Some(CallState::Ringing),
+        "talking" => Some(CallState::Talking),
+        _ => None,
+    };
+    if let Some(state) = call {
+        device.call_status = Some(CallStatus {
+            calls: vec![PhoneCall {
+                call_id: "fake-call".into(),
+                state,
+                contact_name: Some("Mara Lindqvist".into()),
+                number: Some("+46 70 123 45 67".into()),
+                started_at: (state == CallState::Talking)
+                    .then(|| glib::real_time() / 1000 - 83_000),
+                incoming: true,
+            }],
+            muted: false,
+            silenced: false,
+        });
     }
     device
 }

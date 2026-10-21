@@ -10,14 +10,15 @@ use crate::device_links::packet::{
     PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND,
     PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SCREEN_ERROR, PACKET_TYPE_SCREEN_READY,
     PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP, PACKET_TYPE_SETTINGS,
-    PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_UNLOCK_REQUEST,
+    PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_TELEPHONY,
+    PACKET_TYPE_TELEPHONY_REQUEST, PACKET_TYPE_UNLOCK_REQUEST,
 };
 
 /// Packets the desktop can act on when they arrive over the authenticated
 /// WebRTC transport. Each entry has a matching arm in
 /// `packet_handler::dispatch_webrtc_feature_packet` and a DeskLink Android
 /// plugin that actually sends it.
-const DESKTOP_INCOMING: [&str; 20] = [
+const DESKTOP_INCOMING: [&str; 21] = [
     PACKET_TYPE_BATTERY,
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
@@ -49,6 +50,8 @@ const DESKTOP_INCOMING: [&str; 20] = [
     // A phone changing an allow-listed desk setting.
     PACKET_TYPE_SETTINGS_REQUEST,
     PACKET_TYPE_SHARE_REQUEST,
+    // The phone's calls: the incoming-call bar, Answer/Decline, the timer.
+    PACKET_TYPE_TELEPHONY,
     // The phone asking for an unlock nonce ("Unlock desk").
     PACKET_TYPE_UNLOCK_REQUEST,
 ];
@@ -56,7 +59,7 @@ const DESKTOP_INCOMING: [&str; 20] = [
 /// Packets the desktop can construct from a command path, and that a DeskLink
 /// Android plugin can consume. `desklink.systemvolume.request` is absent: the
 /// phone has no receiver for it.
-const DESKTOP_OUTGOING: [&str; 21] = [
+const DESKTOP_OUTGOING: [&str; 22] = [
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
     PACKET_TYPE_FINDMYPHONE_REQUEST,
@@ -83,6 +86,8 @@ const DESKTOP_OUTGOING: [&str; 21] = [
     // The desk's settings, on feature-ready and on every change.
     PACKET_TYPE_SETTINGS,
     PACKET_TYPE_SHARE_REQUEST,
+    // Answer, decline, end, silence, mute and dial a call on the phone.
+    PACKET_TYPE_TELEPHONY_REQUEST,
     // The desk's unlock nonce.
     PACKET_TYPE_UNLOCK_REQUEST,
 ];
@@ -100,7 +105,7 @@ const DESKTOP_OUTGOING: [&str; 21] = [
 /// control plane is `desklink.remote-session.v1` on the control channel, and
 /// the screen packet types exist only so the Android application loads its
 /// screen plugin (see `DESKTOP_INCOMING`). They never cross the wire.
-const WEBRTC_PROFILE: [&str; 23] = [
+const WEBRTC_PROFILE: [&str; 25] = [
     PACKET_TYPE_BATTERY,
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
@@ -123,6 +128,8 @@ const WEBRTC_PROFILE: [&str; 23] = [
     PACKET_TYPE_SETTINGS,
     PACKET_TYPE_SETTINGS_REQUEST,
     PACKET_TYPE_SHARE_REQUEST,
+    PACKET_TYPE_TELEPHONY,
+    PACKET_TYPE_TELEPHONY_REQUEST,
     PACKET_TYPE_UNLOCK_REQUEST,
 ];
 
@@ -292,6 +299,7 @@ mod tests {
                 "desklink.screen.stop",
                 "desklink.settings.request",
                 "desklink.share.request",
+                "desklink.telephony",
                 "desklink.unlock.request",
             ])
         );
@@ -318,6 +326,7 @@ mod tests {
                 "desklink.screen.stop",
                 "desklink.settings",
                 "desklink.share.request",
+                "desklink.telephony.request",
                 "desklink.unlock.request",
             ])
         );
@@ -356,6 +365,8 @@ mod tests {
                 "desklink.settings",
                 "desklink.settings.request",
                 "desklink.share.request",
+                "desklink.telephony",
+                "desklink.telephony.request",
                 "desklink.unlock.request",
             ]
         );

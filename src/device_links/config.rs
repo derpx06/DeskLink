@@ -98,6 +98,13 @@ pub struct AppSettings {
     /// The last folders a phone started a terminal in, newest first.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_folders: Vec<String>,
+    /// Preferences → Calls: offer this computer's speaker and microphone
+    /// for calls, over Bluetooth (experimental; off by default).
+    pub call_audio: bool,
+    /// Each phone's Bluetooth address, once the user confirmed it is that
+    /// phone (by DeskLink device id).
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub call_audio_devices: std::collections::BTreeMap<String, String>,
 }
 
 /// A command a phone may run here, in a shared terminal.
@@ -127,6 +134,8 @@ impl Default for AppSettings {
             top_bar_pill: false,
             run_commands: Vec::new(),
             recent_folders: Vec::new(),
+            call_audio: false,
+            call_audio_devices: Default::default(),
         }
     }
 }

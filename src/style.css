@@ -545,3 +545,29 @@ button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.0
   box-shadow: none;
 }
 .floating-toolbar { margin: 18px; }
+
+/* ── Calls ─────────────────────────────────────────────────────────────── */
+/* The phone's call: a card on its overview, the same card as a bar over the
+ * other pages. Answer is a darker mint, so white text keeps 4.5:1. */
+@define-color call_green #0b7a59;
+.call-card {
+  padding: 14px 16px;
+  border-radius: 16px;
+  background-color: @card_bg_color;
+  box-shadow: 0 0 0 1px @card_edge;
+}
+.call-card.compact { padding: 8px 10px 8px 12px; border-radius: 14px; }
+.call-card.ringing {
+  background-color: alpha(@mint, 0.1);
+  box-shadow: 0 0 0 1px alpha(@mint, 0.3);
+}
+.call-icon { border-radius: 999px; background-color: @call_green; color: white; }
+/* Ringing: a ripple. GTK drops it when the user turned animations off. */
+.call-icon.pulse { animation: ring-pulse 1.4s ease-out infinite; }
+@keyframes ring-pulse {
+  0% { box-shadow: 0 0 0 0 alpha(@mint, 0.55); }
+  70% { box-shadow: 0 0 0 10px alpha(@mint, 0); }
+  100% { box-shadow: 0 0 0 0 alpha(@mint, 0); }
+}
+.call-answer { background-color: @call_green; color: white; }
+.call-answer:hover { background-color: shade(@call_green, 1.1); }

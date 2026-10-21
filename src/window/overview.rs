@@ -74,6 +74,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         .css_classes(["overview-page"])
         .build();
     if device.trusted {
+        if let Some(call) = super::calls::card(daemon, device, false) {
+            page.append(&call);
+        }
         page.append(&hero(daemon, device, &minute));
         if let Some(bar) = now_playing_bar(daemon, device) {
             page.append(&bar);

@@ -165,6 +165,13 @@
                                 <property name="use-markup">False</property>
                               </object>
                             </child>
+                            <!-- A phone's call, on every page but its overview. -->
+                            <child type="top">
+                              <object class="GtkRevealer" id="call_bar">
+                                <property name="reveal-child">False</property>
+                                <property name="transition-type">slide-down</property>
+                              </object>
+                            </child>
                             <property name="content">
                               <object class="GtkStack" id="page_stack">
                                 <property name="transition-type">crossfade</property>

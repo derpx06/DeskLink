@@ -30,7 +30,9 @@ pub const INTERFACE: &str = "derx06.desklink.com.Shell1";
 /// 3: `Notifications`, `Transfers`, `Desk.pill`, `Devices[].lastSeen`, the
 /// `lock`, `send-clipboard` and `reconnect` actions, and the notification and
 /// transfer methods.
-const VERSION: u32 = 3;
+/// 4: `Devices[].call` and the `call-*` actions (a client that shows calls
+/// says `calls` in `Hello`).
+const VERSION: u32 = 4;
 const INVALID_ARGS: &str = "org.freedesktop.DBus.Error.InvalidArgs";
 
 const XML: &str = r#"<node>
@@ -134,7 +136,52 @@ struct ShellDevice {
     terminals: u32,
     /// When its link was lost (Unix seconds), while it stays lost; 0 live.
     last_seen: u64,
+    /// Its call now, live links only.
+    call: Option<ShellCall>,
     actions: Vec<&'static str>,
+}
+
+/// The call a client shows: `Devices[].call`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellCall {
+    /// The phone's id for it, the same for all its updates.
+    id: String,
+    /// "ringing", "dialing", "talking" or "held".
+    state: &'static str,
+    incoming: bool,
+    /// The contact, else the number, else "Incoming call" (the phone keeps
+    /// the caller private unless its user allowed it).
+    caller: String,
+    /// "" when not sent.
+    number: String,
+    /// Unix milliseconds; 0 unknown.
+    started_at: i64,
+    muted: bool,
+    silenced: bool,
+}
+
+fn shell_call(device: &DeviceView) -> Option<ShellCall> {
+    use crate::device_links::device::CallState;
+    let status = device
+        .call_status
+        .as_ref()
+        .filter(|_| device.feature_transport_ready)?;
+    let call = status.primary();
+    Some(ShellCall {
+        id: call.call_id.clone(),
+        state: match call.state {
+            CallState::Ringing => "ringing",
+            CallState::Dialing => "dialing",
+            CallState::Talking => "talking",
+            CallState::Held => "held",
+        },
+        incoming: call.incoming,
+        caller: call.caller(),
+        number: call.number.clone().unwrap_or_default(),
+        started_at: call.started_at.unwrap_or(0),
+        muted: status.muted,
+        silenced: status.silenced,
+    })
 }
 
 fn shell_device(device: &DeviceView, settings: &AppSettings) -> ShellDevice {
@@ -163,6 +210,7 @@ fn shell_device(device: &DeviceView, settings: &AppSettings) -> ShellDevice {
         },
         terminals: device.terminal_sessions_attached as u32,
         last_seen: device.last_seen.unwrap_or(0),
+        call: shell_call(device),
         actions: actions(device, settings),
     }
 }
@@ -183,6 +231,24 @@ fn actions(device: &DeviceView, settings: &AppSettings) -> Vec<&'static str> {
     // phone connected on this network.
     if crate::device_links::desk_features::could_unlock(device, settings) {
         actions.push("unlock-via-phone");
+    }
+    // The call's buttons, when the phone takes call requests.
+    if let Some(status) = device.call_status.as_ref().filter(|_| {
+        device.feature_transport_ready
+            && device.incoming_capabilities.iter().any(|capability| {
+                capability == crate::device_links::packet::PACKET_TYPE_TELEPHONY_REQUEST
+            })
+    }) {
+        for (action, ..) in crate::window::calls::buttons(status) {
+            actions.push(match action {
+                "answer" => "call-answer",
+                "decline" => "call-decline",
+                "silence" => "call-silence",
+                "mute" => "call-mute",
+                "unmute" => "call-unmute",
+                _ => "call-end",
+            });
+        }
     }
     // Ending is local (stop sharing, detach terminals), so it does not wait
     // for the feature transport.
@@ -207,6 +273,18 @@ impl ShellDevice {
         dict.insert("screen", self.screen);
         dict.insert("terminals", self.terminals);
         dict.insert("lastSeen", self.last_seen);
+        if let Some(call) = &self.call {
+            let entry = glib::VariantDict::new(None);
+            entry.insert("id", &call.id);
+            entry.insert("state", call.state);
+            entry.insert("incoming", call.incoming);
+            entry.insert("caller", &call.caller);
+            entry.insert("number", &call.number);
+            entry.insert("startedAt", call.started_at);
+            entry.insert("muted", call.muted);
+            entry.insert("silenced", call.silenced);
+            dict.insert_value("call", &entry.end());
+        }
         dict.insert("actions", &self.actions);
         dict.end()
     }
@@ -488,6 +566,16 @@ fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str
         ("ring", Some(id), Some(daemon)) => daemon.send(DaemonCommand::SendFindPhone(id)),
         ("lock", Some(id), Some(daemon)) => daemon.send(DaemonCommand::SendLockRequest(id, true)),
         ("send-clipboard", Some(id), Some(daemon)) => daemon.send(DaemonCommand::SendClipboard(id)),
+        (
+            "call-answer" | "call-decline" | "call-silence" | "call-end" | "call-mute"
+            | "call-unmute",
+            Some(id),
+            Some(daemon),
+        ) => daemon.send(DaemonCommand::Telephony(
+            id,
+            action.trim_start_matches("call-").to_string(),
+            None,
+        )),
         ("reconnect", _, Some(daemon)) => {
             daemon.send(DaemonCommand::NetworkChanged);
             daemon.send(DaemonCommand::Discover);
@@ -986,6 +1074,54 @@ mod tests {
             (idle.battery, idle.screen, idle.path.as_str()),
             (-1, "", "")
         );
+    }
+
+    #[test]
+    fn a_ringing_call_is_published_with_answer_and_decline() {
+        use crate::device_links::device::{CallState, CallStatus, PhoneCall};
+        let mut device = phone();
+        device.status = DeviceStatus::Paired;
+        device.feature_transport_ready = true;
+        device.incoming_capabilities =
+            vec![crate::device_links::packet::PACKET_TYPE_TELEPHONY_REQUEST.into()];
+        device.call_status = Some(CallStatus {
+            calls: vec![PhoneCall {
+                call_id: "c1".into(),
+                state: CallState::Ringing,
+                contact_name: None,
+                number: None,
+                started_at: None,
+                incoming: true,
+            }],
+            muted: false,
+            silenced: false,
+        });
+        let mapped = shell_device(&device, &AppSettings::default());
+        for action in ["call-answer", "call-decline", "call-silence"] {
+            assert!(mapped.actions.contains(&action), "{action}");
+        }
+        let devices = [mapped.clone()];
+        assert!(check(&devices, "phone1", "call-answer").is_ok());
+        assert!(
+            check(&devices, "phone1", "call-end").is_err(),
+            "nothing to end"
+        );
+        let dict = glib::VariantDict::new(Some(&devices_variant(&devices).child_value(0)));
+        let call = glib::VariantDict::new(Some(&dict.lookup_value("call", None).unwrap()));
+        assert_eq!(
+            call.lookup::<String>("state").unwrap().as_deref(),
+            Some("ringing")
+        );
+        assert_eq!(
+            call.lookup::<String>("caller").unwrap().as_deref(),
+            Some("Incoming call"),
+            "a private caller"
+        );
+        assert_eq!(call.lookup::<bool>("incoming").unwrap(), Some(true));
+
+        device.feature_transport_ready = false;
+        let stale = shell_device(&device, &AppSettings::default());
+        assert!(stale.call.is_none() && !stale.actions.iter().any(|a| a.starts_with("call-")));
     }
 
     #[test]

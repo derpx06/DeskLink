@@ -30,6 +30,15 @@ pub enum DaemonEvent {
     },
     /// The phone offered its screen unasked: open the Phone Screen window.
     PhoneScreenOffered { device_id: String },
+    /// A call the phone missed (T1 `missed`).
+    MissedCall {
+        device_id: String,
+        device_name: String,
+        caller: Option<String>,
+        number: Option<String>,
+    },
+    /// The phone refused a call request, in the user's words.
+    CallRefused { message: String },
 }
 
 struct DaemonStopGuard(Sender<DaemonCommand>);

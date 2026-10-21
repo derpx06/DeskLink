@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=DeskLink
 Comment=Use your phone and computer together
-Exec=desklink
+Exec=desklink %U
 Icon=derx06.desklink.com
 Terminal=false
 Type=Application
@@ -10,4 +10,6 @@ Categories=Network;RemoteAccess;FileTransfer;
 Keywords=phone;android;remote;terminal;clipboard;notifications;file;transfer;screen;
 StartupNotify=true
 DBusActivatable=true
+# `tel:` links: DeskLink asks, then the phone calls.
+MimeType=x-scheme-handler/tel;
 X-GNOME-UsesNotifications=true

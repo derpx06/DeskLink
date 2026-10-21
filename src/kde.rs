@@ -58,10 +58,12 @@ fn on_kde() -> bool {
     is_kde(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
 }
 
-/// KRunner's matches for `query`, from the same results as GNOME's search.
-pub(crate) fn matches(candidates: &[crate::search_provider::Candidate], query: &str) -> Variant {
-    let terms: Vec<String> = query.split_whitespace().map(str::to_string).collect();
-    let found = crate::search_provider::matching(candidates, &terms);
+/// KRunner's rows for the `found` ids, from the same results as GNOME's
+/// search.
+pub(crate) fn matches(
+    candidates: &[crate::search_provider::Candidate],
+    found: &[String],
+) -> Variant {
     let rows = candidates
         .iter()
         .filter(|candidate| found.contains(&candidate.id))
@@ -107,7 +109,9 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
                 )),
                 "Match" => {
                     let query = params.get::<(String,)>().unwrap_or_default().0;
-                    let found = matches(&crate::search_provider::current(&app), &query);
+                    let terms: Vec<String> = query.split_whitespace().map(str::to_string).collect();
+                    let (all, found) = crate::search_provider::search(&app, &terms);
+                    let found = matches(&all, &found);
                     invocation.return_value(Some(&Variant::tuple_from_iter([found])));
                 }
                 "Run" => {
@@ -168,14 +172,18 @@ mod tests {
             transfers: &[],
             phones: &phones,
         });
-        let found = matches(&all, "ring pix");
+        let find = |query: &str| {
+            let terms: Vec<String> = query.split_whitespace().map(str::to_string).collect();
+            matches(&all, &crate::search_provider::matching(&all, &terms))
+        };
+        let found = find("ring pix");
         assert_eq!(found.type_().as_str(), "a(sssida{sv})");
         assert_eq!(found.n_children(), 1);
         let row = found.child_value(0);
         assert_eq!(row.child_value(0).str(), Some("ring:p1"));
         assert_eq!(row.child_value(1).str(), Some("Ring Pixel"));
         assert_eq!(row.child_value(3).get::<i32>(), Some(POSSIBLE_MATCH));
-        assert_eq!(matches(&all, "nothing").n_children(), 0);
+        assert_eq!(find("nothing").n_children(), 0);
     }
 
     #[test]

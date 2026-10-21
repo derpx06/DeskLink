@@ -180,3 +180,96 @@ export class PhoneNotifications {
         dialog.open();
     }
 }
+
+/// An incoming call ringing on a phone, as a critical banner with Answer and
+/// Decline (DeskLink's `call-answer` / `call-decline` actions), taken back as
+/// soon as it stops ringing. Shown only for a phone whose `call` is ringing
+/// and incoming (Shell1 version 4).
+export class PhoneCalls {
+    constructor(call) {
+        this._call = call;
+        this._source = null;
+        // "device\0callId" → its notification.
+        this._shown = new Map();
+        // Answered, declined or closed here: not shown again for that call.
+        this._closed = new Set();
+    }
+
+    sync(devices) {
+        const ringing = new Map();
+        for (const device of devices) {
+            const call = device.ready ? device.call : null;
+            if (call?.state === 'ringing' && call.incoming)
+                ringing.set(key(device.id, call.id), {device, call});
+        }
+        for (const [id, record] of [...this._shown]) {
+            if (!ringing.has(id)) {
+                this._shown.delete(id);
+                record.withdrawn = true;
+                record.notification.destroy(MessageTray.NotificationDestroyedReason.SOURCE_CLOSED);
+            }
+        }
+        for (const id of [...this._closed]) {
+            if (!ringing.has(id))
+                this._closed.delete(id);
+        }
+        for (const [id, {device, call}] of ringing) {
+            if (!this._shown.has(id) && !this._closed.has(id))
+                this._show(id, device, call);
+        }
+    }
+
+    destroy() {
+        this.sync([]);
+        this._source?.destroy();
+        this._source = null;
+    }
+
+    _ensureSource() {
+        if (this._source)
+            return this._source;
+        const title = 'Phone calls';
+        const iconName = 'call-start-symbolic';
+        this._source = SHELL_MAJOR >= 46
+            ? new MessageTray.Source({title, iconName})
+            : new MessageTray.Source(title, iconName);
+        this._source.connect('destroy', () => {
+            this._source = null;
+        });
+        Main.messageTray.add(this._source);
+        return this._source;
+    }
+
+    _show(id, device, call) {
+        const source = this._ensureSource();
+        const title = call.caller;
+        let body = `Incoming call on ${device.name}`;
+        if (call.number && call.number !== call.caller)
+            body += ` · ${call.number}`;
+        let notification;
+        if (SHELL_MAJOR >= 46) {
+            notification = new MessageTray.Notification({
+                source, title, body, urgency: MessageTray.Urgency.CRITICAL,
+            });
+        } else {
+            notification = new MessageTray.Notification(source, title, body);
+            notification.setUrgency(MessageTray.Urgency.CRITICAL);
+        }
+        for (const [action, label] of [['call-answer', 'Answer'], ['call-decline', 'Decline']]) {
+            if (device.actions.includes(action))
+                notification.addAction(label, () => this._call('Invoke', [device.id, action]));
+        }
+        const record = {notification, withdrawn: false};
+        notification.connect('destroy', () => {
+            if (this._shown.get(id) === record)
+                this._shown.delete(id);
+            if (!record.withdrawn)
+                this._closed.add(id);
+        });
+        this._shown.set(id, record);
+        if (SHELL_MAJOR >= 46)
+            source.addNotification(notification);
+        else
+            source.showNotification(notification);
+    }
+}

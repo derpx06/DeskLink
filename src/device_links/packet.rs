@@ -64,6 +64,10 @@ pub const PACKET_TYPE_SCREEN_ERROR: &str = "desklink.screen.error";
 pub const PACKET_TYPE_PRESENTER: &str = "desklink.presenter";
 pub const PACKET_TYPE_CONTACTS_REQUEST: &str = "desklink.contacts.request";
 pub const PACKET_TYPE_SMS_REQUEST: &str = "desklink.sms.request";
+/// The phone's calls (a full snapshot), a missed call, or a refused request
+/// (phone → desk).
+pub const PACKET_TYPE_TELEPHONY: &str = "desklink.telephony";
+/// Answer, decline, end, silence, mute, unmute or dial (desk → phone).
 pub const PACKET_TYPE_TELEPHONY_REQUEST: &str = "desklink.telephony.request";
 pub const PACKET_TYPE_CONNECTIVITY_REPORT: &str = "desklink.connectivity_report";
 pub const PACKET_TYPE_WEBRTC_SIGNAL_V1: &str = "desklink.webrtc.signal.v1";

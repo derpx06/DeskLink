@@ -8,7 +8,8 @@ use super::dispatcher::{PacketSource, SharedPacketDispatcher};
 use super::handle::DaemonEvent;
 use super::state::{
     push_event, remove_notification, replace_notifications, update_battery_status,
-    update_media_from_packet, update_pair_state, update_volume_status, upsert_notification,
+    update_call_status, update_media_from_packet, update_pair_state, update_volume_status,
+    upsert_notification,
 };
 use crate::device_links::config::Config;
 use crate::device_links::core::{DeviceManager, ReadOutcome, SessionBinding};
@@ -20,8 +21,8 @@ use crate::device_links::packet::{
     PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST,
     PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PAIR, PACKET_TYPE_PING,
     PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_REQUEST,
-    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_UNLOCK_REQUEST,
-    PACKET_TYPE_WEBRTC_SIGNAL_V1,
+    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_TELEPHONY,
+    PACKET_TYPE_UNLOCK_REQUEST, PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
 use crate::device_links::pairing::{needs_pair_reconfirmation, PairState};
 
@@ -665,6 +666,28 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         }
         PACKET_TYPE_SYSTEMVOLUME => {
             update_volume_status(devices, device_id, &packet);
+            Ok(())
+        }
+        // A snapshot, a missed call or a refusal: a report, never an
+        // instruction (nothing here answers or ends a call).
+        PACKET_TYPE_TELEPHONY => {
+            use crate::device_links::calls;
+            if let Some(status) = calls::parse_status(&packet) {
+                let in_call = update_call_status(devices, device_id, status);
+                calls::hold_media(device_id, in_call);
+            } else if let Some(missed) = calls::parse_missed(&packet) {
+                push_event(
+                    events,
+                    DaemonEvent::MissedCall {
+                        device_id: device_id.clone(),
+                        device_name: binding.link.info.name.clone(),
+                        caller: missed.contact_name,
+                        number: missed.number,
+                    },
+                );
+            } else if let Some(message) = calls::parse_error(&packet) {
+                push_event(events, DaemonEvent::CallRefused { message });
+            }
             Ok(())
         }
         PACKET_TYPE_FINDMYPHONE_REQUEST => {

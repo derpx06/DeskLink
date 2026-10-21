@@ -74,6 +74,19 @@ fn main() -> glib::ExitCode {
     if args.get(1).is_some_and(|arg| arg == "--send-files") {
         return send_to::run_cli(&args[2..]);
     }
+    // `desklink --dial <number>`, or a `tel:` link from a launcher that does
+    // not use D-Bus activation: the running DeskLink asks, then the phone
+    // calls. Handled here, so a second instance never starts.
+    if args.len() == 3 && args[1] == "--dial" {
+        return send_to::run_dial_cli(&args[2]);
+    }
+    if args.len() == 2
+        && args[1]
+            .get(..4)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("tel:"))
+    {
+        return send_to::run_dial_cli(&args[1]);
+    }
 
     install_crash_reporter();
 
@@ -90,7 +103,8 @@ fn main() -> glib::ExitCode {
     // Create a new GtkApplication. The application manages our main loop,
     // application windows, integration with the window manager/compositor, and
     // desktop features such as file opening and single-instance applications.
-    let app = DesklinkApplication::new("derx06.desklink.com", &gio::ApplicationFlags::empty());
+    // HANDLES_OPEN: `tel:` links arrive as `open` (see `application.rs`).
+    let app = DesklinkApplication::new("derx06.desklink.com", &gio::ApplicationFlags::HANDLES_OPEN);
 
     // Run the application. This function will block until the application
     // exits. Upon return, we have our exit code to return to the shell. (This

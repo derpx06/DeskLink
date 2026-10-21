@@ -83,6 +83,79 @@ pub struct SystemVolumeStatus {
     pub sinks: Vec<VolumeSink>,
 }
 
+/// One call on the phone, as its last snapshot said (T1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PhoneCall {
+    pub call_id: String,
+    pub state: CallState,
+    /// Sent only when the phone's "Show caller" is on (T3).
+    pub contact_name: Option<String>,
+    pub number: Option<String>,
+    /// When it was answered or dialled (Unix milliseconds), for the timer.
+    pub started_at: Option<i64>,
+    pub incoming: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CallState {
+    Ringing,
+    Dialing,
+    Talking,
+    Held,
+}
+
+/// The phone's calls right now. Phone-owned and never stale: it is dropped
+/// when the feature link goes, as a ringing call cannot be answered without
+/// it (and would ring here forever).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CallStatus {
+    /// Never empty: no call is `None` on the device.
+    pub calls: Vec<PhoneCall>,
+    pub muted: bool,
+    pub silenced: bool,
+}
+
+impl CallStatus {
+    /// The call to show and act on: one ringing here first, then the live one.
+    pub fn primary(&self) -> &PhoneCall {
+        let rank = |call: &PhoneCall| match call.state {
+            CallState::Ringing if call.incoming => 0,
+            CallState::Talking => 1,
+            CallState::Dialing => 2,
+            CallState::Ringing => 3,
+            CallState::Held => 4,
+        };
+        self.calls
+            .iter()
+            .min_by_key(|call| rank(call))
+            .expect("a call status always has a call")
+    }
+
+    /// The incoming call ringing now, if one is.
+    pub fn ringing(&self) -> Option<&PhoneCall> {
+        self.calls
+            .iter()
+            .find(|call| call.incoming && call.state == CallState::Ringing)
+    }
+}
+
+impl PhoneCall {
+    /// "Alice", "+1 555 0100", or "Incoming call" when the phone keeps the
+    /// caller private.
+    pub fn caller(&self) -> String {
+        self.contact_name
+            .clone()
+            .or_else(|| self.number.clone())
+            .unwrap_or_else(|| {
+                if self.incoming {
+                    "Incoming call".to_string()
+                } else {
+                    "Call".to_string()
+                }
+            })
+    }
+}
+
 /// A phone's use of this computer's screen.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DesktopSession {
@@ -136,6 +209,9 @@ pub struct DeviceView {
     pub battery_status: Option<BatteryStatus>,
     pub notifications: Vec<DeviceNotification>,
     pub volume_status: Option<SystemVolumeStatus>,
+    /// The phone's calls; `None` when it has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_status: Option<CallStatus>,
 }
 
 /// The user-facing words for a `connection_path`, the one mapping every
@@ -178,6 +254,7 @@ impl DeviceView {
             battery_status: None,
             notifications: Vec::new(),
             volume_status: None,
+            call_status: None,
         }
     }
 

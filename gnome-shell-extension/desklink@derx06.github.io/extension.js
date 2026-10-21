@@ -9,7 +9,8 @@
 // End Everything), recent transfers, Lock & Hand Off and Open DeskLink. A
 // small status icon shows in the top bar while a phone is connected.
 //
-// The phones' notifications become GNOME notifications (notifications.js).
+// The phones' notifications become GNOME notifications, and a call ringing on
+// a phone a critical banner with Answer and Decline (notifications.js).
 //
 // An extra pill in the top bar (the link glyph, a coral dot while a phone is
 // using this computer) is optional (DeskLink's Preferences, off by default).
@@ -33,7 +34,7 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
-import {PhoneNotifications} from './notifications.js';
+import {PhoneCalls, PhoneNotifications} from './notifications.js';
 
 const BUS_NAME = 'derx06.desklink.com';
 const OBJECT_PATH = '/derx06/desklink/com/Shell';
@@ -215,6 +216,7 @@ export default class DeskLinkExtension extends Extension {
         this._selected = null;
         this._menuKey = null;
         this._notifications = new PhoneNotifications((method, args) => this._call(method, args));
+        this._calls = new PhoneCalls((method, args) => this._call(method, args));
         this._quietNotifications = true;
 
         this._indicator = new DeskLinkIndicator();
@@ -241,6 +243,8 @@ export default class DeskLinkExtension extends Extension {
         this._disconnect();
         this._notifications.destroy();
         this._notifications = null;
+        this._calls.destroy();
+        this._calls = null;
         this._indicator.quickSettingsItems.forEach(item => item.destroy());
         this._indicator.destroy();
         this._indicator = null;
@@ -263,10 +267,10 @@ export default class DeskLinkExtension extends Extension {
             }
             this._proxy = proxy;
             this._quietNotifications = true;
-            // Tells DeskLink this extension shows the phones' notifications,
-            // so the app stops showing its own (an older extension does not
-            // say so, and the app keeps them).
-            proxy.HelloRemote(1, ['notifications', 'quick-settings'], (_result, error) => {
+            // Tells DeskLink this extension shows the phones' notifications
+            // and ringing calls, so the app stops showing its own (an older
+            // extension does not say so, and the app keeps them).
+            proxy.HelloRemote(1, ['notifications', 'quick-settings', 'calls'], (_result, error) => {
                 if (error)
                     console.warn(`DeskLink: Hello failed: ${error.message}`);
             });
@@ -283,6 +287,7 @@ export default class DeskLinkExtension extends Extension {
         this._changedId = 0;
         this._proxy = null;
         this._notifications?.destroy();
+        this._calls?.destroy();
         if (this._indicator)
             this._sync();
     }
@@ -308,6 +313,9 @@ export default class DeskLinkExtension extends Extension {
             this._notifications.sync(this._read('Notifications', []), this._quietNotifications);
             this._quietNotifications = false;
         }
+        // A ringing call: a critical banner, never on the lock screen (it
+        // comes back on unlock if the phone still rings).
+        this._calls.sync(running && !locked ? devices : []);
 
         // Quick Settings: everything, but not on the lock screen.
         const toggle = this._indicator.toggle;

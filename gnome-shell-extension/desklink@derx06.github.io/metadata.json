@@ -1,7 +1,7 @@
 {
   "uuid": "desklink@derx06.github.io",
   "name": "DeskLink",
-  "description": "Your DeskLink phone in Quick Settings: how it is connected, its battery, quick actions (ring, lock, send files, send clipboard, keep awake), what it is doing on this computer with End, recent files and Lock & Hand Off. Its notifications appear as GNOME notifications, with replies. On the lock screen it offers \"Unlock with your phone\" when you turned that on in DeskLink. Needs the DeskLink app.",
+  "description": "Your DeskLink phone in Quick Settings: how it is connected, its battery, quick actions (ring, lock, send files, send clipboard, keep awake), what it is doing on this computer with End, recent files and Lock & Hand Off. Its notifications appear as GNOME notifications, with replies, and a call ringing on it as a banner with Answer and Decline. On the lock screen it offers \"Unlock with your phone\" when you turned that on in DeskLink. Needs the DeskLink app.",
   "url": "https://github.com/derpx06/DeskLink",
   "session-modes": ["user", "unlock-dialog"],
   "shell-version": ["45", "46", "47", "48", "49", "50", "51"]

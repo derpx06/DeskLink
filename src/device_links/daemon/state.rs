@@ -112,6 +112,10 @@ pub(crate) fn reconcile_connection_status(
         // the edge: kept, shown as "last seen", acted on only once ready.
         if device.feature_transport_ready && !ready {
             device.last_seen = Some(connection_log::now());
+            // A call is never kept stale: it cannot be answered without the
+            // link, and would ring here forever. Paused players stay paused
+            // until the phone's next snapshot (sent on feature-ready).
+            device.call_status = None;
         } else if ready {
             device.last_seen = None;
         }
@@ -348,6 +352,22 @@ pub(super) fn update_battery_status(
             });
         }
     }
+}
+
+/// `desklink.telephony {calls, muted, silenced}`: the phone's calls now.
+/// Returns whether it is in a call.
+pub(super) fn update_call_status(
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    device_id: &str,
+    status: Option<crate::device_links::device::CallStatus>,
+) -> bool {
+    let in_call = status.is_some();
+    if let Ok(mut devices) = devices.lock() {
+        if let Some(device) = devices.get_mut(device_id) {
+            device.call_status = status;
+        }
+    }
+    in_call
 }
 
 /// `desklink.notification {snapshot: true, ids}`: the phone's full list of

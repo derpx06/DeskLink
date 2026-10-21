@@ -81,11 +81,27 @@ pub fn run_cli(args: &[String]) -> glib::ExitCode {
         eprintln!("desklink --send-files: no files to send (folders are not sent)");
         return glib::ExitCode::FAILURE;
     }
+    let parameter = (request.device.unwrap_or_default(), paths).to_variant();
+    activate_running("send-files", parameter, "--send-files")
+}
+
+/// `desklink --dial <number>`: hands the number to the running DeskLink,
+/// which asks before the phone calls.
+pub fn run_dial_cli(number: &str) -> glib::ExitCode {
+    if crate::device_links::calls::dial_number(number).is_none() {
+        eprintln!("desklink --dial: \"{number}\" is not a phone number");
+        return glib::ExitCode::FAILURE;
+    }
+    activate_running("dial", number.to_variant(), "--dial")
+}
+
+/// Activates `app.<action>` on the running DeskLink, starting it first when
+/// it is not running.
+fn activate_running(action: &str, parameter: Variant, flag: &str) -> glib::ExitCode {
     let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
-        eprintln!("desklink --send-files: no session bus");
+        eprintln!("desklink {flag}: no session bus");
         return glib::ExitCode::FAILURE;
     };
-    let parameter = (request.device.unwrap_or_default(), paths).to_variant();
     let call = || {
         bus.call_sync(
             Some(APP_ID),
@@ -94,7 +110,7 @@ pub fn run_cli(args: &[String]) -> glib::ExitCode {
             "Activate",
             Some(
                 &(
-                    "send-files",
+                    action,
                     vec![parameter.clone()],
                     std::collections::HashMap::<String, Variant>::new(),
                 )
@@ -124,7 +140,7 @@ pub fn run_cli(args: &[String]) -> glib::ExitCode {
             return glib::ExitCode::SUCCESS;
         }
     }
-    eprintln!("desklink --send-files: DeskLink did not start");
+    eprintln!("desklink {flag}: DeskLink did not start");
     glib::ExitCode::FAILURE
 }
 

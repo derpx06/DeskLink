@@ -6,7 +6,7 @@ use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK_REQUEST,
     PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION_ACTION,
     PACKET_TYPE_NOTIFICATION_REPLY, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING,
-    PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
+    PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_TELEPHONY_REQUEST,
 };
 use crate::device_links::transport::{should_surface_send_error, FeatureTransport};
 use crate::device_links::webrtc::terminal_bridge;
@@ -38,6 +38,14 @@ pub enum DaemonCommand {
     SendClipboard(String),
     /// Show the phone as its own top-bar item too.
     SetTopBarPill(bool),
+    /// A call request (T2): the phone ("" = the connected one that can
+    /// call), the action, and the number to dial.
+    Telephony(String, String, Option<String>),
+    /// Preferences → Calls: Bluetooth call audio (experimental).
+    SetCallAudio(bool),
+    /// The Bluetooth address the user confirmed is this phone; `None`
+    /// forgets it.
+    SetCallAudioDevice(String, Option<String>),
     SendLockRequest(String, bool),
     /// Allow or stop a paired phone opening terminals on this computer.
     SetTerminalAccess(String, bool),
@@ -153,6 +161,22 @@ impl DaemonWorker {
             DaemonCommand::SendClipboard(id) => self.send_clipboard(&id),
             DaemonCommand::SetTopBarPill(on) => {
                 self.update_settings(|settings| settings.top_bar_pill = on)
+            }
+            DaemonCommand::Telephony(id, action, number) => {
+                self.send_telephony(&id, &action, number.as_deref())
+            }
+            DaemonCommand::SetCallAudio(on) => {
+                self.update_settings(|settings| settings.call_audio = on)
+            }
+            DaemonCommand::SetCallAudioDevice(id, address) => {
+                self.update_settings(|settings| match address {
+                    Some(address) => {
+                        settings.call_audio_devices.insert(id, address);
+                    }
+                    None => {
+                        settings.call_audio_devices.remove(&id);
+                    }
+                })
             }
             DaemonCommand::SendLockRequest(id, lock) => self.send_lock_request(&id, lock),
             DaemonCommand::SetTerminalAccess(id, allowed) => self.set_terminal_access(&id, allowed),
@@ -413,6 +437,38 @@ impl DaemonWorker {
         }
         // Every phone shows the desk's settings; tell them.
         crate::device_links::desk_features::push_settings();
+    }
+
+    fn send_telephony(&self, device_id: &str, action: &str, number: Option<&str>) {
+        let chosen = self.devices.lock().ok().and_then(|devices| {
+            let phones = || devices.values().filter(|device| device.trusted);
+            if device_id.is_empty() {
+                phones()
+                    .filter(|device| device.feature_transport_ready)
+                    .max_by_key(|device| {
+                        device
+                            .incoming_capabilities
+                            .iter()
+                            .any(|capability| capability == PACKET_TYPE_TELEPHONY_REQUEST)
+                    })
+                    .cloned()
+            } else {
+                phones().find(|device| device.id == device_id).cloned()
+            }
+        });
+        let Some(device) = chosen else {
+            push_error(
+                &self.errors,
+                "No phone is connected to make the call.".to_string(),
+            );
+            return;
+        };
+        match crate::device_links::calls::request(device.call_status.as_ref(), action, number) {
+            Ok(packet) => {
+                self.with_feature_transport(&device.id, |transport| transport.send(&packet));
+            }
+            Err(error) => push_error(&self.errors, error),
+        }
     }
 
     fn send_find_phone(&self, device_id: &str) {
