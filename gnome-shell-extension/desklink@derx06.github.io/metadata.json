@@ -1,7 +1,8 @@
 {
   "uuid": "desklink@derx06.github.io",
   "name": "DeskLink",
-  "description": "Shows your DeskLink phone in the top bar: battery, connection and active screen or terminal sessions, with quick actions to ring it, send files, browse its files or end sessions. Needs the DeskLink app.",
+  "description": "Shows your DeskLink phone in the top bar: how it is connected, what it is doing on this computer and quick actions (end sessions, keep awake, clipboard, send files, ring, Lock & Hand Off). On the lock screen it offers \"Unlock with your phone\" when you turned that on in DeskLink. Needs the DeskLink app.",
   "url": "https://github.com/derpx06/DeskLink",
+  "session-modes": ["user", "unlock-dialog"],
   "shell-version": ["45", "46", "47", "48", "49", "50", "51"]
 }

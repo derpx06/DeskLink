@@ -33,6 +33,7 @@ const ACTIVE_ICON: &str = "screen-shared-symbolic";
 const ID_END: i32 = 1001;
 const ID_OPEN: i32 = 1002;
 const ID_QUIT: i32 = 1003;
+const ID_HAND_OFF: i32 = 1004;
 /// Session lines take ids from here up; they are labels, not actions.
 const ID_FIRST_LINE: i32 = 1;
 
@@ -90,6 +91,8 @@ const XML: &str = r#"<node>
 pub struct TrayActions {
     pub open: Box<dyn Fn()>,
     pub end_sessions: Box<dyn Fn()>,
+    /// Lock this computer and offer the newest terminal to the phones.
+    pub lock_hand_off: Box<dyn Fn()>,
     pub quit: Box<dyn Fn()>,
 }
 
@@ -401,6 +404,7 @@ fn items(state: &State) -> Vec<(i32, HashMap<String, Variant>)> {
             false,
         ),
     ));
+    items.push((ID_HAND_OFF, props(Some("Lock & Hand Off"), true, false)));
     items.push((ID_OPEN, props(Some("Open DeskLink"), true, false)));
     items.push((901, props(None, true, true)));
     items.push((ID_QUIT, props(Some("Quit DeskLink"), true, false)));
@@ -452,6 +456,7 @@ fn menu_call(
             if event == "clicked" {
                 match id {
                     ID_END => (actions.end_sessions)(),
+                    ID_HAND_OFF => (actions.lock_hand_off)(),
                     ID_OPEN => (actions.open)(),
                     ID_QUIT => (actions.quit)(),
                     _ => {}
@@ -477,6 +482,7 @@ mod tests {
         let actions = TrayActions {
             open: Box::new(|| {}),
             end_sessions: Box::new(|| {}),
+            lock_hand_off: Box::new(|| {}),
             quit: Box::new(|| {}),
         };
         let reply = menu_call("GetLayout", &().to_variant(), &idle, &actions).unwrap();

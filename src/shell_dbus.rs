@@ -19,18 +19,22 @@ use gtk::glib::variant::ToVariant;
 use gtk::glib::{self, Variant};
 
 use crate::application::DesklinkApplication;
+use crate::device_links::config::AppSettings;
 use crate::device_links::daemon::DaemonCommand;
 use crate::device_links::device::{DesktopSession, DeviceStatus, DeviceView};
 
 pub const PATH: &str = "/derx06/desklink/com/Shell";
 pub const INTERFACE: &str = "derx06.desklink.com.Shell1";
-const VERSION: u32 = 1;
+/// 2: `Desk`, and the `unlock-via-phone`, `lock-hand-off`, `keep-awake-*`
+/// and `clipboard-*` actions.
+const VERSION: u32 = 2;
 const INVALID_ARGS: &str = "org.freedesktop.DBus.Error.InvalidArgs";
 
 const XML: &str = r#"<node>
   <interface name="derx06.desklink.com.Shell1">
     <property name="Version" type="u" access="read"/>
     <property name="Devices" type="aa{sv}" access="read"/>
+    <property name="Desk" type="a{sv}" access="read"/>
     <method name="Invoke">
       <arg name="device_id" type="s" direction="in"/>
       <arg name="action" type="s" direction="in"/>
@@ -40,7 +44,47 @@ const XML: &str = r#"<node>
 
 /// Actions that need no device (`device_id` ""): `end-sessions` then means
 /// every device.
-const DEVICELESS: [&str; 3] = ["open", "pair-new", "end-sessions"];
+const DEVICELESS: [&str; 8] = [
+    "open",
+    "pair-new",
+    "end-sessions",
+    "lock-hand-off",
+    "keep-awake-on",
+    "keep-awake-off",
+    "clipboard-on",
+    "clipboard-off",
+];
+
+/// This computer's switches, for the menu's tiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Desk {
+    keep_awake: bool,
+    clipboard: bool,
+    /// A terminal is running and a phone is connected.
+    hand_off: bool,
+}
+
+impl Desk {
+    fn to_variant(&self) -> Variant {
+        let dict = glib::VariantDict::new(None);
+        dict.insert("keepAwake", self.keep_awake);
+        dict.insert("clipboard", self.clipboard);
+        dict.insert("handOff", self.hand_off);
+        dict.end()
+    }
+}
+
+fn desk(devices: &[ShellDevice]) -> Desk {
+    let settings = crate::device_links::config::app_settings();
+    Desk {
+        keep_awake: settings.stay_awake,
+        clipboard: settings.clipboard_sync,
+        hand_off: devices.iter().any(|device| device.ready)
+            && crate::terminal_previews::sessions()
+                .iter()
+                .any(|info| info.exit_status.is_none()),
+    }
+}
 
 /// One device as clients see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,7 +103,7 @@ struct ShellDevice {
     actions: Vec<&'static str>,
 }
 
-fn shell_device(device: &DeviceView) -> ShellDevice {
+fn shell_device(device: &DeviceView, settings: &AppSettings) -> ShellDevice {
     let battery = device.battery_status.as_ref();
     ShellDevice {
         id: device.id.clone(),
@@ -80,15 +124,20 @@ fn shell_device(device: &DeviceView) -> ShellDevice {
             DesktopSession::Controlling => "control",
         },
         terminals: device.terminal_sessions_attached as u32,
-        actions: actions(device),
+        actions: actions(device, settings),
     }
 }
 
 /// What a client may offer for `device` right now.
-fn actions(device: &DeviceView) -> Vec<&'static str> {
+fn actions(device: &DeviceView, settings: &AppSettings) -> Vec<&'static str> {
     let mut actions = vec!["open"];
     if device.feature_transport_ready {
         actions.extend(["ring", "send-files", "new-terminal"]);
+    }
+    // The lock-screen button: only with "Unlock with … nearby" on and the
+    // phone connected on this network.
+    if crate::device_links::desk_features::could_unlock(device, settings) {
+        actions.push("unlock-via-phone");
     }
     // Ending is local (stop sharing, detach terminals), so it does not wait
     // for the feature transport.
@@ -149,8 +198,15 @@ fn check<'a>(
 }
 
 fn current(app: &DesklinkApplication) -> Vec<ShellDevice> {
+    let settings = crate::device_links::config::app_settings();
     app.daemon_handle()
-        .map(|daemon| daemon.devices().iter().map(shell_device).collect())
+        .map(|daemon| {
+            daemon
+                .devices()
+                .iter()
+                .map(|device| shell_device(device, &settings))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -165,9 +221,11 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
         return;
     };
     let devices = Rc::new(RefCell::new(current(app)));
+    let desk_state = Rc::new(RefCell::new(desk(&devices.borrow())));
 
     let weak = app.downgrade();
     let shown = Rc::clone(&devices);
+    let shown_desk = Rc::clone(&desk_state);
     let registered = connection
         .register_object(PATH, &interface)
         .method_call(move |_, _, _, _, method, params, invocation| {
@@ -187,6 +245,7 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
         })
         .property(move |_, _, _, _, name| match name {
             "Version" => VERSION.to_variant(),
+            "Desk" => shown_desk.borrow().to_variant(),
             _ => devices_variant(&shown.borrow()),
         })
         .build();
@@ -204,14 +263,18 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
             return glib::ControlFlow::Break;
         };
         let now = current(&app);
+        let now_desk = desk(&now);
+        let mut changed = std::collections::HashMap::new();
         if *devices.borrow() != now {
-            let changed = (
-                INTERFACE,
-                std::collections::HashMap::from([("Devices".to_string(), devices_variant(&now))]),
-                Vec::<String>::new(),
-            )
-                .to_variant();
+            changed.insert("Devices".to_string(), devices_variant(&now));
             devices.replace(now);
+        }
+        if *desk_state.borrow() != now_desk {
+            changed.insert("Desk".to_string(), now_desk.to_variant());
+            desk_state.replace(now_desk);
+        }
+        if !changed.is_empty() {
+            let changed = (INTERFACE, changed, Vec::<String>::new()).to_variant();
             let _ = connection.emit_signal(
                 None,
                 PATH,
@@ -232,6 +295,20 @@ fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str
     match (action, id, daemon) {
         ("ring", Some(id), Some(daemon)) => daemon.send(DaemonCommand::SendFindPhone(id)),
         ("end-sessions", id, Some(daemon)) => daemon.send(DaemonCommand::EndPhoneSessions(id)),
+        ("lock-hand-off", _, Some(daemon)) => daemon.send(DaemonCommand::LockAndHandOff),
+        ("keep-awake-on" | "keep-awake-off", _, Some(daemon)) => {
+            daemon.send(DaemonCommand::SetStayAwake(action == "keep-awake-on"))
+        }
+        ("clipboard-on" | "clipboard-off", _, Some(daemon)) => {
+            daemon.send(DaemonCommand::SetClipboardSync(action == "clipboard-on"))
+        }
+        ("unlock-via-phone", Some(id), _) => {
+            // Reads the lock state (loginctl): off the main loop. Every
+            // check is made again there and when the phone answers.
+            std::thread::spawn(move || {
+                crate::device_links::desk_features::offer_unlock(&id, "button");
+            });
+        }
         ("new-terminal", _, _) => {
             if let Err(error) = crate::device_links::pty::desk::new_desk_session() {
                 eprintln!("[Shell] Could not start a terminal: {error}");
@@ -330,6 +407,148 @@ pub fn extension_active() -> bool {
     EXTENSION_IS_ACTIVE.with(|active| active.get())
 }
 
+/// The extension, built into the app so any install can turn it on.
+const EXTENSION_FILES: [(&str, &str); 3] = [
+    (
+        "metadata.json",
+        include_str!("../gnome-shell-extension/desklink@derx06.github.io/metadata.json"),
+    ),
+    (
+        "extension.js",
+        include_str!("../gnome-shell-extension/desklink@derx06.github.io/extension.js"),
+    ),
+    (
+        "stylesheet.css",
+        include_str!("../gnome-shell-extension/desklink@derx06.github.io/stylesheet.css"),
+    ),
+];
+
+/// Whether this desktop can show the top-bar menu at all.
+pub fn extension_possible() -> bool {
+    is_gnome(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
+        && gio::SettingsSchemaSource::default()
+            .and_then(|source| source.lookup("org.gnome.shell", true))
+            .is_some()
+}
+
+/// Beside the installed extension: the digest of what DeskLink wrote, so a
+/// copy the user changed is told apart from an older one of ours.
+const INSTALL_STAMP: &str = ".desklink-installed";
+
+/// SHA-256 over each extension file's name and contents (missing: empty).
+fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> String {
+    let mut hasher = openssl::sha::Sha256::new();
+    for (name, content) in files {
+        hasher.update(name.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(content.unwrap_or_default().as_bytes());
+        hasher.update(&[0]);
+    }
+    hasher
+        .finish()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Writes `path` whole or not at all.
+fn write_atomically(path: &std::path::Path, content: &str) -> Result<(), String> {
+    let temporary = path.with_extension("desklink-tmp");
+    std::fs::write(&temporary, content).map_err(|error| error.to_string())?;
+    std::fs::rename(&temporary, path).map_err(|error| error.to_string())
+}
+
+/// Writes the extension into `dir` (`~/.local/share/gnome-shell/extensions/<uuid>`)
+/// when missing or an older copy of ours. Whether anything was written. A
+/// copy someone changed is left alone, with an error saying so.
+fn install_extension_files(dir: &std::path::Path) -> Result<bool, String> {
+    let present: Vec<(&str, Option<String>)> = EXTENSION_FILES
+        .iter()
+        .map(|(name, _)| (*name, std::fs::read_to_string(dir.join(name)).ok()))
+        .collect();
+    if present
+        .iter()
+        .zip(EXTENSION_FILES)
+        .all(|((_, have), (_, ours))| have.as_deref() == Some(ours))
+    {
+        return Ok(false);
+    }
+    if present.iter().any(|(_, have)| have.is_some()) {
+        let current = files_digest(present.iter().map(|(name, have)| (*name, have.as_deref())));
+        let stamp = std::fs::read_to_string(dir.join(INSTALL_STAMP)).ok();
+        if stamp.as_deref().map(str::trim) != Some(current.as_str()) {
+            return Err(format!(
+                "A changed copy of the DeskLink extension is in {}; it was left as it is",
+                dir.display()
+            ));
+        }
+    }
+    std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+    for (name, content) in EXTENSION_FILES {
+        write_atomically(&dir.join(name), content)?;
+    }
+    write_atomically(
+        &dir.join(INSTALL_STAMP),
+        &files_digest(
+            EXTENSION_FILES
+                .iter()
+                .map(|(name, content)| (*name, Some(*content))),
+        ),
+    )?;
+    Ok(true)
+}
+
+/// `enabled-extensions` with ours added, once.
+fn with_extension(enabled: Vec<String>) -> Vec<String> {
+    let mut enabled = enabled;
+    if !enabled.iter().any(|uuid| uuid == EXTENSION_UUID) {
+        enabled.push(EXTENSION_UUID.to_string());
+    }
+    enabled
+}
+
+/// "Turn on top-bar menu", only ever from the user's click: installs the
+/// built-in extension for this user (when missing or outdated), turns user
+/// extensions on and enables it. `Ok(true)` when the Shell must be restarted
+/// (on Wayland: log out and back in) before it shows; activation is seen by
+/// [`track_extension`].
+pub fn turn_on_extension() -> Result<bool, String> {
+    if !extension_possible() {
+        return Err("The top-bar menu needs GNOME".into());
+    }
+    let dir = glib::user_data_dir()
+        .join("gnome-shell")
+        .join("extensions")
+        .join(EXTENSION_UUID);
+    let written = install_extension_files(&dir)?;
+    let settings = gio::Settings::new("org.gnome.shell");
+    settings
+        .set_boolean("disable-user-extensions", false)
+        .map_err(|error| error.to_string())?;
+    let strings = |key: &str| -> Vec<String> {
+        settings
+            .strv(key)
+            .iter()
+            .map(|uuid| uuid.to_string())
+            .collect()
+    };
+    settings
+        .set_strv(
+            "enabled-extensions",
+            with_extension(strings("enabled-extensions")),
+        )
+        .map_err(|error| error.to_string())?;
+    let disabled: Vec<String> = strings("disabled-extensions")
+        .into_iter()
+        .filter(|uuid| uuid != EXTENSION_UUID)
+        .collect();
+    settings
+        .set_strv("disabled-extensions", disabled)
+        .map_err(|error| error.to_string())?;
+    gio::Settings::sync();
+    Ok(written && !extension_active())
+}
+
 fn track_extension(connection: &gio::DBusConnection) {
     if !is_gnome(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default()) {
         return;
@@ -356,32 +575,34 @@ fn track_extension(connection: &gio::DBusConnection) {
     });
 }
 
+/// Shown after turning the menu on, when GNOME has to load it first.
+pub const RELOGIN_NOTE: &str =
+    "GNOME shows a newly added top-bar menu after you log out and back in (on X11, restarting GNOME Shell is enough).";
+
 /// On GNOME with no tray host and our extension not running, offers it in
 /// one notification ("Show" / "Not now") a little after start, until the user
 /// says "Not now".
 fn offer_extension(app: &DesklinkApplication) {
     app.add_action_entries([
+        // The notification's "Turn On": the user's click.
         gio::ActionEntry::builder("shell-extension-show")
             .activate(|app: &DesklinkApplication, _, _| {
-                let Some(connection) = app.dbus_connection() else {
-                    return;
+                let notification = match turn_on_extension() {
+                    Ok(false) => return,
+                    Ok(true) => {
+                        let notification = gio::Notification::new("Top-bar menu turned on");
+                        notification.set_body(Some(RELOGIN_NOTE));
+                        notification
+                    }
+                    Err(error) => {
+                        eprintln!("[Shell] Could not turn on the top-bar menu: {error}");
+                        let notification =
+                            gio::Notification::new("Could not turn on the top-bar menu");
+                        notification.set_body(Some(&error));
+                        notification
+                    }
                 };
-                let retry = connection.clone();
-                call_extensions(&connection, "GetExtensionInfo", move |reply| {
-                    let installed = reply
-                        .map(|reply| extension_info(&reply).contains("uuid"))
-                        .unwrap_or(false);
-                    let method = if installed {
-                        "EnableExtension"
-                    } else {
-                        "InstallRemoteExtension"
-                    };
-                    call_extensions(&retry, method, move |reply| {
-                        if let Err(error) = reply {
-                            eprintln!("[Shell] {method} failed: {error}");
-                        }
-                    });
-                });
+                app.send_notification(Some("shell-extension"), &notification);
             })
             .build(),
         gio::ActionEntry::builder("shell-extension-dismiss")
@@ -414,7 +635,7 @@ fn offer_extension(app: &DesklinkApplication) {
             notification.set_body(Some(
                 "See your phone's battery and connection, and act on it, from the top bar.",
             ));
-            notification.add_button("Show", "app.shell-extension-show");
+            notification.add_button("Turn On", "app.shell-extension-show");
             notification.add_button("Not now", "app.shell-extension-dismiss");
             app.send_notification(Some("shell-extension"), &notification);
         });
@@ -426,6 +647,13 @@ mod tests {
     use super::*;
     use crate::device_links::device::BatteryStatus;
     use crate::device_links::device_info::DeviceInfo;
+
+    /// Unlock with the phone on for `phone1` only.
+    fn on() -> AppSettings {
+        let mut settings = AppSettings::default();
+        settings.unlock_devices.insert("phone1".into());
+        settings
+    }
 
     fn phone() -> DeviceView {
         let info = DeviceInfo {
@@ -453,8 +681,9 @@ mod tests {
             is_charging: true,
             battery_quantity: None,
             threshold_event: None,
+            charge_time_remaining: None,
         });
-        let mapped = shell_device(&device);
+        let mapped = shell_device(&device, &AppSettings::default());
         assert!(mapped.paired && mapped.reachable && mapped.ready && mapped.charging);
         assert_eq!(
             (mapped.battery, mapped.screen, mapped.terminals),
@@ -480,7 +709,7 @@ mod tests {
             ["open", "ring", "send-files", "new-terminal", "end-sessions"]
         );
 
-        let idle = shell_device(&phone());
+        let idle = shell_device(&phone(), &AppSettings::default());
         assert!(!idle.reachable && !idle.ready);
         assert_eq!(
             (idle.battery, idle.screen, idle.path.as_str()),
@@ -491,11 +720,11 @@ mod tests {
     #[test]
     fn actions_follow_readiness_and_sessions_and_invoke_checks_them() {
         let mut device = phone();
-        assert_eq!(actions(&device), ["open"]);
+        assert_eq!(actions(&device, &on()), ["open"]);
         device.terminal_sessions_attached = 1;
-        assert_eq!(actions(&device), ["open", "end-sessions"]);
+        assert_eq!(actions(&device, &on()), ["open", "end-sessions"]);
 
-        let devices = [shell_device(&device)];
+        let devices = [shell_device(&device, &on())];
         assert!(check(&devices, "phone1", "open").unwrap().is_some());
         assert!(check(&devices, "phone1", "end-sessions").is_ok());
         assert!(check(&devices, "phone1", "ring").is_err(), "not ready");
@@ -504,6 +733,37 @@ mod tests {
         assert!(check(&devices, "", "pair-new").unwrap().is_none());
         assert!(check(&devices, "", "end-sessions").is_ok());
         assert!(check(&devices, "", "ring").is_err());
+        assert!(check(&devices, "", "lock-hand-off").is_ok());
+        assert!(
+            check(&devices, "phone1", "unlock-via-phone").is_err(),
+            "not connected"
+        );
+    }
+
+    #[test]
+    fn the_unlock_button_needs_the_setting_and_a_phone_on_this_network() {
+        let mut device = phone();
+        device.status = DeviceStatus::Paired;
+        device.feature_transport_ready = true;
+        device.connection_path = Some("lan".into());
+        assert!(actions(&device, &on()).contains(&"unlock-via-phone"));
+        assert!(
+            !actions(&device, &AppSettings::default()).contains(&"unlock-via-phone"),
+            "setting off"
+        );
+        let mut other = AppSettings::default();
+        other.unlock_devices.insert("another-phone".into());
+        assert!(
+            !actions(&device, &other).contains(&"unlock-via-phone"),
+            "on for another phone only"
+        );
+        for path in ["direct", "turn", "relay"] {
+            device.connection_path = Some(path.into());
+            assert!(
+                !actions(&device, &on()).contains(&"unlock-via-phone"),
+                "{path}"
+            );
+        }
     }
 
     #[test]
@@ -517,6 +777,44 @@ mod tests {
         assert!(!is_active(&info(2.0)));
         assert!(!is_active(&info(6.0)));
         assert!(!is_active(&glib::VariantDict::new(None)));
+    }
+
+    #[test]
+    fn the_extension_is_written_once_and_enabled_once() {
+        let dir = std::env::temp_dir().join(format!("desklink-ext-{}", uuid::Uuid::new_v4()));
+        assert!(install_extension_files(&dir).unwrap(), "missing: written");
+        assert!(!install_extension_files(&dir).unwrap(), "same: left alone");
+        // An older copy of ours (its stamp matches what is there): replaced.
+        std::fs::write(dir.join("extension.js"), "old").unwrap();
+        let older = files_digest(EXTENSION_FILES.iter().map(|(name, content)| {
+            (
+                *name,
+                Some(if *name == "extension.js" {
+                    "old"
+                } else {
+                    *content
+                }),
+            )
+        }));
+        std::fs::write(dir.join(INSTALL_STAMP), older).unwrap();
+        assert!(
+            install_extension_files(&dir).unwrap(),
+            "outdated: rewritten"
+        );
+        // A copy someone edited: kept, and the caller is told.
+        std::fs::write(dir.join("extension.js"), "// my tweaks").unwrap();
+        assert!(install_extension_files(&dir).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("extension.js")).unwrap(),
+            "// my tweaks"
+        );
+        let metadata = std::fs::read_to_string(dir.join("metadata.json")).unwrap();
+        assert!(metadata.contains(EXTENSION_UUID) && metadata.contains("unlock-dialog"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let enabled = with_extension(vec!["other@x".into()]);
+        assert_eq!(enabled, ["other@x", EXTENSION_UUID]);
+        assert_eq!(with_extension(enabled.clone()), enabled);
     }
 
     #[test]

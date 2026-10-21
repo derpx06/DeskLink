@@ -79,6 +79,31 @@ pub struct AppSettings {
     /// default.
     #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub hidden_notifications: std::collections::BTreeSet<String>,
+    /// Phones not told when a long command in a shared terminal finishes;
+    /// every phone is by default.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub muted_command_alerts: std::collections::BTreeSet<String>,
+    /// The phones that may unlock this computer from this network, approved
+    /// on the phone each time. None until turned on here, per phone; never
+    /// from the phone.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub unlock_devices: std::collections::BTreeSet<String>,
+    /// The commands a phone may run here (Preferences → Run Commands).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub run_commands: Vec<RunCommand>,
+    /// The last folders a phone started a terminal in, newest first.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub recent_folders: Vec<String>,
+}
+
+/// A command a phone may run here, in a shared terminal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunCommand {
+    /// Opaque, stable: what the phone sends back to run it.
+    pub id: String,
+    pub name: String,
+    /// Run through the login shell (`$SHELL -lc`).
+    pub command: String,
 }
 
 impl Default for AppSettings {
@@ -93,6 +118,10 @@ impl Default for AppSettings {
             shell_extension_prompt_dismissed: false,
             clipboard_sync: true,
             hidden_notifications: Default::default(),
+            muted_command_alerts: Default::default(),
+            unlock_devices: Default::default(),
+            run_commands: Vec::new(),
+            recent_folders: Vec::new(),
         }
     }
 }
@@ -118,6 +147,16 @@ impl AppSettings {
     /// Whether `device_id`'s notifications are shown on this computer.
     pub fn shows_notifications(&self, device_id: &str) -> bool {
         !self.hidden_notifications.contains(device_id)
+    }
+
+    /// Whether `device_id` hears about long commands finishing.
+    pub fn alerts_commands_to(&self, device_id: &str) -> bool {
+        !self.muted_command_alerts.contains(device_id)
+    }
+
+    /// Whether `device_id` may unlock this computer (Preferences, per phone).
+    pub fn unlocks_from(&self, device_id: &str) -> bool {
+        self.unlock_devices.contains(device_id)
     }
 
     /// The relay's address; empty when none is set up.
@@ -631,6 +670,23 @@ mod tests {
         assert!(old.shows_notifications("phone"));
         let written = serde_json::to_string(&AppSettings::default()).unwrap();
         assert!(!written.contains("hidden_notifications"), "{written}");
+
+        assert!(old.alerts_commands_to("phone"), "command alerts default on");
+        assert!(
+            !old.unlocks_from("phone"),
+            "unlocking from a phone defaults off"
+        );
+        assert!(!written.contains("unlock_devices") && !written.contains("muted_command_alerts"));
+        let mut one = AppSettings::default();
+        one.unlock_devices.insert("phone".into());
+        one.muted_command_alerts.insert("tablet".into());
+        assert!(
+            one.unlocks_from("phone") && !one.unlocks_from("tablet"),
+            "per phone"
+        );
+        assert!(one.alerts_commands_to("phone") && !one.alerts_commands_to("tablet"));
+        assert!(old.run_commands.is_empty() && old.recent_folders.is_empty());
+        assert!(!written.contains("run_commands") && !written.contains("recent_folders"));
 
         let mut hidden = AppSettings::default();
         hidden.hidden_notifications.insert("phone".into());

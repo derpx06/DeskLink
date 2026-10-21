@@ -94,6 +94,10 @@ pub enum ControlKind {
     InputFocus,
     /// Phone → desktop: show the next shared screen.
     SwitchScreen,
+    /// Phone → desktop: the phone offers its own screen unasked. The desktop
+    /// adopts the offered id and answers with an ordinary `request-view`
+    /// (or `view-denied`, reason `busy`).
+    OfferView,
 }
 
 impl ControlKind {
@@ -116,6 +120,7 @@ impl ControlKind {
             Self::Resume => "resume",
             Self::InputFocus => "input-focus",
             Self::SwitchScreen => "switch-screen",
+            Self::OfferView => "offer-view",
         }
     }
 
@@ -138,6 +143,7 @@ impl ControlKind {
             "resume" => Self::Resume,
             "input-focus" => Self::InputFocus,
             "switch-screen" => Self::SwitchScreen,
+            "offer-view" => Self::OfferView,
             _ => return None,
         })
     }
@@ -146,7 +152,7 @@ impl ControlKind {
     const fn requires_direction(self) -> bool {
         matches!(
             self,
-            Self::RequestView | Self::ViewGranted | Self::ScreenReady
+            Self::RequestView | Self::ViewGranted | Self::ScreenReady | Self::OfferView
         )
     }
 }
@@ -476,6 +482,9 @@ pub struct RemoteSession {
     /// Why the phone last refused control (e.g. its accessibility service is
     /// off), so the window can say so instead of "requesting" forever.
     control_denial: Option<String>,
+    /// The last few sessions that ended: an offer for one of them is a
+    /// leftover, never a new share.
+    ended: std::collections::VecDeque<String>,
 }
 
 impl Default for RemoteSession {
@@ -498,6 +507,7 @@ impl RemoteSession {
             state_since: Instant::now(),
             phone_screen: None,
             control_denial: None,
+            ended: std::collections::VecDeque::new(),
         }
     }
 
@@ -568,6 +578,25 @@ impl RemoteSession {
         id
     }
 
+    /// Takes up a phone's offer of its screen: a view request under the id
+    /// the phone chose. Refused while any session is under way.
+    /// `Err("stale")` for an offer of a session that already ended (a
+    /// leftover arriving late): it is answered with nothing.
+    pub fn adopt_offer(&mut self, id: &str) -> Result<(), String> {
+        if self.ended.iter().any(|ended| ended == id) {
+            return Err("stale".to_string());
+        }
+        if !matches!(self.state, SessionState::Idle | SessionState::Stopped) {
+            return Err("busy".to_string());
+        }
+        self.remote_session_id = Some(id.to_string());
+        self.direction = Some(ScreenDirection::PhoneToDesktop);
+        self.lease = None;
+        self.peer_input_lease = None;
+        self.set_state(SessionState::RequestingView);
+        Ok(())
+    }
+
     pub fn begin_control(&mut self) -> Result<(), String> {
         if !matches!(
             self.state,
@@ -595,8 +624,8 @@ impl RemoteSession {
                 return Err("input-focus is reported by the desktop only".to_string());
             }
             // A request starts a session, and a heartbeat is checked against the
-            // lease it quotes.
-            ControlKind::RequestView | ControlKind::Heartbeat => {}
+            // lease it quotes. An offer is answered by the coordinator.
+            ControlKind::RequestView | ControlKind::Heartbeat | ControlKind::OfferView => {}
             // A message that *ends* a session is honoured only for the session
             // that is current. A delayed release, denial or error for one this
             // side already left must not stop the new one (and so its portal
@@ -628,8 +657,9 @@ impl RemoteSession {
         }
 
         match message.kind {
-            // Refused above; never applied.
-            ControlKind::InputFocus => {}
+            // Refused above; never applied. An offer is taken up with
+            // `adopt_offer`, not here.
+            ControlKind::InputFocus | ControlKind::OfferView => {}
             // A request about the current desktop share; changes no state.
             ControlKind::SwitchScreen => {
                 if mismatched || self.direction != Some(ScreenDirection::DesktopToPhone) {
@@ -705,9 +735,16 @@ impl RemoteSession {
             ControlKind::RequestControl | ControlKind::TakeoverRequest => {
                 // A phone may ask to control this desktop only while viewing
                 // the desktop's screen. The caller must still obtain a local
-                // GNOME portal grant before it creates an input lease.
-                if self.state == SessionState::Viewing
-                    && self.direction == Some(ScreenDirection::DesktopToPhone)
+                // GNOME portal grant before it creates an input lease. Asking
+                // again while already controlling (the phone retries every few
+                // seconds until it sees the grant) is the same request: the
+                // new grant replaces the lease. Refusing it made control flap.
+                if matches!(
+                    self.state,
+                    SessionState::Viewing
+                        | SessionState::AuthorizingPeerControl
+                        | SessionState::PeerControlling
+                ) && self.direction == Some(ScreenDirection::DesktopToPhone)
                 {
                     self.set_state(SessionState::AuthorizingPeerControl);
                 } else {
@@ -748,9 +785,24 @@ impl RemoteSession {
         Some(previous)
     }
 
+    /// [`Self::stop`], only while `id` is the current session: a share
+    /// that is only now ending must not end the one that replaced it.
+    pub fn stop_if_current(&mut self, id: &str) -> bool {
+        let current = self.remote_session_id.as_deref() == Some(id);
+        if current {
+            self.stop();
+        }
+        current
+    }
+
     pub fn stop(&mut self) {
         self.set_state(SessionState::Stopped);
-        self.remote_session_id = None;
+        if let Some(id) = self.remote_session_id.take() {
+            if self.ended.len() == 8 {
+                self.ended.pop_front();
+            }
+            self.ended.push_back(id);
+        }
         self.direction = None;
         self.lease = None;
         self.peer_input_lease = None;
@@ -1017,6 +1069,33 @@ mod tests {
     /// The peer keeps one `lastSequence` per lease and advances it from both
     /// control messages and input packets, so both must share this counter.
     #[test]
+    fn a_phone_offer_is_adopted_under_its_id_unless_a_session_is_running() {
+        let id = Uuid::new_v4().to_string();
+        let mut offer = message(ControlKind::OfferView, &id);
+        offer.direction = Some(ScreenDirection::PhoneToDesktop);
+        let parsed = ControlMessage::from_json(&offer.to_json()).unwrap();
+        assert_eq!(parsed.kind, ControlKind::OfferView);
+        assert!(String::from_utf8(offer.to_json())
+            .unwrap()
+            .contains("\"offer-view\""));
+
+        let mut session = RemoteSession::new();
+        session.adopt_offer(&id).unwrap();
+        assert_eq!(session.state(), SessionState::RequestingView);
+        assert_eq!(session.remote_session_id.as_deref(), Some(id.as_str()));
+        // The phone then grants the view it offered, under the same id.
+        let mut granted = message(ControlKind::ViewGranted, &id);
+        granted.direction = Some(ScreenDirection::PhoneToDesktop);
+        session.accept(&granted, 1_000).unwrap();
+        assert_eq!(session.state(), SessionState::Viewing);
+        assert_eq!(session.adopt_offer("other").unwrap_err(), "busy");
+        // Once it ends, a late copy of the same offer asks for nothing.
+        session.stop();
+        assert_eq!(session.adopt_offer(&id).unwrap_err(), "stale");
+        assert!(session.adopt_offer("a-new-offer").is_ok());
+    }
+
+    #[test]
     fn one_counter_serves_control_messages_and_input() {
         let mut session = RemoteSession::new();
         let session_id = session.begin_view(ScreenDirection::PhoneToDesktop);
@@ -1112,6 +1191,57 @@ mod tests {
             "phone control request should enter host authorization: {result:?}"
         );
         assert_eq!(session.state(), SessionState::AuthorizingPeerControl);
+    }
+
+    /// The phone re-sends request-control every few seconds until it sees
+    /// the grant; a repeat after the grant is the same request, not an error.
+    #[test]
+    fn a_repeated_control_request_after_the_grant_is_granted_again() {
+        let mut session = RemoteSession::new();
+        let session_id = Uuid::new_v4().to_string();
+        let mut request_view = message(ControlKind::RequestView, &session_id);
+        request_view.direction = Some(ScreenDirection::DesktopToPhone);
+        session.accept(&request_view, 1_000).unwrap();
+        let mut screen_ready = message(ControlKind::ScreenReady, &session_id);
+        screen_ready.direction = Some(ScreenDirection::DesktopToPhone);
+        session.accept(&screen_ready, 1_001).unwrap();
+        let mut request_control = message(ControlKind::RequestControl, &session_id);
+        request_control.direction = Some(ScreenDirection::DesktopToPhone);
+
+        session.accept(&request_control, 1_002).unwrap();
+        session
+            .grant_peer_control("lease-1".into(), "phone".into(), 60_000)
+            .unwrap();
+        assert_eq!(session.state(), SessionState::PeerControlling);
+
+        session.accept(&request_control, 4_002).unwrap();
+        session
+            .grant_peer_control("lease-2".into(), "phone".into(), 64_000)
+            .unwrap();
+        assert_eq!(session.state(), SessionState::PeerControlling);
+        assert_eq!(
+            session
+                .peer_input_lease
+                .as_ref()
+                .map(|lease| lease.id.as_str()),
+            Some("lease-2"),
+            "the new grant replaces the lease"
+        );
+        // Another session's id is still refused.
+        let other = message(ControlKind::RequestControl, &Uuid::new_v4().to_string());
+        assert!(session.accept(&other, 5_000).is_err());
+    }
+
+    #[test]
+    fn a_share_ending_late_does_not_stop_the_one_that_replaced_it() {
+        let mut session = RemoteSession::new();
+        let old = session.begin_view(ScreenDirection::DesktopToPhone);
+        let new = session.begin_view(ScreenDirection::DesktopToPhone);
+        assert!(!session.stop_if_current(&old));
+        assert_eq!(session.state(), SessionState::RequestingView);
+        assert_eq!(session.remote_session_id(), Some(new.as_str()));
+        assert!(session.stop_if_current(&new));
+        assert_eq!(session.state(), SessionState::Stopped);
     }
 
     #[test]

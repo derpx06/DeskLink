@@ -2,9 +2,12 @@ pub mod config;
 pub mod connection_log;
 pub mod core;
 pub mod daemon;
+pub(crate) mod desk_features;
 pub mod device;
 pub mod device_info;
 pub mod features;
+pub(crate) mod logind;
+pub(crate) mod mpris;
 pub mod packet;
 pub mod pairing;
 pub mod pairing_qr;
@@ -13,6 +16,7 @@ pub mod relay_link;
 pub mod session_lock;
 pub mod transfer_log;
 pub mod transport;
+pub(crate) mod unlock;
 pub mod webrtc;
 
 /// Whether this device takes the leading role against `peer_device_id`.

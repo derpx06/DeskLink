@@ -577,6 +577,7 @@ impl DesktopScreenCapture {
         }
         let (scale, convert, rate, filter, queue, encoder, payloader) =
             encoder_chain(width, height, fps)?;
+        let caps_filter = filter.clone();
 
         // Scale before converting: colour conversion then runs on the small
         // frame, not the full-resolution one.
@@ -584,7 +585,7 @@ impl DesktopScreenCapture {
             source,
             scale,
             convert,
-            rate.clone(),
+            rate,
             filter,
             queue,
             encoder.clone(),
@@ -668,12 +669,28 @@ impl DesktopScreenCapture {
                     gst::PadProbeReturn::Ok
                 },
             );
+            // A chain that dies (its PipeWire node gone, a replaced share)
+            // sends EOS. Into webrtcbin's shared, max-bundled sink that ends
+            // the screen track for good, and with the reused `screen_ssrc` the
+            // phone's picture froze. Shares end by being unlinked, never by EOS.
+            src_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, |_, info| {
+                match &info.data {
+                    Some(gst::PadProbeData::Event(event))
+                        if event.type_() == gst::EventType::Eos =>
+                    {
+                        gst::PadProbeReturn::Drop
+                    }
+                    _ => gst::PadProbeReturn::Ok,
+                }
+            });
             if let Err(error) = src_pad.link(&sink_pad) {
                 return fail(format!(
                     "Could not attach the DeskLink screen RTP track: {error}"
                 ));
             }
-            for element in &elements {
+            // Downstream first: an upstream element going PLAYING into a
+            // downstream one still flushing stalled the chain (FLUSHING).
+            for element in elements.iter().rev() {
                 if let Err(error) = element.sync_state_with_parent() {
                     return fail(format!("Could not start DeskLink screen capture: {error}"));
                 }
@@ -682,7 +699,7 @@ impl DesktopScreenCapture {
         };
         match build() {
             Ok((sink_pad, payload_type)) => Ok(Self {
-                rate_control_stop: spawn_bitrate_controller(webrtcbin, &encoder, &rate),
+                rate_control_stop: spawn_bitrate_controller(webrtcbin, &encoder, &caps_filter),
                 pipeline: pipeline.clone(),
                 webrtcbin: webrtcbin.clone(),
                 elements,
@@ -874,19 +891,21 @@ pub(crate) fn next_fps(current: i32, bitrate: u32, fraction_lost: f64, streak: &
 }
 
 /// Once a second, reads the peer-reported loss from `webrtcbin` stats and
-/// steers the encoder's bitrate, then the frame rate (through `videorate`'s
-/// `max-rate`, which needs no caps change). Holds only weak references, so it
-/// ends with the pipeline; the returned flag ends it with the capture.
+/// steers the encoder's bitrate, then the frame rate — through the caps
+/// filter's `framerate`, which `videorate` follows. (Lowering `videorate`'s
+/// `max-rate` under caps that pin 30/1 failed with `not-negotiated`.) Holds
+/// only weak references, so it ends with the pipeline; the returned flag ends
+/// it with the capture.
 fn spawn_bitrate_controller(
     webrtcbin: &gst::Element,
     encoder: &gst::Element,
-    rate: &gst::Element,
+    filter: &gst::Element,
 ) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
-    let (webrtcbin, encoder, rate, flag) = (
+    let (webrtcbin, encoder, filter, flag) = (
         webrtcbin.downgrade(),
         encoder.downgrade(),
-        rate.downgrade(),
+        filter.downgrade(),
         Arc::clone(&stop),
     );
     let spawned = std::thread::Builder::new()
@@ -912,8 +931,9 @@ fn spawn_bitrate_controller(
                 let next = next_fps(fps, bitrate, lost, &mut streak);
                 if next != fps {
                     fps = next;
-                    if let Some(rate) = rate.upgrade() {
-                        set_if_present(&rate, "max-rate", &fps.to_string());
+                    if let Some(filter) = filter.upgrade() {
+                        let caps = filter.property::<gst::Caps>("caps");
+                        filter.set_property("caps", with_framerate(&caps, fps));
                     }
                 }
             }
@@ -937,6 +957,15 @@ fn peer_reported_loss(webrtcbin: &gst::Element) -> Option<f64> {
         .filter_map(|(_, value)| value.get::<gst::Structure>().ok())
         .filter_map(|stats| stats.get::<f64>("fraction-lost").ok())
         .reduce(f64::max)
+}
+
+/// `caps` with its frame rate set to `fps`/1, everything else kept.
+fn with_framerate(caps: &gst::Caps, fps: i32) -> gst::Caps {
+    let mut caps = caps.copy();
+    if let Some(structure) = caps.make_mut().structure_mut(0) {
+        structure.set("framerate", gst::Fraction::new(fps, 1));
+    }
+    caps
 }
 
 fn set_if_present(element: &gst::Element, name: &str, value: &str) {
@@ -1267,6 +1296,33 @@ impl Default for ScreenRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_frame_rate_changes_in_the_caps_and_nothing_else_does() {
+        gst::init().unwrap();
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "I420")
+            .field("width", 1280)
+            .field("height", 800)
+            .field("framerate", gst::Fraction::new(30, 1))
+            .build();
+        let slower = with_framerate(&caps, 15);
+        let structure = slower.structure(0).unwrap();
+        assert_eq!(
+            structure.get::<gst::Fraction>("framerate").unwrap(),
+            gst::Fraction::new(15, 1)
+        );
+        assert_eq!(structure.get::<i32>("width").unwrap(), 1280);
+        assert_eq!(structure.get::<&str>("format").unwrap(), "I420");
+        assert_eq!(
+            caps.structure(0)
+                .unwrap()
+                .get::<gst::Fraction>("framerate")
+                .unwrap(),
+            gst::Fraction::new(30, 1),
+            "the original is untouched"
+        );
+    }
 
     #[test]
     fn bitrate_backs_off_under_loss_probes_up_when_clean_and_stays_bounded() {

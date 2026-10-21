@@ -196,15 +196,15 @@ mod tests {
             .contains(&"desklink.mousepad.request".to_string()));
 
         // Remote input is handled only under a portal-approved control lease.
-        // MPRIS, volume and run-command remain phone-to-desktop capabilities
-        // that the Android application implements in the opposite direction.
+        // The phone has no receiver for the desktop's volume requests; media
+        // control runs both ways.
         assert!(local
             .incoming_capabilities
             .contains(&"desklink.mousepad.request".to_string()));
         assert!(!local
             .outgoing_capabilities
             .contains(&"desklink.systemvolume.request".to_string()));
-        assert!(!local
+        assert!(local
             .outgoing_capabilities
             .contains(&"desklink.mpris.request".to_string()));
     }

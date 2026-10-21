@@ -47,6 +47,9 @@ pub struct BatteryStatus {
     pub is_charging: bool,
     pub battery_quantity: Option<i64>,
     pub threshold_event: Option<i64>,
+    /// Milliseconds until full, while charging and when the phone knows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub charge_time_remaining: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,23 +77,6 @@ pub struct VolumeSink {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SystemVolumeStatus {
     pub sinks: Vec<VolumeSink>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RemoteCommand {
-    pub key: String,
-    pub name: String,
-    pub command: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SftpStatus {
-    pub user: Option<String>,
-    pub port: Option<i64>,
-    pub path: Option<String>,
-    pub password: Option<String>,
-    pub directories: Vec<(String, String)>,
-    pub error: Option<String>,
 }
 
 /// A phone's use of this computer's screen.
@@ -132,14 +118,15 @@ pub struct DeviceView {
     /// (over the internet) or `"turn"`; `None` while not connected.
     #[serde(default)]
     pub connection_path: Option<String>,
+    /// The selected ICE pair's round-trip time, in milliseconds, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rtt_ms: Option<u32>,
     pub verification_key: Option<String>,
     pub last_error: Option<String>,
     pub media_status: Option<MediaStatus>,
     pub battery_status: Option<BatteryStatus>,
     pub notifications: Vec<DeviceNotification>,
     pub volume_status: Option<SystemVolumeStatus>,
-    pub available_commands: Vec<RemoteCommand>,
-    pub sftp_status: Option<SftpStatus>,
 }
 
 /// The user-facing words for a `connection_path`, the one mapping every
@@ -174,14 +161,13 @@ impl DeviceView {
             terminal_sessions_attached: 0,
             desktop_session: DesktopSession::None,
             connection_path: None,
+            rtt_ms: None,
             verification_key: None,
             last_error: None,
             media_status: None,
             battery_status: None,
             notifications: Vec::new(),
             volume_status: None,
-            available_commands: Vec::new(),
-            sftp_status: None,
         }
     }
 

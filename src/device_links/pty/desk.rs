@@ -248,6 +248,21 @@ pub(crate) fn new_desk_session() -> Result<String, String> {
     Ok(info.id)
 }
 
+/// [`new_desk_session`] in `folder` (`~/api`, `/srv`), which must be an
+/// existing readable directory.
+pub(crate) fn new_desk_session_in(folder: &str) -> Result<String, String> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .ok_or("No home folder")?;
+    let cwd = super::registry::resolve_cwd(folder, &home).ok_or("That folder is not available")?;
+    let info = super::registry::registry()
+        .lock()
+        .map_err(|_| "terminal registry lock poisoned".to_string())?
+        .create_in(None, 24, 80, DESK_OWNER, Some(&cwd), None)?;
+    open_on_desktop(&info.id);
+    Ok(info.id)
+}
+
 /// The registry owner of sessions started at this computer.
 const DESK_OWNER: &str = "desk";
 

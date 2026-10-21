@@ -197,14 +197,30 @@ impl Drop for PortalSessionGuard {
     }
 }
 
+/// What `start` says when the portal granted no screen: with a restore
+/// token, usually a token for a screen layout that no longer exists.
+pub(crate) const NO_SCREEN_STREAM: &str = "Desktop portal returned no screen stream";
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PortalInputAction {
     RelativeMotion(f64, f64),
     AbsoluteMotion(f64, f64),
-    Button { evdev_code: i32, pressed: bool },
+    /// A place as fractions (0..=1) of the active screen: the drawing pad,
+    /// which knows its own size but not the screen's.
+    NormalizedMotion(f64, f64),
+    Button {
+        evdev_code: i32,
+        pressed: bool,
+    },
     Scroll(f64, f64),
-    Key { keysym: i32, pressed: bool },
-    TypeText { text: String, modifiers: u32 },
+    Key {
+        keysym: i32,
+        pressed: bool,
+    },
+    TypeText {
+        text: String,
+        modifiers: u32,
+    },
 }
 
 /// What a desktop share needs from the system whose screen it shares: the
@@ -234,6 +250,13 @@ pub(crate) trait DesktopSession {
         match action {
             PortalInputAction::RelativeMotion(dx, dy) => self.pointer_motion(dx, dy),
             PortalInputAction::AbsoluteMotion(x, y) => self.pointer_motion_absolute(x, y),
+            PortalInputAction::NormalizedMotion(x, y) => {
+                let stream = self.active();
+                self.pointer_motion_absolute(
+                    x.clamp(0.0, 1.0) * f64::from(stream.width),
+                    y.clamp(0.0, 1.0) * f64::from(stream.height),
+                )
+            }
             PortalInputAction::Button {
                 evdev_code,
                 pressed,
@@ -379,8 +402,8 @@ impl RemoteDesktopPortal {
                 // leave the screen view working; only control is withheld.
                 let granted_device_types = lookup::<u32>(&started, "devices")?.unwrap_or(0);
                 let restore_token = lookup::<String>(&started, "restore_token")?;
-                let streams = dict_value(&started, "streams")
-                    .ok_or_else(|| "Desktop portal returned no screen stream".to_string())?;
+                let streams =
+                    dict_value(&started, "streams").ok_or_else(|| NO_SCREEN_STREAM.to_string())?;
                 // Every screen the user shared — a laptop and a monitor, say —
                 // so the phone can switch between them without another dialog.
                 let streams = (0..streams.n_children())
@@ -388,7 +411,7 @@ impl RemoteDesktopPortal {
                     .collect::<Result<Vec<_>, _>>()?;
                 let first = *streams
                     .first()
-                    .ok_or_else(|| "Desktop portal returned no screen stream".to_string())?;
+                    .ok_or_else(|| NO_SCREEN_STREAM.to_string())?;
                 let (node_id, size, pipewire_serial) = (
                     first.node_id,
                     (first.width, first.height),
@@ -970,6 +993,35 @@ fn token() -> String {
 mod tests {
     use super::*;
     use crate::device_links::packet::NetworkPacket;
+
+    /// The phone's presenter remote: next/previous slide, start the show,
+    /// leave it, and blank the screen ("b", sent as text).
+    #[test]
+    fn presenter_keys_reach_the_desktop_as_the_keys_slides_expect() {
+        let pressed = |special: i64| {
+            let mut packet = NetworkPacket::new("desklink.mousepad.request");
+            packet.set("specialKey", special);
+            input_actions(&packet)
+                .unwrap()
+                .into_iter()
+                .find_map(|action| match action {
+                    PortalInputAction::Key {
+                        keysym,
+                        pressed: true,
+                    } => Some(keysym),
+                    _ => None,
+                })
+        };
+        assert_eq!(pressed(9), Some(0xff56), "next slide is Page Down");
+        assert_eq!(pressed(8), Some(0xff55), "previous slide is Page Up");
+        assert_eq!(pressed(25), Some(0xffc2), "start the show is F5");
+        assert_eq!(pressed(14), Some(0xff1b), "leave it is Escape");
+        let mut blank = NetworkPacket::new("desklink.mousepad.request");
+        blank.set("key", "b");
+        assert!(input_actions(&blank).unwrap().iter().any(
+            |action| matches!(action, PortalInputAction::TypeText { text, .. } if text == "b")
+        ));
+    }
 
     #[test]
     fn input_translation_preserves_absolute_position_and_click_order() {

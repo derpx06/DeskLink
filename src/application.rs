@@ -149,6 +149,15 @@ impl DesklinkApplication {
                 }
             })
             .build();
+        // Lock this computer and offer the newest terminal to the phones:
+        // the tray, the top-bar menu and the overview.
+        let lock_hand_off_action = gio::ActionEntry::builder("lock-hand-off")
+            .activate(move |app: &Self, _, _| {
+                if let Some(daemon) = app.daemon_handle() {
+                    daemon.send(crate::device_links::daemon::DaemonCommand::LockAndHandOff);
+                }
+            })
+            .build();
         let history_action = gio::ActionEntry::builder("history")
             .activate(move |app: &Self, _, _| app.show_history())
             .build();
@@ -158,6 +167,7 @@ impl DesklinkApplication {
             preferences_action,
             shortcuts_action,
             end_sessions_action,
+            lock_hand_off_action,
             history_action,
         ]);
     }
@@ -235,6 +245,14 @@ impl DesklinkApplication {
                 move || {
                     if let Some(app) = app.upgrade() {
                         app.activate_action("end-sessions", Some(&"".to_variant()));
+                    }
+                }
+            }),
+            lock_hand_off: Box::new({
+                let app = app.clone();
+                move || {
+                    if let Some(app) = app.upgrade() {
+                        app.activate_action("lock-hand-off", None);
                     }
                 }
             }),

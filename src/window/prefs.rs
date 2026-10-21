@@ -11,24 +11,61 @@ use crate::device_links::config::AppSettings;
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::DeviceView;
 
+/// A switch that follows a setting a phone can also change, and how to read
+/// it. Synced in place each refresh: rebuilding the page would move focus.
+type LiveSwitch = (
+    glib::WeakRef<adw::SwitchRow>,
+    fn(&AppSettings, &str) -> bool,
+);
+
+thread_local! {
+    static LIVE: std::cell::RefCell<Vec<LiveSwitch>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn follow(row: &adw::SwitchRow, read: fn(&AppSettings, &str) -> bool) {
+    LIVE.with(|live| live.borrow_mut().push((row.downgrade(), read)));
+}
+
+/// Shows changes made from a phone (or anywhere) on the open switches.
+fn sync_live(device_id: &str) {
+    let settings = crate::device_links::config::app_settings();
+    LIVE.with(|live| {
+        live.borrow_mut().retain(|(row, read)| {
+            let Some(row) = row.upgrade() else {
+                return false;
+            };
+            let value = read(&settings, device_id);
+            if row.is_active() != value {
+                row.set_active(value);
+            }
+            true
+        })
+    });
+}
+
 pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &DeviceView) {
+    sync_live(&device.id);
     let imp = win.imp();
     let approving = imp.approving.borrow().contains(&device.id);
     let approved = crate::device_links::config::remote_desktop_token(&device.id).is_some();
     // Only what the switches cannot show by themselves: a switch the user
     // just flipped already says so, and redrawing would move focus.
+    let settings = crate::device_links::config::app_settings();
     let key = serde_json::to_string(&(
         &device.id,
         &device.name,
         approving,
         approved,
         device.terminal_access,
+        &settings.run_commands,
+        settings.relay_enabled,
+        crate::shell_dbus::extension_active(),
     ))
     .unwrap_or_default();
     if !win.page_changed("preferences", key) {
         return;
     }
-    let settings = crate::device_links::config::app_settings();
+    LIVE.with(|live| live.borrow_mut().clear());
     let page = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(22)
@@ -42,6 +79,8 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     access.add(&password_row(daemon, &settings));
     access.add(&remote_control_row(device, approving));
     access.add(&terminal_access_row(daemon, device));
+    access.add(&unlock_nearby_row(daemon, &settings, device));
+    access.add(&command_alerts_row(daemon, &settings, device));
     page.append(&access);
 
     let connection = adw::PreferencesGroup::builder().title("Connection").build();
@@ -64,12 +103,20 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
             row.is_active(),
         ));
     });
+    follow(&notifications, |settings, id| {
+        settings.shows_notifications(id)
+    });
     connection.add(&notifications);
     page.append(&connection);
+
+    page.append(&run_commands_group(win, daemon, &settings, &device.name));
 
     let look = adw::PreferencesGroup::builder().title("Appearance").build();
     look.add(&appearance_row());
     look.add(&start_at_login_row(daemon, &settings));
+    if crate::shell_dbus::extension_possible() {
+        look.add(&top_bar_row());
+    }
     page.append(&look);
 
     page.append(&unpair_button(daemon, device));
@@ -94,6 +141,9 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>, daemon: &DaemonHandle)
     let look = adw::PreferencesGroup::builder().title("Appearance").build();
     look.add(&appearance_row());
     look.add(&start_at_login_row(daemon, &settings));
+    if crate::shell_dbus::extension_possible() {
+        look.add(&top_bar_row());
+    }
     page.add(&look);
     dialog.add(&page);
     dialog.present(Some(parent));
@@ -112,7 +162,211 @@ fn keep_awake_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::SwitchR
     with_icon(&row, "weather-clear-night-symbolic");
     let daemon = daemon.clone();
     row.connect_active_notify(move |row| daemon.send(DaemonCommand::SetStayAwake(row.is_active())));
+    follow(&row, |settings, _| settings.stay_awake);
     row
+}
+
+/// Unlock with the phone: off unless turned on here, and explained.
+fn unlock_nearby_row(
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    device: &DeviceView,
+) -> adw::SwitchRow {
+    let phone = &device.name;
+    let explained = format!(
+        "When this computer is locked, {phone} can unlock it after you approve on the \
+         phone — only on the same network, never through the relay. Other phones cannot."
+    );
+    let row = adw::SwitchRow::builder()
+        .title(format!("Unlock with {phone} nearby"))
+        .subtitle(&explained)
+        .use_markup(false)
+        .active(settings.unlocks_from(&device.id))
+        .build();
+    with_icon(&row, "changes-allow-symbolic");
+    row.update_property(&[gtk::accessible::Property::Description(&explained)]);
+    let (daemon, id) = (daemon.clone(), device.id.clone());
+    row.connect_active_notify(move |row| {
+        daemon.send(DaemonCommand::SetUnlockNearby(id.clone(), row.is_active()))
+    });
+    follow(&row, |settings, id| settings.unlocks_from(id));
+    row
+}
+
+fn command_alerts_row(
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    device: &DeviceView,
+) -> adw::SwitchRow {
+    let row = adw::SwitchRow::builder()
+        .title("Command alerts")
+        .subtitle(format!(
+            "Tell {} when a terminal command that ran over 10 seconds finishes",
+            device.name
+        ))
+        .use_markup(false)
+        .active(settings.alerts_commands_to(&device.id))
+        .build();
+    with_icon(&row, "alarm-symbolic");
+    let (daemon, id) = (daemon.clone(), device.id.clone());
+    row.connect_active_notify(move |row| {
+        daemon.send(DaemonCommand::SetCommandAlerts(id.clone(), row.is_active()))
+    });
+    follow(&row, |settings, id| settings.alerts_commands_to(id));
+    row
+}
+
+/// The commands the phone can run here, with Add, Edit and Remove.
+fn run_commands_group(
+    win: &DesklinkWindow,
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    phone: &str,
+) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder()
+        .title("Run Commands")
+        .description(format!(
+            "Commands {phone} can start here with one tap. Each runs in a new terminal you can watch."
+        ))
+        .build();
+    let commands = settings.run_commands.clone();
+    for (index, command) in commands.iter().enumerate() {
+        let row = adw::ActionRow::builder()
+            .title(&command.name)
+            .subtitle(&command.command)
+            .use_markup(false)
+            .subtitle_lines(1)
+            .build();
+        with_icon(&row, "system-run-symbolic");
+        let edit = gtk::Button::builder()
+            .icon_name("document-edit-symbolic")
+            .tooltip_text("Edit")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        edit.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Edit {}",
+            command.name
+        ))]);
+        let remove = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Remove")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        remove.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Remove {}",
+            command.name
+        ))]);
+        row.add_suffix(&edit);
+        row.add_suffix(&remove);
+        let (list, sender, window) = (commands.clone(), daemon.clone(), win.downgrade());
+        edit.connect_clicked(move |_| {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            let (existing, list, sender) = (list[index].clone(), list.clone(), sender.clone());
+            edit_command(&window, Some(&existing), move |name, line| {
+                let mut list = list.clone();
+                list[index].name = name;
+                list[index].command = line;
+                sender.send(DaemonCommand::SetRunCommands(list));
+            });
+        });
+        let (list, sender) = (commands.clone(), daemon.clone());
+        remove.connect_clicked(move |_| {
+            let mut list = list.clone();
+            list.remove(index);
+            sender.send(DaemonCommand::SetRunCommands(list));
+        });
+        group.add(&row);
+    }
+    let add = adw::ActionRow::builder()
+        .title("Add Command")
+        .activatable(true)
+        .build();
+    with_icon(&add, "list-add-symbolic");
+    let (sender, window) = (daemon.clone(), win.downgrade());
+    add.connect_activated(move |_| {
+        let Some(window) = window.upgrade() else {
+            return;
+        };
+        let (list, sender) = (commands.clone(), sender.clone());
+        edit_command(&window, None, move |name, line| {
+            let mut list = list.clone();
+            list.push(crate::device_links::config::RunCommand {
+                id: uuid::Uuid::new_v4().simple().to_string(),
+                name,
+                command: line,
+            });
+            sender.send(DaemonCommand::SetRunCommands(list));
+        });
+    });
+    group.add(&add);
+    group
+}
+
+/// Asks for a command's name and command line.
+fn edit_command(
+    parent: &impl IsA<gtk::Widget>,
+    existing: Option<&crate::device_links::config::RunCommand>,
+    done: impl Fn(String, String) + 'static,
+) {
+    let name = adw::EntryRow::builder()
+        .title("Name")
+        .text(existing.map_or("", |command| command.name.as_str()))
+        .build();
+    let line = adw::EntryRow::builder()
+        .title("Command")
+        .text(existing.map_or("", |command| command.command.as_str()))
+        .activates_default(true)
+        .build();
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    list.append(&name);
+    list.append(&line);
+    let dialog = adw::AlertDialog::new(
+        Some(if existing.is_some() {
+            "Edit Command"
+        } else {
+            "Add Command"
+        }),
+        Some("It runs in your login shell, in a new terminal."),
+    );
+    dialog.add_responses(&[("cancel", "Cancel"), ("ok", "Save")]);
+    dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("ok"));
+    dialog.set_close_response("cancel");
+    dialog.set_extra_child(Some(&list));
+    let check = {
+        let (dialog, name, line) = (dialog.downgrade(), name.downgrade(), line.downgrade());
+        move || {
+            if let (Some(dialog), Some(name), Some(line)) =
+                (dialog.upgrade(), name.upgrade(), line.upgrade())
+            {
+                dialog.set_response_enabled(
+                    "ok",
+                    !name.text().trim().is_empty() && !line.text().trim().is_empty(),
+                );
+            }
+        }
+    };
+    check();
+    name.connect_changed({
+        let check = check.clone();
+        move |_| check()
+    });
+    line.connect_changed(move |_| check());
+    dialog.choose(parent, gio::Cancellable::NONE, move |response| {
+        if response == "ok" {
+            done(
+                name.text().trim().to_string(),
+                line.text().trim().to_string(),
+            );
+        }
+    });
 }
 
 fn start_at_login_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::SwitchRow {
@@ -126,6 +380,49 @@ fn start_at_login_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Swi
     row.connect_active_notify(move |row| {
         daemon.send(DaemonCommand::SetStartAtLogin(row.is_active()))
     });
+    row
+}
+
+/// "Top-bar menu": on, or a Turn On button. GNOME's settings change only
+/// when that button is clicked.
+fn top_bar_row() -> adw::ActionRow {
+    let active = crate::shell_dbus::extension_active();
+    let row = adw::ActionRow::builder()
+        .title("Top-bar menu")
+        .subtitle(if active {
+            "On — your phone, live sessions and quick actions in the top bar"
+        } else {
+            "Your phone, live sessions and quick actions in the top bar, and Unlock on the lock screen"
+        })
+        .build();
+    with_icon(&row, "view-app-grid-symbolic");
+    if active {
+        return row;
+    }
+    let button = gtk::Button::builder()
+        .label("Turn On")
+        .valign(gtk::Align::Center)
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label("Turn on the top-bar menu")]);
+    button.connect_clicked(|button| match crate::shell_dbus::turn_on_extension() {
+        Ok(true) => {
+            let dialog = adw::AlertDialog::new(
+                Some("Top-Bar Menu Turned On"),
+                Some(crate::shell_dbus::RELOGIN_NOTE),
+            );
+            dialog.add_response("ok", "OK");
+            dialog.present(Some(button));
+        }
+        Ok(false) => super::toast_from(button, "Top-bar menu turned on"),
+        Err(error) => {
+            eprintln!("[UI] Could not turn on the top-bar menu: {error}");
+            let dialog =
+                adw::AlertDialog::new(Some("Could Not Turn On the Top-Bar Menu"), Some(&error));
+            dialog.add_response("ok", "OK");
+            dialog.present(Some(button));
+        }
+    });
+    row.add_suffix(&button);
     row
 }
 

@@ -193,7 +193,7 @@ impl DeviceManager {
         &self,
         now: Instant,
         idle: std::time::Duration,
-        dead: std::time::Duration,
+        dead: impl Fn(&str) -> std::time::Duration,
     ) -> LivenessTick {
         let mut tick = LivenessTick::default();
         for session in self.reconciler_sessions().values() {
@@ -207,7 +207,7 @@ impl DeviceManager {
                 continue;
             }
             let silence = now.saturating_duration_since(session.last_inbound_at);
-            if silence >= dead {
+            if silence >= dead(&binding.device_id) {
                 tick.dead.push(binding);
             } else if silence >= idle {
                 tick.probe.push(binding);
@@ -451,13 +451,18 @@ impl DeviceManager {
     /// the application restarted.
     /// Whether a replacement bootstrap connection would be accepted at all.
     ///
-    /// `finish_secure_link` discards a new socket while a feature-ready WebRTC
-    /// peer exists, so discovery must not keep dialling one: without this it
-    /// performed a full TCP connect, TLS handshake and certificate validation on
-    /// every beacon purely to have the result thrown away — and reported an
-    /// error banner for each failure, on a device the UI showed as connected.
+    /// `attach_bootstrap_link` discards a new socket while the current one is
+    /// live and answering, so discovery must not keep dialling then: that was
+    /// a full TCP connect, TLS handshake and certificate validation per beacon,
+    /// thrown away.
+    ///
+    /// A surviving WebRTC peer no longer counts: without its bootstrap socket
+    /// the desk has no way to thaw a phone its OS froze (screen off), and a
+    /// replacement is adopted into the session without disturbing the peer
+    /// (`attach_bootstrap_link`). Only a live socket that is still answering
+    /// makes a new one pointless.
     pub fn wants_bootstrap_connection(&self, device_id: &str) -> bool {
-        !self.has_live_bootstrap_link(device_id) && !self.has_ready_webrtc(device_id)
+        !self.has_live_bootstrap_link(device_id)
     }
 
     /// Whether `device_id`'s live bootstrap link is a relay link (it has no

@@ -394,10 +394,11 @@ impl DesktopWebRtcPeer {
         }
     }
 
-    /// How the selected ICE pair reaches the peer, per [`path_label`].
+    /// How the selected ICE pair reaches the peer, per [`path_label`], and
+    /// its current round-trip time in milliseconds when known.
     /// `via_relay` is whether the bootstrap link is the relay.
     /// `None` until a pair is selected.
-    pub fn path(&self, via_relay: bool) -> Option<&'static str> {
+    pub fn path(&self, via_relay: bool) -> Option<(&'static str, Option<u32>)> {
         let promise = gst::Promise::new();
         self.webrtcbin
             .emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
@@ -424,7 +425,18 @@ impl DesktopWebRtcPeer {
             .filter_map(|key| field(pair, key))
             .filter_map(|id| by_id(&id).and_then(|candidate| field(candidate, "candidate-type")))
             .collect();
-        Some(path_label(&types, via_relay))
+        let rtt = pair
+            .get::<f64>("current-round-trip-time")
+            .ok()
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+            .map(|seconds| (seconds * 1000.0).round().max(1.0) as u32);
+        // Until both candidates are resolved the path is unknown, not
+        // "direct": guessing showed "over the internet" for a moment on
+        // every LAN connect.
+        if types.len() != 2 || types.iter().any(String::is_empty) {
+            return None;
+        }
+        Some((path_label(&types, via_relay), rtt))
     }
 
     /// Bytes already queued on `channel` and not yet handed to the network.
@@ -1288,6 +1300,73 @@ a=max-message-size:262144\r\n";
             Some(Err(error)) => panic!("far side got the track but could not display it: {error}"),
             None => panic!("the far side never received the video track"),
         }
+    }
+
+    /// A capture that ends (here: a source that stops after a few frames; on a
+    /// desktop, a PipeWire node that went away) must not EOS webrtcbin's shared
+    /// video sink: that ended the screen track, and the next share on the same
+    /// connection never reached the far side's picture.
+    #[test]
+    fn an_ending_capture_never_sends_eos_into_webrtcbin() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let pair = loopback();
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let watch_eos = |pad: &gst::Pad| {
+            let seen = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&seen);
+            pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+                if let Some(gst::PadProbeData::Event(event)) = &info.data {
+                    if event.type_() == gst::EventType::Eos {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+            seen
+        };
+        let source = gst::ElementFactory::make("videotestsrc")
+            .property("is-live", true)
+            .property("num-buffers", 5i32)
+            .build()
+            .unwrap();
+        let ended = watch_eos(&source.static_pad("src").unwrap());
+        let share = |source| {
+            super::super::screen::DesktopScreenCapture::attach_source(
+                &pair.answerer.pipeline,
+                &pair.answerer.webrtcbin,
+                source,
+                None,
+                640,
+                360,
+                30,
+                Some(super::super::screen::RtpContinuity {
+                    ssrc: pair.answerer.screen_ssrc,
+                    next_seqnum: None,
+                }),
+            )
+            .unwrap()
+        };
+        let first = share(source);
+        let reached: Vec<_> = pair
+            .answerer
+            .webrtcbin
+            .sink_pads()
+            .iter()
+            .map(watch_eos)
+            .collect();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !ended.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(ended.load(Ordering::SeqCst), "the first capture ended");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !reached.iter().any(|seen| seen.load(Ordering::SeqCst)),
+            "EOS reached webrtcbin's video sink"
+        );
+        let _ = first.stop();
+        pair.offerer.close();
+        pair.answerer.close();
     }
 
     /// Reopening Remote input starts a second share on the same connection.

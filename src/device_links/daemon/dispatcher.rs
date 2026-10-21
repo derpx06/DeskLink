@@ -6,7 +6,7 @@
 
 use crate::device_links::core::{DeviceManager, SessionBinding};
 use crate::device_links::device_info::DeviceInfo;
-use crate::device_links::features::is_webrtc_feature;
+use crate::device_links::features::{is_webrtc_feature, peer_sends};
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_IDENTITY, PACKET_TYPE_PAIR, PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
@@ -140,7 +140,10 @@ impl SharedPacketDispatcher {
         if source == PacketSource::WebRtc && !feature_ready {
             return Err(DispatchError::UnpairedFeature);
         }
-        if source == PacketSource::WebRtc && !is_webrtc_feature(&packet.packet_type) {
+        if source == PacketSource::WebRtc
+            && (!is_webrtc_feature(&packet.packet_type)
+                || !peer_sends(&binding.device_id, &packet.packet_type))
+        {
             return Err(DispatchError::FeatureNotEnabled);
         }
         if !local_info

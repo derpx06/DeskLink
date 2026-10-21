@@ -6,11 +6,9 @@ use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK_REQUEST,
     PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION_ACTION,
     PACKET_TYPE_NOTIFICATION_REPLY, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING,
-    PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST,
-    PACKET_TYPE_SYSTEMVOLUME_REQUEST,
+    PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
 };
 use crate::device_links::transport::{should_surface_send_error, FeatureTransport};
-use crate::device_links::webrtc::file_browser;
 use crate::device_links::webrtc::terminal_bridge;
 use std::sync::Arc;
 
@@ -32,9 +30,6 @@ pub enum DaemonCommand {
     StopPhoneRemoteControl(String),
     /// Ask again for control of a phone whose screen is being viewed.
     RequestPhoneControl(String),
-    /// A phone-file browser request that has already been registered with
-    /// [`file_browser::begin_request`]: device ID, request ID, wire bytes.
-    SendPhoneFileRequest(String, String, Vec<u8>),
     SendFile(String, std::path::PathBuf),
     /// Stops a running file transfer: the device and the transfer's id.
     CancelTransfer(String, String),
@@ -59,6 +54,14 @@ pub enum DaemonCommand {
     SetUseTurn(bool),
     /// Start DeskLink in the background at login.
     SetStartAtLogin(bool),
+    /// Tell this phone when a long terminal command finishes (device id).
+    SetCommandAlerts(String, bool),
+    /// Let this phone, on this network, unlock this computer when approved.
+    SetUnlockNearby(String, bool),
+    /// The commands a phone may run here (replaces the list).
+    SetRunCommands(Vec<crate::device_links::config::RunCommand>),
+    /// Lock this computer and offer the newest terminal to the phones.
+    LockAndHandOff,
     /// The network changed: reconnect the relay now.
     NetworkChanged,
     /// Set, change (`Some`) or remove (`None`) the session password.
@@ -71,15 +74,12 @@ pub enum DaemonCommand {
     RequestMprisStatus(String, Option<String>),
     SendMprisSetVolume(String, String, i64),
     SendMprisSeek(String, String, i64),
-    SendSftpRequest(String),
     RequestNotifications(String),
     DismissNotification(String, String),
     ReplyNotification(String, String, String),
     TriggerNotificationAction(String, String, String),
     RequestSystemVolume(String),
     SetSystemVolume(String, String, Option<i64>, Option<bool>),
-    RequestRemoteCommands(String),
-    ExecuteRemoteCommand(String, String),
     Stop,
 }
 
@@ -131,9 +131,6 @@ impl DaemonWorker {
             DaemonCommand::RequestPhoneControl(id) => {
                 self.with_feature_transport(&id, |transport| transport.request_phone_control());
             }
-            DaemonCommand::SendPhoneFileRequest(id, request_id, payload) => {
-                self.send_phone_file_request(&id, &request_id, &payload)
-            }
             DaemonCommand::SendFile(id, path) => self.send_file(&id, path),
             DaemonCommand::CancelTransfer(id, transfer_id) => {
                 self.cancel_transfer(&id, &transfer_id)
@@ -154,6 +151,29 @@ impl DaemonWorker {
                 self.update_settings(|settings| settings.use_turn = on)
             }
             DaemonCommand::SetStartAtLogin(on) => self.set_start_at_login(on),
+            DaemonCommand::SetCommandAlerts(id, on) => self.update_settings(|settings| {
+                if on {
+                    settings.muted_command_alerts.remove(&id);
+                } else {
+                    settings.muted_command_alerts.insert(id);
+                }
+            }),
+            DaemonCommand::SetUnlockNearby(id, on) => self.update_settings(|settings| {
+                if on {
+                    settings.unlock_devices.insert(id);
+                } else {
+                    settings.unlock_devices.remove(&id);
+                }
+            }),
+            DaemonCommand::SetRunCommands(commands) => {
+                self.update_settings(|settings| settings.run_commands = commands);
+                crate::device_links::desk_features::push_command_list();
+            }
+            DaemonCommand::LockAndHandOff => {
+                if let Err(error) = crate::device_links::desk_features::lock_and_hand_off() {
+                    push_error(&self.errors, format!("Could not hand off: {error}"));
+                }
+            }
             DaemonCommand::NetworkChanged => crate::device_links::relay_link::client::reset(),
             DaemonCommand::SetStayAwake(on) => {
                 self.update_settings(|settings| settings.stay_awake = on)
@@ -182,7 +202,6 @@ impl DaemonWorker {
             DaemonCommand::SendMprisSeek(id, player, offset) => {
                 self.send_mpris_seek(&id, &player, offset)
             }
-            DaemonCommand::SendSftpRequest(id) => self.send_sftp_request(&id),
             DaemonCommand::RequestNotifications(id) => self.request_notifications(&id),
             DaemonCommand::DismissNotification(id, notification_id) => {
                 self.dismiss_notification(&id, &notification_id)
@@ -197,8 +216,6 @@ impl DaemonWorker {
             DaemonCommand::SetSystemVolume(id, name, volume, muted) => {
                 self.set_system_volume(&id, &name, volume, muted)
             }
-            DaemonCommand::RequestRemoteCommands(id) => self.request_remote_commands(&id),
-            DaemonCommand::ExecuteRemoteCommand(id, key) => self.execute_remote_command(&id, &key),
             DaemonCommand::Stop => return true,
         }
         false
@@ -257,16 +274,6 @@ impl DaemonWorker {
 
     fn stop_phone_remote_control(&self, device_id: &str) {
         self.with_feature_transport(device_id, |transport| transport.stop_phone_remote_control());
-    }
-
-    /// A failure here belongs in the file dialog that asked, not in the global
-    /// error banner, so it is routed back as that request's reply.
-    fn send_phone_file_request(&self, device_id: &str, request_id: &str, payload: &[u8]) {
-        let result = FeatureTransport::for_device(&self.sessions, device_id)
-            .and_then(|transport| transport.send_phone_file_request(payload));
-        if let Err(error) = result {
-            file_browser::fail_request(device_id, request_id, &error);
-        }
     }
 
     fn send_share_text(&self, device_id: &str, text: &str) {
@@ -365,6 +372,8 @@ impl DaemonWorker {
         if let Err(error) = saved {
             push_error(&self.errors, format!("Could not save the setting: {error}"));
         }
+        // Every phone shows the desk's settings; tell them.
+        crate::device_links::desk_features::push_settings();
     }
 
     fn send_find_phone(&self, device_id: &str) {
@@ -398,13 +407,6 @@ impl DaemonWorker {
     fn send_mpris_seek(&self, device_id: &str, player: &str, offset: i64) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_mpris_seek_packet(player, offset)?;
-            transport.send(&packet)
-        });
-    }
-
-    fn send_sftp_request(&self, device_id: &str) {
-        self.with_feature_transport(device_id, |transport| {
-            let packet = build_sftp_request_packet();
             transport.send(&packet)
         });
     }
@@ -453,36 +455,6 @@ impl DaemonWorker {
     ) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_system_volume_set_packet(name, volume, muted)?;
-            transport.send(&packet)
-        });
-    }
-
-    fn request_remote_commands(&self, device_id: &str) {
-        self.with_feature_transport(device_id, |transport| {
-            let packet = build_remote_command_list_request_packet();
-            transport.send(&packet)
-        });
-    }
-
-    fn execute_remote_command(&self, device_id: &str, key: &str) {
-        self.with_feature_transport(device_id, |transport| {
-            let key = key.trim();
-            let advertised = self
-                .devices
-                .lock()
-                .ok()
-                .and_then(|devices| devices.get(device_id).cloned())
-                .map(|device| {
-                    device
-                        .available_commands
-                        .iter()
-                        .any(|command| command.key == key)
-                })
-                .unwrap_or(false);
-            if !advertised {
-                return Err("Remote command was not advertised by this device".to_string());
-            }
-            let packet = build_remote_command_execute_packet(key)?;
             transport.send(&packet)
         });
     }
@@ -567,12 +539,6 @@ fn build_mpris_seek_packet(player: &str, offset: i64) -> Result<NetworkPacket, S
     Ok(packet)
 }
 
-fn build_sftp_request_packet() -> NetworkPacket {
-    let mut packet = NetworkPacket::new(PACKET_TYPE_SFTP_REQUEST);
-    packet.set("startBrowsing", true);
-    packet
-}
-
 fn build_notification_request_packet() -> NetworkPacket {
     let mut packet = NetworkPacket::new(PACKET_TYPE_NOTIFICATION_REQUEST);
     packet.set("request", true);
@@ -645,22 +611,6 @@ fn build_system_volume_set_packet(
     Ok(packet)
 }
 
-fn build_remote_command_list_request_packet() -> NetworkPacket {
-    let mut packet = NetworkPacket::new(PACKET_TYPE_RUNCOMMAND_REQUEST);
-    packet.set("requestCommandList", true);
-    packet
-}
-
-fn build_remote_command_execute_packet(key: &str) -> Result<NetworkPacket, String> {
-    let key = key.trim();
-    if key.is_empty() {
-        return Err("Remote command key is required".to_string());
-    }
-    let mut packet = NetworkPacket::new(PACKET_TYPE_RUNCOMMAND_REQUEST);
-    packet.set("key", key);
-    Ok(packet)
-}
-
 /// The address other LAN devices reach this desktop on: the source address of
 /// the default route. `connect` on UDP only selects a route; nothing is sent.
 fn lan_address() -> Option<std::net::IpAddr> {
@@ -675,8 +625,8 @@ mod tests {
     use super::*;
     use crate::device_links::packet::{
         PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_REPLY,
-        PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_RUNCOMMAND_REQUEST,
-        PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME_REQUEST,
+        PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_SHARE_REQUEST,
+        PACKET_TYPE_SYSTEMVOLUME_REQUEST,
     };
 
     #[test]
@@ -721,14 +671,6 @@ mod tests {
         assert_eq!(packet.packet_type, PACKET_TYPE_MPRIS_REQUEST);
         assert_eq!(packet.get_str("player"), Some("org.mpris.MediaPlayer2.vlc"));
         assert_eq!(packet.get_str("action"), Some("Next"));
-    }
-
-    #[test]
-    fn sftp_request_packet_starts_remote_browsing() {
-        let packet = build_sftp_request_packet();
-
-        assert_eq!(packet.packet_type, PACKET_TYPE_SFTP_REQUEST);
-        assert_eq!(packet.get_bool("startBrowsing"), Some(true));
     }
 
     #[test]
@@ -786,13 +728,5 @@ mod tests {
     #[test]
     fn system_volume_set_packet_requires_a_change() {
         assert!(build_system_volume_set_packet("sink", None, None).is_err());
-    }
-
-    #[test]
-    fn remote_command_execute_packet_contains_key() {
-        let packet = build_remote_command_execute_packet("command-key").unwrap();
-
-        assert_eq!(packet.packet_type, PACKET_TYPE_RUNCOMMAND_REQUEST);
-        assert_eq!(packet.get_str("key"), Some("command-key"));
     }
 }

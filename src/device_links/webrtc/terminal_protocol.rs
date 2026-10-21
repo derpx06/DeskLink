@@ -85,6 +85,8 @@ pub enum TerminalAction {
     Resize,
     /// Host could not honour a request.
     Error,
+    /// Host → client: a long job in a session finished (`job`, `secs`).
+    Finished,
 }
 
 /// One session as shown in a client's list.
@@ -103,6 +105,18 @@ pub struct TerminalSessionInfo {
     /// as typed keys. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub desk_window: bool,
+    /// A phone other than the receiver is attached. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attached: bool,
+    /// The foreground process's directory, `~` for home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// When it started, in Unix seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    /// The shell's name ("bash").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
 }
 
 /// A `desklink.terminal.control.v1` message.
@@ -147,6 +161,18 @@ pub struct TerminalControl {
     pub exit_status: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// `Create`: where to start, `~`, `~/…` or absolute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// `Sessions`: folders the phone may offer for a new session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub folders: Option<Vec<String>>,
+    /// `Finished`: the job's name ("cargo").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+    /// `Finished`: how long it ran, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secs: Option<u64>,
 }
 
 impl TerminalControl {
@@ -167,6 +193,10 @@ impl TerminalControl {
             password: None,
             exit_status: None,
             error: None,
+            cwd: None,
+            folders: None,
+            job: None,
+            secs: None,
         }
     }
 
@@ -225,6 +255,13 @@ impl TerminalControl {
         }
         if self.error.as_ref().is_some_and(|error| error.len() > 1024) {
             return Err("DeskLink terminal error is too long".to_string());
+        }
+        if self
+            .cwd
+            .as_ref()
+            .is_some_and(|cwd| cwd.is_empty() || cwd.len() > 4096 || cwd.contains('\0'))
+        {
+            return Err("Invalid DeskLink terminal folder".to_string());
         }
         Ok(())
     }
@@ -397,6 +434,10 @@ mod tests {
             cols: 80,
             exit_status: None,
             desk_window: false,
+            attached: false,
+            cwd: None,
+            started_at: None,
+            shell: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         assert!(!json.contains("deskWindow"), "{json}");
@@ -407,6 +448,50 @@ mod tests {
             serde_json::from_str(r#"{"terminalId":"t1","title":"Shell","rows":24,"cols":80}"#)
                 .unwrap();
         assert!(!older.desk_window);
+        assert!(!older.attached && older.cwd.is_none() && older.started_at.is_none());
+    }
+
+    /// The v4 additions are optional both ways: absent when unset, and an
+    /// older peer's messages still parse.
+    #[test]
+    fn the_new_terminal_fields_are_optional_on_the_wire() {
+        let info = TerminalSessionInfo {
+            terminal_id: "t1".into(),
+            title: "Shell".into(),
+            rows: 24,
+            cols: 80,
+            exit_status: None,
+            desk_window: false,
+            attached: true,
+            cwd: Some("~/api".into()),
+            started_at: Some(1_700_000_000),
+            shell: Some("zsh".into()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        for field in [
+            "\"attached\":true",
+            "\"cwd\":\"~/api\"",
+            "\"startedAt\":1700000000",
+            "\"shell\":\"zsh\"",
+        ] {
+            assert!(json.contains(field), "{json}");
+        }
+        let wire = wire();
+        let mut finished = TerminalControl::new(TerminalAction::Finished, &wire);
+        finished.terminal_id = Some("t1".into());
+        finished.job = Some("cargo".into());
+        finished.secs = Some(42);
+        let json = String::from_utf8(finished.to_json().unwrap()).unwrap();
+        assert!(json.contains("\"action\":\"finished\""), "{json}");
+        assert!(
+            json.contains("\"job\":\"cargo\"") && json.contains("\"secs\":42"),
+            "{json}"
+        );
+        assert!(!json.contains("folders") && !json.contains("cwd"), "{json}");
+        let older = TerminalControl::new(TerminalAction::List, &wire);
+        let parsed = TerminalControl::from_json(&older.to_json().unwrap()).unwrap();
+        assert_eq!(parsed.cwd, None);
+        assert_eq!(parsed.folders, None);
     }
 
     fn wire() -> WebRtcWireBinding {

@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -10,20 +9,20 @@ use super::handle::DaemonEvent;
 use super::handshake::handle_disconnect;
 use super::state::{
     push_event, remove_notification, update_battery_status, update_media_from_packet,
-    update_pair_state, update_remote_commands, update_sftp_status, update_volume_status,
-    upsert_notification,
+    update_pair_state, update_volume_status, upsert_notification,
 };
 use crate::device_links::config::Config;
 use crate::device_links::core::{DeviceManager, ReadOutcome, SessionBinding};
 use crate::device_links::device::DeviceView;
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
-    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_HEARTBEAT, PACKET_TYPE_LOCK,
-    PACKET_TYPE_LOCK_REQUEST, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS,
-    PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_REQUEST,
-    PACKET_TYPE_PAIR, PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND, PACKET_TYPE_RUNCOMMAND_REQUEST,
-    PACKET_TYPE_SFTP, PACKET_TYPE_SFTP_REQUEST, PACKET_TYPE_SHARE_REQUEST,
-    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_WEBRTC_SIGNAL_V1,
+    PACKET_TYPE_DIGITIZER, PACKET_TYPE_DIGITIZER_SESSION, PACKET_TYPE_FINDMYPHONE_REQUEST,
+    PACKET_TYPE_HEARTBEAT, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST,
+    PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST,
+    PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PAIR, PACKET_TYPE_PING,
+    PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_REQUEST,
+    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_UNLOCK_REQUEST,
+    PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
 use crate::device_links::pairing::{needs_pair_reconfirmation, PairState};
 
@@ -35,7 +34,7 @@ use crate::device_links::pairing::{needs_pair_reconfirmation, PairState};
 /// per validity window no matter how many devices, transports, or packets are
 /// involved, which is what stops a status-poll loop from turning into a fork
 /// storm.
-fn is_desktop_locked() -> bool {
+pub(crate) fn is_desktop_locked() -> bool {
     let now = std::time::Instant::now();
     if let Ok(cached) = CACHED_LOCK_STATE.lock() {
         if let Some((sampled_at, locked)) = *cached {
@@ -68,58 +67,10 @@ fn sample_desktop_lock_state() -> bool {
     locked
 }
 
-/// Asks `loginctl` for the current lock state, without blocking indefinitely.
-///
-/// `Command::output()` waits forever, and this runs inline on a device's packet
-/// reader. A wedged `systemd-logind` — which happens around suspend/resume and
-/// logind restarts — would freeze that reader for good: it would never re-check
-/// the session, never disconnect, and never return to `read()`, so even the TCP
-/// keepalive detection could not surface through it.
+/// Asks logind for our display session's lock state (bounded; see
+/// [`crate::device_links::logind`]). Unknown reads as unlocked.
 fn read_desktop_lock_state() -> bool {
-    let Some(session_id) = std::env::var("XDG_SESSION_ID")
-        .ok()
-        .filter(|value| !value.is_empty())
-    else {
-        return false;
-    };
-    let Ok(mut child) = std::process::Command::new("loginctl")
-        .args(["show-session", &session_id, "-p", "LockedHint", "--value"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-
-    let deadline = std::time::Instant::now() + LOCK_STATE_TIMEOUT;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
-            }
-            Ok(None) => {
-                debug_log!("[Daemon] loginctl did not answer in time; assuming unlocked");
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-            Err(_) => {
-                // `try_wait` does not retry `EINTR`, and `Child` has no `Drop`
-                // that reaps. Returning here without this would leave a zombie
-                // whenever a signal interrupts the poll.
-                let _ = child.kill();
-                let _ = child.wait();
-                return false;
-            }
-        }
-    }
-
-    let mut stdout = String::new();
-    if let Some(mut pipe) = child.stdout.take() {
-        let _ = pipe.read_to_string(&mut stdout);
-    }
-    stdout.trim() == "yes"
+    crate::device_links::logind::locked().unwrap_or(false)
 }
 
 /// How long the screensaver is given to settle before its state is sampled.
@@ -127,9 +78,6 @@ const LOCK_SETTLE_DELAY: Duration = Duration::from_millis(300);
 
 /// How long a sampled lock state is reused before `loginctl` is asked again.
 const LOCK_STATE_VALIDITY: Duration = Duration::from_millis(1_000);
-
-/// How long `loginctl` is given to answer before it is killed.
-const LOCK_STATE_TIMEOUT: Duration = Duration::from_millis(2_000);
 
 /// Shortest interval between two applied lock operations, process-wide.
 ///
@@ -209,6 +157,8 @@ pub(super) fn apply_lan_packet(
     // healthy peer it was unpaired, once every ten seconds — the mechanism that
     // keeps links alive turned into one that tears pairings down.
     if packet.packet_type == PACKET_TYPE_HEARTBEAT {
+        // Its one field is a state report: whether the phone is dozing.
+        crate::device_links::webrtc::coordinator::note_heartbeat(&device_id, &packet);
         return;
     }
 
@@ -683,14 +633,6 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             update_volume_status(devices, device_id, &packet);
             Ok(())
         }
-        PACKET_TYPE_RUNCOMMAND => {
-            update_remote_commands(devices, device_id, &packet);
-            Ok(())
-        }
-        PACKET_TYPE_SFTP => {
-            update_sftp_status(devices, device_id, &packet);
-            Ok(())
-        }
         PACKET_TYPE_FINDMYPHONE_REQUEST => {
             find_device_received(events, device_id, &binding.link.info.name, spawn_player);
             Ok(())
@@ -708,6 +650,21 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             // Sampling the result costs a settle delay, and this runs on the
             // single worker that also carries SDP, ICE and file chunks — so the
             // wait and the reply happen on their own thread.
+            // An unlock is never a plain request: only the phone's approval of
+            // the desk's own nonce, through every check in `unlock`.
+            if packet.get_bool("setLocked") == Some(false) {
+                let (device_id, nonce) = (
+                    device_id.clone(),
+                    packet.get_str("nonce").map(str::to_string),
+                );
+                crate::device_links::desk_features::run_later(move || {
+                    crate::device_links::desk_features::handle_unlock_approval(
+                        &device_id,
+                        nonce.as_deref(),
+                    )
+                });
+                return Ok(());
+            }
             let wants_state = packet.body.contains_key("requestLocked");
             let requested_lock = apply_lock_request(&packet);
             if wants_state || requested_lock.is_some() {
@@ -741,10 +698,39 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             }
             Ok(())
         }
-        PACKET_TYPE_SYSTEMVOLUME_REQUEST
-        | PACKET_TYPE_RUNCOMMAND_REQUEST
-        | PACKET_TYPE_MPRIS_REQUEST
-        | PACKET_TYPE_SFTP_REQUEST => {
+        PACKET_TYPE_MPRIS_REQUEST => {
+            // D-Bus calls to the players: off the peer worker.
+            let (device_id, packet) = (device_id.clone(), packet.clone());
+            crate::device_links::desk_features::run_later(move || {
+                if let Err(error) = crate::device_links::mpris::handle_request(&device_id, &packet)
+                {
+                    debug_log!("[DeskLink] Media request from {device_id} failed: {error}");
+                }
+            });
+            Ok(())
+        }
+        PACKET_TYPE_RUNCOMMAND_REQUEST => {
+            crate::device_links::desk_features::handle_runcommand_request(device_id, &packet)
+        }
+        PACKET_TYPE_SETTINGS_REQUEST => {
+            let (device_id, packet) = (device_id.clone(), packet.clone());
+            crate::device_links::desk_features::run_later(move || {
+                crate::device_links::desk_features::handle_settings_request(&device_id, &packet)
+            });
+            Ok(())
+        }
+        PACKET_TYPE_UNLOCK_REQUEST => {
+            // Reads the lock state (loginctl): off the peer worker.
+            let (device_id, packet) = (device_id.clone(), packet.clone());
+            crate::device_links::desk_features::run_later(move || {
+                crate::device_links::desk_features::handle_unlock_request(&device_id, &packet)
+            });
+            Ok(())
+        }
+        PACKET_TYPE_DIGITIZER_SESSION | PACKET_TYPE_DIGITIZER => {
+            crate::device_links::webrtc::coordinator::dispatch_digitizer(binding, &packet)
+        }
+        PACKET_TYPE_SYSTEMVOLUME_REQUEST => {
             Err("DeskLink WebRTC request needs its corresponding desktop backend".to_string())
         }
         _ => Err(format!(
@@ -779,36 +765,43 @@ pub(crate) fn apply_lock_request(packet: &NetworkPacket) -> Option<bool> {
         return None;
     }
 
-    // One lock operation per settle window, process-wide.
-    //
-    // Each admitted request spawns up to five subprocesses — `loginctl`, two
-    // `dbus-send`, `xdg-screensaver`, and one more `loginctl` for the
-    // confirmation sample, which alone bypasses the state memo. Nothing else in
-    // the feature profile spawns anything at all, so a peer
-    // repeating this packet is uniquely amplifying: a stuck toggle or a retry
-    // loop would flap the screensaver and bog the machine down. The LAN reader
-    // was incidentally limited by its inline settle delay; the WebRTC path
-    // moved that delay off the worker and so had no limit at all.
-    //
-    // This is a timestamp rather than an in-flight flag on purpose. A flag has
-    // to be released by hand, and the release sits after `is_desktop_locked()`
-    // — a `loginctl` call with no timeout. A wedged logind would then leak the
-    // flag and disable locking for every device until the process restarted.
-    // An elapsed-time check cannot leak, whatever hangs or panics.
+    if !admit_lock_operation() {
+        return None;
+    }
+    debug_log!("[Daemon] Received setLocked command: {requested_lock}");
+    // logind is asked synchronously; not on the peer worker.
+    thread::spawn(lock_desktop);
+    Some(requested_lock)
+}
+
+/// One lock or unlock operation per settle window, process-wide: whether
+/// this one may go ahead.
+pub(crate) fn admit_lock_operation() -> bool {
+    // A peer repeating lock or unlock packets would otherwise flap the
+    // screensaver and hammer logind. A timestamp rather than an in-flight
+    // flag: a flag has to be released by hand, and a wedged logind would leak
+    // it and disable locking for good. An elapsed-time check cannot leak.
     {
         let now = std::time::Instant::now();
-        let mut last = LAST_LOCK_ACTION.lock().ok()?;
+        let Ok(mut last) = LAST_LOCK_ACTION.lock() else {
+            return false;
+        };
         if last.is_some_and(|last| now.duration_since(last) < LOCK_MIN_INTERVAL) {
             debug_log!("[Daemon] Ignoring a lock request received too soon after the last one");
-            return None;
+            return false;
         }
         *last = Some(now);
     }
-    debug_log!("[Daemon] Received setLocked command: {requested_lock}");
+    true
+}
 
-    let _ = std::process::Command::new("loginctl")
-        .arg("lock-session")
-        .spawn();
+/// Locks this desktop session, every way a desktop might listen.
+pub(crate) fn lock_desktop() {
+    match crate::device_links::logind::lock() {
+        Ok(()) => return,
+        Err(error) => debug_log!("[Daemon] logind could not lock the session: {error}"),
+    }
+    // Without logind: ask the screensaver directly.
     for args in [
         [
             "--session",
@@ -830,8 +823,6 @@ pub(crate) fn apply_lock_request(packet: &NetworkPacket) -> Option<bool> {
     let _ = std::process::Command::new("xdg-screensaver")
         .arg("lock")
         .spawn();
-
-    Some(requested_lock)
 }
 
 /// The phone asked this computer to make itself known. The notification is

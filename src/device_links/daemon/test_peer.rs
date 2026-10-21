@@ -361,7 +361,7 @@ impl TestPeer {
         self.sessions.liveness_tick(
             std::time::Instant::now() + after,
             super::HEARTBEAT_IDLE,
-            super::HEARTBEAT_DEAD,
+            |_| super::HEARTBEAT_DEAD,
         )
     }
 
@@ -613,6 +613,39 @@ mod tests {
         assert!(gone.probe.is_empty());
         assert_eq!(gone.dead.len(), 1, "silence past the budget is death");
         assert_eq!(gone.dead[0].device_id, desktop.peer_id());
+    }
+
+    /// A dozing phone (frozen by its OS) gets 90 s of LAN silence before its
+    /// link is buried; an awake one keeps the 30 s budget.
+    #[test]
+    fn a_dozing_phone_keeps_its_lan_link_for_ninety_seconds() {
+        use crate::device_links::daemon::{heartbeat_dead, HEARTBEAT_DEAD, HEARTBEAT_IDLE};
+        use std::time::Duration;
+        assert_eq!(heartbeat_dead(false), Duration::from_secs(30));
+        assert_eq!(heartbeat_dead(true), Duration::from_secs(90));
+
+        let net = TestNetwork::new();
+        let (desktop, _phone) = peer_pair(&net, "desktop-1", "phone-1");
+        let after = |silence: Duration, dozing: bool| {
+            desktop.sessions.liveness_tick(
+                std::time::Instant::now() + silence,
+                HEARTBEAT_IDLE,
+                |_| heartbeat_dead(dozing),
+            )
+        };
+        assert_eq!(after(HEARTBEAT_DEAD, false).dead.len(), 1, "awake: 30 s");
+        let dozing = after(Duration::from_secs(60), true);
+        assert!(dozing.dead.is_empty(), "dozing: kept at 60 s");
+        assert_eq!(
+            dozing.probe.len(),
+            1,
+            "and still sent the thawing heartbeat"
+        );
+        assert_eq!(
+            after(Duration::from_secs(90), true).dead.len(),
+            1,
+            "dozing: 90 s"
+        );
     }
 
     /// A heartbeat is consumed as liveness and never dispatched as a feature.

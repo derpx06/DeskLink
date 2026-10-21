@@ -5,8 +5,8 @@ use super::handle::DaemonEvent;
 use crate::device_links::connection_log::{self, ConnectionEvent};
 use crate::device_links::core::DeviceConnection;
 use crate::device_links::device::{
-    BatteryStatus, DeviceNotification, DeviceStatus, DeviceView, MediaStatus, RemoteCommand,
-    SftpStatus, SystemVolumeStatus, VolumeSink,
+    BatteryStatus, DeviceNotification, DeviceStatus, DeviceView, MediaStatus, SystemVolumeStatus,
+    VolumeSink,
 };
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::NetworkPacket;
@@ -232,7 +232,7 @@ pub(super) fn push_error(errors: &Arc<Mutex<Vec<String>>>, error: String) {
 /// notifications and several minutes of toasts with no way to dismiss them.
 const MAX_PENDING_EVENTS: usize = 16;
 
-pub(super) fn push_event(events: &Arc<Mutex<Vec<DaemonEvent>>>, event: DaemonEvent) {
+pub(crate) fn push_event(events: &Arc<Mutex<Vec<DaemonEvent>>>, event: DaemonEvent) {
     if let Ok(mut events) = events.lock() {
         events.push(event);
         if events.len() > MAX_PENDING_EVENTS {
@@ -267,6 +267,11 @@ pub(super) fn update_media_from_packet(
         });
 
         if let Some(players) = string_vec(packet.body.get("playerList")) {
+            // No players on the phone: nothing to show.
+            if players.is_empty() {
+                device.media_status = None;
+                return;
+            }
             media.player_list = players;
             if media.player.is_empty() {
                 media.player = media.player_list.first().cloned().unwrap_or_default();
@@ -322,6 +327,7 @@ pub(super) fn update_battery_status(
                 is_charging: packet.get_bool("isCharging").unwrap_or(false),
                 battery_quantity: packet.get_i64("batteryQuantity"),
                 threshold_event: packet.get_i64("thresholdEvent"),
+                charge_time_remaining: packet.get_i64("chargeTimeRemaining").filter(|ms| *ms >= 0),
             });
         }
     }
@@ -443,60 +449,6 @@ pub(super) fn update_volume_status(
     }
 }
 
-pub(super) fn update_remote_commands(
-    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    device_id: &str,
-    packet: &NetworkPacket,
-) {
-    let Some(commands) = packet
-        .get_str("commandList")
-        .and_then(parse_remote_commands)
-        .or_else(|| {
-            packet
-                .body
-                .get("commandList")
-                .and_then(parse_remote_commands_value)
-        })
-    else {
-        return;
-    };
-
-    if let Ok(mut devices) = devices.lock() {
-        if let Some(device) = devices.get_mut(device_id) {
-            device.available_commands = commands;
-        }
-    }
-}
-
-pub(super) fn update_sftp_status(
-    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    device_id: &str,
-    packet: &NetworkPacket,
-) {
-    let status = SftpStatus {
-        user: packet
-            .get_str("user")
-            .map(|value| sanitize_text(value, 120)),
-        port: packet.get_i64("port"),
-        path: packet
-            .get_str("path")
-            .map(|value| sanitize_text(value, 500)),
-        password: packet
-            .get_str("password")
-            .map(|value| sanitize_text(value, 500)),
-        directories: parse_sftp_directories(packet),
-        error: packet
-            .get_str("errorMessage")
-            .map(|value| sanitize_text(value, 500)),
-    };
-
-    if let Ok(mut devices) = devices.lock() {
-        if let Some(device) = devices.get_mut(device_id) {
-            device.sftp_status = Some(status);
-        }
-    }
-}
-
 fn sanitize_text(value: &str, max_chars: usize) -> String {
     value
         .chars()
@@ -556,41 +508,6 @@ fn parse_sink_list(value: Option<&Value>) -> Option<Vec<VolumeSink>> {
             })
             .collect(),
     )
-}
-
-fn parse_remote_commands(value: &str) -> Option<Vec<RemoteCommand>> {
-    let parsed = serde_json::from_str::<Value>(value).ok()?;
-    parse_remote_commands_value(&parsed)
-}
-
-fn parse_remote_commands_value(value: &Value) -> Option<Vec<RemoteCommand>> {
-    let object = value.as_object()?;
-    let mut commands = object
-        .iter()
-        .filter_map(|(key, value)| {
-            let object = value.as_object()?;
-            Some(RemoteCommand {
-                key: sanitize_text(key, 120),
-                name: object
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(|value| sanitize_text(value, 120))
-                    .unwrap_or_else(|| sanitize_text(key, 120)),
-                command: object
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .map(|value| sanitize_text(value, 500)),
-            })
-        })
-        .collect::<Vec<_>>();
-    commands.sort_by(|left, right| left.name.cmp(&right.name));
-    Some(commands)
-}
-
-fn parse_sftp_directories(packet: &NetworkPacket) -> Vec<(String, String)> {
-    let paths = string_vec(packet.body.get("multiPaths")).unwrap_or_default();
-    let names = string_vec(packet.body.get("pathNames")).unwrap_or_default();
-    paths.into_iter().zip(names).collect()
 }
 
 #[cfg(test)]
@@ -766,6 +683,52 @@ mod tests {
     }
 
     #[test]
+    fn phone_media_shows_until_the_phone_has_no_players() {
+        let (devices, info) = test_devices();
+        let mut playing = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_MPRIS);
+        playing.set("playerList", serde_json::json!(["Spotify"]));
+        playing.set("player", "Spotify");
+        playing.set("title", "Blurred");
+        playing.set("isPlaying", true);
+        update_media_from_packet(&devices, &info.id, &playing);
+        let title = |devices: &Arc<Mutex<HashMap<String, DeviceView>>>| {
+            devices.lock().unwrap()[&info.id]
+                .media_status
+                .as_ref()
+                .map(|media| media.title.clone())
+        };
+        assert_eq!(title(&devices).as_deref(), Some("Blurred"));
+        let mut none = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_MPRIS);
+        none.set("playerList", serde_json::json!([]));
+        update_media_from_packet(&devices, &info.id, &none);
+        assert_eq!(title(&devices), None);
+    }
+
+    #[test]
+    fn time_to_full_is_read_when_given_and_unknown_is_none() {
+        let (devices, info) = test_devices();
+        let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_BATTERY);
+        packet.set("currentCharge", 40);
+        packet.set("isCharging", true);
+        packet.set("chargeTimeRemaining", 1_500_000);
+        update_battery_status(&devices, &info.id, &packet);
+        let remaining = |devices: &Arc<Mutex<HashMap<String, DeviceView>>>| {
+            devices.lock().unwrap()[&info.id]
+                .battery_status
+                .as_ref()
+                .unwrap()
+                .charge_time_remaining
+        };
+        assert_eq!(remaining(&devices), Some(1_500_000));
+        packet.set("chargeTimeRemaining", -1);
+        update_battery_status(&devices, &info.id, &packet);
+        assert_eq!(remaining(&devices), None, "-1 means unknown");
+        packet.body.remove("chargeTimeRemaining");
+        update_battery_status(&devices, &info.id, &packet);
+        assert_eq!(remaining(&devices), None, "older phones omit it");
+    }
+
+    #[test]
     fn upsert_notification_replaces_existing_notification() {
         let (devices, info) = test_devices();
         let mut first = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_NOTIFICATION);
@@ -836,45 +799,5 @@ mod tests {
         assert_eq!(volume.sinks.len(), 1);
         assert_eq!(volume.sinks[0].name, "sink1");
         assert_eq!(volume.sinks[0].volume, 40);
-    }
-
-    #[test]
-    fn remote_command_packet_updates_available_commands() {
-        let (devices, info) = test_devices();
-        let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_RUNCOMMAND);
-        packet.set(
-            "commandList",
-            r#"{"lock":{"name":"Lock Phone","command":"loginctl lock-session"}}"#,
-        );
-
-        update_remote_commands(&devices, &info.id, &packet);
-
-        let devices = devices.lock().unwrap();
-        let commands = &devices.get(&info.id).unwrap().available_commands;
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0].key, "lock");
-        assert_eq!(commands[0].name, "Lock Phone");
-    }
-
-    #[test]
-    fn sftp_packet_updates_connection_status() {
-        let (devices, info) = test_devices();
-        let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_SFTP);
-        packet.set("user", "kdeconnect");
-        packet.set("port", 1739);
-        packet.set("path", "/");
-        packet.set("multiPaths", json!(["/DCIM"]));
-        packet.set("pathNames", json!(["Camera"]));
-
-        update_sftp_status(&devices, &info.id, &packet);
-
-        let devices = devices.lock().unwrap();
-        let sftp = devices.get(&info.id).unwrap().sftp_status.as_ref().unwrap();
-        assert_eq!(sftp.user.as_deref(), Some("kdeconnect"));
-        assert_eq!(sftp.port, Some(1739));
-        assert_eq!(
-            sftp.directories,
-            vec![("/DCIM".to_string(), "Camera".to_string())]
-        );
     }
 }

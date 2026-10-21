@@ -6,6 +6,7 @@
 
 pub(crate) mod desk;
 pub(crate) mod host;
+pub(crate) mod jobs;
 pub(crate) mod launchers;
 pub(crate) mod registry;
 pub(crate) mod ring;

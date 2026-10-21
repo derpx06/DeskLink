@@ -163,6 +163,7 @@ fn accept_incoming_device(
     let packet = NetworkPacket::deserialize(&line).map_err(|err| err.to_string())?;
     let info = DeviceInfo::from_identity_packet(&packet)
         .ok_or_else(|| format!("Invalid identity packet (type {})", packet.packet_type))?;
+    super::discovery::remember_endpoint(&info, &packet);
     let local_id = config
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())?

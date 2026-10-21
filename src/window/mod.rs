@@ -260,6 +260,22 @@ mod imp {
                         }
                     })
                     .build(),
+                // A new shell here, started in a folder ("~/api").
+                gio::ActionEntry::builder("new-terminal-in")
+                    .parameter_type(Some(glib::VariantTy::STRING))
+                    .activate(|window: &super::DesklinkWindow, _, parameter| {
+                        let Some(folder) = parameter.and_then(|value| value.get::<String>()) else {
+                            return;
+                        };
+                        match crate::device_links::pty::desk::new_desk_session_in(&folder) {
+                            Ok(_) => window.refresh_soon(),
+                            Err(error) => {
+                                eprintln!("[UI] Could not start a terminal in {folder}: {error}");
+                                window.show_feature_toast("Could not start a terminal there");
+                            }
+                        }
+                    })
+                    .build(),
                 gio::ActionEntry::builder("discover")
                     .activate(|window: &super::DesklinkWindow, _, _| {
                         if let Some(daemon) = window.imp().daemon.borrow().clone() {
@@ -604,6 +620,13 @@ impl DesklinkWindow {
                     imp.page.replace("overview".to_string());
                     imp.split_view.set_show_content(true);
                     self.show_feature_toast(&format!("Paired with {device_name}"));
+                }
+                DaemonEvent::PhoneScreenOffered { device_id } => {
+                    crate::remote_control::show_remote_control_dialog(
+                        daemon.clone(),
+                        device_id,
+                        self,
+                    );
                 }
             }
         }
@@ -1621,6 +1644,41 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             }
         }
         "open-switcher" => win.imp().device_card.popup(),
+        // "scroll-end PAGE": that page scrolled to its end.
+        "scroll-end" => {
+            if let Some((scroll, _)) = win.imp().bodies.borrow().get(id).cloned() {
+                let adjustment = scroll.vadjustment();
+                adjustment.set_value(adjustment.upper());
+            }
+        }
+        // New Terminal's menu, with its "Start in" folders.
+        "open-new-terminal" => {
+            if let Some(page) = win.imp().terminals.borrow().as_ref() {
+                for widget in named_widgets(&page.root, "new-terminal") {
+                    if let Some(button) = widget.downcast_ref::<adw::SplitButton>() {
+                        button.popup();
+                    }
+                }
+            }
+        }
+        // Two run commands, as if added in Preferences: into an isolated
+        // runner's own config only.
+        "fake-commands" if std::env::var_os("XDG_CONFIG_HOME").is_none() => {
+            debug_log!("[E2E] {verb} refused: set XDG_CONFIG_HOME to an isolated directory");
+        }
+        "fake-commands" => {
+            if let Some(daemon) = win.daemon() {
+                let command = |name: &str, line: &str| crate::device_links::config::RunCommand {
+                    id: uuid::Uuid::new_v4().simple().to_string(),
+                    name: name.into(),
+                    command: line.into(),
+                };
+                daemon.send(DaemonCommand::SetRunCommands(vec![
+                    command("Deploy staging", "./scripts/deploy.sh staging"),
+                    command("Update system", "sudo pacman -Syu"),
+                ]));
+            }
+        }
         // "open-reply ID": notification ID's reply entry.
         "open-reply" => {
             if let Some(page) = win.imp().notifications.borrow().as_ref() {
@@ -1891,6 +1949,7 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
         is_charging: true,
         battery_quantity: None,
         threshold_event: None,
+        charge_time_remaining: Some(25 * 60_000),
     });
     device.notifications = vec![
         DeviceNotification {
@@ -1952,6 +2011,7 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
                 .into(),
             );
             device.terminal_access = true;
+            device.rtt_ms = Some(9);
             if kind == "live" {
                 device.terminal_sessions_attached = 1;
                 device.desktop_session = DesktopSession::Viewing;

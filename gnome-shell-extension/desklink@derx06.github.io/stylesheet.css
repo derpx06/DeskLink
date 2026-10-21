@@ -1,5 +1,85 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
+/* The link glyph: a computer square, the wire, a phone pill (as in the app). */
+.desklink-glyph-computer {
+  width: 9px;
+  height: 9px;
+  border-radius: 2.5px;
+  background-color: rgba(255, 255, 255, 0.95);
+}
+
+.desklink-glyph-wire {
+  width: 11px;
+  height: 2px;
+  background-color: rgba(255, 255, 255, 0.3);
+}
+
+.desklink-glyph-phone {
+  width: 6px;
+  height: 11px;
+  border-radius: 2px;
+  background-color: rgba(255, 255, 255, 0.3);
+}
+
+.desklink-glyph-wire.live,
+.desklink-glyph-phone.live {
+  background-color: #2fbf8f;
+}
+
+/* A phone is using this computer. */
+.desklink-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 4px;
+  margin-left: 6px;
+  background-color: #e5533d;
+}
+
+.desklink-pill-label {
+  margin-left: 8px;
+}
+
 .desklink-device-name {
   font-weight: bold;
+}
+
+.desklink-end-button {
+  padding: 3px 12px;
+  border-radius: 99px;
+  color: #ff9a88;
+  background-color: rgba(229, 83, 61, 0.18);
+}
+
+.desklink-end-button:hover,
+.desklink-end-button:focus {
+  background-color: rgba(229, 83, 61, 0.3);
+}
+
+.desklink-tiles {
+  spacing: 8px;
+}
+
+.desklink-tile {
+  padding: 10px 4px;
+  border-radius: 12px;
+  background-color: rgba(255, 255, 255, 0.08);
+}
+
+.desklink-tile:hover,
+.desklink-tile:focus {
+  background-color: rgba(255, 255, 255, 0.15);
+}
+
+.desklink-tile:checked {
+  color: #ffffff;
+  background-color: #e5533d;
+}
+
+.desklink-tile:insensitive {
+  color: rgba(255, 255, 255, 0.35);
+}
+
+.desklink-tile-label {
+  margin-top: 4px;
+  font-size: 0.85em;
 }

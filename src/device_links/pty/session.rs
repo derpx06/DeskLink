@@ -177,10 +177,23 @@ impl PtySession {
     ///
     /// Either way the program runs with the allow-listed environment and starts
     /// in `$HOME`; see [`restricted`].
+    #[cfg(test)]
     pub(crate) fn spawn(
         command: Option<CommandBuilder>,
         rows: u16,
         cols: u16,
+    ) -> Result<Self, String> {
+        Self::spawn_in(command, rows, cols, None, None)
+    }
+
+    /// [`Self::spawn`] starting in `cwd` (already checked to be a readable
+    /// directory) and listed as `title`, when given.
+    pub(crate) fn spawn_in(
+        command: Option<CommandBuilder>,
+        rows: u16,
+        cols: u16,
+        cwd: Option<&std::path::Path>,
+        title: Option<&str>,
     ) -> Result<Self, String> {
         let (rows, cols) = clamp_size(rows, cols);
         let pair = portable_pty::native_pty_system()
@@ -198,7 +211,13 @@ impl PtySession {
         // user's PATH additions actually exist.
         let mut command = restricted(command.unwrap_or_else(CommandBuilder::new_default_prog));
 
-        let title = describe(&command);
+        let title = title.map_or_else(
+            || describe(&command),
+            |title| title.chars().take(MAX_TITLE_CHARS).collect(),
+        );
+        if let Some(cwd) = cwd {
+            command.cwd(cwd);
+        }
         // In a Flatpak, the shell and any program run on the host instead.
         if super::host::in_flatpak() {
             let argv = if command.is_default_prog() {
@@ -210,6 +229,11 @@ impl PtySession {
                 .iter_full_env_as_str()
                 .map(|(key, value)| (key.into(), value.into()))
                 .collect();
+            let mut argv = argv;
+            // `flatpak-spawn --host` starts in the host's $HOME otherwise.
+            if let Some(cwd) = cwd {
+                argv.insert(2, format!("--directory={}", cwd.display()).into());
+            }
             command = CommandBuilder::from_argv(argv);
             for (key, value) in env {
                 command.env(key, value);
@@ -281,6 +305,31 @@ impl PtySession {
 
     pub(crate) fn started(&self) -> std::time::SystemTime {
         self.started
+    }
+
+    /// The shell's (session leader's) pid.
+    pub(crate) fn shell_pid(&self) -> Option<i32> {
+        self.pid.and_then(|pid| i32::try_from(pid).ok())
+    }
+
+    /// The process group in the terminal's foreground: the shell itself at a
+    /// prompt, a job while one runs.
+    pub(crate) fn foreground_pgrp(&self) -> Option<i32> {
+        self.master.lock().ok()?.process_group_leader()
+    }
+
+    /// The foreground process's current directory (the shell's at a prompt),
+    /// read from `/proc`. Unknown in a Flatpak: its sessions run on the host
+    /// through `flatpak-spawn`, whose processes the sandbox's `/proc` does not
+    /// show.
+    pub(crate) fn cwd(&self) -> Option<std::path::PathBuf> {
+        let pid = self.foreground_pgrp().or(self.shell_pid())?;
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+
+    /// The shell's program name ("bash", "zsh").
+    pub(crate) fn shell_name(&self) -> Option<String> {
+        process_name(self.shell_pid()?)
     }
 
     pub(crate) fn desk_window_opened(&self) {
@@ -686,6 +735,21 @@ fn describe(command: &CommandBuilder) -> String {
                 .collect()
         })
         .unwrap_or_else(|| "Terminal".to_string())
+}
+
+/// A process's name: `/proc/<pid>/comm`, else its argv[0]'s basename.
+pub(crate) fn process_name(pid: i32) -> Option<String> {
+    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        let comm = comm.trim();
+        if !comm.is_empty() {
+            return Some(comm.to_string());
+        }
+    }
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let argv0 = cmdline.split(|byte| *byte == 0).next()?;
+    let argv0 = String::from_utf8_lossy(argv0);
+    let name = argv0.rsplit('/').next()?.trim_start_matches('-');
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 #[cfg(test)]

@@ -173,9 +173,16 @@ impl Sidebar {
     fn update_card(&self, win: &DesklinkWindow, device: &DeviceView) {
         let state = LinkState::of(device);
         let short = if device.trusted {
-            state.short_label(device)
+            match state.round_trip(device) {
+                // The glyph already says connected: room for the time.
+                Some(rtt) => format!(
+                    "{} · {rtt}",
+                    state.short_label(device).trim_start_matches("Connected · ")
+                ),
+                None => state.short_label(device).to_string(),
+            }
         } else {
-            device_status_presentation(device).0
+            device_status_presentation(device).0.to_string()
         };
         let key = format!("{}\n{short}\n{state:?}", device.name);
         if *self.card_key.borrow() == key {
@@ -191,7 +198,7 @@ impl Sidebar {
             .valign(gtk::Align::Center)
             .build();
         words.append(&super::ellipsized(&device.name, &["device-name"]));
-        words.append(&super::ellipsized(short, &["caption", "text-dim"]));
+        words.append(&super::ellipsized(&short, &["caption", "text-dim"]));
         content.append(&words);
         content.append(
             &gtk::Image::builder()

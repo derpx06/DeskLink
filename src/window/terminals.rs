@@ -37,6 +37,9 @@ pub(super) struct Page {
     device: RefCell<(String, String)>,
     key: RefCell<String>,
     detail_key: RefCell<String>,
+    /// The New Terminal menu's "Start in" folders, and what they were.
+    folders: gtk::gio::Menu,
+    shown_folders: RefCell<Vec<String>>,
 }
 
 impl Page {
@@ -56,7 +59,8 @@ impl Page {
         header.append(&count);
         header.append(&gtk::Box::builder().hexpand(true).build());
         header.append(&detach);
-        header.append(&new_terminal_button());
+        let folders = gtk::gio::Menu::new();
+        header.append(&new_terminal_button(&folders));
 
         let grid = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -137,7 +141,32 @@ impl Page {
             device: RefCell::default(),
             key: RefCell::default(),
             detail_key: RefCell::default(),
+            folders,
+            shown_folders: RefCell::default(),
         }
+    }
+
+    /// The folders New Terminal offers: home, the open sessions' folders,
+    /// then the recent ones (the same list the phone gets).
+    fn update_folders(&self, all: &[SessionInfo]) {
+        let folders = crate::device_links::pty::registry::folders(
+            all,
+            &crate::device_links::config::app_settings().recent_folders,
+        );
+        if *self.shown_folders.borrow() == folders {
+            return;
+        }
+        self.folders.remove_all();
+        for folder in &folders {
+            let label = if folder == "~" { "Home folder" } else { folder };
+            let item = gtk::gio::MenuItem::new(Some(label), None);
+            item.set_action_and_target_value(
+                Some("win.new-terminal-in"),
+                Some(&folder.to_variant()),
+            );
+            self.folders.append_item(&item);
+        }
+        self.shown_folders.replace(folders);
     }
 
     pub(super) fn focus_search(&self) {
@@ -184,6 +213,7 @@ impl Page {
         self.device
             .replace((device.id.clone(), device.name.clone()));
         let all = sessions();
+        self.update_folders(&all);
         let attached: Vec<Vec<String>> =
             all.iter().map(|info| attached_devices(&info.id)).collect();
         let phone_attached = attached.iter().any(|devices| devices.contains(&device.id));
@@ -220,7 +250,9 @@ impl Page {
         let key = serde_json::to_string(&(
             shown
                 .iter()
-                .map(|(info, attached)| (&info.id, &info.title, info.exit_status, attached))
+                .map(|(info, attached)| {
+                    (&info.id, &info.title, info.exit_status, attached, &info.cwd)
+                })
                 .collect::<Vec<_>>(),
             &device.id,
             &device.name,
@@ -304,6 +336,7 @@ impl Page {
             info.exit_status,
             info.desk_window,
             attached,
+            &info.cwd,
             &device.id,
             &device.name,
         ))
@@ -339,7 +372,7 @@ fn tile_text(lines: &[String], exit_status: Option<u32>) -> String {
 }
 
 /// "New Terminal" (a shell); its menu also offers the installed agents.
-fn new_terminal_button() -> adw::SplitButton {
+fn new_terminal_button(folders: &gtk::gio::Menu) -> adw::SplitButton {
     let menu = gtk::gio::Menu::new();
     menu.append(Some("Shell"), Some("win.new-terminal::shell"));
     let agents = crate::terminal_previews::installed_agents();
@@ -349,6 +382,12 @@ fn new_terminal_button() -> adw::SplitButton {
     if agents.iter().any(|agent| agent == "codex") {
         menu.append(Some("Codex"), Some("win.new-terminal::codex"));
     }
+    let menu = {
+        let sections = gtk::gio::Menu::new();
+        sections.append_section(None, &menu);
+        sections.append_section(Some("Start in"), folders);
+        sections
+    };
     let content = adw::ButtonContent::builder()
         .icon_name("list-add-symbolic")
         .label("New Terminal")
@@ -359,11 +398,12 @@ fn new_terminal_button() -> adw::SplitButton {
         .action_name("win.new-terminal")
         .action_target(&"shell".to_variant())
         .tooltip_text("Start a shared terminal here")
-        .dropdown_tooltip("More kinds of terminal")
+        .dropdown_tooltip("More kinds of terminal, and where to start")
         .valign(gtk::Align::Center)
         .css_classes(["suggested-action"])
         .build();
     button.update_property(&[gtk::accessible::Property::Label("New Terminal")]);
+    button.set_widget_name("new-terminal");
     button
 }
 
@@ -408,6 +448,17 @@ fn tile(
         &["mono", "tile-meta"],
     ));
     content.append(&head);
+    if let Some(folder) = &info.cwd {
+        let place = ellipsized(
+            &match &info.shell {
+                Some(shell) => format!("{folder} · {shell}"),
+                None => folder.clone(),
+            },
+            &["mono", "tile-meta"],
+        );
+        place.set_ellipsize(gtk::pango::EllipsizeMode::Start);
+        content.append(&place);
+    }
 
     let (lines, _) = preview(info);
     let body = gtk::Label::builder()
@@ -665,8 +716,17 @@ fn detail_view(
         .css_classes(["boxed-list", "compact-list"])
         .build();
     for (label, value) in [
+        (
+            "Folder",
+            info.cwd.clone().unwrap_or_else(|| "—".to_string()),
+        ),
+        (
+            "Shell",
+            info.shell
+                .clone()
+                .unwrap_or_else(|| info.title.trim_start_matches('-').to_string()),
+        ),
         ("Started", started(&info.id).unwrap_or_default()),
-        ("Shell", info.title.trim_start_matches('-').to_string()),
         ("Size", format!("{}×{}", info.cols, info.rows)),
     ] {
         let row = gtk::Box::builder()

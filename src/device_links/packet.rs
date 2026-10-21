@@ -36,8 +36,6 @@ pub const PACKET_TYPE_LOCK_REQUEST: &str = "desklink.lock.request";
 pub const PACKET_TYPE_FINDMYPHONE_REQUEST: &str = "desklink.findmyphone.request";
 pub const PACKET_TYPE_MPRIS: &str = "desklink.mpris";
 pub const PACKET_TYPE_MPRIS_REQUEST: &str = "desklink.mpris.request";
-pub const PACKET_TYPE_SFTP: &str = "desklink.sftp";
-pub const PACKET_TYPE_SFTP_REQUEST: &str = "desklink.sftp.request";
 pub const PACKET_TYPE_BATTERY: &str = "desklink.battery";
 pub const PACKET_TYPE_NOTIFICATION: &str = "desklink.notification";
 pub const PACKET_TYPE_NOTIFICATION_REQUEST: &str = "desklink.notification.request";
@@ -48,6 +46,16 @@ pub const PACKET_TYPE_SYSTEMVOLUME: &str = "desklink.systemvolume";
 pub const PACKET_TYPE_SYSTEMVOLUME_REQUEST: &str = "desklink.systemvolume.request";
 pub const PACKET_TYPE_RUNCOMMAND: &str = "desklink.runcommand";
 pub const PACKET_TYPE_RUNCOMMAND_REQUEST: &str = "desklink.runcommand.request";
+pub const PACKET_TYPE_DIGITIZER_SESSION: &str = "desklink.digitizer.session";
+pub const PACKET_TYPE_DIGITIZER: &str = "desklink.digitizer";
+/// The desk's own settings, reported to a phone (desk → phone).
+pub const PACKET_TYPE_SETTINGS: &str = "desklink.settings";
+/// A phone changing one of the desk's settings (phone → desk), allow-listed.
+pub const PACKET_TYPE_SETTINGS_REQUEST: &str = "desklink.settings.request";
+/// Unlock with the phone: the desk's nonce, or the phone asking for one.
+pub const PACKET_TYPE_UNLOCK_REQUEST: &str = "desklink.unlock.request";
+/// Lock & Hand Off: the terminal to continue on the phone (desk → phone).
+pub const PACKET_TYPE_HANDOFF: &str = "desklink.handoff";
 pub const PACKET_TYPE_SCREEN_REQUEST: &str = "desklink.screen.request";
 pub const PACKET_TYPE_SCREEN_READY: &str = "desklink.screen.ready";
 pub const PACKET_TYPE_SCREEN_FRAME: &str = "desklink.screen.frame";

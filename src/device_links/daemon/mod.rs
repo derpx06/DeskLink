@@ -31,6 +31,21 @@ pub(super) const HEARTBEAT_IDLE: std::time::Duration = std::time::Duration::from
 /// once with the phone refusing to dial a desktop that was idle and waiting.
 pub(super) const HEARTBEAT_DEAD: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// [`HEARTBEAT_DEAD`] while the phone reports `dozing`: its OS has frozen it,
+/// so it cannot answer, and dropping the link once per freeze cycle would
+/// only churn it. The kernel TCP keepalive (30 s / 10 s / 3, answered by the
+/// phone's kernel even while frozen) still finds a phone that truly vanished.
+pub(super) const HEARTBEAT_DEAD_DOZING: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// The LAN link's silence budget for a phone that is (or is not) dozing.
+pub(super) fn heartbeat_dead(dozing: bool) -> std::time::Duration {
+    if dozing {
+        HEARTBEAT_DEAD_DOZING
+    } else {
+        HEARTBEAT_DEAD
+    }
+}
+
 /// Reads each connected device's ICE path into its view, logging changes.
 /// Every few seconds, off the UI thread: reading stats waits on webrtcbin.
 fn refresh_connection_paths(
@@ -42,11 +57,13 @@ fn refresh_connection_paths(
         .map(|devices| devices.keys().cloned().collect())
         .unwrap_or_default();
     for id in ids {
-        let path = sessions
+        let reading = sessions
             .ready_peer(&id)
             .and_then(|(peer, via_relay)| peer.path(via_relay));
+        let (path, rtt) = reading.map_or((None, None), |(path, rtt)| (Some(path), rtt));
         let changed = devices.lock().ok().and_then(|mut devices| {
             let device = devices.get_mut(&id)?;
+            device.rtt_ms = rtt;
             let path = path.map(str::to_string);
             (device.connection_path != path).then(|| {
                 device.connection_path = path.clone();
@@ -68,7 +85,12 @@ fn run_liveness_tick(
     sessions: &Arc<DeviceManager>,
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
 ) {
-    let tick = sessions.liveness_tick(std::time::Instant::now(), HEARTBEAT_IDLE, HEARTBEAT_DEAD);
+    let dead_after = |device_id: &str| {
+        heartbeat_dead(crate::device_links::webrtc::coordinator::is_dozing(
+            device_id,
+        ))
+    };
+    let tick = sessions.liveness_tick(std::time::Instant::now(), HEARTBEAT_IDLE, dead_after);
 
     for binding in tick.probe {
         let packet = super::packet::NetworkPacket::new(super::packet::PACKET_TYPE_HEARTBEAT);
@@ -81,7 +103,7 @@ fn run_liveness_tick(
         eprintln!(
             "[Daemon] No traffic from {} in {}s; treating the link as dead",
             binding.device_id,
-            HEARTBEAT_DEAD.as_secs()
+            dead_after(&binding.device_id).as_secs()
         );
         handshake::handle_disconnect(
             &binding,
@@ -94,6 +116,10 @@ fn run_liveness_tick(
 
 pub use commands::DaemonCommand;
 pub use handle::{DaemonEvent, DaemonHandle};
+pub(crate) use packet_handler::{
+    admit_lock_operation, is_desktop_locked as desktop_locked, lock_desktop,
+};
+pub(crate) use state::push_event;
 
 pub mod clipboard;
 pub mod commands;
@@ -175,6 +201,16 @@ impl DaemonWorker {
             });
         }
 
+        crate::device_links::desk_features::install(
+            Arc::clone(&sessions),
+            Arc::clone(&config),
+            Arc::clone(&devices),
+        );
+        if !cfg!(test) {
+            crate::device_links::mpris::start();
+            crate::device_links::pty::jobs::start_watch();
+        }
+
         Ok(Self {
             config,
             devices,
@@ -230,6 +266,7 @@ impl DaemonWorker {
     pub(super) fn run(self) -> Result<(), String> {
         self.start_udp_listener()?;
         self.start_broadcaster();
+        self.start_redialer();
         self.start_mdns_advertiser();
         self.start_clipboard_listener();
         self.start_status_reconciler();

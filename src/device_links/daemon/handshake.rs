@@ -78,7 +78,7 @@ pub(super) fn finish_secure_link(
     }
     // Merge, never replace. `insert` here rebuilt the `DeviceView` from the
     // identity packet, which zeroes notifications, battery, volume, media,
-    // commands and sftp state — so a Wi-Fi roam blanked every summary chip.
+    // and commands — so a Wi-Fi roam blanked every summary chip.
     // Worse, the emptied notification set made the UI's dedup table prune
     // itself, and the phone's next resync re-delivered every already-seen
     // notification as a fresh desktop popup.

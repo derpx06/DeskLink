@@ -8,7 +8,6 @@ use super::state::push_error;
 use super::DaemonWorker;
 use crate::device_links::config::terminal_access_allowed;
 use crate::device_links::device::DeviceView;
-use crate::device_links::webrtc::file_browser::{self, BrowserRequest, BrowserResponse};
 use crate::device_links::webrtc::transfer_board::{self, Finished, TransferRow};
 use crate::device_links::webrtc::{coordinator, terminal_bridge};
 
@@ -29,6 +28,8 @@ pub enum DaemonEvent {
         device_id: String,
         device_name: String,
     },
+    /// The phone offered its screen unasked: open the Phone Screen window.
+    PhoneScreenOffered { device_id: String },
 }
 
 struct DaemonStopGuard(Sender<DaemonCommand>);
@@ -115,29 +116,6 @@ impl DaemonHandle {
 
     pub fn send(&self, command: DaemonCommand) {
         let _ = self.command_tx.send(command);
-    }
-
-    /// Asks the phone for files. Returns the request's ID, which the matching
-    /// entry from [`Self::take_phone_file_replies`] carries.
-    ///
-    /// The request is validated and registered here, on the caller's thread, so
-    /// a bad name fails immediately instead of after a round trip.
-    pub fn browse_phone(
-        &self,
-        device_id: &str,
-        request: &BrowserRequest,
-    ) -> Result<String, String> {
-        let (request_id, payload) = file_browser::begin_request(device_id, request)?;
-        self.send(DaemonCommand::SendPhoneFileRequest(
-            device_id.to_string(),
-            request_id.clone(),
-            payload,
-        ));
-        Ok(request_id)
-    }
-
-    pub fn take_phone_file_replies(&self, device_id: &str) -> Vec<BrowserResponse> {
-        file_browser::take_replies(device_id)
     }
 
     /// Every file transfer in progress, for a progress view.

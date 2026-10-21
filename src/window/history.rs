@@ -128,6 +128,9 @@ pub(crate) fn history_content(
         {
             subtitle = format!("{subtitle} · {path}");
         }
+        if let Some(detail) = &entry.detail {
+            subtitle = format!("{subtitle} · {detail}");
+        }
         let row = adw::ActionRow::builder()
             .title(entry.event.label())
             .subtitle(subtitle)
@@ -137,7 +140,9 @@ pub(crate) fn history_content(
         let failed = matches!(
             entry.event,
             crate::device_links::connection_log::ConnectionEvent::PasswordRejected
+                | crate::device_links::connection_log::ConnectionEvent::UnlockRefused
         );
+
         let icon = super::icon_square(event_icon(entry.event), 32, "row-icon");
         if failed {
             icon.add_css_class("error");
@@ -196,6 +201,9 @@ fn event_icon(event: crate::device_links::connection_log::ConnectionEvent) -> &'
         PasswordRejected => "dialog-warning-symbolic",
         SessionsEnded => "process-stop-symbolic",
         Route => "network-workgroup-symbolic",
+        SettingsChanged => "emblem-system-symbolic",
+        UnlockRefused => "dialog-warning-symbolic",
+        UnlockedByPhone => "changes-allow-symbolic",
     }
 }
 

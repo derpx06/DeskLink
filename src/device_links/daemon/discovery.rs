@@ -25,7 +25,109 @@ fn should_publish_outgoing_failure(sessions: &DeviceManager, device_id: &str) ->
     sessions.wants_bootstrap_connection(device_id)
 }
 
+/// What a paired phone last said about itself and the TCP port it listens
+/// on, from its identity (a beacon, or an incoming connection's first line).
+/// The address comes from its `DeviceView`.
+fn known_endpoints() -> &'static Mutex<HashMap<String, (DeviceInfo, u16)>> {
+    static KNOWN: std::sync::OnceLock<Mutex<HashMap<String, (DeviceInfo, u16)>>> =
+        std::sync::OnceLock::new();
+    KNOWN.get_or_init(Default::default)
+}
+
+/// Records `info`'s listening port from an identity packet, when it has one.
+pub(super) fn remember_endpoint(info: &DeviceInfo, packet: &NetworkPacket) {
+    let Some(port) = packet
+        .get_i64("tcpPort")
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| (MIN_TCP_PORT..=MAX_TCP_PORT).contains(port))
+    else {
+        return;
+    };
+    if let Ok(mut known) = known_endpoints().lock() {
+        known.insert(info.id.clone(), (info.clone(), port));
+    }
+}
+
+/// How often paired phones without a bootstrap link are redialled.
+const REDIAL_EVERY: Duration = Duration::from_secs(3);
+
+/// The paired phones to dial now: no live bootstrap link (whether or not
+/// their WebRTC peer survives), a last-known address and listening port.
+fn redial_targets(
+    devices: &HashMap<String, DeviceView>,
+    known: &HashMap<String, (DeviceInfo, u16)>,
+    wants: impl Fn(&str) -> bool,
+) -> Vec<(DeviceInfo, std::net::IpAddr, u16)> {
+    devices
+        .values()
+        .filter(|device| device.trusted && wants(&device.id))
+        .filter_map(|device| {
+            let ip = device.address.parse().ok()?;
+            let (info, port) = known.get(&device.id)?;
+            Some((info.clone(), ip, *port))
+        })
+        .collect()
+}
+
 impl DaemonWorker {
+    /// Keeps a TCP link to every paired phone it can reach. The phone often
+    /// cannot dial in: on its own hotspot it hears only its own beacons, and
+    /// a phone whose screen is off is frozen by its OS until *inbound* TCP
+    /// arrives — this link (and its 10 s heartbeat) is how it is thawed. So
+    /// the desk dials the last-known address itself, including while a
+    /// WebRTC peer survives without its bootstrap socket (the new socket is
+    /// adopted into the session; see `attach_bootstrap_link`). Failures are
+    /// expected and not shown.
+    pub(super) fn start_redialer(&self) {
+        let devices = Arc::clone(&self.devices);
+        let sessions = Arc::clone(&self.sessions);
+        let config = Arc::clone(&self.config);
+        let events = Arc::clone(&self.events);
+        let shutdown = Arc::clone(&self.shutdown);
+        thread::spawn(move || {
+            while !shutdown.load(Ordering::Acquire) {
+                thread::sleep(REDIAL_EVERY);
+                let targets = {
+                    let (Ok(devices), Ok(known)) = (devices.lock(), known_endpoints().lock())
+                    else {
+                        continue;
+                    };
+                    redial_targets(&devices, &known, |id| {
+                        sessions.wants_bootstrap_connection(id)
+                    })
+                };
+                for (info, ip, port) in targets {
+                    let Some(slot) = super::network::HandshakeSlot::claim(ip) else {
+                        continue;
+                    };
+                    let (config, devices, sessions, events) = (
+                        Arc::clone(&config),
+                        Arc::clone(&devices),
+                        Arc::clone(&sessions),
+                        Arc::clone(&events),
+                    );
+                    let _ = thread::Builder::new().spawn(move || {
+                        let _slot = slot;
+                        let id = info.id.clone();
+                        if let Err(error) = connect_to_device(
+                            info,
+                            SocketAddr::new(ip, port),
+                            port,
+                            config,
+                            devices,
+                            sessions,
+                            events,
+                        ) {
+                            debug_log!(
+                                "[DL-WRTC-BOOT] redial of {id} at {ip}:{port} failed: {error}"
+                            );
+                        }
+                    });
+                }
+            }
+        });
+    }
+
     pub(super) fn start_udp_listener(&self) -> Result<(), String> {
         let socket = bind_udp_listener()?;
         socket
@@ -278,6 +380,7 @@ fn handle_identity_packet(
         return;
     }
     upsert_device(devices, &info, address.ip().to_string(), paired);
+    remember_endpoint(&info, &packet);
 
     let Some(remote_port) = packet
         .get_i64("tcpPort")
@@ -333,6 +436,48 @@ fn handle_identity_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paired_phones_without_a_live_link_are_redialled_at_their_last_address() {
+        let info = |id: &str| DeviceInfo {
+            id: id.into(),
+            name: id.into(),
+            device_type: "phone".into(),
+            protocol_version: 9,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+        };
+        let view = |id: &str, address: &str, trusted: bool| {
+            DeviceView::from_info(&info(id), address.to_string(), trusted)
+        };
+        let devices: HashMap<String, DeviceView> = [
+            view("linked", "10.0.0.2", true),
+            view("unlinked", "10.0.0.3", true),
+            view("stranger", "10.0.0.4", false),
+            view("no-port", "10.0.0.5", true),
+            view("relay-only", "unknown", true),
+        ]
+        .into_iter()
+        .map(|device| (device.id.clone(), device))
+        .collect();
+        let mut beacon = NetworkPacket::new(PACKET_TYPE_IDENTITY);
+        beacon.set("tcpPort", 1716);
+        for id in ["linked", "unlinked", "stranger", "relay-only"] {
+            remember_endpoint(&info(id), &beacon);
+        }
+        let mut odd = NetworkPacket::new(PACKET_TYPE_IDENTITY);
+        odd.set("tcpPort", 22);
+        remember_endpoint(&info("no-port"), &odd);
+        let known = known_endpoints().lock().unwrap().clone();
+        // `wants` is the session's view: here only "linked" has a live socket.
+        let targets = redial_targets(&devices, &known, |id| id != "linked");
+        let dialled: Vec<_> = targets
+            .iter()
+            .map(|(info, ip, port)| (info.id.as_str(), ip.to_string(), *port))
+            .collect();
+        assert_eq!(dialled, [("unlinked", "10.0.0.3".to_string(), 1716)]);
+    }
     use crate::device_links::core::SessionLink;
 
     #[test]

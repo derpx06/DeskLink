@@ -37,19 +37,26 @@ pub(super) fn bind_tcp_listener() -> Result<TcpListener, String> {
     ))
 }
 
-/// Enables aggressive TCP keepalive on a device link.
+/// Kernel TCP keepalive on a device link: idle 30 s, then a probe every
+/// 10 s, gone after 3 unanswered (as KDE Connect's `lanlinkprovider.cpp`).
 ///
 /// A Wi-Fi drop, a suspended phone, or a killed peer process leaves the socket
 /// open with no FIN. Without keepalive the reader simply times out forever, the
 /// session is never marked disconnected, and the device keeps reading as
 /// connected — the system's default keepalive would take roughly two hours to
-/// notice. These settings surface a dead peer in about half a minute.
+/// notice. The kernel answers these probes even while the phone's app is
+/// frozen (screen off), so a dozing phone is kept and a vanished one is found
+/// within about a minute; the 30 s app heartbeat usually finds it first.
+pub(super) const KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+pub(super) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+pub(super) const KEEPALIVE_COUNT: u32 = 3;
+
 pub(super) fn enable_keepalive(stream: &TcpStream) {
     let keepalive = TcpKeepalive::new()
-        .with_time(Duration::from_secs(15))
-        .with_interval(Duration::from_secs(5));
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL);
     #[cfg(not(any(target_os = "windows", target_os = "openbsd")))]
-    let keepalive = keepalive.with_retries(3);
+    let keepalive = keepalive.with_retries(KEEPALIVE_COUNT);
 
     if let Err(error) = SockRef::from(stream).set_tcp_keepalive(&keepalive) {
         eprintln!("[Daemon] Could not enable TCP keepalive on a device link: {error}");
@@ -259,6 +266,19 @@ pub(super) fn ssl_connector(config: &Arc<Mutex<Config>>) -> Result<SslConnector,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_links_get_kernel_keepalive() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        enable_keepalive(&stream);
+        let socket = SockRef::from(&stream);
+        assert!(socket.keepalive().unwrap());
+        assert_eq!(socket.tcp_keepalive_time().unwrap(), KEEPALIVE_IDLE);
+        assert_eq!(socket.tcp_keepalive_interval().unwrap(), KEEPALIVE_INTERVAL);
+        assert_eq!(socket.tcp_keepalive_retries().unwrap(), KEEPALIVE_COUNT);
+        assert!(stream.nodelay().unwrap());
+    }
 
     #[test]
     fn preauth_handshakes_are_capped_and_slots_are_released() {

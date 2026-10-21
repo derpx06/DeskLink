@@ -257,7 +257,13 @@ pub fn show_remote_control_dialog(
     overlay.add_overlay(&status);
     toolbar.set_content(Some(&overlay));
 
-    daemon.send(DaemonCommand::StartPhoneRemoteControl(device.to_string()));
+    // A screen the phone offered is already being started under its id.
+    if matches!(
+        session_state(device.as_str()),
+        None | Some(SessionState::Idle | SessionState::Stopped)
+    ) {
+        daemon.send(DaemonCommand::StartPhoneRemoteControl(device.to_string()));
+    }
     let last_start = Rc::new(Cell::new(std::time::Instant::now()));
     let last_control_request = Rc::new(Cell::new(std::time::Instant::now()));
 
@@ -728,6 +734,7 @@ mod tests {
             is_charging: charging,
             battery_quantity: None,
             threshold_event: None,
+            charge_time_remaining: None,
         };
         assert_eq!(
             phone_status_line(Some(&battery(22, true)), "14:39"),

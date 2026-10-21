@@ -129,16 +129,6 @@ impl FeatureTransport {
         )
     }
 
-    /// Sends a phone-file browser request on the WebRTC file-control channel.
-    /// There is no LAN fallback: the phone's files are only offered over the
-    /// authenticated peer connection.
-    pub(crate) fn send_phone_file_request(&self, payload: &[u8]) -> Result<(), String> {
-        if !self.is_ready() {
-            return Err("DeskLink WebRTC feature transport is not ready".to_string());
-        }
-        crate::device_links::webrtc::file_browser::send_request(&self.snapshot, payload)
-    }
-
     pub(crate) fn start_phone_remote_control(&self) -> Result<(), String> {
         crate::device_links::webrtc::coordinator::start_phone_remote_control(
             &self.sessions,
@@ -228,7 +218,7 @@ mod tests {
 
         let error = transport
             .send(&NetworkPacket::new(
-                crate::device_links::packet::PACKET_TYPE_MPRIS_REQUEST,
+                crate::device_links::packet::PACKET_TYPE_SYSTEMVOLUME_REQUEST,
             ))
             .unwrap_err();
         assert!(error.contains("not enabled in the DeskLink feature profile"));

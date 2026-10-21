@@ -1,10 +1,16 @@
 # DeskLink GNOME Shell extension
 
-Shows DeskLink in the GNOME top bar (GNOME 45–51): a Quick Settings tile with
-your paired phones, their battery, how they are connected and what they are
-doing on this computer, plus Ring, Send files…, Browse files, New terminal and
-End sessions. A panel icon appears while a phone is connected or using this
-computer. It needs the DeskLink app running; while it is not, nothing is shown.
+Shows DeskLink in the GNOME top bar (GNOME 45–51): a pill with the link glyph
+(computer, wire, phone; green while a phone is connected) and a coral dot while
+a phone is using this computer. Its menu lists what is live now, each with
+End, then End Everything, the desk's tiles (Keep Awake, Clipboard, Send Files,
+Ring Phone), Lock & Hand Off and Open DeskLink. It needs the DeskLink app
+running; while it is not, nothing is shown.
+
+On the lock screen (`session-modes: ["user", "unlock-dialog"]`) it shows only
+"Unlock with <phone>", and only while the app offers it: "Unlock with <phone>
+nearby" is on in DeskLink's Preferences and the phone is connected on this
+network. The phone must still approve each unlock.
 
 The extension only talks to the app over D-Bus
 (`derx06.desklink.com.Shell1` at `/derx06/desklink/com/Shell`, see
@@ -22,8 +28,12 @@ On Wayland the Shell only picks up a newly installed extension after you log
 out and back in. On X11, Alt+F2 `r` restarts the Shell instead.
 
 Distribution packages built with Meson install it system-wide to
-`/usr/share/gnome-shell/extensions/`; DeskLink offers to enable it once on
-GNOME when no tray host is present.
+`/usr/share/gnome-shell/extensions/`. The app also carries a copy: its
+"Turn On" button (Preferences → Appearance → Top-bar menu, or the one-time
+notification on GNOME without a tray host) writes it to
+`~/.local/share/gnome-shell/extensions/` when missing or outdated, then sets
+`org.gnome.shell disable-user-extensions=false` and adds it to
+`enabled-extensions`. Nothing changes until that button is clicked.
 
 Logs: `journalctl -f -o cat /usr/bin/gnome-shell`.
 
@@ -38,6 +48,3 @@ Logs: `journalctl -f -o cat /usr/bin/gnome-shell`.
    <https://gjs.guide/extensions/review-guidelines/review-guidelines.html>):
    nothing may be created before `enable()`, and `disable()` must undo
    everything.
-
-Once published, DeskLink's "Show" button installs it through GNOME's own
-confirmation dialog (`org.gnome.Shell.Extensions.InstallRemoteExtension`).

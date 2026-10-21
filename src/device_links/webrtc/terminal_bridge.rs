@@ -61,6 +61,9 @@ const MAX_OUTBOX_BYTES: usize = 8 * 1024 * 1024;
 const REAP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Controls are rare next to chunks and the queue is bounded; boxing them would
+// only add an allocation per control.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum TerminalEvent {
     SendControl(TerminalControl),
     SendChunk(TerminalChunk),
@@ -123,6 +126,9 @@ pub(crate) struct TerminalBridge {
     outbox_bytes: usize,
     /// One "input was refused" report per burst, not one per keystroke chunk.
     input_refusal_reported: bool,
+    /// Terminals another phone is attached to, refreshed before each use
+    /// (for `sessions[].attached`).
+    elsewhere: HashSet<String>,
 }
 
 impl TerminalBridge {
@@ -134,6 +140,7 @@ impl TerminalBridge {
             outbox: VecDeque::new(),
             outbox_bytes: 0,
             input_refusal_reported: false,
+            elsewhere: HashSet::new(),
         }
     }
 
@@ -179,15 +186,34 @@ impl TerminalBridge {
     /// The caller must have validated `control` against this bridge's wire
     /// binding and checked the user's consent first. Replies are queued for the
     /// pump; nothing is sent from here.
+    /// [`Self::handle_control_in`], resolving `create`'s folder here (tests).
+    #[cfg(test)]
     pub(crate) fn handle_control(
         &mut self,
         control: &TerminalControl,
         registry: &mut TerminalRegistry,
     ) -> Result<(), String> {
+        self.handle_control_in(control, registry, &Start::of(control))
+    }
+
+    /// Handles one control message; `start` is `create`'s folder, resolved
+    /// by the caller before any lock was taken.
+    pub(crate) fn handle_control_in(
+        &mut self,
+        control: &TerminalControl,
+        registry: &mut TerminalRegistry,
+        start: &Start,
+    ) -> Result<(), String> {
         match control.action {
             TerminalAction::List => {
-                let sessions = sessions_event(&self.wire, registry);
+                let sessions = sessions_event(&self.wire, registry, &self.elsewhere);
                 self.queue(vec![sessions])
+            }
+
+            TerminalAction::Create if matches!(start, Start::Bad) => {
+                audit("create-refused", self.device(), None);
+                self.refuse(None, BAD_CWD);
+                Ok(())
             }
 
             TerminalAction::Create => {
@@ -198,7 +224,19 @@ impl TerminalBridge {
                 });
                 let rows = control.rows.unwrap_or(24);
                 let cols = control.cols.unwrap_or(80);
-                match registry.create(command, rows, cols, &self.wire.peer_device_id) {
+                let cwd = match start {
+                    Start::In(path) => Some(path.clone()),
+                    _ => None,
+                };
+                let made = registry.create_in(
+                    command,
+                    rows,
+                    cols,
+                    &self.wire.peer_device_id,
+                    cwd.as_deref(),
+                    None,
+                );
+                match made {
                     Ok(info) => {
                         audit("create", self.device(), Some(&info.id));
                         // The same session opens at the desk, so it can be
@@ -210,7 +248,7 @@ impl TerminalBridge {
                         reply.terminal_id = Some(info.id);
                         reply.rows = Some(info.rows);
                         reply.cols = Some(info.cols);
-                        let sessions = sessions_event(&self.wire, registry);
+                        let sessions = sessions_event(&self.wire, registry, &self.elsewhere);
                         self.queue(vec![TerminalEvent::SendControl(reply), sessions])
                     }
                     Err(error) => {
@@ -309,7 +347,7 @@ impl TerminalBridge {
                 audit("close", self.device(), Some(id));
                 let mut reply = TerminalControl::new(TerminalAction::Closed, &self.wire);
                 reply.terminal_id = Some(id.to_string());
-                let sessions = sessions_event(&self.wire, registry);
+                let sessions = sessions_event(&self.wire, registry, &self.elsewhere);
                 self.queue(vec![TerminalEvent::SendControl(reply), sessions])
             }
 
@@ -341,6 +379,7 @@ impl TerminalBridge {
             // is what keeps a report from being mistaken for an instruction.
             TerminalAction::Sessions
             | TerminalAction::Created
+            | TerminalAction::Finished
             | TerminalAction::Attached
             | TerminalAction::Closed
             | TerminalAction::Error => Err(format!(
@@ -457,7 +496,7 @@ impl TerminalBridge {
                 attachment.told_size = size;
                 attachment.told_desk_window = desk_window;
             }
-            let list = sessions_event(&self.wire, registry);
+            let list = sessions_event(&self.wire, registry, &self.elsewhere);
             remaining = remaining.saturating_sub(list.cost());
             events.push(list);
         }
@@ -577,6 +616,37 @@ impl TerminalBridge {
     }
 }
 
+/// The error a `create` gets when its folder is not a readable directory.
+pub(crate) const BAD_CWD: &str = "bad-cwd";
+
+/// Where a `create` asked to start, resolved; `None` when it asked for
+/// nothing or for somewhere unusable.
+/// Where a `create` starts. Resolved before any lock is taken: checking a
+/// folder on a hung network mount blocks, and the bridges and registry locks
+/// are also taken by the UI thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Start {
+    /// No folder asked for (or not a `create`): the home folder.
+    Home,
+    In(std::path::PathBuf),
+    /// Asked for a folder that is not an existing readable directory.
+    Bad,
+}
+
+impl Start {
+    pub(crate) fn of(control: &TerminalControl) -> Self {
+        let Some(asked) = control.cwd.as_deref() else {
+            return Self::Home;
+        };
+        if control.action != TerminalAction::Create {
+            return Self::Home;
+        }
+        dirs::home_dir()
+            .and_then(|home| crate::device_links::pty::registry::resolve_cwd(asked, &home))
+            .map_or(Self::Bad, Self::In)
+    }
+}
+
 /// Splits an oversized payload into wire-legal frames.
 ///
 /// A snapshot of a large screen exceeds one frame, and the receiving VT parser
@@ -661,9 +731,11 @@ pub(crate) fn end(device_id: &str, token: u64) {
 /// superseded and its pump thread should stop.
 pub(crate) fn pump_once(device_id: &str, token: u64, budget: usize) -> Option<Vec<TerminalEvent>> {
     let mut open = bridges().lock().ok()?;
+    let elsewhere = attached_elsewhere(&open, device_id);
     let bridge = open
         .get_mut(device_id)
         .filter(|bridge| bridge.token == token)?;
+    bridge.elsewhere = elsewhere;
     let mut registry = registry().lock().ok()?;
     Some(bridge.pump(budget, &mut registry))
 }
@@ -676,10 +748,12 @@ fn with_bridge<R>(
     let mut open = bridges()
         .lock()
         .map_err(|_| "DeskLink terminal bridge lock poisoned".to_string())?;
+    let elsewhere = attached_elsewhere(&open, &wire.peer_device_id);
     let bridge = open
         .get_mut(&wire.peer_device_id)
         .filter(|bridge| bridge.wire == *wire)
         .ok_or_else(|| "DeskLink terminal connection was replaced".to_string())?;
+    bridge.elsewhere = elsewhere;
     let mut registry = registry()
         .lock()
         .map_err(|_| "DeskLink terminal registry lock poisoned".to_string())?;
@@ -749,9 +823,18 @@ pub(crate) fn process_envelope(
                     });
                 }
             }
-            with_bridge(wire, |bridge, registry| {
-                bridge.handle_control(&control, registry)
-            })
+            let start = Start::of(&control);
+            let handled = with_bridge(wire, |bridge, registry| {
+                bridge.handle_control_in(&control, registry, &start)
+            });
+            // Remembered after every lock is released (it writes the config).
+            if let (Ok(()), Start::In(path)) = (&handled, start) {
+                let folder = crate::device_links::pty::registry::tilde(&path);
+                crate::device_links::desk_features::run_later(move || {
+                    crate::device_links::desk_features::remember_folder(&folder)
+                });
+            }
+            handled
         }
         TERMINAL_CHUNK_MESSAGE_TYPE => {
             let chunk = TerminalChunk::decode(&payload)?;
@@ -813,6 +896,38 @@ pub(crate) fn end_device_sessions(device_id: &str) {
     match open.get_mut(device_id) {
         Some(bridge) => bridge.end(&mut registry, TERMINAL_ENDED),
         None => registry.release_writer(device_id),
+    }
+}
+
+/// Terminals some phone other than `device_id` is attached to.
+fn attached_elsewhere(open: &HashMap<String, TerminalBridge>, device_id: &str) -> HashSet<String> {
+    open.iter()
+        .filter(|(device, _)| device.as_str() != device_id)
+        .flat_map(|(_, bridge)| bridge.attached.keys().cloned())
+        .collect()
+}
+
+/// A long job in `terminal_id` finished: every phone with the terminal
+/// channel open is told (it stays quiet if that terminal is on screen).
+pub(crate) fn announce_finished(terminal_id: &str, job: &str, secs: u64) {
+    let settings = crate::device_links::config::app_settings();
+    let Ok(mut open) = bridges().lock() else {
+        return;
+    };
+    for bridge in open.values_mut() {
+        // Only phones that could open the terminal now, and want to hear.
+        let device = bridge.device();
+        if !settings.alerts_commands_to(device)
+            || !terminal_access_allowed(device)
+            || !crate::device_links::session_lock::is_unlocked(device, bridge.wire.generation)
+        {
+            continue;
+        }
+        let mut finished = TerminalControl::new(TerminalAction::Finished, &bridge.wire);
+        finished.terminal_id = Some(terminal_id.to_string());
+        finished.job = Some(job.to_string());
+        finished.secs = Some(secs);
+        bridge.queue_always(TerminalEvent::SendControl(finished));
     }
 }
 
@@ -910,20 +1025,40 @@ fn require_id(control: &TerminalControl) -> Result<&str, String> {
 ///
 /// Lists first and reaps after: reaping first hid the exit status of every
 /// finished session from the one reply that could have shown it.
-fn sessions_event(wire: &WebRtcWireBinding, registry: &mut TerminalRegistry) -> TerminalEvent {
+fn sessions_event(
+    wire: &WebRtcWireBinding,
+    registry: &mut TerminalRegistry,
+    elsewhere: &HashSet<String>,
+) -> TerminalEvent {
     let listed = registry.list();
     registry.reap();
     let mut message = TerminalControl::new(TerminalAction::Sessions, wire);
+    let recent = if cfg!(test) {
+        Vec::new()
+    } else {
+        crate::device_links::config::app_settings().recent_folders
+    };
+    message.folders = Some(crate::device_links::pty::registry::folders(
+        &listed, &recent,
+    ));
     message.sessions = Some(
         listed
             .into_iter()
-            .map(|info| TerminalSessionInfo {
-                terminal_id: info.id,
-                title: info.title,
-                rows: info.rows,
-                cols: info.cols,
-                exit_status: info.exit_status,
-                desk_window: info.desk_window,
+            .map(|info| {
+                // Attached by a phone other than the one asking.
+                let attached = elsewhere.contains(&info.id);
+                TerminalSessionInfo {
+                    terminal_id: info.id,
+                    title: info.title,
+                    rows: info.rows,
+                    cols: info.cols,
+                    exit_status: info.exit_status,
+                    desk_window: info.desk_window,
+                    attached,
+                    cwd: info.cwd,
+                    started_at: Some(info.started_at),
+                    shell: info.shell,
+                }
             })
             .collect(),
     );
@@ -1779,9 +1914,22 @@ mod tests {
                     cols: 1000,
                     exit_status: Some(u32::MAX),
                     desk_window: true,
+                    attached: true,
+                    cwd: Some(
+                        "\u{10348}"
+                            .repeat(crate::device_links::pty::registry::MAX_REPORTED_CWD / 4),
+                    ),
+                    started_at: Some(u64::MAX),
+                    shell: Some("\u{10348}".repeat(4)),
                 })
                 .collect(),
         );
+        message.folders = Some(vec![
+            "/".repeat(
+                crate::device_links::pty::registry::MAX_REPORTED_CWD
+            );
+            8
+        ]);
         let payload = message.to_json().unwrap();
         let envelope = WebRtcEnvelope::create(
             &wire,

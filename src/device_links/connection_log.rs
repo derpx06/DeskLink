@@ -31,6 +31,13 @@ pub enum ConnectionEvent {
     SessionsEnded,
     /// The connection's path was learned or changed (see `path`).
     Route,
+    /// The phone changed one of this computer's settings (`detail`:
+    /// "key=value").
+    SettingsChanged,
+    /// The phone asked to unlock this computer and was refused (`detail`:
+    /// the reason code).
+    UnlockRefused,
+    UnlockedByPhone,
 }
 
 impl ConnectionEvent {
@@ -46,6 +53,9 @@ impl ConnectionEvent {
             Self::PasswordRejected => "Wrong session password",
             Self::SessionsEnded => "Sessions ended from this computer",
             Self::Route => "Connection path",
+            Self::SettingsChanged => "Changed a setting here",
+            Self::UnlockRefused => "Unlock refused",
+            Self::UnlockedByPhone => "Unlocked this computer",
         }
     }
 }
@@ -60,6 +70,10 @@ pub struct ConnectionEntry {
     /// How the devices were connected (`"lan"`, `"direct"`, `"turn"`), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// What changed or why, for the events that say (`settings-changed`,
+    /// `unlock-refused`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// Serializes appends and the startup prune, so lines never interleave.
@@ -116,12 +130,22 @@ pub fn record(device_id: &str, event: ConnectionEvent) {
 }
 
 pub fn record_with_path(device_id: &str, event: ConnectionEvent, path: Option<&str>) {
+    write_entry(device_id, event, path, None);
+}
+
+/// Records `event` with what changed or why.
+pub fn record_detail(device_id: &str, event: ConnectionEvent, detail: &str) {
+    write_entry(device_id, event, None, Some(detail));
+}
+
+fn write_entry(device_id: &str, event: ConnectionEvent, path: Option<&str>, detail: Option<&str>) {
     let entry = ConnectionEntry {
         ts: now(),
         device_id: device_id.to_string(),
         device_name: name_of(device_id),
         event,
         path: path.map(str::to_string),
+        detail: detail.map(str::to_string),
     };
     if let Some(path) = log_path() {
         append(&path, &entry);
@@ -283,6 +307,7 @@ mod tests {
             device_name: "Pixel".into(),
             event,
             path: None,
+            detail: None,
         }
     }
 
@@ -319,5 +344,21 @@ mod tests {
         assert_eq!(text.lines().count(), 2);
         assert!(text.contains("\"screen-control-started\""));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn older_entries_without_a_detail_still_read() {
+        let old = r#"{"ts":5,"device_id":"phone","device_name":"Pixel","event":"connected"}"#;
+        let parsed: ConnectionEntry = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.detail, None);
+        let mut refused = entry(6, ConnectionEvent::UnlockRefused);
+        refused.detail = Some("not-lan".into());
+        let line = serde_json::to_string(&refused).unwrap();
+        assert!(line.contains("\"detail\":\"not-lan\""), "{line}");
+        assert!(
+            !serde_json::to_string(&entry(7, ConnectionEvent::Connected))
+                .unwrap()
+                .contains("detail")
+        );
     }
 }

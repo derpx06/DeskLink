@@ -23,6 +23,10 @@ use super::session::PtySession;
 /// cannot exhaust file descriptors or spawn shells without bound.
 pub(crate) const MAX_SESSIONS: usize = 32;
 
+/// Longer folders are not reported: the whole session list must fit in one
+/// terminal-control message (32 sessions and 8 folders at this length do).
+pub(crate) const MAX_REPORTED_CWD: usize = 512;
+
 /// Sessions one phone may have created and still open. Well under the global
 /// cap, so a single (or compromised) phone cannot use up every slot the desktop
 /// user might want for themselves.
@@ -45,6 +49,12 @@ pub(crate) struct SessionInfo {
     pub(crate) exit_status: Option<u32>,
     /// A terminal window at the desk is showing this session.
     pub(crate) desk_window: bool,
+    /// The foreground process's directory, `$HOME` written `~`.
+    pub(crate) cwd: Option<String>,
+    /// When it started, in Unix seconds.
+    pub(crate) started_at: u64,
+    /// The shell's name ("bash").
+    pub(crate) shell: Option<String>,
 }
 
 #[derive(Default)]
@@ -74,6 +84,19 @@ impl TerminalRegistry {
         cols: u16,
         owner: &str,
     ) -> Result<SessionInfo, String> {
+        self.create_in(command, rows, cols, owner, None, None)
+    }
+
+    /// [`Self::create`] in directory `cwd` and titled `title`, when given.
+    pub(crate) fn create_in(
+        &mut self,
+        command: Option<CommandBuilder>,
+        rows: u16,
+        cols: u16,
+        owner: &str,
+        cwd: Option<&std::path::Path>,
+        title: Option<&str>,
+    ) -> Result<SessionInfo, String> {
         // Reap first: a machine that has accumulated finished shells should not
         // refuse a new one just because nobody has listed sessions lately.
         self.reap();
@@ -92,7 +115,7 @@ impl TerminalRegistry {
                 "This device already has {MAX_SESSIONS_PER_DEVICE} terminal sessions open"
             ));
         }
-        let session = Arc::new(PtySession::spawn(command, rows, cols)?);
+        let session = Arc::new(PtySession::spawn_in(command, rows, cols, cwd, title)?);
         let info = describe(&session);
         self.owners.insert(info.id.clone(), owner.to_string());
         self.sessions.insert(info.id.clone(), session);
@@ -235,7 +258,94 @@ fn describe(session: &PtySession) -> SessionInfo {
         cols,
         exit_status: session.exit_status(),
         desk_window: session.desk_sets_size(),
+        cwd: session
+            .cwd()
+            .map(|cwd| tilde(&cwd))
+            .filter(|cwd| cwd.len() <= MAX_REPORTED_CWD),
+        started_at: session
+            .started()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs()),
+        shell: session.shell_name(),
     }
+}
+
+/// `path` with the home directory written `~`.
+pub(crate) fn tilde(path: &std::path::Path) -> String {
+    match dirs::home_dir()
+        .and_then(|home| path.strip_prefix(&home).ok().map(|rest| rest.to_owned()))
+    {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Some(rest) => format!("~/{}", rest.display()),
+        None => path.display().to_string(),
+    }
+}
+
+/// Where a phone asked a terminal to start: `~`, `~/…` or absolute, and an
+/// existing directory this user can read. `None` otherwise ("bad-cwd").
+pub(crate) fn resolve_cwd(asked: &str, home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let asked = asked.trim();
+    let path = if asked == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = asked.strip_prefix("~/") {
+        home.join(rest)
+    } else if asked.starts_with('/') {
+        std::path::PathBuf::from(asked)
+    } else {
+        return None;
+    };
+    // `..` stays allowed: the user may go anywhere they can read.
+    // In a Flatpak this checks the sandbox's view, which matches the host only
+    // for shared folders (home, usually); a host-only folder reads as missing.
+    // Callers resolve before taking any lock: on a hung network mount this
+    // blocks.
+    let readable = std::fs::read_dir(&path).is_ok();
+    (path.is_dir() && readable).then_some(path)
+}
+
+/// The folders a phone offers to start a terminal in: `~`, the current
+/// sessions' folders, then the last ones used; at most eight, each once.
+pub(crate) fn folders(sessions: &[SessionInfo], recent: &[String]) -> Vec<String> {
+    let mut folders = vec!["~".to_string()];
+    for folder in sessions
+        .iter()
+        .filter_map(|info| info.cwd.clone())
+        .chain(recent.iter().take(5).cloned())
+        .filter(|folder| folder.len() <= MAX_REPORTED_CWD)
+    {
+        if !folders.contains(&folder) {
+            folders.push(folder);
+        }
+    }
+    folders.truncate(8);
+    folders
+}
+
+/// The newest session still running, for Lock & Hand Off.
+pub(crate) fn newest_session() -> Option<SessionInfo> {
+    let registry = registry().lock().ok()?;
+    registry
+        .list()
+        .into_iter()
+        .filter(|info| info.exit_status.is_none())
+        .max_by_key(|info| info.started_at)
+}
+
+/// Starts one of the desk's run commands for `owner`, in a shared session
+/// titled `name`, through the user's login shell.
+pub(crate) fn run_command(name: &str, command: &str, owner: &str) -> Result<SessionInfo, String> {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string());
+    let argv = CommandBuilder::from_argv(vec![shell.into(), "-lc".into(), command.into()]);
+    let info = registry()
+        .lock()
+        .map_err(|_| "terminal registry lock poisoned".to_string())?
+        .create_in(Some(argv), 24, 80, owner, None, Some(name))?;
+    // The command is the session itself: it finishes when the session exits.
+    super::jobs::watch_exit(&info.id);
+    Ok(info)
 }
 
 /// The idle limit for unattended sessions: `DESKLINK_TERMINAL_IDLE_SECS`, else
@@ -282,6 +392,45 @@ mod tests {
     }
 
     #[test]
+    fn a_start_folder_must_be_a_readable_directory() {
+        let home = std::env::temp_dir();
+        assert_eq!(resolve_cwd("~", &home), Some(home.clone()));
+        assert_eq!(resolve_cwd("/", &home), Some(std::path::PathBuf::from("/")));
+        assert_eq!(resolve_cwd("relative/dir", &home), None);
+        assert_eq!(resolve_cwd("~/surely-not-here-desklink", &home), None);
+        assert_eq!(
+            resolve_cwd("/etc/passwd", &home),
+            None,
+            "a file is not a folder"
+        );
+        assert_eq!(resolve_cwd("", &home), None);
+    }
+
+    #[test]
+    fn the_folder_list_starts_home_then_open_then_recent() {
+        let session = |cwd: &str| SessionInfo {
+            id: "x".into(),
+            title: "Shell".into(),
+            rows: 24,
+            cols: 80,
+            exit_status: None,
+            desk_window: false,
+            cwd: Some(cwd.into()),
+            started_at: 0,
+            shell: None,
+        };
+        let recent: Vec<String> = ["~/web", "~/api", "/srv", "~/a", "~/b", "~/c", "~/d"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let listed = folders(&[session("~/api"), session("~"), session("~/api")], &recent);
+        assert_eq!(listed, ["~", "~/api", "~/web", "/srv", "~/a", "~/b"]);
+        assert!(folders(&[], &[]) == ["~"]);
+        let many: Vec<SessionInfo> = (0..12).map(|n| session(&format!("~/p{n}"))).collect();
+        assert_eq!(folders(&many, &recent).len(), 8);
+    }
+
+    #[test]
     fn a_created_session_is_listed_and_retrievable() {
         let mut registry = TerminalRegistry::new();
         let info = registry
@@ -291,7 +440,14 @@ mod tests {
         assert_eq!(info.rows, 24);
         assert_eq!(info.cols, 80);
         assert!(registry.get(&info.id).is_some());
-        assert_eq!(registry.list(), vec![info.clone()]);
+        // The same session; `shell` and `cwd` are read live from `/proc`, and
+        // `sh -c` may have exec'd its command in between.
+        let listed = registry.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            (&listed[0].id, &listed[0].title, listed[0].started_at),
+            (&info.id, &info.title, info.started_at)
+        );
         registry.close(&info.id);
         assert_eq!(registry.len(), 0);
     }

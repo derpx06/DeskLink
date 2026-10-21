@@ -43,8 +43,13 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         .map(|row| row.id)
         .collect();
     let minute = clock_time(gtk::glib::DateTime::now_local().ok());
+    // The round trip changes every reading; it is updated in place.
+    let steady = DeviceView {
+        rtt_ms: None,
+        ..device.clone()
+    };
     let key = serde_json::to_string(&(
-        device,
+        &steady,
         approving,
         approved,
         &since,
@@ -58,6 +63,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     .unwrap_or_default();
     if !win.page_changed("overview", key) {
         refresh_in_place(win, daemon);
+        show_round_trip(win, device);
         return;
     }
     let page = gtk::Box::builder()
@@ -95,6 +101,44 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         .build();
     win.replace_body("overview", &clamp);
     refresh_in_place(win, daemon);
+    show_round_trip(win, device);
+}
+
+/// The hero's "· 12 ms", in place.
+fn show_round_trip(win: &DesklinkWindow, device: &DeviceView) {
+    let Some((_, body)) = win.imp().bodies.borrow().get("overview").cloned() else {
+        return;
+    };
+    let rtt = LinkState::of(device).round_trip(device);
+    for widget in named_widgets(body.upcast_ref(), "hero-rtt") {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            let words = rtt
+                .as_deref()
+                .map(|rtt| format!("· {rtt}"))
+                .unwrap_or_default();
+            if label.label() != words {
+                label.set_label(&words);
+            }
+            label.set_visible(rtt.is_some());
+        }
+    }
+}
+
+/// " · charging", with the time to full when the phone knows it.
+fn charging_words(remaining_ms: Option<i64>) -> String {
+    match remaining_ms.map(|ms| (ms + 59_999) / 60_000) {
+        Some(minutes) if minutes > 0 && minutes < 60 => {
+            format!(" · charging, full in {minutes} min")
+        }
+        Some(minutes) if minutes >= 60 => {
+            format!(
+                " · charging, full in {} h {} min",
+                minutes / 60,
+                minutes % 60
+            )
+        }
+        _ => " · charging".to_string(),
+    }
 }
 
 /// The hero: the phone, its name, how it is connected, its battery, and
@@ -145,6 +189,11 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
     let link = gtk::Box::builder().spacing(10).build();
     link.append(&link_glyph(state, state.label(device)));
     link.append(&text(state.label(device), &["text-dim", "hero-meta"]));
+    let rtt = text("", &["mono", "text-faint", "hero-meta"]);
+    rtt.set_widget_name("hero-rtt");
+    rtt.set_tooltip_text(Some("Round trip to the phone"));
+    rtt.set_visible(false);
+    link.append(&rtt);
     info.append(&link);
     if let Some(battery) = device
         .battery_status
@@ -159,7 +208,10 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
             &["mono", "battery-percent"],
         ));
         if battery.is_charging {
-            words.append(&text(" · charging", &["text-dim", "caption-strong"]));
+            words.append(&text(
+                &charging_words(battery.charge_time_remaining),
+                &["text-dim", "caption-strong"],
+            ));
         }
         line.append(&words);
         info.append(&line);
@@ -761,7 +813,29 @@ fn terminals_card(win: &DesklinkWindow, device: &DeviceView) -> gtk::Box {
                     }
                 }
             });
-            button.upcast()
+            if device.feature_transport_ready && info.exit_status.is_none() {
+                // Walk away: lock here, carry on from the phone.
+                let both = gtk::Box::builder()
+                    .orientation(gtk::Orientation::Vertical)
+                    .spacing(10)
+                    .build();
+                both.append(&button);
+                let hand_off = icon_button(
+                    "system-lock-screen-symbolic",
+                    "Lock & Hand Off",
+                    &["soft-button"],
+                );
+                hand_off.set_halign(gtk::Align::Start);
+                hand_off.set_tooltip_text(Some(&format!(
+                    "Lock this computer and open the newest terminal on {}",
+                    device.name
+                )));
+                hand_off.set_action_name(Some("app.lock-hand-off"));
+                both.append(&hand_off);
+                both.upcast()
+            } else {
+                button.upcast()
+            }
         }
         None => {
             let new = icon_button("list-add-symbolic", "New Terminal", &["dashed-button"]);
@@ -1086,6 +1160,22 @@ fn refresh_in_place(win: &DesklinkWindow, daemon: &DaemonHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn charging_says_when_the_phone_will_be_full() {
+        assert_eq!(charging_words(None), " · charging");
+        assert_eq!(charging_words(Some(-1)), " · charging");
+        assert_eq!(charging_words(Some(0)), " · charging");
+        assert_eq!(
+            charging_words(Some(25 * 60_000)),
+            " · charging, full in 25 min"
+        );
+        assert_eq!(charging_words(Some(30_000)), " · charging, full in 1 min");
+        assert_eq!(
+            charging_words(Some(95 * 60_000)),
+            " · charging, full in 1 h 35 min"
+        );
+    }
 
     #[test]
     fn a_typed_link_gets_a_scheme_and_text_is_not_a_link() {

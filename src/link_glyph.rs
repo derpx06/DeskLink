@@ -50,6 +50,14 @@ impl LinkState {
         }
     }
 
+    /// The link's round-trip time ("12 ms") while connected and measured.
+    pub(crate) fn round_trip(self, device: &DeviceView) -> Option<String> {
+        matches!(self, Self::Direct | Self::Relay)
+            .then_some(device.rtt_ms)
+            .flatten()
+            .map(|ms| format!("{ms} ms"))
+    }
+
     /// "Connected · Wi-Fi": the sidebar's words.
     pub(crate) fn short_label(self, device: &DeviceView) -> &'static str {
         match (self, device.connection_path.as_deref()) {

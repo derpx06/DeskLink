@@ -20,7 +20,10 @@ use crate::device_links::core::{DeviceManager, FeatureTransportSnapshot, Session
 use crate::device_links::daemon::handle::DaemonEvent;
 use crate::device_links::daemon::state::clear_error;
 use crate::device_links::device::DeviceView;
-use crate::device_links::features::{is_webrtc_feature, webrtc_capabilities};
+use crate::device_links::features::{
+    handover_list_is_consistent, is_webrtc_feature, peer_accepts, record_peer_profile,
+    webrtc_capabilities,
+};
 use crate::device_links::packet::NetworkPacket;
 
 use super::file_protocol::{FileControl, FILE_CHUNK_MESSAGE_TYPE, FILE_CONTROL_MESSAGE_TYPE};
@@ -90,6 +93,34 @@ struct DesktopPortalService {
     /// the GNOME consent dialog gives up, instead of starting a capture nobody
     /// asked for.
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// Disconnects when the worker has finished, its portal closed included.
+    done: mpsc::Receiver<()>,
+}
+
+/// The done-signals of shares that were released, per device: the next share
+/// for that phone waits on it (≤ [`RETIRE_WAIT`]) before opening its portal.
+/// Otherwise a Release→RequestView pair raced two portal sessions, and the
+/// old one closing tore down the new one's PipeWire node.
+fn retiring() -> &'static Mutex<HashMap<String, mpsc::Receiver<()>>> {
+    static RETIRING: std::sync::OnceLock<Mutex<HashMap<String, mpsc::Receiver<()>>>> =
+        std::sync::OnceLock::new();
+    RETIRING.get_or_init(Default::default)
+}
+
+/// How long a new share waits for the one it replaces to finish.
+const RETIRE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn retire(device_id: &str, done: mpsc::Receiver<()>) {
+    if let Ok(mut retiring) = retiring().lock() {
+        retiring.insert(device_id.to_string(), done);
+    }
+}
+
+/// Waits (bounded) until the share `done` belongs to has finished.
+fn wait_for_retired(done: Option<mpsc::Receiver<()>>) {
+    if let Some(done) = done {
+        let _ = done.recv_timeout(RETIRE_WAIT);
+    }
 }
 
 static NEXT_PORTAL_SERVICE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -128,6 +159,23 @@ struct PortalWorkerCleanup {
     device_id: String,
     id: u64,
     peer: Arc<DesktopWebRtcPeer>,
+    /// Dropped last of all: tells a share waiting to replace this one.
+    _done: mpsc::Sender<()>,
+}
+
+/// Declared right after the portal, so it runs *before* the portal closes:
+/// the capture is stopped (pipeline to NULL) while its PipeWire node still
+/// exists. The other way round, `Session.Close` removed the node under a
+/// PLAYING `pipewiresrc` (`not-negotiated`, `not-linked`).
+struct StopCaptureFirst {
+    id: u64,
+    peer: Arc<DesktopWebRtcPeer>,
+}
+
+impl Drop for StopCaptureFirst {
+    fn drop(&mut self) {
+        self.peer.stop_desktop_screen_capture_for(self.id);
+    }
 }
 
 impl Drop for PortalWorkerCleanup {
@@ -483,6 +531,12 @@ pub(crate) fn send_feature_packet(
             packet.packet_type
         ));
     }
+    if !peer_accepts(&transport.binding.device_id, &packet.packet_type) {
+        return Err(format!(
+            "{} is not in the feature profile this phone confirmed",
+            packet.packet_type
+        ));
+    }
     let registry = crate::device_links::features::FeatureRegistry::desktop();
     if !registry
         .outgoing_capabilities()
@@ -662,6 +716,78 @@ pub(crate) fn start_phone_remote_control(
         return Err(error);
     }
     Ok(())
+}
+
+/// The phone offered its own screen unasked: adopt its id and answer with an
+/// ordinary `request-view` (the phone has its consent already), and open the
+/// Phone Screen window; or `view-denied`, reason `busy`, while any session is
+/// under way.
+fn take_up_phone_offer(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    offer: &remote_session::ControlMessage,
+    sessions: &Arc<DeviceManager>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
+) -> Result<(), String> {
+    if offer.direction != Some(remote_session::ScreenDirection::PhoneToDesktop) {
+        return Err("A screen offer must be the phone's own screen".to_string());
+    }
+    let busy = desktop_portal_services()
+        .lock()
+        .is_ok_and(|services| services.contains_key(&wire.peer_device_id));
+    let (adopted, sequence) = {
+        let mut open = remote_session::sessions()
+            .lock()
+            .map_err(|_| "DeskLink remote-session lock poisoned".to_string())?;
+        let session = open.entry(wire.peer_device_id.clone()).or_default();
+        let adopted = if busy {
+            Err("busy".to_string())
+        } else {
+            session.adopt_offer(&offer.remote_session_id)
+        };
+        (adopted, session.next_sequence())
+    };
+    if adopted.as_ref().is_err_and(|reason| reason == "stale") {
+        // Not asked for now: no request-view, and no denial either.
+        return Ok(());
+    }
+    let peer = sessions
+        .active_webrtc_peer(binding, attempt_id)
+        .map_err(|error| error.to_string())?;
+    let reply = match adopted {
+        Ok(()) => {
+            let mut request = remote_session::ControlMessage::new(
+                remote_session::ControlKind::RequestView,
+                attempt_id,
+                wire,
+                &offer.remote_session_id,
+                sequence,
+                now_millis(),
+            );
+            request.direction = Some(remote_session::ScreenDirection::PhoneToDesktop);
+            crate::device_links::daemon::push_event(
+                events,
+                DaemonEvent::PhoneScreenOffered {
+                    device_id: wire.peer_device_id.clone(),
+                },
+            );
+            request
+        }
+        Err(reason) => {
+            let mut denied = remote_session::ControlMessage::new(
+                remote_session::ControlKind::ViewDenied,
+                attempt_id,
+                wire,
+                &offer.remote_session_id,
+                sequence,
+                now_millis(),
+            );
+            denied.reason = Some(reason);
+            denied
+        }
+    };
+    send_remote_session_message(&peer, wire, &reply)
 }
 
 /// Asks the phone for control again while its screen is being viewed. The
@@ -903,17 +1029,19 @@ fn start_desktop_portal_session(
     let id = NEXT_PORTAL_SERVICE_ID.fetch_add(1, Ordering::Relaxed);
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel();
-    {
+    let (done_sender, done) = mpsc::channel();
+    let previous_done = {
         let mut services = desktop_portal_services()
             .lock()
             .map_err(|_| "Desktop portal service registry lock poisoned".to_string())?;
         // A newer request supersedes an earlier share for this phone — a retry,
         // or an older phone build that never released the previous one. Refusing
         // it as "already active" left every later request denied.
-        if let Some(previous) = services.remove(&device_id) {
+        let previous = services.remove(&device_id).map(|previous| {
             previous.cancel.store(true, Ordering::Release);
             let _ = previous.sender.send(DesktopPortalCommand::Stop(None));
-        }
+            previous.done
+        });
         services.insert(
             device_id.clone(),
             DesktopPortalService {
@@ -921,9 +1049,17 @@ fn start_desktop_portal_session(
                 sender,
                 can_control: false,
                 cancel: Arc::clone(&cancel),
+                done,
             },
         );
-    }
+        // Else one released a moment ago may still be closing.
+        previous.or_else(|| {
+            retiring()
+                .lock()
+                .ok()
+                .and_then(|mut retiring| retiring.remove(&device_id))
+        })
+    };
     let worker_device_id = device_id.clone();
     let spawned = thread::Builder::new()
         .name(format!("desklink-portal-{device_id}"))
@@ -937,6 +1073,7 @@ fn start_desktop_portal_session(
                 peer,
                 cancel,
                 receiver,
+                (done_sender, previous_done),
             )
         });
     if let Err(error) = spawned {
@@ -959,6 +1096,7 @@ fn run_desktop_portal_worker(
     peer: Arc<DesktopWebRtcPeer>,
     cancel: Arc<std::sync::atomic::AtomicBool>,
     receiver: mpsc::Receiver<DesktopPortalCommand>,
+    (done, previous_done): (mpsc::Sender<()>, Option<mpsc::Receiver<()>>),
 ) {
     use std::sync::atomic::Ordering;
 
@@ -968,7 +1106,10 @@ fn run_desktop_portal_worker(
         device_id: device_id.clone(),
         id,
         peer: Arc::clone(&peer),
+        _done: done,
     };
+    // The share this one replaces closes its portal first.
+    wait_for_retired(previous_done);
 
     #[allow(clippy::type_complexity)]
     let setup =
@@ -998,7 +1139,19 @@ fn run_desktop_portal_worker(
             }
             let stored_grant = crate::device_links::config::remote_desktop_token(&device_id);
             let (portal, source) =
-                RemoteDesktopPortal::start("", &cancel, stored_grant.as_deref())?;
+                match RemoteDesktopPortal::start("", &cancel, stored_grant.as_deref()) {
+                    // A remembered grant for screens that changed: forget it
+                    // and ask once more without it (GNOME shows its dialog).
+                    Err(error)
+                        if stored_grant.is_some()
+                            && error == super::remote_desktop_portal::NO_SCREEN_STREAM =>
+                    {
+                        debug_log!("[DeskLink] Remembered screen grant gave no screen; asking again");
+                        crate::device_links::config::set_remote_desktop_token(&device_id, None);
+                        RemoteDesktopPortal::start("", &cancel, None)?
+                    }
+                    started => started?,
+                };
             // Tokens are single-use: keep the fresh one (if it carries control).
             crate::device_links::config::set_remote_desktop_token(
                 &device_id,
@@ -1066,6 +1219,11 @@ fn run_desktop_portal_worker(
             }
             return;
         }
+    };
+    // Dropped before `portal`: see `StopCaptureFirst`.
+    let _stop_capture_first = StopCaptureFirst {
+        id,
+        peer: Arc::clone(&peer),
     };
     debug_log!(
         "[DeskLink] Desktop portal granted screen {width}x{height} (1 of {} shared) and input-device mask {} for {device_id}",
@@ -1384,7 +1542,9 @@ fn run_desktop_portal_worker(
             .ok()
             .and_then(|mut sessions| {
                 sessions.get_mut(&device_id).map(|session| {
-                    session.stop();
+                    // Only this share's session: a newer one may already be
+                    // running for the same phone.
+                    session.stop_if_current(&session_id);
                     session.next_sequence()
                 })
             })
@@ -1473,6 +1633,134 @@ pub(crate) fn dispatch_desktop_remote_input(
         .map_err(|_| "Desktop portal worker has stopped".to_string())
 }
 
+/// The drawing pad of one phone: its size, and whether the pen is down.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Pad {
+    width: f64,
+    height: f64,
+    down: bool,
+}
+
+fn pads() -> &'static Mutex<HashMap<String, Pad>> {
+    static PADS: std::sync::OnceLock<Mutex<HashMap<String, Pad>>> = std::sync::OnceLock::new();
+    PADS.get_or_init(Default::default)
+}
+
+/// What one `desklink.digitizer(.session)` packet does to the pointer: the
+/// pad's place as a fraction of the screen, the pen touching as the left
+/// button held. No pressure.
+pub(crate) fn digitizer_actions(
+    pad: &mut Option<Pad>,
+    packet: &NetworkPacket,
+) -> Vec<PortalInputAction> {
+    const LEFT: i32 = 0x110;
+    let release = |pad: &mut Pad, actions: &mut Vec<PortalInputAction>| {
+        if pad.down {
+            pad.down = false;
+            actions.push(PortalInputAction::Button {
+                evdev_code: LEFT,
+                pressed: false,
+            });
+        }
+    };
+    let mut actions = Vec::new();
+    if packet.packet_type == crate::device_links::packet::PACKET_TYPE_DIGITIZER_SESSION {
+        match packet.get_str("action") {
+            Some("start") => {
+                let size = |key: &str| packet.get_i64(key).filter(|value| *value > 0);
+                if let (Some(width), Some(height)) = (size("width"), size("height")) {
+                    if let Some(old) = pad.as_mut() {
+                        release(old, &mut actions);
+                    }
+                    *pad = Some(Pad {
+                        width: width as f64,
+                        height: height as f64,
+                        down: false,
+                    });
+                }
+            }
+            Some("end") => {
+                if let Some(old) = pad.as_mut() {
+                    release(old, &mut actions);
+                }
+                *pad = None;
+            }
+            _ => {}
+        }
+        return actions;
+    }
+    let Some(current) = pad.as_mut() else {
+        return actions;
+    };
+    let coordinate = |key: &str| packet.body.get(key).and_then(serde_json::Value::as_f64);
+    if let (Some(x), Some(y)) = (coordinate("x"), coordinate("y")) {
+        if x.is_finite() && y.is_finite() {
+            actions.push(PortalInputAction::NormalizedMotion(
+                (x / current.width).clamp(0.0, 1.0),
+                (y / current.height).clamp(0.0, 1.0),
+            ));
+        }
+    }
+    match packet.get_bool("touching") {
+        Some(true) if !current.down => {
+            current.down = true;
+            actions.push(PortalInputAction::Button {
+                evdev_code: LEFT,
+                pressed: true,
+            });
+        }
+        Some(false) => release(current, &mut actions),
+        _ => {}
+    }
+    if packet.get_bool("active") == Some(false) {
+        release(current, &mut actions);
+    }
+    actions
+}
+
+/// The drawing pad's strokes, as pointer drags on the shared screen. Only
+/// under the control lease, like the mousepad.
+pub(crate) fn dispatch_digitizer(
+    binding: &SessionBinding,
+    packet: &NetworkPacket,
+) -> Result<(), String> {
+    // Refused: forget the pad, so a stroke half-drawn when control ended is
+    // not continued (with the button held) when it comes back.
+    let refuse = |reason: &str| {
+        forget_pad(&binding.device_id);
+        Err(reason.to_string())
+    };
+    if !peer_input_active(&binding.device_id) {
+        return refuse("The drawing pad needs control of this computer first");
+    }
+    let Some(sender) = desktop_portal_services()
+        .lock()
+        .map_err(|_| "Desktop portal service registry lock poisoned".to_string())?
+        .get(&binding.device_id)
+        .map(|service| service.sender.clone())
+    else {
+        return refuse("No approved desktop-control portal session is active");
+    };
+    let actions = {
+        let mut pads = pads()
+            .lock()
+            .map_err(|_| "DeskLink drawing pad lock poisoned".to_string())?;
+        let mut pad = pads.get(&binding.device_id).copied();
+        let actions = digitizer_actions(&mut pad, packet);
+        match pad {
+            Some(pad) => pads.insert(binding.device_id.clone(), pad),
+            None => pads.remove(&binding.device_id),
+        };
+        actions
+    };
+    if actions.is_empty() {
+        return Ok(());
+    }
+    sender
+        .send(DesktopPortalCommand::Input(actions))
+        .map_err(|_| "Desktop portal worker has stopped".to_string())
+}
+
 /// Debug builds: feeds a mousepad body into the active share as if the phone
 /// had sent it, skipping the lease, so the GNOME side can be measured alone.
 #[cfg(debug_assertions)]
@@ -1549,21 +1837,33 @@ pub(crate) fn end_screen_session(device_id: &str) {
 
 /// Ends `device_id`'s share of this screen. `tell` is the reason the phone
 /// is given; `None` stops it without a word (the request already expired).
+/// Drops `device_id`'s drawing pad (its session ended or was refused).
+fn forget_pad(device_id: &str) {
+    if let Ok(mut pads) = pads().lock() {
+        pads.remove(device_id);
+    }
+}
+
 fn stop_desktop_portal_session(device_id: &str, tell: Option<&str>) {
+    forget_pad(device_id);
     let service = desktop_portal_services()
         .lock()
         .ok()
         .and_then(|mut services| services.remove(device_id));
-    if let Some(service) = service {
+    if let Some(DesktopPortalService {
+        cancel,
+        sender,
+        done,
+        ..
+    }) = service
+    {
         connection_log::record(device_id, ConnectionEvent::ScreenSessionEnded);
+        // The next share for this phone waits for this one to finish.
+        retire(device_id, done);
         // Cancelling too: a worker still waiting on the consent dialog never
         // reads the `Stop` command until that dialog is answered.
-        service
-            .cancel
-            .store(true, std::sync::atomic::Ordering::Release);
-        let _ = service
-            .sender
-            .send(DesktopPortalCommand::Stop(tell.map(str::to_string)));
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        let _ = sender.send(DesktopPortalCommand::Stop(tell.map(str::to_string)));
     }
 }
 
@@ -1726,8 +2026,10 @@ fn spawn_event_worker(
                 .webrtc_features_ready(&binding, &attempt_id)
                 .unwrap_or(false);
             if ready && !was_ready {
-                // Start the silence budget at the moment features go live.
+                // Start the silence budget at the moment features go live. A
+                // phone that just finished a handover is awake.
                 last_inbound = std::time::Instant::now();
+                set_dozing(&binding.device_id, false);
             }
             was_ready = ready;
             ever_ready |= ready;
@@ -1752,7 +2054,8 @@ fn spawn_event_worker(
                 break;
             }
             if ready {
-                match liveness(last_inbound.elapsed(), last_probe.elapsed()) {
+                let dozing = is_dozing(&binding.device_id);
+                match liveness(last_inbound.elapsed(), last_probe.elapsed(), dozing) {
                     Liveness::Fine => {}
                     Liveness::Probe => {
                         last_probe = std::time::Instant::now();
@@ -1767,8 +2070,14 @@ fn spawn_event_worker(
                             &binding,
                             &attempt_id,
                             format!(
-                                "WebRTC peer silent for {}s on every data channel",
-                                PEER_DEAD_AFTER.as_secs()
+                                "WebRTC peer silent for {}s on every data channel{}",
+                                if dozing {
+                                    PEER_DEAD_AFTER_DOZING
+                                } else {
+                                    PEER_DEAD_AFTER
+                                }
+                                .as_secs(),
+                                if dozing { " (dozing)" } else { "" }
                             ),
                             &sessions,
                             &config,
@@ -2008,9 +2317,6 @@ fn reset_device_webrtc_state(device_id: &str) {
             session.stop();
         }
     }
-    // A phone-file reply can never arrive on a peer that no longer exists;
-    // tell the open dialog now rather than after its timeout.
-    super::file_browser::reset(device_id, "The connection to the phone was interrupted");
     // Transfers ride this peer; the user should not be left watching a
     // progress bar that will never move.
     super::transfer_board::finish_device(device_id, "The connection to the phone was interrupted");
@@ -2176,6 +2482,46 @@ pub(crate) const NEGOTIATION_TIMEOUT: std::time::Duration = std::time::Duration:
 /// of waiting ~25 s for ICE consent freshness to notice.
 pub(crate) const PEER_PROBE_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 pub(crate) const PEER_DEAD_AFTER: std::time::Duration = std::time::Duration::from_secs(15);
+/// [`PEER_DEAD_AFTER`] while the phone reports `dozing`. A phone whose screen
+/// is off is frozen by its OS (ColorOS: cgroup freezer, scene LcdOff), and only
+/// inbound TCP thaws it — the desk's 10 s LAN heartbeat, which stays the
+/// deliberate thaw — while data-channel UDP does not. 15 s left a 4–5 s margin
+/// and every missed thaw rebuilt the peer.
+pub(crate) const PEER_DEAD_AFTER_DOZING: std::time::Duration = std::time::Duration::from_secs(35);
+
+/// `desklink.heartbeat {dozing}`: whether the sender says it is dozing. A
+/// state report, never a command; absent or not a boolean is awake (older
+/// builds never send it).
+pub(crate) fn reports_dozing(packet: &NetworkPacket) -> bool {
+    packet.get_bool("dozing") == Some(true)
+}
+
+fn dozing_devices() -> &'static Mutex<std::collections::HashSet<String>> {
+    static DOZING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    DOZING.get_or_init(Default::default)
+}
+
+/// Records what `device_id`'s latest heartbeat (LAN or data channel) said.
+pub(crate) fn note_heartbeat(device_id: &str, packet: &NetworkPacket) {
+    set_dozing(device_id, reports_dozing(packet));
+}
+
+fn set_dozing(device_id: &str, dozing: bool) {
+    if let Ok(mut devices) = dozing_devices().lock() {
+        if dozing {
+            devices.insert(device_id.to_string());
+        } else {
+            devices.remove(device_id);
+        }
+    }
+}
+
+pub(crate) fn is_dozing(device_id: &str) -> bool {
+    dozing_devices()
+        .lock()
+        .is_ok_and(|devices| devices.contains(device_id))
+}
 
 /// What the worker should do about data-channel silence right now.
 #[derive(Debug, PartialEq, Eq)]
@@ -2185,10 +2531,21 @@ pub(crate) enum Liveness {
     Dead,
 }
 
-pub(crate) fn liveness(silence: std::time::Duration, since_probe: std::time::Duration) -> Liveness {
-    if silence >= PEER_DEAD_AFTER {
+/// While `dozing`, the dead time is [`PEER_DEAD_AFTER_DOZING`] and nothing is
+/// probed: a frozen phone cannot answer, and a probe does not thaw it.
+pub(crate) fn liveness(
+    silence: std::time::Duration,
+    since_probe: std::time::Duration,
+    dozing: bool,
+) -> Liveness {
+    let dead_after = if dozing {
+        PEER_DEAD_AFTER_DOZING
+    } else {
+        PEER_DEAD_AFTER
+    };
+    if silence >= dead_after {
         Liveness::Dead
-    } else if silence >= PEER_PROBE_AFTER && since_probe >= PEER_PROBE_AFTER {
+    } else if !dozing && silence >= PEER_PROBE_AFTER && since_probe >= PEER_PROBE_AFTER {
         Liveness::Probe
     } else {
         Liveness::Fine
@@ -2347,11 +2704,6 @@ fn handle_peer_envelope(
     transfer_manager: &Arc<WebRtcTransferManager>,
 ) -> Result<(), String> {
     let envelope = WebRtcEnvelope::from_json(bytes)?;
-    if envelope.message_type == super::file_browser::FILE_BROWSER_MESSAGE_TYPE {
-        return super::file_browser::handle_envelope(
-            binding, attempt_id, wire, channel, envelope, sessions,
-        );
-    }
     if matches!(
         envelope.message_type.as_str(),
         FILE_CONTROL_MESSAGE_TYPE | FILE_CHUNK_MESSAGE_TYPE
@@ -2387,6 +2739,7 @@ fn handle_peer_envelope(
             .map_err(|error| error.to_string())?;
         if packet.packet_type == crate::device_links::packet::PACKET_TYPE_HEARTBEAT {
             // Liveness only: arriving at all refreshed the worker's clock.
+            note_heartbeat(&wire.peer_device_id, &packet);
             return if packet.get_bool("reply").unwrap_or(false) {
                 Ok(())
             } else {
@@ -2423,6 +2776,9 @@ fn handle_peer_envelope(
         }
         let now = now_millis();
         message.validate(wire, attempt_id, now)?;
+        if message.kind == remote_session::ControlKind::OfferView {
+            return take_up_phone_offer(binding, attempt_id, wire, &message, sessions, events);
+        }
         if message.kind == remote_session::ControlKind::RequestView {
             let sequence = {
                 let mut open = remote_session::sessions()
@@ -2829,6 +3185,7 @@ fn handle_peer_envelope(
                     binding.device_id
                 );
                 flush_pending_features(binding, sessions);
+                crate::device_links::desk_features::on_feature_ready(&binding.device_id);
                 // A send a lost connection interrupted carries on where the
                 // phone stopped; the phone does the same for its own sends.
                 let resumed = transfer_manager.resume_sends(wire);
@@ -3239,18 +3596,21 @@ fn verify_remote_capabilities(
     binding: &SessionBinding,
     message: &HandoverControlMessage,
 ) -> Result<(), String> {
-    let expected_incoming = webrtc_capabilities(&binding.link.info.incoming_capabilities);
-    let expected_outgoing = webrtc_capabilities(&binding.link.info.outgoing_capabilities);
-    if webrtc_capabilities(&message.incoming_capabilities) != expected_incoming
-        || message.incoming_capabilities != expected_incoming
-    {
+    // The peer's handover may claim less than its identity (an older or a
+    // newer build with a different profile), never more. What is used from
+    // then on is the intersection with our profile.
+    let info = &binding.link.info;
+    if !handover_list_is_consistent(&message.incoming_capabilities, &info.incoming_capabilities) {
         return Err("WebRTC incoming capabilities do not match the paired identity".to_string());
     }
-    if webrtc_capabilities(&message.outgoing_capabilities) != expected_outgoing
-        || message.outgoing_capabilities != expected_outgoing
-    {
+    if !handover_list_is_consistent(&message.outgoing_capabilities, &info.outgoing_capabilities) {
         return Err("WebRTC outgoing capabilities do not match the paired identity".to_string());
     }
+    record_peer_profile(
+        &info.id,
+        &message.incoming_capabilities,
+        &message.outgoing_capabilities,
+    );
     Ok(())
 }
 
@@ -3367,10 +3727,10 @@ mod tests {
     use super::{
         apply_own_denial, authorize_desktop_remote_input, coalesce_motion, desktop_capture_needed,
         desktop_portal_services, end_screen_session, ensure_phone_view_allowed,
-        expired_request_action, liveness, offer_attempt_disposition, recovery_delay,
-        remote_session, remove_service_if_current, screen_stopped, stop_desktop_portal_session,
-        DesktopPortalCommand, DesktopPortalService, ExpiredRequest, Liveness,
-        OfferAttemptDisposition, RECOVERY_BACKOFF_MILLIS, SHARING_STOPPED_AT_DESK,
+        expired_request_action, is_dozing, liveness, note_heartbeat, offer_attempt_disposition,
+        recovery_delay, remote_session, remove_service_if_current, reports_dozing, screen_stopped,
+        stop_desktop_portal_session, DesktopPortalCommand, DesktopPortalService, ExpiredRequest,
+        Liveness, OfferAttemptDisposition, RECOVERY_BACKOFF_MILLIS, SHARING_STOPPED_AT_DESK,
     };
     use crate::device_links::packet::NetworkPacket;
     use crate::device_links::webrtc::remote_session::SessionState;
@@ -3387,6 +3747,7 @@ mod tests {
     ) -> (Arc<AtomicBool>, mpsc::Receiver<DesktopPortalCommand>) {
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, receiver) = mpsc::channel();
+        let (_, done) = mpsc::channel();
         desktop_portal_services().lock().unwrap().insert(
             device.to_string(),
             DesktopPortalService {
@@ -3394,6 +3755,7 @@ mod tests {
                 sender,
                 can_control: false,
                 cancel: Arc::clone(&cancel),
+                done,
             },
         );
         (cancel, receiver)
@@ -3782,6 +4144,96 @@ mod tests {
     }
 
     #[test]
+    fn a_pen_stroke_is_a_drag_across_the_screen() {
+        use super::super::remote_desktop_portal::PortalInputAction as A;
+        use super::{digitizer_actions, Pad};
+        let packet = |kind: &str, body: serde_json::Value| {
+            let mut packet = NetworkPacket::new(kind);
+            packet.body = body.as_object().unwrap().clone();
+            packet
+        };
+        let mut pad: Option<Pad> = None;
+        // Strokes before a session do nothing.
+        assert!(digitizer_actions(
+            &mut pad,
+            &packet(
+                "desklink.digitizer",
+                serde_json::json!({"x": 1, "y": 1, "touching": true})
+            )
+        )
+        .is_empty());
+        digitizer_actions(
+            &mut pad,
+            &packet(
+                "desklink.digitizer.session",
+                serde_json::json!({"action": "start", "width": 1000, "height": 500}),
+            ),
+        );
+        assert_eq!(
+            digitizer_actions(
+                &mut pad,
+                &packet(
+                    "desklink.digitizer",
+                    serde_json::json!({"x": 500, "y": 250, "touching": true, "active": true})
+                )
+            ),
+            vec![
+                A::NormalizedMotion(0.5, 0.5),
+                A::Button {
+                    evdev_code: 0x110,
+                    pressed: true
+                }
+            ]
+        );
+        assert_eq!(
+            digitizer_actions(
+                &mut pad,
+                &packet(
+                    "desklink.digitizer",
+                    serde_json::json!({"x": 1000, "y": 900})
+                )
+            ),
+            vec![A::NormalizedMotion(1.0, 1.0)],
+            "a move while down is a drag, clamped to the screen"
+        );
+        assert_eq!(
+            digitizer_actions(
+                &mut pad,
+                &packet(
+                    "desklink.digitizer",
+                    serde_json::json!({"touching": false, "active": false})
+                )
+            ),
+            vec![A::Button {
+                evdev_code: 0x110,
+                pressed: false
+            }]
+        );
+        // Ending with the pen down lifts it.
+        digitizer_actions(
+            &mut pad,
+            &packet(
+                "desklink.digitizer",
+                serde_json::json!({"x": 1, "y": 1, "touching": true}),
+            ),
+        );
+        assert_eq!(
+            digitizer_actions(
+                &mut pad,
+                &packet(
+                    "desklink.digitizer.session",
+                    serde_json::json!({"action": "end"})
+                )
+            ),
+            vec![A::Button {
+                evdev_code: 0x110,
+                pressed: false
+            }]
+        );
+        assert!(pad.is_none());
+    }
+
+    #[test]
     fn motion_is_coalesced_without_crossing_clicks() {
         use super::super::remote_desktop_portal::PortalInputAction as A;
         let merged = coalesce_motion(vec![
@@ -3822,12 +4274,46 @@ mod tests {
     fn liveness_probes_after_five_seconds_and_declares_dead_after_fifteen() {
         use std::time::Duration;
         let s = Duration::from_secs;
-        assert_eq!(liveness(s(4), s(60)), Liveness::Fine);
-        assert_eq!(liveness(s(5), s(60)), Liveness::Probe);
+        assert_eq!(liveness(s(4), s(60), false), Liveness::Fine);
+        assert_eq!(liveness(s(5), s(60), false), Liveness::Probe);
         // One probe per interval, not one per 500 ms worker tick.
-        assert_eq!(liveness(s(7), s(2)), Liveness::Fine);
-        assert_eq!(liveness(s(14), s(5)), Liveness::Probe);
-        assert_eq!(liveness(s(15), s(0)), Liveness::Dead);
+        assert_eq!(liveness(s(7), s(2), false), Liveness::Fine);
+        assert_eq!(liveness(s(14), s(5), false), Liveness::Probe);
+        assert_eq!(liveness(s(15), s(0), false), Liveness::Dead);
+    }
+
+    #[test]
+    fn a_dozing_phone_gets_thirty_five_seconds_and_no_probes() {
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        assert_eq!(liveness(s(5), s(60), true), Liveness::Fine, "no probe");
+        assert_eq!(liveness(s(20), s(60), true), Liveness::Fine, "past 15 s");
+        assert_eq!(liveness(s(34), s(60), true), Liveness::Fine);
+        assert_eq!(liveness(s(35), s(0), true), Liveness::Dead);
+    }
+
+    #[test]
+    fn dozing_is_read_from_the_heartbeat_and_cleared_by_one_without_it() {
+        let mut heartbeat = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT);
+        assert!(!reports_dozing(&heartbeat), "older peers send no body");
+        heartbeat.set("dozing", "yes");
+        assert!(!reports_dozing(&heartbeat), "not a boolean");
+        heartbeat.set("dozing", true);
+        assert!(reports_dozing(&heartbeat));
+
+        let device = "dozing-test-phone";
+        note_heartbeat(device, &heartbeat);
+        assert!(is_dozing(device));
+        note_heartbeat(
+            device,
+            &NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT),
+        );
+        assert!(!is_dozing(device), "a heartbeat without it is awake");
+        heartbeat.set("dozing", true);
+        note_heartbeat(device, &heartbeat);
+        heartbeat.set("dozing", false);
+        note_heartbeat(device, &heartbeat);
+        assert!(!is_dozing(device));
     }
 
     #[test]
