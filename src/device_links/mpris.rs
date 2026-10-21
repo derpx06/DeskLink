@@ -222,6 +222,8 @@ fn player_names(names: &[String]) -> Vec<&str> {
         .map(String::as_str)
         .filter(|name| name.starts_with("org.mpris.MediaPlayer2."))
         .filter(|name| !PROXIES.contains(name))
+        // DeskLink's own exports of phone players: never echoed to a phone.
+        .filter(|name| !name.starts_with(crate::phone_mpris::BUS_PREFIX))
         .collect()
 }
 
@@ -548,6 +550,7 @@ mod tests {
             "org.freedesktop.DBus",
             "org.mpris.MediaPlayer2.spotify",
             "org.mpris.MediaPlayer2.playerctld",
+            "org.mpris.MediaPlayer2.DeskLink.phone_4f2a",
             "org.mpris.MediaPlayer2.firefox.instance_1_42",
         ]
         .map(String::from)

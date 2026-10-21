@@ -58,6 +58,9 @@ mod imp {
             crate::device_links::connection_log::prune();
             crate::device_links::transfer_log::prune();
             crate::thumbnails::prune();
+            // GNOME integration files this install provides for itself.
+            crate::search_provider::install_description();
+            crate::send_to::start(&obj);
             obj.report_previous_crash();
             obj.setup_gactions();
             self.hold.replace(Some(obj.hold()));
@@ -100,6 +103,8 @@ mod imp {
         ) -> Result<(), glib::Error> {
             self.parent_dbus_register(connection, object_path)?;
             crate::shell_dbus::export(&self.obj(), connection);
+            crate::phone_mpris::start(&self.obj());
+            crate::search_provider::export(&self.obj(), connection);
             Ok(())
         }
     }
@@ -161,6 +166,7 @@ impl DesklinkApplication {
         let history_action = gio::ActionEntry::builder("history")
             .activate(move |app: &Self, _, _| app.show_history())
             .build();
+        crate::send_to::add_action(self);
         self.add_action_entries([
             quit_action,
             about_action,

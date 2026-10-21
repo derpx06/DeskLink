@@ -116,6 +116,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     look.add(&start_at_login_row(daemon, &settings));
     if crate::shell_dbus::extension_possible() {
         look.add(&top_bar_row());
+        look.add(&top_bar_pill_row(daemon, &settings));
     }
     page.append(&look);
 
@@ -143,6 +144,7 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>, daemon: &DaemonHandle)
     look.add(&start_at_login_row(daemon, &settings));
     if crate::shell_dbus::extension_possible() {
         look.add(&top_bar_row());
+        look.add(&top_bar_pill_row(daemon, &settings));
     }
     page.add(&look);
     dialog.add(&page);
@@ -380,6 +382,22 @@ fn start_at_login_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Swi
     row.connect_active_notify(move |row| {
         daemon.send(DaemonCommand::SetStartAtLogin(row.is_active()))
     });
+    row
+}
+
+/// The extension's own top-bar item, besides its Quick Settings entry.
+fn top_bar_pill_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::SwitchRow {
+    let row = adw::SwitchRow::builder()
+        .title("Phone in the top bar")
+        .subtitle("Also show the phone as its own item, not only in Quick Settings")
+        .active(settings.top_bar_pill)
+        .build();
+    with_icon(&row, "phone-symbolic");
+    let daemon = daemon.clone();
+    row.connect_active_notify(move |row| {
+        daemon.send(DaemonCommand::SetTopBarPill(row.is_active()))
+    });
+    follow(&row, |settings, _| settings.top_bar_pill);
     row
 }
 

@@ -88,6 +88,10 @@ pub struct AppSettings {
     /// from the phone.
     #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub unlock_devices: std::collections::BTreeSet<String>,
+    /// Show the phone as its own item in the top bar too (the extension's
+    /// pill), besides the Quick Settings menu. Off by default.
+    #[serde(default)]
+    pub top_bar_pill: bool,
     /// The commands a phone may run here (Preferences → Run Commands).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub run_commands: Vec<RunCommand>,
@@ -120,6 +124,7 @@ impl Default for AppSettings {
             hidden_notifications: Default::default(),
             muted_command_alerts: Default::default(),
             unlock_devices: Default::default(),
+            top_bar_pill: false,
             run_commands: Vec::new(),
             recent_folders: Vec::new(),
         }

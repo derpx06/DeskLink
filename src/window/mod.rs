@@ -26,7 +26,7 @@
 
 mod clipboard;
 pub(crate) mod history;
-mod notifications;
+pub(crate) mod notifications;
 mod overview;
 mod pairing;
 pub(crate) mod prefs;
@@ -951,7 +951,11 @@ impl DesklinkWindow {
                     .insert(unique_id.clone());
                 // Hidden: marked as seen, so turning mirroring back on does
                 // not replay the backlog. A resync (`silent`) never pops.
-                if !pops_up(is_new, shown, notification.silent) {
+                // With the top-bar extension on, it shows them as GNOME's
+                // own notifications: never twice.
+                if !pops_up(is_new, shown, notification.silent)
+                    || crate::shell_dbus::extension_active()
+                {
                     continue;
                 }
                 let title = if notification.title.is_empty() {
@@ -1664,6 +1668,32 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             }
         }
         "open-switcher" => win.imp().device_card.popup(),
+        // "fake-shell-device KIND NAME": a made-up device for the GNOME
+        // integration (extension, media, search), not this window.
+        "fake-shell-device" => {
+            let mut device = debug_fake_device(id, arg);
+            if id == "live" {
+                device.media_status = Some(crate::device_links::device::MediaStatus {
+                    player: "Spotify".into(),
+                    player_list: vec!["Spotify".into()],
+                    title: "Blurred".into(),
+                    artist: "Kiasmos".into(),
+                    album: "Blurred EP".into(),
+                    is_playing: true,
+                    volume: Some(60),
+                    position: Some(72_000),
+                    length: Some(281_000),
+                    can_seek: true,
+                    album_art_url: None,
+                });
+            }
+            if id.starts_with("unreachable") {
+                device.last_seen = Some(crate::device_links::connection_log::now() - 3600);
+            }
+            if let Ok(mut fake) = crate::device_links::daemon::handle::DEBUG_SHELL_DEVICES.lock() {
+                fake.push(device);
+            }
+        }
         // "scroll-end PAGE": that page scrolled to its end.
         "scroll-end" => {
             if let Some((scroll, _)) = win.imp().bodies.borrow().get(id).cloned() {

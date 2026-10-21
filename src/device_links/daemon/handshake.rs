@@ -218,8 +218,9 @@ pub(crate) fn attach_bootstrap_link(
         return Ok(());
     }
 
-    // The incumbent is closed (or silent) but its WebRTC feature transport is
-    // still healthy. Adopt the replacement socket into the existing session
+    // The incumbent is closed, or open but silent (a frozen phone's old socket
+    // while its new one arrives), and its WebRTC feature transport is still
+    // healthy. Adopt the replacement socket into the existing session
     // rather than registering a new one: `register_link` bumps the generation
     // and clears the peer and handover unconditionally, so re-registering here
     // destroyed a *working* transport every time the phone refreshed its
@@ -236,7 +237,10 @@ pub(crate) fn attach_bootstrap_link(
     } else {
         sessions.adopt_bootstrap_link(device_id, &transport)
     };
-    if let Some(binding) = adopted {
+    if let Some((binding, replaced)) = adopted {
+        // Outside the session lock: the old socket's reader wakes, sees the
+        // link carries a newer socket, and leaves quietly.
+        replaced.shutdown();
         debug_log!(
             "[DL-WRTC-BOOT] adopted a replacement bootstrap socket for {} (session {}, generation {}); kept the feature-ready WebRTC transport",
             binding.device_id, binding.session_id, binding.generation

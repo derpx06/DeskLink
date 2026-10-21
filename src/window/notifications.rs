@@ -275,7 +275,7 @@ fn status(icon: &str, title: &str, description: &str) -> (gtk::Box, gtk::Label) 
 }
 
 /// A glyph for the notifying app, from its name.
-pub(super) fn app_icon(app: &str) -> &'static str {
+pub(crate) fn app_icon(app: &str) -> &'static str {
     let app = app.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|word| app.contains(word));
     if has(&["mail", "outlook", "proton"]) {

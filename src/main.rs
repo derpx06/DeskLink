@@ -40,8 +40,11 @@ mod autostart;
 mod config;
 mod device_links;
 mod link_glyph;
+mod phone_mpris;
 mod protocol;
 mod remote_control;
+mod search_provider;
+mod send_to;
 mod shell_dbus;
 mod terminal_previews;
 mod thumbnails;
@@ -63,6 +66,11 @@ fn main() -> glib::ExitCode {
     if args.len() == 3 && args[1] == "--attach-terminal" {
         let status = device_links::pty::desk::run_client(&args[2]);
         return glib::ExitCode::from(status.clamp(0, 255));
+    }
+    // `desklink --send-files [--to <phone>] <files…>`: Files' "Send to"
+    // scripts and Open With entry. Hands the files to the running app.
+    if args.get(1).is_some_and(|arg| arg == "--send-files") {
+        return send_to::run_cli(&args[2..]);
     }
 
     install_crash_reporter();

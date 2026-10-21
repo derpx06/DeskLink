@@ -44,3 +44,9 @@ configure_file(
 )
 
 subdir('icons')
+
+# GNOME Shell search (src/search_provider.rs); the app writes the same file
+# for itself when no package or Flatpak export provides it.
+install_data('derx06.desklink.com.search-provider.ini',
+  install_dir: get_option('datadir') / 'gnome-shell' / 'search-providers',
+)

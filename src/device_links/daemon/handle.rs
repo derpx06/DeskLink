@@ -46,6 +46,12 @@ impl std::fmt::Debug for DaemonStopGuard {
     }
 }
 
+/// Debug builds: made-up devices every reader of [`DaemonHandle::devices`]
+/// sees (the top-bar extension, GNOME media, search), for screenshots of
+/// the GNOME integration without a phone.
+#[cfg(debug_assertions)]
+pub static DEBUG_SHELL_DEVICES: Mutex<Vec<DeviceView>> = Mutex::new(Vec::new());
+
 #[derive(Clone, Debug)]
 pub struct DaemonHandle {
     command_tx: Sender<DaemonCommand>,
@@ -102,6 +108,10 @@ impl DaemonHandle {
             device.terminal_access = terminal_access_allowed(&device.id);
             device.terminal_sessions_attached = terminal_bridge::attached_count(&device.id);
             device.desktop_session = coordinator::desktop_session(&device.id);
+        }
+        #[cfg(debug_assertions)]
+        if let Ok(fake) = DEBUG_SHELL_DEVICES.lock() {
+            devices.extend(fake.iter().cloned());
         }
         devices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         devices

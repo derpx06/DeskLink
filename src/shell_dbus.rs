@@ -27,7 +27,10 @@ pub const PATH: &str = "/derx06/desklink/com/Shell";
 pub const INTERFACE: &str = "derx06.desklink.com.Shell1";
 /// 2: `Desk`, and the `unlock-via-phone`, `lock-hand-off`, `keep-awake-*`
 /// and `clipboard-*` actions.
-const VERSION: u32 = 2;
+/// 3: `Notifications`, `Transfers`, `Desk.pill`, `Devices[].lastSeen`, the
+/// `lock`, `send-clipboard` and `reconnect` actions, and the notification and
+/// transfer methods.
+const VERSION: u32 = 3;
 const INVALID_ARGS: &str = "org.freedesktop.DBus.Error.InvalidArgs";
 
 const XML: &str = r#"<node>
@@ -35,17 +38,37 @@ const XML: &str = r#"<node>
     <property name="Version" type="u" access="read"/>
     <property name="Devices" type="aa{sv}" access="read"/>
     <property name="Desk" type="a{sv}" access="read"/>
+    <property name="Notifications" type="aa{sv}" access="read"/>
+    <property name="Transfers" type="aa{sv}" access="read"/>
     <method name="Invoke">
       <arg name="device_id" type="s" direction="in"/>
       <arg name="action" type="s" direction="in"/>
+    </method>
+    <method name="NotificationAction">
+      <arg name="device_id" type="s" direction="in"/>
+      <arg name="notification_id" type="s" direction="in"/>
+      <arg name="action" type="s" direction="in"/>
+    </method>
+    <method name="NotificationReply">
+      <arg name="device_id" type="s" direction="in"/>
+      <arg name="notification_id" type="s" direction="in"/>
+      <arg name="text" type="s" direction="in"/>
+    </method>
+    <method name="NotificationDismiss">
+      <arg name="device_id" type="s" direction="in"/>
+      <arg name="notification_id" type="s" direction="in"/>
+    </method>
+    <method name="OpenTransfer">
+      <arg name="transfer_id" type="s" direction="in"/>
     </method>
   </interface>
 </node>"#;
 
 /// Actions that need no device (`device_id` ""): `end-sessions` then means
 /// every device.
-const DEVICELESS: [&str; 8] = [
+const DEVICELESS: [&str; 9] = [
     "open",
+    "reconnect",
     "pair-new",
     "end-sessions",
     "lock-hand-off",
@@ -62,6 +85,9 @@ struct Desk {
     clipboard: bool,
     /// A terminal is running and a phone is connected.
     hand_off: bool,
+    /// Preferences → "Phone in the top bar": the extension's own pill, on
+    /// top of the Quick Settings menu.
+    pill: bool,
 }
 
 impl Desk {
@@ -70,6 +96,7 @@ impl Desk {
         dict.insert("keepAwake", self.keep_awake);
         dict.insert("clipboard", self.clipboard);
         dict.insert("handOff", self.hand_off);
+        dict.insert("pill", self.pill);
         dict.end()
     }
 }
@@ -83,6 +110,7 @@ fn desk(devices: &[ShellDevice]) -> Desk {
             && crate::terminal_previews::sessions()
                 .iter()
                 .any(|info| info.exit_status.is_none()),
+        pill: settings.top_bar_pill,
     }
 }
 
@@ -100,6 +128,8 @@ struct ShellDevice {
     path: String,
     screen: &'static str,
     terminals: u32,
+    /// When its link was lost (Unix seconds), while it stays lost; 0 live.
+    last_seen: u64,
     actions: Vec<&'static str>,
 }
 
@@ -128,6 +158,7 @@ fn shell_device(device: &DeviceView, settings: &AppSettings) -> ShellDevice {
             DesktopSession::Controlling => "control",
         },
         terminals: device.terminal_sessions_attached as u32,
+        last_seen: device.last_seen.unwrap_or(0),
         actions: actions(device, settings),
     }
 }
@@ -136,7 +167,13 @@ fn shell_device(device: &DeviceView, settings: &AppSettings) -> ShellDevice {
 fn actions(device: &DeviceView, settings: &AppSettings) -> Vec<&'static str> {
     let mut actions = vec!["open"];
     if device.feature_transport_ready {
-        actions.extend(["ring", "send-files", "new-terminal"]);
+        actions.extend([
+            "ring",
+            "lock",
+            "send-files",
+            "send-clipboard",
+            "new-terminal",
+        ]);
     }
     // The lock-screen button: only with "Unlock with … nearby" on and the
     // phone connected on this network.
@@ -165,9 +202,67 @@ impl ShellDevice {
         dict.insert("path", &self.path);
         dict.insert("screen", self.screen);
         dict.insert("terminals", self.terminals);
+        dict.insert("lastSeen", self.last_seen);
         dict.insert("actions", &self.actions);
         dict.end()
     }
+}
+
+/// The phones' notifications, for the extension's message tray: only phones
+/// whose notifications are shown here. `silent` ones were resent on a
+/// reconnect and never banner; `ready` false means they are stale (no
+/// actions).
+fn notifications_variant(devices: &[DeviceView], settings: &AppSettings) -> Variant {
+    let dicts = devices
+        .iter()
+        .filter(|device| device.trusted && settings.shows_notifications(&device.id))
+        .flat_map(|device| {
+            device.notifications.iter().map(move |notification| {
+                let dict = glib::VariantDict::new(None);
+                dict.insert("device", &device.id);
+                dict.insert("deviceName", &device.name);
+                dict.insert("id", &notification.id);
+                dict.insert("app", &notification.app_name);
+                dict.insert(
+                    "icon",
+                    crate::window::notifications::app_icon(&notification.app_name),
+                );
+                dict.insert("title", &notification.title);
+                dict.insert(
+                    "body",
+                    if notification.text.is_empty() {
+                        &notification.ticker
+                    } else {
+                        &notification.text
+                    },
+                );
+                dict.insert("actions", &notification.actions);
+                dict.insert("replyable", notification.request_reply_id.is_some());
+                dict.insert("dismissable", notification.is_clearable);
+                dict.insert("silent", notification.silent);
+                dict.insert("ready", device.feature_transport_ready);
+                dict.end()
+            })
+        });
+    Variant::array_from_iter_with_type(glib::VariantTy::VARDICT, dicts)
+}
+
+/// How many recent files the menu lists.
+const RECENT_TRANSFERS: usize = 5;
+
+/// The newest files sent or received; `id` is the path, which only
+/// `OpenTransfer` reads back (and only for a file still on this list).
+fn transfers_variant(files: &[crate::device_links::transfer_log::LoggedFile]) -> Variant {
+    let dicts = files.iter().take(RECENT_TRANSFERS).map(|file| {
+        let dict = glib::VariantDict::new(None);
+        dict.insert("id", file.path.to_string_lossy().as_ref());
+        dict.insert("name", &file.name);
+        dict.insert("deviceName", &file.device_name);
+        dict.insert("incoming", file.incoming);
+        dict.insert("time", file.ts);
+        dict.end()
+    });
+    Variant::array_from_iter_with_type(glib::VariantTy::VARDICT, dicts)
 }
 
 fn devices_variant(devices: &[ShellDevice]) -> Variant {
@@ -224,33 +319,27 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
         eprintln!("[Shell] Invalid interface description");
         return;
     };
-    let devices = Rc::new(RefCell::new(current(app)));
-    let desk_state = Rc::new(RefCell::new(desk(&devices.borrow())));
+    let properties = Rc::new(RefCell::new(property_values(app)));
 
     let weak = app.downgrade();
-    let shown = Rc::clone(&devices);
-    let shown_desk = Rc::clone(&desk_state);
+    let shown = Rc::clone(&properties);
     let registered = connection
         .register_object(PATH, &interface)
         .method_call(move |_, _, _, _, method, params, invocation| {
             let Some(app) = weak.upgrade() else {
                 return invocation.return_dbus_error(INVALID_ARGS, "DeskLink is quitting");
             };
-            let (device_id, action) = params.get::<(String, String)>().unwrap_or_default();
-            let devices = current(&app);
-            match check(&devices, &device_id, &action) {
-                Ok(device) if method == "Invoke" => {
-                    perform(&app, device, &action);
-                    invocation.return_value(None);
-                }
-                Ok(_) => invocation.return_dbus_error(INVALID_ARGS, "unknown method"),
+            match call(&app, method, &params) {
+                Ok(()) => invocation.return_value(None),
                 Err(error) => invocation.return_dbus_error(INVALID_ARGS, &error),
             }
         })
-        .property(move |_, _, _, _, name| match name {
-            "Version" => VERSION.to_variant(),
-            "Desk" => shown_desk.borrow().to_variant(),
-            _ => devices_variant(&shown.borrow()),
+        .property(move |_, _, _, _, name| {
+            shown
+                .borrow()
+                .get(name)
+                .cloned()
+                .unwrap_or_else(|| VERSION.to_variant())
         })
         .build();
     if let Err(error) = registered {
@@ -266,17 +355,13 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
         let Some(app) = weak.upgrade().filter(|app| !app.is_remote()) else {
             return glib::ControlFlow::Break;
         };
-        let now = current(&app);
-        let now_desk = desk(&now);
-        let mut changed = std::collections::HashMap::new();
-        if *devices.borrow() != now {
-            changed.insert("Devices".to_string(), devices_variant(&now));
-            devices.replace(now);
-        }
-        if *desk_state.borrow() != now_desk {
-            changed.insert("Desk".to_string(), now_desk.to_variant());
-            desk_state.replace(now_desk);
-        }
+        let now = property_values(&app);
+        let changed: std::collections::HashMap<String, Variant> = now
+            .iter()
+            .filter(|(name, value)| properties.borrow().get(*name) != Some(*value))
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect();
+        properties.replace(now);
         if !changed.is_empty() {
             let changed = (INTERFACE, changed, Vec::<String>::new()).to_variant();
             let _ = connection.emit_signal(
@@ -293,11 +378,109 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
     offer_extension(app);
 }
 
+/// Every property's current value, by name.
+fn property_values(app: &DesklinkApplication) -> std::collections::HashMap<&'static str, Variant> {
+    let settings = crate::device_links::config::app_settings();
+    let views = app
+        .daemon_handle()
+        .map(|daemon| daemon.devices())
+        .unwrap_or_default();
+    let devices: Vec<ShellDevice> = views
+        .iter()
+        .map(|device| shell_device(device, &settings))
+        .collect();
+    std::collections::HashMap::from([
+        ("Version", VERSION.to_variant()),
+        ("Desk", desk(&devices).to_variant()),
+        ("Devices", devices_variant(&devices)),
+        ("Notifications", notifications_variant(&views, &settings)),
+        (
+            "Transfers",
+            transfers_variant(&crate::device_links::transfer_log::recent()),
+        ),
+    ])
+}
+
+/// One method call from a client.
+fn call(app: &DesklinkApplication, method: &str, params: &Variant) -> Result<(), String> {
+    let daemon = app.daemon_handle().ok_or("DeskLink is starting")?;
+    match method {
+        "Invoke" => {
+            let (device_id, action) = params.get::<(String, String)>().unwrap_or_default();
+            let devices = current(app);
+            let device = check(&devices, &device_id, &action)?;
+            perform(app, device, &action);
+            Ok(())
+        }
+        "NotificationAction" | "NotificationReply" | "NotificationDismiss" => {
+            let (device_id, notification_id, argument) = match method {
+                "NotificationDismiss" => {
+                    let (device, id) = params.get::<(String, String)>().unwrap_or_default();
+                    (device, id, String::new())
+                }
+                _ => params.get::<(String, String, String)>().unwrap_or_default(),
+            };
+            let device = daemon
+                .devices()
+                .into_iter()
+                .find(|device| device.id == device_id && device.trusted)
+                .ok_or("no such phone")?;
+            if !device.feature_transport_ready {
+                return Err(format!("{} is not connected", device.name));
+            }
+            let notification = device
+                .notifications
+                .iter()
+                .find(|notification| notification.id == notification_id)
+                .ok_or("no such notification")?;
+            match method {
+                "NotificationAction" if notification.actions.contains(&argument) => daemon.send(
+                    DaemonCommand::TriggerNotificationAction(device_id, notification_id, argument),
+                ),
+                "NotificationReply" if !argument.trim().is_empty() => {
+                    let reply_id = notification
+                        .request_reply_id
+                        .clone()
+                        .ok_or("this notification takes no reply")?;
+                    daemon.send(DaemonCommand::ReplyNotification(
+                        device_id, reply_id, argument,
+                    ))
+                }
+                "NotificationDismiss" => daemon.send(DaemonCommand::DismissNotification(
+                    device_id,
+                    notification_id,
+                )),
+                _ => return Err("not an action this notification offers".to_string()),
+            }
+            Ok(())
+        }
+        "OpenTransfer" => {
+            let id = params.get::<(String,)>().unwrap_or_default().0;
+            // Only a file on the recent list, never an arbitrary path.
+            let file = crate::device_links::transfer_log::recent()
+                .into_iter()
+                .take(RECENT_TRANSFERS)
+                .find(|file| file.path.to_string_lossy() == id)
+                .ok_or("not a recent transfer")?;
+            let uri = gio::File::for_path(&file.path).uri();
+            gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE)
+                .map_err(|error| error.to_string())
+        }
+        _ => Err("unknown method".to_string()),
+    }
+}
+
 fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str) {
     let id = device.map(|device| device.id.clone());
     let daemon = app.daemon_handle();
     match (action, id, daemon) {
         ("ring", Some(id), Some(daemon)) => daemon.send(DaemonCommand::SendFindPhone(id)),
+        ("lock", Some(id), Some(daemon)) => daemon.send(DaemonCommand::SendLockRequest(id, true)),
+        ("send-clipboard", Some(id), Some(daemon)) => daemon.send(DaemonCommand::SendClipboard(id)),
+        ("reconnect", _, Some(daemon)) => {
+            daemon.send(DaemonCommand::NetworkChanged);
+            daemon.send(DaemonCommand::Discover);
+        }
         ("end-sessions", id, Some(daemon)) => daemon.send(DaemonCommand::EndPhoneSessions(id)),
         ("lock-hand-off", _, Some(daemon)) => daemon.send(DaemonCommand::LockAndHandOff),
         ("keep-awake-on" | "keep-awake-off", _, Some(daemon)) => {
@@ -412,7 +595,7 @@ pub fn extension_active() -> bool {
 }
 
 /// The extension, built into the app so any install can turn it on.
-const EXTENSION_FILES: [(&str, &str); 3] = [
+const EXTENSION_FILES: [(&str, &str); 4] = [
     (
         "metadata.json",
         include_str!("../gnome-shell-extension/desklink@derx06.github.io/metadata.json"),
@@ -420,6 +603,10 @@ const EXTENSION_FILES: [(&str, &str); 3] = [
     (
         "extension.js",
         include_str!("../gnome-shell-extension/desklink@derx06.github.io/extension.js"),
+    ),
+    (
+        "notifications.js",
+        include_str!("../gnome-shell-extension/desklink@derx06.github.io/notifications.js"),
     ),
     (
         "stylesheet.css",
@@ -710,7 +897,15 @@ mod tests {
         assert_eq!(dict.lookup::<u32>("terminals").unwrap(), Some(2));
         assert_eq!(
             dict.lookup::<Vec<String>>("actions").unwrap().unwrap(),
-            ["open", "ring", "send-files", "new-terminal", "end-sessions"]
+            [
+                "open",
+                "ring",
+                "lock",
+                "send-files",
+                "send-clipboard",
+                "new-terminal",
+                "end-sessions"
+            ]
         );
 
         let idle = shell_device(&phone(), &AppSettings::default());

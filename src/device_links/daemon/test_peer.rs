@@ -615,6 +615,95 @@ mod tests {
         assert_eq!(gone.dead[0].device_id, desktop.peer_id());
     }
 
+    /// A phone's new socket arrives while its old one is still open but has
+    /// been silent past the answering window (a frozen phone, a Wi-Fi roam).
+    /// It is adopted in place: the old socket's reader leaves quietly, the
+    /// session keeps its generation, and the WebRTC transport survives.
+    /// Re-registering here used to tear down a working peer.
+    #[test]
+    fn a_new_socket_replaces_a_silent_one_without_touching_webrtc() {
+        use crate::device_links::webrtc::{HandoverRuntime, WebRtcWireBinding};
+        use std::time::{Duration, Instant};
+
+        let net = TestNetwork::new();
+        let (desktop, _phone) = peer_pair(&net, "desktop-1", "phone-1");
+        let phone_id = desktop.peer_id();
+        let binding = desktop.binding.clone();
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let wire = WebRtcWireBinding::from_attempt("desktop", &phone_id, &attempt).unwrap();
+        desktop
+            .sessions
+            .with_session(&binding, |session| {
+                let mut handover = HandoverRuntime::new(attempt.clone(), wire);
+                handover.record_offer("offer".into()).unwrap();
+                handover.record_answer("answer".into()).unwrap();
+                handover.mark_local_authenticated().unwrap();
+                handover.mark_remote_authenticated().unwrap();
+                handover.mark_local_capabilities_confirmed().unwrap();
+                handover.mark_remote_capabilities_confirmed().unwrap();
+                handover.mark_local_feature_ready().unwrap();
+                handover.mark_remote_feature_ready().unwrap();
+                session.webrtc_handover = Some(handover);
+                // Silent past the answering window, socket still open.
+                session.last_inbound_at = Instant::now() - Duration::from_secs(25);
+            })
+            .unwrap();
+
+        // The production reader on the old socket.
+        let reader = {
+            let (binding, devices, sessions, config, events) = (
+                binding.clone(),
+                Arc::clone(&desktop.devices),
+                Arc::clone(&desktop.sessions),
+                Arc::clone(&desktop.config),
+                Arc::clone(&desktop.events),
+            );
+            std::thread::spawn(move || {
+                super::super::packet_handler::packet_read_loop(
+                    binding, devices, sessions, config, events,
+                )
+            })
+        };
+
+        // The replacement socket goes through the production attach path.
+        let replacement: Arc<dyn crate::device_links::core::LinkTransport> =
+            Arc::new(crate::device_links::core::link_transport::DeadTransport);
+        let link = SessionLink::new(
+            Arc::clone(&replacement),
+            desktop.peer_certificate_pem.clone(),
+            desktop.local_public_der.clone(),
+            desktop.remote_public_der.clone(),
+            desktop.info.clone(),
+        );
+        super::super::handshake::attach_bootstrap_link(
+            &phone_id,
+            link,
+            replacement,
+            true,
+            false,
+            Arc::clone(&desktop.config),
+            Arc::clone(&desktop.devices),
+            Arc::clone(&desktop.sessions),
+            Arc::clone(&desktop.events),
+        )
+        .unwrap();
+
+        // The old reader leaves on its own, without reporting a disconnect.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !reader.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reader.is_finished(), "the old socket's reader left");
+        assert!(
+            desktop.sessions.is_current(&binding),
+            "same session, same generation, same link"
+        );
+        assert!(
+            desktop.sessions.has_ready_webrtc(&phone_id),
+            "the WebRTC transport survived the socket swap"
+        );
+    }
+
     /// A dozing phone (frozen by its OS) gets 90 s of LAN silence before its
     /// link is buried; an awake one keeps the 30 s budget.
     #[test]

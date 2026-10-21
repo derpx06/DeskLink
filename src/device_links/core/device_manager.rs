@@ -233,11 +233,18 @@ impl DeviceManager {
     ///   this avoids. `establish_secure_link`'s refresh guard already discards
     ///   the newcomer while the incumbent is both open and answering, so the
     ///   only case that reaches here is the one this exists for.
+    ///
+    /// The incumbent may still be open (it went silent: the caller only gets
+    /// here when it is closed or not answering). It is swapped out in place —
+    /// same link, same generation, so the WebRTC peer bound to them lives —
+    /// and returned for the caller to shut down once this lock is released.
+    /// Its reader sees the link's epoch change and leaves without reporting a
+    /// disconnect.
     pub fn adopt_bootstrap_link(
         &self,
         device_id: &str,
         transport: &Arc<dyn LinkTransport>,
-    ) -> Option<SessionBinding> {
+    ) -> Option<(SessionBinding, Arc<dyn LinkTransport>)> {
         let mut sessions = self.sessions.lock().ok()?;
         let session = sessions.get_mut(device_id)?;
         if session.state == SessionState::Terminated {
@@ -251,10 +258,7 @@ impl DeviceManager {
             return None;
         }
         let link = session.active_link.as_ref()?;
-        if !link.is_closed() {
-            return None;
-        }
-        link.adopt(Arc::clone(transport));
+        let replaced = link.adopt(Arc::clone(transport));
         session.state = SessionState::Ready;
         // A working socket is fresh evidence the peer is reachable, so a
         // recovery ladder exhausted while it was away starts over.
@@ -264,7 +268,7 @@ impl DeviceManager {
         // Carrying the old one's staleness clock over would have the liveness
         // tick bury it before its first packet.
         session.last_inbound_at = Instant::now();
-        session.binding()
+        Some((session.binding()?, replaced))
     }
 
     pub fn register_link(
@@ -1386,7 +1390,7 @@ mod tests {
 
         let replacement: Arc<dyn LinkTransport> =
             Arc::new(crate::device_links::core::link_transport::DeadTransport);
-        let adopted = manager
+        let (adopted, _) = manager
             .adopt_bootstrap_link("phone-1", &replacement)
             .expect("a closed link with a ready WebRTC transport is adoptable");
 
@@ -1413,11 +1417,11 @@ mod tests {
     }
 
     /// Adoption is for preserving something. With no feature-ready transport
-    /// there is nothing to preserve and a plain registration is correct — and
-    /// a live incumbent still owns a reader thread, so swapping underneath it
-    /// would leave two readers framing one stream.
+    /// there is nothing to preserve and a plain registration is correct. A
+    /// live (silent) incumbent is swapped out in place: same link, a new
+    /// epoch, and the old socket handed back to be shut down.
     #[test]
-    fn adoption_is_refused_without_a_ready_transport_or_against_a_live_socket() {
+    fn adoption_is_refused_without_a_ready_transport_and_swaps_a_live_socket() {
         let manager = DeviceManager::new();
         let binding = manager
             .register_link("phone-1".to_string(), link("phone-1"), true)
@@ -1439,12 +1443,19 @@ mod tests {
             .unwrap()
             .binding;
         mark_features_ready(&manager, &binding);
-        assert!(
-            manager
-                .adopt_bootstrap_link("phone-1", &replacement)
-                .is_none(),
-            "a live incumbent still owns its reader thread"
+        let epoch = binding.link.epoch();
+        let (adopted, _old) = manager
+            .adopt_bootstrap_link("phone-1", &replacement)
+            .expect("a silent live incumbent is swapped in place");
+        assert!(Arc::ptr_eq(&adopted.link, &binding.link));
+        assert_eq!(adopted.generation, binding.generation);
+        assert_ne!(binding.link.epoch(), epoch, "the old reader sees it");
+        assert_eq!(
+            binding.link.read_byte_at(epoch).unwrap(),
+            crate::device_links::core::ReadOutcome::Closed,
+            "and never reads a byte of the new socket"
         );
+        assert!(manager.has_ready_webrtc("phone-1"));
     }
 
     #[test]

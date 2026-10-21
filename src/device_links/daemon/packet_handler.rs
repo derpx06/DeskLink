@@ -443,12 +443,17 @@ pub(super) fn packet_read_loop(
         return;
     }
     let mut line = Vec::new();
+    // The socket this reader serves. Once the link adopts a newer one, this
+    // reader's socket ending is not the link ending.
+    let epoch = binding.link.epoch();
+    let superseded = || binding.link.epoch() != epoch;
 
     loop {
-        if !sessions.is_current(&binding) {
+        if !sessions.is_current(&binding) || superseded() {
             break;
         }
-        match binding.link.read_byte() {
+        match binding.link.read_byte_at(epoch) {
+            Ok(ReadOutcome::Closed | ReadOutcome::Idle) | Err(_) if superseded() => break,
             Ok(ReadOutcome::Closed) => {
                 if handle_disconnect(
                     &binding,

@@ -1,5 +1,5 @@
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::link_transport::{LinkTransport, ReadOutcome};
@@ -16,6 +16,10 @@ pub struct SessionLink {
     pub remote_public_der: Vec<u8>,
     pub info: DeviceInfo,
     closed: AtomicBool,
+    /// Bumped by every [`SessionLink::adopt`]. A reader started on an earlier
+    /// socket sees it change and leaves quietly: its socket's end is not the
+    /// link's.
+    epoch: AtomicU64,
 }
 
 impl SessionLink {
@@ -33,7 +37,13 @@ impl SessionLink {
             remote_public_der,
             info,
             closed: AtomicBool::new(false),
+            epoch: AtomicU64::new(0),
         }
+    }
+
+    /// Which socket this link carries now; see the `epoch` field.
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
     }
 
     /// The live carrier for this link.
@@ -78,20 +88,47 @@ impl SessionLink {
     /// forever. Android has kept its `retainedBinding` across exactly this
     /// event since `onConnectionReceived` learned to; this is the desktop half.
     ///
-    /// The caller must ensure the outgoing socket is closed, so that no reader
-    /// thread is still framing packets out of it.
-    pub fn adopt(&self, transport: Arc<dyn LinkTransport>) {
-        *self
+    /// Returns the socket it replaced. The caller shuts it down *after*
+    /// releasing the session lock; the reader still on it sees [`Self::epoch`]
+    /// change and exits without reporting a disconnect.
+    pub fn adopt(&self, transport: Arc<dyn LinkTransport>) -> Arc<dyn LinkTransport> {
+        // The epoch moves under the same lock the readers take the socket
+        // under, so no reader can pick up the new socket with an old epoch.
+        let mut current = self
             .transport
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = transport;
+            .unwrap_or_else(PoisonError::into_inner);
+        let previous = std::mem::replace(&mut *current, transport);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         self.closed.store(false, Ordering::Release);
+        previous
+    }
+
+    /// [`Self::read_byte`] for a reader started at `epoch`: once the link has
+    /// adopted a newer socket, that reader gets `Closed` and never a byte of
+    /// the new socket's stream.
+    pub fn read_byte_at(&self, epoch: u64) -> Result<ReadOutcome, String> {
+        let transport = {
+            let current = self
+                .transport
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if self.epoch() != epoch {
+                return Ok(ReadOutcome::Closed);
+            }
+            Arc::clone(&current)
+        };
+        if self.is_closed() {
+            return Err("Session link is closed".to_string());
+        }
+        transport.read_byte()
     }
 
     pub fn send_packet(&self, packet: &NetworkPacket) -> Result<(), String> {
         self.transport()?.send_packet(packet)
     }
 
+    #[cfg(test)]
     pub fn read_byte(&self) -> Result<ReadOutcome, String> {
         self.transport()?.read_byte()
     }
@@ -146,6 +183,7 @@ impl SessionLink {
                 instance_id: None,
             },
             closed: AtomicBool::new(false),
+            epoch: AtomicU64::new(0),
         }
     }
 }

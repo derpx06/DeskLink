@@ -34,6 +34,10 @@ pub enum DaemonCommand {
     /// Stops a running file transfer: the device and the transfer's id.
     CancelTransfer(String, String),
     SendShareText(String, String),
+    /// Sends this computer's clipboard text to the phone now.
+    SendClipboard(String),
+    /// Show the phone as its own top-bar item too.
+    SetTopBarPill(bool),
     SendLockRequest(String, bool),
     /// Allow or stop a paired phone opening terminals on this computer.
     SetTerminalAccess(String, bool),
@@ -74,6 +78,8 @@ pub enum DaemonCommand {
     RequestMprisStatus(String, Option<String>),
     SendMprisSetVolume(String, String, i64),
     SendMprisSeek(String, String, i64),
+    /// Device, player, position in milliseconds.
+    SendMprisSetPosition(String, String, i64),
     RequestNotifications(String),
     DismissNotification(String, String),
     ReplyNotification(String, String, String),
@@ -136,6 +142,10 @@ impl DaemonWorker {
                 self.cancel_transfer(&id, &transfer_id)
             }
             DaemonCommand::SendShareText(id, text) => self.send_share_text(&id, &text),
+            DaemonCommand::SendClipboard(id) => self.send_clipboard(&id),
+            DaemonCommand::SetTopBarPill(on) => {
+                self.update_settings(|settings| settings.top_bar_pill = on)
+            }
             DaemonCommand::SendLockRequest(id, lock) => self.send_lock_request(&id, lock),
             DaemonCommand::SetTerminalAccess(id, allowed) => self.set_terminal_access(&id, allowed),
             DaemonCommand::EndPhoneSessions(device_id) => self.end_phone_sessions(device_id),
@@ -198,6 +208,14 @@ impl DaemonWorker {
             DaemonCommand::RequestMprisStatus(id, player) => self.request_mpris_status(&id, player),
             DaemonCommand::SendMprisSetVolume(id, player, volume) => {
                 self.send_mpris_set_volume(&id, &player, volume)
+            }
+            DaemonCommand::SendMprisSetPosition(id, player, position_ms) => {
+                self.with_feature_transport(&id, |transport| {
+                    let mut packet = NetworkPacket::new(PACKET_TYPE_MPRIS_REQUEST);
+                    packet.set("player", player.as_str());
+                    packet.set("SetPosition", position_ms.max(0));
+                    transport.send(&packet)
+                });
             }
             DaemonCommand::SendMprisSeek(id, player, offset) => {
                 self.send_mpris_seek(&id, &player, offset)
@@ -439,6 +457,24 @@ impl DaemonWorker {
     fn request_notifications(&self, device_id: &str) {
         self.with_feature_transport(device_id, |transport| {
             let packet = build_notification_request_packet();
+            transport.send(&packet)
+        });
+    }
+
+    fn send_clipboard(&self, device_id: &str) {
+        let text = arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.get_text())
+            .unwrap_or_default();
+        if text.is_empty() {
+            push_error(
+                &self.errors,
+                "The clipboard has no text to send".to_string(),
+            );
+            return;
+        }
+        self.with_feature_transport(device_id, |transport| {
+            let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_CLIPBOARD);
+            packet.set("content", text);
             transport.send(&packet)
         });
     }

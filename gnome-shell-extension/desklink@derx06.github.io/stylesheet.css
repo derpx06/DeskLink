@@ -43,43 +43,38 @@
   font-weight: bold;
 }
 
-.desklink-end-button {
-  padding: 3px 12px;
-  border-radius: 99px;
-  color: #ff9a88;
-  background-color: rgba(229, 83, 61, 0.18);
+/* Quick Settings: the action row. Stock `.button` styling, so it follows
+   the accent colour and the high-contrast theme. */
+.desklink-actions {
+  spacing: 6px;
 }
 
-.desklink-end-button:hover,
-.desklink-end-button:focus {
-  background-color: rgba(229, 83, 61, 0.3);
+.desklink-action {
+  padding: 8px 4px;
+  min-width: 56px;
 }
 
-.desklink-tiles {
-  spacing: 8px;
-}
-
-.desklink-tile {
-  padding: 10px 4px;
-  border-radius: 12px;
-  background-color: rgba(255, 255, 255, 0.08);
-}
-
-.desklink-tile:hover,
-.desklink-tile:focus {
-  background-color: rgba(255, 255, 255, 0.15);
-}
-
-.desklink-tile:checked {
-  color: #ffffff;
-  background-color: #e5533d;
-}
-
-.desklink-tile:insensitive {
-  color: rgba(255, 255, 255, 0.35);
-}
-
-.desklink-tile-label {
+.desklink-action-label {
   margin-top: 4px;
   font-size: 0.85em;
+}
+
+.desklink-end-button {
+  padding: 3px 12px;
+}
+
+/* Reply to a phone notification. */
+.desklink-reply-dialog .modal-dialog-content-box {
+  spacing: 12px;
+  padding: 24px;
+  min-width: 360px;
+}
+
+.desklink-reply-heading {
+  font-weight: bold;
+  font-size: 1.1em;
+}
+
+.desklink-reply-quote {
+  color: rgba(255, 255, 255, 0.7);
 }
