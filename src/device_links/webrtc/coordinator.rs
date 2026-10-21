@@ -1950,6 +1950,26 @@ pub(crate) fn start_file_transfer(
     send_transfer_events(peer, wire, manager.start_send(wire, source)?)
 }
 
+/// Sends `source` as a clipboard copy (C3) of type `mime`.
+pub(crate) fn start_clipboard_transfer(
+    sessions: &DeviceManager,
+    transport: &FeatureTransportSnapshot,
+    source: &std::path::Path,
+    mime: &str,
+) -> Result<(), String> {
+    if !sessions.is_current(&transport.binding) || !transport.web_rtc_ready {
+        return Err("DeskLink WebRTC file transport is unavailable".to_string());
+    }
+    let (Some(peer), Some(wire), Some(manager)) = (
+        transport.web_rtc_peer.as_ref(),
+        transport.web_rtc_wire.as_ref(),
+        transport.transfer_manager.as_ref(),
+    ) else {
+        return Err("DeskLink WebRTC file transfer is unavailable".to_string());
+    };
+    send_transfer_events(peer, wire, manager.start_send_as(wire, source, Some(mime))?)
+}
+
 /// Ends a running file transfer at the user's request and tells the peer.
 ///
 /// The transfer is over locally whether or not the peer is still listening: a

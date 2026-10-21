@@ -1792,6 +1792,8 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         // "desk-note-close ID": the phone dismissing this computer's
         // notification ID (C1, the real path).
         "desk-note-close" => crate::device_links::desk_notifications::close_from_phone(id),
+        // "clip-image-in PATH": a phone's copied PNG arriving (the real path).
+        "clip-image-in" => crate::device_links::daemon::clipboard::debug_receive_image(id),
         // "clip-in TEXT": a phone's clipboard arriving (the real path).
         "clip-in" => {
             crate::device_links::daemon::clipboard::debug_receive(format!("{id} {arg}").trim());

@@ -59,6 +59,13 @@ pub struct FileControl {
     pub max_chunk_size: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Offer only (contract C3): the file is a clipboard copy, placed on the
+    /// receiver's clipboard and not saved. Honoured only with `mime_type`
+    /// `image/png`; older peers ignore both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipboard: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
 }
 
 impl FileControl {
@@ -275,6 +282,8 @@ mod tests {
             chunk_size: 16 * 1024,
             max_chunk_size: None,
             error: None,
+            clipboard: None,
+            mime_type: None,
         }
     }
 

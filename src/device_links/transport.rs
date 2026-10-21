@@ -121,6 +121,16 @@ impl FeatureTransport {
         )
     }
 
+    /// Sends an image the user copied here, for the phone's clipboard (C3).
+    pub(crate) fn send_clipboard_image(&self, path: &Path) -> Result<(), String> {
+        crate::device_links::webrtc::coordinator::start_clipboard_transfer(
+            &self.sessions,
+            &self.snapshot,
+            path,
+            "image/png",
+        )
+    }
+
     pub(crate) fn cancel_transfer(&self, transfer_id: &str) -> Result<(), String> {
         crate::device_links::webrtc::coordinator::cancel_file_transfer(
             &self.sessions,

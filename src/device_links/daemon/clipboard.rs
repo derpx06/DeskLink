@@ -53,6 +53,14 @@ pub fn debug_remember(text: &str, from: Option<&str>) {
     remember(text, from);
 }
 
+/// Debug builds only: a phone's copied image arriving, for isolated tests.
+#[cfg(debug_assertions)]
+pub fn debug_receive_image(path: &str) {
+    if let Ok(bytes) = std::fs::read(path) {
+        image_from_phone(&bytes);
+    }
+}
+
 /// Debug builds only: a phone's clipboard arriving, for isolated tests.
 #[cfg(debug_assertions)]
 pub fn debug_receive(text: &str) {
@@ -297,6 +305,192 @@ pub(super) fn set_clipboard_text_from_remote(content: &str) {
     });
 }
 
+// ── Images (contract C3) ────────────────────────────────────────────────
+
+/// PNG files start with these 8 bytes.
+const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+
+pub(crate) fn is_png(bytes: &[u8]) -> bool {
+    bytes.starts_with(&PNG_SIGNATURE)
+}
+
+/// The longest side of an image sent to a phone (as the phone does).
+const MAX_IMAGE_SIDE: i32 = 4096;
+
+/// Bumped each time the X11 CLIPBOARD changes owner (XFixes): an image is
+/// read only after a change, never every second.
+static OWNER_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Watches CLIPBOARD owner changes on its own X11 connection. Without an X
+/// display nothing is watched and images are not sent from here.
+fn watch_owner_changes() {
+    let _ = thread::Builder::new()
+        .name("desklink-clip-owner".into())
+        .spawn(|| {
+            use x11rb::connection::Connection;
+            use x11rb::protocol::xfixes::{ConnectionExt as _, SelectionEventMask};
+            use x11rb::protocol::xproto::ConnectionExt as _;
+            use x11rb::protocol::Event;
+            let Ok((conn, screen)) = x11rb::connect(None) else {
+                return;
+            };
+            let Some(root) = conn.setup().roots.get(screen).map(|screen| screen.root) else {
+                return;
+            };
+            let watched = (|| {
+                let clipboard = conn
+                    .intern_atom(false, b"CLIPBOARD")
+                    .ok()?
+                    .reply()
+                    .ok()?
+                    .atom;
+                conn.xfixes_query_version(5, 0).ok()?.reply().ok()?;
+                conn.xfixes_select_selection_input(
+                    root,
+                    clipboard,
+                    SelectionEventMask::SET_SELECTION_OWNER
+                        | SelectionEventMask::SELECTION_WINDOW_DESTROY
+                        | SelectionEventMask::SELECTION_CLIENT_CLOSE,
+                )
+                .ok()?;
+                conn.flush().ok()
+            })();
+            if watched.is_none() {
+                return;
+            }
+            while let Ok(event) = conn.wait_for_event() {
+                if let Event::XfixesSelectionNotify(_) = event {
+                    OWNER_GEN.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+        });
+}
+
+/// RGBA pixels (tightly packed) from a PNG, for `arboard`.
+fn png_to_rgba(png: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    use gtk::gdk_pixbuf::prelude::*;
+    let loader = gtk::gdk_pixbuf::PixbufLoader::with_type("png").ok()?;
+    loader.write(png).ok()?;
+    loader.close().ok()?;
+    let pixbuf = loader.pixbuf()?.add_alpha(false, 0, 0, 0).ok()?;
+    let (width, height) = (pixbuf.width() as usize, pixbuf.height() as usize);
+    let stride = pixbuf.rowstride() as usize;
+    let bytes = pixbuf.read_pixel_bytes();
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for row in 0..height {
+        rgba.extend_from_slice(bytes.get(row * stride..row * stride + width * 4)?);
+    }
+    Some((width, height, rgba))
+}
+
+/// A PNG from RGBA pixels, its long side brought within [`MAX_IMAGE_SIDE`].
+fn rgba_to_png(width: usize, height: usize, rgba: Vec<u8>) -> Option<Vec<u8>> {
+    use gtk::gdk_pixbuf::{Colorspace, InterpType, Pixbuf};
+    let (w, h) = (i32::try_from(width).ok()?, i32::try_from(height).ok()?);
+    let mut pixbuf = Pixbuf::from_bytes(
+        &gtk::glib::Bytes::from_owned(rgba),
+        Colorspace::Rgb,
+        true,
+        8,
+        w,
+        h,
+        w.checked_mul(4)?,
+    );
+    let long = w.max(h);
+    if long > MAX_IMAGE_SIDE {
+        let scale = f64::from(MAX_IMAGE_SIDE) / f64::from(long);
+        let (sw, sh) = (
+            ((f64::from(w) * scale).round() as i32).max(1),
+            ((f64::from(h) * scale).round() as i32).max(1),
+        );
+        pixbuf = pixbuf.scale_simple(sw, sh, InterpType::Bilinear)?;
+    }
+    pixbuf.save_to_bufferv("png", &[]).ok()
+}
+
+/// A phone's copied image (C3): put on this clipboard — X11 first (Mutter
+/// mirrors it to Wayland apps), GTK's texture with no X display — and never
+/// saved or sent back. Ignored with clipboard sync off or not a PNG.
+pub(crate) fn image_from_phone(png: &[u8]) {
+    if !crate::device_links::config::app_settings().clipboard_sync {
+        debug_log!("[Clipboard] Image from the phone ignored: clipboard sync is off");
+        return;
+    }
+    if !is_png(png) {
+        debug_log!("[Clipboard] Image from the phone ignored: not a PNG");
+        return;
+    }
+    // Tests see it here instead: never the real clipboard of whoever runs them.
+    #[cfg(test)]
+    if let Ok(mut placed) = TEST_PLACED.lock() {
+        placed.push(png.to_vec());
+    }
+    #[cfg(not(test))]
+    place_image(png);
+}
+
+/// What tests' clipboard images were placed (instead of the clipboard).
+#[cfg(test)]
+pub(crate) static TEST_PLACED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+#[cfg(not(test))]
+fn place_image(png: &[u8]) {
+    REMOTE_AT.store(now_ms(), Ordering::Release);
+    LOCAL_CHANGED_AT.store(now_ms(), Ordering::Release);
+    debug_log!("[Clipboard] Image from the phone: {} bytes", png.len());
+    let png = png.to_vec();
+    thread::spawn(move || {
+        let placed = png_to_rgba(&png).is_some_and(|(width, height, rgba)| {
+            X11_CLIPBOARD.lock().is_ok_and(|mut held| {
+                if held.is_none() {
+                    *held = arboard::Clipboard::new().ok();
+                }
+                held.as_mut().is_some_and(|clipboard| {
+                    clipboard
+                        .set_image(arboard::ImageData {
+                            width,
+                            height,
+                            bytes: rgba.into(),
+                        })
+                        .is_ok()
+                })
+            })
+        });
+        if placed {
+            return;
+        }
+        gtk::glib::MainContext::default().invoke(move || {
+            let texture = gtk::gdk::Texture::from_bytes(&gtk::glib::Bytes::from_owned(png));
+            if let (Some(display), Ok(texture)) = (gtk::gdk::Display::default(), texture) {
+                gtk::prelude::DisplayExt::clipboard(&display).set_texture(&texture);
+            }
+        });
+    });
+}
+
+/// An image the user copied here, as a PNG file to send to the phones, when
+/// it is new and not a password manager's. `None` otherwise.
+fn copied_image(clipboard: &mut arboard::Clipboard) -> Option<std::path::PathBuf> {
+    let targets = clipboard_targets()?;
+    if is_password_hint(&targets) || !targets.iter().any(|target| target.starts_with("image/")) {
+        return None;
+    }
+    let image = clipboard.get_image().ok()?;
+    let png = rgba_to_png(image.width, image.height, image.bytes.into_owned())?;
+    if png.len() as u64 > crate::device_links::webrtc::transfer_manager::MAX_CLIPBOARD_IMAGE_BYTES {
+        return None;
+    }
+    let dir = gtk::glib::user_cache_dir()
+        .join("desklink")
+        .join("clipboard")
+        .join(uuid::Uuid::new_v4().simple().to_string());
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("clipboard.png");
+    debug_log!("[Clipboard] Image copied here: {} bytes of PNG", png.len());
+    std::fs::write(&path, png).ok()?;
+    Some(path)
+}
+
 impl DaemonWorker {
     pub(super) fn start_clipboard_listener(&self) {
         if !is_webrtc_feature(PACKET_TYPE_CLIPBOARD) {
@@ -313,6 +507,9 @@ impl DaemonWorker {
             // Learn up front whether passwords can be recognised here, so the
             // Clipboard page can say so before anything is copied.
             record_detection(x11rb::connect(None).is_ok());
+            watch_owner_changes();
+            // The owner change last looked at for an image.
+            let mut image_gen = OWNER_GEN.load(Ordering::Acquire);
             while !shutdown.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(1000));
                 if !crate::device_links::config::app_settings().clipboard_sync {
@@ -324,12 +521,22 @@ impl DaemonWorker {
                     Err(_) => continue,
                 };
 
-                let current_text = match clipboard.get_text() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-
+                let current_text = clipboard.get_text().unwrap_or_default();
                 if current_text.is_empty() {
+                    // No text: perhaps an image, read once per copy.
+                    let generation = OWNER_GEN.load(Ordering::Acquire);
+                    if generation != image_gen {
+                        image_gen = generation;
+                        let seen = now_ms();
+                        if !superseded(seen, REMOTE_AT.load(Ordering::Acquire)) {
+                            if let Some(path) = copied_image(&mut clipboard) {
+                                send_image(&sessions, &path);
+                                if let Some(dir) = path.parent() {
+                                    let _ = std::fs::remove_dir_all(dir);
+                                }
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -430,6 +637,35 @@ impl DaemonWorker {
     }
 }
 
+/// Sends a copied image to every phone with a ready link (the transfer
+/// keeps its own snapshot, so `path` may go right after).
+fn send_image(sessions: &Arc<crate::device_links::core::DeviceManager>, path: &std::path::Path) {
+    for binding in sessions.current_bindings() {
+        let paired = sessions
+            .with_session(&binding, |session| {
+                session.pairing.state == PairState::Paired
+            })
+            .unwrap_or(false);
+        if !paired || !sessions.is_current(&binding) {
+            continue;
+        }
+        let result = FeatureTransport::for_binding(sessions, &binding).and_then(|transport| {
+            if transport.is_ready() {
+                transport.send_clipboard_image(path)
+            } else {
+                Ok(())
+            }
+        });
+        match result {
+            Ok(()) => debug_log!("[Clipboard] Image sent to {}", binding.device_id),
+            Err(error) => debug_log!(
+                "[Clipboard] Image not sent to {}: {error}",
+                binding.device_id
+            ),
+        }
+    }
+}
+
 /// Records `text` as sent to `device_id` only when it really went.
 fn remember_if_sent(
     sent: &mut std::collections::HashMap<String, String>,
@@ -515,6 +751,18 @@ mod tests {
         assert!(!connect_is_newer(Some(0), 0), "unknown time");
         assert!(!connect_is_newer(None, 0));
         assert!(connect_is_newer(Some(1), 0), "nothing copied here yet");
+    }
+
+    #[test]
+    fn images_round_trip_through_png_and_large_ones_are_scaled() {
+        let rgba: Vec<u8> = (0..4 * 3 * 2).map(|n| n as u8).collect();
+        let png = rgba_to_png(3, 2, rgba.clone()).unwrap();
+        assert!(is_png(&png));
+        assert_eq!(png_to_rgba(&png), Some((3, 2, rgba)));
+        assert!(!is_png(b"GIF89a"));
+        let big = rgba_to_png(5000, 10, vec![255; 5000 * 10 * 4]).unwrap();
+        let (width, height, _) = png_to_rgba(&big).unwrap();
+        assert_eq!((width, height), (4096, 8), "long side capped, shape kept");
     }
 
     #[test]

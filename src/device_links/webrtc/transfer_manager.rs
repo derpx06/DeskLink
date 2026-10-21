@@ -51,6 +51,10 @@ struct ReceiveCheckpoint {
     offset: u64,
     part_name: String,
     destination_name: String,
+    /// A clipboard image (C3): placed on the clipboard, never saved or
+    /// listed. Absent in older checkpoints.
+    #[serde(default)]
+    clipboard: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +78,22 @@ struct SendCheckpoint {
     /// Negotiated chunk size (legacy unless the receiver advertised more).
     #[serde(default = "legacy_chunk_size")]
     chunk_size: usize,
+    /// A clipboard copy (C3): its MIME type, sent with the offer.
+    #[serde(default)]
+    clipboard_mime: Option<String>,
+}
+
+/// The largest clipboard image accepted or sent (contract C3).
+pub const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Whether an offer is a clipboard image this side places on its clipboard:
+/// both share fields, PNG, and within the size cap.
+fn is_clipboard_offer(message: &FileControl) -> bool {
+    message.clipboard == Some(true)
+        && message.mime_type.as_deref() == Some("image/png")
+        && message
+            .total_size
+            .is_some_and(|size| size <= MAX_CLIPBOARD_IMAGE_BYTES)
 }
 
 fn legacy_chunk_size() -> usize {
@@ -320,6 +340,17 @@ impl WebRtcTransferManager {
         wire: &WebRtcWireBinding,
         source: &Path,
     ) -> Result<Vec<TransferEvent>, String> {
+        self.start_send_as(wire, source, None)
+    }
+
+    /// Sends `source`; with `clipboard_mime` as a clipboard copy (C3): the
+    /// peer places it on its clipboard, and it is not listed here either.
+    pub fn start_send_as(
+        &self,
+        wire: &WebRtcWireBinding,
+        source: &Path,
+        clipboard_mime: Option<&str>,
+    ) -> Result<Vec<TransferEvent>, String> {
         let filename = source
             .file_name()
             .and_then(|value| value.to_str())
@@ -363,9 +394,11 @@ impl WebRtcTransferManager {
             sha256,
             offset: 0,
             source_name,
-            source_path: Some(source.to_path_buf()),
+            // A clipboard copy is a temporary file: not in the history.
+            source_path: clipboard_mime.is_none().then(|| source.to_path_buf()),
             awaiting_offset: None,
             chunk_size: LEGACY_FILE_CHUNK_BYTES,
+            clipboard_mime: clipboard_mime.map(str::to_string),
         };
         if let Err(error) = self.save_send_checkpoint(&checkpoint) {
             let _ = fs::remove_file(&snapshot);
@@ -375,6 +408,14 @@ impl WebRtcTransferManager {
             .lock()
             .map_err(|_| "DeskLink transfer manager lock poisoned".to_string())?
             .insert(transfer_id, checkpoint.clone());
+        if clipboard_mime.is_some() {
+            return Ok(vec![TransferEvent::SendControl(self.send_control(
+                wire,
+                FileAction::Offer,
+                &checkpoint,
+                0,
+            ))]);
+        }
         board::begin(TransferRow {
             id: checkpoint.transfer_id.clone(),
             device_id: wire.peer_device_id.clone(),
@@ -596,6 +637,8 @@ impl WebRtcTransferManager {
             chunk_size: LEGACY_FILE_CHUNK_BYTES,
             max_chunk_size: None,
             error: Some(reason),
+            clipboard: None,
+            mime_type: None,
         })])
     }
 
@@ -698,6 +741,8 @@ impl WebRtcTransferManager {
                     chunk_size: LEGACY_FILE_CHUNK_BYTES,
                     max_chunk_size: None,
                     error: Some("Too many simultaneous incoming transfers".to_string()),
+                    clipboard: None,
+                    mime_type: None,
                 })]);
             }
         }
@@ -759,6 +804,7 @@ impl WebRtcTransferManager {
                     offset: 0,
                     part_name,
                     destination_name,
+                    clipboard: is_clipboard_offer(&message),
                 }
             }
         };
@@ -767,15 +813,18 @@ impl WebRtcTransferManager {
             .lock()
             .map_err(|_| "DeskLink transfer manager lock poisoned".to_string())?
             .insert(checkpoint.transfer_id.clone(), checkpoint.clone());
-        board::begin(TransferRow {
-            id: checkpoint.transfer_id.clone(),
-            device_id: wire.peer_device_id.clone(),
-            name: checkpoint.filename.clone(),
-            incoming: true,
-            done: checkpoint.offset,
-            total: checkpoint.total_size,
-            preparing: false,
-        });
+        // A clipboard image is not a download: no row on the Transfers page.
+        if !checkpoint.clipboard {
+            board::begin(TransferRow {
+                id: checkpoint.transfer_id.clone(),
+                device_id: wire.peer_device_id.clone(),
+                name: checkpoint.filename.clone(),
+                incoming: true,
+                done: checkpoint.offset,
+                total: checkpoint.total_size,
+                preparing: false,
+            });
+        }
         if checkpoint.offset == checkpoint.total_size {
             // An empty file, or a partial that already holds every byte: there
             // is no chunk left to wait for.
@@ -853,7 +902,16 @@ impl WebRtcTransferManager {
                 Some(reason),
             ))]);
         }
-        let path = self.publish(checkpoint)?;
+        let path = if checkpoint.clipboard {
+            // Placed on the clipboard from memory; the file goes at once.
+            let bytes = fs::read(self.part_path(checkpoint)?)
+                .map_err(|error| format!("Could not read DeskLink clipboard image: {error}"))?;
+            self.discard_receive(checkpoint)?;
+            crate::device_links::daemon::clipboard::image_from_phone(&bytes);
+            PathBuf::from(&checkpoint.filename)
+        } else {
+            self.publish(checkpoint)?
+        };
         let mut events = Vec::new();
         if acknowledge {
             events.push(TransferEvent::SendControl(self.control(
@@ -1235,6 +1293,12 @@ impl WebRtcTransferManager {
             chunk_size: LEGACY_FILE_CHUNK_BYTES,
             max_chunk_size: (action == FileAction::Offer).then_some(MAX_FILE_CHUNK_BYTES),
             error: None,
+            clipboard: (action == FileAction::Offer && checkpoint.clipboard_mime.is_some())
+                .then_some(true),
+            mime_type: checkpoint
+                .clipboard_mime
+                .clone()
+                .filter(|_| action == FileAction::Offer),
         }
     }
 
@@ -1261,6 +1325,8 @@ impl WebRtcTransferManager {
             chunk_size: LEGACY_FILE_CHUNK_BYTES,
             max_chunk_size: None,
             error,
+            clipboard: None,
+            mime_type: None,
         }
     }
 
@@ -1591,6 +1657,8 @@ mod tests {
             chunk_size: LEGACY_FILE_CHUNK_BYTES,
             max_chunk_size: None,
             error: None,
+            clipboard: None,
+            mime_type: None,
         }
     }
 
@@ -1938,6 +2006,67 @@ mod tests {
         assert_eq!(path, sandbox.downloads().join("big.bin"));
         assert_eq!(fs::read(path).unwrap(), data);
         assert!(names(&sandbox.state()).is_empty());
+    }
+
+    /// C3: a clipboard PNG goes to the clipboard, never to Downloads, and
+    /// leaves nothing behind; the same file without both fields is a download.
+    #[test]
+    fn a_clipboard_image_is_placed_and_not_saved() {
+        let sandbox = Sandbox::new("clipboard-image");
+        let mut data = b"\x89PNG\r\n\x1a\n".to_vec();
+        data.extend(payload(1_000));
+        let manager = sandbox.manager();
+        let offer = FileControl {
+            clipboard: Some(true),
+            mime_type: Some("image/png".into()),
+            ..offer_for("transfer_c", "clipboard.png", &data)
+        };
+        assert!(is_clipboard_offer(&offer));
+        manager.handle_control(&wire(), offer).unwrap();
+        let events = feed(&manager, &wire(), "transfer_c", 0, &data).unwrap();
+        assert!(
+            completed_path(&events).is_some(),
+            "the sender is told it arrived"
+        );
+        assert!(names(&sandbox.downloads()).is_empty(), "not a download");
+        assert!(names(&sandbox.state()).is_empty(), "nothing left behind");
+        assert!(crate::device_links::daemon::clipboard::TEST_PLACED
+            .lock()
+            .unwrap()
+            .contains(&data));
+        // Not marked as PNG, or too big: an ordinary file.
+        let plain = FileControl {
+            clipboard: Some(true),
+            ..offer_for("transfer_p", "clipboard.png", &data)
+        };
+        assert!(!is_clipboard_offer(&plain));
+        let huge = FileControl {
+            clipboard: Some(true),
+            mime_type: Some("image/png".into()),
+            total_size: Some(MAX_CLIPBOARD_IMAGE_BYTES + 1),
+            ..offer_for("transfer_h", "clipboard.png", &data)
+        };
+        assert!(!is_clipboard_offer(&huge));
+    }
+
+    #[test]
+    fn a_clipboard_send_carries_the_share_fields_on_the_offer_only() {
+        let sandbox = Sandbox::new("clipboard-send");
+        let source = sandbox.base.join("clipboard.png");
+        fs::write(&source, b"\x89PNG\r\n\x1a\nabc").unwrap();
+        let manager = sandbox.manager();
+        let offer = only_control(
+            manager
+                .start_send_as(&wire(), &source, Some("image/png"))
+                .unwrap(),
+        );
+        assert_eq!(offer.action, FileAction::Offer);
+        assert_eq!(offer.clipboard, Some(true));
+        assert_eq!(offer.mime_type.as_deref(), Some("image/png"));
+        let plain = only_control(manager.start_send(&wire(), &source).unwrap());
+        assert_eq!((plain.clipboard, plain.mime_type), (None, None));
+        let json = String::from_utf8(offer.to_json().unwrap()).unwrap();
+        assert!(json.contains("\"clipboard\":true") && json.contains("\"mimeType\":\"image/png\""));
     }
 
     #[test]

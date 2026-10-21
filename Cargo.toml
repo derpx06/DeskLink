@@ -32,7 +32,7 @@ tungstenite = { version = "0.30", features = ["native-tls"] }
 uuid = { version = "1", features = ["v4"] }
 vt100 = "0.16"
 # X11 fallback for sharing the desktop where no ScreenCast portal exists.
-x11rb = { version = "0.13", features = ["xtest"] }
+x11rb = { version = "0.13", features = ["xtest", "xfixes"] }
 
 [dependencies.gst]
 package = "gstreamer"

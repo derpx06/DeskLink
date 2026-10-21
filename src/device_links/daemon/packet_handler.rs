@@ -126,6 +126,36 @@ fn notify_peer_not_paired(binding: &SessionBinding, sessions: &Arc<DeviceManager
     let _ = binding.link.send_packet(&packet);
 }
 
+/// The link kinds a phone may open here (as the phone allows the other way):
+/// never `file:` or an app's own scheme.
+fn openable_link(url: &str) -> bool {
+    let scheme = url
+        .split_once(':')
+        .map(|(scheme, _)| scheme.to_ascii_lowercase());
+    matches!(
+        scheme.as_deref(),
+        Some("http" | "https" | "mailto" | "tel" | "geo" | "sms")
+    ) && url.len() <= 8192
+        && !url.chars().any(char::is_control)
+}
+
+/// A phone's "Open on computer" (C3): the desktop's default handler opens
+/// it, through GIO (no `xdg-open` needed).
+fn open_link_from_phone(url: &str) -> Result<(), String> {
+    if !openable_link(url) {
+        return Err("DeskLink refused a link it does not open from a phone".to_string());
+    }
+    let url = url.to_string();
+    gtk::glib::MainContext::default().invoke(move || {
+        if let Err(error) =
+            gtk::gio::AppInfo::launch_default_for_uri(&url, gtk::gio::AppLaunchContext::NONE)
+        {
+            eprintln!("[DeskLink] Could not open the phone's link: {error}");
+        }
+    });
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_lan_packet(
     binding: &SessionBinding,
@@ -630,11 +660,7 @@ pub(crate) fn dispatch_webrtc_feature_packet(
                 set_clipboard_text_from_remote(text);
                 Ok(())
             } else if let Some(url) = packet.get_str("url") {
-                std::process::Command::new("xdg-open")
-                    .arg(url)
-                    .spawn()
-                    .map_err(|error| format!("Could not open shared URL: {error}"))?;
-                Ok(())
+                open_link_from_phone(url)
             } else {
                 Err("DeskLink WebRTC file transfer requires the file-data channel".to_string())
             }
@@ -955,6 +981,30 @@ fn spawn_player(program: &str, args: &[&str]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_web_mail_phone_and_map_links_open_from_a_phone() {
+        for url in [
+            "https://example.com/a?b",
+            "HTTP://x.org",
+            "mailto:a@b.c",
+            "tel:+15550100",
+            "geo:1,2",
+            "sms:555",
+        ] {
+            assert!(super::openable_link(url), "{url}");
+        }
+        for url in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "steam://run/1",
+            "no-scheme",
+            "https://a\nb",
+        ] {
+            assert!(!super::openable_link(url), "{url}");
+        }
+    }
+
     #[test]
     fn a_request_to_unlock_is_refused() {
         let mut packet = crate::device_links::packet::NetworkPacket::new(
