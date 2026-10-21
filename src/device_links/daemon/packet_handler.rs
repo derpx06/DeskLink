@@ -607,10 +607,21 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             let content = packet
                 .get_str("content")
                 .ok_or_else(|| "DeskLink WebRTC clipboard packet has no content".to_string())?;
-            // Off here means off both ways: the phone's copies are dropped.
-            if crate::device_links::config::app_settings().clipboard_sync {
-                clipboard_from_phone(content, &binding.link.info.name);
-            }
+            // `connect` (every connection) carries when the phone's copy was
+            // made; a plain `clipboard` is a copy made now.
+            let connect = (packet.packet_type == PACKET_TYPE_CLIPBOARD_CONNECT).then(|| {
+                packet
+                    .body
+                    .get("timestamp")
+                    .and_then(serde_json::Value::as_u64)
+            });
+            // Off means off both ways: the phone's copies are dropped there.
+            let outcome = clipboard_from_phone(content, &binding.link.info.name, connect);
+            debug_log!(
+                "[Clipboard] {} from {device_id}: {} chars, {outcome}",
+                packet.packet_type,
+                content.chars().count()
+            );
             Ok(())
         }
         PACKET_TYPE_SHARE_REQUEST => {

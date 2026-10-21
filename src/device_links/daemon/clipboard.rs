@@ -1,4 +1,4 @@
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -51,6 +51,13 @@ pub fn history() -> Vec<ClipboardItem> {
 #[cfg(debug_assertions)]
 pub fn debug_remember(text: &str, from: Option<&str>) {
     remember(text, from);
+}
+
+/// Debug builds only: a phone's clipboard arriving, for isolated tests.
+#[cfg(debug_assertions)]
+pub fn debug_receive(text: &str) {
+    let outcome = clipboard_from_phone(text, "Test phone", None);
+    debug_log!("[Clipboard] test copy: {outcome}");
 }
 
 fn remember(text: &str, from: Option<&str>) {
@@ -170,41 +177,123 @@ fn clipboard_targets() -> Option<Vec<String>> {
     None
 }
 
-/// A phone's clipboard arrived: listed, then published here.
-pub(super) fn clipboard_from_phone(content: &str, device_name: &str) {
+/// When a phone's copy last arrived, and when the desk's own clipboard last
+/// changed (Unix milliseconds; 0 never).
+static REMOTE_AT: AtomicU64 = AtomicU64::new(0);
+static LOCAL_CHANGED_AT: AtomicU64 = AtomicU64::new(0);
+
+/// How long a phone's copy may take to land on this clipboard. Text first
+/// seen here before that is older than the phone's copy and is never sent
+/// back over it.
+const SETTLE_MS: u64 = 1500;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
+/// Whether desk text first seen at `seen_ms` was replaced by a phone's copy
+/// received at `remote_ms`: it is then not a new copy to share (the phone's
+/// copy is the newer one, even while it is still landing or if it could not
+/// be placed).
+fn superseded(seen_ms: u64, remote_ms: u64) -> bool {
+    remote_ms != 0 && seen_ms < remote_ms.saturating_add(SETTLE_MS)
+}
+
+/// `clipboard.connect` (sent on every connection) is the phone's clipboard
+/// as of `timestamp`; it replaces the desk's only when newer than the desk's
+/// own last change. An unknown time (absent or 0) never does.
+fn connect_is_newer(timestamp: Option<u64>, local_changed_ms: u64) -> bool {
+    timestamp.is_some_and(|at| at > 0 && at > local_changed_ms)
+}
+
+/// What a phone's clipboard packet did here, for the debug log.
+pub(super) fn clipboard_from_phone(
+    content: &str,
+    device_name: &str,
+    connect_timestamp: Option<Option<u64>>,
+) -> &'static str {
+    if !crate::device_links::config::app_settings().clipboard_sync {
+        return "ignored: clipboard sync is off";
+    }
+    if get_last_clipboard()
+        .lock()
+        .is_ok_and(|last| *last == content)
+    {
+        return "unchanged";
+    }
+    if let Some(timestamp) = connect_timestamp {
+        if !connect_is_newer(timestamp, LOCAL_CHANGED_AT.load(Ordering::Acquire)) {
+            return "ignored: older than this computer's clipboard";
+        }
+    }
     remember(content, Some(device_name));
     set_clipboard_text_from_remote(content);
+    "placed on the clipboard"
+}
+
+/// The X11 clipboard context, kept for the life of the process: `arboard`
+/// serves our selection from it, so it must outlive every paste. On GNOME
+/// and KDE Wayland the compositor mirrors this X11 selection (through
+/// XWayland) to every Wayland application.
+static X11_CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
+
+fn set_x11(text: &str) -> bool {
+    let Ok(mut held) = X11_CLIPBOARD.lock() else {
+        return false;
+    };
+    // A second try with a fresh context: the first may be dead (XWayland
+    // restarted), and a dead one would refuse every later copy.
+    for _ in 0..2 {
+        if held.is_none() {
+            *held = arboard::Clipboard::new().ok();
+        }
+        let Some(clipboard) = held.as_mut() else {
+            return false;
+        };
+        if clipboard.set_text(text.to_string()).is_ok() {
+            return true;
+        }
+        *held = None;
+    }
+    false
 }
 
 /// Publishes clipboard text received from a paired device.
 ///
-/// On X11 the selection has no backing store: the owning process must stay
-/// alive to answer paste requests. The previous implementation dropped its
-/// `Clipboard` after a five second sleep, so anything pasted later came back
-/// empty. `arboard`'s `wait()` keeps ownership until another application takes
-/// the selection, which is exactly the required lifetime. Wayland has a real
-/// clipboard manager and needs no such handling, and `set_text` is enough
-/// there; both paths are covered by keeping the owner thread alive.
+/// Through X11 first. A Wayland client cannot do this: Mutter (and KWin)
+/// accept a Wayland clipboard only from the focused window, and the phone's
+/// copy arrives while DeskLink is hidden or in the background — GTK's
+/// `Gdk.Clipboard` then claims it locally and nobody else ever sees it.
+/// Verified on GNOME Shell 50: X11 text from an unfocused client pastes in
+/// Wayland applications; GTK text from an unfocused (or windowless) client
+/// does not. With no X display at all, GTK is the last resort: it works
+/// while a DeskLink window has focus.
 pub(super) fn set_clipboard_text_from_remote(content: &str) {
+    REMOTE_AT.store(now_ms(), Ordering::Release);
+    LOCAL_CHANGED_AT.store(now_ms(), Ordering::Release);
     if let Ok(mut last) = get_last_clipboard().lock() {
         *last = content.to_string();
     }
-
     let content = content.to_string();
+    // Off the packet thread: the first X11 connection can start XWayland.
     thread::spawn(move || {
-        let Ok(mut clipboard) = arboard::Clipboard::new() else {
-            return;
+        // A newer copy may have arrived meanwhile: only the latest is set.
+        let latest = || {
+            get_last_clipboard()
+                .lock()
+                .is_ok_and(|last| *last == content)
         };
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            use arboard::SetExtLinux;
-            // Blocks until ownership is lost, keeping the text pasteable.
-            if clipboard.set().wait().text(content.clone()).is_ok() {
-                return;
-            }
+        if !latest() || set_x11(&content) {
+            return;
         }
-        let _ = clipboard.set_text(content);
-        thread::sleep(Duration::from_secs(5));
+        debug_log!("[Clipboard] No X11 clipboard here; placing it through GTK instead");
+        gtk::glib::MainContext::default().invoke(move || {
+            if let Some(display) = gtk::gdk::Display::default() {
+                gtk::prelude::DisplayExt::clipboard(&display).set_text(&content);
+            }
+        });
     });
 }
 
@@ -217,9 +306,10 @@ impl DaemonWorker {
         let shutdown = Arc::clone(&self.shutdown);
         let errors = Arc::clone(&self.errors);
         thread::spawn(move || {
-            // The last local text looked at, and whether it was a password,
-            // so the selection is asked once per copy, not every second.
-            let mut examined: Option<(String, bool)> = None;
+            // The last local text looked at, whether it was a password (so
+            // the selection is asked once per copy, not every second), and
+            // when it was first seen.
+            let mut examined: Option<(String, bool, u64)> = None;
             // Learn up front whether passwords can be recognised here, so the
             // Clipboard page can say so before anything is copied.
             record_detection(x11rb::connect(None).is_ok());
@@ -252,15 +342,23 @@ impl DaemonWorker {
                 drop(last);
                 if examined
                     .as_ref()
-                    .is_none_or(|(text, _)| *text != current_text)
+                    .is_none_or(|(text, ..)| *text != current_text)
                 {
                     let secret = clipboard_is_password();
+                    let seen = now_ms();
                     if !secret {
                         remember(&current_text, None);
                     }
-                    examined = Some((current_text.clone(), secret));
+                    if !superseded(seen, REMOTE_AT.load(Ordering::Acquire)) {
+                        LOCAL_CHANGED_AT.store(seen, Ordering::Release);
+                    }
+                    examined = Some((current_text.clone(), secret, seen));
                 }
-                if examined.as_ref().is_some_and(|(_, secret)| *secret) {
+                // A password, or the text a phone's newer copy replaced (still
+                // landing, or it could not be placed): never sent.
+                if examined.as_ref().is_some_and(|(_, secret, seen)| {
+                    *secret || superseded(*seen, REMOTE_AT.load(Ordering::Acquire))
+                }) {
                     continue;
                 }
 
@@ -394,6 +492,29 @@ mod tests {
             "10",
             "blank text is not listed"
         );
+    }
+
+    #[test]
+    fn a_phone_copy_is_never_sent_back_over_by_older_desk_text() {
+        // Desk text seen before the phone's copy arrived, or while it was
+        // landing, is older: not sent (it would overwrite the phone's copy).
+        assert!(superseded(1_000, 2_000));
+        assert!(superseded(2_500, 2_000), "still landing");
+        // Copied here after the phone's copy landed: a new copy to share.
+        assert!(!superseded(2_000 + SETTLE_MS, 2_000));
+        assert!(!superseded(5, 0), "no phone copy yet");
+    }
+
+    #[test]
+    fn a_reconnect_replaces_the_desk_clipboard_only_with_a_newer_copy() {
+        assert!(connect_is_newer(Some(2_000), 1_000));
+        assert!(
+            !connect_is_newer(Some(1_000), 2_000),
+            "the desk copied since"
+        );
+        assert!(!connect_is_newer(Some(0), 0), "unknown time");
+        assert!(!connect_is_newer(None, 0));
+        assert!(connect_is_newer(Some(1), 0), "nothing copied here yet");
     }
 
     #[test]

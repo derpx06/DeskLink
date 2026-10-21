@@ -321,6 +321,46 @@ mod tests {
         .is_ok());
     }
 
+    /// The phone's copies reach the clipboard arm over WebRTC.
+    #[test]
+    fn allows_the_phone_clipboard_over_webrtc_after_handover() {
+        use crate::device_links::packet::PACKET_TYPE_CLIPBOARD_CONNECT;
+        let manager = DeviceManager::new();
+        let binding = paired_binding(
+            &manager,
+            vec![
+                PACKET_TYPE_CLIPBOARD.to_string(),
+                PACKET_TYPE_CLIPBOARD_CONNECT.to_string(),
+            ],
+        );
+        manager
+            .with_session(&binding, |session| {
+                let wire = WebRtcWireBinding::from_attempt(
+                    "desktop",
+                    "phone",
+                    "01234567-89ab-cdef-0123-456789abcdef",
+                )
+                .unwrap();
+                let mut runtime = HandoverRuntime::new("attempt".to_string(), wire);
+                make_feature_ready(&mut runtime);
+                session.webrtc_handover = Some(runtime);
+            })
+            .unwrap();
+        for packet_type in [PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT] {
+            assert!(
+                SharedPacketDispatcher::authorize(
+                    PacketSource::WebRtc,
+                    &binding,
+                    &manager,
+                    &local(),
+                    &NetworkPacket::new(packet_type),
+                )
+                .is_ok(),
+                "{packet_type}"
+            );
+        }
+    }
+
     #[test]
     fn allows_find_phone_only_over_webrtc_after_handover() {
         let manager = DeviceManager::new();

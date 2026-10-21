@@ -1764,6 +1764,10 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 }
             }
         }
+        // "clip-in TEXT": a phone's clipboard arriving (the real path).
+        "clip-in" => {
+            crate::device_links::daemon::clipboard::debug_receive(format!("{id} {arg}").trim());
+        }
         // "fake-clip TEXT" / "fake-clip-phone TEXT": a clipboard history item.
         "fake-clip" | "fake-clip-phone" => {
             let text = format!("{id} {arg}");
