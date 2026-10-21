@@ -132,6 +132,8 @@ pub(crate) fn metadata(
         .ok()
         .flatten()
         .filter(|url| !url.is_empty());
+    let page = dict.lookup::<String>("xesam:url").ok().flatten();
+    let art = usable_art(art, page.as_deref(), local_art);
     (
         text("xesam:title"),
         artist,
@@ -140,6 +142,74 @@ pub(crate) fn metadata(
         art,
         track,
     )
+}
+
+/// The art URL to read: the player's own; a local file this process cannot
+/// see at its path is looked up with `find` (a Flatpak app's private /tmp);
+/// failing that, a YouTube video's thumbnail from the page URL, else none.
+fn usable_art(
+    art: Option<String>,
+    page: Option<&str>,
+    find: impl Fn(&std::path::Path) -> Option<std::path::PathBuf>,
+) -> Option<String> {
+    art.and_then(|url| {
+        if !url.to_ascii_lowercase().starts_with("file://") {
+            return Some(url);
+        }
+        let path = gio::File::for_uri(&url).path()?;
+        find(&path).map(|found| gio::File::for_path(found).uri().to_string())
+    })
+    .or_else(|| page.and_then(youtube_thumbnail))
+}
+
+/// Where a player's local art file really is. A Flatpak app (Chrome, for
+/// one) writes `/tmp/<name>` in its own /tmp, which the host sees as
+/// `$XDG_RUNTIME_DIR/.flatpak/<app>/tmp/<name>`; only a file directly in
+/// /tmp is looked for there.
+fn local_art(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    let name = path.file_name()?;
+    if path.parent() != Some(std::path::Path::new("/tmp")) {
+        return None;
+    }
+    std::fs::read_dir(glib::user_runtime_dir().join(".flatpak"))
+        .ok()?
+        .flatten()
+        .map(|app| app.path().join("tmp").join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// `https://i.ytimg.com/vi/<id>/hqdefault.jpg` for a YouTube video page:
+/// youtube.com (www., m., music.) `/watch?v=<id>`, `/shorts/<id>`,
+/// `/embed/<id>`, `/live/<id>`, or `youtu.be/<id>`.
+fn youtube_thumbnail(page: &str) -> Option<String> {
+    let rest = page
+        .strip_prefix("https://")
+        .or_else(|| page.strip_prefix("http://"))?;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = host.to_ascii_lowercase();
+    let (path, query) = path.split_once('?').unwrap_or((path, ""));
+    let path = path.split('#').next().unwrap_or_default();
+    let id = match host.as_str() {
+        "youtu.be" => path.split('/').next()?,
+        "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com" => {
+            match path.split_once('/') {
+                Some(("shorts" | "embed" | "live", id)) => id.split('/').next()?,
+                _ if path == "watch" => query
+                    .split(['&', '#'])
+                    .find_map(|pair| pair.strip_prefix("v="))?,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let valid = id.len() == 11
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    valid.then(|| format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"))
 }
 
 /// Every property of `interface` on player `name`, in one call.
@@ -652,6 +722,83 @@ mod tests {
     }
 
     #[test]
+    fn youtube_pages_give_their_thumbnail() {
+        let thumb = |id: &str| Some(format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg"));
+        for (page, expected) in [
+            (
+                "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                thumb("dQw4w9WgXcQ"),
+            ),
+            (
+                "https://youtube.com/watch?list=PL1&v=dQw4w9WgXcQ&t=42",
+                thumb("dQw4w9WgXcQ"),
+            ),
+            (
+                "https://music.youtube.com/watch?v=abc-DEF_123",
+                thumb("abc-DEF_123"),
+            ),
+            (
+                "https://m.youtube.com/watch?v=dQw4w9WgXcQ#t=1",
+                thumb("dQw4w9WgXcQ"),
+            ),
+            ("https://youtu.be/dQw4w9WgXcQ?si=xyz", thumb("dQw4w9WgXcQ")),
+            (
+                "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+                thumb("dQw4w9WgXcQ"),
+            ),
+            (
+                "http://www.youtube.com/embed/dQw4w9WgXcQ",
+                thumb("dQw4w9WgXcQ"),
+            ),
+            ("https://www.youtube.com/", None),
+            ("https://www.youtube.com/watch?v=short", None),
+            ("https://www.youtube.com/watch?v=dQw4w9WgXc%22", None),
+            ("https://evil.example/watch?v=dQw4w9WgXcQ", None),
+            ("https://youtube.com.evil.example/watch?v=dQw4w9WgXcQ", None),
+            ("file:///home/me/song.mp3", None),
+        ] {
+            assert_eq!(youtube_thumbnail(page), expected, "{page}");
+        }
+    }
+
+    #[test]
+    fn unreadable_local_art_is_found_or_falls_back_to_the_video_thumbnail() {
+        use std::path::{Path, PathBuf};
+        let page = Some("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+        let chrome = Some("file:///tmp/.com.google.Chrome.Ab12Cd".to_string());
+        let thumb = Some("https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg".to_string());
+        let nowhere = |_: &Path| None;
+        // Chrome's Flatpak /tmp, seen from the host.
+        let flatpak = |path: &Path| {
+            Some(
+                PathBuf::from("/run/user/1000/.flatpak/com.google.Chrome/tmp")
+                    .join(path.file_name()?),
+            )
+        };
+        assert_eq!(
+            usable_art(chrome.clone(), None, flatpak).as_deref(),
+            Some("file:///run/user/1000/.flatpak/com.google.Chrome/tmp/.com.google.Chrome.Ab12Cd")
+        );
+        assert_eq!(
+            usable_art(chrome.clone(), page, nowhere),
+            thumb,
+            "not found anywhere"
+        );
+        assert_eq!(usable_art(chrome, None, nowhere), None);
+        assert_eq!(usable_art(None, page, nowhere), thumb, "no art at all");
+        assert_eq!(
+            usable_art(None, Some("https://example.com/"), nowhere),
+            None
+        );
+        let remote = Some("https://example.com/a.jpg".to_string());
+        assert_eq!(usable_art(remote.clone(), page, nowhere), remote);
+        assert_eq!(
+            local_art(Path::new("/tmp/../etc/no-such-desklink-file")),
+            None
+        );
+    }
+
+    #[test]
     fn mpris_metadata_maps_to_the_phones_fields() {
         let dict = glib::VariantDict::new(None);
         dict.insert("xesam:title", "Blurred");
@@ -661,13 +808,13 @@ mod tests {
         );
         dict.insert("xesam:album", "Blurred EP");
         dict.insert("mpris:length", 281_000_000i64);
-        dict.insert("mpris:artUrl", "file:///tmp/a.jpg");
+        dict.insert("mpris:artUrl", "https://example.com/a.jpg");
         let (title, artist, album, length_ms, art, _) = metadata(&dict.end());
         assert_eq!(title, "Blurred");
         assert_eq!(artist, "Kiasmos, Guest");
         assert_eq!(album, "Blurred EP");
         assert_eq!(length_ms, 281_000);
-        assert_eq!(art.as_deref(), Some("file:///tmp/a.jpg"));
+        assert_eq!(art.as_deref(), Some("https://example.com/a.jpg"));
         let (title, _, _, length_ms, art, _) = metadata(&glib::VariantDict::new(None).end());
         assert!(title.is_empty() && length_ms == 0 && art.is_none());
     }
