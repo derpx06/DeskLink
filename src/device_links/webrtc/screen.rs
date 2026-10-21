@@ -1575,6 +1575,265 @@ const MAX_DIMENSION: i64 = 2560;
 /// The highest frame rate served.
 const MAX_FPS: i64 = 60;
 
+// ── The phone as a webcam (contract C4) ─────────────────────────────────
+
+/// What the camera's picture is published as.
+pub(crate) const CAMERA_NODE_DESCRIPTION: &str = "DeskLink Camera";
+
+/// A v4l2loopback device that already exists (`/dev/videoN`), for apps that
+/// only open V4L2 devices. Nothing is loaded for it.
+fn loopback_device() -> Option<std::path::PathBuf> {
+    let dir = std::fs::read_dir("/sys/devices/virtual/video4linux").ok()?;
+    let mut names: Vec<String> = dir
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("video"))
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| std::path::PathBuf::from("/dev").join(name))
+        .find(|path| path.exists())
+}
+
+/// The decode chain feeding the camera outputs: a PipeWire `Video/Source`
+/// node every app can choose ("DeskLink Camera"), and a v4l2loopback device
+/// when one exists.
+struct CameraStream {
+    pipeline: gst::Pipeline,
+    source_pad: gst::Pad,
+    elements: Vec<gst::Element>,
+}
+
+impl CameraStream {
+    fn stop(self) {
+        if let Some(decode_sink) = self
+            .elements
+            .first()
+            .and_then(|decode| decode.static_pad("sink"))
+        {
+            let _ = self.source_pad.unlink(&decode_sink);
+        }
+        for element in self.elements.iter().rev() {
+            let _ = element.set_state(gst::State::Null);
+        }
+        let _ = self.pipeline.remove_many(self.elements.iter());
+        park_pad(&self.pipeline, &self.source_pad);
+        if let Ok(mut map) = parked().lock() {
+            map.retain(|_, (_, pad)| pad != &self.source_pad);
+        }
+    }
+}
+
+fn cameras() -> &'static Mutex<std::collections::HashMap<String, CameraStream>> {
+    static CAMERAS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, CameraStream>>> =
+        std::sync::OnceLock::new();
+    CAMERAS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// The pipeline and the phone's video pad, taken from whatever uses it now
+/// (a view of the phone's screen, or the parking fakesink).
+fn take_phone_video(device_id: &str) -> Option<(gst::Pipeline, gst::Pad)> {
+    if let Some(stream) = streams()
+        .lock()
+        .ok()
+        .and_then(|mut map| map.remove(device_id))
+    {
+        let found = (
+            stream.inner.pipeline.clone(),
+            stream.inner.source_pad.clone(),
+        );
+        stream.stop();
+        if let Ok(mut map) = parked().lock() {
+            map.remove(device_id);
+        }
+        return Some(unpark(found));
+    }
+    parked()
+        .lock()
+        .ok()
+        .and_then(|mut map| map.remove(device_id))
+        .map(unpark)
+}
+
+/// Frees a parked pad from its fakesink.
+fn unpark((pipeline, pad): (gst::Pipeline, gst::Pad)) -> (gst::Pipeline, gst::Pad) {
+    if let Some(peer) = pad.peer() {
+        let _ = pad.unlink(&peer);
+        if let Some(fake) = peer.parent_element() {
+            let _ = fake.set_state(gst::State::Null);
+            let _ = pipeline.remove(&fake);
+        }
+    }
+    (pipeline, pad)
+}
+
+/// Sends the phone's incoming video to the camera outputs. `Ok(false)` when
+/// no video has arrived yet (call again once it does).
+pub(crate) fn attach_camera(device_id: &str) -> Result<bool, String> {
+    if cameras()
+        .lock()
+        .is_ok_and(|map| map.contains_key(device_id))
+    {
+        return Ok(true);
+    }
+    let Some((pipeline, pad)) = take_phone_video(device_id) else {
+        return Ok(false);
+    };
+    let make = |factory: &str| {
+        gst::ElementFactory::make(factory)
+            .build()
+            .map_err(|error| format!("DeskLink Camera needs GStreamer's {factory}: {error}"))
+    };
+    let decode = make("decodebin")?;
+    let convert = make("videoconvert")?;
+    let tee = make("tee")?;
+    let queue = make("queue")?;
+    let sink = if cfg!(test) {
+        make("fakesink")?
+    } else {
+        let sink = make("pipewiresink")?;
+        sink.set_property_from_str("mode", "provide");
+        sink.set_property("client-name", "DeskLink");
+        sink.set_property(
+            "stream-properties",
+            gst::Structure::builder("properties")
+                .field("media.class", "Video/Source")
+                .field("media.role", "Camera")
+                .field("node.name", "desklink-camera")
+                .field("node.description", CAMERA_NODE_DESCRIPTION)
+                .build(),
+        );
+        sink
+    };
+    sink.set_property("sync", false);
+    let mut elements = vec![
+        decode.clone(),
+        convert.clone(),
+        tee.clone(),
+        queue.clone(),
+        sink.clone(),
+    ];
+    // Also an existing v4l2loopback device, for V4L2-only apps.
+    let loopback = loopback_device()
+        .filter(|_| !cfg!(test))
+        .and_then(|device| {
+            let queue = make("queue").ok()?;
+            let convert = make("videoconvert").ok()?;
+            let caps = gst::ElementFactory::make("capsfilter")
+                .property(
+                    "caps",
+                    gst::Caps::builder("video/x-raw")
+                        .field("format", "YUY2")
+                        .build(),
+                )
+                .build()
+                .ok()?;
+            let v4l2 = gst::ElementFactory::make("v4l2sink")
+                .property("device", device.to_string_lossy().as_ref())
+                .property("sync", false)
+                .build()
+                .ok()?;
+            Some(vec![queue, convert, caps, v4l2])
+        });
+    if let Some(chain) = &loopback {
+        elements.extend(chain.iter().cloned());
+    }
+    pipeline
+        .add_many(elements.iter())
+        .map_err(|error| format!("Could not build DeskLink Camera: {error}"))?;
+    let build = || -> Result<(), String> {
+        gst::Element::link_many([&tee, &queue, &sink]).map_err(|error| error.to_string())?;
+        if let Some(chain) = &loopback {
+            let mut linked = vec![&tee];
+            linked.extend(chain.iter());
+            gst::Element::link_many(linked).map_err(|error| error.to_string())?;
+        }
+        convert.link(&tee).map_err(|error| error.to_string())?;
+        if let Some(bin) = decode.downcast_ref::<gst::Bin>() {
+            bin.connect_deep_element_added(|_, _, element| {
+                if element.has_property("automatic-request-sync-points", None) {
+                    set_if_present(element, "automatic-request-sync-points", "true");
+                    set_if_present(element, "discard-corrupted-frames", "true");
+                    set_if_present(element, "min-force-key-unit-interval", "500000000");
+                }
+            });
+        }
+        let convert_for_decode = convert.clone();
+        decode.connect_pad_added(move |_, decoded| {
+            if let Some(target) = convert_for_decode.static_pad("sink") {
+                if let Err(error) = decoded.link(&target) {
+                    eprintln!("[DeskLink] Could not link the camera picture: {error}");
+                }
+            }
+        });
+        for element in elements.iter().rev() {
+            element
+                .sync_state_with_parent()
+                .map_err(|error| format!("Could not start DeskLink Camera: {error}"))?;
+        }
+        let target = decode
+            .static_pad("sink")
+            .ok_or_else(|| "DeskLink Camera decoder has no input".to_string())?;
+        pad.link(&target)
+            .map_err(|error| format!("Could not attach the phone's camera: {error}"))?;
+        Ok(())
+    };
+    if let Err(error) = build() {
+        for element in elements.iter().rev() {
+            let _ = element.set_state(gst::State::Null);
+        }
+        let _ = pipeline.remove_many(elements.iter());
+        park_pad(&pipeline, &pad);
+        if let Ok(mut map) = parked().lock() {
+            map.insert(device_id.to_string(), (pipeline, pad));
+        }
+        return Err(error);
+    }
+    debug_log!(
+        "[DeskLink] {device_id}'s camera is \"{CAMERA_NODE_DESCRIPTION}\"{}",
+        if loopback.is_some() {
+            " and a v4l2loopback device"
+        } else {
+            ""
+        }
+    );
+    if let Ok(mut map) = cameras().lock() {
+        map.insert(
+            device_id.to_string(),
+            CameraStream {
+                pipeline,
+                source_pad: pad,
+                elements,
+            },
+        );
+    }
+    Ok(true)
+}
+
+/// Ends the camera outputs; the phone's video pad is parked for a later
+/// screen view.
+pub(crate) fn detach_camera(device_id: &str) {
+    let removed = cameras()
+        .lock()
+        .ok()
+        .and_then(|mut map| map.remove(device_id));
+    if let Some(camera) = removed {
+        let parked_pad = (camera.pipeline.clone(), camera.source_pad.clone());
+        camera.stop();
+        if let Ok(mut map) = parked().lock() {
+            map.insert(device_id.to_string(), parked_pad);
+        }
+    }
+}
+
+/// Whether the phone's video is the camera now.
+pub(crate) fn camera_attached(device_id: &str) -> bool {
+    cameras()
+        .lock()
+        .is_ok_and(|map| map.contains_key(device_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1824,6 +2083,37 @@ mod tests {
             .and_then(|peer| peer.parent_element())
             .and_then(|element| element.factory())
             .is_some_and(|factory| factory.name() == "fakesink")
+    }
+
+    /// C4: the phone's video, shown or parked, becomes the camera outputs,
+    /// and goes back to being parked (for a later screen view) when it stops.
+    #[test]
+    fn the_phones_video_becomes_the_camera_and_is_parked_again_after() {
+        gst::init().unwrap();
+        let pipeline = gst::Pipeline::new();
+        let source = gst::ElementFactory::make("identity").build().unwrap();
+        pipeline.add(&source).unwrap();
+        let source_pad = source.static_pad("src").unwrap();
+        assert!(!attach_camera("phone-cam").unwrap(), "no video yet");
+        publish_stream(
+            "phone-cam",
+            attach_incoming_video(&pipeline, &source_pad).unwrap(),
+        );
+
+        assert!(attach_camera("phone-cam").unwrap());
+        assert!(camera_attached("phone-cam"));
+        assert!(stream_for("phone-cam").is_none(), "no longer a screen view");
+        assert!(!is_parked(&source_pad), "feeding the camera");
+        // identity + decodebin, videoconvert, tee, queue, sink.
+        assert_eq!(pipeline.children().len(), 6);
+
+        detach_camera("phone-cam");
+        assert!(!camera_attached("phone-cam"));
+        assert!(is_parked(&source_pad));
+        assert_eq!(pipeline.children().len(), 2, "identity + parking fakesink");
+        assert!(resume_parked("phone-cam"), "a later view gets the pad back");
+        clear_stream("phone-cam");
+        forget_parked("phone-cam");
     }
 
     #[test]

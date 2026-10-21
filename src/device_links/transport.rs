@@ -131,6 +131,30 @@ impl FeatureTransport {
         )
     }
 
+    /// Asks the phone for its camera (C4).
+    pub(crate) fn start_camera(&self, facing: &str, width: i32, height: i32) -> Result<(), String> {
+        let device_id = self.snapshot.binding.device_id.clone();
+        crate::device_links::webrtc::coordinator::send_camera_message(
+            &self.sessions,
+            &self.snapshot,
+            |build| {
+                Some(crate::device_links::webrtc::camera::begin(
+                    &device_id, facing, width, height, 30, build,
+                ))
+            },
+        )
+    }
+
+    /// `flip` or `stop` for the running camera session.
+    pub(crate) fn camera_control(&self, action: &str) -> Result<(), String> {
+        let device_id = self.snapshot.binding.device_id.clone();
+        crate::device_links::webrtc::coordinator::send_camera_message(
+            &self.sessions,
+            &self.snapshot,
+            |build| crate::device_links::webrtc::camera::control(&device_id, action, build),
+        )
+    }
+
     pub(crate) fn cancel_transfer(&self, transfer_id: &str) -> Result<(), String> {
         crate::device_links::webrtc::coordinator::cancel_file_transfer(
             &self.sessions,

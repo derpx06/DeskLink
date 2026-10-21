@@ -41,6 +41,10 @@ pub enum DaemonCommand {
     /// A call request (T2): the phone ("" = the connected one that can
     /// call), the action, and the number to dial.
     Telephony(String, String, Option<String>),
+    /// Use the phone's camera as this computer's webcam: facing, size.
+    StartCamera(String, String, i32, i32),
+    /// `flip` or `stop` the phone's camera.
+    CameraControl(String, String),
     /// "Type on phone": keys for the phone's focused text field.
     SendFocusedFieldKeys(String, serde_json::Map<String, serde_json::Value>),
     /// Send this computer's notifications to the phones.
@@ -170,6 +174,19 @@ impl DaemonWorker {
             }
             DaemonCommand::Telephony(id, action, number) => {
                 self.send_telephony(&id, &action, number.as_deref())
+            }
+            DaemonCommand::StartCamera(id, facing, width, height) => {
+                self.with_feature_transport(&id, |transport| {
+                    transport.start_camera(&facing, width, height)
+                });
+            }
+            DaemonCommand::CameraControl(id, action) => {
+                let sent =
+                    self.with_feature_transport(&id, |transport| transport.camera_control(&action));
+                // Stopping is local too: the outputs go even if the link is gone.
+                if !sent && action == "stop" {
+                    crate::device_links::webrtc::camera::end(&id);
+                }
             }
             DaemonCommand::SendFocusedFieldKeys(id, payload) => {
                 self.send_focused_field_keys(&id, payload)

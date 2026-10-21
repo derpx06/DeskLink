@@ -77,6 +77,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         if let Some(call) = super::calls::card(daemon, device, false) {
             page.append(&call);
         }
+        if let Some(camera) = super::camera::bar(daemon, device) {
+            page.append(&camera);
+        }
         page.append(&hero(daemon, device, &minute));
         if let Some(bar) = now_playing_bar(daemon, device) {
             page.append(&bar);
@@ -262,18 +265,6 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         disable_with(&show, reason.as_deref());
         buttons.append(&show);
     }
-    // "Type on <phone>" (C2): a phone that reports its focused field.
-    if crate::type_on_phone::supported(device) {
-        let typing = icon_button("input-keyboard-symbolic", "Type", &["soft-button"]);
-        typing.set_tooltip_text(Some("Type on the phone with this keyboard (Ctrl+Shift+K)"));
-        let (daemon, id) = (daemon.clone(), device.id.clone());
-        typing.connect_clicked(move |button| {
-            let root = button.root().and_downcast::<gtk::Window>();
-            crate::type_on_phone::open(&daemon, &id, root.as_ref());
-        });
-        disable_with(&typing, reason.as_deref());
-        buttons.append(&typing);
-    }
     if can_send_feature(device, PACKET_TYPE_SHARE_REQUEST) {
         let send = icon_button(
             "document-send-symbolic",
@@ -350,6 +341,33 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         }
         disable_with(&button, reason.as_deref());
         round.append(&button);
+    }
+    // Type on the phone (C2), for a phone that reports its focused field.
+    if crate::type_on_phone::supported(device) {
+        let typing = round_action(
+            "input-keyboard-symbolic",
+            "Type",
+            &format!("Type on {} with this keyboard (Ctrl+Shift+K)", device.name),
+        );
+        let (daemon, id) = (daemon.clone(), device.id.clone());
+        typing.connect_clicked(move |button| {
+            let root = button.root().and_downcast::<gtk::Window>();
+            crate::type_on_phone::open(&daemon, &id, root.as_ref());
+        });
+        disable_with(&typing, reason.as_deref());
+        round.append(&typing);
+    }
+    // The phone as a webcam (C4), from a phone that can share its screen.
+    if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) && device.camera.is_none() {
+        let camera = round_action(
+            "camera-web-symbolic",
+            "Webcam",
+            &format!("Use {}'s camera as this computer's webcam", device.name),
+        );
+        let (daemon, view) = (daemon.clone(), device.clone());
+        camera.connect_clicked(move |button| super::camera::ask(&daemon, &view, button));
+        disable_with(&camera, reason.as_deref());
+        round.append(&camera);
     }
     actions.append(&round);
     band.append(&actions);

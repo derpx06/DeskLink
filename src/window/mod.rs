@@ -25,6 +25,7 @@
 //! module and is redrawn only when what it shows has changed.
 
 pub(crate) mod calls;
+mod camera;
 pub(crate) use calls::confirm_dial;
 mod clipboard;
 pub(crate) mod history;
@@ -652,6 +653,7 @@ impl DesklinkWindow {
                     number,
                 } => calls::missed(self, &device_id, &device_name, caller, number),
                 DaemonEvent::CallRefused { message } => self.show_feature_toast(&message),
+                DaemonEvent::CameraNotice { message, .. } => self.show_feature_toast(&message),
             }
         }
 
@@ -2111,6 +2113,15 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
                 device.desktop_session = DesktopSession::Viewing;
             }
         }
+    }
+    // "camera" / "camera-asked": the phone as a webcam.
+    if kind.starts_with("camera") {
+        device.camera = Some(crate::device_links::device::CameraUse {
+            live: kind == "camera",
+            facing: "back".into(),
+            width: 1280,
+            height: 720,
+        });
     }
     // "ringing" / "talking": a call on the phone.
     use crate::device_links::device::{CallState, CallStatus, PhoneCall};

@@ -98,6 +98,13 @@ pub enum ControlKind {
     /// adopts the offered id and answers with an ordinary `request-view`
     /// (or `view-denied`, reason `busy`).
     OfferView,
+    /// The phone as a webcam (contract C4), outside the screen session and
+    /// with its own sequence: desk → phone `camera-request`, phone → desk
+    /// `camera-ready`, either way `camera-control` and `camera-stopped`.
+    CameraRequest,
+    CameraReady,
+    CameraControl,
+    CameraStopped,
 }
 
 impl ControlKind {
@@ -121,6 +128,10 @@ impl ControlKind {
             Self::InputFocus => "input-focus",
             Self::SwitchScreen => "switch-screen",
             Self::OfferView => "offer-view",
+            Self::CameraRequest => "camera-request",
+            Self::CameraReady => "camera-ready",
+            Self::CameraControl => "camera-control",
+            Self::CameraStopped => "camera-stopped",
         }
     }
 
@@ -144,6 +155,10 @@ impl ControlKind {
             "input-focus" => Self::InputFocus,
             "switch-screen" => Self::SwitchScreen,
             "offer-view" => Self::OfferView,
+            "camera-request" => Self::CameraRequest,
+            "camera-ready" => Self::CameraReady,
+            "camera-control" => Self::CameraControl,
+            "camera-stopped" => Self::CameraStopped,
             _ => return None,
         })
     }
@@ -189,6 +204,23 @@ pub struct ControlMessage {
     /// both.
     pub max_dimension: Option<i64>,
     pub fps: Option<i64>,
+    /// Camera (C4): "front" / "back", the picture's size, whether the
+    /// microphone comes too, and a `camera-control` action.
+    pub facing: Option<String>,
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub audio: Option<bool>,
+    pub action: Option<String>,
+}
+
+impl ControlKind {
+    /// The webcam's kinds, handled apart from the screen session.
+    pub const fn is_camera(self) -> bool {
+        matches!(
+            self,
+            Self::CameraRequest | Self::CameraReady | Self::CameraControl | Self::CameraStopped
+        )
+    }
 }
 
 impl ControlMessage {
@@ -222,6 +254,11 @@ impl ControlMessage {
             max_dimension: None,
             fps: None,
             password: None,
+            facing: None,
+            width: None,
+            height: None,
+            audio: None,
+            action: None,
         }
     }
 
@@ -288,6 +325,19 @@ impl ControlMessage {
         if let Some(fps) = self.fps {
             root.insert("fps".into(), Value::from(fps));
         }
+        if let Some(facing) = &self.facing {
+            root.insert("facing".into(), Value::from(facing.clone()));
+        }
+        if let (Some(width), Some(height)) = (self.width, self.height) {
+            root.insert("width".into(), Value::from(width));
+            root.insert("height".into(), Value::from(height));
+        }
+        if let Some(audio) = self.audio {
+            root.insert("audio".into(), Value::from(audio));
+        }
+        if let Some(action) = &self.action {
+            root.insert("action".into(), Value::from(action.clone()));
+        }
         serde_json::to_vec(&Value::Object(root)).unwrap_or_default()
     }
 
@@ -335,6 +385,11 @@ impl ControlMessage {
             password: optional_text("password"),
             max_dimension: number("maxDimension"),
             fps: number("fps"),
+            facing: optional_text("facing"),
+            width: number("width").map(|value| value.clamp(0, 8192) as i32),
+            height: number("height").map(|value| value.clamp(0, 8192) as i32),
+            audio: object.get("audio").and_then(Value::as_bool),
+            action: optional_text("action"),
         })
     }
 
@@ -390,6 +445,21 @@ impl ControlMessage {
             }
         } else if self.screen_width.is_some() || self.screen_height.is_some() {
             return Err("Remote-session screen size needs both dimensions".to_string());
+        }
+        if self
+            .facing
+            .as_deref()
+            .is_some_and(|facing| !matches!(facing, "front" | "back"))
+        {
+            return Err("Camera facing is neither front nor back".to_string());
+        }
+        if self.kind == ControlKind::CameraControl
+            && !matches!(
+                self.action.as_deref(),
+                Some("flip" | "mic-on" | "mic-off" | "stop")
+            )
+        {
+            return Err("Unknown camera action".to_string());
         }
         if let Some(rotation) = self.screen_rotation {
             if self.screen_width.is_none() {
@@ -675,6 +745,13 @@ impl RemoteSession {
             // Refused above; never applied. An offer is taken up with
             // `adopt_offer`, not here.
             ControlKind::InputFocus | ControlKind::OfferView => {}
+            // The webcam is not the screen session: `camera` handles it.
+            ControlKind::CameraRequest
+            | ControlKind::CameraReady
+            | ControlKind::CameraControl
+            | ControlKind::CameraStopped => {
+                return Err("Camera controls are not part of the screen session".to_string());
+            }
             // A request about the current desktop share; changes no state.
             ControlKind::SwitchScreen => {
                 if mismatched || self.direction != Some(ScreenDirection::DesktopToPhone) {
@@ -976,6 +1053,63 @@ mod tests {
             1,
             1_000,
         )
+    }
+
+    /// C4: the camera's kinds and fields cross the wire in the phone's
+    /// shape, bad ones are refused, and the screen session never takes them.
+    #[test]
+    fn camera_messages_round_trip_and_stay_out_of_the_screen_session() {
+        let id = Uuid::new_v4().to_string();
+        let mut request = message(ControlKind::CameraRequest, &id);
+        request.facing = Some("front".into());
+        request.width = Some(1280);
+        request.height = Some(720);
+        request.fps = Some(30);
+        request.audio = Some(false);
+        let json: Value = serde_json::from_slice(&request.to_json()).unwrap();
+        assert_eq!(json["kind"], "camera-request");
+        assert_eq!(
+            (
+                json["facing"].as_str(),
+                json["width"].as_i64(),
+                json["height"].as_i64()
+            ),
+            (Some("front"), Some(1280), Some(720))
+        );
+        assert_eq!(
+            (json["fps"].as_i64(), json["audio"].as_bool()),
+            (Some(30), Some(false))
+        );
+        let parsed = ControlMessage::from_json(&request.to_json()).unwrap();
+        assert_eq!(parsed, request);
+        assert!(parsed.kind.is_camera());
+        assert!(parsed
+            .validate(&wire(), "01234567-89ab-cdef-0123-456789abcdef", 1_000)
+            .is_ok());
+
+        let mut sideways = parsed.clone();
+        sideways.facing = Some("side".into());
+        assert!(sideways
+            .validate(&wire(), "01234567-89ab-cdef-0123-456789abcdef", 1_000)
+            .is_err());
+        let mut control = message(ControlKind::CameraControl, &id);
+        control.action = Some("zoom".into());
+        assert!(control
+            .validate(&wire(), "01234567-89ab-cdef-0123-456789abcdef", 1_000)
+            .is_err());
+        control.action = Some("flip".into());
+        assert!(control
+            .validate(&wire(), "01234567-89ab-cdef-0123-456789abcdef", 1_000)
+            .is_ok());
+
+        let mut session = RemoteSession::new();
+        assert!(session.accept(&parsed, 1_000).is_err());
+        for kind in ["camera-ready", "camera-control", "camera-stopped"] {
+            assert!(
+                ControlKind::parse(kind).is_some_and(ControlKind::is_camera),
+                "{kind}"
+            );
+        }
     }
 
     /// The desktop reports text focus with `editable`; the field survives the

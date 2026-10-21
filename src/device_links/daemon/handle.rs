@@ -37,6 +37,8 @@ pub enum DaemonEvent {
         caller: Option<String>,
         number: Option<String>,
     },
+    /// The phone's camera stopped or could not start, in the user's words.
+    CameraNotice { device_id: String, message: String },
     /// The phone refused a call request, in the user's words.
     CallRefused { message: String },
 }
@@ -117,6 +119,20 @@ impl DaemonHandle {
             device.terminal_access = terminal_access_allowed(&device.id);
             device.terminal_sessions_attached = terminal_bridge::attached_count(&device.id);
             device.desktop_session = coordinator::desktop_session(&device.id);
+            device.camera = crate::device_links::webrtc::camera::status(&device.id).map(|camera| {
+                let (live, width, height) = match camera.state {
+                    crate::device_links::webrtc::camera::CameraState::Live { width, height } => {
+                        (true, width, height)
+                    }
+                    crate::device_links::webrtc::camera::CameraState::Requested => (false, 0, 0),
+                };
+                crate::device_links::device::CameraUse {
+                    live,
+                    facing: camera.facing,
+                    width,
+                    height,
+                }
+            });
         }
         #[cfg(debug_assertions)]
         if let Ok(fake) = DEBUG_SHELL_DEVICES.lock() {

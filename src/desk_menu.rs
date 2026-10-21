@@ -168,6 +168,17 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
                 .icon("media-skip-forward-symbolic"),
         );
     }
+    if let Some(camera) = phone.camera.as_ref() {
+        menu.push(TrayEntry::Label(if camera.live {
+            "● Camera in use as DeskLink Camera".to_string()
+        } else {
+            "Asking for the camera…".to_string()
+        }));
+        menu.push(
+            TrayEntry::action("Stop Camera", format!("camera-stop:{}", phone.id))
+                .icon("camera-web-symbolic"),
+        );
+    }
     if crate::type_on_phone::supported(phone) {
         menu.push(
             TrayEntry::action("Type on Phone…", format!("type:{}", phone.id))
@@ -325,6 +336,7 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
         )),
         "lock" => daemon.send(DaemonCommand::SendLockRequest(target, true)),
         "type" => crate::type_on_phone::open(&daemon, &target, None),
+        "camera-stop" => daemon.send(DaemonCommand::CameraControl(target, "stop".into())),
         "send-clipboard" => daemon.send(DaemonCommand::SendClipboard(target)),
         "send-files" => {
             let name = daemon

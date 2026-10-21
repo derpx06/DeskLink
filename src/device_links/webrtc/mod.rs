@@ -1,5 +1,6 @@
 #![allow(dead_code)] // Wired into the live GStreamer transport in the next slice.
 
+pub(crate) mod camera;
 pub(crate) mod coordinator;
 pub(crate) mod file_protocol;
 mod handover;

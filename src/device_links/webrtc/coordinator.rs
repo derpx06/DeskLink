@@ -1048,6 +1048,39 @@ fn apply_own_denial(device_id: &str, denial: &remote_session::ControlMessage) {
     }
 }
 
+/// Sends the camera message `make` builds (from a kind, session id and
+/// sequence) to the phone over its ready link (C4).
+pub(crate) fn send_camera_message(
+    sessions: &Arc<DeviceManager>,
+    transport: &FeatureTransportSnapshot,
+    make: impl FnOnce(
+        &dyn Fn(remote_session::ControlKind, &str, i64) -> remote_session::ControlMessage,
+    ) -> Option<remote_session::ControlMessage>,
+) -> Result<(), String> {
+    if !transport.web_rtc_ready || !sessions.is_current(&transport.binding) {
+        return Err("The phone is not connected".to_string());
+    }
+    let wire = transport
+        .web_rtc_wire
+        .as_ref()
+        .ok_or_else(|| "The phone is not connected".to_string())?;
+    let attempt_id = sessions
+        .active_webrtc_attempt(&transport.binding)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "The phone is not connected".to_string())?;
+    let build = |kind, id: &str, sequence| {
+        remote_session::ControlMessage::new(kind, &attempt_id, wire, id, sequence, now_millis())
+    };
+    let Some(message) = make(&build) else {
+        return Ok(());
+    };
+    let peer = transport
+        .web_rtc_peer
+        .as_ref()
+        .ok_or_else(|| "The phone is not connected".to_string())?;
+    send_remote_session_message(peer, wire, &message)
+}
+
 fn send_remote_session_message(
     peer: &DesktopWebRtcPeer,
     wire: &WebRtcWireBinding,
@@ -2296,6 +2329,12 @@ fn spawn_event_worker(
                             binding.device_id
                         );
                         super::screen::publish_stream(&binding.device_id, stream);
+                        // The camera's first frames create the pad: feed it.
+                        if super::camera::is_live(&binding.device_id) {
+                            if let Err(error) = super::screen::attach_camera(&binding.device_id) {
+                                eprintln!("[DeskLink] {error}");
+                            }
+                        }
                     }
                     // Most peer errors are not fatal (an oversized candidate, an
                     // empty message); a negotiation that truly cannot finish is
@@ -2396,6 +2435,8 @@ fn spawn_event_worker(
 /// live one (the replaced worker skips it, see `PeerWorkerGuard`).
 fn reset_device_webrtc_state(device_id: &str) {
     stop_desktop_portal_session(device_id, None);
+    // A lost or replaced peer ends the camera too (the desk asks again).
+    super::camera::end(device_id);
     super::screen::clear_stream(device_id);
     super::screen::forget_parked(device_id);
     // The session state must not outlive its peer: a stale `Controlling`
@@ -2904,6 +2945,31 @@ fn handle_peer_envelope(
         }
         let now = now_millis();
         message.validate(wire, attempt_id, now)?;
+        if message.kind.is_camera() {
+            let device_id = &wire.peer_device_id;
+            match super::camera::handle(device_id, &binding.link.info.name, &message) {
+                super::camera::Outcome::Live => match super::screen::attach_camera(device_id) {
+                    Ok(true) => {}
+                    Ok(false) => debug_log!("[DeskLink] Camera ready; waiting for its first frame"),
+                    Err(error) => crate::device_links::daemon::push_event(
+                        events,
+                        DaemonEvent::CameraNotice {
+                            device_id: device_id.clone(),
+                            message: error,
+                        },
+                    ),
+                },
+                super::camera::Outcome::Stopped(words) => crate::device_links::daemon::push_event(
+                    events,
+                    DaemonEvent::CameraNotice {
+                        device_id: device_id.clone(),
+                        message: words,
+                    },
+                ),
+                super::camera::Outcome::Ignored => {}
+            }
+            return Ok(());
+        }
         if message.kind == remote_session::ControlKind::OfferView {
             return take_up_phone_offer(binding, attempt_id, wire, &message, sessions, events);
         }
@@ -4201,6 +4267,11 @@ mod tests {
             max_dimension: None,
             fps: None,
             password: None,
+            facing: None,
+            width: None,
+            height: None,
+            audio: None,
+            action: None,
         }
     }
 
