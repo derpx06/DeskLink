@@ -63,7 +63,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         device.terminal_access,
         &settings.run_commands,
         settings.relay_enabled,
-        crate::shell_dbus::extension_active(),
+        top_bar_key(),
         settings.call_audio,
         settings.call_audio_devices.get(&device.id),
         &bonded,
@@ -123,11 +123,8 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     let look = adw::PreferencesGroup::builder().title("Appearance").build();
     look.add(&appearance_row());
     look.add(&start_at_login_row(daemon, &settings));
-    if crate::shell_dbus::extension_possible() {
-        look.add(&top_bar_row());
-        look.add(&top_bar_pill_row(daemon, &settings));
-    }
     page.append(&look);
+    page.append(&top_bar_group(daemon, &settings));
 
     page.append(&unpair_button(daemon, device));
     win.replace_body(
@@ -151,11 +148,8 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>, daemon: &DaemonHandle)
     let look = adw::PreferencesGroup::builder().title("Appearance").build();
     look.add(&appearance_row());
     look.add(&start_at_login_row(daemon, &settings));
-    if crate::shell_dbus::extension_possible() {
-        look.add(&top_bar_row());
-        look.add(&top_bar_pill_row(daemon, &settings));
-    }
     page.add(&look);
+    page.add(&top_bar_group(daemon, &settings));
     dialog.add(&page);
     dialog.present(Some(parent));
 }
@@ -554,47 +548,126 @@ fn top_bar_pill_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Switc
     row
 }
 
-/// "Top-bar menu": on, or a Turn On button. GNOME's settings change only
-/// when that button is clicked.
-fn top_bar_row() -> adw::ActionRow {
-    let active = crate::shell_dbus::extension_active();
-    let row = adw::ActionRow::builder()
-        .title("Top-bar menu")
-        .subtitle(if active {
-            "On — your phone, live sessions and quick actions in the top bar"
-        } else {
-            "Your phone, live sessions and quick actions in the top bar, and Unlock on the lock screen"
-        })
-        .build();
-    with_icon(&row, "view-app-grid-symbolic");
-    if active {
-        return row;
-    }
+fn tray_hosted() -> bool {
+    gio::Application::default()
+        .and_downcast::<crate::application::DesklinkApplication>()
+        .is_some_and(|app| app.tray_hosted())
+}
+
+/// What the Top Bar group shows, to redraw it when that changes.
+fn top_bar_key() -> String {
+    format!(
+        "{} {:?} {:?}",
+        tray_hosted(),
+        crate::shell_dbus::extension_status(),
+        crate::shell_dbus::appindicator_off()
+    )
+}
+
+/// "Log Out Now…" (GNOME asks to confirm).
+fn log_out_button() -> gtk::Button {
     let button = gtk::Button::builder()
-        .label("Turn On")
+        .label("Log Out Now…")
         .valign(gtk::Align::Center)
         .build();
-    button.update_property(&[gtk::accessible::Property::Label("Turn on the top-bar menu")]);
-    button.connect_clicked(|button| match crate::shell_dbus::turn_on_extension() {
-        Ok(true) => {
-            let dialog = adw::AlertDialog::new(
-                Some("Top-Bar Menu Turned On"),
-                Some(crate::shell_dbus::RELOGIN_NOTE),
-            );
-            dialog.add_response("ok", "OK");
-            dialog.present(Some(button));
-        }
-        Ok(false) => super::toast_from(button, "Top-bar menu turned on"),
-        Err(error) => {
-            eprintln!("[UI] Could not turn on the top-bar menu: {error}");
-            let dialog =
-                adw::AlertDialog::new(Some("Could Not Turn On the Top-Bar Menu"), Some(&error));
-            dialog.add_response("ok", "OK");
-            dialog.present(Some(button));
-        }
+    button.connect_clicked(|_| crate::shell_dbus::log_out());
+    button
+}
+
+/// Top Bar: whether DeskLink shows there, and the one step that fixes it.
+/// The tray icon is the freedesktop way (KDE, most desktops; GNOME with the
+/// AppIndicator extension); GNOME also has DeskLink's own extension.
+fn top_bar_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::PreferencesGroup {
+    use crate::shell_dbus::ExtensionStatus;
+    let group = adw::PreferencesGroup::builder().title("Top Bar").build();
+    let gnome = crate::shell_dbus::extension_possible();
+
+    let tray = adw::ActionRow::builder().title("Tray icon").build();
+    with_icon(&tray, "phone-symbolic");
+    let indicator_off = crate::shell_dbus::appindicator_off();
+    tray.set_subtitle(if tray_hosted() {
+        "Shown"
+    } else if indicator_off.is_some() {
+        "Not shown — the AppIndicator extension is installed but off"
+    } else if gnome {
+        "Not available — GNOME shows tray icons only with the AppIndicator extension"
+    } else {
+        "Not available on this desktop"
     });
-    row.add_suffix(&button);
-    row
+    if let Some(uuid) = indicator_off.filter(|_| !tray_hosted()) {
+        let button = gtk::Button::builder()
+            .label("Turn On")
+            .valign(gtk::Align::Center)
+            .build();
+        button.update_property(&[gtk::accessible::Property::Label(
+            "Turn on the AppIndicator extension",
+        )]);
+        button.connect_clicked(move |button| {
+            button.set_sensitive(false);
+            let weak = button.downgrade();
+            crate::shell_dbus::enable_extension(&uuid, move |result| {
+                let Some(button) = weak.upgrade() else { return };
+                button.set_sensitive(true);
+                if let Err(error) = result {
+                    super::toast_from(&button, &format!("Could not turn it on: {error}"));
+                }
+            });
+        });
+        tray.add_suffix(&button);
+    }
+    group.add(&tray);
+
+    if !gnome {
+        return group;
+    }
+    let menu = adw::ActionRow::builder().title("GNOME extension").build();
+    with_icon(&menu, "view-app-grid-symbolic");
+    match crate::shell_dbus::extension_status() {
+        ExtensionStatus::Active => {
+            menu.set_subtitle("Active — your phone, live sessions and quick actions in the top bar")
+        }
+        ExtensionStatus::NeedsLogin => {
+            menu.set_subtitle("Installed — it appears after you log in again");
+            menu.add_suffix(&log_out_button());
+        }
+        ExtensionStatus::Off => {
+            menu.set_subtitle(
+                "Off — your phone, live sessions and quick actions in the top bar, and Unlock on the lock screen",
+            );
+            let button = gtk::Button::builder()
+                .label("Turn On")
+                .valign(gtk::Align::Center)
+                .build();
+            button.update_property(&[gtk::accessible::Property::Label("Turn on the top-bar menu")]);
+            button.connect_clicked(|button| match crate::shell_dbus::turn_on_extension() {
+                Ok(true) => {
+                    let dialog = adw::AlertDialog::new(
+                        Some("Top-Bar Menu Installed"),
+                        Some(crate::shell_dbus::RELOGIN_NOTE),
+                    );
+                    dialog.add_response("later", "_Later");
+                    dialog.add_response("log-out", "_Log Out Now…");
+                    dialog.set_close_response("later");
+                    dialog.connect_response(Some("log-out"), |_, _| crate::shell_dbus::log_out());
+                    dialog.present(Some(button));
+                }
+                Ok(false) => super::toast_from(button, "Top-bar menu turned on"),
+                Err(error) => {
+                    eprintln!("[UI] Could not turn on the top-bar menu: {error}");
+                    let dialog = adw::AlertDialog::new(
+                        Some("Could Not Turn On the Top-Bar Menu"),
+                        Some(&error),
+                    );
+                    dialog.add_response("ok", "OK");
+                    dialog.present(Some(button));
+                }
+            });
+            menu.add_suffix(&button);
+        }
+    }
+    group.add(&menu);
+    group.add(&top_bar_pill_row(daemon, settings));
+    group
 }
 
 /// System, Light or Dark.

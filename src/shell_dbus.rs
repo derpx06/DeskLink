@@ -665,6 +665,7 @@ pub(crate) fn is_gnome(current_desktop: &str) -> bool {
 fn call_extensions(
     connection: &gio::DBusConnection,
     method: &str,
+    uuid: &str,
     done: impl FnOnce(Result<Variant, glib::Error>) + 'static,
 ) {
     connection.call(
@@ -672,7 +673,7 @@ fn call_extensions(
         SHELL_EXTENSIONS_PATH,
         SHELL_EXTENSIONS,
         method,
-        Some(&(EXTENSION_UUID,).to_variant()),
+        Some(&(uuid,).to_variant()),
         None,
         // The Shell's D-Bus-activated extensions service, meant for apps.
         gio::DBusCallFlags::NONE,
@@ -692,8 +693,109 @@ fn is_active(info: &glib::VariantDict) -> bool {
     info.lookup::<f64>("state").ok().flatten() == Some(EXTENSION_ACTIVE)
 }
 
+/// The GNOME extensions that host StatusNotifier tray icons.
+const APPINDICATOR_UUIDS: [&str; 2] = [
+    "appindicatorsupport@rgcjonas.gmail.com",
+    "ubuntu-appindicators@ubuntu.com",
+];
+
 thread_local! {
     static EXTENSION_IS_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// GNOME Shell has loaded ours (it may still be off): `GetExtensionInfo`
+    /// is not empty. A copy written this session is not loaded until the
+    /// next login on Wayland.
+    static EXTENSION_KNOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// An installed AppIndicator extension, and whether it is on.
+    static APPINDICATOR: RefCell<Option<(String, bool)>> = const { RefCell::new(None) };
+}
+
+/// The top bar on this desktop, for Preferences.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum ExtensionStatus {
+    Active,
+    /// Written for this user; GNOME loads it at the next login.
+    NeedsLogin,
+    Off,
+}
+
+pub fn extension_status() -> ExtensionStatus {
+    let installed = || user_extension_dir().join("metadata.json").is_file();
+    if extension_active() {
+        ExtensionStatus::Active
+    } else if !EXTENSION_KNOWN.with(|known| known.get()) && installed() {
+        ExtensionStatus::NeedsLogin
+    } else {
+        ExtensionStatus::Off
+    }
+}
+
+/// An installed AppIndicator extension that is off (its uuid): turning it on
+/// shows DeskLink's tray icon at once, no login needed.
+pub fn appindicator_off() -> Option<String> {
+    APPINDICATOR.with(|found| {
+        found
+            .borrow()
+            .as_ref()
+            .filter(|(_, on)| !on)
+            .map(|(uuid, _)| uuid.clone())
+    })
+}
+
+fn user_extension_dir() -> std::path::PathBuf {
+    glib::user_data_dir()
+        .join("gnome-shell")
+        .join("extensions")
+        .join(EXTENSION_UUID)
+}
+
+/// Turns on an installed extension by `uuid`, user extensions first (the
+/// user's own click only).
+pub fn enable_extension(uuid: &str, done: impl FnOnce(Result<(), String>) + 'static) {
+    let settings = gio::Settings::new("org.gnome.shell");
+    if settings.boolean("disable-user-extensions") {
+        if let Err(error) = settings.set_boolean("disable-user-extensions", false) {
+            return done(Err(error.to_string()));
+        }
+        gio::Settings::sync();
+    }
+    let Ok(connection) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
+        return done(Err("No session bus".into()));
+    };
+    call_extensions(&connection, "EnableExtension", uuid, move |reply| {
+        done(match reply {
+            Ok(reply)
+                if reply.try_child_value(0).and_then(|ok| ok.get::<bool>()) == Some(false) =>
+            {
+                Err("GNOME did not turn it on".into())
+            }
+            Ok(_) => Ok(()),
+            Err(error) => Err(error.message().to_string()),
+        })
+    });
+}
+
+/// Asks GNOME to log out; GNOME itself asks the user to confirm.
+pub fn log_out() {
+    let Ok(connection) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
+        return;
+    };
+    connection.call(
+        Some("org.gnome.SessionManager"),
+        "/org/gnome/SessionManager",
+        "org.gnome.SessionManager",
+        "Logout",
+        // 0: the normal logout, with GNOME's confirmation dialog.
+        Some(&(0u32,).to_variant()),
+        None,
+        gio::DBusCallFlags::NONE,
+        -1,
+        gio::Cancellable::NONE,
+        |reply| {
+            if let Err(error) = reply {
+                eprintln!("[Shell] Could not log out: {error}");
+            }
+        },
+    );
 }
 
 /// The top-bar client that said `Hello`: its bus name, what it handles, and
@@ -802,6 +904,32 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
         .collect()
 }
 
+/// Every extension DeskLink has shipped, by [`files_digest`] over the four
+/// files (computed from the git history of `gnome-shell-extension/`): a copy
+/// installed by hand, with no stamp, is still ours and safe to update.
+const KNOWN_BUILDS: [&str; 7] = [
+    // be1b760, 2026-10-21: calls.
+    "3fa28f25e72b8b59f0af2879e0d0d9ff7990b22c15ec2984c4ffe926f85a541d",
+    // 9784a7d, 2026-10-21.
+    "e3e3df22d222169b4678303ac40a356ddf3d346556b1ea52f713a8b7d7737273",
+    // f798285, 2026-10-21: Quick Settings, notifications.
+    "2edaa8eff4cfd4081af2dc3d38b84e9fa88d34eb7e02f79980ec077e91ba2328",
+    // 1b78f08, 2026-10-21.
+    "9c43c50e6be20bb1dd47bf0ae9fdaafa4319346b1c0dff779e251563367f2718",
+    // ba03b84, 2026-10-21.
+    "40c37c1f492f1f2edae2088228e57ca7e3866958f4c244f738169beac9e118b9",
+    // 635fc5d, 2026-10-20 (extension.js 6911 bytes, metadata 398).
+    "abafaef4d727d3ce9ebc0f1343ab38d2ce8dd8bec5990a1ab24d7cd781d391f8",
+    // 1f8c0a4, 2026-10-20: the first.
+    "ffade2b6be57adece9c983324df114d8e4758b30694fb3467dae6531b77b08a2",
+];
+
+/// Whether an installed copy (by digest) is DeskLink's own and may be
+/// replaced: the stamp we wrote says so, or it is a build we shipped.
+fn ours(digest: &str, stamped: bool, known: &[&str]) -> bool {
+    stamped || known.contains(&digest)
+}
+
 /// Writes `path` whole or not at all.
 fn write_atomically(path: &std::path::Path, content: &str) -> Result<(), String> {
     let temporary = path.with_extension("desklink-tmp");
@@ -817,35 +945,33 @@ fn install_extension_files(dir: &std::path::Path) -> Result<bool, String> {
         .iter()
         .map(|(name, _)| (*name, std::fs::read_to_string(dir.join(name)).ok()))
         .collect();
-    if present
-        .iter()
-        .zip(EXTENSION_FILES)
-        .all(|((_, have), (_, ours))| have.as_deref() == Some(ours))
-    {
+    let current = files_digest(present.iter().map(|(name, have)| (*name, have.as_deref())));
+    let embedded = files_digest(
+        EXTENSION_FILES
+            .iter()
+            .map(|(name, content)| (*name, Some(*content))),
+    );
+    let stamp = std::fs::read_to_string(dir.join(INSTALL_STAMP)).ok();
+    let stamped = stamp.as_deref().map(str::trim) == Some(current.as_str());
+    if current == embedded {
+        // Ours already (perhaps copied by hand): stamped, so a later build
+        // knows it may update it.
+        if !stamped {
+            write_atomically(&dir.join(INSTALL_STAMP), &embedded)?;
+        }
         return Ok(false);
     }
-    if present.iter().any(|(_, have)| have.is_some()) {
-        let current = files_digest(present.iter().map(|(name, have)| (*name, have.as_deref())));
-        let stamp = std::fs::read_to_string(dir.join(INSTALL_STAMP)).ok();
-        if stamp.as_deref().map(str::trim) != Some(current.as_str()) {
-            return Err(format!(
-                "A changed copy of the DeskLink extension is in {}; it was left as it is",
-                dir.display()
-            ));
-        }
+    if present.iter().any(|(_, have)| have.is_some()) && !ours(&current, stamped, &KNOWN_BUILDS) {
+        return Err(format!(
+            "A changed copy of the DeskLink extension is in {}; it was left as it is",
+            dir.display()
+        ));
     }
     std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
     for (name, content) in EXTENSION_FILES {
         write_atomically(&dir.join(name), content)?;
     }
-    write_atomically(
-        &dir.join(INSTALL_STAMP),
-        &files_digest(
-            EXTENSION_FILES
-                .iter()
-                .map(|(name, content)| (*name, Some(*content))),
-        ),
-    )?;
+    write_atomically(&dir.join(INSTALL_STAMP), &embedded)?;
     Ok(true)
 }
 
@@ -867,11 +993,7 @@ pub fn turn_on_extension() -> Result<bool, String> {
     if !extension_possible() {
         return Err("The top-bar menu needs GNOME".into());
     }
-    let dir = glib::user_data_dir()
-        .join("gnome-shell")
-        .join("extensions")
-        .join(EXTENSION_UUID);
-    let written = install_extension_files(&dir)?;
+    let written = install_extension_files(&user_extension_dir())?;
     let settings = gio::Settings::new("org.gnome.shell");
     settings
         .set_boolean("disable-user-extensions", false)
@@ -904,7 +1026,10 @@ fn track_extension(connection: &gio::DBusConnection) {
     if !is_gnome(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default()) {
         return;
     }
-    let set = |active: bool| EXTENSION_IS_ACTIVE.with(|cell| cell.set(active));
+    let set = |active: bool| {
+        EXTENSION_IS_ACTIVE.with(|cell| cell.set(active));
+        EXTENSION_KNOWN.with(|cell| cell.set(true));
+    };
     // Broadcast by the Shell (and the extensions service); any sender.
     connection.signal_subscribe(
         None,
@@ -919,11 +1044,44 @@ fn track_extension(connection: &gio::DBusConnection) {
             )))
         },
     );
-    call_extensions(connection, "GetExtensionInfo", move |reply| {
-        if let Ok(reply) = reply {
-            set(is_active(&extension_info(&reply)));
-        }
-    });
+    call_extensions(
+        connection,
+        "GetExtensionInfo",
+        EXTENSION_UUID,
+        move |reply| {
+            if let Ok(reply) = reply {
+                let info = extension_info(&reply);
+                EXTENSION_IS_ACTIVE.with(|cell| cell.set(is_active(&info)));
+                EXTENSION_KNOWN.with(|cell| cell.set(info.lookup_value("uuid", None).is_some()));
+            }
+        },
+    );
+    // The tray hosts: which one is installed, and whether it is on.
+    for uuid in APPINDICATOR_UUIDS {
+        let note = move |info: &glib::VariantDict| {
+            if info.lookup_value("uuid", None).is_some() {
+                APPINDICATOR.with(|found| {
+                    found.replace(Some((uuid.to_string(), is_active(info))));
+                });
+            }
+        };
+        connection.signal_subscribe(
+            None,
+            Some(SHELL_EXTENSIONS),
+            Some("ExtensionStateChanged"),
+            None,
+            Some(uuid),
+            gio::DBusSignalFlags::NONE,
+            move |_, _, _, _, _, params| {
+                note(&glib::VariantDict::new(params.try_child_value(1).as_ref()))
+            },
+        );
+        call_extensions(connection, "GetExtensionInfo", uuid, move |reply| {
+            if let Ok(reply) = reply {
+                note(&extension_info(&reply));
+            }
+        });
+    }
 }
 
 /// Shown after turning the menu on, when GNOME has to load it first.
@@ -943,6 +1101,7 @@ fn offer_extension(app: &DesklinkApplication) {
                     Ok(true) => {
                         let notification = gio::Notification::new("Top-bar menu turned on");
                         notification.set_body(Some(RELOGIN_NOTE));
+                        notification.add_button("Log Out Now", "app.log-out");
                         notification
                     }
                     Err(error) => {
@@ -956,6 +1115,32 @@ fn offer_extension(app: &DesklinkApplication) {
                 app.send_notification(Some("shell-extension"), &notification);
             })
             .build(),
+        // "Turn On" for an installed AppIndicator extension: the tray icon
+        // shows at once.
+        gio::ActionEntry::builder("tray-host-on")
+            .parameter_type(Some(glib::VariantTy::STRING))
+            .activate(|app: &DesklinkApplication, _, uuid| {
+                let Some(uuid) = uuid.and_then(|uuid| uuid.get::<String>()) else {
+                    return;
+                };
+                if !APPINDICATOR_UUIDS.contains(&uuid.as_str()) {
+                    return;
+                }
+                let app = app.clone();
+                enable_extension(&uuid, move |result| {
+                    app.withdraw_notification("shell-extension");
+                    if let Err(error) = result {
+                        let notification =
+                            gio::Notification::new("Could not show DeskLink in the top bar");
+                        notification.set_body(Some(&error));
+                        app.send_notification(Some("shell-extension"), &notification);
+                    }
+                });
+            })
+            .build(),
+        gio::ActionEntry::builder("log-out")
+            .activate(|_: &DesklinkApplication, _, _| log_out())
+            .build(),
         gio::ActionEntry::builder("shell-extension-dismiss")
             .activate(|app: &DesklinkApplication, _, _| {
                 if let Some(daemon) = app.daemon_handle() {
@@ -964,6 +1149,25 @@ fn offer_extension(app: &DesklinkApplication) {
             })
             .build(),
     ]);
+
+    // An installed copy of ours from an older DeskLink: brought up to date
+    // (it was turned on before, so this is no new choice), and the user told
+    // when it shows.
+    if !app.is_remote()
+        && is_gnome(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
+        && user_extension_dir().join("metadata.json").is_file()
+    {
+        match install_extension_files(&user_extension_dir()) {
+            Ok(true) => {
+                let notification = gio::Notification::new("DeskLink's top-bar menu was updated");
+                notification.set_body(Some(RELOGIN_NOTE));
+                notification.add_button("Log Out Now", "app.log-out");
+                app.send_notification(Some("shell-extension"), &notification);
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!("[Shell] {error}"),
+        }
+    }
 
     let weak = app.downgrade();
     // Late enough for the tray to have found any host.
@@ -976,20 +1180,41 @@ fn offer_extension(app: &DesklinkApplication) {
         let Some(connection) = app.dbus_connection().filter(|_| wanted) else {
             return;
         };
-        // Fails when the Shell's extension service is absent: no offer then.
-        call_extensions(&connection, "GetExtensionInfo", move |reply| {
-            let Ok(reply) = reply else { return };
-            if is_active(&extension_info(&reply)) {
-                return;
-            }
+        // An AppIndicator extension that is only off: the one-click fix
+        // (not needed while our own extension shows DeskLink).
+        if let Some(uuid) = appindicator_off().filter(|_| !extension_active()) {
             let notification = gio::Notification::new("Show DeskLink in the top bar");
             notification.set_body(Some(
-                "See your phone's battery and connection, and act on it, from the top bar.",
+                "Turn on the AppIndicator extension that is already installed to see DeskLink's icon in the top bar.",
             ));
-            notification.add_button("Turn On", "app.shell-extension-show");
+            notification.add_button_with_target_value(
+                "Turn On",
+                "app.tray-host-on",
+                Some(&uuid.to_variant()),
+            );
             notification.add_button("Not now", "app.shell-extension-dismiss");
             app.send_notification(Some("shell-extension"), &notification);
-        });
+            return;
+        }
+        // Fails when the Shell's extension service is absent: no offer then.
+        call_extensions(
+            &connection,
+            "GetExtensionInfo",
+            EXTENSION_UUID,
+            move |reply| {
+                let Ok(reply) = reply else { return };
+                if is_active(&extension_info(&reply)) {
+                    return;
+                }
+                let notification = gio::Notification::new("Show DeskLink in the top bar");
+                notification.set_body(Some(
+                    "See your phone's battery and connection, and act on it, from the top bar.",
+                ));
+                notification.add_button("Turn On", "app.shell-extension-show");
+                notification.add_button("Not now", "app.shell-extension-dismiss");
+                app.send_notification(Some("shell-extension"), &notification);
+            },
+        );
     });
 }
 
@@ -1187,6 +1412,33 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_is_ours_when_stamped_or_a_shipped_build() {
+        let known = ["aaa", "bbb"];
+        assert!(ours("zzz", true, &known), "stamped by us");
+        assert!(
+            ours("bbb", false, &known),
+            "copied by hand, a shipped build"
+        );
+        assert!(!ours("zzz", false, &known), "edited by someone");
+        // Every build is listed, so a hand copy of this one is known later:
+        // changing the extension means adding its digest to KNOWN_BUILDS.
+        let embedded = files_digest(
+            EXTENSION_FILES
+                .iter()
+                .map(|(name, content)| (*name, Some(*content))),
+        );
+        assert!(
+            KNOWN_BUILDS.contains(&embedded.as_str()),
+            "add {embedded} to KNOWN_BUILDS"
+        );
+        assert!(
+            KNOWN_BUILDS
+                .contains(&"abafaef4d727d3ce9ebc0f1343ab38d2ce8dd8bec5990a1ab24d7cd781d391f8"),
+            "the 2026-10-20 build (extension.js 6911 bytes)"
+        );
+    }
+
+    #[test]
     fn the_extension_is_written_once_and_enabled_once() {
         let dir = std::env::temp_dir().join(format!("desklink-ext-{}", uuid::Uuid::new_v4()));
         assert!(install_extension_files(&dir).unwrap(), "missing: written");
@@ -1217,6 +1469,16 @@ mod tests {
         );
         let metadata = std::fs::read_to_string(dir.join("metadata.json")).unwrap();
         assert!(metadata.contains(EXTENSION_UUID) && metadata.contains("unlock-dialog"));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Copied by hand (no stamp) and identical: stamped, nothing written.
+        let dir = std::env::temp_dir().join(format!("desklink-ext-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, content) in EXTENSION_FILES {
+            std::fs::write(dir.join(name), content).unwrap();
+        }
+        assert!(!install_extension_files(&dir).unwrap());
+        assert!(dir.join(INSTALL_STAMP).is_file(), "stamped");
         let _ = std::fs::remove_dir_all(&dir);
 
         let enabled = with_extension(vec!["other@x".into()]);
