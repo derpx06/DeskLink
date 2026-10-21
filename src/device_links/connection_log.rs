@@ -244,8 +244,20 @@ pub(crate) fn prune_lines<T: Serialize + serde::de::DeserializeOwned>(
     now: u64,
     ts: impl Fn(&T) -> u64,
 ) {
+    rewrite_lines(path, now, ts, |_: &T| true);
+}
+
+/// Rewrites a JSON-lines log with only the recent entries `keep` accepts,
+/// under the lock from read to rename.
+pub(crate) fn rewrite_lines<T: Serialize + serde::de::DeserializeOwned>(
+    path: &PathBuf,
+    now: u64,
+    ts: impl Fn(&T) -> u64,
+    keep: impl Fn(&T) -> bool,
+) {
     let _guard = FILE_LOCK.lock();
     let mut kept: Vec<T> = read_unlocked(path, now, ts);
+    kept.retain(|entry| keep(entry));
     kept.reverse();
     let mut text = String::new();
     for entry in kept {

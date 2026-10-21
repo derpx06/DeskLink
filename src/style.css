@@ -455,6 +455,56 @@ progressbar.thin > trough { background-color: @surface_2; }
   border-radius: 6px;
 }
 
+/* File cards: a preview on top, the name, size and time, and which way. */
+.file-card {
+  padding: 0;
+  border-radius: 14px;
+  background-color: @card_bg_color;
+  box-shadow: 0 0 0 1px @card_edge, 0 1px 3px @card_shadow_near;
+  font-weight: normal;
+}
+button.file-card:hover { background-color: mix(@card_bg_color, @surface_2, 0.6); }
+button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.09); }
+.file-preview-clip { border-radius: 14px 14px 0 0; }
+.file-preview { background-color: @surface_2; }
+.file-card-words { padding: 10px 12px 12px 12px; }
+.file-name { font-weight: 600; font-size: 13px; }
+.type-label { font-weight: 700; letter-spacing: 0.06em; color: @text_dim; }
+.file-card.missing .file-name { color: @text_dim; }
+.remove-button { min-height: 28px; font-size: 12px; font-weight: 600; }
+/* Loading: a soft pulse where the thumbnail will be. */
+.skeleton {
+  background-color: alpha(currentColor, 0.08);
+  animation: shimmer 1.2s ease-in-out infinite;
+}
+@keyframes shimmer {
+  0% { opacity: 0.35; }
+  50% { opacity: 1; }
+  100% { opacity: 0.35; }
+}
+.play-badge {
+  min-width: 40px;
+  min-height: 40px;
+  border-radius: 20px;
+  background-color: rgba(0, 0, 0, 0.55);
+  color: white;
+}
+.play-badge image { margin: 12px; }
+.duration-chip {
+  margin: 8px;
+  padding: 1px 7px;
+  border-radius: 6px;
+  background-color: rgba(0, 0, 0, 0.6);
+  color: white;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* The viewer: pictures and video on a dark stage. */
+.viewer-area { background-color: #111214; color: white; }
+.viewer-area .title-4 { color: white; }
+.viewer-area .text-dim { color: alpha(white, 0.7); }
+
 /* ── Clipboard and lists ───────────────────────────────────────────────── */
 .padded-row { padding: 12px 18px; }
 

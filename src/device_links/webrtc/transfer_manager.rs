@@ -65,6 +65,10 @@ struct SendCheckpoint {
     sha256: String,
     offset: u64,
     source_name: String,
+    /// The file the user picked, for the Transfers page's history. Local
+    /// state only (never sent); absent in checkpoints from older builds.
+    #[serde(default)]
+    source_path: Option<PathBuf>,
     /// Highest byte sent; `offset` is the highest acknowledged.
     awaiting_offset: Option<u64>,
     /// Negotiated chunk size (legacy unless the receiver advertised more).
@@ -359,6 +363,7 @@ impl WebRtcTransferManager {
             sha256,
             offset: 0,
             source_name,
+            source_path: Some(source.to_path_buf()),
             awaiting_offset: None,
             chunk_size: LEGACY_FILE_CHUNK_BYTES,
         };
@@ -1132,6 +1137,13 @@ impl WebRtcTransferManager {
         remove_if_present(&self.checked_state_path(&checkpoint.source_name)?)?;
         self.remove_send_checkpoint(&checkpoint.transfer_id)?;
         board::finish(&checkpoint.transfer_id, Outcome::Sent);
+        if let Some(source) = &checkpoint.source_path {
+            crate::device_links::transfer_log::record_sent(
+                &checkpoint.device_id,
+                &checkpoint.filename,
+                source,
+            );
+        }
         Ok(vec![TransferEvent::Completed {
             transfer_id: checkpoint.transfer_id,
             path: PathBuf::from(checkpoint.filename),

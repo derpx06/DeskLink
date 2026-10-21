@@ -185,20 +185,34 @@ fn terminal_access_row(daemon: &DaemonHandle, device: &DeviceView) -> adw::Switc
 /// "Reach this computer from anywhere": the relay switch, and its full
 /// settings (server, TURN, state) behind the row.
 fn away_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::ActionRow {
-    let host = relay_host(settings.relay_url());
+    // No relay set up: say so, and the switch waits for an address.
+    let configured = settings.relay_configured();
     let row = adw::ActionRow::builder()
         .title("Reach this computer from anywhere")
-        .subtitle(format!("{host} · end-to-end encrypted"))
-        .subtitle_lines(1)
+        .subtitle(if configured {
+            format!(
+                "{} · end-to-end encrypted",
+                relay_host(settings.relay_url())
+            )
+        } else {
+            NO_RELAY.to_string()
+        })
+        .subtitle_lines(2)
         .use_markup(false)
         .activatable(true)
-        .css_classes(["mono-subtitle"])
         .build();
+    if configured {
+        row.add_css_class("mono-subtitle");
+    }
     row.add_prefix(&icon_square("desklink-globe-symbolic", 30, "row-icon"));
     let switch = gtk::Switch::builder()
-        .active(settings.relay_enabled)
+        .active(settings.relay_wanted())
+        .sensitive(configured)
         .valign(gtk::Align::Center)
         .build();
+    if !configured {
+        switch.set_tooltip_text(Some("Add a relay server first"));
+    }
     switch.update_property(&[gtk::accessible::Property::Label("Connect away from home")]);
     {
         let daemon = daemon.clone();
@@ -231,20 +245,32 @@ fn away_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::ActionRow {
             .content_height(520)
             .child(&crate::application::with_header(&content))
             .build();
-        // The page's switch catches up with the dialog's.
-        let shown = shown.clone();
+        // The page catches up with what was set in the dialog.
+        let (shown, page) = (shown.clone(), row.downgrade());
         dialog.connect_closed(move |_| {
+            let settings = crate::device_links::config::app_settings();
             if let Some(switch) = shown.upgrade() {
-                let on = crate::device_links::config::app_settings().relay_enabled;
-                if switch.is_active() != on {
-                    switch.set_active(on);
+                switch.set_sensitive(settings.relay_configured());
+                if switch.is_active() != settings.relay_wanted() {
+                    switch.set_active(settings.relay_wanted());
                 }
+            }
+            if let Some(window) = page
+                .upgrade()
+                .and_then(|row| row.root())
+                .and_downcast::<DesklinkWindow>()
+            {
+                window.imp().snapshots.borrow_mut().remove("preferences");
+                window.refresh_soon();
             }
         });
         dialog.present(Some(row));
     });
     row
 }
+
+/// What the relay row says while no relay server is set up.
+const NO_RELAY: &str = "No relay server set up · add one to reach this computer away from home";
 
 /// "relay.desklink.app" from "wss://relay.desklink.app/v1".
 fn relay_host(url: &str) -> &str {
@@ -257,16 +283,22 @@ fn away_from_home_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::P
     let group = adw::PreferencesGroup::builder()
         .title("Away From Home")
         .description(
-            "When your phone is on another network, it meets this computer through the \
-             DeskLink server. What they exchange is end-to-end encrypted.",
+            "When your phone is on another network, it meets this computer through a \
+             DeskLink relay server. What they exchange is end-to-end encrypted.",
         )
         .build();
+    let built_in = !crate::device_links::config::DEFAULT_RELAY_URL.is_empty();
     let enabled = adw::SwitchRow::builder()
         .title("Connect Away From Home")
-        .active(settings.relay_enabled)
+        .active(settings.relay_wanted())
+        .sensitive(settings.relay_configured())
         .build();
     let url = adw::EntryRow::builder()
-        .title("Server (leave empty for the DeskLink server)")
+        .title(if built_in {
+            "Server (leave empty for the DeskLink server)"
+        } else {
+            "Relay server address (wss://…)"
+        })
         .text(settings.relay_url.as_str())
         .show_apply_button(true)
         .build();
@@ -300,13 +332,33 @@ fn away_from_home_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::P
         let send_relay = send_relay.clone();
         move |_| send_relay()
     });
-    url.connect_apply(move |_| send_relay());
+    // An address makes the switch usable; entering one turns it on.
+    {
+        let enabled = enabled.downgrade();
+        url.connect_changed(move |url| {
+            if let Some(enabled) = enabled.upgrade() {
+                enabled.set_sensitive(built_in || !url.text().trim().is_empty());
+            }
+        });
+    }
+    {
+        let enabled = enabled.downgrade();
+        url.connect_apply(move |url| match enabled.upgrade() {
+            Some(enabled) if !enabled.is_active() && !url.text().trim().is_empty() => {
+                enabled.set_active(true)
+            }
+            _ => send_relay(),
+        });
+    }
     let daemon = daemon.clone();
     turn.connect_active_notify(move |row| daemon.send(DaemonCommand::SetUseTurn(row.is_active())));
 
     let update = move |label: &gtk::Label| {
         use crate::device_links::relay_link::client::{status, RelayStatus};
         label.set_label(&match status() {
+            RelayStatus::Off if !crate::device_links::config::app_settings().relay_configured() => {
+                "No relay server set up".to_string()
+            }
             RelayStatus::Off => "Off".to_string(),
             RelayStatus::Connecting => "Connecting…".to_string(),
             RelayStatus::Online => "Ready".to_string(),

@@ -578,7 +578,7 @@ fn palette_css(dark: bool, modern: bool, contrast: bool) -> String {
     let mut css = String::new();
     let mut root = String::new();
     if !contrast {
-        for (name, light, dark_value) in PALETTE {
+        for (name, light, dark_value) in PALETTE.iter().filter(|(name, _, _)| !is_accent(name)) {
             let value = pick(light, dark_value);
             css.push_str(&format!("@define-color {name} {value};\n"));
             root.push_str(&format!("--{}: {value}; ", name.replace('_', "-")));
@@ -599,6 +599,33 @@ fn palette_css(dark: bool, modern: bool, contrast: bool) -> String {
     css
 }
 
+/// libadwaita's accent colours, which DeskLink keeps as its own blue.
+fn is_accent(name: &str) -> bool {
+    name.starts_with("accent_")
+}
+
+/// The accent part of the palette. It is loaded above the user's own
+/// `gtk.css` as well as the system accent: a user stylesheet that sets
+/// `--accent-bg-color` (as accent-colour tweaks do) otherwise turned
+/// DeskLink's buttons, switches and links that colour while the rest of
+/// the palette stayed DeskLink's. High contrast keeps libadwaita's.
+fn accent_css(dark: bool, modern: bool, contrast: bool) -> String {
+    if contrast {
+        return String::new();
+    }
+    let mut css = String::new();
+    let mut root = String::new();
+    for (name, light, dark_value) in PALETTE.iter().filter(|(name, _, _)| is_accent(name)) {
+        let value = if dark { dark_value } else { light };
+        css.push_str(&format!("@define-color {name} {value};\n"));
+        root.push_str(&format!("--{}: {value}; ", name.replace('_', "-")));
+    }
+    if modern {
+        css.push_str(&format!(":root {{ {root}}}\n"));
+    }
+    css
+}
+
 /// Loads the palette for the current style and keeps it in step: light,
 /// dark or high contrast, as the system or the Appearance setting changes.
 fn install_brand_styles() {
@@ -613,12 +640,16 @@ fn install_brand_styles() {
         &palette,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
     );
+    let accent = gtk::CssProvider::new();
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &accent,
+        gtk::STYLE_PROVIDER_PRIORITY_USER + 1,
+    );
     let update = move |manager: &adw::StyleManager| {
-        palette.load_from_string(&palette_css(
-            manager.is_dark(),
-            modern,
-            manager.is_high_contrast(),
-        ));
+        let (dark, contrast) = (manager.is_dark(), manager.is_high_contrast());
+        palette.load_from_string(&palette_css(dark, modern, contrast));
+        accent.load_from_string(&accent_css(dark, modern, contrast));
     };
     let manager = adw::StyleManager::default();
     manager.set_color_scheme(appearance_scheme(&load_appearance()));
@@ -792,6 +823,22 @@ mod tests {
 
     /// WCAG AA: every text colour reads at 4.5:1 or more on each surface it
     /// is used on, light and dark.
+    /// The accent goes in its own stylesheet, above the user's; the rest of
+    /// the palette does not.
+    #[test]
+    fn the_accent_is_split_out_of_the_palette() {
+        let palette = palette_css(false, true, false);
+        let accent = accent_css(false, true, false);
+        assert!(!palette.contains("accent_bg_color"), "{palette}");
+        assert!(accent.contains("@define-color accent_bg_color #3b63e6;"));
+        assert!(accent.contains("--accent-bg-color: #3b63e6;"));
+        assert!(accent_css(true, true, false).contains("--accent-bg-color: #7c95ff;"));
+        assert!(
+            accent_css(false, true, true).is_empty(),
+            "high contrast keeps its own"
+        );
+    }
+
     #[test]
     fn every_text_colour_meets_4_5_to_1_on_its_surfaces() {
         let text = [

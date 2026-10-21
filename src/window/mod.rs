@@ -33,6 +33,7 @@ pub(crate) mod prefs;
 mod sidebar;
 mod terminals;
 mod transfers;
+mod viewer;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -1658,7 +1659,9 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         }
         // These two write history files: only into an isolated runner's own
         // state directory, never the user's.
-        "fake-history" | "fake-received" if std::env::var_os("XDG_STATE_HOME").is_none() => {
+        "fake-history" | "fake-received" | "fake-sent"
+            if std::env::var_os("XDG_STATE_HOME").is_none() =>
+        {
             debug_log!("[E2E] {verb} refused: set XDG_STATE_HOME to an isolated directory");
         }
         // "fake-history N": a few connection-history entries for fake device N.
@@ -1679,17 +1682,45 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             }
         }
         // "fake-received N NAME": a file received from fake device N.
-        "fake-received" => {
+        // "fake-received N PATH" / "fake-sent N PATH": a file in the
+        // history of fake device N (PATH absolute, or a name in /tmp).
+        "fake-received" | "fake-sent" => {
             let device = id
                 .parse::<usize>()
                 .ok()
                 .and_then(|index| win.imp().fake_devices.borrow().get(index).cloned());
+            let path = std::path::Path::new(arg);
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::temp_dir().join(arg)
+            };
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
             if let Some(device) = device {
-                crate::device_links::transfer_log::record_received(
-                    &device.id,
-                    arg,
-                    &std::env::temp_dir().join(arg),
-                );
+                if verb == "fake-sent" {
+                    crate::device_links::transfer_log::record_sent(&device.id, &name, &path);
+                } else {
+                    crate::device_links::transfer_log::record_received(&device.id, &name, &path);
+                }
+            }
+        }
+        "close-dialog" => {
+            if let Some(dialog) = win.visible_dialog() {
+                dialog.close();
+            }
+        }
+        // "open-viewer N": the selected device's Nth file still on disk.
+        "open-viewer" => {
+            let selected = win.selected_id().unwrap_or_default();
+            let files: Vec<_> = crate::device_links::transfer_log::recent()
+                .into_iter()
+                .filter(|file| file.device_id == selected && file.path.is_file())
+                .collect();
+            if let Some(index) = id.parse::<usize>().ok().filter(|n| *n < files.len()) {
+                viewer::show(win, &files, index, "Pixel 9");
             }
         }
         "window-size" => {

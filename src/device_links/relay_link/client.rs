@@ -201,8 +201,16 @@ impl Client {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// On, a relay to reach (none is set up unless one was built in or
+    /// entered: then nothing is looked up or retried), and phones to reach.
     fn wanted(&self) -> bool {
-        app_settings().relay_enabled
+        let settings = app_settings();
+        let reachable = if self.context.relay_url.is_some() {
+            settings.relay_enabled
+        } else {
+            settings.relay_wanted()
+        };
+        reachable
             && self
                 .context
                 .config

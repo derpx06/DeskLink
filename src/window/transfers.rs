@@ -1,11 +1,14 @@
 //! The Transfers page: a drop zone and Choose Files… to send to the phone,
-//! what is moving right now with a way to stop it, and the files received
-//! here in the last 30 days.
+//! then cards — what is moving right now, with a way to stop it, and the
+//! files received or sent in the last 30 days, each with a preview (a
+//! thumbnail, a video's poster frame, or a typed icon) that opens in the
+//! viewer.
 //!
-//! What a moving row says is decided by [`subtitle`] and [`fraction`],
-//! which have no GTK in them and are unit-tested. Rows are updated in place
-//! four times a second, so a progress bar never flickers and a click on
-//! Cancel never lands on a row that was just rebuilt.
+//! What a moving card says is decided by [`subtitle`] and [`fraction`],
+//! which have no GTK in them and are unit-tested. Moving cards are updated
+//! in place four times a second, so a progress bar never flickers and a
+//! click on Cancel never lands on a card that was just rebuilt. Thumbnails
+//! are made on a worker thread ([`crate::thumbnails`]).
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -15,10 +18,14 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::{gio, glib};
 
+use adw::subclass::prelude::*;
+
 use super::{ellipsized, icon_button, icon_square, text, DesklinkWindow};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::DeviceView;
+use crate::device_links::transfer_log::LoggedFile;
 use crate::device_links::webrtc::transfer_board::TransferRow;
+use crate::thumbnails::FileKind;
 
 /// Often enough that a progress bar looks alive, rarely enough to cost nothing.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -86,7 +93,7 @@ fn file_icon(name: &str) -> gio::Icon {
 }
 
 struct RowWidgets {
-    row: gtk::ListBoxRow,
+    row: gtk::Box,
     subtitle: gtk::Label,
     bar: gtk::ProgressBar,
     /// When `done` was last sampled, and the smoothed rate since.
@@ -99,10 +106,33 @@ pub(super) struct Page {
     pub(super) root: gtk::Widget,
     zone_title: gtk::Label,
     choose: gtk::Button,
-    received: gtk::ListBox,
-    received_key: RefCell<String>,
+    history: gtk::FlowBox,
+    empty: gtk::Label,
+    history_key: RefCell<String>,
     /// The selected device: id and name.
     device: Rc<RefCell<(String, String)>>,
+}
+
+/// Cards a line in the grids: at least two, at most five, as wide allows.
+fn grid() -> gtk::FlowBox {
+    gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .homogeneous(true)
+        .min_children_per_line(2)
+        .max_children_per_line(5)
+        .column_spacing(14)
+        .row_spacing(14)
+        .valign(gtk::Align::Start)
+        .build()
+}
+
+/// Adds `card` to `grid`; Tab and the arrow keys go card to card, not to
+/// the FlowBox's wrapper around each.
+fn add_card(grid: &gtk::FlowBox, card: &impl IsA<gtk::Widget>) {
+    grid.append(card);
+    if let Some(child) = card.as_ref().parent() {
+        child.set_focusable(false);
+    }
 }
 
 impl Page {
@@ -129,10 +159,9 @@ impl Page {
         let zone_title = text("", &["card-title"]);
         zone_title.set_wrap(true);
         words.append(&zone_title);
-        words.append(&text(
-            "They land in Downloads on the phone",
-            &["card-subtitle"],
-        ));
+        let landing = text("They land in Downloads on the phone", &["card-subtitle"]);
+        landing.set_wrap(true);
+        words.append(&landing);
         inner.append(&words);
         let choose = icon_button(
             "document-send-symbolic",
@@ -143,18 +172,12 @@ impl Page {
         inner.append(&choose);
         zone.append(&inner);
 
-        let live = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
-            .visible(false)
-            .build();
-        live.update_property(&[gtk::accessible::Property::Label("Moving now")]);
+        let moving = grid();
+        moving.set_visible(false);
+        moving.update_property(&[gtk::accessible::Property::Label("Moving now")]);
 
-        let received_card = super::card(10);
-        received_card.add_css_class("padded-card");
-        let head = gtk::Box::builder().spacing(12).build();
-        head.append(&icon_square("folder-download-symbolic", 32, "feature-icon"));
-        let title = text("Received here", &["card-title"]);
+        let head = gtk::Box::builder().spacing(12).margin_top(6).build();
+        let title = text("Received and sent", &["card-title"]);
         title.set_hexpand(true);
         head.append(&title);
         let open = gtk::Button::builder()
@@ -177,13 +200,10 @@ impl Page {
             );
         });
         head.append(&open);
-        received_card.append(&head);
-        let received = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["received-list"])
-            .build();
-        received.update_property(&[gtk::accessible::Property::Label("Received here")]);
-        received_card.append(&received);
+        let history = grid();
+        history.update_property(&[gtk::accessible::Property::Label("Received and sent")]);
+        let empty = text("", &["text-faint", "body-small"]);
+        empty.set_wrap(true);
 
         let page = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -194,8 +214,10 @@ impl Page {
             .margin_end(28)
             .build();
         page.append(&zone);
-        page.append(&live);
-        page.append(&received_card);
+        page.append(&moving);
+        page.append(&head);
+        page.append(&history);
+        page.append(&empty);
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
@@ -212,13 +234,13 @@ impl Page {
             });
         }
         if let Some(daemon) = win.daemon() {
-            follow(&live, daemon, Rc::clone(&device));
+            follow(&moving, daemon, Rc::clone(&device));
         } else {
             // The daemon is handed over after construction.
-            let (window, live, device) = (win.downgrade(), live.clone(), Rc::clone(&device));
+            let (window, moving, device) = (win.downgrade(), moving.clone(), Rc::clone(&device));
             glib::idle_add_local_once(move || {
                 if let Some(daemon) = window.upgrade().and_then(|window| window.daemon()) {
-                    follow(&live, daemon, device);
+                    follow(&moving, daemon, device);
                 }
             });
         }
@@ -240,18 +262,19 @@ impl Page {
             root: scroll.upcast(),
             zone_title,
             choose,
-            received,
-            received_key: RefCell::default(),
+            history,
+            empty,
+            history_key: RefCell::default(),
             device,
         }
     }
 
-    pub(super) fn update(
-        &self,
-        _win: &DesklinkWindow,
-        _daemon: &DaemonHandle,
-        device: &DeviceView,
-    ) {
+    /// Redraws the history on its next update, e.g. after Remove from List.
+    pub(super) fn invalidate(&self) {
+        self.history_key.replace(String::new());
+    }
+
+    pub(super) fn update(&self, win: &DesklinkWindow, _daemon: &DaemonHandle, device: &DeviceView) {
         self.device
             .replace((device.id.clone(), device.name.clone()));
         self.zone_title
@@ -266,100 +289,388 @@ impl Page {
             .filter(|entry| entry.device_id == device.id)
             .take(50)
             .collect();
+        let present: Vec<bool> = entries.iter().map(|entry| entry.path.is_file()).collect();
         let minute = super::clock_time(glib::DateTime::now_local().ok());
-        let key = serde_json::to_string(&(&entries, &device.name, minute)).unwrap_or_default();
-        if *self.received_key.borrow() == key {
+        let key =
+            serde_json::to_string(&(&entries, &present, &device.name, minute)).unwrap_or_default();
+        if *self.history_key.borrow() == key {
             return;
         }
-        self.received_key.replace(key);
-        self.received.remove_all();
-        if entries.is_empty() {
-            let none = text(
-                &format!("Nothing received from {} in the last 30 days.", device.name),
-                &["text-faint", "body-small"],
-            );
-            none.set_wrap(true);
-            self.received.append(
-                &gtk::ListBoxRow::builder()
-                    .activatable(false)
-                    .child(&none)
-                    .build(),
-            );
-            return;
-        }
-        let now = glib::DateTime::now_local().ok();
-        for entry in &entries {
-            let line = gtk::Box::builder().spacing(10).build();
-            line.append(
-                &gtk::Image::builder()
-                    .gicon(&file_icon(&entry.name))
-                    .css_classes(["text-dim"])
-                    .accessible_role(gtk::AccessibleRole::Presentation)
-                    .build(),
-            );
-            let name = ellipsized(&entry.name, &["mono", "body-small"]);
-            name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-            name.set_hexpand(true);
-            line.append(&name);
-            let when = glib::DateTime::from_unix_local(entry.ts as i64)
-                .ok()
-                .zip(now.as_ref())
-                .map(|(when, now)| super::history::time_label(now, &when))
-                .unwrap_or_default();
-            line.append(&text(
-                &format!("{} · {when}", glib::format_size(entry.size)),
-                &["caption", "text-dim"],
-            ));
-            let row = gtk::ListBoxRow::builder()
-                .child(&line)
-                .action_name("win.show-download")
-                .action_target(&entry.path.to_string_lossy().to_string().to_variant())
-                .tooltip_text("Show in Folder")
-                .build();
-            row.update_property(&[gtk::accessible::Property::Label(&format!(
-                "{}, received {when}. Show in folder",
-                entry.name
-            ))]);
-            self.received.append(&row);
+        self.history_key.replace(key);
+        self.history.remove_all();
+        self.empty.set_visible(entries.is_empty());
+        self.empty.set_label(&format!(
+            "Nothing sent to or received from {} in the last 30 days.",
+            device.name
+        ));
+        // What the viewer pages through: the files still there.
+        let viewable: Rc<Vec<LoggedFile>> = Rc::new(
+            entries
+                .iter()
+                .zip(&present)
+                .filter(|(_, here)| **here)
+                .map(|(entry, _)| entry.clone())
+                .collect(),
+        );
+        for (entry, here) in entries.iter().zip(&present) {
+            let card: gtk::Widget = if *here {
+                file_card(win, entry, &device.name, &viewable).upcast()
+            } else {
+                missing_card(win, entry, &device.name).upcast()
+            };
+            add_card(&self.history, &card);
         }
     }
 }
 
-/// Keeps `list` showing the transfers moving now while it exists.
-fn follow(list: &gtk::ListBox, daemon: DaemonHandle, device: Rc<RefCell<(String, String)>>) {
+/// "2.4 MB · 12 min ago".
+pub(super) fn size_and_time(entry: &LoggedFile) -> String {
+    format!("{} · {}", glib::format_size(entry.size), when(entry))
+}
+
+fn when(entry: &LoggedFile) -> String {
+    glib::DateTime::from_unix_local(entry.ts as i64)
+        .ok()
+        .zip(glib::DateTime::now_local().ok())
+        .map(|(when, now)| super::history::time_label(&now, &when))
+        .unwrap_or_default()
+}
+
+/// "From Pixel 9" or "Sent to Pixel 9", with its arrow.
+fn direction(entry: &LoggedFile, device: &str) -> gtk::Box {
+    let line = gtk::Box::builder().spacing(6).build();
+    line.append(
+        &gtk::Image::builder()
+            .icon_name(if entry.incoming {
+                "go-down-symbolic"
+            } else {
+                "go-up-symbolic"
+            })
+            .pixel_size(12)
+            .css_classes(["text-faint"])
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build(),
+    );
+    line.append(&ellipsized(
+        &if entry.incoming {
+            format!("From {device}")
+        } else {
+            format!("Sent to {device}")
+        },
+        &["caption", "text-faint"],
+    ));
+    line
+}
+
+/// A card's name, size and time, and direction, under its preview.
+fn card_words(entry: &LoggedFile, device: &str) -> gtk::Box {
+    let words = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .css_classes(["file-card-words"])
+        .build();
+    let name = ellipsized(&entry.name, &["file-name"]);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    name.set_max_width_chars(16);
+    words.append(&name);
+    words.append(&ellipsized(&size_and_time(entry), &["caption", "text-dim"]));
+    words.append(&direction(entry, device));
+    words
+}
+
+/// The preview area, fixed in size; what it shows is laid over it so a big
+/// picture cannot widen the card.
+fn preview_area() -> (gtk::Overlay, gtk::Box) {
+    let base = gtk::Box::builder()
+        .width_request(176)
+        .height_request(132)
+        .css_classes(["file-preview"])
+        .build();
+    let overlay = gtk::Overlay::builder()
+        .child(&base)
+        .overflow(gtk::Overflow::Hidden)
+        .css_classes(["file-preview-clip"])
+        .build();
+    (overlay, base)
+}
+
+/// A typed icon for a file with no picture: a PDF, a document.
+fn type_icon(name: &str) -> gtk::Box {
+    let icon = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    icon.append(
+        &gtk::Image::builder()
+            .gicon(&file_icon(name))
+            .pixel_size(40)
+            .css_classes(["text-dim"])
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build(),
+    );
+    let extension = std::path::Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("file")
+        .to_uppercase();
+    icon.append(&text(&extension, &["caption", "type-label"]));
+    icon
+}
+
+thread_local! {
+    /// Thumbnails made this run, by cache key: a page redraw shows them at
+    /// once instead of loading them again.
+    static SHOWN: RefCell<HashMap<String, (gtk::gdk::Texture, Option<Duration>)>> =
+        RefCell::default();
+}
+
+/// The memory key of `path` as it is now, if it is still there.
+fn memory_key(path: &std::path::Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(crate::thumbnails::cache_key(
+        path,
+        meta.modified().ok()?,
+        meta.len(),
+    ))
+}
+
+/// Shows `path`'s thumbnail in `overlay`: a shimmer now, the picture once a
+/// worker has made it (or a typed icon if it cannot be).
+fn fill_preview(overlay: &gtk::Overlay, path: &std::path::Path, name: &str, kind: FileKind) {
+    if !matches!(kind, FileKind::Image | FileKind::Video) {
+        overlay.add_overlay(&type_icon(name));
+        return;
+    }
+    let key = memory_key(path);
+    let known = key
+        .as_ref()
+        .and_then(|key| SHOWN.with(|shown| shown.borrow().get(key).cloned()));
+    if let Some((texture, duration)) = known {
+        show_thumbnail(overlay, &texture, duration, kind);
+        return;
+    }
+    let shimmer = gtk::Box::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .css_classes(["skeleton"])
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
+    overlay.add_overlay(&shimmer);
+    let (overlay, shimmer, path, name) = (
+        overlay.downgrade(),
+        shimmer.downgrade(),
+        path.to_path_buf(),
+        name.to_string(),
+    );
+    glib::spawn_future_local(async move {
+        let made = {
+            let path = path.clone();
+            gio::spawn_blocking(move || {
+                crate::thumbnails::thumbnail(&path).map(|thumb| (thumb.texture, thumb.duration))
+            })
+            .await
+        };
+        let Some(overlay) = overlay.upgrade() else {
+            return;
+        };
+        if let Some(shimmer) = shimmer.upgrade() {
+            overlay.remove_overlay(&shimmer);
+        }
+        match made {
+            Ok(Ok((texture, duration))) => {
+                if let Some(key) = key {
+                    SHOWN.with(|shown| shown.borrow_mut().insert(key, (texture.clone(), duration)));
+                }
+                show_thumbnail(&overlay, &texture, duration, kind);
+            }
+            Ok(Err(error)) => {
+                debug_log!("[UI] No thumbnail for {}: {error}", path.display());
+                overlay.add_overlay(&type_icon(&name));
+            }
+            Err(_) => overlay.add_overlay(&type_icon(&name)),
+        }
+    });
+}
+
+/// The picture, and for a video a play badge and its length.
+fn show_thumbnail(
+    overlay: &gtk::Overlay,
+    texture: &gtk::gdk::Texture,
+    duration: Option<Duration>,
+    kind: FileKind,
+) {
+    let picture = gtk::Picture::builder()
+        .paintable(texture)
+        .content_fit(gtk::ContentFit::Cover)
+        .can_shrink(true)
+        .hexpand(true)
+        .vexpand(true)
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
+    overlay.add_overlay(&picture);
+    if kind != FileKind::Video {
+        return;
+    }
+    let badge = gtk::Box::builder()
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .css_classes(["play-badge"])
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
+    badge.append(&gtk::Image::from_icon_name("media-playback-start-symbolic"));
+    overlay.add_overlay(&badge);
+    if let Some(duration) = duration {
+        let length = text(&clock(duration), &["duration-chip", "numeric"]);
+        length.set_halign(gtk::Align::End);
+        length.set_valign(gtk::Align::End);
+        overlay.add_overlay(&length);
+    }
+}
+
+/// "1:05", or "1:02:05" past the hour.
+pub(super) fn clock(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match seconds / 3600 {
+        0 => format!("{}:{:02}", seconds / 60, seconds % 60),
+        hours => format!("{hours}:{:02}:{:02}", (seconds / 60) % 60, seconds % 60),
+    }
+}
+
+/// A file still where it was: a button that opens it in the viewer.
+fn file_card(
+    win: &DesklinkWindow,
+    entry: &LoggedFile,
+    device: &str,
+    viewable: &Rc<Vec<LoggedFile>>,
+) -> gtk::Button {
+    let kind = crate::thumbnails::kind_of(&entry.path);
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    let (preview, _) = preview_area();
+    fill_preview(&preview, &entry.path, &entry.name, kind);
+    card.append(&preview);
+    card.append(&card_words(entry, device));
+    let button = gtk::Button::builder()
+        .child(&card)
+        .css_classes(["file-card"])
+        .tooltip_text(&entry.name)
+        .build();
+    let verb = if entry.incoming { "received" } else { "sent" };
+    button.update_property(&[gtk::accessible::Property::Label(&format!(
+        "{}, {}, {verb} {}",
+        entry.name,
+        glib::format_size(entry.size),
+        when(entry)
+    ))]);
+    let index = viewable
+        .iter()
+        .position(|file| file == entry)
+        .unwrap_or_default();
+    let (window, viewable) = (win.downgrade(), Rc::clone(viewable));
+    let device = device.to_string();
+    button.connect_clicked(move |_| {
+        if let Some(window) = window.upgrade() {
+            super::viewer::show(&window, &viewable, index, &device);
+        }
+    });
+    button
+}
+
+/// A file that has been moved or deleted since: said so, and Remove from
+/// List; nothing to open.
+fn missing_card(win: &DesklinkWindow, entry: &LoggedFile, device: &str) -> gtk::Box {
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["file-card", "missing"])
+        .build();
+    let (preview, _) = preview_area();
+    let gone = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    gone.append(
+        &gtk::Image::builder()
+            .icon_name("edit-find-symbolic")
+            .pixel_size(28)
+            .css_classes(["text-faint"])
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build(),
+    );
+    gone.append(&text("File moved or deleted", &["caption", "text-dim"]));
+    let remove = gtk::Button::builder()
+        .label("Remove from List")
+        .halign(gtk::Align::Center)
+        .css_classes(["flat", "remove-button"])
+        .build();
+    gone.append(&remove);
+    preview.add_overlay(&gone);
+    card.append(&preview);
+    card.append(&card_words(entry, device));
+    remove.update_property(&[gtk::accessible::Property::Label(&format!(
+        "Remove {} from the list",
+        entry.name
+    ))]);
+    let (window, gone) = (win.downgrade(), entry.clone());
+    remove.connect_clicked(move |_| {
+        crate::device_links::transfer_log::remove(&gone);
+        if let Some(window) = window.upgrade() {
+            if let Some(page) = window.imp().transfers.borrow().as_ref() {
+                page.invalidate();
+            }
+            window.refresh_soon();
+        }
+    });
+    card.update_property(&[gtk::accessible::Property::Label(&format!(
+        "{}, moved or deleted",
+        entry.name
+    ))]);
+    card
+}
+
+/// Keeps `grid` showing the transfers moving now while it exists.
+fn follow(grid: &gtk::FlowBox, daemon: DaemonHandle, device: Rc<RefCell<(String, String)>>) {
     let rows: Rc<RefCell<HashMap<String, RowWidgets>>> = Rc::default();
-    let weak = list.downgrade();
+    let weak = grid.downgrade();
     glib::timeout_add_local(POLL_INTERVAL, move || {
-        let Some(list) = weak.upgrade() else {
+        let Some(grid) = weak.upgrade() else {
             return glib::ControlFlow::Break;
         };
-        if list.is_mapped() || !rows.borrow().is_empty() {
-            refresh(&list, &daemon, &rows, &device.borrow().1);
+        // The grid is hidden while nothing moves: ask whether its page shows.
+        let shown = grid.parent().is_some_and(|page| page.is_mapped());
+        if shown || !rows.borrow().is_empty() {
+            refresh(&grid, &daemon, &rows, &device.borrow().1);
         }
         glib::ControlFlow::Continue
     });
 }
 
 fn refresh(
-    list: &gtk::ListBox,
+    grid: &gtk::FlowBox,
     daemon: &DaemonHandle,
     widgets: &RefCell<HashMap<String, RowWidgets>>,
     device: &str,
 ) {
     let rows = rows(daemon);
     let mut widgets = widgets.borrow_mut();
-    // Rows whose transfer has ended.
+    // Cards whose transfer has ended.
     widgets.retain(|id, shown| {
         let alive = rows.iter().any(|row| row.id == *id);
         if !alive {
-            list.remove(&shown.row);
+            if let Some(child) = shown.row.parent() {
+                grid.remove(&child);
+            }
         }
         alive
     });
     for row in &rows {
         let shown = widgets.entry(row.id.clone()).or_insert_with(|| {
             let widgets = new_row(daemon, row);
-            list.append(&widgets.row);
+            add_card(grid, &widgets.row);
             widgets
         });
         // A smoothed rate, so the estimate does not jump on every poll.
@@ -389,43 +700,64 @@ fn refresh(
         }
         // Labels here are plain text, so peer-supplied names need no escaping.
         shown.subtitle.set_label(&text);
+        shown.subtitle.set_tooltip_text(Some(&text));
         match fraction(row) {
             Some(fraction) => shown.bar.set_fraction(fraction),
             None => shown.bar.pulse(),
         }
     }
-    list.set_visible(!rows.is_empty());
+    grid.set_visible(!rows.is_empty());
 }
 
+/// A transfer moving now, as a card: its type, name, progress and Cancel.
 fn new_row(daemon: &DaemonHandle, row: &TransferRow) -> RowWidgets {
-    let content = gtk::Box::builder()
-        .spacing(12)
-        .margin_top(12)
-        .margin_bottom(12)
-        .margin_start(16)
-        .margin_end(12)
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .css_classes(["file-card", "moving"])
         .build();
-    content.append(
-        &gtk::Image::builder()
-            .gicon(&file_icon(&row.name))
-            .pixel_size(24)
-            .valign(gtk::Align::Center)
-            .css_classes(["text-dim"])
-            .accessible_role(gtk::AccessibleRole::Presentation)
-            .build(),
-    );
+    let (preview, _) = preview_area();
+    preview.add_overlay(&type_icon(&row.name));
+    // A file still being copied has no transfer to cancel yet.
+    if !row.preparing {
+        let cancel = gtk::Button::builder()
+            .icon_name("process-stop-symbolic")
+            .tooltip_text("Cancel this transfer")
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Start)
+            .margin_top(6)
+            .margin_end(6)
+            .css_classes(["circular", "osd"])
+            .build();
+        cancel.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Cancel sending {}",
+            row.name
+        ))]);
+        let (daemon, device_id, transfer_id) =
+            (daemon.clone(), row.device_id.clone(), row.id.clone());
+        cancel.connect_clicked(move |button| {
+            // Once is enough; the card goes when the daemon has done it.
+            button.set_sensitive(false);
+            daemon.send(DaemonCommand::CancelTransfer(
+                device_id.clone(),
+                transfer_id.clone(),
+            ));
+        });
+        preview.add_overlay(&cancel);
+    }
+    card.append(&preview);
     let words = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
-        .hexpand(true)
-        .valign(gtk::Align::Center)
+        .css_classes(["file-card-words"])
         .build();
-    let name = ellipsized(&row.name, &["mono", "body-small"]);
+    let name = ellipsized(&row.name, &["file-name"]);
     name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    name.set_max_width_chars(16);
     words.append(&name);
     let subtitle = gtk::Label::builder()
         .xalign(0.0)
         .ellipsize(gtk::pango::EllipsizeMode::End)
+        .max_width_chars(16)
         .css_classes(["caption", "text-dim", "numeric"])
         .build();
     words.append(&subtitle);
@@ -435,34 +767,14 @@ fn new_row(daemon: &DaemonHandle, row: &TransferRow) -> RowWidgets {
         .build();
     bar.update_property(&[gtk::accessible::Property::Label(&row.name)]);
     words.append(&bar);
-    content.append(&words);
-
-    // A file still being copied has no transfer to cancel yet.
-    if !row.preparing {
-        let cancel = gtk::Button::builder()
-            .icon_name("process-stop-symbolic")
-            .tooltip_text("Cancel this transfer")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat", "circular"])
-            .build();
-        cancel.update_property(&[gtk::accessible::Property::Label("Cancel this transfer")]);
-        let (daemon, device_id, transfer_id) =
-            (daemon.clone(), row.device_id.clone(), row.id.clone());
-        cancel.connect_clicked(move |button| {
-            // Once is enough; the row disappears when the daemon has done it.
-            button.set_sensitive(false);
-            daemon.send(DaemonCommand::CancelTransfer(
-                device_id.clone(),
-                transfer_id.clone(),
-            ));
-        });
-        content.append(&cancel);
-    }
+    card.append(&words);
+    card.update_property(&[gtk::accessible::Property::Label(&format!(
+        "{}, {}",
+        row.name,
+        if row.incoming { "receiving" } else { "sending" }
+    ))]);
     RowWidgets {
-        row: gtk::ListBoxRow::builder()
-            .activatable(false)
-            .child(&content)
-            .build(),
+        row: card,
         subtitle,
         bar,
         sample: Cell::new((std::time::Instant::now(), row.done)),
@@ -518,6 +830,13 @@ mod tests {
         );
         // Over 2 GB still measures.
         assert_eq!(fraction(&row(false, 3 << 30, 6 << 30)), Some(0.5));
+    }
+
+    #[test]
+    fn a_video_length_reads_like_a_player() {
+        assert_eq!(clock(Duration::from_secs(5)), "0:05");
+        assert_eq!(clock(Duration::from_secs(65)), "1:05");
+        assert_eq!(clock(Duration::from_secs(3725)), "1:02:05");
     }
 
     #[test]

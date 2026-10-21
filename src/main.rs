@@ -44,6 +44,7 @@ mod protocol;
 mod remote_control;
 mod shell_dbus;
 mod terminal_previews;
+mod thumbnails;
 mod tray;
 mod window;
 

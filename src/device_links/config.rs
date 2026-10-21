@@ -99,11 +99,20 @@ impl Default for AppSettings {
 
 /// The relay used when the user has not set one. Release builds set
 /// `DESKLINK_RELAY_URL` at build time to the deployed server
-/// (relay/deploy/DEPLOY.md).
+/// (relay/deploy/DEPLOY.md). Without it there is none: no relay is set up
+/// until the user enters one, and nothing tries to reach one.
 pub const DEFAULT_RELAY_URL: &str = match option_env!("DESKLINK_RELAY_URL") {
     Some(url) => url,
-    None => "wss://relay.desklink.example/v1",
+    None => "",
 };
+
+/// The relay to use: the user's, else `default`; empty when there is none.
+fn relay_url_or<'a>(chosen: &'a str, default: &'a str) -> &'a str {
+    match chosen.trim() {
+        "" => default.trim(),
+        chosen => chosen,
+    }
+}
 
 impl AppSettings {
     /// Whether `device_id`'s notifications are shown on this computer.
@@ -111,12 +120,20 @@ impl AppSettings {
         !self.hidden_notifications.contains(device_id)
     }
 
+    /// The relay's address; empty when none is set up.
     pub fn relay_url(&self) -> &str {
-        if self.relay_url.trim().is_empty() {
-            DEFAULT_RELAY_URL
-        } else {
-            self.relay_url.trim()
-        }
+        relay_url_or(&self.relay_url, DEFAULT_RELAY_URL)
+    }
+
+    /// Whether a relay server is set up at all.
+    pub fn relay_configured(&self) -> bool {
+        !self.relay_url().is_empty()
+    }
+
+    /// Whether DeskLink should reach paired phones through the relay: on,
+    /// and a relay to reach.
+    pub fn relay_wanted(&self) -> bool {
+        self.relay_enabled && self.relay_configured()
     }
 }
 
@@ -619,6 +636,27 @@ mod tests {
         hidden.hidden_notifications.insert("phone".into());
         assert!(!hidden.shows_notifications("phone"));
         assert!(hidden.shows_notifications("tablet"));
+    }
+
+    /// With no relay built in and none entered, nothing tries to reach one.
+    #[test]
+    fn no_relay_is_wanted_until_one_is_set_up() {
+        assert_eq!(relay_url_or("", ""), "");
+        assert_eq!(relay_url_or("  ", "wss://built.in/v1"), "wss://built.in/v1");
+        assert_eq!(
+            relay_url_or(" wss://mine.example/v1 ", ""),
+            "wss://mine.example/v1"
+        );
+        let mut settings = AppSettings::default();
+        if DEFAULT_RELAY_URL.is_empty() {
+            assert!(settings.relay_enabled, "on by default once one exists");
+            assert!(!settings.relay_configured());
+            assert!(!settings.relay_wanted(), "empty default: client not wanted");
+        }
+        settings.relay_url = "wss://mine.example/v1".into();
+        assert!(settings.relay_wanted());
+        settings.relay_enabled = false;
+        assert!(!settings.relay_wanted());
     }
 
     #[test]
