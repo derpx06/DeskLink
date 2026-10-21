@@ -243,7 +243,56 @@ fn ice_config_for(binding: &SessionBinding, config: &Arc<Mutex<Config>>) -> IceS
     }
     ice.relay_only =
         cfg!(debug_assertions) && std::env::var("DESKLINK_ICE_RELAY_ONLY").as_deref() == Ok("1");
+    if let Ok(mut used) = ice_addresses().lock() {
+        used.insert(binding.device_id.clone(), ice.local_ips.clone());
+    }
     ice
+}
+
+/// The local addresses each device's current peer gathers on.
+fn ice_addresses() -> &'static Mutex<HashMap<String, Vec<std::net::IpAddr>>> {
+    static USED: std::sync::OnceLock<Mutex<HashMap<String, Vec<std::net::IpAddr>>>> =
+        std::sync::OnceLock::new();
+    USED.get_or_init(Default::default)
+}
+
+/// Whether a peer gathering on `used` lost every one of them.
+pub(crate) fn addresses_vanished(used: &[std::net::IpAddr], present: &[std::net::IpAddr]) -> bool {
+    !used.is_empty() && used.iter().all(|ip| !present.contains(ip))
+}
+
+/// The network changed: rebuilds every peer whose local addresses are all
+/// gone (its ICE candidates can never work again), instead of waiting for
+/// silence to bury it.
+pub(crate) fn rebuild_peers_off_the_network(
+    present: &[std::net::IpAddr],
+    sessions: &Arc<DeviceManager>,
+    config: &Arc<Mutex<Config>>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
+) {
+    for binding in sessions.current_bindings() {
+        let used = ice_addresses()
+            .lock()
+            .ok()
+            .and_then(|used| used.get(&binding.device_id).cloned())
+            .unwrap_or_default();
+        if !addresses_vanished(&used, present) {
+            continue;
+        }
+        let Ok(Some(attempt_id)) = sessions.active_webrtc_attempt(&binding) else {
+            continue;
+        };
+        rebuild_peer(
+            &binding,
+            &attempt_id,
+            "This computer's network changed".to_string(),
+            sessions,
+            config,
+            devices,
+            events,
+        );
+    }
 }
 
 /// STUN for relay-bootstrapped peers when neither the relay nor the user
@@ -2026,10 +2075,8 @@ fn spawn_event_worker(
                 .webrtc_features_ready(&binding, &attempt_id)
                 .unwrap_or(false);
             if ready && !was_ready {
-                // Start the silence budget at the moment features go live. A
-                // phone that just finished a handover is awake.
+                // Start the silence budget at the moment features go live.
                 last_inbound = std::time::Instant::now();
-                set_dozing(&binding.device_id, false);
             }
             was_ready = ready;
             ever_ready |= ready;
@@ -2055,7 +2102,20 @@ fn spawn_event_worker(
             }
             if ready {
                 let dozing = is_dozing(&binding.device_id);
-                match liveness(last_inbound.elapsed(), last_probe.elapsed(), dozing) {
+                if take_probe_now(&binding.device_id) {
+                    last_probe = std::time::Instant::now();
+                    if let Err(error) =
+                        send_keepalive(&binding, &attempt_id, &wire, &sessions, false)
+                    {
+                        eprintln!("[DeskLink] WebRTC wake probe failed: {error}");
+                    }
+                }
+                let silence = effective_silence(
+                    last_inbound.elapsed(),
+                    sessions.silence(&binding.device_id),
+                    dozing,
+                );
+                match liveness(silence, last_probe.elapsed(), dozing) {
                     Liveness::Fine => {}
                     Liveness::Probe => {
                         last_probe = std::time::Instant::now();
@@ -2503,17 +2563,54 @@ fn dozing_devices() -> &'static Mutex<std::collections::HashSet<String>> {
 }
 
 /// Records what `device_id`'s latest heartbeat (LAN or data channel) said.
+/// A phone that just woke (`dozing: false` after `true`) is probed on the
+/// data channel at once: its link may have died while it slept.
 pub(crate) fn note_heartbeat(device_id: &str, packet: &NetworkPacket) {
-    set_dozing(device_id, reports_dozing(packet));
+    if set_dozing(device_id, reports_dozing(packet)) {
+        if let Ok(mut woke) = probe_now().lock() {
+            woke.insert(device_id.to_string());
+        }
+    }
 }
 
-fn set_dozing(device_id: &str, dozing: bool) {
-    if let Ok(mut devices) = dozing_devices().lock() {
-        if dozing {
-            devices.insert(device_id.to_string());
-        } else {
-            devices.remove(device_id);
-        }
+fn probe_now() -> &'static Mutex<std::collections::HashSet<String>> {
+    static PROBE_NOW: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    PROBE_NOW.get_or_init(Default::default)
+}
+
+/// Whether `device_id` woke since this was last asked (and forgets it).
+fn take_probe_now(device_id: &str) -> bool {
+    probe_now()
+        .lock()
+        .is_ok_and(|mut woke| woke.remove(device_id))
+}
+
+/// Records the phone's doze state. Only the phone clears it: a finished
+/// handover says nothing about whether its screen is on. Whether it woke.
+fn set_dozing(device_id: &str, dozing: bool) -> bool {
+    let Ok(mut devices) = dozing_devices().lock() else {
+        return false;
+    };
+    if dozing {
+        devices.insert(device_id.to_string());
+        false
+    } else {
+        devices.remove(device_id)
+    }
+}
+
+/// The silence liveness judges by: the data channel's, or while the phone
+/// dozes the more recent of the data channel's and the LAN link's (a frozen
+/// phone thawed by the LAN heartbeat answers on either).
+pub(crate) fn effective_silence(
+    data: std::time::Duration,
+    lan: Option<std::time::Duration>,
+    dozing: bool,
+) -> std::time::Duration {
+    match lan {
+        Some(lan) if dozing => data.min(lan),
+        _ => data,
     }
 }
 
@@ -2596,7 +2693,9 @@ fn send_keepalive(
 /// Rebuilding immediately and unconditionally allocated a fresh GStreamer
 /// pipeline and seven data channels per failure, so a peer that could not be
 /// reached at all span the CPU instead of settling into a retry cadence.
-const RECOVERY_BACKOFF_MILLIS: [u64; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 30_000];
+/// Mirrored by Android's `WebRtcRecoveryPolicy` (contract B3): a healthy
+/// rebuild takes under a second, so the first rung is short.
+const RECOVERY_BACKOFF_MILLIS: [u64; 6] = [250, 1_000, 2_000, 4_000, 8_000, 16_000];
 
 /// The delay before retry `attempt`, or `None` once the ladder is exhausted.
 ///
@@ -3727,11 +3826,12 @@ fn now_millis() -> i64 {
 mod tests {
     use super::{
         apply_own_denial, authorize_desktop_remote_input, coalesce_motion, desktop_capture_needed,
-        desktop_portal_services, end_screen_session, ensure_phone_view_allowed,
+        desktop_portal_services, effective_silence, end_screen_session, ensure_phone_view_allowed,
         expired_request_action, is_dozing, liveness, note_heartbeat, offer_attempt_disposition,
         recovery_delay, remote_session, remove_service_if_current, reports_dozing, screen_stopped,
-        stop_desktop_portal_session, DesktopPortalCommand, DesktopPortalService, ExpiredRequest,
-        Liveness, OfferAttemptDisposition, RECOVERY_BACKOFF_MILLIS, SHARING_STOPPED_AT_DESK,
+        stop_desktop_portal_session, take_probe_now, DesktopPortalCommand, DesktopPortalService,
+        ExpiredRequest, Liveness, OfferAttemptDisposition, RECOVERY_BACKOFF_MILLIS,
+        SHARING_STOPPED_AT_DESK,
     };
     use crate::device_links::packet::NetworkPacket;
     use crate::device_links::webrtc::remote_session::SessionState;
@@ -4291,6 +4391,63 @@ mod tests {
         assert_eq!(liveness(s(20), s(60), true), Liveness::Fine, "past 15 s");
         assert_eq!(liveness(s(34), s(60), true), Liveness::Fine);
         assert_eq!(liveness(s(35), s(0), true), Liveness::Dead);
+    }
+
+    #[test]
+    fn a_peer_is_rebuilt_only_when_all_its_addresses_are_gone() {
+        use super::addresses_vanished;
+        let ip = |text: &str| text.parse::<std::net::IpAddr>().unwrap();
+        let present = [ip("192.168.1.20"), ip("fe80::1")];
+        assert!(!addresses_vanished(&[ip("192.168.1.20")], &present));
+        assert!(
+            addresses_vanished(&[ip("10.0.0.5")], &present),
+            "Wi-Fi switched"
+        );
+        assert!(
+            !addresses_vanished(&[ip("10.0.0.5"), ip("fe80::1")], &present),
+            "one left"
+        );
+        assert!(
+            !addresses_vanished(&[], &present),
+            "nothing recorded: nothing to judge"
+        );
+    }
+
+    #[test]
+    fn the_recovery_ladder_is_the_shared_one() {
+        assert_eq!(
+            RECOVERY_BACKOFF_MILLIS,
+            [250, 1_000, 2_000, 4_000, 8_000, 16_000]
+        );
+    }
+
+    #[test]
+    fn a_dozing_phone_is_judged_by_its_most_recent_channel_and_probed_on_waking() {
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        assert_eq!(
+            effective_silence(s(30), Some(s(4)), true),
+            s(4),
+            "LAN answered"
+        );
+        assert_eq!(
+            effective_silence(s(30), Some(s(4)), false),
+            s(30),
+            "awake: data only"
+        );
+        assert_eq!(effective_silence(s(30), None, true), s(30));
+
+        let device = "waking-test-phone";
+        let mut heartbeat = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT);
+        heartbeat.set("dozing", true);
+        note_heartbeat(device, &heartbeat);
+        assert!(!take_probe_now(device), "falling asleep probes nothing");
+        heartbeat.set("dozing", false);
+        note_heartbeat(device, &heartbeat);
+        assert!(take_probe_now(device), "waking probes at once");
+        assert!(!take_probe_now(device), "once");
+        note_heartbeat(device, &heartbeat);
+        assert!(!take_probe_now(device), "already awake: nothing new");
     }
 
     #[test]

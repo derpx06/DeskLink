@@ -193,6 +193,25 @@ impl TestPeer {
         self.relink_with_certificate(pem);
     }
 
+    /// Rebuilds the link presenting `certificate_pem` as `finish_secure_link`
+    /// admits a changed certificate during a QR scan: never paired.
+    pub(crate) fn relink_unpaired_with_certificate(&mut self, certificate_pem: String) {
+        self.net.reconnect(self.end);
+        self.line.clear();
+        let session_link = SessionLink::new(
+            Arc::new(self.net.end(self.end)),
+            certificate_pem,
+            self.local_public_der.clone(),
+            self.remote_public_der.clone(),
+            self.info.clone(),
+        );
+        self.binding = self
+            .sessions
+            .register_link(self.peer_id.clone(), session_link, false)
+            .expect("re-register link")
+            .binding;
+    }
+
     /// Rebuilds the link presenting an arbitrary certificate.
     ///
     /// This is the pairing-hijack vector: a second connection claiming the same
@@ -1025,6 +1044,92 @@ mod tests {
             Some(intruder.as_str()),
             "the intruder's certificate must never reach the trust store"
         );
+    }
+
+    /// A reinstalled phone has a new certificate. While a QR code is on
+    /// screen its link is admitted *unpaired*; only a valid proof from that
+    /// link replaces the stored certificate, and a bad one changes nothing.
+    #[test]
+    fn a_reinstalled_phone_re_pairs_by_qr_and_only_a_valid_proof_moves_trust() {
+        use crate::device_links::pairing_qr;
+        let _one_code = pairing_qr::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let net = TestNetwork::new();
+        let (mut desktop, mut phone) = peer_pair(&net, "desktop-1", "phone-1");
+        desktop.request_pair();
+        net.advance(0);
+        phone.pump();
+        phone.accept();
+        net.advance(0);
+        desktop.pump();
+        assert!(desktop.is_trusted());
+        let old = desktop.trusted_certificate().expect("stored certificate");
+
+        // The reinstalled phone: a new certificate for the same device id,
+        // admitted as finish_secure_link does while a QR code is live.
+        let desk_der = desktop
+            .config
+            .lock()
+            .unwrap()
+            .certificate()
+            .to_der()
+            .unwrap();
+        let desk_id = desktop.local_id();
+        pairing_qr::start(&desk_id, &desk_der, None, &[], 1716).unwrap();
+        let new_pem = foreign_certificate_pem();
+        desktop.relink_unpaired_with_certificate(new_pem.clone());
+        assert_eq!(
+            desktop.pair_state(),
+            PairState::NotPaired,
+            "a stranger until proven"
+        );
+
+        let proof_packet = |mac: String| {
+            let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_PAIR_QR);
+            packet.set("mac", mac);
+            packet
+        };
+        let send = |packet: NetworkPacket| {
+            apply_lan_packet(
+                &desktop.binding,
+                packet,
+                &desktop.devices,
+                &desktop.sessions,
+                &desktop.config,
+                &desktop.events,
+            )
+        };
+        // A forged proof: nothing moves.
+        send(proof_packet("AAAA".into()));
+        assert_eq!(desktop.trusted_certificate().as_deref(), Some(old.as_str()));
+        assert_ne!(desktop.pair_state(), PairState::Paired);
+
+        // The real proof, over the certificate this link presented.
+        let secret = pairing_qr::live_secret().expect("code still live");
+        let phone_der = openssl::x509::X509::from_pem(new_pem.as_bytes())
+            .unwrap()
+            .to_der()
+            .unwrap();
+        let mac = pairing_qr::proof(
+            &secret,
+            &desk_id,
+            &desktop.peer_id(),
+            &pairing_qr::fingerprint(&desk_der).unwrap(),
+            &pairing_qr::fingerprint(&phone_der).unwrap(),
+        )
+        .unwrap();
+        use base64::Engine;
+        send(proof_packet(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac),
+        ));
+        assert_eq!(desktop.pair_state(), PairState::Paired);
+        assert_eq!(
+            desktop.trusted_certificate().as_deref(),
+            Some(new_pem.as_str()),
+            "the proof moved trust to the new certificate"
+        );
+        pairing_qr::cancel();
     }
 
     #[test]

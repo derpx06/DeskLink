@@ -46,6 +46,15 @@ pub(super) fn heartbeat_dead(dozing: bool) -> std::time::Duration {
     }
 }
 
+/// Whether a DeskLink window is on screen: the route and round trip are then
+/// read every second instead of every five.
+static UI_VISIBLE: AtomicBool = AtomicBool::new(false);
+
+/// The window says whether it is showing (each refresh).
+pub(crate) fn set_ui_visible(visible: bool) {
+    UI_VISIBLE.store(visible, Ordering::Relaxed);
+}
+
 /// Reads each connected device's ICE path into its view, logging changes.
 /// Every few seconds, off the UI thread: reading stats waits on webrtcbin.
 fn refresh_connection_paths(
@@ -177,9 +186,8 @@ impl DaemonWorker {
             .port();
         let sessions = Arc::new(DeviceManager::new());
         let shutdown = Arc::new(AtomicBool::new(false));
-        tcp_listener
-            .set_nonblocking(true)
-            .map_err(|err| err.to_string())?;
+        // Blocking: a phone's connection is taken the moment it arrives, not
+        // at the next 50 ms poll. The accept thread lives as long as the app.
 
         {
             let config = Arc::clone(&config);
@@ -241,7 +249,8 @@ impl DaemonWorker {
             let mut tick: u32 = 0;
             while !shutdown.load(Ordering::Acquire) {
                 tick = tick.wrapping_add(1);
-                if tick % 5 == 0 {
+                // Every second while a window shows them, else every five.
+                if tick % 5 == 0 || UI_VISIBLE.load(Ordering::Relaxed) {
                     refresh_connection_paths(&devices, &sessions);
                 }
                 let wanted = super::config::app_settings().stay_awake

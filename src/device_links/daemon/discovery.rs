@@ -25,6 +25,15 @@ fn should_publish_outgoing_failure(sessions: &DeviceManager, device_id: &str) ->
     sessions.wants_bootstrap_connection(device_id)
 }
 
+/// Set when the network changes: the broadcaster starts its burst again.
+static BEACON_AGAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Announces this computer again at once, as at startup (broadcast, then
+/// unicast to each paired phone's last address).
+pub(super) fn beacon_again() {
+    BEACON_AGAIN.store(true, Ordering::Release);
+}
+
 /// What a paired phone last said about itself and the TCP port it listens
 /// on, from its identity (a beacon, or an incoming connection's first line).
 /// The address comes from its `DeviceView`.
@@ -34,8 +43,13 @@ fn known_endpoints() -> &'static Mutex<HashMap<String, (DeviceInfo, u16)>> {
     KNOWN.get_or_init(Default::default)
 }
 
-/// Records `info`'s listening port from an identity packet, when it has one.
-pub(super) fn remember_endpoint(info: &DeviceInfo, packet: &NetworkPacket) {
+/// Records `info`'s listening port from an identity packet, when it has one,
+/// and (with `ip`, where it was seen) remembers the address across restarts.
+pub(super) fn remember_endpoint(
+    info: &DeviceInfo,
+    packet: &NetworkPacket,
+    ip: Option<std::net::IpAddr>,
+) {
     let Some(port) = packet
         .get_i64("tcpPort")
         .and_then(|port| u16::try_from(port).ok())
@@ -46,6 +60,57 @@ pub(super) fn remember_endpoint(info: &DeviceInfo, packet: &NetworkPacket) {
     if let Ok(mut known) = known_endpoints().lock() {
         known.insert(info.id.clone(), (info.clone(), port));
     }
+    if let Some(ip) = ip.filter(|ip| !ip.is_loopback() && !ip.is_unspecified()) {
+        persist_endpoint(&info.id, SocketAddr::new(ip, port));
+    }
+}
+
+/// Where each paired phone was last reachable, kept across restarts so the
+/// first dial after a restart needs no discovery (`endpoints.json` beside
+/// the connection history).
+fn endpoints_path() -> Option<std::path::PathBuf> {
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join(format!(
+            "desklink-test-endpoints-{}.json",
+            std::process::id()
+        )));
+    }
+    Some(
+        dirs::state_dir()
+            .or_else(dirs::data_local_dir)?
+            .join("desklink")
+            .join("endpoints.json"),
+    )
+}
+
+/// The remembered addresses, by device id.
+pub(super) fn persisted_endpoints() -> HashMap<String, SocketAddr> {
+    endpoints_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+fn persist_endpoint(device_id: &str, address: SocketAddr) {
+    let Some(path) = endpoints_path() else {
+        return;
+    };
+    let mut all = persisted_endpoints();
+    if all.get(device_id) == Some(&address) {
+        return;
+    }
+    all.insert(device_id.to_string(), address);
+    let written = serde_json::to_string(&all)
+        .map_err(|error| error.to_string())
+        .and_then(|text| {
+            path.parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, text))
+                .map_err(|error| error.to_string())
+        });
+    if let Err(error) = written {
+        eprintln!("[Daemon] Could not remember {device_id}'s address: {error}");
+    }
 }
 
 /// How often paired phones without a bootstrap link are redialled.
@@ -53,18 +118,34 @@ const REDIAL_EVERY: Duration = Duration::from_secs(3);
 
 /// The paired phones to dial now: no live bootstrap link (whether or not
 /// their WebRTC peer survives), a last-known address and listening port.
+///
+/// Heard from this run (`known`): its address and port. Otherwise, after a
+/// restart before any beacon, the address remembered from last time
+/// (`persisted`), with what the trust store says about the phone.
 fn redial_targets(
     devices: &HashMap<String, DeviceView>,
     known: &HashMap<String, (DeviceInfo, u16)>,
+    persisted: &HashMap<String, SocketAddr>,
     wants: impl Fn(&str) -> bool,
 ) -> Vec<(DeviceInfo, std::net::IpAddr, u16)> {
     devices
         .values()
         .filter(|device| device.trusted && wants(&device.id))
         .filter_map(|device| {
-            let ip = device.address.parse().ok()?;
-            let (info, port) = known.get(&device.id)?;
-            Some((info.clone(), ip, *port))
+            if let (Ok(ip), Some((info, port))) = (device.address.parse(), known.get(&device.id)) {
+                return Some((info.clone(), ip, *port));
+            }
+            let address = persisted.get(&device.id)?;
+            let info = DeviceInfo {
+                id: device.id.clone(),
+                name: device.name.clone(),
+                device_type: device.device_type.clone(),
+                protocol_version: device.protocol_version,
+                incoming_capabilities: Vec::new(),
+                outgoing_capabilities: Vec::new(),
+                instance_id: None,
+            };
+            Some((info, address.ip(), address.port()))
         })
         .collect()
 }
@@ -85,6 +166,7 @@ impl DaemonWorker {
         let events = Arc::clone(&self.events);
         let shutdown = Arc::clone(&self.shutdown);
         thread::spawn(move || {
+            let persisted = persisted_endpoints();
             while !shutdown.load(Ordering::Acquire) {
                 thread::sleep(REDIAL_EVERY);
                 let targets = {
@@ -92,7 +174,7 @@ impl DaemonWorker {
                     else {
                         continue;
                     };
-                    redial_targets(&devices, &known, |id| {
+                    redial_targets(&devices, &known, &persisted, |id| {
                         sessions.wants_bootstrap_connection(id)
                     })
                 };
@@ -195,6 +277,11 @@ impl DaemonWorker {
                 sent = sent.saturating_add(1);
                 for _ in 0..wait_ms / 250 {
                     if shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    // The network changed: start the burst over, now.
+                    if BEACON_AGAIN.swap(false, Ordering::AcqRel) {
+                        sent = 0;
                         break;
                     }
                     thread::sleep(Duration::from_millis(250));
@@ -380,7 +467,7 @@ fn handle_identity_packet(
         return;
     }
     upsert_device(devices, &info, address.ip().to_string(), paired);
-    remember_endpoint(&info, &packet);
+    remember_endpoint(&info, &packet, Some(address.ip()));
 
     let Some(remote_port) = packet
         .get_i64("tcpPort")
@@ -464,19 +551,33 @@ mod tests {
         let mut beacon = NetworkPacket::new(PACKET_TYPE_IDENTITY);
         beacon.set("tcpPort", 1716);
         for id in ["linked", "unlinked", "stranger", "relay-only"] {
-            remember_endpoint(&info(id), &beacon);
+            remember_endpoint(&info(id), &beacon, None);
         }
         let mut odd = NetworkPacket::new(PACKET_TYPE_IDENTITY);
         odd.set("tcpPort", 22);
-        remember_endpoint(&info("no-port"), &odd);
+        remember_endpoint(&info("no-port"), &odd, None);
         let known = known_endpoints().lock().unwrap().clone();
         // `wants` is the session's view: here only "linked" has a live socket.
-        let targets = redial_targets(&devices, &known, |id| id != "linked");
+        let mut persisted = HashMap::new();
+        persisted.insert("restarted".to_string(), "10.0.0.7:1716".parse().unwrap());
+        let mut devices = devices;
+        let restarted = view("restarted", "", true);
+        devices.insert(restarted.id.clone(), restarted);
+        let targets = redial_targets(&devices, &known, &persisted, |id| id != "linked");
         let dialled: Vec<_> = targets
             .iter()
             .map(|(info, ip, port)| (info.id.as_str(), ip.to_string(), *port))
             .collect();
-        assert_eq!(dialled, [("unlinked", "10.0.0.3".to_string(), 1716)]);
+        let mut dialled = dialled;
+        dialled.sort();
+        assert_eq!(
+            dialled,
+            [
+                ("restarted", "10.0.0.7".to_string(), 1716),
+                ("unlinked", "10.0.0.3".to_string(), 1716)
+            ],
+            "after a restart, the address remembered from last time"
+        );
     }
     use crate::device_links::core::SessionLink;
 

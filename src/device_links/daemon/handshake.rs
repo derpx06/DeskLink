@@ -20,8 +20,10 @@ use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::PACKET_TYPE_WEBRTC_SIGNAL_V1;
 
 /// Idle read timeout on an established device link. It also bounds how long a
-/// feature send can wait for the stream mutex the reader holds.
-pub(super) const READ_TIMEOUT: Duration = Duration::from_millis(50);
+/// send can wait for the stream mutex the reader holds — signalling (SDP and
+/// ICE during a rebuild) included, so it is short. ~40 idle wakeups a
+/// second per link.
+pub(super) const READ_TIMEOUT: Duration = Duration::from_millis(20);
 
 pub(super) fn finish_secure_link(
     initial_info: DeviceInfo,
@@ -66,13 +68,21 @@ pub(super) fn finish_secure_link(
         .key()
         .public_key_to_der()
         .map_err(|err| err.to_string())?;
-    validate_pinned_certificate(&config, &secure_info.id, &cert)?;
+    let pinned = validate_pinned_certificate(&config, &secure_info.id, &cert);
+    let new_certificate = certificate_admission(
+        pinned,
+        crate::device_links::pairing_qr::current_uri().is_some(),
+    )?;
     enforce_unpaired_link_limit(&config, &sessions, &secure_info.id)?;
 
-    let paired = config
-        .lock()
-        .map_err(|_| "Config lock poisoned".to_string())?
-        .is_trusted(&secure_info.id);
+    // A link presenting a new certificate is never paired, whatever the trust
+    // store says about its device id; only a valid QR proof (or a pairing the
+    // user accepts) can make it so, and only then is its certificate stored.
+    let paired = !new_certificate
+        && config
+            .lock()
+            .map_err(|_| "Config lock poisoned".to_string())?
+            .is_trusted(&secure_info.id);
     if paired && crate::device_links::relay_link::client::force_relay() {
         return Err("LAN links are disabled for testing (DESKLINK_FORCE_RELAY)".to_string());
     }
@@ -146,6 +156,25 @@ pub(super) fn finish_secure_link(
         sessions,
         events,
     )
+}
+
+/// Whether a link may be admitted given the pinned-certificate check: as
+/// itself (`Ok(false)`), or — a certificate that differs from the stored
+/// one, while a QR code is on screen — as an *unpaired* newcomer
+/// (`Ok(true)`), so a reinstalled phone can re-pair by scanning. Otherwise
+/// the mismatch refuses the link.
+pub(super) fn certificate_admission(
+    pinned: Result<(), String>,
+    qr_live: bool,
+) -> Result<bool, String> {
+    match pinned {
+        Ok(()) => Ok(false),
+        Err(_) if qr_live => {
+            debug_log!("[Daemon] Certificate changed; admitted unpaired while a QR code is shown");
+            Ok(true)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Installs an authenticated bootstrap link — a LAN TLS socket or a relay
@@ -397,4 +426,32 @@ pub(super) fn handle_disconnect(
     }
     mark_status(devices, &binding.device_id, DeviceStatus::Unreachable);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::certificate_admission;
+
+    /// A changed certificate is a stranger, never the paired phone: refused,
+    /// or — only while a QR code is on screen — admitted unpaired, so the
+    /// scan's proof can re-pair a reinstalled phone.
+    #[test]
+    fn a_changed_certificate_is_admitted_only_unpaired_and_only_during_a_qr_scan() {
+        assert_eq!(certificate_admission(Ok(()), false), Ok(false));
+        assert_eq!(
+            certificate_admission(Ok(()), true),
+            Ok(false),
+            "matching: as itself"
+        );
+        let changed = || Err("Trusted device certificate changed".to_string());
+        assert!(
+            certificate_admission(changed(), false).is_err(),
+            "no QR: refused"
+        );
+        assert_eq!(
+            certificate_admission(changed(), true),
+            Ok(true),
+            "QR live: unpaired"
+        );
+    }
 }

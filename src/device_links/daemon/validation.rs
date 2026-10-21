@@ -145,6 +145,11 @@ pub(super) fn connect_to_device(
     if !wanted() {
         return Ok(());
     }
+    // One connection being set up per phone: discovery, the redialer and an
+    // inbound socket for the same phone must not race (see `DeviceFlight`).
+    let Some(_flight) = super::network::DeviceFlight::claim(&initial_info.id) else {
+        return Ok(());
+    };
     // Without a timeout a peer that vanished costs ~2 minutes of SYN retries.
     let mut stream = TcpStream::connect_timeout(
         &std::net::SocketAddr::new(address.ip(), remote_port),

@@ -76,7 +76,11 @@ pub(super) fn incoming_tcp_loop(
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(50));
             }
-            Err(error) => push_error(&errors, format!("TCP listener failed: {error}")),
+            Err(error) => {
+                push_error(&errors, format!("TCP listener failed: {error}"));
+                // Out of file descriptors and the like: do not spin.
+                thread::sleep(Duration::from_millis(200));
+            }
         }
     }
 }
@@ -163,7 +167,7 @@ fn accept_incoming_device(
     let packet = NetworkPacket::deserialize(&line).map_err(|err| err.to_string())?;
     let info = DeviceInfo::from_identity_packet(&packet)
         .ok_or_else(|| format!("Invalid identity packet (type {})", packet.packet_type))?;
-    super::discovery::remember_endpoint(&info, &packet);
+    super::discovery::remember_endpoint(&info, &packet, stream.peer_addr().ok().map(|a| a.ip()));
     let local_id = config
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())?
@@ -187,6 +191,9 @@ fn accept_incoming_device(
             .map(|config| config.is_trusted(&info.id))
             .unwrap_or(false),
     );
+    // A dial of ours to the same phone is under way: that one goes ahead.
+    let _flight = super::network::DeviceFlight::claim(&info.id)
+        .ok_or_else(|| format!("A connection to {} is already being set up", info.id))?;
     let connector = ssl_connector(&config)?;
     let ssl_stream = connector
         .connect(&info.id, stream)

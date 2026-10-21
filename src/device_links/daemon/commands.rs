@@ -109,7 +109,15 @@ impl DaemonWorker {
                     })
                     .and_then(|(id, der)| {
                         let host = lan_address().map(|ip| format!("{ip}:{}", self.tcp_port));
-                        crate::device_links::pairing_qr::start(&id, &der, host)
+                        let addresses =
+                            super::network::lan_ipv4s(&super::network::local_interfaces());
+                        crate::device_links::pairing_qr::start(
+                            &id,
+                            &der,
+                            host,
+                            &addresses,
+                            self.tcp_port,
+                        )
                     });
                 if let Err(error) = started {
                     push_error(
@@ -184,7 +192,7 @@ impl DaemonWorker {
                     push_error(&self.errors, format!("Could not hand off: {error}"));
                 }
             }
-            DaemonCommand::NetworkChanged => crate::device_links::relay_link::client::reset(),
+            DaemonCommand::NetworkChanged => self.network_changed(),
             DaemonCommand::SetStayAwake(on) => {
                 self.update_settings(|settings| settings.stay_awake = on)
             }
@@ -459,6 +467,41 @@ impl DaemonWorker {
             let packet = build_notification_request_packet();
             transport.send(&packet)
         });
+    }
+
+    /// The network changed (Wi-Fi switched, a cable plugged): recover in
+    /// about two seconds instead of waiting for silence. Announce again, drop
+    /// LAN links on addresses this computer no longer has, and rebuild peers
+    /// whose addresses all went; the redialer and the phones' answers to the
+    /// beacons bring the links back.
+    fn network_changed(&self) {
+        crate::device_links::relay_link::client::reset();
+        super::discovery::beacon_again();
+        let present: Vec<std::net::IpAddr> = super::network::local_interfaces()
+            .into_iter()
+            .map(|(_, ip)| ip)
+            .collect();
+        for binding in self.sessions.current_bindings() {
+            if binding
+                .link
+                .local_ip()
+                .is_some_and(|ip| !present.contains(&ip))
+            {
+                super::handshake::handle_disconnect(
+                    &binding,
+                    &self.devices,
+                    &self.sessions,
+                    "This computer's network changed".to_string(),
+                );
+            }
+        }
+        crate::device_links::webrtc::coordinator::rebuild_peers_off_the_network(
+            &present,
+            &self.sessions,
+            &self.config,
+            &self.devices,
+            &self.events,
+        );
     }
 
     fn send_clipboard(&self, device_id: &str) {

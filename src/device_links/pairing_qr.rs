@@ -10,8 +10,11 @@
 //!   fingerprints. The desktop computes the phone's fingerprint from the
 //!   certificate the link actually presented, so a relaying attacker — who must
 //!   present its own certificate — cannot produce a valid proof.
-//! * `h` — a LAN address hint so the phone can dial without waiting for
-//!   discovery.
+//! * `h` — a LAN address hint (`ip:port`) so the phone can dial without
+//!   waiting for discovery; kept for older phones.
+//! * `a` and `p` — every LAN IPv4 address of this computer (comma-separated,
+//!   virtual interfaces left out) and its TCP port: a newer phone dials them
+//!   all at once, with the pinned TLS check, and needs no discovery at all.
 //!
 //! Only one code is live at a time; it expires after 5 minutes, is consumed by
 //! the first valid proof, and is burned after 3 bad ones.
@@ -38,6 +41,16 @@ struct Pending {
 
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 
+/// Tests that use the one live code take this first: they share it.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// The live code's secret, for a test to compute a phone's proof.
+#[cfg(test)]
+pub(crate) fn live_secret() -> Option<[u8; 32]> {
+    PENDING.lock().ok()?.as_ref().map(|pending| pending.secret)
+}
+
 /// SHA-256 of a DER certificate.
 pub fn fingerprint(certificate_der: &[u8]) -> Result<[u8; 32], String> {
     let digest = hash(MessageDigest::sha256(), certificate_der).map_err(|e| e.to_string())?;
@@ -51,6 +64,8 @@ pub fn start(
     desktop_id: &str,
     desktop_certificate_der: &[u8],
     host: Option<String>,
+    addresses: &[std::net::Ipv4Addr],
+    port: u16,
 ) -> Result<String, String> {
     let mut secret = [0u8; 32];
     openssl::rand::rand_bytes(&mut secret).map_err(|e| e.to_string())?;
@@ -63,6 +78,10 @@ pub fn start(
     if let Some(host) = host {
         uri.push_str("&h=");
         uri.push_str(&host);
+    }
+    if !addresses.is_empty() {
+        let list: Vec<String> = addresses.iter().map(ToString::to_string).collect();
+        uri.push_str(&format!("&a={}&p={port}", list.join(",")));
     }
     let mut pending = PENDING
         .lock()
@@ -182,12 +201,26 @@ mod tests {
     // The tests share the one global code, so they run as one sequence.
     #[test]
     fn a_code_pairs_once_rejects_forgeries_and_burns_after_three_failures() {
+        let _one_code = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let desktop_fp = [1u8; 32];
         let phone_fp = [2u8; 32];
 
-        let uri = start("desk", b"desktop-cert-der", Some("192.0.2.1:1717".into())).unwrap();
+        let addresses = ["192.0.2.1".parse().unwrap(), "10.0.0.5".parse().unwrap()];
+        let uri = start(
+            "desk",
+            b"desktop-cert-der",
+            Some("192.0.2.1:1717".into()),
+            &addresses,
+            1717,
+        )
+        .unwrap();
         assert!(uri.starts_with("desklink://pair?v=1&id=desk&fp="));
-        assert!(uri.ends_with("&h=192.0.2.1:1717"));
+        assert!(
+            uri.ends_with("&h=192.0.2.1:1717&a=192.0.2.1,10.0.0.5&p=1717"),
+            "{uri}"
+        );
         assert_eq!(current_uri().as_deref(), Some(uri.as_str()));
         let secret = PENDING.lock().unwrap().as_ref().unwrap().secret;
         let good = URL_SAFE_NO_PAD
@@ -201,7 +234,11 @@ mod tests {
         assert!(verify("desk", "phone", &desktop_fp, &phone_fp, &good).is_err());
         assert_eq!(current_uri(), None);
 
-        start("desk", b"desktop-cert-der", None).unwrap();
+        let without = start("desk", b"desktop-cert-der", None, &[], 1716).unwrap();
+        assert!(
+            !without.contains("&a=") && !without.contains("&p="),
+            "no addresses: no list"
+        );
         for _ in 0..MAX_FAILURES {
             assert!(verify("desk", "phone", &desktop_fp, &phone_fp, "AAAA").is_err());
         }

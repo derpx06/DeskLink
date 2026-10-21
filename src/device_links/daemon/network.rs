@@ -204,6 +204,99 @@ impl Drop for HandshakeSlot {
     }
 }
 
+/// This computer's addresses, each with its interface, from `getifaddrs`
+/// (interfaces that are up only).
+pub(crate) fn local_interfaces() -> Vec<(String, IpAddr)> {
+    let mut found = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills `list` with a linked list we only read and
+    // then free once; every pointer is checked before it is dereferenced.
+    unsafe {
+        if libc::getifaddrs(&mut list) != 0 {
+            return found;
+        }
+        let mut cursor = list;
+        while !cursor.is_null() {
+            let entry = &*cursor;
+            cursor = entry.ifa_next;
+            if entry.ifa_addr.is_null() || entry.ifa_flags & libc::IFF_UP as u32 == 0 {
+                continue;
+            }
+            let name = std::ffi::CStr::from_ptr(entry.ifa_name)
+                .to_string_lossy()
+                .into_owned();
+            let ip = match i32::from((*entry.ifa_addr).sa_family) {
+                libc::AF_INET => {
+                    let address = &*(entry.ifa_addr as *const libc::sockaddr_in);
+                    IpAddr::from(u32::from_be(address.sin_addr.s_addr).to_be_bytes())
+                }
+                libc::AF_INET6 => {
+                    let address = &*(entry.ifa_addr as *const libc::sockaddr_in6);
+                    IpAddr::from(address.sin6_addr.s6_addr)
+                }
+                _ => continue,
+            };
+            found.push((name, ip));
+        }
+        libc::freeifaddrs(list);
+    }
+    found
+}
+
+/// Interfaces that never reach a phone: loopback, containers, VMs, VPNs.
+pub(crate) fn is_virtual_interface(name: &str) -> bool {
+    const VIRTUAL: [&str; 11] = [
+        "lo", "docker", "virbr", "veth", "tun", "tap", "wg", "br-", "vmnet", "vboxnet", "podman",
+    ];
+    VIRTUAL.iter().any(|prefix| name.starts_with(prefix))
+}
+
+/// The IPv4 addresses a phone on the same network can dial: not loopback,
+/// not link-local, not on a virtual interface. For the QR code.
+pub(crate) fn lan_ipv4s(interfaces: &[(String, IpAddr)]) -> Vec<std::net::Ipv4Addr> {
+    let mut found: Vec<std::net::Ipv4Addr> = interfaces
+        .iter()
+        .filter(|(name, _)| !is_virtual_interface(name))
+        .filter_map(|(_, ip)| match ip {
+            IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() => {
+                Some(*ip)
+            }
+            _ => None,
+        })
+        .collect();
+    found.dedup();
+    found
+}
+
+/// The device ids with a connection being set up (dialled, or accepted and
+/// still in its handshake).
+static IN_FLIGHT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// One connection being set up for a device id; a second (a duplicate dial
+/// from discovery, the redialer and an inbound socket racing at startup)
+/// is not started. Each one that completed used to register again, bump
+/// the generation and kill the WebRTC peer the first had just begun.
+pub(super) struct DeviceFlight(String);
+
+impl DeviceFlight {
+    pub(super) fn claim(device_id: &str) -> Option<Self> {
+        let mut in_flight = IN_FLIGHT.lock().ok()?;
+        if in_flight.iter().any(|id| id == device_id) {
+            return None;
+        }
+        in_flight.push(device_id.to_string());
+        Some(Self(device_id.to_string()))
+    }
+}
+
+impl Drop for DeviceFlight {
+    fn drop(&mut self) {
+        if let Ok(mut in_flight) = IN_FLIGHT.lock() {
+            in_flight.retain(|id| *id != self.0);
+        }
+    }
+}
+
 /// Packets from a peer that is not paired yet are identity, pairing and
 /// signaling only; the largest legitimate one (signed SDP) is well under this.
 pub(super) const MAX_UNPAIRED_PACKET_BYTES: usize = 256 * 1024;
@@ -266,6 +359,50 @@ pub(super) fn ssl_connector(config: &Arc<Mutex<Config>>) -> Result<SslConnector,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_qr_lists_only_addresses_a_phone_can_dial() {
+        let interfaces: Vec<(String, IpAddr)> = [
+            ("lo", "127.0.0.1"),
+            ("wlp2s0", "192.168.1.20"),
+            ("wlp2s0", "fe80::1"),
+            ("enp3s0", "10.0.0.5"),
+            ("docker0", "172.17.0.1"),
+            ("virbr0", "192.168.122.1"),
+            ("veth12ab", "169.254.3.3"),
+            ("tun0", "10.8.0.2"),
+            ("wg0", "10.9.0.1"),
+            ("eth9", "169.254.9.9"),
+        ]
+        .iter()
+        .map(|(name, ip)| (name.to_string(), ip.parse().unwrap()))
+        .collect();
+        let found: Vec<String> = lan_ipv4s(&interfaces)
+            .iter()
+            .map(|ip| ip.to_string())
+            .collect();
+        assert_eq!(found, ["192.168.1.20", "10.0.0.5"]);
+        assert!(
+            !local_interfaces().is_empty(),
+            "this machine has at least loopback"
+        );
+    }
+
+    #[test]
+    fn one_connection_at_a_time_per_device() {
+        let first = DeviceFlight::claim("flight-phone").expect("free");
+        assert!(
+            DeviceFlight::claim("flight-phone").is_none(),
+            "a duplicate waits its turn"
+        );
+        let other = DeviceFlight::claim("flight-tablet");
+        assert!(other.is_some(), "other devices are not held up");
+        drop(first);
+        assert!(
+            DeviceFlight::claim("flight-phone").is_some(),
+            "free again once done"
+        );
+    }
 
     #[test]
     fn device_links_get_kernel_keepalive() {

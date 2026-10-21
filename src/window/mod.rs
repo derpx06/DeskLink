@@ -564,6 +564,7 @@ impl DesklinkWindow {
     }
 
     fn refresh_devices(&self) {
+        crate::device_links::daemon::set_ui_visible(self.is_visible());
         let imp = self.imp();
         if imp.refreshing.get() {
             return;

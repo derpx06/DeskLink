@@ -399,6 +399,19 @@ impl DesktopWebRtcPeer {
     /// `via_relay` is whether the bootstrap link is the relay.
     /// `None` until a pair is selected.
     pub fn path(&self, via_relay: bool) -> Option<(&'static str, Option<u32>)> {
+        let (types, rtt) = self.selected_pair_types()?;
+        // Until both candidates are resolved the path is unknown, not
+        // "direct": guessing showed "over the internet" for a moment on
+        // every LAN connect.
+        if types.len() != 2 || types.iter().any(String::is_empty) {
+            return None;
+        }
+        Some((path_label(&types, via_relay), rtt))
+    }
+
+    /// The selected pair's two candidate types as webrtcbin spells them, and
+    /// its round-trip time in milliseconds when known.
+    pub fn selected_pair_types(&self) -> Option<(Vec<String>, Option<u32>)> {
         let promise = gst::Promise::new();
         self.webrtcbin
             .emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
@@ -430,13 +443,7 @@ impl DesktopWebRtcPeer {
             .ok()
             .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
             .map(|seconds| (seconds * 1000.0).round().max(1.0) as u32);
-        // Until both candidates are resolved the path is unknown, not
-        // "direct": guessing showed "over the internet" for a moment on
-        // every LAN connect.
-        if types.len() != 2 || types.iter().any(String::is_empty) {
-            return None;
-        }
-        Some((path_label(&types, via_relay), rtt))
+        Some((types, rtt))
     }
 
     /// Bytes already queued on `channel` and not yet handed to the network.
@@ -1053,19 +1060,35 @@ fn local_description_promise_field(
     }
 }
 
+/// A candidate type in its short spelling: webrtcbin's stats say
+/// "peer-reflexive", "server-reflexive" and "relayed", libwebrtc's SDP
+/// "prflx", "srflx" and "relay" (contract B5).
+fn candidate_kind(raw: &str) -> &str {
+    match raw {
+        "peer-reflexive" => "prflx",
+        "server-reflexive" => "srflx",
+        "relayed" => "relay",
+        other => other,
+    }
+}
+
 /// The connection-path rule, identical on both apps. `candidate_types` is
 /// the selected pair's `[local, remote]` candidate types:
 /// - either is `relay` → `"turn"`;
 /// - both are `host`/`prflx` and the bootstrap link is not the relay → `"lan"`;
 /// - anything else, including an unknown or incomplete pair → `"direct"`.
+///
+/// Either spelling of each type counts (see [`candidate_kind`]).
 fn path_label(candidate_types: &[String], via_relay: bool) -> &'static str {
-    if candidate_types.iter().any(|kind| kind == "relay") {
+    let kinds: Vec<&str> = candidate_types
+        .iter()
+        .map(|kind| candidate_kind(kind))
+        .collect();
+    if kinds.contains(&"relay") {
         "turn"
     } else if !via_relay
-        && candidate_types.len() == 2
-        && candidate_types
-            .iter()
-            .all(|kind| kind == "host" || kind == "prflx")
+        && kinds.len() == 2
+        && kinds.iter().all(|kind| *kind == "host" || *kind == "prflx")
     {
         "lan"
     } else {
@@ -1097,6 +1120,31 @@ pub(crate) mod tests {
         assert_eq!(label(&["host"], false), "direct");
         assert_eq!(label(&[], false), "direct");
         assert_eq!(label(&["", ""], false), "direct");
+        // webrtcbin's own spellings (its stats).
+        assert_eq!(label(&["host", "peer-reflexive"], false), "lan");
+        assert_eq!(label(&["relayed", "host"], false), "turn");
+        assert_eq!(label(&["host", "server-reflexive"], false), "direct");
+    }
+
+    /// What webrtcbin really reports for a connected pair, and that it
+    /// reads as the LAN: two peers on loopback.
+    #[test]
+    fn a_connected_loopback_pair_reads_as_the_lan() {
+        let pair = loopback();
+        wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut path = None;
+        while path.is_none() && std::time::Instant::now() < deadline {
+            path = pair.offerer.path(false);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        eprintln!(
+            "[test] candidate types: {:?}",
+            pair.offerer.selected_pair_types()
+        );
+        assert_eq!(path.map(|(label, _)| label), Some("lan"));
+        pair.offerer.close();
+        pair.answerer.close();
     }
 
     /// What libwebrtc (Android) offers when the phone is the initiator: one
