@@ -71,21 +71,6 @@ pub struct DeviceNotification {
     pub silent: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VolumeSink {
-    pub name: String,
-    pub description: String,
-    pub volume: i64,
-    pub max_volume: Option<i64>,
-    pub muted: bool,
-    pub enabled: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SystemVolumeStatus {
-    pub sinks: Vec<VolumeSink>,
-}
-
 /// A capture asked of the phone (F3), while open.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CaptureUse {
@@ -104,16 +89,6 @@ pub struct SoundUse {
     /// it flows (else asked, waiting for the phone).
     pub hearing: Option<String>,
     pub hearing_live: bool,
-}
-
-/// The phone's camera in use here (C4).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CameraUse {
-    /// Streaming (else asked, waiting for the phone).
-    pub live: bool,
-    pub facing: String,
-    pub width: i32,
-    pub height: i32,
 }
 
 /// One call on the phone, as its last snapshot said (T1).
@@ -244,13 +219,9 @@ pub struct DeviceView {
     pub media_status: Option<MediaStatus>,
     pub battery_status: Option<BatteryStatus>,
     pub notifications: Vec<DeviceNotification>,
-    pub volume_status: Option<SystemVolumeStatus>,
     /// The phone's calls; `None` when it has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call_status: Option<CallStatus>,
-    /// The phone's camera as this computer's webcam (C4), while asked or live.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub camera: Option<CameraUse>,
     /// Insert from the phone (F3), while a capture is open.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture: Option<CaptureUse>,
@@ -308,11 +279,9 @@ impl DeviceView {
             media_status: None,
             battery_status: None,
             notifications: Vec::new(),
-            volume_status: None,
             call_status: None,
             keyboard_focused: None,
             keyboard_allowed: None,
-            camera: None,
             sound: None,
             capture: None,
         }

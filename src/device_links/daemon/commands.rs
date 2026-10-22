@@ -6,7 +6,7 @@ use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK_REQUEST,
     PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION_ACTION,
     PACKET_TYPE_NOTIFICATION_REPLY, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING,
-    PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_TELEPHONY_REQUEST,
+    PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_TELEPHONY_REQUEST,
 };
 use crate::device_links::transport::{should_surface_send_error, FeatureTransport};
 use crate::device_links::webrtc::terminal_bridge;
@@ -41,9 +41,6 @@ pub enum DaemonCommand {
     /// A call request (T2): the phone ("" = the connected one that can
     /// call), the action, and the number to dial.
     Telephony(String, String, Option<String>),
-    /// Use the phone's camera as this computer's webcam: facing, size,
-    /// and whether its microphone comes too.
-    StartCamera(String, String, i32, i32, bool),
     /// Insert from the phone (F3): photo / scan / text / qr into the
     /// clipboard or a file, or "cancel" the open one.
     Capture(String, String, String),
@@ -52,19 +49,12 @@ pub enum DaemonCommand {
     /// Sound (F1): `desk-sound` (this computer's sound to the phone),
     /// `phone-sound` or `phone-mic` (the phone's, here), on or off.
     Sound(String, String, bool),
-    /// `flip` or `stop` the phone's camera.
-    CameraControl(String, String),
     /// "Type on phone": keys for the phone's focused text field.
     SendFocusedFieldKeys(String, serde_json::Map<String, serde_json::Value>),
     /// Send this computer's notifications to the phones.
     SetForwardNotifications(bool),
     /// Allow (or stop) one app's notifications going to the phones.
     SetForwardApp(String, bool),
-    /// Preferences → Calls: Bluetooth call audio (experimental).
-    SetCallAudio(bool),
-    /// The Bluetooth address the user confirmed is this phone; `None`
-    /// forgets it.
-    SetCallAudioDevice(String, Option<String>),
     SendLockRequest(String, bool),
     /// Allow or stop a paired phone opening terminals on this computer.
     SetTerminalAccess(String, bool),
@@ -95,7 +85,6 @@ pub enum DaemonCommand {
     /// Name this phone's callers from the contacts it shares (F5 K4).
     SetContactCallerNames(String, bool),
     /// The commands a phone may run here (replaces the list).
-    SetRunCommands(Vec<crate::device_links::config::RunCommand>),
     /// Lock this computer and offer the newest terminal to the phones.
     LockAndHandOff,
     /// The network changed: reconnect the relay now.
@@ -116,8 +105,6 @@ pub enum DaemonCommand {
     DismissNotification(String, String),
     ReplyNotification(String, String, String),
     TriggerNotificationAction(String, String, String),
-    RequestSystemVolume(String),
-    SetSystemVolume(String, String, Option<i64>, Option<bool>),
     Stop,
 }
 
@@ -189,11 +176,6 @@ impl DaemonWorker {
             DaemonCommand::Telephony(id, action, number) => {
                 self.send_telephony(&id, &action, number.as_deref())
             }
-            DaemonCommand::StartCamera(id, facing, width, height, audio) => {
-                self.with_feature_transport(&id, |transport| {
-                    transport.start_camera(&facing, width, height, audio)
-                });
-            }
             DaemonCommand::Capture(id, kind, target) => {
                 let sent =
                     self.with_feature_transport(&id, |transport| transport.capture(&kind, &target));
@@ -209,14 +191,6 @@ impl DaemonWorker {
                 // Off is local too: nothing plays on once the link is gone.
                 if !sent && !on {
                     crate::device_links::webrtc::audio_session::end_all(&id);
-                }
-            }
-            DaemonCommand::CameraControl(id, action) => {
-                let sent =
-                    self.with_feature_transport(&id, |transport| transport.camera_control(&action));
-                // Stopping is local too: the outputs go even if the link is gone.
-                if !sent && action == "stop" {
-                    crate::device_links::webrtc::camera::end(&id);
                 }
             }
             DaemonCommand::SendFocusedFieldKeys(id, payload) => {
@@ -235,19 +209,6 @@ impl DaemonWorker {
                     }
                 });
                 crate::device_links::desk_notifications::send_snapshot(None);
-            }
-            DaemonCommand::SetCallAudio(on) => {
-                self.update_settings(|settings| settings.call_audio = on)
-            }
-            DaemonCommand::SetCallAudioDevice(id, address) => {
-                self.update_settings(|settings| match address {
-                    Some(address) => {
-                        settings.call_audio_devices.insert(id, address);
-                    }
-                    None => {
-                        settings.call_audio_devices.remove(&id);
-                    }
-                })
             }
             DaemonCommand::SendLockRequest(id, lock) => self.send_lock_request(&id, lock),
             DaemonCommand::SetTerminalAccess(id, allowed) => self.set_terminal_access(&id, allowed),
@@ -299,10 +260,6 @@ impl DaemonWorker {
                     settings.contact_caller_names.remove(&id);
                 }
             }),
-            DaemonCommand::SetRunCommands(commands) => {
-                self.update_settings(|settings| settings.run_commands = commands);
-                crate::device_links::desk_features::push_command_list();
-            }
             DaemonCommand::LockAndHandOff => {
                 if let Err(error) = crate::device_links::desk_features::lock_and_hand_off() {
                     push_error(&self.errors, format!("Could not hand off: {error}"));
@@ -353,10 +310,6 @@ impl DaemonWorker {
             }
             DaemonCommand::TriggerNotificationAction(id, key, action) => {
                 self.trigger_notification_action(&id, &key, &action)
-            }
-            DaemonCommand::RequestSystemVolume(id) => self.request_system_volume(&id),
-            DaemonCommand::SetSystemVolume(id, name, volume, muted) => {
-                self.set_system_volume(&id, &name, volume, muted)
             }
             DaemonCommand::Stop => return true,
         }
@@ -469,10 +422,6 @@ impl DaemonWorker {
         if !allowed {
             terminal_bridge::revoke_device(device_id);
         }
-        // The phone hears its commands, or the refusal, at once.
-        crate::device_links::desk_features::run_later(
-            crate::device_links::desk_features::push_command_list,
-        );
         if let Err(error) = saved {
             mark_error(
                 &self.devices,
@@ -498,11 +447,6 @@ impl DaemonWorker {
 
     fn set_session_password(&self, password: Option<String>) {
         self.set_session_password_only(password);
-        // Set: the phones must prove it before running commands; removed:
-        // they may again. Either way they are told.
-        crate::device_links::desk_features::run_later(
-            crate::device_links::desk_features::push_command_list,
-        );
     }
 
     fn set_session_password_only(&self, password: Option<String>) {
@@ -709,27 +653,6 @@ impl DaemonWorker {
             transport.send(&packet)
         });
     }
-
-    fn request_system_volume(&self, device_id: &str) {
-        self.with_feature_transport(device_id, |transport| {
-            let packet = build_system_volume_request_packet();
-            transport.send(&packet)
-        });
-    }
-
-    fn set_system_volume(
-        &self,
-        device_id: &str,
-        name: &str,
-        volume: Option<i64>,
-        muted: Option<bool>,
-    ) {
-        self.with_feature_transport(device_id, |transport| {
-            let packet = build_system_volume_set_packet(name, volume, muted)?;
-            transport.send(&packet)
-        });
-    }
-
     /// Builds a generation-checked transport snapshot under the session lock,
     /// then runs the caller after the lock has been released.  Feature sends
     /// therefore cannot block link replacement, shutdown, or ICE recovery.
@@ -911,36 +834,6 @@ fn build_notification_action_packet(key: &str, action: &str) -> Result<NetworkPa
     packet.set("action", action);
     Ok(packet)
 }
-
-fn build_system_volume_request_packet() -> NetworkPacket {
-    let mut packet = NetworkPacket::new(PACKET_TYPE_SYSTEMVOLUME_REQUEST);
-    packet.set("requestSinks", true);
-    packet
-}
-
-fn build_system_volume_set_packet(
-    name: &str,
-    volume: Option<i64>,
-    muted: Option<bool>,
-) -> Result<NetworkPacket, String> {
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("Audio sink name is required".to_string());
-    }
-    if volume.is_none() && muted.is_none() {
-        return Err("Volume or mute state is required".to_string());
-    }
-    let mut packet = NetworkPacket::new(PACKET_TYPE_SYSTEMVOLUME_REQUEST);
-    packet.set("name", name);
-    if let Some(volume) = volume {
-        packet.set("volume", volume.max(0));
-    }
-    if let Some(muted) = muted {
-        packet.set("muted", muted);
-    }
-    Ok(packet)
-}
-
 /// The address other LAN devices reach this desktop on: the source address of
 /// the default route. `connect` on UDP only selects a route; nothing is sent.
 fn lan_address() -> Option<std::net::IpAddr> {
@@ -1006,7 +899,6 @@ mod tests {
     use crate::device_links::packet::{
         PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_REPLY,
         PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_SHARE_REQUEST,
-        PACKET_TYPE_SYSTEMVOLUME_REQUEST,
     };
 
     #[test]
@@ -1095,18 +987,5 @@ mod tests {
 
         assert_eq!(packet.packet_type, PACKET_TYPE_NOTIFICATION_REQUEST);
         assert_eq!(packet.get_bool("request"), Some(true));
-    }
-
-    #[test]
-    fn system_volume_request_packet_requests_sinks() {
-        let packet = build_system_volume_request_packet();
-
-        assert_eq!(packet.packet_type, PACKET_TYPE_SYSTEMVOLUME_REQUEST);
-        assert_eq!(packet.get_bool("requestSinks"), Some(true));
-    }
-
-    #[test]
-    fn system_volume_set_packet_requires_a_change() {
-        assert!(build_system_volume_set_packet("sink", None, None).is_err());
     }
 }

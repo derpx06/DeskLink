@@ -293,6 +293,49 @@ mod tests {
         .is_ok());
     }
 
+    /// A peer still sending a removed feature's packet (an older build, or a
+    /// hostile one) is refused at the boundary: an error, never a crash.
+    #[test]
+    fn packets_of_removed_features_are_refused_at_the_boundary() {
+        let removed = crate::device_links::features::REMOVED_TYPES;
+        let manager = DeviceManager::new();
+        let binding = paired_binding(
+            &manager,
+            removed.iter().map(|name| name.to_string()).collect(),
+        );
+        manager
+            .with_session(&binding, |session| {
+                let wire = WebRtcWireBinding::from_attempt(
+                    "desktop",
+                    "phone",
+                    "01234567-89ab-cdef-0123-456789abcdef",
+                )
+                .unwrap();
+                let mut runtime = HandoverRuntime::new("attempt".to_string(), wire);
+                make_feature_ready(&mut runtime);
+                session.webrtc_handover = Some(runtime);
+            })
+            .unwrap();
+        for name in removed {
+            let mut packet = NetworkPacket::new(name);
+            packet.set("commandList", "{}");
+            packet.set("key", "x");
+            for source in [PacketSource::WebRtc, PacketSource::LanBootstrap] {
+                assert!(
+                    SharedPacketDispatcher::authorize(
+                        source,
+                        &binding,
+                        &manager,
+                        &local(),
+                        &packet
+                    )
+                    .is_err(),
+                    "{name} over {source:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn allows_ping_over_webrtc_after_handover() {
         let manager = DeviceManager::new();

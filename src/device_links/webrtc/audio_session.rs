@@ -5,9 +5,7 @@
 //! the desk asks for the phone's with `audio-request {phone-to-desk}`. The
 //! sender answers `audio-ready` once sound flows, or `audio-denied`. Either
 //! side ends one with `audio-stop`; a new request replaces a live one
-//! (`audio-stop {replaced}`). The webcam's microphone (C4 `audio:true`)
-//! arrives as `audio-ready {phone-to-desk, mic}` under the camera's id.
-//! Messages carry their own sequence, outside the screen session.
+//! (`audio-stop {replaced}`). Messages carry their own sequence, outside the screen session.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -177,22 +175,6 @@ pub(crate) fn stop(device_id: &str, sending: bool, build: Build) -> Option<Contr
     .flatten()
 }
 
-/// The webcam `id` ended: its microphone ends with it. Whether it was
-/// playing here.
-pub(crate) fn end_camera_microphone(device_id: &str, id: &str) -> bool {
-    with(device_id, |phone| {
-        let ours = phone
-            .hearing
-            .as_ref()
-            .is_some_and(|session| session.id == id);
-        if ours {
-            phone.hearing = None;
-        }
-        ours
-    })
-    .unwrap_or(false)
-}
-
 /// Whether the phone's sound (not its microphone) is asked for or plays here.
 pub(crate) fn hearing_system(device_id: &str) -> bool {
     status(device_id)
@@ -239,13 +221,11 @@ pub(crate) enum Step {
 }
 
 /// A phone's `audio-*` message. `mic_allowed`: the desk's setting that lets
-/// a phone hear this computer's microphone. `camera_id`: the live webcam
-/// session, whose microphone arrives under its id.
+/// a phone hear this computer's microphone.
 pub(crate) fn handle(
     device_id: &str,
     message: &ControlMessage,
     mic_allowed: bool,
-    camera_id: Option<&str>,
     build: Build,
 ) -> Step {
     let id = message.remote_session_id.as_str();
@@ -291,14 +271,6 @@ pub(crate) fn handle(
                     session.live = true;
                     Step::Hear(session.source)
                 }
-                None if camera_id == Some(id) => {
-                    phone.hearing = Some(Session {
-                        id: id.to_string(),
-                        source: Source::Mic,
-                        live: true,
-                    });
-                    Step::Hear(Source::Mic)
-                }
                 None => Step::Ignored,
             }
         })
@@ -333,7 +305,7 @@ pub(crate) fn handle(
 /// A refusal in the user's words.
 pub(crate) fn reason_words(phone: &str, reason: &str) -> String {
     match reason {
-        "busy" => format!("{phone}'s microphone is in use by its camera"),
+        "busy" => format!("{phone}'s sound is already in use"),
         "permission" => format!("DeskLink may not record sound on {phone}"),
         "unsupported" => format!("{phone} cannot share its sound (it needs Android 10)"),
         _ => format!("{phone} did not share its sound"),
@@ -368,7 +340,7 @@ mod tests {
         let first = uuid::Uuid::new_v4().to_string();
         let request = from_phone(ControlKind::AudioRequest, &first, DESK_TO_PHONE, "system");
         assert_eq!(
-            handle(device, &request, false, None, &build),
+            handle(device, &request, false, &build),
             Step::Send {
                 id: first.clone(),
                 source: Source::System,
@@ -384,7 +356,7 @@ mod tests {
         let second = uuid::Uuid::new_v4().to_string();
         let again = from_phone(ControlKind::AudioRequest, &second, DESK_TO_PHONE, "system");
         assert_eq!(
-            handle(device, &again, false, None, &build),
+            handle(device, &again, false, &build),
             Step::Send {
                 id: second.clone(),
                 source: Source::System,
@@ -393,12 +365,9 @@ mod tests {
         );
         // A stop for the replaced one changes nothing; the current one ends.
         let late = build(ControlKind::AudioStop, &first, 2);
-        assert_eq!(handle(device, &late, false, None, &build), Step::Ignored);
+        assert_eq!(handle(device, &late, false, &build), Step::Ignored);
         let stop = build(ControlKind::AudioStop, &second, 3);
-        assert_eq!(
-            handle(device, &stop, false, None, &build),
-            Step::StopSending
-        );
+        assert_eq!(handle(device, &stop, false, &build), Step::StopSending);
         assert_eq!(status(device), (None, None));
     }
 
@@ -407,19 +376,19 @@ mod tests {
         let device = "sound-phone-b";
         let id = uuid::Uuid::new_v4().to_string();
         let mic = from_phone(ControlKind::AudioRequest, &id, DESK_TO_PHONE, "mic");
-        match handle(device, &mic, false, None, &build) {
+        match handle(device, &mic, false, &build) {
             Step::Deny(denied) => assert_eq!(denied.reason.as_deref(), Some("declined")),
             other => panic!("{other:?}"),
         }
         assert!(matches!(
-            handle(device, &mic, true, None, &build),
+            handle(device, &mic, true, &build),
             Step::Send {
                 source: Source::Mic,
                 ..
             }
         ));
         let backwards = from_phone(ControlKind::AudioRequest, &id, PHONE_TO_DESK, "mic");
-        match handle(device, &backwards, true, None, &build) {
+        match handle(device, &backwards, true, &build) {
             Step::Deny(denied) => assert_eq!(denied.reason.as_deref(), Some("unsupported")),
             other => panic!("{other:?}"),
         }
@@ -439,16 +408,13 @@ mod tests {
             PHONE_TO_DESK,
             "mic",
         );
-        assert_eq!(
-            handle(device, &stranger, false, None, &build),
-            Step::Ignored
-        );
+        assert_eq!(handle(device, &stranger, false, &build), Step::Ignored);
         let ready = from_phone(ControlKind::AudioReady, &id, PHONE_TO_DESK, "mic");
         assert_eq!(
-            handle(device, &ready, false, None, &build),
+            handle(device, &ready, false, &build),
             Step::Hear(Source::Mic)
         );
-        assert_eq!(handle(device, &ready, false, None, &build), Step::Ignored);
+        assert_eq!(handle(device, &ready, false, &build), Step::Ignored);
 
         // Asking again replaces it, and says so.
         let again = ask_phone(device, Source::System, &build);
@@ -457,7 +423,7 @@ mod tests {
         let mut denied = build(ControlKind::AudioDenied, &again[1].remote_session_id, 2);
         denied.reason = Some("busy".into());
         assert_eq!(
-            handle(device, &denied, false, None, &build),
+            handle(device, &denied, false, &build),
             Step::StopHearing(Some("busy".into()))
         );
         assert!(sequence_rises(&again));
@@ -472,7 +438,7 @@ mod tests {
             DESK_TO_PHONE,
             "system",
         );
-        match handle(device, &request, false, None, &build) {
+        match handle(device, &request, false, &build) {
             Step::Deny(denied) => assert_eq!(denied.reason.as_deref(), Some("busy")),
             other => panic!("{other:?}"),
         }
@@ -482,19 +448,5 @@ mod tests {
         messages
             .windows(2)
             .all(|pair| pair[0].sequence < pair[1].sequence)
-    }
-
-    #[test]
-    fn the_webcams_microphone_arrives_under_the_cameras_id() {
-        let device = "sound-phone-d";
-        let camera = uuid::Uuid::new_v4().to_string();
-        let ready = from_phone(ControlKind::AudioReady, &camera, PHONE_TO_DESK, "mic");
-        assert_eq!(handle(device, &ready, false, None, &build), Step::Ignored);
-        assert_eq!(
-            handle(device, &ready, false, Some(&camera), &build),
-            Step::Hear(Source::Mic)
-        );
-        end_all(device);
-        assert_eq!(status(device), (None, None));
     }
 }

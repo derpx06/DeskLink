@@ -1,7 +1,7 @@
 //! GNOME Shell search: `org.gnome.Shell.SearchProvider2` at
 //! `/derx06/desklink/com/SearchProvider`. Typing in the Activities overview
-//! finds this computer's shared terminals (open one at the desk), the run
-//! commands (run one here), recent transfers (open the file), the phones
+//! finds this computer's shared terminals (open one at the desk), recent
+//! transfers (open the file), the phones
 //! (ring one) and the contacts they share (show one).
 //!
 //! GNOME reads providers from `gnome-shell/search-providers/*.ini` under the
@@ -60,7 +60,7 @@ const XML: &str = r#"<node>
 /// Something search can find.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Candidate {
-    /// `terminal:<id>`, `command:<id>`, `transfer:<path>`, `ring:<device>`,
+    /// `terminal:<id>`, `transfer:<path>`, `ring:<device>`,
     /// `dial:<device>:<number>`, `contact:<device>:<uid>`.
     pub(crate) id: String,
     pub(crate) name: String,
@@ -86,7 +86,6 @@ impl Candidate {
 /// What there is to find now.
 pub(crate) struct Sources<'a> {
     pub(crate) terminals: &'a [crate::device_links::pty::registry::SessionInfo],
-    pub(crate) commands: &'a [crate::device_links::config::RunCommand],
     pub(crate) transfers: &'a [crate::device_links::transfer_log::LoggedFile],
     /// Connected phones: id and name.
     pub(crate) phones: &'a [(String, String)],
@@ -120,15 +119,6 @@ pub(crate) fn candidates(sources: &Sources) -> Vec<Candidate> {
             },
             "utilities-terminal-symbolic",
             "terminal shell",
-        ));
-    }
-    for command in sources.commands {
-        found.push(Candidate::new(
-            format!("command:{}", command.id),
-            command.name.clone(),
-            format!("Run command · {}", command.command),
-            "system-run-symbolic",
-            "run command",
         ));
     }
     for file in sources.transfers.iter().take(10) {
@@ -253,7 +243,6 @@ pub(crate) fn matching(candidates: &[Candidate], terms: &[String]) -> Vec<String
 
 pub(crate) fn current(app: &DesklinkApplication) -> Vec<Candidate> {
     let terminals = crate::terminal_previews::sessions();
-    let commands = crate::device_links::config::app_settings().run_commands;
     let transfers = crate::device_links::transfer_log::recent();
     let phones: Vec<(String, String)> = app
         .daemon_handle()
@@ -281,7 +270,6 @@ pub(crate) fn current(app: &DesklinkApplication) -> Vec<Candidate> {
         .collect();
     candidates(&Sources {
         terminals: &terminals,
-        commands: &commands,
         transfers: &transfers,
         phones: &phones,
         contacts: &contacts,
@@ -330,20 +318,6 @@ pub(crate) fn activate(app: &DesklinkApplication, id: &str) {
     }
     match kind {
         "terminal" => crate::device_links::pty::desk::open_on_desktop(rest),
-        "command" => {
-            let commands = crate::device_links::config::app_settings().run_commands;
-            if let Some(command) = commands.iter().find(|command| command.id == rest) {
-                match crate::device_links::pty::registry::run_command(
-                    &command.name,
-                    &command.command,
-                    "desk",
-                ) {
-                    Ok(info) => crate::device_links::pty::desk::open_on_desktop(&info.id),
-                    // No command name or error text: they can carry personal data.
-                    Err(_) => eprintln!("[Search] Could not run a saved command"),
-                }
-            }
-        }
         "transfer" => {
             let uri = gio::File::for_path(rest).uri();
             if gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE).is_err() {
@@ -470,7 +444,6 @@ pub fn install_description() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device_links::config::RunCommand;
     use crate::device_links::pty::registry::SessionInfo;
     use crate::device_links::transfer_log::LoggedFile;
 
@@ -499,11 +472,6 @@ mod tests {
                 shell: None,
             },
         ];
-        let commands = [RunCommand {
-            id: "c1".into(),
-            name: "Deploy staging".into(),
-            command: "./deploy.sh".into(),
-        }];
         let transfers = [LoggedFile {
             ts: 1,
             device_id: "p1".into(),
@@ -525,7 +493,6 @@ mod tests {
         )];
         run(&Sources {
             terminals: &terminals,
-            commands: &commands,
             transfers: &transfers,
             phones: &phones,
             contacts: &contacts,
@@ -557,7 +524,7 @@ mod tests {
                 "a running terminal, by folder"
             );
             assert!(ids(&["htop"]).is_empty(), "an ended one is not offered");
-            assert_eq!(ids(&["deploy"]), ["command:c1"]);
+            assert!(ids(&["deploy"]).is_empty(), "run commands are gone");
             assert_eq!(
                 ids(&["boarding"]),
                 ["transfer:/home/me/Downloads/boarding-pass.pdf"]
@@ -600,22 +567,22 @@ mod tests {
     fn result_metas_carry_name_description_and_icon() {
         sources_and(|sources| {
             let all = candidates(sources);
-            let metas = metas(&all, &["command:c1".to_string(), "gone".to_string()]);
+            let metas = metas(&all, &["ring:p1".to_string(), "gone".to_string()]);
             assert_eq!(metas.n_children(), 1, "unknown ids are skipped");
             let meta = glib::VariantDict::new(Some(&metas.child_value(0)));
             assert_eq!(
                 meta.lookup::<String>("name").unwrap().unwrap(),
-                "Deploy staging"
+                "Ring Pixel"
             );
             assert_eq!(
                 meta.lookup::<String>("description").unwrap().unwrap(),
-                "Run command · ./deploy.sh"
+                "Find your phone"
             );
             assert!(meta
                 .lookup::<String>("gicon")
                 .unwrap()
                 .unwrap()
-                .contains("system-run"));
+                .contains("audio-volume-high"));
         });
     }
 

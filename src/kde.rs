@@ -1,6 +1,6 @@
 //! KDE Plasma extras, used only when Plasma is the desktop: a KRunner runner
 //! (`org.kde.krunner1` on the app's own D-Bus name) that finds what GNOME's
-//! search provider finds — terminals, run commands, recent files, phones —
+//! search provider finds — terminals, recent files, phones —
 //! and the file that tells KRunner about it. Never required: everything is
 //! also in the app and its tray menu.
 
@@ -35,7 +35,7 @@ const XML: &str = r#"<node>
 /// The runner's description, in `krunner/dbusplugins/`.
 pub(crate) const RUNNER: &str = "[Desktop Entry]
 Name=DeskLink
-Comment=Shared terminals, run commands, recent files and your phone
+Comment=Shared terminals, recent files and your phone
 Icon=derx06.desklink.com
 Type=Service
 X-KDE-ServiceTypes=Plasma/Runner
@@ -173,7 +173,6 @@ mod tests {
         let phones = [("p1".to_string(), "Pixel".to_string())];
         let all = candidates(&Sources {
             terminals: &[],
-            commands: &[],
             transfers: &[],
             phones: &phones,
             contacts: &[],

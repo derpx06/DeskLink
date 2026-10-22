@@ -2,18 +2,16 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::device_links::packet::{
-    PACKET_TYPE_AUTOMATIONS, PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD,
-    PACKET_TYPE_CLIPBOARD_CONNECT, PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS,
-    PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID, PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS,
-    PACKET_TYPE_CONTACTS_RESPONSE_VCARDS, PACKET_TYPE_DIGITIZER, PACKET_TYPE_DIGITIZER_SESSION,
+    PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
+    PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS, PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID,
+    PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS, PACKET_TYPE_CONTACTS_RESPONSE_VCARDS,
     PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_FOLDERS, PACKET_TYPE_HANDOFF, PACKET_TYPE_LOCK,
     PACKET_TYPE_LOCK_REQUEST, PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE, PACKET_TYPE_MOUSEPAD_REQUEST,
     PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTES, PACKET_TYPE_NOTIFICATION,
     PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_REPLY,
-    PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND,
-    PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SCREEN_ERROR, PACKET_TYPE_SCREEN_READY,
-    PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP, PACKET_TYPE_SETTINGS,
-    PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_INPUT_DEVICES,
+    PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_SCREEN_ERROR,
+    PACKET_TYPE_SCREEN_READY, PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP,
+    PACKET_TYPE_SETTINGS, PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_INPUT_DEVICES,
     PACKET_TYPE_SHARE_INPUT_DEVICES_REQUEST, PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SNIPPETS,
     PACKET_TYPE_TELEPHONY, PACKET_TYPE_TELEPHONY_REQUEST, PACKET_TYPE_UNLOCK_REQUEST,
 };
@@ -22,11 +20,9 @@ use crate::device_links::packet::{
 /// WebRTC transport. Each entry has a matching arm in
 /// `packet_handler::dispatch_webrtc_feature_packet` and a DeskLink Android
 /// plugin that actually sends it.
-const DESKTOP_INCOMING: [&str; 30] = [
+const DESKTOP_INCOMING: [&str; 26] = [
     // Folder sync (F8): both ways.
     PACKET_TYPE_FOLDERS,
-    // Automations (F7): both ways.
-    PACKET_TYPE_AUTOMATIONS,
     // Glide (F4): the phone handing the pointer back.
     PACKET_TYPE_SHARE_INPUT_DEVICES,
     // Snippets and notes (F6): both ways.
@@ -37,9 +33,6 @@ const DESKTOP_INCOMING: [&str; 30] = [
     PACKET_TYPE_BATTERY,
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
-    // The drawing pad: strokes become pointer drags, under the control lease.
-    PACKET_TYPE_DIGITIZER,
-    PACKET_TYPE_DIGITIZER_SESSION,
     PACKET_TYPE_FINDMYPHONE_REQUEST,
     // The phone's Lock button, and its approval of an unlock (with the desk's
     // nonce; see `unlock`). Handled by `packet_handler::apply_lock_request`.
@@ -57,8 +50,6 @@ const DESKTOP_INCOMING: [&str; 30] = [
     // The phone dismissing one of this computer's notifications (C1).
     PACKET_TYPE_NOTIFICATION_REQUEST,
     PACKET_TYPE_PING,
-    // The phone asking for the desk's command list, or running one.
-    PACKET_TYPE_RUNCOMMAND_REQUEST,
     // Screen sharing. `desklink.screen.frame` is deliberately absent on both
     // sides: video is a WebRTC media track, and the frame type is a vestige of
     // an earlier data-channel design that neither application implements.
@@ -78,11 +69,9 @@ const DESKTOP_INCOMING: [&str; 30] = [
 /// Packets the desktop can construct from a command path, and that a DeskLink
 /// Android plugin can consume. `desklink.systemvolume.request` is absent: the
 /// phone has no receiver for it.
-const DESKTOP_OUTGOING: [&str; 30] = [
+const DESKTOP_OUTGOING: [&str; 28] = [
     // Folder sync (F8): both ways.
     PACKET_TYPE_FOLDERS,
-    // Automations (F7): both ways.
-    PACKET_TYPE_AUTOMATIONS,
     // Glide (F4): the pointer crossing onto the phone.
     PACKET_TYPE_SHARE_INPUT_DEVICES_REQUEST,
     // Snippets and notes (F6): both ways.
@@ -109,8 +98,6 @@ const DESKTOP_OUTGOING: [&str; 30] = [
     PACKET_TYPE_NOTIFICATION_REPLY,
     PACKET_TYPE_NOTIFICATION_REQUEST,
     PACKET_TYPE_PING,
-    // The desk's command list.
-    PACKET_TYPE_RUNCOMMAND,
     PACKET_TYPE_SCREEN_ERROR,
     PACKET_TYPE_SCREEN_READY,
     PACKET_TYPE_SCREEN_REQUEST,
@@ -137,11 +124,9 @@ const DESKTOP_OUTGOING: [&str; 30] = [
 /// control plane is `desklink.remote-session.v1` on the control channel, and
 /// the screen packet types exist only so the Android application loads its
 /// screen plugin (see `DESKTOP_INCOMING`). They never cross the wire.
-const WEBRTC_PROFILE: [&str; 36] = [
+const WEBRTC_PROFILE: [&str; 31] = [
     // Folder sync (F8).
     PACKET_TYPE_FOLDERS,
-    // Automations (F7).
-    PACKET_TYPE_AUTOMATIONS,
     // Glide (F4).
     PACKET_TYPE_SHARE_INPUT_DEVICES,
     PACKET_TYPE_SHARE_INPUT_DEVICES_REQUEST,
@@ -155,8 +140,6 @@ const WEBRTC_PROFILE: [&str; 36] = [
     PACKET_TYPE_BATTERY,
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
-    PACKET_TYPE_DIGITIZER,
-    PACKET_TYPE_DIGITIZER_SESSION,
     PACKET_TYPE_FINDMYPHONE_REQUEST,
     PACKET_TYPE_HANDOFF,
     PACKET_TYPE_LOCK,
@@ -170,8 +153,6 @@ const WEBRTC_PROFILE: [&str; 36] = [
     PACKET_TYPE_NOTIFICATION_REPLY,
     PACKET_TYPE_NOTIFICATION_REQUEST,
     PACKET_TYPE_PING,
-    PACKET_TYPE_RUNCOMMAND,
-    PACKET_TYPE_RUNCOMMAND_REQUEST,
     PACKET_TYPE_SETTINGS,
     PACKET_TYPE_SETTINGS_REQUEST,
     PACKET_TYPE_SHARE_REQUEST,
@@ -259,6 +240,26 @@ pub(crate) fn webrtc_capabilities(capabilities: &[String]) -> Vec<String> {
     result
 }
 
+/// 1.3 removed these features; their types are in no list and nobody
+/// may send or accept them, whatever a peer advertises.
+#[cfg(test)]
+pub(crate) const REMOVED_TYPES: [&str; 14] = [
+    "desklink.automations",
+    "desklink.runcommand",
+    "desklink.runcommand.request",
+    "desklink.digitizer",
+    "desklink.digitizer.session",
+    "desklink.presenter",
+    "desklink.mousepad.echo",
+    "desklink.systemvolume",
+    "desklink.systemvolume.request",
+    "desklink.connectivity_report",
+    "desklink.share.request.update",
+    "desklink.notification.cancel",
+    "desklink.telephony.request_mute",
+    "desklink.sms.request",
+];
+
 /// The capability contract for the desktop feature layer.  A packet is listed
 /// only when the current desktop process has a handler that can consume it or
 /// a command path that can construct it.  Portal and host-backend dependent
@@ -327,14 +328,11 @@ mod tests {
         assert_eq!(
             registry.incoming_capabilities(),
             strings(&[
-                "desklink.automations",
                 "desklink.battery",
                 "desklink.clipboard",
                 "desklink.clipboard.connect",
                 "desklink.contacts.response_uids_timestamps",
                 "desklink.contacts.response_vcards",
-                "desklink.digitizer",
-                "desklink.digitizer.session",
                 "desklink.findmyphone.request",
                 "desklink.folders",
                 "desklink.lock.request",
@@ -346,7 +344,6 @@ mod tests {
                 "desklink.notification",
                 "desklink.notification.request",
                 "desklink.ping",
-                "desklink.runcommand.request",
                 "desklink.screen.error",
                 "desklink.screen.ready",
                 "desklink.screen.request",
@@ -362,7 +359,6 @@ mod tests {
         assert_eq!(
             registry.outgoing_capabilities(),
             strings(&[
-                "desklink.automations",
                 "desklink.clipboard",
                 "desklink.clipboard.connect",
                 "desklink.contacts.request_all_uids_timestamps",
@@ -381,7 +377,6 @@ mod tests {
                 "desklink.notification.reply",
                 "desklink.notification.request",
                 "desklink.ping",
-                "desklink.runcommand",
                 "desklink.screen.error",
                 "desklink.screen.ready",
                 "desklink.screen.request",
@@ -407,7 +402,6 @@ mod tests {
         assert_eq!(
             profile,
             vec![
-                "desklink.automations",
                 "desklink.battery",
                 "desklink.clipboard",
                 "desklink.clipboard.connect",
@@ -415,8 +409,6 @@ mod tests {
                 "desklink.contacts.request_vcards_by_uid",
                 "desklink.contacts.response_uids_timestamps",
                 "desklink.contacts.response_vcards",
-                "desklink.digitizer",
-                "desklink.digitizer.session",
                 "desklink.findmyphone.request",
                 "desklink.folders",
                 "desklink.handoff",
@@ -432,8 +424,6 @@ mod tests {
                 "desklink.notification.reply",
                 "desklink.notification.request",
                 "desklink.ping",
-                "desklink.runcommand",
-                "desklink.runcommand.request",
                 "desklink.settings",
                 "desklink.settings.request",
                 "desklink.share.request",
@@ -446,6 +436,33 @@ mod tests {
             ]
         );
         assert!(!profile.contains(&"desklink.sftp"), "SFTP is gone");
+    }
+
+    #[test]
+    fn removed_feature_types_are_in_no_list_and_never_accepted_or_sent() {
+        let registry = FeatureRegistry::desktop();
+        let advertised = strings(&REMOVED_TYPES);
+        for removed in REMOVED_TYPES {
+            assert!(!is_webrtc_feature(removed), "{removed}");
+            assert!(!registry
+                .incoming_capabilities()
+                .iter()
+                .any(|c| c == removed));
+            assert!(!registry
+                .outgoing_capabilities()
+                .iter()
+                .any(|c| c == removed));
+            // Even a peer that confirms them in its handover gets nothing.
+            record_peer_profile("removed-peer", &advertised, &advertised);
+            assert!(!peer_accepts("removed-peer", removed), "{removed}");
+            assert!(!peer_sends("removed-peer", removed), "{removed}");
+        }
+        assert!(webrtc_capabilities(&advertised).is_empty());
+        assert_eq!(
+            WEBRTC_PROFILE.len(),
+            31,
+            "Android's WebRtcFeatureProfile.enabled"
+        );
     }
 
     /// Every type each registry lists, except the screen types, rides the

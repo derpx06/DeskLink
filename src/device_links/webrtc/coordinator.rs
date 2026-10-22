@@ -1054,9 +1054,9 @@ fn apply_own_denial(device_id: &str, denial: &remote_session::ControlMessage) {
     }
 }
 
-/// Sends the camera message `make` builds (from a kind, session id and
-/// sequence) to the phone over its ready link (C4).
-pub(crate) fn send_camera_message(
+/// Sends the control message `make` builds (from a kind, session id and
+/// sequence) to the phone over its ready link.
+pub(crate) fn send_control_message(
     sessions: &Arc<DeviceManager>,
     transport: &FeatureTransportSnapshot,
     make: impl FnOnce(
@@ -1106,9 +1106,8 @@ fn handle_audio_message(
     let build = |kind, id: &str, sequence| {
         remote_session::ControlMessage::new(kind, attempt_id, wire, id, sequence, now_millis())
     };
-    let camera = super::camera::status(device_id).map(|camera| camera.id);
     let mic_allowed = crate::device_links::config::app_settings().desk_mic_to_phone;
-    match audio_session::handle(device_id, message, mic_allowed, camera.as_deref(), &build) {
+    match audio_session::handle(device_id, message, mic_allowed, &build) {
         Step::Send { id, source, .. } => match peer.start_audio_send(source) {
             Ok(()) => {
                 if let Some(ready) = audio_session::sending_started(device_id, &id, &build) {
@@ -1191,7 +1190,7 @@ pub(crate) fn capture_request(
     target: &str,
 ) -> Result<(), String> {
     let device_id = transport.binding.device_id.clone();
-    send_camera_message(sessions, transport, |build| {
+    send_control_message(sessions, transport, |build| {
         if kind == "cancel" {
             super::capture::cancel(&device_id, build)
         } else if super::capture::KINDS.contains(&kind) {
@@ -2030,134 +2029,6 @@ pub(crate) fn dispatch_desktop_remote_input(
         .map_err(|_| "Desktop portal worker has stopped".to_string())
 }
 
-/// The drawing pad of one phone: its size, and whether the pen is down.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Pad {
-    width: f64,
-    height: f64,
-    down: bool,
-}
-
-fn pads() -> &'static Mutex<HashMap<String, Pad>> {
-    static PADS: std::sync::OnceLock<Mutex<HashMap<String, Pad>>> = std::sync::OnceLock::new();
-    PADS.get_or_init(Default::default)
-}
-
-/// What one `desklink.digitizer(.session)` packet does to the pointer: the
-/// pad's place as a fraction of the screen, the pen touching as the left
-/// button held. No pressure.
-pub(crate) fn digitizer_actions(
-    pad: &mut Option<Pad>,
-    packet: &NetworkPacket,
-) -> Vec<PortalInputAction> {
-    const LEFT: i32 = 0x110;
-    let release = |pad: &mut Pad, actions: &mut Vec<PortalInputAction>| {
-        if pad.down {
-            pad.down = false;
-            actions.push(PortalInputAction::Button {
-                evdev_code: LEFT,
-                pressed: false,
-            });
-        }
-    };
-    let mut actions = Vec::new();
-    if packet.packet_type == crate::device_links::packet::PACKET_TYPE_DIGITIZER_SESSION {
-        match packet.get_str("action") {
-            Some("start") => {
-                let size = |key: &str| packet.get_i64(key).filter(|value| *value > 0);
-                if let (Some(width), Some(height)) = (size("width"), size("height")) {
-                    if let Some(old) = pad.as_mut() {
-                        release(old, &mut actions);
-                    }
-                    *pad = Some(Pad {
-                        width: width as f64,
-                        height: height as f64,
-                        down: false,
-                    });
-                }
-            }
-            Some("end") => {
-                if let Some(old) = pad.as_mut() {
-                    release(old, &mut actions);
-                }
-                *pad = None;
-            }
-            _ => {}
-        }
-        return actions;
-    }
-    let Some(current) = pad.as_mut() else {
-        return actions;
-    };
-    let coordinate = |key: &str| packet.body.get(key).and_then(serde_json::Value::as_f64);
-    if let (Some(x), Some(y)) = (coordinate("x"), coordinate("y")) {
-        if x.is_finite() && y.is_finite() {
-            actions.push(PortalInputAction::NormalizedMotion(
-                (x / current.width).clamp(0.0, 1.0),
-                (y / current.height).clamp(0.0, 1.0),
-            ));
-        }
-    }
-    match packet.get_bool("touching") {
-        Some(true) if !current.down => {
-            current.down = true;
-            actions.push(PortalInputAction::Button {
-                evdev_code: LEFT,
-                pressed: true,
-            });
-        }
-        Some(false) => release(current, &mut actions),
-        _ => {}
-    }
-    if packet.get_bool("active") == Some(false) {
-        release(current, &mut actions);
-    }
-    actions
-}
-
-/// The drawing pad's strokes, as pointer drags on the shared screen. Only
-/// under the control lease, like the mousepad.
-pub(crate) fn dispatch_digitizer(
-    binding: &SessionBinding,
-    packet: &NetworkPacket,
-) -> Result<(), String> {
-    // Refused: forget the pad, so a stroke half-drawn when control ended is
-    // not continued (with the button held) when it comes back.
-    let refuse = |reason: &str| {
-        forget_pad(&binding.device_id);
-        Err(reason.to_string())
-    };
-    if !peer_input_active(&binding.device_id) {
-        return refuse("The drawing pad needs control of this computer first");
-    }
-    let Some(sender) = desktop_portal_services()
-        .lock()
-        .map_err(|_| "Desktop portal service registry lock poisoned".to_string())?
-        .get(&binding.device_id)
-        .map(|service| service.sender.clone())
-    else {
-        return refuse("No approved desktop-control portal session is active");
-    };
-    let actions = {
-        let mut pads = pads()
-            .lock()
-            .map_err(|_| "DeskLink drawing pad lock poisoned".to_string())?;
-        let mut pad = pads.get(&binding.device_id).copied();
-        let actions = digitizer_actions(&mut pad, packet);
-        match pad {
-            Some(pad) => pads.insert(binding.device_id.clone(), pad),
-            None => pads.remove(&binding.device_id),
-        };
-        actions
-    };
-    if actions.is_empty() {
-        return Ok(());
-    }
-    sender
-        .send(DesktopPortalCommand::Input(actions))
-        .map_err(|_| "Desktop portal worker has stopped".to_string())
-}
-
 /// Debug builds: feeds a mousepad body into the active share as if the phone
 /// had sent it, skipping the lease, so the GNOME side can be measured alone.
 #[cfg(debug_assertions)]
@@ -2241,17 +2112,7 @@ pub(crate) fn end_screen_session(device_id: &str) {
     stop_desktop_portal_session(device_id, Some(SHARING_STOPPED_AT_DESK));
 }
 
-/// Ends `device_id`'s share of this screen. `tell` is the reason the phone
-/// is given; `None` stops it without a word (the request already expired).
-/// Drops `device_id`'s drawing pad (its session ended or was refused).
-fn forget_pad(device_id: &str) {
-    if let Ok(mut pads) = pads().lock() {
-        pads.remove(device_id);
-    }
-}
-
 fn stop_desktop_portal_session(device_id: &str, tell: Option<&str>) {
-    forget_pad(device_id);
     let service = desktop_portal_services()
         .lock()
         .ok()
@@ -2670,12 +2531,6 @@ fn spawn_event_worker(
                             binding.device_id
                         );
                         super::screen::publish_stream(&binding.device_id, stream);
-                        // The camera's first frames create the pad: feed it.
-                        if super::camera::is_live(&binding.device_id) {
-                            if let Err(error) = super::screen::attach_camera(&binding.device_id) {
-                                eprintln!("[DeskLink] {error}");
-                            }
-                        }
                     }
                     // Most peer errors are not fatal (an oversized candidate, an
                     // empty message); a negotiation that truly cannot finish is
@@ -2776,9 +2631,8 @@ fn spawn_event_worker(
 /// live one (the replaced worker skips it, see `PeerWorkerGuard`).
 fn reset_device_webrtc_state(device_id: &str) {
     stop_desktop_portal_session(device_id, None);
-    // A lost or replaced peer ends the camera too (the desk asks again),
-    // and every sound session (the phone asks again on its next link).
-    super::camera::end(device_id);
+    // A lost or replaced peer ends every sound session (the phone asks
+    // again on its next link).
     super::audio_session::end_all(device_id);
     super::capture::end(device_id);
     super::screen::clear_stream(device_id);
@@ -3290,41 +3144,6 @@ fn handle_peer_envelope(
         }
         let now = now_millis();
         message.validate(wire, attempt_id, now)?;
-        if message.kind.is_camera() {
-            let device_id = &wire.peer_device_id;
-            let camera_id = super::camera::status(device_id).map(|camera| camera.id);
-            match super::camera::handle(device_id, &binding.link.info.name, &message) {
-                super::camera::Outcome::Live => match super::screen::attach_camera(device_id) {
-                    Ok(true) => {}
-                    Ok(false) => debug_log!("[DeskLink] Camera ready; waiting for its first frame"),
-                    Err(error) => crate::device_links::daemon::push_event(
-                        events,
-                        DaemonEvent::CameraNotice {
-                            device_id: device_id.clone(),
-                            message: error,
-                        },
-                    ),
-                },
-                super::camera::Outcome::Stopped(words) => {
-                    if camera_id.is_some_and(|id| {
-                        super::audio_session::end_camera_microphone(device_id, &id)
-                    }) {
-                        if let Ok(peer) = sessions.active_webrtc_peer(binding, attempt_id) {
-                            peer.stop_audio_playback();
-                        }
-                    }
-                    crate::device_links::daemon::push_event(
-                        events,
-                        DaemonEvent::CameraNotice {
-                            device_id: device_id.clone(),
-                            message: words,
-                        },
-                    )
-                }
-                super::camera::Outcome::Ignored => {}
-            }
-            return Ok(());
-        }
         if message.kind.is_audio() {
             return handle_audio_message(binding, attempt_id, wire, &message, sessions, events);
         }
@@ -4654,10 +4473,6 @@ mod tests {
             max_dimension: None,
             fps: None,
             password: None,
-            facing: None,
-            width: None,
-            height: None,
-            audio: None,
             action: None,
             audio_direction: None,
             source: None,
@@ -4747,96 +4562,6 @@ mod tests {
         let past_the_end = RECOVERY_BACKOFF_MILLIS.len() as u32;
         assert_eq!(recovery_delay(past_the_end), None);
         assert_eq!(recovery_delay(u32::MAX), None);
-    }
-
-    #[test]
-    fn a_pen_stroke_is_a_drag_across_the_screen() {
-        use super::super::remote_desktop_portal::PortalInputAction as A;
-        use super::{digitizer_actions, Pad};
-        let packet = |kind: &str, body: serde_json::Value| {
-            let mut packet = NetworkPacket::new(kind);
-            packet.body = body.as_object().unwrap().clone();
-            packet
-        };
-        let mut pad: Option<Pad> = None;
-        // Strokes before a session do nothing.
-        assert!(digitizer_actions(
-            &mut pad,
-            &packet(
-                "desklink.digitizer",
-                serde_json::json!({"x": 1, "y": 1, "touching": true})
-            )
-        )
-        .is_empty());
-        digitizer_actions(
-            &mut pad,
-            &packet(
-                "desklink.digitizer.session",
-                serde_json::json!({"action": "start", "width": 1000, "height": 500}),
-            ),
-        );
-        assert_eq!(
-            digitizer_actions(
-                &mut pad,
-                &packet(
-                    "desklink.digitizer",
-                    serde_json::json!({"x": 500, "y": 250, "touching": true, "active": true})
-                )
-            ),
-            vec![
-                A::NormalizedMotion(0.5, 0.5),
-                A::Button {
-                    evdev_code: 0x110,
-                    pressed: true
-                }
-            ]
-        );
-        assert_eq!(
-            digitizer_actions(
-                &mut pad,
-                &packet(
-                    "desklink.digitizer",
-                    serde_json::json!({"x": 1000, "y": 900})
-                )
-            ),
-            vec![A::NormalizedMotion(1.0, 1.0)],
-            "a move while down is a drag, clamped to the screen"
-        );
-        assert_eq!(
-            digitizer_actions(
-                &mut pad,
-                &packet(
-                    "desklink.digitizer",
-                    serde_json::json!({"touching": false, "active": false})
-                )
-            ),
-            vec![A::Button {
-                evdev_code: 0x110,
-                pressed: false
-            }]
-        );
-        // Ending with the pen down lifts it.
-        digitizer_actions(
-            &mut pad,
-            &packet(
-                "desklink.digitizer",
-                serde_json::json!({"x": 1, "y": 1, "touching": true}),
-            ),
-        );
-        assert_eq!(
-            digitizer_actions(
-                &mut pad,
-                &packet(
-                    "desklink.digitizer.session",
-                    serde_json::json!({"action": "end"})
-                )
-            ),
-            vec![A::Button {
-                evdev_code: 0x110,
-                pressed: false
-            }]
-        );
-        assert!(pad.is_none());
     }
 
     #[test]

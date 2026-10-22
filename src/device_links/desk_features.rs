@@ -1,6 +1,6 @@
 //! The desk's side of the features a phone drives that are not a single
 //! packet handler: the desk's settings (reported and changed from the phone),
-//! the desk's run commands, unlock with the phone, and Lock & Hand Off.
+//! unlock with the phone, and Lock & Hand Off.
 //!
 //! The daemon installs its session manager, config and device table here
 //! once, so pushes can start from any thread (a settings change at the desk,
@@ -11,15 +11,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
-use super::config::{AppSettings, Config, RunCommand};
+use super::config::{AppSettings, Config};
 use super::connection_log::{record_detail, ConnectionEvent};
 use super::core::DeviceManager;
 use super::device::{DeviceStatus, DeviceView};
 use super::packet::{
-    NetworkPacket, PACKET_TYPE_HANDOFF, PACKET_TYPE_LOCK, PACKET_TYPE_RUNCOMMAND,
-    PACKET_TYPE_SETTINGS, PACKET_TYPE_UNLOCK_REQUEST,
+    NetworkPacket, PACKET_TYPE_HANDOFF, PACKET_TYPE_LOCK, PACKET_TYPE_SETTINGS,
+    PACKET_TYPE_UNLOCK_REQUEST,
 };
 use super::transport::FeatureTransport;
 use super::unlock::{self, Conditions, Refusal};
@@ -112,37 +112,6 @@ pub(crate) fn run_later(job: impl FnOnce() + Send + 'static) -> bool {
     }
     queued
 }
-
-/// The connection generation `device_id`'s terminal channel is bound to.
-fn wire_generation(device_id: &str) -> Option<u64> {
-    let daemon = DAEMON.get()?;
-    let binding = daemon
-        .sessions
-        .current_bindings()
-        .into_iter()
-        .find(|binding| binding.device_id == device_id)?;
-    let snapshot = daemon.sessions.feature_transport_snapshot(&binding).ok()?;
-    snapshot.web_rtc_wire.map(|wire| wire.generation)
-}
-
-/// Whether `device_id` may use terminals now, the gate every terminal path
-/// shares: Terminal Access on, and the session password (when one is set)
-/// proved on this connection. The refusal code otherwise.
-pub(crate) fn terminal_gate(device_id: &str) -> Result<(), &'static str> {
-    gate(
-        super::config::terminal_access_allowed(device_id),
-        super::session_lock::is_unlocked(device_id, wire_generation(device_id).unwrap_or(0)),
-    )
-}
-
-fn gate(access: bool, unlocked: bool) -> Result<(), &'static str> {
-    match (access, unlocked) {
-        (false, _) => Err("terminal-off"),
-        (true, false) => Err("locked"),
-        (true, true) => Ok(()),
-    }
-}
-
 fn device(device_id: &str) -> Option<DeviceView> {
     DAEMON.get()?.devices.lock().ok()?.get(device_id).cloned()
 }
@@ -153,11 +122,6 @@ pub(crate) fn on_feature_ready(device_id: &str) {
     run_later(move || {
         let settings = super::config::app_settings();
         send(&device_id, &settings_packet(&settings, &device_id));
-        // The list, or why not: always answered.
-        send(
-            &device_id,
-            &command_state_packet(terminal_gate(&device_id), &settings.run_commands),
-        );
         super::mpris::forget_art_sent(&device_id);
         super::mpris::send_state_to(&device_id);
         // This computer's notifications (C1): the snapshot, then bodies.
@@ -166,13 +130,6 @@ pub(crate) fn on_feature_ready(device_id: &str) {
         for index in super::notes::indexes() {
             send(&device_id, &index);
         }
-        // Automations (F7): the rules here, then "phone connected" to it.
-        if let Some(index) = super::automations::index() {
-            send(&device_id, &index);
-        }
-        super::automations::phone_link(&device_id, true);
-        // Folder sync (F8): runs only while connected.
-        super::folders::link(&device_id, true);
     });
 }
 
@@ -335,19 +292,6 @@ pub(crate) fn cancel_transfer(device_id: &str, transfer_id: &str) -> Result<(), 
     FeatureTransport::for_device(&daemon.sessions, device_id)?.cancel_transfer(transfer_id)
 }
 
-/// Changes this computer's settings from inside the daemon (an automation),
-/// saved and told to every phone.
-pub(crate) fn change_settings(change: impl FnOnce(&mut AppSettings)) -> Result<(), String> {
-    let daemon = DAEMON.get().ok_or("DeskLink is starting")?;
-    daemon
-        .config
-        .lock()
-        .map_err(|_| "Config lock poisoned".to_string())
-        .and_then(|mut config| config.update_settings(change))?;
-    push_settings();
-    Ok(())
-}
-
 /// Remembers a folder a phone started a terminal in (newest first, five).
 pub(crate) fn remember_folder(folder: &str) {
     let Some(daemon) = DAEMON.get() else {
@@ -360,115 +304,6 @@ pub(crate) fn remember_folder(folder: &str) {
             settings.recent_folders.insert(0, folder);
             settings.recent_folders.truncate(5);
         });
-    }
-}
-
-// ── Run commands ───────────────────────────────────────────────────────────
-
-/// `desklink.runcommand`: the commands as KDE Connect sends them, a JSON
-/// string mapping each id to its name and command.
-pub(crate) fn command_list_packet(commands: &[RunCommand]) -> NetworkPacket {
-    // The list is one packet the phone takes as complete: as many commands
-    // as fit one data-channel message (the stringified list is escaped
-    // again inside the packet, so a quarter of the budget per pass is kept
-    // for that).
-    let budget = crate::device_links::webrtc::MAX_FEATURE_PACKET_BYTES / 2;
-    let mut list = serde_json::Map::new();
-    let mut size = 2;
-    for command in commands {
-        let entry = json!({ "name": command.name, "command": command.command });
-        let length = command.id.len() + entry.to_string().len() + 4;
-        if size + length > budget {
-            super::limits::log_limited("run-commands", "Some run commands did not fit the list");
-            break;
-        }
-        size += length;
-        list.insert(command.id.clone(), entry);
-    }
-    let mut packet = NetworkPacket::new(PACKET_TYPE_RUNCOMMAND);
-    packet.set("commandList", Value::Object(list).to_string());
-    packet
-}
-
-/// What a phone is told about the desk's commands: the list when it may
-/// run them, else `{error}` (`terminal-off`, `locked`) — never nothing, so a
-/// phone never keeps a list it may no longer use.
-pub(crate) fn command_state_packet(
-    gate: Result<(), &'static str>,
-    commands: &[RunCommand],
-) -> NetworkPacket {
-    match gate {
-        Ok(()) => command_list_packet(commands),
-        Err(code) => {
-            let mut refused = NetworkPacket::new(PACKET_TYPE_RUNCOMMAND);
-            refused.set("error", code);
-            refused
-        }
-    }
-}
-
-/// Tells every connected phone the desk's commands, or why not: after an
-/// edit, a Terminal Access change, or the session password set or removed.
-pub(crate) fn push_command_list() {
-    for device_id in ready_devices() {
-        push_command_list_to(&device_id);
-    }
-}
-
-/// [`push_command_list`] for one phone (it just proved the password).
-pub(crate) fn push_command_list_to(device_id: &str) {
-    let commands = super::config::app_settings().run_commands;
-    send(
-        device_id,
-        &command_state_packet(terminal_gate(device_id), &commands),
-    );
-}
-
-/// What a `desklink.runcommand.request` gets: a reply (the list, or why
-/// not), and the command to run.
-fn runcommand_reply(
-    gate: Result<(), &'static str>,
-    commands: &[RunCommand],
-    packet: &NetworkPacket,
-) -> (Option<NetworkPacket>, Option<RunCommand>) {
-    if gate.is_err() {
-        // A refused tap names the command it refuses (`key`), so the phone
-        // can tell it from a state push.
-        let mut refused = command_state_packet(gate, commands);
-        if let Some(key) = packet.get_str("key") {
-            refused.set("key", key);
-        }
-        return (Some(refused), None);
-    }
-    let list = packet
-        .get_bool("requestCommandList")
-        .unwrap_or(false)
-        .then(|| command_list_packet(commands));
-    let chosen = packet
-        .get_str("key")
-        .and_then(|key| commands.iter().find(|command| command.id == key).cloned());
-    (list, chosen)
-}
-
-/// `desklink.runcommand.request`: the list, or run one. Behind the same gate
-/// as terminals: Terminal Access and the session password.
-pub(crate) fn handle_runcommand_request(
-    device_id: &str,
-    packet: &NetworkPacket,
-) -> Result<(), String> {
-    let commands = super::config::app_settings().run_commands;
-    let gate = terminal_gate(device_id);
-    let (reply, chosen) = runcommand_reply(gate, &commands, packet);
-    if let Some(reply) = reply {
-        send(device_id, &reply);
-    }
-    match (gate, chosen, packet.get_str("key")) {
-        (Err(_), _, _) | (Ok(()), None, None) => Ok(()),
-        (Ok(()), Some(command), _) => {
-            super::pty::registry::run_command(&command.name, &command.command, device_id)
-                .map(|_| ())
-        }
-        (Ok(()), None, Some(_)) => Err("No such command on this computer".to_string()),
     }
 }
 
@@ -645,22 +480,7 @@ fn hand_off(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_command_list_fits_one_wire_message() {
-        let commands: Vec<RunCommand> = (0..200)
-            .map(|index| RunCommand {
-                id: format!("c{index}"),
-                name: format!("\"Deploy\" {index}"),
-                command: "\\\"".repeat(200),
-            })
-            .collect();
-        let packet = command_list_packet(&commands);
-        assert!(crate::device_links::webrtc::fits_on_wire(&packet));
-        let list: serde_json::Map<String, Value> =
-            serde_json::from_str(packet.get_str("commandList").unwrap()).unwrap();
-        assert!(!list.is_empty() && list.len() < 200, "as many as fit");
-    }
+    use serde_json::json;
 
     #[test]
     fn the_settings_and_art_packets_fit_one_wire_message() {
@@ -812,48 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn run_commands_need_terminal_access_and_the_password() {
-        let commands = [RunCommand {
-            id: "a1".into(),
-            name: "Deploy".into(),
-            command: "make deploy".into(),
-        }];
-        let mut packet =
-            NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_RUNCOMMAND_REQUEST);
-        packet.set("requestCommandList", true);
-        packet.set("key", "a1");
-        for (access, unlocked, code) in [(false, true, "terminal-off"), (true, false, "locked")] {
-            let (reply, run) = runcommand_reply(gate(access, unlocked), &commands, &packet);
-            let reply = reply.unwrap();
-            assert_eq!(reply.get_str("error"), Some(code));
-            assert_eq!(reply.get_str("key"), Some("a1"), "the refused tap is named");
-            assert!(
-                !reply.body.contains_key("commandList"),
-                "no list behind the gate"
-            );
-            assert!(run.is_none(), "{code}: nothing runs");
-        }
-        let (reply, run) = runcommand_reply(gate(true, true), &commands, &packet);
-        assert!(reply.unwrap().body.contains_key("commandList"));
-        assert_eq!(run.map(|command| command.name), Some("Deploy".to_string()));
-    }
-
-    #[test]
-    fn a_phone_always_hears_the_commands_or_why_not() {
-        let commands = [RunCommand {
-            id: "a1".into(),
-            name: "Deploy".into(),
-            command: "make deploy".into(),
-        }];
-        let allowed = command_state_packet(gate(true, true), &commands);
-        assert!(allowed.body.contains_key("commandList"));
-        assert!(!allowed.body.contains_key("error"));
-        for (access, unlocked, code) in [(false, true, "terminal-off"), (true, false, "locked")] {
-            let refused = command_state_packet(gate(access, unlocked), &commands);
-            assert_eq!(refused.packet_type, "desklink.runcommand");
-            assert_eq!(refused.get_str("error"), Some(code));
-            assert!(!refused.body.contains_key("commandList"));
-        }
+    fn the_settings_packet_says_whether_a_session_password_is_set() {
         let mut settings = AppSettings::default();
         assert_eq!(
             settings_packet(&settings, "phone").get_bool("sessionPasswordSet"),
@@ -963,20 +742,6 @@ mod tests {
         let accepted = (0..QUEUE * 4).filter(|_| run_later(|| {})).count();
         assert!(accepted <= QUEUE, "{accepted} queued");
         drop(held);
-    }
-
-    #[test]
-    fn the_command_list_is_a_json_string_in_kde_form() {
-        let packet = command_list_packet(&[RunCommand {
-            id: "a1".into(),
-            name: "Deploy".into(),
-            command: "make deploy".into(),
-        }]);
-        let list: Value = serde_json::from_str(packet.get_str("commandList").unwrap()).unwrap();
-        assert_eq!(list["a1"]["name"], "Deploy");
-        assert_eq!(list["a1"]["command"], "make deploy");
-        let empty = command_list_packet(&[]);
-        assert_eq!(empty.get_str("commandList"), Some("{}"));
     }
 
     #[test]

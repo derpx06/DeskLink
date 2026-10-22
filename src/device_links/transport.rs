@@ -145,26 +145,6 @@ impl FeatureTransport {
         )
     }
 
-    /// Asks the phone for its camera (C4).
-    pub(crate) fn start_camera(
-        &self,
-        facing: &str,
-        width: i32,
-        height: i32,
-        audio: bool,
-    ) -> Result<(), String> {
-        let device_id = self.snapshot.binding.device_id.clone();
-        crate::device_links::webrtc::coordinator::send_camera_message(
-            &self.sessions,
-            &self.snapshot,
-            |build| {
-                Some(crate::device_links::webrtc::camera::begin(
-                    &device_id, facing, width, height, 30, audio, build,
-                ))
-            },
-        )
-    }
-
     /// Insert from the phone (F3): see `coordinator::capture_request`.
     pub(crate) fn capture(&self, kind: &str, target: &str) -> Result<(), String> {
         crate::device_links::webrtc::coordinator::capture_request(
@@ -182,26 +162,6 @@ impl FeatureTransport {
             &self.snapshot,
             what,
             on,
-        )
-    }
-
-    /// `flip` or `stop` for the running camera session.
-    pub(crate) fn camera_control(&self, action: &str) -> Result<(), String> {
-        let device_id = self.snapshot.binding.device_id.clone();
-        let camera = crate::device_links::webrtc::camera::status(&device_id);
-        if let Some(camera) = camera.filter(|_| action == "stop") {
-            if crate::device_links::webrtc::audio_session::end_camera_microphone(
-                &device_id, &camera.id,
-            ) {
-                if let Some(peer) = self.snapshot.web_rtc_peer.as_ref() {
-                    peer.stop_audio_playback();
-                }
-            }
-        }
-        crate::device_links::webrtc::coordinator::send_camera_message(
-            &self.sessions,
-            &self.snapshot,
-            |build| crate::device_links::webrtc::camera::control(&device_id, action, build),
         )
     }
 
@@ -301,9 +261,7 @@ mod tests {
         let transport = FeatureTransport::for_device(&sessions, "phone-1").unwrap();
 
         let error = transport
-            .send(&NetworkPacket::new(
-                crate::device_links::packet::PACKET_TYPE_SYSTEMVOLUME_REQUEST,
-            ))
+            .send(&NetworkPacket::new("desklink.systemvolume.request"))
             .unwrap_err();
         assert!(error.contains("not enabled in the DeskLink feature profile"));
     }

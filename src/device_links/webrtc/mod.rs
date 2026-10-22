@@ -2,7 +2,6 @@
 
 pub(crate) mod audio;
 pub(crate) mod audio_session;
-pub(crate) mod camera;
 pub(crate) mod capture;
 pub(crate) mod coordinator;
 pub(crate) mod file_protocol;
@@ -41,8 +40,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::device_links::packet::{
-    NetworkPacket, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_PAIR, PACKET_TYPE_PRESENTER,
-    PACKET_TYPE_WEBRTC_SIGNAL_V1,
+    NetworkPacket, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_PAIR, PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
 
 pub const ENVELOPE_VERSION: u32 = 1;
@@ -301,10 +299,7 @@ impl WebRtcPacketBridge {
     pub fn channel_for(packet: &NetworkPacket) -> WebRtcChannel {
         if Self::is_replaceable_pointer_motion(packet) {
             WebRtcChannel::InputRealtime
-        } else if matches!(
-            packet.packet_type.as_str(),
-            PACKET_TYPE_MOUSEPAD_REQUEST | PACKET_TYPE_PRESENTER
-        ) {
+        } else if packet.packet_type == PACKET_TYPE_MOUSEPAD_REQUEST {
             WebRtcChannel::InputReliable
         } else {
             WebRtcChannel::Events
@@ -317,9 +312,6 @@ impl WebRtcPacketBridge {
             .any(|key| packet.body.contains_key(*key));
         if !has_motion {
             return false;
-        }
-        if packet.packet_type == PACKET_TYPE_PRESENTER {
-            return !packet.get_bool("stop").unwrap_or(false);
         }
         if packet.packet_type != PACKET_TYPE_MOUSEPAD_REQUEST {
             return false;

@@ -260,13 +260,6 @@ pub fn check(device_id: &str, generation: u64, offered: Option<&str>) -> Result<
                 .finish(device_id, generation, offered, correct, Instant::now())
         }
     };
-    // Proven just now: the phone may run commands; tell it which.
-    if result.is_ok() {
-        let device_id = device_id.to_string();
-        crate::device_links::desk_features::run_later(move || {
-            crate::device_links::desk_features::push_command_list_to(&device_id)
-        });
-    }
     if result.is_err() && offered.is_some() {
         crate::device_links::connection_log::record(
             device_id,

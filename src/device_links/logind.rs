@@ -81,11 +81,6 @@ fn display_session(bus: &gio::DBusConnection) -> Result<String, String> {
     Ok(path)
 }
 
-/// Our display session's object path (for its PropertiesChanged).
-pub(crate) fn display_session_path() -> Option<String> {
-    display_session(&system_bus().ok()?).ok()
-}
-
 /// Whether our display session is locked; `None` when logind cannot say.
 pub(crate) fn locked() -> Option<bool> {
     let bus = system_bus().ok()?;

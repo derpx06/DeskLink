@@ -5,8 +5,7 @@ use super::handle::DaemonEvent;
 use crate::device_links::connection_log;
 use crate::device_links::core::DeviceConnection;
 use crate::device_links::device::{
-    BatteryStatus, DeviceNotification, DeviceStatus, DeviceView, MediaStatus, SystemVolumeStatus,
-    VolumeSink,
+    BatteryStatus, DeviceNotification, DeviceStatus, DeviceView, MediaStatus,
 };
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::NetworkPacket;
@@ -508,60 +507,6 @@ pub(super) fn remove_notification(
         }
     }
 }
-
-pub(super) fn update_volume_status(
-    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    device_id: &str,
-    packet: &NetworkPacket,
-) {
-    if let Ok(mut devices) = devices.lock() {
-        let Some(device) = devices.get_mut(device_id) else {
-            return;
-        };
-
-        let mut status = device
-            .volume_status
-            .clone()
-            .unwrap_or(SystemVolumeStatus { sinks: Vec::new() });
-
-        if let Some(sinks) = parse_sink_list(packet.body.get("sinkList")) {
-            status.sinks = sinks;
-        } else if let Some(name) = packet.get_str("name") {
-            let name = sanitize_text(name, 240);
-            let sink = status
-                .sinks
-                .iter_mut()
-                .find(|sink| sink.name == name)
-                .map(|sink| {
-                    if let Some(volume) = packet.get_i64("volume") {
-                        sink.volume = volume.max(0);
-                    }
-                    if let Some(muted) = packet.get_bool("muted") {
-                        sink.muted = muted;
-                    }
-                    if let Some(enabled) = packet.get_bool("enabled") {
-                        sink.enabled = enabled;
-                    }
-                });
-            if sink.is_none() {
-                status.sinks.push(VolumeSink {
-                    name,
-                    description: packet
-                        .get_str("description")
-                        .map(|value| sanitize_text(value, 240))
-                        .unwrap_or_else(|| "Audio device".to_string()),
-                    volume: packet.get_i64("volume").unwrap_or(0).max(0),
-                    max_volume: packet.get_i64("maxVolume"),
-                    muted: packet.get_bool("muted").unwrap_or(false),
-                    enabled: packet.get_bool("enabled").unwrap_or(false),
-                });
-            }
-        }
-
-        device.volume_status = Some(status);
-    }
-}
-
 fn sanitize_text(value: &str, max_chars: usize) -> String {
     value
         .chars()
@@ -581,48 +526,6 @@ fn string_vec(value: Option<&Value>) -> Option<Vec<String>> {
         })
     })
 }
-
-fn parse_sink_list(value: Option<&Value>) -> Option<Vec<VolumeSink>> {
-    let value = value?;
-    let parsed;
-    let array = if let Some(array) = value.as_array() {
-        array
-    } else if let Some(json) = value.as_str() {
-        parsed = serde_json::from_str::<Value>(json).ok()?;
-        parsed.as_array()?
-    } else {
-        return None;
-    };
-
-    Some(
-        array
-            .iter()
-            .filter_map(|item| {
-                let object = item.as_object()?;
-                let name = object.get("name")?.as_str()?;
-                Some(VolumeSink {
-                    name: sanitize_text(name, 240),
-                    description: object
-                        .get("description")
-                        .and_then(Value::as_str)
-                        .map(|value| sanitize_text(value, 240))
-                        .unwrap_or_else(|| sanitize_text(name, 240)),
-                    volume: object.get("volume").and_then(Value::as_i64).unwrap_or(0),
-                    max_volume: object.get("maxVolume").and_then(Value::as_i64),
-                    muted: object
-                        .get("muted")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    enabled: object
-                        .get("enabled")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                })
-            })
-            .collect(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1101,28 +1004,5 @@ mod tests {
         assert_eq!(media.position, Some(1234));
         assert_eq!(media.length, Some(9999));
         assert!(media.can_seek);
-    }
-
-    #[test]
-    fn volume_packet_updates_sink_list() {
-        let (devices, info) = test_devices();
-        let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_SYSTEMVOLUME);
-        packet.set(
-            "sinkList",
-            json!([{"name":"sink1","description":"Speakers","volume":40,"maxVolume":100,"muted":false,"enabled":true}]),
-        );
-
-        update_volume_status(&devices, &info.id, &packet);
-
-        let devices = devices.lock().unwrap();
-        let volume = devices
-            .get(&info.id)
-            .unwrap()
-            .volume_status
-            .as_ref()
-            .unwrap();
-        assert_eq!(volume.sinks.len(), 1);
-        assert_eq!(volume.sinks[0].name, "sink1");
-        assert_eq!(volume.sinks[0].volume, 40);
     }
 }

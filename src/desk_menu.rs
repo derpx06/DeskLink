@@ -178,17 +178,6 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
                 .icon("folder-symbolic"),
         );
     }
-    if let Some(camera) = phone.camera.as_ref() {
-        menu.push(TrayEntry::Label(if camera.live {
-            "● Camera in use as DeskLink Camera".to_string()
-        } else {
-            "Asking for the camera…".to_string()
-        }));
-        menu.push(
-            TrayEntry::action("Stop Camera", format!("camera-stop:{}", phone.id))
-                .icon("camera-web-symbolic"),
-        );
-    }
     // Sound both ways (F1).
     if phone.feature_transport_ready {
         let sound = phone.sound.clone().unwrap_or_default();
@@ -406,7 +395,6 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
         )),
         "lock" => daemon.send(DaemonCommand::SendLockRequest(target, true)),
         "type" => crate::type_on_phone::open(&daemon, &target, None),
-        "camera-stop" => daemon.send(DaemonCommand::CameraControl(target, "stop".into())),
         "desk-sound-on" | "desk-sound-off" | "phone-mic-on" | "phone-mic-off" => {
             let (what, state) = verb.rsplit_once('-').unwrap_or((verb, "off"));
             daemon.send(DaemonCommand::Sound(target, what.into(), state == "on"))

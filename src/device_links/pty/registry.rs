@@ -331,23 +331,6 @@ pub(crate) fn newest_session() -> Option<SessionInfo> {
         .max_by_key(|info| info.started_at)
 }
 
-/// Starts one of the desk's run commands for `owner`, in a shared session
-/// titled `name`, through the user's login shell.
-pub(crate) fn run_command(name: &str, command: &str, owner: &str) -> Result<SessionInfo, String> {
-    let shell = std::env::var("SHELL")
-        .ok()
-        .filter(|shell| !shell.is_empty())
-        .unwrap_or_else(|| "/bin/sh".to_string());
-    let argv = CommandBuilder::from_argv(vec![shell.into(), "-lc".into(), command.into()]);
-    let info = registry()
-        .lock()
-        .map_err(|_| "terminal registry lock poisoned".to_string())?
-        .create_in(Some(argv), 24, 80, owner, None, Some(name))?;
-    // The command is the session itself: it finishes when the session exits.
-    super::jobs::watch_exit(&info.id);
-    Ok(info)
-}
-
 /// The idle limit for unattended sessions: `DESKLINK_TERMINAL_IDLE_SECS`, else
 /// 24 hours. `0` closes an unattended session at the next sweep.
 pub(crate) fn idle_timeout() -> Duration {

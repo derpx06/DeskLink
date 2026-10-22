@@ -78,9 +78,6 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         if let Some(call) = super::calls::card(daemon, device, false) {
             page.append(&call);
         }
-        if let Some(camera) = super::camera::bar(daemon, device) {
-            page.append(&camera);
-        }
         for sound in super::sound::bars(daemon, device) {
             page.append(&sound);
         }
@@ -368,14 +365,14 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         disable_with(&typing, reason.as_deref());
         add_wrapped(&round, &typing);
     }
-    // The phone's camera, from a phone that can share its screen: as a
-    // webcam (C4), or for a photo, scan, text or QR code here (F3).
+    // The phone's camera, from a phone that can share its screen: for a
+    // photo, scan, text or QR code here (F3).
     if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
         let camera = round_action(
             "camera-photo-symbolic",
             "Camera",
             &format!(
-                "Use {}'s camera: a webcam, a photo, a scan, text or a QR code",
+                "Use {}'s camera: a photo, a scan, text or a QR code",
                 device.name
             ),
         );

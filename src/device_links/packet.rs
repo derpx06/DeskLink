@@ -25,10 +25,8 @@ pub const PACKET_TYPE_PAIR_QR: &str = "desklink.pair.qr";
 pub const PACKET_TYPE_HEARTBEAT: &str = "desklink.heartbeat";
 pub const PACKET_TYPE_PING: &str = "desklink.ping";
 pub const PACKET_TYPE_MOUSEPAD_REQUEST: &str = "desklink.mousepad.request";
-pub const PACKET_TYPE_MOUSEPAD_ECHO: &str = "desklink.mousepad.echo";
 pub const PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE: &str = "desklink.mousepad.keyboardstate";
 pub const PACKET_TYPE_SHARE_REQUEST: &str = "desklink.share.request";
-pub const PACKET_TYPE_SHARE_REQUEST_UPDATE: &str = "desklink.share.request.update";
 pub const PACKET_TYPE_CLIPBOARD: &str = "desklink.clipboard";
 pub const PACKET_TYPE_CLIPBOARD_CONNECT: &str = "desklink.clipboard.connect";
 pub const PACKET_TYPE_LOCK: &str = "desklink.lock";
@@ -39,15 +37,8 @@ pub const PACKET_TYPE_MPRIS_REQUEST: &str = "desklink.mpris.request";
 pub const PACKET_TYPE_BATTERY: &str = "desklink.battery";
 pub const PACKET_TYPE_NOTIFICATION: &str = "desklink.notification";
 pub const PACKET_TYPE_NOTIFICATION_REQUEST: &str = "desklink.notification.request";
-pub const PACKET_TYPE_NOTIFICATION_CANCEL: &str = "desklink.notification.cancel";
 pub const PACKET_TYPE_NOTIFICATION_REPLY: &str = "desklink.notification.reply";
 pub const PACKET_TYPE_NOTIFICATION_ACTION: &str = "desklink.notification.action";
-pub const PACKET_TYPE_SYSTEMVOLUME: &str = "desklink.systemvolume";
-pub const PACKET_TYPE_SYSTEMVOLUME_REQUEST: &str = "desklink.systemvolume.request";
-pub const PACKET_TYPE_RUNCOMMAND: &str = "desklink.runcommand";
-pub const PACKET_TYPE_RUNCOMMAND_REQUEST: &str = "desklink.runcommand.request";
-pub const PACKET_TYPE_DIGITIZER_SESSION: &str = "desklink.digitizer.session";
-pub const PACKET_TYPE_DIGITIZER: &str = "desklink.digitizer";
 /// The desk's own settings, reported to a phone (desk → phone).
 pub const PACKET_TYPE_SETTINGS: &str = "desklink.settings";
 /// A phone changing one of the desk's settings (phone → desk), allow-listed.
@@ -58,11 +49,8 @@ pub const PACKET_TYPE_UNLOCK_REQUEST: &str = "desklink.unlock.request";
 pub const PACKET_TYPE_HANDOFF: &str = "desklink.handoff";
 pub const PACKET_TYPE_SCREEN_REQUEST: &str = "desklink.screen.request";
 pub const PACKET_TYPE_SCREEN_READY: &str = "desklink.screen.ready";
-pub const PACKET_TYPE_SCREEN_FRAME: &str = "desklink.screen.frame";
 pub const PACKET_TYPE_SCREEN_STOP: &str = "desklink.screen.stop";
 pub const PACKET_TYPE_SCREEN_ERROR: &str = "desklink.screen.error";
-pub const PACKET_TYPE_PRESENTER: &str = "desklink.presenter";
-pub const PACKET_TYPE_CONTACTS_REQUEST: &str = "desklink.contacts.request";
 /// Contacts (F5), desk → phone: a fresh snapshot, then the changed vCards.
 pub const PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS: &str =
     "desklink.contacts.request_all_uids_timestamps";
@@ -77,19 +65,15 @@ pub const PACKET_TYPE_SNIPPETS: &str = "desklink.snippets";
 pub const PACKET_TYPE_NOTES: &str = "desklink.notes";
 /// Folder sync (F8): pairs, manifests and file requests, both ways.
 pub const PACKET_TYPE_FOLDERS: &str = "desklink.folders";
-/// Automations (F7): rules, events and remote actions, both ways.
-pub const PACKET_TYPE_AUTOMATIONS: &str = "desklink.automations";
 /// Glide (F4): the pointer crossing onto the phone (desk→phone), and back
 /// (phone→desk). KDE Connect's shareinputdevices edge protocol.
 pub const PACKET_TYPE_SHARE_INPUT_DEVICES_REQUEST: &str = "desklink.shareinputdevices.request";
 pub const PACKET_TYPE_SHARE_INPUT_DEVICES: &str = "desklink.shareinputdevices";
-pub const PACKET_TYPE_SMS_REQUEST: &str = "desklink.sms.request";
 /// The phone's calls (a full snapshot), a missed call, or a refused request
 /// (phone → desk).
 pub const PACKET_TYPE_TELEPHONY: &str = "desklink.telephony";
 /// Answer, decline, end, silence, mute, unmute or dial (desk → phone).
 pub const PACKET_TYPE_TELEPHONY_REQUEST: &str = "desklink.telephony.request";
-pub const PACKET_TYPE_CONNECTIVITY_REPORT: &str = "desklink.connectivity_report";
 pub const PACKET_TYPE_WEBRTC_SIGNAL_V1: &str = "desklink.webrtc.signal.v1";
 
 #[derive(Debug, Clone, PartialEq)]

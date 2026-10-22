@@ -9,20 +9,18 @@ use super::handle::DaemonEvent;
 use super::state::{
     push_event, remove_notification, replace_notifications, update_battery_status,
     update_call_status, update_keyboard_state, update_media_from_packet, update_pair_state,
-    update_volume_status, upsert_notification,
+    upsert_notification,
 };
 use crate::device_links::config::Config;
 use crate::device_links::core::{DeviceManager, ReadOutcome, SessionBinding};
 use crate::device_links::device::DeviceView;
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
-    PACKET_TYPE_DIGITIZER, PACKET_TYPE_DIGITIZER_SESSION, PACKET_TYPE_FINDMYPHONE_REQUEST,
-    PACKET_TYPE_HEARTBEAT, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST,
-    PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST,
-    PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PAIR, PACKET_TYPE_PING,
-    PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_REQUEST,
-    PACKET_TYPE_SYSTEMVOLUME, PACKET_TYPE_SYSTEMVOLUME_REQUEST, PACKET_TYPE_TELEPHONY,
-    PACKET_TYPE_UNLOCK_REQUEST, PACKET_TYPE_WEBRTC_SIGNAL_V1,
+    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_HEARTBEAT, PACKET_TYPE_LOCK,
+    PACKET_TYPE_LOCK_REQUEST, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS,
+    PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_REQUEST,
+    PACKET_TYPE_PAIR, PACKET_TYPE_PING, PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_REQUEST,
+    PACKET_TYPE_TELEPHONY, PACKET_TYPE_UNLOCK_REQUEST, PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
 use crate::device_links::pairing::{needs_pair_reconfirmation, PairState};
 
@@ -695,10 +693,6 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             }
             Ok(())
         }
-        PACKET_TYPE_SYSTEMVOLUME => {
-            update_volume_status(devices, device_id, &packet);
-            Ok(())
-        }
         // A snapshot, a missed call or a refusal: a report, never an
         // instruction (nothing here answers or ends a call).
         PACKET_TYPE_TELEPHONY => {
@@ -755,16 +749,6 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         // Folder sync (F8): to its own worker.
         crate::device_links::packet::PACKET_TYPE_FOLDERS => {
             crate::device_links::folders::on_packet(device_id, &packet);
-            Ok(())
-        }
-        // Automations (F7): sync, events and remote actions.
-        crate::device_links::packet::PACKET_TYPE_AUTOMATIONS => {
-            let (device_id, packet) = (device_id.clone(), packet.clone());
-            crate::device_links::desk_features::run_later(move || {
-                for answer in crate::device_links::automations::on_packet(&device_id, &packet) {
-                    crate::device_links::desk_features::send(&device_id, &answer);
-                }
-            });
             Ok(())
         }
         // Glide (F4): the phone hands the pointer back.
@@ -875,9 +859,6 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             });
             Ok(())
         }
-        PACKET_TYPE_RUNCOMMAND_REQUEST => {
-            crate::device_links::desk_features::handle_runcommand_request(device_id, &packet)
-        }
         PACKET_TYPE_SETTINGS_REQUEST => {
             let (device_id, packet) = (device_id.clone(), packet.clone());
             crate::device_links::desk_features::run_later(move || {
@@ -892,12 +873,6 @@ pub(crate) fn dispatch_webrtc_feature_packet(
                 crate::device_links::desk_features::handle_unlock_request(&device_id, &packet)
             });
             Ok(())
-        }
-        PACKET_TYPE_DIGITIZER_SESSION | PACKET_TYPE_DIGITIZER => {
-            crate::device_links::webrtc::coordinator::dispatch_digitizer(binding, &packet)
-        }
-        PACKET_TYPE_SYSTEMVOLUME_REQUEST => {
-            Err("DeskLink WebRTC request needs its corresponding desktop backend".to_string())
         }
         _ => Err(format!(
             "DeskLink has no active WebRTC handler for {}",

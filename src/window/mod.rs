@@ -24,10 +24,8 @@
 //! dialogs, mirrored notifications, errors; each page lives in its own
 //! module and is redrawn only when what it shows has changed.
 
-mod automations;
 mod bucket;
 pub(crate) mod calls;
-mod camera;
 mod insert;
 mod sound;
 pub(crate) use calls::confirm_dial;
@@ -68,7 +66,6 @@ const PAGES: &[(&str, &str, &str)] = &[
     ("clipboard", "Clipboard", "edit-paste-symbolic"),
     ("contacts", "Contacts", "x-office-address-book-symbolic"),
     ("notes", "Notes", "document-edit-symbolic"),
-    ("automations", "Automations", "system-run-symbolic"),
     ("bucket", "Bucket", "folder-symbolic"),
     (
         "history",
@@ -79,7 +76,7 @@ const PAGES: &[(&str, &str, &str)] = &[
 ];
 
 /// How many of [`PAGES`] are in the sidebar's main list.
-const MAIN_PAGES: usize = 9;
+const MAIN_PAGES: usize = 8;
 
 mod imp {
     use super::*;
@@ -808,8 +805,7 @@ impl DesklinkWindow {
                     number,
                 } => calls::missed(self, &device_id, &device_name, caller, number),
                 DaemonEvent::CallRefused { message } => self.show_feature_toast(&message),
-                DaemonEvent::CameraNotice { message, .. }
-                | DaemonEvent::SoundNotice { message, .. }
+                DaemonEvent::SoundNotice { message, .. }
                 | DaemonEvent::CaptureNotice { message, .. } => self.show_feature_toast(&message),
                 DaemonEvent::WifiFromPhone { network, .. } => self.offer_wifi(network),
                 // Handled by this refresh itself (the call card and notification).
@@ -952,7 +948,6 @@ impl DesklinkWindow {
                 }
             }
             "history" => history::update(self, device),
-            "automations" => automations::update(self, device),
             "bucket" => bucket::update(self, device),
             "preferences" => prefs::update(self, daemon, device),
             _ => {}
@@ -1997,24 +1992,6 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 }
             }
         }
-        // Two run commands, as if added in Preferences: into an isolated
-        // runner's own config only.
-        "fake-commands" if std::env::var_os("XDG_CONFIG_HOME").is_none() => {
-            debug_log!("[E2E] {verb} refused: set XDG_CONFIG_HOME to an isolated directory");
-        }
-        "fake-commands" => {
-            if let Some(daemon) = win.daemon() {
-                let command = |name: &str, line: &str| crate::device_links::config::RunCommand {
-                    id: uuid::Uuid::new_v4().simple().to_string(),
-                    name: name.into(),
-                    command: line.into(),
-                };
-                daemon.send(DaemonCommand::SetRunCommands(vec![
-                    command("Deploy staging", "./scripts/deploy.sh staging"),
-                    command("Update system", "sudo pacman -Syu"),
-                ]));
-            }
-        }
         // "open-reply ID": notification ID's reply entry.
         "open-reply" => {
             if let Some(page) = win.imp().notifications.borrow().as_ref() {
@@ -2131,56 +2108,6 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         }
         // "fake-snippet TEXT" (underscores for spaces) and "fake-note": F6
         // content without a phone.
-        // F7: two rules (one test-run, for its history), a template in the
-        // editor, and every rule row opened. Only harmless actions run.
-        "fake-rules" => {
-            use crate::device_links::automations::{self, Rule, Side, Step};
-            let rule = |name: &str, trigger: Step, actions: Vec<Step>| Rule {
-                id: String::new(),
-                name: name.into(),
-                enabled: true,
-                trigger,
-                conditions: vec![Step::new("time-between")
-                    .with("from", "08:00")
-                    .with("to", "20:00")],
-                actions,
-                run_on: Side::Desk,
-                modified: 0,
-                deleted: false,
-            };
-            let first = automations::save_rule(rule(
-                "",
-                Step::new("wifi")
-                    .with("state", "connected")
-                    .with("ssid", "Home"),
-                vec![Step::new("notify").with("title", "Welcome home")],
-            ));
-            let second = automations::save_rule(rule(
-                "Quiet evenings",
-                Step::new("time").with("at", "21:30").with("days", "12345"),
-                vec![
-                    Step::new("pause-media"),
-                    Step::new("phone-ringer").with("mode", "vibrate"),
-                ],
-            ));
-            let third = automations::save_rule(rule(
-                "Welcome back",
-                Step::new("desk-resume"),
-                vec![Step::new("notify").with("title", "Welcome back")],
-            ));
-            debug_log!("[E2E] fake-rules: {first:?} {second:?} {third:?}");
-            if let Some(first) = automations::rules()
-                .into_iter()
-                .find(|rule| !rule.is_builtin())
-            {
-                automations::test_run(&first.id);
-            }
-            win.refresh_soon();
-        }
-        // "fire KIND": an automation trigger here, as if it happened.
-        "fire" => {
-            crate::device_links::automations::fire(crate::device_links::automations::Step::new(id))
-        }
         // F8b: "fake-bucket": a Bucket with items in every state for the
         // selected device (shots without a phone); "bucket-on" turns the real
         // one on; "bucket-add PATH" adds a file or folder as a drop would.
@@ -2350,34 +2277,6 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                     vec![std::path::PathBuf::from(id)],
                     arg,
                 );
-            }
-        }
-        "rule-template" => {
-            let name = win
-                .selected_id()
-                .and_then(|id| {
-                    win.imp()
-                        .fake_devices
-                        .borrow()
-                        .iter()
-                        .find(|device| device.id == id)
-                        .map(|device| device.name.clone())
-                })
-                .unwrap_or_else(|| "the phone".into());
-            if let Some((_, rule)) = automations::templates(&name)
-                .into_iter()
-                .nth(id.parse().unwrap_or(0))
-            {
-                automations::edit(win, rule);
-            }
-        }
-        "expand-rules" => {
-            if let Some((scroll, _)) = win.imp().bodies.borrow().get("automations").cloned() {
-                for row in named_widgets(scroll.upcast_ref(), "rule-row") {
-                    if let Some(row) = row.downcast_ref::<adw::ExpanderRow>() {
-                        row.set_expanded(true);
-                    }
-                }
             }
         }
         "fake-snippet" => {
@@ -2812,15 +2711,6 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
             }
         }
     }
-    // "camera" / "camera-asked": the phone as a webcam.
-    if kind.starts_with("camera") {
-        device.camera = Some(crate::device_links::device::CameraUse {
-            live: kind == "camera",
-            facing: "back".into(),
-            width: 1280,
-            height: 720,
-        });
-    }
     // "ringing" / "talking": a call on the phone.
     use crate::device_links::device::{CallState, CallStatus, PhoneCall};
     let call = match kind {
@@ -3017,7 +2907,6 @@ mod tests {
                 "clipboard",
                 "contacts",
                 "notes",
-                "automations",
                 "bucket",
                 "history",
                 "preferences"

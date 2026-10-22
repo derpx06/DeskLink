@@ -1257,10 +1257,10 @@ mod tests {
         }
     }
 
-    /// The phone's presenter remote: next/previous slide, start the show,
-    /// leave it, and blank the screen ("b", sent as text).
+    /// Special keys from the phone reach the desktop as the keys apps
+    /// expect: Page Down/Up, F5, Escape; a letter is typed.
     #[test]
-    fn presenter_keys_reach_the_desktop_as_the_keys_slides_expect() {
+    fn special_keys_reach_the_desktop_as_the_keys_apps_expect() {
         let pressed = |special: i64| {
             let mut packet = NetworkPacket::new("desklink.mousepad.request");
             packet.set("specialKey", special);

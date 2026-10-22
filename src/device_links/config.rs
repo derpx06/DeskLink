@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use openssl::asn1::Asn1Time;
@@ -92,19 +92,9 @@ pub struct AppSettings {
     /// pill), besides the Quick Settings menu. Off by default.
     #[serde(default)]
     pub top_bar_pill: bool,
-    /// The commands a phone may run here (Preferences → Run Commands).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub run_commands: Vec<RunCommand>,
     /// The last folders a phone started a terminal in, newest first.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent_folders: Vec<String>,
-    /// Preferences → Calls: offer this computer's speaker and microphone
-    /// for calls, over Bluetooth (experimental; off by default).
-    pub call_audio: bool,
-    /// Each phone's Bluetooth address, once the user confirmed it is that
-    /// phone (by DeskLink device id).
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub call_audio_devices: std::collections::BTreeMap<String, String>,
     /// Preferences → Notifications to Phone: send this computer's
     /// notifications to the phones (off by default), only from these apps
     /// (app id, desktop entry or name).
@@ -123,16 +113,9 @@ pub struct AppSettings {
     /// phone at a time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub glide: Option<crate::device_links::glide::GlideSetting>,
-}
-
-/// A command a phone may run here, in a shared terminal.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RunCommand {
-    /// Opaque, stable: what the phone sends back to run it.
-    pub id: String,
-    pub name: String,
-    /// Run through the login shell (`$SHELL -lc`).
-    pub command: String,
+    /// Pause this computer's music while the phone is in a call, and resume
+    /// it after (on by default).
+    pub pause_media_on_call: bool,
 }
 
 impl Default for AppSettings {
@@ -150,15 +133,13 @@ impl Default for AppSettings {
             muted_command_alerts: Default::default(),
             unlock_devices: Default::default(),
             top_bar_pill: false,
-            run_commands: Vec::new(),
             recent_folders: Vec::new(),
-            call_audio: false,
-            call_audio_devices: Default::default(),
             forward_notifications: false,
             forward_apps: Default::default(),
             desk_mic_to_phone: false,
             contact_caller_names: Default::default(),
             glide: None,
+            pause_media_on_call: true,
         }
     }
 }
@@ -301,6 +282,19 @@ pub(crate) fn set_remote_desktop_token(device_id: &str, token: Option<&str>) {
     }
 }
 
+/// What features removed in 1.3 left in `base_dir`: the automations' sealed
+/// rules and their key.
+const REMOVED_FEATURE_DIRS: [&str; 1] = ["automations"];
+
+/// Deletes what removed features stored in `base_dir`. Whether any was there.
+fn remove_stored_removed_features(base_dir: &Path) -> bool {
+    REMOVED_FEATURE_DIRS
+        .iter()
+        .filter(|name| fs::remove_dir_all(base_dir.join(name)).is_ok())
+        .count()
+        > 0
+}
+
 pub struct Config {
     base_dir: PathBuf,
     stored: StoredConfig,
@@ -370,6 +364,10 @@ impl Config {
             mirror_terminal_access(&device.id, device.terminal_access);
         }
         mirror_settings(&stored.settings);
+        // Features that were removed: what they stored goes, quietly. The
+        // settings that went with them are dropped by the save below
+        // (unknown keys are not kept); pairing records and the rest stay.
+        remove_stored_removed_features(&base_dir);
         let config = Self {
             base_dir,
             stored,
@@ -438,11 +436,6 @@ impl Config {
     /// Folder sync pairs and manifests (F8), encrypted.
     pub fn folders_dir(&self) -> PathBuf {
         self.base_dir.join("folders")
-    }
-
-    /// Automation rules and their history (F7), encrypted.
-    pub fn automations_dir(&self) -> PathBuf {
-        self.base_dir.join("automations")
     }
 
     /// The phones' contact caches (F5), encrypted.
@@ -767,8 +760,8 @@ mod tests {
             "per phone"
         );
         assert!(one.alerts_commands_to("phone") && !one.alerts_commands_to("tablet"));
-        assert!(old.run_commands.is_empty() && old.recent_folders.is_empty());
-        assert!(!written.contains("run_commands") && !written.contains("recent_folders"));
+        assert!(old.recent_folders.is_empty());
+        assert!(!written.contains("recent_folders"));
 
         let mut hidden = AppSettings::default();
         hidden.hidden_notifications.insert("phone".into());
@@ -906,6 +899,64 @@ mod tests {
         assert!(!reloaded.stored.trusted_devices[&id].terminal_access);
         assert!(!terminal_access_allowed(&id));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 1.3: what removed features stored is deleted on the first start, quietly;
+    /// pairing records, the certificate and every other preference stay.
+    #[test]
+    fn the_stored_data_of_removed_features_goes_on_first_start_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("desklink-removed-{}", Uuid::new_v4()));
+        let id = format!("phone-{}", Uuid::new_v4().simple());
+        let config = trusted_config(&dir, &id, "cert-a");
+        let device_id = config.stored.device_id.clone();
+        drop(config);
+        // As a 1.2 install left things: sealed automation rules and their
+        // key, and run-command and call-audio settings in config.json.
+        let automations = dir.join("automations");
+        fs::create_dir_all(&automations).unwrap();
+        fs::write(automations.join("rules.sealed"), b"sealed").unwrap();
+        fs::write(automations.join("key"), b"k").unwrap();
+        let path = dir.join("config.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        json["settings"]["run_commands"] =
+            serde_json::json!([{"id": "a", "name": "Deploy", "command": "make"}]);
+        json["settings"]["call_audio"] = true.into();
+        json["settings"]["call_audio_devices"] = serde_json::json!({"p": "AA:BB"});
+        json["settings"]["stay_awake"] = true.into();
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let before = fs::read(dir.join("certificate.pem")).unwrap();
+
+        let reloaded = Config::load_from_dir(dir.clone()).unwrap();
+        assert!(!automations.exists(), "the rules and their key are gone");
+        let written = fs::read_to_string(&path).unwrap();
+        for gone in ["run_commands", "call_audio"] {
+            assert!(!written.contains(gone), "{gone} still in config.json");
+        }
+        assert_eq!(reloaded.stored.device_id, device_id, "same device id");
+        assert!(
+            reloaded.stored.trusted_devices.contains_key(&id),
+            "pairing kept"
+        );
+        assert!(
+            reloaded.stored.settings.stay_awake,
+            "other preferences kept"
+        );
+        assert_eq!(fs::read(dir.join("certificate.pem")).unwrap(), before);
+        // A second start has nothing to remove and changes nothing.
+        assert!(!remove_stored_removed_features(&dir));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// "Pause music during calls" is on unless turned off, also for a
+    /// config written before the switch existed.
+    #[test]
+    fn pausing_music_during_calls_defaults_on() {
+        assert!(AppSettings::default().pause_media_on_call);
+        let old: AppSettings = serde_json::from_str(r#"{"stay_awake": true}"#).unwrap();
+        assert!(old.pause_media_on_call);
+        let off: AppSettings = serde_json::from_str(r#"{"pause_media_on_call": false}"#).unwrap();
+        assert!(!off.pause_media_on_call);
     }
 
     /// Settings default off, survive a restart, and load from a config that

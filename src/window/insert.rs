@@ -1,7 +1,7 @@
 //! The phone's camera in the window: the overview's Camera action, a
-//! popover with the webcam (C4) and Insert from the phone (F3) — a photo, a
-//! scanned document, the text in a picture or a QR code — and a bar while a
-//! capture waits for the phone, with Cancel.
+//! popover with Insert from the phone (F3) — a photo, a scanned document,
+//! the text in a picture or a QR code — and a bar while a capture waits for
+//! the phone, with Cancel.
 
 use adw::prelude::*;
 
@@ -53,21 +53,6 @@ pub(super) fn attach_menu(daemon: &DaemonHandle, device: &DeviceView, button: &g
         .margin_end(6)
         .build();
     let popover = gtk::Popover::builder().child(&list).build();
-    if device.camera.is_none() {
-        let webcam = row("camera-web-symbolic", "Use as Webcam…");
-        let (daemon, view, popover, anchor) = (
-            daemon.clone(),
-            device.clone(),
-            popover.clone(),
-            button.clone(),
-        );
-        webcam.connect_clicked(move |_| {
-            popover.popdown();
-            super::camera::ask(&daemon, &view, &anchor);
-        });
-        list.append(&webcam);
-        list.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    }
     for (kind, target, label, icon) in CAPTURES {
         let item = row(icon, label);
         let (daemon, id, popover) = (daemon.clone(), device.id.clone(), popover.clone());
