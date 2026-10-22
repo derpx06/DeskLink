@@ -96,7 +96,7 @@ fn bar(
         .hexpand(true)
         .valign(gtk::Align::Center)
         .build();
-    words.append(&text(&headline, &["heading"]));
+    words.append(&ellipsized(&headline, &["heading"]));
     words.append(&ellipsized(&detail, &["text-dim"]));
     bar.append(&words);
     bar.update_property(&[gtk::accessible::Property::Label(&format!(

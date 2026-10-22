@@ -5,7 +5,7 @@
 
 use adw::prelude::*;
 
-use super::{ellipsized, icon_square, text, DeviceView};
+use super::{ellipsized, icon_square, DeviceView};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 
 /// What each row asks for: kind, target, label, icon.
@@ -119,7 +119,7 @@ pub(super) fn bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Box
             "Continue on the phone".to_string(),
         )
     };
-    words.append(&text(&headline, &["heading"]));
+    words.append(&ellipsized(&headline, &["heading"]));
     if !detail.is_empty() {
         words.append(&ellipsized(&detail, &["text-dim"]));
     }

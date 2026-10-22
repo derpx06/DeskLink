@@ -121,12 +121,12 @@ pub(super) struct Page {
     device: Rc<RefCell<(String, String)>>,
 }
 
-/// Cards a line in the grids: at least two, at most five, as wide allows.
+/// Cards a line in the grids: one to five, as wide allows.
 fn grid() -> gtk::FlowBox {
     gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .homogeneous(true)
-        .min_children_per_line(2)
+        .min_children_per_line(1)
         .max_children_per_line(5)
         .column_spacing(14)
         .row_spacing(14)

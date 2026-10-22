@@ -96,10 +96,13 @@ pub(super) fn open(path: &Path) -> Rc<PdfView> {
     let zoom_out = tool("zoom-out-symbolic", "Zoom Out");
     let fit = tool("zoom-fit-best-symbolic", "Fit Width");
     let zoom_in = tool("zoom-in-symbolic", "Zoom In");
+    // Short, so the bar fits a phone-width window.
     let open_default = gtk::Button::builder()
-        .label("Open in Default App")
+        .label("Open")
+        .tooltip_text("Open in Default App")
         .css_classes(["flat"])
         .build();
+    open_default.update_property(&[gtk::accessible::Property::Label("Open in Default App")]);
     bar.append(&page_label);
     bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     bar.append(&zoom_out);

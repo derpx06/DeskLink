@@ -132,6 +132,9 @@ pub(super) fn card(daemon: &DaemonHandle, device: &DeviceView, compact: bool) ->
         .build();
     if compact {
         card.add_css_class("compact");
+    } else {
+        // On a narrow page the buttons go under the caller.
+        card.set_widget_name("responsive");
     }
     if ringing {
         card.add_css_class("ringing");
@@ -171,12 +174,33 @@ pub(super) fn card(daemon: &DaemonHandle, device: &DeviceView, compact: bool) ->
         detail_words(&device.name, status, now_ms())
     ))]);
     let can = can_send_feature(device, PACKET_TYPE_TELEPHONY_REQUEST);
-    let actions = gtk::Box::builder()
-        .spacing(8)
-        .valign(gtk::Align::Center)
-        .build();
+    // On a narrow page the buttons wrap under the caller.
+    let actions = super::overview::wrap_row(1, 3);
+    actions.set_column_spacing(8);
+    actions.set_row_spacing(8);
+    if !compact {
+        actions.set_widget_name("hero-wrap");
+    }
     for (action, label, icon, classes) in buttons(status) {
-        let button = icon_button(icon, label, classes);
+        // The bar over other pages stays one line at any width: icons only,
+        // their words in the tooltip and for screen readers.
+        let button = if compact {
+            let button = gtk::Button::builder()
+                .icon_name(icon)
+                .tooltip_text(label)
+                .css_classes(
+                    classes
+                        .iter()
+                        .copied()
+                        .chain(["circular"])
+                        .collect::<Vec<_>>(),
+                )
+                .build();
+            button.update_property(&[gtk::accessible::Property::Label(label)]);
+            button
+        } else {
+            icon_button(icon, label, classes)
+        };
         button.set_sensitive(can);
         if !can {
             button.set_tooltip_text(Some("Update DeskLink on the phone to answer here"));
@@ -189,7 +213,7 @@ pub(super) fn card(daemon: &DaemonHandle, device: &DeviceView, compact: bool) ->
                 None,
             ))
         });
-        actions.append(&button);
+        super::overview::add_wrapped(&actions, &button);
     }
     card.append(&actions);
     Some(card)

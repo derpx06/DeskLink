@@ -107,8 +107,8 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         page.append(&super::pairing::pair_waiting_view(device));
     }
     let clamp = adw::Clamp::builder()
-        .maximum_size(940)
-        .tightening_threshold(720)
+        .maximum_size(1120)
+        .tightening_threshold(960)
         .child(&page)
         .build();
     win.replace_body("overview", &clamp);
@@ -247,11 +247,13 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         .halign(gtk::Align::End)
         .valign(gtk::Align::Center)
         .build();
+    actions.set_widget_name("hero-actions");
     let reason = unavailable_reason(device);
-    let buttons = gtk::Box::builder()
-        .spacing(8)
-        .halign(gtk::Align::End)
-        .build();
+    // Both wrap rather than run off the page: the buttons onto two lines,
+    // the round actions onto as many rows as the width needs.
+    let buttons = wrap_row(1, 2);
+    buttons.set_row_spacing(8);
+    buttons.set_widget_name("hero-wrap");
     if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
         let show = icon_button(
             "video-display-symbolic",
@@ -269,7 +271,7 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
             }
         });
         disable_with(&show, reason.as_deref());
-        buttons.append(&show);
+        add_wrapped(&buttons, &show);
     }
     if can_send_feature(device, PACKET_TYPE_SHARE_REQUEST) {
         let send = icon_button(
@@ -280,14 +282,13 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         let (daemon, id) = (daemon.clone(), device.id.clone());
         send.connect_clicked(move |button| pick_and_send_files(&daemon, &id, button));
         disable_with(&send, reason.as_deref());
-        buttons.append(&send);
+        add_wrapped(&buttons, &send);
     }
     actions.append(&buttons);
 
-    let round = gtk::Box::builder()
-        .spacing(2)
-        .halign(gtk::Align::End)
-        .build();
+    let round = wrap_row(3, 3);
+    round.set_homogeneous(true);
+    round.set_widget_name("hero-wrap");
     let kind = device_type_label(&device.device_type);
     for (packet, icon, label, accessible, action) in [
         (
@@ -346,7 +347,7 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
             }
         }
         disable_with(&button, reason.as_deref());
-        round.append(&button);
+        add_wrapped(&round, &button);
     }
     // Type on the phone (C2), for a phone that reports its focused field.
     if crate::type_on_phone::supported(device) {
@@ -361,7 +362,7 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
             crate::type_on_phone::open(&daemon, &id, root.as_ref());
         });
         disable_with(&typing, reason.as_deref());
-        round.append(&typing);
+        add_wrapped(&round, &typing);
     }
     // The phone's camera, from a phone that can share its screen: as a
     // webcam (C4), or for a photo, scan, text or QR code here (F3).
@@ -376,7 +377,7 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         );
         super::insert::attach_menu(daemon, device, &camera);
         disable_with(&camera, reason.as_deref());
-        round.append(&camera);
+        add_wrapped(&round, &camera);
     }
     // Sound both ways (F1): one round action, its two switches in a popover.
     if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
@@ -390,8 +391,17 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         }
         super::sound::attach_menu(daemon, device, &button);
         disable_with(&button, reason.as_deref());
-        round.append(&button);
+        add_wrapped(&round, &button);
     }
+    // One row when the page has room for them all: a FlowBox's natural
+    // width is its maximum line.
+    let mut count = 0;
+    let mut cell = round.first_child();
+    while let Some(next) = cell {
+        count += 1;
+        cell = next.next_sibling();
+    }
+    round.set_max_children_per_line(count.max(3));
     actions.append(&round);
     band.append(&actions);
     band
@@ -402,6 +412,26 @@ fn disable_with(button: &gtk::Button, reason: Option<&str>) {
     if let Some(reason) = reason {
         button.set_sensitive(false);
         button.set_tooltip_text(Some(reason));
+    }
+}
+
+/// A row of controls that wraps when the page is too narrow for it. Its
+/// cells are not focus stops: Tab goes from control to control.
+pub(super) fn wrap_row(min: u32, max: u32) -> gtk::FlowBox {
+    gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .min_children_per_line(min)
+        .max_children_per_line(max)
+        .column_spacing(2)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Center)
+        .build()
+}
+
+pub(super) fn add_wrapped(row: &gtk::FlowBox, widget: &impl IsA<gtk::Widget>) {
+    row.append(widget);
+    if let Some(cell) = widget.as_ref().parent() {
+        cell.set_focusable(false);
     }
 }
 
@@ -654,7 +684,7 @@ fn live_banner(
     if let Some(since) = since.filter(|since| !since.is_empty()) {
         detail.push_str(&format!(" · since {since}"));
     }
-    words.append(&text(&headline, &["heading"]));
+    words.append(&ellipsized(&headline, &["heading"]));
     let detail_label = ellipsized(&detail, &["text-dim"]);
     detail_label.set_hexpand(true);
     words.append(&detail_label);
@@ -662,6 +692,11 @@ fn live_banner(
     banner.update_property(&[gtk::accessible::Property::Label(&format!(
         "{headline}{detail}"
     ))]);
+    // Its buttons stack at the right edge when the page is narrow.
+    let controls = wrap_row(1, 3);
+    controls.set_row_spacing(6);
+    controls.set_column_spacing(6);
+    banner.append(&controls);
     // A second display (F2) is placed with the desktop's display settings.
     if device.desktop_extended {
         if let Some(settings) = gtk::glib::find_program_in_path("gnome-control-center") {
@@ -670,7 +705,7 @@ fn live_banner(
             arrange.connect_clicked(move |_| {
                 let _ = std::process::Command::new(&settings).arg("display").spawn();
             });
-            banner.append(&arrange);
+            add_wrapped(&controls, &arrange);
         }
     }
     // Its speaker toggle (F1): this computer's sound to the phone too.
@@ -694,7 +729,7 @@ fn live_banner(
             &sound.tooltip_text().unwrap_or_default(),
         )]);
         super::sound::toggle(daemon, device, "desk-sound", &sound);
-        banner.append(&sound);
+        add_wrapped(&controls, &sound);
     }
     let end = super::soft_button("End All");
     end.set_css_classes(&["coral-outline"]);
@@ -713,7 +748,7 @@ fn live_banner(
             },
         );
     });
-    banner.append(&end);
+    add_wrapped(&controls, &end);
     banner
 }
 

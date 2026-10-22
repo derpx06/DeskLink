@@ -4,7 +4,7 @@
 
 use adw::prelude::*;
 
-use super::{ellipsized, icon_square, text, DeviceView};
+use super::{ellipsized, icon_square, DeviceView};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 
 /// The bar shown while the phone's camera is asked for or in use.
@@ -37,7 +37,7 @@ pub(super) fn bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Box
             "Allow it on the phone".to_string(),
         )
     };
-    words.append(&text(&headline, &["heading"]));
+    words.append(&ellipsized(&headline, &["heading"]));
     words.append(&ellipsized(&detail, &["text-dim"]));
     bar.append(&words);
     bar.update_property(&[gtk::accessible::Property::Label(&format!(

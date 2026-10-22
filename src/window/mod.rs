@@ -104,9 +104,14 @@ mod imp {
         #[template_child]
         pub narrow_breakpoint: TemplateChild<adw::Breakpoint>,
         #[template_child]
+        pub compact_breakpoint: TemplateChild<adw::Breakpoint>,
+        #[template_child]
         pub toast_overlay: TemplateChild<adw::ToastOverlay>,
         /// The window is phone-narrow: grids go one to a line.
         pub narrow: Cell<bool>,
+        /// The page area is under 760sp wide (window narrow, or the sidebar
+        /// takes the room): rows stack.
+        pub compact: Cell<bool>,
         pub daemon: RefCell<Option<DaemonHandle>>,
         pub selected_device_id: RefCell<Option<String>>,
         /// The page shown, one of [`PAGES`]' names.
@@ -188,6 +193,20 @@ mod imp {
                     window.apply_layout();
                 }
             });
+            for (apply, compact) in [(true, true), (false, false)] {
+                let window = obj.downgrade();
+                let changed = move |_: &adw::Breakpoint| {
+                    if let Some(window) = window.upgrade() {
+                        window.imp().compact.set(compact);
+                        window.apply_layout();
+                    }
+                };
+                if apply {
+                    self.compact_breakpoint.connect_apply(changed);
+                } else {
+                    self.compact_breakpoint.connect_unapply(changed);
+                }
+            }
 
             self.sidebar.replace(Some(sidebar::Sidebar::new(&obj)));
             for (name, _, _) in PAGES {
@@ -852,6 +871,7 @@ impl DesklinkWindow {
     /// goes one to a line.
     fn apply_layout(&self) {
         let narrow = self.imp().narrow.get();
+        let compact = narrow || self.imp().compact.get();
         // Tighter page edges, for `style.css`.
         if narrow {
             self.add_css_class("narrow");
@@ -863,7 +883,7 @@ impl DesklinkWindow {
             match widget.widget_name().as_str() {
                 "responsive" => {
                     if let Some(row) = widget.downcast_ref::<gtk::Box>() {
-                        row.set_orientation(if narrow {
+                        row.set_orientation(if compact {
                             gtk::Orientation::Vertical
                         } else {
                             gtk::Orientation::Horizontal
@@ -875,6 +895,18 @@ impl DesklinkWindow {
                         grid.set_max_children_per_line(if narrow { 1 } else { 3 });
                     }
                 }
+                // Right-aligned beside the hero's name; under it when the
+                // hero stacks.
+                "hero-actions" => widget.set_halign(if compact {
+                    gtk::Align::Fill
+                } else {
+                    gtk::Align::End
+                }),
+                "hero-wrap" => widget.set_halign(if compact {
+                    gtk::Align::Start
+                } else {
+                    gtk::Align::End
+                }),
                 _ => {}
             }
             let mut child = widget.first_child();
@@ -1931,9 +1963,43 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 }
             }
         }
+        // "click TEXT": clicks the visible button whose tooltip starts with
+        // TEXT (underscores for spaces), e.g. to open the Camera popover.
+        "click" => {
+            let wanted = id.replace('_', " ");
+            let mut stack = vec![win.clone().upcast::<gtk::Widget>()];
+            while let Some(widget) = stack.pop() {
+                if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                    if button.is_mapped()
+                        && button
+                            .tooltip_text()
+                            .is_some_and(|tip| tip.starts_with(&wanted))
+                    {
+                        button.emit_clicked();
+                        break;
+                    }
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    child = next.next_sibling();
+                    stack.push(next);
+                }
+            }
+        }
         "close-dialog" => {
             if let Some(dialog) = win.visible_dialog() {
                 dialog.close();
+            }
+            let mut stack = vec![win.clone().upcast::<gtk::Widget>()];
+            while let Some(widget) = stack.pop() {
+                if let Some(popover) = widget.downcast_ref::<gtk::Popover>() {
+                    popover.popdown();
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    child = next.next_sibling();
+                    stack.push(next);
+                }
             }
         }
         // "open-viewer N": the selected device's Nth file still on disk.
@@ -1946,6 +2012,51 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             if let Some(index) = id.parse::<usize>().ok().filter(|n| *n < files.len()) {
                 viewer::show(win, &files, index, "Pixel 9");
             }
+        }
+        // "too-wide N [window]": the widgets on the visible page (or the
+        // whole window) whose minimum width is over N px, deepest first (the
+        // ones to fix for a narrow window).
+        "too-wide" => {
+            let limit: i32 = id.parse().unwrap_or(340);
+            let mut found = Vec::new();
+            let root: gtk::Widget = if arg == "window" {
+                win.imp().toast_overlay.get().upcast()
+            } else {
+                win.imp().page_stack.get().upcast()
+            };
+            let mut stack = vec![(root, 0)];
+            while let Some((widget, depth)) = stack.pop() {
+                let (min, _, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+                if min > limit && widget.is_visible() && widget.is_mapped() {
+                    let wide_child = {
+                        let mut child = widget.first_child();
+                        let mut any = false;
+                        while let Some(next) = child {
+                            if next.is_mapped()
+                                && next.measure(gtk::Orientation::Horizontal, -1).0 > limit
+                            {
+                                any = true;
+                            }
+                            child = next.next_sibling();
+                        }
+                        any
+                    };
+                    if !wide_child {
+                        found.push(format!(
+                            "{min}px {} {:?} {:?}",
+                            widget.type_().name(),
+                            widget.widget_name(),
+                            widget.css_classes()
+                        ));
+                    }
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    stack.push((next.clone(), depth + 1));
+                    child = next.next_sibling();
+                }
+            }
+            debug_log!("[E2E] too-wide {limit}: {found:#?}");
         }
         "window-size" => {
             if let (Ok(width), Ok(height)) = (id.parse(), arg.parse()) {
@@ -1988,6 +2099,14 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 imp.page_stack.width(),
                 imp.page_stack.height()
             );
+            for widget in named_widgets(&imp.page_stack.get().upcast(), "hero-") {
+                let (min, nat, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
+                debug_log!(
+                    "[E2E] {}: {} wide, min {min}, natural {nat}",
+                    widget.widget_name(),
+                    widget.width()
+                );
+            }
         }
         "focus-info" => {
             let focus = gtk::prelude::RootExt::focus(win);
@@ -2177,9 +2296,23 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
             );
             device.terminal_access = true;
             device.rtt_ms = Some(9);
-            if kind == "live" {
+            if kind == "live" || kind == "extended" {
                 device.terminal_sessions_attached = 1;
                 device.desktop_session = DesktopSession::Viewing;
+            }
+            // "extended": a second display, with sound going and a capture
+            // asked for — every bar the overview can show.
+            if kind == "extended" {
+                device.desktop_extended = true;
+                device.sound = Some(crate::device_links::device::SoundUse {
+                    sending: Some("system".into()),
+                    hearing: Some("mic".into()),
+                    hearing_live: true,
+                });
+                device.capture = Some(crate::device_links::device::CaptureUse {
+                    kind: "scan".into(),
+                    receiving: false,
+                });
             }
         }
     }

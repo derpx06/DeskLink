@@ -63,7 +63,8 @@ pub(super) fn show(win: &DesklinkWindow, items: &[LoggedFile], index: usize, dev
     let title = adw::WindowTitle::new("", "");
     let header = adw::HeaderBar::builder().title_widget(&title).build();
 
-    let open_with = gtk::Button::builder().label("Open With…").build();
+    // An icon: the header must fit a phone-width window.
+    let open_with = header_button("document-open-symbolic", "Open With…");
     let zoom = header_button("zoom-original-symbolic", "Actual Size");
     let copy = header_button("edit-copy-symbolic", "Copy");
     let folder = header_button("folder-open-symbolic", "Show in Folder");
