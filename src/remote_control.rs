@@ -83,6 +83,12 @@ thread_local! {
         RefCell::new(std::collections::HashMap::new());
 }
 
+/// How to turn on the phone's control, shown when it refuses for that. A
+/// sideloaded app's accessibility switch is greyed out until Android's
+/// "restricted settings" are allowed for it.
+const ACCESSIBILITY_STEPS: &str = "On the phone: Settings → Accessibility → DeskLink → On \
+     (if it's greyed out: App info → ⋮ → Allow restricted settings first)";
+
 pub fn show_remote_control_dialog(
     daemon: DaemonHandle,
     device_id: String,
@@ -360,9 +366,8 @@ pub fn show_remote_control_dialog(
                 daemon.send(DaemonCommand::RequestPhoneControl(device.to_string()));
                 last_control_request.set(std::time::Instant::now());
             }
-            let denial = session_control_denial(device.as_str()).map(|reason| {
-                format!("{reason} — on the phone: Settings → Accessibility → DeskLink → On")
-            });
+            let denial = session_control_denial(device.as_str())
+                .map(|reason| format!("{reason} — {ACCESSIBILITY_STEPS}"));
             let paintable = crate::device_links::webrtc::screen::stream_for(device.as_str())
                 .and_then(|stream| stream.paintable());
             if picture.paintable() != paintable {
