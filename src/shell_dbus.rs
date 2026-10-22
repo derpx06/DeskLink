@@ -260,6 +260,13 @@ fn shell_device(device: &DeviceView, settings: &AppSettings) -> ShellDevice {
             && battery.is_some_and(|battery| battery.is_charging),
         path: device.connection_path.clone().unwrap_or_default(),
         screen: match device.desktop_session {
+            // Glide (F4): this computer's pointer is on the phone.
+            DesktopSession::None
+                if crate::device_links::glide::status().gliding.as_deref()
+                    == Some(device.id.as_str()) =>
+            {
+                "glide"
+            }
             DesktopSession::None => "",
             DesktopSession::Viewing => "view",
             DesktopSession::Controlling => "control",
@@ -1032,8 +1039,10 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 9] = [
-    // The current build (F6: Snippets and New Note in the menu).
+const KNOWN_BUILDS: [&str; 10] = [
+    // The current build (F4: glide in the live row).
+    "1ce14fd319e5ac1654c16dfa8a79910c95da9bdcca33f880f5f3f62654de440d",
+    // F6: Snippets and New Note in the menu.
     "d15f25a0eaca4d3f37d6423d5eefafeadacd0dc3fb8e6c07389ce7861d701f50",
     // Top-bar redesign: menu.js, the glyph icon.
     "299c2cbb85734c4379c74cf5afd4e6d3a73f3d9ab9fb4cc1738de0b165297da5",

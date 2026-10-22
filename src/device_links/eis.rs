@@ -408,6 +408,143 @@ fn send(devices: &[Emulated], command: &Command, serial: u32) {
     }
 }
 
+/// One event from a receiver context (input capture, F4 glide): what the
+/// compositor captured, evdev codes and logical-pixel deltas.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Captured {
+    /// The compositor started sending: `sequence` is the portal activation
+    /// id this burst belongs to.
+    Start(u32),
+    Motion(f64, f64),
+    Button(u32, bool),
+    /// Smooth scroll, logical pixels.
+    Scroll(f64, f64),
+    /// Wheel clicks, in 120ths of a click.
+    Discrete(i32, i32),
+    Key(u32, bool),
+    /// The locked modifier mask (XKB: Caps Lock is 2).
+    Locked(u32),
+    /// The connection closed.
+    Closed,
+}
+
+/// How long the receiver's handshake may take before it is given up.
+const RECEIVER_HANDSHAKE: Duration = Duration::from_secs(5);
+
+/// Starts a receiver context on an input-capture portal's socket: a thread
+/// that forwards what it captures to `forward` until the socket closes or
+/// the other end hangs up. A full channel drops events (counted), never
+/// blocks or grows.
+pub(crate) fn spawn_receiver(
+    socket: OwnedFd,
+    name: &str,
+    forward: impl Fn(Captured) -> bool + Send + 'static,
+) -> Result<(), String> {
+    let stream = UnixStream::from(socket);
+    // The handshake reads blocking; a server that never answers must not
+    // hold the thread forever.
+    let _ = stream.set_read_timeout(Some(RECEIVER_HANDSHAKE));
+    let name = name.to_string();
+    std::thread::Builder::new()
+        .name("desklink-ei-capture".into())
+        .spawn(move || {
+            let Ok(context) = ei::Context::new(stream) else {
+                forward(Captured::Closed);
+                return;
+            };
+            let response = match reis::handshake::ei_handshake_blocking(
+                &context,
+                &name,
+                ei::handshake::ContextType::Receiver,
+            ) {
+                Ok(response) => response,
+                Err(error) => {
+                    eprintln!("[DeskLink] Input capture refused DeskLink: {error}");
+                    forward(Captured::Closed);
+                    return;
+                }
+            };
+            let mut converter = EiEventConverter::new(&context, response);
+            receive(&context, &mut converter, &forward);
+            forward(Captured::Closed);
+        })
+        .map(|_| ())
+        .map_err(|error| format!("Could not start the input capture reader: {error}"))
+}
+
+fn receive(
+    context: &ei::Context,
+    converter: &mut EiEventConverter,
+    forward: &impl Fn(Captured) -> bool,
+) {
+    loop {
+        let mut poll = libc::pollfd {
+            fd: context.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd for the duration of the call.
+        let ready = unsafe { libc::poll(&mut poll, 1, 100) };
+        if ready > 0 {
+            match context.read() {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return,
+            }
+        }
+        while let Some(pending) = context.pending_event() {
+            if let reis::PendingRequestResult::Request(request) = pending {
+                if converter.handle_event(request).is_err() {
+                    return;
+                }
+            }
+        }
+        while let Some(event) = converter.next_event() {
+            let captured = match event {
+                EiEvent::Disconnected(_) => return,
+                EiEvent::SeatAdded(added) => {
+                    added.seat.bind_capabilities(&[
+                        DeviceCapability::Pointer,
+                        DeviceCapability::Button,
+                        DeviceCapability::Scroll,
+                        DeviceCapability::Keyboard,
+                    ]);
+                    None
+                }
+                EiEvent::DeviceStartEmulating(start) => Some(Captured::Start(start.sequence)),
+                EiEvent::PointerMotion(motion) => {
+                    Some(Captured::Motion(f64::from(motion.dx), f64::from(motion.dy)))
+                }
+                EiEvent::Button(button) => Some(Captured::Button(
+                    button.button,
+                    button.state == ei::button::ButtonState::Press,
+                )),
+                EiEvent::ScrollDelta(scroll) => {
+                    Some(Captured::Scroll(f64::from(scroll.dx), f64::from(scroll.dy)))
+                }
+                EiEvent::ScrollDiscrete(scroll) => {
+                    Some(Captured::Discrete(scroll.discrete_dx, scroll.discrete_dy))
+                }
+                EiEvent::KeyboardKey(key) => Some(Captured::Key(
+                    key.key,
+                    key.state == ei::keyboard::KeyState::Press,
+                )),
+                EiEvent::KeyboardModifiers(modifiers) => Some(Captured::Locked(modifiers.locked)),
+                _ => None,
+            };
+            if let Some(captured) = captured {
+                if !forward(captured) {
+                    return;
+                }
+            }
+        }
+        if context.flush().is_err() {
+            return;
+        }
+    }
+}
+
 /// A point at fractions `(x, y)` of `region`, inside it.
 fn region_point(region: &reis::event::Region, x: f64, y: f64) -> (f32, f32) {
     let inside = |origin: u32, size: u32, fraction: f64| {

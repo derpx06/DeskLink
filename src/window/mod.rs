@@ -565,6 +565,20 @@ impl DesklinkWindow {
                         e2e_daemon.send(DaemonCommand::Sound(id, what.into(), state == "on"));
                         return;
                     }
+                    // "glide ID left|right|top|bottom|off" (F4; an `e2e-*`
+                    // id glides with no phone, its packets logged).
+                    if verb == "glide" {
+                        let edge = crate::device_links::glide::Edge::ALL
+                            .into_iter()
+                            .find(|edge| format!("{edge:?}").eq_ignore_ascii_case(&arg));
+                        let id = if id == "selected" {
+                            win.selected_id().unwrap_or_default()
+                        } else {
+                            id
+                        };
+                        e2e_daemon.send(DaemonCommand::SetGlide(id, edge));
+                        return;
+                    }
                     if verb == "desk-terminal" {
                         let result = crate::device_links::pty::desk::new_desk_session();
                         debug_log!("[E2E] desk-terminal: {result:?}");
@@ -1952,6 +1966,12 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             }
         }
         // "scroll-end PAGE": that page scrolled to its end.
+        // "scroll-to PAGE Y": that page scrolled to Y pixels.
+        "scroll-to" => {
+            if let Some((scroll, _)) = win.imp().bodies.borrow().get(id).cloned() {
+                scroll.vadjustment().set_value(arg.parse().unwrap_or(0.0));
+            }
+        }
         "scroll-end" => {
             if let Some((scroll, _)) = win.imp().bodies.borrow().get(id).cloned() {
                 let adjustment = scroll.vadjustment();

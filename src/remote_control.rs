@@ -699,7 +699,7 @@ fn remote_control_lease_active(device_id: &str) -> bool {
     crate::device_links::webrtc::coordinator::has_remote_control_lease(device_id)
 }
 
-fn map_gdk_key_to_special(keyval: Key) -> i32 {
+pub(crate) fn map_gdk_key_to_special(keyval: Key) -> i32 {
     match keyval {
         Key::BackSpace => 1,
         Key::Tab => 2,

@@ -752,6 +752,11 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             });
             Ok(())
         }
+        // Glide (F4): the phone hands the pointer back.
+        crate::device_links::packet::PACKET_TYPE_SHARE_INPUT_DEVICES => {
+            crate::device_links::glide::phone_released(device_id, &packet);
+            Ok(())
+        }
         // Snippets and notes (F6): index, fetch or items, both ways.
         crate::device_links::packet::PACKET_TYPE_SNIPPETS
         | crate::device_links::packet::PACKET_TYPE_NOTES => {

@@ -223,6 +223,7 @@ impl DaemonWorker {
                 crate::device_links::desk_notifications::start();
             }
             crate::device_links::mpris::start();
+            crate::device_links::glide::start();
             crate::device_links::pty::jobs::start_watch();
         }
 

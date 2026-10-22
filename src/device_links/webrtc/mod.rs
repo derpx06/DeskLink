@@ -9,7 +9,7 @@ pub(crate) mod file_protocol;
 mod handover;
 pub(crate) mod ice;
 mod peer_connection;
-mod remote_desktop_portal;
+pub(crate) mod remote_desktop_portal;
 pub(crate) mod virtual_display;
 // The one portal entry point the UI may call: asking for consent, not input.
 #[cfg(debug_assertions)]

@@ -18,10 +18,10 @@ use gtk::gio::prelude::*;
 use gtk::glib::variant::{ObjectPath, ToVariant};
 use gtk::{gio, glib};
 
-const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
-const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
+pub(crate) const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
+pub(crate) const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const REQUEST_INTERFACE: &str = "org.freedesktop.portal.Request";
-const SESSION_INTERFACE: &str = "org.freedesktop.portal.Session";
+pub(crate) const SESSION_INTERFACE: &str = "org.freedesktop.portal.Session";
 const REMOTE_INTERFACE: &str = "org.freedesktop.portal.RemoteDesktop";
 const SCREEN_INTERFACE: &str = "org.freedesktop.portal.ScreenCast";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
@@ -1055,7 +1055,7 @@ fn type_text(
 /// `OpenPipeWireRemote` returns `(h)`: a D-Bus *handle*, which is an index into
 /// the fd list that travels with the reply. It is a different variant type from
 /// `i32`, so reading it as one never succeeds.
-fn pipewire_fd_index(reply: &glib::Variant) -> Result<i32, String> {
+pub(crate) fn pipewire_fd_index(reply: &glib::Variant) -> Result<i32, String> {
     reply
         .child_value(0)
         .get::<glib::variant::Handle>()
@@ -1080,7 +1080,7 @@ fn text_keysyms(text: &str) -> Vec<i32> {
         .collect()
 }
 
-fn request(
+pub(crate) fn request(
     context: &glib::MainContext,
     connection: &gio::DBusConnection,
     cancel: &AtomicBool,
@@ -1173,23 +1173,23 @@ fn request(
         .map_err(|error| error.to_string())?
 }
 
-fn options(build: impl FnOnce(&glib::VariantDict)) -> glib::Variant {
+pub(crate) fn options(build: impl FnOnce(&glib::VariantDict)) -> glib::Variant {
     let dict = glib::VariantDict::new(None);
     build(&dict);
     dict.end()
 }
 
-fn tuple(values: impl IntoIterator<Item = glib::Variant>) -> glib::Variant {
+pub(crate) fn tuple(values: impl IntoIterator<Item = glib::Variant>) -> glib::Variant {
     glib::Variant::tuple_from_iter(values)
 }
 
-fn object_path(path: &str) -> Result<glib::Variant, String> {
+pub(crate) fn object_path(path: &str) -> Result<glib::Variant, String> {
     ObjectPath::try_from(path.to_string())
         .map(|path| path.to_variant())
         .map_err(|_| "Desktop portal returned an invalid object path".to_string())
 }
 
-fn lookup<T: glib::variant::FromVariant>(
+pub(crate) fn lookup<T: glib::variant::FromVariant>(
     values: &glib::Variant,
     key: &str,
 ) -> Result<Option<T>, String> {
@@ -1209,7 +1209,7 @@ fn dict_value(values: &glib::Variant, key: &str) -> Option<glib::Variant> {
     dict.lookup_value(key, None)
 }
 
-fn token() -> String {
+pub(crate) fn token() -> String {
     format!("desklink_{}", uuid::Uuid::new_v4().simple())
 }
 

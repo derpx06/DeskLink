@@ -59,6 +59,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         settings.shows_notifications(&device.id),
         &clip,
         &minute,
+        gliding_onto(&device.id),
     ))
     .unwrap_or_default();
     if !win.page_changed("overview", key) {
@@ -82,6 +83,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         }
         for sound in super::sound::bars(daemon, device) {
             page.append(&sound);
+        }
+        if gliding_onto(&device.id) {
+            page.append(&glide_bar(device));
         }
         if let Some(capture) = super::insert::bar(daemon, device) {
             page.append(&capture);
@@ -1316,6 +1320,38 @@ fn refresh_in_place(win: &DesklinkWindow, daemon: &DaemonHandle) {
             label.set_label(&progress_words(row));
         }
     }
+}
+
+/// Whether this computer's pointer is on `device_id` now (glide, F4).
+fn gliding_onto(device_id: &str) -> bool {
+    crate::device_links::glide::status().gliding.as_deref() == Some(device_id)
+}
+
+/// The coral in-use bar while gliding. No Stop button: every click goes to
+/// the phone then; Esc+Super is the way back.
+fn glide_bar(device: &DeviceView) -> gtk::Box {
+    let bar = gtk::Box::builder()
+        .spacing(14)
+        .css_classes(["live-banner"])
+        .build();
+    bar.append(&icon_square("input-mouse-symbolic", 28, "live-icon"));
+    let words = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
+    let headline = format!("Controlling {}", device.name);
+    let detail = "This mouse and keyboard are on the phone. Esc+Super to return.";
+    words.append(&ellipsized(&headline, &["heading"]));
+    let detail_label = text(detail, &["text-dim"]);
+    detail_label.set_wrap(true);
+    detail_label.set_xalign(0.0);
+    words.append(&detail_label);
+    bar.append(&words);
+    bar.update_property(&[gtk::accessible::Property::Label(&format!(
+        "{headline}. {detail}"
+    ))]);
+    bar
 }
 
 #[cfg(test)]

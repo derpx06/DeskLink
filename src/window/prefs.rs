@@ -55,7 +55,10 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     let bonded = settings
         .call_audio
         .then(crate::device_links::call_audio::bonded_phones);
+    // Glide's availability and problem; its switch and edge update in place.
+    let glide_status = crate::device_links::glide::status();
     let key = serde_json::to_string(&(
+        format!("{:?}{:?}", glide_status.availability, glide_status.problem),
         &device.id,
         &device.name,
         approving,
@@ -120,6 +123,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     connection.add(&notifications);
     page.append(&connection);
 
+    if let Some(glide) = glide_group(daemon, &settings, device, &glide_status) {
+        page.append(&glide);
+    }
     page.append(&calls_group(win, daemon, &settings, device, bonded));
     page.append(&forward_group(daemon, &settings));
     page.append(&sound_group(daemon, &settings));
@@ -1281,6 +1287,153 @@ fn unpair_button(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Button {
         );
     });
     button
+}
+
+/// Glide (F4): the pointer glides onto this phone past an edge of this
+/// screen. A switch, and where the phone sits (a small arrangement: this
+/// screen with a phone slot on each side). Hidden, with the reason, where
+/// the desktop cannot capture input.
+fn glide_group(
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    device: &DeviceView,
+    status: &crate::device_links::glide::Status,
+) -> Option<adw::PreferencesGroup> {
+    use crate::device_links::glide::{Availability, Edge};
+    let group = adw::PreferencesGroup::builder().title("Glide").build();
+    match status.availability {
+        Availability::Checking => return None,
+        Availability::Unavailable(reason) => {
+            let row = adw::ActionRow::builder()
+                .title(format!("Glide onto {}", device.name))
+                .subtitle(reason)
+                .build();
+            with_icon(&row, "input-mouse-symbolic");
+            row.update_property(&[gtk::accessible::Property::Description(reason)]);
+            group.add(&row);
+            return Some(group);
+        }
+        Availability::Available => {}
+    }
+    let phone = device.name.clone();
+    let explained = format!(
+        "Move the pointer past the edge of this screen to use {phone} with this mouse and \
+         keyboard. Esc+Super brings it back."
+    );
+    let current = settings
+        .glide
+        .as_ref()
+        .filter(|glide| glide.device == device.id)
+        .map(|glide| glide.edge);
+    let switch = adw::SwitchRow::builder()
+        .title(format!("Glide onto {phone}"))
+        .subtitle(&explained)
+        .active(current.is_some())
+        .build();
+    with_icon(&switch, "input-mouse-symbolic");
+    switch.update_property(&[gtk::accessible::Property::Description(&explained)]);
+    follow(&switch, |settings, id| {
+        settings
+            .glide
+            .as_ref()
+            .is_some_and(|glide| glide.device == id)
+    });
+    group.add(&switch);
+
+    // The arrangement: a phone slot on each side of this screen.
+    let grid = gtk::Grid::builder()
+        .row_spacing(8)
+        .column_spacing(8)
+        .halign(gtk::Align::Center)
+        .margin_top(14)
+        .margin_bottom(14)
+        .build();
+    let screen = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .width_request(132)
+        .height_request(80)
+        .valign(gtk::Align::Center)
+        .css_classes(["glide-screen"])
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
+    let monitor = gtk::Image::builder()
+        .icon_name("desklink-device-desktop-symbolic")
+        .pixel_size(24)
+        .vexpand(true)
+        .valign(gtk::Align::End)
+        .build();
+    screen.append(&monitor);
+    let label = gtk::Label::builder()
+        .label("This screen")
+        .vexpand(true)
+        .valign(gtk::Align::Start)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    screen.append(&label);
+    grid.attach(&screen, 1, 1, 1, 1);
+    let mut first: Option<gtk::ToggleButton> = None;
+    let mut slots = Vec::new();
+    for edge in Edge::ALL {
+        let words = format!("{phone} is {} this screen", edge.words());
+        let button = gtk::ToggleButton::builder()
+            .icon_name("desklink-device-phone-symbolic")
+            .tooltip_text(&words)
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::Center)
+            .css_classes(["circular", "glide-slot"])
+            .active(current.unwrap_or(Edge::Right) == edge)
+            .build();
+        button.update_property(&[gtk::accessible::Property::Label(&words)]);
+        match first.as_ref() {
+            Some(group) => button.set_group(Some(group)),
+            None => first = Some(button.clone()),
+        }
+        let (row, column) = match edge {
+            Edge::Left => (1, 0),
+            Edge::Right => (1, 2),
+            Edge::Top => (0, 1),
+            Edge::Bottom => (2, 1),
+        };
+        grid.attach(&button, column, row, 1, 1);
+        slots.push((edge, button.clone()));
+        let (daemon, id, switch) = (daemon.clone(), device.id.clone(), switch.downgrade());
+        button.connect_toggled(move |button| {
+            if button.is_active() && switch.upgrade().is_some_and(|switch| switch.is_active()) {
+                daemon.send(DaemonCommand::SetGlide(id.clone(), Some(edge)));
+            }
+        });
+    }
+    let arrangement = adw::PreferencesRow::builder()
+        .activatable(false)
+        .child(&grid)
+        .visible(current.is_some())
+        .build();
+    arrangement.update_property(&[gtk::accessible::Property::Label(&format!(
+        "Where {phone} sits"
+    ))]);
+    group.add(&arrangement);
+    let (daemon, id) = (daemon.clone(), device.id.clone());
+    switch.connect_active_notify(move |switch| {
+        arrangement.set_visible(switch.is_active());
+        // The slot shown as chosen (right by default).
+        let edge = switch.is_active().then(|| {
+            slots
+                .iter()
+                .find(|(_, button)| button.is_active())
+                .map_or(Edge::Right, |(edge, _)| *edge)
+        });
+        daemon.send(DaemonCommand::SetGlide(id.clone(), edge));
+    });
+    if let Some(problem) = status.problem.as_deref() {
+        let row = adw::ActionRow::builder()
+            .title("Glide is not working")
+            .subtitle(problem)
+            .build();
+        row.add_prefix(&icon_square("dialog-warning-symbolic", 30, "row-icon"));
+        group.add(&row);
+    }
+    Some(group)
 }
 
 #[cfg(test)]

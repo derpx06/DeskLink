@@ -89,6 +89,9 @@ pub enum DaemonCommand {
     SetCommandAlerts(String, bool),
     /// Let this phone, on this network, unlock this computer when approved.
     SetUnlockNearby(String, bool),
+    /// Glide (F4): the pointer glides onto this phone past this edge, or
+    /// off (`None`) for it.
+    SetGlide(String, Option<crate::device_links::glide::Edge>),
     /// Name this phone's callers from the contacts it shares (F5 K4).
     SetContactCallerNames(String, bool),
     /// The commands a phone may run here (replaces the list).
@@ -274,6 +277,20 @@ impl DaemonWorker {
                 } else {
                     settings.unlock_devices.remove(&id);
                 }
+            }),
+            DaemonCommand::SetGlide(id, edge) => self.update_settings(|settings| match edge {
+                Some(edge) => {
+                    settings.glide =
+                        Some(crate::device_links::glide::GlideSetting { device: id, edge })
+                }
+                None if settings
+                    .glide
+                    .as_ref()
+                    .is_some_and(|glide| glide.device == id) =>
+                {
+                    settings.glide = None
+                }
+                None => {}
             }),
             DaemonCommand::SetContactCallerNames(id, on) => self.update_settings(|settings| {
                 if on {

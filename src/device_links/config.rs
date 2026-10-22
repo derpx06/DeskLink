@@ -118,6 +118,11 @@ pub struct AppSettings {
     /// contacts they share (F5 K4; off by default, per phone).
     #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub contact_caller_names: std::collections::BTreeSet<String>,
+    /// Glide (F4): the phone this computer's pointer glides onto, and the
+    /// edge of this screen it sits at. `None` (the default) is off; one
+    /// phone at a time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub glide: Option<crate::device_links::glide::GlideSetting>,
 }
 
 /// A command a phone may run here, in a shared terminal.
@@ -153,6 +158,7 @@ impl Default for AppSettings {
             forward_apps: Default::default(),
             desk_mic_to_phone: false,
             contact_caller_names: Default::default(),
+            glide: None,
         }
     }
 }
@@ -602,6 +608,17 @@ impl Config {
         // and so is the contacts cache.
         set_remote_desktop_token(device_id, None);
         crate::device_links::contacts::forget_in(&self.contacts_dir(), device_id);
+        // Glide onto it, too (F4).
+        if self
+            .stored
+            .settings
+            .glide
+            .as_ref()
+            .is_some_and(|glide| glide.device == device_id)
+        {
+            self.stored.settings.glide = None;
+            mirror_settings(&self.stored.settings);
+        }
         self.save_or_restore(device_id, previous)?;
         crate::device_links::relay_link::client::reset();
         Ok(())

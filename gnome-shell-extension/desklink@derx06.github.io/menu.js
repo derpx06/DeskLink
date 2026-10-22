@@ -84,6 +84,8 @@ export function sessionLine(device) {
         parts.push('controlling the screen');
     else if (device.screen === 'view')
         parts.push('viewing the screen');
+    else if (device.screen === 'glide')
+        parts.push('this mouse and keyboard are on it · Esc+Super to return');
     if (device.terminals > 0)
         parts.push(device.terminals === 1 ? '1 terminal' : `${device.terminals} terminals`);
     return parts.join(' · ');
