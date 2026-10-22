@@ -1811,6 +1811,47 @@ a=max-message-size:262144\r\n";
         pub(crate) answerer: Arc<DesktopWebRtcPeer>,
         pub(crate) offerer_events: mpsc::Receiver<PeerEvent>,
         pub(crate) answerer_events: mpsc::Receiver<PeerEvent>,
+        _watchdog: Watchdog,
+    }
+
+    /// How long a loopback test may take before the run is stopped. Tests
+    /// take seconds; this is for a GStreamer deadlock (a state change
+    /// waiting on a blocked streaming thread), which otherwise hangs the
+    /// whole suite with nothing to say which test.
+    const LOOPBACK_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// Ends the test run, naming the test, if it outlives its limit; the
+    /// test ending (the loopback dropped) disarms it.
+    struct Watchdog(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Watchdog {
+        fn start(limit: std::time::Duration) -> Self {
+            use std::sync::atomic::Ordering;
+            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let test = std::thread::current()
+                .name()
+                .unwrap_or("a loopback test")
+                .to_string();
+            let watching = Arc::clone(&done);
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + limit;
+                while std::time::Instant::now() < deadline {
+                    if watching.load(Ordering::Acquire) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                eprintln!("{test} hung for {limit:?}: stopping the test run");
+                std::process::abort();
+            });
+            Self(done)
+        }
+    }
+
+    impl Drop for Watchdog {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Wires two peers together: signalling events from each are applied to the
@@ -1826,6 +1867,7 @@ a=max-message-size:262144\r\n";
         offer_audio: bool,
         munge: fn(SignalingMessageType, &str) -> String,
     ) -> Loopback {
+        let watchdog = Watchdog::start(LOOPBACK_LIMIT);
         let ice = IceServerConfig {
             local_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
             ..IceServerConfig::default()
@@ -1893,6 +1935,7 @@ a=max-message-size:262144\r\n";
             answerer,
             offerer_events,
             answerer_events,
+            _watchdog: watchdog,
         }
     }
 

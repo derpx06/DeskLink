@@ -572,3 +572,9 @@ button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.0
 }
 .call-answer { background-color: @call_green; color: white; }
 .call-answer:hover { background-color: shade(@call_green, 1.1); }
+
+/* A PDF page in the viewer: paper on the stage. */
+.pdf-page {
+  background-color: white;
+  box-shadow: 0 1px 4px alpha(black, 0.28);
+}

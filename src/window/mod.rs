@@ -33,6 +33,7 @@ pub(crate) mod history;
 pub(crate) mod notifications;
 mod overview;
 mod pairing;
+mod pdf_view;
 pub(crate) mod prefs;
 mod sidebar;
 mod terminals;

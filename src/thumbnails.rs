@@ -237,7 +237,10 @@ fn make(key: String, path: &Path, kind: FileKind) -> Reply {
             duration,
         };
     }
-    if none.exists() || on_fuse(path) || !matches!(kind, FileKind::Image | FileKind::Video) {
+    if none.exists()
+        || on_fuse(path)
+        || !matches!(kind, FileKind::Image | FileKind::Video | FileKind::Pdf)
+    {
         return Reply::Failed { key };
     }
     let (done, made) = std::sync::mpsc::channel();
@@ -249,6 +252,7 @@ fn make(key: String, path: &Path, kind: FileKind) -> Reply {
         .spawn(move || {
             let result = match kind {
                 FileKind::Image => image(&source).map(|pixbuf| (pixbuf, None)),
+                FileKind::Pdf => pdf_page(&source).map(|pixbuf| (page_top(&pixbuf), None)),
                 _ => video_frame(&source),
             }
             .map(|(pixbuf, length)| {
@@ -344,6 +348,114 @@ fn texture(pixbuf: &Pixbuf) -> gdk::Texture {
         pixbuf.rowstride() as usize,
     )
     .upcast()
+}
+
+/// The shared freedesktop thumbnail cache (`$XDG_CACHE_HOME/thumbnails`),
+/// which Files and every other previewer read and write.
+fn freedesktop_dir() -> Option<PathBuf> {
+    // Tests must never write the person's cache.
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join(format!(
+            "desklink-test-xdg-thumbnails-{}",
+            std::process::id()
+        )));
+    }
+    Some(dirs::cache_dir()?.join("thumbnails"))
+}
+
+/// A file's modification time in whole seconds, as `Thumb::MTime` holds it.
+fn mtime_secs(path: &Path) -> Option<String> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    let secs = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(secs.to_string())
+}
+
+/// A PDF's first page: the freedesktop thumbnail another app already made
+/// for this version of the file, else drawn now with poppler (and written
+/// there for the others too). `Err` with neither: the card keeps its icon.
+fn pdf_page(path: &Path) -> Result<Pixbuf, String> {
+    let mtime = mtime_secs(path).ok_or("The file has no modification time")?;
+    let cache = freedesktop_dir().ok_or("No cache directory")?;
+    for size in ["large", "normal"] {
+        let Some(file) = crate::pdf::freedesktop_thumbnail(&cache, size, path) else {
+            continue;
+        };
+        if let Ok(pixbuf) = Pixbuf::from_file(&file) {
+            if pixbuf.option("tEXt::Thumb::MTime").as_deref() == Some(mtime.as_str()) {
+                return Ok(pixbuf);
+            }
+        }
+    }
+    let document = crate::pdf::Document::open(path)?;
+    let &(width, height) = document.sizes().first().ok_or("The PDF has no pages")?;
+    // The freedesktop "large" size: 256 px on the long side.
+    let pixels = if width >= height {
+        256
+    } else {
+        (256.0 * width / height).round() as i32
+    };
+    let page = document.render(0, pixels)?;
+    let pixbuf = Pixbuf::from_bytes(
+        &glib::Bytes::from_owned(page.rgba()),
+        gtk::gdk_pixbuf::Colorspace::Rgb,
+        true,
+        8,
+        page.width,
+        page.height,
+        page.width * 4,
+    );
+    write_freedesktop(&cache, path, &mtime, &pixbuf);
+    Ok(pixbuf)
+}
+
+/// The top of a page, in a card's wide shape: a document is recognised by
+/// its heading, not by a middle slice of it.
+fn page_top(page: &Pixbuf) -> Pixbuf {
+    let height = ((f64::from(page.width()) / 1.5).round() as i32).clamp(1, page.height());
+    page.new_subpixbuf(0, 0, page.width(), height)
+        .copy()
+        .unwrap_or_else(|| page.clone())
+}
+
+/// Saves `pixbuf` as `path`'s "large" freedesktop thumbnail: written aside
+/// and renamed into place (a reader never sees half a file), 0600 in a
+/// 0700 directory, with the URI and modification time it was made from.
+fn write_freedesktop(cache: &Path, path: &Path, mtime: &str, pixbuf: &Pixbuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let (Some(target), Ok(uri)) = (
+        crate::pdf::freedesktop_thumbnail(cache, "large", path),
+        glib::filename_to_uri(path, None),
+    ) else {
+        return;
+    };
+    let Some(dir) = target.parent() else {
+        return;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let _ = std::fs::set_permissions(cache, std::fs::Permissions::from_mode(0o700));
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    let aside = target.with_extension(format!("desklink-{}", std::process::id()));
+    let saved = pixbuf.savev(
+        &aside,
+        "png",
+        &[
+            ("tEXt::Thumb::URI", uri.as_str()),
+            ("tEXt::Thumb::MTime", mtime),
+            ("tEXt::Software", "DeskLink"),
+        ],
+    );
+    if saved.is_ok() {
+        let _ = std::fs::set_permissions(&aside, std::fs::Permissions::from_mode(0o600));
+        if std::fs::rename(&aside, &target).is_ok() {
+            return;
+        }
+    }
+    let _ = std::fs::remove_file(&aside);
 }
 
 /// An image scaled to fit [`SIZE`], the right way up.
@@ -506,6 +618,65 @@ mod tests {
         let found = presence(&here);
         assert!(found.exists && found.key.is_some());
         let _ = std::fs::remove_file(here);
+    }
+
+    /// A PDF's preview comes from the shared freedesktop cache when it was
+    /// made for this version of the file (even without poppler), and not
+    /// when the file changed since.
+    #[test]
+    fn a_pdf_uses_the_shared_thumbnail_made_for_its_version() {
+        let dir = std::env::temp_dir().join(format!("desklink-pdf-thumb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("scan.pdf");
+        std::fs::write(&path, b"not really a PDF").unwrap();
+        let mtime = mtime_secs(&path).unwrap();
+        let cache = freedesktop_dir().unwrap();
+        let shared = crate::pdf::freedesktop_thumbnail(&cache, "large", &path).unwrap();
+        assert!(
+            shared.starts_with(std::env::temp_dir()),
+            "never the real cache"
+        );
+        let picture = Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, true, 8, 20, 30).unwrap();
+        write_freedesktop(&cache, &path, &mtime, &picture);
+        assert!(shared.exists());
+        let found = pdf_page(&path).expect("the shared thumbnail is used");
+        assert_eq!((found.width(), found.height()), (20, 30));
+        // Made for another version of the file: not used (and this one
+        // cannot be drawn, it is not a PDF).
+        write_freedesktop(&cache, &path, "1", &picture);
+        assert!(pdf_page(&path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&shared);
+    }
+
+    /// With poppler here, a PDF's first page is drawn and shared.
+    #[test]
+    fn a_pdfs_first_page_is_drawn_and_shared_when_poppler_is_here() {
+        if !crate::pdf::available() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("desklink-pdf-draw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wide.pdf");
+        std::fs::write(&path, crate::pdf::MINIMAL_PDF).unwrap();
+        let page = pdf_page(&path).unwrap();
+        assert_eq!(
+            (page.width(), page.height()),
+            (256, 128),
+            "large: 256 on the long side"
+        );
+        let shared =
+            crate::pdf::freedesktop_thumbnail(&freedesktop_dir().unwrap(), "large", &path).unwrap();
+        let saved = Pixbuf::from_file(&shared).unwrap();
+        assert_eq!(
+            saved.option("tEXt::Thumb::MTime").as_deref(),
+            mtime_secs(&path).as_deref()
+        );
+        assert!(saved
+            .option("tEXt::Thumb::URI")
+            .is_some_and(|uri| uri.ends_with("wide.pdf")));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(&shared);
     }
 
     #[test]

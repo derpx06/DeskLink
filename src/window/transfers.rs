@@ -540,7 +540,9 @@ fn fill_preview(
     name: &str,
     kind: FileKind,
 ) {
-    let Some(key) = key.filter(|_| matches!(kind, FileKind::Image | FileKind::Video)) else {
+    let Some(key) =
+        key.filter(|_| matches!(kind, FileKind::Image | FileKind::Video | FileKind::Pdf))
+    else {
         overlay.add_overlay(&type_icon(name));
         return;
     };

@@ -1,6 +1,7 @@
 //! The viewer for transferred files, inside DeskLink: an image to fit or at
 //! full size (Ctrl+scroll or pinch to zoom), a video playing with its
-//! controls, anything else with Open With… and Show in Folder. Left and
+//! controls, a PDF's pages (`pdf_view`), anything else with Open With… and
+//! Show in Folder. Left and
 //! Right page through the files; Escape closes.
 
 use std::cell::RefCell;
@@ -26,6 +27,8 @@ struct State {
     picture: Option<gtk::Picture>,
     /// The video playing, for Space and for stopping it.
     stream: Option<gtk::MediaStream>,
+    /// The PDF shown, for zooming it.
+    pdf: Option<Rc<super::pdf_view::PdfView>>,
 }
 
 struct Viewer {
@@ -105,6 +108,7 @@ pub(super) fn show(win: &DesklinkWindow, items: &[LoggedFile], index: usize, dev
             texture: None,
             picture: None,
             stream: None,
+            pdf: None,
         }),
     });
 
@@ -171,7 +175,16 @@ pub(super) fn show(win: &DesklinkWindow, items: &[LoggedFile], index: usize, dev
         let ctrl = controller
             .current_event_state()
             .contains(gdk::ModifierType::CONTROL_MASK);
+        let pdf = weak
+            .upgrade()
+            .and_then(|viewer| viewer.state.borrow().pdf.clone());
         match weak.upgrade() {
+            Some(_) if ctrl && pdf.is_some() => {
+                if let Some(pdf) = pdf {
+                    pdf.zoom_by(1.15_f64.powf(-dy));
+                }
+                glib::Propagation::Stop
+            }
             Some(viewer) if ctrl => {
                 let scale = viewer.scale();
                 viewer.set_zoom(Some(scale * 1.15_f64.powf(-dy)));
@@ -186,13 +199,18 @@ pub(super) fn show(win: &DesklinkWindow, items: &[LoggedFile], index: usize, dev
     let (weak, start) = (Rc::downgrade(&viewer), Rc::clone(&base));
     pinch.connect_begin(move |_, _| {
         if let Some(viewer) = weak.upgrade() {
-            start.set(viewer.scale());
+            let pdf = viewer.state.borrow().pdf.clone();
+            start.set(pdf.map_or_else(|| viewer.scale(), |pdf| pdf.zoom()));
         }
     });
     let weak = Rc::downgrade(&viewer);
     pinch.connect_scale_changed(move |_, scale| {
         if let Some(viewer) = weak.upgrade() {
-            viewer.set_zoom(Some(base.get() * scale));
+            let pdf = viewer.state.borrow().pdf.clone();
+            match pdf {
+                Some(pdf) => pdf.set_zoom(base.get() * scale),
+                None => viewer.set_zoom(Some(base.get() * scale)),
+            }
         }
     });
     viewer.area.add_controller(pinch);
@@ -266,6 +284,7 @@ impl Viewer {
             state.zoom = None;
             state.texture = None;
             state.picture = None;
+            state.pdf = None;
         }
         let (index, count, device) = {
             let state = self.state.borrow();
@@ -293,6 +312,11 @@ impl Viewer {
         match kind {
             FileKind::Image => self.show_image(&file),
             FileKind::Video => self.show_video(&file),
+            FileKind::Pdf => {
+                let pdf = super::pdf_view::open(&file.path);
+                self.area.append(&pdf.root);
+                self.state.borrow_mut().pdf = Some(pdf);
+            }
             _ => self.show_other(&file),
         }
     }

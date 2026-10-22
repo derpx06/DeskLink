@@ -42,6 +42,7 @@ mod desk_menu;
 mod device_links;
 mod kde;
 mod link_glyph;
+mod pdf;
 mod phone_mpris;
 mod protocol;
 mod remote_control;
