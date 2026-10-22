@@ -1964,6 +1964,7 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                     length: Some(281_000),
                     can_seek: true,
                     album_art_url: None,
+                    album_art: None,
                 });
             }
             if id.starts_with("unreachable") {

@@ -281,6 +281,10 @@ pub(super) fn update_media_from_packet(
     device_id: &str,
     packet: &NetworkPacket,
 ) {
+    // Decoded here, before the lock the UI also takes.
+    let art = packet
+        .get_str("albumArtData")
+        .map(crate::device_links::media_art::phone_art);
     if let Ok(mut devices) = devices.lock() {
         let Some(device) = devices.get_mut(device_id) else {
             return;
@@ -308,6 +312,7 @@ pub(super) fn update_media_from_packet(
             length: None,
             can_seek: false,
             album_art_url: None,
+            album_art: None,
         });
 
         if let Some(players) = string_vec(packet.body.get("playerList")) {
@@ -352,7 +357,15 @@ pub(super) fn update_media_from_packet(
             media.can_seek = can_seek;
         }
         if let Some(album_art_url) = packet.get_str("albumArtUrl") {
-            media.album_art_url = Some(sanitize_text(album_art_url, 1024));
+            let url = sanitize_text(album_art_url, 1024);
+            // Another track's cover with no picture sent: none shown.
+            if art.is_none() && media.album_art_url.as_ref() != Some(&url) {
+                media.album_art = None;
+            }
+            media.album_art_url = Some(url);
+        }
+        if let Some(art) = art {
+            media.album_art = art;
         }
 
         device.media_status = Some(media);
@@ -998,6 +1011,67 @@ mod tests {
         let notifications = &devices.get(&info.id).unwrap().notifications;
         assert_eq!(notifications.len(), 1);
         assert_eq!(notifications[0].title, "New");
+    }
+
+    #[test]
+    fn the_phones_album_art_data_is_shown_and_a_bad_one_ignored() {
+        use base64::Engine as _;
+        use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
+        let picture = Pixbuf::new(Colorspace::Rgb, false, 8, 400, 300).unwrap();
+        picture.fill(0x3366_99ff);
+        let jpeg = picture
+            .save_to_bufferv("jpeg", &[("quality", "80")])
+            .unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(&jpeg);
+        let (devices, info) = test_devices();
+        let mpris = |art: &str, url: &str| {
+            let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_MPRIS);
+            packet.set("player", "Spotify");
+            packet.set("title", "Track");
+            packet.set("albumArtUrl", url);
+            packet.set("albumArtData", art);
+            packet
+        };
+        let cover = |devices: &Arc<Mutex<HashMap<String, DeviceView>>>| {
+            let mut devices = devices.lock().unwrap();
+            let device = devices.get_mut(&info.id).unwrap();
+            device.trusted = true;
+            device.feature_transport_ready = true;
+            let art = device.media_status.as_ref().unwrap().album_art.clone();
+            (art, crate::phone_mpris::shown_for(device).unwrap().art_url)
+        };
+
+        update_media_from_packet(&devices, &info.id, &mpris(&data, "content://a"));
+        let (art, url) = cover(&devices);
+        let art = art.expect("the cover is shown");
+        assert_eq!((art.width, art.height), (320, 240), "scaled to MAX_SIDE");
+        assert_eq!(art.pixels.len(), art.stride * 240);
+        let file = art.file.clone().unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), jpeg);
+        assert!(
+            url.unwrap().starts_with("file://"),
+            "the MPRIS player points at it"
+        );
+
+        let oversized = "A".repeat(crate::device_links::media_art::MAX_JPEG_BYTES / 3 * 4 + 8);
+        let png = base64::engine::general_purpose::STANDARD
+            .encode(picture.save_to_bufferv("png", &[]).unwrap());
+        let mut not_jpeg = jpeg.clone();
+        not_jpeg.truncate(40);
+        let truncated = base64::engine::general_purpose::STANDARD.encode(&not_jpeg);
+        for bad in [
+            oversized.as_str(),
+            "%%not base64%%",
+            png.as_str(),
+            truncated.as_str(),
+            "",
+        ] {
+            update_media_from_packet(&devices, &info.id, &mpris(&data, "content://a"));
+            update_media_from_packet(&devices, &info.id, &mpris(bad, "content://b"));
+            let (art, url) = cover(&devices);
+            assert!(art.is_none(), "ignored: {}", &bad[..bad.len().min(16)]);
+            assert_eq!(url, None);
+        }
     }
 
     #[test]

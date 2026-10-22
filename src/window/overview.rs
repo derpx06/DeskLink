@@ -540,7 +540,7 @@ fn now_playing_bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Bo
         .spacing(16)
         .css_classes(["dl-card", "now-playing"])
         .build();
-    bar.append(&art(52));
+    bar.append(&art(52, media.album_art.as_ref()));
     let words = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(3)
@@ -650,15 +650,40 @@ fn media_controls(
 }
 
 /// Album art stand-in: a soft gradient tile (the phone sends no artwork).
-fn art(size: i32) -> gtk::Box {
+/// The cover, or the gradient square when there is none. The pixels were
+/// decoded on the daemon thread; wrapping them is a copy-free texture.
+fn art(size: i32, cover: Option<&crate::device_links::media_art::PhoneArt>) -> gtk::Box {
     let art = gtk::Box::builder()
         .width_request(size)
         .height_request(size)
         .valign(gtk::Align::Center)
         .css_classes(["album-art"])
         .accessible_role(gtk::AccessibleRole::Presentation)
+        .overflow(gtk::Overflow::Hidden)
         .build();
     art.set_hexpand(false);
+    if let Some(cover) = cover {
+        let format = if cover.has_alpha {
+            gtk::gdk::MemoryFormat::R8g8b8a8
+        } else {
+            gtk::gdk::MemoryFormat::R8g8b8
+        };
+        let texture = gtk::gdk::MemoryTexture::new(
+            cover.width,
+            cover.height,
+            format,
+            &cover.pixels,
+            cover.stride,
+        );
+        let picture = gtk::Picture::builder()
+            .paintable(&texture)
+            .content_fit(gtk::ContentFit::Cover)
+            .hexpand(true)
+            .vexpand(true)
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build();
+        art.append(&picture);
+    }
     art
 }
 
@@ -853,7 +878,7 @@ fn columns(
         .filter(|media| !media.is_playing)
     {
         let bottom = gtk::Box::builder().spacing(14).build();
-        bottom.append(&art(44));
+        bottom.append(&art(44, media.album_art.as_ref()));
         let words = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(2)

@@ -129,11 +129,20 @@ pub(crate) fn shown_for(device: &DeviceView) -> Option<Shown> {
             .volume
             .map_or(1.0, |volume| (volume as f64 / 100.0).clamp(0.0, 1.0)),
         can_seek: media.can_seek,
-        // A phone-side path means nothing here; only a web address does.
+        // The cover the phone sent; else a web address (a phone-side path
+        // means nothing here).
         art_url: media
-            .album_art_url
-            .clone()
-            .filter(|url| url.starts_with("https://") || url.starts_with("http://")),
+            .album_art
+            .as_ref()
+            .and_then(|art| art.file.as_ref())
+            .and_then(|file| glib::filename_to_uri(file, None).ok())
+            .map(String::from)
+            .or_else(|| {
+                media
+                    .album_art_url
+                    .clone()
+                    .filter(|url| url.starts_with("https://") || url.starts_with("http://"))
+            }),
     })
 }
 
@@ -431,6 +440,7 @@ mod tests {
             length: Some(281_000),
             can_seek: true,
             album_art_url: Some("content://media/42".into()),
+            album_art: None,
         }
     }
 

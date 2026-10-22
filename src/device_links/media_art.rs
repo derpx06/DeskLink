@@ -249,6 +249,97 @@ fn encode_pixbuf(pixbuf: &Pixbuf) -> Result<Art, String> {
     Err("album art does not fit in 48 KB".to_string())
 }
 
+/// The phone's cover (`albumArtData`), decoded on the daemon thread: the UI
+/// wraps `pixels` in a texture without decoding, and the exported MPRIS
+/// player points at `file`.
+#[derive(Clone)]
+pub struct PhoneArt {
+    pub(crate) id: String,
+    pub(crate) width: i32,
+    pub(crate) height: i32,
+    pub(crate) has_alpha: bool,
+    pub(crate) stride: usize,
+    pub(crate) pixels: gtk::glib::Bytes,
+    pub(crate) file: Option<std::path::PathBuf>,
+}
+
+impl std::fmt::Debug for PhoneArt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PhoneArt({}, {}x{})", self.id, self.width, self.height)
+    }
+}
+
+/// Longest base64 `albumArtData` read: [`MAX_JPEG_BYTES`] encoded.
+const MAX_PHONE_ART_CHARS: usize = MAX_JPEG_BYTES.div_ceil(3) * 4;
+static PHONE_ART: Mutex<VecDeque<PhoneArt>> = Mutex::new(VecDeque::new());
+
+/// The phone's `albumArtData`, or `None` when it is empty, too big, not
+/// base64 or not a JPEG. The same picture again is not decoded again.
+pub(crate) fn phone_art(data: &str) -> Option<PhoneArt> {
+    if data.is_empty() || data.len() > MAX_PHONE_ART_CHARS {
+        return None;
+    }
+    let jpeg = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()
+        .filter(|jpeg| jpeg.len() <= MAX_JPEG_BYTES && jpeg.starts_with(&[0xff, 0xd8, 0xff]))?;
+    let id = art_id(&jpeg);
+    if let Some(known) = PHONE_ART
+        .lock()
+        .ok()
+        .and_then(|cache| cache.iter().find(|art| art.id == id).cloned())
+    {
+        return Some(known);
+    }
+    let loader = PixbufLoader::with_type("jpeg").ok()?;
+    loader.write(&jpeg).ok()?;
+    loader.close().ok()?;
+    let mut pixbuf = loader.pixbuf()?;
+    let (width, height) = (pixbuf.width(), pixbuf.height());
+    if width.max(height) > MAX_SIDE {
+        let scale = f64::from(MAX_SIDE) / f64::from(width.max(height));
+        pixbuf = pixbuf.scale_simple(
+            ((f64::from(width) * scale).round() as i32).max(1),
+            ((f64::from(height) * scale).round() as i32).max(1),
+            InterpType::Bilinear,
+        )?;
+    }
+    let art = PhoneArt {
+        file: write_phone_art(&id, &jpeg),
+        id,
+        width: pixbuf.width(),
+        height: pixbuf.height(),
+        has_alpha: pixbuf.has_alpha(),
+        stride: usize::try_from(pixbuf.rowstride()).ok()?,
+        pixels: pixbuf.read_pixel_bytes(),
+    };
+    if let Ok(mut cache) = PHONE_ART.lock() {
+        if cache.len() >= CACHED {
+            if let Some(old) = cache.pop_front() {
+                if let Some(file) = old.file {
+                    let _ = std::fs::remove_file(file);
+                }
+            }
+        }
+        cache.push_back(art.clone());
+    }
+    Some(art)
+}
+
+/// `$XDG_RUNTIME_DIR/desklink/art/<id>.jpg`, for the MPRIS `artUrl`.
+fn write_phone_art(id: &str, jpeg: &[u8]) -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let dir = gtk::glib::user_runtime_dir().join("desklink").join("art");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .ok()?;
+    let file = dir.join(format!("{id}.jpg"));
+    std::fs::write(&file, jpeg).ok()?;
+    Some(file)
+}
+
 /// A stable id for the encoded picture: the first 16 hex digits of its
 /// SHA-256.
 pub(crate) fn art_id(jpeg: &[u8]) -> String {

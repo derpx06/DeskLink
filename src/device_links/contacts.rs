@@ -108,6 +108,87 @@ pub(crate) fn parse_snapshot(packet: &NetworkPacket) -> Option<(BTreeMap<String,
     Some((stamps, sharing))
 }
 
+/// Parts one snapshot may come in (40 KiB each: ~1,200 uids per part).
+const MAX_SNAPSHOT_PARTS: u64 = 64;
+/// A snapshot not complete this long after its first part is dropped (and
+/// nothing is deleted for it).
+const SNAPSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_SNAPSHOT_ID_CHARS: usize = 128;
+
+/// A multi-part K1 snapshot being put together (Wire size, Android notes).
+#[derive(Debug)]
+struct Pending {
+    id: String,
+    parts: u64,
+    got: BTreeMap<u64, BTreeMap<String, String>>,
+    uids: usize,
+    started: std::time::Instant,
+}
+
+/// One K1 packet for `device_id`: the complete snapshot (and whether the
+/// phone shares) once every part of it is here, else `None`. A packet
+/// without `snapshot`/`part`/`parts` is a whole snapshot (older phones). At
+/// most one snapshot per phone is pending: another id replaces it, and one
+/// left incomplete past [`SNAPSHOT_TIMEOUT`] is dropped — deletion by absence
+/// only ever runs on a complete snapshot.
+fn assemble(
+    pending: &mut HashMap<String, Pending>,
+    device_id: &str,
+    packet: &NetworkPacket,
+    now: std::time::Instant,
+) -> Option<(BTreeMap<String, String>, bool)> {
+    let (stamps, sharing) = parse_snapshot(packet)?;
+    let id = packet.get_str("snapshot");
+    let (part, parts) = (packet.get_i64("part"), packet.get_i64("parts"));
+    if !sharing || (id.is_none() && part.is_none() && parts.is_none()) {
+        pending.remove(device_id);
+        return Some((stamps, sharing));
+    }
+    let (Some(id), Some(part), Some(parts)) = (id, part, parts) else {
+        return None;
+    };
+    let (Ok(part), Ok(parts)) = (u64::try_from(part), u64::try_from(parts)) else {
+        return None;
+    };
+    if id.is_empty()
+        || id.chars().count() > MAX_SNAPSHOT_ID_CHARS
+        || !(1..=MAX_SNAPSHOT_PARTS).contains(&parts)
+        || !(1..=parts).contains(&part)
+    {
+        return None;
+    }
+    let stale = pending.get(device_id).is_some_and(|known| {
+        known.id != id
+            || known.parts != parts
+            || now.duration_since(known.started) > SNAPSHOT_TIMEOUT
+    });
+    if stale {
+        pending.remove(device_id);
+    }
+    let entry = pending
+        .entry(device_id.to_string())
+        .or_insert_with(|| Pending {
+            id: id.to_string(),
+            parts,
+            got: BTreeMap::new(),
+            uids: 0,
+            started: now,
+        });
+    if !entry.got.contains_key(&part) {
+        entry.uids += stamps.len();
+        if entry.uids > MAX_CONTACTS {
+            pending.remove(device_id);
+            return None;
+        }
+        entry.got.insert(part, stamps);
+    }
+    if entry.got.len() as u64 != entry.parts {
+        return None;
+    }
+    let done = pending.remove(device_id)?;
+    Some((done.got.into_values().flatten().collect(), true))
+}
+
 fn valid_uid(uid: &str) -> bool {
     !uid.is_empty() && uid.len() <= MAX_UID_BYTES && !uid.chars().any(char::is_control)
 }
@@ -459,7 +540,16 @@ fn with_book<T>(device_id: &str, job: impl FnOnce(&mut Book, &Path) -> T) -> Opt
 
 /// A snapshot from `device_id` (K1): the requests to send.
 pub(crate) fn on_snapshot(device_id: &str, packet: &NetworkPacket) -> Vec<NetworkPacket> {
-    let Some((snapshot, sharing)) = parse_snapshot(packet) else {
+    static PENDING: Mutex<Option<HashMap<String, Pending>>> = Mutex::new(None);
+    let complete = PENDING.lock().ok().and_then(|mut pending| {
+        assemble(
+            pending.get_or_insert_with(HashMap::new),
+            device_id,
+            packet,
+            std::time::Instant::now(),
+        )
+    });
+    let Some((snapshot, sharing)) = complete else {
         return Vec::new();
     };
     if !sharing {
@@ -941,5 +1031,156 @@ X-UNKNOWN:ignored\r\nREV:2026-10-01T10:00:00Z\r\nEND:VCARD\r\n";
         forget_in(&dir, "phone-1");
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn part(id: &str, part: i64, parts: i64, entries: &[(&str, &str)]) -> NetworkPacket {
+        let mut packet = snapshot(entries, true);
+        packet.set("snapshot", id);
+        packet.set("part", part);
+        packet.set("parts", parts);
+        packet
+    }
+
+    fn book_with(uids: &[&str]) -> Book {
+        let mut book = Book::default();
+        for uid in uids {
+            book.contacts.insert(
+                uid.to_string(),
+                parse_vcard(uid, "BEGIN:VCARD\nFN:X\nEND:VCARD").unwrap(),
+            );
+            book.stamps.insert(uid.to_string(), "1".into());
+        }
+        book
+    }
+
+    #[test]
+    fn snapshot_parts_in_any_order_apply_once_as_one_book() {
+        let now = std::time::Instant::now();
+        let mut pending = HashMap::new();
+        let packets = [
+            part("s1", 3, 3, &[("e", "1")]),
+            part("s1", 1, 3, &[("a", "1"), ("b", "2")]),
+            part("s1", 1, 3, &[("a", "1"), ("b", "2")]),
+            part("s1", 2, 3, &[("c", "1")]),
+        ];
+        let done: Vec<_> = packets
+            .iter()
+            .filter_map(|packet| assemble(&mut pending, "phone", packet, now))
+            .collect();
+        assert_eq!(done.len(), 1, "applied once, on the last part");
+        let (stamps, sharing) = done.into_iter().next().unwrap();
+        assert!(sharing);
+        assert_eq!(stamps.keys().collect::<Vec<_>>(), ["a", "b", "c", "e"]);
+        // Deletion by absence runs across the union: only `d` goes.
+        let mut book = book_with(&["a", "c", "d", "e"]);
+        let ask = apply_snapshot(&mut book, stamps);
+        assert_eq!(book.contacts.keys().collect::<Vec<_>>(), ["a", "c", "e"]);
+        assert_eq!(ask, ["b"]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn a_missing_part_never_deletes_and_times_out() {
+        let start = std::time::Instant::now();
+        let mut pending = HashMap::new();
+        assert!(assemble(
+            &mut pending,
+            "phone",
+            &part("s1", 1, 2, &[("a", "1")]),
+            start
+        )
+        .is_none());
+        assert!(pending.contains_key("phone"));
+        // Part 2 arrives after the timeout: the old half was dropped, so
+        // this is only half of a fresh snapshot, not a complete one.
+        let late = start + SNAPSHOT_TIMEOUT + std::time::Duration::from_secs(1);
+        assert!(assemble(
+            &mut pending,
+            "phone",
+            &part("s1", 2, 2, &[("b", "1")]),
+            late
+        )
+        .is_none());
+        // Bad part numbers and an empty id are ignored.
+        for packet in [
+            part("s2", 0, 2, &[]),
+            part("s2", 3, 2, &[]),
+            part("", 1, 1, &[]),
+            part("s2", 1, MAX_SNAPSHOT_PARTS as i64 + 1, &[]),
+        ] {
+            assert!(assemble(&mut pending, "phone", &packet, late).is_none());
+        }
+    }
+
+    #[test]
+    fn a_newer_snapshot_supersedes_an_older_one() {
+        let now = std::time::Instant::now();
+        let mut pending = HashMap::new();
+        assert!(assemble(
+            &mut pending,
+            "phone",
+            &part("old", 1, 2, &[("a", "1")]),
+            now
+        )
+        .is_none());
+        assert!(assemble(
+            &mut pending,
+            "phone",
+            &part("new", 1, 2, &[("x", "1")]),
+            now
+        )
+        .is_none());
+        // The old snapshot's second part now starts it over, and is not enough.
+        assert!(assemble(
+            &mut pending,
+            "phone",
+            &part("old", 2, 2, &[("b", "1")]),
+            now
+        )
+        .is_none());
+        assert!(assemble(
+            &mut pending,
+            "phone",
+            &part("new", 1, 2, &[("x", "1")]),
+            now
+        )
+        .is_none());
+        let (stamps, _) = assemble(
+            &mut pending,
+            "phone",
+            &part("new", 2, 2, &[("y", "1")]),
+            now,
+        )
+        .unwrap();
+        assert_eq!(stamps.keys().collect::<Vec<_>>(), ["x", "y"]);
+        // Another phone's parts are its own.
+        assert!(assemble(&mut pending, "tablet", &part("new", 1, 2, &[]), now).is_none());
+        assert!(!pending.contains_key("phone"));
+    }
+
+    #[test]
+    fn a_single_packet_snapshot_still_applies_and_drops_a_pending_one() {
+        let now = std::time::Instant::now();
+        let mut pending = HashMap::new();
+        assert!(assemble(&mut pending, "phone", &part("s1", 1, 2, &[("a", "1")]), now).is_none());
+        let (stamps, sharing) =
+            assemble(&mut pending, "phone", &snapshot(&[("z", "1")], true), now).unwrap();
+        assert!(sharing);
+        assert_eq!(stamps.keys().collect::<Vec<_>>(), ["z"]);
+        assert!(pending.is_empty());
+        let (_, sharing) = assemble(&mut pending, "phone", &snapshot(&[], false), now).unwrap();
+        assert!(!sharing, "not sharing is applied at once");
+    }
+
+    #[test]
+    fn snapshot_parts_are_capped_at_max_contacts_uids() {
+        let now = std::time::Instant::now();
+        let mut pending = HashMap::new();
+        let uids: Vec<String> = (0..MAX_CONTACTS / 2 + 1).map(|n| format!("u{n}")).collect();
+        let entries: Vec<(&str, &str)> = uids.iter().map(|uid| (uid.as_str(), "1")).collect();
+        assert!(assemble(&mut pending, "phone", &part("big", 1, 3, &entries), now).is_none());
+        assert!(assemble(&mut pending, "phone", &part("big", 2, 3, &entries), now).is_none());
+        assert!(!pending.contains_key("phone"), "over the cap: dropped");
+        assert!(assemble(&mut pending, "phone", &part("big", 3, 3, &[]), now).is_none());
     }
 }

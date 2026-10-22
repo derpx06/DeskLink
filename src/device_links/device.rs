@@ -39,6 +39,9 @@ pub struct MediaStatus {
     pub length: Option<i64>,
     pub can_seek: bool,
     pub album_art_url: Option<String>,
+    /// The phone's cover, from `albumArtData`.
+    #[serde(skip)]
+    pub album_art: Option<crate::device_links::media_art::PhoneArt>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
