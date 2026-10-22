@@ -355,6 +355,22 @@ impl AudioSend {
         }
         let sink_pad = audio_sink_pad(webrtcbin)
             .ok_or_else(|| "This connection has no sound track".to_string())?;
+        // webrtcbin paces each input with a `clocksync`. Sound is pushed as
+        // it is captured (stamped with the running time), so waiting there
+        // only adds latency; a session started on a running connection
+        // also stalled in that wait after two packets.
+        if let Some(bin) = webrtcbin.downcast_ref::<gst::Bin>() {
+            for element in bin.iterate_recurse().into_iter().flatten() {
+                if element
+                    .factory()
+                    .is_some_and(|factory| factory.name() == "clocksync")
+                    && element.find_property("sync").is_some()
+                    && element.property::<bool>("sync")
+                {
+                    element.set_property("sync", false);
+                }
+            }
+        }
         let convert = make("audioconvert")?;
         let resample = make("audioresample")?;
         let caps = gst::ElementFactory::make("capsfilter")
@@ -388,6 +404,11 @@ impl AudioSend {
         // carried on: a new SSRC is a new receive pad on the far side (silence
         // until it is found), and a reset sequence trips SRTP's replay check.
         payloader.set_property("ssrc", continuity.ssrc);
+        // One RTP clock for the connection too: the payloader's timestamps
+        // are this offset plus the running time, so a new session carries on
+        // where the last one's time would be, instead of jumping (a jump the
+        // far side's jitter buffer sat out).
+        payloader.set_property("timestamp-offset", continuity.timestamp_offset);
         if let Some(next) = continuity.next_seqnum {
             payloader.set_property("seqnum-offset", i32::from(next));
         }
@@ -490,6 +511,7 @@ impl AudioSend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Continuity {
     pub(crate) ssrc: u32,
+    pub(crate) timestamp_offset: u32,
     pub(crate) next_seqnum: Option<u16>,
 }
 
