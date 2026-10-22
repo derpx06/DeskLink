@@ -734,7 +734,12 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         }
         // A report of the phone's focus ("Type on phone"), never an input.
         crate::device_links::packet::PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE => {
-            update_keyboard_state(devices, device_id, packet.get_bool("state"));
+            update_keyboard_state(
+                devices,
+                device_id,
+                packet.get_bool("state"),
+                packet.get_bool("allowed"),
+            );
             Ok(())
         }
         PACKET_TYPE_MOUSEPAD_REQUEST => {

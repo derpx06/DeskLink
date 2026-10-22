@@ -96,13 +96,35 @@ pub(crate) fn supported(device: &crate::device_links::device::DeviceView) -> boo
             .any(|capability| capability == PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE)
 }
 
-/// The line under the title: what the phone says about its focus.
-pub(crate) fn state_words(phone: &str, focused: Option<bool>) -> String {
+/// The line under the title: what the phone says about its focus, or that
+/// this computer (`desk`) may not type there.
+pub(crate) fn state_words(
+    phone: &str,
+    desk: &str,
+    focused: Option<bool>,
+    allowed: Option<bool>,
+) -> String {
+    if allowed == Some(false) {
+        return format!(
+            "Typing is off on {phone} — tap Allow in the notification on the phone \
+             (or Settings → {desk} → Let {desk} type on this phone)"
+        );
+    }
     match focused {
         Some(true) => format!("Typing into the field in focus on {phone}"),
         Some(false) => format!("Tap a text field on {phone} to type there"),
+        // Nothing reported on this connection yet.
         None => format!("Waiting for {phone}…"),
     }
+}
+
+/// This computer's name as the phone shows it (its host name).
+fn desk_name() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "this computer".to_string())
 }
 
 thread_local! {
@@ -141,7 +163,7 @@ pub(crate) fn open(daemon: &DaemonHandle, device_id: &str, parent: Option<&gtk::
         .css_classes(["title-3"])
         .build();
     let status = gtk::Label::builder()
-        .label(state_words(&name, None))
+        .label(state_words(&name, "", None, None))
         .wrap(true)
         .justify(gtk::Justification::Center)
         .build();
@@ -222,15 +244,19 @@ pub(crate) fn open(daemon: &DaemonHandle, device_id: &str, parent: Option<&gtk::
     {
         let (daemon, id, status) = (daemon.clone(), device_id.to_string(), status.downgrade());
         let name = name.clone();
+        let desk = desk_name();
         glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
             let Some(status) = status.upgrade() else {
                 return glib::ControlFlow::Break;
             };
             let device = daemon.devices().into_iter().find(|device| device.id == id);
             let words = match device.as_ref() {
-                Some(device) if device.feature_transport_ready => {
-                    state_words(&name, device.keyboard_focused)
-                }
+                Some(device) if device.feature_transport_ready => state_words(
+                    &name,
+                    &desk,
+                    device.keyboard_focused,
+                    device.keyboard_allowed,
+                ),
                 _ => format!("{name} is not connected"),
             };
             if status.label() != words {
@@ -277,13 +303,25 @@ mod tests {
     #[test]
     fn the_window_says_what_the_phone_reports() {
         assert_eq!(
-            state_words("Pixel", Some(true)),
+            state_words("Pixel", "desk", Some(true), None),
             "Typing into the field in focus on Pixel"
         );
         assert_eq!(
-            state_words("Pixel", Some(false)),
+            state_words("Pixel", "desk", Some(false), None),
             "Tap a text field on Pixel to type there"
         );
-        assert_eq!(state_words("Pixel", None), "Waiting for Pixel…");
+        assert_eq!(
+            state_words("Pixel", "desk", None, None),
+            "Waiting for Pixel…",
+            "no report yet: nothing implies a field is needed"
+        );
+        // The phone refused this computer: that, whatever the focus.
+        for focused in [None, Some(false), Some(true)] {
+            assert_eq!(
+                state_words("Pixel", "desk", focused, Some(false)),
+                "Typing is off on Pixel — tap Allow in the notification on the phone \
+                 (or Settings → desk → Let desk type on this phone)"
+            );
+        }
     }
 }

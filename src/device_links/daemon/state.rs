@@ -117,6 +117,7 @@ pub(crate) fn reconcile_connection_status(
             // until the phone's next snapshot (sent on feature-ready).
             device.call_status = None;
             device.keyboard_focused = None;
+            device.keyboard_allowed = None;
         } else if ready {
             device.last_seen = None;
         }
@@ -390,10 +391,12 @@ pub(super) fn update_keyboard_state(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     device_id: &str,
     focused: Option<bool>,
+    allowed: Option<bool>,
 ) {
     if let Ok(mut devices) = devices.lock() {
         if let Some(device) = devices.get_mut(device_id) {
             device.keyboard_focused = focused;
+            device.keyboard_allowed = allowed.filter(|allowed| !allowed);
         }
     }
 }
@@ -652,6 +655,21 @@ mod tests {
             paired: true,
             feature_transport_ready: ready,
         }
+    }
+
+    /// `allowed: false` sticks until a report without it.
+    #[test]
+    fn a_refused_typing_permission_is_cleared_by_the_next_report() {
+        let (devices, info) = test_devices();
+        let allowed = |devices: &Arc<Mutex<HashMap<String, DeviceView>>>| {
+            devices.lock().unwrap()[&info.id].keyboard_allowed
+        };
+        update_keyboard_state(&devices, &info.id, Some(false), Some(false));
+        assert_eq!(allowed(&devices), Some(false));
+        update_keyboard_state(&devices, &info.id, Some(true), None);
+        assert_eq!(allowed(&devices), None);
+        update_keyboard_state(&devices, &info.id, Some(false), Some(true));
+        assert_eq!(allowed(&devices), None, "only a refusal is kept");
     }
 
     /// The reported symptom: the app kept showing "Connected" for a paired

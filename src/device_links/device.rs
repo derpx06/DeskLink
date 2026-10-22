@@ -258,6 +258,11 @@ pub struct DeviceView {
     /// `None` until it says, and while its link is down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyboard_focused: Option<bool>,
+    /// False when the phone said this computer may not type on it ("Let
+    /// <desk> type on this phone" off); cleared by its next report without
+    /// `allowed: false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyboard_allowed: Option<bool>,
 }
 
 /// The user-facing words for a `connection_path`, the one mapping every
@@ -303,6 +308,7 @@ impl DeviceView {
             volume_status: None,
             call_status: None,
             keyboard_focused: None,
+            keyboard_allowed: None,
             camera: None,
             sound: None,
             capture: None,
