@@ -133,7 +133,7 @@ impl WebRtcChannel {
             Self::InputReliable => "desklink-input-reliable-v1",
             Self::InputRealtime => "desklink-input-realtime-v1",
             Self::FileControl => "desklink-file-control-v1",
-            Self::FileData => "desklink-file-data-v1",
+            Self::FileData => "desklink-file-data-v2",
             Self::Terminal => "desklink-terminal-v1",
             Self::Liveness => "desklink-liveness-v1",
         }
@@ -169,7 +169,7 @@ impl WebRtcChannel {
             "desklink-input-reliable-v1" => Ok(Self::InputReliable),
             "desklink-input-realtime-v1" => Ok(Self::InputRealtime),
             "desklink-file-control-v1" => Ok(Self::FileControl),
-            "desklink-file-data-v1" => Ok(Self::FileData),
+            "desklink-file-data-v2" => Ok(Self::FileData),
             "desklink-terminal-v1" => Ok(Self::Terminal),
             "desklink-liveness-v1" => Ok(Self::Liveness),
             _ => Err("Unknown DeskLink WebRTC data channel".to_string()),

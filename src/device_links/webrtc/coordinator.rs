@@ -28,7 +28,7 @@ use crate::device_links::features::{
 };
 use crate::device_links::packet::NetworkPacket;
 
-use super::file_protocol::{FileControl, FILE_CHUNK_MESSAGE_TYPE, FILE_CONTROL_MESSAGE_TYPE};
+use super::file_protocol::{FileControl, FILE_CONTROL_MESSAGE_TYPE};
 use super::ice::IceServerConfig;
 use super::remote_desktop_portal::{
     input_actions, DesktopSession, PortalInputAction, RemoteDesktopPortal,
@@ -37,7 +37,7 @@ use super::remote_session;
 use super::screen::DesktopSource;
 use super::terminal_bridge::{self, TerminalEvent};
 use super::terminal_protocol::{TERMINAL_CHUNK_MESSAGE_TYPE, TERMINAL_CONTROL_MESSAGE_TYPE};
-use super::transfer_manager::{TransferEvent, WebRtcTransferManager};
+use super::transfer_manager::{FileLink, WebRtcTransferManager};
 use super::{
     AuthenticationTranscript, DesktopWebRtcPeer, HandoverControlKind, HandoverControlMessage,
     PeerEvent, SignalingMessageType, WebRtcChannel, WebRtcEnvelope, WebRtcPacketBridge,
@@ -379,17 +379,18 @@ pub(crate) fn start_initiator(
     spawn_event_worker(
         binding.clone(),
         attempt_id.clone(),
-        wire,
+        wire.clone(),
         receiver,
         Arc::clone(&sessions),
         config,
         devices,
         events,
-        transfer_manager,
+        Arc::clone(&transfer_manager),
     )?;
     let peer = sessions
         .active_webrtc_peer(&binding, &attempt_id)
         .map_err(|error| error.to_string())?;
+    attach_transfer_manager(&transfer_manager, &peer, &wire);
     peer.create_offer()
 }
 
@@ -2160,49 +2161,46 @@ fn stop_desktop_portal_session(device_id: &str, tell: Option<&str>) {
     }
 }
 
+/// The manager of the current authenticated WebRTC peer, if features may use
+/// it. There is no LAN fallback once feature-ready is active.
+fn ready_transfer_manager<'a>(
+    sessions: &DeviceManager,
+    transport: &'a FeatureTransportSnapshot,
+) -> Result<&'a Arc<WebRtcTransferManager>, String> {
+    if !sessions.is_current(&transport.binding) || !transport.web_rtc_ready {
+        return Err("DeskLink WebRTC file transport is unavailable".to_string());
+    }
+    transport
+        .transfer_manager
+        .as_ref()
+        .ok_or_else(|| "DeskLink WebRTC file transfer manager is unavailable".to_string())
+}
+
 /// Starts a desktop-originated transfer through the current authenticated
-/// WebRTC peer. It has no LAN fallback once feature-ready is active.
+/// WebRTC peer.
 pub(crate) fn start_file_transfer(
     sessions: &DeviceManager,
     transport: &FeatureTransportSnapshot,
     source: &std::path::Path,
 ) -> Result<(), String> {
-    if !sessions.is_current(&transport.binding) || !transport.web_rtc_ready {
-        return Err("DeskLink WebRTC file transport is unavailable".to_string());
-    }
-    let peer = transport
-        .web_rtc_peer
-        .as_ref()
-        .ok_or_else(|| "DeskLink WebRTC file transfer has no active peer".to_string())?;
-    let wire = transport
-        .web_rtc_wire
-        .as_ref()
-        .ok_or_else(|| "DeskLink WebRTC file transfer has no wire binding".to_string())?;
-    let manager = transport
-        .transfer_manager
-        .as_ref()
-        .ok_or_else(|| "DeskLink WebRTC file transfer manager is unavailable".to_string())?;
-    send_transfer_events(peer, wire, manager.start_send(wire, source)?)
+    ready_transfer_manager(sessions, transport)?
+        .start_send(source)
+        .map(|_| ())
 }
 
-/// Sends a synced file (F8 P4) through the current peer.
+/// Sends a synced file (F8 P4) through the current peer; `content_sha256` is
+/// the manifest's hash of it, which the receiver matches against what it asked
+/// for.
 pub(crate) fn start_folder_transfer(
     sessions: &DeviceManager,
     transport: &FeatureTransportSnapshot,
     source: &std::path::Path,
     folder: super::file_protocol::FolderRef,
+    content_sha256: &str,
 ) -> Result<(), String> {
-    if !sessions.is_current(&transport.binding) || !transport.web_rtc_ready {
-        return Err("DeskLink WebRTC file transport is unavailable".to_string());
-    }
-    let (Some(peer), Some(wire), Some(manager)) = (
-        transport.web_rtc_peer.as_ref(),
-        transport.web_rtc_wire.as_ref(),
-        transport.transfer_manager.as_ref(),
-    ) else {
-        return Err("DeskLink WebRTC file transfer is unavailable".to_string());
-    };
-    send_transfer_events(peer, wire, manager.start_send_folder(wire, source, folder)?)
+    ready_transfer_manager(sessions, transport)?
+        .start_send_folder(source, folder, content_sha256)
+        .map(|_| ())
 }
 
 /// Sends `source` as a clipboard copy (C3) of type `mime`.
@@ -2212,20 +2210,13 @@ pub(crate) fn start_clipboard_transfer(
     source: &std::path::Path,
     mime: &str,
 ) -> Result<(), String> {
-    if !sessions.is_current(&transport.binding) || !transport.web_rtc_ready {
-        return Err("DeskLink WebRTC file transport is unavailable".to_string());
-    }
-    let (Some(peer), Some(wire), Some(manager)) = (
-        transport.web_rtc_peer.as_ref(),
-        transport.web_rtc_wire.as_ref(),
-        transport.transfer_manager.as_ref(),
-    ) else {
-        return Err("DeskLink WebRTC file transfer is unavailable".to_string());
-    };
-    send_transfer_events(peer, wire, manager.start_send_as(wire, source, Some(mime))?)
+    ready_transfer_manager(sessions, transport)?
+        .start_send_as(source, Some(mime))
+        .map(|_| ())
 }
 
-/// Ends a running file transfer at the user's request and tells the peer.
+/// Ends a running file transfer (`why`: `code::USER`, or `code::REMOVED` for
+/// a Bucket item removed while it moves) and tells the peer.
 ///
 /// The transfer is over locally whether or not the peer is still listening: a
 /// cancelled transfer is never resumed, so its state goes either way.
@@ -2233,23 +2224,74 @@ pub(crate) fn cancel_file_transfer(
     sessions: &DeviceManager,
     transport: &FeatureTransportSnapshot,
     transfer_id: &str,
+    why: &'static str,
 ) -> Result<(), String> {
     if !sessions.is_current(&transport.binding) {
         return Err("DeskLink WebRTC file transport is unavailable".to_string());
     }
-    let wire = transport
-        .web_rtc_wire
-        .as_ref()
-        .ok_or_else(|| "DeskLink WebRTC file transfer has no wire binding".to_string())?;
-    let manager = transport
+    transport
         .transfer_manager
         .as_ref()
-        .ok_or_else(|| "DeskLink WebRTC file transfer manager is unavailable".to_string())?;
-    let events = manager.cancel_transfer(wire, transfer_id)?;
-    match transport.web_rtc_peer.as_ref() {
-        Some(peer) => send_transfer_events(peer, wire, events),
-        None => Ok(()),
+        .ok_or_else(|| "DeskLink WebRTC file transfer manager is unavailable".to_string())?
+        .cancel_transfer(transfer_id, why)
+}
+
+/// One peer's file channels, for the transfer manager. Holds the peer weakly:
+/// the peer owns the manager, not the other way round.
+struct PeerFileLink {
+    peer: std::sync::Weak<DesktopWebRtcPeer>,
+    wire: WebRtcWireBinding,
+}
+
+impl FileLink for PeerFileLink {
+    fn send_control(&self, control: &FileControl) -> Result<(), String> {
+        let peer = self
+            .peer
+            .upgrade()
+            .ok_or_else(|| "The WebRTC peer has gone".to_string())?;
+        let encoded = control.to_json()?;
+        let envelope = WebRtcEnvelope::create(
+            &self.wire,
+            WebRtcChannel::FileControl,
+            FILE_CONTROL_MESSAGE_TYPE,
+            &encoded,
+            now_millis(),
+        )?;
+        let text = String::from_utf8(envelope.to_json()?)
+            .map_err(|_| "DeskLink WebRTC file envelope was not UTF-8".to_string())?;
+        peer.send_text(WebRtcChannel::FileControl, &text)
     }
+
+    fn send_frame(&self, frame: Vec<u8>) -> Result<(), String> {
+        self.peer
+            .upgrade()
+            .ok_or_else(|| "The WebRTC peer has gone".to_string())?
+            .send_file_frame(frame)
+    }
+
+    fn buffered(&self) -> u64 {
+        self.peer.upgrade().map_or(u64::MAX, |peer| {
+            peer.buffered_amount(WebRtcChannel::FileData)
+        })
+    }
+}
+
+/// Binds the peer's file channels to its transfer manager.
+fn attach_transfer_manager(
+    manager: &Arc<WebRtcTransferManager>,
+    peer: &Arc<DesktopWebRtcPeer>,
+    wire: &WebRtcWireBinding,
+) {
+    manager.attach(
+        wire.clone(),
+        Arc::new(PeerFileLink {
+            peer: Arc::downgrade(peer),
+            wire: wire.clone(),
+        }),
+    );
+    // A sender waiting for room in the channel is woken when it drains.
+    let waking = Arc::clone(manager);
+    peer.set_file_wake(move || waking.wake());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2285,17 +2327,19 @@ fn install_responder(
     spawn_event_worker(
         binding.clone(),
         attempt_id.clone(),
-        wire,
+        wire.clone(),
         receiver,
         Arc::clone(&sessions),
         config,
         devices,
         events,
-        transfer_manager,
+        Arc::clone(&transfer_manager),
     )?;
-    sessions
+    let peer = sessions
         .active_webrtc_peer(&binding, &attempt_id)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    attach_transfer_manager(&transfer_manager, &peer, &wire);
+    Ok(peer)
 }
 
 #[allow(clippy::too_many_arguments)] // Captures one immutable peer/session context.
@@ -2560,10 +2604,7 @@ fn spawn_event_worker(
                         );
                     }
                     PeerEvent::Envelope {
-                        channel:
-                            channel @ (WebRtcChannel::FileControl
-                            | WebRtcChannel::FileData
-                            | WebRtcChannel::Terminal),
+                        channel: channel @ (WebRtcChannel::FileControl | WebRtcChannel::Terminal),
                         bytes,
                         credit,
                     } => {
@@ -2632,12 +2673,21 @@ fn spawn_event_worker(
                             );
                         }
                     }
+                    PeerEvent::Binary {
+                        channel: WebRtcChannel::FileData,
+                        bytes,
+                        ..
+                    } => {
+                        // A frame of file data: queued for the file thread,
+                        // which writes and hashes it. Nothing else happens here.
+                        if sessions
+                            .webrtc_features_ready(&binding, &attempt_id)
+                            .unwrap_or(false)
+                        {
+                            transfer_manager.on_frame(bytes);
+                        }
+                    }
                     PeerEvent::Binary { channel, bytes, .. } => {
-                        // Android wraps file data in an authenticated envelope,
-                        // including when the underlying data channel is binary.
-                        // Raw chunks have no generation/replay binding and are
-                        // therefore rejected rather than falling back to a TLS
-                        // payload socket.
                         crate::device_links::limits::log_limited(
                             "rejected-binary",
                             &format!(
@@ -2725,8 +2775,6 @@ fn spawn_event_worker(
                                 {
                                     finish_feature_ready(
                                         &binding,
-                                        &attempt_id,
-                                        &wire,
                                         &sessions,
                                         &devices,
                                         &transfer_manager,
@@ -2776,6 +2824,10 @@ fn spawn_event_worker(
         // impossible instead of a property of every exit path remembering to.
         // Exits that already cleared their attempt get `StaleBinding` back,
         // which is a no-op.
+        //
+        // The transfers ride this peer: receivers checkpoint now (a resume
+        // loses less than a block), and nothing is sent into a closed channel.
+        transfer_manager.detach();
     });
     Ok(())
 }
@@ -3429,10 +3481,23 @@ fn new_transfer_manager(config: &Arc<Mutex<Config>>) -> Result<Arc<WebRtcTransfe
         .map_err(|_| "DeskLink configuration lock poisoned".to_string())?;
     let transfer_state = config.transfer_state_dir();
     let downloads = dirs::download_dir().unwrap_or_else(|| transfer_state.join("downloads"));
-    Ok(Arc::new(WebRtcTransferManager::new(
-        transfer_state,
-        downloads,
-    )?))
+    let manager = Arc::new(WebRtcTransferManager::new(transfer_state, downloads)?);
+    // A photo or scan a desk asked for (F3) has arrived.
+    manager.set_completion_hook(|completed| {
+        debug_log!(
+            "[DeskLink] WebRTC transfer {} completed at {}",
+            completed.transfer_id,
+            completed.path.display()
+        );
+        if let Some(capture_id) = completed
+            .capture_id
+            .as_deref()
+            .filter(|_| completed.incoming)
+        {
+            super::capture::file_arrived(capture_id);
+        }
+    });
+    Ok(manager)
 }
 
 fn begin_handover(
@@ -3477,10 +3542,7 @@ fn handle_peer_envelope(
     transfer_manager: &Arc<WebRtcTransferManager>,
 ) -> Result<(), String> {
     let envelope = WebRtcEnvelope::from_json(bytes)?;
-    if matches!(
-        envelope.message_type.as_str(),
-        FILE_CONTROL_MESSAGE_TYPE | FILE_CHUNK_MESSAGE_TYPE
-    ) {
+    if envelope.message_type == FILE_CONTROL_MESSAGE_TYPE {
         return handle_file_envelope(
             binding,
             attempt_id,
@@ -3975,14 +4037,7 @@ fn handle_peer_envelope(
                 .webrtc_features_ready(binding, attempt_id)
                 .map_err(|error| error.to_string())?
             {
-                finish_feature_ready(
-                    binding,
-                    attempt_id,
-                    wire,
-                    sessions,
-                    devices,
-                    transfer_manager,
-                );
+                finish_feature_ready(binding, sessions, devices, transfer_manager);
             }
             Ok(())
         }
@@ -4053,8 +4108,6 @@ fn spawn_work_lane_with(
 /// go, the connection log and the phone hear of it, interrupted sends resume.
 fn finish_feature_ready(
     binding: &SessionBinding,
-    attempt_id: &str,
-    wire: &WebRtcWireBinding,
     sessions: &Arc<DeviceManager>,
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     transfer_manager: &Arc<WebRtcTransferManager>,
@@ -4075,16 +4128,7 @@ fn finish_feature_ready(
     crate::device_links::desk_features::on_feature_ready(&binding.device_id);
     // A send a lost connection interrupted carries on where the
     // phone stopped; the phone does the same for its own sends.
-    let resumed = transfer_manager.resume_sends(wire);
-    if !resumed.is_empty() {
-        let sent = sessions
-            .active_webrtc_peer(binding, attempt_id)
-            .map_err(|error| error.to_string())
-            .and_then(|peer| send_transfer_events(&peer, wire, resumed));
-        if let Err(error) = sent {
-            eprintln!("[DeskLink] Could not resume interrupted file sends: {error}");
-        }
-    }
+    transfer_manager.resume_sends();
 }
 
 /// Sends this side's `feature-ready` once capabilities are confirmed and
@@ -4125,7 +4169,8 @@ fn send_feature_ready_if_possible(
     Ok(true)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// A control message of the file protocol. (File data never comes here: it is
+/// binary frames on its own channel, handed to the manager as they arrive.)
 fn handle_file_envelope(
     binding: &SessionBinding,
     attempt_id: &str,
@@ -4141,29 +4186,17 @@ fn handle_file_envelope(
     {
         return Err("DeskLink WebRTC file transfer arrived before feature handover".to_string());
     }
-    let expected_channel = match envelope.message_type.as_str() {
-        FILE_CONTROL_MESSAGE_TYPE => WebRtcChannel::FileControl,
-        FILE_CHUNK_MESSAGE_TYPE => WebRtcChannel::FileData,
-        _ => unreachable!("file envelope has already been classified"),
-    };
-    if channel != expected_channel || envelope.channel != expected_channel.label() {
+    if channel != WebRtcChannel::FileControl
+        || envelope.channel != WebRtcChannel::FileControl.label()
+    {
         return Err("DeskLink WebRTC file message arrived on the wrong channel".to_string());
     }
     let payload = envelope.validate(wire)?;
     sessions
         .accept_webrtc_envelope(binding, attempt_id, envelope.message_id)
         .map_err(|error| error.to_string())?;
-    let events = match expected_channel {
-        WebRtcChannel::FileControl => {
-            transfer_manager.handle_control(wire, FileControl::from_json(&payload)?)?
-        }
-        WebRtcChannel::FileData => transfer_manager.handle_chunk(wire, &payload)?,
-        _ => unreachable!("file channel classification is exhaustive"),
-    };
-    let peer = sessions
-        .active_webrtc_peer(binding, attempt_id)
-        .map_err(|error| error.to_string())?;
-    send_transfer_events(&peer, wire, events)
+    transfer_manager.on_control(FileControl::from_json(&payload)?);
+    Ok(())
 }
 
 /// Queue ceiling for terminal output on one peer.
@@ -4305,56 +4338,6 @@ fn run_terminal_pump(
             break;
         }
     }
-}
-
-fn send_transfer_events(
-    peer: &DesktopWebRtcPeer,
-    wire: &WebRtcWireBinding,
-    events: Vec<TransferEvent>,
-) -> Result<(), String> {
-    for event in events {
-        match event {
-            TransferEvent::SendControl(control) => {
-                let encoded = control.to_json()?;
-                let envelope = WebRtcEnvelope::create(
-                    wire,
-                    WebRtcChannel::FileControl,
-                    FILE_CONTROL_MESSAGE_TYPE,
-                    &encoded,
-                    now_millis(),
-                )?;
-                let text = String::from_utf8(envelope.to_json()?)
-                    .map_err(|_| "DeskLink WebRTC file envelope was not UTF-8".to_string())?;
-                peer.send_text(WebRtcChannel::FileControl, &text)?;
-            }
-            TransferEvent::SendChunk(chunk) => {
-                let envelope = WebRtcEnvelope::create(
-                    wire,
-                    WebRtcChannel::FileData,
-                    FILE_CHUNK_MESSAGE_TYPE,
-                    &chunk,
-                    now_millis(),
-                )?;
-                let text = String::from_utf8(envelope.to_json()?)
-                    .map_err(|_| "DeskLink WebRTC file envelope was not UTF-8".to_string())?;
-                peer.send_text(WebRtcChannel::FileData, &text)?;
-            }
-            TransferEvent::Completed {
-                transfer_id,
-                path,
-                capture_id,
-            } => {
-                if let Some(capture_id) = capture_id {
-                    super::capture::file_arrived(&capture_id);
-                }
-                debug_log!(
-                    "[DeskLink] WebRTC transfer {transfer_id} completed at {}",
-                    path.display()
-                );
-            }
-        }
-    }
-    Ok(())
 }
 
 fn send_capabilities(
@@ -4755,173 +4738,419 @@ mod tests {
         );
     }
 
-    /// A real file, both directions, over real ICE/DTLS/SCTP data channels: the
-    /// two transfer managers are driven exactly as `handle_file_envelope` drives
-    /// them, and every envelope crosses a live connection. The unit tests in
-    /// `transfer_manager` cannot see transport problems (ordering, message size,
-    /// backpressure); this can.
-    fn transfer_over_loopback(offerer_sends: bool, size: usize) {
-        use super::send_transfer_events;
-        use crate::device_links::webrtc::file_protocol::{
-            FileControl, FILE_CHUNK_MESSAGE_TYPE, FILE_CONTROL_MESSAGE_TYPE,
-        };
-        use crate::device_links::webrtc::peer_connection::tests as net;
-        use crate::device_links::webrtc::transfer_manager::{TransferEvent, WebRtcTransferManager};
-        use crate::device_links::webrtc::{
-            PeerEvent, WebRtcChannel, WebRtcEnvelope, WebRtcWireBinding,
-        };
+    // ── File transfers over real connections ────────────────────────────
 
-        let pair = net::loopback();
-        let all = [
-            WebRtcChannel::Control,
-            WebRtcChannel::FileControl,
-            WebRtcChannel::FileData,
-        ];
-        net::wait_for_channels(&pair.offerer_events, &all);
-        net::wait_for_channels(&pair.answerer_events, &all);
+    /// Two real peers (ICE, DTLS, SCTP over loopback), each with a transfer
+    /// manager attached exactly as the coordinator attaches one, and the
+    /// event routing the coordinator's worker does for file traffic: control
+    /// envelopes to `on_control`, binary frames to `on_frame`. Heartbeats and a
+    /// "terminal" echo ride their own channels so a test can see whether a
+    /// transfer delays them.
+    struct LiveRig {
+        pair_offerer: Arc<DesktopWebRtcPeer>,
+        pair_answerer: Arc<DesktopWebRtcPeer>,
+        offerer: Arc<WebRtcTransferManager>,
+        answerer: Arc<WebRtcTransferManager>,
+        offerer_done: mpsc::Receiver<Completed>,
+        answerer_done: mpsc::Receiver<Completed>,
+        stop: Arc<AtomicBool>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+        /// Longest round trip seen on the liveness and terminal channels.
+        slowest: Arc<Mutex<(Duration, Duration)>>,
+        base: std::path::PathBuf,
+        // Kept alive: its drop is the test's watchdog.
+        _watchdog: Box<dyn std::any::Any>,
+    }
 
-        let (sender_peer, receiver_peer, sender_events, receiver_events) = if offerer_sends {
-            (
-                &pair.offerer,
-                &pair.answerer,
-                &pair.offerer_events,
-                &pair.answerer_events,
-            )
-        } else {
-            (
-                &pair.answerer,
-                &pair.offerer,
-                &pair.answerer_events,
-                &pair.offerer_events,
-            )
-        };
-        let wire_sender = WebRtcWireBinding {
-            sender_device_id: "sender".into(),
-            peer_device_id: "receiver".into(),
-            session_id: 11,
-            generation: 1,
-        };
-        let wire_receiver = WebRtcWireBinding {
-            sender_device_id: "receiver".into(),
-            peer_device_id: "sender".into(),
-            session_id: 11,
-            generation: 1,
-        };
-        let root = std::env::temp_dir().join(format!(
-            "desklink-loopback-{}-{size}-{offerer_sends}",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let source = root.join("payload.bin");
-        // Deterministic, incompressible-looking bytes.
-        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-        let bytes: Vec<u8> = (0..size)
-            .map(|_| {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                (state >> 33) as u8
-            })
-            .collect();
-        std::fs::write(&source, &bytes).unwrap();
+    use crate::device_links::webrtc::file_protocol::FileControl;
+    use crate::device_links::webrtc::peer_connection::DesktopWebRtcPeer;
+    use crate::device_links::webrtc::transfer_manager::{Completed, WebRtcTransferManager};
+    use crate::device_links::webrtc::{WebRtcChannel, WebRtcEnvelope};
+    use std::time::{Duration, Instant};
 
-        let sender =
-            WebRtcTransferManager::new(root.join("sender-state"), root.join("sender-out")).unwrap();
-        let receiver =
-            WebRtcTransferManager::new(root.join("receiver-state"), root.join("receiver-out"))
-                .unwrap();
-
-        let first = sender.start_send(&wire_sender, &source).unwrap();
-        send_transfer_events(sender_peer, &wire_sender, first).unwrap();
-
-        let mut published = None;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
-        while published.is_none() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the transfer did not finish in time"
-            );
-            for (events, manager, wire, peer) in [
-                (receiver_events, &receiver, &wire_receiver, receiver_peer),
-                (sender_events, &sender, &wire_sender, sender_peer),
-            ] {
-                let Ok(PeerEvent::Envelope { bytes, .. }) =
-                    events.recv_timeout(std::time::Duration::from_millis(5))
-                else {
-                    continue;
-                };
-                let envelope = WebRtcEnvelope::from_json(&bytes).unwrap();
-                let payload = envelope.validate(wire).unwrap();
-                let out = match envelope.message_type.as_str() {
-                    FILE_CONTROL_MESSAGE_TYPE => manager
-                        .handle_control(wire, FileControl::from_json(&payload).unwrap())
-                        .unwrap(),
-                    FILE_CHUNK_MESSAGE_TYPE => manager.handle_chunk(wire, &payload).unwrap(),
-                    other => panic!("unexpected message type {other}"),
-                };
-                for event in &out {
-                    if let TransferEvent::Completed { path, .. } = event {
-                        published = Some(path.clone());
+    impl LiveRig {
+        fn new(label: &str, base: std::path::PathBuf) -> Self {
+            use crate::device_links::webrtc::peer_connection::tests as net;
+            use crate::device_links::webrtc::PeerEvent;
+            let pair = net::loopback();
+            let all = [
+                WebRtcChannel::Control,
+                WebRtcChannel::Events,
+                WebRtcChannel::FileControl,
+                WebRtcChannel::FileData,
+                WebRtcChannel::Terminal,
+                WebRtcChannel::Liveness,
+            ];
+            net::wait_for_channels(&pair.offerer_events, &all);
+            net::wait_for_channels(&pair.answerer_events, &all);
+            let wire_o = WebRtcWireBinding {
+                sender_device_id: "offerer".into(),
+                peer_device_id: "answerer".into(),
+                session_id: 11,
+                generation: 1,
+            };
+            let wire_a = WebRtcWireBinding {
+                sender_device_id: "answerer".into(),
+                peer_device_id: "offerer".into(),
+                session_id: 11,
+                generation: 1,
+            };
+            let _ = label;
+            std::fs::create_dir_all(&base).unwrap();
+            let make = |side: &str| {
+                Arc::new(
+                    WebRtcTransferManager::new(
+                        base.join(format!("{side}-state")),
+                        base.join(format!("{side}-dl")),
+                    )
+                    .unwrap(),
+                )
+            };
+            let (offerer, answerer) = (make("o"), make("a"));
+            let (tx_o, offerer_done) = mpsc::channel();
+            let (tx_a, answerer_done) = mpsc::channel();
+            let (tx_o, tx_a) = (Mutex::new(tx_o), Mutex::new(tx_a));
+            offerer.set_completion_hook(move |c| {
+                let _ = tx_o.lock().unwrap().send(c.clone());
+            });
+            answerer.set_completion_hook(move |c| {
+                let _ = tx_a.lock().unwrap().send(c.clone());
+            });
+            super::attach_transfer_manager(&offerer, &pair.offerer, &wire_o);
+            super::attach_transfer_manager(&answerer, &pair.answerer, &wire_a);
+            let stop = Arc::new(AtomicBool::new(false));
+            let slowest = Arc::new(Mutex::new((Duration::ZERO, Duration::ZERO)));
+            let epoch = Instant::now();
+            let route = |peer: Arc<DesktopWebRtcPeer>,
+                         manager: Arc<WebRtcTransferManager>,
+                         wire: WebRtcWireBinding,
+                         events: mpsc::Receiver<PeerEvent>| {
+                let (stop, slowest) = (Arc::clone(&stop), Arc::clone(&slowest));
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Acquire) {
+                        let Ok(event) = events.recv_timeout(Duration::from_millis(5)) else {
+                            continue;
+                        };
+                        match event {
+                            PeerEvent::Envelope {
+                                channel: WebRtcChannel::FileControl,
+                                bytes,
+                                ..
+                            } => {
+                                let envelope = WebRtcEnvelope::from_json(&bytes).unwrap();
+                                let payload = envelope.validate(&wire).unwrap();
+                                manager.on_control(FileControl::from_json(&payload).unwrap());
+                            }
+                            PeerEvent::Binary {
+                                channel: WebRtcChannel::FileData,
+                                bytes,
+                                ..
+                            } => manager.on_frame(bytes),
+                            // A probe goes back at once; an answer is timed.
+                            PeerEvent::Envelope {
+                                channel:
+                                    channel @ (WebRtcChannel::Liveness | WebRtcChannel::Terminal),
+                                bytes,
+                                ..
+                            } => {
+                                let text = String::from_utf8_lossy(&bytes).into_owned();
+                                if let Some(sent) = text.strip_prefix("ping:") {
+                                    let stamp = sent.split(':').next().unwrap_or(sent);
+                                    let _ = peer.send_text(channel, &format!("pong:{stamp}"));
+                                } else if let Some(sent) = text.strip_prefix("pong:") {
+                                    let sent: u128 = sent
+                                        .split(':')
+                                        .next()
+                                        .and_then(|n| n.parse().ok())
+                                        .unwrap_or(0);
+                                    let took = epoch
+                                        .elapsed()
+                                        .saturating_sub(Duration::from_nanos(sent as u64));
+                                    let mut slowest = slowest.lock().unwrap();
+                                    if channel == WebRtcChannel::Liveness {
+                                        slowest.0 = slowest.0.max(took);
+                                    } else {
+                                        slowest.1 = slowest.1.max(took);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
                     }
+                })
+            };
+            let threads = vec![
+                route(
+                    Arc::clone(&pair.offerer),
+                    Arc::clone(&offerer),
+                    wire_o.clone(),
+                    pair.offerer_events,
+                ),
+                route(
+                    Arc::clone(&pair.answerer),
+                    Arc::clone(&answerer),
+                    wire_a.clone(),
+                    pair.answerer_events,
+                ),
+            ];
+            // Heartbeats and terminal traffic from the offerer, every 20 ms.
+            let (peer, stop_pings) = (Arc::clone(&pair.offerer), Arc::clone(&stop));
+            let pinger = std::thread::spawn(move || {
+                while !stop_pings.load(Ordering::Acquire) {
+                    let now = epoch.elapsed().as_nanos();
+                    let _ = peer.send_heartbeat(&format!("ping:{now}"));
+                    let _ = peer.send_text(
+                        WebRtcChannel::Terminal,
+                        &format!("ping:{now}:{}", "x".repeat(2_000)),
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
                 }
-                send_transfer_events(peer, wire, out).unwrap();
+            });
+            let mut threads = threads;
+            threads.push(pinger);
+            Self {
+                pair_offerer: pair.offerer,
+                pair_answerer: pair.answerer,
+                offerer,
+                answerer,
+                offerer_done,
+                answerer_done,
+                stop,
+                threads,
+                slowest,
+                base,
+                _watchdog: Box::new(()),
             }
         }
 
-        let arrived = std::fs::read(published.unwrap()).unwrap();
-        assert_eq!(arrived.len(), bytes.len());
-        assert!(arrived == bytes, "the file arrived corrupted");
-        pair.offerer.close();
-        pair.answerer.close();
-        let _ = std::fs::remove_dir_all(&root);
+        fn finished(self) {
+            self.stop.store(true, Ordering::Release);
+            for thread in self.threads {
+                let _ = thread.join();
+            }
+            self.pair_offerer.close();
+            self.pair_answerer.close();
+            let _ = std::fs::remove_dir_all(&self.base);
+        }
+    }
+
+    fn live_base(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("desklink-live-{label}-{}", std::process::id()))
+    }
+
+    fn sha_of_file(path: &std::path::Path) -> String {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).unwrap();
+        let mut hasher = openssl::sha::Sha256::new();
+        let mut buffer = vec![0u8; 1 << 20];
+        loop {
+            let count = file.read(&mut buffer).unwrap();
+            if count == 0 {
+                break;
+            }
+            hasher.update(&buffer[..count]);
+        }
+        hasher.finish().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// A file of `length` bytes that does not repeat on a block boundary.
+    fn write_pattern_file(path: &std::path::Path, length: u64, seed: u64) {
+        use std::io::Write;
+        let mut file = std::fs::File::create(path).unwrap();
+        let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut buffer = vec![0u8; 1 << 20];
+        let mut left = length;
+        while left > 0 {
+            for chunk in buffer.chunks_mut(8) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let bytes = state.to_le_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+            let take = left.min(buffer.len() as u64) as usize;
+            file.write_all(&buffer[..take]).unwrap();
+            left -= take as u64;
+        }
+        file.sync_all().unwrap();
+    }
+
+    /// Sends `sizes` (bytes) at once from the offerer or the answerer and
+    /// checks every file arrives byte for byte; the seconds it took, from the
+    /// first start to the last file placed.
+    fn live_transfer(
+        label: &str,
+        offerer_sends: bool,
+        sizes: &[u64],
+        base: std::path::PathBuf,
+    ) -> f64 {
+        let rig = LiveRig::new(label, base.clone());
+        let (sender, receiver, done) = if offerer_sends {
+            (&rig.offerer, &rig.answerer, &rig.answerer_done)
+        } else {
+            (&rig.answerer, &rig.offerer, &rig.offerer_done)
+        };
+        let _ = receiver;
+        let sources: Vec<std::path::PathBuf> = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| {
+                let path = base.join(format!("source-{index}.bin"));
+                write_pattern_file(&path, *size, index as u64 + 1);
+                path
+            })
+            .collect();
+        let started = Instant::now();
+        for source in &sources {
+            sender.start_send(source).unwrap();
+        }
+        let mut arrived = Vec::new();
+        for _ in &sources {
+            arrived.push(
+                done.recv_timeout(Duration::from_secs(110))
+                    .expect("a file never arrived"),
+            );
+        }
+        let seconds = started.elapsed().as_secs_f64();
+        for source in &sources {
+            let name = source.file_name().unwrap();
+            let got = arrived
+                .iter()
+                .find(|completed| completed.path.file_name() == Some(name))
+                .expect("every file arrives under its own name");
+            assert_eq!(
+                std::fs::metadata(&got.path).unwrap().len(),
+                std::fs::metadata(source).unwrap().len()
+            );
+            assert_eq!(
+                sha_of_file(&got.path),
+                sha_of_file(source),
+                "{name:?} arrived corrupted"
+            );
+        }
+        rig.finished();
+        seconds
     }
 
     #[test]
     fn a_file_crosses_a_live_connection_from_the_offerer() {
-        transfer_over_loopback(true, 2 * 1024 * 1024 + 123);
-    }
-
-    /// `cargo test --release transfer_throughput -- --ignored --nocapture`:
-    /// real webrtcbin on both ends, so this measures the protocol and stack,
-    /// not Wi-Fi.
-    #[test]
-    #[ignore]
-    fn transfer_throughput_over_loopback() {
-        let size = 64 * 1024 * 1024;
-        let started = std::time::Instant::now();
-        transfer_over_loopback(true, size);
-        let seconds = started.elapsed().as_secs_f64();
-        eprintln!(
-            "[bench] {} MiB in {seconds:.2}s = {:.1} MB/s",
-            size >> 20,
-            size as f64 / seconds / 1e6
+        live_transfer(
+            "from-offerer",
+            true,
+            &[2 * 1024 * 1024 + 123],
+            live_base("from-offerer"),
         );
     }
 
     #[test]
     fn a_file_crosses_a_live_connection_from_the_answerer() {
-        transfer_over_loopback(false, 2 * 1024 * 1024 + 123);
-    }
-
-    /// `cargo test --release transfer_throughput -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn transfer_throughput() {
-        let size = 200 * 1024 * 1024;
-        let started = std::time::Instant::now();
-        transfer_over_loopback(true, size);
-        let seconds = started.elapsed().as_secs_f64();
-        eprintln!(
-            "THROUGHPUT {:.1} MB/s ({} MiB in {seconds:.1} s)",
-            size as f64 / seconds / 1e6,
-            size >> 20
+        live_transfer(
+            "from-answerer",
+            false,
+            &[2 * 1024 * 1024 + 123],
+            live_base("from-answerer"),
         );
     }
 
     #[test]
     fn an_empty_and_a_one_byte_file_cross_a_live_connection() {
-        transfer_over_loopback(true, 1);
+        live_transfer("tiny", true, &[0, 1], live_base("tiny"));
+    }
+
+    /// The edge-case row "two big transfers plus Bucket sync plus a terminal
+    /// at once": two big files and a small one (queued, as a Bucket file is,
+    /// behind the two slots) move together with heartbeats on the liveness
+    /// channel and terminal traffic on its own: all complete, and the
+    /// heartbeat and terminal round trips stay far below the 5 s probe time
+    /// (about 100 ms on a quiet machine; the bound allows a loaded test run).
+    #[test]
+    fn two_big_transfers_a_third_and_live_traffic_all_progress_without_delaying_heartbeats() {
+        let base = live_base("mixed");
+        let rig = LiveRig::new("mixed", base.clone());
+        let sizes = [48u64 << 20, 48 << 20, 3 << 20];
+        let sources: Vec<std::path::PathBuf> = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| {
+                let path = base.join(format!("mixed-{index}.bin"));
+                write_pattern_file(&path, *size, 100 + index as u64);
+                path
+            })
+            .collect();
+        for source in &sources {
+            rig.offerer.start_send(source).unwrap();
+        }
+        let mut arrived = Vec::new();
+        for _ in &sources {
+            arrived.push(
+                rig.answerer_done
+                    .recv_timeout(Duration::from_secs(110))
+                    .unwrap(),
+            );
+        }
+        for source in &sources {
+            let got = arrived
+                .iter()
+                .find(|c| c.path.file_name() == source.file_name())
+                .unwrap();
+            assert_eq!(sha_of_file(&got.path), sha_of_file(source));
+        }
+        let (liveness, terminal) = *rig.slowest.lock().unwrap();
+        eprintln!("[mixed] slowest heartbeat {liveness:?}, slowest terminal echo {terminal:?}");
+        assert!(liveness > Duration::ZERO, "heartbeats were answered");
+        assert!(
+            liveness < Duration::from_secs(4) && terminal < Duration::from_secs(4),
+            "a transfer delayed the other channels: heartbeat {liveness:?}, terminal {terminal:?}"
+        );
+        rig.finished();
+    }
+
+    // ── Opt-in benchmarks: `cargo test --release -- --ignored transfer_throughput --nocapture`
+    //
+    // Real webrtcbin on both ends over loopback: they measure the protocol and
+    // the stack, not Wi-Fi. Files go under `$DESKLINK_BENCH_DIR` (default
+    // `~/.cache/desklink-bench`; not `/tmp`, which is RAM on most systems).
+
+    fn bench_base(label: &str) -> std::path::PathBuf {
+        std::env::var_os("DESKLINK_BENCH_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| dirs::cache_dir().map(|cache| cache.join("desklink-bench")))
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!("{label}-{}", std::process::id()))
+    }
+
+    fn bench(label: &str, megabytes: &[u64]) {
+        let sizes: Vec<u64> = megabytes.iter().map(|mb| mb * 1_000_000).collect();
+        let total: u64 = sizes.iter().sum();
+        let seconds = live_transfer(label, true, &sizes, bench_base(label));
+        eprintln!(
+            "[bench] {label}: {megabytes:?} MB in {seconds:.2} s = {:.1} MB/s",
+            total as f64 / seconds / 1e6
+        );
+    }
+
+    #[test]
+    #[ignore = "benchmark; run with --ignored transfer_throughput"]
+    fn transfer_throughput_100mb_one_file() {
+        bench("one-100mb", &[100]);
+    }
+
+    #[test]
+    #[ignore = "benchmark; run with --ignored transfer_throughput"]
+    fn transfer_throughput_100mb_two_files() {
+        bench("two-100mb", &[50, 50]);
+    }
+
+    #[test]
+    #[ignore = "benchmark; run with --ignored transfer_throughput"]
+    fn transfer_throughput_1gb_one_file() {
+        bench("one-1gb", &[1000]);
+    }
+
+    #[test]
+    #[ignore = "benchmark; run with --ignored transfer_throughput"]
+    fn transfer_throughput_1gb_two_files() {
+        bench("two-1gb", &[500, 500]);
     }
 
     fn session_control(kind: ControlKind, session_id: &str) -> ControlMessage {

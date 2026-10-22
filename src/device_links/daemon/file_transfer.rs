@@ -8,8 +8,8 @@ use super::DaemonWorker;
 use crate::device_links::transport::FeatureTransport;
 use crate::device_links::webrtc::transfer_board::Preparing;
 
-/// Files waiting to be prepared, or being prepared. Each holds a row in the
-/// transfers window and, once its turn comes, a full copy of the file.
+/// Files waiting to be queued with the transfer manager, or being queued. Each
+/// holds a row in the transfers window until the manager lists it itself.
 const MAX_QUEUED: usize = 64;
 
 static QUEUED: AtomicUsize = AtomicUsize::new(0);
@@ -24,10 +24,10 @@ struct SendJob {
     preparing: Preparing,
 }
 
-/// One thread prepares files one at a time. Copying and hashing up to 4 GiB
-/// takes as long as the disk does, so it must not run on the thread that
-/// answers pairing, pings and the phone-file browser — and several at once
-/// would only make the disk thrash.
+/// One thread queues files one at a time. A file is no longer copied or hashed
+/// before its offer (the manager reads it in place, block by block), so this is
+/// quick; it stays off the thread that answers pairing and pings because it
+/// still touches the disk and the session.
 fn preparer() -> &'static Sender<SendJob> {
     static PREPARER: OnceLock<Sender<SendJob>> = OnceLock::new();
     PREPARER.get_or_init(|| {
@@ -112,8 +112,13 @@ impl DaemonWorker {
     }
 
     pub(super) fn cancel_transfer(&self, device_id: &str, transfer_id: &str) {
-        let result = FeatureTransport::for_device(&self.sessions, device_id)
-            .and_then(|transport| transport.cancel_transfer(transfer_id));
+        let result =
+            FeatureTransport::for_device(&self.sessions, device_id).and_then(|transport| {
+                transport.cancel_transfer(
+                    transfer_id,
+                    crate::device_links::webrtc::file_protocol::code::USER,
+                )
+            });
         if let Err(error) = result {
             let message = format!("Could not cancel the file transfer: {error}");
             debug_log!("[Daemon] {message}");

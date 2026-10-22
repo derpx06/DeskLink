@@ -50,6 +50,9 @@ fn subtitle(row: &TransferRow, device: &str) -> String {
     if row.preparing {
         return format!("Preparing to send to {device}…");
     }
+    if let Some(note) = crate::device_links::webrtc::transfer_board::note(&row.id) {
+        return note;
+    }
     if row.paused {
         return format!("Paused — resumes when {device} reconnects");
     }

@@ -13,8 +13,12 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 /// Rows are bounded by the manager's own limits; this only stops a bug there
 /// from growing the table without end.
 const MAX_ROWS: usize = 64;
-/// Outcomes the UI has not collected yet. Oldest are dropped first.
+/// Outcomes the UI has not collected yet. Oldest are dropped first. (Tests
+/// share this queue across threads and never collect it.)
+#[cfg(not(test))]
 const MAX_FINISHED: usize = 64;
+#[cfg(test)]
+const MAX_FINISHED: usize = 8192;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferRow {
@@ -64,6 +68,10 @@ pub struct TransferBoard {
     synced_failed: VecDeque<String>,
     /// Every Bucket transfer that ended, for the folder worker's slots.
     synced_ended: VecDeque<SyncedEnd>,
+    /// Why a listed transfer is not moving right now, in the person's words
+    /// ("Storage is full. The transfer continues when there is space."), by
+    /// transfer id. Dropped when the transfer ends.
+    notes: std::collections::HashMap<String, String>,
 }
 
 /// A Bucket transfer that ended (F8c: frees an in-flight slot).
@@ -142,6 +150,7 @@ impl TransferBoard {
     /// paths that both notice the end (a peer's `Error` and our own cleanup)
     /// report it once.
     pub fn finish(&mut self, id: &str, outcome: Outcome) {
+        self.notes.remove(id);
         if let Some(position) = self.synced.iter().position(|row| row.id == id) {
             let row = self.synced.remove(position);
             if self.synced_ended.len() >= MAX_FINISHED {
@@ -210,6 +219,26 @@ impl TransferBoard {
         self.rows.clone()
     }
 
+    /// Removes a listed transfer without recording an outcome: it carries on
+    /// under another id (a changed file begun again).
+    pub fn discard(&mut self, id: &str) {
+        self.notes.remove(id);
+        self.rows.retain(|row| row.id != id);
+        self.synced.retain(|row| row.id != id);
+    }
+
+    /// Says why a transfer is waiting (`None`: it is moving again).
+    pub fn set_note(&mut self, id: &str, note: Option<String>) {
+        match note {
+            Some(note) if self.rows.iter().chain(&self.synced).any(|row| row.id == id) => {
+                self.notes.insert(id.to_string(), note);
+            }
+            _ => {
+                self.notes.remove(id);
+            }
+        }
+    }
+
     pub fn take_finished(&mut self) -> Vec<Finished> {
         self.finished.drain(..).collect()
     }
@@ -258,6 +287,21 @@ pub fn finish_device(device_id: &str, reason: &str) {
 
 pub fn pause_device(device_id: &str) {
     board().pause_device(device_id);
+}
+
+/// Removes a listed transfer without an outcome (see [`TransferBoard::discard`]).
+pub fn discard(id: &str) {
+    board().discard(id);
+}
+
+/// Says why a listed transfer is waiting; `None` clears it.
+pub fn set_note(id: &str, note: Option<&str>) {
+    board().set_note(id, note.map(str::to_string));
+}
+
+/// Why `id` is waiting, if it is.
+pub fn note(id: &str) -> Option<String> {
+    board().notes.get(id).cloned()
 }
 
 pub fn rows() -> Vec<TransferRow> {

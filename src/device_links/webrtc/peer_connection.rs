@@ -102,9 +102,12 @@ pub enum PeerEvent {
 
 /// Received bytes not yet handled, per data channel: a peer that floods,
 /// or a worker that stalls, cannot grow memory past this. Over it, a
-/// message is dropped (counted, logged): a file chunk then fails its
-/// transfer, which resumes.
-const MAX_BACKLOG_FILE_BYTES: usize = 32 * 1024 * 1024;
+/// message is dropped (counted, logged).
+///
+/// File data has no bound here: a frame dropped from the middle of a stream
+/// would fail the transfer. The transfer manager bounds it instead
+/// (`FILE_QUEUE_MAX_BYTES`) and pauses or restarts the transfer.
+const MAX_BACKLOG_FILE_BYTES: usize = usize::MAX / 2;
 const MAX_BACKLOG_BYTES: usize = 4 * 1024 * 1024;
 
 /// One received message's share of its channel's backlog, given back when
@@ -190,6 +193,19 @@ pub struct DesktopWebRtcPeer {
 pub(crate) struct Held {
     messages: std::collections::VecDeque<String>,
     bytes: usize,
+    /// Called when the file-data channel's buffer drains below
+    /// `IN_FLIGHT_LOW`: a sender waiting for room tries again.
+    file_wake: Option<FileWake>,
+}
+
+/// A callback, which has no `Debug` of its own.
+#[derive(Clone)]
+pub(crate) struct FileWake(std::sync::Arc<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for FileWake {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("FileWake")
+    }
 }
 
 impl Held {
@@ -692,11 +708,18 @@ impl DesktopWebRtcPeer {
         self.send_text(WebRtcChannel::Liveness, text).map(|()| true)
     }
 
-    /// Sends a bounded binary payload over the dedicated file-data channel.
-    /// Feature envelopes always use text channels; accepting arbitrary binary
+    /// What to do when the file-data channel's buffer has drained.
+    pub fn set_file_wake(&self, wake: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut held) = self.held.lock() {
+            held.file_wake = Some(FileWake(std::sync::Arc::new(wake)));
+        }
+    }
+
+    /// Sends one frame over the dedicated file-data channel. Feature
+    /// envelopes always use text channels; accepting arbitrary binary
     /// payloads on them would make channel authorization ambiguous.
-    pub fn send_file_data(&self, bytes: &[u8]) -> Result<(), String> {
-        validate_file_data(bytes)?;
+    pub fn send_file_frame(&self, frame: Vec<u8>) -> Result<(), String> {
+        validate_file_data(&frame)?;
         let channel = self
             .channels
             .lock()
@@ -707,7 +730,7 @@ impl DesktopWebRtcPeer {
         if channel.ready_state() != WebRTCDataChannelState::Open {
             return Err("DeskLink WebRTC file-data channel is not open".to_string());
         }
-        let data = gst::glib::Bytes::from_owned(bytes.to_vec());
+        let data = gst::glib::Bytes::from_owned(frame);
         channel
             .send_data_full(Some(&data))
             .map_err(|error| format!("Could not send DeskLink WebRTC file data: {error}"))
@@ -1386,6 +1409,20 @@ fn install_data_channel(
         channels.insert(channel_kind, channel.clone());
     }
 
+    if channel_kind == WebRtcChannel::FileData {
+        // A sender waiting for room is woken when the buffer drains.
+        let wake_held = Arc::clone(&held);
+        channel.set_buffered_amount_low_threshold(super::file_protocol::IN_FLIGHT_LOW);
+        channel.connect_on_buffered_amount_low(move |_| {
+            let wake = wake_held
+                .lock()
+                .ok()
+                .and_then(|held| held.file_wake.clone());
+            if let Some(FileWake(wake)) = wake {
+                wake();
+            }
+        });
+    }
     if channel_kind == WebRtcChannel::Events {
         // Held sends resume, in order, once the queue drains.
         channel.set_buffered_amount_low_threshold(EVENTS_LOW_WATER);
@@ -1413,6 +1450,13 @@ fn install_data_channel(
     let message_events = events.clone();
     let message_backlog = Arc::clone(&backlog);
     channel.connect_on_message_string(move |_, data| {
+        // File data is binary frames only; text on it is not a file message.
+        if channel_kind == WebRtcChannel::FileData {
+            let _ = message_events.send(PeerEvent::Error(
+                "DeskLink WebRTC rejected text on the file-data channel".to_string(),
+            ));
+            return;
+        }
         let Some(data) = data else {
             let _ = message_events.send(PeerEvent::Error(
                 "DeskLink WebRTC received an empty text message".to_string(),
@@ -2143,6 +2187,53 @@ a=max-message-size:262144\r\n";
                 Err(_) => panic!("{pending:?} never opened over loopback"),
             }
         }
+    }
+
+    /// What a description says about the largest data-channel message: both
+    /// sides advertise 256 KiB, the most libwebrtc allows.
+    fn advertise_256_kib(_: SignalingMessageType, sdp: &str) -> String {
+        let mut text = sdp.trim_end().to_string();
+        text.push_str("\r\na=max-message-size:262144\r\n");
+        text
+    }
+
+    /// **The measurement behind the file frame size.** The plan was 192 KiB
+    /// frames if 256 KiB messages crossed intact; they cannot: GStreamer's
+    /// `webrtcbin` keeps the SCTP transport's `max-message-size` at 65 536
+    /// (it follows a *smaller* advertised value, never a larger one), and a
+    /// send over that fails locally. The file protocol therefore keeps its
+    /// 60 KiB frames. If a GStreamer upgrade lifts the limit this fails, and
+    /// the frame size can be reconsidered (with a phone to prove the other
+    /// direction).
+    #[test]
+    fn webrtcbin_never_carries_a_data_channel_message_over_64_kib() {
+        let pair = loopback_with(true, advertise_256_kib);
+        wait_for_channels(&pair.offerer_events, &[WebRtcChannel::FileData]);
+        wait_for_channels(&pair.answerer_events, &[WebRtcChannel::FileData]);
+        for peer in [&pair.offerer, &pair.answerer] {
+            let transport = peer
+                .webrtcbin
+                .property::<Option<gst_webrtc::WebRTCSCTPTransport>>("sctp-transport")
+                .expect("an SCTP transport");
+            assert_eq!(transport.max_message_size(), 65_536);
+        }
+        let channel = pair
+            .offerer
+            .channels
+            .lock()
+            .unwrap()
+            .get(&WebRtcChannel::FileData)
+            .cloned()
+            .unwrap();
+        let big = gst::glib::Bytes::from_owned(vec![1u8; 196_608]);
+        assert!(
+            channel.send_data_full(Some(&big)).is_err(),
+            "192 KiB is refused"
+        );
+        let fits = gst::glib::Bytes::from_owned(vec![1u8; 61_440]);
+        assert!(channel.send_data_full(Some(&fits)).is_ok(), "60 KiB goes");
+        pair.offerer.close();
+        pair.answerer.close();
     }
 
     /// Waits until `channel` is open on the peer whose events are `events`.

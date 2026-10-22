@@ -2860,10 +2860,12 @@ impl Worker {
                 relpath: path.clone(),
                 mtime: Some(entry.mtime),
             };
-            // Snapshotting a big file takes a while: not on this worker.
+            // Not on this worker: the transport may wait for the peer.
             let (owner, sent) = (device.clone(), path.clone());
+            let content = entry.sha256.clone();
             let job = move || {
-                if let Err(error) = super::desk_features::send_folder_file(&owner, &source, folder)
+                if let Err(error) =
+                    super::desk_features::send_folder_file(&owner, &source, folder, &content)
                 {
                     log_limited("send", &format!("A synced file was not sent: {error}"));
                     send_message(Message::SendFailed {

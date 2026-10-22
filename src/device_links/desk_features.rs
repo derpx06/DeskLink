@@ -566,19 +566,24 @@ pub(crate) fn send_folder_file(
     device_id: &str,
     path: &std::path::Path,
     folder: crate::device_links::webrtc::file_protocol::FolderRef,
+    content_sha256: &str,
 ) -> Result<(), String> {
     let daemon = DAEMON.get().ok_or("DeskLink is starting")?;
     let transport = FeatureTransport::for_device(&daemon.sessions, device_id)?;
     if !transport.is_ready() {
         return Err("The phone is not connected".into());
     }
-    transport.send_folder_file(path, folder)
+    transport.send_folder_file(path, folder, content_sha256)
 }
 
-/// Cancels a transfer (F8c: an item removed while it moves).
+/// Cancels a transfer (F8c: an item removed while it moves). The phone is
+/// told it was `removed`, so both sides clean up.
 pub(crate) fn cancel_transfer(device_id: &str, transfer_id: &str) -> Result<(), String> {
     let daemon = DAEMON.get().ok_or("DeskLink is starting")?;
-    FeatureTransport::for_device(&daemon.sessions, device_id)?.cancel_transfer(transfer_id)
+    FeatureTransport::for_device(&daemon.sessions, device_id)?.cancel_transfer(
+        transfer_id,
+        crate::device_links::webrtc::file_protocol::code::REMOVED,
+    )
 }
 
 /// Remembers a folder a phone started a terminal in (newest first, five).

@@ -126,12 +126,14 @@ impl FeatureTransport {
         &self,
         path: &Path,
         folder: crate::device_links::webrtc::file_protocol::FolderRef,
+        content_sha256: &str,
     ) -> Result<(), String> {
         crate::device_links::webrtc::coordinator::start_folder_transfer(
             &self.sessions,
             &self.snapshot,
             path,
             folder,
+            content_sha256,
         )
     }
 
@@ -165,11 +167,16 @@ impl FeatureTransport {
         )
     }
 
-    pub(crate) fn cancel_transfer(&self, transfer_id: &str) -> Result<(), String> {
+    pub(crate) fn cancel_transfer(
+        &self,
+        transfer_id: &str,
+        why: &'static str,
+    ) -> Result<(), String> {
         crate::device_links::webrtc::coordinator::cancel_file_transfer(
             &self.sessions,
             &self.snapshot,
             transfer_id,
+            why,
         )
     }
 
