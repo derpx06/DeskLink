@@ -281,6 +281,7 @@ impl WebRtcTransferManager {
                 done: rebound.offset,
                 total: rebound.total_size,
                 preparing: false,
+                paused: false,
             });
             events.push(TransferEvent::SendControl(self.send_control(
                 wire,
@@ -424,6 +425,7 @@ impl WebRtcTransferManager {
             done: 0,
             total: checkpoint.total_size,
             preparing: false,
+            paused: false,
         });
         Ok(vec![TransferEvent::SendControl(self.send_control(
             wire,
@@ -823,6 +825,7 @@ impl WebRtcTransferManager {
                 done: checkpoint.offset,
                 total: checkpoint.total_size,
                 preparing: false,
+                paused: false,
             });
         }
         if checkpoint.offset == checkpoint.total_size {
@@ -1571,6 +1574,10 @@ fn ensure_regular_file(path: &Path) -> Result<(), String> {
 
 /// What to show for a peer's `Error`. It is the other device's text, so it is
 /// bounded and stripped of control characters before it reaches a window.
+/// A peer's reason for ending a transfer, fit to show. One that reads like
+/// a stack trace (an exception or a class name: a phone once sent
+/// "org.desklink.mobile.transport.TransportError: WebRTC data channel is not
+/// open") is replaced by plain words.
 fn peer_reason(error: Option<&str>) -> String {
     let text: String = error
         .unwrap_or_default()
@@ -1579,10 +1586,52 @@ fn peer_reason(error: Option<&str>) -> String {
         .take(256)
         .collect();
     if text.trim().is_empty() {
-        "The other device reported an error".to_string()
-    } else {
-        text
+        return "The other device reported an error".to_string();
     }
+    if !looks_technical(&text) {
+        return text;
+    }
+    let lower = text.to_lowercase();
+    if [
+        "not open",
+        "closed",
+        "connection",
+        "disconnect",
+        "socket",
+        "timeout",
+        "timed out",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
+    {
+        "The connection dropped".to_string()
+    } else {
+        "The phone stopped the transfer".to_string()
+    }
+}
+
+/// Whether `text` names an exception or a class rather than saying what
+/// happened.
+fn looks_technical(text: &str) -> bool {
+    if [
+        "Exception",
+        "org.",
+        "java.",
+        "javax.",
+        "kotlin.",
+        "kotlinx.",
+        "android.",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+    {
+        return true;
+    }
+    // "some.package.ClassError: …"
+    text.split_whitespace().any(|word| {
+        let word = word.trim_end_matches(':');
+        word.matches('.').count() >= 2 && (word.ends_with("Error") || word.ends_with("Exception"))
+    })
 }
 
 fn sync_directory(path: &Path) -> Result<(), String> {
@@ -2006,6 +2055,43 @@ mod tests {
         assert_eq!(path, sandbox.downloads().join("big.bin"));
         assert_eq!(fs::read(path).unwrap(), data);
         assert!(names(&sandbox.state()).is_empty());
+    }
+
+    /// A peer's reason is shown as it is, unless it reads like a stack trace.
+    #[test]
+    fn a_peers_exception_is_never_shown_as_the_reason() {
+        assert_eq!(
+            peer_reason(Some("Disk full over there")),
+            "Disk full over there"
+        );
+        assert_eq!(
+            peer_reason(Some("  ")),
+            "The other device reported an error"
+        );
+        assert_eq!(
+            peer_reason(Some(
+                "org.desklink.mobile.transport.TransportError: WebRTC data channel is not open"
+            )),
+            "The connection dropped"
+        );
+        assert_eq!(
+            peer_reason(Some("java.io.IOException: write failed: ENOSPC")),
+            "The phone stopped the transfer"
+        );
+        assert_eq!(
+            peer_reason(Some(
+                "kotlin.UninitializedPropertyAccessException: lateinit"
+            )),
+            "The phone stopped the transfer"
+        );
+        assert_eq!(
+            peer_reason(Some("some.pkg.SocketError: socket closed")),
+            "The connection dropped"
+        );
+        assert_eq!(
+            peer_reason(Some("Cancelled by the user. Try again.")),
+            "Cancelled by the user. Try again."
+        );
     }
 
     /// C3: a clipboard PNG goes to the clipboard, never to Downloads, and

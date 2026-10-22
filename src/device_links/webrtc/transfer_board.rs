@@ -29,6 +29,9 @@ pub struct TransferRow {
     /// A file being copied and hashed before its offer can be made. It has no
     /// size to show progress against yet.
     pub preparing: bool,
+    /// The connection dropped: both sides keep their checkpoint, and the
+    /// transfer resumes when the device reconnects.
+    pub paused: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +86,7 @@ impl TransferBoard {
     pub fn progress(&mut self, id: &str, done: u64) {
         if let Some(row) = self.rows.iter_mut().find(|row| row.id == id) {
             row.preparing = false;
+            row.paused = false;
             row.done = if row.total > 0 {
                 done.min(row.total)
             } else {
@@ -111,7 +115,21 @@ impl TransferBoard {
         });
     }
 
-    /// Ends everything a device had running, e.g. when its connection goes.
+    /// Pauses everything a device had running when its connection drops:
+    /// the rows stay ("Paused — resumes when … reconnects") and nothing is
+    /// reported as failed. A resumed transfer is offered again under the
+    /// same id and replaces its row.
+    pub fn pause_device(&mut self, device_id: &str) {
+        for row in self
+            .rows
+            .iter_mut()
+            .filter(|row| row.device_id == device_id)
+        {
+            row.paused = true;
+        }
+    }
+
+    /// Ends everything a device had running.
     pub fn finish_device(&mut self, device_id: &str, reason: &str) {
         let ids: Vec<String> = self
             .rows
@@ -174,6 +192,10 @@ pub fn finish_device(device_id: &str, reason: &str) {
     board().finish_device(device_id, reason);
 }
 
+pub fn pause_device(device_id: &str) {
+    board().pause_device(device_id);
+}
+
 pub fn rows() -> Vec<TransferRow> {
     board().rows()
 }
@@ -224,6 +246,7 @@ impl Preparing {
             done: 0,
             total: 0,
             preparing: true,
+            paused: false,
         });
         Self { id }
     }
@@ -251,6 +274,7 @@ mod tests {
             done: 0,
             total,
             preparing: false,
+            paused: false,
         }
     }
 
@@ -309,6 +333,27 @@ mod tests {
         board.finish("b", Outcome::Sent);
         let ids: Vec<_> = board.rows().into_iter().map(|row| row.id).collect();
         assert_eq!(ids, ["a", "c"]);
+    }
+
+    #[test]
+    fn a_dropped_connection_pauses_its_transfers_until_they_resume() {
+        let mut board = TransferBoard::default();
+        board.begin(row("p", "phone", true, 10));
+        board.begin(row("t", "tablet", true, 10));
+        board.pause_device("phone");
+        assert!(board.take_finished().is_empty(), "no failure is reported");
+        let paused: Vec<_> = board
+            .rows()
+            .into_iter()
+            .map(|row| (row.id, row.paused))
+            .collect();
+        assert_eq!(paused, [("p".into(), true), ("t".into(), false)]);
+        // The resumed offer replaces the row; progress also clears it.
+        board.begin(row("p", "phone", true, 10));
+        assert!(!board.rows()[0].paused);
+        board.pause_device("phone");
+        board.progress("p", 4);
+        assert!(!board.rows()[0].paused);
     }
 
     #[test]

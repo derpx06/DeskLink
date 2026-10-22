@@ -50,6 +50,9 @@ fn subtitle(row: &TransferRow, device: &str) -> String {
     if row.preparing {
         return format!("Preparing to send to {device}…");
     }
+    if row.paused {
+        return format!("Paused — resumes when {device} reconnects");
+    }
     let direction = if row.incoming {
         format!("Receiving from {device}")
     } else {
@@ -874,6 +877,7 @@ mod tests {
             done,
             total,
             preparing: false,
+            paused: false,
         }
     }
 
@@ -886,6 +890,16 @@ mod tests {
         assert!(
             receiving.starts_with("Receiving from Pixel · "),
             "{receiving}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_connection_reads_as_paused() {
+        let mut paused = row(true, 1_000, 4_000);
+        paused.paused = true;
+        assert_eq!(
+            subtitle(&paused, "Pixel"),
+            "Paused — resumes when Pixel reconnects"
         );
     }
 

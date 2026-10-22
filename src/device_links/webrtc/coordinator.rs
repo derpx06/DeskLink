@@ -2610,9 +2610,10 @@ fn reset_device_webrtc_state(device_id: &str) {
             session.stop();
         }
     }
-    // Transfers ride this peer; the user should not be left watching a
-    // progress bar that will never move.
-    super::transfer_board::finish_device(device_id, "The connection to the phone was interrupted");
+    // Transfers ride this peer. Both sides keep their checkpoints and the
+    // phone resumes them when it reconnects (this side re-offers its own
+    // sends): shown as paused, not as failures.
+    super::transfer_board::pause_device(device_id);
 }
 
 /// Releases a WebRTC peer when its event worker stops, however it stops.

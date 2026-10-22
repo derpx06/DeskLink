@@ -1926,6 +1926,7 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                         done: done.trim_start_matches('-').parse().unwrap_or(0),
                         total: total.parse().unwrap_or(0),
                         preparing: total == "0",
+                        paused: false,
                     })
             });
         }
