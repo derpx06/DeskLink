@@ -190,8 +190,12 @@ impl Drop for PortalWorkerCleanup {
 /// silence means the stream died (PipeWire errors, a failed negotiation) and
 /// the phone would otherwise wait for a picture forever.
 const CAPTURE_STALL: std::time::Duration = std::time::Duration::from_secs(3);
-/// Rebuilds in a row without a frame before the share is reported failed.
+/// Rebuilds in a row without steady video before the share is reported
+/// failed to the phone (`screen-stopped`, "not producing any video").
 const CAPTURE_RESTARTS: u32 = 3;
+/// How long a rebuilt capture must keep sending before the rebuild count
+/// starts over.
+const CAPTURE_HEALTHY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 /// Scroll steps closer together than this are one gesture.
 const SCROLL_FINISH_AFTER: std::time::Duration = std::time::Duration::from_millis(150);
 
@@ -1470,6 +1474,7 @@ fn run_desktop_portal_worker(
     let mut last_frames = 0u64;
     let mut last_progress = std::time::Instant::now();
     let mut restarts = 0u32;
+    let mut last_rebuild: Option<std::time::Instant> = None;
     let mut scroll_open: Option<std::time::Instant> = None;
     'serve: loop {
         // A scroll gesture ends when its steps stop coming.
@@ -1482,7 +1487,12 @@ fn run_desktop_portal_worker(
         if frames != last_frames {
             last_frames = frames;
             last_progress = std::time::Instant::now();
-            restarts = 0;
+            // Only video that keeps flowing clears the count: a rebuilt chain
+            // that let a few packets out and then died reset it every time,
+            // and the share rebuilt every 4 s for as long as the phone looked.
+            if last_rebuild.is_none_or(|at| at.elapsed() >= CAPTURE_HEALTHY_AFTER) {
+                restarts = 0;
+            }
         } else if last_progress.elapsed() >= CAPTURE_STALL {
             if restarts >= CAPTURE_RESTARTS {
                 no_video = true;
@@ -1504,6 +1514,7 @@ fn run_desktop_portal_worker(
             }
             last_frames = peer.desktop_screen_frames_sent();
             last_progress = std::time::Instant::now();
+            last_rebuild = Some(last_progress);
         }
         let wait = if scroll_open.is_some() {
             SCROLL_FINISH_AFTER

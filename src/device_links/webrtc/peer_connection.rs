@@ -1513,6 +1513,42 @@ a=max-message-size:262144\r\n";
         pair.answerer.close();
     }
 
+    /// A capture that fails to start (as a PipeWire stream that would not
+    /// negotiate did) must leave the screen track usable: the next share
+    /// reaches the far side's picture.
+    #[test]
+    fn a_failed_capture_leaves_the_screen_track_for_the_next_share() {
+        let pair = loopback();
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let share = |source| {
+            super::super::screen::DesktopScreenCapture::attach_source(
+                &pair.answerer.pipeline,
+                &pair.answerer.webrtcbin,
+                source,
+                None,
+                1280,
+                720,
+                super::super::screen::ScreenRequest::FALLBACK,
+                Some(super::super::screen::RtpContinuity {
+                    ssrc: pair.answerer.screen_ssrc,
+                    next_seqnum: None,
+                }),
+            )
+        };
+        // Cannot start: its file does not exist.
+        let broken = gst::ElementFactory::make("filesrc")
+            .property("location", "/nonexistent/desklink-screen")
+            .build()
+            .unwrap();
+        assert!(share(broken).is_err());
+        let working = share(test_source()).unwrap();
+        let stream = assert_far_side_decodes(&pair.offerer_events);
+        assert!(stream.frames_shown() > 0);
+        assert!(working.stop().is_ok());
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
     pub(crate) struct Loopback {
         pub(crate) offerer: Arc<DesktopWebRtcPeer>,
         pub(crate) answerer: Arc<DesktopWebRtcPeer>,

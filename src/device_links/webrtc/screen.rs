@@ -626,10 +626,20 @@ impl DesktopScreenCapture {
             .factory()
             .is_some_and(|factory| factory.name() == "vapostproc");
 
+        // Frames in system memory. Offered DMA-BUF (vapostproc takes it),
+        // PipeWire negotiated buffers with Mutter's tiled modifiers that
+        // the GPU path then refused: not-negotiated on the first frame, and
+        // every reconnect to that stream failed (`gst_caps_is_fixed`
+        // assertion, "error use input buffers: -22") until the share ended.
+        let system_memory = gst::ElementFactory::make("capsfilter")
+            .property("caps", gst::Caps::new_empty_simple("video/x-raw"))
+            .build()
+            .map_err(|error| format!("DeskLink screen capture needs capsfilter: {error}"))?;
         // Scale before converting: colour conversion then runs on the small
         // frame, not the full-resolution one.
         let elements = vec![
             source,
+            system_memory,
             scale,
             convert,
             rate.clone(),
@@ -665,10 +675,12 @@ impl DesktopScreenCapture {
                         })?
                 }
             };
-            let fail = |message: String| {
-                webrtcbin.release_request_pad(&sink_pad);
-                Err(message)
-            };
+            // The sink pad is kept on failure, never released: requesting it
+            // again made webrtcbin build a second FEC/RED encoder for the
+            // transceiver ("duplicate call to create a fec encoder"), and
+            // every later share on that peer died not-linked. Removing the
+            // chain unlinks it; the next share finds it unlinked and reuses it.
+            let fail = |message: String| Err(message);
             // The payload type is whatever was negotiated for the codec, not a
             // number we assume libwebrtc will hand out.
             let codec = if h264_experiment() { "H264" } else { "VP8" };
@@ -1327,8 +1339,13 @@ pub(crate) fn desktop_share_selftest(device_id: &str) -> Result<String, String> 
         .property("sync", false)
         .build()
         .map_err(|error| error.to_string())?;
+    let system_memory = gst::ElementFactory::make("capsfilter")
+        .property("caps", gst::Caps::new_empty_simple("video/x-raw"))
+        .build()
+        .map_err(|error| error.to_string())?;
     let chain = [
         capture,
+        system_memory,
         scale,
         convert,
         rate,
