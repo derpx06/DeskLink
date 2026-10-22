@@ -37,6 +37,7 @@ pub(crate) fn debug_logging() -> bool {
 
 mod application;
 mod autostart;
+mod bucket_progress;
 mod config;
 mod desk_menu;
 mod device_links;

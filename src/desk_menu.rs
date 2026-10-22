@@ -168,6 +168,16 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
                 .icon("media-skip-forward-symbolic"),
         );
     }
+    // The Bucket (F8b): how its sync is going, and the way to it.
+    if let Some(summary) = crate::bucket_progress::summary(&phone.id) {
+        menu.push(TrayEntry::Label(summary.line()));
+    }
+    if crate::device_links::folders::bucket_on(&phone.id) {
+        menu.push(
+            TrayEntry::action("Open Bucket", format!("open-bucket:{}", phone.id))
+                .icon("folder-symbolic"),
+        );
+    }
     if let Some(camera) = phone.camera.as_ref() {
         menu.push(TrayEntry::Label(if camera.live {
             "● Camera in use as DeskLink Camera".to_string()
@@ -419,6 +429,7 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
             }
         }
         "end-sessions" => app.activate_action("end-sessions", Some(&target.to_variant())),
+        "open-bucket" => app.activate_action("open-bucket", Some(&target.to_variant())),
         "keep-awake-on" | "keep-awake-off" => {
             daemon.send(DaemonCommand::SetStayAwake(verb == "keep-awake-on"))
         }
@@ -511,6 +522,62 @@ mod tests {
                 _ => Vec::new(),
             })
             .collect()
+    }
+
+    #[test]
+    fn the_bucket_sync_is_a_line_and_open_bucket_an_action() {
+        use crate::device_links::folders::{self, Pair, PairView, Phase};
+        use crate::device_links::webrtc::transfer_board::TransferRow;
+        let ready = phone("tray-bucket", true);
+        let labels = |menu: &[TrayEntry]| -> Vec<String> {
+            menu.iter()
+                .filter_map(|entry| match entry {
+                    TrayEntry::Label(label) => Some(label.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let menu = phone_section(&ready, &AppSettings::default());
+        assert!(!actions(&menu).contains(&"open-bucket:tray-bucket".to_string()));
+        folders::debug_show(
+            vec![PairView {
+                pair: Pair {
+                    id: folders::BUCKET_ID.into(),
+                    name: "DeskLink Bucket".into(),
+                    root: std::env::temp_dir(),
+                    device: "tray-bucket".into(),
+                    include_hidden: false,
+                    ignore: Vec::new(),
+                    bucket: true,
+                },
+                phase: Phase::UpToDate,
+                files: 0,
+                last_sync: None,
+                conflicts: Vec::new(),
+                items: Vec::new(),
+                bytes: 0,
+                skipped: Vec::new(),
+            }],
+            Vec::new(),
+        );
+        crate::bucket_progress::sample_for_test(vec![TransferRow {
+            id: "tray-bucket-1".into(),
+            device_id: "tray-bucket".into(),
+            name: "a.mov".into(),
+            incoming: false,
+            done: 1_100_000_000,
+            total: 2_400_000_000,
+            preparing: false,
+            paused: false,
+        }]);
+        let menu = phone_section(&ready, &AppSettings::default());
+        assert!(labels(&menu).contains(&"Syncing 1 file · 1.1 GB of 2.4 GB".to_string()));
+        assert!(actions(&menu).contains(&"open-bucket:tray-bucket".to_string()));
+        crate::bucket_progress::sample_for_test(Vec::new());
+        let menu = phone_section(&ready, &AppSettings::default());
+        assert!(!labels(&menu)
+            .iter()
+            .any(|label| label.starts_with("Syncing")));
     }
 
     #[test]

@@ -190,3 +190,17 @@
 .desklink-thumb { icon-size: 32px; border-radius: 8px; }
 .desklink-file-name { font-weight: bold; }
 .desklink-empty { padding: 12px 0; }
+.desklink-bucket-words { spacing: 4px; }
+.desklink-bucket-words > StBoxLayout { spacing: 8px; }
+.desklink-bucket-icon { icon-size: 16px; }
+.desklink-progress {
+  height: 4px;
+  margin-top: 2px;
+  border-radius: 2px;
+  background-color: rgba(127, 127, 127, 0.3);
+}
+.desklink-progress-fill {
+  height: 4px;
+  border-radius: 2px;
+  background-color: -st-accent-color;
+}

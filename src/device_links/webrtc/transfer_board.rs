@@ -57,6 +57,11 @@ pub struct TransferBoard {
     /// Insertion order, so rows do not jump around as they update.
     rows: Vec<TransferRow>,
     finished: VecDeque<Finished>,
+    /// Bucket files moving (F8b): not downloads, so not on the Transfers
+    /// page and never in the history. `name` is the path in the Bucket.
+    synced: Vec<TransferRow>,
+    /// Bucket transfers that ended without their file: the sync is not done.
+    synced_failed: VecDeque<String>,
 }
 
 impl TransferBoard {
@@ -73,6 +78,18 @@ impl TransferBoard {
         self.rows.push(row);
     }
 
+    /// Adds (or replaces) a Bucket transfer.
+    pub fn begin_synced(&mut self, row: TransferRow) {
+        if let Some(existing) = self.synced.iter_mut().find(|known| known.id == row.id) {
+            *existing = row;
+            return;
+        }
+        if self.synced.len() >= MAX_ROWS {
+            self.synced.remove(0);
+        }
+        self.synced.push(row);
+    }
+
     /// Reports a transfer that ended without ever being listed, such as an
     /// offer refused on arrival.
     pub fn record(&mut self, finished: Finished) {
@@ -84,7 +101,12 @@ impl TransferBoard {
 
     /// Records how far a listed transfer has got; unknown ids are ignored.
     pub fn progress(&mut self, id: &str, done: u64) {
-        if let Some(row) = self.rows.iter_mut().find(|row| row.id == id) {
+        if let Some(row) = self
+            .rows
+            .iter_mut()
+            .chain(self.synced.iter_mut())
+            .find(|row| row.id == id)
+        {
             row.preparing = false;
             row.paused = false;
             row.done = if row.total > 0 {
@@ -99,6 +121,16 @@ impl TransferBoard {
     /// paths that both notice the end (a peer's `Error` and our own cleanup)
     /// report it once.
     pub fn finish(&mut self, id: &str, outcome: Outcome) {
+        if let Some(position) = self.synced.iter().position(|row| row.id == id) {
+            self.synced.remove(position);
+            if matches!(outcome, Outcome::Failed(_) | Outcome::Cancelled) {
+                if self.synced_failed.len() >= MAX_FINISHED {
+                    self.synced_failed.pop_front();
+                }
+                self.synced_failed.push_back(id.to_string());
+            }
+            return;
+        }
         let Some(position) = self.rows.iter().position(|row| row.id == id) else {
             return;
         };
@@ -123,6 +155,7 @@ impl TransferBoard {
         for row in self
             .rows
             .iter_mut()
+            .chain(self.synced.iter_mut())
             .filter(|row| row.device_id == device_id)
         {
             row.paused = true;
@@ -134,6 +167,7 @@ impl TransferBoard {
         let ids: Vec<String> = self
             .rows
             .iter()
+            .chain(self.synced.iter())
             .filter(|row| row.device_id == device_id)
             .map(|row| row.id.clone())
             .collect();
@@ -198,6 +232,20 @@ pub fn pause_device(device_id: &str) {
 
 pub fn rows() -> Vec<TransferRow> {
     board().rows()
+}
+
+pub fn begin_synced(row: TransferRow) {
+    board().begin_synced(row);
+}
+
+/// Bucket transfers moving now.
+pub fn synced_rows() -> Vec<TransferRow> {
+    board().synced.clone()
+}
+
+/// Bucket transfers that ended without their file since last asked.
+pub fn take_synced_failed() -> Vec<String> {
+    board().synced_failed.drain(..).collect()
 }
 
 pub fn take_finished() -> Vec<Finished> {
@@ -391,6 +439,25 @@ mod tests {
             Some(format!("f{}", MAX_FINISHED + 9).as_str()),
             "the newest outcome survives"
         );
+    }
+
+    #[test]
+    fn bucket_transfers_move_pause_and_end_off_the_transfers_page() {
+        let mut board = TransferBoard::default();
+        board.begin_synced(row("s1", "phone", true, 100));
+        board.begin_synced(row("s2", "phone", false, 100));
+        board.progress("s1", 40);
+        assert!(board.rows().is_empty(), "not a download");
+        assert_eq!(board.synced[0].done, 40);
+        board.pause_device("phone");
+        assert!(board.synced.iter().all(|row| row.paused));
+        board.progress("s1", 50);
+        assert!(!board.synced[0].paused, "moving again");
+        board.finish("s1", Outcome::Sent);
+        board.finish("s2", Outcome::Failed("gone".into()));
+        assert!(board.synced.is_empty());
+        assert!(board.take_finished().is_empty(), "never in the history");
+        assert_eq!(board.synced_failed, ["s2"]);
     }
 
     #[test]

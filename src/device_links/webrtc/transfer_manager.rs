@@ -293,17 +293,22 @@ impl WebRtcTransferManager {
                 Ok(mut outgoing) => outgoing.insert(rebound.transfer_id.clone(), rebound.clone()),
                 Err(_) => continue,
             };
-            if rebound.folder.is_none() {
-                board::begin(TransferRow {
-                    id: rebound.transfer_id.clone(),
-                    device_id: wire.peer_device_id.clone(),
-                    name: rebound.filename.clone(),
-                    incoming: false,
-                    done: rebound.offset,
-                    total: rebound.total_size,
-                    preparing: false,
-                    paused: false,
-                });
+            let row = TransferRow {
+                id: rebound.transfer_id.clone(),
+                device_id: wire.peer_device_id.clone(),
+                name: rebound.filename.clone(),
+                incoming: false,
+                done: rebound.offset,
+                total: rebound.total_size,
+                preparing: false,
+                paused: false,
+            };
+            match &rebound.folder {
+                None => board::begin(row),
+                Some(folder) => board::begin_synced(TransferRow {
+                    name: folder.relpath.clone(),
+                    ..row
+                }),
             }
             events.push(TransferEvent::SendControl(self.send_control(
                 wire,
@@ -459,6 +464,18 @@ impl WebRtcTransferManager {
             .lock()
             .map_err(|_| "DeskLink transfer manager lock poisoned".to_string())?
             .insert(transfer_id, checkpoint.clone());
+        if let Some(folder) = &checkpoint.folder {
+            board::begin_synced(TransferRow {
+                id: checkpoint.transfer_id.clone(),
+                device_id: wire.peer_device_id.clone(),
+                name: folder.relpath.clone(),
+                incoming: false,
+                done: 0,
+                total: checkpoint.total_size,
+                preparing: false,
+                paused: false,
+            });
+        }
         if clipboard_mime.is_some() || checkpoint.folder.is_some() {
             return Ok(vec![TransferEvent::SendControl(self.send_control(
                 wire,
@@ -903,17 +920,24 @@ impl WebRtcTransferManager {
             .insert(checkpoint.transfer_id.clone(), checkpoint.clone());
         // A clipboard image or a synced file is not a download: no row on
         // the Transfers page.
-        if !checkpoint.clipboard && checkpoint.folder.is_none() {
-            board::begin(TransferRow {
-                id: checkpoint.transfer_id.clone(),
-                device_id: wire.peer_device_id.clone(),
-                name: checkpoint.filename.clone(),
-                incoming: true,
-                done: checkpoint.offset,
-                total: checkpoint.total_size,
-                preparing: false,
-                paused: false,
-            });
+        let row = TransferRow {
+            id: checkpoint.transfer_id.clone(),
+            device_id: wire.peer_device_id.clone(),
+            name: checkpoint.filename.clone(),
+            incoming: true,
+            done: checkpoint.offset,
+            total: checkpoint.total_size,
+            preparing: false,
+            paused: false,
+        };
+        match &checkpoint.folder {
+            // The Bucket's own table: its page shows how far each file is.
+            Some(folder) => board::begin_synced(TransferRow {
+                name: folder.relpath.clone(),
+                ..row
+            }),
+            None if !checkpoint.clipboard => board::begin(row),
+            None => {}
         }
         if checkpoint.offset == checkpoint.total_size {
             // An empty file, or a partial that already holds every byte: there
@@ -1007,6 +1031,7 @@ impl WebRtcTransferManager {
                 checkpoint.sha256.clone(),
                 checkpoint.total_size,
             );
+            board::finish(&checkpoint.transfer_id, Outcome::Received(stash.clone()));
             stash
         } else if checkpoint.clipboard {
             // Placed on the clipboard from memory; the file goes at once.

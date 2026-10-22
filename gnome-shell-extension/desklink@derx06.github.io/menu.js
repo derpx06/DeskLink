@@ -378,6 +378,42 @@ export function fillMenu(menu, ctx) {
         menu.addMenuItem(row(line));
     }
 
+    // The Bucket syncing: what, how fast, how long; opens the Bucket page.
+    const bucket = selected.bucket;
+    if (bucket) {
+        const item = new PopupMenu.PopupBaseMenuItem({style_class: 'desklink-row desklink-bucket'});
+        const words = column({style_class: 'desklink-bucket-words'});
+        const head = box();
+        head.add_child(new St.Icon({icon_name: 'folder-symbolic', style_class: 'desklink-bucket-icon', y_align: Clutter.ActorAlign.CENTER}));
+        const line = label('', 'desklink-card-title');
+        head.add_child(line);
+        words.add_child(head);
+        const detail = dim(label('', 'desklink-card-subtitle'));
+        words.add_child(detail);
+        const track = new St.Widget({style_class: 'desklink-progress', x_expand: true, layout_manager: new Clutter.BinLayout()});
+        const fill = new St.Widget({style_class: 'desklink-progress-fill', x_align: Clutter.ActorAlign.START, y_expand: true});
+        track.add_child(fill);
+        words.add_child(track);
+        item.add_child(words);
+        let fraction = 0;
+        const draw = () => (fill.width = Math.round(track.width * fraction));
+        track.connect('notify::width', draw);
+        const show = now => {
+            if (!now)
+                return;
+            line.text = now.line;
+            detail.text = now.detail;
+            fraction = Math.min(1, Math.max(0, now.fraction ?? 0));
+            item.accessible_name = `Bucket: ${now.line}, ${now.detail}, ${Math.round(fraction * 100)}%`;
+            draw();
+        };
+        show(bucket);
+        ctx.onBucket?.(show);
+        item.connect('activate', () => invoke(selected.id, 'open-bucket'));
+        ctx.appear(item, `bucket:${selected.id}`);
+        menu.addMenuItem(item);
+    }
+
     // What is live on this computer.
     const live = devices.filter(device => device.screen || device.terminals > 0);
     if (live.length > 0) {

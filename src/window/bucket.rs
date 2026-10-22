@@ -18,6 +18,132 @@ use crate::device_links::transfer_log::LoggedFile;
 thread_local! {
     /// Ctrl+V is installed on the window once.
     static PASTE_READY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Progress widgets on screen, updated by `bucket_progress`'s tick (at
+    /// most four times a second) without rebuilding the page.
+    static LIVE: std::cell::RefCell<Vec<Live>> = const { std::cell::RefCell::new(Vec::new()) };
+    static LISTENING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A progress widget kept current.
+enum Live {
+    /// One file moving: "340 MB of 1.2 GB · 2 min left" and its bar.
+    Tile {
+        device: String,
+        path: String,
+        incoming: bool,
+        line: glib::WeakRef<gtk::Label>,
+        bar: glib::WeakRef<gtk::ProgressBar>,
+    },
+    /// The page header or the overview card: the sync's summary while one
+    /// goes, `idle` otherwise.
+    Summary {
+        device: String,
+        idle: String,
+        line: glib::WeakRef<gtk::Label>,
+        bar: glib::WeakRef<gtk::ProgressBar>,
+        speed: Option<glib::WeakRef<gtk::Label>>,
+    },
+}
+
+fn watch(live: Live) {
+    update_live(&live);
+    LIVE.with(|all| all.borrow_mut().push(live));
+    if !LISTENING.replace(true) {
+        crate::bucket_progress::on_tick(|| {
+            LIVE.with(|all| all.borrow_mut().retain(update_live));
+            true
+        });
+    }
+}
+
+fn set_text(label: &gtk::Label, text: &str) {
+    if label.label() != text {
+        label.set_label(text);
+    }
+}
+
+fn set_bar(bar: &gtk::ProgressBar, fraction: f64, text: &str) {
+    if (bar.fraction() - fraction).abs() > f64::EPSILON {
+        bar.set_fraction(fraction);
+    }
+    bar.update_property(&[gtk::accessible::Property::ValueText(text)]);
+}
+
+/// Shows the latest numbers; `false` once the widgets are gone.
+fn update_live(live: &Live) -> bool {
+    match live {
+        Live::Tile {
+            device,
+            path,
+            incoming,
+            line,
+            bar,
+        } => {
+            let (Some(line), Some(bar)) = (line.upgrade(), bar.upgrade()) else {
+                return false;
+            };
+            if !line.is_mapped() && line.label() != "" {
+                return true;
+            }
+            let tile = crate::bucket_progress::tile(device, path, *incoming);
+            let text = tile
+                .as_ref()
+                .map_or_else(|| "Waiting…".to_string(), |tile| tile.line());
+            set_text(&line, &text);
+            set_bar(&bar, tile.map_or(0.0, |tile| tile.fraction()), &text);
+        }
+        Live::Summary {
+            device,
+            idle,
+            line,
+            bar,
+            speed,
+        } => {
+            let (Some(line), Some(bar)) = (line.upgrade(), bar.upgrade()) else {
+                return false;
+            };
+            if !line.is_mapped() && line.label() != "" {
+                return true;
+            }
+            let speed = speed.as_ref().and_then(|speed| speed.upgrade());
+            match crate::bucket_progress::summary(device) {
+                Some(summary) => {
+                    let text = summary.line();
+                    set_text(&line, &text);
+                    set_bar(&bar, summary.fraction(), &text);
+                    bar.set_visible(true);
+                    if let Some(speed) = speed {
+                        let words = if summary.paused || summary.speed < 1.0 {
+                            String::new()
+                        } else {
+                            crate::bucket_progress::speed_words(summary.speed)
+                        };
+                        speed.set_visible(!words.is_empty());
+                        set_text(&speed, &words);
+                    }
+                }
+                None => {
+                    set_text(&line, idle);
+                    bar.set_visible(false);
+                    if let Some(speed) = speed {
+                        speed.set_visible(false);
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+/// A thin bar for screen readers too.
+fn thin_bar(name: &str) -> gtk::ProgressBar {
+    let bar = gtk::ProgressBar::builder()
+        .css_classes(["thin"])
+        .valign(gtk::Align::Center)
+        .hexpand(true)
+        .build();
+    bar.update_property(&[gtk::accessible::Property::Label(name)]);
+    bar
 }
 
 /// This phone's Bucket, if it is on (or being turned on).
@@ -277,11 +403,7 @@ fn header(view: &PairView, device: &DeviceView) -> gtk::Box {
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
-    let mut parts = vec![if connected {
-        format!("With {}", device.name)
-    } else {
-        format!("{} is away · changes sync when it is back", device.name)
-    }];
+    let mut parts = Vec::new();
     if connected {
         match &view.phase {
             Phase::Syncing(count) => parts.push(format!(
@@ -289,14 +411,39 @@ fn header(view: &PairView, device: &DeviceView) -> gtk::Box {
                 if *count == 1 { "item" } else { "items" }
             )),
             Phase::Scanning => parts.push("Checking…".into()),
-            _ => parts.extend(synced_words(view.last_sync)),
+            _ => {
+                parts.push("Up to date".to_string());
+                parts.extend(synced_words(view.last_sync));
+            }
         }
+    } else {
+        parts.push(format!(
+            "{} is away · changes sync when it is back",
+            device.name
+        ));
     }
     parts.push(glib::format_size(view.bytes).to_string());
-    let line = text(&parts.join(" · "), &["caption", "text-dim"]);
+    let idle = parts.join(" · ");
+    let line = text(&idle, &["caption", "text-dim", "numeric"]);
     line.set_wrap(true);
     state.append(&line);
     words.append(&state);
+    // While files move: a thin bar for the whole sync, and its speed.
+    let progress = gtk::Box::builder().spacing(10).margin_top(2).build();
+    let bar = thin_bar("Bucket sync progress");
+    bar.set_visible(false);
+    progress.append(&bar);
+    let speed = text("", &["caption", "text-dim", "numeric"]);
+    speed.set_visible(false);
+    progress.append(&speed);
+    words.append(&progress);
+    watch(Live::Summary {
+        device: device.id.clone(),
+        idle,
+        line: line.downgrade(),
+        bar: bar.downgrade(),
+        speed: Some(speed.downgrade()),
+    });
     head.append(&words);
 
     let actions = gtk::Box::builder()
@@ -606,7 +753,23 @@ fn tile(
         glib::format_size(item.size),
         from_words(item, device)
     );
-    words.append(&ellipsized(&meta, &["caption", "text-dim"]));
+    if matches!(item.state, ItemState::Sending | ItemState::Receiving) {
+        // "340 MB of 1.2 GB · 2 min left" and a bar, kept current.
+        let line = ellipsized("Waiting…", &["caption", "text-dim", "numeric"]);
+        words.append(&line);
+        let bar = thin_bar(&format!("Progress of {}", item.path));
+        bar.set_margin_top(4);
+        words.append(&bar);
+        watch(Live::Tile {
+            device: device.id.clone(),
+            path: item.path.clone(),
+            incoming: item.state == ItemState::Receiving,
+            line: line.downgrade(),
+            bar: bar.downgrade(),
+        });
+    } else {
+        words.append(&ellipsized(&meta, &["caption", "text-dim"]));
+    }
     card.append(&words);
     let button = gtk::Button::builder()
         .child(&card)
@@ -675,9 +838,13 @@ fn badge(item: &Item, device: &DeviceView) -> Option<gtk::Widget> {
             holder.add_css_class("synced");
             holder.append(&gtk::Image::from_icon_name("object-select-symbolic"));
         }
-        ItemState::Sending | ItemState::Receiving => {
+        ItemState::Sending => {
             holder.add_css_class("moving");
-            holder.append(&gtk::Spinner::builder().spinning(true).build());
+            holder.append(&gtk::Image::from_icon_name("go-up-symbolic"));
+        }
+        ItemState::Receiving => {
+            holder.add_css_class("moving");
+            holder.append(&gtk::Image::from_icon_name("go-down-symbolic"));
         }
         ItemState::Waiting => {
             holder.add_css_class("waiting");
@@ -1060,13 +1227,24 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
         ),
         None => format!("Off · share anything with {}", device.name),
     };
-    words.append(&ellipsized(&subtitle, &["card-subtitle"]));
+    let line = ellipsized(&subtitle, &["card-subtitle", "numeric"]);
+    words.append(&line);
     head.append(&words);
+    let bar = thin_bar("Bucket sync progress");
+    bar.set_visible(false);
+    watch(Live::Summary {
+        device: device.id.clone(),
+        idle: subtitle,
+        line: line.downgrade(),
+        bar: bar.downgrade(),
+        speed: None,
+    });
     head.append(&super::page_link(
         if view.is_some() { "Open" } else { "Set Up" },
         "bucket",
     ));
     card.append(&head);
+    card.append(&bar);
     let Some(view) = view else {
         return card;
     };

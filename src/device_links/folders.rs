@@ -574,6 +574,15 @@ pub(crate) fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
 }
 
+/// Whether `device` has its Bucket on.
+pub(crate) fn bucket_on(device: &str) -> bool {
+    SHOWN.lock().is_ok_and(|shown| {
+        shown.pairs.iter().any(|view| {
+            view.pair.device == device && view.pair.bucket && view.phase != Phase::Offered
+        })
+    })
+}
+
 pub(crate) fn pairs() -> Vec<PairView> {
     SHOWN
         .lock()

@@ -65,6 +65,7 @@ mod imp {
             obj.setup_gactions();
             self.hold.replace(Some(obj.hold()));
             obj.start_session_indicator();
+            crate::bucket_progress::start(&obj);
             obj.watch_network();
             obj.set_accels_for_action("app.quit", &["<control>q"]);
             obj.set_accels_for_action("app.shortcuts", &["<control>question"]);
@@ -186,6 +187,18 @@ impl DesklinkApplication {
                 }
             })
             .build();
+        // A phone's Bucket page (the sync notification, the tray, the top bar).
+        let open_bucket_action = gio::ActionEntry::builder("open-bucket")
+            .parameter_type(Some(glib::VariantTy::STRING))
+            .activate(move |app: &Self, _, target| {
+                let window = app.main_window();
+                window.present();
+                if let Some(device) = target.and_then(|target| target.get::<String>()) {
+                    window.show_device(&device);
+                }
+                window.show_page("bucket");
+            })
+            .build();
         let history_action = gio::ActionEntry::builder("history")
             .activate(move |app: &Self, _, _| app.show_history())
             .build();
@@ -228,6 +241,7 @@ impl DesklinkApplication {
             end_sessions_action,
             lock_hand_off_action,
             history_action,
+            open_bucket_action,
             call_action,
             dial_action,
         ]);

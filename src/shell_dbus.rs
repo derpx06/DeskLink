@@ -36,7 +36,9 @@ pub const INTERFACE: &str = "derx06.desklink.com.Shell1";
 /// and `Devices[].liveSince`.
 /// 6: `Snippets` (id, label, text: the client copies the text itself) and
 /// the device-less `new-note` action.
-const VERSION: u32 = 6;
+/// 7: `Devices[].bucket` (`line`, `detail`, `fraction`) while the Bucket
+/// syncs, and the `open-bucket` action.
+const VERSION: u32 = 7;
 const INVALID_ARGS: &str = "org.freedesktop.DBus.Error.InvalidArgs";
 
 const XML: &str = r#"<node>
@@ -146,9 +148,30 @@ struct ShellDevice {
     call: Option<ShellCall>,
     /// The phone's music now, live links only.
     media: Option<ShellMedia>,
+    /// Its Bucket sync, while one is going.
+    bucket: Option<ShellBucket>,
     /// Since when it has been using this computer (Unix seconds); 0 not.
     live_since: u64,
     actions: Vec<&'static str>,
+}
+
+/// The phone's Bucket sync now: `Devices[].bucket`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellBucket {
+    /// "Syncing 3 files · 1.1 GB of 2.4 GB".
+    line: String,
+    /// "12 MB/s · about 4 min left".
+    detail: String,
+    /// 0..=1000.
+    permille: u32,
+}
+
+fn shell_bucket(summary: &crate::bucket_progress::Summary) -> ShellBucket {
+    ShellBucket {
+        line: summary.head(),
+        detail: summary.rate_line(),
+        permille: (summary.fraction() * 1000.0).round() as u32,
+    }
 }
 
 /// The phone's music: `Devices[].media`.
@@ -275,6 +298,7 @@ fn shell_device(device: &DeviceView, settings: &AppSettings) -> ShellDevice {
         last_seen: device.last_seen.unwrap_or(0),
         call: shell_call(device),
         media: shell_media(device),
+        bucket: crate::bucket_progress::summary(&device.id).map(|summary| shell_bucket(&summary)),
         live_since: 0,
         actions: actions(device, settings),
     }
@@ -318,6 +342,9 @@ fn actions(device: &DeviceView, settings: &AppSettings) -> Vec<&'static str> {
     if shell_media(device).is_some() {
         actions.extend(["media-play-pause", "media-next"]);
     }
+    if device.trusted && crate::device_links::folders::bucket_on(&device.id) {
+        actions.push("open-bucket");
+    }
     // Ending is local (stop sharing, detach terminals), so it does not wait
     // for the feature transport.
     if device.desktop_session != DesktopSession::None || device.terminal_sessions_attached > 0 {
@@ -359,6 +386,13 @@ impl ShellDevice {
             entry.insert("artist", &media.artist);
             entry.insert("playing", media.playing);
             dict.insert_value("media", &entry.end());
+        }
+        if let Some(bucket) = &self.bucket {
+            let entry = glib::VariantDict::new(None);
+            entry.insert("line", &bucket.line);
+            entry.insert("detail", &bucket.detail);
+            entry.insert("fraction", f64::from(bucket.permille) / 1000.0);
+            dict.insert_value("bucket", &entry.end());
         }
         dict.insert("liveSince", self.live_since);
         dict.insert("actions", &self.actions);
@@ -723,6 +757,9 @@ fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str
                 .unwrap_or_default();
             pick_and_send_files(app, &id, name);
         }
+        ("open-bucket", Some(id), _) => {
+            app.activate_action("open-bucket", Some(&id.to_variant()));
+        }
         ("new-note", _, _) => {
             let window = app.main_window();
             window.present();
@@ -1044,8 +1081,10 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 10] = [
-    // The current build (F4: glide in the live row).
+const KNOWN_BUILDS: [&str; 11] = [
+    // The current build (the Bucket's sync progress row).
+    "01fee36c261108ac481f15db17de0b7c860e79ba8e77d8a932540e07952a7f8a",
+    // 35a2ff3, F4: glide in the live row.
     "1ce14fd319e5ac1654c16dfa8a79910c95da9bdcca33f880f5f3f62654de440d",
     // F6: Snippets and New Note in the menu.
     "d15f25a0eaca4d3f37d6423d5eefafeadacd0dc3fb8e6c07389ce7861d701f50",
@@ -1404,6 +1443,39 @@ mod tests {
             instance_id: None,
         };
         DeviceView::from_info(&info, "10.0.0.2".into(), true)
+    }
+
+    #[test]
+    fn a_bucket_sync_is_published_with_its_line_detail_and_fraction() {
+        use crate::device_links::webrtc::transfer_board::TransferRow;
+        let mut device = phone();
+        device.id = "shell-bucket".into();
+        assert_eq!(shell_device(&device, &AppSettings::default()).bucket, None);
+        crate::bucket_progress::sample_for_test(vec![TransferRow {
+            id: "shell-bucket-1".into(),
+            device_id: "shell-bucket".into(),
+            name: "film.mkv".into(),
+            incoming: true,
+            done: 300_000_000,
+            total: 1_200_000_000,
+            preparing: false,
+            paused: false,
+        }]);
+        let mapped = shell_device(&device, &AppSettings::default());
+        let bucket = mapped.bucket.clone().expect("published while syncing");
+        assert_eq!(bucket.line, "Syncing 1 file · 300 MB of 1.2 GB");
+        assert_eq!(bucket.detail, "Waiting…", "no speed after one sample");
+        assert_eq!(bucket.permille, 250);
+        let list = devices_variant(&[mapped]);
+        let dict = glib::VariantDict::new(Some(&list.child_value(0)));
+        let entry = glib::VariantDict::new(dict.lookup_value("bucket", None).as_ref());
+        assert_eq!(
+            entry.lookup::<String>("line").unwrap().as_deref(),
+            Some("Syncing 1 file · 300 MB of 1.2 GB")
+        );
+        assert_eq!(entry.lookup::<f64>("fraction").unwrap(), Some(0.25));
+        crate::bucket_progress::sample_for_test(Vec::new());
+        assert_eq!(shell_device(&device, &AppSettings::default()).bucket, None);
     }
 
     #[test]

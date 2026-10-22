@@ -310,11 +310,16 @@ export default class DeskLinkExtension extends Extension {
         const snippets = this._read('Snippets', []);
         // Rebuilt only when what it shows changed, so keyboard focus in an
         // open menu is not thrown away every second.
-        const menuKey = JSON.stringify([devices, selected?.id, desk, transfers, snippets, styleVariant()]);
-        if (menuKey === this._menuKey)
+        // The Bucket's progress changes every second: updated in place.
+        const steady = devices.map(device => ({...device, bucket: !!device.bucket}));
+        const menuKey = JSON.stringify([steady, selected?.id, desk, transfers, snippets, styleVariant()]);
+        if (menuKey === this._menuKey) {
+            this._bucketUpdate?.(selected?.bucket);
             return;
+        }
         this._menuKey = menuKey;
         this._tickers = [];
+        this._bucketUpdate = null;
         const shown = new Set();
         fillMenu(menu, {
             devices, selected, desk, transfers, snippets,
@@ -327,6 +332,7 @@ export default class DeskLinkExtension extends Extension {
                 this._sync();
             },
             tick: fn => this._tickers.push(fn),
+            onBucket: fn => (this._bucketUpdate = fn),
             // New cards fade in (instantly when animations are off).
             appear: (actor, key) => {
                 shown.add(key);

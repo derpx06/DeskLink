@@ -2272,6 +2272,42 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             );
             win.refresh_soon();
         }
+        // "fake-bucket-progress [paused]": the fake Bucket's moving items
+        // as slow transfers (about 8 MB/s each), for progress shots.
+        "fake-bucket-progress" => {
+            use crate::device_links::webrtc::transfer_board::{self, TransferRow};
+            let Some(device) = win.selected_id() else {
+                return true;
+            };
+            let rows = [
+                ("fake-in", "Boarding pass.pdf", true, 1_200_000_000u64),
+                ("fake-out", "Quarterly report.pdf", false, 900_000_000),
+            ];
+            for (id, name, incoming, total) in rows {
+                transfer_board::begin_synced(TransferRow {
+                    id: id.into(),
+                    device_id: device.clone(),
+                    name: name.into(),
+                    incoming,
+                    done: if incoming { 340_000_000 } else { 0 },
+                    total,
+                    preparing: false,
+                    paused: false,
+                });
+            }
+            if id == "paused" {
+                transfer_board::pause_device(&device);
+                return true;
+            }
+            let started = std::time::Instant::now();
+            glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+                let moved = (started.elapsed().as_secs_f64() * 8e6) as u64;
+                transfer_board::progress("fake-in", 340_000_000 + moved);
+                // The second file starts after a second ("Waiting…" first).
+                transfer_board::progress("fake-out", moved.saturating_sub(8_000_000));
+                glib::ControlFlow::Continue
+            });
+        }
         "bucket-on" => {
             if let Some(device) = win.selected_id() {
                 crate::device_links::folders::turn_on_bucket(&device);
