@@ -1,8 +1,8 @@
 //! GNOME Shell search: `org.gnome.Shell.SearchProvider2` at
 //! `/derx06/desklink/com/SearchProvider`. Typing in the Activities overview
 //! finds this computer's shared terminals (open one at the desk), the run
-//! commands (run one here), recent transfers (open the file) and the phones
-//! (ring one).
+//! commands (run one here), recent transfers (open the file), the phones
+//! (ring one) and the contacts they share (show one).
 //!
 //! GNOME reads providers from `gnome-shell/search-providers/*.ini` under the
 //! data dirs. Packages install `data/derx06.desklink.com.search-provider.ini`;
@@ -61,7 +61,7 @@ const XML: &str = r#"<node>
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Candidate {
     /// `terminal:<id>`, `command:<id>`, `transfer:<path>`, `ring:<device>`,
-    /// `dial:<device>:<number>`.
+    /// `dial:<device>:<number>`, `contact:<device>:<uid>`.
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) description: String,
@@ -90,6 +90,8 @@ pub(crate) struct Sources<'a> {
     pub(crate) transfers: &'a [crate::device_links::transfer_log::LoggedFile],
     /// Connected phones: id and name.
     pub(crate) phones: &'a [(String, String)],
+    /// The contacts paired phones share: phone id, phone name, contact.
+    pub(crate) contacts: &'a [(String, String, crate::device_links::contacts::Contact)],
 }
 
 /// Every result, in the order shown.
@@ -144,6 +146,35 @@ pub(crate) fn candidates(sources: &Sources) -> Vec<Candidate> {
                 "document-send-symbolic"
             },
             "file transfer",
+        ));
+    }
+    for (device, phone, contact) in sources.contacts {
+        let detail = contact
+            .phones
+            .first()
+            .map(|number| number.number.clone())
+            .or_else(|| contact.emails.first().cloned());
+        let mut words: Vec<String> = contact
+            .phones
+            .iter()
+            .flat_map(|number| {
+                [
+                    number.number.clone(),
+                    number.number.chars().filter(char::is_ascii_digit).collect(),
+                ]
+            })
+            .collect();
+        words.extend(contact.emails.iter().cloned());
+        words.extend(contact.org.iter().cloned());
+        found.push(Candidate::new(
+            format!("contact:{device}:{}", contact.uid),
+            contact.name.clone(),
+            match detail {
+                Some(detail) => format!("{detail} · Contact on {phone}"),
+                None => format!("Contact on {phone}"),
+            },
+            "avatar-default-symbolic",
+            &words.join(" "),
         ));
     }
     found
@@ -235,11 +266,25 @@ pub(crate) fn current(app: &DesklinkApplication) -> Vec<Candidate> {
                 .collect()
         })
         .unwrap_or_default();
+    // Paired phones' contacts, connected or not: the cache is local.
+    let contacts: Vec<_> = app
+        .daemon_handle()
+        .map(|daemon| daemon.devices())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|device| device.trusted)
+        .flat_map(|device| {
+            crate::device_links::contacts::list(&device.id)
+                .into_iter()
+                .map(move |contact| (device.id.clone(), device.name.clone(), contact))
+        })
+        .collect();
     candidates(&Sources {
         terminals: &terminals,
         commands: &commands,
         transfers: &transfers,
         phones: &phones,
+        contacts: &contacts,
     })
 }
 
@@ -304,6 +349,13 @@ pub(crate) fn activate(app: &DesklinkApplication, id: &str) {
                 gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE)
             {
                 eprintln!("[Search] Could not open {rest}: {error}");
+            }
+        }
+        "contact" => {
+            if let Some((device, uid)) = rest.split_once(':') {
+                let window = app.main_window();
+                window.present();
+                window.show_contact(device, uid);
             }
         }
         "ring" => {
@@ -458,11 +510,21 @@ mod tests {
             incoming: true,
         }];
         let phones = [("p1".to_string(), "Pixel".to_string())];
+        let contacts = [(
+            "p1".to_string(),
+            "Pixel".to_string(),
+            crate::device_links::contacts::parse_vcard(
+                "u:1",
+                "FN:Mara Lindqvist\nTEL:+46 70-123 45 67\nEMAIL:mara@example.org",
+            )
+            .unwrap(),
+        )];
         run(&Sources {
             terminals: &terminals,
             commands: &commands,
             transfers: &transfers,
             phones: &phones,
+            contacts: &contacts,
         })
     }
 
@@ -496,6 +558,10 @@ mod tests {
                 ids(&["boarding"]),
                 ["transfer:/home/me/Downloads/boarding-pass.pdf"]
             );
+            // A shared contact, by name, number (as typed or digits) or email.
+            for terms in [&["mara"][..], &["lindq"], &["701234567"], &["example.org"]] {
+                assert_eq!(ids(terms), ["contact:p1:u:1"], "{terms:?}");
+            }
             assert!(ids(&[]).is_empty() && ids(&["  "]).is_empty());
             assert!(ids(&["nothing-like-this"]).is_empty());
         });

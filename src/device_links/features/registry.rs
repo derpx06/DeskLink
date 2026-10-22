@@ -3,6 +3,8 @@ use std::sync::Mutex;
 
 use crate::device_links::packet::{
     PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
+    PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS, PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID,
+    PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS, PACKET_TYPE_CONTACTS_RESPONSE_VCARDS,
     PACKET_TYPE_DIGITIZER, PACKET_TYPE_DIGITIZER_SESSION, PACKET_TYPE_FINDMYPHONE_REQUEST,
     PACKET_TYPE_HANDOFF, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST,
     PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS,
@@ -18,7 +20,9 @@ use crate::device_links::packet::{
 /// WebRTC transport. Each entry has a matching arm in
 /// `packet_handler::dispatch_webrtc_feature_packet` and a DeskLink Android
 /// plugin that actually sends it.
-const DESKTOP_INCOMING: [&str; 23] = [
+const DESKTOP_INCOMING: [&str; 25] = [
+    PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS,
+    PACKET_TYPE_CONTACTS_RESPONSE_VCARDS,
     PACKET_TYPE_BATTERY,
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
@@ -63,7 +67,9 @@ const DESKTOP_INCOMING: [&str; 23] = [
 /// Packets the desktop can construct from a command path, and that a DeskLink
 /// Android plugin can consume. `desklink.systemvolume.request` is absent: the
 /// phone has no receiver for it.
-const DESKTOP_OUTGOING: [&str; 23] = [
+const DESKTOP_OUTGOING: [&str; 25] = [
+    PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS,
+    PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID,
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
     PACKET_TYPE_FINDMYPHONE_REQUEST,
@@ -111,7 +117,11 @@ const DESKTOP_OUTGOING: [&str; 23] = [
 /// control plane is `desklink.remote-session.v1` on the control channel, and
 /// the screen packet types exist only so the Android application loads its
 /// screen plugin (see `DESKTOP_INCOMING`). They never cross the wire.
-const WEBRTC_PROFILE: [&str; 26] = [
+const WEBRTC_PROFILE: [&str; 30] = [
+    PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS,
+    PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID,
+    PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS,
+    PACKET_TYPE_CONTACTS_RESPONSE_VCARDS,
     PACKET_TYPE_BATTERY,
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
@@ -290,6 +300,8 @@ mod tests {
                 "desklink.battery",
                 "desklink.clipboard",
                 "desklink.clipboard.connect",
+                "desklink.contacts.response_uids_timestamps",
+                "desklink.contacts.response_vcards",
                 "desklink.digitizer",
                 "desklink.digitizer.session",
                 "desklink.findmyphone.request",
@@ -317,6 +329,8 @@ mod tests {
             strings(&[
                 "desklink.clipboard",
                 "desklink.clipboard.connect",
+                "desklink.contacts.request_all_uids_timestamps",
+                "desklink.contacts.request_vcards_by_uid",
                 "desklink.findmyphone.request",
                 "desklink.handoff",
                 "desklink.lock",
@@ -356,6 +370,10 @@ mod tests {
                 "desklink.battery",
                 "desklink.clipboard",
                 "desklink.clipboard.connect",
+                "desklink.contacts.request_all_uids_timestamps",
+                "desklink.contacts.request_vcards_by_uid",
+                "desklink.contacts.response_uids_timestamps",
+                "desklink.contacts.response_vcards",
                 "desklink.digitizer",
                 "desklink.digitizer.session",
                 "desklink.findmyphone.request",

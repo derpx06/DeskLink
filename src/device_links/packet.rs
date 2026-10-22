@@ -63,6 +63,15 @@ pub const PACKET_TYPE_SCREEN_STOP: &str = "desklink.screen.stop";
 pub const PACKET_TYPE_SCREEN_ERROR: &str = "desklink.screen.error";
 pub const PACKET_TYPE_PRESENTER: &str = "desklink.presenter";
 pub const PACKET_TYPE_CONTACTS_REQUEST: &str = "desklink.contacts.request";
+/// Contacts (F5), desk → phone: a fresh snapshot, then the changed vCards.
+pub const PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS: &str =
+    "desklink.contacts.request_all_uids_timestamps";
+pub const PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID: &str =
+    "desklink.contacts.request_vcards_by_uid";
+/// Contacts (F5), phone → desk: the snapshot (uids and timestamps), vCards.
+pub const PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS: &str =
+    "desklink.contacts.response_uids_timestamps";
+pub const PACKET_TYPE_CONTACTS_RESPONSE_VCARDS: &str = "desklink.contacts.response_vcards";
 pub const PACKET_TYPE_SMS_REQUEST: &str = "desklink.sms.request";
 /// The phone's calls (a full snapshot), a missed call, or a refused request
 /// (phone → desk).

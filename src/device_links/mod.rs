@@ -2,6 +2,7 @@ pub(crate) mod call_audio;
 pub(crate) mod calls;
 pub mod config;
 pub mod connection_log;
+pub(crate) mod contacts;
 pub mod core;
 pub mod daemon;
 pub(crate) mod desk_features;

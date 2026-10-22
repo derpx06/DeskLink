@@ -406,9 +406,10 @@ pub(super) fn missed(
     );
 }
 
-/// Asks before calling `number` from a link (`tel:`) or `desklink --dial`:
-/// a web page can open `tel:` links without the user meaning to call.
-pub(crate) fn confirm_dial(win: &DesklinkWindow, number: &str) {
+/// Asks before calling `number` from a link (`tel:`), `desklink --dial` or
+/// a contact: a web page can open `tel:` links without the user meaning to
+/// call. With `phone`, that phone places the call; else the first that can.
+pub(crate) fn confirm_dial(win: &DesklinkWindow, number: &str, phone: Option<&str>) {
     let Some(daemon) = win.imp().daemon.borrow().clone() else {
         return;
     };
@@ -420,6 +421,7 @@ pub(crate) fn confirm_dial(win: &DesklinkWindow, number: &str) {
         .devices()
         .into_iter()
         .filter(|device| device.trusted && device.feature_transport_ready)
+        .filter(|device| phone.is_none_or(|id| id == device.id))
         .find(|device| can_send_feature(device, PACKET_TYPE_TELEPHONY_REQUEST));
     let Some(phone) = phone else {
         let dialog = adw::AlertDialog::new(

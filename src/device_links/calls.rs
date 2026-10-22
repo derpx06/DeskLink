@@ -10,9 +10,10 @@ use serde_json::Value;
 use super::device::{CallState, CallStatus, PhoneCall};
 use super::packet::{NetworkPacket, PACKET_TYPE_TELEPHONY_REQUEST};
 
-/// What a request may ask (T2).
-pub(crate) const ACTIONS: [&str; 7] = [
-    "answer", "decline", "end", "silence", "mute", "unmute", "dial",
+/// What a request may ask (T2). `message` opens the phone's messaging app
+/// on a number (F5 K5).
+pub(crate) const ACTIONS: [&str; 8] = [
+    "answer", "decline", "end", "silence", "mute", "unmute", "dial", "message",
 ];
 
 /// More calls than any phone holds at once; the rest are ignored.
@@ -80,6 +81,8 @@ pub(crate) fn parse_status(packet: &NetworkPacket) -> Option<Option<CallStatus>>
 pub(crate) struct Missed {
     pub(crate) contact_name: Option<String>,
     pub(crate) number: Option<String>,
+    /// The caller's uid in the contacts the phone shares (F5 K4).
+    pub(crate) contact_uid: Option<String>,
 }
 
 pub(crate) fn parse_missed(packet: &NetworkPacket) -> Option<Missed> {
@@ -87,7 +90,44 @@ pub(crate) fn parse_missed(packet: &NetworkPacket) -> Option<Missed> {
     Some(Missed {
         contact_name: clean(missed.get("contactName"), 120),
         number: clean(missed.get("number"), 40),
+        contact_uid: clean(missed.get("contactUid"), 256),
     })
+}
+
+/// Each call's `contactUid` (F5 K4), by call id.
+pub(crate) fn contact_uids(packet: &NetworkPacket) -> Vec<(String, String)> {
+    packet
+        .body
+        .get("calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|call| {
+            Some((
+                clean(call.get("callId"), 120)?,
+                clean(call.get("contactUid"), 256)?,
+            ))
+        })
+        .collect()
+}
+
+/// Names the callers `status` has no name for from the phone's shared
+/// contacts (`lookup`: uid and number to a name), when the user asked.
+pub(crate) fn name_callers(
+    status: &mut CallStatus,
+    uids: &[(String, String)],
+    lookup: impl Fn(Option<&str>, Option<&str>) -> Option<String>,
+) {
+    for call in &mut status.calls {
+        if call.contact_name.is_some() {
+            continue;
+        }
+        let uid = uids
+            .iter()
+            .find(|(id, _)| *id == call.call_id)
+            .map(|(_, uid)| uid.as_str());
+        call.contact_name = lookup(uid, call.number.as_deref());
+    }
 }
 
 /// A refused request, in the user's words.
@@ -99,6 +139,7 @@ pub(crate) fn parse_error(packet: &NetworkPacket) -> Option<String> {
     };
     Some(match packet.get_str("action").unwrap_or_default() {
         "dial" => format!("Could not call: {why}"),
+        "message" => format!("Could not open messages: {why}"),
         "" => format!("Call: {why}"),
         action => format!("Could not {action} the call: {why}"),
     })
@@ -363,6 +404,10 @@ mod tests {
         assert_eq!(dial.get_str("action"), Some("dial"));
         assert_eq!(dial.get_str("number"), Some("+15550100"));
         assert!(request(None, "dial", Some("call me")).is_err());
+        let message = request(None, "message", Some("+1 555 0100")).unwrap();
+        assert_eq!(message.get_str("action"), Some("message"));
+        assert_eq!(message.get_str("number"), Some("+15550100"));
+        assert!(request(None, "message", None).is_err());
     }
 
     #[test]
@@ -388,6 +433,34 @@ mod tests {
         }
     }
 
+    /// F5 K4: a caller without a name gets the shared contact's, by the
+    /// phone's uid first, else by number; a name the phone sent stays.
+    #[test]
+    fn callers_are_named_from_the_shared_contacts() {
+        let snapshot = packet(json!({"calls": [
+            {"callId": "1", "state": "ringing", "incoming": true, "number": "555 0100", "contactUid": "u1"},
+            {"callId": "2", "state": "held", "number": "555 0199"},
+            {"callId": "3", "state": "held", "contactName": "Phone's name", "contactUid": "u1"},
+        ]}));
+        let mut status = parse_status(&snapshot).unwrap().unwrap();
+        let uids = contact_uids(&snapshot);
+        assert_eq!(
+            uids,
+            vec![("1".into(), "u1".into()), ("3".into(), "u1".into())]
+        );
+        name_callers(&mut status, &uids, |uid, number| match (uid, number) {
+            (Some("u1"), _) => Some("Mara".into()),
+            (None, Some("555 0199")) => Some("Bo".into()),
+            _ => None,
+        });
+        let names: Vec<_> = status
+            .calls
+            .iter()
+            .map(|call| call.contact_name.as_deref())
+            .collect();
+        assert_eq!(names, vec![Some("Mara"), Some("Bo"), Some("Phone's name")]);
+    }
+
     #[test]
     fn missed_calls_and_refusals_are_read() {
         assert_eq!(
@@ -396,8 +469,15 @@ mod tests {
             )),
             Some(Missed {
                 contact_name: None,
-                number: Some("555".into())
+                number: Some("555".into()),
+                contact_uid: None,
             })
+        );
+        assert_eq!(
+            parse_missed(&packet(json!({"missed": {"contactUid": "u7"}})))
+                .and_then(|missed| missed.contact_uid)
+                .as_deref(),
+            Some("u7")
         );
         assert_eq!(
             parse_error(&packet(json!({"error": "permission", "action": "answer"}))).as_deref(),

@@ -254,6 +254,21 @@ fn calls_group(
         sender.send(DaemonCommand::SetCallAudio(row.is_active()))
     });
     group.add(&audio);
+    // F5 K4: names from the contacts the phone shares, off until asked.
+    let names = adw::SwitchRow::builder()
+        .title(format!("Name callers from {}'s contacts", device.name))
+        .subtitle("Uses the contacts the phone shares with this computer")
+        .active(settings.names_callers_from(&device.id))
+        .build();
+    with_icon(&names, "avatar-default-symbolic");
+    let (sender, id) = (daemon.clone(), device.id.clone());
+    names.connect_active_notify(move |row| {
+        sender.send(DaemonCommand::SetContactCallerNames(
+            id.clone(),
+            row.is_active(),
+        ))
+    });
+    group.add(&names);
     let Some(bonded) = bonded else {
         return group;
     };

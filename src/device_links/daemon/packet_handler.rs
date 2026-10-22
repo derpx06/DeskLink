@@ -703,7 +703,14 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         // instruction (nothing here answers or ends a call).
         PACKET_TYPE_TELEPHONY => {
             use crate::device_links::calls;
-            if let Some(status) = calls::parse_status(&packet) {
+            let named = crate::device_links::config::app_settings().names_callers_from(device_id);
+            let lookup = |uid: Option<&str>, number: Option<&str>| {
+                crate::device_links::contacts::caller_name(device_id, uid, number)
+            };
+            if let Some(mut status) = calls::parse_status(&packet) {
+                if let Some(status) = status.as_mut().filter(|_| named) {
+                    calls::name_callers(status, &calls::contact_uids(&packet), lookup);
+                }
                 let in_call = update_call_status(devices, device_id, status);
                 calls::hold_media(device_id, in_call);
                 // The card, the bar and the notification follow within a frame.
@@ -719,13 +726,38 @@ pub(crate) fn dispatch_webrtc_feature_packet(
                     DaemonEvent::MissedCall {
                         device_id: device_id.clone(),
                         device_name: binding.link.info.name.clone(),
-                        caller: missed.contact_name,
+                        caller: missed.contact_name.or_else(|| {
+                            named
+                                .then(|| {
+                                    lookup(missed.contact_uid.as_deref(), missed.number.as_deref())
+                                })
+                                .flatten()
+                        }),
                         number: missed.number,
                     },
                 );
             } else if let Some(message) = calls::parse_error(&packet) {
                 push_event(events, DaemonEvent::CallRefused { message });
             }
+            Ok(())
+        }
+        // The phone's contacts (F5): its snapshot, then the vCards asked for.
+        // Decrypting and saving the cache stays off the peer worker.
+        crate::device_links::packet::PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS => {
+            let (device_id, packet) = (device_id.clone(), packet.clone());
+            crate::device_links::desk_features::run_later(move || {
+                for request in crate::device_links::contacts::on_snapshot(&device_id, &packet) {
+                    crate::device_links::desk_features::send(&device_id, &request);
+                }
+            });
+            Ok(())
+        }
+        crate::device_links::packet::PACKET_TYPE_CONTACTS_RESPONSE_VCARDS => {
+            let (device_id, packet) = (device_id.clone(), packet.clone());
+            // Dropped when the queue is full: the next snapshot asks again.
+            crate::device_links::desk_features::run_later(move || {
+                crate::device_links::contacts::on_vcards(&device_id, &packet)
+            });
             Ok(())
         }
         PACKET_TYPE_FINDMYPHONE_REQUEST => {

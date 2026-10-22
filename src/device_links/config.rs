@@ -114,6 +114,10 @@ pub struct AppSettings {
     /// Preferences → Sound: a phone may ask to hear this computer's
     /// microphone (F1 A3; off by default).
     pub desk_mic_to_phone: bool,
+    /// Preferences → Calls: the phones whose callers are named from the
+    /// contacts they share (F5 K4; off by default, per phone).
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub contact_caller_names: std::collections::BTreeSet<String>,
 }
 
 /// A command a phone may run here, in a shared terminal.
@@ -148,6 +152,7 @@ impl Default for AppSettings {
             forward_notifications: false,
             forward_apps: Default::default(),
             desk_mic_to_phone: false,
+            contact_caller_names: Default::default(),
         }
     }
 }
@@ -178,6 +183,11 @@ impl AppSettings {
     /// Whether `device_id` hears about long commands finishing.
     pub fn alerts_commands_to(&self, device_id: &str) -> bool {
         !self.muted_command_alerts.contains(device_id)
+    }
+
+    /// Whether `device_id`'s callers are named from its shared contacts.
+    pub fn names_callers_from(&self, device_id: &str) -> bool {
+        self.contact_caller_names.contains(device_id)
     }
 
     /// Whether `device_id` may unlock this computer (Preferences, per phone).
@@ -414,6 +424,11 @@ impl Config {
         self.base_dir.join("webrtc-transfers")
     }
 
+    /// The phones' contact caches (F5), encrypted.
+    pub fn contacts_dir(&self) -> PathBuf {
+        self.base_dir.join("contacts")
+    }
+
     /// ICE servers for the WebRTC peer.
     ///
     /// Environment variables win over the stored lists so a deployment can set
@@ -523,8 +538,10 @@ impl Config {
             .as_ref()
             .is_some_and(|existing| existing.certificate_pem == certificate_pem);
         if !same_identity {
-            // A new identity does not inherit remote control of this desktop.
+            // A new identity does not inherit remote control of this desktop,
+            // nor the contacts the old one shared.
             set_remote_desktop_token(&info.id, None);
+            crate::device_links::contacts::forget_in(&self.contacts_dir(), &info.id);
         }
         mirror_terminal_access(&info.id, terminal_access);
         self.stored.trusted_devices.insert(
@@ -576,8 +593,10 @@ impl Config {
     pub fn untrust_device(&mut self, device_id: &str) -> Result<(), String> {
         let previous = self.stored.trusted_devices.remove(device_id);
         mirror_terminal_access(device_id, false);
-        // Remote control of this desktop is a property of the pairing too.
+        // Remote control of this desktop is a property of the pairing too,
+        // and so is the contacts cache.
         set_remote_desktop_token(device_id, None);
+        crate::device_links::contacts::forget_in(&self.contacts_dir(), device_id);
         self.save_or_restore(device_id, previous)?;
         crate::device_links::relay_link::client::reset();
         Ok(())
@@ -609,6 +628,11 @@ fn write_atomic_if_changed(path: &std::path::Path, bytes: &[u8], mode: u32) -> R
         return Ok(());
     }
     write_atomic(path, bytes, mode)
+}
+
+/// Writes `bytes` to `path` atomically, readable by this user only.
+pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    write_atomic(path, bytes, 0o600)
 }
 
 /// Replaces `path` so a reader — or a crash — only ever sees the old file or

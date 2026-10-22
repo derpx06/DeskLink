@@ -234,7 +234,7 @@ impl DesklinkApplication {
     pub(crate) fn dial(&self, number: &str) {
         let window = self.main_window();
         window.present();
-        crate::window::confirm_dial(&window, number);
+        crate::window::confirm_dial(&window, number, None);
     }
 
     /// Each known device's type, by id.
@@ -265,7 +265,7 @@ impl DesklinkApplication {
 
     /// The main window, never the Phone Screen window that `active_window()`
     /// can return.
-    fn main_window(&self) -> DesklinkWindow {
+    pub(crate) fn main_window(&self) -> DesklinkWindow {
         if let Some(window) = self
             .windows()
             .into_iter()

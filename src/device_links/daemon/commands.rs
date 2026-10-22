@@ -89,6 +89,8 @@ pub enum DaemonCommand {
     SetCommandAlerts(String, bool),
     /// Let this phone, on this network, unlock this computer when approved.
     SetUnlockNearby(String, bool),
+    /// Name this phone's callers from the contacts it shares (F5 K4).
+    SetContactCallerNames(String, bool),
     /// The commands a phone may run here (replaces the list).
     SetRunCommands(Vec<crate::device_links::config::RunCommand>),
     /// Lock this computer and offer the newest terminal to the phones.
@@ -271,6 +273,13 @@ impl DaemonWorker {
                     settings.unlock_devices.insert(id);
                 } else {
                     settings.unlock_devices.remove(&id);
+                }
+            }),
+            DaemonCommand::SetContactCallerNames(id, on) => self.update_settings(|settings| {
+                if on {
+                    settings.contact_caller_names.insert(id);
+                } else {
+                    settings.contact_caller_names.remove(&id);
                 }
             }),
             DaemonCommand::SetRunCommands(commands) => {

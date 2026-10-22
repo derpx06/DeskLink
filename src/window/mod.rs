@@ -30,6 +30,7 @@ mod insert;
 mod sound;
 pub(crate) use calls::confirm_dial;
 mod clipboard;
+mod contacts;
 pub(crate) mod history;
 pub(crate) mod notifications;
 mod overview;
@@ -62,6 +63,7 @@ const PAGES: &[(&str, &str, &str)] = &[
     ),
     ("transfers", "Transfers", "folder-download-symbolic"),
     ("clipboard", "Clipboard", "edit-paste-symbolic"),
+    ("contacts", "Contacts", "x-office-address-book-symbolic"),
     (
         "history",
         "Connection History",
@@ -71,7 +73,7 @@ const PAGES: &[(&str, &str, &str)] = &[
 ];
 
 /// How many of [`PAGES`] are in the sidebar's main list.
-const MAIN_PAGES: usize = 5;
+const MAIN_PAGES: usize = 6;
 
 mod imp {
     use super::*;
@@ -125,6 +127,7 @@ mod imp {
         pub(super) terminals: RefCell<Option<terminals::Page>>,
         pub(super) notifications: RefCell<Option<notifications::Page>>,
         pub(super) transfers: RefCell<Option<transfers::Page>>,
+        pub(super) contacts: RefCell<Option<contacts::Page>>,
         /// The welcome page's pairing code is on show.
         pub welcome_qr: RefCell<Option<std::rc::Rc<Cell<bool>>>>,
         /// When each device's active session started ("14:02"), by id.
@@ -227,6 +230,12 @@ mod imp {
                         let page = transfers::Page::new(&obj);
                         let root = page.root.clone();
                         self.transfers.replace(Some(page));
+                        root
+                    }
+                    "contacts" => {
+                        let page = contacts::Page::new(&obj);
+                        let root = page.root.clone();
+                        self.contacts.replace(Some(page));
                         root
                     }
                     _ => {
@@ -389,6 +398,15 @@ impl DesklinkWindow {
     pub fn show_device(&self, device_id: &str) {
         self.select_device(device_id);
         self.show_page("overview");
+    }
+
+    /// Shows one of `device_id`'s contacts (from GNOME search).
+    pub fn show_contact(&self, device_id: &str, uid: &str) {
+        self.select_device(device_id);
+        self.show_page("contacts");
+        if let Some(page) = self.imp().contacts.borrow().as_ref() {
+            page.show_contact(self, device_id, uid);
+        }
     }
 
     /// Makes `device_id` the device every page is about, and remembers it.
@@ -821,6 +839,11 @@ impl DesklinkWindow {
             }
             "overview" => overview::update(self, daemon, device),
             "clipboard" => clipboard::update(self, device),
+            "contacts" => {
+                if let Some(contacts) = imp.contacts.borrow().as_ref() {
+                    contacts.update(self, daemon, device);
+                }
+            }
             "history" => history::update(self, device),
             "preferences" => prefs::update(self, daemon, device),
             _ => {}
@@ -1916,6 +1939,73 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             debug_log!("[E2E] {verb} refused: set XDG_STATE_HOME to an isolated directory");
         }
         // "fake-history N": a few connection-history entries for fake device N.
+        // "fake-contacts N": N shared contacts for the selected device, as
+        // if its phone had sent them (some with photos).
+        "fake-contacts" => {
+            use crate::device_links::packet::NetworkPacket;
+            let Some(device) = win.selected_id() else {
+                return true;
+            };
+            let count: usize = id.parse().unwrap_or(40);
+            let first = [
+                "Mara", "Bo", "Åsa", "Lars", "Chen", "Priya", "Omar", "Zoe", "Ines", "Kai", "Noor",
+                "Femi", "Yuki", "Diego", "Hana",
+            ];
+            let last = [
+                "Lindqvist",
+                "Okafor",
+                "Sato",
+                "Nguyen",
+                "Berg",
+                "Silva",
+                "Kaur",
+            ];
+            let photo =
+                gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 96, 96)
+                    .and_then(|pixbuf| {
+                        pixbuf.fill(0x3d7a_c4ff);
+                        pixbuf.save_to_bufferv("jpeg", &[]).ok()
+                    })
+                    .map(|bytes| {
+                        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+                    });
+            let uids: Vec<String> = (0..count).map(|n| format!("lookup-{n}")).collect();
+            let mut snapshot = NetworkPacket::new("desklink.contacts.response_uids_timestamps");
+            snapshot.set("uids", uids.clone());
+            for uid in &uids {
+                snapshot.set(uid, "1");
+            }
+            snapshot.set("sharing", true);
+            let _ = crate::device_links::contacts::on_snapshot(&device, &snapshot);
+            let mut cards = NetworkPacket::new("desklink.contacts.response_vcards");
+            cards.set("uids", uids.clone());
+            for (n, uid) in uids.iter().enumerate() {
+                let mut card = format!(
+                    "BEGIN:VCARD\nVERSION:3.0\nFN:{} {}\nTEL;TYPE=CELL:+46 70 {:03} {:02} {:02}\n",
+                    first[n % first.len()],
+                    last[n % last.len()],
+                    n,
+                    n % 100,
+                    (n * 7) % 100
+                );
+                if n % 3 == 0 {
+                    card.push_str("TEL;TYPE=WORK:08-123 456\nEMAIL:someone@example.org\nORG:Acme\nNOTE:Met at the conference\\nlikes tea\n");
+                }
+                if let (0, Some(photo)) = (n % 4, &photo) {
+                    card.push_str(&format!("PHOTO;ENCODING=b;TYPE=JPEG:{photo}\n"));
+                }
+                card.push_str("END:VCARD");
+                cards.set(uid, card);
+            }
+            crate::device_links::contacts::on_vcards(&device, &cards);
+            win.refresh_soon();
+        }
+        // "open-contact UID": the selected device's contact, as from search.
+        "open-contact" => {
+            if let Some(device) = win.selected_id() {
+                win.show_contact(&device, id);
+            }
+        }
         "fake-history" => {
             use crate::device_links::connection_log::{
                 record_with_path, remember_name, ConnectionEvent,
@@ -2519,6 +2609,7 @@ mod tests {
                 "notifications",
                 "transfers",
                 "clipboard",
+                "contacts",
                 "history",
                 "preferences"
             ]

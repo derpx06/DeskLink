@@ -171,6 +171,7 @@ mod tests {
             commands: &[],
             transfers: &[],
             phones: &phones,
+            contacts: &[],
         });
         let find = |query: &str| {
             let terms: Vec<String> = query.split_whitespace().map(str::to_string).collect();

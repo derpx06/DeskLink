@@ -209,6 +209,9 @@ impl DaemonWorker {
             });
         }
 
+        if let Ok(config) = config.lock() {
+            crate::device_links::contacts::install(config.contacts_dir());
+        }
         crate::device_links::desk_features::install(
             Arc::clone(&sessions),
             Arc::clone(&config),
