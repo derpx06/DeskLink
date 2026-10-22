@@ -12,6 +12,7 @@ pub mod device;
 pub mod device_info;
 pub(crate) mod eis;
 pub mod features;
+pub(crate) mod folders;
 pub(crate) mod glide;
 pub(crate) mod logind;
 pub(crate) mod media_art;

@@ -2298,6 +2298,26 @@ pub(crate) fn start_file_transfer(
     send_transfer_events(peer, wire, manager.start_send(wire, source)?)
 }
 
+/// Sends a synced file (F8 P4) through the current peer.
+pub(crate) fn start_folder_transfer(
+    sessions: &DeviceManager,
+    transport: &FeatureTransportSnapshot,
+    source: &std::path::Path,
+    folder: super::file_protocol::FolderRef,
+) -> Result<(), String> {
+    if !sessions.is_current(&transport.binding) || !transport.web_rtc_ready {
+        return Err("DeskLink WebRTC file transport is unavailable".to_string());
+    }
+    let (Some(peer), Some(wire), Some(manager)) = (
+        transport.web_rtc_peer.as_ref(),
+        transport.web_rtc_wire.as_ref(),
+        transport.transfer_manager.as_ref(),
+    ) else {
+        return Err("DeskLink WebRTC file transfer is unavailable".to_string());
+    };
+    send_transfer_events(peer, wire, manager.start_send_folder(wire, source, folder)?)
+}
+
 /// Sends `source` as a clipboard copy (C3) of type `mime`.
 pub(crate) fn start_clipboard_transfer(
     sessions: &DeviceManager,

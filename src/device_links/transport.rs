@@ -121,6 +121,20 @@ impl FeatureTransport {
         )
     }
 
+    /// Sends a synced file (F8).
+    pub(crate) fn send_folder_file(
+        &self,
+        path: &Path,
+        folder: crate::device_links::webrtc::file_protocol::FolderRef,
+    ) -> Result<(), String> {
+        crate::device_links::webrtc::coordinator::start_folder_transfer(
+            &self.sessions,
+            &self.snapshot,
+            path,
+            folder,
+        )
+    }
+
     /// Sends an image the user copied here, for the phone's clipboard (C3).
     pub(crate) fn send_clipboard_image(&self, path: &Path) -> Result<(), String> {
         crate::device_links::webrtc::coordinator::start_clipboard_transfer(

@@ -213,6 +213,9 @@ impl DaemonWorker {
             crate::device_links::contacts::install(config.contacts_dir());
             crate::device_links::notes::install(config.notes_dir());
             crate::device_links::automations::install(config.automations_dir());
+            if !cfg!(test) {
+                crate::device_links::folders::start(config.folders_dir());
+            }
         }
         crate::device_links::desk_features::install(
             Arc::clone(&sessions),

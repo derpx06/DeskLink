@@ -435,6 +435,11 @@ impl Config {
         self.base_dir.join("notes")
     }
 
+    /// Folder sync pairs and manifests (F8), encrypted.
+    pub fn folders_dir(&self) -> PathBuf {
+        self.base_dir.join("folders")
+    }
+
     /// Automation rules and their history (F7), encrypted.
     pub fn automations_dir(&self) -> PathBuf {
         self.base_dir.join("automations")

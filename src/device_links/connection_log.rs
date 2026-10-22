@@ -164,6 +164,7 @@ pub fn note_ready(device_id: &str, ready: bool) {
     });
     if news && !ready {
         crate::device_links::automations::phone_link(device_id, false);
+        crate::device_links::folders::link(device_id, false);
     }
     if news {
         record(

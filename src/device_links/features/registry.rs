@@ -6,7 +6,7 @@ use crate::device_links::packet::{
     PACKET_TYPE_CLIPBOARD_CONNECT, PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS,
     PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID, PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS,
     PACKET_TYPE_CONTACTS_RESPONSE_VCARDS, PACKET_TYPE_DIGITIZER, PACKET_TYPE_DIGITIZER_SESSION,
-    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_HANDOFF, PACKET_TYPE_LOCK,
+    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_FOLDERS, PACKET_TYPE_HANDOFF, PACKET_TYPE_LOCK,
     PACKET_TYPE_LOCK_REQUEST, PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE, PACKET_TYPE_MOUSEPAD_REQUEST,
     PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTES, PACKET_TYPE_NOTIFICATION,
     PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_REPLY,
@@ -22,7 +22,9 @@ use crate::device_links::packet::{
 /// WebRTC transport. Each entry has a matching arm in
 /// `packet_handler::dispatch_webrtc_feature_packet` and a DeskLink Android
 /// plugin that actually sends it.
-const DESKTOP_INCOMING: [&str; 29] = [
+const DESKTOP_INCOMING: [&str; 30] = [
+    // Folder sync (F8): both ways.
+    PACKET_TYPE_FOLDERS,
     // Automations (F7): both ways.
     PACKET_TYPE_AUTOMATIONS,
     // Glide (F4): the phone handing the pointer back.
@@ -76,7 +78,9 @@ const DESKTOP_INCOMING: [&str; 29] = [
 /// Packets the desktop can construct from a command path, and that a DeskLink
 /// Android plugin can consume. `desklink.systemvolume.request` is absent: the
 /// phone has no receiver for it.
-const DESKTOP_OUTGOING: [&str; 29] = [
+const DESKTOP_OUTGOING: [&str; 30] = [
+    // Folder sync (F8): both ways.
+    PACKET_TYPE_FOLDERS,
     // Automations (F7): both ways.
     PACKET_TYPE_AUTOMATIONS,
     // Glide (F4): the pointer crossing onto the phone.
@@ -133,7 +137,9 @@ const DESKTOP_OUTGOING: [&str; 29] = [
 /// control plane is `desklink.remote-session.v1` on the control channel, and
 /// the screen packet types exist only so the Android application loads its
 /// screen plugin (see `DESKTOP_INCOMING`). They never cross the wire.
-const WEBRTC_PROFILE: [&str; 35] = [
+const WEBRTC_PROFILE: [&str; 36] = [
+    // Folder sync (F8).
+    PACKET_TYPE_FOLDERS,
     // Automations (F7).
     PACKET_TYPE_AUTOMATIONS,
     // Glide (F4).
@@ -330,6 +336,7 @@ mod tests {
                 "desklink.digitizer",
                 "desklink.digitizer.session",
                 "desklink.findmyphone.request",
+                "desklink.folders",
                 "desklink.lock.request",
                 "desklink.mousepad.keyboardstate",
                 "desklink.mousepad.request",
@@ -361,6 +368,7 @@ mod tests {
                 "desklink.contacts.request_all_uids_timestamps",
                 "desklink.contacts.request_vcards_by_uid",
                 "desklink.findmyphone.request",
+                "desklink.folders",
                 "desklink.handoff",
                 "desklink.lock",
                 "desklink.lock.request",
@@ -410,6 +418,7 @@ mod tests {
                 "desklink.digitizer",
                 "desklink.digitizer.session",
                 "desklink.findmyphone.request",
+                "desklink.folders",
                 "desklink.handoff",
                 "desklink.lock",
                 "desklink.lock.request",

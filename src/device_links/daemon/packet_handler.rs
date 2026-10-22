@@ -752,6 +752,11 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             });
             Ok(())
         }
+        // Folder sync (F8): to its own worker.
+        crate::device_links::packet::PACKET_TYPE_FOLDERS => {
+            crate::device_links::folders::on_packet(device_id, &packet);
+            Ok(())
+        }
         // Automations (F7): sync, events and remote actions.
         crate::device_links::packet::PACKET_TYPE_AUTOMATIONS => {
             let (device_id, packet) = (device_id.clone(), packet.clone());

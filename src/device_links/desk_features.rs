@@ -171,6 +171,8 @@ pub(crate) fn on_feature_ready(device_id: &str) {
             send(&device_id, &index);
         }
         super::automations::phone_link(&device_id, true);
+        // Folder sync (F8): runs only while connected.
+        super::folders::link(&device_id, true);
     });
 }
 
@@ -311,6 +313,20 @@ pub(crate) fn handle_settings_request(device_id: &str, packet: &NetworkPacket) {
         }
     }
     push_settings();
+}
+
+/// Sends a synced file to `device_id` (F8), if its connection is ready.
+pub(crate) fn send_folder_file(
+    device_id: &str,
+    path: &std::path::Path,
+    folder: crate::device_links::webrtc::file_protocol::FolderRef,
+) -> Result<(), String> {
+    let daemon = DAEMON.get().ok_or("DeskLink is starting")?;
+    let transport = FeatureTransport::for_device(&daemon.sessions, device_id)?;
+    if !transport.is_ready() {
+        return Err("The phone is not connected".into());
+    }
+    transport.send_folder_file(path, folder)
 }
 
 /// Changes this computer's settings from inside the daemon (an automation),

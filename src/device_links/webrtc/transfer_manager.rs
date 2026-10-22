@@ -16,8 +16,8 @@ use std::time::{Duration, SystemTime};
 use serde::{Deserialize, Serialize};
 
 use super::file_protocol::{
-    validate_filename, FileAction, FileChunk, FileControl, FILE_PROTOCOL_VERSION,
-    LEGACY_FILE_CHUNK_BYTES, MAX_FILE_CHUNK_BYTES, MAX_TRANSFER_BYTES,
+    validate_filename, validate_relpath, FileAction, FileChunk, FileControl, FolderRef,
+    FILE_PROTOCOL_VERSION, LEGACY_FILE_CHUNK_BYTES, MAX_FILE_CHUNK_BYTES, MAX_TRANSFER_BYTES,
 };
 use super::transfer_board::{self as board, Finished, Outcome, TransferRow};
 use super::WebRtcWireBinding;
@@ -64,6 +64,10 @@ struct ReceiveCheckpoint {
     /// The capture it answers (F3), from the offer.
     #[serde(default)]
     capture_id: Option<String>,
+    /// A synced file (F8): handed to folder sync, never saved to Downloads
+    /// or listed.
+    #[serde(default)]
+    folder: Option<FolderRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,6 +94,9 @@ struct SendCheckpoint {
     /// A clipboard copy (C3): its MIME type, sent with the offer.
     #[serde(default)]
     clipboard_mime: Option<String>,
+    /// A synced file (F8): its pair and path, sent with the offer.
+    #[serde(default)]
+    folder: Option<FolderRef>,
 }
 
 /// The largest clipboard image accepted or sent (contract C3).
@@ -227,7 +234,7 @@ impl WebRtcTransferManager {
                 continue;
             };
             let ours = name.starts_with(".desklink-")
-                && [".send", ".send.json", ".part", ".json", ".tmp"]
+                && [".send", ".send.json", ".part", ".json", ".tmp", ".sync"]
                     .iter()
                     .any(|suffix| name.ends_with(suffix));
             if !ours {
@@ -286,16 +293,18 @@ impl WebRtcTransferManager {
                 Ok(mut outgoing) => outgoing.insert(rebound.transfer_id.clone(), rebound.clone()),
                 Err(_) => continue,
             };
-            board::begin(TransferRow {
-                id: rebound.transfer_id.clone(),
-                device_id: wire.peer_device_id.clone(),
-                name: rebound.filename.clone(),
-                incoming: false,
-                done: rebound.offset,
-                total: rebound.total_size,
-                preparing: false,
-                paused: false,
-            });
+            if rebound.folder.is_none() {
+                board::begin(TransferRow {
+                    id: rebound.transfer_id.clone(),
+                    device_id: wire.peer_device_id.clone(),
+                    name: rebound.filename.clone(),
+                    incoming: false,
+                    done: rebound.offset,
+                    total: rebound.total_size,
+                    preparing: false,
+                    paused: false,
+                });
+            }
             events.push(TransferEvent::SendControl(self.send_control(
                 wire,
                 FileAction::Offer,
@@ -365,12 +374,38 @@ impl WebRtcTransferManager {
         source: &Path,
         clipboard_mime: Option<&str>,
     ) -> Result<Vec<TransferEvent>, String> {
-        let filename = source
-            .file_name()
-            .and_then(|value| value.to_str())
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| "DeskLink shared file has no safe filename".to_string())?
-            .to_string();
+        self.start_send_with(wire, source, clipboard_mime, None)
+    }
+
+    /// Sends a synced file (F8 P4): offered with its pair and path, not
+    /// listed on the Transfers page.
+    pub fn start_send_folder(
+        &self,
+        wire: &WebRtcWireBinding,
+        source: &Path,
+        folder: FolderRef,
+    ) -> Result<Vec<TransferEvent>, String> {
+        validate_relpath(&folder.relpath)?;
+        self.start_send_with(wire, source, None, Some(folder))
+    }
+
+    fn start_send_with(
+        &self,
+        wire: &WebRtcWireBinding,
+        source: &Path,
+        clipboard_mime: Option<&str>,
+        folder: Option<FolderRef>,
+    ) -> Result<Vec<TransferEvent>, String> {
+        let filename = match &folder {
+            // The last segment of the synced path.
+            Some(folder) => folder.relpath.rsplit('/').next().unwrap_or_default(),
+            None => source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "DeskLink shared file has no safe filename".to_string())?,
+        }
+        .to_string();
         // The peer refuses an unsafe name only after the whole file has been
         // offered, so refuse it here before copying anything.
         validate_filename(&filename)?;
@@ -409,10 +444,12 @@ impl WebRtcTransferManager {
             offset: 0,
             source_name,
             // A clipboard copy is a temporary file: not in the history.
-            source_path: clipboard_mime.is_none().then(|| source.to_path_buf()),
+            source_path: (clipboard_mime.is_none() && folder.is_none())
+                .then(|| source.to_path_buf()),
             awaiting_offset: None,
             chunk_size: LEGACY_FILE_CHUNK_BYTES,
             clipboard_mime: clipboard_mime.map(str::to_string),
+            folder,
         };
         if let Err(error) = self.save_send_checkpoint(&checkpoint) {
             let _ = fs::remove_file(&snapshot);
@@ -422,7 +459,7 @@ impl WebRtcTransferManager {
             .lock()
             .map_err(|_| "DeskLink transfer manager lock poisoned".to_string())?
             .insert(transfer_id, checkpoint.clone());
-        if clipboard_mime.is_some() {
+        if clipboard_mime.is_some() || checkpoint.folder.is_some() {
             return Ok(vec![TransferEvent::SendControl(self.send_control(
                 wire,
                 FileAction::Offer,
@@ -655,6 +692,7 @@ impl WebRtcTransferManager {
             clipboard: None,
             mime_type: None,
             capture_id: None,
+            folder: None,
         })])
     }
 
@@ -734,6 +772,32 @@ impl WebRtcTransferManager {
             .sha256
             .clone()
             .ok_or_else(|| "DeskLink WebRTC file offer has no checksum".to_string())?;
+        // F8 P4: only a file folder sync asked for, for this phone's pair.
+        if let Some(folder) = &message.folder {
+            if !crate::device_links::folders::accepts(
+                &wire.peer_device_id,
+                folder,
+                &sha256,
+                total_size,
+            ) {
+                let mut refused = message.clone();
+                refused.action = FileAction::Error;
+                refused.device_id = wire.sender_device_id.clone();
+                refused.session_id = wire.session_id;
+                refused.connection_generation = wire.generation;
+                refused.filename = None;
+                refused.total_size = None;
+                refused.sha256 = None;
+                refused.offset = 0;
+                refused.max_chunk_size = None;
+                refused.clipboard = None;
+                refused.mime_type = None;
+                refused.capture_id = None;
+                refused.folder = None;
+                refused.error = Some("folder-refused".to_string());
+                return Ok(vec![TransferEvent::SendControl(refused)]);
+            }
+        }
         {
             let active = self
                 .active
@@ -760,6 +824,7 @@ impl WebRtcTransferManager {
                     clipboard: None,
                     mime_type: None,
                     capture_id: None,
+                    folder: None,
                 })]);
             }
         }
@@ -785,6 +850,7 @@ impl WebRtcTransferManager {
                 if existing.device_id != wire.peer_device_id
                     || existing.token != message.transfer_token
                     || existing.filename != filename
+                    || existing.folder.as_ref() != message.folder.as_deref()
                     || existing.total_size != total_size
                     || !existing.sha256.eq_ignore_ascii_case(&sha256)
                 {
@@ -826,6 +892,7 @@ impl WebRtcTransferManager {
                         .capture_id
                         .clone()
                         .filter(|id| uuid::Uuid::parse_str(id).is_ok()),
+                    folder: message.folder.as_deref().cloned(),
                 }
             }
         };
@@ -834,8 +901,9 @@ impl WebRtcTransferManager {
             .lock()
             .map_err(|_| "DeskLink transfer manager lock poisoned".to_string())?
             .insert(checkpoint.transfer_id.clone(), checkpoint.clone());
-        // A clipboard image is not a download: no row on the Transfers page.
-        if !checkpoint.clipboard {
+        // A clipboard image or a synced file is not a download: no row on
+        // the Transfers page.
+        if !checkpoint.clipboard && checkpoint.folder.is_none() {
             board::begin(TransferRow {
                 id: checkpoint.transfer_id.clone(),
                 device_id: wire.peer_device_id.clone(),
@@ -924,7 +992,23 @@ impl WebRtcTransferManager {
                 Some(reason),
             ))]);
         }
-        let path = if checkpoint.clipboard {
+        let path = if let Some(folder) = &checkpoint.folder {
+            // F8: stashed beside the state (one rename), then folder sync
+            // puts it in place on its own thread.
+            let stash =
+                self.checked_state_path(&format!(".desklink-{}.sync", checkpoint.transfer_id))?;
+            fs::rename(self.part_path(checkpoint)?, &stash)
+                .map_err(|error| format!("Could not stash a synced file: {error}"))?;
+            self.discard_receive(checkpoint)?;
+            crate::device_links::folders::arrived(
+                &wire.peer_device_id,
+                folder.clone(),
+                stash.clone(),
+                checkpoint.sha256.clone(),
+                checkpoint.total_size,
+            );
+            stash
+        } else if checkpoint.clipboard {
             // Placed on the clipboard from memory; the file goes at once.
             let bytes = fs::read(self.part_path(checkpoint)?)
                 .map_err(|error| format!("Could not read DeskLink clipboard image: {error}"))?;
@@ -1327,6 +1411,11 @@ impl WebRtcTransferManager {
                 .clone()
                 .filter(|_| action == FileAction::Offer),
             capture_id: None,
+            folder: checkpoint
+                .folder
+                .clone()
+                .filter(|_| action == FileAction::Offer)
+                .map(Box::new),
         }
     }
 
@@ -1356,6 +1445,7 @@ impl WebRtcTransferManager {
             clipboard: None,
             mime_type: None,
             capture_id: None,
+            folder: None,
         }
     }
 
@@ -1735,6 +1825,7 @@ mod tests {
             clipboard: None,
             mime_type: None,
             capture_id: None,
+            folder: None,
         }
     }
 
@@ -2123,6 +2214,47 @@ mod tests {
 
     /// C3: a clipboard PNG goes to the clipboard, never to Downloads, and
     /// leaves nothing behind; the same file without both fields is a download.
+    /// F8 P4: a synced file is taken only when folder sync asked for it,
+    /// and then never lands in Downloads.
+    #[test]
+    fn a_synced_file_is_only_taken_when_asked_for() {
+        let sandbox = Sandbox::new("folder-file");
+        let data = payload(1_000);
+        let manager = sandbox.manager();
+        let folder = FolderRef {
+            folder: "pair-1".into(),
+            relpath: "docs/a.txt".into(),
+            mtime: Some(5),
+        };
+        let unasked = FileControl {
+            folder: Some(Box::new(folder.clone())),
+            ..offer_for("transfer_f1", "a.txt", &data)
+        };
+        let events = manager.handle_control(&wire(), unasked).unwrap();
+        assert!(
+            matches!(events.as_slice(), [TransferEvent::SendControl(control)]
+            if control.action == FileAction::Error
+                && control.error.as_deref() == Some("folder-refused"))
+        );
+        assert!(names(&sandbox.state()).is_empty(), "nothing was started");
+        crate::device_links::folders::test_want(
+            &wire().peer_device_id,
+            &folder,
+            &sha256_hex(&data),
+            data.len() as u64,
+        );
+        let asked = FileControl {
+            folder: Some(Box::new(folder)),
+            ..offer_for("transfer_f2", "a.txt", &data)
+        };
+        manager.handle_control(&wire(), asked).unwrap();
+        let events = feed(&manager, &wire(), "transfer_f2", 0, &data).unwrap();
+        assert!(completed_path(&events).is_some());
+        assert!(names(&sandbox.downloads()).is_empty(), "not a download");
+        // With no folder worker running, the stash is not kept.
+        assert!(names(&sandbox.state()).is_empty(), "nothing left behind");
+    }
+
     #[test]
     fn a_clipboard_image_is_placed_and_not_saved() {
         let sandbox = Sandbox::new("clipboard-image");

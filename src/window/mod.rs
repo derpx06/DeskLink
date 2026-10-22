@@ -27,6 +27,7 @@
 mod automations;
 pub(crate) mod calls;
 mod camera;
+mod folders;
 mod insert;
 mod sound;
 pub(crate) use calls::confirm_dial;
@@ -68,6 +69,7 @@ const PAGES: &[(&str, &str, &str)] = &[
     ("contacts", "Contacts", "x-office-address-book-symbolic"),
     ("notes", "Notes", "document-edit-symbolic"),
     ("automations", "Automations", "system-run-symbolic"),
+    ("folders", "Folders", "folder-symbolic"),
     (
         "history",
         "Connection History",
@@ -77,7 +79,7 @@ const PAGES: &[(&str, &str, &str)] = &[
 ];
 
 /// How many of [`PAGES`] are in the sidebar's main list.
-const MAIN_PAGES: usize = 8;
+const MAIN_PAGES: usize = 9;
 
 mod imp {
     use super::*;
@@ -949,6 +951,7 @@ impl DesklinkWindow {
             }
             "history" => history::update(self, device),
             "automations" => automations::update(self, device),
+            "folders" => folders::update(self, device),
             "preferences" => prefs::update(self, daemon, device),
             _ => {}
         }
@@ -2175,6 +2178,69 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         "fire" => {
             crate::device_links::automations::fire(crate::device_links::automations::Step::new(id))
         }
+        // F8: pairs in each state, two conflicts and an offer, for the
+        // selected device; "folder-add PATH" offers a real one.
+        "fake-folders" => {
+            use crate::device_links::folders::{self, Conflict, Offer, Pair, PairView, Phase};
+            let Some(device) = win.selected_id() else {
+                return true;
+            };
+            let home = glib::home_dir();
+            let pair = |name: &str, folder: &str, phase: Phase, files: usize| PairView {
+                pair: Pair {
+                    id: format!("fake-{name}"),
+                    name: name.into(),
+                    root: home.join(folder),
+                    device: device.clone(),
+                    include_hidden: false,
+                    ignore: Vec::new(),
+                },
+                phase,
+                files,
+                last_sync: Some(1_761_130_000_000),
+                conflicts: Vec::new(),
+            };
+            let mut documents = pair("Documents", "Documents/Shared", Phase::UpToDate, 214);
+            documents.conflicts = vec![
+                Conflict {
+                    path: "plan/budget.ods".into(),
+                    copy: "plan/budget (conflict from Pixel 9 2026-10-22).ods".into(),
+                    at: 0,
+                },
+                Conflict {
+                    path: "notes.md".into(),
+                    copy: "notes (conflict from Pixel 9 2026-10-21).md".into(),
+                    at: 0,
+                },
+            ];
+            folders::debug_show(
+                vec![
+                    documents,
+                    pair("Photos", "Pictures/Phone", Phase::Syncing(12), 1840),
+                    pair("Music", "Music", Phase::NotOnPhone, 0),
+                ],
+                vec![Offer {
+                    device: device.clone(),
+                    id: "fake-offer".into(),
+                    name: "Camera".into(),
+                }],
+            );
+            win.refresh_soon();
+        }
+        "folder-add" => {
+            if let Some(device) = win.selected_id() {
+                crate::device_links::folders::add(&device, std::path::PathBuf::from(id));
+            }
+        }
+        "expand-pairs" => {
+            if let Some((scroll, _)) = win.imp().bodies.borrow().get("folders").cloned() {
+                for row in named_widgets(scroll.upcast_ref(), "pair-row") {
+                    if let Some(row) = row.downcast_ref::<adw::ExpanderRow>() {
+                        row.set_expanded(true);
+                    }
+                }
+            }
+        }
         "rule-template" => {
             let name = win
                 .selected_id()
@@ -2841,6 +2907,7 @@ mod tests {
                 "contacts",
                 "notes",
                 "automations",
+                "folders",
                 "history",
                 "preferences"
             ]

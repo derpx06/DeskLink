@@ -70,6 +70,36 @@ pub struct FileControl {
     /// `capture-request` id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_id: Option<String>,
+    /// Offer only (F8 P4): a synced file, for this pair at this path.
+    #[serde(flatten)]
+    pub folder: Option<Box<FolderRef>>,
+}
+
+/// F8 P4: which pair a file belongs to, where in it, and its mtime (ms).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FolderRef {
+    pub folder: String,
+    pub relpath: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtime: Option<i64>,
+}
+
+/// Segments of a synced path, and its length (F8 P2).
+const MAX_RELPATH_SEGMENTS: usize = 32;
+const MAX_RELPATH_BYTES: usize = 1024;
+
+/// F8 P2: a path relative to a pair's root: `/`-separated valid filenames,
+/// at most 32 of them and 1024 bytes. Never absolute, never `.` or `..`.
+pub(crate) fn validate_relpath(value: &str) -> Result<(), String> {
+    let segments: Vec<&str> = value.split('/').collect();
+    if value.is_empty() || value.len() > MAX_RELPATH_BYTES || segments.len() > MAX_RELPATH_SEGMENTS
+    {
+        return Err("Unsafe DeskLink synced path".to_string());
+    }
+    segments
+        .iter()
+        .try_for_each(|segment| validate_filename(segment))
+        .map_err(|_| "Unsafe DeskLink synced path".to_string())
 }
 
 impl FileControl {
@@ -122,6 +152,19 @@ impl FileControl {
             )?;
             if self.total_size.is_none() || self.sha256.is_none() || self.offset != 0 {
                 return Err("Malformed DeskLink WebRTC file offer".to_string());
+            }
+            if let Some(folder) = &self.folder {
+                let named = folder.relpath.rsplit('/').next() == self.filename.as_deref();
+                let id = !folder.folder.is_empty()
+                    && folder.folder.len() <= 64
+                    && folder
+                        .folder
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-');
+                validate_relpath(&folder.relpath)?;
+                if !named || !id {
+                    return Err("Malformed DeskLink synced file offer".to_string());
+                }
             }
         }
         if self.error.as_ref().is_some_and(|error| error.len() > 4096) {
@@ -261,6 +304,41 @@ fn validate_chunk_data(data: &[u8]) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_synced_file_offer_names_its_path_safely() {
+        let synced = |relpath: &str, filename: &str, folder: &str| FileControl {
+            filename: Some(filename.into()),
+            folder: Some(Box::new(FolderRef {
+                folder: folder.into(),
+                relpath: relpath.into(),
+                mtime: Some(1),
+            })),
+            ..offer()
+        };
+        assert!(synced("docs/a.txt", "a.txt", "pair-1")
+            .validate(&wire())
+            .is_ok());
+        assert!(synced("docs/a.txt", "b.txt", "pair-1")
+            .validate(&wire())
+            .is_err());
+        assert!(synced("../a.txt", "a.txt", "pair-1")
+            .validate(&wire())
+            .is_err());
+        assert!(synced("docs/a.txt", "a.txt", "pair/1")
+            .validate(&wire())
+            .is_err());
+        assert!(synced("docs/a.txt", "a.txt", "").validate(&wire()).is_err());
+        // Old peers ignore it; the fields sit flat in the offer.
+        let json = String::from_utf8(synced("d/a.txt", "a.txt", "p").to_json().unwrap()).unwrap();
+        assert!(json.contains("\"relpath\":\"d/a.txt\"") && json.contains("\"folder\":\"p\""));
+        let plain = String::from_utf8(offer().to_json().unwrap()).unwrap();
+        assert!(!plain.contains("relpath"));
+        assert_eq!(
+            FileControl::from_json(plain.as_bytes()).unwrap().folder,
+            None
+        );
+    }
+
     fn wire() -> WebRtcWireBinding {
         WebRtcWireBinding {
             sender_device_id: "desktop-device".to_string(),
@@ -289,6 +367,7 @@ mod tests {
             clipboard: None,
             mime_type: None,
             capture_id: None,
+            folder: None,
         }
     }
 
