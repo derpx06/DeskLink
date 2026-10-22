@@ -118,6 +118,19 @@ pub struct DesktopWebRtcPeer {
     /// Captures that could not be wound down while the connection was not ready
     /// (see `DesktopScreenCapture::stop`); `close` releases them.
     retired_captures: Mutex<Vec<super::screen::DesktopScreenCapture>>,
+    /// The incoming audio pad (parked on a fakesink while no one listens),
+    /// once the phone's first audio arrived.
+    audio_pad: Arc<Mutex<Option<gst::Pad>>>,
+    /// The phone's sound or microphone being played here (F1). Shared
+    /// with the pad callback, which moves it to a new incoming stream.
+    audio_playback: Arc<Mutex<Option<super::audio::AudioPlayback>>>,
+    /// Where the phone's sound should play once its first packet arrives:
+    /// its `audio-ready` comes before the stream does.
+    audio_wanted: Arc<Mutex<Option<(super::audio::Output, String)>>>,
+    /// This computer's sound or microphone going to the phone (F1).
+    audio_send: Mutex<Option<super::audio::AudioSend>>,
+    /// The sound's SSRC and where its sequence continues.
+    audio_continuity: Mutex<super::audio::Continuity>,
 }
 
 impl DesktopWebRtcPeer {
@@ -161,7 +174,18 @@ impl DesktopWebRtcPeer {
         let channels = Arc::new(Mutex::new(HashMap::new()));
         let offer_requested = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
-        install_webrtcbin_callbacks(&webrtcbin, &pipeline, Arc::clone(&channels), events.clone())?;
+        let audio_pad = Arc::new(Mutex::new(None));
+        let audio_playback = Arc::new(Mutex::new(None));
+        let audio_wanted = Arc::new(Mutex::new(None));
+        install_webrtcbin_callbacks(
+            &webrtcbin,
+            &pipeline,
+            Arc::clone(&channels),
+            events.clone(),
+            Arc::clone(&audio_pad),
+            Arc::clone(&audio_playback),
+            Arc::clone(&audio_wanted),
+        )?;
 
         pipeline
             .set_state(gst::State::Playing)
@@ -187,10 +211,32 @@ impl DesktopWebRtcPeer {
             closed,
             desktop_screen_capture: Mutex::new(None),
             retired_captures: Mutex::new(Vec::new()),
+            audio_pad,
+            audio_playback,
+            audio_wanted,
+            audio_send: Mutex::new(None),
+            audio_continuity: Mutex::new(super::audio::Continuity {
+                ssrc: loop {
+                    let mut bytes = [0u8; 4];
+                    let _ = openssl::rand::rand_bytes(&mut bytes);
+                    let ssrc = u32::from_ne_bytes(bytes);
+                    if ssrc != 0 {
+                        break ssrc;
+                    }
+                },
+                next_seqnum: None,
+            }),
         };
         if initiator {
             peer.create_local_channels()?;
             peer.add_screen_transceiver()?;
+            #[cfg(test)]
+            let with_audio = !NO_AUDIO_SECTION.with(|flag| flag.get());
+            #[cfg(not(test))]
+            let with_audio = true;
+            if with_audio {
+                peer.add_audio_transceiver()?;
+            }
         }
         Ok(peer)
     }
@@ -521,6 +567,9 @@ impl DesktopWebRtcPeer {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
+        // Sound first: its sources are live and push into webrtcbin.
+        self.stop_audio_send();
+        self.stop_audio_playback();
         if let Ok(channels) = self.channels.lock() {
             for channel in channels.values() {
                 channel.close();
@@ -545,6 +594,148 @@ impl DesktopWebRtcPeer {
             }
         }
         let _ = self.events.send(PeerEvent::Closed);
+    }
+
+    /// Adds the one Opus audio section (A1), `sendrecv` and present from the
+    /// first offer, after the video section: sound in either direction later
+    /// needs no renegotiation (there is none).
+    fn add_audio_transceiver(&self) -> Result<(), String> {
+        self.webrtcbin
+            .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
+                "add-transceiver",
+                &[
+                    &gst_webrtc::WebRTCRTPTransceiverDirection::Sendrecv,
+                    &super::audio::audio_caps(),
+                ],
+            )
+            .map(|_| ())
+            .ok_or_else(|| "Could not add the DeskLink sound section".to_string())
+    }
+
+    /// Whether this connection has a live audio section (an older phone's
+    /// answer has none).
+    pub fn audio_negotiated(&self) -> bool {
+        super::audio::negotiated(&self.webrtcbin)
+    }
+
+    /// Plays (or publishes as "DeskLink Microphone") the phone's audio,
+    /// replacing whatever played before.
+    pub(crate) fn start_audio_playback(
+        &self,
+        output: super::audio::Output,
+        phone: &str,
+    ) -> Result<(), String> {
+        self.stop_audio_playback();
+        if let Ok(mut wanted) = self.audio_wanted.lock() {
+            *wanted = Some((output, phone.to_string()));
+        }
+        // Not arrived yet: it starts on the stream's first packet.
+        let Some(pad) = self.audio_pad.lock().ok().and_then(|pad| pad.clone()) else {
+            return Ok(());
+        };
+        let playback = super::audio::AudioPlayback::start(&self.pipeline, &pad, output, phone)?;
+        if let Ok(mut current) = self.audio_playback.lock() {
+            *current = Some(playback);
+        }
+        Ok(())
+    }
+
+    /// Whether the phone's audio plays here now, and where.
+    pub(crate) fn audio_playback(&self) -> Option<super::audio::Output> {
+        self.audio_playback
+            .lock()
+            .ok()
+            .and_then(|playback| playback.as_ref().map(|playback| playback.output))
+    }
+
+    pub(crate) fn audio_received(&self) -> u64 {
+        self.audio_playback
+            .lock()
+            .ok()
+            .and_then(|playback| playback.as_ref().map(|playback| playback.received()))
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn stop_audio_playback(&self) {
+        if let Ok(mut wanted) = self.audio_wanted.lock() {
+            *wanted = None;
+        }
+        let playback = self.audio_playback.lock().ok().and_then(|mut p| p.take());
+        if let Some(playback) = playback {
+            playback.stop();
+        }
+    }
+
+    /// Sends this computer's sound or microphone to the phone, replacing
+    /// whatever was sent before.
+    pub(crate) fn start_audio_send(&self, source: super::audio::Source) -> Result<(), String> {
+        self.stop_audio_send();
+        let send = super::audio::AudioSend::start(
+            &self.pipeline,
+            &self.webrtcbin,
+            source,
+            self.continuity(),
+        )?;
+        if let Ok(mut current) = self.audio_send.lock() {
+            *current = Some(send);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_audio_send_from(
+        &self,
+        source: super::audio::Source,
+        input: gst::Element,
+    ) -> Result<(), String> {
+        self.stop_audio_send();
+        let send = super::audio::AudioSend::start_from(
+            &self.pipeline,
+            &self.webrtcbin,
+            source,
+            input,
+            self.continuity(),
+        )?;
+        if let Ok(mut current) = self.audio_send.lock() {
+            *current = Some(send);
+        }
+        Ok(())
+    }
+
+    /// What this computer sends to the phone now, if anything.
+    pub(crate) fn audio_sending(&self) -> Option<super::audio::Source> {
+        self.audio_send
+            .lock()
+            .ok()
+            .and_then(|send| send.as_ref().map(|send| send.source))
+    }
+
+    pub(crate) fn audio_sent(&self) -> u64 {
+        self.audio_send
+            .lock()
+            .ok()
+            .and_then(|send| send.as_ref().map(|send| send.sent()))
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn stop_audio_send(&self) {
+        let send = self.audio_send.lock().ok().and_then(|mut s| s.take());
+        if let Some(send) = send {
+            let next = send.stop();
+            if let (Some(next), Ok(mut continuity)) = (next, self.audio_continuity.lock()) {
+                continuity.next_seqnum = Some(next);
+            }
+        }
+    }
+
+    fn continuity(&self) -> super::audio::Continuity {
+        self.audio_continuity
+            .lock()
+            .map(|continuity| *continuity)
+            .unwrap_or(super::audio::Continuity {
+                ssrc: 1,
+                next_seqnum: None,
+            })
     }
 
     /// Adds the bidirectional video section used for screen sharing.
@@ -806,6 +997,16 @@ fn configure_video_transceivers(webrtcbin: &gst::Element) {
         else {
             return;
         };
+        // The audio section (A1) is answered sendrecv too; nothing else.
+        if transceiver.kind() == gst_webrtc::WebRTCKind::Audio {
+            if transceiver.find_property("direction").is_some() {
+                transceiver.set_property(
+                    "direction",
+                    gst_webrtc::WebRTCRTPTransceiverDirection::Sendrecv,
+                );
+            }
+            continue;
+        }
         if transceiver.kind() != gst_webrtc::WebRTCKind::Video {
             continue;
         }
@@ -828,6 +1029,12 @@ fn configure_video_transceivers(webrtcbin: &gst::Element) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: build an offerer without the audio section (an older phone).
+    static NO_AUDIO_SECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A max-bundle session has one media section per kind; this is slack, not a
 /// budget.
 ///
@@ -837,28 +1044,47 @@ fn configure_video_transceivers(webrtcbin: &gst::Element) {
 /// and equally invisible until the signal actually fires.
 const MAX_TRANSCEIVERS: i32 = 16;
 
-fn pad_carries_video(pad: &gst::Pad) -> bool {
-    // `property` panics when the property is absent, and only webrtcbin's own
-    // source pads carry this one.
+/// The kind of media an inbound pad carries. Its caps come first: with max
+/// bundle, `webrtcbin` hands every receive pad the *first* transceiver (the
+/// audio pad claimed to be video, and would have been decoded as a screen).
+fn pad_media(pad: &gst::Pad) -> Option<String> {
+    let from_caps = pad.current_caps().and_then(|caps| {
+        caps.structure(0)
+            .and_then(|structure| structure.get::<&str>("media").ok().map(str::to_string))
+    });
+    if from_caps.is_some() {
+        return from_caps;
+    }
     if pad.find_property("transceiver").is_some() {
         if let Some(transceiver) =
             pad.property::<Option<gst_webrtc::WebRTCRTPTransceiver>>("transceiver")
         {
-            return transceiver.kind() == gst_webrtc::WebRTCKind::Video;
+            match transceiver.kind() {
+                gst_webrtc::WebRTCKind::Audio => return Some("audio".into()),
+                gst_webrtc::WebRTCKind::Video => return Some("video".into()),
+                _ => {}
+            }
         }
     }
-
-    pad.current_caps()
-        .or_else(|| pad.query_caps(None).into())
-        .and_then(|caps| {
-            caps.structure(0).map(|structure| {
-                structure
-                    .get::<&str>("media")
-                    .map(|media| media == "video")
-                    .unwrap_or_else(|_| structure.name().starts_with("video/"))
+    pad.query_caps(None).structure(0).and_then(|structure| {
+        structure
+            .get::<&str>("media")
+            .ok()
+            .map(str::to_string)
+            .or_else(|| {
+                let name = structure.name();
+                (name.starts_with("video/") || name.starts_with("audio/"))
+                    .then(|| name.split('/').next().unwrap_or_default().to_string())
             })
-        })
-        .unwrap_or(false)
+    })
+}
+
+fn pad_carries_audio(pad: &gst::Pad) -> bool {
+    pad_media(pad).as_deref() == Some("audio")
+}
+
+fn pad_carries_video(pad: &gst::Pad) -> bool {
+    pad_media(pad).as_deref() == Some("video")
 }
 
 fn install_webrtcbin_callbacks(
@@ -866,6 +1092,9 @@ fn install_webrtcbin_callbacks(
     pipeline: &gst::Pipeline,
     channels: Arc<Mutex<HashMap<WebRtcChannel, WebRTCDataChannel>>>,
     events: Sender<PeerEvent>,
+    audio_pad: Arc<Mutex<Option<gst::Pad>>>,
+    audio_playback: Arc<Mutex<Option<super::audio::AudioPlayback>>>,
+    audio_wanted: Arc<Mutex<Option<(super::audio::Output, String)>>>,
 ) -> Result<(), String> {
     // `on-negotiation-needed` deliberately does nothing.
     //
@@ -913,6 +1142,28 @@ fn install_webrtcbin_callbacks(
     let media_pipeline = pipeline.clone();
     webrtcbin.connect_pad_added(move |_, pad| {
         if pad.direction() != gst::PadDirection::Src {
+            return;
+        }
+        // Sound (F1): parked until someone listens, never left unlinked.
+        if pad_carries_audio(pad) {
+            super::screen::park_pad(&media_pipeline, pad);
+            if let Ok(mut slot) = audio_pad.lock() {
+                *slot = Some(pad.clone());
+            }
+            // A new incoming stream (the phone restarted its sound): what was
+            // playing moves to it, or what was asked before it arrived starts.
+            if let Ok(mut playing) = audio_playback.lock() {
+                if let Some(old) = playing.take() {
+                    old.stop();
+                }
+                let wanted = audio_wanted.lock().ok().and_then(|wanted| wanted.clone());
+                if let Some((output, phone)) = wanted {
+                    match super::audio::AudioPlayback::start(&media_pipeline, pad, output, &phone) {
+                        Ok(moved) => *playing = Some(moved),
+                        Err(error) => eprintln!("[DeskLink] {error}"),
+                    }
+                }
+            }
             return;
         }
         if !pad_carries_video(pad) {
@@ -1559,13 +1810,26 @@ a=max-message-size:262144\r\n";
     /// Wires two peers together: signalling events from each are applied to the
     /// other, everything else is handed to the test.
     pub(crate) fn loopback() -> Loopback {
+        loopback_with(true, |_, sdp| sdp.to_string())
+    }
+
+    /// A loopback whose descriptions pass through `munge` on the way across
+    /// (to stand in for an older phone), and whose offerer adds the audio
+    /// section only with `offer_audio`.
+    pub(crate) fn loopback_with(
+        offer_audio: bool,
+        munge: fn(SignalingMessageType, &str) -> String,
+    ) -> Loopback {
         let ice = IceServerConfig {
             local_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
             ..IceServerConfig::default()
         };
         let (offerer_tx, offerer_raw) = mpsc::channel();
         let (answerer_tx, answerer_raw) = mpsc::channel();
-        let offerer = Arc::new(DesktopWebRtcPeer::new(true, offerer_tx, &ice).unwrap());
+        NO_AUDIO_SECTION.with(|flag| flag.set(!offer_audio));
+        let offerer = DesktopWebRtcPeer::new(true, offerer_tx, &ice);
+        NO_AUDIO_SECTION.with(|flag| flag.set(false));
+        let offerer = Arc::new(offerer.unwrap());
         let answerer = Arc::new(DesktopWebRtcPeer::new(false, answerer_tx, &ice).unwrap());
         let (offerer_app_tx, offerer_events) = mpsc::channel();
         let (answerer_app_tx, answerer_events) = mpsc::channel();
@@ -1578,7 +1842,7 @@ a=max-message-size:262144\r\n";
                 }
                 match event {
                     PeerEvent::LocalDescription { message_type, sdp } => {
-                        let _ = to.set_remote_description(message_type, &sdp);
+                        let _ = to.set_remote_description(message_type, &munge(message_type, &sdp));
                     }
                     PeerEvent::IceCandidate {
                         sdp_m_line_index,
@@ -1601,7 +1865,7 @@ a=max-message-size:262144\r\n";
                 }
                 match event {
                     PeerEvent::LocalDescription { message_type, sdp } => {
-                        let _ = to.set_remote_description(message_type, &sdp);
+                        let _ = to.set_remote_description(message_type, &munge(message_type, &sdp));
                     }
                     PeerEvent::IceCandidate {
                         sdp_m_line_index,
@@ -1674,6 +1938,298 @@ a=max-message-size:262144\r\n";
                 Err(_) => panic!("no message arrived on {channel:?}"),
             }
         }
+    }
+
+    /// Live and stamped with the pipeline's running time, as `pipewiresrc`
+    /// is in use (`do-timestamp`).
+    fn audio_source() -> gst::Element {
+        gst::ElementFactory::make("audiotestsrc")
+            .property("is-live", true)
+            .property("do-timestamp", true)
+            .build()
+            .unwrap()
+    }
+
+    /// Waits until `peer` has an incoming audio pad, then plays it.
+    fn play_when_audio_arrives(peer: &DesktopWebRtcPeer) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while peer.audio_pad.lock().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "no audio pad arrived");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        peer.start_audio_playback(super::super::audio::Output::Speakers, "test")
+            .unwrap();
+    }
+
+    fn wait_for_audio(peer: &DesktopWebRtcPeer) -> u64 {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let received = peer.audio_received();
+            if received > 20 || std::time::Instant::now() > deadline {
+                return received;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// The phone's `audio-ready` comes before its first packet: playback
+    /// asked for then starts when the stream arrives.
+    #[test]
+    fn sound_asked_for_before_it_arrives_plays_when_it_does() {
+        let pair = loopback();
+        wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        assert!(pair.answerer.audio_pad.lock().unwrap().is_none());
+        pair.answerer
+            .start_audio_playback(super::super::audio::Output::Speakers, "test")
+            .unwrap();
+        pair.offerer
+            .start_audio_send_from(super::super::audio::Source::System, audio_source())
+            .unwrap();
+        assert!(wait_for_audio(&pair.answerer) > 20, "nothing played");
+    }
+
+    /// F1 latency over loopback: each RTP packet's time from the payloader
+    /// to the far side's webrtcbin output (SRTP, ICE, jitter buffer). Run by
+    /// hand: `cargo test sound_latency -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn sound_latency_over_loopback() {
+        use std::collections::HashMap;
+        use std::time::Instant;
+        type Stamps = Arc<Mutex<HashMap<u16, Instant>>>;
+        fn seqnum(buffer: &gst::BufferRef) -> Option<u16> {
+            let map = buffer.map_readable().ok()?;
+            (map.len() > 4).then(|| u16::from_be_bytes([map[2], map[3]]))
+        }
+        fn stamp(pad: &gst::Pad, stamps: Stamps) {
+            pad.add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                move |_, info| {
+                    let now = Instant::now();
+                    let mut stamps = stamps.lock().unwrap();
+                    match &info.data {
+                        Some(gst::PadProbeData::Buffer(buffer)) => {
+                            if let Some(seq) = seqnum(buffer) {
+                                stamps.entry(seq).or_insert(now);
+                            }
+                        }
+                        Some(gst::PadProbeData::BufferList(list)) => {
+                            for buffer in list.iter() {
+                                if let Some(seq) = seqnum(buffer) {
+                                    stamps.entry(seq).or_insert(now);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    gst::PadProbeReturn::Ok
+                },
+            );
+        }
+        let pair = loopback();
+        wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let ticks = audio_source();
+        ticks.set_property_from_str("wave", "ticks");
+        pair.offerer
+            .start_audio_send_from(super::super::audio::Source::System, ticks)
+            .unwrap();
+        play_when_audio_arrives(&pair.answerer);
+        let (sent, heard): (Stamps, Stamps) = Default::default();
+        let sink = pair
+            .offerer
+            .webrtcbin
+            .sink_pads()
+            .into_iter()
+            .find(|pad| {
+                pad.peer()
+                    .and_then(|peer| peer.parent_element())
+                    .and_then(|element| element.factory())
+                    .is_some_and(|factory| factory.name() == "rtpopuspay")
+            })
+            .unwrap();
+        stamp(&sink, Arc::clone(&sent));
+        stamp(
+            &pair.answerer.audio_pad.lock().unwrap().clone().unwrap(),
+            Arc::clone(&heard),
+        );
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let (sent, heard) = (sent.lock().unwrap(), heard.lock().unwrap());
+        let mut delays: Vec<f64> = heard
+            .iter()
+            .filter_map(|(seq, at)| Some(at.duration_since(*sent.get(seq)?).as_secs_f64() * 1e3))
+            .collect();
+        delays.sort_by(f64::total_cmp);
+        assert!(delays.len() > 100, "only {} packets matched", delays.len());
+        let at = |q: f64| delays[((delays.len() - 1) as f64 * q) as usize];
+        eprintln!(
+            "SOUND LATENCY {} packets: median {:.2} ms, p95 {:.2} ms, max {:.2} ms",
+            delays.len(),
+            at(0.5),
+            at(0.95),
+            at(1.0)
+        );
+    }
+
+    /// F1 A1: one Opus section in the first offer, after video, answered
+    /// sendrecv — and sound flows both ways over it.
+    #[test]
+    fn sound_flows_both_ways_over_the_first_negotiation() {
+        let pair = loopback();
+        wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let offer = pair
+            .offerer
+            .webrtcbin
+            .property::<Option<WebRTCSessionDescription>>("local-description")
+            .unwrap()
+            .sdp()
+            .as_text()
+            .unwrap();
+        let audio = media_section(&offer, "audio");
+        assert!(
+            audio.contains("OPUS/48000/2") || audio.contains("opus/48000/2"),
+            "{audio}"
+        );
+        for fmtp in [
+            "minptime=10",
+            "useinbandfec=1",
+            "stereo=1",
+            "maxaveragebitrate=128000",
+        ] {
+            assert!(audio.contains(fmtp), "{fmtp} missing in:\n{audio}");
+        }
+        assert!(audio.contains("a=sendrecv"));
+        assert!(
+            offer.find("m=video").unwrap() < offer.find("m=audio").unwrap(),
+            "audio after video"
+        );
+        let answer = pair
+            .answerer
+            .webrtcbin
+            .property::<Option<WebRTCSessionDescription>>("local-description")
+            .unwrap()
+            .sdp()
+            .as_text()
+            .unwrap();
+        assert!(
+            media_section(&answer, "audio").contains("a=sendrecv"),
+            "{answer}"
+        );
+        assert!(pair.offerer.audio_negotiated() && pair.answerer.audio_negotiated());
+
+        // Offerer → answerer.
+        pair.offerer
+            .start_audio_send_from(super::super::audio::Source::System, audio_source())
+            .unwrap();
+        play_when_audio_arrives(&pair.answerer);
+        assert!(
+            wait_for_audio(&pair.answerer) > 20,
+            "answerer heard nothing"
+        );
+        // Answerer → offerer, at the same time.
+        pair.answerer
+            .start_audio_send_from(super::super::audio::Source::Mic, audio_source())
+            .unwrap();
+        play_when_audio_arrives(&pair.offerer);
+        assert!(wait_for_audio(&pair.offerer) > 20, "offerer heard nothing");
+        assert!(pair.offerer.audio_sent() > 0 && pair.answerer.audio_sent() > 0);
+
+        // Stopping and starting again reuses the same section.
+        pair.offerer.stop_audio_send();
+        pair.answerer.stop_audio_playback();
+        pair.offerer
+            .start_audio_send_from(super::super::audio::Source::System, audio_source())
+            .unwrap();
+        pair.answerer
+            .start_audio_playback(super::super::audio::Output::Microphone, "test")
+            .unwrap();
+        let heard = wait_for_audio(&pair.answerer);
+        assert!(heard > 20, "a second session heard {heard} packets");
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
+    /// An older phone answers the audio section rejected: everything else
+    /// keeps working and sound is simply unavailable.
+    #[test]
+    fn an_answer_without_audio_leaves_the_rest_working() {
+        fn reject_audio(kind: SignalingMessageType, sdp: &str) -> String {
+            if kind != SignalingMessageType::Answer {
+                return sdp.to_string();
+            }
+            // Rejected the way libwebrtc rejects: port 0, inactive, and out
+            // of the BUNDLE group.
+            let section = &sdp[sdp.find("m=audio").unwrap()..];
+            let mid = section
+                .lines()
+                .find_map(|line| line.strip_prefix("a=mid:"))
+                .unwrap()
+                .trim()
+                .to_string();
+            let mut in_audio = false;
+            sdp.split_inclusive('\n')
+                .map(|line| {
+                    if line.starts_with("a=group:BUNDLE") {
+                        let kept: Vec<&str> = line
+                            .trim_end()
+                            .split(' ')
+                            .filter(|part| *part != mid)
+                            .collect();
+                        return format!("{}\r\n", kept.join(" "));
+                    }
+                    if line.starts_with("m=") {
+                        in_audio = line.starts_with("m=audio");
+                        if in_audio {
+                            let mut parts: Vec<&str> = line.splitn(3, ' ').collect();
+                            parts[1] = "0";
+                            return parts.join(" ");
+                        }
+                    }
+                    if in_audio && line.starts_with("a=sendrecv") {
+                        return line.replace("sendrecv", "inactive");
+                    }
+                    line.to_string()
+                })
+                .collect()
+        }
+        let pair = loopback_with(true, reject_audio);
+        wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        pair.answerer
+            .send_text(WebRtcChannel::Control, "still here")
+            .unwrap();
+        assert_eq!(
+            next_envelope(&pair.offerer_events, WebRtcChannel::Control),
+            b"still here"
+        );
+        assert!(!pair.offerer.audio_negotiated());
+        assert!(pair
+            .offerer
+            .start_audio_send_from(super::super::audio::Source::System, audio_source())
+            .is_err());
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
+    /// An older phone offers no audio section: the desk answers what it was
+    /// offered, and the connection works.
+    #[test]
+    fn an_offer_without_audio_is_answered_and_works() {
+        let pair = loopback_with(false, |_, sdp| sdp.to_string());
+        wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        pair.offerer
+            .send_text(WebRtcChannel::Control, "old phone")
+            .unwrap();
+        assert_eq!(
+            next_envelope(&pair.answerer_events, WebRtcChannel::Control),
+            b"old phone"
+        );
+        assert!(!pair.answerer.audio_negotiated());
+        pair.offerer.close();
+        pair.answerer.close();
     }
 
     #[test]

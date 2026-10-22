@@ -111,6 +111,9 @@ pub struct AppSettings {
     pub forward_notifications: bool,
     #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub forward_apps: std::collections::BTreeSet<String>,
+    /// Preferences → Sound: a phone may ask to hear this computer's
+    /// microphone (F1 A3; off by default).
+    pub desk_mic_to_phone: bool,
 }
 
 /// A command a phone may run here, in a shared terminal.
@@ -144,6 +147,7 @@ impl Default for AppSettings {
             call_audio_devices: Default::default(),
             forward_notifications: false,
             forward_apps: Default::default(),
+            desk_mic_to_phone: false,
         }
     }
 }

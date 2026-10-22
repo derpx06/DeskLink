@@ -41,8 +41,14 @@ pub enum DaemonCommand {
     /// A call request (T2): the phone ("" = the connected one that can
     /// call), the action, and the number to dial.
     Telephony(String, String, Option<String>),
-    /// Use the phone's camera as this computer's webcam: facing, size.
-    StartCamera(String, String, i32, i32),
+    /// Use the phone's camera as this computer's webcam: facing, size,
+    /// and whether its microphone comes too.
+    StartCamera(String, String, i32, i32, bool),
+    /// Preferences → Sound: phones may hear this computer's microphone.
+    SetDeskMicToPhone(bool),
+    /// Sound (F1): `desk-sound` (this computer's sound to the phone),
+    /// `phone-sound` or `phone-mic` (the phone's, here), on or off.
+    Sound(String, String, bool),
     /// `flip` or `stop` the phone's camera.
     CameraControl(String, String),
     /// "Type on phone": keys for the phone's focused text field.
@@ -175,10 +181,20 @@ impl DaemonWorker {
             DaemonCommand::Telephony(id, action, number) => {
                 self.send_telephony(&id, &action, number.as_deref())
             }
-            DaemonCommand::StartCamera(id, facing, width, height) => {
+            DaemonCommand::StartCamera(id, facing, width, height, audio) => {
                 self.with_feature_transport(&id, |transport| {
-                    transport.start_camera(&facing, width, height)
+                    transport.start_camera(&facing, width, height, audio)
                 });
+            }
+            DaemonCommand::SetDeskMicToPhone(on) => {
+                self.update_settings(|settings| settings.desk_mic_to_phone = on)
+            }
+            DaemonCommand::Sound(id, what, on) => {
+                let sent = self.with_feature_transport(&id, |transport| transport.sound(&what, on));
+                // Off is local too: nothing plays on once the link is gone.
+                if !sent && !on {
+                    crate::device_links::webrtc::audio_session::end_all(&id);
+                }
             }
             DaemonCommand::CameraControl(id, action) => {
                 let sent =

@@ -105,6 +105,13 @@ pub enum ControlKind {
     CameraReady,
     CameraControl,
     CameraStopped,
+    /// Sound both ways (F1 A2), outside the screen session too. The
+    /// requester is always the one who hears.
+    AudioRequest,
+    AudioReady,
+    AudioControl,
+    AudioStop,
+    AudioDenied,
 }
 
 impl ControlKind {
@@ -132,6 +139,11 @@ impl ControlKind {
             Self::CameraReady => "camera-ready",
             Self::CameraControl => "camera-control",
             Self::CameraStopped => "camera-stopped",
+            Self::AudioRequest => "audio-request",
+            Self::AudioReady => "audio-ready",
+            Self::AudioControl => "audio-control",
+            Self::AudioStop => "audio-stop",
+            Self::AudioDenied => "audio-denied",
         }
     }
 
@@ -159,6 +171,11 @@ impl ControlKind {
             "camera-ready" => Self::CameraReady,
             "camera-control" => Self::CameraControl,
             "camera-stopped" => Self::CameraStopped,
+            "audio-request" => Self::AudioRequest,
+            "audio-ready" => Self::AudioReady,
+            "audio-control" => Self::AudioControl,
+            "audio-stop" => Self::AudioStop,
+            "audio-denied" => Self::AudioDenied,
             _ => return None,
         })
     }
@@ -211,6 +228,14 @@ pub struct ControlMessage {
     pub height: Option<i32>,
     pub audio: Option<bool>,
     pub action: Option<String>,
+    /// Sound (F1): who sends ("desk-to-phone" / "phone-to-desk", on the wire
+    /// as `direction` — never a screen direction), what ("system" / "mic"),
+    /// its format, and an `audio-control` value (0..100).
+    pub audio_direction: Option<String>,
+    pub source: Option<String>,
+    pub sample_rate: Option<i32>,
+    pub channels: Option<i32>,
+    pub value: Option<i32>,
 }
 
 impl ControlKind {
@@ -219,6 +244,18 @@ impl ControlKind {
         matches!(
             self,
             Self::CameraRequest | Self::CameraReady | Self::CameraControl | Self::CameraStopped
+        )
+    }
+
+    /// Sound's kinds (F1), handled apart from the screen session.
+    pub const fn is_audio(self) -> bool {
+        matches!(
+            self,
+            Self::AudioRequest
+                | Self::AudioReady
+                | Self::AudioControl
+                | Self::AudioStop
+                | Self::AudioDenied
         )
     }
 }
@@ -259,6 +296,11 @@ impl ControlMessage {
             height: None,
             audio: None,
             action: None,
+            audio_direction: None,
+            source: None,
+            sample_rate: None,
+            channels: None,
+            value: None,
         }
     }
 
@@ -338,6 +380,21 @@ impl ControlMessage {
         if let Some(action) = &self.action {
             root.insert("action".into(), Value::from(action.clone()));
         }
+        if let Some(direction) = &self.audio_direction {
+            root.insert("direction".into(), Value::from(direction.clone()));
+        }
+        if let Some(source) = &self.source {
+            root.insert("source".into(), Value::from(source.clone()));
+        }
+        if let Some(rate) = self.sample_rate {
+            root.insert("sampleRate".into(), Value::from(rate));
+        }
+        if let Some(channels) = self.channels {
+            root.insert("channels".into(), Value::from(channels));
+        }
+        if let Some(value) = self.value {
+            root.insert("value".into(), Value::from(value));
+        }
         serde_json::to_vec(&Value::Object(root)).unwrap_or_default()
     }
 
@@ -373,7 +430,9 @@ impl ControlMessage {
             sequence: number("sequence").unwrap_or_default(),
             timestamp: number("timestamp").unwrap_or_default(),
             lease_id: optional_text("leaseId"),
-            direction: optional_text("direction").and_then(|value| ScreenDirection::parse(&value)),
+            direction: optional_text("direction")
+                .filter(|_| !kind.is_audio())
+                .and_then(|value| ScreenDirection::parse(&value)),
             owner_device_id: optional_text("ownerDeviceId"),
             lease_expires_at: number("leaseExpiresAt"),
             reason: optional_text("reason"),
@@ -390,6 +449,11 @@ impl ControlMessage {
             height: number("height").map(|value| value.clamp(0, 8192) as i32),
             audio: object.get("audio").and_then(Value::as_bool),
             action: optional_text("action"),
+            audio_direction: optional_text("direction").filter(|_| kind.is_audio()),
+            source: optional_text("source"),
+            sample_rate: number("sampleRate").map(|value| value.clamp(0, 1 << 20) as i32),
+            channels: number("channels").map(|value| value.clamp(0, 64) as i32),
+            value: number("value").map(|value| value.clamp(-1, 1000) as i32),
         })
     }
 
@@ -460,6 +524,38 @@ impl ControlMessage {
             )
         {
             return Err("Unknown camera action".to_string());
+        }
+        if self.kind == ControlKind::AudioControl
+            && !matches!(self.action.as_deref(), Some("mute" | "unmute" | "volume"))
+        {
+            return Err("Unknown audio action".to_string());
+        }
+        if self
+            .audio_direction
+            .as_deref()
+            .is_some_and(|direction| !matches!(direction, "desk-to-phone" | "phone-to-desk"))
+        {
+            return Err("Unknown audio direction".to_string());
+        }
+        if self.kind == ControlKind::AudioRequest && self.audio_direction.is_none() {
+            return Err("audio-request needs a direction".to_string());
+        }
+        if self
+            .source
+            .as_deref()
+            .is_some_and(|source| !matches!(source, "system" | "mic"))
+        {
+            return Err("Unknown audio source".to_string());
+        }
+        if self
+            .sample_rate
+            .is_some_and(|rate| !(8_000..=192_000).contains(&rate))
+            || self
+                .channels
+                .is_some_and(|channels| !(1..=2).contains(&channels))
+            || self.value.is_some_and(|value| !(0..=100).contains(&value))
+        {
+            return Err("Audio format is out of range".to_string());
         }
         if let Some(rotation) = self.screen_rotation {
             if self.screen_width.is_none() {
@@ -749,8 +845,15 @@ impl RemoteSession {
             ControlKind::CameraRequest
             | ControlKind::CameraReady
             | ControlKind::CameraControl
-            | ControlKind::CameraStopped => {
-                return Err("Camera controls are not part of the screen session".to_string());
+            | ControlKind::CameraStopped
+            | ControlKind::AudioRequest
+            | ControlKind::AudioReady
+            | ControlKind::AudioControl
+            | ControlKind::AudioStop
+            | ControlKind::AudioDenied => {
+                return Err(
+                    "Camera and sound controls are not part of the screen session".to_string(),
+                );
             }
             // A request about the current desktop share; changes no state.
             ControlKind::SwitchScreen => {
@@ -1109,6 +1212,53 @@ mod tests {
                 ControlKind::parse(kind).is_some_and(ControlKind::is_camera),
                 "{kind}"
             );
+        }
+    }
+
+    /// F1: audio's `direction` is its own (never a screen direction), its
+    /// fields survive the wire, and what the phone would refuse is refused.
+    #[test]
+    fn audio_messages_round_trip_with_their_own_direction() {
+        let id = Uuid::new_v4().to_string();
+        let attempt = "01234567-89ab-cdef-0123-456789abcdef";
+        let mut ready = message(ControlKind::AudioReady, &id);
+        ready.audio_direction = Some("desk-to-phone".into());
+        ready.source = Some("system".into());
+        ready.sample_rate = Some(48_000);
+        ready.channels = Some(2);
+        let json: Value = serde_json::from_slice(&ready.to_json()).unwrap();
+        assert_eq!(
+            (
+                json["direction"].as_str(),
+                json["source"].as_str(),
+                json["sampleRate"].as_i64(),
+                json["channels"].as_i64()
+            ),
+            (Some("desk-to-phone"), Some("system"), Some(48_000), Some(2))
+        );
+        let parsed = ControlMessage::from_json(&ready.to_json()).unwrap();
+        assert_eq!(parsed, ready);
+        assert!(parsed.kind.is_audio() && parsed.direction.is_none());
+        assert!(parsed.validate(&wire(), attempt, 1_000).is_ok());
+
+        let mut request = message(ControlKind::AudioRequest, &id);
+        assert!(request.validate(&wire(), attempt, 1_000).is_err());
+        request.audio_direction = Some("sideways".into());
+        assert!(request.validate(&wire(), attempt, 1_000).is_err());
+        request.audio_direction = Some("phone-to-desk".into());
+        request.source = Some("radio".into());
+        assert!(request.validate(&wire(), attempt, 1_000).is_err());
+        request.source = Some("mic".into());
+        assert!(request.validate(&wire(), attempt, 1_000).is_ok());
+
+        let mut control = message(ControlKind::AudioControl, &id);
+        control.action = Some("volume".into());
+        control.value = Some(101);
+        assert!(control.validate(&wire(), attempt, 1_000).is_err());
+        control.value = Some(40);
+        assert!(control.validate(&wire(), attempt, 1_000).is_ok());
+        for kind in ["audio-stop", "audio-denied"] {
+            assert!(ControlKind::parse(kind).is_some_and(ControlKind::is_audio));
         }
     }
 

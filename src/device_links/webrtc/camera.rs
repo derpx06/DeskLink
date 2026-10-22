@@ -7,8 +7,9 @@
 //! `Video/Source` node, "DeskLink Camera", that every app can pick (and an
 //! existing v4l2loopback device). `camera-control {flip|stop}` and
 //! `camera-stopped {reason}` end or change it. Messages carry their own
-//! sequence, outside the screen session. The phone sends no microphone yet:
-//! `audio: false` means video only.
+//! sequence, outside the screen session. With `audio: true` the phone's
+//! microphone comes as `audio-ready {phone-to-desk, mic}` under the camera's
+//! id and is published as "DeskLink Microphone" (`audio_session`).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -69,6 +70,7 @@ pub(crate) fn begin(
     width: i32,
     height: i32,
     fps: i32,
+    audio: bool,
     build: impl FnOnce(ControlKind, &str, i64) -> ControlMessage,
 ) -> ControlMessage {
     let facing = if facing == "front" { "front" } else { "back" };
@@ -79,7 +81,7 @@ pub(crate) fn begin(
     message.width = Some(width);
     message.height = Some(height);
     message.fps = Some(i64::from(fps));
-    message.audio = Some(false);
+    message.audio = Some(audio);
     with(|sessions| {
         sessions.insert(
             device_id.to_string(),
@@ -217,14 +219,14 @@ mod tests {
 
     #[test]
     fn a_request_goes_live_and_ends_with_the_phones_reason() {
-        let request = begin("cam-a", "front", 1920, 1080, 30, build);
+        let request = begin("cam-a", "front", 1920, 1080, 30, true, build);
         assert_eq!(request.kind, ControlKind::CameraRequest);
         assert_eq!(request.facing.as_deref(), Some("front"));
         assert_eq!(
             (request.width, request.height, request.fps),
             (Some(1920), Some(1080), Some(30))
         );
-        assert_eq!(request.audio, Some(false));
+        assert_eq!(request.audio, Some(true));
         let id = request.remote_session_id.clone();
         assert!(uuid::Uuid::parse_str(&id).is_ok());
         assert!(!is_live("cam-a"));
@@ -260,7 +262,7 @@ mod tests {
 
     #[test]
     fn controls_count_their_own_sequence_and_stop_ends_it() {
-        let request = begin("cam-b", "sideways", 640, 480, 99, build);
+        let request = begin("cam-b", "sideways", 640, 480, 99, false, build);
         assert_eq!(
             request.facing.as_deref(),
             Some("back"),

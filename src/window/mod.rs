@@ -26,6 +26,7 @@
 
 pub(crate) mod calls;
 mod camera;
+mod sound;
 pub(crate) use calls::confirm_dial;
 mod clipboard;
 pub(crate) mod history;
@@ -447,6 +448,12 @@ impl DesklinkWindow {
                     if debug_ui_verb(win, verb, &id, &arg) {
                         return;
                     }
+                    // "sound ID desk-sound|phone-sound|phone-mic on|off" (F1).
+                    if verb == "sound" {
+                        let (what, state) = arg.split_once(' ').unwrap_or((&arg, "on"));
+                        e2e_daemon.send(DaemonCommand::Sound(id, what.into(), state == "on"));
+                        return;
+                    }
                     if verb == "desk-terminal" {
                         let result = crate::device_links::pty::desk::new_desk_session();
                         debug_log!("[E2E] desk-terminal: {result:?}");
@@ -655,7 +662,8 @@ impl DesklinkWindow {
                     number,
                 } => calls::missed(self, &device_id, &device_name, caller, number),
                 DaemonEvent::CallRefused { message } => self.show_feature_toast(&message),
-                DaemonEvent::CameraNotice { message, .. } => self.show_feature_toast(&message),
+                DaemonEvent::CameraNotice { message, .. }
+                | DaemonEvent::SoundNotice { message, .. } => self.show_feature_toast(&message),
                 // Handled by this refresh itself (the call card and notification).
                 DaemonEvent::CallChanged { .. } => {}
             }

@@ -68,6 +68,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         &settings.forward_apps,
         crate::device_links::desk_notifications::seen_apps(),
         settings.call_audio,
+        settings.desk_mic_to_phone,
         settings.call_audio_devices.get(&device.id),
         &bonded,
     ))
@@ -121,6 +122,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
 
     page.append(&calls_group(win, daemon, &settings, device, bonded));
     page.append(&forward_group(daemon, &settings));
+    page.append(&sound_group(daemon, &settings));
 
     page.append(&run_commands_group(win, daemon, &settings, &device.name));
 
@@ -156,6 +158,23 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>, daemon: &DaemonHandle)
     page.add(&top_bar_group(daemon, &settings));
     dialog.add(&page);
     dialog.present(Some(parent));
+}
+
+/// Sound (F1 A3): whether a phone may hear this computer's microphone.
+fn sound_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::builder().title("Sound").build();
+    let mic = adw::SwitchRow::builder()
+        .title("Phones may hear this computer's microphone")
+        .subtitle("Only when one asks; a coral bar shows while it listens")
+        .active(settings.desk_mic_to_phone)
+        .build();
+    with_icon(&mic, "audio-input-microphone-symbolic");
+    let sender = daemon.clone();
+    mic.connect_active_notify(move |row| {
+        sender.send(DaemonCommand::SetDeskMicToPhone(row.is_active()))
+    });
+    group.add(&mic);
+    group
 }
 
 /// Notifications to Phone (C1): this computer's notifications on the

@@ -80,6 +80,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         if let Some(camera) = super::camera::bar(daemon, device) {
             page.append(&camera);
         }
+        for sound in super::sound::bars(daemon, device) {
+            page.append(&sound);
+        }
         page.append(&hero(daemon, device, &minute));
         if let Some(bar) = now_playing_bar(daemon, device) {
             page.append(&bar);
@@ -369,6 +372,20 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         disable_with(&camera, reason.as_deref());
         round.append(&camera);
     }
+    // Sound both ways (F1): one round action, its two switches in a popover.
+    if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
+        let button = round_action(
+            "audio-speakers-symbolic",
+            "Sound",
+            &format!("Sound with {}", device.name),
+        );
+        if device.sound.is_some() {
+            button.add_css_class("on");
+        }
+        super::sound::attach_menu(daemon, device, &button);
+        disable_with(&button, reason.as_deref());
+        round.append(&button);
+    }
     actions.append(&round);
     band.append(&actions);
     band
@@ -635,6 +652,29 @@ fn live_banner(
     banner.update_property(&[gtk::accessible::Property::Label(&format!(
         "{headline}{detail}"
     ))]);
+    // Its speaker toggle (F1): this computer's sound to the phone too.
+    if device.desktop_session != DesktopSession::None {
+        let on = super::sound::is_on(device, "desk-sound");
+        let sound = gtk::Button::builder()
+            .icon_name(if on {
+                "audio-volume-high-symbolic"
+            } else {
+                "audio-volume-muted-symbolic"
+            })
+            .tooltip_text(if on {
+                "Stop Sending This Computer's Sound"
+            } else {
+                "Play This Computer's Sound on the Phone"
+            })
+            .valign(gtk::Align::Center)
+            .css_classes(["circular", "flat"])
+            .build();
+        sound.update_property(&[gtk::accessible::Property::Label(
+            &sound.tooltip_text().unwrap_or_default(),
+        )]);
+        super::sound::toggle(daemon, device, "desk-sound", &sound);
+        banner.append(&sound);
+    }
     let end = super::soft_button("End All");
     end.set_css_classes(&["coral-outline"]);
     end.set_tooltip_text(Some("End the phone's sessions on this computer"));

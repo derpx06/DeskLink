@@ -1085,6 +1085,156 @@ pub(crate) fn send_camera_message(
     send_remote_session_message(peer, wire, &message)
 }
 
+/// A phone's `audio-*` message (F1 A2): start or stop sending this
+/// computer's sound, or play the phone's.
+fn handle_audio_message(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    message: &remote_session::ControlMessage,
+    sessions: &Arc<DeviceManager>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
+) -> Result<(), String> {
+    use super::audio_session::{self, Step};
+    let device_id = &wire.peer_device_id;
+    let phone = &binding.link.info.name;
+    let peer = sessions
+        .active_webrtc_peer(binding, attempt_id)
+        .map_err(|error| error.to_string())?;
+    let build = |kind, id: &str, sequence| {
+        remote_session::ControlMessage::new(kind, attempt_id, wire, id, sequence, now_millis())
+    };
+    let camera = super::camera::status(device_id).map(|camera| camera.id);
+    let mic_allowed = crate::device_links::config::app_settings().desk_mic_to_phone;
+    match audio_session::handle(device_id, message, mic_allowed, camera.as_deref(), &build) {
+        Step::Send { id, source, .. } => match peer.start_audio_send(source) {
+            Ok(()) => {
+                if let Some(ready) = audio_session::sending_started(device_id, &id, &build) {
+                    send_remote_session_message(&peer, wire, &ready)?;
+                }
+            }
+            Err(error) => {
+                eprintln!("[DeskLink] Could not send sound to {phone}: {error}");
+                peer.stop_audio_send();
+                let denied = audio_session::sending_failed(device_id, &id, &build);
+                send_remote_session_message(&peer, wire, &denied)?;
+            }
+        },
+        Step::Deny(denied) => send_remote_session_message(&peer, wire, &denied)?,
+        Step::Hear(source) => {
+            let output = if source == super::audio::Source::Mic {
+                super::audio::Output::Microphone
+            } else {
+                super::audio::Output::Speakers
+            };
+            peer.start_audio_playback(output, phone)?;
+        }
+        Step::StopSending => peer.stop_audio_send(),
+        Step::StopHearing(reason) => {
+            peer.stop_audio_playback();
+            if let Some(reason) = reason {
+                crate::device_links::daemon::push_event(
+                    events,
+                    DaemonEvent::SoundNotice {
+                        device_id: device_id.clone(),
+                        message: audio_session::reason_words(phone, &reason),
+                    },
+                );
+            }
+        }
+        Step::Ignored => {}
+    }
+    Ok(())
+}
+
+/// What the desk's sound switches do (F1): `desk-sound` sends this
+/// computer's sound to the phone, `phone-sound` / `phone-mic` play the
+/// phone's sound here or publish its microphone as "DeskLink Microphone".
+pub(crate) fn audio_switch(
+    sessions: &Arc<DeviceManager>,
+    transport: &FeatureTransportSnapshot,
+    what: &str,
+    on: bool,
+) -> Result<(), String> {
+    use super::audio::Source;
+    use super::audio_session;
+    let not_connected = || "The phone is not connected".to_string();
+    if !transport.web_rtc_ready || !sessions.is_current(&transport.binding) {
+        return Err(not_connected());
+    }
+    let wire = transport.web_rtc_wire.as_ref().ok_or_else(not_connected)?;
+    let peer = transport.web_rtc_peer.as_ref().ok_or_else(not_connected)?;
+    let attempt_id = sessions
+        .active_webrtc_attempt(&transport.binding)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(not_connected)?;
+    let device_id = &transport.binding.device_id;
+    let build = |kind, id: &str, sequence| {
+        remote_session::ControlMessage::new(kind, &attempt_id, wire, id, sequence, now_millis())
+    };
+    let sending = what == "desk-sound";
+    // Sound both ways at once would loop through each side's capture: the
+    // newer switch wins, and the other one stops.
+    let loops = if sending {
+        audio_session::hearing_system(device_id)
+    } else {
+        what == "phone-sound" && audio_session::sending_system(device_id)
+    };
+    if on && loops {
+        if sending {
+            peer.stop_audio_playback();
+        } else {
+            peer.stop_audio_send();
+        }
+        if let Some(stop) = audio_session::stop(device_id, !sending, &build) {
+            send_remote_session_message(peer, wire, &stop)?;
+        }
+    }
+    if !on {
+        if sending {
+            peer.stop_audio_send();
+        } else {
+            peer.stop_audio_playback();
+        }
+        return match audio_session::stop(device_id, sending, &build) {
+            Some(stop) => send_remote_session_message(peer, wire, &stop),
+            None => Ok(()),
+        };
+    }
+    if sending {
+        // The phone asked for it already: that session goes on.
+        if audio_session::sending_system(device_id) {
+            return Ok(());
+        }
+        let (id, replaced) = audio_session::offer_desk_sound(device_id, &build);
+        if let Some(stop) = replaced {
+            send_remote_session_message(peer, wire, &stop)?;
+        }
+        if let Err(error) = peer.start_audio_send(Source::System) {
+            audio_session::stop(device_id, true, &build);
+            return Err(error);
+        }
+        return match audio_session::sending_started(device_id, &id, &build) {
+            Some(ready) => send_remote_session_message(peer, wire, &ready),
+            None => Ok(()),
+        };
+    }
+    if !peer.audio_negotiated() {
+        return Err("This phone's DeskLink cannot send sound yet (update it)".to_string());
+    }
+    let source = if what == "phone-mic" {
+        Source::Mic
+    } else {
+        Source::System
+    };
+    // A replaced session's sound stops here; the new one plays on `audio-ready`.
+    peer.stop_audio_playback();
+    for message in audio_session::ask_phone(device_id, source, &build) {
+        send_remote_session_message(peer, wire, &message)?;
+    }
+    Ok(())
+}
+
 fn send_remote_session_message(
     peer: &DesktopWebRtcPeer,
     wire: &WebRtcWireBinding,
@@ -2446,8 +2596,10 @@ fn spawn_event_worker(
 /// live one (the replaced worker skips it, see `PeerWorkerGuard`).
 fn reset_device_webrtc_state(device_id: &str) {
     stop_desktop_portal_session(device_id, None);
-    // A lost or replaced peer ends the camera too (the desk asks again).
+    // A lost or replaced peer ends the camera too (the desk asks again),
+    // and every sound session (the phone asks again on its next link).
     super::camera::end(device_id);
+    super::audio_session::end_all(device_id);
     super::screen::clear_stream(device_id);
     super::screen::forget_parked(device_id);
     // The session state must not outlive its peer: a stale `Controlling`
@@ -2958,6 +3110,7 @@ fn handle_peer_envelope(
         message.validate(wire, attempt_id, now)?;
         if message.kind.is_camera() {
             let device_id = &wire.peer_device_id;
+            let camera_id = super::camera::status(device_id).map(|camera| camera.id);
             match super::camera::handle(device_id, &binding.link.info.name, &message) {
                 super::camera::Outcome::Live => match super::screen::attach_camera(device_id) {
                     Ok(true) => {}
@@ -2970,16 +3123,28 @@ fn handle_peer_envelope(
                         },
                     ),
                 },
-                super::camera::Outcome::Stopped(words) => crate::device_links::daemon::push_event(
-                    events,
-                    DaemonEvent::CameraNotice {
-                        device_id: device_id.clone(),
-                        message: words,
-                    },
-                ),
+                super::camera::Outcome::Stopped(words) => {
+                    if camera_id.is_some_and(|id| {
+                        super::audio_session::end_camera_microphone(device_id, &id)
+                    }) {
+                        if let Ok(peer) = sessions.active_webrtc_peer(binding, attempt_id) {
+                            peer.stop_audio_playback();
+                        }
+                    }
+                    crate::device_links::daemon::push_event(
+                        events,
+                        DaemonEvent::CameraNotice {
+                            device_id: device_id.clone(),
+                            message: words,
+                        },
+                    )
+                }
                 super::camera::Outcome::Ignored => {}
             }
             return Ok(());
+        }
+        if message.kind.is_audio() {
+            return handle_audio_message(binding, attempt_id, wire, &message, sessions, events);
         }
         if message.kind == remote_session::ControlKind::OfferView {
             return take_up_phone_offer(binding, attempt_id, wire, &message, sessions, events);
@@ -4283,6 +4448,11 @@ mod tests {
             height: None,
             audio: None,
             action: None,
+            audio_direction: None,
+            source: None,
+            sample_rate: None,
+            channels: None,
+            value: None,
         }
     }
 

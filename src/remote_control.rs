@@ -166,6 +166,32 @@ pub fn show_remote_control_dialog(
         keys.append(&button);
     }
     keys.append(&gtk::Separator::new(gtk::Orientation::Vertical));
+    // The phone's sound here while its screen shows (F1).
+    let speaker = gtk::ToggleButton::builder()
+        .icon_name("audio-volume-muted-symbolic")
+        .tooltip_text("Play the Phone's Sound Here")
+        .css_classes(["circular"])
+        .build();
+    speaker.update_property(&[gtk::accessible::Property::Label(
+        "Play the Phone's Sound Here",
+    )]);
+    {
+        let (daemon, device) = (daemon.clone(), Rc::clone(&device));
+        speaker.connect_toggled(move |speaker| {
+            let on = speaker.is_active();
+            speaker.set_icon_name(if on {
+                "audio-volume-high-symbolic"
+            } else {
+                "audio-volume-muted-symbolic"
+            });
+            daemon.send(DaemonCommand::Sound(
+                device.to_string(),
+                "phone-sound".into(),
+                on,
+            ));
+        });
+    }
+    keys.append(&speaker);
     let fullscreen = gtk::Button::builder()
         .icon_name("view-fullscreen-symbolic")
         .tooltip_text("Full Screen")
@@ -386,8 +412,16 @@ pub fn show_remote_control_dialog(
     {
         let daemon = daemon.clone();
         let device = Rc::clone(&device);
+        let speaker = speaker.downgrade();
         window.connect_close_request(move |_| {
             OPEN_WINDOWS.with(|open| open.borrow_mut().remove(device.as_str()));
+            if speaker.upgrade().is_some_and(|speaker| speaker.is_active()) {
+                daemon.send(DaemonCommand::Sound(
+                    device.to_string(),
+                    "phone-sound".into(),
+                    false,
+                ));
+            }
             daemon.send(DaemonCommand::StopPhoneRemoteControl(device.to_string()));
             glib::Propagation::Proceed
         });

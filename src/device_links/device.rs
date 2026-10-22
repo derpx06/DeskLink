@@ -83,6 +83,17 @@ pub struct SystemVolumeStatus {
     pub sinks: Vec<VolumeSink>,
 }
 
+/// Sound between this computer and the phone (F1).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SoundUse {
+    /// This computer's "system" sound or "mic" goes to the phone (live).
+    pub sending: Option<String>,
+    /// The phone's "system" sound or "mic" comes here; `hearing_live` once
+    /// it flows (else asked, waiting for the phone).
+    pub hearing: Option<String>,
+    pub hearing_live: bool,
+}
+
 /// The phone's camera in use here (C4).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CameraUse {
@@ -225,6 +236,9 @@ pub struct DeviceView {
     /// The phone's camera as this computer's webcam (C4), while asked or live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<CameraUse>,
+    /// Sound both ways (F1), while any flows or is asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound: Option<SoundUse>,
     /// Whether a text field has focus on the phone ("Type on phone", C2);
     /// `None` until it says, and while its link is down.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -274,6 +288,7 @@ impl DeviceView {
             call_status: None,
             keyboard_focused: None,
             camera: None,
+            sound: None,
         }
     }
 

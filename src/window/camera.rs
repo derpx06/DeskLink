@@ -86,6 +86,12 @@ pub(super) fn ask(daemon: &DaemonHandle, device: &DeviceView, parent: &impl IsA<
         .build();
     extra.append(&facing);
     extra.append(&size);
+    let microphone = gtk::CheckButton::builder()
+        .label("Its microphone too, as “DeskLink Microphone”")
+        .active(true)
+        .halign(gtk::Align::Center)
+        .build();
+    extra.append(&microphone);
     let dialog = adw::AlertDialog::new(
         Some(&format!("Use {} as a Webcam", device.name)),
         Some("Apps here can then pick “DeskLink Camera”. The phone asks you to allow it."),
@@ -111,6 +117,7 @@ pub(super) fn ask(daemon: &DaemonHandle, device: &DeviceView, parent: &impl IsA<
             facing.into(),
             width,
             height,
+            microphone.is_active(),
         ));
     });
 }

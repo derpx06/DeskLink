@@ -180,18 +180,22 @@ impl ScreenStreamInner {
         if self.stopped.swap(true, Ordering::AcqRel) {
             return;
         }
-        if let Some(decode_sink) = self
-            .elements
-            .first()
-            .and_then(|decode| decode.static_pad("sink"))
-        {
-            let _ = self.source_pad.unlink(&decode_sink);
-        }
-        for element in self.elements.iter().rev() {
-            let _ = element.set_state(gst::State::Null);
-        }
-        let _ = self.pipeline.remove_many(self.elements.iter());
-        park_pad(&self.pipeline, &self.source_pad);
+        // Held while it changes hands: RTP into an unlinked pad stops the
+        // whole receive path (see `while_blocked`).
+        while_blocked(&self.source_pad, || {
+            if let Some(decode_sink) = self
+                .elements
+                .first()
+                .and_then(|decode| decode.static_pad("sink"))
+            {
+                let _ = self.source_pad.unlink(&decode_sink);
+            }
+            park_pad(&self.pipeline, &self.source_pad);
+            for element in self.elements.iter().rev() {
+                let _ = element.set_state(gst::State::Null);
+            }
+            let _ = self.pipeline.remove_many(self.elements.iter());
+        });
     }
 }
 
@@ -216,7 +220,7 @@ fn zero_copy_wanted(decodebin: &gst::Element) -> bool {
 /// `not-linked` error for webrtcbin's shared receive path — which also carries
 /// every data channel (max-bundle). Stopping remote control used to kill the
 /// whole connection until the 15 s liveness check rebuilt it.
-fn park_pad(pipeline: &gst::Pipeline, pad: &gst::Pad) {
+pub(crate) fn park_pad(pipeline: &gst::Pipeline, pad: &gst::Pad) {
     if pad.is_linked() {
         return;
     }
@@ -239,6 +243,21 @@ fn park_pad(pipeline: &gst::Pipeline, pad: &gst::Pad) {
     }
 }
 
+/// Runs `change` while `pad` holds its data: an inbound RTP pad must never
+/// be found unlinked, even for a moment, or webrtcbin's shared receive path
+/// stops with `not-linked` (data channels included). Measured: a session
+/// switch with audio flowing hit that window every time.
+pub(crate) fn while_blocked<R>(pad: &gst::Pad, change: impl FnOnce() -> R) -> R {
+    let probe = pad.add_probe(gst::PadProbeType::BLOCK_DOWNSTREAM, |_, _| {
+        gst::PadProbeReturn::Ok
+    });
+    let result = change();
+    if let Some(probe) = probe {
+        pad.remove_probe(probe);
+    }
+    result
+}
+
 /// Inbound video pads parked by a stopped view, by device, so the next view of
 /// the same stream can be shown again. webrtcbin creates the pad once per
 /// connection; without this every view after the first stayed blank.
@@ -259,21 +278,27 @@ pub(crate) fn resume_parked(device_id: &str) -> bool {
     else {
         return false;
     };
-    if let Some(peer) = pad.peer() {
-        let _ = pad.unlink(&peer);
-        if let Some(fake) = peer.parent_element() {
-            let _ = fake.set_state(gst::State::Null);
-            let _ = pipeline.remove(&fake);
+    let attached = while_blocked(&pad, || {
+        if let Some(peer) = pad.peer() {
+            let _ = pad.unlink(&peer);
+            if let Some(fake) = peer.parent_element() {
+                let _ = fake.set_state(gst::State::Null);
+                let _ = pipeline.remove(&fake);
+            }
         }
-    }
-    match attach_incoming_video(&pipeline, &pad) {
+        let attached = attach_incoming_video(&pipeline, &pad);
+        if attached.is_err() {
+            park_pad(&pipeline, &pad);
+        }
+        attached
+    });
+    match attached {
         Ok(stream) => {
             publish_stream(device_id, stream);
             true
         }
         Err(error) => {
             eprintln!("[DeskLink] Could not show the phone's screen again: {error}");
-            park_pad(&pipeline, &pad);
             false
         }
     }
@@ -1497,11 +1522,20 @@ fn negotiated_video_mline(webrtcbin: &gst::Element) -> Option<u32> {
 /// (they only carry a payload *range*). An answerer must reuse the offerer's
 /// payload type, and an offerer's own list is what the answerer maps to.
 fn negotiated_payload(webrtcbin: &gst::Element, wanted: &str) -> Option<u32> {
+    negotiated_payload_in(webrtcbin, "video", wanted)
+}
+
+/// The payload type of `wanted` in the local description's `kind` section.
+pub(crate) fn negotiated_payload_in(
+    webrtcbin: &gst::Element,
+    kind: &str,
+    wanted: &str,
+) -> Option<u32> {
     let description =
         webrtcbin.property::<Option<gst_webrtc::WebRTCSessionDescription>>("local-description")?;
     let sdp = description.sdp();
     for media in sdp.medias() {
-        if media.media() != Some("video") {
+        if media.media() != Some(kind) {
             continue;
         }
         for attribute in media.attributes() {
@@ -1664,13 +1698,12 @@ fn take_phone_video(device_id: &str) -> Option<(gst::Pipeline, gst::Pad)> {
         if let Ok(mut map) = parked().lock() {
             map.remove(device_id);
         }
-        return Some(unpark(found));
+        return Some(found);
     }
     parked()
         .lock()
         .ok()
         .and_then(|mut map| map.remove(device_id))
-        .map(unpark)
 }
 
 /// Frees a parked pad from its fakesink.
@@ -1697,6 +1730,18 @@ pub(crate) fn attach_camera(device_id: &str) -> Result<bool, String> {
     let Some((pipeline, pad)) = take_phone_video(device_id) else {
         return Ok(false);
     };
+    // Still parked: the swap to the camera chain happens held.
+    while_blocked(&pad.clone(), || {
+        attach_camera_chain(device_id, pipeline, pad)
+    })
+}
+
+fn attach_camera_chain(
+    device_id: &str,
+    pipeline: gst::Pipeline,
+    pad: gst::Pad,
+) -> Result<bool, String> {
+    let (pipeline, pad) = unpark((pipeline, pad));
     let make = |factory: &str| {
         gst::ElementFactory::make(factory)
             .build()

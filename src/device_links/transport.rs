@@ -132,22 +132,48 @@ impl FeatureTransport {
     }
 
     /// Asks the phone for its camera (C4).
-    pub(crate) fn start_camera(&self, facing: &str, width: i32, height: i32) -> Result<(), String> {
+    pub(crate) fn start_camera(
+        &self,
+        facing: &str,
+        width: i32,
+        height: i32,
+        audio: bool,
+    ) -> Result<(), String> {
         let device_id = self.snapshot.binding.device_id.clone();
         crate::device_links::webrtc::coordinator::send_camera_message(
             &self.sessions,
             &self.snapshot,
             |build| {
                 Some(crate::device_links::webrtc::camera::begin(
-                    &device_id, facing, width, height, 30, build,
+                    &device_id, facing, width, height, 30, audio, build,
                 ))
             },
+        )
+    }
+
+    /// Sound on or off (F1): see `coordinator::audio_switch`.
+    pub(crate) fn sound(&self, what: &str, on: bool) -> Result<(), String> {
+        crate::device_links::webrtc::coordinator::audio_switch(
+            &self.sessions,
+            &self.snapshot,
+            what,
+            on,
         )
     }
 
     /// `flip` or `stop` for the running camera session.
     pub(crate) fn camera_control(&self, action: &str) -> Result<(), String> {
         let device_id = self.snapshot.binding.device_id.clone();
+        let camera = crate::device_links::webrtc::camera::status(&device_id);
+        if let Some(camera) = camera.filter(|_| action == "stop") {
+            if crate::device_links::webrtc::audio_session::end_camera_microphone(
+                &device_id, &camera.id,
+            ) {
+                if let Some(peer) = self.snapshot.web_rtc_peer.as_ref() {
+                    peer.stop_audio_playback();
+                }
+            }
+        }
         crate::device_links::webrtc::coordinator::send_camera_message(
             &self.sessions,
             &self.snapshot,

@@ -272,6 +272,7 @@ button.suggested-action { font-weight: 600; }
 }
 .round-caption { font-size: 11px; font-weight: 600; color: @text_dim; }
 .round-action:disabled { opacity: 0.45; }
+.round-action.on .round-icon { background-color: @coral; color: white; }
 
 /* ── Now playing ───────────────────────────────────────────────────────── */
 .now-playing { padding: 12px 16px 12px 12px; }

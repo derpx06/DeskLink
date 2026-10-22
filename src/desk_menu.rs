@@ -179,6 +179,31 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
                 .icon("camera-web-symbolic"),
         );
     }
+    // Sound both ways (F1).
+    if phone.feature_transport_ready {
+        let sound = phone.sound.clone().unwrap_or_default();
+        for (what, on, label, icon) in [
+            (
+                "desk-sound",
+                sound.sending.is_some(),
+                format!("Play This Computer's Sound on {}", phone.name),
+                "audio-speakers-symbolic",
+            ),
+            (
+                "phone-mic",
+                sound.hearing.as_deref() == Some("mic"),
+                format!("Use {} as Microphone", phone.name),
+                "audio-input-microphone-symbolic",
+            ),
+        ] {
+            menu.push(TrayEntry::Toggle {
+                label,
+                action: format!("{what}-{}:{}", if on { "off" } else { "on" }, phone.id),
+                on,
+                icon: icon.into(),
+            });
+        }
+    }
     if crate::type_on_phone::supported(phone) {
         menu.push(
             TrayEntry::action("Type on Phone…", format!("type:{}", phone.id))
@@ -337,6 +362,10 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
         "lock" => daemon.send(DaemonCommand::SendLockRequest(target, true)),
         "type" => crate::type_on_phone::open(&daemon, &target, None),
         "camera-stop" => daemon.send(DaemonCommand::CameraControl(target, "stop".into())),
+        "desk-sound-on" | "desk-sound-off" | "phone-mic-on" | "phone-mic-off" => {
+            let (what, state) = verb.rsplit_once('-').unwrap_or((verb, "off"));
+            daemon.send(DaemonCommand::Sound(target, what.into(), state == "on"))
+        }
         "send-clipboard" => daemon.send(DaemonCommand::SendClipboard(target)),
         "send-files" => {
             let name = daemon

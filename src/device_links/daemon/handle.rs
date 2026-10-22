@@ -41,6 +41,8 @@ pub enum DaemonEvent {
     CallChanged { device_id: String },
     /// The phone's camera stopped or could not start, in the user's words.
     CameraNotice { device_id: String, message: String },
+    /// Sound to or from the phone was refused or ended there (F1).
+    SoundNotice { device_id: String, message: String },
     /// The phone refused a call request, in the user's words.
     CallRefused { message: String },
 }
@@ -121,6 +123,19 @@ impl DaemonHandle {
             device.terminal_access = terminal_access_allowed(&device.id);
             device.terminal_sessions_attached = terminal_bridge::attached_count(&device.id);
             device.desktop_session = coordinator::desktop_session(&device.id);
+            device.sound = match crate::device_links::webrtc::audio_session::status(&device.id) {
+                (None, None) => None,
+                (sending, hearing) => {
+                    use crate::device_links::webrtc::audio_session::source_name;
+                    Some(crate::device_links::device::SoundUse {
+                        sending: sending
+                            .filter(|session| session.live)
+                            .map(|session| source_name(session.source).to_string()),
+                        hearing_live: hearing.as_ref().is_some_and(|session| session.live),
+                        hearing: hearing.map(|session| source_name(session.source).to_string()),
+                    })
+                }
+            };
             device.camera = crate::device_links::webrtc::camera::status(&device.id).map(|camera| {
                 let (live, width, height) = match camera.state {
                     crate::device_links::webrtc::camera::CameraState::Live { width, height } => {
