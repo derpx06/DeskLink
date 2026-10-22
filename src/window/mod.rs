@@ -805,6 +805,17 @@ impl DesklinkWindow {
                     number,
                 } => calls::missed(self, &device_id, &device_name, caller, number),
                 DaemonEvent::CallRefused { message } => self.show_feature_toast(&message),
+                DaemonEvent::PairingReplaced { name } => {
+                    let text = format!(
+                        "The earlier pairing of {name} was replaced. If that was a different phone, pair it again."
+                    );
+                    self.send_feature_notification(
+                        &format!("desklink-replaced-{}", glib::monotonic_time()),
+                        &format!("Replaced the old pairing of {name}"),
+                        &text,
+                    );
+                    self.show_feature_toast(&text);
+                }
                 DaemonEvent::SoundNotice { message, .. }
                 | DaemonEvent::CaptureNotice { message, .. } => self.show_feature_toast(&message),
                 DaemonEvent::WifiFromPhone { network, .. } => self.offer_wifi(network),

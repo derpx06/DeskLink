@@ -69,6 +69,13 @@ pub(crate) fn ready_devices() -> Vec<String> {
 /// Sends `packet` to `device_id` if its connection is up; quietly drops it
 /// otherwise (a phone that reconnects gets the current state then).
 pub(crate) fn send(device_id: &str, packet: &NetworkPacket) {
+    #[cfg(test)]
+    if device_id.starts_with(TEST_OUTBOX_PREFIX) {
+        if let Ok(mut sent) = TEST_SENT.lock() {
+            sent.push((device_id.to_string(), packet.clone()));
+        }
+        return;
+    }
     let Some(daemon) = DAEMON.get() else {
         return;
     };
@@ -87,6 +94,28 @@ pub(crate) fn send(device_id: &str, packet: &NetworkPacket) {
     }
 }
 
+/// Tests: packets sent to a device whose id starts with this are kept here
+/// instead of going to a connection.
+#[cfg(test)]
+pub(crate) const TEST_OUTBOX_PREFIX: &str = "test-outbox-";
+
+#[cfg(test)]
+static TEST_SENT: Mutex<Vec<(String, NetworkPacket)>> = Mutex::new(Vec::new());
+
+/// Tests: what was sent to `device_id`, oldest first.
+#[cfg(test)]
+pub(crate) fn test_sent(device_id: &str) -> Vec<NetworkPacket> {
+    TEST_SENT
+        .lock()
+        .map(|sent| {
+            sent.iter()
+                .filter(|(device, _)| device == device_id)
+                .map(|(_, packet)| packet.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Work for the one desk-features thread, waiting.
 type Job = Box<dyn FnOnce() + Send>;
 
@@ -98,6 +127,17 @@ const QUEUE: usize = 16;
 /// stay off the peer worker, and a flood costs one thread, not one per
 /// packet). False when it was dropped because the queue was full.
 pub(crate) fn run_later(job: impl FnOnce() + Send + 'static) -> bool {
+    let queued = try_queue(Box::new(job)).is_ok();
+    if !queued {
+        report_dropped();
+    }
+    queued
+}
+
+/// Queues `job` for the desk thread, or hands it back when the queue is full.
+/// Every job runs under [`crate::guard`]: one that panics must not end the
+/// one thread all the others depend on.
+fn try_queue(job: Job) -> Result<(), Job> {
     static WORKER: OnceLock<std::sync::mpsc::SyncSender<Job>> = OnceLock::new();
     let sender = WORKER.get_or_init(|| {
         let (sender, jobs) = std::sync::mpsc::sync_channel::<Job>(QUEUE);
@@ -105,16 +145,59 @@ pub(crate) fn run_later(job: impl FnOnce() + Send + 'static) -> bool {
             .name("desklink-desk".into())
             .spawn(move || {
                 for job in jobs {
-                    job();
+                    crate::guard("desk job", (), job);
                 }
             });
         sender
     });
-    let queued = sender.try_send(Box::new(job)).is_ok();
-    if !queued {
+    sender.try_send(job).map_err(|error| match error {
+        std::sync::mpsc::TrySendError::Full(job)
+        | std::sync::mpsc::TrySendError::Disconnected(job) => job,
+    })
+}
+
+/// How long a job that must not be lost waits for room in the queue.
+const MUST_RUN_WITHIN: Duration = Duration::from_secs(10);
+
+/// Like [`run_later`] for work the sync cannot do without (the `have`, the
+/// snapshots): a full queue is waited out, not a dropped job. The wait is on a
+/// thread of its own, so the caller (a peer worker, a timer) never blocks.
+pub(crate) fn run_later_reliably(job: impl FnOnce() + Send + 'static) {
+    let Err(mut waiting) = try_queue(Box::new(job)) else {
+        return;
+    };
+    // A flood still costs a bounded number of waiting threads.
+    static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    const MAX_WAITING: usize = 8;
+    if WAITING.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= MAX_WAITING {
+        WAITING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        report_dropped();
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("desklink-desk-retry".into())
+        .spawn(move || {
+            let until = Instant::now() + MUST_RUN_WITHIN;
+            let mut queued = false;
+            while Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(50));
+                match try_queue(waiting) {
+                    Ok(()) => {
+                        queued = true;
+                        break;
+                    }
+                    Err(job) => waiting = job,
+                }
+            }
+            WAITING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            if !queued {
+                report_dropped();
+            }
+        });
+    if spawned.is_err() {
+        WAITING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
         report_dropped();
     }
-    queued
 }
 
 /// Jobs dropped because the queue was full, since start.
@@ -183,35 +266,97 @@ fn own_instance() -> String {
 /// [`super::sync::SYNC_WAIT`] — the desk's state: only what differs.
 pub(crate) fn on_feature_ready(device_id: &str) {
     let device_id = device_id.to_string();
-    run_later(move || {
+    // The connection this ready belongs to: a job that runs after it ended
+    // (or after another began) must not speak for it.
+    let connection = current_connection(&device_id);
+    run_later_reliably(move || {
+        if !same_connection(&connection, &current_connection(&device_id)) {
+            return;
+        }
         send(
             &device_id,
             &super::sync::have_packet(&device_id, peer_instance(&device_id).as_deref()),
         );
+        // Folder sync (F8): runs only while connected. Without this the
+        // Bucket's worker never counts the phone as ready and nothing syncs.
+        super::folders::link(&device_id, true);
         match super::sync::begin_wait(&device_id) {
             // Their `have` came before our ready: send now.
             None => send_initial_snapshots(&device_id),
             Some(token) => {
-                let _ = std::thread::Builder::new()
+                let spawned = std::thread::Builder::new()
                     .name("desklink-sync-wait".into())
-                    .spawn(move || {
-                        std::thread::sleep(super::sync::SYNC_WAIT);
-                        if super::sync::release_wait(&device_id, token) {
-                            run_later(move || send_initial_snapshots(&device_id));
+                    .spawn({
+                        let (device_id, connection) = (device_id.clone(), connection.clone());
+                        move || {
+                            std::thread::sleep(super::sync::SYNC_WAIT);
+                            if super::sync::release_wait(&device_id, token) {
+                                run_later_reliably(move || {
+                                    if same_connection(&connection, &current_connection(&device_id))
+                                    {
+                                        send_initial_snapshots(&device_id)
+                                    }
+                                });
+                            }
                         }
                     });
+                if spawned.is_err() {
+                    // No timer thread: the snapshots go now rather than never.
+                    if super::sync::release_wait(&device_id, token) {
+                        send_initial_snapshots(&device_id);
+                    }
+                }
             }
         }
     });
 }
 
-/// A phone's `desklink.sync.have`: kept; and if the desk's snapshots were
-/// waiting for it, sent now.
-pub(crate) fn on_sync_have(device_id: &str, packet: &NetworkPacket) {
-    if super::sync::on_have(device_id, packet) {
-        let device_id = device_id.to_string();
-        run_later(move || send_initial_snapshots(&device_id));
+/// Which connection a job belongs to: the WebRTC attempt of the phone's
+/// session (a rebuilt peer is a new connection).
+pub(crate) type Connection = Option<String>;
+
+/// The phone's current connection, as far as this process knows.
+pub(crate) fn current_connection(device_id: &str) -> Connection {
+    let sessions = &DAEMON.get()?.sessions;
+    let binding = sessions
+        .current_bindings()
+        .into_iter()
+        .find(|binding| binding.device_id == device_id)?;
+    sessions.active_webrtc_attempt(&binding).ok().flatten()
+}
+
+fn same_connection(expected: &Connection, now: &Connection) -> bool {
+    expected == now
+}
+
+/// A phone's `desklink.sync.have`, received on `connection`: kept for it, and
+/// if the desk's snapshots were waiting for it, sent now. One that arrives
+/// after its connection ended says nothing about the new one.
+pub(crate) fn on_sync_have(device_id: &str, packet: &NetworkPacket, connection: &Connection) {
+    if apply_have(
+        device_id,
+        packet,
+        connection,
+        &current_connection(device_id),
+    ) {
+        let (device_id, connection) = (device_id.to_string(), connection.clone());
+        run_later_reliably(move || {
+            if same_connection(&connection, &current_connection(&device_id)) {
+                send_initial_snapshots(&device_id)
+            }
+        });
     }
+}
+
+/// Whether `packet` was kept: only on the connection it arrived on. Whether a
+/// send was waiting for it.
+fn apply_have(
+    device_id: &str,
+    packet: &NetworkPacket,
+    arrived_on: &Connection,
+    current: &Connection,
+) -> bool {
+    same_connection(arrived_on, current) && super::sync::on_have(device_id, packet)
 }
 
 /// The media state and its artwork.
@@ -964,7 +1109,56 @@ mod tests {
             "DeskLink was busy and ignored a request from a phone. Try again."
         );
         assert!(drop_notice(5).contains("5 requests"));
+        // Review finding F: work the sync cannot do without is waited for,
+        // not dropped, while the queue is full.
+        let (ran_tx, ran) = std::sync::mpsc::channel::<&'static str>();
+        run_later_reliably(move || {
+            let _ = ran_tx.send("ran");
+        });
+        assert!(
+            ran.recv_timeout(Duration::from_millis(200)).is_err(),
+            "still waiting for room"
+        );
         drop(held);
+        assert_eq!(
+            ran.recv_timeout(Duration::from_secs(5)),
+            Ok("ran"),
+            "it ran once the queue drained"
+        );
+    }
+
+    /// Review finding F: one job that panics must not end the desk thread.
+    #[test]
+    fn a_panicking_job_does_not_end_the_desk_thread() {
+        let (done_tx, done) = std::sync::mpsc::channel::<u8>();
+        run_later_reliably(|| panic!("a job failed"));
+        run_later_reliably(move || {
+            let _ = done_tx.send(1);
+        });
+        assert_eq!(done.recv_timeout(Duration::from_secs(10)), Ok(1));
+    }
+
+    /// Review finding H: a `have` that arrives after its connection ended is
+    /// not kept for the next one.
+    #[test]
+    fn a_have_from_an_ended_connection_is_ignored() {
+        let device = "stale-have-phone";
+        super::super::sync::forget_device(device);
+        let mut have = NetworkPacket::new(super::super::packet::PACKET_TYPE_SYNC_HAVE);
+        have.set("peerInstance", "desk");
+        have.set("have", serde_json::json!({"settings": "r1"}));
+        let first = Some("attempt-1".to_string());
+        let second = Some("attempt-2".to_string());
+        // Queued on attempt 1, running when attempt 2 is current.
+        assert!(!apply_have(device, &have, &first, &second));
+        assert!(super::super::sync::theirs(device).is_none());
+        // On its own connection it is kept.
+        assert!(
+            !apply_have(device, &have, &second, &second),
+            "nothing waited"
+        );
+        assert!(super::super::sync::theirs(device).is_some());
+        super::super::sync::forget_device(device);
     }
 
     #[test]

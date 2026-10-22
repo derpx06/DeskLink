@@ -433,15 +433,20 @@ pub(super) fn replace_notifications(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     device_id: &str,
     packet: &NetworkPacket,
-) {
+) -> std::collections::HashSet<String> {
     let ids = string_vec(packet.body.get("ids")).unwrap_or_default();
+    let mut missing: std::collections::HashSet<String> = ids.iter().cloned().collect();
     if let Ok(mut devices) = devices.lock() {
         if let Some(device) = devices.get_mut(device_id) {
             device
                 .notifications
                 .retain(|notification| ids.contains(&notification.id));
+            for notification in &device.notifications {
+                missing.remove(&notification.id);
+            }
         }
     }
+    missing
 }
 
 pub(super) fn upsert_notification(
@@ -801,6 +806,22 @@ mod tests {
         snapshot.set("ids", json!([]));
         replace_notifications(&devices, &info.id, &snapshot);
         assert!(ids(&devices).is_empty());
+    }
+
+    /// Review finding B: a snapshot lists ids whose bodies follow; the ones
+    /// not here yet are what the rev must wait for.
+    #[test]
+    fn a_notification_snapshot_reports_the_bodies_still_to_come() {
+        let (devices, info) = test_devices();
+        upsert_notification(&devices, &info.id, &notification("n1"));
+        let mut snapshot =
+            NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_NOTIFICATION);
+        snapshot.set("snapshot", true);
+        snapshot.set("ids", json!(["n1", "n2", "n3"]));
+        let missing = replace_notifications(&devices, &info.id, &snapshot);
+        let mut missing: Vec<_> = missing.into_iter().collect();
+        missing.sort();
+        assert_eq!(missing, ["n2", "n3"]);
     }
 
     #[test]

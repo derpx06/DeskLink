@@ -227,7 +227,13 @@ impl Sidebar {
         } else {
             0
         };
-        let key = format!("{}\n{shared}\n{unread}\n{}", sessions.len(), device.trusted);
+        // The phone asked for a Bucket that is not on yet.
+        let bucket_asked = device.trusted && super::bucket::asked(&device.id);
+        let key = format!(
+            "{}\n{shared}\n{unread}\n{}\n{bucket_asked}",
+            sessions.len(),
+            device.trusted
+        );
         if *self.rows_key.borrow() == key {
             return;
         }
@@ -254,6 +260,10 @@ impl Sidebar {
                         &["mono", "nav-count"],
                     ));
                     label.push_str(&format!(", {} open", sessions.len()));
+                }
+                "bucket" if bucket_asked => {
+                    end.append(&super::text("1", &["count-badge"]));
+                    label.push_str(", a question is waiting");
                 }
                 "notifications" if unread > 0 => {
                     end.append(&super::text(&unread.to_string(), &["count-badge"]));

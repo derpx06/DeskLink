@@ -661,6 +661,15 @@ impl DesktopWebRtcPeer {
             .map_err(|error| format!("Could not send DeskLink WebRTC data: {error}"))
     }
 
+    /// Whether one data channel is open.
+    pub fn channel_open(&self, kind: WebRtcChannel) -> bool {
+        self.channels.lock().is_ok_and(|channels| {
+            channels
+                .get(&kind)
+                .is_some_and(|channel| channel.ready_state() == WebRTCDataChannelState::Open)
+        })
+    }
+
     /// Whether the channels a link needs before it is feature-ready are open.
     pub fn required_channels_open(&self) -> bool {
         let Ok(channels) = self.channels.lock() else {

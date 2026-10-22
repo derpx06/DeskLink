@@ -578,6 +578,9 @@ pub(crate) fn on_snapshot(
     // its `rev` is remembered for the next resync.
     if ask.is_empty() {
         super::sync::note_received(device_id, instance, "contacts", packet);
+    } else {
+        // Applied only in part: the older snapshot's rev is not claimed.
+        super::sync::forget_feature(device_id, "contacts");
     }
     vcard_requests(&ask)
 }

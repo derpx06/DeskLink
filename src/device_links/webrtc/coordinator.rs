@@ -16,7 +16,9 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::device_links::config::Config;
-use crate::device_links::core::{DeviceManager, FeatureTransportSnapshot, SessionBinding};
+use crate::device_links::core::{
+    DeviceManager, FeatureTransportSnapshot, Installed, SessionBinding,
+};
 use crate::device_links::daemon::handle::DaemonEvent;
 use crate::device_links::daemon::state::clear_error;
 use crate::device_links::device::DeviceView;
@@ -317,6 +319,12 @@ pub(crate) fn start_initiator(
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     events: Arc<Mutex<Vec<DaemonEvent>>>,
 ) -> Result<(), String> {
+    // One start at a time per phone: the wake, the beacon, the network change
+    // and the ladder's own timer can all arrive within milliseconds, and each
+    // used to build a pipeline or send its own restart request.
+    let Some(_starting) = claim_start(&binding.device_id) else {
+        return Ok(());
+    };
     let (local_device_id, remote_device_id) = local_and_remote_device_ids(&binding, &config)?;
     if local_device_id >= remote_device_id {
         let request_id = Uuid::new_v4().to_string();
@@ -344,15 +352,24 @@ pub(crate) fn start_initiator(
     let transfer_manager = new_transfer_manager(&config)?;
     let (sender, receiver) = mpsc::channel();
     let peer = DesktopWebRtcPeer::new(true, sender, &ice_config_for(&binding, &config))?;
-    let replaced = sessions
-        .install_webrtc_peer(
+    // Only if the session still has none, under the install's own lock.
+    let replaced = match sessions
+        .install_webrtc_peer_if_none(
             &binding,
             attempt_id.clone(),
             wire.clone(),
             peer,
             Arc::clone(&transfer_manager),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+    {
+        Installed::Replaced(replaced) => replaced,
+        Installed::Occupied(unused) => {
+            // Another starter got there first.
+            unused.close();
+            return Ok(());
+        }
+    };
     if let Some(replaced) = replaced {
         // The new peer cannot be feature-ready yet, so only the replaced
         // peer's device-keyed state goes; its superseded worker skips this.
@@ -536,8 +553,9 @@ pub(crate) fn handle_signaling_packet(
     }
 }
 
-/// Drops the current peer, resets the backoff ladder and offers afresh. Used
-/// when the responder asks for a restart: it cannot rebuild on its own.
+/// Drops the current peer, caps the backoff ladder at its last rung (it does
+/// not reset it) and offers afresh. Used when the responder asks for a
+/// restart: it cannot rebuild on its own.
 fn restart_as_initiator(
     binding: &SessionBinding,
     sessions: Arc<DeviceManager>,
@@ -549,7 +567,7 @@ fn restart_as_initiator(
         .with_session(binding, |session| {
             // Cap rather than reset: zeroing on every request meant a network
             // where ICE can never succeed retried forever without the ladder
-            // ever reaching "unavailable". At the cap it retries every 30 s.
+            // ever reaching "unavailable". At the cap it retries every 16 s.
             session.webrtc_recovery_attempt = session
                 .webrtc_recovery_attempt
                 .min(RECOVERY_BACKOFF_MILLIS.len() as u32 - 1);
@@ -2315,7 +2333,25 @@ fn spawn_event_worker(
         // File and terminal messages are handled on their own thread, in
         // order, so a heavy one never holds up the liveness clocks and the
         // control traffic this worker serves.
-        let lane = spawn_work_lane();
+        let lane = match spawn_work_lane() {
+            Ok(lane) => lane,
+            Err(error) => {
+                // Without its lane the peer would drop every file and
+                // terminal message while reading as connected: torn down,
+                // so the ladder (and the guard) take over.
+                eprintln!("[DeskLink] {error}");
+                rebuild_peer(
+                    &binding,
+                    &attempt_id,
+                    error,
+                    &sessions,
+                    &config,
+                    &devices,
+                    &events,
+                );
+                return;
+            }
+        };
         let started = std::time::Instant::now();
         loop {
             // A timed receive lets the transient-disconnect grace window expire
@@ -2531,38 +2567,50 @@ fn spawn_event_worker(
                         bytes,
                         credit,
                     } => {
-                        let (binding, attempt_id, wire) =
-                            (binding.clone(), attempt_id.clone(), wire.clone());
-                        let (sessions, config, devices, events, transfer_manager) = (
-                            Arc::clone(&sessions),
-                            Arc::clone(&config),
-                            Arc::clone(&devices),
-                            Arc::clone(&events),
-                            Arc::clone(&transfer_manager),
-                        );
-                        let job: WorkJob = Box::new(move || {
-                            // Held until handled: the backlog budget counts it.
-                            let _credit = credit;
-                            if let Err(error) = handle_peer_envelope(
+                        let job: WorkJob = {
+                            let (binding, attempt_id, wire) =
+                                (binding.clone(), attempt_id.clone(), wire.clone());
+                            let (sessions, config, devices, events, transfer_manager) = (
+                                Arc::clone(&sessions),
+                                Arc::clone(&config),
+                                Arc::clone(&devices),
+                                Arc::clone(&events),
+                                Arc::clone(&transfer_manager),
+                            );
+                            Box::new(move || {
+                                // Held until handled: the backlog budget counts it.
+                                let _credit = credit;
+                                if let Err(error) = handle_peer_envelope(
+                                    &binding,
+                                    &attempt_id,
+                                    &wire,
+                                    channel,
+                                    &bytes,
+                                    &sessions,
+                                    &config,
+                                    &devices,
+                                    &events,
+                                    &transfer_manager,
+                                ) {
+                                    crate::device_links::limits::log_limited(
+                                        "rejected-envelope",
+                                        &format!("Rejected WebRTC data-channel message: {error}"),
+                                    );
+                                }
+                            })
+                        };
+                        if lane.send(job).is_err() {
+                            eprintln!("[DeskLink] The peer's work thread has stopped");
+                            rebuild_peer(
                                 &binding,
                                 &attempt_id,
-                                &wire,
-                                channel,
-                                &bytes,
+                                "The peer's work thread stopped".to_string(),
                                 &sessions,
                                 &config,
                                 &devices,
                                 &events,
-                                &transfer_manager,
-                            ) {
-                                crate::device_links::limits::log_limited(
-                                    "rejected-envelope",
-                                    &format!("Rejected WebRTC data-channel message: {error}"),
-                                );
-                            }
-                        });
-                        if lane.send(job).is_err() {
-                            eprintln!("[DeskLink] The peer's work thread has stopped");
+                            );
+                            break;
                         }
                     }
                     PeerEvent::Envelope { channel, bytes, .. } => {
@@ -2825,7 +2873,10 @@ fn rebuild_peer(
     events: &Arc<Mutex<Vec<DaemonEvent>>>,
 ) {
     match sessions.clear_webrtc_if_current(binding, attempt_id, reason.clone()) {
-        Ok(Some(peer)) => peer.close(),
+        Ok(Some(peer)) => {
+            note_channels_of(&binding.device_id, &peer);
+            peer.close();
+        }
         Ok(None) => {}
         Err(error) => {
             eprintln!("[DeskLink] Ignored stale WebRTC peer failure: {error}");
@@ -2855,7 +2906,10 @@ fn rebuild_peer(
         mark_error(
             devices,
             &binding.device_id,
-            unavailable_words(&device_name(devices, &binding.device_id)),
+            exhausted_words(
+                &binding.device_id,
+                &device_name(devices, &binding.device_id),
+            ),
         );
         return;
     };
@@ -3128,12 +3182,133 @@ pub(crate) fn unavailable_words(phone: &str) -> String {
     format!("Can't reach {phone} · Try again")
 }
 
+/// Whether `error` is the unavailable state, which has a "Try Again" control.
+pub(crate) fn is_unavailable(error: &str) -> bool {
+    error.starts_with("Can't reach ")
+}
+
+/// What the state says when the phone's app is too old to connect: a build
+/// from before the liveness channel never opens it, so the link can never
+/// become feature-ready however often it is retried.
+pub(crate) fn update_words(phone: &str) -> String {
+    format!("Update DeskLink on {phone}")
+}
+
+/// Whether a peer that was torn down shows the phone lacks the liveness
+/// channel: the others were open and it never was.
+pub(crate) fn lacks_liveness_channel(control: bool, events: bool, liveness: bool) -> bool {
+    control && events && !liveness
+}
+
+/// Consecutive torn-down peers, per phone, that lacked the liveness channel.
+fn lacking_streaks() -> &'static Mutex<HashMap<String, u32>> {
+    static STREAKS: std::sync::OnceLock<Mutex<HashMap<String, u32>>> = std::sync::OnceLock::new();
+    STREAKS.get_or_init(Default::default)
+}
+
+/// Two in a row are a phone with an older app, not a slow network.
+const LACKING_STREAK_FOR_UPDATE: u32 = 2;
+
+fn note_channels_of(device_id: &str, peer: &DesktopWebRtcPeer) {
+    let lacks = lacks_liveness_channel(
+        peer.channel_open(WebRtcChannel::Control),
+        peer.channel_open(WebRtcChannel::Events),
+        peer.channel_open(WebRtcChannel::Liveness),
+    );
+    note_lacking(device_id, lacks);
+}
+
+fn note_lacking(device_id: &str, lacks: bool) {
+    if let Ok(mut streaks) = lacking_streaks().lock() {
+        if lacks {
+            *streaks.entry(device_id.to_string()).or_default() += 1;
+        } else {
+            streaks.remove(device_id);
+        }
+    }
+}
+
+/// What the exhausted ladder says for `device_id`: "Update DeskLink on …" when
+/// the phone keeps lacking the liveness channel, else "Can't reach …".
+pub(crate) fn exhausted_words(device_id: &str, phone: &str) -> String {
+    let lacking = lacking_streaks()
+        .lock()
+        .ok()
+        .and_then(|streaks| streaks.get(device_id).copied())
+        .unwrap_or(0);
+    if lacking >= LACKING_STREAK_FOR_UPDATE {
+        update_words(phone)
+    } else {
+        unavailable_words(phone)
+    }
+}
+
+/// "Try again" in the Overview card, the tray and the shell: the phone is
+/// tried now, however long the ladder had been given up.
+pub(crate) fn reconnect(
+    device_id: &str,
+    sessions: &Arc<DeviceManager>,
+    config: &Arc<Mutex<Config>>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
+) {
+    crate::device_links::daemon::discovery::wake_addresses(device_id);
+    recovery_sign(device_id, sessions, config, devices, events);
+}
+
 fn device_name(devices: &Arc<Mutex<HashMap<String, DeviceView>>>, device_id: &str) -> String {
     devices
         .lock()
         .ok()
         .and_then(|devices| devices.get(device_id).map(|device| device.name.clone()))
         .unwrap_or_else(|| "the phone".to_string())
+}
+
+/// Marks a start of the WebRTC connection to `device_id` as under way; dropped
+/// when it ends.
+struct Starting(String);
+
+impl Drop for Starting {
+    fn drop(&mut self) {
+        if let Ok(mut starting) = starting().lock() {
+            starting.remove(&self.0);
+        }
+    }
+}
+
+fn starting() -> &'static Mutex<std::collections::HashSet<String>> {
+    static STARTING: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    STARTING.get_or_init(Default::default)
+}
+
+/// The claim to start a connection to `device_id`, or `None` when one is
+/// already under way.
+fn claim_start(device_id: &str) -> Option<Starting> {
+    starting()
+        .lock()
+        .ok()?
+        .insert(device_id.to_string())
+        .then(|| Starting(device_id.to_string()))
+}
+
+/// Signs of a phone closer together than this are one sign.
+const SIGN_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether a sign of `device_id` at `now` is a new one (see [`SIGN_DEBOUNCE`]).
+fn sign_is_new(device_id: &str, now: std::time::Instant) -> bool {
+    static LAST: Mutex<Option<HashMap<String, std::time::Instant>>> = Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return true;
+    };
+    let last = last.get_or_insert_with(HashMap::new);
+    match last.get(device_id) {
+        Some(at) if now.saturating_duration_since(*at) < SIGN_DEBOUNCE => false,
+        _ => {
+            last.insert(device_id.to_string(), now);
+            true
+        }
+    }
 }
 
 /// Any sign of the phone — a network change, the phone waking, a beacon, an
@@ -3153,6 +3328,9 @@ pub(crate) fn recovery_sign(
     else {
         return;
     };
+    if !sign_is_new(device_id, std::time::Instant::now()) {
+        return;
+    }
     let was_exhausted = sessions
         .with_session(&binding, |session| {
             let exhausted = recovery_delay(session.webrtc_recovery_attempt).is_none();
@@ -3204,8 +3382,9 @@ const RECOVERY_BACKOFF_MILLIS: [u64; 6] = [250, 1_000, 2_000, 4_000, 8_000, 16_0
 /// This bounds *initiation only*. The desktop must keep accepting inbound
 /// offers afterwards: the phone is the deterministic initiator whenever its
 /// device id sorts lower, and `WebRtcRecoveryPolicy` on Android never gives up
-/// on attempt count. A new or adopted bootstrap link, or a restart request
-/// from the responder, resets the ladder.
+/// on attempt count. A new or adopted bootstrap link, a sign of the phone or
+/// "Try again" resets the ladder; a restart request from the responder only
+/// caps it at the last rung.
 pub(crate) fn recovery_delay(attempt: u32) -> Option<std::time::Duration> {
     RECOVERY_BACKOFF_MILLIS
         .get(attempt as usize)
@@ -3842,16 +4021,32 @@ type WorkJob = Box<dyn FnOnce() + Send>;
 /// Starts a peer's work thread (it ends with the worker that owns the
 /// sender). Unbounded in messages, bounded in bytes: each queued message holds
 /// a `Credit` from the channel's backlog budget.
-fn spawn_work_lane() -> mpsc::Sender<WorkJob> {
+fn spawn_work_lane() -> Result<mpsc::Sender<WorkJob>, String> {
+    spawn_work_lane_with(|name, body| {
+        thread::Builder::new()
+            .name(name.into())
+            .spawn(body)
+            .map(|_| ())
+    })
+}
+
+/// The lane, started through `spawn`. A lane whose thread did not start is an
+/// error: its sender would accept jobs that never run, and the peer would
+/// drop every file and terminal message while reading as connected.
+fn spawn_work_lane_with(
+    spawn: impl FnOnce(&str, Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+) -> Result<mpsc::Sender<WorkJob>, String> {
     let (sender, jobs) = mpsc::channel::<WorkJob>();
-    let _ = thread::Builder::new()
-        .name("desklink-peer-work".into())
-        .spawn(move || {
+    spawn(
+        "desklink-peer-work",
+        Box::new(move || {
             for job in jobs {
                 crate::guard("peer work", (), job);
             }
-        });
-    sender
+        }),
+    )
+    .map_err(|error| format!("Could not start the peer's work thread: {error}"))?;
+    Ok(sender)
 }
 
 /// What happens once, when both sides are feature-ready: the queued features
@@ -3865,6 +4060,7 @@ fn finish_feature_ready(
     transfer_manager: &Arc<WebRtcTransferManager>,
 ) {
     clear_error(devices, &binding.device_id);
+    note_lacking(&binding.device_id, false);
     // Not a reset of the backoff ladder: a link that dies right
     // after becoming ready (a failure after ready) must keep
     // climbing, or it loops at the first rung for ever. The
@@ -4998,11 +5194,190 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    fn paired_session(
+        sessions: &crate::device_links::core::DeviceManager,
+        id: &str,
+    ) -> crate::device_links::core::SessionBinding {
+        sessions
+            .register_link(
+                id.to_string(),
+                crate::device_links::core::SessionLink::test_placeholder(id),
+                true,
+            )
+            .unwrap()
+            .binding
+    }
+
+    /// Review finding G: a work thread that did not start is an error, not a
+    /// sender whose jobs never run.
+    #[test]
+    fn a_work_lane_that_cannot_start_is_an_error() {
+        let failed =
+            super::spawn_work_lane_with(|_, _| Err(std::io::Error::other("no threads left")));
+        assert!(failed.unwrap_err().contains("no threads left"));
+        assert!(super::spawn_work_lane().is_ok());
+    }
+
+    /// Review finding D: "Try Again" resets an exhausted ladder, clears the
+    /// "Can't reach" state and wakes the phone's backed-off addresses.
+    #[test]
+    fn try_again_restarts_the_ladder_clears_the_state_and_wakes_the_addresses() {
+        let dir = std::env::temp_dir().join(format!("desklink-try-{}", uuid::Uuid::new_v4()));
+        let config = Arc::new(Mutex::new(Config::load_from_dir(dir.clone()).unwrap()));
+        let sessions = Arc::new(crate::device_links::core::DeviceManager::new());
+        // "00" sorts below any device id: this side only asks the phone to
+        // restart, so the test builds no peer.
+        let binding = paired_session(&sessions, "00");
+        let devices: Arc<Mutex<HashMap<String, crate::device_links::device::DeviceView>>> =
+            Arc::default();
+        let info = crate::device_links::device_info::DeviceInfo {
+            id: "00".into(),
+            name: "Pixel 9".into(),
+            device_type: "phone".into(),
+            protocol_version: 9,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+        };
+        let mut card =
+            crate::device_links::device::DeviceView::from_info(&info, "10.0.0.2".into(), true);
+        card.last_error = Some(super::unavailable_words("Pixel 9"));
+        assert!(super::is_unavailable(card.last_error.as_deref().unwrap()));
+        devices.lock().unwrap().insert("00".into(), card);
+        sessions
+            .with_session(&binding, |session| {
+                session.webrtc_recovery_attempt = RECOVERY_BACKOFF_MILLIS.len() as u32
+            })
+            .unwrap();
+        let ip: std::net::IpAddr = "10.77.0.2".parse().unwrap();
+        crate::device_links::daemon::discovery::test_dead_address("00", ip);
+        assert!(crate::device_links::daemon::discovery::test_due("00").is_empty());
+        let events = Arc::default();
+        super::reconnect("00", &sessions, &config, &devices, &events);
+        assert_eq!(
+            sessions
+                .with_session(&binding, |s| s.webrtc_recovery_attempt)
+                .unwrap(),
+            0
+        );
+        assert_eq!(devices.lock().unwrap()["00"].last_error, None);
+        assert_eq!(
+            crate::device_links::daemon::discovery::test_due("00"),
+            [ip],
+            "its addresses are tried again at once"
+        );
+        crate::device_links::daemon::discovery::forget_addresses("00");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The pre-W2 rollout: an app without the liveness channel can never become
+    /// feature-ready; after two peers like that the words say what to do.
+    #[test]
+    fn a_phone_without_the_liveness_channel_is_told_to_update() {
+        assert!(super::lacks_liveness_channel(true, true, false));
+        assert!(!super::lacks_liveness_channel(true, true, true));
+        assert!(
+            !super::lacks_liveness_channel(false, false, false),
+            "a network that never connected says nothing about the app"
+        );
+        let id = "old-app-phone";
+        assert_eq!(
+            super::exhausted_words(id, "Pixel 9"),
+            "Can't reach Pixel 9 · Try again"
+        );
+        super::note_lacking(id, true);
+        assert!(super::exhausted_words(id, "Pixel 9").starts_with("Can't reach"));
+        super::note_lacking(id, true);
+        assert_eq!(
+            super::exhausted_words(id, "Pixel 9"),
+            "Update DeskLink on Pixel 9"
+        );
+        assert!(!super::is_unavailable(&super::exhausted_words(
+            id, "Pixel 9"
+        )));
+        // One good connection forgets it.
+        super::note_lacking(id, false);
+        assert!(super::is_unavailable(&super::exhausted_words(
+            id, "Pixel 9"
+        )));
+    }
+
+    /// Review finding E: several signs within a second are one.
+    #[test]
+    fn signs_of_a_phone_within_a_second_count_once() {
+        let start = std::time::Instant::now();
+        let at = |ms| start + std::time::Duration::from_millis(ms);
+        assert!(super::sign_is_new("sign-debounce-phone", at(0)));
+        assert!(!super::sign_is_new("sign-debounce-phone", at(10)));
+        assert!(!super::sign_is_new("sign-debounce-phone", at(999)));
+        assert!(super::sign_is_new("sign-debounce-phone", at(1000)));
+        assert!(super::sign_is_new("another-phone", at(5)));
+    }
+
+    /// Review finding E: one start at a time per phone.
+    #[test]
+    fn only_one_start_per_phone_runs_at_a_time() {
+        let first = super::claim_start("claim-phone").expect("free");
+        assert!(super::claim_start("claim-phone").is_none(), "taken");
+        assert!(super::claim_start("another-claim-phone").is_some());
+        drop(first);
+        assert!(super::claim_start("claim-phone").is_some(), "released");
+    }
+
+    /// Review finding E: the install itself refuses a second peer, so two
+    /// starters that both saw "no peer" cannot replace one another.
+    #[test]
+    fn installing_a_peer_if_none_refuses_a_second_one() {
+        use crate::device_links::core::{DeviceManager, Installed};
+        use crate::device_links::webrtc::ice::IceServerConfig;
+        use crate::device_links::webrtc::peer_connection::DesktopWebRtcPeer;
+        use crate::device_links::webrtc::transfer_manager::WebRtcTransferManager;
+        let dir = std::env::temp_dir().join(format!("desklink-install-{}", uuid::Uuid::new_v4()));
+        let sessions = DeviceManager::new();
+        let binding = paired_session(&sessions, "install-phone");
+        let manager = || {
+            Arc::new(WebRtcTransferManager::new(dir.join("state"), dir.join("downloads")).unwrap())
+        };
+        let peer = || {
+            DesktopWebRtcPeer::new(true, mpsc::channel().0, &IceServerConfig::default()).unwrap()
+        };
+        let wire =
+            WebRtcWireBinding::from_attempt("a", "b", &uuid::Uuid::new_v4().to_string()).unwrap();
+        let first = sessions
+            .install_webrtc_peer_if_none(
+                &binding,
+                "attempt-1".into(),
+                wire.clone(),
+                peer(),
+                manager(),
+            )
+            .unwrap();
+        assert!(matches!(first, Installed::Replaced(None)));
+        match sessions
+            .install_webrtc_peer_if_none(&binding, "attempt-2".into(), wire, peer(), manager())
+            .unwrap()
+        {
+            Installed::Occupied(unused) => unused.close(),
+            Installed::Replaced(_) => panic!("the second install replaced the first"),
+        }
+        assert_eq!(
+            sessions.active_webrtc_attempt(&binding).unwrap().as_deref(),
+            Some("attempt-1"),
+            "the first peer stays"
+        );
+        if let Ok(Some(peer)) =
+            sessions.clear_webrtc_if_current(&binding, "attempt-1", "test".into())
+        {
+            peer.close();
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// File and terminal messages run on their own thread, in order: a slow
     /// one never holds up the thread that serves liveness.
     #[test]
     fn a_slow_file_message_does_not_hold_up_the_worker_and_runs_in_order() {
-        let lane = super::spawn_work_lane();
+        let lane = super::spawn_work_lane().unwrap();
         let (done_tx, done) = mpsc::channel();
         let slow = done_tx.clone();
         let started = std::time::Instant::now();

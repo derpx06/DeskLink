@@ -50,6 +50,9 @@ pub enum DaemonEvent {
     },
     /// The phone refused a call request, in the user's words.
     CallRefused { message: String },
+    /// A new pairing replaced an older record of the same name that was
+    /// offline and looked like the same phone reinstalled.
+    PairingReplaced { name: String },
 }
 
 struct DaemonStopGuard(Sender<DaemonCommand>);

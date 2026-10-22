@@ -239,6 +239,15 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         label.set_wrap(true);
         label.set_tooltip_text(Some(error));
         info.append(&label);
+        // The ladder gave up: this is what acts on "Try again".
+        if crate::device_links::webrtc::coordinator::is_unavailable(error) {
+            let retry = icon_button("view-refresh-symbolic", "Try Again", &["soft-button"]);
+            retry.set_widget_name("hero-reconnect");
+            retry.set_halign(gtk::Align::Start);
+            let (daemon, id) = (daemon.clone(), device.id.clone());
+            retry.connect_clicked(move |_| daemon.send(DaemonCommand::Reconnect(id.clone())));
+            info.append(&retry);
+        }
     }
     band.append(&info);
 

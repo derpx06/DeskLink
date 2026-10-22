@@ -38,8 +38,33 @@ pub(super) fn beacon_again() {
     BEACON_AGAIN.store(true, Ordering::Release);
 }
 
+/// Tests elsewhere: a phone seen at `ip` whose dial just failed, and what is
+/// due to be dialled.
+#[cfg(test)]
+pub(crate) fn test_dead_address(device_id: &str, ip: std::net::IpAddr) {
+    if let Ok(mut book) = addresses().lock() {
+        book.seen(device_id, ip);
+        book.failed(device_id, ip, Instant::now());
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_due(device_id: &str) -> Vec<std::net::IpAddr> {
+    addresses()
+        .lock()
+        .map(|book| book.due(device_id, Instant::now()))
+        .unwrap_or_default()
+}
+
+/// Every address of one phone gets a fresh chance at once ("Try again").
+pub(crate) fn wake_addresses(device_id: &str) {
+    if let Ok(mut book) = addresses().lock() {
+        book.wake(Some(device_id));
+    }
+}
+
 /// A phone was unpaired: its addresses go.
-pub(super) fn forget_addresses(device_id: &str) {
+pub(crate) fn forget_addresses(device_id: &str) {
     if let Ok(mut book) = addresses().lock() {
         book.forget(device_id);
     }
@@ -128,12 +153,29 @@ fn endpoints_path() -> Option<std::path::PathBuf> {
     )
 }
 
-/// The remembered addresses, by device id.
+/// The remembered addresses, by device id, read from the file.
 pub(super) fn persisted_endpoints() -> HashMap<String, SocketAddr> {
     endpoints_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
+}
+
+static PERSISTED: Mutex<Option<HashMap<String, SocketAddr>>> = Mutex::new(None);
+
+/// Where `device_id` was last reached, as remembered across runs.
+pub(super) fn persisted_ip(device_id: &str) -> Option<std::net::IpAddr> {
+    persisted_snapshot().get(device_id).map(SocketAddr::ip)
+}
+
+/// The remembered addresses as of now: read once, then kept current by
+/// [`persist_endpoint`] (the redialer used to hold the snapshot from its
+/// start for ever, so an address learned later was never in it).
+fn persisted_snapshot() -> HashMap<String, SocketAddr> {
+    let Ok(mut cached) = PERSISTED.lock() else {
+        return HashMap::new();
+    };
+    cached.get_or_insert_with(persisted_endpoints).clone()
 }
 
 fn persist_endpoint(
@@ -146,6 +188,9 @@ fn persist_endpoint(
     };
     let before = persisted_endpoints();
     let all = updated_endpoints(before.clone(), device_id, address, trusted);
+    if let Ok(mut cached) = PERSISTED.lock() {
+        *cached = Some(all.clone());
+    }
     if all == before {
         return;
     }
@@ -192,11 +237,48 @@ const MAX_ADDRESSES: usize = 3;
 const FIRST_ADDRESS_BACKOFF: Duration = Duration::from_secs(3);
 const MAX_ADDRESS_BACKOFF: Duration = Duration::from_secs(300);
 
+/// Unverified addresses (a beacon's source, an mDNS answer, the card's
+/// address) a phone may have in the book at once. They are dialled like any
+/// other, but can never push a verified address out: a spoofed beacon could
+/// otherwise evict the real ones.
+const MAX_CANDIDATES: usize = 2;
+/// Gap between unicast beacons to one address, doubling per beacon up to
+/// [`MAX_BEACON_GAP`]: an address that never answers is not told about this
+/// computer every 15 s for ever.
+const FIRST_BEACON_GAP: Duration = Duration::from_secs(15);
+const MAX_BEACON_GAP: Duration = Duration::from_secs(300);
+/// A beacon from a phone may wake its backed-off addresses and the recovery
+/// ladder at most this often. Beacons are not authenticated.
+const BEACON_EFFECT_EVERY: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone)]
 struct Address {
     ip: std::net::IpAddr,
     failures: u32,
     retry_at: Option<Instant>,
+    /// Seen through a pinned, authenticated handshake (now or in an earlier
+    /// run) rather than only claimed by an unauthenticated packet.
+    verified: bool,
+    /// Unicast beacons sent here since the last sign of the phone.
+    beacons: u32,
+    beacon_at: Option<Instant>,
+}
+
+impl Address {
+    fn new(ip: std::net::IpAddr, verified: bool) -> Self {
+        Self {
+            ip,
+            failures: 0,
+            retry_at: None,
+            verified,
+            beacons: 0,
+            beacon_at: None,
+        }
+    }
+}
+
+fn unusable(ip: std::net::IpAddr) -> bool {
+    ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
 }
 
 /// Where each paired phone was last seen: its last [`MAX_ADDRESSES`] IPv4s
@@ -212,25 +294,86 @@ impl AddressBook {
     /// `ip` is where `device_id` was just seen: newest first, a repeat moves
     /// up and is tried again at once.
     pub(super) fn seen(&mut self, device_id: &str, ip: std::net::IpAddr) {
-        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        if unusable(ip) {
             return;
         }
         let list = self.phones.entry(device_id.to_string()).or_default();
         list.retain(|known| known.ip != ip);
-        list.insert(
-            0,
-            Address {
-                ip,
-                failures: 0,
-                retry_at: None,
-            },
-        );
+        list.insert(0, Address::new(ip, true));
+        Self::trim_verified(list);
+    }
+
+    /// Keeps the newest [`MAX_ADDRESSES`] verified IPv4s and one IPv6.
+    fn trim_verified(list: &mut Vec<Address>) {
         let (mut v4, mut v6) = (0, 0);
         list.retain(|known| {
+            if !known.verified {
+                return true;
+            }
             let counter = if known.ip.is_ipv4() { &mut v4 } else { &mut v6 };
             *counter += 1;
             *counter <= if known.ip.is_ipv4() { MAX_ADDRESSES } else { 1 }
         });
+    }
+
+    /// An address only an unauthenticated packet vouches for (a beacon, an
+    /// mDNS answer, the address on the card): added if absent, last in line,
+    /// and never in place of a verified one. It becomes verified when a
+    /// pinned handshake over it works ([`Self::worked`]). A known address is
+    /// left exactly as it is (its backoff is not reset).
+    pub(super) fn candidate(&mut self, device_id: &str, ip: std::net::IpAddr) {
+        if unusable(ip) {
+            return;
+        }
+        let list = self.phones.entry(device_id.to_string()).or_default();
+        if list.iter().any(|known| known.ip == ip) {
+            return;
+        }
+        list.push(Address::new(ip, false));
+        while list.iter().filter(|known| !known.verified).count() > MAX_CANDIDATES {
+            if let Some(oldest) = list.iter().position(|known| !known.verified) {
+                list.remove(oldest);
+            }
+        }
+    }
+
+    /// An address remembered from an earlier run's authenticated link: added
+    /// if absent (last in line), its backoff untouched if present.
+    pub(super) fn remembered(&mut self, device_id: &str, ip: std::net::IpAddr) {
+        if unusable(ip) {
+            return;
+        }
+        let list = self.phones.entry(device_id.to_string()).or_default();
+        match list.iter_mut().find(|known| known.ip == ip) {
+            Some(known) => known.verified = true,
+            None => list.push(Address::new(ip, true)),
+        }
+        Self::trim_verified(list);
+    }
+
+    /// The addresses of `device_id` to send a unicast beacon to now, and
+    /// when each next one is due: the gap doubles per beacon, so a phone that
+    /// never answers costs a packet every five minutes, not every 15 s.
+    pub(super) fn beacon_targets(
+        &mut self,
+        device_id: &str,
+        now: Instant,
+    ) -> Vec<std::net::IpAddr> {
+        let Some(list) = self.phones.get_mut(device_id) else {
+            return Vec::new();
+        };
+        let mut due = Vec::new();
+        for known in list {
+            if known.beacon_at.is_none_or(|at| at <= now) {
+                let gap = FIRST_BEACON_GAP
+                    .saturating_mul(2u32.saturating_pow(known.beacons.min(10)))
+                    .min(MAX_BEACON_GAP);
+                known.beacons = known.beacons.saturating_add(1);
+                known.beacon_at = Some(now + gap);
+                due.push(known.ip);
+            }
+        }
+        due
     }
 
     /// The addresses to dial now: those whose backoff is over, newest first.
@@ -272,6 +415,8 @@ impl AddressBook {
                 for known in list {
                     known.failures = 0;
                     known.retry_at = None;
+                    known.beacons = 0;
+                    known.beacon_at = None;
                 }
             }
         }
@@ -281,22 +426,26 @@ impl AddressBook {
     pub(super) fn forget(&mut self, device_id: &str) {
         self.phones.remove(device_id);
     }
+}
 
-    /// Whether `ip` is a known address of the phone that is waiting out its
-    /// backoff.
-    fn is_backing_off(&self, device_id: &str, ip: std::net::IpAddr, now: Instant) -> bool {
-        self.phones.get(device_id).is_some_and(|list| {
-            list.iter()
-                .any(|known| known.ip == ip && known.retry_at.is_some_and(|at| at > now))
-        })
+/// Whether a beacon from `device_id` may wake its addresses and the recovery
+/// ladder now (at most every [`BEACON_EFFECT_EVERY`] per phone): a beacon is an
+/// unauthenticated UDP packet anyone on the network can repeat.
+fn beacon_may_act(device_id: &str, now: Instant) -> bool {
+    static LAST: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return false;
+    };
+    let last = last.get_or_insert_with(HashMap::new);
+    if last.len() > 256 {
+        last.retain(|_, at| now.saturating_duration_since(*at) < BEACON_EFFECT_EVERY);
     }
-
-    /// Every address of every phone, for unicast beacons.
-    fn all(&self) -> Vec<(String, std::net::IpAddr)> {
-        self.phones
-            .iter()
-            .flat_map(|(id, list)| list.iter().map(|known| (id.clone(), known.ip)))
-            .collect()
+    match last.get(device_id) {
+        Some(at) if now.saturating_duration_since(*at) < BEACON_EFFECT_EVERY => false,
+        _ => {
+            last.insert(device_id.to_string(), now);
+            true
+        }
     }
 }
 
@@ -320,6 +469,14 @@ pub(super) fn note_address(device_id: &str, ip: std::net::IpAddr) {
     }
 }
 
+/// Records an address an unauthenticated packet claims (an mDNS answer): a
+/// candidate, dialled but never in place of a verified address.
+pub(super) fn note_candidate_address(device_id: &str, ip: std::net::IpAddr) {
+    if let Ok(mut book) = addresses().lock() {
+        book.candidate(device_id, ip);
+    }
+}
+
 /// The paired phones to dial now: no live bootstrap link (whether or not
 /// their WebRTC peer survives), a last-known address and listening port.
 ///
@@ -330,7 +487,7 @@ fn redial_targets(
     devices: &HashMap<String, DeviceView>,
     known: &HashMap<String, (DeviceInfo, u16)>,
     persisted: &HashMap<String, SocketAddr>,
-    book: &AddressBook,
+    book: &mut AddressBook,
     now: Instant,
     wants: impl Fn(&str) -> bool,
 ) -> Vec<(DeviceInfo, std::net::IpAddr, u16)> {
@@ -357,19 +514,18 @@ fn redial_targets(
             ),
             (None, None) => continue,
         };
-        // Every address it was seen on, newest first; the address on its
-        // `DeviceView` and the remembered one are the seeds.
-        let mut ips = book.due(&device.id, now);
-        let seeds = [
-            device.address.parse().ok(),
-            persisted.get(&device.id).map(SocketAddr::ip),
-        ];
-        for seed in seeds.into_iter().flatten() {
-            if !ips.contains(&seed) && !book.is_backing_off(&device.id, seed, now) {
-                ips.push(seed);
-            }
+        // Every address it was seen on, newest first. The address on its
+        // `DeviceView` and the remembered one are put in the book (when
+        // absent, without touching a backoff) so that they wait out their
+        // failures like any other: dialled straight from the card or the
+        // file, a dead one was retried every second for ever.
+        if let Ok(card) = device.address.parse() {
+            book.candidate(&device.id, card);
         }
-        for ip in ips {
+        if let Some(remembered) = persisted.get(&device.id) {
+            book.remembered(&device.id, remembered.ip());
+        }
+        for ip in book.due(&device.id, now) {
             targets.push((info.clone(), ip, port));
         }
     }
@@ -381,7 +537,8 @@ impl DaemonWorker {
     /// cannot dial in: on its own hotspot it hears only its own beacons, and
     /// a phone whose screen is off is frozen by its OS until *inbound* TCP
     /// arrives — this link (and its 10 s heartbeat) is how it is thawed. So
-    /// the desk dials the last-known address itself, including while a
+    /// the desk dials the addresses the phone was seen on itself (each on its
+    /// own backoff, a dead one less and less often), including while a
     /// WebRTC peer survives without its bootstrap socket (the new socket is
     /// adopted into the session; see `attach_bootstrap_link`). Failures are
     /// expected and not shown.
@@ -392,7 +549,6 @@ impl DaemonWorker {
         let events = Arc::clone(&self.events);
         let shutdown = Arc::clone(&self.shutdown);
         thread::spawn(move || {
-            let persisted = persisted_endpoints();
             while !shutdown.load(Ordering::Acquire) {
                 thread::sleep(REDIAL_EVERY);
                 let targets = {
@@ -400,12 +556,18 @@ impl DaemonWorker {
                     else {
                         continue;
                     };
-                    let Ok(book) = addresses().lock() else {
+                    let Ok(mut book) = addresses().lock() else {
                         continue;
                     };
-                    redial_targets(&devices, &known, &persisted, &book, Instant::now(), |id| {
-                        sessions.wants_bootstrap_connection(id)
-                    })
+                    let persisted = persisted_snapshot();
+                    redial_targets(
+                        &devices,
+                        &known,
+                        &persisted,
+                        &mut book,
+                        Instant::now(),
+                        |id| sessions.wants_bootstrap_connection(id),
+                    )
                 };
                 for (info, ip, port) in targets {
                     let Some(slot) = super::network::HandshakeSlot::claim(ip) else {
@@ -600,7 +762,7 @@ impl DaemonWorker {
                             continue;
                         }
                         for ip in found.get_addresses() {
-                            note_address(&id, ip.to_ip_addr());
+                            note_candidate_address(&id, ip.to_ip_addr());
                         }
                     }
                 }
@@ -656,19 +818,17 @@ fn beacon_unreachable_paired(
                 .collect()
         })
         .unwrap_or_default();
-    // Every address a phone was seen on, not only the newest.
-    let book = addresses()
-        .lock()
-        .map(|book| book.all())
-        .unwrap_or_default();
+    // Every address a phone was seen on, not only the newest, each on its own
+    // backoff: one that never answers is told less and less often.
     let mut targets: Vec<std::net::IpAddr> = Vec::new();
-    for (id, current) in &unreachable {
-        targets.extend(current);
-        targets.extend(
-            book.iter()
-                .filter(|(owner, _)| owner == id)
-                .map(|(_, ip)| *ip),
-        );
+    if let Ok(mut book) = addresses().lock() {
+        let now = Instant::now();
+        for (id, current) in &unreachable {
+            if let Some(current) = current {
+                book.candidate(id, *current);
+            }
+            targets.extend(book.beacon_targets(id, now));
+        }
     }
     targets.sort();
     targets.dedup();
@@ -718,15 +878,18 @@ fn handle_identity_packet(
         return;
     }
 
-    // A beacon from a paired phone is a sign of it: its address is kept, the
-    // addresses get a fresh chance, and a recovery ladder that ran out
-    // starts over (and reconnects at once).
+    // A beacon from a paired phone is a sign of it: its addresses get a fresh
+    // chance, and a recovery ladder that ran out starts over (and reconnects
+    // at once). It is not authenticated, so this happens at most every few
+    // seconds per phone, and its source is only a candidate address until a
+    // pinned handshake over it works.
     if config
         .lock()
         .is_ok_and(|config| config.is_trusted(&info.id))
+        && beacon_may_act(&info.id, Instant::now())
     {
         if let Ok(mut book) = addresses().lock() {
-            book.seen(&info.id, address.ip());
+            book.candidate(&info.id, address.ip());
             book.wake(Some(&info.id));
         }
         crate::device_links::webrtc::coordinator::recovery_sign(
@@ -790,7 +953,7 @@ fn handle_identity_packet(
     };
     let spawned = thread::Builder::new().spawn(move || {
         let _slot = slot;
-        if let Err(error) = connect_to_device(
+        let connected = connect_to_device(
             info.clone(),
             address,
             remote_port,
@@ -798,7 +961,14 @@ fn handle_identity_packet(
             devices.clone(),
             Arc::clone(&sessions),
             events,
-        ) {
+        );
+        if connected.is_ok() {
+            // Authenticated over this address: now it is a verified one.
+            if let Ok(mut book) = addresses().lock() {
+                book.worked(&info.id, address.ip());
+            }
+        }
+        if let Err(error) = connected {
             if should_publish_outgoing_failure(&sessions, &info.id) {
                 mark_error(&devices, &info.id, error.clone());
                 eprintln!(
@@ -865,7 +1035,7 @@ mod tests {
             &devices,
             &known,
             &persisted,
-            &AddressBook::default(),
+            &mut AddressBook::default(),
             Instant::now(),
             |id| id != "linked",
         );
@@ -976,8 +1146,8 @@ mod tests {
         );
         assert_eq!(addresses().lock().unwrap().due(id, now).len(), 2);
         // The unicast burst reaches every address of an unreachable phone.
-        let book = addresses().lock().unwrap().all();
-        assert!(book.iter().filter(|(owner, _)| owner == id).count() >= 2);
+        let burst = addresses().lock().unwrap().beacon_targets(id, now);
+        assert_eq!(burst.len(), 2);
         forget_addresses(id);
     }
 
@@ -1003,7 +1173,7 @@ mod tests {
             book.seen("multi", ip(address));
         }
         book.failed("multi", ip("10.0.0.6"), now);
-        let targets = redial_targets(&devices, &known, &HashMap::new(), &book, now, |_| true);
+        let targets = redial_targets(&devices, &known, &HashMap::new(), &mut book, now, |_| true);
         let mut dialled: Vec<String> = targets.iter().map(|(_, ip, _)| ip.to_string()).collect();
         dialled.sort();
         assert_eq!(
@@ -1014,6 +1184,154 @@ mod tests {
         assert!(targets
             .iter()
             .all(|(info, _, port)| info.id == "multi" && *port == 1716));
+    }
+
+    fn plain_info(id: &str) -> DeviceInfo {
+        DeviceInfo {
+            id: id.into(),
+            name: id.into(),
+            device_type: "phone".into(),
+            protocol_version: 9,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+        }
+    }
+
+    /// Review finding A: the address on the card and the remembered one were
+    /// dialled straight from `redial_targets` every second when dead, because
+    /// only addresses already in the book had a backoff.
+    #[test]
+    fn the_cards_address_and_the_remembered_one_back_off_when_dead() {
+        let info = plain_info("seeded");
+        let view = DeviceView::from_info(&info, "10.1.0.8".to_string(), true);
+        let devices: HashMap<String, DeviceView> = [("seeded".to_string(), view)].into();
+        let known: HashMap<String, (DeviceInfo, u16)> =
+            [("seeded".to_string(), (info, 1716))].into();
+        let persisted: HashMap<String, SocketAddr> =
+            [("seeded".to_string(), "10.1.0.9:1716".parse().unwrap())].into();
+        let mut book = AddressBook::default();
+        let start = Instant::now();
+        let dialled = |book: &mut AddressBook, at: Instant| {
+            let mut ips: Vec<String> =
+                redial_targets(&devices, &known, &persisted, book, at, |_| true)
+                    .iter()
+                    .map(|(_, ip, _)| ip.to_string())
+                    .collect();
+            ips.sort();
+            ips
+        };
+        assert_eq!(dialled(&mut book, start), ["10.1.0.8", "10.1.0.9"]);
+        // Both are dead.
+        book.failed("seeded", ip("10.1.0.8"), start);
+        book.failed("seeded", ip("10.1.0.9"), start);
+        // Every second passes; nothing is dialled until the backoff is over.
+        for second in 1..3 {
+            assert!(
+                dialled(&mut book, start + Duration::from_secs(second)).is_empty(),
+                "second {second}"
+            );
+        }
+        assert_eq!(
+            dialled(&mut book, start + Duration::from_secs(3)).len(),
+            2,
+            "then again"
+        );
+        // The seeds never reset a failure count.
+        book.failed("seeded", ip("10.1.0.8"), start + Duration::from_secs(3));
+        assert_eq!(address_backoff(2).as_secs(), 6);
+        assert!(dialled(&mut book, start + Duration::from_secs(8)).len() == 1);
+    }
+
+    /// Review finding A: the remembered addresses were read once at start.
+    #[test]
+    fn an_address_remembered_later_is_seen_by_the_redialer() {
+        let trusted: std::collections::HashSet<String> = ["late-phone".to_string()].into();
+        let before = persisted_snapshot();
+        assert!(!before.contains_key("late-phone"));
+        persist_endpoint("late-phone", "10.2.0.5:1716".parse().unwrap(), &trusted);
+        assert_eq!(
+            persisted_snapshot().get("late-phone"),
+            Some(&"10.2.0.5:1716".parse().unwrap())
+        );
+    }
+
+    /// Review finding I: a spoofed beacon must not push the real addresses
+    /// out, and an unverified address becomes verified only by a handshake.
+    #[test]
+    fn unverified_addresses_never_evict_verified_ones() {
+        let mut book = AddressBook::default();
+        let now = Instant::now();
+        for real in ["10.3.0.1", "10.3.0.2", "10.3.0.3"] {
+            book.seen("phone", ip(real));
+        }
+        for fake in ["10.3.9.1", "10.3.9.2", "10.3.9.3", "10.3.9.4"] {
+            book.candidate("phone", ip(fake));
+        }
+        let due = book.due("phone", now);
+        for real in ["10.3.0.1", "10.3.0.2", "10.3.0.3"] {
+            assert!(due.contains(&ip(real)), "{real} is still there");
+        }
+        assert_eq!(due.len(), 5, "three real, at most two unverified");
+        // Verified only once a pinned handshake worked over it.
+        book.worked("phone", ip("10.3.9.4"));
+        assert!(book.due("phone", now).contains(&ip("10.3.9.4")));
+        // A known address is not reset by a candidate sighting.
+        book.failed("phone", ip("10.3.0.3"), now);
+        book.candidate("phone", ip("10.3.0.3"));
+        assert!(!book.due("phone", now).contains(&ip("10.3.0.3")));
+    }
+
+    /// Review finding I: a beacon's effect is rate-limited per phone.
+    #[test]
+    fn a_beacon_wakes_a_phone_at_most_every_five_seconds() {
+        let start = Instant::now();
+        assert!(beacon_may_act("beacon-phone", start));
+        assert!(!beacon_may_act(
+            "beacon-phone",
+            start + Duration::from_secs(1)
+        ));
+        assert!(!beacon_may_act(
+            "beacon-phone",
+            start + Duration::from_secs(4)
+        ));
+        assert!(beacon_may_act(
+            "beacon-phone",
+            start + Duration::from_secs(5)
+        ));
+        assert!(beacon_may_act(
+            "other-beacon-phone",
+            start + Duration::from_secs(1)
+        ));
+    }
+
+    /// Review finding I: unicast beacons share the per-address backoff.
+    #[test]
+    fn unicast_beacons_to_a_silent_address_get_rarer() {
+        let mut book = AddressBook::default();
+        book.seen("silent", ip("10.4.0.1"));
+        let start = Instant::now();
+        let sent = |book: &mut AddressBook, at: u64| {
+            book.beacon_targets("silent", start + Duration::from_secs(at))
+                .len()
+        };
+        assert_eq!(sent(&mut book, 0), 1);
+        assert_eq!(sent(&mut book, 10), 0);
+        assert_eq!(sent(&mut book, 15), 1);
+        assert_eq!(sent(&mut book, 30), 0, "the gap doubled to 30 s");
+        assert_eq!(sent(&mut book, 45), 1);
+        // The 300 s cap.
+        let mut at = 45;
+        for _ in 0..8 {
+            at += 301;
+            assert_eq!(sent(&mut book, at), 1);
+        }
+        // A sign of the phone starts it over.
+        book.wake(Some("silent"));
+        assert_eq!(sent(&mut book, at + 1), 1);
+        assert_eq!(sent(&mut book, at + 2), 0);
+        book.wake(Some("silent"));
+        assert_eq!(sent(&mut book, at + 3), 1);
     }
 
     /// Only paired phones are remembered, strangers' identities are not

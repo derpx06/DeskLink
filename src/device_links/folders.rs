@@ -844,8 +844,16 @@ pub(crate) fn on_packet(device_id: &str, packet: &NetworkPacket) {
 
 /// The link to `device_id` came up or went down: sync runs only while up.
 pub(crate) fn link(device_id: &str, ready: bool) {
+    #[cfg(test)]
+    if let Ok(mut links) = TEST_LINKS.lock() {
+        links.push((device_id.to_string(), ready));
+    }
     send_message(Message::Link(device_id.to_string(), ready));
 }
+
+/// Tests: every call of [`link`], in order.
+#[cfg(test)]
+static TEST_LINKS: Mutex<Vec<(String, bool)>> = Mutex::new(Vec::new());
 
 pub(crate) fn decline(device_id: &str, id: &str) {
     send_message(Message::Decline {
@@ -3671,11 +3679,18 @@ mod tests {
     }
 
     fn bucket_worker(base: &Path, root: &Path) -> Worker {
+        let mut worker = bucket_worker_for(base, root, "phone-b");
+        worker.ready = ["phone-b".to_string()].into();
+        worker
+    }
+
+    /// A worker with `device`'s Bucket, the phone not yet ready.
+    fn bucket_worker_for(base: &Path, root: &Path, device: &str) -> Worker {
         let pair = Pair {
             id: BUCKET_ID.into(),
             name: "DeskLink Bucket".into(),
             root: root.to_path_buf(),
-            device: "phone-b".into(),
+            device: device.into(),
             include_hidden: false,
             ignore: Vec::new(),
             bucket: true,
@@ -3683,7 +3698,7 @@ mod tests {
         let worker = Worker {
             dir: base.join("state"),
             pairs: vec![Live::new(pair, Book::default())],
-            ready: ["phone-b".to_string()].into(),
+            ready: HashSet::new(),
             asked: HashMap::new(),
             offered: Vec::new(),
             dirty: Default::default(),
@@ -3697,6 +3712,75 @@ mod tests {
         let base = std::env::temp_dir().join(format!("desklink-{name}-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&base).unwrap();
         base
+    }
+
+    // ── Folder sync starts when the phone is feature-ready ────────────────
+
+    /// Regression: the W1 removals deleted `folders::link(id, true)` together
+    /// with the automations call beside it, so the worker never counted a phone
+    /// as ready and the Bucket never synced. The chain: a link goes
+    /// feature-ready, the folder worker is told, a file written into the
+    /// Bucket's folder is scanned and its manifest goes out.
+    #[test]
+    fn a_feature_ready_link_makes_the_bucket_sync_and_send_its_manifest() {
+        let device = format!(
+            "{}{}",
+            super::super::desk_features::TEST_OUTBOX_PREFIX,
+            uuid::Uuid::new_v4().simple()
+        );
+        let base = scratch("ready-chain");
+        let root = base.join("bucket");
+        fs::create_dir_all(&root).unwrap();
+        let mut worker = bucket_worker_for(&base, &root, &device);
+        fs::write(root.join("hello.txt"), "hi").unwrap();
+        let manifests = |device: &str| {
+            super::super::desk_features::test_sent(device)
+                .into_iter()
+                .filter(|packet| {
+                    packet.packet_type == PACKET_TYPE_FOLDERS
+                        && packet.get_str("op") == Some("manifest")
+                })
+                .collect::<Vec<_>>()
+        };
+        // A phone that is not ready is not synced, however long it waits.
+        for _ in 0..3 {
+            worker.tick();
+        }
+        assert!(manifests(&device).is_empty());
+
+        // The link goes feature-ready: this is what the daemon calls.
+        super::super::desk_features::on_feature_ready(&device);
+        let linked = |device: &str| -> Vec<bool> {
+            TEST_LINKS
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(owner, _)| owner == device)
+                .map(|(_, ready)| *ready)
+                .collect()
+        };
+        let waited = Instant::now();
+        while linked(&device).is_empty() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "feature-ready never told the folder worker"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(linked(&device), [true]);
+
+        // The folder worker hears it, scans, and sends the manifest.
+        worker.handle(Message::Link(device.clone(), true));
+        worker.tick();
+        let sent = manifests(&device);
+        assert_eq!(sent.len(), 1, "one manifest");
+        let listed = serde_json::Value::Object(sent[0].body.clone()).to_string();
+        assert!(listed.contains("hello.txt"), "{listed}");
+        let pairs = super::super::desk_features::test_sent(&device)
+            .into_iter()
+            .any(|packet| packet.get_str("op") == Some("pairs"));
+        assert!(pairs, "the phone is told which pairs this side has");
+        let _ = fs::remove_dir_all(base);
     }
 
     // ── F8c ────────────────────────────────────────────────────────────────

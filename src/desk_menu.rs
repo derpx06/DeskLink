@@ -252,6 +252,18 @@ pub(crate) fn entries(
                 label: header,
                 icon,
             });
+            // The ladder gave up: the way to act on "Try again".
+            if let Some(error) = phone
+                .last_error
+                .as_deref()
+                .filter(|error| crate::device_links::webrtc::coordinator::is_unavailable(error))
+            {
+                menu.push(TrayEntry::Label(error.to_string()));
+                menu.push(
+                    TrayEntry::action("Try Again", format!("reconnect:{}", phone.id))
+                        .icon("view-refresh-symbolic"),
+                );
+            }
         } else if Some(index) == first_ready {
             menu.push(TrayEntry::Header {
                 label: header,
@@ -418,6 +430,7 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
         }
         "end-sessions" => app.activate_action("end-sessions", Some(&target.to_variant())),
         "open-bucket" => app.activate_action("open-bucket", Some(&target.to_variant())),
+        "reconnect" => daemon.send(DaemonCommand::Reconnect(target)),
         "keep-awake-on" | "keep-awake-off" => {
             daemon.send(DaemonCommand::SetStayAwake(verb == "keep-awake-on"))
         }
@@ -510,6 +523,22 @@ mod tests {
                 _ => Vec::new(),
             })
             .collect()
+    }
+
+    /// Review finding D: once the ladder gives up, the tray has a button.
+    #[test]
+    fn an_unreachable_phone_has_a_try_again_entry_only_when_the_ladder_gave_up() {
+        let tray =
+            |device: DeviceView| actions(&entries(&[device], &AppSettings::default(), &[], false));
+        let mut gave_up = phone("tray-retry", false);
+        gave_up.last_error = Some(crate::device_links::webrtc::coordinator::unavailable_words(
+            "Phone tray-retry",
+        ));
+        assert!(tray(gave_up.clone()).contains(&"reconnect:tray-retry".to_string()));
+        let mut other = gave_up;
+        other.last_error = Some("Update DeskLink on Phone tray-retry".into());
+        assert!(!tray(other).contains(&"reconnect:tray-retry".to_string()));
+        assert!(!tray(phone("tray-retry", false)).contains(&"reconnect:tray-retry".to_string()));
     }
 
     #[test]

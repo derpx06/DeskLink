@@ -305,6 +305,98 @@ impl PairingContext {
     }
 }
 
+/// What to do with an older record that a new pairing of the same name and
+/// type might replace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Replacement {
+    /// Offline, and the same machine by a second signal: replaced.
+    Replace,
+    /// The older phone is connected right now: it is a different phone.
+    KeepOnline,
+    /// Offline, but nothing says it is the same machine: two phones of one
+    /// model are both "realme 14 5G". Kept; the user can remove it.
+    KeepTwin,
+}
+
+/// The decision, from facts only. `same_machine`: the old record was last
+/// reached at the address the new phone paired from.
+pub(super) fn replacement_verdict(old_is_live: bool, same_machine: bool) -> Replacement {
+    if old_is_live {
+        Replacement::KeepOnline
+    } else if same_machine {
+        Replacement::Replace
+    } else {
+        Replacement::KeepTwin
+    }
+}
+
+/// Whether the old record's last known address (its card's, or the remembered
+/// one) is the address the new phone is on.
+pub(super) fn same_machine(
+    old_card: Option<std::net::IpAddr>,
+    old_remembered: Option<std::net::IpAddr>,
+    new_card: Option<std::net::IpAddr>,
+) -> bool {
+    let Some(new_card) = new_card else {
+        return false;
+    };
+    old_card == Some(new_card) || old_remembered == Some(new_card)
+}
+
+/// A pairing succeeded for `candidate.new_id`; `candidate.old_id` has the same
+/// name and type. Replaced only when its record has no live session and the
+/// new phone is at its last known address; the user is told which pairing
+/// was replaced. (The old record's identity is not kept: a phone that was
+/// replaced by mistake is told `pair:false` when it next sends anything and
+/// has to be paired again.)
+pub(super) fn consider_replacement(
+    sessions: &Arc<DeviceManager>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    config: &Arc<Mutex<crate::device_links::config::Config>>,
+    events: &Arc<Mutex<Vec<super::DaemonEvent>>>,
+    errors: &Arc<Mutex<Vec<String>>>,
+    candidate: crate::device_links::config::ReplacementCandidate,
+) {
+    let address = |id: &str| {
+        devices.lock().ok().and_then(|devices| {
+            devices
+                .get(id)
+                .and_then(|device| device.address.parse().ok())
+        })
+    };
+    let remembered = super::discovery::persisted_ip(&candidate.old_id);
+    let verdict = replacement_verdict(
+        sessions.current_binding(&candidate.old_id).is_some(),
+        same_machine(
+            address(&candidate.old_id),
+            remembered,
+            address(&candidate.new_id),
+        ),
+    );
+    if verdict != Replacement::Replace {
+        debug_log!(
+            "[Pairing] kept the older pairing of {} next to the new one: {verdict:?}",
+            candidate.name
+        );
+        return;
+    }
+    let removed = config
+        .lock()
+        .map_err(|_| "Config lock poisoned".to_string())
+        .and_then(|mut config| config.untrust_device(&candidate.old_id));
+    if let Err(error) = removed {
+        super::state::push_error(errors, error);
+        return;
+    }
+    forget_replaced(sessions, devices, &candidate.old_id);
+    super::state::push_event(
+        events,
+        super::DaemonEvent::PairingReplaced {
+            name: candidate.name,
+        },
+    );
+}
+
 /// Everything the daemon holds for a pairing that a newer one replaced (or
 /// that was removed): its session and peer, its card, the addresses it was
 /// dialled at and what was remembered of its snapshots.
@@ -314,10 +406,14 @@ pub(super) fn forget_replaced(
     device_id: &str,
 ) {
     if let Some(binding) = sessions.current_binding(device_id) {
-        if let Ok((_packet, Some(peer))) =
+        if let Ok((packet, peer)) =
             sessions.revoke_pairing(&binding, "Replaced by a newer pairing".to_string())
         {
-            peer.close();
+            // Told, not just cut off: this `pair:false` was discarded.
+            let _ = binding.link.send_packet(&packet);
+            if let Some(peer) = peer {
+                peer.close();
+            }
         }
         binding.link.close();
     } else if let Some(peer) = sessions.forget_pairing(device_id) {
@@ -334,6 +430,140 @@ pub(super) fn forget_replaced(
 mod replaced_tests {
     use super::*;
     use crate::device_links::core::SessionLink;
+
+    fn info(id: &str, name: &str) -> crate::device_links::device_info::DeviceInfo {
+        crate::device_links::device_info::DeviceInfo {
+            id: id.into(),
+            name: name.into(),
+            device_type: "phone".into(),
+            protocol_version: 9,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+        }
+    }
+
+    struct Replacing {
+        sessions: Arc<DeviceManager>,
+        devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+        config: Arc<Mutex<crate::device_links::config::Config>>,
+        events: Arc<Mutex<Vec<super::super::DaemonEvent>>>,
+        errors: Arc<Mutex<Vec<String>>>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Drop for Replacing {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Two paired records of one name: `old` at `old_address`, `new` just
+    /// paired at `new_address`.
+    fn replacing(old_address: &str, new_address: &str) -> Replacing {
+        let dir = std::env::temp_dir().join(format!("desklink-c-{}", uuid::Uuid::new_v4()));
+        let mut config = crate::device_links::config::Config::load_from_dir(dir.clone()).unwrap();
+        config
+            .trust_device(&info("old-phone", "realme 14 5G"), "cert-old".into())
+            .unwrap();
+        config
+            .trust_device(&info("new-phone", "realme 14 5G"), "cert-new".into())
+            .unwrap();
+        let devices: Arc<Mutex<HashMap<String, DeviceView>>> = Arc::default();
+        for (id, address) in [("old-phone", old_address), ("new-phone", new_address)] {
+            devices.lock().unwrap().insert(
+                id.into(),
+                DeviceView::from_info(&info(id, "realme 14 5G"), address.into(), true),
+            );
+        }
+        Replacing {
+            sessions: Arc::new(DeviceManager::new()),
+            devices,
+            config: Arc::new(Mutex::new(config)),
+            events: Arc::default(),
+            errors: Arc::default(),
+            dir,
+        }
+    }
+
+    fn candidate() -> crate::device_links::config::ReplacementCandidate {
+        crate::device_links::config::ReplacementCandidate {
+            old_id: "old-phone".into(),
+            new_id: "new-phone".into(),
+            name: "realme 14 5G".into(),
+        }
+    }
+
+    fn run(setup: &Replacing) {
+        consider_replacement(
+            &setup.sessions,
+            &setup.devices,
+            &setup.config,
+            &setup.events,
+            &setup.errors,
+            candidate(),
+        );
+    }
+
+    /// Review finding C: an offline twin at the same address is the same
+    /// phone reinstalled: replaced, and the user is told.
+    #[test]
+    fn an_offline_record_at_the_same_address_is_replaced_and_announced() {
+        let setup = replacing("10.5.0.7", "10.5.0.7");
+        run(&setup);
+        let config = setup.config.lock().unwrap();
+        assert!(!config.is_trusted("old-phone") && config.is_trusted("new-phone"));
+        assert!(setup.devices.lock().unwrap().get("old-phone").is_none());
+        assert!(matches!(
+            setup.events.lock().unwrap().as_slice(),
+            [super::super::DaemonEvent::PairingReplaced { name }] if name == "realme 14 5G"
+        ));
+    }
+
+    /// Review finding C: two phones of one model must not delete each other.
+    #[test]
+    fn an_offline_twin_elsewhere_is_kept() {
+        let setup = replacing("10.5.0.7", "10.5.0.99");
+        run(&setup);
+        let config = setup.config.lock().unwrap();
+        assert!(config.is_trusted("old-phone") && config.is_trusted("new-phone"));
+        assert!(setup.events.lock().unwrap().is_empty(), "nothing replaced");
+    }
+
+    /// Review finding C: a record with a live session is never replaced, even
+    /// at the same address.
+    #[test]
+    fn a_connected_record_is_never_replaced() {
+        let setup = replacing("10.5.0.7", "10.5.0.7");
+        setup
+            .sessions
+            .register_link(
+                "old-phone".into(),
+                crate::device_links::core::SessionLink::test_placeholder("old-phone"),
+                true,
+            )
+            .unwrap();
+        run(&setup);
+        assert!(setup.config.lock().unwrap().is_trusted("old-phone"));
+        assert!(setup.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_replacement_verdict_needs_offline_and_the_same_machine() {
+        assert_eq!(replacement_verdict(true, true), Replacement::KeepOnline);
+        assert_eq!(replacement_verdict(false, false), Replacement::KeepTwin);
+        assert_eq!(replacement_verdict(false, true), Replacement::Replace);
+        let ip = |text: &str| text.parse().ok();
+        assert!(same_machine(ip("10.0.0.1"), None, ip("10.0.0.1")));
+        assert!(same_machine(None, ip("10.0.0.1"), ip("10.0.0.1")));
+        assert!(!same_machine(
+            ip("10.0.0.2"),
+            ip("10.0.0.3"),
+            ip("10.0.0.1")
+        ));
+        assert!(!same_machine(None, None, None));
+        assert!(!same_machine(ip("10.0.0.1"), None, None));
+    }
 
     /// A phone that paired again under a new id left a ghost: its session,
     /// card, addresses and remembered revs all go, so nothing redials it.

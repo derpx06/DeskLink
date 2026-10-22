@@ -345,6 +345,14 @@ fn actions(device: &DeviceView, settings: &AppSettings) -> Vec<&'static str> {
     if device.trusted && crate::device_links::folders::bucket_on(&device.id) {
         actions.push("open-bucket");
     }
+    // "Can't reach … · Try again" has something to press.
+    if device
+        .last_error
+        .as_deref()
+        .is_some_and(crate::device_links::webrtc::coordinator::is_unavailable)
+    {
+        actions.push("try-again");
+    }
     // Ending is local (stop sharing, detach terminals), so it does not wait
     // for the feature transport.
     if device.desktop_session != DesktopSession::None || device.terminal_sessions_attached > 0 {
@@ -727,6 +735,7 @@ fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str
             action.trim_start_matches("call-").to_string(),
             None,
         )),
+        ("try-again", Some(id), Some(daemon)) => daemon.send(DaemonCommand::Reconnect(id)),
         ("reconnect", _, Some(daemon)) => {
             daemon.send(DaemonCommand::NetworkChanged);
             daemon.send(DaemonCommand::Discover);

@@ -30,6 +30,15 @@ pub struct FeatureTransportSnapshot {
     pub web_rtc_ready: bool,
 }
 
+/// What an install of a WebRTC peer did.
+#[allow(clippy::large_enum_variant)] // the refused peer is handed back whole, once per race
+pub enum Installed {
+    /// The peer is the session's now; the one it replaced, if any.
+    Replaced(Option<Arc<DesktopWebRtcPeer>>),
+    /// The session already had a peer: the new one comes back, unused.
+    Occupied(DesktopWebRtcPeer),
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionError {
@@ -835,9 +844,57 @@ impl DeviceManager {
         peer: DesktopWebRtcPeer,
         transfer_manager: Arc<WebRtcTransferManager>,
     ) -> Result<Option<Arc<DesktopWebRtcPeer>>, SessionError> {
+        match self.install_webrtc_peer_with(
+            binding,
+            attempt_id,
+            wire_binding,
+            peer,
+            transfer_manager,
+            false,
+        )? {
+            Installed::Replaced(replaced) => Ok(replaced),
+            Installed::Occupied(_) => unreachable!("a replacing install is never refused"),
+        }
+    }
+
+    /// Like [`Self::install_webrtc_peer`], but only if the session has no peer
+    /// yet, decided under the same lock as the install: two starters (a wake, a
+    /// beacon and a network change within milliseconds) can both have seen "no
+    /// peer", and the second used to replace the first's half-built pipeline.
+    /// A refused install gives the peer back for the caller to close.
+    pub fn install_webrtc_peer_if_none(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: String,
+        wire_binding: WebRtcWireBinding,
+        peer: DesktopWebRtcPeer,
+        transfer_manager: Arc<WebRtcTransferManager>,
+    ) -> Result<Installed, SessionError> {
+        self.install_webrtc_peer_with(
+            binding,
+            attempt_id,
+            wire_binding,
+            peer,
+            transfer_manager,
+            true,
+        )
+    }
+
+    fn install_webrtc_peer_with(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: String,
+        wire_binding: WebRtcWireBinding,
+        peer: DesktopWebRtcPeer,
+        transfer_manager: Arc<WebRtcTransferManager>,
+        only_if_none: bool,
+    ) -> Result<Installed, SessionError> {
         self.with_session(binding, |session| {
             if session.pairing.state != crate::device_links::pairing::PairState::Paired {
                 return Err(SessionError::NotPaired);
+            }
+            if only_if_none && session.active_webrtc.is_some() {
+                return Ok(Installed::Occupied(peer));
             }
             if session
                 .webrtc_handover
@@ -852,7 +909,7 @@ impl DeviceManager {
             session.webrtc_attempt_id = Some(attempt_id);
             session.seen_webrtc_request_ids.clear();
             session.seen_webrtc_message_ids.clear();
-            Ok(replaced)
+            Ok(Installed::Replaced(replaced))
         })?
     }
 

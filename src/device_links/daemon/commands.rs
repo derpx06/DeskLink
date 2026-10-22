@@ -20,6 +20,9 @@ pub enum DaemonCommand {
     AcceptPair(String, Option<String>),
     RejectPair(String),
     Unpair(String),
+    /// "Try again" for a phone that can't be reached: the recovery ladder
+    /// starts over and the phone is tried now.
+    Reconnect(String),
     /// Show a fresh QR pairing code (see `pairing_qr`); the UI reads it back
     /// with `pairing_qr::current_uri`.
     StartQrPairing,
@@ -155,6 +158,15 @@ impl DaemonWorker {
                 self.reject_pair(&device_id);
             }
             DaemonCommand::Unpair(device_id) => self.unpair(&device_id),
+            DaemonCommand::Reconnect(device_id) => {
+                crate::device_links::webrtc::coordinator::reconnect(
+                    &device_id,
+                    &self.sessions,
+                    &self.config,
+                    &self.devices,
+                    &self.events,
+                )
+            }
             DaemonCommand::SendPing(id) => self.send_ping(&id),
             DaemonCommand::SendMousepadRequest(id, payload) => {
                 self.send_mousepad_request(&id, payload)

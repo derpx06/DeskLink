@@ -14,7 +14,7 @@
 //! process re-sends everything by construction. Changes after ready are
 //! always sent live.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -54,6 +54,16 @@ struct PeerSync {
     theirs: Option<Theirs>,
     /// A connection waiting for the peer's `have` (its token).
     waiting: Option<u64>,
+    /// Snapshots whose items are still arriving: remembered once complete.
+    pending: HashMap<String, Pending>,
+}
+
+/// A snapshot (its `rev`) waiting for the items it listed.
+#[derive(Debug)]
+struct Pending {
+    instance: String,
+    rev: String,
+    missing: HashSet<String>,
 }
 
 fn state() -> &'static Mutex<HashMap<String, PeerSync>> {
@@ -115,11 +125,92 @@ pub(crate) fn note_received(
         return;
     };
     with(device_id, |peer| {
-        if peer.received_from.as_deref() != Some(instance) {
-            peer.have.clear();
-            peer.received_from = Some(instance.to_string());
+        peer.pending.remove(feature);
+        record(peer, instance, feature, rev);
+    });
+}
+
+fn record(peer: &mut PeerSync, instance: &str, feature: &str, rev: &str) {
+    if peer.received_from.as_deref() != Some(instance) {
+        peer.have.clear();
+        peer.received_from = Some(instance.to_string());
+    }
+    peer.have.insert(feature.to_string(), rev.to_string());
+}
+
+/// What was remembered of `feature` no longer describes what this side holds
+/// (a live change, or a snapshot only partly applied): forgotten, so the next
+/// `have` does not claim it. A remembered rev that outlives the state it
+/// described would suppress the very snapshot that repairs it.
+pub(crate) fn forget_feature(device_id: &str, feature: &str) {
+    with(device_id, |peer| {
+        peer.have.remove(feature);
+        peer.pending.remove(feature);
+    });
+}
+
+/// A snapshot of `feature` that lists items which arrive separately (the
+/// notifications' ids, then their bodies): its rev is remembered once every
+/// id in `missing` has arrived, not before. What was remembered of the
+/// feature goes at once: the list was replaced.
+pub(crate) fn note_when_complete(
+    device_id: &str,
+    instance: Option<&str>,
+    feature: &str,
+    packet: &NetworkPacket,
+    missing: HashSet<String>,
+) {
+    forget_feature(device_id, feature);
+    if missing.is_empty() {
+        note_received(device_id, instance, feature, packet);
+        return;
+    }
+    let Some(rev) = packet
+        .get_str("rev")
+        .filter(|rev| !rev.is_empty() && rev.chars().count() <= MAX_REV_CHARS)
+    else {
+        return;
+    };
+    let (Some(instance), true) = (instance, FEATURES.contains(&feature)) else {
+        return;
+    };
+    with(device_id, |peer| {
+        peer.pending.insert(
+            feature.to_string(),
+            Pending {
+                instance: instance.to_string(),
+                rev: rev.to_string(),
+                missing,
+            },
+        );
+    });
+}
+
+/// A live item of `feature` arrived (an upsert) or went (a cancel; `id` is
+/// `None`). If it is one a pending snapshot was waiting for, that snapshot
+/// may now be complete and is remembered. Anything else is a live change to
+/// the list: whatever was remembered, or pending, is forgotten.
+pub(crate) fn item_changed(device_id: &str, feature: &str, id: Option<&str>) {
+    with(device_id, |peer| {
+        let waiting = peer
+            .pending
+            .get_mut(feature)
+            .zip(id)
+            .is_some_and(|(pending, id)| pending.missing.remove(id));
+        if !waiting {
+            peer.have.remove(feature);
+            peer.pending.remove(feature);
+            return;
         }
-        peer.have.insert(feature.to_string(), rev.to_string());
+        if peer
+            .pending
+            .get(feature)
+            .is_some_and(|pending| pending.missing.is_empty())
+        {
+            if let Some(done) = peer.pending.remove(feature) {
+                record(peer, &done.instance, feature, &done.rev);
+            }
+        }
     });
 }
 
@@ -137,6 +228,8 @@ pub(crate) fn forget_connection(device_id: &str) {
     with(device_id, |peer| {
         peer.theirs = None;
         peer.waiting = None;
+        // A snapshot whose items were still arriving never completes.
+        peer.pending.clear();
     });
 }
 
@@ -364,6 +457,96 @@ mod tests {
             .unwrap()
             .have
             .is_empty());
+    }
+
+    fn stamped(rev: &str) -> NetworkPacket {
+        let mut packet = snapshot("on");
+        packet.set("rev", rev);
+        packet
+    }
+
+    fn held(device: &str, feature: &str) -> Option<String> {
+        parse_have(&have_packet(device, Some("phone-1")))
+            .unwrap()
+            .have
+            .get(feature)
+            .cloned()
+    }
+
+    /// Review finding B: the notifications' rev was remembered with only the
+    /// ids; a link that dropped mid-flood left the desk claiming a list it
+    /// did not hold.
+    #[test]
+    fn a_snapshot_that_lists_items_is_remembered_only_when_all_have_arrived() {
+        let device = "sync-test-pending";
+        forget_device(device);
+        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<HashSet<_>>();
+        note_when_complete(
+            device,
+            Some("phone-1"),
+            "notifications",
+            &stamped("r1"),
+            ids(&["a", "b"]),
+        );
+        assert_eq!(held(device, "notifications"), None, "bodies are missing");
+        item_changed(device, "notifications", Some("a"));
+        assert_eq!(held(device, "notifications"), None, "one left");
+        item_changed(device, "notifications", Some("b"));
+        assert_eq!(held(device, "notifications").as_deref(), Some("r1"));
+        // A link drop mid-flood: a new snapshot with bodies missing replaces
+        // the old claim at once.
+        forget_connection(device);
+        note_when_complete(
+            device,
+            Some("phone-1"),
+            "notifications",
+            &stamped("r2"),
+            ids(&["c"]),
+        );
+        assert_eq!(held(device, "notifications"), None);
+        // Nothing missing: remembered straight away.
+        note_when_complete(
+            device,
+            Some("phone-1"),
+            "notifications",
+            &stamped("r3"),
+            HashSet::new(),
+        );
+        assert_eq!(held(device, "notifications").as_deref(), Some("r3"));
+        forget_device(device);
+    }
+
+    /// Review finding B: a live upsert, remove or cancel changes the list
+    /// without touching the rev, so the remembered rev goes.
+    #[test]
+    fn a_live_change_forgets_the_remembered_rev() {
+        let device = "sync-test-live";
+        forget_device(device);
+        note_received(device, Some("phone-1"), "notifications", &stamped("r1"));
+        note_received(device, Some("phone-1"), "media", &stamped("m1"));
+        assert_eq!(held(device, "notifications").as_deref(), Some("r1"));
+        // A cancel (no id waited for) and an upsert both forget it.
+        item_changed(device, "notifications", None);
+        assert_eq!(held(device, "notifications"), None);
+        note_received(device, Some("phone-1"), "notifications", &stamped("r1"));
+        item_changed(device, "notifications", Some("new"));
+        assert_eq!(held(device, "notifications"), None);
+        // Another feature is untouched; media is forgotten explicitly.
+        assert_eq!(held(device, "media").as_deref(), Some("m1"));
+        forget_feature(device, "media");
+        assert_eq!(held(device, "media"), None);
+        // A live change while a snapshot is pending drops that too.
+        note_when_complete(
+            device,
+            Some("phone-1"),
+            "notifications",
+            &stamped("r2"),
+            ["x".to_string()].into(),
+        );
+        item_changed(device, "notifications", None);
+        item_changed(device, "notifications", Some("x"));
+        assert_eq!(held(device, "notifications"), None, "never recorded");
+        forget_device(device);
     }
 
     #[test]

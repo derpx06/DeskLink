@@ -256,6 +256,7 @@ impl DaemonWorker {
         let shutdown = Arc::clone(&self.shutdown);
         let config = Arc::clone(&self.config);
         let errors = Arc::clone(&self.errors);
+        let events = Arc::clone(&self.events);
         thread::spawn(move || {
             let mut stay_awake = power::StayAwake::default();
             let mut tick: u32 = 0;
@@ -277,10 +278,14 @@ impl DaemonWorker {
                 // device to go unreachable — and the peer is told, so it stops
                 // waiting too.
                 pairing_commands::expire_pairings(&sessions, &devices, unix_secs());
-                // A phone that paired again under a new id replaced its old
-                // record: nothing may keep dialling or showing the ghost.
-                for ghost in super::config::take_replaced_devices() {
-                    pairing_commands::forget_replaced(&sessions, &devices, &ghost);
+                // A phone that paired again under a new id may be the same
+                // phone reinstalled: its old record is replaced only when it
+                // is offline and looks like the same machine, and the user is
+                // told.
+                for candidate in super::config::take_replacement_candidates() {
+                    pairing_commands::consider_replacement(
+                        &sessions, &devices, &config, &events, &errors, candidate,
+                    );
                 }
                 run_liveness_tick(&sessions, &devices);
                 state::reconcile_connection_status(&devices, &sessions.connection_snapshot());

@@ -675,30 +675,47 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         }
         PACKET_TYPE_MPRIS => {
             update_media_from_packet(devices, device_id, &packet);
-            crate::device_links::sync::note_received(
-                device_id,
-                binding.link.info.instance_id.as_deref(),
-                "media",
-                &packet,
-            );
+            if packet.get_str("rev").is_some() {
+                crate::device_links::sync::note_received(
+                    device_id,
+                    binding.link.info.instance_id.as_deref(),
+                    "media",
+                    &packet,
+                );
+            } else {
+                // A live change: what was remembered no longer describes the
+                // media shown, and the phone's next snapshot may carry the
+                // very rev that was.
+                crate::device_links::sync::forget_feature(device_id, "media");
+            }
             Ok(())
         }
         PACKET_TYPE_NOTIFICATION => {
             if packet.get_bool("snapshot").unwrap_or(false) {
-                replace_notifications(devices, device_id, &packet);
-                crate::device_links::sync::note_received(
+                let missing = replace_notifications(devices, device_id, &packet);
+                // Remembered once every id has its body here, not on the ids.
+                crate::device_links::sync::note_when_complete(
                     device_id,
                     binding.link.info.instance_id.as_deref(),
                     "notifications",
                     &packet,
+                    missing,
                 );
             } else if packet.get_bool("isCancel").unwrap_or(false) {
                 let id = packet
                     .get_str("id")
                     .ok_or_else(|| "DeskLink WebRTC notification cancel has no id".to_string())?;
                 remove_notification(devices, device_id, id);
+                crate::device_links::sync::item_changed(device_id, "notifications", None);
             } else {
-                upsert_notification(devices, device_id, &packet);
+                let stored = upsert_notification(devices, device_id, &packet);
+                // The id a snapshot was waiting for completes it; any other
+                // upsert changes the list, so its remembered rev goes.
+                crate::device_links::sync::item_changed(
+                    device_id,
+                    "notifications",
+                    stored.as_ref().map(|notification| notification.id.as_str()),
+                );
             }
             Ok(())
         }
@@ -762,7 +779,7 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         crate::device_links::packet::PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS => {
             let (device_id, packet) = (device_id.clone(), packet.clone());
             let instance = binding.link.info.instance_id.clone();
-            crate::device_links::desk_features::run_later(move || {
+            crate::device_links::desk_features::run_later_reliably(move || {
                 for request in crate::device_links::contacts::on_snapshot(
                     &device_id,
                     instance.as_deref(),
@@ -781,8 +798,10 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         // Delta resync (W2): what the phone already holds from this desk.
         crate::device_links::packet::PACKET_TYPE_SYNC_HAVE => {
             let (device_id, packet) = (device_id.clone(), packet.clone());
-            crate::device_links::desk_features::run_later(move || {
-                crate::device_links::desk_features::on_sync_have(&device_id, &packet)
+            // The connection it arrived on, taken now: the job runs later.
+            let connection = sessions.active_webrtc_attempt(binding).ok().flatten();
+            crate::device_links::desk_features::run_later_reliably(move || {
+                crate::device_links::desk_features::on_sync_have(&device_id, &packet, &connection)
             });
             Ok(())
         }
@@ -796,28 +815,35 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         | crate::device_links::packet::PACKET_TYPE_NOTES => {
             let (device_id, packet) = (device_id.clone(), packet.clone());
             let instance = binding.link.info.instance_id.clone();
-            crate::device_links::desk_features::run_later(move || {
+            crate::device_links::desk_features::run_later_reliably(move || {
                 let answers = crate::device_links::notes::on_packet(&device_id, &packet);
                 // An index with nothing to fetch is fully applied: remembered
                 // for the next resync.
-                if packet.get_str("op") == Some("index")
-                    && answers
-                        .iter()
-                        .all(|answer| answer.get_str("op") != Some("fetch"))
-                {
-                    let feature = if packet.packet_type
-                        == crate::device_links::packet::PACKET_TYPE_SNIPPETS
-                    {
+                let feature =
+                    if packet.packet_type == crate::device_links::packet::PACKET_TYPE_SNIPPETS {
                         "snippets"
                     } else {
                         "notes"
                     };
-                    crate::device_links::sync::note_received(
-                        &device_id,
-                        instance.as_deref(),
-                        feature,
-                        &packet,
-                    );
+                if packet.get_str("op") == Some("index") {
+                    if answers
+                        .iter()
+                        .all(|answer| answer.get_str("op") != Some("fetch"))
+                    {
+                        crate::device_links::sync::note_received(
+                            &device_id,
+                            instance.as_deref(),
+                            feature,
+                            &packet,
+                        );
+                    } else {
+                        // Partly applied: what was remembered of the older
+                        // index must not be claimed any more.
+                        crate::device_links::sync::forget_feature(&device_id, feature);
+                    }
+                } else {
+                    // An item or a change arrived live.
+                    crate::device_links::sync::forget_feature(&device_id, feature);
                 }
                 for answer in answers {
                     crate::device_links::desk_features::send(&device_id, &answer);

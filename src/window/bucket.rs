@@ -437,6 +437,15 @@ pub(super) fn update(win: &DesklinkWindow, device: &DeviceView) {
     );
 }
 
+/// Whether `device_id`'s phone has asked for a Bucket that is not on yet: the
+/// question "Turn on the Bucket?" waits for an answer.
+pub(super) fn asked(device_id: &str) -> bool {
+    bucket_of(device_id).is_none()
+        && folders::offers()
+            .iter()
+            .any(|offer| offer.device == device_id && offer.bucket)
+}
+
 /// Before the Bucket is on: what it is, one button.
 fn off_card(device: &DeviceView, asked: bool) -> gtk::Box {
     let card = gtk::Box::builder()
@@ -1963,6 +1972,7 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
             },
             glib::format_size(view.bytes)
         ),
+        None if asked(&device.id) => format!("{} asked for a Bucket. Turn it on?", device.name),
         None => format!("Off · share anything with {}", device.name),
     };
     let line = ellipsized(&subtitle, &["card-subtitle", "numeric"]);
@@ -1977,10 +1987,24 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
         bar: bar.downgrade(),
         speed: None,
     });
-    head.append(&super::page_link(
-        if view.is_some() { "Open" } else { "Set Up" },
-        "bucket",
-    ));
+    // The phone asked: the question is answered right here.
+    let asking = view.is_none() && asked(&device.id);
+    if asking {
+        let later = super::soft_button("Not Now");
+        let id = device.id.clone();
+        later.connect_clicked(move |_| folders::decline(&id, BUCKET_ID));
+        head.append(&later);
+        let on = super::soft_button("Turn On");
+        on.add_css_class("suggested-action");
+        let id = device.id.clone();
+        on.connect_clicked(move |_| folders::turn_on_bucket(&id));
+        head.append(&on);
+    } else {
+        head.append(&super::page_link(
+            if view.is_some() { "Open" } else { "Set Up" },
+            "bucket",
+        ));
+    }
     card.append(&head);
     card.append(&bar);
     let Some(view) = view else {
@@ -2036,6 +2060,49 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The phone asked for a Bucket: the question shows on the Overview card
+    /// and as a badge on the sidebar's Bucket entry until it is answered.
+    #[test]
+    fn a_bucket_the_phone_asked_for_is_a_question_until_it_is_on() {
+        use crate::device_links::folders::{Offer, Pair, PairView, Phase};
+        let device = "asked-bucket-phone";
+        assert!(!asked(device), "nothing asked");
+        folders::debug_show(
+            Vec::new(),
+            vec![Offer {
+                device: device.into(),
+                id: BUCKET_ID.into(),
+                name: "DeskLink Bucket".into(),
+                bucket: true,
+            }],
+        );
+        assert!(asked(device));
+        assert!(!asked("another-phone"));
+        // Turned on: no question any more.
+        folders::debug_show(
+            vec![PairView {
+                pair: Pair {
+                    id: BUCKET_ID.into(),
+                    name: "DeskLink Bucket".into(),
+                    root: std::env::temp_dir(),
+                    device: device.into(),
+                    include_hidden: false,
+                    ignore: Vec::new(),
+                    bucket: true,
+                },
+                phase: Phase::UpToDate,
+                files: 0,
+                last_sync: None,
+                conflicts: Vec::new(),
+                items: Vec::new(),
+                bytes: 0,
+                skipped: Vec::new(),
+            }],
+            Vec::new(),
+        );
+        assert!(!asked(device));
+    }
 
     #[test]
     fn the_overview_card_drops_at_the_top_whatever_folder_the_page_showed() {
