@@ -25,9 +25,9 @@
 //! module and is redrawn only when what it shows has changed.
 
 mod automations;
+mod bucket;
 pub(crate) mod calls;
 mod camera;
-mod folders;
 mod insert;
 mod sound;
 pub(crate) use calls::confirm_dial;
@@ -69,7 +69,7 @@ const PAGES: &[(&str, &str, &str)] = &[
     ("contacts", "Contacts", "x-office-address-book-symbolic"),
     ("notes", "Notes", "document-edit-symbolic"),
     ("automations", "Automations", "system-run-symbolic"),
-    ("folders", "Folders", "folder-symbolic"),
+    ("bucket", "Bucket", "folder-symbolic"),
     (
         "history",
         "Connection History",
@@ -953,7 +953,7 @@ impl DesklinkWindow {
             }
             "history" => history::update(self, device),
             "automations" => automations::update(self, device),
-            "folders" => folders::update(self, device),
+            "bucket" => bucket::update(self, device),
             "preferences" => prefs::update(self, daemon, device),
             _ => {}
         }
@@ -2180,67 +2180,111 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         "fire" => {
             crate::device_links::automations::fire(crate::device_links::automations::Step::new(id))
         }
-        // F8: pairs in each state, two conflicts and an offer, for the
-        // selected device; "folder-add PATH" offers a real one.
-        "fake-folders" => {
-            use crate::device_links::folders::{self, Conflict, Offer, Pair, PairView, Phase};
+        // F8b: "fake-bucket": a Bucket with items in every state for the
+        // selected device (shots without a phone); "bucket-on" turns the real
+        // one on; "bucket-add PATH" adds a file or folder as a drop would.
+        "fake-bucket" => {
+            use crate::device_links::folders::{
+                self, Item, ItemState, Pair, PairView, Phase, Side,
+            };
             let Some(device) = win.selected_id() else {
                 return true;
             };
-            let home = glib::home_dir();
-            let pair = |name: &str, folder: &str, phase: Phase, files: usize| PairView {
-                pair: Pair {
-                    id: format!("fake-{name}"),
-                    name: name.into(),
-                    root: home.join(folder),
-                    device: device.clone(),
-                    include_hidden: false,
-                    ignore: Vec::new(),
-                },
-                phase,
-                files,
-                last_sync: Some(1_761_130_000_000),
-                conflicts: Vec::new(),
+            let root = std::env::var_os("DESKLINK_FAKE_BUCKET")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| glib::home_dir().join("DeskLink Bucket"));
+            let item = |path: &str, size: u64, ago: i64, from: Side, state: ItemState| Item {
+                path: path.into(),
+                size,
+                mtime: 1_761_130_000_000 - ago * 60_000,
+                from,
+                state,
             };
-            let mut documents = pair("Documents", "Documents/Shared", Phase::UpToDate, 214);
-            documents.conflicts = vec![
-                Conflict {
-                    path: "plan/budget.ods".into(),
-                    copy: "plan/budget (conflict from Pixel 9 2026-10-22).ods".into(),
-                    at: 0,
-                },
-                Conflict {
-                    path: "notes.md".into(),
-                    copy: "notes (conflict from Pixel 9 2026-10-21).md".into(),
-                    at: 0,
-                },
+            let items = vec![
+                item(
+                    "Boarding pass.pdf",
+                    182_000,
+                    1,
+                    Side::Phone,
+                    ItemState::Receiving,
+                ),
+                item(
+                    "Sunset at the pier.jpg",
+                    3_400_000,
+                    4,
+                    Side::Phone,
+                    ItemState::Synced,
+                ),
+                item(
+                    "Quarterly report.pdf",
+                    920_000,
+                    15,
+                    Side::Desk,
+                    ItemState::Sending,
+                ),
+                item("notes.md", 4_200, 40, Side::Desk, ItemState::Conflict),
+                item("Wi-Fi password.txt", 64, 90, Side::Phone, ItemState::Synced),
+                item(
+                    "github.com 2026-10-22.url",
+                    90,
+                    120,
+                    Side::Desk,
+                    ItemState::Waiting,
+                ),
+                item(
+                    "Invoice 2041.pdf",
+                    210_000,
+                    300,
+                    Side::Desk,
+                    ItemState::Synced,
+                ),
             ];
+            let bytes = items.iter().map(|item| item.size).sum();
             folders::debug_show(
-                vec![
-                    documents,
-                    pair("Photos", "Pictures/Phone", Phase::Syncing(12), 1840),
-                    pair("Music", "Music", Phase::NotOnPhone, 0),
-                ],
-                vec![Offer {
-                    device: device.clone(),
-                    id: "fake-offer".into(),
-                    name: "Camera".into(),
+                vec![PairView {
+                    pair: Pair {
+                        id: folders::BUCKET_ID.into(),
+                        name: "DeskLink Bucket".into(),
+                        root,
+                        device: device.clone(),
+                        include_hidden: false,
+                        ignore: Vec::new(),
+                        bucket: true,
+                    },
+                    phase: Phase::UpToDate,
+                    files: items.len(),
+                    last_sync: Some(glib::real_time() / 1000 - 120_000),
+                    conflicts: vec![folders::Conflict {
+                        path: "notes.md".into(),
+                        copy: "notes (conflict from Pixel 9 2026-10-22).md".into(),
+                        at: 0,
+                    }],
+                    items: if id == "empty" { Vec::new() } else { items },
+                    bytes,
+                    skipped: if id == "empty" {
+                        Vec::new()
+                    } else {
+                        vec!["Old photos".into()]
+                    },
                 }],
+                Vec::new(),
             );
             win.refresh_soon();
         }
-        "folder-add" => {
+        "bucket-on" => {
             if let Some(device) = win.selected_id() {
-                crate::device_links::folders::add(&device, std::path::PathBuf::from(id));
+                crate::device_links::folders::turn_on_bucket(&device);
             }
         }
-        "expand-pairs" => {
-            if let Some((scroll, _)) = win.imp().bodies.borrow().get("folders").cloned() {
-                for row in named_widgets(scroll.upcast_ref(), "pair-row") {
-                    if let Some(row) = row.downcast_ref::<adw::ExpanderRow>() {
-                        row.set_expanded(true);
-                    }
+        "bucket-add" => {
+            if let Some(device) = win.selected_id() {
+                let (files, folder) =
+                    crate::device_links::folders::split_files(vec![std::path::PathBuf::from(id)]);
+                debug_log!("[E2E] bucket-add: {} file(s), folder {folder}", files.len());
+                if folder {
+                    win.show_feature_toast(crate::device_links::folders::FOLDERS_NOT_YET);
                 }
+                crate::device_links::folders::import(&device, files);
             }
         }
         "rule-template" => {
@@ -2909,7 +2953,7 @@ mod tests {
                 "contacts",
                 "notes",
                 "automations",
-                "folders",
+                "bucket",
                 "history",
                 "preferences"
             ]

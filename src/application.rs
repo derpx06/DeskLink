@@ -219,6 +219,7 @@ impl DesklinkApplication {
             })
             .build();
         crate::send_to::add_action(self);
+        crate::send_to::add_bucket_action(self);
         self.add_action_entries([
             quit_action,
             about_action,

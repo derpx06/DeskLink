@@ -122,7 +122,7 @@ pub(super) struct Page {
 }
 
 /// Cards a line in the grids: one to five, as wide allows.
-fn grid() -> gtk::FlowBox {
+pub(super) fn grid() -> gtk::FlowBox {
     gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .homogeneous(true)
@@ -136,7 +136,7 @@ fn grid() -> gtk::FlowBox {
 
 /// Adds `card` to `grid`; Tab and the arrow keys go card to card, not to
 /// the FlowBox's wrapper around each.
-fn add_card(grid: &gtk::FlowBox, card: &impl IsA<gtk::Widget>) {
+pub(super) fn add_card(grid: &gtk::FlowBox, card: &impl IsA<gtk::Widget>) {
     grid.append(card);
     if let Some(child) = card.as_ref().parent() {
         child.set_focusable(false);
@@ -434,7 +434,7 @@ fn preview_area() -> (gtk::Overlay, gtk::Box) {
 }
 
 /// A typed icon for a file with no picture: a PDF, a document.
-fn type_icon(name: &str) -> gtk::Box {
+pub(super) fn type_icon(name: &str) -> gtk::Box {
     let icon = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
@@ -533,7 +533,7 @@ fn waiters(key: &str) -> Vec<(gtk::Overlay, glib::WeakRef<gtk::Box>, String, Fil
 
 /// Shows a thumbnail in `overlay`: a shimmer now, the picture once the
 /// worker has made it (or a typed icon if it cannot be).
-fn fill_preview(
+pub(super) fn fill_preview(
     overlay: &gtk::Overlay,
     key: Option<&str>,
     path: &std::path::Path,

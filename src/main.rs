@@ -76,6 +76,10 @@ fn main() -> glib::ExitCode {
     if args.get(1).is_some_and(|arg| arg == "--send-files") {
         return send_to::run_cli(&args[2..]);
     }
+    // `desklink --bucket [--to <phone>] <files…>`: into the Bucket (F8b).
+    if args.get(1).is_some_and(|arg| arg == "--bucket") {
+        return send_to::run_bucket_cli(&args[2..]);
+    }
     // `desklink --dial <number>`, or a `tel:` link from a launcher that does
     // not use D-Bus activation: the running DeskLink asks, then the phone
     // calls. Handled here, so a second instance never starts.

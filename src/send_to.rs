@@ -20,6 +20,11 @@ const APP_PATH: &str = "/derx06/desklink/com";
 /// Marks a script DeskLink wrote, with the phone it is for.
 const SCRIPT_MARK: &str = "# desklink-device: ";
 const OPEN_WITH: &str = "derx06.desklink.com.SendTo.desktop";
+/// F8b: "Add to DeskLink Bucket" in Open With.
+const BUCKET_OPEN_WITH: &str = "derx06.desklink.com.Bucket.desktop";
+/// The Files script that puts the chosen files in the Bucket.
+const BUCKET_SCRIPT: &str = "Add to DeskLink Bucket";
+const BUCKET_SCRIPT_MARK: &str = "# desklink-bucket";
 /// File types the Open With entry is offered for; `application/octet-stream`
 /// puts it under "Open With…" for every file.
 const MIME_TYPES: &str = "application/octet-stream;image/jpeg;image/png;image/gif;image/webp;\
@@ -83,6 +88,26 @@ pub fn run_cli(args: &[String]) -> glib::ExitCode {
     }
     let parameter = (request.device.unwrap_or_default(), paths).to_variant();
     activate_running("send-files", parameter, "--send-files")
+}
+
+/// `desklink --bucket [--to <phone>] <files…>`: puts the files in that
+/// phone's Bucket (the running DeskLink copies them; folders are refused
+/// there, out loud).
+pub fn run_bucket_cli(args: &[String]) -> glib::ExitCode {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let request = parse(args, &cwd);
+    let paths: Vec<String> = request
+        .paths
+        .iter()
+        .filter(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    if paths.is_empty() {
+        eprintln!("desklink --bucket: nothing to add");
+        return glib::ExitCode::FAILURE;
+    }
+    let parameter = (request.device.unwrap_or_default(), paths).to_variant();
+    activate_running("bucket", parameter, "--bucket")
 }
 
 /// `desklink --dial <number>`: hands the number to the running DeskLink,
@@ -159,6 +184,65 @@ pub(crate) fn add_action(app: &DesklinkApplication) {
         send(&app, &device, &paths);
     });
     app.add_action(&action);
+}
+
+/// The `app.bucket` action: `(device, paths)` into that phone's Bucket
+/// ("" the first phone with one).
+pub(crate) fn add_bucket_action(app: &DesklinkApplication) {
+    let action = gio::SimpleAction::new("bucket", Some(glib::VariantTy::new("(sas)").unwrap()));
+    let weak = app.downgrade();
+    action.connect_activate(move |_, parameter| {
+        let (Some(app), Some((device, paths))) = (
+            weak.upgrade(),
+            parameter.and_then(|value| value.get::<(String, Vec<String>)>()),
+        ) else {
+            return;
+        };
+        to_bucket(
+            &app,
+            &device,
+            paths.into_iter().map(PathBuf::from).collect(),
+        );
+    });
+    app.add_action(&action);
+}
+
+fn to_bucket(app: &DesklinkApplication, device: &str, paths: Vec<PathBuf>) {
+    let buckets: Vec<String> = crate::device_links::folders::pairs()
+        .into_iter()
+        .filter(|view| view.pair.bucket)
+        .map(|view| view.pair.device)
+        .collect();
+    let target = if device.is_empty() {
+        buckets.first().cloned()
+    } else {
+        buckets.iter().find(|id| *id == device).cloned()
+    };
+    let notification = match target {
+        None => {
+            let notification = gio::Notification::new("The Bucket is off");
+            notification.set_body(Some("Turn on the Bucket in DeskLink first."));
+            notification
+        }
+        Some(device) => {
+            let (files, folder) = crate::device_links::folders::split_files(paths);
+            let count = files.len();
+            if count > 0 {
+                crate::device_links::folders::import(&device, files);
+            }
+            let notification = gio::Notification::new(&match count {
+                0 => "Nothing was added to the Bucket".to_string(),
+                1 => "Added to the Bucket".to_string(),
+                count => format!("Added {count} files to the Bucket"),
+            });
+            if folder {
+                notification.set_body(Some(crate::device_links::folders::FOLDERS_NOT_YET));
+            }
+            notification
+        }
+    };
+    notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+    app.send_notification(Some("bucket"), &notification);
 }
 
 fn send(app: &DesklinkApplication, device: &str, paths: &[String]) {
@@ -257,6 +341,22 @@ pub(crate) fn desktop_exec_quoted(path: &Path) -> String {
     }
     quoted.push('"');
     quoted
+}
+
+/// The Files script for the Bucket.
+pub(crate) fn bucket_script(exe: &Path) -> String {
+    format!(
+        "#!/bin/sh\n# Written by DeskLink.\n{BUCKET_SCRIPT_MARK}\nexec {} --bucket -- \"$@\"\n",
+        shell_quote(&exe.to_string_lossy()),
+    )
+}
+
+/// "Add to DeskLink Bucket" in Open With.
+pub(crate) fn bucket_open_with_entry(exe: &Path) -> String {
+    let exe = desktop_exec_quoted(exe);
+    format!(
+        "[Desktop Entry]\nType=Application\nName=Add to DeskLink Bucket\nComment=Put files in the Bucket you share with your phone\nIcon=derx06.desklink.com\nExec={exe} --bucket %F\nTerminal=false\nNoDisplay=true\nMimeType={MIME_TYPES}\n"
+    )
 }
 
 pub(crate) fn open_with_entry(exe: &Path) -> String {
@@ -372,6 +472,11 @@ pub fn start(app: &DesklinkApplication) {
     ) {
         eprintln!("[DeskLink] Could not add \"Send to Phone\" to Open With: {error}");
     }
+    let _ = write_if_changed(
+        &data.join("applications").join(BUCKET_OPEN_WITH),
+        &bucket_open_with_entry(&exe),
+        false,
+    );
     let scripts = data.join("nautilus").join("scripts");
     let service_menu = data.join("kio").join("servicemenus").join(SERVICE_MENU);
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
@@ -400,6 +505,13 @@ pub fn start(app: &DesklinkApplication) {
                 if let Err(error) = sync_scripts(&scripts, &exe, &phones) {
                     eprintln!("[DeskLink] Could not update the Files scripts: {error}");
                 }
+                // F8b: "Add to DeskLink Bucket", while a phone is paired.
+                let bucket = scripts.join(BUCKET_SCRIPT);
+                let _ = if phones.is_empty() {
+                    std::fs::remove_file(&bucket)
+                } else {
+                    write_if_changed(&bucket, &bucket_script(&exe), true)
+                };
             }
             if dolphin {
                 let written = if phones.is_empty() {

@@ -587,3 +587,46 @@ button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.0
 }
 .glide-slot { min-width: 40px; min-height: 40px; }
 .glide-slot:checked { background-color: @coral; color: @window_bg_color; }
+
+/* ── Bucket (F8b) ──────────────────────────────────────────────────────── */
+.bucket-hero { padding: 36px 28px 30px 28px; }
+.bucket-art {
+  border-radius: 20px;
+  background-color: alpha(@accent_color, 0.12);
+  color: @accent_color;
+  -gtk-icon-size: 30px;
+}
+.bucket-title { font-weight: 700; font-size: 18px; }
+.bucket-heading { font-weight: 800; font-size: 22px; letter-spacing: -0.01em; }
+.bucket-drop {
+  border-radius: 20px;
+  background-color: alpha(@accent_color, 0.035);
+}
+.bucket-drop-hover .bucket-drop,
+.bucket-drop.bucket-drop-hover,
+.bucket-drop-hover.file-card {
+  border-color: @accent_color;
+  background-color: alpha(@accent_color, 0.10);
+}
+.bucket-drop-hover { box-shadow: inset 0 0 0 2px alpha(@accent_color, 0.55); border-radius: 18px; }
+.bucket-badge {
+  min-width: 24px;
+  min-height: 24px;
+  border-radius: 12px;
+  padding: 2px;
+  -gtk-icon-size: 14px;
+  background-color: alpha(@window_bg_color, 0.92);
+  box-shadow: 0 1px 3px @card_shadow_near;
+}
+.bucket-badge > image, .bucket-badge > spinner { margin: 3px; }
+.bucket-badge.synced { color: @mint; }
+.bucket-badge.moving { color: @accent_color; }
+.bucket-badge.waiting { color: @text_dim; }
+.bucket-badge.conflict { background-color: @coral; color: @window_bg_color; }
+.bucket-words { padding-right: 38px; }
+.bucket-menu { min-width: 28px; min-height: 28px; }
+.bucket-recent {
+  padding: 10px 12px;
+  border-radius: 12px;
+  background-color: @surface_2;
+}

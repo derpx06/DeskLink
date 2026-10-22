@@ -846,6 +846,7 @@ fn columns(
     ));
     right.append(&notifications_card(device));
     right.append(&transfer_card(daemon, device));
+    right.append(&super::bucket::overview_card(device));
     if let Some(media) = device
         .media_status
         .as_ref()
