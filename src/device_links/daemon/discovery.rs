@@ -305,7 +305,9 @@ impl DaemonWorker {
                     }
                     Err(err)
                         if err.kind() == std::io::ErrorKind::WouldBlock
-                            || err.kind() == std::io::ErrorKind::TimedOut => {}
+                            || err.kind() == std::io::ErrorKind::TimedOut
+                            // A signal (suspend/resume) interrupted the wait: just read again.
+                            || err.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(err) => push_error(&errors, format!("UDP discovery failed: {err}")),
                 }
             }
