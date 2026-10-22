@@ -8,6 +8,7 @@ pub(crate) mod desk_features;
 pub(crate) mod desk_notifications;
 pub mod device;
 pub mod device_info;
+pub(crate) mod eis;
 pub mod features;
 pub(crate) mod logind;
 pub(crate) mod media_art;

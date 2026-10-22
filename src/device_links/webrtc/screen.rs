@@ -587,6 +587,9 @@ pub(crate) enum DesktopSource {
         fd: OwnedFd,
         node_id: u32,
         serial: Option<u64>,
+        /// An extended display (F2): the pixel size pinned on PipeWire,
+        /// which is what creates the virtual monitor at that size.
+        virtual_size: Option<(i32, i32)>,
     },
     /// The X11 root window, for desktops without a portal (`x11_desktop`).
     X11,
@@ -602,7 +605,7 @@ impl DesktopScreenCapture {
         request: ScreenRequest,
         continuity: Option<RtpContinuity>,
     ) -> Result<Self, String> {
-        let (source, pipewire_fd) = match source {
+        let (source, pipewire_fd, pinned) = match source {
             DesktopSource::PipeWire { node_id: 0, .. } => {
                 return Err(
                     "The desktop portal returned invalid screen stream metadata".to_string()
@@ -612,18 +615,23 @@ impl DesktopScreenCapture {
                 fd,
                 node_id,
                 serial,
-            } => (pipewire_source(&fd, node_id, serial)?, Some(fd)),
-            DesktopSource::X11 => (x11_source()?, None),
+                virtual_size,
+            } => (
+                pipewire_source(&fd, node_id, serial)?,
+                Some(fd),
+                virtual_size,
+            ),
+            DesktopSource::X11 => (x11_source()?, None, None),
         };
-        Self::attach_source(
+        Self::attach_source_sized(
             pipeline,
             webrtcbin,
             source,
             pipewire_fd,
-            width,
-            height,
+            (width, height),
             request,
             continuity,
+            pinned,
         )
     }
 
@@ -641,6 +649,32 @@ impl DesktopScreenCapture {
         request: ScreenRequest,
         continuity: Option<RtpContinuity>,
     ) -> Result<Self, String> {
+        Self::attach_source_sized(
+            pipeline,
+            webrtcbin,
+            source,
+            pipewire_fd,
+            (width, height),
+            request,
+            continuity,
+            None,
+        )
+    }
+
+    /// [`Self::attach_source`], with the source's size `pinned` on its caps:
+    /// an extended display's virtual monitor takes the size its consumer
+    /// negotiates (unpinned it came out 1×1).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attach_source_sized(
+        pipeline: &gst::Pipeline,
+        webrtcbin: &gst::Element,
+        source: gst::Element,
+        pipewire_fd: Option<OwnedFd>,
+        (width, height): (i32, i32),
+        request: ScreenRequest,
+        continuity: Option<RtpContinuity>,
+        pinned: Option<(i32, i32)>,
+    ) -> Result<Self, String> {
         if !(1..=8192).contains(&width) || !(1..=8192).contains(&height) {
             return Err("The desktop portal returned invalid screen stream metadata".to_string());
         }
@@ -656,8 +690,19 @@ impl DesktopScreenCapture {
         // the GPU path then refused: not-negotiated on the first frame, and
         // every reconnect to that stream failed (`gst_caps_is_fixed`
         // assertion, "error use input buffers: -22") until the share ended.
+        let caps = match pinned {
+            Some((w, h)) => gst::Caps::builder("video/x-raw")
+                .field("width", w)
+                .field("height", h)
+                .field(
+                    "max-framerate",
+                    gst::Fraction::new(request.fps.clamp(1, MAX_FPS as i32), 1),
+                )
+                .build(),
+            None => gst::Caps::new_empty_simple("video/x-raw"),
+        };
         let system_memory = gst::ElementFactory::make("capsfilter")
-            .property("caps", gst::Caps::new_empty_simple("video/x-raw"))
+            .property("caps", caps)
             .build()
             .map_err(|error| format!("DeskLink screen capture needs capsfilter: {error}"))?;
         // Scale before converting: colour conversion then runs on the small
@@ -1441,7 +1486,7 @@ pub(crate) fn desktop_share_selftest(device_id: &str) -> Result<String, String> 
 }
 
 /// The PipeWire frame source for a portal-approved stream.
-fn pipewire_source(
+pub(crate) fn pipewire_source(
     pipewire_fd: &OwnedFd,
     node_id: u32,
     pipewire_serial: Option<u64>,
@@ -1567,6 +1612,8 @@ pub(crate) fn negotiated_payload_in(
 pub struct ScreenRequest {
     pub max_dimension: i32,
     pub fps: i32,
+    /// A second display (F2): the phone's view in pixels. `None` mirrors.
+    pub extend: Option<(i32, i32)>,
 }
 
 impl ScreenRequest {
@@ -1575,6 +1622,7 @@ impl ScreenRequest {
     pub(crate) const FALLBACK: Self = Self {
         max_dimension: 1280,
         fps: 30,
+        extend: None,
     };
 
     /// The phone's `maxDimension` (its real landscape long side) and `fps`,
@@ -1587,6 +1635,7 @@ impl ScreenRequest {
             fps: fps
                 .unwrap_or(i64::from(Self::FALLBACK.fps))
                 .clamp(1, MAX_FPS) as i32,
+            extend: None,
         }
     }
 
@@ -1601,6 +1650,7 @@ impl ScreenRequest {
             } else {
                 self.fps
             },
+            extend: self.extend,
         }
     }
 

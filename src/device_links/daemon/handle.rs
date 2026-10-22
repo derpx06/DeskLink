@@ -130,6 +130,7 @@ impl DaemonHandle {
             device.terminal_access = terminal_access_allowed(&device.id);
             device.terminal_sessions_attached = terminal_bridge::attached_count(&device.id);
             device.desktop_session = coordinator::desktop_session(&device.id);
+            device.desktop_extended = coordinator::desktop_extended(&device.id);
             device.capture =
                 crate::device_links::webrtc::capture::status(&device.id).map(|capture| {
                     crate::device_links::device::CaptureUse {

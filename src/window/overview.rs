@@ -645,7 +645,11 @@ fn live_banner(
         .hexpand(true)
         .valign(gtk::Align::Center)
         .build();
-    let headline = format!("{} is using this computer", device.name);
+    let headline = if device.desktop_extended {
+        format!("{} is a second display", device.name)
+    } else {
+        format!("{} is using this computer", device.name)
+    };
     let mut detail = format!(" · {summary}");
     if let Some(since) = since.filter(|since| !since.is_empty()) {
         detail.push_str(&format!(" · since {since}"));
@@ -658,6 +662,17 @@ fn live_banner(
     banner.update_property(&[gtk::accessible::Property::Label(&format!(
         "{headline}{detail}"
     ))]);
+    // A second display (F2) is placed with the desktop's display settings.
+    if device.desktop_extended {
+        if let Some(settings) = gtk::glib::find_program_in_path("gnome-control-center") {
+            let arrange = super::soft_button("Arrange…");
+            arrange.set_tooltip_text(Some("Place the phone's display beside this screen"));
+            arrange.connect_clicked(move |_| {
+                let _ = std::process::Command::new(&settings).arg("display").spawn();
+            });
+            banner.append(&arrange);
+        }
+    }
     // Its speaker toggle (F1): this computer's sound to the phone too.
     if device.desktop_session != DesktopSession::None {
         let on = super::sound::is_on(device, "desk-sound");

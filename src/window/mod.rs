@@ -461,6 +461,21 @@ impl DesklinkWindow {
                         debug_log!("[E2E] desk-terminal: {result:?}");
                         return;
                     }
+                    // "extend-selftest WxH": F2's second display without a phone.
+                    if verb == "extend-selftest" {
+                        let size = id
+                            .split_once('x')
+                            .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
+                            .unwrap_or((2400, 1080));
+                        let _ = std::thread::Builder::new()
+                            .name("desklink-extend-selftest".into())
+                            .spawn(move || {
+                                let result =
+                                    crate::device_links::webrtc::virtual_display::selftest(size);
+                                debug_log!("[E2E] extend-selftest: {result:?}");
+                            });
+                        return;
+                    }
                     if verb == "desktop-selftest" {
                         let _ = std::thread::Builder::new()
                             .name("desklink-share-selftest".into())
@@ -1312,10 +1327,11 @@ fn session_summary(device: &DeviceView) -> Option<String> {
         1 => parts.push("in a terminal".to_string()),
         count => parts.push(format!("in {count} terminals")),
     }
-    match device.desktop_session {
-        DesktopSession::None => {}
-        DesktopSession::Viewing => parts.push("viewing your screen".to_string()),
-        DesktopSession::Controlling => parts.push("controlling your screen".to_string()),
+    match (device.desktop_session, device.desktop_extended) {
+        (DesktopSession::None, _) => {}
+        (_, true) => parts.push("a second display".to_string()),
+        (DesktopSession::Viewing, false) => parts.push("viewing your screen".to_string()),
+        (DesktopSession::Controlling, false) => parts.push("controlling your screen".to_string()),
     }
     (!parts.is_empty()).then(|| parts.join(", "))
 }

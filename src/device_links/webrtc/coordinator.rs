@@ -89,6 +89,8 @@ struct DesktopPortalService {
     id: u64,
     sender: mpsc::Sender<DesktopPortalCommand>,
     can_control: bool,
+    /// The phone is a second display (F2), not a mirror.
+    extended: bool,
     /// Set when the share is released or replaced. A worker still waiting on
     /// the GNOME consent dialog gives up, instead of starting a capture nobody
     /// asked for.
@@ -1306,6 +1308,84 @@ fn send_remote_session_message(
     peer.send_text(WebRtcChannel::Control, &text)
 }
 
+/// The phone as a second display (F2): a virtual monitor of `pixels`, its
+/// scale set so it is readable, input through EIS. Returns what the share
+/// worker needs, with the monitor's logical size (what the phone maps its
+/// taps into).
+#[allow(clippy::type_complexity)]
+fn start_extended_display(
+    device_id: &str,
+    id: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+    peer: &Arc<DesktopWebRtcPeer>,
+    request: super::screen::ScreenRequest,
+    pixels: (i32, i32),
+) -> Result<
+    (
+        Box<dyn DesktopSession>,
+        i32,
+        i32,
+        bool,
+        Option<std::os::fd::OwnedFd>,
+    ),
+    String,
+> {
+    use super::virtual_display::{self, VirtualDisplay};
+    // Its own remembered grant: a mirror's would select a monitor.
+    let key = format!("{device_id}:extend");
+    let stored = crate::device_links::config::remote_desktop_token(&key);
+    let (display, source) = match VirtualDisplay::start(cancel, stored.as_deref(), pixels) {
+        Err(error) if stored.is_some() => {
+            debug_log!(
+                "[DeskLink] Remembered extended-display grant failed ({error}); asking again"
+            );
+            crate::device_links::config::set_remote_desktop_token(&key, None);
+            VirtualDisplay::start(cancel, None, pixels)?
+        }
+        started => started?,
+    };
+    crate::device_links::config::set_remote_desktop_token(&key, source.token_to_remember());
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("The desktop share was cancelled".to_string());
+    }
+    let switch_fd = source
+        .fd
+        .try_clone()
+        .map_err(|error| format!("Could not keep the PipeWire connection: {error}"))?;
+    let before = virtual_display::connectors();
+    peer.start_desktop_screen_capture(
+        id,
+        DesktopSource::PipeWire {
+            fd: source.fd,
+            node_id: source.node_id,
+            serial: source.pipewire_serial,
+            virtual_size: Some(pixels),
+        },
+        pixels.0,
+        pixels.1,
+        request,
+    )?;
+    // The monitor appears once the capture has negotiated its size.
+    let scale = virtual_display::apply_scale(&before, pixels);
+    let logical = virtual_display::logical_size(pixels, scale);
+    display.settle(logical);
+    debug_log!(
+        "[DeskLink] Extended display {}x{} px at scale {scale} ({}x{} logical) for {device_id}",
+        pixels.0,
+        pixels.1,
+        logical.0,
+        logical.1
+    );
+    let can_control = display.can_control();
+    Ok((
+        Box::new(display),
+        logical.0,
+        logical.1,
+        can_control,
+        Some(switch_fd),
+    ))
+}
+
 fn start_desktop_portal_session(
     device_id: String,
     session_id: String,
@@ -1338,6 +1418,7 @@ fn start_desktop_portal_session(
                 id,
                 sender,
                 can_control: false,
+                extended: request.extend.is_some(),
                 cancel: Arc::clone(&cancel),
                 done,
             },
@@ -1429,6 +1510,9 @@ fn run_desktop_portal_worker(
                 let can_control = desk.can_control();
                 return Ok((Box::new(desk), screen.width, screen.height, can_control, None));
             }
+            if let Some(pixels) = request.extend {
+                return start_extended_display(&device_id, id, &cancel, &peer, request, pixels);
+            }
             let stored_grant = crate::device_links::config::remote_desktop_token(&device_id);
             let (portal, source) =
                 match RemoteDesktopPortal::start("", &cancel, stored_grant.as_deref()) {
@@ -1466,6 +1550,7 @@ fn run_desktop_portal_worker(
                     fd: source.fd,
                     node_id: source.node_id,
                     serial: source.pipewire_serial,
+                    virtual_size: None,
                 },
                 source.width,
                 source.height,
@@ -1589,6 +1674,9 @@ fn run_desktop_portal_worker(
     ready.screen_width = Some(width);
     ready.screen_height = Some(height);
     ready.screen_count = Some(portal.stream_count() as i32);
+    if request.extend.is_some() {
+        ready.display = Some("extend".to_string());
+    }
     if send_remote_session_message(&peer, &wire, &ready).is_err() {
         return;
     }
@@ -1601,10 +1689,14 @@ fn run_desktop_portal_worker(
                     .map_err(|error| format!("Could not reuse the PipeWire connection: {error}"))?,
                 node_id: stream.node_id,
                 serial: stream.pipewire_serial,
+                virtual_size: request.extend,
             },
             None => DesktopSource::X11,
         };
-        peer.start_desktop_screen_capture(id, source, stream.width, stream.height, request)
+        // An extended display is captured at its pixel size, not the
+        // logical one the phone maps its taps into.
+        let (width, height) = request.extend.unwrap_or((stream.width, stream.height));
+        peer.start_desktop_screen_capture(id, source, width, height, request)
     };
     // Moves the share to the next screen and tells the phone its new size.
     let switch_screen = || {
@@ -2113,6 +2205,15 @@ pub(crate) fn desktop_session(device_id: &str) -> crate::device_links::device::D
         (true, false) => DesktopSession::Viewing,
         (true, true) => DesktopSession::Controlling,
     }
+}
+
+/// Whether `device_id`'s share of this desk is a second display (F2).
+pub(crate) fn desktop_extended(device_id: &str) -> bool {
+    desktop_portal_services().lock().is_ok_and(|services| {
+        services
+            .get(device_id)
+            .is_some_and(|service| service.extended)
+    })
 }
 
 /// "End phone sessions": stops `device_id` viewing or controlling this screen
@@ -3248,8 +3349,25 @@ fn handle_peer_envelope(
             }
             // The phone's own size and rate (contract V1); older phones ask
             // nothing and get the fallback.
-            let request =
+            let mut request =
                 super::screen::ScreenRequest::from_parts(message.max_dimension, message.fps);
+            // A second display (F2) at the phone's own pixel size.
+            if message.display.as_deref() == Some("extend") {
+                let size = message.screen_width.zip(message.screen_height);
+                match size.filter(|_| super::virtual_display::supported()) {
+                    Some(size) => request.extend = Some(size),
+                    None => {
+                        return deny_view(
+                            &peer,
+                            wire,
+                            attempt_id,
+                            &message.remote_session_id,
+                            sequence,
+                            "extend-unsupported".to_string(),
+                        )
+                    }
+                }
+            }
             let started = start_desktop_portal_session(
                 wire.peer_device_id.clone(),
                 message.remote_session_id.clone(),
@@ -4197,6 +4315,7 @@ mod tests {
                 id,
                 sender,
                 can_control: false,
+                extended: false,
                 cancel: Arc::clone(&cancel),
                 done,
             },
@@ -4524,6 +4643,7 @@ mod tests {
             text: None,
             mime_type: None,
             pages: None,
+            display: None,
         }
     }
 

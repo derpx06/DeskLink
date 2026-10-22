@@ -221,6 +221,9 @@ pub struct DeviceView {
     /// What this device is doing with this computer's screen right now.
     #[serde(default)]
     pub desktop_session: DesktopSession,
+    /// The phone shows this desk as a second display (F2), not a mirror.
+    #[serde(default)]
+    pub desktop_extended: bool,
     /// How the WebRTC connection reaches the device: `"lan"`, `"direct"`
     /// (over the internet) or `"turn"`; `None` while not connected.
     #[serde(default)]
@@ -288,6 +291,7 @@ impl DeviceView {
             terminal_access: false,
             terminal_sessions_attached: 0,
             desktop_session: DesktopSession::None,
+            desktop_extended: false,
             connection_path: None,
             rtt_ms: None,
             last_seen: None,

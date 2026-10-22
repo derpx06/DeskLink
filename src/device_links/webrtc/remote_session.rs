@@ -259,6 +259,9 @@ pub struct ControlMessage {
     pub text: Option<String>,
     pub mime_type: Option<String>,
     pub pages: Option<i32>,
+    /// `request-view` / `screen-ready` (F2): "mirror" or "extend" (a second
+    /// display sized `screenWidth`×`screenHeight`). Absent means mirror.
+    pub display: Option<String>,
 }
 
 impl ControlKind {
@@ -338,6 +341,7 @@ impl ControlMessage {
             text: None,
             mime_type: None,
             pages: None,
+            display: None,
         }
     }
 
@@ -447,6 +451,9 @@ impl ControlMessage {
         if let Some(pages) = self.pages {
             root.insert("pages".into(), Value::from(pages));
         }
+        if let Some(display) = &self.display {
+            root.insert("display".into(), Value::from(display.clone()));
+        }
         serde_json::to_vec(&Value::Object(root)).unwrap_or_default()
     }
 
@@ -511,6 +518,7 @@ impl ControlMessage {
             text: text("text"),
             mime_type: optional_text("mimeType"),
             pages: number("pages").map(|value| value.clamp(-1, 10_000) as i32),
+            display: optional_text("display"),
         })
     }
 
@@ -600,6 +608,13 @@ impl ControlMessage {
             .is_some_and(|text| text.len() > MAX_CAPTURE_TEXT_BYTES)
         {
             return Err("Captured text is too long".to_string());
+        }
+        if self
+            .display
+            .as_deref()
+            .is_some_and(|display| !matches!(display, "mirror" | "extend"))
+        {
+            return Err("Unknown screen display mode".to_string());
         }
         if self.pages.is_some_and(|pages| !(1..=500).contains(&pages)) {
             return Err("Capture page count is out of range".to_string());

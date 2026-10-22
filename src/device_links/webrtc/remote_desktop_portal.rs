@@ -81,7 +81,12 @@ pub(crate) struct PortalStream {
     pub pipewire_serial: Option<u64>,
 }
 
-fn parse_stream(stream: &glib::Variant) -> Result<PortalStream, String> {
+/// One stream from Start. A virtual monitor's (F2) has no `size`: the
+/// caller chose it, and passes it as `virtual_size`.
+fn parse_stream(
+    stream: &glib::Variant,
+    virtual_size: Option<(i32, i32)>,
+) -> Result<PortalStream, String> {
     let node_id = stream
         .child_value(0)
         .get::<u32>()
@@ -89,6 +94,7 @@ fn parse_stream(stream: &glib::Variant) -> Result<PortalStream, String> {
     let properties = stream.child_value(1);
     let (width, height) = dict_value(&properties, "size")
         .and_then(|value| value.get::<(i32, i32)>())
+        .or(virtual_size)
         .ok_or_else(|| "Desktop portal omitted screen stream dimensions".to_string())?;
     if node_id == 0 || !(1..=8192).contains(&width) || !(1..=8192).contains(&height) {
         return Err("Desktop portal returned invalid screen stream metadata".to_string());
@@ -112,6 +118,9 @@ pub(crate) struct PortalScreenSource {
     /// Resumes this grant next time without the consent dialog; present only
     /// if the user chose to remember it. Single-use: replaces the old one.
     pub restore_token: Option<String>,
+    /// The first stream's input mapping (portal v2): the EIS region that
+    /// belongs to it.
+    pub mapping_id: Option<String>,
 }
 
 impl PortalScreenSource {
@@ -289,6 +298,26 @@ impl RemoteDesktopPortal {
         cancel: &AtomicBool,
         restore_token: Option<&str>,
     ) -> Result<(Self, PortalScreenSource), String> {
+        Self::start_sources(parent_window, cancel, restore_token, None)
+    }
+
+    /// A new virtual monitor of `size` pixels instead of a monitor (F2's
+    /// extended display). The portal stream has no size of its own: the
+    /// capture's caps create the monitor at this size.
+    pub(crate) fn start_virtual(
+        cancel: &AtomicBool,
+        restore_token: Option<&str>,
+        size: (i32, i32),
+    ) -> Result<(Self, PortalScreenSource), String> {
+        Self::start_sources("", cancel, restore_token, Some(size))
+    }
+
+    fn start_sources(
+        parent_window: &str,
+        cancel: &AtomicBool,
+        restore_token: Option<&str>,
+        virtual_size: Option<(i32, i32)>,
+    ) -> Result<(Self, PortalScreenSource), String> {
         let connection = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>)
             .map_err(|error| format!("Could not connect to the desktop portal: {error}"))?;
         let context = glib::MainContext::new();
@@ -366,9 +395,14 @@ impl RemoteDesktopPortal {
                 )?;
 
                 let source_options = options(|dict| {
-                    dict.insert("types", 1u32); // MONITOR
-                                                // All screens may be shared at once; the phone switches.
-                    dict.insert("multiple", true);
+                    if virtual_size.is_some() {
+                        dict.insert("types", 4u32); // VIRTUAL
+                        dict.insert("multiple", false);
+                    } else {
+                        dict.insert("types", 1u32); // MONITOR
+                                                    // All screens may be shared at once; the phone switches.
+                        dict.insert("multiple", true);
+                    }
                     dict.insert("cursor_mode", 2u32); // EMBEDDED
                     dict.insert("handle_token", token());
                 });
@@ -406,8 +440,12 @@ impl RemoteDesktopPortal {
                     dict_value(&started, "streams").ok_or_else(|| NO_SCREEN_STREAM.to_string())?;
                 // Every screen the user shared — a laptop and a monitor, say —
                 // so the phone can switch between them without another dialog.
+                let mapping_id = (streams.n_children() > 0)
+                    .then(|| dict_value(&streams.child_value(0).child_value(1), "mapping_id"))
+                    .flatten()
+                    .and_then(|value| value.str().map(str::to_string));
                 let streams = (0..streams.n_children())
-                    .map(|index| parse_stream(&streams.child_value(index)))
+                    .map(|index| parse_stream(&streams.child_value(index), virtual_size))
                     .collect::<Result<Vec<_>, _>>()?;
                 let first = *streams
                     .first()
@@ -463,6 +501,7 @@ impl RemoteDesktopPortal {
                         height: size.1,
                         granted_device_types,
                         restore_token,
+                        mapping_id,
                     },
                 ))
             })
@@ -479,6 +518,41 @@ impl RemoteDesktopPortal {
                 u32::from(pressed).to_variant(),
             ]),
         )
+    }
+
+    /// The session's EIS socket (RemoteDesktop v2). Once it is asked for,
+    /// the session's input goes through it: the D-Bus `Notify*` calls are
+    /// refused from then on.
+    pub(crate) fn connect_to_eis(&self) -> Result<OwnedFd, String> {
+        let reply = self
+            .connection
+            .call_with_unix_fd_list_sync(
+                Some(PORTAL_BUS),
+                PORTAL_PATH,
+                REMOTE_INTERFACE,
+                "ConnectToEIS",
+                Some(&tuple([
+                    object_path(&self.session_handle)?,
+                    options(|_| {}),
+                ])),
+                None,
+                gio::DBusCallFlags::NONE,
+                10_000,
+                None::<&gio::UnixFDList>,
+                None::<&gio::Cancellable>,
+            )
+            .map_err(|error| {
+                format!("This desktop cannot route input to a new display: {error}")
+            })?;
+        let index = pipewire_fd_index(&reply.0)?;
+        let list = reply
+            .1
+            .ok_or_else(|| "Desktop portal omitted the input socket".to_string())?;
+        let raw = list
+            .get(index)
+            .map_err(|error| format!("Could not receive the input socket: {error}"))?;
+        // SAFETY: `get` returned a fresh descriptor this side now owns.
+        Ok(unsafe { OwnedFd::from_raw_fd(raw) })
     }
 
     fn notify(&self, method: &str, parameters: glib::Variant) -> Result<(), String> {
@@ -1059,7 +1133,7 @@ mod tests {
         let stream =
             |node: u32, w, h| glib::Variant::tuple_from_iter([node.to_variant(), dict(w, h)]);
         assert_eq!(
-            parse_stream(&stream(41, 1920, 1080)).unwrap(),
+            parse_stream(&stream(41, 1920, 1080), None).unwrap(),
             PortalStream {
                 node_id: 41,
                 width: 1920,
@@ -1067,12 +1141,25 @@ mod tests {
                 pipewire_serial: None
             }
         );
-        assert_eq!(parse_stream(&stream(42, 2560, 1600)).unwrap().width, 2560);
+        assert_eq!(
+            parse_stream(&stream(42, 2560, 1600), None).unwrap().width,
+            2560
+        );
         assert!(
-            parse_stream(&stream(0, 1920, 1080)).is_err(),
+            parse_stream(&stream(0, 1920, 1080), None).is_err(),
             "node 0 is not a stream"
         );
-        assert!(parse_stream(&stream(5, 0, 1080)).is_err());
+        assert!(parse_stream(&stream(5, 0, 1080), None).is_err());
+        // A virtual monitor's stream (F2) has no size: the requested one.
+        let sizeless = glib::Variant::tuple_from_iter([
+            43u32.to_variant(),
+            glib::VariantDict::new(None).end(),
+        ]);
+        assert!(parse_stream(&sizeless, None).is_err());
+        assert_eq!(
+            parse_stream(&sizeless, Some((2400, 1080))).unwrap().width,
+            2400
+        );
     }
 
     #[test]
@@ -1115,6 +1202,7 @@ mod tests {
             height: 10,
             granted_device_types: devices,
             restore_token: token.map(str::to_string),
+            mapping_id: None,
         };
         assert_eq!(source(3, Some("t")).token_to_remember(), Some("t"));
         assert_eq!(source(0, Some("t")).token_to_remember(), None, "view-only");
