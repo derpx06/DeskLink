@@ -247,10 +247,12 @@ impl Tray {
         connection
             .register_object(ITEM_PATH, &item)
             .method_call(move |_, _, _, _, method, _, invocation| {
-                if matches!(method, "Activate" | "SecondaryActivate") {
-                    (item_actions.open)();
-                }
-                invocation.return_value(None);
+                crate::guard("tray call", (), || {
+                    if matches!(method, "Activate" | "SecondaryActivate") {
+                        (item_actions.open)();
+                    }
+                    invocation.return_value(None);
+                })
             })
             .property(move |_, _, _, _, name| item_property(name, &item_state.borrow()))
             .build()
@@ -263,8 +265,10 @@ impl Tray {
         connection
             .register_object(MENU_PATH, &menu)
             .method_call(move |_, _, _, _, method, params, invocation| {
-                let reply = menu_call(method, &params, &menu_state.borrow(), &actions);
-                invocation.return_value(reply.as_ref());
+                crate::guard("tray menu call", (), || {
+                    let reply = menu_call(method, &params, &menu_state.borrow(), &actions);
+                    invocation.return_value(reply.as_ref());
+                })
             })
             .property(|_, _, _, _, name| match name {
                 "Version" => 3u32.to_variant(),
@@ -298,11 +302,13 @@ impl Tray {
                 arg0,
                 gio::DBusSignalFlags::NONE,
                 move |connection, _, _, _, member, _| {
-                    if member != "StatusNotifierItemRegistered"
-                        && member != "StatusNotifierItemUnregistered"
-                    {
-                        refresh_host(connection, &hosted);
-                    }
+                    crate::guard("tray signal", (), || {
+                        if member != "StatusNotifierItemRegistered"
+                            && member != "StatusNotifierItemUnregistered"
+                        {
+                            refresh_host(connection, &hosted);
+                        }
+                    })
                 },
             );
         }

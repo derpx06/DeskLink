@@ -25,6 +25,7 @@ use gtk::{gdk, gio, glib};
 use serde::{Deserialize, Serialize};
 
 use crate::device_links::eis::{self, Captured};
+use crate::device_links::limits::{log_limited, Buckets};
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_MOUSEPAD_REQUEST,
     PACKET_TYPE_SHARE_INPUT_DEVICES_REQUEST,
@@ -63,8 +64,6 @@ const CALL_TIMEOUT_MS: i32 = 2_000;
 const KEY_LOOKUP: Duration = Duration::from_millis(500);
 /// Keys remembered by the main-thread lookup cache.
 const KEY_CACHE_MAX: usize = 1024;
-/// A repeated log line is written at most once per this long.
-const LOG_EVERY: Duration = Duration::from_secs(10);
 
 /// Where the phone sits, beside this screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -623,32 +622,14 @@ pub(crate) fn start() {
     }
 }
 
-/// A rate-limited log line: at most one per [`LOG_EVERY`] per `kind`, with
-/// how many were skipped.
-fn log_limited(kind: &'static str, line: &str) {
-    static LAST: Mutex<Option<HashMap<&'static str, (Instant, u64)>>> = Mutex::new(None);
-    let Ok(mut last) = LAST.lock() else {
-        return;
-    };
-    let entry = last
-        .get_or_insert_with(HashMap::new)
-        .entry(kind)
-        .or_insert((Instant::now() - LOG_EVERY, 0));
-    if entry.0.elapsed() >= LOG_EVERY {
-        eprintln!("[Glide] {line} ({} similar skipped)", entry.1);
-        *entry = (Instant::now(), 0);
-    } else {
-        entry.1 += 1;
-    }
-}
-
 /// G3 from the phone (`desklink.shareinputdevices`).
 pub(crate) fn phone_released(device_id: &str, packet: &NetworkPacket) {
     let Some((dx, dy)) = release_deltas(packet) else {
         log_limited("bad-release", "A release without a position was ignored");
         return;
     };
-    if !release_allowed(device_id) {
+    static RELEASES: Buckets = Buckets::new(RELEASES_PER_SECOND, Duration::from_secs(1));
+    if !RELEASES.allow(device_id) {
         log_limited("release-rate", "Too many releases from a phone; dropped");
         return;
     }
@@ -669,29 +650,6 @@ fn release_deltas(packet: &NetworkPacket) -> Option<(f64, f64)> {
             .filter(|value| value.is_finite() && value.abs() <= MAX_DELTA)
     };
     Some((number("releaseDeltax")?, number("releaseDeltay")?))
-}
-
-/// [`RELEASES_PER_SECOND`] per phone.
-fn release_allowed(device_id: &str) -> bool {
-    static BUCKETS: Mutex<Option<HashMap<String, (Instant, u32)>>> = Mutex::new(None);
-    let Ok(mut buckets) = BUCKETS.lock() else {
-        return false;
-    };
-    let buckets = buckets.get_or_insert_with(HashMap::new);
-    if buckets.len() > 64 {
-        buckets.clear();
-    }
-    let bucket = buckets
-        .entry(device_id.to_string())
-        .or_insert((Instant::now(), RELEASES_PER_SECOND));
-    if bucket.0.elapsed() >= Duration::from_secs(1) {
-        *bucket = (Instant::now(), RELEASES_PER_SECOND);
-    }
-    if bucket.1 == 0 {
-        return false;
-    }
-    bucket.1 -= 1;
-    true
 }
 
 fn send_command(command: Command) -> bool {
@@ -784,30 +742,32 @@ impl Portal {
             None,
             gio::DBusSignalFlags::NONE,
             move |_, _, _, _, member, parameters| {
-                if parameters.child_value(0).str() != Some(handle.as_str()) {
-                    return;
-                }
-                let values = parameters.child_value(1);
-                let signal = match member {
-                    "Activated" => {
-                        let id = lookup::<u32>(&values, "activation_id").ok().flatten();
-                        let cursor = lookup::<(f64, f64)>(&values, "cursor_position")
-                            .ok()
-                            .flatten();
-                        match (id, cursor) {
-                            (Some(id), Some(cursor)) => Signal::Activated { id, cursor },
-                            _ => return,
-                        }
+                crate::guard("glide signal", (), || {
+                    if parameters.child_value(0).str() != Some(handle.as_str()) {
+                        return;
                     }
-                    "Deactivated" => Signal::Deactivated,
-                    "Disabled" => Signal::Disabled,
-                    "ZonesChanged" => Signal::ZonesChanged,
-                    _ => return,
-                };
-                let mut queue = queue.borrow_mut();
-                if queue.len() < PENDING_MAX {
-                    queue.push_back(signal);
-                }
+                    let values = parameters.child_value(1);
+                    let signal = match member {
+                        "Activated" => {
+                            let id = lookup::<u32>(&values, "activation_id").ok().flatten();
+                            let cursor = lookup::<(f64, f64)>(&values, "cursor_position")
+                                .ok()
+                                .flatten();
+                            match (id, cursor) {
+                                (Some(id), Some(cursor)) => Signal::Activated { id, cursor },
+                                _ => return,
+                            }
+                        }
+                        "Deactivated" => Signal::Deactivated,
+                        "Disabled" => Signal::Disabled,
+                        "ZonesChanged" => Signal::ZonesChanged,
+                        _ => return,
+                    };
+                    let mut queue = queue.borrow_mut();
+                    if queue.len() < PENDING_MAX {
+                        queue.push_back(signal);
+                    }
+                })
             },
         );
         self.subscriptions.push(id);
@@ -1561,15 +1521,6 @@ mod tests {
         assert!(clipboard_packet(String::new()).is_none());
         assert!(clipboard_packet("x".repeat(MAX_CLIPBOARD_BYTES)).is_some());
         assert!(clipboard_packet("x".repeat(MAX_CLIPBOARD_BYTES + 1)).is_none());
-    }
-
-    #[test]
-    fn releases_are_rate_limited_per_phone() {
-        let allowed = (0..RELEASES_PER_SECOND + 5)
-            .filter(|_| release_allowed("rate-test"))
-            .count();
-        assert_eq!(allowed, RELEASES_PER_SECOND as usize);
-        assert!(release_allowed("another-phone"));
     }
 
     #[test]

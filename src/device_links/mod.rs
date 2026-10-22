@@ -14,6 +14,7 @@ pub(crate) mod eis;
 pub mod features;
 pub(crate) mod folders;
 pub(crate) mod glide;
+pub(crate) mod limits;
 pub(crate) mod logind;
 pub(crate) mod media_art;
 pub(crate) mod mpris;

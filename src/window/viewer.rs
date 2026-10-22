@@ -360,7 +360,7 @@ impl Viewer {
             if shown.get() != page {
                 return;
             }
-            let loaded = gio::spawn_blocking(move || gdk::Texture::from_filename(&path)).await;
+            let loaded = gio::spawn_blocking(move || load_bounded(&path)).await;
             if shown.get() != page {
                 return;
             }
@@ -589,4 +589,24 @@ fn launch(widget: &impl IsA<gtk::Widget>, path: &std::path::Path, in_folder: boo
         launcher.set_always_ask(true);
         launcher.launch(window.as_ref(), gio::Cancellable::NONE, done);
     }
+}
+
+/// The most pixels an image is shown at: a huge one (a 30,000 px scan,
+/// or a decompression bomb) is decoded scaled down instead of in full.
+const MAX_VIEW_PIXELS: u64 = 64_000_000;
+/// The longest side it is scaled to then.
+const MAX_VIEW_SIDE: i32 = 8192;
+
+/// `path` as a texture, never decoding more than [`MAX_VIEW_PIXELS`].
+fn load_bounded(path: &std::path::Path) -> Result<gdk::Texture, glib::Error> {
+    let huge = gtk::gdk_pixbuf::Pixbuf::file_info(path).is_some_and(|(_, width, height)| {
+        u64::from(width.unsigned_abs()) * u64::from(height.unsigned_abs()) > MAX_VIEW_PIXELS
+    });
+    if huge {
+        let pixbuf =
+            gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, MAX_VIEW_SIDE, MAX_VIEW_SIDE, true)?;
+        #[allow(deprecated)]
+        return Ok(gdk::Texture::for_pixbuf(&pixbuf));
+    }
+    gdk::Texture::from_filename(path)
 }

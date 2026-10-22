@@ -503,18 +503,21 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
         .register_object(PATH, &interface)
         .method_call(
             move |connection, sender, _, _, method, params, invocation| {
-                let Some(app) = weak.upgrade() else {
-                    return invocation.return_dbus_error(INVALID_ARGS, "DeskLink is quitting");
-                };
-                if method == "Hello" {
-                    let (_, capabilities) = params.get::<(u32, Vec<String>)>().unwrap_or_default();
-                    client_said_hello(&connection, sender.unwrap_or_default(), capabilities);
-                    return invocation.return_value(None);
-                }
-                match call(&app, method, &params) {
-                    Ok(()) => invocation.return_value(None),
-                    Err(error) => invocation.return_dbus_error(INVALID_ARGS, &error),
-                }
+                crate::guard("top-bar call", (), || {
+                    let Some(app) = weak.upgrade() else {
+                        return invocation.return_dbus_error(INVALID_ARGS, "DeskLink is quitting");
+                    };
+                    if method == "Hello" {
+                        let (_, capabilities) =
+                            params.get::<(u32, Vec<String>)>().unwrap_or_default();
+                        client_said_hello(&connection, sender.unwrap_or_default(), capabilities);
+                        return invocation.return_value(None);
+                    }
+                    match call(&app, method, &params) {
+                        Ok(()) => invocation.return_value(None),
+                        Err(error) => invocation.return_dbus_error(INVALID_ARGS, &error),
+                    }
+                })
             },
         )
         .property(move |_, _, _, _, name| {
@@ -535,27 +538,29 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
     let weak = app.downgrade();
     let connection = connection.clone();
     glib::timeout_add_seconds_local(1, move || {
-        let Some(app) = weak.upgrade().filter(|app| !app.is_remote()) else {
-            return glib::ControlFlow::Break;
-        };
-        let now = property_values(&app);
-        let changed: std::collections::HashMap<String, Variant> = now
-            .iter()
-            .filter(|(name, value)| properties.borrow().get(*name) != Some(*value))
-            .map(|(name, value)| (name.to_string(), value.clone()))
-            .collect();
-        properties.replace(now);
-        if !changed.is_empty() {
-            let changed = (INTERFACE, changed, Vec::<String>::new()).to_variant();
-            let _ = connection.emit_signal(
-                None,
-                PATH,
-                "org.freedesktop.DBus.Properties",
-                "PropertiesChanged",
-                Some(&changed),
-            );
-        }
-        glib::ControlFlow::Continue
+        crate::guard("top-bar tick", glib::ControlFlow::Continue, || {
+            let Some(app) = weak.upgrade().filter(|app| !app.is_remote()) else {
+                return glib::ControlFlow::Break;
+            };
+            let now = property_values(&app);
+            let changed: std::collections::HashMap<String, Variant> = now
+                .iter()
+                .filter(|(name, value)| properties.borrow().get(*name) != Some(*value))
+                .map(|(name, value)| (name.to_string(), value.clone()))
+                .collect();
+            properties.replace(now);
+            if !changed.is_empty() {
+                let changed = (INTERFACE, changed, Vec::<String>::new()).to_variant();
+                let _ = connection.emit_signal(
+                    None,
+                    PATH,
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                    Some(&changed),
+                );
+            }
+            glib::ControlFlow::Continue
+        })
     });
 
     offer_extension(app);
@@ -1177,12 +1182,14 @@ fn track_extension(connection: &gio::DBusConnection) {
         Some(EXTENSION_UUID),
         gio::DBusSignalFlags::NONE,
         move |_, _, _, _, _, params| {
-            set(is_active(&glib::VariantDict::new(
-                params
-                    .try_child_value(1)
-                    .filter(|v| v.type_() == glib::VariantTy::VARDICT)
-                    .as_ref(),
-            )))
+            crate::guard("top-bar signal", (), || {
+                set(is_active(&glib::VariantDict::new(
+                    params
+                        .try_child_value(1)
+                        .filter(|v| v.type_() == glib::VariantTy::VARDICT)
+                        .as_ref(),
+                )))
+            })
         },
     );
     call_extensions(
@@ -1214,12 +1221,14 @@ fn track_extension(connection: &gio::DBusConnection) {
             Some(uuid),
             gio::DBusSignalFlags::NONE,
             move |_, _, _, _, _, params| {
-                note(&glib::VariantDict::new(
-                    params
-                        .try_child_value(1)
-                        .filter(|v| v.type_() == glib::VariantTy::VARDICT)
-                        .as_ref(),
-                ))
+                crate::guard("top-bar signal", (), || {
+                    note(&glib::VariantDict::new(
+                        params
+                            .try_child_value(1)
+                            .filter(|v| v.type_() == glib::VariantTy::VARDICT)
+                            .as_ref(),
+                    ))
+                })
             },
         );
         call_extensions(connection, "GetExtensionInfo", uuid, move |reply| {

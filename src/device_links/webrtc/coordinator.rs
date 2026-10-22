@@ -2630,7 +2630,7 @@ fn spawn_event_worker(
                             &config,
                         );
                     }
-                    PeerEvent::Envelope { channel, bytes } => {
+                    PeerEvent::Envelope { channel, bytes, .. } => {
                         if let Err(error) = handle_peer_envelope(
                             &binding,
                             &attempt_id,
@@ -2643,19 +2643,25 @@ fn spawn_event_worker(
                             &events,
                             &transfer_manager,
                         ) {
-                            eprintln!("[DeskLink] Rejected WebRTC data-channel message: {error}");
+                            crate::device_links::limits::log_limited(
+                                "rejected-envelope",
+                                &format!("Rejected WebRTC data-channel message: {error}"),
+                            );
                         }
                     }
-                    PeerEvent::Binary { channel, bytes } => {
+                    PeerEvent::Binary { channel, bytes, .. } => {
                         // Android wraps file data in an authenticated envelope,
                         // including when the underlying data channel is binary.
                         // Raw chunks have no generation/replay binding and are
                         // therefore rejected rather than falling back to a TLS
                         // payload socket.
-                        eprintln!(
-                            "[DeskLink] Rejected raw WebRTC binary payload on {} ({} bytes)",
-                            channel.label(),
-                            bytes.len(),
+                        crate::device_links::limits::log_limited(
+                            "rejected-binary",
+                            &format!(
+                                "Rejected raw WebRTC binary payload on {} ({} bytes)",
+                                channel.label(),
+                                bytes.len(),
+                            ),
                         );
                     }
                     PeerEvent::ScreenStream(stream) => {

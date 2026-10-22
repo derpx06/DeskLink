@@ -161,9 +161,7 @@ impl Document {
     pub(crate) fn render(&self, index: usize, width: i32) -> Result<Rendered, String> {
         let poppler = poppler().ok_or("PDF previews need poppler-glib")?;
         let &(points_w, points_h) = self.sizes.get(index).ok_or("No such page")?;
-        let width = width.clamp(16, 8192);
-        let scale = f64::from(width) / points_w;
-        let height = ((points_h * scale).round() as i32).clamp(16, 16_384);
+        let (width, height, scale) = page_pixels(points_w, points_h, width);
         let mut surface = cairo::ImageSurface::create(cairo::Format::ARgb32, width, height)
             .map_err(|error| error.to_string())?;
         {
@@ -215,6 +213,26 @@ pub(crate) fn freedesktop_thumbnail(
     Some(cache.join(size).join(format!("{name}.png")))
 }
 
+/// The most pixels one rendered page may have (a 128 MiB surface): a page
+/// with an absurd aspect ratio is drawn smaller rather than allocating more.
+const MAX_PAGE_PIXELS: f64 = 32_000_000.0;
+
+/// A page of `points_w` × `points_h` points drawn about `width` px wide:
+/// its pixel size and scale, within the side and pixel bounds.
+fn page_pixels(points_w: f64, points_h: f64, width: i32) -> (i32, i32, f64) {
+    let points_w = points_w.max(1.0);
+    let points_h = points_h.max(1.0);
+    let mut scale = f64::from(width.clamp(16, 8192)) / points_w;
+    scale = scale.min(16_384.0 / points_h);
+    let pixels = points_w * points_h * scale * scale;
+    if pixels > MAX_PAGE_PIXELS {
+        scale *= (MAX_PAGE_PIXELS / pixels).sqrt();
+    }
+    let width = ((points_w * scale).round() as i32).clamp(16, 8192);
+    let height = ((points_h * scale).round() as i32).clamp(16, 16_384);
+    (width, height, scale)
+}
+
 /// A one-page, 200×100 pt PDF with nothing on it, for tests.
 #[cfg(test)]
 pub(crate) const MINIMAL_PDF: &[u8] = b"%PDF-1.4\n\
@@ -226,6 +244,19 @@ trailer<</Root 1 0 R>>\n%%EOF\n";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_is_never_drawn_past_its_pixel_bound() {
+        let (width, height, _) = page_pixels(612.0, 792.0, 1200);
+        assert_eq!(width, 1200, "a normal page at the asked width");
+        assert!((height - 1553).abs() <= 1);
+        // A ribbon 200 pages tall: drawn smaller, not 8192 × 16384.
+        let (width, height, scale) = page_pixels(612.0, 158_400.0, 8192);
+        assert!(f64::from(width) * f64::from(height) <= MAX_PAGE_PIXELS + 20_000.0);
+        assert!(height <= 16_384 && scale > 0.0);
+        let (width, height, _) = page_pixels(0.0, 0.0, 99_999);
+        assert!(width >= 16 && height >= 16);
+    }
 
     #[test]
     fn freedesktop_thumbnails_are_named_by_the_md5_of_the_uri() {

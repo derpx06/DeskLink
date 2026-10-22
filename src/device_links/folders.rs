@@ -26,6 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::limits::{log_limited, Buckets};
 use super::packet::{NetworkPacket, PACKET_TYPE_FOLDERS};
 use super::webrtc::file_protocol::{validate_relpath, FolderRef, MAX_TRANSFER_BYTES};
 
@@ -47,6 +48,9 @@ const MAX_OUTSTANDING: usize = 256;
 const TOMBSTONE_DAYS: i64 = 30;
 /// Directories watched per pair (beyond it, the periodic rescan covers).
 const MAX_WATCHED_DIRS: usize = 2048;
+/// A leftover `.desklink-*.tmp` in a synced folder older than this is
+/// removed by the next scan.
+const STALE_TEMP: Duration = Duration::from_secs(3600);
 /// Directory depth scanned.
 const MAX_DEPTH: usize = 32;
 /// Local changes settle this long before a rescan.
@@ -603,7 +607,8 @@ fn send_message(message: Message) -> bool {
 
 /// A `desklink.folders` packet from `device_id`.
 pub(crate) fn on_packet(device_id: &str, packet: &NetworkPacket) {
-    if !allowed(device_id) {
+    static PACKETS: Buckets = Buckets::new(PACKETS_PER_MINUTE, Duration::from_secs(60));
+    if !PACKETS.allow(device_id) {
         log_limited("rate", "Too many folder-sync packets from a phone; dropped");
         return;
     }
@@ -708,45 +713,6 @@ pub(crate) fn test_want(device_id: &str, folder: &FolderRef, sha256: &str, size:
 /// Shared with the transfer manager's offer check.
 static WANTED: Mutex<BTreeMap<(String, String), (String, Entry)>> = Mutex::new(BTreeMap::new());
 
-// ── Rate limit and logs ────────────────────────────────────────────────────
-
-fn allowed(device_id: &str) -> bool {
-    static BUCKETS: Mutex<Option<HashMap<String, (Instant, u32)>>> = Mutex::new(None);
-    let Ok(mut buckets) = BUCKETS.lock() else {
-        return false;
-    };
-    let buckets = buckets.get_or_insert_with(HashMap::new);
-    if buckets.len() > 64 {
-        buckets.clear();
-    }
-    let bucket = buckets
-        .entry(device_id.to_string())
-        .or_insert((Instant::now(), PACKETS_PER_MINUTE));
-    if bucket.0.elapsed() >= Duration::from_secs(60) {
-        *bucket = (Instant::now(), PACKETS_PER_MINUTE);
-    }
-    if bucket.1 == 0 {
-        return false;
-    }
-    bucket.1 -= 1;
-    true
-}
-
-fn log_limited(kind: &'static str, line: &str) {
-    static LAST: Mutex<Option<HashMap<&'static str, Instant>>> = Mutex::new(None);
-    let Ok(mut last) = LAST.lock() else {
-        return;
-    };
-    let last = last.get_or_insert_with(HashMap::new);
-    if last
-        .get(kind)
-        .is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
-    {
-        eprintln!("[Folders] {line}");
-        last.insert(kind, Instant::now());
-    }
-}
-
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -797,6 +763,19 @@ fn scan(pair: &Pair) -> Result<Scanned, String> {
             } else {
                 format!("{prefix}/{name}")
             };
+            if name.starts_with(".desklink-") && name.ends_with(".tmp") {
+                // An interrupted put-in-place: gone once it is stale.
+                let stale = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age > STALE_TEMP);
+                if stale {
+                    let _ = fs::remove_file(entry.path());
+                }
+                continue;
+            }
             if ignored(&path, pair.include_hidden, &pair.ignore) || validate_relpath(&path).is_err()
             {
                 continue;

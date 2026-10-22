@@ -316,20 +316,41 @@ pub(crate) fn prune() {
         .spawn(move || prune_dir(&dir, std::time::SystemTime::now()));
 }
 
+/// The thumbnail cache's disk quota: past it, the oldest go first.
+const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+
 fn prune_dir(dir: &Path, now: std::time::SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     let retention = crate::device_links::connection_log::RETENTION;
+    let mut kept = Vec::new();
     for entry in entries.flatten() {
-        let old = entry
-            .metadata()
-            .and_then(|meta| meta.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > retention);
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        let old = now
+            .duration_since(modified)
+            .is_ok_and(|age| age > retention);
         if old {
             let _ = std::fs::remove_file(entry.path());
+        } else {
+            kept.push((modified, meta.len(), entry.path()));
+        }
+    }
+    // Then the quota, oldest first.
+    kept.sort();
+    let mut total: u64 = kept.iter().map(|(_, size, _)| size).sum();
+    for (_, size, path) in kept {
+        if total <= MAX_CACHE_BYTES {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            total -= size;
         }
     }
 }
@@ -600,6 +621,24 @@ mod tests {
             now + crate::device_links::connection_log::RETENTION + Duration::from_secs(60),
         );
         assert!(!file.exists(), "an old one goes");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_cache_keeps_to_its_quota_oldest_first() {
+        let dir = std::env::temp_dir().join(format!("desklink-quota-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let now = std::time::SystemTime::now();
+        for (index, name) in ["old.png", "mid.png", "new.png"].iter().enumerate() {
+            // Sparse: the logical size counts, no disk is used.
+            let file = std::fs::File::create(dir.join(name)).unwrap();
+            file.set_len(MAX_CACHE_BYTES / 2 - 1).unwrap();
+            file.set_modified(now - Duration::from_secs(300 - index as u64 * 100))
+                .unwrap();
+        }
+        prune_dir(&dir, now);
+        assert!(!dir.join("old.png").exists(), "the oldest went");
+        assert!(dir.join("mid.png").exists() && dir.join("new.png").exists());
         let _ = std::fs::remove_dir_all(dir);
     }
 

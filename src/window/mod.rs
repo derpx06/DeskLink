@@ -697,12 +697,14 @@ impl DesklinkWindow {
 
         let weak = self.downgrade();
         glib::timeout_add_seconds_local(1, move || {
-            if let Some(window) = weak.upgrade() {
-                window.refresh_devices();
-                glib::ControlFlow::Continue
-            } else {
-                glib::ControlFlow::Break
-            }
+            crate::guard("window refresh", glib::ControlFlow::Continue, || {
+                if let Some(window) = weak.upgrade() {
+                    window.refresh_devices();
+                    glib::ControlFlow::Continue
+                } else {
+                    glib::ControlFlow::Break
+                }
+            })
         });
     }
 

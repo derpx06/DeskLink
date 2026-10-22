@@ -81,16 +81,61 @@ pub enum PeerEvent {
     Envelope {
         channel: WebRtcChannel,
         bytes: Vec<u8>,
+        /// Counts against the channel's backlog until handled (dropped).
+        credit: Arc<Credit>,
     },
     Binary {
         channel: WebRtcChannel,
         bytes: Vec<u8>,
+        credit: Arc<Credit>,
     },
     ConnectionChanged(String),
     /// An inbound screen stream is decoding and ready to be displayed.
     ScreenStream(super::screen::ScreenStream),
     Error(String),
     Closed,
+}
+
+/// Received bytes not yet handled, per data channel: a peer that floods,
+/// or a worker that stalls, cannot grow memory past this. Over it, a
+/// message is dropped (counted, logged): a file chunk then fails its
+/// transfer, which resumes.
+const MAX_BACKLOG_FILE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_BACKLOG_BYTES: usize = 4 * 1024 * 1024;
+
+/// One received message's share of its channel's backlog, given back when
+/// the event is dropped (handled).
+#[derive(Debug)]
+pub struct Credit {
+    backlog: Arc<std::sync::atomic::AtomicUsize>,
+    bytes: usize,
+}
+
+impl Drop for Credit {
+    fn drop(&mut self) {
+        self.backlog.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// A share of `backlog` for `bytes`, or `None` when it would pass `max`.
+fn take_credit(
+    backlog: &Arc<std::sync::atomic::AtomicUsize>,
+    bytes: usize,
+    max: usize,
+) -> Option<Arc<Credit>> {
+    let before = backlog.fetch_add(bytes, Ordering::AcqRel);
+    if before.saturating_add(bytes) > max {
+        backlog.fetch_sub(bytes, Ordering::AcqRel);
+        crate::device_links::limits::log_limited(
+            "peer-backlog",
+            "A peer sent faster than DeskLink could handle; a message was dropped",
+        );
+        return None;
+    }
+    Some(Arc::new(Credit {
+        backlog: Arc::clone(backlog),
+        bytes,
+    }))
 }
 
 /// A single GStreamer `webrtcbin` peer. It owns no DeskLink feature state: it
@@ -1235,7 +1280,14 @@ fn install_data_channel(
     channel.connect_on_open(move |_| {
         let _ = open_events.send(PeerEvent::ChannelOpened(channel_kind));
     });
+    let backlog = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let max_backlog = if channel_kind == WebRtcChannel::FileData {
+        MAX_BACKLOG_FILE_BYTES
+    } else {
+        MAX_BACKLOG_BYTES
+    };
     let message_events = events.clone();
+    let message_backlog = Arc::clone(&backlog);
     channel.connect_on_message_string(move |_, data| {
         let Some(data) = data else {
             let _ = message_events.send(PeerEvent::Error(
@@ -1249,9 +1301,13 @@ fn install_data_channel(
             ));
             return;
         }
+        let Some(credit) = take_credit(&message_backlog, data.len(), max_backlog) else {
+            return;
+        };
         let _ = message_events.send(PeerEvent::Envelope {
             channel: channel_kind,
             bytes: data.as_bytes().to_vec(),
+            credit,
         });
     });
     let binary_events = events.clone();
@@ -1273,9 +1329,13 @@ fn install_data_channel(
             let _ = binary_events.send(PeerEvent::Error(error));
             return;
         }
+        let Some(credit) = take_credit(&backlog, bytes.len(), max_backlog) else {
+            return;
+        };
         let _ = binary_events.send(PeerEvent::Binary {
             channel: channel_kind,
             bytes: bytes.to_vec(),
+            credit,
         });
     });
     let error_events = events;
@@ -1982,6 +2042,7 @@ a=max-message-size:262144\r\n";
                 Ok(PeerEvent::Envelope {
                     channel: got,
                     bytes,
+                    ..
                 }) if got == channel => return bytes,
                 Ok(_) => {}
                 Err(_) => panic!("no message arrived on {channel:?}"),

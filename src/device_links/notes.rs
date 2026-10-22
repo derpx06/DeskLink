@@ -26,8 +26,8 @@ const MAX_NOTE_TITLE_CHARS: usize = 200;
 const MAX_NOTE_BYTES: usize = 64 * 1024;
 /// ids per `fetch`.
 const FETCH_IDS: usize = 100;
-/// One `items` packet stays under this (its JSON).
-const MAX_PACKET_BYTES: usize = 256 * 1024;
+/// One `items` packet stays under the WebRTC payload bound (128 KiB).
+const MAX_PACKET_BYTES: usize = 96 * 1024;
 const TOMBSTONE_DAYS: i64 = 90;
 
 fn is_false(value: &bool) -> bool {
@@ -452,9 +452,7 @@ const AAD: &[u8] = b"desklink-snippets-and-notes";
 
 /// Loads the shelf from `dir` (`<config>/notes`). Called once at startup.
 pub(crate) fn install(dir: PathBuf) {
-    let mut shelf: Shelf = super::vault::open(&dir, &dir.join(FILE), AAD)
-        .and_then(|plain| serde_json::from_slice(&plain).ok())
-        .unwrap_or_default();
+    let mut shelf: Shelf = super::vault::open_or_quarantine(&dir, &dir.join(FILE), AAD);
     prune(&mut shelf, now_ms());
     if let Ok(mut store) = store().lock() {
         *store = Some(Store { dir, shelf });
@@ -482,11 +480,10 @@ fn with_shelf<T>(job: impl FnOnce(&mut Shelf) -> (T, bool)) -> Option<T> {
     let store = guard.as_mut()?;
     let (result, changed) = job(&mut store.shelf);
     if changed {
-        let saved = serde_json::to_vec(&store.shelf)
-            .map_err(|error| error.to_string())
-            .and_then(|plain| super::vault::seal(&store.dir, &store.dir.join(FILE), AAD, &plain));
-        if let Err(error) = saved {
-            eprintln!("[Notes] Could not save snippets and notes: {error}");
+        // Sealed and written off this thread (often the GTK one, typing).
+        match serde_json::to_vec(&store.shelf) {
+            Ok(plain) => super::vault::seal_later(&store.dir, &store.dir.join(FILE), AAD, plain),
+            Err(_) => eprintln!("[Notes] Could not save snippets and notes"),
         }
         GENERATION.fetch_add(1, Ordering::Relaxed);
     }

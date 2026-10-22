@@ -323,64 +323,66 @@ impl DesklinkApplication {
 
         let mut notified = std::collections::HashSet::<String>::new();
         glib::timeout_add_seconds_local(1, move || {
-            let Some(app) = app.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            let Some(daemon) = app.daemon_handle() else {
-                return glib::ControlFlow::Continue;
-            };
-            let active: Vec<_> = daemon
-                .devices()
-                .into_iter()
-                .filter_map(|device| session_line(&device).map(|line| (device, line)))
-                .collect();
-            let hosted = app
-                .imp()
-                .tray
-                .borrow()
-                .as_ref()
-                .is_some_and(|tray| tray.hosted())
-                || crate::shell_dbus::extension_active();
-            if !hosted {
-                for (device, line) in &active {
-                    if notified.insert(device.id.clone()) {
-                        let notification = gio::Notification::new(line);
-                        notification.set_body(Some("Open DeskLink to see more."));
-                        notification.add_button_with_target_value(
-                            "End Session",
-                            "app.end-sessions",
-                            Some(&device.id.to_variant()),
-                        );
-                        app.send_notification(
-                            Some(&format!("session-{}", device.id)),
-                            &notification,
-                        );
+            crate::guard("app tick", glib::ControlFlow::Continue, || {
+                let Some(app) = app.upgrade() else {
+                    return glib::ControlFlow::Break;
+                };
+                let Some(daemon) = app.daemon_handle() else {
+                    return glib::ControlFlow::Continue;
+                };
+                let active: Vec<_> = daemon
+                    .devices()
+                    .into_iter()
+                    .filter_map(|device| session_line(&device).map(|line| (device, line)))
+                    .collect();
+                let hosted = app
+                    .imp()
+                    .tray
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|tray| tray.hosted())
+                    || crate::shell_dbus::extension_active();
+                if !hosted {
+                    for (device, line) in &active {
+                        if notified.insert(device.id.clone()) {
+                            let notification = gio::Notification::new(line);
+                            notification.set_body(Some("Open DeskLink to see more."));
+                            notification.add_button_with_target_value(
+                                "End Session",
+                                "app.end-sessions",
+                                Some(&device.id.to_variant()),
+                            );
+                            app.send_notification(
+                                Some(&format!("session-{}", device.id)),
+                                &notification,
+                            );
+                        }
                     }
                 }
-            }
-            notified.retain(|id| active.iter().any(|(device, _)| &device.id == id));
-            if let Some(tray) = app.imp().tray.borrow().as_ref() {
-                let devices = daemon.devices();
-                let hand_off = devices.iter().any(|device| device.feature_transport_ready)
-                    && crate::terminal_previews::sessions()
-                        .iter()
-                        .any(|info| info.exit_status.is_none());
-                let menu = crate::desk_menu::entries(
-                    &devices,
-                    &crate::device_links::config::app_settings(),
-                    &crate::device_links::transfer_log::recent(),
-                    hand_off,
-                );
-                let icon = crate::desk_menu::tray_icon(&devices);
-                tray.update(
-                    active.into_iter().map(|(_, line)| line).collect(),
-                    menu,
-                    icon,
-                    // DeskLink's own extension is in the top bar already.
-                    crate::shell_dbus::extension_active(),
-                );
-            }
-            glib::ControlFlow::Continue
+                notified.retain(|id| active.iter().any(|(device, _)| &device.id == id));
+                if let Some(tray) = app.imp().tray.borrow().as_ref() {
+                    let devices = daemon.devices();
+                    let hand_off = devices.iter().any(|device| device.feature_transport_ready)
+                        && crate::terminal_previews::sessions()
+                            .iter()
+                            .any(|info| info.exit_status.is_none());
+                    let menu = crate::desk_menu::entries(
+                        &devices,
+                        &crate::device_links::config::app_settings(),
+                        &crate::device_links::transfer_log::recent(),
+                        hand_off,
+                    );
+                    let icon = crate::desk_menu::tray_icon(&devices);
+                    tray.update(
+                        active.into_iter().map(|(_, line)| line).collect(),
+                        menu,
+                        icon,
+                        // DeskLink's own extension is in the top bar already.
+                        crate::shell_dbus::extension_active(),
+                    );
+                }
+                glib::ControlFlow::Continue
+            })
         });
     }
 

@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
+use super::limits::{log_limited, Buckets};
 use super::packet::{NetworkPacket, PACKET_TYPE_AUTOMATIONS};
 
 // Limits: what a peer can make this module hold or do.
@@ -709,19 +710,7 @@ fn builtin_call_pause() -> Rule {
 /// Loads the rules from `dir` (`<config>/automations`). Called once at
 /// startup. An unreadable file is set aside, never fatal.
 pub(crate) fn install(dir: PathBuf) {
-    let path = dir.join(FILE);
-    let mut shelf: Shelf = match super::vault::open(&dir, &path, AAD) {
-        Some(plain) => serde_json::from_slice(&plain).unwrap_or_else(|_| {
-            quarantine(&path);
-            Shelf::default()
-        }),
-        None => {
-            if path.exists() {
-                quarantine(&path);
-            }
-            Shelf::default()
-        }
-    };
+    let mut shelf: Shelf = super::vault::open_or_quarantine(&dir, &dir.join(FILE), AAD);
     shelf.version = SCHEMA;
     shelf.rules.retain(|_, rule| valid_rule(rule));
     shelf
@@ -733,13 +722,6 @@ pub(crate) fn install(dir: PathBuf) {
         *store = Some(Store { dir, shelf });
     }
     GENERATION.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Keeps a file that could not be read beside it, for the user to recover.
-fn quarantine(path: &std::path::Path) {
-    let aside = path.with_extension(format!("corrupt-{}", now_ms()));
-    let _ = std::fs::rename(path, &aside);
-    eprintln!("[Automations] The rules file could not be read; set aside");
 }
 
 fn prune(shelf: &mut Shelf, now: i64) {
@@ -773,11 +755,10 @@ fn with_shelf<T>(job: impl FnOnce(&mut Shelf) -> (T, bool)) -> Option<T> {
     let store = guard.as_mut()?;
     let (result, changed) = job(&mut store.shelf);
     if changed {
-        let saved = serde_json::to_vec(&store.shelf)
-            .map_err(|error| error.to_string())
-            .and_then(|plain| super::vault::seal(&store.dir, &store.dir.join(FILE), AAD, &plain));
-        if let Err(error) = saved {
-            eprintln!("[Automations] Could not save the rules: {error}");
+        // Sealed and written off this thread (often the GTK one).
+        match serde_json::to_vec(&store.shelf) {
+            Ok(plain) => super::vault::seal_later(&store.dir, &store.dir.join(FILE), AAD, plain),
+            Err(_) => eprintln!("[Automations] Could not save the rules"),
         }
         GENERATION.fetch_add(1, Ordering::Relaxed);
     }
@@ -998,7 +979,7 @@ pub(crate) fn on_packet(device_id: &str, packet: &NetworkPacket) -> Vec<NetworkP
             Vec::new()
         }
         Some("event") => {
-            if !allowed(&EVENT_BUCKETS, device_id, EVENTS_PER_MINUTE) {
+            if !EVENT_BUCKETS.allow(device_id) {
                 log_limited("events", "Too many automation events from a phone; dropped");
                 return Vec::new();
             }
@@ -1016,7 +997,7 @@ pub(crate) fn on_packet(device_id: &str, packet: &NetworkPacket) -> Vec<NetworkP
             Vec::new()
         }
         Some("do") => {
-            if !allowed(&DO_BUCKETS, device_id, DOS_PER_MINUTE) {
+            if !DO_BUCKETS.allow(device_id) {
                 return vec![done_packet(
                     packet.get_str("runId").unwrap_or(""),
                     Err("busy"),
@@ -1161,46 +1142,8 @@ fn push(ids: Vec<String>) {
 
 // ── Rate limits and logs ───────────────────────────────────────────────────
 
-type Buckets = Mutex<Option<HashMap<String, (Instant, u32)>>>;
-static EVENT_BUCKETS: Buckets = Mutex::new(None);
-static DO_BUCKETS: Buckets = Mutex::new(None);
-
-/// `per_minute` per device, refilled each minute.
-fn allowed(buckets: &Buckets, device_id: &str, per_minute: u32) -> bool {
-    let Ok(mut buckets) = buckets.lock() else {
-        return false;
-    };
-    let buckets = buckets.get_or_insert_with(HashMap::new);
-    if buckets.len() > 64 {
-        buckets.clear();
-    }
-    let bucket = buckets
-        .entry(device_id.to_string())
-        .or_insert((Instant::now(), per_minute));
-    if bucket.0.elapsed() >= Duration::from_secs(60) {
-        *bucket = (Instant::now(), per_minute);
-    }
-    if bucket.1 == 0 {
-        return false;
-    }
-    bucket.1 -= 1;
-    true
-}
-
-fn log_limited(kind: &'static str, line: &str) {
-    static LAST: Mutex<Option<HashMap<&'static str, Instant>>> = Mutex::new(None);
-    let Ok(mut last) = LAST.lock() else {
-        return;
-    };
-    let last = last.get_or_insert_with(HashMap::new);
-    if last
-        .get(kind)
-        .is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
-    {
-        eprintln!("[Automations] {line}");
-        last.insert(kind, Instant::now());
-    }
-}
+static EVENT_BUCKETS: Buckets = Buckets::new(EVENTS_PER_MINUTE, Duration::from_secs(60));
+static DO_BUCKETS: Buckets = Buckets::new(DOS_PER_MINUTE, Duration::from_secs(60));
 
 // ── The engine ─────────────────────────────────────────────────────────────
 
@@ -1721,13 +1664,15 @@ fn subscribe_logind() -> Option<(
         None,
         gio::DBusSignalFlags::NONE,
         |_, _, _, _, _, parameters| {
-            if let Some(sleeping) = parameters.child_value(0).get::<bool>() {
-                fire(Step::new(if sleeping {
-                    "desk-sleep"
-                } else {
-                    "desk-resume"
-                }));
-            }
+            crate::guard("sleep signal", (), || {
+                if let Some(sleeping) = parameters.child_value(0).get::<bool>() {
+                    fire(Step::new(if sleeping {
+                        "desk-sleep"
+                    } else {
+                        "desk-resume"
+                    }));
+                }
+            })
         },
     ));
     let session = super::logind::display_session_path();
@@ -1741,20 +1686,22 @@ fn subscribe_logind() -> Option<(
             None,
             gio::DBusSignalFlags::NONE,
             move |_, _, _, _, _, parameters| {
-                let changed = parameters.child_value(1);
-                let dict = gtk::glib::VariantDict::new(Some(&changed));
-                let locked = dict
-                    .lookup_value("LockedHint", None)
-                    .and_then(|value| value.get::<bool>());
-                if let Some(locked) = locked {
-                    if last.replace(Some(locked)) != Some(locked) {
-                        fire(Step::new(if locked {
-                            "desk-locked"
-                        } else {
-                            "desk-unlocked"
-                        }));
+                crate::guard("lock signal", (), || {
+                    let changed = parameters.child_value(1);
+                    let dict = gtk::glib::VariantDict::new(Some(&changed));
+                    let locked = dict
+                        .lookup_value("LockedHint", None)
+                        .and_then(|value| value.get::<bool>());
+                    if let Some(locked) = locked {
+                        if last.replace(Some(locked)) != Some(locked) {
+                            fire(Step::new(if locked {
+                                "desk-locked"
+                            } else {
+                                "desk-unlocked"
+                            }));
+                        }
                     }
-                }
+                })
             },
         ));
     }
@@ -1968,10 +1915,10 @@ mod tests {
     #[test]
     fn events_and_dos_are_rate_limited_per_phone() {
         let allowed_events = (0..EVENTS_PER_MINUTE + 3)
-            .filter(|_| allowed(&EVENT_BUCKETS, "rate-phone", EVENTS_PER_MINUTE))
+            .filter(|_| EVENT_BUCKETS.allow("rate-phone"))
             .count();
         assert_eq!(allowed_events, EVENTS_PER_MINUTE as usize);
-        assert!(allowed(&EVENT_BUCKETS, "other-phone", EVENTS_PER_MINUTE));
+        assert!(EVENT_BUCKETS.allow("other-phone"));
     }
 
     #[test]

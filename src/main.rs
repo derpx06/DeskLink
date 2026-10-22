@@ -155,3 +155,23 @@ fn install_crash_reporter() {
         default(info);
     }));
 }
+
+/// Runs `body`, turning a panic into a logged error and `fallback`. For GLib
+/// callbacks fed by other processes or peers (D-Bus calls and signals, the
+/// timers that read what peers sent): a panic cannot unwind into C, so it
+/// would abort the whole app. The crash hook still writes its report.
+pub(crate) fn guard<T>(name: &str, fallback: T, body: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or_else(|_| {
+        eprintln!("[DeskLink] The {name} handler failed; carrying on");
+        fallback
+    })
+}
+
+#[cfg(test)]
+mod guard_tests {
+    #[test]
+    fn a_panicking_callback_returns_its_fallback() {
+        assert_eq!(super::guard("test", 7, || -> i32 { panic!("boom") }), 7);
+        assert_eq!(super::guard("test", 7, || 3), 3);
+    }
+}

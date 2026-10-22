@@ -247,15 +247,18 @@ impl Export {
             connection
                 .register_object(PATH, &info)
                 .method_call(move |_, _, _, _, method, params, invocation| {
-                    if method == "Raise" {
-                        if let Some(app) = app.upgrade() {
-                            app.activate();
+                    crate::guard("phone media call", (), || {
+                        if method == "Raise" {
+                            if let Some(app) = app.upgrade() {
+                                app.activate();
+                            }
+                        } else if let Some(command) =
+                            request_for(&id, &state.borrow(), method, &params)
+                        {
+                            daemon.send(command);
                         }
-                    } else if let Some(command) = request_for(&id, &state.borrow(), method, &params)
-                    {
-                        daemon.send(command);
-                    }
-                    invocation.return_value(None);
+                        invocation.return_value(None);
+                    })
                 })
                 .property(move |_, _, _, interface, name| {
                     let shown = read.borrow();

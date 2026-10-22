@@ -379,46 +379,50 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
     let registered = connection
         .register_object(PATH, &interface)
         .method_call(move |_, _, _, _, method, params, invocation| {
-            let Some(app) = weak.upgrade() else {
-                return invocation.return_value(None);
-            };
-            match method {
-                "GetInitialResultSet" => {
-                    let terms = params.get::<(Vec<String>,)>().unwrap_or_default().0;
-                    let (_, found) = search(&app, &terms);
-                    invocation.return_value(Some(&(found,).to_variant()));
-                }
-                "GetSubsearchResultSet" => {
-                    let (previous, terms) = params
-                        .get::<(Vec<String>, Vec<String>)>()
-                        .unwrap_or_default();
-                    // A number typed further is a new "Call" result.
-                    let found: Vec<String> = search(&app, &terms)
-                        .1
-                        .into_iter()
-                        .filter(|id| previous.contains(id) || id.starts_with("dial:"))
-                        .collect();
-                    invocation.return_value(Some(&(found,).to_variant()));
-                }
-                "GetResultMetas" => {
-                    let ids = params.get::<(Vec<String>,)>().unwrap_or_default().0;
-                    let mut all = current(&app);
-                    let callers = callers(&app);
-                    all.extend(ids.iter().filter_map(|id| dial_from_id(&callers, id)));
-                    let metas = metas(&all, &ids);
-                    invocation.return_value(Some(&Variant::tuple_from_iter([metas])));
-                }
-                "ActivateResult" => {
-                    if let Some(id) = params.try_child_value(0).and_then(|id| id.get::<String>()) {
-                        activate(&app, &id);
+            crate::guard("search provider call", (), || {
+                let Some(app) = weak.upgrade() else {
+                    return invocation.return_value(None);
+                };
+                match method {
+                    "GetInitialResultSet" => {
+                        let terms = params.get::<(Vec<String>,)>().unwrap_or_default().0;
+                        let (_, found) = search(&app, &terms);
+                        invocation.return_value(Some(&(found,).to_variant()));
                     }
-                    invocation.return_value(None);
+                    "GetSubsearchResultSet" => {
+                        let (previous, terms) = params
+                            .get::<(Vec<String>, Vec<String>)>()
+                            .unwrap_or_default();
+                        // A number typed further is a new "Call" result.
+                        let found: Vec<String> = search(&app, &terms)
+                            .1
+                            .into_iter()
+                            .filter(|id| previous.contains(id) || id.starts_with("dial:"))
+                            .collect();
+                        invocation.return_value(Some(&(found,).to_variant()));
+                    }
+                    "GetResultMetas" => {
+                        let ids = params.get::<(Vec<String>,)>().unwrap_or_default().0;
+                        let mut all = current(&app);
+                        let callers = callers(&app);
+                        all.extend(ids.iter().filter_map(|id| dial_from_id(&callers, id)));
+                        let metas = metas(&all, &ids);
+                        invocation.return_value(Some(&Variant::tuple_from_iter([metas])));
+                    }
+                    "ActivateResult" => {
+                        if let Some(id) =
+                            params.try_child_value(0).and_then(|id| id.get::<String>())
+                        {
+                            activate(&app, &id);
+                        }
+                        invocation.return_value(None);
+                    }
+                    _ => {
+                        app.activate();
+                        invocation.return_value(None);
+                    }
                 }
-                _ => {
-                    app.activate();
-                    invocation.return_value(None);
-                }
-            }
+            })
         })
         .build();
     if let Err(error) = registered {

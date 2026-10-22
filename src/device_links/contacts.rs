@@ -33,6 +33,9 @@ const MAX_UID_BYTES: usize = 256;
 const MAX_VCARD_BYTES: usize = 256 * 1024;
 /// A ≤96 px JPEG is a few KiB; anything far larger is not a thumbnail.
 const MAX_PHOTO_BYTES: usize = 64 * 1024;
+/// Photos kept per phone in all (base64): the cache's disk and memory
+/// bound; beyond it a contact is kept without its photo.
+const MAX_PHOTOS_TOTAL_BYTES: usize = 16 * 1024 * 1024;
 const MAX_FIELD_CHARS: usize = 200;
 const MAX_NOTE_CHARS: usize = 2_000;
 const MAX_VALUES: usize = 20;
@@ -149,6 +152,11 @@ fn apply_vcards(book: &mut Book, packet: &NetworkPacket) -> bool {
         return false;
     };
     let mut changed = false;
+    let mut photos: usize = book
+        .contacts
+        .values()
+        .filter_map(|contact| contact.photo.as_ref().map(String::len))
+        .sum();
     for uid in uids.iter().filter_map(Value::as_str) {
         let Some(stamp) = book.wanted.remove(uid) else {
             continue;
@@ -159,9 +167,19 @@ fn apply_vcards(book: &mut Book, packet: &NetworkPacket) -> bool {
         else {
             continue;
         };
-        let Some(contact) = parse_vcard(uid, card) else {
+        let Some(mut contact) = parse_vcard(uid, card) else {
             continue;
         };
+        let replaced = book
+            .contacts
+            .get(uid)
+            .and_then(|old| old.photo.as_ref().map(String::len))
+            .unwrap_or(0);
+        let photo = contact.photo.as_ref().map_or(0, String::len);
+        if photos - replaced + photo > MAX_PHOTOS_TOTAL_BYTES {
+            contact.photo = None;
+        }
+        photos = photos - replaced + contact.photo.as_ref().map_or(0, String::len);
         book.contacts.insert(uid.to_string(), contact);
         book.stamps.insert(uid.to_string(), stamp);
         changed = true;
@@ -564,13 +582,50 @@ fn save_logged(dir: &Path, device_id: &str, book: &Book) {
 }
 
 fn load(dir: &Path, device_id: &str) -> Option<Book> {
-    let plain = super::vault::open(dir, &book_path(dir, device_id), device_id.as_bytes())?;
-    serde_json::from_slice(&plain).ok()
+    Some(super::vault::open_or_quarantine(
+        dir,
+        &book_path(dir, device_id),
+        device_id.as_bytes(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn photos_stop_at_the_cache_bound_but_contacts_stay() {
+        // A JPEG of about 60 KB, base64.
+        let photo = format!("/9j/{}", "A".repeat(80_000));
+        let mut book = Book::default();
+        let count = MAX_PHOTOS_TOTAL_BYTES / photo.len() + 3;
+        let mut packet = NetworkPacket::new("desklink.contacts.response_vcards");
+        let uids: Vec<String> = (0..count).map(|index| format!("{index}")).collect();
+        for uid in &uids {
+            book.wanted.insert(uid.clone(), "1".into());
+            packet.set(
+                uid,
+                format!("BEGIN:VCARD\r\nVERSION:3.0\r\nFN:N {uid}\r\nTEL:555\r\nPHOTO;ENCODING=b;TYPE=JPEG:{photo}\r\nEND:VCARD\r\n"),
+            );
+        }
+        packet.set("uids", uids.clone());
+        assert!(apply_vcards(&mut book, &packet));
+        assert_eq!(book.contacts.len(), count, "every contact is kept");
+        let total: usize = book
+            .contacts
+            .values()
+            .filter_map(|c| c.photo.as_ref())
+            .map(String::len)
+            .sum();
+        assert!(
+            total > MAX_PHOTOS_TOTAL_BYTES / 2 && total <= MAX_PHOTOS_TOTAL_BYTES,
+            "{total}"
+        );
+        assert!(
+            book.contacts.values().any(|c| c.photo.is_none()),
+            "beyond it, without a photo"
+        );
+    }
     use serde_json::json;
 
     const CARD: &str = "BEGIN:VCARD\r\nVERSION:3.0\r\nN:Lindqvist;Mara;;;\r\nFN:Mara Lindqvist\r\n\
@@ -737,7 +792,11 @@ X-UNKNOWN:ignored\r\nREV:2026-10-01T10:00:00Z\r\nEND:VCARD\r\n";
         );
         // Another phone's id cannot open it, even renamed into place.
         std::fs::copy(&path, book_path(&dir, "phone-2")).unwrap();
-        assert!(load(&dir, "phone-2").is_none());
+        assert!(load(&dir, "phone-2").unwrap().contacts.is_empty());
+        assert!(
+            !book_path(&dir, "phone-2").exists(),
+            "set aside, not read as another phone's"
+        );
         forget_in(&dir, "phone-1");
         assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);

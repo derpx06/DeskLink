@@ -100,28 +100,33 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
     let registered = connection
         .register_object(PATH, &interface)
         .method_call(move |_, _, _, _, method, params, invocation| {
-            let Some(app) = weak.upgrade() else {
-                return invocation.return_value(None);
-            };
-            match method {
-                "Actions" => invocation.return_value(Some(
-                    &(Vec::<(String, String, String)>::new(),).to_variant(),
-                )),
-                "Match" => {
-                    let query = params.get::<(String,)>().unwrap_or_default().0;
-                    let terms: Vec<String> = query.split_whitespace().map(str::to_string).collect();
-                    let (all, found) = crate::search_provider::search(&app, &terms);
-                    let found = matches(&all, &found);
-                    invocation.return_value(Some(&Variant::tuple_from_iter([found])));
-                }
-                "Run" => {
-                    if let Some(id) = params.try_child_value(0).and_then(|id| id.get::<String>()) {
-                        crate::search_provider::activate(&app, &id);
+            crate::guard("KRunner call", (), || {
+                let Some(app) = weak.upgrade() else {
+                    return invocation.return_value(None);
+                };
+                match method {
+                    "Actions" => invocation.return_value(Some(
+                        &(Vec::<(String, String, String)>::new(),).to_variant(),
+                    )),
+                    "Match" => {
+                        let query = params.get::<(String,)>().unwrap_or_default().0;
+                        let terms: Vec<String> =
+                            query.split_whitespace().map(str::to_string).collect();
+                        let (all, found) = crate::search_provider::search(&app, &terms);
+                        let found = matches(&all, &found);
+                        invocation.return_value(Some(&Variant::tuple_from_iter([found])));
                     }
-                    invocation.return_value(None);
+                    "Run" => {
+                        if let Some(id) =
+                            params.try_child_value(0).and_then(|id| id.get::<String>())
+                        {
+                            crate::search_provider::activate(&app, &id);
+                        }
+                        invocation.return_value(None);
+                    }
+                    _ => invocation.return_value(None),
                 }
-                _ => invocation.return_value(None),
-            }
+            })
         })
         .build();
     if let Err(error) = registered {
