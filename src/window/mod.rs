@@ -2282,7 +2282,7 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                  - [x] contract\n- [ ] Android side\n- `cargo test` green\n1. tag\n2. push",
             );
             if let (Some(note), "pinned") = (id, verb_id) {
-                crate::device_links::notes::edit_note(&note, |note| note.pinned = true);
+                let _ = crate::device_links::notes::edit_note(&note, |note| note.pinned = true);
             }
             win.refresh_soon();
         }

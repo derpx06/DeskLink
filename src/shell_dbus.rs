@@ -1307,11 +1307,18 @@ fn offer_extension(app: &DesklinkApplication) {
 
     // An installed copy of ours from an older DeskLink: brought up to date
     // (it was turned on before, so this is no new choice), and the user told
-    // when it shows.
-    if !app.is_remote()
-        && is_gnome(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
-        && user_extension_dir().join("metadata.json").is_file()
-    {
+    // when it shows. Once registration has finished: during `dbus_register`
+    // the application is not registered yet, so `is_remote` and
+    // `send_notification` only assert.
+    let weak = app.downgrade();
+    glib::idle_add_local_once(move || {
+        let Some(app) = weak.upgrade() else { return };
+        if app.is_remote()
+            || !is_gnome(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
+            || !user_extension_dir().join("metadata.json").is_file()
+        {
+            return;
+        }
         match install_extension_files(&user_extension_dir()) {
             Ok(true) => {
                 let notification = gio::Notification::new("DeskLink's top-bar menu was updated");
@@ -1322,7 +1329,7 @@ fn offer_extension(app: &DesklinkApplication) {
             Ok(false) => {}
             Err(error) => eprintln!("[Shell] {error}"),
         }
-    }
+    });
 
     let weak = app.downgrade();
     // Late enough for the tray to have found any host.

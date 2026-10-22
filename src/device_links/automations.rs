@@ -27,6 +27,8 @@ use super::limits::{log_limited, Buckets};
 use super::packet::{NetworkPacket, PACKET_TYPE_AUTOMATIONS};
 
 // Limits: what a peer can make this module hold or do.
+/// How far ahead of this clock a rule's `modified` may be.
+const MAX_FUTURE_MS: i64 = 24 * 3600 * 1000;
 /// Rules kept (live and tombstones).
 const MAX_RULES: usize = 200;
 const MAX_ID_CHARS: usize = 128;
@@ -489,6 +491,9 @@ pub(crate) fn valid_rule(rule: &Rule) -> bool {
     valid_id(&rule.id)
         && rule.name.chars().count() <= MAX_NAME_CHARS
         && rule.modified > 0
+        // A clock a little off is fine; a version from far ahead would win
+        // every merge forever.
+        && rule.modified <= now_ms().saturating_add(MAX_FUTURE_MS)
         && rule.conditions.len() <= MAX_CONDITIONS
         && rule.actions.len() <= MAX_ACTIONS
         && (rule.deleted || !rule.actions.is_empty())
@@ -846,7 +851,7 @@ pub(crate) fn save_rule(mut rule: Rule) -> Result<(), String> {
         if previous.is_none() && live >= MAX_RULES {
             return (Err("Too many rules (200 at most)"), false);
         }
-        rule.modified = now_ms().max(previous.map_or(0, |rule| rule.modified + 1));
+        rule.modified = now_ms().max(previous.map_or(0, |rule| rule.modified.saturating_add(1)));
         shelf.origin.insert(rule.id.clone(), DESK.into());
         shelf.rules.insert(rule.id.clone(), rule);
         (Ok(()), true)
@@ -861,8 +866,9 @@ pub(crate) fn set_enabled(id: &str, enabled: bool) {
     let changed = with_shelf(|shelf| match shelf.rules.get_mut(id) {
         Some(rule) if rule.enabled != enabled && !rule.deleted => {
             rule.enabled = enabled;
-            rule.modified = now_ms().max(rule.modified + 1);
-            shelf.origin.insert(id.to_string(), DESK.into());
+            rule.modified = now_ms().max(rule.modified.saturating_add(1));
+            // Toggling is not editing: who last changed the rule (and so
+            // whether it needs approval or a gate) stays as it was.
             (true, true)
         }
         _ => (false, false),
@@ -878,7 +884,7 @@ pub(crate) fn delete_rule(id: &str) {
             rule.deleted = true;
             rule.conditions.clear();
             rule.actions.clear();
-            rule.modified = now_ms().max(rule.modified + 1);
+            rule.modified = now_ms().max(rule.modified.saturating_add(1));
             shelf.history.remove(id);
             (true, true)
         }
@@ -1393,11 +1399,9 @@ fn run_matching(from: Option<&str>, trigger: &Step, fired: &mut HashMap<String, 
 
 /// The rule's actions in order: here, or asked of the phones.
 fn run_rule(rule: &Rule, from: Option<&str>, cause: String) {
-    let origin = with_shelf(|shelf| (shelf.origin.get(&rule.id).cloned(), false)).flatten();
-    // A phone fired it, or a phone last changed it: its gate applies.
-    let gate = from
-        .map(str::to_string)
-        .or_else(|| origin.filter(|origin| origin != DESK));
+    let approved = approved_here(&rule.id);
+    // A phone fired it: that phone's gate applies to a saved command.
+    let gate = from.map(str::to_string);
     let run_id = uuid::Uuid::new_v4().to_string();
     let mut results = Vec::new();
     let mut ok = true;
@@ -1408,6 +1412,9 @@ fn run_rule(rule: &Rule, from: Option<&str>, cause: String) {
             continue;
         };
         let result = match kind.side {
+            // A rule a phone made or changed acts here only once approved
+            // here: syncing a rule must not be a way to run desk actions.
+            Side::Desk if !approved => Err(NOT_APPROVED.to_string()),
             Side::Desk => run_action(action, gate.as_deref()),
             Side::Phone => ask_phones(&rule.id, &run_id, action),
         };
@@ -1462,14 +1469,50 @@ fn ask_phones(rule_id: &str, run_id: &str, action: &Step) -> Result<String, Stri
     ))
 }
 
+const NOT_APPROVED: &str = "Not approved on this computer yet";
+
+/// Whether rule `id`'s desk actions may run: saved or approved on this
+/// computer (or built in), not merely synced from a phone.
+fn approved_here(id: &str) -> bool {
+    with_shelf(|shelf| {
+        (
+            shelf.origin.get(id).is_none_or(|origin| origin == DESK),
+            false,
+        )
+    })
+    .unwrap_or(false)
+}
+
+/// Whether `rule` has desk actions that wait for the user's approval here.
+pub(crate) fn needs_approval(rule: &Rule) -> bool {
+    !approved_here(&rule.id)
+        && rule
+            .actions
+            .iter()
+            .any(|step| action_kind(&step.kind).is_some_and(|kind| kind.side == Side::Desk))
+}
+
+/// "Approve": the user lets a rule a phone made act on this computer. Local
+/// only; the rule itself is unchanged.
+pub(crate) fn approve(id: &str) {
+    with_shelf(|shelf| {
+        let known = shelf.rules.get(id).is_some_and(|rule| !rule.deleted);
+        if known {
+            shelf.origin.insert(id.to_string(), DESK.into());
+        }
+        ((), known)
+    });
+}
+
 /// A phone's `do`: only an identical action of a rule here that the phone
-/// runs, enabled.
+/// runs, enabled, and approved on this computer.
 fn run_requested(device: &str, rule_id: &str, action: &Step) -> Result<String, String> {
     let rule = rules()
         .into_iter()
         .find(|rule| rule.id == rule_id)
         .ok_or("refused")?;
     let known = rule.enabled
+        && approved_here(rule_id)
         && rule.run_on == Side::Phone
         && rule.actions.iter().any(|step| step == action)
         && action_kind(&action.kind).is_some_and(|kind| kind.side == Side::Desk);
@@ -1712,6 +1755,9 @@ fn subscribe_logind() -> Option<(
 mod tests {
     use super::*;
 
+    /// The store is one per process: tests that install it take turns.
+    static STORE_TEST: Mutex<()> = Mutex::new(());
+
     fn rule(trigger: Step, actions: Vec<Step>) -> Rule {
         Rule {
             id: "r1".into(),
@@ -1932,6 +1978,9 @@ mod tests {
 
     #[test]
     fn the_editor_saves_checks_and_deletes_rules() {
+        let _store = STORE_TEST
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let dir = std::env::temp_dir().join(format!("desklink-rules-{}", uuid::Uuid::new_v4()));
         install(dir.clone());
         assert!(rules().iter().any(|rule| rule.id == BUILTIN_CALL_PAUSE));
@@ -1968,6 +2017,67 @@ mod tests {
         install(dir.clone());
         assert!(builtin_enabled(BUILTIN_CALL_PAUSE));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_phone_made_rule_acts_here_only_once_approved() {
+        let _store = STORE_TEST
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let dir = std::env::temp_dir().join(format!("desklink-approve-{}", uuid::Uuid::new_v4()));
+        install(dir.clone());
+        let mut synced = rule(
+            Step::new("wifi").with("state", "connected"),
+            vec![Step::new("lock-desk")],
+        );
+        synced.id = "from-phone".into();
+        synced.enabled = false;
+        synced.run_on = Side::Phone;
+        synced.modified = now_ms();
+        let mut packet = NetworkPacket::new(PACKET_TYPE_AUTOMATIONS);
+        packet.set("op", "items");
+        packet.set("items", json!([synced]));
+        on_packet("phone-a", &packet);
+        let stored = || {
+            rules()
+                .into_iter()
+                .find(|rule| rule.id == "from-phone")
+                .unwrap()
+        };
+        assert!(needs_approval(&stored()));
+        // Turning it on is not approving it.
+        set_enabled("from-phone", true);
+        assert!(stored().enabled && needs_approval(&stored()));
+        assert_eq!(
+            run_requested("phone-a", "from-phone", &Step::new("lock-desk")),
+            Err("refused".into()),
+            "a synced rule cannot make the phone's request valid"
+        );
+        approve("from-phone");
+        assert!(!needs_approval(&stored()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn versions_from_the_far_future_are_refused_and_never_overflow() {
+        let mut far = rule(Step::new("desk-locked"), vec![Step::new("pause-media")]);
+        far.modified = i64::MAX;
+        assert!(!valid_rule(&far));
+        far.modified = now_ms() + MAX_FUTURE_MS / 2;
+        assert!(valid_rule(&far), "a clock a little ahead is fine");
+        let mut shelf = Shelf::default();
+        let mut max = far.clone();
+        max.modified = i64::MAX;
+        shelf.rules.insert(max.id.clone(), max);
+        with_shelf_test(&mut shelf);
+    }
+
+    /// `set_enabled`'s arithmetic on a stored `i64::MAX` (it cannot arrive
+    /// by sync any more, but an old file could hold one).
+    fn with_shelf_test(shelf: &mut Shelf) {
+        let rule = shelf.rules.values_mut().next().unwrap();
+        rule.modified = now_ms().max(rule.modified.saturating_add(1));
+        assert_eq!(rule.modified, i64::MAX);
     }
 
     #[test]

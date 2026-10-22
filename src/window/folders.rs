@@ -206,6 +206,9 @@ fn phase_words(view: &PairView, phone: &str) -> String {
         Phase::Syncing(1) => "Syncing 1 file".into(),
         Phase::Syncing(count) => format!("Syncing {count} files"),
         Phase::TooMany => "Too many files: only the first 20,000 sync".into(),
+        Phase::EmptyHeld => {
+            "Empty here though it had files. Is its drive connected? Paused, nothing deleted".into()
+        }
         Phase::Problem(problem) => problem.clone(),
         Phase::UpToDate => match view.last_sync {
             Some(at) => format!(
@@ -246,12 +249,39 @@ fn pair_row(view: &PairView, phone: &str) -> adw::ExpanderRow {
         .build();
     row.set_widget_name("pair-row");
     let icon = match view.phase {
-        Phase::Problem(_) | Phase::NotOnPhone | Phase::TooMany => "dialog-warning-symbolic",
+        Phase::Problem(_) | Phase::NotOnPhone | Phase::TooMany | Phase::EmptyHeld => {
+            "dialog-warning-symbolic"
+        }
         Phase::Syncing(_) | Phase::Scanning => "emblem-synchronizing-symbolic",
         _ => "folder-symbolic",
     };
     row.add_prefix(&icon_square(icon, 30, "row-icon"));
 
+    if view.phase == Phase::EmptyHeld {
+        let confirm = gtk::Button::builder()
+            .label("It’s Empty on Purpose")
+            .valign(gtk::Align::Center)
+            .css_classes(["destructive-action"])
+            .build();
+        let (id, name, phone_name) = (
+            view.pair.id.clone(),
+            view.pair.name.clone(),
+            phone.to_string(),
+        );
+        confirm.connect_clicked(move |button| {
+            let id = id.clone();
+            super::confirm(
+                button,
+                "Delete these files on the phone too?",
+                &format!(
+                    "“{name}” is empty on this computer. Syncing it deletes its files on {phone_name}."
+                ),
+                "Sync the Empty Folder",
+                move || folders::confirm_empty(&id),
+            );
+        });
+        row.add_suffix(&confirm);
+    }
     let open = gtk::Button::builder()
         .icon_name("folder-open-symbolic")
         .tooltip_text("Open Folder")

@@ -897,9 +897,11 @@ impl Portal {
         self.enabled = false;
     }
 
-    fn release(&self, activation: u32, x: f64, y: f64) {
+    /// Ends the capture; false when the desktop refused (the caller then
+    /// disables the session, which ends it too).
+    fn release(&self, activation: u32, x: f64, y: f64) -> bool {
         let Ok(session) = object_path(&self.handle) else {
-            return;
+            return false;
         };
         if let Err(error) = self.call(
             "Release",
@@ -912,7 +914,9 @@ impl Portal {
             ]),
         ) {
             log_limited("release", &error);
+            return false;
         }
+        true
     }
 }
 
@@ -1045,18 +1049,91 @@ fn send_clipboard(device: &str) {
     }
 }
 
-/// Carries out what the state machine asked, for `device`.
-fn perform(device: Option<&str>, outs: Vec<Out>, portal: Option<&Portal>) {
+/// Something that changes the capture session.
+#[derive(Debug)]
+enum Event {
+    Signal(Signal),
+    /// The EIS reader stopped (the compositor closed the socket).
+    ReaderClosed,
+}
+
+/// What the worker does with the session after an [`Event`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum After {
+    Keep,
+    /// Disable, so the next check sets the barrier again (new screens).
+    Rearm,
+    /// Disable and drop the session; glide stops with this reason.
+    Close(&'static str),
+}
+
+/// The outs and the session change for `event` (tested). A capture that may
+/// still be live is always released, never just forgotten.
+fn react(event: Event, glide: Option<&mut Glide>) -> (Vec<Out>, After) {
+    let mut outs = Vec::new();
+    let after = match event {
+        Event::Signal(Signal::Activated { id, cursor }) => {
+            if let Some(glide) = glide {
+                outs = glide.activated(id, cursor, &desk_key, Instant::now());
+            }
+            After::Keep
+        }
+        Event::Signal(Signal::Deactivated) => {
+            if let Some(glide) = glide {
+                outs = glide.deactivated();
+            }
+            After::Keep
+        }
+        // The compositor ended capture itself: nothing left to release.
+        Event::Signal(Signal::Disabled) => {
+            if let Some(glide) = glide {
+                outs = glide.deactivated();
+            }
+            After::Rearm
+        }
+        // Screens changed (a monitor plugged mid-glide): the capture may
+        // still hold the pointer, so it is released, then re-armed.
+        Event::Signal(Signal::ZonesChanged) => {
+            if let Some(glide) = glide {
+                outs = glide.take_back();
+            }
+            After::Rearm
+        }
+        Event::Signal(Signal::Closed) => {
+            if let Some(glide) = glide {
+                outs = glide.deactivated();
+            }
+            After::Close("The desktop stopped glide. Turn it off and on again to restart it.")
+        }
+        Event::ReaderClosed => {
+            if let Some(glide) = glide {
+                outs = glide.take_back();
+            }
+            After::Close(
+                "Glide lost its connection to the desktop. Turn it off and on again to restart it.",
+            )
+        }
+    };
+    (outs, after)
+}
+
+/// Carries out what the state machine asked, for `device`. A Release the
+/// desktop refuses falls back to disabling the session, so the pointer is
+/// never left captured.
+fn perform(device: Option<&str>, outs: Vec<Out>, portal: Option<&mut Portal>) {
     let Some(device) = device else {
         return;
     };
+    let mut portal = portal;
     for out in outs {
         match out {
             Out::Send(packet) => deliver(device, &packet),
             Out::Clipboard => send_clipboard(device),
             Out::Release { activation, x, y } => {
-                if let Some(portal) = portal {
-                    portal.release(activation, x, y);
+                if let Some(portal) = portal.as_deref_mut() {
+                    if !portal.release(activation, x, y) {
+                        portal.disable();
+                    }
                 }
             }
             Out::Gliding(on) => {
@@ -1097,9 +1174,10 @@ fn worker(context: &glib::MainContext, commands: &Receiver<Command>) {
             break;
         }
         let device = current.as_ref().map(|setting| setting.device.clone());
+        let mut events = Vec::new();
         for command in first.into_iter().chain(commands.try_iter().take(QUEUE)) {
             match command {
-                Command::Captured(Captured::Closed) => {}
+                Command::Captured(Captured::Closed) => events.push(Event::ReaderClosed),
                 Command::Captured(captured) => {
                     if let Some(glide) = glide.as_mut() {
                         outs.extend(glide.input(captured, &desk_key, Instant::now()));
@@ -1125,38 +1203,33 @@ fn worker(context: &glib::MainContext, commands: &Receiver<Command>) {
             .as_ref()
             .map(|portal| portal.signals.borrow_mut().drain(..).collect())
             .unwrap_or_default();
-        for signal in signals {
-            match signal {
-                Signal::Activated { id, cursor } => {
-                    if let Some(glide) = glide.as_mut() {
-                        outs.extend(glide.activated(id, cursor, &desk_key, Instant::now()));
-                    }
-                }
-                Signal::Deactivated => {
-                    if let Some(glide) = glide.as_mut() {
-                        outs.extend(glide.deactivated());
-                    }
-                }
-                Signal::Disabled | Signal::ZonesChanged => {
-                    if let Some(glide) = glide.as_mut() {
-                        outs.extend(glide.deactivated());
-                    }
+        events.extend(signals.into_iter().map(Event::Signal));
+        for event in events {
+            let (more, after) = react(event, glide.as_mut());
+            outs.extend(more);
+            if after == After::Keep {
+                continue;
+            }
+            // The Release first, while the session that captured is open.
+            perform(
+                current.as_ref().map(|setting| setting.device.as_str()),
+                std::mem::take(&mut outs),
+                portal.as_mut(),
+            );
+            match after {
+                After::Keep => {}
+                After::Rearm => {
                     if let Some(portal) = portal.as_mut() {
-                        portal.enabled = false;
+                        portal.disable();
                     }
                 }
-                Signal::Closed => {
-                    if let Some(glide) = glide.as_mut() {
-                        outs.extend(glide.deactivated());
+                After::Close(problem) => {
+                    if let Some(mut closing) = portal.take() {
+                        closing.disable();
                     }
-                    portal = None;
+                    glide = None;
                     refused = true;
-                    set_status(|status| {
-                        status.problem = Some(
-                            "The desktop stopped glide. Turn it off and on again to restart it."
-                                .to_string(),
-                        )
-                    });
+                    set_status(|status| status.problem = Some(problem.to_string()));
                 }
             }
         }
@@ -1177,7 +1250,7 @@ fn worker(context: &glib::MainContext, commands: &Receiver<Command>) {
                 perform(
                     current.as_ref().map(|setting| setting.device.as_str()),
                     back,
-                    portal.as_ref(),
+                    portal.as_mut(),
                 );
                 // Another phone or off: a new session (and consent) for it.
                 if setting.as_ref().map(|s| &s.device) != current.as_ref().map(|s| &s.device) {
@@ -1220,9 +1293,12 @@ fn worker(context: &glib::MainContext, commands: &Receiver<Command>) {
                         }
                     }
                 } else if !want && open.enabled {
+                    // The Release (and telling the phone) before Disable.
+                    let mut back = std::mem::take(&mut outs);
                     if let Some(glide) = glide.as_mut() {
-                        outs.extend(glide.take_back());
+                        back.extend(glide.take_back());
                     }
+                    perform(Some(setting.device.as_str()), back, Some(&mut *open));
                     open.disable();
                 }
             }
@@ -1233,7 +1309,7 @@ fn worker(context: &glib::MainContext, commands: &Receiver<Command>) {
         }
 
         let target = current.as_ref().map(|setting| setting.device.clone());
-        perform(target.as_deref(), outs, portal.as_ref());
+        perform(target.as_deref(), outs, portal.as_mut());
         if glide.as_ref().is_some_and(|glide| glide.dropped > 0) {
             if let Some(glide) = glide.as_mut() {
                 log_limited("pending", "Input before the capture started was dropped");
@@ -1521,6 +1597,35 @@ mod tests {
         assert!(clipboard_packet(String::new()).is_none());
         assert!(clipboard_packet("x".repeat(MAX_CLIPBOARD_BYTES)).is_some());
         assert!(clipboard_packet("x".repeat(MAX_CLIPBOARD_BYTES + 1)).is_none());
+    }
+
+    #[test]
+    fn a_lost_reader_or_new_screens_release_the_pointer() {
+        let live = || {
+            let mut glide = Glide::new(Barrier::on(Edge::Right, &screen()).unwrap());
+            glide.activated(3, (1600.0, 200.0), &keys, Instant::now());
+            glide
+        };
+        for (event, expected) in [
+            (Event::ReaderClosed, "Close"),
+            (Event::Signal(Signal::ZonesChanged), "Rearm"),
+        ] {
+            let mut glide = live();
+            let (outs, after) = react(event, Some(&mut glide));
+            assert!(
+                outs.iter()
+                    .any(|out| matches!(out, Out::Release { activation: 3, .. })),
+                "{expected}: the capture is released"
+            );
+            assert!(outs.contains(&Out::Gliding(false)));
+            assert!(format!("{after:?}").starts_with(expected));
+            assert!(!glide.gliding());
+        }
+        // Not gliding: nothing to release, the session still changes.
+        let (outs, after) = react(Event::ReaderClosed, None);
+        assert!(outs.is_empty() && matches!(after, After::Close(_)));
+        let (_, after) = react(Event::Signal(Signal::Disabled), Some(&mut live()));
+        assert_eq!(after, After::Rearm);
     }
 
     #[test]

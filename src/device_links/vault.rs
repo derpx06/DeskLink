@@ -13,10 +13,16 @@ const TAG_BYTES: usize = 16;
 /// `dir`'s key, made on first use.
 fn key(dir: &Path) -> Result<[u8; 32], String> {
     let path = dir.join("key");
-    if let Ok(bytes) = std::fs::read(&path) {
-        return bytes
-            .try_into()
-            .map_err(|_| format!("{} is not a key", path.display()));
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            return bytes
+                .try_into()
+                .map_err(|_| format!("{} is not a key", path.display()));
+        }
+        // Only a key that is not there is made: any other failure (too many
+        // open files, an I/O error) must not orphan every sealed file.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("The encryption key could not be read: {error}")),
     }
     create_private_dir(dir)?;
     let mut key = [0u8; 32];
@@ -180,6 +186,12 @@ mod tests {
             .any(|entry| entry.file_name().to_string_lossy().contains("corrupt"));
         assert!(aside, "the damaged file is kept beside it");
         seal_later(&dir, &path, b"purpose", b"[4]".to_vec());
+        // A key that cannot be read (here: a directory in its place) is an
+        // error, never a reason to make a new one.
+        let unreadable = dir.join("other");
+        std::fs::create_dir_all(unreadable.join("key")).unwrap();
+        assert!(key(&unreadable).is_err());
+        assert!(unreadable.join("key").is_dir(), "left alone");
         assert_eq!(open(&dir, &path, b"purpose").unwrap(), b"[4]");
         let _ = std::fs::remove_dir_all(&dir);
     }

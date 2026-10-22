@@ -339,16 +339,16 @@ pub(crate) fn activate(app: &DesklinkApplication, id: &str) {
                     "desk",
                 ) {
                     Ok(info) => crate::device_links::pty::desk::open_on_desktop(&info.id),
-                    Err(error) => eprintln!("[Search] Could not run {}: {error}", command.name),
+                    // No command name or error text: they can carry personal data.
+                    Err(_) => eprintln!("[Search] Could not run a saved command"),
                 }
             }
         }
         "transfer" => {
             let uri = gio::File::for_path(rest).uri();
-            if let Err(error) =
-                gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE)
-            {
-                eprintln!("[Search] Could not open {rest}: {error}");
+            if gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE).is_err() {
+                // No path: file names are personal data.
+                eprintln!("[Search] Could not open a received file");
             }
         }
         "contact" => {

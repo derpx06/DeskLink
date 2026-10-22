@@ -470,6 +470,9 @@ struct Book {
     last_sync: Option<i64>,
 }
 
+const TRASH_MISSING: &str =
+    "Files deleted on the phone could not go to the trash here, so they were kept";
+
 /// What the window shows for a pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -483,6 +486,9 @@ pub(crate) enum Phase {
     Syncing(usize),
     UpToDate,
     TooMany,
+    /// The folder scanned empty though it had files (an unmounted drive?):
+    /// nothing is deleted anywhere until the user confirms.
+    EmptyHeld,
     Problem(String),
 }
 
@@ -582,6 +588,8 @@ enum Message {
         id: String,
     },
     Remove(String),
+    /// "It's empty on purpose" for a held pair.
+    ConfirmEmpty(String),
     Resolve {
         pair: String,
         path: String,
@@ -641,6 +649,11 @@ pub(crate) fn decline(device_id: &str, id: &str) {
         device: device_id.to_string(),
         id: id.to_string(),
     });
+}
+
+/// The user confirms a pair's folder is meant to be empty now.
+pub(crate) fn confirm_empty(id: &str) {
+    send_message(Message::ConfirmEmpty(id.to_string()));
 }
 
 pub(crate) fn remove(id: &str) {
@@ -883,13 +896,24 @@ fn put_in_place(from: &Path, to: &Path, mtime: i64) -> Result<(), String> {
 }
 
 /// Removes a local file: to the trash when the desktop has one.
+/// Moves a local file to the trash; false when the desktop has none for it.
+/// A file is never deleted for good because a peer said so.
 fn trash(path: &Path) -> bool {
-    if cfg!(test) {
-        return fs::remove_file(path).is_ok();
+    #[cfg(test)]
+    {
+        !TEST_TRASH_FAILS.with(std::cell::Cell::get) && fs::remove_file(path).is_ok()
     }
-    let file = gtk::gio::File::for_path(path);
-    gtk::prelude::FileExt::trash(&file, gtk::gio::Cancellable::NONE).is_ok()
-        || fs::remove_file(path).is_ok()
+    #[cfg(not(test))]
+    {
+        let file = gtk::gio::File::for_path(path);
+        gtk::prelude::FileExt::trash(&file, gtk::gio::Cancellable::NONE).is_ok()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: a desktop without a trash (this test's thread only).
+    static TEST_TRASH_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 // ── Storage ────────────────────────────────────────────────────────────────
@@ -955,6 +979,8 @@ struct Live {
     outstanding: VecDeque<String>,
     /// Waiting to be asked (beyond [`MAX_OUTSTANDING`]).
     to_request: VecDeque<String>,
+    /// The user confirmed an empty folder is meant: the next scan applies.
+    allow_empty: bool,
 }
 
 struct Worker {
@@ -1063,8 +1089,10 @@ fn manifest_packets(id: &str, manifest: &Manifest) -> Vec<NetworkPacket> {
         .collect()
 }
 
-/// Entries of a `manifest` part that are safe to use.
-fn manifest_entries(packet: &NetworkPacket) -> Vec<(String, Entry)> {
+/// Entries of a `manifest` part that are safe to use, minus what this
+/// pair ignores (a peer cannot have `.git/hooks/…` or hidden files written
+/// here that the next scan would then make it delete).
+fn manifest_entries(packet: &NetworkPacket, pair: &Pair) -> Vec<(String, Entry)> {
     packet
         .body
         .get("entries")
@@ -1077,6 +1105,7 @@ fn manifest_entries(packet: &NetworkPacket) -> Vec<(String, Entry)> {
                     let path = value.get("path")?.as_str()?;
                     let entry: Entry = serde_json::from_value(value.clone()).ok()?;
                     let sane = validate_relpath(path).is_ok()
+                        && !ignored(path, pair.include_hidden, &pair.ignore)
                         && (entry.deleted
                             || (entry.sha256.len() == 64
                                 && entry.sha256.bytes().all(|b| b.is_ascii_hexdigit())
@@ -1109,6 +1138,7 @@ impl Live {
             on_phone: true,
             outstanding: VecDeque::new(),
             to_request: VecDeque::new(),
+            allow_empty: false,
         }
     }
 
@@ -1309,6 +1339,12 @@ impl Worker {
                 self.publish();
             }
             Message::Resolve { pair, path, how } => self.resolve(&pair, &path, how),
+            Message::ConfirmEmpty(id) => {
+                if let Some(live) = self.pairs.iter_mut().find(|live| live.pair.id == id) {
+                    live.allow_empty = true;
+                    live.dirty = Some(Instant::now() - SETTLE);
+                }
+            }
         }
     }
 
@@ -1457,7 +1493,8 @@ impl Worker {
             live.incoming.clear();
             return;
         }
-        live.incoming.insert(part as u32, manifest_entries(packet));
+        let entries = manifest_entries(packet, &live.pair);
+        live.incoming.insert(part as u32, entries);
         if live.incoming.len() as i64 != parts {
             return;
         }
@@ -1478,6 +1515,7 @@ impl Worker {
         let device = self.pairs[index].pair.device.clone();
         let mut downloads = Vec::new();
         let mut rescan = false;
+        let mut kept = false;
         {
             let live = &mut self.pairs[index];
             let manifest = &mut live.book.manifest;
@@ -1495,6 +1533,10 @@ impl Worker {
                         Ok(target) if unchanged(&target, manifest.get(&path)) => {
                             if !target.exists() || trash(&target) {
                                 manifest.insert(path, entry);
+                            } else {
+                                // Kept: the next round asks again, the user
+                                // is told meanwhile.
+                                kept = true;
                             }
                         }
                         _ => rescan = true,
@@ -1577,7 +1619,9 @@ impl Worker {
         }
         self.request_more(index);
         let live = &mut self.pairs[index];
-        live.phase = if live.to_request.is_empty() && live.outstanding.is_empty() {
+        live.phase = if kept {
+            Phase::Problem(TRASH_MISSING.into())
+        } else if live.to_request.is_empty() && live.outstanding.is_empty() {
             live.book.last_sync = Some(now_ms());
             Phase::UpToDate
         } else {
@@ -1796,6 +1840,13 @@ impl Worker {
                 return;
             }
         };
+        let had_files = live.book.manifest.values().any(|entry| !entry.deleted);
+        if found.is_empty() && had_files && !std::mem::take(&mut live.allow_empty) {
+            // An unmounted drive looks exactly like this: deleting every
+            // file on the phone too would be the worst outcome.
+            live.phase = Phase::EmptyHeld;
+            return;
+        }
         let root = pair.root.clone();
         let changed = apply_scan(
             Side::Desk,
@@ -1850,6 +1901,119 @@ fn live_dirty(dirty: &std::rc::Rc<std::cell::RefCell<HashSet<String>>>, id: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_pair() -> Pair {
+        Pair {
+            id: "pair-t".into(),
+            name: "t".into(),
+            root: PathBuf::from("/nonexistent"),
+            device: "phone-t".into(),
+            include_hidden: false,
+            ignore: vec!["*.log".into()],
+        }
+    }
+
+    #[test]
+    fn a_phone_cannot_send_what_this_pair_ignores() {
+        let mut packet = NetworkPacket::new(PACKET_TYPE_FOLDERS);
+        let entry = |path: &str| {
+            json!({"path": path, "size": 1, "mtime": 1, "sha256": "a".repeat(64),
+                   "vv": {"desk": 0, "phone": 1}})
+        };
+        packet.set(
+            "entries",
+            json!([
+                entry(".git/hooks/pre-commit"),
+                entry("src/.env"),
+                entry("build.log"),
+                entry("node_modules/x.js"),
+                entry("docs/readme.md"),
+            ]),
+        );
+        let kept: Vec<String> = manifest_entries(&packet, &test_pair())
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(kept, ["docs/readme.md"]);
+        let with_hidden = Pair {
+            include_hidden: true,
+            ..test_pair()
+        };
+        assert_eq!(
+            manifest_entries(&packet, &with_hidden).len(),
+            2,
+            ".env too, never .git"
+        );
+    }
+
+    fn worker_for(base: &Path, root: &Path) -> Worker {
+        let pair = Pair {
+            id: "pair-h".into(),
+            name: "root".into(),
+            root: root.to_path_buf(),
+            device: "phone-h".into(),
+            include_hidden: false,
+            ignore: Vec::new(),
+        };
+        let worker = Worker {
+            dir: base.join("state"),
+            pairs: vec![Live::new(pair, Book::default())],
+            ready: ["phone-h".to_string()].into(),
+            asked: HashMap::new(),
+            offered: Vec::new(),
+            dirty: Default::default(),
+        };
+        fs::create_dir_all(&worker.dir).unwrap();
+        worker
+    }
+
+    #[test]
+    fn an_empty_folder_is_held_until_confirmed() {
+        let base = std::env::temp_dir().join(format!("desklink-hold-{}", uuid::Uuid::new_v4()));
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), "one").unwrap();
+        let mut worker = worker_for(&base, &root);
+        worker.rescan(0);
+        fs::remove_file(root.join("a.txt")).unwrap();
+        worker.rescan(0);
+        assert_eq!(worker.pairs[0].phase, Phase::EmptyHeld);
+        assert!(
+            !worker.pairs[0].book.manifest["a.txt"].deleted,
+            "nothing tombstoned"
+        );
+        worker.handle(Message::ConfirmEmpty("pair-h".into()));
+        worker.rescan(0);
+        assert!(
+            worker.pairs[0].book.manifest["a.txt"].deleted,
+            "confirmed: synced as deleted"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn without_a_trash_a_deleted_file_is_kept_and_reported() {
+        let base = std::env::temp_dir().join(format!("desklink-trash-{}", uuid::Uuid::new_v4()));
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), "one").unwrap();
+        fs::write(root.join("b.txt"), "two").unwrap();
+        let mut worker = worker_for(&base, &root);
+        worker.rescan(0);
+        let a = worker.pairs[0].book.manifest["a.txt"].clone();
+        let packet = folders_packet(
+            "manifest",
+            json!({"id": "pair-h", "part": 1, "parts": 1, "entries": [
+                {"path": "a.txt", "size": 0, "mtime": 9, "sha256": "", "deleted": true,
+                 "vv": {"desk": a.vv.desk, "phone": 1}}]}),
+        );
+        TEST_TRASH_FAILS.with(|fails| fails.set(true));
+        worker.on_packet("phone-h", &packet);
+        TEST_TRASH_FAILS.with(|fails| fails.set(false));
+        assert!(root.join("a.txt").exists(), "never deleted for good");
+        assert_eq!(worker.pairs[0].phase, Phase::Problem(TRASH_MISSING.into()));
+        let _ = fs::remove_dir_all(&base);
+    }
 
     fn entry(sha: &str, vv: (u64, u64)) -> Entry {
         Entry {
@@ -2118,7 +2282,7 @@ mod tests {
         let mut total = 0;
         for packet in &packets {
             assert!(packet.serialize().unwrap().len() <= MAX_PACKET_BYTES);
-            total += manifest_entries(packet).len();
+            total += manifest_entries(packet, &test_pair()).len();
         }
         assert_eq!(total, 3000);
         let mut bad = NetworkPacket::new(PACKET_TYPE_FOLDERS);
@@ -2130,7 +2294,7 @@ mod tests {
                 {"path": "fine.txt", "size": 1, "mtime": 1, "sha256": "A".repeat(64), "vv": {"desk": 1, "phone": 0}},
             ]),
         );
-        let entries = manifest_entries(&bad);
+        let entries = manifest_entries(&bad, &test_pair());
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].1.sha256, "a".repeat(64), "lowercased");
     }

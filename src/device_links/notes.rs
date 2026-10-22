@@ -29,6 +29,15 @@ const FETCH_IDS: usize = 100;
 /// One `items` packet stays under the WebRTC payload bound (128 KiB).
 const MAX_PACKET_BYTES: usize = 96 * 1024;
 const TOMBSTONE_DAYS: i64 = 90;
+/// Entries kept, live and tombstones: a peer cannot grow the shelf past
+/// these (new ids are refused, logged).
+const MAX_SNIPPET_ENTRIES: usize = MAX_SNIPPETS * 2;
+const MAX_NOTE_ENTRIES: usize = MAX_NOTES * 2;
+/// Items read from one `items` or `index` packet.
+const MAX_ITEMS_PER_PACKET: usize = 200;
+const MAX_INDEX_ENTRIES: usize = MAX_NOTE_ENTRIES;
+/// Snippet and note packets accepted per phone per minute.
+const PACKETS_PER_MINUTE: u32 = 240;
 
 fn is_false(value: &bool) -> bool {
     !value
@@ -338,12 +347,15 @@ fn item_values(shelf: &Shelf, kind: Kind, ids: &[String]) -> Vec<Value> {
 fn handle(shelf: &mut Shelf, kind: Kind, packet: &NetworkPacket) -> (Vec<NetworkPacket>, bool) {
     match packet.get_str("op") {
         Some("index") => {
-            let index = packet
+            let index: Vec<Value> = packet
                 .body
                 .get("items")
                 .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .take(MAX_INDEX_ENTRIES)
                 .cloned()
-                .unwrap_or_default();
+                .collect();
             let ids = wanted(shelf, kind, &index);
             let fetches = ids
                 .chunks(FETCH_IDS)
@@ -370,12 +382,15 @@ fn handle(shelf: &mut Shelf, kind: Kind, packet: &NetworkPacket) -> (Vec<Network
             (items_packets(kind, item_values(shelf, kind, &ids)), false)
         }
         Some("items") => {
-            let items = packet
+            let items: Vec<Value> = packet
                 .body
                 .get("items")
                 .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .take(MAX_ITEMS_PER_PACKET)
                 .cloned()
-                .unwrap_or_default();
+                .collect();
             let mut changed = false;
             let mut send_back = Vec::new();
             for item in items {
@@ -388,6 +403,15 @@ fn handle(shelf: &mut Shelf, kind: Kind, packet: &NetworkPacket) -> (Vec<Network
                             continue;
                         }
                         let id = snippet.id.clone();
+                        if !shelf.snippets.contains_key(&id)
+                            && shelf.snippets.len() >= MAX_SNIPPET_ENTRIES
+                        {
+                            super::limits::log_limited(
+                                "snippets-full",
+                                "Snippets are full; one was refused",
+                            );
+                            continue;
+                        }
                         let older = shelf
                             .snippets
                             .get(&id)
@@ -406,6 +430,14 @@ fn handle(shelf: &mut Shelf, kind: Kind, packet: &NetworkPacket) -> (Vec<Network
                             continue;
                         }
                         let id = note.id.clone();
+                        // A new id, or a conflict copy, needs room.
+                        if shelf.notes.len() >= MAX_NOTE_ENTRIES {
+                            super::limits::log_limited(
+                                "notes-full",
+                                "Notes are full; one was refused",
+                            );
+                            continue;
+                        }
                         match merge_note(shelf, note) {
                             Merged::KeptOurs => send_back.push(id),
                             Merged::Same => {}
@@ -493,9 +525,15 @@ fn with_shelf<T>(job: impl FnOnce(&mut Shelf) -> (T, bool)) -> Option<T> {
 /// A `desklink.snippets` or `desklink.notes` packet from `device_id`: the
 /// packets to answer with.
 pub(crate) fn on_packet(device_id: &str, packet: &NetworkPacket) -> Vec<NetworkPacket> {
+    static PACKETS: super::limits::Buckets =
+        super::limits::Buckets::new(PACKETS_PER_MINUTE, std::time::Duration::from_secs(60));
     let Some(kind) = Kind::from_packet(&packet.packet_type) else {
         return Vec::new();
     };
+    if !PACKETS.allow(device_id) {
+        super::limits::log_limited("notes-rate", "Too many note packets from a phone; dropped");
+        return Vec::new();
+    }
     let answers = with_shelf(|shelf| handle(shelf, kind, packet)).unwrap_or_default();
     debug_log!(
         "[Notes] {} {} from {device_id}: {} answers",
@@ -666,21 +704,23 @@ pub(crate) fn new_note(body: &str) -> Option<String> {
 }
 
 /// Saves an edit to note `id`: title, body, pinned, or deleted.
-pub(crate) fn edit_note(id: &str, change: impl FnOnce(&mut Note)) {
+/// Saves an edit to note `id`. Refused, in words the editor shows, when
+/// the note would pass 64 KB — never dropped silently.
+pub(crate) fn edit_note(id: &str, change: impl FnOnce(&mut Note)) -> Result<(), String> {
     let changed = with_shelf(|shelf| {
         let synced = shelf.synced.get(id).copied().unwrap_or(0);
         let Some(note) = shelf.notes.get_mut(id) else {
-            return (false, false);
+            return (Ok(false), false);
         };
         let before = note.clone();
         change(note);
         note.title = note.title.chars().take(MAX_NOTE_TITLE_CHARS).collect();
         if note.body.len() > MAX_NOTE_BYTES {
             *note = before;
-            return (false, false);
+            return (Err(TOO_LONG.to_string()), false);
         }
         if note.same_content(&before) {
-            return (false, false);
+            return (Ok(false), false);
         }
         if note.deleted {
             note.title.clear();
@@ -688,17 +728,84 @@ pub(crate) fn edit_note(id: &str, change: impl FnOnce(&mut Note)) {
         }
         note.parent = synced;
         // Strictly later, even within one millisecond.
-        note.modified = now_ms().max(before.modified + 1);
-        (true, true)
+        note.modified = now_ms().max(before.modified.saturating_add(1));
+        (Ok(true), true)
     });
-    if changed == Some(true) {
-        push(Kind::Notes, vec![id.to_string()]);
+    match changed {
+        Some(Ok(true)) => {
+            push(Kind::Notes, vec![id.to_string()]);
+            Ok(())
+        }
+        Some(Ok(false)) | None => Ok(()),
+        Some(Err(error)) => Err(error),
     }
 }
+
+/// What the editor says when a note passes its size bound.
+pub(crate) const TOO_LONG: &str =
+    "This note is too long to save (64 KB at most). Shorten it: the last changes are not saved yet.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_peer_cannot_grow_the_shelf_past_its_bounds() {
+        let mut shelf = Shelf::default();
+        let now = now_ms();
+        for index in 0..MAX_SNIPPET_ENTRIES {
+            shelf.snippets.insert(
+                format!("s{index}"),
+                Snippet {
+                    id: format!("s{index}"),
+                    text: "x".into(),
+                    title: String::new(),
+                    modified: now,
+                    deleted: false,
+                },
+            );
+        }
+        let mut packet = NetworkPacket::new(PACKET_TYPE_SNIPPETS);
+        packet.set("op", "items");
+        packet.set(
+            "items",
+            json!([{"id": "new-one", "text": "hi", "modified": now + 1},
+                   {"id": "s1", "text": "changed", "modified": now + 1}]),
+        );
+        handle(&mut shelf, Kind::Snippets, &packet);
+        assert!(
+            !shelf.snippets.contains_key("new-one"),
+            "full: a new id is refused"
+        );
+        assert_eq!(
+            shelf.snippets["s1"].text, "changed",
+            "a known one still updates"
+        );
+        // At most MAX_ITEMS_PER_PACKET items are read from one packet.
+        let mut empty = Shelf::default();
+        let many: Vec<Value> = (0..MAX_ITEMS_PER_PACKET + 50)
+            .map(|index| json!({"id": format!("n{index}"), "text": "t", "modified": now}))
+            .collect();
+        packet.set("items", many);
+        handle(&mut empty, Kind::Snippets, &packet);
+        assert_eq!(empty.snippets.len(), MAX_ITEMS_PER_PACKET);
+    }
+
+    #[test]
+    fn a_note_too_long_is_refused_out_loud_and_kept_as_it_was() {
+        let dir = std::env::temp_dir().join(format!("desklink-notes-{}", uuid::Uuid::new_v4()));
+        install(dir.clone());
+        let id = new_note("short").unwrap();
+        let result = edit_note(&id, |note| note.body = "x".repeat(MAX_NOTE_BYTES + 1));
+        assert_eq!(result, Err(TOO_LONG.to_string()));
+        assert_eq!(
+            super::note(&id).unwrap().body,
+            "short",
+            "the saved note is unchanged"
+        );
+        assert_eq!(edit_note(&id, |note| note.body = "fine".into()), Ok(()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn note(id: &str, body: &str, modified: i64, parent: i64) -> Note {
         Note {

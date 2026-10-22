@@ -62,7 +62,6 @@ mod imp {
             crate::search_provider::install_description();
             crate::kde::install_runner();
             crate::send_to::start(&obj);
-            obj.report_previous_crash();
             obj.setup_gactions();
             self.hold.replace(Some(obj.hold()));
             obj.start_session_indicator();
@@ -81,6 +80,9 @@ mod imp {
     impl ApplicationImpl for DesklinkApplication {
         fn startup(&self) {
             self.parent_startup();
+            // Registered now (startup runs only in the primary instance), so
+            // the notice is really shown before the crash is marked told.
+            self.obj().report_previous_crash();
             register_bundled_fonts();
             install_brand_styles();
         }
@@ -411,25 +413,9 @@ impl DesklinkApplication {
         let Some(dir) = crate::crash_dir() else {
             return;
         };
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return;
-        };
-        let seen = dir.join("crash-reported");
-        let reported_up_to = std::fs::metadata(&seen)
-            .and_then(|meta| meta.modified())
-            .ok();
-        let newest = entries
-            .flatten()
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("crash-1"))
-            .filter_map(|entry| entry.metadata().ok()?.modified().ok())
-            .max();
-        let Some(newest) = newest else {
-            return;
-        };
-        if reported_up_to.is_some_and(|reported| reported >= newest) {
+        if !self.is_registered() || !take_unreported_crash(&dir) {
             return;
         }
-        let _ = std::fs::write(&seen, b"");
         let notification = gio::Notification::new("DeskLink stopped unexpectedly");
         notification.set_body(Some(&format!(
             "A crash report was saved in {}. Attaching it to a bug report helps fix this.",
@@ -852,9 +838,44 @@ pub(crate) fn session_line(device: &crate::device_links::device::DeviceView) -> 
     Some(format!("{} — {what}", device.name))
 }
 
+/// Whether `dir` holds a crash report newer than the last one told, marking
+/// it told.
+fn take_unreported_crash(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let seen = dir.join("crash-reported");
+    let reported_up_to = std::fs::metadata(&seen)
+        .and_then(|meta| meta.modified())
+        .ok();
+    let newest = entries
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("crash-1"))
+        .filter_map(|entry| entry.metadata().ok()?.modified().ok())
+        .max();
+    let Some(newest) = newest else {
+        return false;
+    };
+    if reported_up_to.is_some_and(|reported| reported >= newest) {
+        return false;
+    }
+    std::fs::write(&seen, b"").is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_crash_is_reported_once() {
+        let dir = std::env::temp_dir().join(format!("desklink-crash-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!take_unreported_crash(&dir), "no crash");
+        std::fs::write(dir.join("crash-1700000000.txt"), b"x").unwrap();
+        assert!(take_unreported_crash(&dir));
+        assert!(!take_unreported_crash(&dir), "told already");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// "#rrggbb" or "rgba(r,g,b,a)" as linear-light-ready 0..1 channels and alpha.
     fn parse(colour: &str) -> ([f64; 3], f64) {

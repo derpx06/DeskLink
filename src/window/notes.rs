@@ -81,11 +81,15 @@ impl Editor {
             .to_string();
         let title = self.title.text().to_string();
         let pinned = self.pin.is_active();
-        notes::edit_note(&id, |note| {
+        if let Err(error) = notes::edit_note(&id, |note| {
             note.title = title;
             note.body = body;
             note.pinned = pinned;
-        });
+        }) {
+            // The text stays in the editor; nothing is thrown away.
+            toast_from(&self.body, &error);
+            return;
+        }
         if let Some(note) = notes::note(&id) {
             self.open.replace(Some((id, note.modified)));
         }
@@ -457,7 +461,7 @@ impl Page {
                 };
                 if let Some((id, _)) = editor.open.borrow().clone() {
                     editor.cancel_save();
-                    notes::edit_note(&id, |note| note.deleted = true);
+                    let _ = notes::edit_note(&id, |note| note.deleted = true);
                     toast_from(button, "Note deleted");
                 }
                 editor.load(None);

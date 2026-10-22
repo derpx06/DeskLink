@@ -180,6 +180,11 @@ fn rule_row(win: &DesklinkWindow, device: &DeviceView, rule: &Rule) -> adw::Expa
     };
     let note = if rule.is_builtin() {
         "Built in".to_string()
+    } else if automations::needs_approval(rule) {
+        format!(
+            "Made on {} · approve it to let it act on this computer",
+            device.name
+        )
     } else if !supported {
         "Needs a newer DeskLink".to_string()
     } else {
@@ -241,6 +246,15 @@ fn rule_row(win: &DesklinkWindow, device: &DeviceView, rule: &Rule) -> adw::Expa
         toast_from(button, "Running the rule’s steps now");
     });
     actions.append(&test);
+    if automations::needs_approval(rule) {
+        let approve = icon_button("object-select-symbolic", "Approve", &["suggested-action"]);
+        let id = rule.id.clone();
+        approve.connect_clicked(move |button| {
+            automations::approve(&id);
+            toast_from(button, "The rule may now act on this computer");
+        });
+        actions.append(&approve);
+    }
     if !rule.is_builtin() {
         let edit_button = icon_button("document-edit-symbolic", "Edit", &["soft-button"]);
         let (win_weak, editing) = (win.downgrade(), rule.clone());

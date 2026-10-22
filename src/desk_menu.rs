@@ -460,10 +460,10 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
                 .any(|file| file.path.to_string_lossy() == target);
             if offered {
                 let uri = gio::File::for_path(&target).uri();
-                if let Err(error) =
-                    gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE)
+                if gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE).is_err()
                 {
-                    eprintln!("[DeskLink] Could not open {target}: {error}");
+                    // No path: file names are personal data.
+                    eprintln!("[DeskLink] Could not open a received file");
                 }
             }
         }
