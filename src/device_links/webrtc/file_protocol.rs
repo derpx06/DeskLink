@@ -62,6 +62,12 @@ pub const MAX_RESTARTS: u32 = 2;
 /// Frames received and not yet handled by the file thread.
 pub const FILE_QUEUE_MAX_BYTES: usize = 32 * 1024 * 1024;
 
+/// Whether a data-channel message of `length` bytes is within the largest
+/// frame this build accepts (61 440 including header and trailer).
+pub const fn message_fits(length: usize) -> bool {
+    length <= FRAME_BYTES_PROVEN
+}
+
 /// Payload bytes one frame of `max_frame` total bytes carries. The trailer
 /// space is reserved in every frame.
 pub const fn payload_capacity(max_frame: usize) -> usize {
@@ -1060,5 +1066,310 @@ mod tests {
         assert!(id_bytes("transfer_1").is_none());
         assert!(id_bytes(&ID.replace('-', "")).is_none());
         assert!(id_bytes("").is_none());
+    }
+
+    // ── Golden vectors, pinned identically on both sides ──────────────────
+    // (the phone's tests carry the same bytes and values)
+
+    const TOKEN: &str = "00112233445566778899aabbccddeeff";
+
+    fn unhex(text: &str) -> Vec<u8> {
+        let text: String = text.split_whitespace().collect();
+        (0..text.len() / 2)
+            .map(|at| u8::from_str_radix(&text[at * 2..at * 2 + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// F1: a whole 3-byte file "abc", pass 0, one LAST_OF_BLOCK frame.
+    #[test]
+    fn golden_f1_a_whole_three_byte_file_is_one_75_byte_frame() {
+        let expected = unhex(
+            "444c4632 01 00 0000 0f8fad5bd9cb469fa16570867728950e 00000000 0000000000000000 00000003 616263
+             ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+        assert_eq!(expected.len(), 75);
+        let header = FrameHeader {
+            last_of_block: true,
+            pass: 0,
+            transfer: id_bytes(ID).unwrap(),
+            block_index: 0,
+            offset: 0,
+            length: 3,
+        };
+        let mut made = Vec::new();
+        header.write(&mut made);
+        made.extend_from_slice(b"abc");
+        made.extend_from_slice(&sha256(b"abc"));
+        assert_eq!(made, expected);
+        let parsed = parse_frame(&expected).unwrap();
+        assert_eq!(parsed.header, header);
+        assert_eq!(parsed.payload, b"abc");
+        assert_eq!(parsed.trailer, Some(sha256(b"abc")));
+        header.check(3).unwrap();
+    }
+
+    /// F2: a middle frame, pass 7, block 1 of a 2 MiB file, no trailer.
+    #[test]
+    fn golden_f2_a_middle_frame_of_block_one_has_no_trailer() {
+        let expected = unhex(
+            "444c4632 00 07 0000 0f8fad5bd9cb469fa16570867728950e 00000001 0000000000100000 00000005 68656c6c6f",
+        );
+        assert_eq!(expected.len(), 45);
+        let header = FrameHeader {
+            last_of_block: false,
+            pass: 7,
+            transfer: id_bytes(ID).unwrap(),
+            block_index: 1,
+            offset: BLOCK_BYTES,
+            length: 5,
+        };
+        let mut made = Vec::new();
+        header.write(&mut made);
+        made.extend_from_slice(b"hello");
+        assert_eq!(made, expected);
+        let parsed = parse_frame(&expected).unwrap();
+        assert_eq!(
+            (parsed.header, parsed.payload, parsed.trailer),
+            (header, &b"hello"[..], None)
+        );
+        header.check(2 * BLOCK_BYTES).unwrap();
+    }
+
+    /// F3: the size rules.
+    #[test]
+    fn golden_f3_the_largest_frame_is_61440_bytes_and_the_rules_hold() {
+        assert_eq!(FRAME_BYTES_PROVEN, 61_440);
+        assert_eq!(
+            FRAME_HEADER_BYTES + payload_capacity(61_440) + BLOCK_TRAILER_BYTES,
+            61_440
+        );
+        assert_eq!(payload_capacity(61_440), 61_368);
+        assert!(message_fits(61_440));
+        assert!(!message_fits(61_441), "over 61 440 is rejected");
+        // A LAST frame with a missing trailer.
+        let f1 = unhex(
+            "444c4632 01 00 0000 0f8fad5bd9cb469fa16570867728950e 00000000 0000000000000000 00000003 616263",
+        );
+        assert!(parse_frame(&f1).is_err());
+        // A non-LAST frame that ends exactly at a block end.
+        let at_end = FrameHeader {
+            last_of_block: false,
+            pass: 0,
+            transfer: id_bytes(ID).unwrap(),
+            block_index: 0,
+            offset: BLOCK_BYTES - 5,
+            length: 5,
+        };
+        assert!(at_end.check(2 * BLOCK_BYTES).is_err());
+        // Nonzero reserved bytes, unknown flag bits.
+        let good = unhex(
+            "444c4632 00 07 0000 0f8fad5bd9cb469fa16570867728950e 00000001 0000000000100000 00000005 68656c6c6f",
+        );
+        for at in [6usize, 7] {
+            let mut bad = good.clone();
+            bad[at] = 1;
+            assert!(parse_frame(&bad).is_err(), "reserved byte {at}");
+        }
+        for flag in [2u8, 4, 0x80, 0x81] {
+            let mut bad = good.clone();
+            bad[4] = flag;
+            assert!(parse_frame(&bad).is_err(), "flag {flag:#x}");
+        }
+    }
+
+    /// H: the hashes.
+    #[test]
+    fn golden_h_hashes() {
+        let empty = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(hex(&hash_of_hashes(&[])), empty, "n = 0 hashes");
+        assert_eq!(hex(&sha256(b"")), empty, "the 0-byte file");
+        let block = sha256(b"abc");
+        assert_eq!(
+            hex(&block),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex(&hash_of_hashes(&[block])),
+            "4f8b42c22dd3729b519ba6f68d2da7cc5b2d606d05daed5ad5128cc03e6c6358",
+            "fileHash of \"abc\" = SHA-256 of the 32 raw block-hash bytes"
+        );
+        assert_eq!(
+            (blocks_for(BLOCK_BYTES), blocks_for(BLOCK_BYTES + 1)),
+            (1, 2)
+        );
+        assert_eq!(blocks_for(0), 0);
+    }
+
+    fn vector(json: &str) -> FileControl {
+        FileControl::from_json(json.as_bytes()).unwrap_or_else(|error| panic!("{json}: {error}"))
+    }
+
+    fn common(action: &str) -> String {
+        format!(
+            r#""protocolVersion":2,"action":"{action}","transferId":"{ID}","deviceId":"phone-device","sessionId":9,"connectionGeneration":2,"transferToken":"{TOKEN}""#
+        )
+    }
+
+    /// C: the control JSON, compared as parsed values.
+    #[test]
+    fn golden_c_control_json_parses_validates_and_round_trips() {
+        let prefix = "ab".repeat(32);
+        let sha = "cd".repeat(32);
+        type Check = Box<dyn Fn(&FileControl)>;
+        let vectors: Vec<(String, Check)> = vec![
+            (
+                format!(
+                    r#"{{{},"filename":"big.iso","totalSize":4294967296,"mtime":1700000000000,"blockSize":1048576,"maxFrameBytes":61440}}"#,
+                    common("offer")
+                ),
+                Box::new(|c| {
+                    assert_eq!(c.action, FileAction::Offer);
+                    assert_eq!(c.total_size, Some(4_294_967_296));
+                    assert_eq!(c.mtime, Some(1_700_000_000_000));
+                    assert_eq!(
+                        (c.block_size, c.max_frame_bytes),
+                        (Some(1_048_576), Some(61_440))
+                    );
+                }),
+            ),
+            (
+                format!(
+                    r#"{{{},"filename":"a.jpg","totalSize":10,"mtime":1,"blockSize":1048576,"maxFrameBytes":61440,"folder":"bucket","relpath":"Trips/a.jpg","contentSha256":"{sha}"}}"#,
+                    common("offer")
+                ),
+                Box::new(|c| {
+                    assert_eq!(c.folder_ref().unwrap().relpath, "Trips/a.jpg");
+                    assert_eq!(c.content_sha256.as_deref(), Some("cd".repeat(32).as_str()));
+                }),
+            ),
+            (
+                format!(
+                    r#"{{{},"filename":"clip.png","totalSize":10,"mtime":1,"blockSize":1048576,"maxFrameBytes":61440,"clipboard":true,"mimeType":"image/png"}}"#,
+                    common("offer")
+                ),
+                Box::new(|c| {
+                    assert_eq!(c.clipboard, Some(true));
+                    assert_eq!(c.mime_type.as_deref(), Some("image/png"));
+                }),
+            ),
+            (
+                format!(
+                    r#"{{{},"resumeBlock":3,"prefixSha256":"{prefix}","maxFrameBytes":61440}}"#,
+                    common("accept")
+                ),
+                Box::new(|c| {
+                    assert_eq!((c.resume_block, c.max_frame_bytes), (Some(3), Some(61_440)))
+                }),
+            ),
+            (
+                format!(
+                    r#"{{{},"blockIndex":2,"sha256":"{sha}"}}"#,
+                    common("block-ack")
+                ),
+                Box::new(|c| assert_eq!(c.block_index, Some(2))),
+            ),
+            (
+                format!(
+                    r#"{{{},"blockIndex":4,"pass":1,"reason":"hash-mismatch"}}"#,
+                    common("block-nack")
+                ),
+                Box::new(|c| {
+                    assert_eq!((c.block_index, c.pass), (Some(4), Some(1)));
+                    assert_eq!(c.reason.as_deref(), Some("hash-mismatch"));
+                }),
+            ),
+            (
+                format!(r#"{{{},"reason":"backlog"}}"#, common("pause")),
+                Box::new(|c| assert_eq!(c.reason.as_deref(), Some("backlog"))),
+            ),
+            (
+                format!(
+                    r#"{{{},"resumeBlock":5,"prefixSha256":"{prefix}","pass":2}}"#,
+                    common("resume")
+                ),
+                Box::new(|c| assert_eq!((c.resume_block, c.pass), (Some(5), Some(2)))),
+            ),
+            (
+                format!(r#"{{{}}}"#, common("resume")),
+                Box::new(|c| assert_eq!((c.resume_block, c.pass), (None, None))),
+            ),
+            (
+                format!(
+                    r#"{{{},"fileHash":"{sha}","blocks":4096,"totalSize":4294967296}}"#,
+                    common("done")
+                ),
+                Box::new(|c| {
+                    assert_eq!((c.blocks, c.total_size), (Some(4096), Some(4_294_967_296)))
+                }),
+            ),
+            (
+                format!(r#"{{{},"fileHash":"{sha}"}}"#, common("complete")),
+                Box::new(|c| assert_eq!(c.file_hash.as_deref(), Some("cd".repeat(32).as_str()))),
+            ),
+        ];
+        for (json, check) in &vectors {
+            let control = vector(json);
+            control
+                .validate(&wire())
+                .unwrap_or_else(|error| panic!("{json}: {error}"));
+            check(&control);
+            // Parsed values, not strings.
+            let again = FileControl::from_json(&control.to_json().unwrap()).unwrap();
+            assert_eq!(again, control, "{json}");
+        }
+        for code in ["user", "source-gone", "source-changed", "removed"] {
+            let control = vector(&format!(
+                r#"{{{},"code":"{code}","message":"x"}}"#,
+                common("cancel")
+            ));
+            control.validate(&wire()).unwrap();
+            assert_eq!(control.code.as_deref(), Some(code));
+        }
+        for code in [
+            "refused",
+            "busy",
+            "too-large",
+            "bad-frame",
+            "hash-mismatch",
+            "internal",
+        ] {
+            let control = vector(&format!(
+                r#"{{{},"code":"{code}","message":"x"}}"#,
+                common("error")
+            ));
+            control.validate(&wire()).unwrap();
+            assert_eq!(control.code.as_deref(), Some(code));
+        }
+    }
+
+    /// N: negative and tolerant cases.
+    #[test]
+    fn golden_n_partial_resumes_are_rejected_and_unknown_values_are_tolerated() {
+        let prefix = "ab".repeat(32);
+        for fields in [
+            r#""resumeBlock":1"#.to_string(),
+            r#""pass":1"#.to_string(),
+            format!(r#""prefixSha256":"{prefix}""#),
+            format!(r#""resumeBlock":1,"prefixSha256":"{prefix}""#),
+            r#""resumeBlock":1,"pass":1"#.to_string(),
+            format!(r#""prefixSha256":"{prefix}","pass":1"#),
+        ] {
+            let control = vector(&format!("{{{},{fields}}}", common("resume")));
+            assert!(control.validate(&wire()).is_err(), "{fields}");
+        }
+        // Unknown codes and reasons parse, validate, and are a generic end
+        // (cancel) or `user` (pause); they never throw.
+        for action in ["cancel", "error"] {
+            let control = vector(&format!(
+                r#"{{{},"code":"brand-new-code"}}"#,
+                common(action)
+            ));
+            control.validate(&wire()).unwrap();
+        }
+        let pause = vector(&format!(
+            r#"{{{},"reason":"brand-new-reason"}}"#,
+            common("pause")
+        ));
+        pause.validate(&wire()).unwrap();
     }
 }

@@ -1,0 +1,82 @@
+{
+  "scenario": "S5",
+  "title": "source read error: error{internal} (not cancel), both slots freed",
+  "replay": [
+    "sender",
+    "receiver"
+  ],
+  "ids": {
+    "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+    "token": "00112233445566778899aabbccddeeff",
+    "sender": "sender-device",
+    "receiver": "receiver-device",
+    "sessionId": 9,
+    "generation": 2
+  },
+  "file": {
+    "name": "scenario.bin",
+    "length": 100000,
+    "formula": "byte(i) = (((i * 2654435761) mod 2^32) >> 13) & 255",
+    "mtime": 1700000000000
+  },
+  "ignore": [
+    "message"
+  ],
+  "steps": [
+    {
+      "from": "sender",
+      "control": {
+        "protocolVersion": 2,
+        "action": "offer",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "sender-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "filename": "scenario.bin",
+        "totalSize": 100000,
+        "mtime": 1700000000000,
+        "blockSize": 1048576,
+        "maxFrameBytes": 61440
+      }
+    },
+    {
+      "from": "test",
+      "side": "sender",
+      "event": "source-read-error"
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "accept",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "resumeBlock": 0,
+        "prefixSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "maxFrameBytes": 61440
+      }
+    },
+    {
+      "from": "sender",
+      "control": {
+        "protocolVersion": 2,
+        "action": "error",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "sender-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "code": "internal",
+        "message": "read error"
+      }
+    }
+  ],
+  "final": {
+    "receiverPublished": false,
+    "slotsFree": true
+  }
+}

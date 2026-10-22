@@ -1,0 +1,140 @@
+{
+  "scenario": "S1",
+  "title": "sender resumed at block 2 without hashes: it re-reads the prefix, keeps its pass, completes",
+  "replay": [
+    "sender",
+    "receiver"
+  ],
+  "ids": {
+    "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+    "token": "00112233445566778899aabbccddeeff",
+    "sender": "sender-device",
+    "receiver": "receiver-device",
+    "sessionId": 9,
+    "generation": 2
+  },
+  "file": {
+    "name": "scenario.bin",
+    "length": 3146728,
+    "formula": "byte(i) = (((i * 2654435761) mod 2^32) >> 13) & 255",
+    "mtime": 1700000000000
+  },
+  "ignore": [
+    "message"
+  ],
+  "receiverHolds": {
+    "blocks": 2
+  },
+  "steps": [
+    {
+      "from": "sender",
+      "control": {
+        "protocolVersion": 2,
+        "action": "offer",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "sender-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "filename": "scenario.bin",
+        "totalSize": 3146728,
+        "mtime": 1700000000000,
+        "blockSize": 1048576,
+        "maxFrameBytes": 61440
+      }
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "accept",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "resumeBlock": 2,
+        "prefixSha256": "280ace7205549cb3498232e0be3a1dc8d9ee540552b6a0f1fb72562072b3d69f",
+        "maxFrameBytes": 61440
+      }
+    },
+    {
+      "from": "sender",
+      "blockFrames": {
+        "pass": 0,
+        "block": 2,
+        "frames": 18,
+        "sha256": "afdf8532b36f778793bf13580327b023d9e1e573a386eb97c25a4fb417e91916"
+      }
+    },
+    {
+      "from": "sender",
+      "blockFrames": {
+        "pass": 0,
+        "block": 3,
+        "frames": 1,
+        "sha256": "3f7ba39a5ed3e352d42da14b423d7f601fb12dcc391a3a33c050feddb7ebc4aa"
+      }
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "block-ack",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "blockIndex": 2,
+        "sha256": "f5600770a8695a85fc7bb6d18a40a5b80a2b8a39c86f346a1b58f8ccc1e8fde6"
+      }
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "block-ack",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "blockIndex": 3,
+        "sha256": "5ce24b09ed17367a4becf59d11b53f298bdd6a068dfe10050028e046137f9653"
+      }
+    },
+    {
+      "from": "sender",
+      "control": {
+        "protocolVersion": 2,
+        "action": "done",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "sender-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "fileHash": "01288e1f378a945a764ac5a331d4777792a90a25bab0a075241032c4fc48149e",
+        "blocks": 4,
+        "totalSize": 3146728
+      }
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "complete",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "fileHash": "01288e1f378a945a764ac5a331d4777792a90a25bab0a075241032c4fc48149e"
+      }
+    }
+  ],
+  "final": {
+    "receiverPublished": true,
+    "slotsFree": true
+  }
+}

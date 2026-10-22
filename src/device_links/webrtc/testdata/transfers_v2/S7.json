@@ -1,0 +1,157 @@
+{
+  "scenario": "S7",
+  "title": "busy ordering: an unrequested Bucket file is refused before the busy check; a plain third offer is busy",
+  "replay": [
+    "receiver"
+  ],
+  "ids": {
+    "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+    "token": "00112233445566778899aabbccddeeff",
+    "sender": "sender-device",
+    "receiver": "receiver-device",
+    "sessionId": 9,
+    "generation": 2
+  },
+  "file": {
+    "name": "scenario.bin",
+    "length": 10,
+    "formula": "byte(i) = (((i * 2654435761) mod 2^32) >> 13) & 255",
+    "mtime": 1700000000000
+  },
+  "ignore": [
+    "message"
+  ],
+  "steps": [
+    {
+      "from": "sender",
+      "control": {
+        "protocolVersion": 2,
+        "action": "offer",
+        "transferId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "deviceId": "sender-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "filename": "a.bin",
+        "totalSize": 10,
+        "mtime": 1700000000000,
+        "blockSize": 1048576,
+        "maxFrameBytes": 61440
+      }
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "accept",
+        "transferId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "resumeBlock": 0,
+        "prefixSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "maxFrameBytes": 61440
+      }
+    },
+    {
+      "from": "sender",
+      "control": {
+        "protocolVersion": 2,
+        "action": "offer",
+        "transferId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "deviceId": "sender-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "filename": "b.bin",
+        "totalSize": 10,
+        "mtime": 1700000000000,
+        "blockSize": 1048576,
+        "maxFrameBytes": 61440
+      }
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "accept",
+        "transferId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "resumeBlock": 0,
+        "prefixSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "maxFrameBytes": 61440
+      }
+    },
+    {
+      "from": "sender",
+      "control": {
+        "protocolVersion": 2,
+        "action": "offer",
+        "transferId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "deviceId": "sender-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "filename": "c.txt",
+        "totalSize": 10,
+        "mtime": 1700000000000,
+        "blockSize": 1048576,
+        "maxFrameBytes": 61440,
+        "folder": "bucket",
+        "relpath": "docs/c.txt",
+        "contentSha256": "2e7d2c03a9507ae265ecf5b5356885a53393a2029d241394997265a1a25aefc6"
+      }
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "error",
+        "transferId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "code": "refused",
+        "message": "folder-refused"
+      }
+    },
+    {
+      "from": "sender",
+      "control": {
+        "protocolVersion": 2,
+        "action": "offer",
+        "transferId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "deviceId": "sender-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "filename": "d.bin",
+        "totalSize": 10,
+        "mtime": 1700000000000,
+        "blockSize": 1048576,
+        "maxFrameBytes": 61440
+      }
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "error",
+        "transferId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "code": "busy"
+      }
+    }
+  ],
+  "final": {
+    "slotsFree": false
+  }
+}

@@ -218,13 +218,24 @@ impl Incoming {
         if matches!(self.paused, Some(Pause::Storage { .. })) {
             return Ok(());
         }
-        if header.pass == self.pass {
-            // The pass we expect: the first frame after an `accept` is simply
-            // the stream beginning.
-            if header.offset >= self.next_offset {
-                self.adopt_any = false;
+        if self.adopt_any {
+            // The first frame after an `accept`, whatever its pass: from a
+            // block boundary at or before the verified end it is the stream
+            // beginning, and the sender's word on where it begins. A phone
+            // that cannot reproduce the prefix restarts at block 0 under the
+            // SAME pass (older builds), so an earlier offset of this pass is
+            // not a duplicate here.
+            match self.adopts(frame) {
+                Some(block) => self
+                    .restart_at(block, header.pass)
+                    .map_err(Ending::internal)?,
+                None if header.pass != self.pass => {
+                    super::note_dropped("another pass");
+                    return Ok(());
+                }
+                None => self.adopt_any = false,
             }
-        } else {
+        } else if header.pass != self.pass {
             let Some(block) = self.adopts(frame) else {
                 super::note_dropped("another pass");
                 return Ok(());
@@ -520,7 +531,7 @@ impl Engine {
             super::note_dropped("malformed");
             return;
         };
-        if bytes.len() > FRAME_BYTES_PROVEN {
+        if !super::super::file_protocol::message_fits(bytes.len()) {
             super::note_dropped("over the frame size");
             return;
         }

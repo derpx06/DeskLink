@@ -81,6 +81,9 @@ pub(super) struct Outgoing {
     /// Why the receiver told us to hold still, if it did.
     peer_pause: Option<String>,
     verify: Option<Verify>,
+    /// Tests: the next read of the source fails.
+    #[cfg(test)]
+    pub(super) fail_read: bool,
     pub stall: Stall,
     last_report: Instant,
     reported: u64,
@@ -94,6 +97,7 @@ impl Outgoing {
         clipboard_mime: Option<&str>,
         folder: Option<FolderRef>,
         content_sha256: Option<String>,
+        fixed_ids: Option<(&str, &str)>,
     ) -> Result<Self, String> {
         let filename = match &folder {
             // The last segment of the synced path.
@@ -121,9 +125,15 @@ impl Outgoing {
             .map_err(|error| format!("Could not resolve DeskLink shared file: {error}"))?;
         let outgoing = Self::new(
             SendCheckpoint {
-                transfer_id: uuid::Uuid::new_v4().hyphenated().to_string(),
+                transfer_id: fixed_ids.map_or_else(
+                    || uuid::Uuid::new_v4().hyphenated().to_string(),
+                    |(id, _)| id.to_string(),
+                ),
                 device_id: String::new(),
-                token: uuid::Uuid::new_v4().simple().to_string(),
+                token: fixed_ids.map_or_else(
+                    || uuid::Uuid::new_v4().simple().to_string(),
+                    |(_, token)| token.to_string(),
+                ),
                 filename,
                 total_size: metadata.len(),
                 mtime: modified_ms(&metadata),
@@ -171,6 +181,8 @@ impl Outgoing {
             acked: 0,
             peer_pause: None,
             verify: None,
+            #[cfg(test)]
+            fail_read: false,
             stall: Stall::new(now),
             last_report: now,
             reported: 0,
@@ -411,6 +423,12 @@ impl Outgoing {
 
     /// Reads and frames the next piece of the current block.
     fn next_frame(&mut self) -> Result<Vec<u8>, Trouble> {
+        #[cfg(test)]
+        if self.fail_read {
+            return Err(Trouble::Failed(
+                "The shared file could not be read".to_string(),
+            ));
+        }
         if self.next_offset % BLOCK_BYTES == 0 {
             // Before each block: the source must still be the offered file.
             self.stat_source()?;
@@ -828,7 +846,14 @@ impl Engine {
                 board::finish(&id, Outcome::Failed(words::source_gone()));
             }
             Trouble::Failed(text) => {
-                tell(code::INTERNAL, &text);
+                // A failure, not a deliberate cancel: `error`, so the
+                // receiver (which rejects an unknown cancel code) frees its slot.
+                if let (Some(net), true) = (&net, outgoing.offered) {
+                    let mut error = net.msg(FileAction::Error, &outgoing.id, &outgoing.token);
+                    error.code = Some(code::INTERNAL.to_string());
+                    error.message = Some(text.chars().take(256).collect());
+                    net.send(error);
+                }
                 outgoing.discard(&self.store);
                 board::finish(&id, Outcome::Failed(text));
             }

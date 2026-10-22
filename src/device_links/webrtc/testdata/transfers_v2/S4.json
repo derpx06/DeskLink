@@ -1,0 +1,172 @@
+{
+  "scenario": "S4",
+  "title": "final hash mismatch: resume {0, SHA256(\"\"), pass 1}, the file is sent again once and completes",
+  "replay": [
+    "sender",
+    "receiver"
+  ],
+  "ids": {
+    "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+    "token": "00112233445566778899aabbccddeeff",
+    "sender": "sender-device",
+    "receiver": "receiver-device",
+    "sessionId": 9,
+    "generation": 2
+  },
+  "file": {
+    "name": "scenario.bin",
+    "length": 70000,
+    "formula": "byte(i) = (((i * 2654435761) mod 2^32) >> 13) & 255",
+    "mtime": 1700000000000
+  },
+  "ignore": [
+    "message"
+  ],
+  "steps": [
+    {
+      "from": "sender",
+      "control": {
+        "protocolVersion": 2,
+        "action": "offer",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "sender-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "filename": "scenario.bin",
+        "totalSize": 70000,
+        "mtime": 1700000000000,
+        "blockSize": 1048576,
+        "maxFrameBytes": 61440
+      }
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "accept",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "resumeBlock": 0,
+        "prefixSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "maxFrameBytes": 61440
+      }
+    },
+    {
+      "from": "test",
+      "side": "sender",
+      "event": "spoil-next-done"
+    },
+    {
+      "from": "sender",
+      "blockFrames": {
+        "pass": 0,
+        "block": 0,
+        "frames": 2,
+        "sha256": "686460e173edca38f17d25eda4096f1187963a78341263d2eabe11ca0e04d128"
+      }
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "block-ack",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "blockIndex": 0,
+        "sha256": "66803ee1d1e43a69f46e56b26189e2b8623fc7afac18d7c0e41ddb6665aa7efe"
+      }
+    },
+    {
+      "from": "sender",
+      "control": {
+        "protocolVersion": 2,
+        "action": "done",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "sender-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "fileHash": "0000000000000000000000000000000000000000000000000000000000000000",
+        "blocks": 1,
+        "totalSize": 70000
+      }
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "resume",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "resumeBlock": 0,
+        "prefixSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "pass": 1
+      }
+    },
+    {
+      "from": "sender",
+      "blockFrames": {
+        "pass": 1,
+        "block": 0,
+        "frames": 2,
+        "sha256": "c6ba46d79670eef31acfc1c1eb827349dd3171ea3cd370c117aac1288a41226b"
+      }
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "block-ack",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "blockIndex": 0,
+        "sha256": "66803ee1d1e43a69f46e56b26189e2b8623fc7afac18d7c0e41ddb6665aa7efe"
+      }
+    },
+    {
+      "from": "sender",
+      "control": {
+        "protocolVersion": 2,
+        "action": "done",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "sender-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "fileHash": "856efc4f9f01794175f934303714abbdee7a89ef13cbc2bf13d2f09cc584f92c",
+        "blocks": 1,
+        "totalSize": 70000
+      }
+    },
+    {
+      "from": "receiver",
+      "control": {
+        "protocolVersion": 2,
+        "action": "complete",
+        "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+        "deviceId": "receiver-device",
+        "sessionId": 9,
+        "connectionGeneration": 2,
+        "transferToken": "00112233445566778899aabbccddeeff",
+        "fileHash": "856efc4f9f01794175f934303714abbdee7a89ef13cbc2bf13d2f09cc584f92c"
+      }
+    }
+  ],
+  "final": {
+    "receiverPublished": true,
+    "slotsFree": true
+  }
+}

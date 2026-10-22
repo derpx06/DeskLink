@@ -21,6 +21,8 @@
 //!   backlog or a silent peer pause the transfer, and it goes on by itself.
 
 mod recv;
+#[cfg(test)]
+mod replay;
 mod send;
 mod store;
 #[cfg(test)]
@@ -395,8 +397,14 @@ impl WebRtcTransferManager {
         if !self.shared.attached.load(Ordering::Acquire) {
             return Err("DeskLink WebRTC file transport is unavailable".to_string());
         }
-        let outgoing =
-            Outgoing::prepare(&self.store, source, clipboard_mime, folder, content_sha256)?;
+        let outgoing = Outgoing::prepare(
+            &self.store,
+            source,
+            clipboard_mime,
+            folder,
+            content_sha256,
+            None,
+        )?;
         let id = outgoing.id.clone();
         self.commands
             .send(Cmd::Start(Box::new(outgoing)))
@@ -420,6 +428,16 @@ impl WebRtcTransferManager {
         answer
             .recv_timeout(Duration::from_secs(10))
             .map_err(|_| "DeskLink file transfer thread did not answer".to_string())?
+    }
+
+    /// Tests: sends `source` under the given id and token (transcripts).
+    #[cfg(test)]
+    fn start_send_fixed(&self, source: &Path, id: &str, token: &str) -> Result<String, String> {
+        let outgoing = Outgoing::prepare(&self.store, source, None, None, None, Some((id, token)))?;
+        self.commands
+            .send(Cmd::Start(Box::new(outgoing)))
+            .map_err(|_| "DeskLink file transfer thread has stopped".to_string())?;
+        Ok(id.to_string())
     }
 
     /// Ends the file thread and waits for it: its final checkpoints are on
