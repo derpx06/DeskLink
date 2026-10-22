@@ -199,7 +199,8 @@ fn accept_incoming_device(
     let ssl_stream = connector
         .connect(&info.id, stream)
         .map_err(|err| err.to_string())?;
+    // The phone dialed this computer's listener.
     finish_secure_link(
-        info, ssl_stream, deadline, config, devices, sessions, events,
+        info, ssl_stream, deadline, config, devices, sessions, events, false,
     )
 }

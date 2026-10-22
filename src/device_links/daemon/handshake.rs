@@ -34,6 +34,7 @@ pub(super) fn finish_secure_link(
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     sessions: Arc<DeviceManager>,
     events: Arc<Mutex<Vec<DaemonEvent>>>,
+    dialed_by_us: bool,
 ) -> Result<(), String> {
     let identity = config
         .lock()
@@ -130,7 +131,8 @@ pub(super) fn finish_secure_link(
         local_public_der,
         remote_public_der,
         secure_info.clone(),
-    );
+    )
+    .dialed_by_us(dialed_by_us);
     if new_certificate {
         // Kept out of the device's session entirely: see `admit_qr_only`.
         return admit_qr_only(
@@ -288,6 +290,37 @@ pub(crate) fn attach_bootstrap_link(
     // a replacement LAN connection the same way (`onConnectionReceived`'s
     // retained binding). Keep-or-adopt is decided under the session lock.
     // Only a paired link is adopted: adoption keeps the session's pairing.
+    // Two links within a second, one dialed by each side, are one
+    // reconnection: both sides keep the one dialed by the lower device id.
+    let race = match (
+        paired && !restarted && !supersede_live,
+        sessions.incumbent_link(device_id),
+    ) {
+        (true, Some((incumbent_ours, age))) => {
+            let local_id = config
+                .lock()
+                .map(|config| config.local_device_info().id)
+                .unwrap_or_default();
+            crate::device_links::core::link_race(
+                incumbent_ours,
+                age,
+                link.was_dialed_by_us(),
+                &local_id,
+                device_id,
+            )
+        }
+        _ => crate::device_links::core::RaceVerdict::NotARace,
+    };
+    if race == crate::device_links::core::RaceVerdict::KeepIncumbent {
+        debug_log!(
+            "[DL-WRTC-BOOT] {} dialed us as we dialed it: keeping the link the lower id dialed",
+            device_id
+        );
+        link.close();
+        return Ok(());
+    }
+    let replace_incumbent = race == crate::device_links::core::RaceVerdict::ReplaceIncumbent;
+    let link_dialed_by_us = link.was_dialed_by_us();
     let adoption = if restarted || supersede_live || !paired {
         crate::device_links::core::Adoption::Register
     } else {
@@ -295,7 +328,12 @@ pub(crate) fn attach_bootstrap_link(
             device_id,
             &transport,
             &link.certificate_pem,
-            super::HEARTBEAT_IDLE * 2,
+            // The newer link of a race wins even against an answering one.
+            if replace_incumbent {
+                Duration::ZERO
+            } else {
+                super::HEARTBEAT_IDLE * 2
+            },
         )
     };
     match adoption {
@@ -315,6 +353,7 @@ pub(crate) fn attach_bootstrap_link(
             // Outside the session lock: the old socket's reader wakes, sees the
             // link carries a newer socket, and leaves quietly.
             replaced.shutdown();
+            binding.link.note_attached(link_dialed_by_us);
             debug_log!(
                 "[DL-WRTC-BOOT] adopted a replacement bootstrap socket for {} (session {}, generation {}); kept the feature-ready WebRTC transport",
                 binding.device_id, binding.session_id, binding.generation
@@ -333,6 +372,11 @@ pub(crate) fn attach_bootstrap_link(
                     read_events,
                 )
             });
+            // A socket from the phone is a sign of it: if its WebRTC peer is
+            // gone (the ladder ran out while it was away), rebuild at once.
+            crate::device_links::webrtc::coordinator::recovery_sign(
+                device_id, &sessions, &config, &devices, &events,
+            );
             return Ok(());
         }
         crate::device_links::core::Adoption::Refuse => {

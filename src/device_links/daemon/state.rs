@@ -216,7 +216,7 @@ pub(crate) fn clear_error(devices: &Arc<Mutex<HashMap<String, DeviceView>>>, dev
 /// this is a bounded ring rather than an unbounded log.
 const MAX_PENDING_ERRORS: usize = 32;
 
-pub(super) fn push_error(errors: &Arc<Mutex<Vec<String>>>, error: String) {
+pub(crate) fn push_error(errors: &Arc<Mutex<Vec<String>>>, error: String) {
     if let Ok(mut errors) = errors.lock() {
         // Repeating the same message adds nothing and hides what came before.
         if errors.last().is_some_and(|last| last == &error) {

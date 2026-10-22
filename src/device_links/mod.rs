@@ -23,6 +23,7 @@ pub mod pairing_qr;
 pub mod pty;
 pub mod relay_link;
 pub mod session_lock;
+pub(crate) mod sync;
 pub mod transfer_log;
 pub mod transport;
 pub(crate) mod unlock;

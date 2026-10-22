@@ -9,7 +9,11 @@ use gst_webrtc::{
 };
 
 use super::ice::IceServerConfig;
-use super::{SignalingMessageType, WebRtcChannel, MAX_ENVELOPE_BYTES, MAX_WIRE_MESSAGE_BYTES};
+use super::{
+    SignalingMessageType, WebRtcChannel, EVENTS_HIGH_WATER, EVENTS_LOW_WATER,
+    EVENTS_MAX_HELD_BYTES, EVENTS_MAX_HELD_MESSAGES, LIVENESS_MAX_BUFFERED_BYTES,
+    MAX_ENVELOPE_BYTES, MAX_WIRE_MESSAGE_BYTES,
+};
 
 static GST_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -176,6 +180,47 @@ pub struct DesktopWebRtcPeer {
     audio_send: Mutex<Option<super::audio::AudioSend>>,
     /// The sound's SSRC and where its sequence continues.
     audio_continuity: Mutex<super::audio::Continuity>,
+    /// Sends on `events` waiting for it to drain below the high-water mark,
+    /// in order (see [`EVENTS_HIGH_WATER`]).
+    held: Arc<Mutex<Held>>,
+}
+
+/// What waits for `events` to drain.
+#[derive(Debug, Default)]
+pub(crate) struct Held {
+    messages: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+impl Held {
+    /// Whether a send of `len` bytes must wait: something already waits (order
+    /// matters), or `buffered` is over the high-water mark.
+    pub(crate) fn must_wait(&self, buffered: u64) -> bool {
+        !self.messages.is_empty() || buffered > EVENTS_HIGH_WATER
+    }
+
+    /// Queues `text`; false when the queue is full (the caller reports it).
+    pub(crate) fn push(&mut self, text: &str) -> bool {
+        if self.messages.len() >= EVENTS_MAX_HELD_MESSAGES
+            || self.bytes + text.len() > EVENTS_MAX_HELD_BYTES
+        {
+            return false;
+        }
+        self.bytes += text.len();
+        self.messages.push_back(text.to_string());
+        true
+    }
+
+    /// The next message to send, if `buffered` is not over the high-water
+    /// mark.
+    pub(crate) fn next(&mut self, buffered: u64) -> Option<String> {
+        if buffered > EVENTS_HIGH_WATER {
+            return None;
+        }
+        let text = self.messages.pop_front()?;
+        self.bytes -= text.len();
+        Some(text)
+    }
 }
 
 impl DesktopWebRtcPeer {
@@ -222,6 +267,7 @@ impl DesktopWebRtcPeer {
         let audio_pad = Arc::new(Mutex::new(None));
         let audio_playback = Arc::new(Mutex::new(None));
         let audio_wanted = Arc::new(Mutex::new(None));
+        let held: Arc<Mutex<Held>> = Arc::default();
         install_webrtcbin_callbacks(
             &webrtcbin,
             &pipeline,
@@ -230,6 +276,7 @@ impl DesktopWebRtcPeer {
             Arc::clone(&audio_pad),
             Arc::clone(&audio_playback),
             Arc::clone(&audio_wanted),
+            Arc::clone(&held),
         )?;
 
         pipeline
@@ -260,6 +307,7 @@ impl DesktopWebRtcPeer {
             audio_playback,
             audio_wanted,
             audio_send: Mutex::new(None),
+            held,
             audio_continuity: Mutex::new(super::audio::Continuity {
                 ssrc: loop {
                     let mut bytes = [0u8; 4];
@@ -573,7 +621,7 @@ impl DesktopWebRtcPeer {
         channel.property::<u64>("buffered-amount")
     }
 
-    pub fn send_text(&self, channel: WebRtcChannel, text: &str) -> Result<(), String> {
+    pub fn send_text(&self, kind: WebRtcChannel, text: &str) -> Result<(), String> {
         // Over 64 KiB would wreck the SCTP association, not just fail: see
         // [`MAX_WIRE_MESSAGE_BYTES`].
         if text.len() > MAX_WIRE_MESSAGE_BYTES.min(MAX_ENVELOPE_BYTES) {
@@ -586,15 +634,53 @@ impl DesktopWebRtcPeer {
             .channels
             .lock()
             .map_err(|_| "DeskLink WebRTC channel lock poisoned".to_string())?
-            .get(&channel)
+            .get(&kind)
             .cloned()
             .ok_or_else(|| "DeskLink WebRTC data channel is not open".to_string())?;
         if channel.ready_state() != WebRTCDataChannelState::Open {
             return Err("DeskLink WebRTC data channel is not open".to_string());
         }
+        if kind == WebRtcChannel::Events {
+            let mut held = self
+                .held
+                .lock()
+                .map_err(|_| "DeskLink WebRTC send queue lock poisoned".to_string())?;
+            if held.must_wait(channel.property::<u64>("buffered-amount")) {
+                return if held.push(text) {
+                    Ok(())
+                } else {
+                    Err(
+                        "The connection to the phone is too busy; try again in a moment"
+                            .to_string(),
+                    )
+                };
+            }
+        }
         channel
             .send_string_full(Some(text))
             .map_err(|error| format!("Could not send DeskLink WebRTC data: {error}"))
+    }
+
+    /// Whether the channels a link needs before it is feature-ready are open.
+    pub fn required_channels_open(&self) -> bool {
+        let Ok(channels) = self.channels.lock() else {
+            return false;
+        };
+        WebRtcChannel::REQUIRED.iter().all(|kind| {
+            channels
+                .get(kind)
+                .is_some_and(|channel| channel.ready_state() == WebRTCDataChannelState::Open)
+        })
+    }
+
+    /// Sends a heartbeat on the liveness channel, or skips it (`Ok(false)`)
+    /// when more than [`LIVENESS_MAX_BUFFERED_BYTES`] is already queued: the
+    /// next one supersedes it.
+    pub fn send_heartbeat(&self, text: &str) -> Result<bool, String> {
+        if self.buffered_amount(WebRtcChannel::Liveness) > LIVENESS_MAX_BUFFERED_BYTES {
+            return Ok(false);
+        }
+        self.send_text(WebRtcChannel::Liveness, text).map(|()| true)
     }
 
     /// Sends a bounded binary payload over the dedicated file-data channel.
@@ -835,7 +921,12 @@ impl DesktopWebRtcPeer {
                         channel.label()
                     )
                 })?;
-            install_data_channel(created, Arc::clone(&self.channels), self.events.clone())?;
+            install_data_channel(
+                created,
+                Arc::clone(&self.channels),
+                self.events.clone(),
+                Arc::clone(&self.held),
+            )?;
         }
         Ok(())
     }
@@ -1143,6 +1234,7 @@ fn pad_carries_video(pad: &gst::Pad) -> bool {
     pad_media(pad).as_deref() == Some("video")
 }
 
+#[allow(clippy::too_many_arguments)] // Captures the peer's shared state once.
 fn install_webrtcbin_callbacks(
     webrtcbin: &gst::Element,
     pipeline: &gst::Pipeline,
@@ -1151,6 +1243,7 @@ fn install_webrtcbin_callbacks(
     audio_pad: Arc<Mutex<Option<gst::Pad>>>,
     audio_playback: Arc<Mutex<Option<super::audio::AudioPlayback>>>,
     audio_wanted: Arc<Mutex<Option<(super::audio::Output, String)>>>,
+    held: Arc<Mutex<Held>>,
 ) -> Result<(), String> {
     // `on-negotiation-needed` deliberately does nothing.
     //
@@ -1173,6 +1266,7 @@ fn install_webrtcbin_callbacks(
     });
 
     let incoming_channels = Arc::clone(&channels);
+    let incoming_held = Arc::clone(&held);
     let incoming_events = events.clone();
     webrtcbin.connect("on-data-channel", false, move |values| {
         match values[1].get::<WebRTCDataChannel>() {
@@ -1181,6 +1275,7 @@ fn install_webrtcbin_callbacks(
                     channel,
                     Arc::clone(&incoming_channels),
                     incoming_events.clone(),
+                    Arc::clone(&incoming_held),
                 );
             }
             Err(_) => {
@@ -1253,6 +1348,7 @@ fn install_data_channel(
     channel: WebRTCDataChannel,
     channels: Arc<Mutex<HashMap<WebRtcChannel, WebRTCDataChannel>>>,
     events: Sender<PeerEvent>,
+    held: Arc<Mutex<Held>>,
 ) -> Result<(), String> {
     let label = channel
         .label()
@@ -1281,6 +1377,20 @@ fn install_data_channel(
         channels.insert(channel_kind, channel.clone());
     }
 
+    if channel_kind == WebRtcChannel::Events {
+        // Held sends resume, in order, once the queue drains.
+        channel.set_buffered_amount_low_threshold(EVENTS_LOW_WATER);
+        channel.connect_on_buffered_amount_low(move |channel| {
+            let Ok(mut held) = held.lock() else {
+                return;
+            };
+            while let Some(text) = held.next(channel.property::<u64>("buffered-amount")) {
+                if channel.send_string_full(Some(&text)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     let open_events = events.clone();
     channel.connect_on_open(move |_| {
         let _ = open_events.send(PeerEvent::ChannelOpened(channel_kind));
@@ -1300,10 +1410,12 @@ fn install_data_channel(
             ));
             return;
         };
-        if data.len() > MAX_ENVELOPE_BYTES {
-            let _ = message_events.send(PeerEvent::Error(
-                "DeskLink WebRTC received an oversized message".to_string(),
-            ));
+        if data.len() > channel_kind.max_inbound_bytes() {
+            // Dropped and logged; the channel stays.
+            let _ = message_events.send(PeerEvent::Error(format!(
+                "DeskLink WebRTC received an oversized message on {}",
+                channel_kind.label()
+            )));
             return;
         }
         let Some(credit) = take_credit(&message_backlog, data.len(), max_backlog) else {
@@ -2701,6 +2813,109 @@ a=max-message-size:262144\r\n";
         assert!(channels.contains_key(&WebRtcChannel::InputRealtime));
         drop(channels);
         peer.close();
+    }
+
+    /// The liveness channel: heartbeats arrive on their own channel, in a
+    /// reliable ordered channel the feature channels cannot delay, an
+    /// oversized message is dropped (the channel stays), and the link is
+    /// only feature-ready once the required channels are open.
+    #[test]
+    fn heartbeats_cross_a_real_connection_on_the_liveness_channel() {
+        let pair = loopback();
+        wait_for_channels(
+            &pair.offerer_events,
+            &[
+                WebRtcChannel::Control,
+                WebRtcChannel::Events,
+                WebRtcChannel::Liveness,
+            ],
+        );
+        wait_for_channels(
+            &pair.answerer_events,
+            &[
+                WebRtcChannel::Control,
+                WebRtcChannel::Events,
+                WebRtcChannel::Liveness,
+            ],
+        );
+        assert!(pair.offerer.required_channels_open());
+        assert!(pair.answerer.required_channels_open());
+        assert!(pair.offerer.send_heartbeat("ping").unwrap());
+        assert_eq!(
+            next_envelope(&pair.answerer_events, WebRtcChannel::Liveness),
+            b"ping"
+        );
+        // A feature burst on `events` cannot sit in front of a probe.
+        for _ in 0..40 {
+            pair.offerer
+                .send_text(WebRtcChannel::Events, &"x".repeat(MAX_WIRE_MESSAGE_BYTES))
+                .unwrap();
+        }
+        pair.answerer.send_heartbeat("probe").unwrap();
+        assert_eq!(
+            next_envelope(&pair.offerer_events, WebRtcChannel::Liveness),
+            b"probe"
+        );
+        // Over 2 KiB is dropped and reported; a normal one still arrives.
+        pair.offerer
+            .send_text(
+                WebRtcChannel::Liveness,
+                &"x".repeat(super::super::MAX_LIVENESS_ENVELOPE_BYTES + 1),
+            )
+            .unwrap();
+        pair.offerer.send_heartbeat("still here").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut reported = false;
+        loop {
+            match pair
+                .answerer_events
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            {
+                Ok(PeerEvent::Error(error)) if error.contains("oversized") => reported = true,
+                Ok(PeerEvent::Envelope {
+                    channel: WebRtcChannel::Liveness,
+                    bytes,
+                    ..
+                }) => {
+                    assert_eq!(bytes, b"still here", "the oversized one was dropped");
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => panic!("no heartbeat after the oversized message"),
+            }
+        }
+        assert!(reported);
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
+    #[test]
+    fn sends_on_events_wait_in_order_above_the_high_water_mark_and_are_bounded() {
+        let mut held = Held::default();
+        assert!(!held.must_wait(0) && !held.must_wait(EVENTS_HIGH_WATER));
+        assert!(held.must_wait(EVENTS_HIGH_WATER + 1));
+        assert!(held.push("first") && held.push("second"));
+        // Something waiting: later sends queue behind it, whatever the buffer.
+        assert!(held.must_wait(0));
+        assert_eq!(
+            held.next(EVENTS_HIGH_WATER + 1),
+            None,
+            "still over the mark"
+        );
+        assert_eq!(held.next(EVENTS_LOW_WATER).as_deref(), Some("first"));
+        assert_eq!(held.next(0).as_deref(), Some("second"));
+        assert_eq!(held.next(0), None);
+        assert!(!held.must_wait(0));
+        // Bounded: messages and bytes.
+        for _ in 0..EVENTS_MAX_HELD_MESSAGES {
+            assert!(held.push("m"));
+        }
+        assert!(!held.push("one too many"));
+        let mut big = Held::default();
+        assert!(big.push(&"x".repeat(EVENTS_MAX_HELD_BYTES)));
+        assert!(!big.push("y"), "past the byte budget");
+        assert_eq!(big.next(0).unwrap().len(), EVENTS_MAX_HELD_BYTES);
+        assert!(big.push("y"), "room again once it drains");
     }
 
     #[test]

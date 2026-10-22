@@ -539,7 +539,11 @@ fn with_book<T>(device_id: &str, job: impl FnOnce(&mut Book, &Path) -> T) -> Opt
 }
 
 /// A snapshot from `device_id` (K1): the requests to send.
-pub(crate) fn on_snapshot(device_id: &str, packet: &NetworkPacket) -> Vec<NetworkPacket> {
+pub(crate) fn on_snapshot(
+    device_id: &str,
+    instance: Option<&str>,
+    packet: &NetworkPacket,
+) -> Vec<NetworkPacket> {
     static PENDING: Mutex<Option<HashMap<String, Pending>>> = Mutex::new(None);
     let complete = PENDING.lock().ok().and_then(|mut pending| {
         assemble(
@@ -570,6 +574,11 @@ pub(crate) fn on_snapshot(device_id: &str, packet: &NetworkPacket) -> Vec<Networ
         "[Contacts] Snapshot from {device_id}: asking for {} vCards",
         ask.len()
     );
+    // Nothing left to fetch: the whole snapshot (every part) is applied, so
+    // its `rev` is remembered for the next resync.
+    if ask.is_empty() {
+        super::sync::note_received(device_id, instance, "contacts", packet);
+    }
     vcard_requests(&ask)
 }
 

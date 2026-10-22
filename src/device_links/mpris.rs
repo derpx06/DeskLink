@@ -432,22 +432,32 @@ fn poll(bus: &gio::DBusConnection) {
     }
 }
 
-/// Sends `device_id` the current state (on connect, or when it asks).
+/// The current state with its artwork, if there is one: the packet carries
+/// its `rev` (the position, which moves every second, does not count).
+pub(crate) fn state_snapshot(
+) -> Option<(NetworkPacket, Option<std::sync::Arc<super::media_art::Art>>)> {
+    let shown = SHOWN.lock().ok()?;
+    let shown = shown.as_ref()?;
+    let current = active(&shown.players, &shown.last_playing);
+    let mut packet = state_packet(&shown.players, current);
+    let rev = super::sync::rev_of(std::slice::from_ref(&packet), &["pos"]);
+    packet.set("rev", rev);
+    Some((packet, current.and_then(current_art)))
+}
+
+/// Sends a [`state_snapshot`] to `device_id`.
+pub(crate) fn send_snapshot_to(
+    device_id: &str,
+    snapshot: (NetworkPacket, Option<std::sync::Arc<super::media_art::Art>>),
+) {
+    send_with_art(device_id, snapshot.0, snapshot.1.as_deref());
+}
+
+/// Sends `device_id` the current state (when it asks).
 pub(crate) fn send_state_to(device_id: &str) {
-    let (packet, art) = {
-        let Ok(shown) = SHOWN.lock() else {
-            return;
-        };
-        let Some(shown) = shown.as_ref() else {
-            return;
-        };
-        let current = active(&shown.players, &shown.last_playing);
-        (
-            state_packet(&shown.players, current),
-            current.and_then(current_art),
-        )
-    };
-    send_with_art(device_id, packet, art.as_deref());
+    if let Some(snapshot) = state_snapshot() {
+        send_snapshot_to(device_id, snapshot);
+    }
 }
 
 /// The art id each phone was last sent the picture for.

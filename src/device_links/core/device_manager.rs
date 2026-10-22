@@ -315,6 +315,18 @@ impl DeviceManager {
         }
     }
 
+    /// The incumbent link's dialer and age, if it is open: what the link
+    /// race rule compares a newly authenticated link with.
+    pub fn incumbent_link(&self, device_id: &str) -> Option<(bool, std::time::Duration)> {
+        let sessions = self.sessions.lock().ok()?;
+        let session = sessions.get(device_id)?;
+        if session.state == SessionState::Terminated {
+            return None;
+        }
+        let link = session.active_link.as_ref()?;
+        (!link.is_closed()).then(|| (link.was_dialed_by_us(), link.age()))
+    }
+
     pub fn register_link(
         &self,
         device_id: String,

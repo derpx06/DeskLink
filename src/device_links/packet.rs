@@ -41,6 +41,9 @@ pub const PACKET_TYPE_NOTIFICATION_REPLY: &str = "desklink.notification.reply";
 pub const PACKET_TYPE_NOTIFICATION_ACTION: &str = "desklink.notification.action";
 /// The desk's own settings, reported to a phone (desk → phone).
 pub const PACKET_TYPE_SETTINGS: &str = "desklink.settings";
+/// Delta resync (W2): the snapshot revs a side already holds, sent first on
+/// every feature-ready, both ways.
+pub const PACKET_TYPE_SYNC_HAVE: &str = "desklink.sync.have";
 /// A phone changing one of the desk's settings (phone → desk), allow-listed.
 pub const PACKET_TYPE_SETTINGS_REQUEST: &str = "desklink.settings.request";
 /// Unlock with the phone: the desk's nonce, or the phone asking for one.

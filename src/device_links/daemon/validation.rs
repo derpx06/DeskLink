@@ -186,5 +186,7 @@ pub(super) fn connect_to_device(
         devices,
         sessions,
         events,
+        // This computer dialed the phone.
+        true,
     )
 }

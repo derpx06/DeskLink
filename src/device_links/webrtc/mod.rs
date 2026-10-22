@@ -40,7 +40,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::device_links::packet::{
-    NetworkPacket, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_PAIR, PACKET_TYPE_WEBRTC_SIGNAL_V1,
+    NetworkPacket, PACKET_TYPE_HEARTBEAT, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_PAIR,
+    PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
 
 pub const ENVELOPE_VERSION: u32 = 1;
@@ -61,6 +62,21 @@ pub const MAX_WIRE_MESSAGE_BYTES: usize = 64 * 1024;
 /// about half a kilobyte of fields), it always fits one wire message. Every
 /// sender that packs a list splits or trims to this.
 pub const MAX_FEATURE_PACKET_BYTES: usize = 40 * 1024;
+
+/// A message on the liveness channel is a heartbeat: a larger inbound one is
+/// dropped and logged (the channel stays). Mirrored by Android.
+pub const MAX_LIVENESS_ENVELOPE_BYTES: usize = 2048;
+/// A heartbeat is not sent while this much is already queued on the liveness
+/// channel: the next one supersedes it (every heartbeat carries `dozing`).
+pub const LIVENESS_MAX_BUFFERED_BYTES: u64 = 8192;
+/// Flow control on `events`: a send above the high-water mark waits in order
+/// and resumes under the low-water mark. Nothing user-visible is dropped.
+pub const EVENTS_HIGH_WATER: u64 = 256 * 1024;
+pub const EVENTS_LOW_WATER: u64 = 64 * 1024;
+/// What may wait for `events` to drain (messages, bytes); past it a send
+/// fails with an error the caller reports.
+pub const EVENTS_MAX_HELD_MESSAGES: usize = 1024;
+pub const EVENTS_MAX_HELD_BYTES: usize = 8 * 1024 * 1024;
 
 /// How long `packet`'s envelope is on the wire (with the longest ids a
 /// binding has), for senders and tests to check against
@@ -93,10 +109,13 @@ pub enum WebRtcChannel {
     /// Reserved for a future explicitly authorised terminal feature. No
     /// packet bridge operation may currently select this channel.
     Terminal,
+    /// Heartbeats only (probe, reply, doze report): small and reliable, so a
+    /// feature burst on `events` can never queue a probe behind it.
+    Liveness,
 }
 
 impl WebRtcChannel {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Control,
         Self::Events,
         Self::InputReliable,
@@ -104,6 +123,7 @@ impl WebRtcChannel {
         Self::FileControl,
         Self::FileData,
         Self::Terminal,
+        Self::Liveness,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -115,8 +135,20 @@ impl WebRtcChannel {
             Self::FileControl => "desklink-file-control-v1",
             Self::FileData => "desklink-file-data-v1",
             Self::Terminal => "desklink-terminal-v1",
+            Self::Liveness => "desklink-liveness-v1",
         }
     }
+
+    /// The longest text message accepted on this channel.
+    pub const fn max_inbound_bytes(self) -> usize {
+        match self {
+            Self::Liveness => MAX_LIVENESS_ENVELOPE_BYTES,
+            _ => MAX_ENVELOPE_BYTES,
+        }
+    }
+
+    /// The channels a link needs open before it can be feature-ready.
+    pub const REQUIRED: [Self; 3] = [Self::Control, Self::Events, Self::Liveness];
 
     pub const fn ordered(self) -> bool {
         !matches!(self, Self::InputRealtime)
@@ -139,6 +171,7 @@ impl WebRtcChannel {
             "desklink-file-control-v1" => Ok(Self::FileControl),
             "desklink-file-data-v1" => Ok(Self::FileData),
             "desklink-terminal-v1" => Ok(Self::Terminal),
+            "desklink-liveness-v1" => Ok(Self::Liveness),
             _ => Err("Unknown DeskLink WebRTC data channel".to_string()),
         }
     }
@@ -290,14 +323,18 @@ impl WebRtcPacketBridge {
         let payload = envelope.validate(binding)?;
         let packet = NetworkPacket::deserialize(&payload).map_err(|error| error.to_string())?;
         Self::ensure_feature_packet(&packet)?;
-        if envelope.channel != Self::channel_for(&packet).label() {
+        let lenient_heartbeat = packet.packet_type == PACKET_TYPE_HEARTBEAT
+            && envelope.channel == WebRtcChannel::Events.label();
+        if envelope.channel != Self::channel_for(&packet).label() && !lenient_heartbeat {
             return Err("DeskLink packet arrived on the wrong WebRTC channel".to_string());
         }
         Ok(packet)
     }
 
     pub fn channel_for(packet: &NetworkPacket) -> WebRtcChannel {
-        if Self::is_replaceable_pointer_motion(packet) {
+        if packet.packet_type == PACKET_TYPE_HEARTBEAT {
+            WebRtcChannel::Liveness
+        } else if Self::is_replaceable_pointer_motion(packet) {
             WebRtcChannel::InputRealtime
         } else if packet.packet_type == PACKET_TYPE_MOUSEPAD_REQUEST {
             WebRtcChannel::InputReliable
@@ -377,6 +414,78 @@ mod tests {
 
         assert_eq!(binding.session_id, 0x0123456789abcde);
         assert_eq!(WebRtcChannel::Events.label(), "desklink-events-v1");
+        assert_eq!(WebRtcChannel::Liveness.label(), "desklink-liveness-v1");
+        assert_eq!(MAX_LIVENESS_ENVELOPE_BYTES, 2048);
+        assert_eq!(LIVENESS_MAX_BUFFERED_BYTES, 8192);
+        assert_eq!(
+            (EVENTS_HIGH_WATER, EVENTS_LOW_WATER),
+            (256 * 1024, 64 * 1024)
+        );
+    }
+
+    /// Heartbeats ride the liveness channel and nothing else does; a
+    /// heartbeat on `events` (a mixed build) is still understood.
+    #[test]
+    fn only_heartbeats_use_the_liveness_channel() {
+        let local = WebRtcWireBinding::from_attempt(
+            "desktop",
+            "phone",
+            "01234567-89ab-cdef-0123-456789abcdef",
+        )
+        .unwrap();
+        let remote = WebRtcWireBinding::from_attempt(
+            "phone",
+            "desktop",
+            "01234567-89ab-cdef-0123-456789abcdef",
+        )
+        .unwrap();
+        let mut beat = NetworkPacket::new(PACKET_TYPE_HEARTBEAT);
+        beat.set("reply", true);
+        beat.set("dozing", true);
+        assert_eq!(
+            WebRtcPacketBridge::channel_for(&beat),
+            WebRtcChannel::Liveness
+        );
+        let envelope = WebRtcPacketBridge::encode(&local, &beat, 1).unwrap();
+        assert_eq!(envelope.channel, "desklink-liveness-v1");
+        assert!(envelope.to_json().unwrap().len() <= MAX_LIVENESS_ENVELOPE_BYTES);
+        assert!(WebRtcChannel::Liveness.ordered());
+        assert_eq!(
+            WebRtcChannel::Liveness.max_retransmits(),
+            None,
+            "fully reliable"
+        );
+        assert!(WebRtcChannel::ALL.contains(&WebRtcChannel::Liveness));
+        assert_eq!(
+            WebRtcChannel::parse("desklink-liveness-v1"),
+            Ok(WebRtcChannel::Liveness)
+        );
+        assert_eq!(WebRtcChannel::Liveness.max_inbound_bytes(), 2048);
+        assert_eq!(
+            WebRtcChannel::Events.max_inbound_bytes(),
+            MAX_ENVELOPE_BYTES
+        );
+        assert!(WebRtcChannel::REQUIRED.contains(&WebRtcChannel::Liveness));
+        let decoded = WebRtcPacketBridge::decode(&remote, &envelope).unwrap();
+        assert!(decoded.get_bool("dozing").unwrap());
+        // On `events` (an older build): accepted.
+        let mut on_events = envelope.clone();
+        on_events.channel = WebRtcChannel::Events.label().to_string();
+        assert!(WebRtcPacketBridge::decode(&remote, &on_events).is_ok());
+        // Anything else on the liveness channel: refused.
+        for other in [
+            PACKET_TYPE_CLIPBOARD,
+            "desklink.notification",
+            "desklink.mpris",
+        ] {
+            let packet = NetworkPacket::new(other);
+            let mut sneaky = WebRtcPacketBridge::encode(&local, &packet, 1).unwrap();
+            sneaky.channel = WebRtcChannel::Liveness.label().to_string();
+            assert!(
+                WebRtcPacketBridge::decode(&remote, &sneaky).is_err(),
+                "{other}"
+            );
+        }
     }
 
     #[test]

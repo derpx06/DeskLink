@@ -20,6 +20,50 @@ pub struct SessionLink {
     /// socket sees it change and leaves quietly: its socket's end is not the
     /// link's.
     epoch: AtomicU64,
+    /// Whether this computer dialed the connection (else the phone did), for
+    /// the link race rule: see [`link_race`].
+    dialed_by_us: AtomicBool,
+    /// When this link was made.
+    attached_at: Mutex<std::time::Instant>,
+}
+
+/// Two authenticated LAN links to one peer made within this long of each
+/// other, dialed by different sides, are one reconnection. Mirrored by
+/// Android's `LINK_RACE_WINDOW`.
+pub const LINK_RACE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// What to do with a newly authenticated link when an incumbent exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaceVerdict {
+    /// Not a race: decided as before (a replacement, or a refreshed socket).
+    NotARace,
+    /// The incumbent is the one dialed by the lower device id: the new link
+    /// is closed.
+    KeepIncumbent,
+    /// The new link is: it replaces the incumbent.
+    ReplaceIncumbent,
+}
+
+/// Both sides keep the link dialed by the lower device id and close the
+/// other, so they cannot disagree about which survives. Only for links made
+/// within [`LINK_RACE_WINDOW`] by different dialers.
+pub fn link_race(
+    incumbent_dialed_by_us: bool,
+    incumbent_age: std::time::Duration,
+    new_dialed_by_us: bool,
+    local_id: &str,
+    peer_id: &str,
+) -> RaceVerdict {
+    if incumbent_dialed_by_us == new_dialed_by_us || incumbent_age >= LINK_RACE_WINDOW {
+        return RaceVerdict::NotARace;
+    }
+    // The dialer of a link is us (local id) or the peer.
+    let lower_dialer_is_us = local_id < peer_id;
+    if incumbent_dialed_by_us == lower_dialer_is_us {
+        RaceVerdict::KeepIncumbent
+    } else {
+        RaceVerdict::ReplaceIncumbent
+    }
 }
 
 impl SessionLink {
@@ -38,7 +82,36 @@ impl SessionLink {
             info,
             closed: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
+            dialed_by_us: AtomicBool::new(false),
+            attached_at: Mutex::new(std::time::Instant::now()),
         }
+    }
+
+    /// Marks this link as dialed by this computer.
+    pub fn dialed_by_us(self, yes: bool) -> Self {
+        self.dialed_by_us.store(yes, Ordering::Release);
+        self
+    }
+
+    pub fn was_dialed_by_us(&self) -> bool {
+        self.dialed_by_us.load(Ordering::Acquire)
+    }
+
+    /// How long ago this link last got a socket (made, or adopted one).
+    pub fn age(&self) -> std::time::Duration {
+        self.attached_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .elapsed()
+    }
+
+    /// A replacement socket was adopted: dialed by `dialed_by_us`, just now.
+    pub fn note_attached(&self, dialed_by_us: bool) {
+        self.dialed_by_us.store(dialed_by_us, Ordering::Release);
+        *self
+            .attached_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = std::time::Instant::now();
     }
 
     /// Which socket this link carries now; see the `epoch` field.
@@ -184,6 +257,8 @@ impl SessionLink {
             },
             closed: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
+            dialed_by_us: AtomicBool::new(false),
+            attached_at: Mutex::new(std::time::Instant::now()),
         }
     }
 }
@@ -195,5 +270,66 @@ impl std::fmt::Debug for SessionLink {
             .field("device_id", &self.info.id)
             .field("closed", &self.is_closed())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    /// Two links within a second, dialed by different sides, are one
+    /// reconnection; both sides keep the one the lower device id dialed.
+    #[test]
+    fn two_racing_links_collapse_to_the_one_the_lower_id_dialed() {
+        use RaceVerdict::*;
+        // We are "a" (lower): the link we dialed is the lower id's.
+        assert_eq!(link_race(true, MS(200), false, "a", "b"), KeepIncumbent);
+        assert_eq!(link_race(false, MS(200), true, "a", "b"), ReplaceIncumbent);
+        // We are "b" (higher): the phone's link is the lower id's.
+        assert_eq!(link_race(false, MS(200), true, "b", "a"), KeepIncumbent);
+        assert_eq!(link_race(true, MS(200), false, "b", "a"), ReplaceIncumbent);
+        // Both sides reach the same answer: the surviving dialer is the same.
+        let ours = |incumbent_ours: bool, new_ours: bool, local: &str, peer: &str| {
+            let verdict = link_race(incumbent_ours, MS(10), new_ours, local, peer);
+            // Whose link survives: the dialer's id.
+            let survivor_ours = match verdict {
+                KeepIncumbent => incumbent_ours,
+                ReplaceIncumbent => new_ours,
+                NotARace => unreachable!(),
+            };
+            if survivor_ours {
+                local.to_string()
+            } else {
+                peer.to_string()
+            }
+        };
+        assert_eq!(ours(true, false, "a", "b"), "a", "we are the lower dialer");
+        // From the phone's point of view the same two links, mirrored.
+        assert_eq!(
+            ours(false, true, "b", "a"),
+            "a",
+            "the phone sees the same survivor"
+        );
+        // Same dialer twice, or a link after the window: replaces as before.
+        assert_eq!(link_race(true, MS(200), true, "a", "b"), NotARace);
+        assert_eq!(link_race(true, LINK_RACE_WINDOW, false, "a", "b"), NotARace);
+        assert_eq!(link_race(false, MS(999), true, "a", "b"), ReplaceIncumbent);
+        assert_eq!(LINK_RACE_WINDOW, MS(1000));
+    }
+
+    #[test]
+    fn a_link_knows_who_dialed_it_and_how_long_ago_it_was_attached() {
+        let link = SessionLink::test_placeholder("phone");
+        assert!(!link.was_dialed_by_us());
+        let link = link.dialed_by_us(true);
+        assert!(link.was_dialed_by_us());
+        std::thread::sleep(MS(30));
+        assert!(link.age() >= MS(30));
+        link.note_attached(false);
+        assert!(!link.was_dialed_by_us());
+        assert!(link.age() < MS(30), "adopting a socket restarts the age");
     }
 }

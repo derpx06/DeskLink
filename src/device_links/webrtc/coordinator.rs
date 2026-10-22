@@ -420,19 +420,19 @@ pub(crate) fn handle_signaling_packet(
         message.message_type,
         SignalingMessageType::IceRestart | SignalingMessageType::RestartRequest
     ) {
-        if local_device_id >= message.from_device_id {
-            // This side answers; the initiator rebuilds on its own.
-            return Ok(());
-        }
-        // A late request about an attempt that has since been replaced must not
-        // kill the healthy newer one.
         let active = sessions
             .active_webrtc_attempt(binding)
             .map_err(|error| error.to_string())?;
-        if active.is_some_and(|active| active != message.session_attempt_id) {
-            return Ok(());
-        }
-        return restart_as_initiator(binding, sessions, config, devices, events);
+        return match restart_request_action(
+            local_device_id < message.from_device_id,
+            active.as_deref(),
+            &message.session_attempt_id,
+        ) {
+            RestartAction::Ignore => Ok(()),
+            RestartAction::Restart => {
+                restart_as_initiator(binding, sessions, config, devices, events)
+            }
+        };
     }
 
     let peer = match message.message_type {
@@ -452,16 +452,24 @@ pub(crate) fn handle_signaling_packet(
                 OfferAttemptDisposition::ReuseCurrent => sessions
                     .active_webrtc_peer(binding, &message.session_attempt_id)
                     .map_err(|error| error.to_string())?,
-                OfferAttemptDisposition::InstallNew => install_responder(
-                    binding.clone(),
-                    message.session_attempt_id.clone(),
-                    &local_device_id,
-                    &message.from_device_id,
-                    Arc::clone(&sessions),
-                    Arc::clone(&config),
-                    Arc::clone(&devices),
-                    Arc::clone(&events),
-                )?,
+                OfferAttemptDisposition::InstallNew => {
+                    // The phone is dialling: a sign of it, so a ladder that ran
+                    // out while it was away starts over.
+                    let _ = sessions.with_session(binding, |session| {
+                        session.webrtc_recovery_attempt = 0;
+                    });
+                    clear_error(&devices, &binding.device_id);
+                    install_responder(
+                        binding.clone(),
+                        message.session_attempt_id.clone(),
+                        &local_device_id,
+                        &message.from_device_id,
+                        Arc::clone(&sessions),
+                        Arc::clone(&config),
+                        Arc::clone(&devices),
+                        Arc::clone(&events),
+                    )?
+                }
             }
         }
         _ => sessions
@@ -2301,6 +2309,13 @@ fn spawn_event_worker(
         let mut last_probe = std::time::Instant::now();
         let mut was_ready = false;
         let mut ever_ready = false;
+        // Since when this peer has been feature-ready (the ladder resets
+        // only after it stays so for [`HEALTHY_AFTER`]).
+        let mut ready_at: Option<std::time::Instant> = None;
+        // File and terminal messages are handled on their own thread, in
+        // order, so a heavy one never holds up the liveness clocks and the
+        // control traffic this worker serves.
+        let lane = spawn_work_lane();
         let started = std::time::Instant::now();
         loop {
             // A timed receive lets the transient-disconnect grace window expire
@@ -2336,6 +2351,18 @@ fn spawn_event_worker(
                 // Start the silence budget at the moment features go live.
                 last_inbound = std::time::Instant::now();
             }
+            if ready && !was_ready {
+                ready_at = Some(std::time::Instant::now());
+            } else if !ready {
+                ready_at = None;
+            }
+            if ladder_resets(ready_at.map(|at| at.elapsed())) {
+                // Healthy for a minute: the next failure starts from the top.
+                ready_at = Some(std::time::Instant::now());
+                let _ = sessions.with_session(&binding, |session| {
+                    session.webrtc_recovery_attempt = 0;
+                });
+            }
             was_ready = ready;
             ever_ready |= ready;
             // Nothing else ends a negotiation that stalls before feature-ready:
@@ -2360,7 +2387,12 @@ fn spawn_event_worker(
             }
             if ready {
                 let dozing = is_dozing(&binding.device_id);
-                if take_probe_now(&binding.device_id) {
+                let woke = take_probe_now(&binding.device_id);
+                last_inbound = clock_after_wake(woke, last_inbound, std::time::Instant::now());
+                if woke {
+                    let _ = sessions.with_session(&binding, |session| {
+                        session.webrtc_recovery_attempt = 0;
+                    });
                     last_probe = std::time::Instant::now();
                     if let Err(error) =
                         send_keepalive(&binding, &attempt_id, &wire, &sessions, false)
@@ -2491,6 +2523,48 @@ fn spawn_event_worker(
                             &config,
                         );
                     }
+                    PeerEvent::Envelope {
+                        channel:
+                            channel @ (WebRtcChannel::FileControl
+                            | WebRtcChannel::FileData
+                            | WebRtcChannel::Terminal),
+                        bytes,
+                        credit,
+                    } => {
+                        let (binding, attempt_id, wire) =
+                            (binding.clone(), attempt_id.clone(), wire.clone());
+                        let (sessions, config, devices, events, transfer_manager) = (
+                            Arc::clone(&sessions),
+                            Arc::clone(&config),
+                            Arc::clone(&devices),
+                            Arc::clone(&events),
+                            Arc::clone(&transfer_manager),
+                        );
+                        let job: WorkJob = Box::new(move || {
+                            // Held until handled: the backlog budget counts it.
+                            let _credit = credit;
+                            if let Err(error) = handle_peer_envelope(
+                                &binding,
+                                &attempt_id,
+                                &wire,
+                                channel,
+                                &bytes,
+                                &sessions,
+                                &config,
+                                &devices,
+                                &events,
+                                &transfer_manager,
+                            ) {
+                                crate::device_links::limits::log_limited(
+                                    "rejected-envelope",
+                                    &format!("Rejected WebRTC data-channel message: {error}"),
+                                );
+                            }
+                        });
+                        if lane.send(job).is_err() {
+                            eprintln!("[DeskLink] The peer's work thread has stopped");
+                        }
+                    }
                     PeerEvent::Envelope { channel, bytes, .. } => {
                         if let Err(error) = handle_peer_envelope(
                             &binding,
@@ -2584,6 +2658,39 @@ fn spawn_event_worker(
                             Arc::clone(&sessions),
                         );
                     }
+                    PeerEvent::ChannelOpened(opened)
+                        if WebRtcChannel::REQUIRED.contains(&opened) =>
+                    {
+                        // The handover may have been waiting for this
+                        // channel: send our `feature-ready` now, and if the
+                        // phone's already came, features are live.
+                        match send_feature_ready_if_possible(
+                            &binding,
+                            &attempt_id,
+                            &wire,
+                            &sessions,
+                        ) {
+                            Ok(true) => {
+                                if sessions
+                                    .webrtc_features_ready(&binding, &attempt_id)
+                                    .unwrap_or(false)
+                                {
+                                    finish_feature_ready(
+                                        &binding,
+                                        &attempt_id,
+                                        &wire,
+                                        &sessions,
+                                        &devices,
+                                        &transfer_manager,
+                                    );
+                                }
+                            }
+                            Ok(false) => {}
+                            Err(error) => {
+                                eprintln!("[DeskLink] Could not send feature-ready: {error}")
+                            }
+                        }
+                    }
                     PeerEvent::ChannelOpened(_) => {}
                     PeerEvent::Closed => break,
                 }
@@ -2635,6 +2742,8 @@ fn reset_device_webrtc_state(device_id: &str) {
     // again on its next link).
     super::audio_session::end_all(device_id);
     super::capture::end(device_id);
+    // What the phone said it had belongs to the connection that ended.
+    crate::device_links::sync::forget_connection(device_id);
     super::screen::clear_stream(device_id);
     super::screen::forget_parked(device_id);
     // The session state must not outlive its peer: a stale `Controlling`
@@ -2746,8 +2855,7 @@ fn rebuild_peer(
         mark_error(
             devices,
             &binding.device_id,
-            "Could not establish a direct connection. This network may block peer-to-peer traffic."
-                .to_string(),
+            unavailable_words(&device_name(devices, &binding.device_id)),
         );
         return;
     };
@@ -2834,11 +2942,29 @@ fn dozing_devices() -> &'static Mutex<std::collections::HashSet<String>> {
 /// Records what `device_id`'s latest heartbeat (LAN or data channel) said.
 /// A phone that just woke (`dozing: false` after `true`) is probed on the
 /// data channel at once: its link may have died while it slept.
-pub(crate) fn note_heartbeat(device_id: &str, packet: &NetworkPacket) {
-    if set_dozing(device_id, reports_dozing(packet)) {
+/// Whether the phone just woke (a sign of it: see [`recovery_sign`]).
+pub(crate) fn note_heartbeat(device_id: &str, packet: &NetworkPacket) -> bool {
+    let woke = set_dozing(device_id, reports_dozing(packet));
+    if woke {
         if let Ok(mut woke) = probe_now().lock() {
             woke.insert(device_id.to_string());
         }
+    }
+    woke
+}
+
+/// The silence clock after the phone woke: restarted, so the silence that
+/// built up over the whole doze is not judged at once (a woken phone needs
+/// about one probe cycle to answer). Otherwise unchanged.
+pub(crate) fn clock_after_wake(
+    woke: bool,
+    last_inbound: std::time::Instant,
+    now: std::time::Instant,
+) -> std::time::Instant {
+    if woke {
+        now
+    } else {
+        last_inbound
     }
 }
 
@@ -2955,7 +3081,107 @@ fn send_keepalive(
     let envelope = WebRtcPacketBridge::encode(wire, &packet, now_millis())?;
     let text = String::from_utf8(envelope.to_json()?)
         .map_err(|_| "DeskLink heartbeat serialization was not UTF-8".to_string())?;
-    peer.send_text(WebRtcPacketBridge::channel_for(&packet), &text)
+    // On its own channel, behind nothing; skipped when its queue is backed up
+    // (the next one supersedes it).
+    peer.send_heartbeat(&text).map(|_| ())
+}
+
+/// What a phone's restart request does here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartAction {
+    Ignore,
+    Restart,
+}
+
+/// Only the deterministic initiator rebuilds on request, and only the attempt
+/// the request is about: a late request about one that has since been
+/// replaced (both sides declared silence in the same second, and this side
+/// already rebuilt) must not kill the healthy newer peer. So two sides that
+/// both give up produce one rebuild, not two.
+pub(crate) fn restart_request_action(
+    local_initiates: bool,
+    active_attempt: Option<&str>,
+    requested_attempt: &str,
+) -> RestartAction {
+    if !local_initiates {
+        // This side answers; the initiator rebuilds on its own.
+        return RestartAction::Ignore;
+    }
+    if active_attempt.is_some_and(|active| active != requested_attempt) {
+        return RestartAction::Ignore;
+    }
+    RestartAction::Restart
+}
+
+/// How long a peer must stay feature-ready before the recovery ladder starts
+/// over. Mirrored by Android's `WebRtcRecoveryPolicy`.
+pub(crate) const HEALTHY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a peer that has been feature-ready for `ready_for` has earned a
+/// fresh ladder.
+pub(crate) fn ladder_resets(ready_for: Option<std::time::Duration>) -> bool {
+    ready_for.is_some_and(|ready_for| ready_for >= HEALTHY_AFTER)
+}
+
+/// What the unavailable state says (the ladder is exhausted).
+pub(crate) fn unavailable_words(phone: &str) -> String {
+    format!("Can't reach {phone} · Try again")
+}
+
+fn device_name(devices: &Arc<Mutex<HashMap<String, DeviceView>>>, device_id: &str) -> String {
+    devices
+        .lock()
+        .ok()
+        .and_then(|devices| devices.get(device_id).map(|device| device.name.clone()))
+        .unwrap_or_else(|| "the phone".to_string())
+}
+
+/// Any sign of the phone — a network change, the phone waking, a beacon, an
+/// inbound dial or offer — starts the recovery ladder over and, when no peer
+/// is being built, reconnects at once instead of waiting out the backoff.
+pub(crate) fn recovery_sign(
+    device_id: &str,
+    sessions: &Arc<DeviceManager>,
+    config: &Arc<Mutex<Config>>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
+) {
+    let Some(binding) = sessions
+        .current_bindings()
+        .into_iter()
+        .find(|binding| binding.device_id == device_id)
+    else {
+        return;
+    };
+    let was_exhausted = sessions
+        .with_session(&binding, |session| {
+            let exhausted = recovery_delay(session.webrtc_recovery_attempt).is_none();
+            session.webrtc_recovery_attempt = 0;
+            exhausted
+        })
+        .unwrap_or(false);
+    if was_exhausted {
+        clear_error(devices, device_id);
+    }
+    if sessions
+        .active_webrtc_attempt(&binding)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
+    let (sessions, config, devices, events) = (
+        Arc::clone(sessions),
+        Arc::clone(config),
+        Arc::clone(devices),
+        Arc::clone(events),
+    );
+    thread::spawn(move || {
+        if let Err(error) = start_initiator(binding, sessions, config, devices, events) {
+            eprintln!("[DeskLink] Reconnecting at a sign of the phone failed: {error}");
+        }
+    });
 }
 
 /// Bounded reconnect backoff, matching `WebRtcRecoveryPolicy` on Android.
@@ -3559,7 +3785,7 @@ fn handle_peer_envelope(
             // `send_capabilities` is intentionally idempotent and makes the
             // order of the two peers' messages harmless.
             send_capabilities(binding, attempt_id, wire, sessions, config)?;
-            send_feature_ready_if_possible(binding, attempt_id, wire, sessions)
+            send_feature_ready_if_possible(binding, attempt_id, wire, sessions).map(|_| ())
         }
         HandoverControlKind::FeatureReady => {
             sessions.with_webrtc_handover(binding, attempt_id, |handover| {
@@ -3570,32 +3796,14 @@ fn handle_peer_envelope(
                 .webrtc_features_ready(binding, attempt_id)
                 .map_err(|error| error.to_string())?
             {
-                clear_error(devices, &binding.device_id);
-                // A completed handover means the backoff ladder has served its
-                // purpose. The next unrelated failure starts from the top again
-                // instead of inheriting a 30-second delay.
-                let _ = sessions.with_session(binding, |session| {
-                    session.webrtc_recovery_attempt = 0;
-                });
-                debug_log!(
-                    "[DeskLink] WebRTC feature transport ready for {}",
-                    binding.device_id
+                finish_feature_ready(
+                    binding,
+                    attempt_id,
+                    wire,
+                    sessions,
+                    devices,
+                    transfer_manager,
                 );
-                flush_pending_features(binding, sessions);
-                crate::device_links::connection_log::note_ready(&binding.device_id, true);
-                crate::device_links::desk_features::on_feature_ready(&binding.device_id);
-                // A send a lost connection interrupted carries on where the
-                // phone stopped; the phone does the same for its own sends.
-                let resumed = transfer_manager.resume_sends(wire);
-                if !resumed.is_empty() {
-                    let sent = sessions
-                        .active_webrtc_peer(binding, attempt_id)
-                        .map_err(|error| error.to_string())
-                        .and_then(|peer| send_transfer_events(&peer, wire, resumed));
-                    if let Err(error) = sent {
-                        eprintln!("[DeskLink] Could not resume interrupted file sends: {error}");
-                    }
-                }
             }
             Ok(())
         }
@@ -3628,17 +3836,84 @@ fn handle_peer_envelope(
 /// Completes the desktop half of the symmetric handover. Android sends its
 /// `feature-ready` after receiving desktop capabilities; desktop must answer
 /// with its own message before either side installs the feature transport.
+/// Work for a peer's file and terminal thread.
+type WorkJob = Box<dyn FnOnce() + Send>;
+
+/// Starts a peer's work thread (it ends with the worker that owns the
+/// sender). Unbounded in messages, bounded in bytes: each queued message holds
+/// a `Credit` from the channel's backlog budget.
+fn spawn_work_lane() -> mpsc::Sender<WorkJob> {
+    let (sender, jobs) = mpsc::channel::<WorkJob>();
+    let _ = thread::Builder::new()
+        .name("desklink-peer-work".into())
+        .spawn(move || {
+            for job in jobs {
+                crate::guard("peer work", (), job);
+            }
+        });
+    sender
+}
+
+/// What happens once, when both sides are feature-ready: the queued features
+/// go, the connection log and the phone hear of it, interrupted sends resume.
+fn finish_feature_ready(
+    binding: &SessionBinding,
+    attempt_id: &str,
+    wire: &WebRtcWireBinding,
+    sessions: &Arc<DeviceManager>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    transfer_manager: &Arc<WebRtcTransferManager>,
+) {
+    clear_error(devices, &binding.device_id);
+    // Not a reset of the backoff ladder: a link that dies right
+    // after becoming ready (a failure after ready) must keep
+    // climbing, or it loops at the first rung for ever. The
+    // ladder resets after [`HEALTHY_AFTER`] of healthy ready time,
+    // or on a sign of the phone (`recovery_sign`).
+    debug_log!(
+        "[DeskLink] WebRTC feature transport ready for {}",
+        binding.device_id
+    );
+    flush_pending_features(binding, sessions);
+    crate::device_links::connection_log::note_ready(&binding.device_id, true);
+    crate::device_links::desk_features::on_feature_ready(&binding.device_id);
+    // A send a lost connection interrupted carries on where the
+    // phone stopped; the phone does the same for its own sends.
+    let resumed = transfer_manager.resume_sends(wire);
+    if !resumed.is_empty() {
+        let sent = sessions
+            .active_webrtc_peer(binding, attempt_id)
+            .map_err(|error| error.to_string())
+            .and_then(|peer| send_transfer_events(&peer, wire, resumed));
+        if let Err(error) = sent {
+            eprintln!("[DeskLink] Could not resume interrupted file sends: {error}");
+        }
+    }
+}
+
+/// Sends this side's `feature-ready` once capabilities are confirmed and
+/// the required channels (control, events, liveness) are open. Whether it
+/// was sent now.
 fn send_feature_ready_if_possible(
     binding: &SessionBinding,
     attempt_id: &str,
     wire: &WebRtcWireBinding,
     sessions: &Arc<DeviceManager>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let should_send = sessions.with_webrtc_handover(binding, attempt_id, |handover| {
         Ok(handover.capabilities_confirmed() && !handover.local_feature_ready())
     })?;
     if !should_send {
-        return Ok(());
+        return Ok(false);
+    }
+    // Not before every required channel is open: a probe or a feature sent
+    // into a channel that is not there yet is lost.
+    let open = sessions
+        .active_webrtc_peer(binding, attempt_id)
+        .map_err(|error| error.to_string())?
+        .required_channels_open();
+    if !open {
+        return Ok(false);
     }
 
     let message = HandoverControlMessage::new(
@@ -3650,7 +3925,8 @@ fn send_feature_ready_if_possible(
     send_control(binding, attempt_id, wire, message, sessions)?;
     sessions.with_webrtc_handover(binding, attempt_id, |handover| {
         handover.mark_local_feature_ready()
-    })
+    })?;
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4138,14 +4414,16 @@ mod tests {
         ExpiredRequest, Liveness, OfferAttemptDisposition, RECOVERY_BACKOFF_MILLIS,
         SHARING_STOPPED_AT_DESK,
     };
+    use crate::device_links::config::Config;
     use crate::device_links::packet::NetworkPacket;
     use crate::device_links::webrtc::remote_session::SessionState;
     use crate::device_links::webrtc::remote_session::{
         ControlKind, ControlMessage, RemoteSession, ScreenDirection,
     };
     use crate::device_links::webrtc::WebRtcWireBinding;
+    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{mpsc, Arc};
+    use std::sync::{mpsc, Arc, Mutex};
 
     fn register_share(
         device: &str,
@@ -4649,6 +4927,168 @@ mod tests {
             RECOVERY_BACKOFF_MILLIS,
             [250, 1_000, 2_000, 4_000, 8_000, 16_000]
         );
+    }
+
+    /// Feature-ready no longer resets the ladder: only a minute of healthy
+    /// ready time does (and a sign of the phone, below).
+    #[test]
+    fn the_ladder_resets_only_after_a_minute_of_healthy_ready_time() {
+        let secs = std::time::Duration::from_secs;
+        assert!(!super::ladder_resets(None), "not ready: nothing to reset");
+        assert!(!super::ladder_resets(Some(secs(0))), "just became ready");
+        assert!(
+            !super::ladder_resets(Some(secs(15))),
+            "a link that dies after 15 s keeps climbing"
+        );
+        assert!(!super::ladder_resets(Some(secs(59))));
+        assert!(super::ladder_resets(Some(secs(60))));
+        assert_eq!(super::HEALTHY_AFTER, secs(60));
+        assert_eq!(
+            super::unavailable_words("Pixel 9"),
+            "Can't reach Pixel 9 · Try again"
+        );
+    }
+
+    /// Any sign of the phone starts an exhausted ladder over, clears the
+    /// "can't reach" state, and goes for the connection at once.
+    #[test]
+    fn a_sign_of_the_phone_restarts_the_ladder_and_clears_the_unavailable_state() {
+        use crate::device_links::core::{DeviceManager, SessionLink};
+        let dir = std::env::temp_dir().join(format!("desklink-sign-{}", uuid::Uuid::new_v4()));
+        let config = Arc::new(Mutex::new(Config::load_from_dir(dir.clone()).unwrap()));
+        let sessions = Arc::new(DeviceManager::new());
+        // A remote id below ours: this side only asks the phone to restart,
+        // so the test builds no peer.
+        let binding = sessions
+            .register_link("0".to_string(), SessionLink::test_placeholder("0"), true)
+            .unwrap()
+            .binding;
+        let devices: Arc<Mutex<HashMap<String, crate::device_links::device::DeviceView>>> =
+            Arc::default();
+        let info = crate::device_links::device_info::DeviceInfo {
+            id: "0".into(),
+            name: "Pixel 9".into(),
+            device_type: "phone".into(),
+            protocol_version: 9,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+        };
+        let mut card =
+            crate::device_links::device::DeviceView::from_info(&info, "10.0.0.2".into(), true);
+        card.last_error = Some(super::unavailable_words("Pixel 9"));
+        devices.lock().unwrap().insert("0".into(), card);
+        let exhausted = RECOVERY_BACKOFF_MILLIS.len() as u32;
+        sessions
+            .with_session(&binding, |session| {
+                session.webrtc_recovery_attempt = exhausted
+            })
+            .unwrap();
+        let events = Arc::default();
+        super::recovery_sign("0", &sessions, &config, &devices, &events);
+        assert_eq!(
+            sessions
+                .with_session(&binding, |s| s.webrtc_recovery_attempt)
+                .unwrap(),
+            0
+        );
+        assert_eq!(devices.lock().unwrap()["0"].last_error, None);
+        // A phone with no session is no sign of anything.
+        super::recovery_sign("unknown", &sessions, &config, &devices, &events);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// File and terminal messages run on their own thread, in order: a slow
+    /// one never holds up the thread that serves liveness.
+    #[test]
+    fn a_slow_file_message_does_not_hold_up_the_worker_and_runs_in_order() {
+        let lane = super::spawn_work_lane();
+        let (done_tx, done) = mpsc::channel();
+        let slow = done_tx.clone();
+        let started = std::time::Instant::now();
+        lane.send(Box::new(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            slow.send(1).unwrap();
+        }))
+        .unwrap();
+        lane.send(Box::new(move || done_tx.send(2).unwrap()))
+            .unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "handing over is instant"
+        );
+        assert_eq!(
+            done.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            done.recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap(),
+            2,
+            "in order"
+        );
+        // A panicking job does not end the lane.
+        let (after_tx, after) = mpsc::channel();
+        lane.send(Box::new(|| panic!("boom"))).unwrap();
+        lane.send(Box::new(move || after_tx.send(()).unwrap()))
+            .unwrap();
+        after
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+    }
+
+    #[test]
+    fn waking_restarts_the_silence_clock_instead_of_judging_the_doze() {
+        let secs = std::time::Duration::from_secs;
+        let start = std::time::Instant::now();
+        let last_heard = start;
+        let now = start + secs(34);
+        // Not woke: the clock keeps running.
+        assert_eq!(super::clock_after_wake(false, last_heard, now), last_heard);
+        // Woke after 34 s of doze: silence starts from now, so the 15 s
+        // dead time is judged afresh and one probe cycle fits first.
+        let restarted = super::clock_after_wake(true, last_heard, now);
+        assert_eq!(restarted, now);
+        let silence = now + secs(1) - restarted;
+        assert_eq!(super::liveness(silence, secs(1), false), Liveness::Fine);
+        assert_eq!(super::liveness(secs(5), secs(5), false), Liveness::Probe);
+        assert_eq!(
+            super::liveness(now + secs(15) - restarted, secs(5), false),
+            Liveness::Dead,
+            "a phone that never answers is still declared gone"
+        );
+        // Waking is reported once, by the heartbeat that says so.
+        let device = "wake-clock-phone";
+        let mut asleep = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT);
+        asleep.set("dozing", true);
+        assert!(!note_heartbeat(device, &asleep));
+        let awake = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT);
+        assert!(note_heartbeat(device, &awake));
+        assert!(!note_heartbeat(device, &awake));
+    }
+
+    /// Both sides give up in the same second: the request that arrives for an
+    /// attempt this side already replaced is ignored, so one rebuild happens.
+    #[test]
+    fn simultaneous_give_ups_cause_one_rebuild_and_only_the_initiator_rebuilds() {
+        use super::{restart_request_action as action, RestartAction::*};
+        assert_eq!(
+            action(true, Some("old"), "old"),
+            Restart,
+            "the attempt it is about"
+        );
+        assert_eq!(action(true, None, "old"), Restart, "nothing rebuilt yet");
+        assert_eq!(action(true, Some("new"), "old"), Ignore, "already rebuilt");
+        assert_eq!(
+            action(false, Some("old"), "old"),
+            Ignore,
+            "the responder never offers"
+        );
+        // Simultaneous offers: only the lower id offers; a higher one refuses.
+        assert!(crate::device_links::local_goes_first("a", "b"));
+        assert!(!crate::device_links::local_goes_first("b", "a"));
+        assert!(!crate::device_links::local_goes_first("a", "a"));
     }
 
     #[test]

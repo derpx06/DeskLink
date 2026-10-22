@@ -28,6 +28,8 @@ struct Daemon {
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    /// Where a visible error goes (the window's toast).
+    errors: Arc<Mutex<Vec<String>>>,
 }
 
 static DAEMON: OnceLock<Daemon> = OnceLock::new();
@@ -37,11 +39,13 @@ pub(crate) fn install(
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    errors: Arc<Mutex<Vec<String>>>,
 ) {
     let _ = DAEMON.set(Daemon {
         sessions,
         config,
         devices,
+        errors,
     });
 }
 
@@ -108,29 +112,167 @@ pub(crate) fn run_later(job: impl FnOnce() + Send + 'static) -> bool {
     });
     let queued = sender.try_send(Box::new(job)).is_ok();
     if !queued {
-        debug_log!("[DeskLink] Desk request dropped: too many waiting");
+        report_dropped();
     }
     queued
+}
+
+/// Jobs dropped because the queue was full, since start.
+static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A dropped job is told to the user at most this often.
+const DROP_NOTICE_EVERY: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+pub(crate) fn dropped_jobs() -> u64 {
+    DROPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// What the user is told when requests were dropped.
+pub(crate) fn drop_notice(count: u64) -> String {
+    match count {
+        1 => "DeskLink was busy and ignored a request from a phone. Try again.".to_string(),
+        count => format!("DeskLink was busy and ignored {count} requests from phones. Try again."),
+    }
+}
+
+/// A full queue is visible, not silent: counted, logged, and shown once in a
+/// while (a flood must not become a flood of toasts).
+fn report_dropped() {
+    static LAST: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+    let total = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    debug_log!("[DeskLink] Desk request dropped: too many waiting ({total} so far)");
+    let Ok(mut last) = LAST.lock() else {
+        return;
+    };
+    let due = last.is_none_or(|(at, _)| at.elapsed() >= DROP_NOTICE_EVERY);
+    if !due {
+        return;
+    }
+    let since = last.map_or(0, |(_, counted)| counted);
+    *last = Some((Instant::now(), total));
+    if let Some(daemon) = DAEMON.get() {
+        super::daemon::push_user_error(&daemon.errors, drop_notice(total - since));
+    }
 }
 fn device(device_id: &str) -> Option<DeviceView> {
     DAEMON.get()?.devices.lock().ok()?.get(device_id).cloned()
 }
 
-/// A phone's encrypted connection just came up: tell it the desk's state.
+/// The phone's process (its identity's `instanceId`), if known.
+fn peer_instance(device_id: &str) -> Option<String> {
+    DAEMON
+        .get()?
+        .sessions
+        .current_bindings()
+        .into_iter()
+        .find(|binding| binding.device_id == device_id)
+        .and_then(|binding| binding.link.info.instance_id.clone())
+}
+
+/// This process's `instanceId`.
+fn own_instance() -> String {
+    DAEMON
+        .get()
+        .and_then(|daemon| daemon.config.lock().ok())
+        .and_then(|config| config.local_device_info().instance_id)
+        .unwrap_or_default()
+}
+
+/// A phone's encrypted connection just came up: first what this side already
+/// holds from it (`desklink.sync.have`), then — after the phone's own, or
+/// [`super::sync::SYNC_WAIT`] — the desk's state: only what differs.
 pub(crate) fn on_feature_ready(device_id: &str) {
     let device_id = device_id.to_string();
     run_later(move || {
-        let settings = super::config::app_settings();
-        send(&device_id, &settings_packet(&settings, &device_id));
-        super::mpris::forget_art_sent(&device_id);
-        super::mpris::send_state_to(&device_id);
-        // This computer's notifications (C1): the snapshot, then bodies.
-        super::desk_notifications::send_snapshot(Some(&device_id));
-        // Snippets and notes (F6): what is here; the phone fetches.
-        for index in super::notes::indexes() {
-            send(&device_id, &index);
+        send(
+            &device_id,
+            &super::sync::have_packet(&device_id, peer_instance(&device_id).as_deref()),
+        );
+        match super::sync::begin_wait(&device_id) {
+            // Their `have` came before our ready: send now.
+            None => send_initial_snapshots(&device_id),
+            Some(token) => {
+                let _ = std::thread::Builder::new()
+                    .name("desklink-sync-wait".into())
+                    .spawn(move || {
+                        std::thread::sleep(super::sync::SYNC_WAIT);
+                        if super::sync::release_wait(&device_id, token) {
+                            run_later(move || send_initial_snapshots(&device_id));
+                        }
+                    });
+            }
         }
     });
+}
+
+/// A phone's `desklink.sync.have`: kept; and if the desk's snapshots were
+/// waiting for it, sent now.
+pub(crate) fn on_sync_have(device_id: &str, packet: &NetworkPacket) {
+    if super::sync::on_have(device_id, packet) {
+        let device_id = device_id.to_string();
+        run_later(move || send_initial_snapshots(&device_id));
+    }
+}
+
+/// The media state and its artwork.
+type MediaSnapshot = (NetworkPacket, Option<Arc<super::media_art::Art>>);
+
+/// The desk's snapshots for a phone that just connected, each only when the
+/// phone's `have` (`theirs`) does not already hold this very version
+/// (everything when it saw an older process of ours — `own` differs — or said
+/// nothing): the settings, the media, the notifications, the snippets and
+/// the notes.
+fn initial_snapshots(
+    device_id: &str,
+    theirs: Option<&super::sync::Theirs>,
+    own: &str,
+    accepts_notifications: bool,
+) -> (Vec<NetworkPacket>, Option<MediaSnapshot>) {
+    let wanted = |feature: &str, rev: &str| super::sync::should_send(theirs, own, feature, rev);
+    let mut packets = Vec::new();
+    let settings = settings_packet(&super::config::app_settings(), device_id);
+    if wanted("settings", settings.get_str("rev").unwrap_or_default()) {
+        packets.push(settings);
+    }
+    let media = super::mpris::state_snapshot()
+        .filter(|snapshot| wanted("media", snapshot.0.get_str("rev").unwrap_or_default()));
+    // This computer's notifications (C1): the snapshot, then bodies.
+    let notifications = super::desk_notifications::snapshot_packets();
+    let rev = notifications
+        .first()
+        .and_then(|packet| packet.get_str("rev"))
+        .unwrap_or_default()
+        .to_string();
+    if accepts_notifications && wanted("notifications", &rev) {
+        packets.extend(notifications);
+    }
+    // Snippets and notes (F6): what is here; the phone fetches.
+    for mut index in super::notes::indexes() {
+        let feature = if index.packet_type == super::packet::PACKET_TYPE_SNIPPETS {
+            "snippets"
+        } else {
+            "notes"
+        };
+        let rev = super::sync::rev_of(std::slice::from_ref(&index), &[]);
+        index.set("rev", rev.as_str());
+        if wanted(feature, &rev) {
+            packets.push(index);
+        }
+    }
+    (packets, media)
+}
+
+fn send_initial_snapshots(device_id: &str) {
+    let theirs = super::sync::theirs(device_id);
+    let accepts = super::features::peer_accepts(device_id, super::packet::PACKET_TYPE_NOTIFICATION);
+    let (packets, media) = initial_snapshots(device_id, theirs.as_ref(), &own_instance(), accepts);
+    for packet in &packets {
+        send(device_id, packet);
+    }
+    if let Some(snapshot) = media {
+        super::mpris::forget_art_sent(device_id);
+        super::mpris::send_snapshot_to(device_id, snapshot);
+    }
 }
 
 // ── Settings ───────────────────────────────────────────────────────────────
@@ -146,6 +288,8 @@ pub(crate) fn settings_packet(settings: &AppSettings, device_id: &str) -> Networ
     packet.set("commandAlerts", settings.alerts_commands_to(device_id));
     packet.set("unlockNearby", settings.unlocks_from(device_id));
     packet.set("sessionPasswordSet", settings.session_password.is_some());
+    let rev = super::sync::rev_of(std::slice::from_ref(&packet), &[]);
+    packet.set("rev", rev);
     packet
 }
 
@@ -482,6 +626,77 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Delta resync, desk side: on a reconnect of the same processes only what
+    /// differs goes; a restart of either side sends everything.
+    #[test]
+    fn a_reconnect_sends_only_what_changed_and_a_new_epoch_sends_everything() {
+        let device = "delta-phone";
+        let own = "desk-process-1";
+        let (all, _) = initial_snapshots(device, None, own, true);
+        let types = |packets: &[NetworkPacket]| -> Vec<String> {
+            packets.iter().map(|p| p.packet_type.clone()).collect()
+        };
+        assert!(
+            types(&all).contains(&PACKET_TYPE_SETTINGS.to_string()),
+            "no `have`: everything"
+        );
+        assert!(
+            all.iter().all(|p| p.get_str("rev").is_some()),
+            "every snapshot carries its rev"
+        );
+        let notifications_rev = all
+            .iter()
+            .find(|p| p.packet_type == super::super::packet::PACKET_TYPE_NOTIFICATION)
+            .and_then(|p| p.get_str("rev"))
+            .map(str::to_string)
+            .expect("the notifications snapshot");
+        let settings_rev = all
+            .iter()
+            .find(|p| p.packet_type == PACKET_TYPE_SETTINGS)
+            .and_then(|p| p.get_str("rev"))
+            .map(str::to_string)
+            .unwrap();
+        // The phone holds this very settings and notifications of this process.
+        let theirs = crate::device_links::sync::Theirs {
+            peer_instance: own.to_string(),
+            have: [
+                ("settings".to_string(), settings_rev),
+                ("notifications".to_string(), notifications_rev),
+            ]
+            .into(),
+        };
+        let (delta, _) = initial_snapshots(device, Some(&theirs), own, true);
+        assert!(!types(&delta).contains(&PACKET_TYPE_SETTINGS.to_string()));
+        assert!(
+            !types(&delta).contains(&super::super::packet::PACKET_TYPE_NOTIFICATION.to_string())
+        );
+        // Settings changed meanwhile: only those go.
+        let mut changed = theirs.clone();
+        changed
+            .have
+            .insert("settings".into(), "an-older-rev".into());
+        let (delta, _) = initial_snapshots(device, Some(&changed), own, true);
+        assert_eq!(
+            types(&delta)
+                .iter()
+                .filter(|kind| *kind == PACKET_TYPE_SETTINGS)
+                .count(),
+            1
+        );
+        // This desk restarted: the phone's `have` names the old process.
+        let (everything, _) = initial_snapshots(device, Some(&theirs), "desk-process-2", true);
+        assert_eq!(
+            types(&everything),
+            types(&all),
+            "a new epoch resends everything"
+        );
+        // A phone that takes no notifications gets none either way.
+        let (without, _) = initial_snapshots(device, None, own, false);
+        assert!(
+            !types(&without).contains(&super::super::packet::PACKET_TYPE_NOTIFICATION.to_string())
+        );
+    }
+
     #[test]
     fn the_settings_and_art_packets_fit_one_wire_message() {
         let packet = settings_packet(&AppSettings::default(), &"d".repeat(64));
@@ -739,8 +954,16 @@ mod tests {
             let _unused = blocker.lock();
         }));
         release.recv().unwrap();
+        let before = dropped_jobs();
         let accepted = (0..QUEUE * 4).filter(|_| run_later(|| {})).count();
         assert!(accepted <= QUEUE, "{accepted} queued");
+        // A full queue is visible: counted, and said in plain words.
+        assert_eq!(dropped_jobs() - before, (QUEUE * 4 - accepted) as u64);
+        assert_eq!(
+            drop_notice(1),
+            "DeskLink was busy and ignored a request from a phone. Try again."
+        );
+        assert!(drop_notice(5).contains("5 requests"));
         drop(held);
     }
 

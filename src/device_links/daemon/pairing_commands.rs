@@ -293,10 +293,103 @@ impl PairingContext {
         }
 
         update_pair_state(&self.devices, device_id, PairState::NotPaired, None);
+        if remove_trust {
+            super::discovery::forget_addresses(device_id);
+            crate::device_links::sync::forget_device(device_id);
+        }
         // Unpairing a device that is not connected succeeded: it is told the
         // next time it reaches us (it gets pair:false for its signaling).
         if let Err(error) = if offline { Ok(()) } else { result } {
             report(&self.devices, &self.errors, device_id, error);
         }
+    }
+}
+
+/// Everything the daemon holds for a pairing that a newer one replaced (or
+/// that was removed): its session and peer, its card, the addresses it was
+/// dialled at and what was remembered of its snapshots.
+pub(super) fn forget_replaced(
+    sessions: &Arc<DeviceManager>,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    device_id: &str,
+) {
+    if let Some(binding) = sessions.current_binding(device_id) {
+        if let Ok((_packet, Some(peer))) =
+            sessions.revoke_pairing(&binding, "Replaced by a newer pairing".to_string())
+        {
+            peer.close();
+        }
+        binding.link.close();
+    } else if let Some(peer) = sessions.forget_pairing(device_id) {
+        peer.close();
+    }
+    if let Ok(mut devices) = devices.lock() {
+        devices.remove(device_id);
+    }
+    super::discovery::forget_addresses(device_id);
+    crate::device_links::sync::forget_device(device_id);
+}
+
+#[cfg(test)]
+mod replaced_tests {
+    use super::*;
+    use crate::device_links::core::SessionLink;
+
+    /// A phone that paired again under a new id left a ghost: its session,
+    /// card, addresses and remembered revs all go, so nothing redials it.
+    #[test]
+    fn a_replaced_pairing_leaves_no_session_card_address_or_revs_behind() {
+        let sessions = Arc::new(DeviceManager::new());
+        let ghost = "ghost-phone";
+        let binding = sessions
+            .register_link(
+                ghost.to_string(),
+                SessionLink::test_placeholder(ghost),
+                true,
+            )
+            .unwrap()
+            .binding;
+        let info = crate::device_links::device_info::DeviceInfo {
+            id: ghost.into(),
+            name: "Pixel 9".into(),
+            device_type: "phone".into(),
+            protocol_version: 9,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+        };
+        let devices: Arc<Mutex<HashMap<String, DeviceView>>> = Arc::default();
+        devices.lock().unwrap().insert(
+            ghost.into(),
+            DeviceView::from_info(&info, "10.0.0.9".into(), true),
+        );
+        let ip: std::net::IpAddr = "10.0.0.9".parse().unwrap();
+        super::super::discovery::note_address(ghost, ip);
+        let mut rev = crate::device_links::packet::NetworkPacket::new("desklink.settings");
+        rev.set("rev", "r1");
+        crate::device_links::sync::note_received(ghost, Some("p"), "contacts", &rev);
+        assert!(!binding.link.is_closed());
+
+        forget_replaced(&sessions, &devices, ghost);
+
+        assert!(binding.link.is_closed(), "its link is closed");
+        assert!(
+            devices.lock().unwrap().get(ghost).is_none(),
+            "its card is gone"
+        );
+        assert!(
+            super::super::discovery::addresses()
+                .lock()
+                .unwrap()
+                .due(ghost, std::time::Instant::now())
+                .is_empty(),
+            "nothing dials it"
+        );
+        assert!(crate::device_links::sync::theirs(ghost).is_none());
+        let held = crate::device_links::sync::have_packet(ghost, Some("p"));
+        assert!(crate::device_links::sync::parse_have(&held)
+            .unwrap()
+            .have
+            .is_empty());
     }
 }

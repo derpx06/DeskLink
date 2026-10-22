@@ -613,6 +613,17 @@ impl DaemonWorker {
             &self.devices,
             &self.events,
         );
+        // A network change is a sign of every phone: ladders start over, and
+        // a phone with no peer is dialled at once.
+        for binding in self.sessions.current_bindings() {
+            crate::device_links::webrtc::coordinator::recovery_sign(
+                &binding.device_id,
+                &self.sessions,
+                &self.config,
+                &self.devices,
+                &self.events,
+            );
+        }
     }
 
     fn send_clipboard(&self, device_id: &str) {

@@ -186,7 +186,13 @@ pub(super) fn apply_lan_packet(
     // keeps links alive turned into one that tears pairings down.
     if packet.packet_type == PACKET_TYPE_HEARTBEAT {
         // Its one field is a state report: whether the phone is dozing.
-        crate::device_links::webrtc::coordinator::note_heartbeat(&device_id, &packet);
+        if crate::device_links::webrtc::coordinator::note_heartbeat(&device_id, &packet) {
+            // The phone woke: a sign of it, so a link that dropped while it
+            // slept comes back at once.
+            crate::device_links::webrtc::coordinator::recovery_sign(
+                &device_id, &sessions, &config, &devices, &events,
+            );
+        }
         return;
     }
 
@@ -459,7 +465,11 @@ fn handle_qr_pairing_proof(
             );
             start_webrtc_after_pairing(binding, sessions, config, devices, events);
         }
-        Err(error) => eprintln!("[Daemon] QR pairing from {device_id} refused: {error}"),
+        Err(error) => {
+            eprintln!("[Daemon] QR pairing from {device_id} refused: {error}");
+            // In plain words on the phone's card (see `friendly_error`).
+            super::state::mark_error(devices, device_id, error);
+        }
     }
 }
 
@@ -665,11 +675,23 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         }
         PACKET_TYPE_MPRIS => {
             update_media_from_packet(devices, device_id, &packet);
+            crate::device_links::sync::note_received(
+                device_id,
+                binding.link.info.instance_id.as_deref(),
+                "media",
+                &packet,
+            );
             Ok(())
         }
         PACKET_TYPE_NOTIFICATION => {
             if packet.get_bool("snapshot").unwrap_or(false) {
                 replace_notifications(devices, device_id, &packet);
+                crate::device_links::sync::note_received(
+                    device_id,
+                    binding.link.info.instance_id.as_deref(),
+                    "notifications",
+                    &packet,
+                );
             } else if packet.get_bool("isCancel").unwrap_or(false) {
                 let id = packet
                     .get_str("id")
@@ -739,8 +761,13 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         // Decrypting and saving the cache stays off the peer worker.
         crate::device_links::packet::PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS => {
             let (device_id, packet) = (device_id.clone(), packet.clone());
+            let instance = binding.link.info.instance_id.clone();
             crate::device_links::desk_features::run_later(move || {
-                for request in crate::device_links::contacts::on_snapshot(&device_id, &packet) {
+                for request in crate::device_links::contacts::on_snapshot(
+                    &device_id,
+                    instance.as_deref(),
+                    &packet,
+                ) {
                     crate::device_links::desk_features::send(&device_id, &request);
                 }
             });
@@ -749,6 +776,14 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         // Folder sync (F8): to its own worker.
         crate::device_links::packet::PACKET_TYPE_FOLDERS => {
             crate::device_links::folders::on_packet(device_id, &packet);
+            Ok(())
+        }
+        // Delta resync (W2): what the phone already holds from this desk.
+        crate::device_links::packet::PACKET_TYPE_SYNC_HAVE => {
+            let (device_id, packet) = (device_id.clone(), packet.clone());
+            crate::device_links::desk_features::run_later(move || {
+                crate::device_links::desk_features::on_sync_have(&device_id, &packet)
+            });
             Ok(())
         }
         // Glide (F4): the phone hands the pointer back.
@@ -760,8 +795,31 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         crate::device_links::packet::PACKET_TYPE_SNIPPETS
         | crate::device_links::packet::PACKET_TYPE_NOTES => {
             let (device_id, packet) = (device_id.clone(), packet.clone());
+            let instance = binding.link.info.instance_id.clone();
             crate::device_links::desk_features::run_later(move || {
-                for answer in crate::device_links::notes::on_packet(&device_id, &packet) {
+                let answers = crate::device_links::notes::on_packet(&device_id, &packet);
+                // An index with nothing to fetch is fully applied: remembered
+                // for the next resync.
+                if packet.get_str("op") == Some("index")
+                    && answers
+                        .iter()
+                        .all(|answer| answer.get_str("op") != Some("fetch"))
+                {
+                    let feature = if packet.packet_type
+                        == crate::device_links::packet::PACKET_TYPE_SNIPPETS
+                    {
+                        "snippets"
+                    } else {
+                        "notes"
+                    };
+                    crate::device_links::sync::note_received(
+                        &device_id,
+                        instance.as_deref(),
+                        feature,
+                        &packet,
+                    );
+                }
+                for answer in answers {
                     crate::device_links::desk_features::send(&device_id, &answer);
                 }
             });

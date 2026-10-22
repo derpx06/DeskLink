@@ -273,13 +273,23 @@ fn snapshot_for(settings: &super::config::AppSettings) -> Vec<NetworkPacket> {
         .collect()
 }
 
-/// On every feature-ready, and after the switch or the allowlist changed.
-pub(crate) fn send_snapshot(device_id: Option<&str>) {
+/// The notifications snapshot (the id list, then the bodies), every part
+/// carrying the same `rev` (delta resync).
+pub(crate) fn snapshot_packets() -> Vec<NetworkPacket> {
     let settings = super::config::app_settings();
     if settings.forward_notifications {
         start();
     }
-    let packets = snapshot_for(&settings);
+    let mut packets = snapshot_for(&settings);
+    let rev = super::sync::rev_of(&packets, &[]);
+    super::sync::stamp(&mut packets, &rev);
+    packets
+}
+
+/// After the switch or the allowlist changed (to every phone), or to one
+/// phone that asked: the snapshot, unconditionally.
+pub(crate) fn send_snapshot(device_id: Option<&str>) {
+    let packets = snapshot_packets();
     let device_id = device_id.map(str::to_string);
     super::desk_features::run_later(move || {
         let devices = match device_id {

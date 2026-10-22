@@ -14,4 +14,4 @@ pub use device_session::{
     ConnectionGeneration, DeviceSession, ReplayCache, SessionBinding, SessionId, SessionState,
 };
 pub use link_transport::{LinkTransport, ReadOutcome};
-pub use session_link::SessionLink;
+pub use session_link::{link_race, RaceVerdict, SessionLink};

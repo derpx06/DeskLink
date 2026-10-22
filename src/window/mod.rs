@@ -1527,6 +1527,27 @@ fn friendly_error(raw: &str) -> (String, bool) {
         "no route to host",
     ]) {
         (OFFLINE, true)
+    } else if has(&["trusted device certificate changed"]) {
+        (
+            "This phone's identity changed. If DeskLink was reinstalled on it, pair it again \
+             by scanning the QR code: the old pairing is replaced.",
+            true,
+        )
+    } else if has(&["qr pairing code expired"]) {
+        (
+            "That QR code expired. Scan the new one shown on this computer.",
+            false,
+        )
+    } else if has(&["no qr pairing code is active"]) {
+        (
+            "Open the pairing QR code on this computer first, then scan it.",
+            false,
+        )
+    } else if has(&["invalid qr pairing proof"]) {
+        (
+            "That QR code is not from this computer. Scan the one shown here.",
+            false,
+        )
     } else if has(&["(os error 98)", "address already in use"]) {
         (
             "Another app is using DeskLink's network ports. Close other phone-link apps, \
@@ -2082,7 +2103,7 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 snapshot.set(uid, "1");
             }
             snapshot.set("sharing", true);
-            let _ = crate::device_links::contacts::on_snapshot(&device, &snapshot);
+            let _ = crate::device_links::contacts::on_snapshot(&device, None, &snapshot);
             let mut cards = NetworkPacket::new("desklink.contacts.response_vcards");
             cards.set("uids", uids.clone());
             for (n, uid) in uids.iter().enumerate() {
@@ -2738,6 +2759,30 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pairing_errors_are_said_in_plain_words_and_the_reinstall_hint_is_right() {
+        for (raw, needle) in [
+            (
+                "Trusted device certificate changed",
+                "pair it again by scanning the QR code",
+            ),
+            ("The QR pairing code expired", "Scan the new one"),
+            ("No QR pairing code is active", "Open the pairing QR code"),
+            ("Invalid QR pairing proof", "not from this computer"),
+        ] {
+            let (words, _) = super::friendly_error(raw);
+            assert!(words.contains(needle), "{raw}: {words}");
+            assert!(
+                !words.to_lowercase().contains("unpair"),
+                "never tells the user to unpair first: {words}"
+            );
+        }
+        assert!(
+            super::friendly_error("Trusted device certificate changed").1,
+            "shown as a banner"
+        );
+    }
+
     use super::*;
 
     #[test]

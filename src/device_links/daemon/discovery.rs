@@ -31,7 +31,18 @@ static BEACON_AGAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// Announces this computer again at once, as at startup (broadcast, then
 /// unicast to each paired phone's last address).
 pub(super) fn beacon_again() {
+    // Every address of every phone gets a fresh chance too.
+    if let Ok(mut book) = addresses().lock() {
+        book.wake(None);
+    }
     BEACON_AGAIN.store(true, Ordering::Release);
+}
+
+/// A phone was unpaired: its addresses go.
+pub(super) fn forget_addresses(device_id: &str) {
+    if let Ok(mut book) = addresses().lock() {
+        book.forget(device_id);
+    }
 }
 
 /// What a paired phone last said about itself and the TCP port it listens
@@ -86,6 +97,7 @@ pub(super) fn persist_paired_endpoint(
     else {
         return;
     };
+    note_address(device_id, ip);
     let device_id = device_id.to_string();
     let _ = thread::Builder::new()
         .name("desklink-endpoints".into())
@@ -170,8 +182,143 @@ fn updated_endpoints(
     all
 }
 
-/// How often paired phones without a bootstrap link are redialled.
-const REDIAL_EVERY: Duration = Duration::from_secs(3);
+/// How often paired phones without a bootstrap link are considered for a
+/// redial (each address has its own backoff).
+const REDIAL_EVERY: Duration = Duration::from_secs(1);
+/// Addresses kept per phone (the newest IPv4s; one IPv6 on top).
+const MAX_ADDRESSES: usize = 3;
+/// A dead address is retried after this, doubling per failure up to
+/// [`MAX_ADDRESS_BACKOFF`]: not every few seconds for ever.
+const FIRST_ADDRESS_BACKOFF: Duration = Duration::from_secs(3);
+const MAX_ADDRESS_BACKOFF: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone)]
+struct Address {
+    ip: std::net::IpAddr,
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+/// Where each paired phone was last seen: its last [`MAX_ADDRESSES`] IPv4s
+/// (from beacons, authenticated links and mDNS) and its newest IPv6. Phones
+/// move between networks and DHCP leases, so dialling only the newest one
+/// left a phone on its old address unreachable for minutes.
+#[derive(Debug, Default)]
+pub(super) struct AddressBook {
+    phones: HashMap<String, Vec<Address>>,
+}
+
+impl AddressBook {
+    /// `ip` is where `device_id` was just seen: newest first, a repeat moves
+    /// up and is tried again at once.
+    pub(super) fn seen(&mut self, device_id: &str, ip: std::net::IpAddr) {
+        if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+            return;
+        }
+        let list = self.phones.entry(device_id.to_string()).or_default();
+        list.retain(|known| known.ip != ip);
+        list.insert(
+            0,
+            Address {
+                ip,
+                failures: 0,
+                retry_at: None,
+            },
+        );
+        let (mut v4, mut v6) = (0, 0);
+        list.retain(|known| {
+            let counter = if known.ip.is_ipv4() { &mut v4 } else { &mut v6 };
+            *counter += 1;
+            *counter <= if known.ip.is_ipv4() { MAX_ADDRESSES } else { 1 }
+        });
+    }
+
+    /// The addresses to dial now: those whose backoff is over, newest first.
+    pub(super) fn due(&self, device_id: &str, now: Instant) -> Vec<std::net::IpAddr> {
+        self.phones
+            .get(device_id)
+            .map(|list| {
+                list.iter()
+                    .filter(|known| known.retry_at.is_none_or(|at| at <= now))
+                    .map(|known| known.ip)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A dial to `ip` failed: it waits longer next time.
+    pub(super) fn failed(&mut self, device_id: &str, ip: std::net::IpAddr, now: Instant) {
+        if let Some(known) = self
+            .phones
+            .get_mut(device_id)
+            .and_then(|list| list.iter_mut().find(|known| known.ip == ip))
+        {
+            known.failures = known.failures.saturating_add(1);
+            known.retry_at = Some(now + address_backoff(known.failures));
+        }
+    }
+
+    /// A dial to `ip` worked: the others are only fallbacks now, and `ip`
+    /// stays first.
+    pub(super) fn worked(&mut self, device_id: &str, ip: std::net::IpAddr) {
+        self.seen(device_id, ip);
+    }
+
+    /// Any sign of the phone (a network change, a beacon): every address is
+    /// tried again at once.
+    pub(super) fn wake(&mut self, device_id: Option<&str>) {
+        for (id, list) in self.phones.iter_mut() {
+            if device_id.is_none_or(|only| only == id) {
+                for known in list {
+                    known.failures = 0;
+                    known.retry_at = None;
+                }
+            }
+        }
+    }
+
+    /// Forgets `device_id` (unpaired).
+    pub(super) fn forget(&mut self, device_id: &str) {
+        self.phones.remove(device_id);
+    }
+
+    /// Whether `ip` is a known address of the phone that is waiting out its
+    /// backoff.
+    fn is_backing_off(&self, device_id: &str, ip: std::net::IpAddr, now: Instant) -> bool {
+        self.phones.get(device_id).is_some_and(|list| {
+            list.iter()
+                .any(|known| known.ip == ip && known.retry_at.is_some_and(|at| at > now))
+        })
+    }
+
+    /// Every address of every phone, for unicast beacons.
+    fn all(&self) -> Vec<(String, std::net::IpAddr)> {
+        self.phones
+            .iter()
+            .flat_map(|(id, list)| list.iter().map(|known| (id.clone(), known.ip)))
+            .collect()
+    }
+}
+
+/// How long a dead address waits after its `failures`-th failure.
+pub(super) fn address_backoff(failures: u32) -> Duration {
+    FIRST_ADDRESS_BACKOFF
+        .saturating_mul(2u32.saturating_pow(failures.saturating_sub(1).min(10)))
+        .min(MAX_ADDRESS_BACKOFF)
+}
+
+pub(super) fn addresses() -> &'static Mutex<AddressBook> {
+    static BOOK: std::sync::OnceLock<Mutex<AddressBook>> = std::sync::OnceLock::new();
+    BOOK.get_or_init(Default::default)
+}
+
+/// Records where `device_id` was seen (a paired phone's beacon, link or mDNS
+/// answer).
+pub(super) fn note_address(device_id: &str, ip: std::net::IpAddr) {
+    if let Ok(mut book) = addresses().lock() {
+        book.seen(device_id, ip);
+    }
+}
 
 /// The paired phones to dial now: no live bootstrap link (whether or not
 /// their WebRTC peer survives), a last-known address and listening port.
@@ -183,28 +330,50 @@ fn redial_targets(
     devices: &HashMap<String, DeviceView>,
     known: &HashMap<String, (DeviceInfo, u16)>,
     persisted: &HashMap<String, SocketAddr>,
+    book: &AddressBook,
+    now: Instant,
     wants: impl Fn(&str) -> bool,
 ) -> Vec<(DeviceInfo, std::net::IpAddr, u16)> {
-    devices
+    let mut targets = Vec::new();
+    for device in devices
         .values()
         .filter(|device| device.trusted && wants(&device.id))
-        .filter_map(|device| {
-            if let (Ok(ip), Some((info, port))) = (device.address.parse(), known.get(&device.id)) {
-                return Some((info.clone(), ip, *port));
+    {
+        // Where it listens, and who it is: what it announced this run, else
+        // what the trust store and the remembered address say.
+        let (info, port) = match (known.get(&device.id), persisted.get(&device.id)) {
+            (Some((info, port)), _) => (info.clone(), *port),
+            (None, Some(address)) => (
+                DeviceInfo {
+                    id: device.id.clone(),
+                    name: device.name.clone(),
+                    device_type: device.device_type.clone(),
+                    protocol_version: device.protocol_version,
+                    incoming_capabilities: Vec::new(),
+                    outgoing_capabilities: Vec::new(),
+                    instance_id: None,
+                },
+                address.port(),
+            ),
+            (None, None) => continue,
+        };
+        // Every address it was seen on, newest first; the address on its
+        // `DeviceView` and the remembered one are the seeds.
+        let mut ips = book.due(&device.id, now);
+        let seeds = [
+            device.address.parse().ok(),
+            persisted.get(&device.id).map(SocketAddr::ip),
+        ];
+        for seed in seeds.into_iter().flatten() {
+            if !ips.contains(&seed) && !book.is_backing_off(&device.id, seed, now) {
+                ips.push(seed);
             }
-            let address = persisted.get(&device.id)?;
-            let info = DeviceInfo {
-                id: device.id.clone(),
-                name: device.name.clone(),
-                device_type: device.device_type.clone(),
-                protocol_version: device.protocol_version,
-                incoming_capabilities: Vec::new(),
-                outgoing_capabilities: Vec::new(),
-                instance_id: None,
-            };
-            Some((info, address.ip(), address.port()))
-        })
-        .collect()
+        }
+        for ip in ips {
+            targets.push((info.clone(), ip, port));
+        }
+    }
+    targets
 }
 
 impl DaemonWorker {
@@ -231,7 +400,10 @@ impl DaemonWorker {
                     else {
                         continue;
                     };
-                    redial_targets(&devices, &known, &persisted, |id| {
+                    let Ok(book) = addresses().lock() else {
+                        continue;
+                    };
+                    redial_targets(&devices, &known, &persisted, &book, Instant::now(), |id| {
                         sessions.wants_bootstrap_connection(id)
                     })
                 };
@@ -248,7 +420,7 @@ impl DaemonWorker {
                     let _ = thread::Builder::new().spawn(move || {
                         let _slot = slot;
                         let id = info.id.clone();
-                        if let Err(error) = connect_to_device(
+                        match connect_to_device(
                             info,
                             SocketAddr::new(ip, port),
                             port,
@@ -257,9 +429,21 @@ impl DaemonWorker {
                             sessions,
                             events,
                         ) {
-                            debug_log!(
-                                "[DL-WRTC-BOOT] redial of {id} at {ip}:{port} failed: {error}"
-                            );
+                            Ok(()) => {
+                                if let Ok(mut book) = addresses().lock() {
+                                    book.worked(&id, ip);
+                                }
+                            }
+                            Err(error) => {
+                                // Backoff for this address only: the phone's
+                                // others are still tried.
+                                if let Ok(mut book) = addresses().lock() {
+                                    book.failed(&id, ip, Instant::now());
+                                }
+                                debug_log!(
+                                    "[DL-WRTC-BOOT] redial of {id} at {ip}:{port} failed: {error}"
+                                );
+                            }
                         }
                     });
                 }
@@ -361,6 +545,8 @@ impl DaemonWorker {
             return;
         };
         let shutdown = Arc::clone(&self.shutdown);
+        let trusted = Arc::clone(&self.config);
+        let own_id = info.id.clone();
         let spawned = thread::Builder::new()
             .name("desklink-mdns".to_string())
             .spawn(move || {
@@ -394,8 +580,29 @@ impl DaemonWorker {
                     Ok(()) => debug_log!("[Daemon] Advertising {MDNS_SERVICE_TYPE} over mDNS"),
                     Err(error) => eprintln!("[Daemon] mDNS advertising failed: {error}"),
                 }
+                // Also browse: a phone found by mDNS is another address to
+                // dial (broadcast-filtering networks often pass multicast).
+                let browser = daemon.browse(MDNS_SERVICE_TYPE).ok();
                 while !shutdown.load(Ordering::Acquire) {
-                    thread::sleep(Duration::from_millis(500));
+                    let Some(browser) = browser.as_ref() else {
+                        thread::sleep(Duration::from_millis(500));
+                        continue;
+                    };
+                    if let Ok(mdns_sd::ServiceEvent::ServiceResolved(found)) =
+                        browser.recv_timeout(Duration::from_millis(500))
+                    {
+                        let Some(id) = found.get_property_val_str("id").map(str::to_string) else {
+                            continue;
+                        };
+                        if id == own_id
+                            || !trusted.lock().is_ok_and(|config| config.is_trusted(&id))
+                        {
+                            continue;
+                        }
+                        for ip in found.get_addresses() {
+                            note_address(&id, ip.to_ip_addr());
+                        }
+                    }
                 }
                 let _ = daemon.shutdown();
             });
@@ -439,16 +646,32 @@ fn beacon_unreachable_paired(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     tcp_port: u16,
 ) {
-    let targets: Vec<std::net::IpAddr> = devices
+    let unreachable: Vec<(String, Option<std::net::IpAddr>)> = devices
         .lock()
         .map(|devices| {
             devices
                 .values()
                 .filter(|device| device.trusted && device.status == DeviceStatus::Unreachable)
-                .filter_map(|device| device.address.parse().ok())
+                .map(|device| (device.id.clone(), device.address.parse().ok()))
                 .collect()
         })
         .unwrap_or_default();
+    // Every address a phone was seen on, not only the newest.
+    let book = addresses()
+        .lock()
+        .map(|book| book.all())
+        .unwrap_or_default();
+    let mut targets: Vec<std::net::IpAddr> = Vec::new();
+    for (id, current) in &unreachable {
+        targets.extend(current);
+        targets.extend(
+            book.iter()
+                .filter(|(owner, _)| owner == id)
+                .map(|(_, ip)| *ip),
+        );
+    }
+    targets.sort();
+    targets.dedup();
     if targets.is_empty() {
         return;
     }
@@ -493,6 +716,22 @@ fn handle_identity_packet(
     }
     if should_throttle_connection(last_connections, &info.id) {
         return;
+    }
+
+    // A beacon from a paired phone is a sign of it: its address is kept, the
+    // addresses get a fresh chance, and a recovery ladder that ran out
+    // starts over (and reconnects at once).
+    if config
+        .lock()
+        .is_ok_and(|config| config.is_trusted(&info.id))
+    {
+        if let Ok(mut book) = addresses().lock() {
+            book.seen(&info.id, address.ip());
+            book.wake(Some(&info.id));
+        }
+        crate::device_links::webrtc::coordinator::recovery_sign(
+            &info.id, sessions, config, devices, events,
+        );
     }
 
     // A closed link stays installed while a WebRTC transport outlives it, so
@@ -622,7 +861,14 @@ mod tests {
         let mut devices = devices;
         let restarted = view("restarted", "", true);
         devices.insert(restarted.id.clone(), restarted);
-        let targets = redial_targets(&devices, &known, &persisted, |id| id != "linked");
+        let targets = redial_targets(
+            &devices,
+            &known,
+            &persisted,
+            &AddressBook::default(),
+            Instant::now(),
+            |id| id != "linked",
+        );
         let dialled: Vec<_> = targets
             .iter()
             .map(|(info, ip, port)| (info.id.as_str(), ip.to_string(), *port))
@@ -639,6 +885,136 @@ mod tests {
         );
     }
     use crate::device_links::core::SessionLink;
+
+    fn ip(text: &str) -> std::net::IpAddr {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn a_phone_keeps_its_last_three_ipv4_addresses_and_one_ipv6() {
+        let mut book = AddressBook::default();
+        let now = Instant::now();
+        for address in [
+            "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "fe80::1", "fe80::2",
+        ] {
+            book.seen("phone", ip(address));
+        }
+        assert_eq!(
+            book.due("phone", now),
+            [
+                ip("fe80::2"),
+                ip("10.0.0.4"),
+                ip("10.0.0.3"),
+                ip("10.0.0.2")
+            ],
+            "newest first; the oldest IPv4 and the older IPv6 are gone"
+        );
+        // Seen again: moves to the front, once.
+        book.seen("phone", ip("10.0.0.2"));
+        assert_eq!(book.due("phone", now)[0], ip("10.0.0.2"));
+        assert_eq!(book.due("phone", now).len(), 4);
+        // Never loopback, unspecified or multicast.
+        book.seen("phone", ip("127.0.0.1"));
+        book.seen("phone", ip("0.0.0.0"));
+        book.seen("phone", ip("224.0.0.1"));
+        assert_eq!(book.due("phone", now).len(), 4);
+        book.forget("phone");
+        assert!(book.due("phone", now).is_empty());
+    }
+
+    #[test]
+    fn a_dead_address_backs_off_instead_of_being_redialled_every_few_seconds() {
+        let backoffs: Vec<u64> = (1..=9).map(|n| address_backoff(n).as_secs()).collect();
+        assert_eq!(backoffs, [3, 6, 12, 24, 48, 96, 192, 300, 300]);
+        let mut book = AddressBook::default();
+        let start = Instant::now();
+        book.seen("phone", ip("10.0.0.2"));
+        book.seen("phone", ip("10.0.0.3"));
+        // The newest is dead; the other is still dialled at once.
+        book.failed("phone", ip("10.0.0.3"), start);
+        assert_eq!(book.due("phone", start), [ip("10.0.0.2")]);
+        assert!(book.due("phone", start + Duration::from_secs(2)).len() == 1);
+        assert_eq!(book.due("phone", start + Duration::from_secs(3)).len(), 2);
+        // Each failure doubles the wait.
+        book.failed("phone", ip("10.0.0.3"), start);
+        assert_eq!(book.due("phone", start + Duration::from_secs(5)).len(), 1);
+        assert_eq!(book.due("phone", start + Duration::from_secs(6)).len(), 2);
+        // A sign of the phone (a beacon, a network change) clears every wait.
+        book.failed("phone", ip("10.0.0.2"), start);
+        book.failed("phone", ip("10.0.0.3"), start);
+        assert!(book.due("phone", start).is_empty());
+        book.wake(Some("phone"));
+        assert_eq!(book.due("phone", start).len(), 2);
+        // Others are untouched by one phone's wake.
+        book.seen("other", ip("10.0.0.9"));
+        book.failed("other", ip("10.0.0.9"), start);
+        book.wake(Some("phone"));
+        assert!(book.due("other", start).is_empty());
+        book.wake(None);
+        assert_eq!(book.due("other", start).len(), 1);
+    }
+
+    /// A network change starts the beacon burst at once and gives every dead
+    /// address a fresh chance.
+    #[test]
+    fn network_up_restarts_the_beacons_and_wakes_every_backed_off_address() {
+        let id = "network-up-phone";
+        note_address(id, ip("10.9.0.2"));
+        note_address(id, ip("10.9.0.3"));
+        let now = Instant::now();
+        {
+            let mut book = addresses().lock().unwrap();
+            book.failed(id, ip("10.9.0.2"), now);
+            book.failed(id, ip("10.9.0.3"), now);
+            assert!(book.due(id, now).is_empty());
+        }
+        BEACON_AGAIN.store(false, Ordering::Release);
+        beacon_again();
+        assert!(
+            BEACON_AGAIN.swap(false, Ordering::AcqRel),
+            "the burst starts over"
+        );
+        assert_eq!(addresses().lock().unwrap().due(id, now).len(), 2);
+        // The unicast burst reaches every address of an unreachable phone.
+        let book = addresses().lock().unwrap().all();
+        assert!(book.iter().filter(|(owner, _)| owner == id).count() >= 2);
+        forget_addresses(id);
+    }
+
+    #[test]
+    fn the_redialer_dials_every_address_the_phone_was_seen_on() {
+        let info = DeviceInfo {
+            id: "multi".into(),
+            name: "Multi".into(),
+            device_type: "phone".into(),
+            protocol_version: 9,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+        };
+        let mut view = DeviceView::from_info(&info, "10.0.0.8".to_string(), true);
+        view.trusted = true;
+        let devices: HashMap<String, DeviceView> = [("multi".to_string(), view)].into();
+        let known: HashMap<String, (DeviceInfo, u16)> =
+            [("multi".to_string(), (info, 1716))].into();
+        let mut book = AddressBook::default();
+        let now = Instant::now();
+        for address in ["10.0.0.5", "10.0.0.6", "10.0.0.7"] {
+            book.seen("multi", ip(address));
+        }
+        book.failed("multi", ip("10.0.0.6"), now);
+        let targets = redial_targets(&devices, &known, &HashMap::new(), &book, now, |_| true);
+        let mut dialled: Vec<String> = targets.iter().map(|(_, ip, _)| ip.to_string()).collect();
+        dialled.sort();
+        assert_eq!(
+            dialled,
+            ["10.0.0.5", "10.0.0.7", "10.0.0.8"],
+            "the three seen (one backing off) and the address on its card"
+        );
+        assert!(targets
+            .iter()
+            .all(|(info, _, port)| info.id == "multi" && *port == 1716));
+    }
 
     /// Only paired phones are remembered, strangers' identities are not
     /// kept even in memory, and the file stays bounded.

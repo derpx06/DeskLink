@@ -295,6 +295,20 @@ fn remove_stored_removed_features(base_dir: &Path) -> bool {
         > 0
 }
 
+fn replaced_devices() -> &'static Mutex<Vec<String>> {
+    static REPLACED: std::sync::OnceLock<Mutex<Vec<String>>> = std::sync::OnceLock::new();
+    REPLACED.get_or_init(Default::default)
+}
+
+/// The ids whose pairing records were replaced by a newer pairing of the same
+/// phone since last asked: their sessions, addresses and cards go.
+pub fn take_replaced_devices() -> Vec<String> {
+    replaced_devices()
+        .lock()
+        .map(|mut replaced| std::mem::take(&mut *replaced))
+        .unwrap_or_default()
+}
+
 pub struct Config {
     base_dir: PathBuf,
     stored: StoredConfig,
@@ -569,12 +583,41 @@ impl Config {
                 terminal_access,
             },
         );
+        let is_new_record = previous.is_none();
         self.save_or_restore(&info.id, previous)?;
         if !same_identity {
             // The relay's allow list is built from the trust store.
             crate::device_links::relay_link::client::reset();
         }
+        if is_new_record {
+            self.replace_lookalikes(info);
+        }
         Ok(())
+    }
+
+    /// A phone paired again under a new id — it was reinstalled, so its id
+    /// and certificate are new — replaces the old record of the same name and
+    /// type, silently: nothing else would ever stop this desk redialling the
+    /// ghost. The ids are queued for the daemon (see [`take_replaced_devices`]).
+    fn replace_lookalikes(&mut self, info: &DeviceInfo) {
+        let ghosts: Vec<String> = self
+            .stored
+            .trusted_devices
+            .values()
+            .filter(|known| {
+                known.id != info.id
+                    && known.name == info.name
+                    && known.device_type == info.device_type
+            })
+            .map(|known| known.id.clone())
+            .collect();
+        for id in ghosts {
+            if self.untrust_device(&id).is_ok() {
+                if let Ok(mut replaced) = replaced_devices().lock() {
+                    replaced.push(id);
+                }
+            }
+        }
     }
 
     /// Saves, or puts the device's previous record back if the save fails.
@@ -945,6 +988,67 @@ mod tests {
         assert_eq!(fs::read(dir.join("certificate.pem")).unwrap(), before);
         // A second start has nothing to remove and changes nothing.
         assert!(!remove_stored_removed_features(&dir));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A reinstalled phone pairs again under a new id with the same name and
+    /// type: the old record is replaced, silently, and queued so its session
+    /// and addresses go. Anything else is left alone.
+    #[test]
+    fn pairing_the_same_phone_again_under_a_new_id_replaces_its_old_record() {
+        let dir = std::env::temp_dir().join(format!("desklink-replace-{}", Uuid::new_v4()));
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        let info = |id: &str, name: &str, kind: &str| DeviceInfo {
+            id: id.to_string(),
+            name: name.to_string(),
+            device_type: kind.to_string(),
+            protocol_version: 9,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+        };
+        let tag = Uuid::new_v4().simple().to_string();
+        let (old, fresh) = (format!("old-{tag}"), format!("new-{tag}"));
+        let (other, tablet, same_id) = (
+            format!("other-{tag}"),
+            format!("tablet-{tag}"),
+            format!("same-{tag}"),
+        );
+        let name = format!("Pixel {tag}");
+        config
+            .trust_device(&info(&old, &name, "phone"), "cert-old".into())
+            .unwrap();
+        config
+            .trust_device(&info(&other, "Another phone", "phone"), "cert-o".into())
+            .unwrap();
+        config
+            .trust_device(&info(&tablet, &name, "tablet"), "cert-t".into())
+            .unwrap();
+        let _ = take_replaced_devices();
+        // Re-confirming the same id (even with a new certificate) is not a
+        // replacement.
+        config
+            .trust_device(&info(&old, &name, "phone"), "cert-old-2".into())
+            .unwrap();
+        assert!(!take_replaced_devices().contains(&old));
+        // The reinstalled phone: new id, same name and type.
+        config
+            .trust_device(&info(&fresh, &name, "phone"), "cert-new".into())
+            .unwrap();
+        assert!(!config.is_trusted(&old), "the ghost is gone");
+        assert!(config.is_trusted(&fresh));
+        assert!(config.is_trusted(&other), "another phone stays");
+        assert!(config.is_trusted(&tablet), "another type stays");
+        assert!(
+            take_replaced_devices().contains(&old),
+            "queued for the daemon"
+        );
+        assert!(take_replaced_devices().is_empty(), "taken once");
+        // And it is on disk: a restart does not bring the ghost back.
+        drop(config);
+        let reloaded = Config::load_from_dir(dir.clone()).unwrap();
+        assert!(!reloaded.is_trusted(&old) && reloaded.is_trusted(&fresh));
+        let _ = same_id;
         let _ = fs::remove_dir_all(dir);
     }
 

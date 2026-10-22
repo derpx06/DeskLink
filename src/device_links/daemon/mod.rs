@@ -128,7 +128,7 @@ pub use handle::{DaemonEvent, DaemonHandle};
 pub(crate) use packet_handler::{
     admit_lock_operation, is_desktop_locked as desktop_locked, lock_desktop,
 };
-pub(crate) use state::push_event;
+pub(crate) use state::{push_error as push_user_error, push_event};
 
 pub mod clipboard;
 pub mod commands;
@@ -220,6 +220,7 @@ impl DaemonWorker {
             Arc::clone(&sessions),
             Arc::clone(&config),
             Arc::clone(&devices),
+            Arc::clone(&errors),
         );
         if !cfg!(test) {
             if crate::device_links::config::app_settings().forward_notifications {
@@ -276,6 +277,11 @@ impl DaemonWorker {
                 // device to go unreachable — and the peer is told, so it stops
                 // waiting too.
                 pairing_commands::expire_pairings(&sessions, &devices, unix_secs());
+                // A phone that paired again under a new id replaced its old
+                // record: nothing may keep dialling or showing the ghost.
+                for ghost in super::config::take_replaced_devices() {
+                    pairing_commands::forget_replaced(&sessions, &devices, &ghost);
+                }
                 run_liveness_tick(&sessions, &devices);
                 state::reconcile_connection_status(&devices, &sessions.connection_snapshot());
                 thread::sleep(std::time::Duration::from_millis(1000));
