@@ -1051,7 +1051,7 @@ fn deliver(device: &str, packet: &NetworkPacket) {
 }
 
 /// G6's packet: non-empty text within [`MAX_CLIPBOARD_BYTES`].
-fn clipboard_packet(text: String) -> Option<NetworkPacket> {
+pub(crate) fn clipboard_packet(text: String) -> Option<NetworkPacket> {
     if text.is_empty() || text.len() > MAX_CLIPBOARD_BYTES {
         return None;
     }

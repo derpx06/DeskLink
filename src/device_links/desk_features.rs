@@ -166,6 +166,11 @@ pub(crate) fn on_feature_ready(device_id: &str) {
         for index in super::notes::indexes() {
             send(&device_id, &index);
         }
+        // Automations (F7): the rules here, then "phone connected" to it.
+        if let Some(index) = super::automations::index() {
+            send(&device_id, &index);
+        }
+        super::automations::phone_link(&device_id, true);
     });
 }
 
@@ -306,6 +311,19 @@ pub(crate) fn handle_settings_request(device_id: &str, packet: &NetworkPacket) {
         }
     }
     push_settings();
+}
+
+/// Changes this computer's settings from inside the daemon (an automation),
+/// saved and told to every phone.
+pub(crate) fn change_settings(change: impl FnOnce(&mut AppSettings)) -> Result<(), String> {
+    let daemon = DAEMON.get().ok_or("DeskLink is starting")?;
+    daemon
+        .config
+        .lock()
+        .map_err(|_| "Config lock poisoned".to_string())
+        .and_then(|mut config| config.update_settings(change))?;
+    push_settings();
+    Ok(())
 }
 
 /// Remembers a folder a phone started a terminal in (newest first, five).

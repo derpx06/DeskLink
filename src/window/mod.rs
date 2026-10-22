@@ -24,6 +24,7 @@
 //! dialogs, mirrored notifications, errors; each page lives in its own
 //! module and is redrawn only when what it shows has changed.
 
+mod automations;
 pub(crate) mod calls;
 mod camera;
 mod insert;
@@ -66,6 +67,7 @@ const PAGES: &[(&str, &str, &str)] = &[
     ("clipboard", "Clipboard", "edit-paste-symbolic"),
     ("contacts", "Contacts", "x-office-address-book-symbolic"),
     ("notes", "Notes", "document-edit-symbolic"),
+    ("automations", "Automations", "system-run-symbolic"),
     (
         "history",
         "Connection History",
@@ -75,7 +77,7 @@ const PAGES: &[(&str, &str, &str)] = &[
 ];
 
 /// How many of [`PAGES`] are in the sidebar's main list.
-const MAIN_PAGES: usize = 7;
+const MAIN_PAGES: usize = 8;
 
 mod imp {
     use super::*;
@@ -946,6 +948,7 @@ impl DesklinkWindow {
                 }
             }
             "history" => history::update(self, device),
+            "automations" => automations::update(self, device),
             "preferences" => prefs::update(self, daemon, device),
             _ => {}
         }
@@ -2122,6 +2125,84 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         }
         // "fake-snippet TEXT" (underscores for spaces) and "fake-note": F6
         // content without a phone.
+        // F7: two rules (one test-run, for its history), a template in the
+        // editor, and every rule row opened. Only harmless actions run.
+        "fake-rules" => {
+            use crate::device_links::automations::{self, Rule, Side, Step};
+            let rule = |name: &str, trigger: Step, actions: Vec<Step>| Rule {
+                id: String::new(),
+                name: name.into(),
+                enabled: true,
+                trigger,
+                conditions: vec![Step::new("time-between")
+                    .with("from", "08:00")
+                    .with("to", "20:00")],
+                actions,
+                run_on: Side::Desk,
+                modified: 0,
+                deleted: false,
+            };
+            let first = automations::save_rule(rule(
+                "",
+                Step::new("wifi")
+                    .with("state", "connected")
+                    .with("ssid", "Home"),
+                vec![Step::new("notify").with("title", "Welcome home")],
+            ));
+            let second = automations::save_rule(rule(
+                "Quiet evenings",
+                Step::new("time").with("at", "21:30").with("days", "12345"),
+                vec![
+                    Step::new("pause-media"),
+                    Step::new("phone-ringer").with("mode", "vibrate"),
+                ],
+            ));
+            let third = automations::save_rule(rule(
+                "Welcome back",
+                Step::new("desk-resume"),
+                vec![Step::new("notify").with("title", "Welcome back")],
+            ));
+            debug_log!("[E2E] fake-rules: {first:?} {second:?} {third:?}");
+            if let Some(first) = automations::rules()
+                .into_iter()
+                .find(|rule| !rule.is_builtin())
+            {
+                automations::test_run(&first.id);
+            }
+            win.refresh_soon();
+        }
+        // "fire KIND": an automation trigger here, as if it happened.
+        "fire" => {
+            crate::device_links::automations::fire(crate::device_links::automations::Step::new(id))
+        }
+        "rule-template" => {
+            let name = win
+                .selected_id()
+                .and_then(|id| {
+                    win.imp()
+                        .fake_devices
+                        .borrow()
+                        .iter()
+                        .find(|device| device.id == id)
+                        .map(|device| device.name.clone())
+                })
+                .unwrap_or_else(|| "the phone".into());
+            if let Some((_, rule)) = automations::templates(&name)
+                .into_iter()
+                .nth(id.parse().unwrap_or(0))
+            {
+                automations::edit(win, rule);
+            }
+        }
+        "expand-rules" => {
+            if let Some((scroll, _)) = win.imp().bodies.borrow().get("automations").cloned() {
+                for row in named_widgets(scroll.upcast_ref(), "rule-row") {
+                    if let Some(row) = row.downcast_ref::<adw::ExpanderRow>() {
+                        row.set_expanded(true);
+                    }
+                }
+            }
+        }
         "fake-snippet" => {
             let _ = crate::device_links::notes::add_snippet(&id.replace('_', " "));
             win.refresh_soon();
@@ -2759,6 +2840,7 @@ mod tests {
                 "clipboard",
                 "contacts",
                 "notes",
+                "automations",
                 "history",
                 "preferences"
             ]

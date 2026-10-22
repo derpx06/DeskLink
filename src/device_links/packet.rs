@@ -75,6 +75,8 @@ pub const PACKET_TYPE_CONTACTS_RESPONSE_VCARDS: &str = "desklink.contacts.respon
 /// Snippets and notes (F6), both directions: `op` index, fetch or items.
 pub const PACKET_TYPE_SNIPPETS: &str = "desklink.snippets";
 pub const PACKET_TYPE_NOTES: &str = "desklink.notes";
+/// Automations (F7): rules, events and remote actions, both ways.
+pub const PACKET_TYPE_AUTOMATIONS: &str = "desklink.automations";
 /// Glide (F4): the pointer crossing onto the phone (desk→phone), and back
 /// (phone→desk). KDE Connect's shareinputdevices edge protocol.
 pub const PACKET_TYPE_SHARE_INPUT_DEVICES_REQUEST: &str = "desklink.shareinputdevices.request";

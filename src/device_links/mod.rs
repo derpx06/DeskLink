@@ -1,3 +1,4 @@
+pub(crate) mod automations;
 pub(crate) mod call_audio;
 pub(crate) mod calls;
 pub mod config;

@@ -752,6 +752,16 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             });
             Ok(())
         }
+        // Automations (F7): sync, events and remote actions.
+        crate::device_links::packet::PACKET_TYPE_AUTOMATIONS => {
+            let (device_id, packet) = (device_id.clone(), packet.clone());
+            crate::device_links::desk_features::run_later(move || {
+                for answer in crate::device_links::automations::on_packet(&device_id, &packet) {
+                    crate::device_links::desk_features::send(&device_id, &answer);
+                }
+            });
+            Ok(())
+        }
         // Glide (F4): the phone hands the pointer back.
         crate::device_links::packet::PACKET_TYPE_SHARE_INPUT_DEVICES => {
             crate::device_links::glide::phone_released(device_id, &packet);

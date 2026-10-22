@@ -181,6 +181,9 @@ fn watch_once(jobs: &mut HashMap<String, JobWatch>, exits: &mut HashMap<String, 
                 &job,
                 ran.as_secs(),
             );
+            crate::device_links::automations::fire(
+                crate::device_links::automations::Step::new("command-finished").with("job", job),
+            );
         }
     }
 }

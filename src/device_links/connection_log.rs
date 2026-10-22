@@ -162,6 +162,9 @@ pub fn note_ready(device_id: &str, ready: bool) {
             ready,
         )
     });
+    if news && !ready {
+        crate::device_links::automations::phone_link(device_id, false);
+    }
     if news {
         record(
             device_id,

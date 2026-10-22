@@ -435,6 +435,11 @@ impl Config {
         self.base_dir.join("notes")
     }
 
+    /// Automation rules and their history (F7), encrypted.
+    pub fn automations_dir(&self) -> PathBuf {
+        self.base_dir.join("automations")
+    }
+
     /// The phones' contact caches (F5), encrypted.
     pub fn contacts_dir(&self) -> PathBuf {
         self.base_dir.join("contacts")

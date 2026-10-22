@@ -278,6 +278,11 @@ pub(crate) fn hold_media(device_id: &str, in_call: bool) {
             })
             .unwrap_or(HoldStep::Nothing);
         match step {
+            // The built-in rule (F7 A7) can turn the pause off; a resume
+            // after it is harmless (nothing was recorded as paused).
+            HoldStep::Pause
+                if !super::automations::builtin_enabled(super::automations::BUILTIN_CALL_PAUSE) => {
+            }
             HoldStep::Pause => {
                 let paused = super::mpris::pause_playing();
                 if let Ok(mut hold) = HOLD.lock() {

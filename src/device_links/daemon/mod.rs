@@ -212,6 +212,7 @@ impl DaemonWorker {
         if let Ok(config) = config.lock() {
             crate::device_links::contacts::install(config.contacts_dir());
             crate::device_links::notes::install(config.notes_dir());
+            crate::device_links::automations::install(config.automations_dir());
         }
         crate::device_links::desk_features::install(
             Arc::clone(&sessions),
@@ -224,6 +225,7 @@ impl DaemonWorker {
             }
             crate::device_links::mpris::start();
             crate::device_links::glide::start();
+            crate::device_links::automations::start();
             crate::device_links::pty::jobs::start_watch();
         }
 
