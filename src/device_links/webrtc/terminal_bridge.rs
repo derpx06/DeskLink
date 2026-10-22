@@ -1939,8 +1939,10 @@ mod tests {
             1,
         )
         .unwrap();
+        let length = envelope.to_json().unwrap().len();
         assert!(
-            envelope.to_json().unwrap().len() < crate::device_links::webrtc::MAX_ENVELOPE_BYTES
+            length <= crate::device_links::webrtc::MAX_WIRE_MESSAGE_BYTES,
+            "one data-channel message at most: {length}"
         );
     }
 

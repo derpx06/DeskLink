@@ -18,8 +18,10 @@ use gtk::prelude::*;
 
 /// Longest side of the picture sent.
 pub(crate) const MAX_SIDE: i32 = 320;
-/// The JPEG sent is at most this big; quality drops until it fits.
-pub(crate) const MAX_JPEG_BYTES: usize = 48 * 1024;
+/// The JPEG sent is at most this big; quality drops until it fits. Base64
+/// in the packet and again in the envelope, it must stay one data-channel
+/// message (64 KiB).
+pub(crate) const MAX_JPEG_BYTES: usize = 24 * 1024;
 /// A source image larger than this is not read.
 pub(crate) const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
 const FETCH_TIMEOUT: Duration = Duration::from_secs(3);

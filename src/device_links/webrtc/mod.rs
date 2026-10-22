@@ -49,6 +49,40 @@ pub const ENVELOPE_VERSION: u32 = 1;
 pub const NETWORK_PACKET_MESSAGE_TYPE: &str = "desklink.packet.v1";
 pub const MAX_PAYLOAD_BYTES: usize = 128 * 1024;
 pub const MAX_ENVELOPE_BYTES: usize = 256 * 1024;
+/// The largest message one data channel may carry: 64 KiB.
+///
+/// Our SDP carries no `a=max-message-size`, so webrtcbin assumes RFC 8841's
+/// 64 KiB default, and so does the phone's libwebrtc. A larger send does not
+/// fail cleanly: GStreamer's `sctpenc` puts the whole SCTP association in an
+/// error state ("Could not write to resource") and every channel goes silent,
+/// so the peer is rebuilt every ~16 s for as long as the sender retries (seen
+/// with 100 KiB contact replies). Envelopes over this are refused before they
+/// reach a data channel, as an ordinary send error.
+pub const MAX_WIRE_MESSAGE_BYTES: usize = 64 * 1024;
+/// What a feature packet's JSON may take so that, enveloped (base64 ×4/3 and
+/// about half a kilobyte of fields), it always fits one wire message. Every
+/// sender that packs a list splits or trims to this.
+pub const MAX_FEATURE_PACKET_BYTES: usize = 40 * 1024;
+
+/// How long `packet`'s envelope is on the wire (with the longest ids a
+/// binding has), for senders and tests to check against
+/// [`MAX_WIRE_MESSAGE_BYTES`].
+pub fn enveloped_len(packet: &NetworkPacket) -> Result<usize, String> {
+    let binding = WebRtcWireBinding {
+        sender_device_id: "d".repeat(64),
+        peer_device_id: "p".repeat(64),
+        session_id: u64::MAX,
+        generation: u64::MAX,
+    };
+    WebRtcPacketBridge::encode(&binding, packet, i64::MAX)?
+        .to_json()
+        .map(|json| json.len())
+}
+
+/// Whether `packet` fits one data-channel message once enveloped.
+pub fn fits_on_wire(packet: &NetworkPacket) -> bool {
+    enveloped_len(packet).is_ok_and(|length| length <= MAX_WIRE_MESSAGE_BYTES)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WebRtcChannel {
@@ -325,6 +359,19 @@ impl WebRtcPacketBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_feature_budget_always_fits_one_wire_message() {
+        // A packet whose JSON is the whole budget, of characters that need
+        // no escaping, fits; one well over it does not.
+        let mut packet = NetworkPacket::new("desklink.notes");
+        let pad = MAX_FEATURE_PACKET_BYTES - packet.serialize().unwrap().len() - 16;
+        packet.set("pad", "x".repeat(pad));
+        assert!(packet.serialize().unwrap().len() <= MAX_FEATURE_PACKET_BYTES);
+        assert!(fits_on_wire(&packet), "{:?}", enveloped_len(&packet));
+        packet.set("pad", "x".repeat(MAX_FEATURE_PACKET_BYTES + 10_000));
+        assert!(!fits_on_wire(&packet));
+    }
     use crate::device_links::packet::PACKET_TYPE_CLIPBOARD;
 
     #[test]

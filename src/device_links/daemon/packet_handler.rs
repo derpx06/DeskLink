@@ -784,11 +784,9 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             Ok(())
         }
         crate::device_links::packet::PACKET_TYPE_CONTACTS_RESPONSE_VCARDS => {
-            let (device_id, packet) = (device_id.clone(), packet.clone());
-            // Dropped when the queue is full: the next snapshot asks again.
-            crate::device_links::desk_features::run_later(move || {
-                crate::device_links::contacts::on_vcards(&device_id, &packet)
-            });
+            // Its own queue: a first sync is a burst of hundreds of replies
+            // to requests this desk made (the shared desk queue holds 16).
+            crate::device_links::contacts::queue_vcards(device_id, packet.clone());
             Ok(())
         }
         PACKET_TYPE_FINDMYPHONE_REQUEST => {

@@ -42,8 +42,8 @@ const MAX_PARAM_CHARS: usize = 512;
 const MAX_KIND_CHARS: usize = 40;
 /// ids per `fetch`.
 const FETCH_IDS: usize = 100;
-/// One `items` packet stays under this (the WebRTC payload bound is 128 KiB).
-const MAX_PACKET_BYTES: usize = 96 * 1024;
+/// One `items` packet stays one data-channel message once enveloped.
+const MAX_PACKET_BYTES: usize = crate::device_links::webrtc::MAX_FEATURE_PACKET_BYTES;
 const TOMBSTONE_DAYS: i64 = 30;
 /// Runs remembered per rule.
 const HISTORY: usize = 20;
@@ -1114,6 +1114,7 @@ fn items_packets(values: Vec<Value>) -> Vec<NetworkPacket> {
     for value in values {
         let length = value.to_string().len();
         if length > MAX_PACKET_BYTES {
+            log_limited("rule-size", "A rule too large to sync was skipped");
             continue;
         }
         if size + length > MAX_PACKET_BYTES {
@@ -1756,6 +1757,24 @@ mod tests {
     use super::*;
 
     /// The store is one per process: tests that install it take turns.
+
+    #[test]
+    fn every_items_packet_fits_one_wire_message() {
+        let big = |index: usize| {
+            let mut step = Step::new("notify");
+            for key in 0..MAX_PARAMS {
+                step = step.with(&format!("k{key}"), "\"".repeat(MAX_PARAM_CHARS / 4));
+            }
+            let mut rule = rule(step.clone(), vec![step.clone(); 2]);
+            rule.id = format!("r{index}");
+            serde_json::to_value(rule).unwrap()
+        };
+        let packets = items_packets((0..40).map(big).collect());
+        assert!(!packets.is_empty());
+        for packet in &packets {
+            assert!(crate::device_links::webrtc::fits_on_wire(packet));
+        }
+    }
     static STORE_TEST: Mutex<()> = Mutex::new(());
 
     fn rule(trigger: Step, actions: Vec<Step>) -> Rule {
@@ -1948,7 +1967,7 @@ mod tests {
 
     #[test]
     fn items_packets_stay_under_the_bound() {
-        let big = json!({"id": "x", "pad": "y".repeat(40_000)});
+        let big = json!({"id": "x", "pad": "y".repeat(15_000)});
         let packets = items_packets(vec![big.clone(), big.clone(), big.clone()]);
         assert_eq!(packets.len(), 2);
         for packet in &packets {

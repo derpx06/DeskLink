@@ -112,15 +112,32 @@ fn valid_uid(uid: &str) -> bool {
     !uid.is_empty() && uid.len() <= MAX_UID_BYTES && !uid.chars().any(char::is_control)
 }
 
-/// The K2 requests for `uids`, at most [`UIDS_PER_REQUEST`] each.
+/// The K2 requests for `uids`: at most [`UIDS_PER_REQUEST`] each, and each
+/// one data-channel message on the wire (uids may be 256 bytes).
 fn vcard_requests(uids: &[String]) -> Vec<NetworkPacket> {
-    uids.chunks(UIDS_PER_REQUEST)
-        .map(|chunk| {
+    let budget = crate::device_links::webrtc::MAX_FEATURE_PACKET_BYTES - 256;
+    let mut packets = Vec::new();
+    let mut chunk: Vec<String> = Vec::new();
+    let mut size = 0;
+    let flush = |chunk: &mut Vec<String>, packets: &mut Vec<NetworkPacket>| {
+        if !chunk.is_empty() {
             let mut packet = NetworkPacket::new(PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID);
-            packet.set("uids", chunk.to_vec());
-            packet
-        })
-        .collect()
+            packet.set("uids", std::mem::take(chunk));
+            packets.push(packet);
+        }
+    };
+    for uid in uids {
+        // Quoted and escaped, with its comma.
+        let length = serde_json::to_string(uid).map_or(uid.len() + 3, |json| json.len() + 1);
+        if chunk.len() >= UIDS_PER_REQUEST || size + length > budget {
+            flush(&mut chunk, &mut packets);
+            size = 0;
+        }
+        size += length;
+        chunk.push(uid.clone());
+    }
+    flush(&mut chunk, &mut packets);
+    packets
 }
 
 /// Refresh: the phone answers with a snapshot.
@@ -466,20 +483,93 @@ pub(crate) fn on_snapshot(device_id: &str, packet: &NetworkPacket) -> Vec<Networ
     vcard_requests(&ask)
 }
 
-/// vCards from `device_id` (K3).
-pub(crate) fn on_vcards(device_id: &str, packet: &NetworkPacket) {
-    let changed = with_book(device_id, |book, dir| {
-        let changed = apply_vcards(book, packet);
-        // ponytail: the whole book is rewritten per reply; batch the writes
-        // if first syncs of very large address books feel slow.
-        if changed {
-            save_logged(dir, device_id, book);
+/// vCard replies waiting for the contacts worker. A first sync of a large
+/// address book is a burst of a few hundred replies to requests this desk
+/// made: none may be dropped (the shared desk queue holds 16), and memory
+/// stays bounded (~40 KiB each).
+const VCARD_QUEUE: usize = 1024;
+/// A book being filled is sealed to disk at most this often, and once the
+/// burst is over, not after every reply.
+const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// vCards from `device_id` (K3): queued for the contacts worker.
+pub(crate) fn queue_vcards(device_id: &str, packet: NetworkPacket) {
+    static WORKER: OnceLock<std::sync::mpsc::SyncSender<(String, NetworkPacket)>> = OnceLock::new();
+    let sender = WORKER.get_or_init(|| {
+        let (sender, replies) = std::sync::mpsc::sync_channel(VCARD_QUEUE);
+        let _ = std::thread::Builder::new()
+            .name("desklink-contacts".into())
+            .spawn(move || vcard_worker(&replies));
+        sender
+    });
+    if sender.try_send((device_id.to_string(), packet)).is_err() {
+        // The next snapshot asks for these again.
+        super::limits::log_limited(
+            "vcards-full",
+            "Contacts arrived faster than they could be kept",
+        );
+    }
+}
+
+/// Applies replies as they come. A changed book is sealed at most once per
+/// [`SAVE_EVERY`] while a burst lasts, and once it has been quiet for
+/// [`QUIET`] — never after every reply.
+fn vcard_worker(replies: &std::sync::mpsc::Receiver<(String, NetworkPacket)>) {
+    use std::sync::mpsc::RecvTimeoutError;
+    let mut dirty: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut saved = std::time::Instant::now();
+    let save = |dirty: &mut std::collections::HashSet<String>| {
+        for device_id in dirty.drain() {
+            with_book(&device_id, |book, dir| save_logged(dir, &device_id, book));
         }
-        changed
-    })
-    .unwrap_or(false);
+    };
+    loop {
+        let next = if dirty.is_empty() {
+            replies.recv().map_err(|_| RecvTimeoutError::Disconnected)
+        } else {
+            replies.recv_timeout(QUIET)
+        };
+        match next {
+            Ok((device_id, packet)) => {
+                if on_vcards_unsaved(&device_id, &packet) {
+                    dirty.insert(device_id);
+                }
+                if !dirty.is_empty() && saved.elapsed() >= SAVE_EVERY {
+                    save(&mut dirty);
+                    saved = std::time::Instant::now();
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                save(&mut dirty);
+                saved = std::time::Instant::now();
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                save(&mut dirty);
+                break;
+            }
+        }
+    }
+}
+
+/// The burst is over once no reply came for this long: save then.
+const QUIET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// vCards from `device_id` (K3), applied in memory; whether they changed
+/// the book (the caller saves).
+fn on_vcards_unsaved(device_id: &str, packet: &NetworkPacket) -> bool {
+    let changed = with_book(device_id, |book, _| apply_vcards(book, packet)).unwrap_or(false);
     if changed {
         GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+    changed
+}
+
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+/// vCards from `device_id` (K3), applied and saved at once (tests, and the
+/// debug `fake-contacts` verb).
+pub(crate) fn on_vcards(device_id: &str, packet: &NetworkPacket) {
+    if on_vcards_unsaved(device_id, packet) {
+        with_book(device_id, |book, dir| save_logged(dir, device_id, book));
     }
 }
 
@@ -592,6 +682,57 @@ fn load(dir: &Path, device_id: &str) -> Option<Book> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_vcard_request_fits_one_wire_message() {
+        let uids: Vec<String> = (0..1000)
+            .map(|index| format!("{index}{}", "\"".repeat(MAX_UID_BYTES - 6)))
+            .collect();
+        let packets = vcard_requests(&uids);
+        let asked: usize = packets
+            .iter()
+            .map(|packet| packet.body["uids"].as_array().unwrap().len())
+            .sum();
+        assert_eq!(asked, 1000, "every uid asked for");
+        for packet in &packets {
+            assert!(packet.body["uids"].as_array().unwrap().len() <= UIDS_PER_REQUEST);
+            assert!(crate::device_links::webrtc::fits_on_wire(packet));
+        }
+        // Short ids still go 200 at a time.
+        let short: Vec<String> = (0..450).map(|index| index.to_string()).collect();
+        assert_eq!(vcard_requests(&short).len(), 3);
+    }
+
+    #[test]
+    fn a_burst_of_replies_is_kept_and_saved_once_it_settles() {
+        let dir = std::env::temp_dir().join(format!("desklink-vcards-{}", uuid::Uuid::new_v4()));
+        install(dir.clone());
+        let uids: Vec<String> = (0..300).map(|index| index.to_string()).collect();
+        with_book("phone-v", |book, _| {
+            for uid in &uids {
+                book.wanted.insert(uid.clone(), "1".into());
+            }
+        });
+        let (sender, replies) = std::sync::mpsc::sync_channel(VCARD_QUEUE);
+        for uid in &uids {
+            let mut packet = NetworkPacket::new("desklink.contacts.response_vcards");
+            packet.set("uids", vec![uid.clone()]);
+            packet.set(
+                uid,
+                format!("BEGIN:VCARD\r\nFN:N {uid}\r\nTEL:555\r\nEND:VCARD\r\n"),
+            );
+            sender.send(("phone-v".to_string(), packet)).unwrap();
+        }
+        drop(sender);
+        vcard_worker(&replies);
+        assert_eq!(list("phone-v").len(), 300, "none dropped");
+        assert_eq!(
+            load(&dir, "phone-v").unwrap().contacts.len(),
+            300,
+            "saved at the end"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn photos_stop_at_the_cache_bound_but_contacts_stay() {

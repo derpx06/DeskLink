@@ -38,8 +38,8 @@ const MAX_FILES: usize = 20_000;
 /// A file larger than this is skipped (the transfer bound).
 const MAX_FILE_BYTES: u64 = MAX_TRANSFER_BYTES;
 const MAX_NAME_CHARS: usize = 80;
-/// A `manifest` packet stays under this (WebRTC payload bound 128 KiB).
-const MAX_PACKET_BYTES: usize = 96 * 1024;
+/// A `manifest` packet stays one data-channel message once enveloped.
+const MAX_PACKET_BYTES: usize = crate::device_links::webrtc::MAX_FEATURE_PACKET_BYTES;
 /// Parts of one manifest, and entries held while assembling one.
 const MAX_PARTS: usize = 256;
 /// Paths per `request`, and outstanding requested paths per pair.
@@ -2259,10 +2259,16 @@ impl Worker {
     fn request_more(&mut self, index: usize) {
         let live = &mut self.pairs[index];
         let mut batch = Vec::new();
-        while live.outstanding.len() < MAX_OUTSTANDING && batch.len() < REQUEST_PATHS {
+        // And one data-channel message: paths may be 1 KiB each.
+        let mut bytes = 0;
+        while live.outstanding.len() < MAX_OUTSTANDING
+            && batch.len() < REQUEST_PATHS
+            && bytes < MAX_PACKET_BYTES / 2
+        {
             let Some(path) = live.to_request.pop_front() else {
                 break;
             };
+            bytes += path.len() * 2 + 3;
             live.outstanding.push_back(path.clone());
             batch.push(path);
         }
@@ -2544,6 +2550,26 @@ fn live_dirty(dirty: &std::rc::Rc<std::cell::RefCell<HashSet<String>>>, id: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_full_bucket_manifest_fits_the_wire_part_by_part() {
+        let mut manifest = Manifest::new();
+        for index in 0..MAX_BUCKET_ITEMS {
+            manifest.insert(
+                format!("{index:05} {}.jpg", "\u{10348}".repeat(40)),
+                entry(&"a".repeat(64), (u64::MAX, u64::MAX)),
+            );
+        }
+        let packets = manifest_packets(BUCKET_ID, &manifest);
+        assert!(packets.len() <= MAX_PARTS, "{} parts", packets.len());
+        for packet in &packets {
+            assert!(
+                crate::device_links::webrtc::fits_on_wire(packet),
+                "{:?}",
+                crate::device_links::webrtc::enveloped_len(packet)
+            );
+        }
+    }
 
     fn bucket_worker(base: &Path, root: &Path) -> Worker {
         let pair = Pair {

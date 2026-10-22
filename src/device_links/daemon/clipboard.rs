@@ -619,6 +619,16 @@ impl DaemonWorker {
                             }
                             let mut packet = NetworkPacket::new(PACKET_TYPE_CLIPBOARD);
                             packet.set("content", current_text.clone());
+                            // Too large for one data-channel message: not
+                            // shared, and taken as handled so it is not
+                            // retried every second.
+                            if !crate::device_links::webrtc::fits_on_wire(&packet) {
+                                crate::device_links::limits::log_limited(
+                                    "clipboard-size",
+                                    "A copied text too large to share was not sent",
+                                );
+                                return Ok(true);
+                            }
                             transport.send(&packet).map(|()| true)
                         });
                     if let Ok(mut sent) = LAST_SENT_BY_DEVICE

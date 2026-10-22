@@ -9,7 +9,7 @@ use gst_webrtc::{
 };
 
 use super::ice::IceServerConfig;
-use super::{SignalingMessageType, WebRtcChannel, MAX_ENVELOPE_BYTES};
+use super::{SignalingMessageType, WebRtcChannel, MAX_ENVELOPE_BYTES, MAX_WIRE_MESSAGE_BYTES};
 
 static GST_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
@@ -574,8 +574,13 @@ impl DesktopWebRtcPeer {
     }
 
     pub fn send_text(&self, channel: WebRtcChannel, text: &str) -> Result<(), String> {
-        if text.len() > MAX_ENVELOPE_BYTES {
-            return Err("DeskLink WebRTC envelope is too large".to_string());
+        // Over 64 KiB would wreck the SCTP association, not just fail: see
+        // [`MAX_WIRE_MESSAGE_BYTES`].
+        if text.len() > MAX_WIRE_MESSAGE_BYTES.min(MAX_ENVELOPE_BYTES) {
+            return Err(format!(
+                "DeskLink WebRTC message is too large to send ({} bytes, 64 KiB at most)",
+                text.len()
+            ));
         }
         let channel = self
             .channels
@@ -866,7 +871,7 @@ fn register_bundled_paintable_sink() {
 }
 
 fn validate_file_data(bytes: &[u8]) -> Result<(), String> {
-    if bytes.is_empty() || bytes.len() > MAX_ENVELOPE_BYTES {
+    if bytes.is_empty() || bytes.len() > MAX_ENVELOPE_BYTES.min(MAX_WIRE_MESSAGE_BYTES) {
         return Err("DeskLink WebRTC file-data chunk is outside the allowed size".to_string());
     }
     Ok(())
@@ -2703,6 +2708,30 @@ a=max-message-size:262144\r\n";
         assert!(validate_file_data(&[1]).is_ok());
         assert!(validate_file_data(&[]).is_err());
         assert!(validate_file_data(&vec![0; MAX_ENVELOPE_BYTES + 1]).is_err());
+        assert!(validate_file_data(&vec![0; MAX_WIRE_MESSAGE_BYTES + 1]).is_err());
+        assert!(validate_file_data(&vec![0; MAX_WIRE_MESSAGE_BYTES]).is_ok());
+    }
+
+    /// Over 64 KiB is refused as a plain error before any data channel sees
+    /// it: handed to `sctpenc` it puts the whole association in an error
+    /// state and every channel dies (the 16 s rebuild loop).
+    #[test]
+    fn a_message_over_one_wire_message_is_refused_before_the_channel() {
+        let (sender, _receiver) = mpsc::channel();
+        let peer = DesktopWebRtcPeer::new(true, sender, &IceServerConfig::default()).unwrap();
+        let error = peer
+            .send_text(
+                WebRtcChannel::Events,
+                &"x".repeat(MAX_WIRE_MESSAGE_BYTES + 1),
+            )
+            .unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+        // At the limit it gets as far as the (unopened) channel.
+        let error = peer
+            .send_text(WebRtcChannel::Events, &"x".repeat(MAX_WIRE_MESSAGE_BYTES))
+            .unwrap_err();
+        assert!(error.contains("not open"), "{error}");
+        peer.close();
     }
     #[test]
     fn answer_creation_reads_the_answer_promise_field() {

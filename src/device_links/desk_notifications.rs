@@ -674,6 +674,29 @@ mod tests {
     }
 
     #[test]
+    fn the_biggest_notification_fits_one_wire_message() {
+        let hints = glib::VariantDict::new(None);
+        hints.insert("desktop-entry", "x".repeat(200).as_str());
+        let (note, _) = from_notify(
+            &notify(
+                &"\u{10348}".repeat(MAX_TITLE),
+                0,
+                &"\"".repeat(MAX_TITLE * 4),
+                &"\u{10348}".repeat(MAX_TEXT * 2),
+                hints,
+            ),
+            ":1.9",
+        )
+        .unwrap();
+        let packet = body_packet(&note, true);
+        assert!(
+            crate::device_links::webrtc::fits_on_wire(&packet),
+            "{:?}",
+            crate::device_links::webrtc::enveloped_len(&packet)
+        );
+    }
+
+    #[test]
     fn a_notify_call_becomes_a_note_and_ours_are_left_out() {
         let hints = glib::VariantDict::new(None);
         hints.insert("desktop-entry", "org.gnome.Calendar");

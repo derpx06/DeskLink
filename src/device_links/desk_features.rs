@@ -362,15 +362,23 @@ pub(crate) fn remember_folder(folder: &str) {
 /// `desklink.runcommand`: the commands as KDE Connect sends them, a JSON
 /// string mapping each id to its name and command.
 pub(crate) fn command_list_packet(commands: &[RunCommand]) -> NetworkPacket {
-    let list: serde_json::Map<String, Value> = commands
-        .iter()
-        .map(|command| {
-            (
-                command.id.clone(),
-                json!({ "name": command.name, "command": command.command }),
-            )
-        })
-        .collect();
+    // The list is one packet the phone takes as complete: as many commands
+    // as fit one data-channel message (the stringified list is escaped
+    // again inside the packet, so a quarter of the budget per pass is kept
+    // for that).
+    let budget = crate::device_links::webrtc::MAX_FEATURE_PACKET_BYTES / 2;
+    let mut list = serde_json::Map::new();
+    let mut size = 2;
+    for command in commands {
+        let entry = json!({ "name": command.name, "command": command.command });
+        let length = command.id.len() + entry.to_string().len() + 4;
+        if size + length > budget {
+            super::limits::log_limited("run-commands", "Some run commands did not fit the list");
+            break;
+        }
+        size += length;
+        list.insert(command.id.clone(), entry);
+    }
     let mut packet = NetworkPacket::new(PACKET_TYPE_RUNCOMMAND);
     packet.set("commandList", Value::Object(list).to_string());
     packet
@@ -631,6 +639,43 @@ fn hand_off(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_command_list_fits_one_wire_message() {
+        let commands: Vec<RunCommand> = (0..200)
+            .map(|index| RunCommand {
+                id: format!("c{index}"),
+                name: format!("\"Deploy\" {index}"),
+                command: "\\\"".repeat(200),
+            })
+            .collect();
+        let packet = command_list_packet(&commands);
+        assert!(crate::device_links::webrtc::fits_on_wire(&packet));
+        let list: serde_json::Map<String, Value> =
+            serde_json::from_str(packet.get_str("commandList").unwrap()).unwrap();
+        assert!(!list.is_empty() && list.len() < 200, "as many as fit");
+    }
+
+    #[test]
+    fn the_settings_and_art_packets_fit_one_wire_message() {
+        let packet = settings_packet(&AppSettings::default(), &"d".repeat(64));
+        assert!(crate::device_links::webrtc::fits_on_wire(&packet));
+        let art = super::super::media_art::Art {
+            id: "a".repeat(64),
+            data: "A".repeat(super::super::media_art::MAX_JPEG_BYTES * 4 / 3 + 4),
+        };
+        let mut mpris = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_MPRIS);
+        mpris.set("player", "\u{10348}".repeat(64));
+        mpris.set("title", "\u{10348}".repeat(256));
+        mpris.set("artist", "\u{10348}".repeat(256));
+        mpris.set("album", "\u{10348}".repeat(256));
+        super::super::mpris::add_art(&mut mpris, Some(&art), true);
+        assert!(
+            crate::device_links::webrtc::fits_on_wire(&mpris),
+            "{:?}",
+            crate::device_links::webrtc::enveloped_len(&mpris)
+        );
+    }
 
     #[test]
     fn the_settings_report_carries_every_key() {

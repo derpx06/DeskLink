@@ -23,11 +23,13 @@ const MAX_SNIPPET_BYTES: usize = 16 * 1024;
 const MAX_SNIPPET_TITLE_CHARS: usize = 120;
 const MAX_NOTES: usize = 2000;
 const MAX_NOTE_TITLE_CHARS: usize = 200;
-const MAX_NOTE_BYTES: usize = 64 * 1024;
+/// A note's body: its JSON (escaped) must fit one packet on the wire, so
+/// half the packet budget.
+const MAX_NOTE_BYTES: usize = 20 * 1024;
 /// ids per `fetch`.
 const FETCH_IDS: usize = 100;
-/// One `items` packet stays under the WebRTC payload bound (128 KiB).
-const MAX_PACKET_BYTES: usize = 96 * 1024;
+/// One `items` packet stays one data-channel message once enveloped.
+const MAX_PACKET_BYTES: usize = crate::device_links::webrtc::MAX_FEATURE_PACKET_BYTES;
 const TOMBSTONE_DAYS: i64 = 90;
 /// Entries kept, live and tombstones: a peer cannot grow the shelf past
 /// these (new ids are refused, logged).
@@ -315,8 +317,14 @@ fn items_packets(kind: Kind, values: Vec<Value>) -> Vec<NetworkPacket> {
         }
     };
     for value in values {
-        let length = value.to_string().len();
-        if size + length > MAX_PACKET_BYTES {
+        let length = value.to_string().len() + 1;
+        // One that cannot fit any packet is never sent (edits are refused
+        // before they get this big; see `fits_one_packet`).
+        if length > MAX_PACKET_BYTES - PACKET_OVERHEAD {
+            super::limits::log_limited("notes-item-size", "An item too large to sync was skipped");
+            continue;
+        }
+        if size + length > MAX_PACKET_BYTES - PACKET_OVERHEAD {
             flush(&mut batch, &mut packets);
             size = 0;
         }
@@ -325,6 +333,14 @@ fn items_packets(kind: Kind, values: Vec<Value>) -> Vec<NetworkPacket> {
     }
     flush(&mut batch, &mut packets);
     packets
+}
+
+/// The `items` packet's own JSON around its items.
+const PACKET_OVERHEAD: usize = 256;
+
+/// Whether `item` can go in an `items` packet at all.
+fn fits_one_packet(item: &impl Serialize) -> bool {
+    serde_json::to_string(item).is_ok_and(|json| json.len() < MAX_PACKET_BYTES - PACKET_OVERHEAD)
 }
 
 fn item_values(shelf: &Shelf, kind: Kind, ids: &[String]) -> Vec<Value> {
@@ -715,7 +731,8 @@ pub(crate) fn edit_note(id: &str, change: impl FnOnce(&mut Note)) -> Result<(), 
         let before = note.clone();
         change(note);
         note.title = note.title.chars().take(MAX_NOTE_TITLE_CHARS).collect();
-        if note.body.len() > MAX_NOTE_BYTES {
+        // The bound on what crosses the wire, escapes included.
+        if note.body.len() > MAX_NOTE_BYTES || !fits_one_packet(&*note) {
             *note = before;
             return (Err(TOO_LONG.to_string()), false);
         }
@@ -743,11 +760,43 @@ pub(crate) fn edit_note(id: &str, change: impl FnOnce(&mut Note)) -> Result<(), 
 
 /// What the editor says when a note passes its size bound.
 pub(crate) const TOO_LONG: &str =
-    "This note is too long to save (64 KB at most). Shorten it: the last changes are not saved yet.";
+    "This note is too long to save (20 KB at most). Shorten it: the last changes are not saved yet.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_items_packet_fits_one_wire_message() {
+        // Notes at the bound, quotes and backslashes doubling on escape.
+        let values: Vec<Value> = (0..12)
+            .map(|index| {
+                serde_json::to_value(Note {
+                    id: format!("{index}-{}", "i".repeat(100)),
+                    title: "\"".repeat(MAX_NOTE_TITLE_CHARS),
+                    body: "\"\\x".repeat(MAX_NOTE_BYTES / 3),
+                    pinned: true,
+                    created: i64::MAX,
+                    modified: i64::MAX,
+                    parent: i64::MAX,
+                    deleted: false,
+                })
+                .unwrap()
+            })
+            .collect();
+        let packets = items_packets(Kind::Notes, values);
+        assert!(!packets.is_empty());
+        for packet in &packets {
+            assert!(
+                crate::device_links::webrtc::fits_on_wire(packet),
+                "{:?}",
+                crate::device_links::webrtc::enveloped_len(packet)
+            );
+        }
+        // One that can never fit is not sent at all.
+        let huge = json!({"id": "h", "body": "\u{1}".repeat(MAX_PACKET_BYTES)});
+        assert!(items_packets(Kind::Notes, vec![huge]).is_empty());
+    }
 
     #[test]
     fn a_peer_cannot_grow_the_shelf_past_its_bounds() {

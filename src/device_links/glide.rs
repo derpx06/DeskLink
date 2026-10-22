@@ -56,8 +56,9 @@ const REARMS_PER_MINUTE: usize = 6;
 const RELEASES_PER_SECOND: u32 = 10;
 /// A release delta further than this (logical px) is not a position.
 const MAX_DELTA: f64 = 100_000.0;
-/// The clipboard text that follows the pointer onto the phone.
-const MAX_CLIPBOARD_BYTES: usize = 64 * 1024;
+/// The clipboard text that follows the pointer onto the phone (escaped and
+/// enveloped, one data-channel message).
+const MAX_CLIPBOARD_BYTES: usize = 16 * 1024;
 /// D-Bus calls that answer at once (Enable, Release, …).
 const CALL_TIMEOUT_MS: i32 = 2_000;
 /// How long one key lookup on the main thread may take.
@@ -1021,7 +1022,7 @@ pub(crate) fn clipboard_packet(text: String) -> Option<NetworkPacket> {
     }
     let mut packet = NetworkPacket::new(PACKET_TYPE_CLIPBOARD);
     packet.set("content", text);
-    Some(packet)
+    crate::device_links::webrtc::fits_on_wire(&packet).then_some(packet)
 }
 
 /// G6, off the worker thread (a clipboard read may wait on another app).
@@ -1323,6 +1324,20 @@ fn worker(context: &glib::MainContext, commands: &Receiver<Command>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glide_packets_fit_one_wire_message() {
+        let barrier = Barrier::on(Edge::Right, &screen()).unwrap();
+        assert!(crate::device_links::webrtc::fits_on_wire(
+            &barrier.enter_packet((f64::MAX, f64::MAX))
+        ));
+        let quotes = "\"".repeat(MAX_CLIPBOARD_BYTES);
+        assert!(clipboard_packet(quotes)
+            .is_some_and(|packet| { crate::device_links::webrtc::fits_on_wire(&packet) }));
+        let controls = "\u{1}".repeat(MAX_CLIPBOARD_BYTES);
+        // Escaped six times over: does not fit, so it is not sent.
+        assert!(clipboard_packet(controls).is_none());
+    }
 
     fn screen() -> Vec<Zone> {
         vec![Zone {
