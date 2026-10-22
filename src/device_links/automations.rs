@@ -201,6 +201,7 @@ const RINGER: &[(&str, &str)] = &[
     ("vibrate", "Vibrate"),
     ("silent", "Silent"),
 ];
+const STREAMS: &[(&str, &str)] = &[("media", "Media"), ("ring", "Ring"), ("alarm", "Alarm")];
 const SCREENS: &[(&str, &str)] = &[("terminals", "Terminals"), ("desk-screen", "Desk screen")];
 
 pub(crate) const TRIGGERS: &[Kind] = &[
@@ -377,6 +378,21 @@ pub(crate) const ACTIONS: &[Kind] = &[
         label: "Ring the phone",
         side: Side::Phone,
         params: &[],
+    },
+    Kind {
+        id: "phone-volume",
+        label: "Set a phone volume",
+        side: Side::Phone,
+        params: &[
+            ("stream", "Volume", Param::Choice(STREAMS)),
+            ("percent", "Level (%)", Param::Number(0, 100)),
+        ],
+    },
+    Kind {
+        id: "phone-dnd",
+        label: "Set the phone's Do Not Disturb",
+        side: Side::Phone,
+        params: &[("on", "On", Param::Bool)],
     },
     Kind {
         id: "phone-notify",
