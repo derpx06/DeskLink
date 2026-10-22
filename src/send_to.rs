@@ -225,20 +225,15 @@ fn to_bucket(app: &DesklinkApplication, device: &str, paths: Vec<PathBuf>) {
             notification
         }
         Some(device) => {
-            let (files, folder) = crate::device_links::folders::split_files(paths);
-            let count = files.len();
-            if count > 0 {
-                crate::device_links::folders::import(&device, files);
-            }
-            let notification = gio::Notification::new(&match count {
+            // Folders go in whole (2 levels); what was left out is told
+            // afterwards, when the copy is done.
+            let count = paths.len();
+            crate::device_links::folders::import(&device, paths, "");
+            gio::Notification::new(&match count {
                 0 => "Nothing was added to the Bucket".to_string(),
-                1 => "Added to the Bucket".to_string(),
-                count => format!("Added {count} files to the Bucket"),
-            });
-            if folder {
-                notification.set_body(Some(crate::device_links::folders::FOLDERS_NOT_YET));
-            }
-            notification
+                1 => "Adding to the Bucket".to_string(),
+                count => format!("Adding {count} items to the Bucket"),
+            })
         }
     };
     notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));

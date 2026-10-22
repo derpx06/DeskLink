@@ -1425,7 +1425,7 @@ impl DesklinkWindow {
         self.imp().toast_overlay.add_toast(toast);
     }
 
-    fn show_feature_toast(&self, message: &str) {
+    pub(crate) fn show_feature_toast(&self, message: &str) {
         let toast = adw::Toast::new(message);
         toast.set_use_markup(false);
         toast.set_timeout(3);
@@ -2195,13 +2195,36 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| glib::home_dir().join("DeskLink Bucket"));
             let item = |path: &str, size: u64, ago: i64, from: Side, state: ItemState| Item {
+                dir: false,
                 path: path.into(),
                 size,
                 mtime: 1_761_130_000_000 - ago * 60_000,
                 from,
                 state,
             };
+            let folder = |path: &str, ago: i64| Item {
+                dir: true,
+                ..item(path, 0, ago, Side::Desk, ItemState::Synced)
+            };
             let items = vec![
+                folder("Trips", 2),
+                folder("Trips/Rome", 3),
+                folder("Receipts", 500),
+                item(
+                    "Trips/Rome/Video.mov",
+                    600_000_000,
+                    2,
+                    Side::Phone,
+                    ItemState::Receiving,
+                ),
+                item(
+                    "Trips/Rome/Ticket.pdf",
+                    90_000,
+                    3,
+                    Side::Phone,
+                    ItemState::Synced,
+                ),
+                item("Trips/Map.jpg", 2_400_000, 3, Side::Desk, ItemState::Synced),
                 item(
                     "Boarding pass.pdf",
                     182_000,
@@ -2241,6 +2264,7 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 ),
             ];
             let bytes = items.iter().map(|item| item.size).sum();
+            let items: Vec<Item> = if id == "empty" { Vec::new() } else { items };
             folders::debug_show(
                 vec![PairView {
                     pair: Pair {
@@ -2260,7 +2284,7 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                         copy: "notes (conflict from Pixel 9 2026-10-22).md".into(),
                         at: 0,
                     }],
-                    items: if id == "empty" { Vec::new() } else { items },
+                    items,
                     bytes,
                     skipped: if id == "empty" {
                         Vec::new()
@@ -2281,6 +2305,7 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             };
             let rows = [
                 ("fake-in", "Boarding pass.pdf", true, 1_200_000_000u64),
+                ("fake-in2", "Trips/Rome/Video.mov", true, 600_000_000),
                 ("fake-out", "Quarterly report.pdf", false, 900_000_000),
             ];
             for (id, name, incoming, total) in rows {
@@ -2308,6 +2333,10 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 glib::ControlFlow::Continue
             });
         }
+        // "bucket-open Trips/Rome": the Bucket page inside that folder ("top"
+        // for the top); "bucket-select a|b": those items, selecting.
+        "bucket-open" => bucket::debug_open(win, if id == "top" { "" } else { id }),
+        "bucket-select" => bucket::debug_select(id.split('|').map(str::to_string).collect()),
         "bucket-on" => {
             if let Some(device) = win.selected_id() {
                 crate::device_links::folders::turn_on_bucket(&device);
@@ -2315,13 +2344,12 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         }
         "bucket-add" => {
             if let Some(device) = win.selected_id() {
-                let (files, folder) =
-                    crate::device_links::folders::split_files(vec![std::path::PathBuf::from(id)]);
-                debug_log!("[E2E] bucket-add: {} file(s), folder {folder}", files.len());
-                if folder {
-                    win.show_feature_toast(crate::device_links::folders::FOLDERS_NOT_YET);
-                }
-                crate::device_links::folders::import(&device, files);
+                debug_log!("[E2E] bucket-add");
+                crate::device_links::folders::import(
+                    &device,
+                    vec![std::path::PathBuf::from(id)],
+                    arg,
+                );
             }
         }
         "rule-template" => {

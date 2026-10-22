@@ -62,6 +62,19 @@ pub struct TransferBoard {
     synced: Vec<TransferRow>,
     /// Bucket transfers that ended without their file: the sync is not done.
     synced_failed: VecDeque<String>,
+    /// Every Bucket transfer that ended, for the folder worker's slots.
+    synced_ended: VecDeque<SyncedEnd>,
+}
+
+/// A Bucket transfer that ended (F8c: frees an in-flight slot).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncedEnd {
+    pub device: String,
+    /// The path in the Bucket.
+    pub name: String,
+    pub incoming: bool,
+    /// It arrived (or was delivered).
+    pub ok: bool,
 }
 
 impl TransferBoard {
@@ -122,7 +135,16 @@ impl TransferBoard {
     /// report it once.
     pub fn finish(&mut self, id: &str, outcome: Outcome) {
         if let Some(position) = self.synced.iter().position(|row| row.id == id) {
-            self.synced.remove(position);
+            let row = self.synced.remove(position);
+            if self.synced_ended.len() >= MAX_FINISHED {
+                self.synced_ended.pop_front();
+            }
+            self.synced_ended.push_back(SyncedEnd {
+                device: row.device_id,
+                name: row.name,
+                incoming: row.incoming,
+                ok: matches!(outcome, Outcome::Sent | Outcome::Received(_)),
+            });
             if matches!(outcome, Outcome::Failed(_) | Outcome::Cancelled) {
                 if self.synced_failed.len() >= MAX_FINISHED {
                     self.synced_failed.pop_front();
@@ -241,6 +263,11 @@ pub fn begin_synced(row: TransferRow) {
 /// Bucket transfers moving now.
 pub fn synced_rows() -> Vec<TransferRow> {
     board().synced.clone()
+}
+
+/// Bucket transfers that ended since last asked.
+pub fn take_synced_ended() -> Vec<SyncedEnd> {
+    board().synced_ended.drain(..).collect()
 }
 
 /// Bucket transfers that ended without their file since last asked.

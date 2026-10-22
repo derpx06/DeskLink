@@ -624,6 +624,16 @@ button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.0
 .bucket-badge.waiting { color: @text_dim; }
 .bucket-badge.conflict { background-color: @coral; color: @window_bg_color; }
 .bucket-words { padding-right: 38px; }
+.bucket-folder-icon { -gtk-icon-size: 56px; }
+.bucket-crumb { padding: 0 6px; font-weight: 700; font-size: 1.25em; }
+.file-card.selected {
+  outline: 2px solid @accent_color;
+  outline-offset: -2px;
+  background-color: alpha(@accent_color, 0.10);
+}
+.bucket-check { color: @text_dim; }
+.bucket-check.on { background-color: @accent_color; color: @accent_fg_color; }
+.selection-bar { padding: 8px 12px; }
 .bucket-menu { min-width: 28px; min-height: 28px; }
 .bucket-recent {
   padding: 10px 12px;

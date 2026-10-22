@@ -382,6 +382,37 @@ impl Tracker {
         })
     }
 
+    /// Everything moving under folder `prefix` of `device`'s Bucket, added
+    /// up: a folder tile's progress.
+    pub(crate) fn folder(&self, device: &str, prefix: &str, now: Instant) -> Option<Tile> {
+        let below = format!("{prefix}/");
+        let rows: Vec<&TransferRow> = self
+            .rows
+            .iter()
+            .filter(|row| row.device_id == device && row.name.starts_with(&below))
+            .collect();
+        if rows.is_empty() {
+            return None;
+        }
+        let done: u64 = rows.iter().map(|row| row.done).sum();
+        let total: u64 = rows.iter().map(|row| row.total).sum();
+        let rates: Vec<&Rate> = rows
+            .iter()
+            .filter(|row| !row.paused)
+            .filter_map(|row| self.rates.get(&row.id))
+            .collect();
+        let speed: f64 = rates.iter().filter_map(|rate| rate.speed()).sum();
+        let steady = rates.iter().any(|rate| rate.steady(now));
+        Some(Tile {
+            done,
+            total,
+            paused: rows.iter().all(|row| row.paused),
+            eta: steady
+                .then(|| estimate(total.saturating_sub(done), speed))
+                .flatten(),
+        })
+    }
+
     /// `device`'s sync now, while one is going.
     pub(crate) fn summary(&self, device: &str, now: Instant) -> Option<Summary> {
         let batch = self.batches.get(device)?;
@@ -432,6 +463,12 @@ fn with<T>(job: impl FnOnce(&mut Tracker) -> T) -> T {
 pub(crate) fn tile(device: &str, path: &str, incoming: bool) -> Option<Tile> {
     let now = Instant::now();
     with(|tracker| tracker.tile(device, path, incoming, now))
+}
+
+/// The files moving under folder `prefix`, added up.
+pub(crate) fn folder(device: &str, prefix: &str) -> Option<Tile> {
+    let now = Instant::now();
+    with(|tracker| tracker.folder(device, prefix, now))
 }
 
 /// `device`'s Bucket sync, while one is going.
@@ -495,6 +532,20 @@ fn tick(app: &crate::application::DesklinkApplication) -> bool {
         *listeners = kept;
         listeners.extend(added);
     });
+    // What an add left out (too deep, too big, full…): said in the window
+    // when it is in front, else as a notification.
+    while let Some(message) = crate::device_links::folders::take_report() {
+        let window = app.windows().into_iter().find(|window| window.is_active());
+        match window.and_downcast::<crate::DesklinkWindow>() {
+            Some(window) => window.show_feature_toast(&message),
+            None => {
+                let notification = gio::Notification::new("Bucket");
+                notification.set_body(Some(&message));
+                notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+                app.send_notification(Some("bucket-report"), &notification);
+            }
+        }
+    }
     for sync in ended.iter().filter(|sync| announced(sync)) {
         // Not while the user is looking at DeskLink.
         if app.windows().iter().any(|window| window.is_active()) {
@@ -747,6 +798,46 @@ mod tests {
         assert!(tracker.summary("phone", at(13)).is_none());
         assert!(announced(&ended[0]));
         assert_eq!(ended_words(&ended[0], "Pixel 9"), "3 files from Pixel 9");
+    }
+
+    #[test]
+    fn a_folder_adds_up_what_moves_inside_it() {
+        let start = Instant::now();
+        let mut tracker = Tracker::default();
+        let named = |id: &str, name: &str, done, total| TransferRow {
+            name: name.into(),
+            ..row(id, done, total)
+        };
+        for second in 0..=4u64 {
+            tracker.sample(
+                vec![
+                    named("a", "Trips/a.mov", second * 4 * MB, 100 * MB),
+                    named("b", "Trips/Rome/b.mov", second * 2 * MB, 50 * MB),
+                    named("c", "Other/c.mov", 1, 10),
+                ],
+                &[],
+                start + Duration::from_secs(second),
+            );
+        }
+        let now = start + Duration::from_secs(4);
+        let trips = tracker.folder("phone", "Trips", now).unwrap();
+        assert_eq!(
+            (trips.done, trips.total),
+            (24 * MB, 150 * MB),
+            "both, not Other"
+        );
+        assert_eq!(trips.eta, Some(21), "126 MB at 6 MB/s");
+        assert_eq!(
+            tracker.folder("phone", "Trips/Rome", now).unwrap().total,
+            50 * MB
+        );
+        assert_eq!(
+            tracker.folder("phone", "Trip", now),
+            None,
+            "not a prefix match"
+        );
+        assert_eq!(tracker.folder("other-phone", "Trips", now), None);
+        assert!(trips.line().starts_with("24 MB of 150 MB"));
     }
 
     #[test]

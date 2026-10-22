@@ -3,6 +3,7 @@
 //! phone too. A thumbnail grid, newest first, each with its state and menu.
 //! Files only for now: folders are refused, out loud.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -24,6 +25,205 @@ thread_local! {
     static LISTENING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Where the page is and what is selected (F8c). Selection changes touch
+/// the widgets in place: the page is not rebuilt, so scrolling stays.
+#[derive(Default)]
+struct Browse {
+    device: String,
+    /// The folder shown: "" the top, `A`, `A/B`.
+    current: String,
+    selecting: bool,
+    selected: BTreeSet<String>,
+    /// For Shift-click ranges.
+    anchor: Option<String>,
+    /// The visible items, in order.
+    order: Vec<String>,
+    tiles: Vec<TileRef>,
+    bar: Option<glib::WeakRef<gtk::Box>>,
+    count: Option<glib::WeakRef<gtk::Label>>,
+    toggle: Option<glib::WeakRef<gtk::ToggleButton>>,
+}
+
+struct TileRef {
+    path: String,
+    button: glib::WeakRef<gtk::Button>,
+    check: glib::WeakRef<gtk::Box>,
+}
+
+thread_local! {
+    static BROWSE: std::cell::RefCell<Browse> = std::cell::RefCell::default();
+}
+
+fn current() -> String {
+    BROWSE.with(|browse| browse.borrow().current.clone())
+}
+
+/// Folder levels of the folder shown (0 at the top).
+fn current_depth() -> usize {
+    let current = current();
+    if current.is_empty() {
+        0
+    } else {
+        current.split('/').count()
+    }
+}
+
+fn selecting() -> bool {
+    BROWSE.with(|browse| browse.borrow().selecting)
+}
+
+fn selected_paths() -> Vec<String> {
+    BROWSE.with(|browse| browse.borrow().selected.iter().cloned().collect())
+}
+
+/// Shows the folder `path` ("" the top); selection ends.
+fn go_to(win: &DesklinkWindow, path: &str) {
+    BROWSE.with(|browse| {
+        let mut browse = browse.borrow_mut();
+        browse.current = path.to_string();
+        browse.selecting = false;
+        browse.selected.clear();
+        browse.anchor = None;
+    });
+    win.refresh_soon();
+}
+
+fn set_selecting(on: bool) {
+    BROWSE.with(|browse| {
+        let mut browse = browse.borrow_mut();
+        browse.selecting = on;
+        if !on {
+            browse.selected.clear();
+            browse.anchor = None;
+        }
+    });
+    refresh_selection();
+}
+
+/// Ctrl-click: one more in or out of the selection.
+fn toggle_item(path: &str) {
+    BROWSE.with(|browse| {
+        let mut browse = browse.borrow_mut();
+        browse.selecting = true;
+        if !browse.selected.remove(path) {
+            browse.selected.insert(path.to_string());
+        }
+        browse.anchor = Some(path.to_string());
+    });
+    refresh_selection();
+}
+
+/// Shift-click: from the last one clicked to this one.
+fn range_to(path: &str) {
+    BROWSE.with(|browse| {
+        let mut browse = browse.borrow_mut();
+        browse.selecting = true;
+        let at = |name: &str, order: &[String]| order.iter().position(|item| item == name);
+        let from = browse
+            .anchor
+            .as_deref()
+            .and_then(|anchor| at(anchor, &browse.order))
+            .or_else(|| at(path, &browse.order));
+        if let (Some(from), Some(to)) = (from, at(path, &browse.order)) {
+            let (low, high) = (from.min(to), from.max(to));
+            let range: Vec<String> = browse.order[low..=high].to_vec();
+            browse.selected.extend(range);
+        }
+    });
+    refresh_selection();
+}
+
+fn select_all() {
+    BROWSE.with(|browse| {
+        let mut browse = browse.borrow_mut();
+        browse.selecting = true;
+        let all = browse.order.clone();
+        browse.selected = all.into_iter().collect();
+    });
+    refresh_selection();
+}
+
+/// Makes the widgets say what the selection is (outside the borrow:
+/// setting the toggle runs its handler).
+fn refresh_selection() {
+    type Shown = (
+        bool,
+        Vec<(bool, glib::WeakRef<gtk::Button>, glib::WeakRef<gtk::Box>)>,
+        Option<glib::WeakRef<gtk::Box>>,
+        Option<glib::WeakRef<gtk::Label>>,
+        Option<glib::WeakRef<gtk::ToggleButton>>,
+        usize,
+    );
+    let (on, tiles, bar, count, toggle, selected): Shown = BROWSE.with(|browse| {
+        let mut browse = browse.borrow_mut();
+        browse.tiles.retain(|tile| tile.button.upgrade().is_some());
+        (
+            browse.selecting,
+            browse
+                .tiles
+                .iter()
+                .map(|tile| {
+                    (
+                        browse.selected.contains(&tile.path),
+                        tile.button.clone(),
+                        tile.check.clone(),
+                    )
+                })
+                .collect(),
+            browse.bar.clone(),
+            browse.count.clone(),
+            browse.toggle.clone(),
+            browse.selected.len(),
+        )
+    });
+    for (chosen, button, check) in tiles {
+        if let (Some(button), Some(check)) = (button.upgrade(), check.upgrade()) {
+            if chosen {
+                button.add_css_class("selected");
+                check.add_css_class("on");
+            } else {
+                button.remove_css_class("selected");
+                check.remove_css_class("on");
+            }
+            check.set_visible(on);
+            button.update_state(&[gtk::accessible::State::Selected(if on {
+                Some(chosen)
+            } else {
+                None
+            })]);
+        }
+    }
+    if let Some(bar) = bar.and_then(|bar| bar.upgrade()) {
+        bar.set_visible(on);
+    }
+    if let Some(label) = count.and_then(|label| label.upgrade()) {
+        label.set_label(&match selected {
+            0 => "Select items".to_string(),
+            1 => "1 selected".to_string(),
+            count => format!("{count} selected"),
+        });
+    }
+    if let Some(toggle) = toggle.and_then(|toggle| toggle.upgrade()) {
+        if toggle.is_active() != on {
+            toggle.set_active(on);
+        }
+    }
+}
+
+/// Debug builds: shots without clicking.
+pub(super) fn debug_open(win: &DesklinkWindow, path: &str) {
+    go_to(win, path);
+}
+
+pub(super) fn debug_select(paths: Vec<String>) {
+    BROWSE.with(|browse| {
+        let mut browse = browse.borrow_mut();
+        browse.selecting = true;
+        browse.selected = paths.into_iter().collect();
+    });
+    refresh_selection();
+}
+
 /// A progress widget kept current.
 enum Live {
     /// One file moving: "340 MB of 1.2 GB · 2 min left" and its bar.
@@ -31,6 +231,15 @@ enum Live {
         device: String,
         path: String,
         incoming: bool,
+        line: glib::WeakRef<gtk::Label>,
+        bar: glib::WeakRef<gtk::ProgressBar>,
+    },
+    /// A folder tile: everything moving inside it, added up; `idle` when
+    /// nothing is.
+    Folder {
+        device: String,
+        prefix: String,
+        idle: String,
         line: glib::WeakRef<gtk::Label>,
         bar: glib::WeakRef<gtk::ProgressBar>,
     },
@@ -91,6 +300,29 @@ fn update_live(live: &Live) -> bool {
                 .map_or_else(|| "Waiting…".to_string(), |tile| tile.line());
             set_text(&line, &text);
             set_bar(&bar, tile.map_or(0.0, |tile| tile.fraction()), &text);
+        }
+        Live::Folder {
+            device,
+            prefix,
+            idle,
+            line,
+            bar,
+        } => {
+            let (Some(line), Some(bar)) = (line.upgrade(), bar.upgrade()) else {
+                return false;
+            };
+            match crate::bucket_progress::folder(device, prefix) {
+                Some(tile) => {
+                    let text = tile.line();
+                    set_text(&line, &text);
+                    set_bar(&bar, tile.fraction(), &text);
+                    bar.set_visible(true);
+                }
+                None => {
+                    set_text(&line, idle);
+                    bar.set_visible(false);
+                }
+            }
         }
         Live::Summary {
             device,
@@ -155,8 +387,18 @@ pub(super) fn bucket_of(device: &str) -> Option<PairView> {
 
 pub(super) fn update(win: &DesklinkWindow, device: &DeviceView) {
     install_paste(win);
+    BROWSE.with(|browse| {
+        let mut browse = browse.borrow_mut();
+        if browse.device != device.id {
+            *browse = Browse {
+                device: device.id.clone(),
+                ..Browse::default()
+            };
+        }
+    });
     let key = format!(
-        "{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        current(),
         folders::generation(),
         device.id,
         device.name,
@@ -338,16 +580,48 @@ fn synced_words(at: Option<i64>) -> Option<String> {
 }
 
 fn fill(win: &DesklinkWindow, page: &gtk::Box, view: &PairView, device: &DeviceView) {
-    page.append(&header(view, device));
+    // A folder that is gone (removed on the phone): back to the top.
+    let here = current();
+    if !here.is_empty() && !view.items.iter().any(|item| item.dir && item.path == here) {
+        BROWSE.with(|browse| browse.borrow_mut().current.clear());
+    }
+    let here = current();
+    // This folder's items, folders first.
+    let mut level: Vec<Item> = view
+        .items
+        .iter()
+        .filter(|item| folders::parent_of(&item.path) == here)
+        .cloned()
+        .collect();
+    level.sort_by_key(|item| !item.dir);
+    BROWSE.with(|browse| {
+        let mut browse = browse.borrow_mut();
+        browse.order = level.iter().map(|item| item.path.clone()).collect();
+        browse.tiles.clear();
+        browse
+            .selected
+            .retain(|path| level.iter().any(|item| item.path == *path));
+    });
+    page.append(&header(win, view, device));
+    page.append(&selection_bar(win, view, device));
     if let Some(banner) = problem_banner(view) {
         page.append(&banner);
     }
-    if view.items.is_empty() {
+    if level.is_empty() && here.is_empty() {
         page.append(&empty_zone(device));
-    } else {
-        page.append(&grid(win, &view.items, view, device));
+    } else if level.is_empty() {
         let hint = text(
-            "Drop files anywhere here, or press Ctrl+V to paste.",
+            "This folder is empty. Drop files here to add them.",
+            &["bucket-title"],
+        );
+        hint.set_margin_top(40);
+        hint.set_margin_bottom(40);
+        hint.set_halign(gtk::Align::Center);
+        page.append(&hint);
+    } else {
+        page.append(&grid(win, &level, view, device));
+        let hint = text(
+            "Drop files or folders anywhere here, or press Ctrl+V to paste.",
             &["caption", "text-faint"],
         );
         hint.set_halign(gtk::Align::Center);
@@ -357,6 +631,236 @@ fn fill(win: &DesklinkWindow, page: &gtk::Box, view: &PairView, device: &DeviceV
         page.append(&not_synced(&view.skipped));
     }
     accept_drops(page, &device.id);
+    rubber_band(page);
+    refresh_selection();
+}
+
+/// Dragging over empty space selects what the rectangle touches.
+fn rubber_band(page: &gtk::Box) {
+    let drag = gtk::GestureDrag::new();
+    let active = Rc::new(std::cell::Cell::new(false));
+    {
+        let (active, page) = (Rc::clone(&active), page.clone());
+        drag.connect_drag_begin(move |_, x, y| {
+            // Only from empty space: a tile or a button has its own click.
+            let mut hit = page.pick(x, y, gtk::PickFlags::DEFAULT);
+            let mut on_item = false;
+            while let Some(widget) = hit {
+                if widget.is::<gtk::Button>()
+                    || widget.is::<gtk::MenuButton>()
+                    || widget.is::<gtk::ToggleButton>()
+                    || widget.is::<gtk::Entry>()
+                {
+                    on_item = true;
+                    break;
+                }
+                hit = widget.parent();
+            }
+            active.set(!on_item);
+        });
+    }
+    {
+        let (active, page) = (Rc::clone(&active), page.clone());
+        drag.connect_drag_update(move |gesture, dx, dy| {
+            if !active.get() || (dx.abs() < 6.0 && dy.abs() < 6.0) {
+                return;
+            }
+            let Some((x, y)) = gesture.start_point() else {
+                return;
+            };
+            let band = gtk::graphene::Rect::new(
+                x.min(x + dx) as f32,
+                y.min(y + dy) as f32,
+                dx.abs() as f32,
+                dy.abs() as f32,
+            );
+            let ctrl = gesture
+                .current_event_state()
+                .contains(gdk::ModifierType::CONTROL_MASK);
+            let hits: Vec<String> = BROWSE.with(|browse| {
+                browse
+                    .borrow()
+                    .tiles
+                    .iter()
+                    .filter(|tile| {
+                        tile.button
+                            .upgrade()
+                            .and_then(|button| button.compute_bounds(&page))
+                            .is_some_and(|bounds| bounds.intersection(&band).is_some())
+                    })
+                    .map(|tile| tile.path.clone())
+                    .collect()
+            });
+            BROWSE.with(|browse| {
+                let mut browse = browse.borrow_mut();
+                browse.selecting = true;
+                if !ctrl {
+                    browse.selected.clear();
+                }
+                browse.selected.extend(hits);
+            });
+            refresh_selection();
+        });
+    }
+    page.add_controller(drag);
+}
+
+/// The bar shown while selecting: the count and the bulk actions.
+fn selection_bar(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> gtk::Box {
+    let bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .css_classes(["state-banner", "selection-bar"])
+        .visible(false)
+        .build();
+    bar.update_property(&[gtk::accessible::Property::Label("Selection actions")]);
+    let top = gtk::Box::builder().spacing(8).build();
+    let count = text("Select items", &["heading"]);
+    count.set_hexpand(true);
+    count.set_xalign(0.0);
+    top.append(&count);
+    let done = menu_item("Done");
+    done.connect_clicked(|_| set_selecting(false));
+    top.append(&done);
+    bar.append(&top);
+    // The actions wrap on a narrow window.
+    let actions = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .max_children_per_line(4)
+        .column_spacing(4)
+        .row_spacing(0)
+        .homogeneous(false)
+        .build();
+    let add = |button: &gtk::Button| {
+        actions.append(button);
+    };
+    let all = menu_item("Select All");
+    all.connect_clicked(|_| select_all());
+    add(&all);
+    let move_to = menu_item("Move to Folder…");
+    {
+        let (id, view) = (device.id.clone(), view.clone());
+        move_to.connect_clicked(move |button| {
+            let paths = selected_paths();
+            if !paths.is_empty() {
+                move_dialog(button, &id, paths, &view);
+            }
+        });
+    }
+    add(&move_to);
+    let copy = menu_item("Copy");
+    {
+        let root = view.pair.root.clone();
+        copy.connect_clicked(move |button| {
+            let files: Vec<gio::File> = selected_paths()
+                .iter()
+                .map(|path| gio::File::for_path(root.join(path)))
+                .collect();
+            if files.is_empty() {
+                return;
+            }
+            let list = gdk::FileList::from_array(&files);
+            button
+                .clipboard()
+                .set_content(Some(&gdk::ContentProvider::for_value(&list.to_value())))
+                .ok();
+            toast_from(button, "Copied");
+        });
+    }
+    add(&copy);
+    let remove = menu_item("Remove from Both…");
+    remove.add_css_class("error");
+    {
+        let (id, phone) = (device.id.clone(), device.name.clone());
+        remove.connect_clicked(move |button| {
+            let paths = selected_paths();
+            let count = paths.len();
+            if count == 0 {
+                return;
+            }
+            let id = id.clone();
+            super::confirm(
+                button,
+                &match count {
+                    1 => "Remove 1 item?".to_string(),
+                    count => format!("Remove {count} items?"),
+                },
+                &format!("They go to the trash here and on {phone}."),
+                "Remove",
+                move || {
+                    folders::remove_items(&id, paths.clone());
+                    set_selecting(false);
+                },
+            );
+        });
+    }
+    add(&remove);
+    bar.append(&actions);
+    let _ = win;
+    BROWSE.with(|browse| {
+        let mut browse = browse.borrow_mut();
+        browse.bar = Some(bar.downgrade());
+        browse.count = Some(count.downgrade());
+    });
+    bar
+}
+
+/// "Move to Folder…": pick the Bucket or one of its folders.
+fn move_dialog(anchor: &gtk::Button, device: &str, paths: Vec<String>, view: &PairView) {
+    let mut places = vec![String::new()];
+    places.extend(
+        view.items
+            .iter()
+            .filter(|item| item.dir)
+            .map(|item| item.path.clone()),
+    );
+    places.sort();
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .css_classes(["boxed-list"])
+        .build();
+    list.update_property(&[gtk::accessible::Property::Label("Folders")]);
+    for place in &places {
+        let name = if place.is_empty() {
+            "Bucket".to_string()
+        } else {
+            place.replace('/', " › ")
+        };
+        list.append(
+            &gtk::Label::builder()
+                .label(&name)
+                .xalign(0.0)
+                .margin_top(8)
+                .margin_bottom(8)
+                .margin_start(10)
+                .build(),
+        );
+    }
+    if let Some(first) = list.row_at_index(0) {
+        list.select_row(Some(&first));
+    }
+    let scroll = gtk::ScrolledWindow::builder()
+        .child(&list)
+        .min_content_height(120)
+        .max_content_height(280)
+        .propagate_natural_height(true)
+        .build();
+    let dialog = adw::AlertDialog::new(Some("Move to Folder"), None);
+    dialog.set_extra_child(Some(&scroll));
+    dialog.add_responses(&[("cancel", "_Cancel"), ("move", "_Move")]);
+    dialog.set_response_appearance("move", adw::ResponseAppearance::Suggested);
+    dialog.set_close_response("cancel");
+    let device = device.to_string();
+    dialog.choose(anchor, gio::Cancellable::NONE, move |response| {
+        if response != "move" {
+            return;
+        }
+        let index = list.selected_row().map_or(0, |row| row.index()) as usize;
+        if let Some(dest) = places.get(index) {
+            folders::move_items(&device, paths.clone(), dest);
+            set_selecting(false);
+        }
+    });
 }
 
 /// "Not synced: folders" — folders put in the Bucket folder from outside.
@@ -375,7 +879,7 @@ fn not_synced(folders: &[String]) -> gtk::Box {
     );
     let names = folders.join(", ");
     let label = text(
-        &format!("Not synced: folders ({names}). The Bucket holds files only for now."),
+        &format!("Not synced ({}): {names}", folders.len()),
         &["caption", "text-faint"],
     );
     label.set_wrap(true);
@@ -384,7 +888,7 @@ fn not_synced(folders: &[String]) -> gtk::Box {
 }
 
 /// The status line, storage, and the Add and folder buttons.
-fn header(view: &PairView, device: &DeviceView) -> gtk::Box {
+fn header(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> gtk::Box {
     let head = gtk::Box::builder().spacing(12).build();
     head.set_widget_name("responsive");
     let words = gtk::Box::builder()
@@ -393,7 +897,7 @@ fn header(view: &PairView, device: &DeviceView) -> gtk::Box {
         .hexpand(true)
         .valign(gtk::Align::Center)
         .build();
-    words.append(&text("Bucket", &["bucket-heading"]));
+    words.append(&breadcrumb(win));
     let state = gtk::Box::builder().spacing(8).build();
     let connected = device.feature_transport_ready;
     state.append(
@@ -452,19 +956,83 @@ fn header(view: &PairView, device: &DeviceView) -> gtk::Box {
         .halign(gtk::Align::End)
         .build();
     actions.append(&add_button(&device.id));
-    let open = gtk::Button::builder()
-        .icon_name("folder-open-symbolic")
-        .tooltip_text("Open in Files")
+    // F8c: a new folder (not inside a level-2 folder) and selection.
+    if current_depth() < folders::MAX_BUCKET_DEPTH {
+        let new = gtk::Button::builder()
+            .icon_name("folder-new-symbolic")
+            .tooltip_text("New Folder")
+            .valign(gtk::Align::Center)
+            .css_classes(["circular"])
+            .build();
+        new.update_property(&[gtk::accessible::Property::Label("New Folder")]);
+        let id = device.id.clone();
+        new.connect_clicked(move |_| {
+            folders::new_folder(&id, &current());
+        });
+        actions.append(&new);
+    }
+    let select = gtk::ToggleButton::builder()
+        .icon_name("selection-mode-symbolic")
+        .tooltip_text("Select")
         .valign(gtk::Align::Center)
         .css_classes(["circular"])
+        .active(selecting())
         .build();
-    open.update_property(&[gtk::accessible::Property::Label("Open the Bucket in Files")]);
-    let root = view.pair.root.clone();
-    open.connect_clicked(move |button| launch(button, &root));
-    actions.append(&open);
+    select.update_property(&[gtk::accessible::Property::Label("Select items")]);
+    select.connect_toggled(|button| set_selecting(button.is_active()));
+    BROWSE.with(|browse| browse.borrow_mut().toggle = Some(select.downgrade()));
+    actions.append(&select);
     actions.append(&more_menu(view, device));
     head.append(&actions);
     head
+}
+
+/// "Bucket › Trips › 2026": every part but the last goes back there.
+fn breadcrumb(win: &DesklinkWindow) -> gtk::Box {
+    let here = current();
+    let crumbs = gtk::Box::builder().spacing(4).build();
+    crumbs.update_property(&[gtk::accessible::Property::Label(
+        "Where you are in the Bucket",
+    )]);
+    if here.is_empty() {
+        crumbs.append(&text("Bucket", &["bucket-heading"]));
+        return crumbs;
+    }
+    let mut parts = vec![(String::new(), "Bucket".to_string())];
+    let mut path = String::new();
+    for segment in here.split('/') {
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(segment);
+        parts.push((path.clone(), segment.to_string()));
+    }
+    let last = parts.len() - 1;
+    for (index, (target, name)) in parts.into_iter().enumerate() {
+        if index > 0 {
+            crumbs.append(&text("›", &["bucket-heading", "text-faint"]));
+        }
+        if index == last {
+            let label = text(&name, &["bucket-heading"]);
+            label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+            label.set_max_width_chars(20);
+            crumbs.append(&label);
+        } else {
+            let button = gtk::Button::builder()
+                .label(&name)
+                .css_classes(["flat", "bucket-crumb"])
+                .build();
+            button.update_property(&[gtk::accessible::Property::Label(&format!("Back to {name}"))]);
+            let win = win.downgrade();
+            button.connect_clicked(move |_| {
+                if let Some(win) = win.upgrade() {
+                    go_to(&win, &target);
+                }
+            });
+            crumbs.append(&button);
+        }
+    }
+    crumbs
 }
 
 /// "Add Files…".
@@ -490,6 +1058,24 @@ fn more_menu(view: &PairView, device: &DeviceView) -> gtk::MenuButton {
         .margin_end(6)
         .build();
     let popover = gtk::Popover::builder().child(&menu).build();
+    let open_files = menu_item("Open in Files");
+    {
+        let (root, pop) = (view.pair.root.clone(), popover.clone());
+        open_files.connect_clicked(move |button| {
+            pop.popdown();
+            launch(button, &root);
+        });
+    }
+    menu.append(&open_files);
+    let add_folder = menu_item("Add Folder…");
+    {
+        let (id, pop) = (device.id.clone(), popover.clone());
+        add_folder.connect_clicked(move |button| {
+            pop.popdown();
+            choose_folder(button, &id);
+        });
+    }
+    menu.append(&add_folder);
     let off = menu_item("Turn Off the Bucket…");
     off.add_css_class("error");
     let (id, name, root) = (
@@ -671,7 +1257,7 @@ fn grid(
     let files: Rc<Vec<LoggedFile>> = Rc::new(
         items
             .iter()
-            .filter(|item| item.state != ItemState::Receiving)
+            .filter(|item| item.state != ItemState::Receiving && !item.dir)
             .map(|item| LoggedFile {
                 ts: (item.mtime / 1000).max(0) as u64,
                 device_id: device.id.clone(),
@@ -699,7 +1285,13 @@ fn from_words(item: &Item, device: &DeviceView) -> String {
     }
 }
 
-/// One item: its picture, name, size and origin, its state, its menu.
+/// The last part of a path.
+fn leaf(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// One item: its picture, name, size and origin, its state, its menu. A
+/// folder shows what it holds and opens on a click.
 fn tile(
     win: &DesklinkWindow,
     item: &Item,
@@ -709,6 +1301,20 @@ fn tile(
     view: &PairView,
 ) -> gtk::Overlay {
     let path = root.join(&item.path);
+    let item = &{
+        let mut shown = item.clone();
+        if shown.dir {
+            // The badge rolls up from the children.
+            let below = format!("{}/", item.path);
+            shown.state = folders::rollup(
+                view.items
+                    .iter()
+                    .filter(|other| other.path.starts_with(&below))
+                    .map(|other| other.state),
+            );
+        }
+        shown
+    };
     let card = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .build();
@@ -722,7 +1328,18 @@ fn tile(
         .overflow(gtk::Overflow::Hidden)
         .css_classes(["file-preview-clip"])
         .build();
-    if item.state == ItemState::Receiving {
+    if item.dir {
+        preview.add_overlay(
+            &gtk::Image::builder()
+                .icon_name("folder-symbolic")
+                .pixel_size(56)
+                .halign(gtk::Align::Center)
+                .valign(gtk::Align::Center)
+                .css_classes(["text-dim", "bucket-folder-icon"])
+                .accessible_role(gtk::AccessibleRole::Presentation)
+                .build(),
+        );
+    } else if item.state == ItemState::Receiving {
         preview.add_overlay(&super::transfers::type_icon(&item.path));
     } else {
         let kind = crate::thumbnails::kind_of(&path);
@@ -738,26 +1355,65 @@ fn tile(
     if let Some(badge) = badge(item, device) {
         preview.add_overlay(&badge);
     }
+    // The selection mark, top left, while selecting.
+    let check = gtk::Box::builder()
+        .halign(gtk::Align::Start)
+        .valign(gtk::Align::Start)
+        .margin_top(8)
+        .margin_start(8)
+        .css_classes(["bucket-badge", "bucket-check"])
+        .visible(false)
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
+    check.append(&gtk::Image::from_icon_name("object-select-symbolic"));
+    preview.add_overlay(&check);
     card.append(&preview);
     let words = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
         .css_classes(["file-card-words", "bucket-words"])
         .build();
-    let name = ellipsized(&item.path, &["file-name"]);
+    let name = ellipsized(leaf(&item.path), &["file-name"]);
     name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
     name.set_max_width_chars(14);
     words.append(&name);
-    let meta = format!(
-        "{} · {}",
-        glib::format_size(item.size),
-        from_words(item, device)
-    );
-    if matches!(item.state, ItemState::Sending | ItemState::Receiving) {
+    let meta = if item.dir {
+        let (count, bytes) = folders::totals(&view.items, &item.path);
+        format!(
+            "{} · {}",
+            match count {
+                1 => "1 item".to_string(),
+                count => format!("{count} items"),
+            },
+            glib::format_size(bytes)
+        )
+    } else {
+        format!(
+            "{} · {}",
+            glib::format_size(item.size),
+            from_words(item, device)
+        )
+    };
+    if item.dir {
+        // Everything moving inside it, added up.
+        let line = ellipsized(&meta, &["caption", "text-dim", "numeric"]);
+        words.append(&line);
+        let bar = thin_bar(&format!("Progress of {}", leaf(&item.path)));
+        bar.set_margin_top(4);
+        bar.set_visible(false);
+        words.append(&bar);
+        watch(Live::Folder {
+            device: device.id.clone(),
+            prefix: item.path.clone(),
+            idle: meta.clone(),
+            line: line.downgrade(),
+            bar: bar.downgrade(),
+        });
+    } else if matches!(item.state, ItemState::Sending | ItemState::Receiving) {
         // "340 MB of 1.2 GB · 2 min left" and a bar, kept current.
         let line = ellipsized("Waiting…", &["caption", "text-dim", "numeric"]);
         words.append(&line);
-        let bar = thin_bar(&format!("Progress of {}", item.path));
+        let bar = thin_bar(&format!("Progress of {}", leaf(&item.path)));
         bar.set_margin_top(4);
         words.append(&bar);
         watch(Live::Tile {
@@ -777,23 +1433,53 @@ fn tile(
         .tooltip_text(&item.path)
         .build();
     button.update_property(&[gtk::accessible::Property::Label(&format!(
-        "{}, {}, {}",
-        &item.path,
+        "{}, {}{}, {}",
+        leaf(&item.path),
+        if item.dir { "folder, " } else { "" },
         meta,
         state_words(item, device)
     ))]);
+    BROWSE.with(|browse| {
+        browse.borrow_mut().tiles.push(TileRef {
+            path: item.path.clone(),
+            button: button.downgrade(),
+            check: check.downgrade(),
+        });
+    });
     {
-        let (item, device_id, win) = (item.clone(), device.id.clone(), win.downgrade());
+        let (item, win) = (item.clone(), win.downgrade());
         let (files, device_name, path) = (Rc::clone(files), device.name.clone(), path.clone());
-        let _ = device_id;
         button.connect_clicked(move |_| {
-            if item.state != ItemState::Receiving {
-                if let Some(win) = win.upgrade() {
-                    let index = files.iter().position(|file| file.path == path).unwrap_or(0);
-                    super::viewer::show(&win, &files, index, &device_name);
-                }
+            let Some(win) = win.upgrade() else {
+                return;
+            };
+            if item.dir {
+                go_to(&win, &item.path);
+            } else if item.state != ItemState::Receiving {
+                let index = files.iter().position(|file| file.path == path).unwrap_or(0);
+                super::viewer::show(&win, &files, index, &device_name);
             }
         });
+    }
+    // Ctrl-click and Shift-click select; so does any click while selecting.
+    {
+        let click = gtk::GestureClick::builder()
+            .button(1)
+            .propagation_phase(gtk::PropagationPhase::Capture)
+            .build();
+        let rel = item.path.clone();
+        click.connect_pressed(move |gesture, _, _, _| {
+            let state = gesture.current_event_state();
+            if state.contains(gdk::ModifierType::SHIFT_MASK) {
+                range_to(&rel);
+            } else if state.contains(gdk::ModifierType::CONTROL_MASK) || selecting() {
+                toggle_item(&rel);
+            } else {
+                return;
+            }
+            gesture.set_state(gtk::EventSequenceState::Claimed);
+        });
+        button.add_controller(click);
     }
     let overlay = gtk::Overlay::builder().child(&button).build();
     if item.state != ItemState::Receiving {
@@ -938,17 +1624,31 @@ fn item_menu(item: &Item, path: &Path, device: &DeviceView, view: &PairView) -> 
             }
         }
     }
-    let (name, phone) = (item.path.clone(), device.name.clone());
+    let (name, phone, rel, id) = (
+        leaf(&item.path).to_string(),
+        device.name.clone(),
+        item.path.clone(),
+        device.id.clone(),
+    );
+    let folder = item.dir;
     let remove = add(
         "Remove from Both…",
         Box::new(move |button| {
-            let path = path.clone();
+            let (rel, id) = (rel.clone(), id.clone());
             super::confirm(
                 button,
                 &format!("Remove “{name}”?"),
-                &format!("It goes to the trash here and on {phone}."),
+                &if folder {
+                    format!(
+                        "The folder and everything in it goes to the trash here and on {phone}."
+                    )
+                } else {
+                    format!("It goes to the trash here and on {phone}.")
+                },
                 "Remove",
-                move || trash(&path),
+                move || {
+                    folders::remove_items(&id, vec![rel.clone()]);
+                },
             );
         }),
     );
@@ -968,19 +1668,6 @@ fn item_menu(item: &Item, path: &Path, device: &DeviceView, view: &PairView) -> 
         &item.path
     ))]);
     button
-}
-
-/// To the trash as one item (a folder whole); the scan syncs the removal.
-fn trash(path: &Path) {
-    gio::File::for_path(path).trash_async(
-        glib::Priority::DEFAULT,
-        gio::Cancellable::NONE,
-        |result| {
-            if result.is_err() {
-                eprintln!("[Bucket] Could not move an item to the trash");
-            }
-        },
-    );
 }
 
 /// Asks for a new name; renamed in place (the phone gets a move, no copy).
@@ -1052,20 +1739,10 @@ fn shown_path(path: &Path) -> String {
     }
 }
 
-/// Puts the files among `paths` in `device`'s Bucket and says so; a folder
-/// among them is refused out loud (files only for now).
-fn add_paths(anchor: &impl IsA<gtk::Widget>, device: &str, paths: Vec<PathBuf>) -> bool {
-    let (files, folder) = folders::split_files(paths);
-    let count = files.len();
-    let added = count > 0 && folders::import(device, files);
-    let message = match (added, folder) {
-        (_, true) => folders::FOLDERS_NOT_YET.to_string(),
-        (true, false) if count == 1 => "Added to the Bucket".to_string(),
-        (true, false) => format!("Added {count} files to the Bucket"),
-        (false, false) => return false,
-    };
-    toast_from(anchor, &message);
-    added
+/// Puts `paths` (files and folders) in the folder shown of `device`'s
+/// Bucket. What was left out is told when the copy is done.
+fn add_paths(device: &str, paths: Vec<PathBuf>) -> bool {
+    !paths.is_empty() && folders::import(device, paths, &current())
 }
 
 /// "Add Files…".
@@ -1074,7 +1751,6 @@ fn choose(widget: &impl IsA<gtk::Widget>, device: &str) {
         return;
     };
     let device = device.to_string();
-    let anchor = widget.as_ref().clone();
     let dialog = gtk::FileDialog::builder()
         .title("Add Files to the Bucket")
         .modal(true)
@@ -1086,7 +1762,29 @@ fn choose(widget: &impl IsA<gtk::Widget>, device: &str) {
                 .flatten()
                 .filter_map(|file| file.path())
                 .collect();
-            add_paths(&anchor, &device, paths);
+            add_paths(&device, paths);
+        }
+    });
+}
+
+/// "Add Folder…".
+fn choose_folder(widget: &impl IsA<gtk::Widget>, device: &str) {
+    let Some(root) = widget.root().and_downcast::<gtk::Window>() else {
+        return;
+    };
+    let device = device.to_string();
+    let dialog = gtk::FileDialog::builder()
+        .title("Add a Folder to the Bucket")
+        .modal(true)
+        .build();
+    dialog.select_multiple_folders(Some(&root), gio::Cancellable::NONE, move |result| {
+        if let Ok(files) = result {
+            let paths: Vec<PathBuf> = files
+                .iter::<gio::File>()
+                .flatten()
+                .filter_map(|file| file.path())
+                .collect();
+            add_paths(&device, paths);
         }
     });
 }
@@ -1109,7 +1807,7 @@ pub(super) fn accept_drops(target: &impl IsA<gtk::Widget>, device: &str) {
             return false;
         };
         let paths: Vec<PathBuf> = list.files().iter().filter_map(|file| file.path()).collect();
-        add_paths(&shown, &device, paths)
+        add_paths(&device, paths)
     });
     target.as_ref().add_controller(drop);
 }
@@ -1140,6 +1838,34 @@ fn install_paste(win: &DesklinkWindow) {
         gtk::ShortcutTrigger::parse_string("<Control>v"),
         Some(action),
     ));
+    // Ctrl+A selects everything shown; Escape leaves selecting.
+    let on_bucket = |widget: &gtk::Widget| {
+        widget
+            .downcast_ref::<DesklinkWindow>()
+            .is_some_and(|win| win.imp().page.borrow().as_str() == "bucket")
+    };
+    controller.add_shortcut(gtk::Shortcut::new(
+        gtk::ShortcutTrigger::parse_string("<Control>a"),
+        Some(gtk::CallbackAction::new(move |widget, _| {
+            if on_bucket(widget) {
+                select_all();
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        })),
+    ));
+    controller.add_shortcut(gtk::Shortcut::new(
+        gtk::ShortcutTrigger::parse_string("Escape"),
+        Some(gtk::CallbackAction::new(move |widget, _| {
+            if on_bucket(widget) && selecting() {
+                set_selecting(false);
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        })),
+    ));
     win.add_controller(controller);
 }
 
@@ -1148,6 +1874,7 @@ fn paste(win: &DesklinkWindow, device: &str) {
     let formats = clipboard.formats();
     let device = device.to_string();
     let anchor = win.clone();
+    let here = current();
     if formats.contains_type(gdk::FileList::static_type()) {
         clipboard.read_value_async(
             gdk::FileList::static_type(),
@@ -1159,7 +1886,7 @@ fn paste(win: &DesklinkWindow, device: &str) {
                     .and_then(|value| value.get::<gdk::FileList>().ok())
                     .map(|list| list.files().iter().filter_map(|file| file.path()).collect())
                     .unwrap_or_default();
-                add_paths(&anchor, &device, paths);
+                add_paths(&device, paths);
             },
         );
     } else if formats.contains_type(gdk::Texture::static_type()) {
@@ -1173,11 +1900,15 @@ fn paste(win: &DesklinkWindow, device: &str) {
                 .and_then(|now| now.format("%Y-%m-%d %H.%M.%S").ok())
                 .map(|stamp| stamp.to_string())
                 .unwrap_or_default();
-            let device = device.clone();
+            let (device, here) = (device.clone(), here.clone());
             std::thread::spawn(move || {
                 let png = texture.save_to_png_bytes();
-                let _ =
-                    folders::import_bytes(&device, &format!("Picture {stamp}.png"), png.to_vec());
+                let _ = folders::import_bytes(
+                    &device,
+                    &format!("Picture {stamp}.png"),
+                    png.to_vec(),
+                    &here,
+                );
             });
             anchor.show_feature_toast("Pasted into the Bucket");
         });
@@ -1191,7 +1922,7 @@ fn paste(win: &DesklinkWindow, device: &str) {
                 return;
             };
             let (name, bytes) = folders::pasted_text(&text, &now);
-            match folders::import_bytes(&device, &name, bytes) {
+            match folders::import_bytes(&device, &name, bytes, &here) {
                 Ok(()) => anchor.show_feature_toast("Pasted into the Bucket"),
                 Err(error) => anchor.show_feature_toast(&error),
             }

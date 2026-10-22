@@ -329,6 +329,12 @@ pub(crate) fn send_folder_file(
     transport.send_folder_file(path, folder)
 }
 
+/// Cancels a transfer (F8c: an item removed while it moves).
+pub(crate) fn cancel_transfer(device_id: &str, transfer_id: &str) -> Result<(), String> {
+    let daemon = DAEMON.get().ok_or("DeskLink is starting")?;
+    FeatureTransport::for_device(&daemon.sessions, device_id)?.cancel_transfer(transfer_id)
+}
+
 /// Changes this computer's settings from inside the daemon (an automation),
 /// saved and told to every phone.
 pub(crate) fn change_settings(change: impl FnOnce(&mut AppSettings)) -> Result<(), String> {

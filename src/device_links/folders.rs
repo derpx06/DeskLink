@@ -28,15 +28,29 @@ use serde_json::{json, Value};
 
 use super::limits::{log_limited, Buckets};
 use super::packet::{NetworkPacket, PACKET_TYPE_FOLDERS};
-use super::webrtc::file_protocol::{validate_relpath, FolderRef, MAX_TRANSFER_BYTES};
+use super::webrtc::file_protocol::{validate_relpath, FolderRef};
 
 // Limits. Each bounds what a peer, or a huge folder, can make this hold or do.
 /// Pairs per phone.
 pub(crate) const MAX_PAIRS_PER_DEVICE: usize = 8;
 /// Manifest entries per pair (live and tombstones).
 const MAX_FILES: usize = 20_000;
-/// A file larger than this is skipped (the transfer bound).
-const MAX_FILE_BYTES: u64 = MAX_TRANSFER_BYTES;
+/// F8c: a file larger than this can't go in the Bucket (1 GiB; "1 GB" to
+/// the user).
+pub(crate) const MAX_FILE_BYTES: u64 = 1 << 30;
+/// F8c: folder levels in a Bucket: folders `A` and `A/B`, with files in any.
+pub(crate) const MAX_BUCKET_DEPTH: usize = 2;
+/// F8c: transfers in flight per direction; the rest read "Waiting…".
+pub(crate) const MAX_IN_FLIGHT: usize = 2;
+/// F8c: one add action (a drop, a paste, `--bucket`): at most this many
+/// items and bytes; the rest are left out and the user is told.
+pub(crate) const MAX_ADD_ITEMS: usize = 500;
+pub(crate) const MAX_ADD_BYTES: u64 = 5 << 30;
+/// F8c: a name (one path segment) is at most this many bytes.
+pub(crate) const MAX_NAME_BYTES: usize = 255;
+/// F8c: a file is sent once its size and mtime have held this long (a
+/// download still being written is not).
+pub(crate) const STABLE_FOR: Duration = Duration::from_secs(2);
 const MAX_NAME_CHARS: usize = 80;
 /// A `manifest` packet stays one data-channel message once enveloped.
 const MAX_PACKET_BYTES: usize = crate::device_links::webrtc::MAX_FEATURE_PACKET_BYTES;
@@ -70,8 +84,10 @@ const QUEUE: usize = 512;
 pub(crate) const BUCKET_ID: &str = "bucket";
 /// Items in one Bucket (the scan lists no more).
 pub(crate) const MAX_BUCKET_ITEMS: usize = 10_000;
-/// A Bucket larger than this shows a warning.
-pub(crate) const BUCKET_WARN_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+/// A Bucket larger than this shows a warning (8 GB)...
+pub(crate) const BUCKET_WARN_BYTES: u64 = 8 << 30;
+/// ...and takes no more additions past this (10 GB).
+pub(crate) const BUCKET_FULL_BYTES: u64 = 10 << 30;
 /// A pasted text or link item.
 pub(crate) const MAX_TEXT_ITEM_BYTES: usize = 1024 * 1024;
 /// Packets accepted per phone per minute (a full manifest is ≤ 256).
@@ -117,13 +133,79 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
+/// A name another system (Windows, SAF) can hold too: bounded, with no
+/// `\` or `:`, no control characters, no trailing dot or space.
+pub(crate) fn name_ok(segment: &str) -> bool {
+    !segment.is_empty()
+        && segment.len() <= MAX_NAME_BYTES
+        && !matches!(segment, "." | "..")
+        && !segment.ends_with(['.', ' '])
+        && !segment
+            .chars()
+            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+}
+
+/// A path the Bucket holds: valid names, at most [`MAX_BUCKET_DEPTH`] folder
+/// levels (a folder `A/B`, a file `A/B/c`).
+pub(crate) fn bucket_path_ok(path: &str, dir: bool) -> bool {
+    let segments = path.split('/').count();
+    validate_relpath(path).is_ok()
+        && segments <= MAX_BUCKET_DEPTH + usize::from(!dir)
+        && path.split('/').all(name_ok)
+}
+
+/// The folder `path` is in ("" for the top).
+pub(crate) fn parent_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+/// Items under folder `dir` (all levels, folders too) and their bytes: a
+/// folder tile's "N items · size".
+pub(crate) fn totals(items: &[Item], dir: &str) -> (usize, u64) {
+    let below = format!("{dir}/");
+    items
+        .iter()
+        .filter(|item| item.path.starts_with(&below))
+        .fold((0, 0), |(count, bytes), item| {
+            (count + 1, bytes + item.size)
+        })
+}
+
+/// A folder's badge, from what is in it: a conflict first, then movement,
+/// then waiting.
+pub(crate) fn rollup(states: impl IntoIterator<Item = ItemState>) -> ItemState {
+    let mut result = ItemState::Synced;
+    for state in states {
+        result = match (result, state) {
+            (ItemState::Conflict, _) | (_, ItemState::Conflict) => ItemState::Conflict,
+            (ItemState::Receiving, _) | (_, ItemState::Receiving) => ItemState::Receiving,
+            (ItemState::Sending, _) | (_, ItemState::Sending) => ItemState::Sending,
+            (ItemState::Waiting, _) | (_, ItemState::Waiting) => ItemState::Waiting,
+            _ => ItemState::Synced,
+        };
+    }
+    result
+}
+
+/// Folder levels a path has above it (`a` 0, `A/a` 1).
+fn levels(path: &str) -> usize {
+    path.matches('/').count()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Entry {
+    #[serde(default)]
     pub(crate) size: u64,
+    #[serde(default)]
     pub(crate) mtime: i64,
+    #[serde(default)]
     pub(crate) sha256: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) deleted: bool,
+    /// F8c: a folder (`dir: true` on the wire): no size or hash; only that
+    /// it exists.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(crate) dir: bool,
     pub(crate) vv: Vv,
 }
 
@@ -134,6 +216,8 @@ pub(crate) type Manifest = BTreeMap<String, Entry>;
 pub(crate) struct Stat {
     pub(crate) size: u64,
     pub(crate) mtime: i64,
+    /// A folder.
+    pub(crate) dir: bool,
 }
 
 /// One step of a plan, for the side that made it.
@@ -308,7 +392,7 @@ fn renames_by_hash(local: &Manifest, steps: Vec<Step>) -> Vec<Step> {
     let mut deletes: HashMap<String, (String, Entry)> = HashMap::new();
     for step in &steps {
         if let Step::Delete { path, entry } = step {
-            if let Some(ours) = local.get(path).filter(|ours| !ours.deleted) {
+            if let Some(ours) = local.get(path).filter(|ours| !ours.deleted && !ours.dir) {
                 deletes
                     .entry(ours.sha256.clone())
                     .or_insert((path.clone(), entry.clone()));
@@ -326,13 +410,14 @@ fn renames_by_hash(local: &Manifest, steps: Vec<Step>) -> Vec<Step> {
         .collect();
     let kept: HashMap<&str, &str> = local
         .iter()
-        .filter(|(path, entry)| !entry.deleted && !changing.contains(path.as_str()))
+        .filter(|(path, entry)| !entry.deleted && !entry.dir && !changing.contains(path.as_str()))
         .map(|(path, entry)| (entry.sha256.as_str(), path.as_str()))
         .collect();
     let mut moved: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
     for step in steps {
         match step {
+            Step::Download { path, entry } if entry.dir => out.push(Step::Download { path, entry }),
             Step::Download { path, entry } => {
                 if let Some((from, tombstone)) = deletes.remove(&entry.sha256) {
                     moved.insert(from.clone());
@@ -371,15 +456,42 @@ pub(crate) fn apply_scan(
 ) -> bool {
     let mut changed = false;
     for (path, stat) in found {
+        if stat.dir {
+            let fresh = |vv: Vv| Entry {
+                size: 0,
+                mtime: 0,
+                sha256: String::new(),
+                deleted: false,
+                dir: true,
+                vv,
+            };
+            match manifest.get_mut(path) {
+                Some(entry) if entry.dir && !entry.deleted => {}
+                Some(entry) => {
+                    *entry = fresh(entry.vv.bumped(side));
+                    changed = true;
+                }
+                None => {
+                    if manifest.len() < MAX_FILES {
+                        manifest.insert(path.clone(), fresh(Vv::default().bumped(side)));
+                        changed = true;
+                    }
+                }
+            }
+            continue;
+        }
         match manifest.get_mut(path) {
             Some(entry)
-                if !entry.deleted && entry.size == stat.size && entry.mtime == stat.mtime => {}
+                if !entry.deleted
+                    && !entry.dir
+                    && entry.size == stat.size
+                    && entry.mtime == stat.mtime => {}
             existing => {
                 let Some(sha256) = hash(path) else {
                     continue;
                 };
                 match existing {
-                    Some(entry) if !entry.deleted && entry.sha256 == sha256 => {
+                    Some(entry) if !entry.deleted && !entry.dir && entry.sha256 == sha256 => {
                         // Touched, not changed.
                         entry.size = stat.size;
                         entry.mtime = stat.mtime;
@@ -390,6 +502,7 @@ pub(crate) fn apply_scan(
                             mtime: stat.mtime,
                             sha256,
                             deleted: false,
+                            dir: false,
                             vv: entry.vv.bumped(side),
                         };
                     }
@@ -404,6 +517,7 @@ pub(crate) fn apply_scan(
                                 mtime: stat.mtime,
                                 sha256,
                                 deleted: false,
+                                dir: false,
                                 vv: Vv::default().bumped(side),
                             },
                         );
@@ -525,6 +639,8 @@ pub(crate) struct PairView {
 /// One Bucket item, as the window shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Item {
+    /// A folder (F8c): its size is 0; the page adds its children up.
+    pub(crate) dir: bool,
     /// Its name: Bucket items sit at the top level.
     pub(crate) path: String,
     pub(crate) size: u64,
@@ -669,12 +785,27 @@ enum Message {
     Import {
         device: String,
         sources: Vec<PathBuf>,
+        into: String,
+    },
+    NewFolder {
+        device: String,
+        parent: String,
+    },
+    MoveItems {
+        device: String,
+        paths: Vec<String>,
+        dest: String,
+    },
+    RemoveItems {
+        device: String,
+        paths: Vec<String>,
     },
     /// F8b: a pasted picture, text or link, saved as `name` in the Bucket.
     ImportBytes {
         device: String,
         name: String,
         bytes: Vec<u8>,
+        into: String,
     },
 }
 
@@ -723,41 +854,331 @@ pub(crate) fn turn_on_bucket(device_id: &str) {
     });
 }
 
-/// F8b: copies the files among `sources` into `device_id`'s Bucket
-/// (folders are not taken; see [`split_files`]).
-pub(crate) fn import(device_id: &str, sources: Vec<PathBuf>) -> bool {
+/// F8c: copies `sources` (files and folders, within the depth limit) into
+/// `into` ("" the top, `A`, `A/B`) of `device_id`'s Bucket. What was left out
+/// comes back through [`take_report`].
+pub(crate) fn import(device_id: &str, sources: Vec<PathBuf>, into: &str) -> bool {
     send_message(Message::Import {
         device: device_id.to_string(),
         sources,
+        into: into.to_string(),
     })
 }
 
-/// What can go in the Bucket: the regular files of `paths`, and whether any
-/// folder was among them (said to the user: files only for now). Links are
-/// not followed.
-pub(crate) fn split_files(paths: Vec<PathBuf>) -> (Vec<PathBuf>, bool) {
-    let mut folder = false;
-    let files = paths
-        .into_iter()
-        .filter(|path| match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.is_dir() => {
-                folder = true;
-                false
-            }
-            Ok(metadata) => metadata.is_file(),
-            Err(_) => false,
-        })
-        .collect();
-    (files, folder)
+/// F8c: a new folder in `parent` ("" the top).
+pub(crate) fn new_folder(device_id: &str, parent: &str) -> bool {
+    send_message(Message::NewFolder {
+        device: device_id.to_string(),
+        parent: parent.to_string(),
+    })
 }
 
-/// What the desk says when folders are dropped or pasted (F8b: files only).
-pub(crate) const FOLDERS_NOT_YET: &str =
-    "Folders aren't supported in the Bucket yet. Drop the files instead.";
+/// F8c: moves Bucket items (files and folders) into folder `dest` ("" the
+/// top). An item that would end up too deep stays where it is.
+pub(crate) fn move_items(device_id: &str, paths: Vec<String>, dest: &str) -> bool {
+    send_message(Message::MoveItems {
+        device: device_id.to_string(),
+        paths,
+        dest: dest.to_string(),
+    })
+}
+
+/// F8c: removes Bucket items from both sides (a folder to the trash as one
+/// item, its transfers cancelled first).
+pub(crate) fn remove_items(device_id: &str, paths: Vec<String>) -> bool {
+    send_message(Message::RemoveItems {
+        device: device_id.to_string(),
+        paths,
+    })
+}
+
+/// What an add, move or new folder left out, in plain words (the counts are
+/// what the user is told).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Report {
+    pub(crate) added: usize,
+    pub(crate) too_deep: usize,
+    pub(crate) too_big: usize,
+    pub(crate) bad_names: usize,
+    pub(crate) over_items: usize,
+    pub(crate) over_bytes: usize,
+    /// The Bucket would pass 10 GB.
+    pub(crate) full: bool,
+    pub(crate) not_moved: usize,
+    pub(crate) refused: Option<String>,
+}
+
+impl Report {
+    /// The one message for the user, if there is anything to say.
+    pub(crate) fn message(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(refused) = &self.refused {
+            parts.push(refused.clone());
+        }
+        let counted = |what: &str, count: usize| match count {
+            1 => what.to_string(),
+            count => format!("{what} ({count})"),
+        };
+        if self.too_big > 0 {
+            parts.push(counted(
+                "Files over 1 GB can't go in the Bucket",
+                self.too_big,
+            ));
+        }
+        if self.too_deep > 0 {
+            parts.push(format!(
+                "Some items were more than {MAX_BUCKET_DEPTH} folders deep and were left out ({})",
+                self.too_deep
+            ));
+        }
+        if self.bad_names > 0 {
+            parts.push(format!(
+                "Some names can't sync, so they were left out ({})",
+                self.bad_names
+            ));
+        }
+        if self.full {
+            parts.push("The Bucket is full (10 GB)".to_string());
+        }
+        if self.over_items > 0 {
+            parts.push(format!(
+                "Only {MAX_ADD_ITEMS} items can be added at once; {} were left out",
+                self.over_items
+            ));
+        }
+        if self.over_bytes > 0 {
+            parts.push(format!(
+                "Only 5 GB can be added at once; {} were left out",
+                self.over_bytes
+            ));
+        }
+        if self.not_moved > 0 {
+            parts.push(format!(
+                "{} couldn't be moved: they would be more than {MAX_BUCKET_DEPTH} folders deep",
+                match self.not_moved {
+                    1 => "1 item".to_string(),
+                    count => format!("{count} items"),
+                }
+            ));
+        }
+        if self.added > 0 {
+            parts.insert(
+                0,
+                match self.added {
+                    1 => "Added 1 item to the Bucket".to_string(),
+                    count => format!("Added {count} items to the Bucket"),
+                },
+            );
+        }
+        (!parts.is_empty()).then(|| parts.join(". "))
+    }
+}
+
+/// Messages for the user, waiting for the window (or a notification).
+static REPORTS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+
+fn tell(report: &Report) {
+    if let (Some(message), Ok(mut reports)) = (report.message(), REPORTS.lock()) {
+        if reports.len() >= 8 {
+            reports.pop_front();
+        }
+        reports.push_back(message);
+    }
+}
+
+/// The next message about what the Bucket left out, if any.
+pub(crate) fn take_report() -> Option<String> {
+    REPORTS
+        .lock()
+        .ok()
+        .and_then(|mut reports| reports.pop_front())
+}
+
+/// One thing to copy into the Bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Add {
+    src: PathBuf,
+    rel: String,
+    dir: bool,
+    size: u64,
+}
+
+/// Entries under `dir`, counted (links not followed), up to `cap`.
+fn count_below(dir: &Path, cap: usize) -> usize {
+    let mut count = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            count += 1;
+            if count >= cap {
+                return cap;
+            }
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                stack.push(entry.path());
+            }
+        }
+    }
+    count
+}
+
+struct Collector<'a> {
+    adds: Vec<Add>,
+    report: &'a mut Report,
+    used_bytes: u64,
+    used_items: usize,
+    bytes: u64,
+}
+
+impl Collector<'_> {
+    /// Whether one more item of `size` fits; says why when it does not.
+    fn room(&mut self, size: u64) -> bool {
+        if self.adds.len() >= MAX_ADD_ITEMS || self.used_items + self.adds.len() >= MAX_BUCKET_ITEMS
+        {
+            self.report.over_items += 1;
+        } else if self.bytes + size > MAX_ADD_BYTES {
+            self.report.over_bytes += 1;
+        } else if self.used_bytes + self.bytes + size > BUCKET_FULL_BYTES {
+            self.report.full = true;
+        } else {
+            return true;
+        }
+        false
+    }
+
+    fn walk(&mut self, src: &Path, rel: &str) {
+        let Ok(metadata) = fs::symlink_metadata(src) else {
+            return;
+        };
+        // Links and special files are always skipped.
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        if metadata.file_type().is_symlink() || !(metadata.is_dir() || metadata.is_file()) {
+            return;
+        }
+        if !name_ok(name) {
+            self.report.bad_names += 1;
+            return;
+        }
+        if metadata.is_dir() {
+            if levels(rel) + 1 > MAX_BUCKET_DEPTH {
+                self.report.too_deep += 1 + count_below(src, MAX_BUCKET_ITEMS);
+                return;
+            }
+            if !self.room(0) {
+                return;
+            }
+            self.adds.push(Add {
+                src: src.to_path_buf(),
+                rel: rel.to_string(),
+                dir: true,
+                size: 0,
+            });
+            let Ok(children) = fs::read_dir(src) else {
+                return;
+            };
+            let mut names: Vec<String> = children
+                .flatten()
+                .filter_map(|child| child.file_name().to_str().map(str::to_string))
+                .collect();
+            names.sort();
+            for child in names {
+                self.walk(&src.join(&child), &format!("{rel}/{child}"));
+            }
+        } else if metadata.len() > MAX_FILE_BYTES {
+            self.report.too_big += 1;
+        } else if self.room(metadata.len()) {
+            self.bytes += metadata.len();
+            self.adds.push(Add {
+                src: src.to_path_buf(),
+                rel: rel.to_string(),
+                dir: false,
+                size: metadata.len(),
+            });
+        }
+    }
+}
+
+/// What to copy from `sources` into folder `into` of the Bucket at `dest_root`
+/// (a folder is copied with what is in it, within the depth limit; the
+/// limits of one add and of the Bucket are applied; every left-out item is
+/// counted in `report`).
+fn collect(
+    sources: &[PathBuf],
+    dest_root: &Path,
+    into: &str,
+    used: (u64, usize),
+    report: &mut Report,
+) -> Vec<Add> {
+    let mut collector = Collector {
+        adds: Vec::new(),
+        report,
+        used_bytes: used.0,
+        used_items: used.1,
+        bytes: 0,
+    };
+    let dest = if into.is_empty() {
+        dest_root.to_path_buf()
+    } else {
+        dest_root.join(into)
+    };
+    let mut taken = HashSet::new();
+    for source in sources.iter().take(MAX_BUCKET_ITEMS) {
+        // Never the Bucket into itself.
+        if source.starts_with(dest_root) || dest_root.starts_with(source) {
+            continue;
+        }
+        let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let target = unique_among(&dest, name, &taken);
+        taken.insert(target.clone());
+        let Some(unique) = target.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let rel = if into.is_empty() {
+            unique.to_string()
+        } else {
+            format!("{into}/{unique}")
+        };
+        collector.walk(source, &rel);
+    }
+    collector.adds
+}
+
+/// Writes `adds` under `dest_root`; how many were written.
+fn copy_adds(adds: &[Add], dest_root: &Path) -> usize {
+    let mut written = 0;
+    for add in adds {
+        let target = dest_root.join(&add.rel);
+        let done = if add.dir {
+            fs::create_dir(&target).is_ok() || target.is_dir()
+        } else {
+            let staged =
+                target.with_file_name(format!(".desklink-{}.tmp", uuid::Uuid::new_v4().simple()));
+            let mtime = fs::metadata(&add.src)
+                .map(|meta| mtime_ms(&meta))
+                .unwrap_or(0);
+            fs::copy(&add.src, &staged).is_ok() && put_in_place(&staged, &target, mtime).is_ok()
+        };
+        if done {
+            written += 1;
+        } else {
+            log_limited("import", "Could not copy an item into the Bucket");
+        }
+    }
+    written
+}
 
 /// F8b: saves pasted `bytes` as `name` in `device_id`'s Bucket. Text and
 /// links over [`MAX_TEXT_ITEM_BYTES`] are refused here.
-pub(crate) fn import_bytes(device_id: &str, name: &str, bytes: Vec<u8>) -> Result<(), String> {
+pub(crate) fn import_bytes(
+    device_id: &str,
+    name: &str,
+    bytes: Vec<u8>,
+    into: &str,
+) -> Result<(), String> {
     let text = name.ends_with(".txt") || name.ends_with(".url");
     if text && bytes.len() > MAX_TEXT_ITEM_BYTES {
         return Err("That text is too long for the Bucket (1 MB at most)".into());
@@ -769,6 +1190,7 @@ pub(crate) fn import_bytes(device_id: &str, name: &str, bytes: Vec<u8>) -> Resul
         device: device_id.to_string(),
         name: name.to_string(),
         bytes,
+        into: into.to_string(),
     });
     Ok(())
 }
@@ -832,7 +1254,8 @@ pub(crate) fn resolve(device_id: &str, pair: &str, path: &str, how: Resolve) {
 /// What the transfer manager asks before accepting a folder file (P4): a
 /// pair of `device_id`'s, a valid path, and a file this side asked for.
 pub(crate) fn accepts(device_id: &str, folder: &FolderRef, sha256: &str, size: u64) -> bool {
-    validate_relpath(&folder.relpath).is_ok()
+    bucket_path_ok(&folder.relpath, false)
+        && size <= MAX_FILE_BYTES
         && WANTED.lock().is_ok_and(|wanted| {
             wanted
                 .get(&(
@@ -880,6 +1303,7 @@ pub(crate) fn test_want(device_id: &str, folder: &FolderRef, sha256: &str, size:
                 mtime: 0,
                 sha256: sha256.to_string(),
                 deleted: false,
+                dir: false,
                 vv: Vv::default(),
             },
         );
@@ -924,6 +1348,11 @@ fn scan(pair: &Pair) -> Result<Scanned, String> {
     if !root_meta.is_dir() {
         return Err("The folder is missing".into());
     }
+    let mut note = |path: &str, why: &str| {
+        if skipped.len() < MAX_SKIPPED_SHOWN {
+            skipped.push(format!("{path} ({why})"));
+        }
+    };
     let mut stack = vec![(pair.root.clone(), String::new(), 0usize)];
     while let Some((dir, prefix, depth)) = stack.pop() {
         if directories.len() < MAX_WATCHED_DIRS {
@@ -961,20 +1390,42 @@ fn scan(pair: &Pair) -> Result<Scanned, String> {
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
+            let linked = metadata.file_type().is_symlink();
+            if pair.bucket && !name_ok(&name) {
+                note(&path, "the name can't sync");
+                continue;
+            }
             // Links are never followed, special files never read.
-            if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                if pair.bucket {
-                    // F8b: files only. A folder put in from outside is
-                    // left alone and listed as not synced.
-                    if skipped.len() < MAX_SKIPPED_SHOWN {
-                        skipped.push(name);
+            if metadata.is_dir() && !linked {
+                if !pair.bucket {
+                    if depth + 1 < MAX_DEPTH {
+                        stack.push((entry.path(), path, depth + 1));
                     }
-                } else if depth + 1 < MAX_DEPTH {
+                } else if depth >= MAX_BUCKET_DEPTH {
+                    note(&path, "more than 2 folders deep");
+                } else if found.len() >= MAX_BUCKET_ITEMS {
+                    too_many = true;
+                } else {
+                    found.insert(
+                        path.clone(),
+                        Stat {
+                            size: 0,
+                            mtime: 0,
+                            dir: true,
+                        },
+                    );
                     stack.push((entry.path(), path, depth + 1));
                 }
                 continue;
             }
-            if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
+            if linked || !metadata.is_file() {
+                if pair.bucket {
+                    note(&path, "links and special files aren't synced");
+                }
+                continue;
+            }
+            if metadata.len() > MAX_FILE_BYTES {
+                note(&path, "over 1 GB");
                 continue;
             }
             let cap = if pair.bucket {
@@ -991,12 +1442,70 @@ fn scan(pair: &Pair) -> Result<Scanned, String> {
                 Stat {
                     size: metadata.len(),
                     mtime: mtime_ms(&metadata),
+                    dir: false,
                 },
             );
         }
     }
     skipped.sort();
     Ok((found, directories, too_many, skipped))
+}
+
+/// [`STABLE_FOR`] in ms (tests write and scan at once: none unless asked).
+fn stable_ms() -> i64 {
+    #[cfg(test)]
+    {
+        TEST_STABLE_MS.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        STABLE_FOR.as_millis() as i64
+    }
+}
+
+/// F8c: a file whose mtime is under [`STABLE_FOR`] old may still be being
+/// written. A new one is left out of `found` for now; a known one is held at
+/// what the manifest says. Whether any was held (scan again soon).
+fn hold_unstable(
+    found: &mut BTreeMap<String, Stat>,
+    manifest: &Manifest,
+    now_ms: i64,
+    window: i64,
+) -> bool {
+    let mut held = false;
+    let unstable: Vec<String> = found
+        .iter()
+        .filter(|(path, stat)| {
+            !stat.dir
+                && now_ms - stat.mtime < window
+                && manifest
+                    .get(*path)
+                    .is_none_or(|entry| entry.deleted || entry.mtime != stat.mtime)
+        })
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in unstable {
+        held = true;
+        match manifest
+            .get(&path)
+            .filter(|entry| !entry.deleted && !entry.dir)
+        {
+            Some(entry) => {
+                found.insert(
+                    path,
+                    Stat {
+                        size: entry.size,
+                        mtime: entry.mtime,
+                        dir: false,
+                    },
+                );
+            }
+            None => {
+                found.remove(&path);
+            }
+        }
+    }
+    held
 }
 
 fn sha256_of(path: &Path) -> Option<String> {
@@ -1040,6 +1549,24 @@ fn target_path(root: &Path, relpath: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// `root`/`relpath` as a folder, made with every folder on the way.
+fn make_dir(root: &Path, relpath: &str) -> Result<PathBuf, String> {
+    if relpath.is_empty() {
+        return Ok(root.to_path_buf());
+    }
+    validate_relpath(relpath)?;
+    let mut path = root.to_path_buf();
+    for segment in relpath.split('/') {
+        path.push(segment);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err("Something that is not a folder is in the way".into()),
+            Err(_) => fs::create_dir(&path).map_err(|_| "Could not create a folder".to_string())?,
+        }
+    }
+    Ok(path)
+}
+
 /// Whether the local file still matches what the manifest says (absent
 /// when the manifest has no live entry).
 fn unchanged(path: &Path, entry: Option<&Entry>) -> bool {
@@ -1048,6 +1575,7 @@ fn unchanged(path: &Path, entry: Option<&Entry>) -> bool {
         entry.filter(|entry| !entry.deleted),
     ) {
         (Err(_), None) => true,
+        (Ok(metadata), Some(entry)) if entry.dir => metadata.is_dir(),
         (Ok(metadata), Some(entry)) => {
             metadata.is_file() && metadata.len() == entry.size && mtime_ms(&metadata) == entry.mtime
         }
@@ -1093,8 +1621,14 @@ fn bucket_root(home: &Path, phone: &str, taken: &[PathBuf]) -> PathBuf {
 /// `name` in `dir`, or `name (2)`, `name (3)` … before the extension when
 /// it is taken.
 fn unique_in(dir: &Path, name: &str) -> PathBuf {
+    unique_among(dir, name, &HashSet::new())
+}
+
+/// [`unique_in`], also avoiding names in `taken` (picked, not yet written).
+fn unique_among(dir: &Path, name: &str, taken: &HashSet<PathBuf>) -> PathBuf {
+    let free = |path: &Path| fs::symlink_metadata(path).is_err() && !taken.contains(path);
     let first = dir.join(name);
-    if fs::symlink_metadata(&first).is_err() {
+    if free(&first) {
         return first;
     }
     let (stem, extension) = match name.rsplit_once('.') {
@@ -1105,7 +1639,7 @@ fn unique_in(dir: &Path, name: &str) -> PathBuf {
     };
     (2..10_000)
         .map(|number| dir.join(format!("{stem} ({number}){extension}")))
-        .find(|path| fs::symlink_metadata(path).is_err())
+        .find(|path| free(path))
         .unwrap_or_else(|| {
             dir.join(format!(
                 "{stem} {}{extension}",
@@ -1191,20 +1725,6 @@ fn bookmark(folder: &Path, add: bool) {
     }
 }
 
-/// Copies the regular file `source` to `target` (F8b: files only; links,
-/// folders and special files are left out), through a temporary name and a
-/// rename; at most `budget` files.
-fn copy_in(source: &Path, target: &Path, budget: &mut usize) -> Result<(), String> {
-    let metadata = fs::symlink_metadata(source).map_err(|_| "A file to add is gone".to_string())?;
-    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES || *budget == 0 {
-        return Ok(());
-    }
-    *budget -= 1;
-    let staged = target.with_file_name(format!(".desklink-{}.tmp", uuid::Uuid::new_v4().simple()));
-    fs::copy(source, &staged).map_err(|_| "Could not copy a file into the Bucket".to_string())?;
-    put_in_place(&staged, target, mtime_ms(&metadata))
-}
-
 /// Moves `from` into place at `to` atomically: a rename, or a copy to a
 /// temporary name beside it and a rename.
 fn put_in_place(from: &Path, to: &Path, mtime: i64) -> Result<(), String> {
@@ -1232,7 +1752,15 @@ fn put_in_place(from: &Path, to: &Path, mtime: i64) -> Result<(), String> {
 fn trash(path: &Path) -> bool {
     #[cfg(test)]
     {
-        !TEST_TRASH_FAILS.with(std::cell::Cell::get) && fs::remove_file(path).is_ok()
+        if TEST_TRASH_FAILS.with(std::cell::Cell::get) {
+            return false;
+        }
+        TEST_TRASHED.with(|count| count.set(count.get() + 1));
+        if path.is_dir() {
+            fs::remove_dir_all(path).is_ok()
+        } else {
+            fs::remove_file(path).is_ok()
+        }
     }
     #[cfg(not(test))]
     {
@@ -1245,6 +1773,10 @@ fn trash(path: &Path) -> bool {
 thread_local! {
     /// Tests: a desktop without a trash (this test's thread only).
     static TEST_TRASH_FAILS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: how long a file must have held before it is scanned (ms).
+    static TEST_STABLE_MS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    /// Tests: how many items were sent to the trash (this thread).
+    static TEST_TRASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 // ── Storage ────────────────────────────────────────────────────────────────
@@ -1322,8 +1854,14 @@ struct Live {
     sending: HashMap<String, String>,
     /// Files asked of the other side: receiving.
     receiving: BTreeMap<String, Entry>,
-    /// F8b: folders found in the Bucket, not synced (files only).
+    /// What the Bucket does not sync, with why (too deep, a name that can't
+    /// sync, over 1 GB, a link).
     skipped: Vec<String>,
+    /// F8c: files the other side asked for, waiting for a free slot of
+    /// [`MAX_IN_FLIGHT`].
+    send_queue: VecDeque<String>,
+    /// Files being sent now, and since when.
+    flight: HashMap<String, Instant>,
 }
 
 struct Worker {
@@ -1482,9 +2020,10 @@ fn manifest_entries(packet: &NetworkPacket, pair: &Pair) -> Vec<(String, Entry)>
                     let path = value.get("path")?.as_str()?;
                     let entry: Entry = serde_json::from_value(value.clone()).ok()?;
                     let sane = validate_relpath(path).is_ok()
-                        && !(pair.bucket && path.contains('/'))
+                        && (!pair.bucket || bucket_path_ok(path, entry.dir))
                         && !ignored(path, pair.include_hidden, &pair.ignore)
                         && (entry.deleted
+                            || entry.dir
                             || (entry.sha256.len() == 64
                                 && entry.sha256.bytes().all(|b| b.is_ascii_hexdigit())
                                 && entry.size <= MAX_FILE_BYTES));
@@ -1521,6 +2060,8 @@ impl Live {
             sending: HashMap::new(),
             receiving: BTreeMap::new(),
             skipped: Vec::new(),
+            send_queue: VecDeque::new(),
+            flight: HashMap::new(),
         }
     }
 
@@ -1569,6 +2110,8 @@ impl Live {
                 let there = self.remote.get(path) == Some(&entry.sha256);
                 let state = if conflicted.contains(path.as_str()) {
                     ItemState::Conflict
+                } else if entry.dir {
+                    ItemState::Synced
                 } else if self.sending.contains_key(path) && !there {
                     ItemState::Sending
                 } else if !there && !online {
@@ -1577,6 +2120,7 @@ impl Live {
                     ItemState::Synced
                 };
                 Item {
+                    dir: entry.dir,
                     path: path.clone(),
                     size: entry.size,
                     mtime: entry.mtime,
@@ -1596,6 +2140,7 @@ impl Live {
                 .iter()
                 .filter(|(path, _)| self.book.manifest.get(*path).is_none_or(|e| e.deleted))
                 .map(|(path, entry)| Item {
+                    dir: false,
                     path: path.clone(),
                     size: entry.size,
                     mtime: entry.mtime,
@@ -1715,6 +2260,8 @@ impl Worker {
                         live.to_request.clear();
                         live.receiving.clear();
                         live.sending.clear();
+                        live.send_queue.clear();
+                        live.flight.clear();
                     }
                     if let Ok(mut wanted) = WANTED.lock() {
                         wanted.retain(|(owner, _, _), _| *owner != device);
@@ -1814,12 +2361,24 @@ impl Worker {
                 }
             }
             Message::TurnOnBucket { device } => self.turn_on_bucket(&device),
-            Message::Import { device, sources } => self.import(&device, sources),
+            Message::Import {
+                device,
+                sources,
+                into,
+            } => self.import(&device, sources, &into),
             Message::ImportBytes {
                 device,
                 name,
                 bytes,
-            } => self.import_bytes(&device, &name, &bytes),
+                into,
+            } => self.import_bytes(&device, &name, &bytes, &into),
+            Message::NewFolder { device, parent } => self.new_folder(&device, &parent),
+            Message::MoveItems {
+                device,
+                paths,
+                dest,
+            } => self.move_items(&device, paths, &dest),
+            Message::RemoveItems { device, paths } => self.remove_items(&device, paths),
         }
     }
 
@@ -1903,51 +2462,64 @@ impl Worker {
             })
     }
 
-    /// Room left in `device`'s Bucket, in items.
-    fn bucket_room(&self, device: &str) -> usize {
-        let used = self
-            .index_of(device, BUCKET_ID)
+    /// What `device`'s Bucket holds: bytes and items (files and folders).
+    fn bucket_used(&self, device: &str) -> (u64, usize) {
+        self.index_of(device, BUCKET_ID)
             .map(|index| {
-                self.pairs[index]
-                    .book
-                    .manifest
-                    .values()
-                    .filter(|entry| !entry.deleted)
-                    .count()
+                let live = self.pairs[index].book.manifest.values();
+                live.filter(|entry| !entry.deleted)
+                    .fold((0, 0), |(bytes, items), entry| {
+                        (bytes + entry.size, items + 1)
+                    })
             })
-            .unwrap_or(0);
-        MAX_BUCKET_ITEMS.saturating_sub(used)
+            .unwrap_or((0, 0))
     }
 
-    fn import(&mut self, device: &str, sources: Vec<PathBuf>) {
+    fn import(&mut self, device: &str, sources: Vec<PathBuf>, into: &str) {
         let Some(dir) = self.bucket_dir(device) else {
             return;
         };
-        let mut budget = self.bucket_room(device);
-        for source in sources.into_iter().take(MAX_BUCKET_ITEMS) {
-            // Never the Bucket into itself.
-            if source.starts_with(&dir) || dir.starts_with(&source) {
-                continue;
-            }
-            let Some(name) = source.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let target = unique_in(&dir, name);
-            if let Err(error) = copy_in(&source, &target, &mut budget) {
-                log_limited("import", &error);
-            }
+        let mut report = Report::default();
+        if !(into.is_empty() || bucket_path_ok(into, true))
+            || make_dir(&dir, into).is_err() && !into.is_empty()
+        {
+            report.refused = Some("That folder isn't in the Bucket".into());
+            tell(&report);
+            return;
         }
+        let adds = collect(&sources, &dir, into, self.bucket_used(device), &mut report);
+        report.added = copy_adds(&adds, &dir);
+        tell(&report);
         self.touched(device);
     }
 
-    fn import_bytes(&mut self, device: &str, name: &str, bytes: &[u8]) {
+    fn import_bytes(&mut self, device: &str, name: &str, bytes: &[u8], into: &str) {
         let Some(dir) = self.bucket_dir(device) else {
             return;
         };
-        if self.bucket_room(device) == 0 || validate_relpath(name).is_err() || name.contains('/') {
+        let (used_bytes, used_items) = self.bucket_used(device);
+        if used_items >= MAX_BUCKET_ITEMS
+            || used_bytes + bytes.len() as u64 > BUCKET_FULL_BYTES
+            || !name_ok(name)
+            || name.contains('/')
+            || !(into.is_empty() || bucket_path_ok(into, true))
+        {
+            tell(&Report {
+                full: true,
+                ..Report::default()
+            });
             return;
         }
-        let target = unique_in(&dir, name);
+        let Ok(folder) = make_dir(&dir, into).or_else(|_| {
+            if into.is_empty() {
+                Ok(dir.clone())
+            } else {
+                Err(())
+            }
+        }) else {
+            return;
+        };
+        let target = unique_in(&folder, name);
         let staged =
             target.with_file_name(format!(".desklink-{}.tmp", uuid::Uuid::new_v4().simple()));
         let written =
@@ -1957,6 +2529,168 @@ impl Worker {
             log_limited("import", "Could not save a pasted item in the Bucket");
         }
         self.touched(device);
+    }
+
+    /// F8c: "New Folder" in `parent`; not past the depth limit.
+    fn new_folder(&mut self, device: &str, parent: &str) {
+        let Some(dir) = self.bucket_dir(device) else {
+            return;
+        };
+        let depth = if parent.is_empty() {
+            0
+        } else {
+            parent.split('/').count()
+        };
+        let mut report = Report::default();
+        if depth >= MAX_BUCKET_DEPTH || !(parent.is_empty() || bucket_path_ok(parent, true)) {
+            report.refused = Some(format!(
+                "Folders can only go {MAX_BUCKET_DEPTH} levels deep in the Bucket"
+            ));
+        } else if self.bucket_used(device).1 >= MAX_BUCKET_ITEMS {
+            report.over_items = 1;
+        } else if let Ok(folder) = make_dir(&dir, parent) {
+            let _ = fs::create_dir(unique_in(&folder, "New Folder"));
+            self.touched(device);
+        }
+        tell(&report);
+    }
+
+    /// F8c: moves items into folder `dest` ("" the top); an item that
+    /// would end up past the depth limit stays and is counted.
+    fn move_items(&mut self, device: &str, paths: Vec<String>, dest: &str) {
+        let (Some(index), Some(root)) = (self.index_of(device, BUCKET_ID), self.bucket_dir(device))
+        else {
+            return;
+        };
+        let mut report = Report::default();
+        if !(dest.is_empty() || bucket_path_ok(dest, true))
+            || make_dir(&root, dest).is_err() && !dest.is_empty()
+        {
+            report.refused = Some("That folder isn't in the Bucket".into());
+            tell(&report);
+            return;
+        }
+        let dest_depth = if dest.is_empty() {
+            0
+        } else {
+            dest.split('/').count()
+        };
+        let manifest = &self.pairs[index].book.manifest;
+        let mut moved = false;
+        for path in paths.iter().take(MAX_ADD_ITEMS) {
+            let Some(entry) = manifest.get(path).filter(|entry| !entry.deleted) else {
+                continue;
+            };
+            let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+            if parent == dest {
+                continue;
+            }
+            if dest == path || dest.starts_with(&format!("{path}/")) {
+                report.refused = Some("A folder can't go inside itself".into());
+                continue;
+            }
+            if entry.dir {
+                let below = format!("{path}/");
+                let height = manifest
+                    .iter()
+                    .filter(|(other, found)| {
+                        found.dir && !found.deleted && other.starts_with(&below)
+                    })
+                    .map(|(other, _)| levels(other) - levels(path))
+                    .max()
+                    .unwrap_or(0);
+                if dest_depth + 1 + height > MAX_BUCKET_DEPTH {
+                    report.not_moved += 1;
+                    continue;
+                }
+            }
+            let name = path.rsplit('/').next().unwrap_or(path);
+            let target = unique_in(&root.join(dest), name);
+            moved |= fs::rename(root.join(path), target).is_ok();
+        }
+        tell(&report);
+        if moved {
+            self.touched(device);
+        }
+    }
+
+    /// F8c: removes items from both sides. Transfers of them are cancelled
+    /// first; a folder goes to the trash as one item.
+    fn remove_items(&mut self, device: &str, paths: Vec<String>) {
+        let (Some(index), Some(root)) = (self.index_of(device, BUCKET_ID), self.bucket_dir(device))
+        else {
+            return;
+        };
+        let rows = super::webrtc::transfer_board::synced_rows();
+        let live = &mut self.pairs[index];
+        for path in paths.iter().take(MAX_BUCKET_ITEMS) {
+            if !bucket_path_ok(path, true) && !bucket_path_ok(path, false) {
+                continue;
+            }
+            let below = format!("{path}/");
+            for row in rows
+                .iter()
+                .filter(|row| row.device_id == device)
+                .filter(|row| row.name == *path || row.name.starts_with(&below))
+            {
+                let _ = super::desk_features::cancel_transfer(device, &row.id);
+            }
+            live.send_queue
+                .retain(|queued| queued != path && !queued.starts_with(&below));
+            live.flight
+                .retain(|sent, _| sent != path && !sent.starts_with(&below));
+            live.outstanding
+                .retain(|asked| asked != path && !asked.starts_with(&below));
+            live.to_request
+                .retain(|asked| asked != path && !asked.starts_with(&below));
+            if fs::symlink_metadata(root.join(path)).is_ok() {
+                trash(&root.join(path));
+            }
+        }
+        live.dirty = Some(Instant::now() - SETTLE);
+        self.publish();
+    }
+
+    /// Starts the sends that may start now (see [`due_sends`]).
+    fn pump_sends(&mut self, index: usize, ended: &[String]) {
+        let live = &mut self.pairs[index];
+        let due = due_sends(
+            &mut live.send_queue,
+            &mut live.flight,
+            ended,
+            Instant::now(),
+        );
+        let (device, id, root) = (
+            live.pair.device.clone(),
+            live.pair.id.clone(),
+            live.pair.root.clone(),
+        );
+        for path in due {
+            let Some(entry) = live.book.manifest.get(&path).filter(|entry| !entry.deleted) else {
+                live.flight.remove(&path);
+                continue;
+            };
+            let Ok(source) = target_path(&root, &path) else {
+                live.flight.remove(&path);
+                continue;
+            };
+            if !unchanged(&source, Some(entry)) {
+                // Changed since it was asked for: scanned again; the new
+                // version is asked for next.
+                live.flight.remove(&path);
+                live.dirty = Some(Instant::now());
+                continue;
+            }
+            let folder = FolderRef {
+                folder: id.clone(),
+                relpath: path.clone(),
+                mtime: Some(entry.mtime),
+            };
+            if let Err(error) = super::desk_features::send_folder_file(&device, &source, folder) {
+                live.flight.remove(&path);
+                log_limited("send", &format!("A synced file was not sent: {error}"));
+            }
+        }
     }
 
     /// Something was added: scan the Bucket soon.
@@ -2142,7 +2876,53 @@ impl Worker {
         {
             let live = &mut self.pairs[index];
             let manifest = &mut live.book.manifest;
+            // A folder the other side removed, with only files that go too:
+            // one trash item.
+            let removals: HashMap<String, Entry> = steps
+                .iter()
+                .filter_map(|step| match step {
+                    Step::Delete { path, entry } => Some((path.clone(), entry.clone())),
+                    _ => None,
+                })
+                .collect();
+            let mut handled: HashSet<String> = HashSet::new();
+            let mut folders: Vec<&String> = removals
+                .iter()
+                .filter(|(_, entry)| entry.dir)
+                .map(|(path, _)| path)
+                .collect();
+            folders.sort_by_key(|path| path.len());
+            for folder in folders {
+                if handled.contains(folder) {
+                    continue;
+                }
+                let below_prefix = format!("{folder}/");
+                let below: Vec<(String, Entry)> = manifest
+                    .iter()
+                    .filter(|(path, entry)| path.starts_with(&below_prefix) && !entry.deleted)
+                    .map(|(path, entry)| (path.clone(), entry.clone()))
+                    .collect();
+                let target = root.join(folder);
+                let tidy = !below.is_empty()
+                    && target.is_dir()
+                    && below.iter().all(|(path, entry)| {
+                        removals.contains_key(path) && unchanged(&root.join(path), Some(entry))
+                    })
+                    && count_below(&target, MAX_BUCKET_ITEMS) == below.len();
+                if tidy && trash(&target) {
+                    handled.insert(folder.clone());
+                    manifest.insert(folder.clone(), removals[folder].clone());
+                    for (path, _) in below {
+                        manifest.insert(path.clone(), removals[&path].clone());
+                        handled.insert(path);
+                    }
+                }
+            }
+            let mut folder_deletes: Vec<(String, Entry)> = Vec::new();
             for step in steps {
+                if matches!(&step, Step::Delete { path, .. } if handled.contains(path)) {
+                    continue;
+                }
                 match step {
                     Step::Take { path, entry } => {
                         manifest.insert(path, entry);
@@ -2151,6 +2931,9 @@ impl Worker {
                         if let Some(entry) = manifest.get_mut(&path) {
                             entry.vv = vv;
                         }
+                    }
+                    Step::Delete { path, entry } if entry.dir => {
+                        folder_deletes.push((path, entry));
                     }
                     Step::Delete { path, entry } => match target_path(&root, &path) {
                         Ok(target) if unchanged(&target, manifest.get(&path)) => {
@@ -2209,6 +2992,12 @@ impl Worker {
                             downloads.push((to, entry));
                         }
                     }
+                    Step::Download { path, entry } if entry.dir => match make_dir(&root, &path) {
+                        Ok(_) => {
+                            manifest.insert(path, entry);
+                        }
+                        Err(_) => rescan = true,
+                    },
                     Step::Download { path, entry } => downloads.push((path, entry)),
                     Step::Conflict { path, copy } => {
                         let conflicts = &mut live.book.conflicts;
@@ -2224,6 +3013,26 @@ impl Worker {
                     }
                     // The desk never renames its own version (P3).
                     Step::Rename { .. } => {}
+                }
+            }
+            // Folders go last, the deepest first, and only when empty: one
+            // that still holds something (a change not synced yet) stays, and
+            // the next scan tells the other side it is still here.
+            folder_deletes.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+            for (path, entry) in folder_deletes {
+                let target = root.join(&path);
+                if !target.exists() || fs::remove_dir(&target).is_ok() {
+                    manifest.insert(path, entry);
+                } else if let Some(ours) = manifest.get(&path).cloned() {
+                    // Kept: our version now dominates the removal, so the
+                    // phone gets the folder back.
+                    manifest.insert(
+                        path,
+                        Entry {
+                            vv: ours.vv.max(entry.vv).bumped(Side::Desk),
+                            ..ours
+                        },
+                    );
                 }
             }
             if let Ok(mut wanted) = WANTED.lock() {
@@ -2270,7 +3079,7 @@ impl Worker {
         let mut batch = Vec::new();
         // And one data-channel message: paths may be 1 KiB each.
         let mut bytes = 0;
-        while live.outstanding.len() < MAX_OUTSTANDING
+        while live.outstanding.len() < MAX_IN_FLIGHT
             && batch.len() < REQUEST_PATHS
             && bytes < MAX_PACKET_BYTES / 2
         {
@@ -2308,7 +3117,12 @@ impl Worker {
             })
             .unwrap_or_default();
         for path in paths {
-            let Some(entry) = live.book.manifest.get(&path).filter(|entry| !entry.deleted) else {
+            let Some(entry) = live
+                .book
+                .manifest
+                .get(&path)
+                .filter(|entry| !entry.deleted && !entry.dir)
+            else {
                 continue;
             };
             let Ok(source) = target_path(&live.pair.root, &path) else {
@@ -2321,15 +3135,11 @@ impl Worker {
             if live.sending.len() < MAX_OUTSTANDING {
                 live.sending.insert(path.clone(), entry.sha256.clone());
             }
-            let folder = FolderRef {
-                folder: id.to_string(),
-                relpath: path,
-                mtime: Some(entry.mtime),
-            };
-            if let Err(error) = super::desk_features::send_folder_file(device, &source, folder) {
-                log_limited("send", &format!("A synced file was not sent: {error}"));
+            if live.send_queue.len() < MAX_OUTSTANDING && !live.flight.contains_key(&path) {
+                live.send_queue.push_back(path);
             }
         }
+        self.pump_sends(index, &[]);
     }
 
     /// A requested file arrived: checked, put in place, recorded.
@@ -2363,6 +3173,7 @@ impl Worker {
             Ok(Stat {
                 size: metadata.len(),
                 mtime: mtime_ms(&metadata),
+                dir: false,
             })
         });
         match placed {
@@ -2448,6 +3259,32 @@ impl Worker {
                 live.dirty.get_or_insert_with(Instant::now);
             }
         }
+        // Transfers that ended free their slots (F8c: 2 in flight).
+        let ended = super::webrtc::transfer_board::take_synced_ended();
+        for index in 0..self.pairs.len() {
+            let device = self.pairs[index].pair.device.clone();
+            let sent: Vec<String> = ended
+                .iter()
+                .filter(|end| end.device == device && !end.incoming)
+                .map(|end| end.name.clone())
+                .collect();
+            let failed: Vec<&str> = ended
+                .iter()
+                .filter(|end| end.device == device && end.incoming && !end.ok)
+                .map(|end| end.name.as_str())
+                .collect();
+            let live = &mut self.pairs[index];
+            if !failed.is_empty() {
+                live.outstanding
+                    .retain(|path| !failed.contains(&path.as_str()));
+            }
+            if !sent.is_empty() || !live.send_queue.is_empty() {
+                self.pump_sends(index, &sent);
+            }
+            if !failed.is_empty() {
+                self.request_more(index);
+            }
+        }
         let before = self.offered.len() + self.asked.len();
         self.offered.retain(|(_, at)| at.elapsed() < OFFER_LAPSES);
         self.asked
@@ -2480,7 +3317,7 @@ impl Worker {
         live.phase = Phase::Scanning;
         let pair = live.pair.clone();
         let scanned = scan(&pair);
-        let (found, directories, too_many, skipped) = match scanned {
+        let (mut found, directories, too_many, skipped) = match scanned {
             Ok(scanned) => scanned,
             Err(problem) => {
                 live.phase = Phase::Problem(problem);
@@ -2494,6 +3331,10 @@ impl Worker {
             // file on the phone too would be the worst outcome.
             live.phase = Phase::EmptyHeld;
             return;
+        }
+        // A file still being written waits until it has held for 2 s.
+        if hold_unstable(&mut found, &live.book.manifest, now_ms(), stable_ms()) {
+            live.dirty = Some(Instant::now());
         }
         let root = pair.root.clone();
         let changed = apply_scan(
@@ -2547,6 +3388,33 @@ impl Worker {
             self.send_manifest(index);
         }
     }
+}
+
+/// A send that never showed on the board lapses after this.
+const FLIGHT_LAPSES: Duration = Duration::from_secs(1800);
+
+/// F8c: the files to start sending now: the slots of `ended` are freed,
+/// then the queue fills up to [`MAX_IN_FLIGHT`] in flight.
+fn due_sends(
+    queue: &mut VecDeque<String>,
+    flight: &mut HashMap<String, Instant>,
+    ended: &[String],
+    now: Instant,
+) -> Vec<String> {
+    for path in ended {
+        flight.remove(path);
+    }
+    flight.retain(|_, at| now.saturating_duration_since(*at) < FLIGHT_LAPSES);
+    let mut due = Vec::new();
+    while flight.len() < MAX_IN_FLIGHT {
+        let Some(path) = queue.pop_front() else {
+            break;
+        };
+        if flight.insert(path.clone(), now).is_none() {
+            due.push(path);
+        }
+    }
+    due
 }
 
 fn live_dirty(dirty: &std::rc::Rc<std::cell::RefCell<HashSet<String>>>, id: &str) {
@@ -2609,78 +3477,957 @@ mod tests {
         base
     }
 
-    #[test]
-    fn a_bucket_holds_top_level_files_only() {
-        let base = scratch("bucket-scan");
+    // ── F8c ────────────────────────────────────────────────────────────────
+
+    fn scratch_bucket(name: &str) -> (PathBuf, PathBuf, Worker) {
+        let base = scratch(name);
         let root = base.join("bucket");
-        fs::create_dir_all(root.join("Old photos/2024")).unwrap();
-        fs::write(root.join("a.txt"), "one").unwrap();
-        fs::write(root.join("Old photos/b.jpg"), "two").unwrap();
-        std::os::unix::fs::symlink(base.join("elsewhere"), root.join("link")).unwrap();
+        fs::create_dir_all(&root).unwrap();
         let worker = bucket_worker(&base, &root);
+        (base, root, worker)
+    }
+
+    fn trashed() -> usize {
+        TEST_TRASHED.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn the_limits_are_the_documented_ones() {
+        assert_eq!(MAX_FILE_BYTES, 1 << 30, "1 GB per file");
+        assert_eq!(MAX_BUCKET_DEPTH, 2);
+        assert_eq!(MAX_IN_FLIGHT, 2);
+        assert_eq!((MAX_ADD_ITEMS, MAX_ADD_BYTES), (500, 5 << 30));
+        assert_eq!(BUCKET_WARN_BYTES, 8 << 30, "warning at 8 GB");
+        assert_eq!(BUCKET_FULL_BYTES, 10 << 30, "refusal at 10 GB");
+        assert_eq!(MAX_BUCKET_ITEMS, 10_000);
+        assert_eq!(MAX_NAME_BYTES, 255);
+        assert_eq!(MAX_TEXT_ITEM_BYTES, 1 << 20);
+        assert_eq!(STABLE_FOR, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn names_that_another_system_cannot_hold_are_not_synced() {
+        for good in ["a.txt", "Trip 2026", "naïve – café.md", &"x".repeat(255)] {
+            assert!(name_ok(good), "{good}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a:b",
+            "a\\b",
+            "trailing.",
+            "trailing ",
+            "a\u{7}b",
+            &"x".repeat(256),
+            &"é".repeat(128),
+        ] {
+            assert!(!name_ok(bad), "{bad:?}");
+        }
+        assert!(bucket_path_ok("A/B", true) && bucket_path_ok("A/B/c.txt", false));
+        assert!(!bucket_path_ok("A/B/C", true) && !bucket_path_ok("A/B/C/d.txt", false));
+        // Scanned from disk: listed with why, never synced.
+        let (base, root, worker) = scratch_bucket("bucket-names");
+        fs::write(root.join("ok.txt"), "1").unwrap();
+        fs::write(root.join("a:b.txt"), "1").unwrap();
+        fs::write(root.join("dot."), "1").unwrap();
         let (found, _, _, skipped) = scan(&worker.pairs[0].pair).unwrap();
-        assert_eq!(found.keys().collect::<Vec<_>>(), ["a.txt"]);
-        assert_eq!(skipped, ["Old photos"], "listed as not synced");
-        // A peer cannot put a nested path in a Bucket either.
-        let mut packet = NetworkPacket::new(PACKET_TYPE_FOLDERS);
-        let entry = |path: &str| {
-            json!({"path": path, "size": 1, "mtime": 1, "sha256": "a".repeat(64),
-                   "vv": {"desk": 0, "phone": 1}})
-        };
-        packet.set("entries", json!([entry("x/y.txt"), entry("z.txt")]));
-        let kept: Vec<String> = manifest_entries(&packet, &worker.pairs[0].pair)
-            .into_iter()
-            .map(|(path, _)| path)
-            .collect();
-        assert_eq!(kept, ["z.txt"]);
+        assert_eq!(found.keys().collect::<Vec<_>>(), ["ok.txt"]);
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        assert!(skipped
+            .iter()
+            .all(|line| line.contains("the name can't sync")));
         let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
-    fn dropped_folders_and_links_are_refused_files_are_added() {
-        let base = scratch("bucket-drop");
+    fn depth_three_is_refused_and_reported_everywhere() {
+        let (base, root, worker) = scratch_bucket("bucket-depth");
+        fs::create_dir_all(root.join("A/B/C/D")).unwrap();
+        fs::write(root.join("A/B/ok.txt"), "x").unwrap();
+        fs::write(root.join("A/B/C/deep.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), root.join("link")).unwrap();
+        // From outside, in the Bucket folder: listed as not synced.
+        let (found, _, _, skipped) = scan(&worker.pairs[0].pair).unwrap();
+        assert_eq!(
+            found.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["A", "A/B", "A/B/ok.txt"]
+        );
+        assert!(found["A"].dir && found["A/B"].dir && !found["A/B/ok.txt"].dir);
+        assert!(skipped
+            .iter()
+            .any(|line| line == "A/B/C (more than 2 folders deep)"));
+        assert!(
+            skipped.iter().any(|line| line.starts_with("link (")),
+            "links listed"
+        );
+        // From the phone: a deeper path is dropped, a dir entry needs no hash.
+        let mut packet = NetworkPacket::new(PACKET_TYPE_FOLDERS);
+        let file = |path: &str| {
+            json!({"path": path, "size": 1, "mtime": 1, "sha256": "a".repeat(64),
+                   "vv": {"desk": 0, "phone": 1}})
+        };
+        let folder = |path: &str| json!({"path": path, "dir": true, "vv": {"desk": 0, "phone": 1}});
+        packet.set(
+            "entries",
+            json!([
+                file("A/B/C/d.txt"),
+                file("A/B/e.txt"),
+                folder("A/B/C"),
+                folder("A/B")
+            ]),
+        );
+        let kept: Vec<String> = manifest_entries(&packet, &worker.pairs[0].pair)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(kept, ["A/B/e.txt", "A/B"]);
+        let wanted = FolderRef {
+            folder: BUCKET_ID.into(),
+            relpath: "A/B/C/d.txt".into(),
+            mtime: None,
+        };
+        test_want("phone-b", &wanted, &"a".repeat(64), 1);
+        assert!(
+            !accepts("phone-b", &wanted, &"a".repeat(64), 1),
+            "never accepted"
+        );
+        // From a drop: counted, and said.
+        let outside = base.join("outside");
+        fs::create_dir_all(outside.join("T/U/V")).unwrap();
+        fs::write(outside.join("T/U/V/w.txt"), "x").unwrap();
+        fs::write(outside.join("T/U/x.txt"), "x").unwrap();
+        let mut report = Report::default();
+        let adds = collect(&[outside.join("T")], &root, "A", (0, 0), &mut report);
+        // Into A, T is level 2 and U would be level 3.
+        assert_eq!(
+            adds.iter().map(|add| add.rel.as_str()).collect::<Vec<_>>(),
+            ["A/T"]
+        );
+        assert_eq!(report.too_deep, 4, "U, V and the two files in them");
+        assert_eq!(
+            report.message().unwrap(),
+            "Some items were more than 2 folders deep and were left out (4)"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_nested_round_trip_with_an_empty_folder_converges() {
+        let mut desk = Replica {
+            side: Side::Desk,
+            disk: Disk::new(),
+            manifest: Manifest::new(),
+        };
+        let mut phone = Replica {
+            side: Side::Phone,
+            disk: Disk::new(),
+            manifest: Manifest::new(),
+        };
+        for dir in ["A", "A/B", "Empty"] {
+            desk.disk.insert(dir.into(), DIR.into());
+        }
+        desk.disk.insert("A/B/deep.txt".into(), "deep".into());
+        desk.disk.insert("top.txt".into(), "top".into());
+        desk.scan(1);
+        sync(&mut phone, &desk);
+        phone.scan(2);
+        assert_eq!(
+            desk.disk, phone.disk,
+            "folders, the empty one too, and files"
+        );
+        assert!(phone.manifest["Empty"].dir && phone.manifest["A/B"].dir);
+        // And back: the phone adds a folder and a file inside the desk's.
+        phone.disk.insert("A/New".into(), DIR.into());
+        phone.disk.insert("A/New/p.txt".into(), "phone".into());
+        phone.scan(3);
+        sync(&mut desk, &phone);
+        desk.scan(4);
+        assert_eq!(desk.disk, phone.disk);
+        // The empty folder is removed on one side: the other follows.
+        desk.disk.remove("Empty");
+        desk.scan(5);
+        sync(&mut phone, &desk);
+        phone.scan(6);
+        assert_eq!(desk.disk, phone.disk);
+        assert!(!phone.disk.contains_key("Empty"));
+    }
+
+    #[test]
+    fn a_folder_rename_moves_its_files_and_transfers_nothing() {
+        let mut desk = Replica {
+            side: Side::Desk,
+            disk: Disk::new(),
+            manifest: Manifest::new(),
+        };
+        let mut phone = Replica {
+            side: Side::Phone,
+            disk: Disk::new(),
+            manifest: Manifest::new(),
+        };
+        desk.disk.insert("Trips".into(), DIR.into());
+        desk.disk.insert("Trips/Rome".into(), DIR.into());
+        desk.disk.insert("Trips/Rome/a.jpg".into(), "aaa".into());
+        desk.disk.insert("Trips/b.jpg".into(), "bbb".into());
+        desk.scan(1);
+        sync(&mut phone, &desk);
+        phone.scan(2);
+        // The desk renames the folder.
+        let moved: Vec<(String, String)> = desk
+            .disk
+            .iter()
+            .map(|(path, content)| (path.replacen("Trips", "Journeys", 1), content.clone()))
+            .collect();
+        desk.disk = moved.into_iter().collect();
+        desk.scan(3);
+        let steps = plan(Side::Phone, &phone.manifest, &desk.manifest, "P");
+        let downloads: Vec<&Step> = steps
+            .iter()
+            .filter(|step| matches!(step, Step::Download { entry, .. } if !entry.dir))
+            .collect();
+        assert!(downloads.is_empty(), "nothing re-sent: {downloads:?}");
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(step, Step::Move { .. }))
+                .count(),
+            2,
+            "both files moved by hash"
+        );
+        sync(&mut phone, &desk);
+        phone.scan(4);
+        assert_eq!(desk.disk, phone.disk);
+        assert!(phone.disk.contains_key("Journeys/Rome/a.jpg"));
+        assert!(
+            !phone.disk.contains_key("Trips"),
+            "the old folder went, empty"
+        );
+    }
+
+    #[test]
+    fn a_rename_and_an_edit_on_opposite_sides_lose_nothing_and_converge() {
+        let mut desk = Replica {
+            side: Side::Desk,
+            disk: Disk::new(),
+            manifest: Manifest::new(),
+        };
+        let mut phone = Replica {
+            side: Side::Phone,
+            disk: Disk::new(),
+            manifest: Manifest::new(),
+        };
+        desk.disk.insert("A".into(), DIR.into());
+        desk.disk.insert("A/f.txt".into(), "base".into());
+        desk.scan(1);
+        sync(&mut phone, &desk);
+        phone.scan(2);
+        // The desk renames the folder; the phone edits a file inside it.
+        desk.disk.remove("A");
+        desk.disk.remove("A/f.txt");
+        desk.disk.insert("B".into(), DIR.into());
+        desk.disk.insert("B/f.txt".into(), "base".into());
+        phone.disk.insert("A/f.txt".into(), "phone edit".into());
+        desk.scan(3);
+        phone.scan(3);
+        for round in 4..9 {
+            sync(&mut desk, &phone);
+            desk.scan(round);
+            sync(&mut phone, &desk);
+            phone.scan(round);
+        }
+        assert_eq!(desk.disk, phone.disk, "converged");
+        assert!(
+            desk.disk.values().any(|content| content == "phone edit"),
+            "the edit is not lost: {:?}",
+            desk.disk
+        );
+        assert!(desk.disk.contains_key("B/f.txt"), "the rename is applied");
+    }
+
+    #[test]
+    fn a_folder_that_still_holds_something_stays() {
+        let mut desk = Replica {
+            side: Side::Desk,
+            disk: Disk::new(),
+            manifest: Manifest::new(),
+        };
+        let mut phone = Replica {
+            side: Side::Phone,
+            disk: Disk::new(),
+            manifest: Manifest::new(),
+        };
+        desk.disk.insert("A".into(), DIR.into());
+        desk.scan(1);
+        sync(&mut phone, &desk);
+        phone.scan(2);
+        // The phone removes it while the desk (unsynced) put a file in.
+        phone.disk.remove("A");
+        phone.scan(3);
+        desk.disk.insert("A/new.txt".into(), "keep me".into());
+        desk.scan(3);
+        for round in 4..8 {
+            sync(&mut desk, &phone);
+            desk.scan(round);
+            sync(&mut phone, &desk);
+            phone.scan(round);
+        }
+        assert_eq!(
+            desk.disk.get("A/new.txt").map(String::as_str),
+            Some("keep me")
+        );
+        assert_eq!(
+            desk.disk, phone.disk,
+            "the phone got the folder and the file back"
+        );
+    }
+
+    #[test]
+    fn both_sides_creating_the_same_folder_merge() {
+        let mut desk = Replica {
+            side: Side::Desk,
+            disk: Disk::new(),
+            manifest: Manifest::new(),
+        };
+        let mut phone = Replica {
+            side: Side::Phone,
+            disk: Disk::new(),
+            manifest: Manifest::new(),
+        };
+        desk.disk.insert("Trips".into(), DIR.into());
+        phone.disk.insert("Trips".into(), DIR.into());
+        desk.scan(1);
+        phone.scan(1);
+        let steps = plan(Side::Desk, &desk.manifest, &phone.manifest, "P");
+        assert!(
+            matches!(steps.as_slice(), [Step::Take { .. }]),
+            "one folder, no conflict: {steps:?}"
+        );
+        sync(&mut desk, &phone);
+        sync(&mut phone, &desk);
+        assert_eq!(desk.disk, phone.disk);
+        assert_eq!(desk.disk.len(), 1);
+    }
+
+    #[test]
+    fn a_case_only_rename_is_a_rename_and_no_decision_reads_the_clock() {
+        let mut local = Manifest::new();
+        local.insert("a.txt".into(), entry("aaa", (1, 0)));
+        let mut remote = Manifest::new();
+        remote.insert("a.txt".into(), tomb((2, 0)));
+        remote.insert("A.txt".into(), entry("aaa", (2, 0)));
+        let steps = plan(Side::Phone, &local, &remote, "P");
+        assert!(
+            steps.iter().any(|step| matches!(step, Step::Move { from, to, .. } if from == "a.txt" && to == "A.txt")),
+            "{steps:?}"
+        );
+        // Clock skew: mtimes a year apart change nothing.
+        let mut skewed = remote.clone();
+        for entry in skewed.values_mut() {
+            entry.mtime += 365 * 24 * 3600 * 1000;
+        }
+        assert_eq!(
+            plan(Side::Phone, &local, &remote, "P").len(),
+            plan(Side::Phone, &local, &skewed, "P").len()
+        );
+        // Same content on both, concurrent: nothing is sent again.
+        let mut ours = Manifest::new();
+        ours.insert("p.txt".into(), entry("same", (2, 0)));
+        let mut theirs = Manifest::new();
+        theirs.insert("p.txt".into(), entry("same", (0, 3)));
+        let steps = plan(Side::Desk, &ours, &theirs, "P");
+        assert!(matches!(steps.as_slice(), [Step::Take { .. }]), "{steps:?}");
+    }
+
+    #[test]
+    fn an_empty_folder_from_the_phone_is_created_here() {
+        let (base, root, mut worker) = scratch_bucket("bucket-dir-in");
+        let packet = folders_packet(
+            "manifest",
+            json!({"id": BUCKET_ID, "part": 1, "parts": 1, "entries": [
+                {"path": "Trips", "dir": true, "vv": {"desk": 0, "phone": 1}},
+                {"path": "Trips/Rome", "dir": true, "vv": {"desk": 0, "phone": 1}},
+            ]}),
+        );
+        worker.on_packet("phone-b", &packet);
+        assert!(root.join("Trips/Rome").is_dir());
+        assert_eq!(worker.pairs[0].phase, Phase::UpToDate, "nothing to fetch");
+        let items = worker.pairs[0].view(true).items;
+        assert!(items.iter().all(|item| item.dir));
+        // A phone-side removal of an empty folder removes it here.
+        let removal = folders_packet(
+            "manifest",
+            json!({"id": BUCKET_ID, "part": 1, "parts": 1, "entries": [
+                {"path": "Trips", "dir": true, "vv": {"desk": 0, "phone": 1}},
+                {"path": "Trips/Rome", "dir": true, "deleted": true, "vv": {"desk": 0, "phone": 2}},
+            ]}),
+        );
+        worker.on_packet("phone-b", &removal);
+        assert!(root.join("Trips").is_dir() && !root.join("Trips/Rome").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_folder_removed_on_the_phone_goes_to_the_trash_as_one_item() {
+        let (base, root, mut worker) = scratch_bucket("bucket-remote-trash");
+        fs::create_dir_all(root.join("A/B")).unwrap();
+        fs::write(root.join("A/one.txt"), "1").unwrap();
+        fs::write(root.join("A/B/two.txt"), "2").unwrap();
+        worker.rescan(0);
+        let manifest = worker.pairs[0].book.manifest.clone();
+        assert_eq!(manifest.len(), 4);
+        let gone = |path: &str| {
+            let mut entry = manifest[path].clone();
+            let (size, mtime) = (0, entry.mtime);
+            entry.deleted = true;
+            entry.size = size;
+            entry.mtime = mtime;
+            entry.sha256.clear();
+            entry.vv.phone = entry.vv.desk + 1;
+            json!({"path": path, "dir": entry.dir, "deleted": true,
+                   "vv": {"desk": entry.vv.desk, "phone": entry.vv.phone}})
+        };
+        let packet = folders_packet(
+            "manifest",
+            json!({"id": BUCKET_ID, "part": 1, "parts": 1, "entries": [
+                gone("A"), gone("A/B"), gone("A/one.txt"), gone("A/B/two.txt"),
+            ]}),
+        );
+        let before = trashed();
+        worker.on_packet("phone-b", &packet);
+        assert_eq!(trashed() - before, 1, "the folder, once");
+        assert!(!root.join("A").exists());
+        assert!(worker.pairs[0]
+            .book
+            .manifest
+            .values()
+            .all(|entry| entry.deleted));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn removing_a_folder_here_is_one_trash_item_and_cancels_its_transfers() {
+        let (base, root, mut worker) = scratch_bucket("bucket-remove");
+        fs::create_dir_all(root.join("A/B")).unwrap();
+        fs::write(root.join("A/one.txt"), "1").unwrap();
+        fs::write(root.join("A/B/two.txt"), "2").unwrap();
+        fs::write(root.join("keep.txt"), "k").unwrap();
+        worker.rescan(0);
+        {
+            let live = &mut worker.pairs[0];
+            live.send_queue.push_back("A/one.txt".into());
+            live.flight.insert("A/B/two.txt".into(), Instant::now());
+            live.outstanding.push_back("A/B/three.txt".into());
+            live.to_request.push_back("A/four.txt".into());
+            live.send_queue.push_back("keep.txt".into());
+        }
+        let before = trashed();
+        worker.handle(Message::RemoveItems {
+            device: "phone-b".into(),
+            paths: vec!["A".into()],
+        });
+        assert_eq!(trashed() - before, 1, "one item for the whole folder");
+        assert!(!root.join("A").exists() && root.join("keep.txt").exists());
+        let live = &worker.pairs[0];
+        assert_eq!(live.send_queue, ["keep.txt"], "its transfers are dropped");
+        assert!(
+            live.flight.is_empty() && live.outstanding.is_empty() && live.to_request.is_empty()
+        );
+        // The next scan tombstones all four, so the phone removes them.
+        worker.rescan(0);
+        let manifest = &worker.pairs[0].book.manifest;
+        assert!(["A", "A/B", "A/one.txt", "A/B/two.txt"]
+            .iter()
+            .all(|path| manifest[*path].deleted));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bulk_remove_trashes_every_selected_item() {
+        let (base, root, mut worker) = scratch_bucket("bucket-bulk");
+        fs::create_dir_all(root.join("Folder")).unwrap();
+        fs::write(root.join("Folder/in.txt"), "i").unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(root.join(name), name).unwrap();
+        }
+        worker.rescan(0);
+        let before = trashed();
+        worker.handle(Message::RemoveItems {
+            device: "phone-b".into(),
+            paths: vec!["a.txt".into(), "Folder".into(), "c.txt".into()],
+        });
+        assert_eq!(trashed() - before, 3);
+        assert!(root.join("b.txt").exists());
+        assert!(!root.join("a.txt").exists() && !root.join("c.txt").exists());
+        assert!(!root.join("Folder").exists());
+        worker.rescan(0);
+        let live: Vec<&String> = worker.pairs[0]
+            .book
+            .manifest
+            .iter()
+            .filter(|(_, entry)| !entry.deleted)
+            .map(|(path, _)| path)
+            .collect();
+        assert_eq!(live, ["b.txt"]);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_file_over_1_gb_is_refused_with_the_documented_words() {
+        let (base, root, worker) = scratch_bucket("bucket-big");
+        let big = base.join("big.bin");
+        fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        let exact = base.join("exact.bin");
+        fs::File::create(&exact)
+            .unwrap()
+            .set_len(MAX_FILE_BYTES)
+            .unwrap();
+        let mut report = Report::default();
+        let adds = collect(
+            &[big.clone(), exact.clone()],
+            &root,
+            "",
+            (0, 0),
+            &mut report,
+        );
+        assert_eq!(
+            adds.iter().map(|add| add.rel.as_str()).collect::<Vec<_>>(),
+            ["exact.bin"]
+        );
+        assert_eq!(report.too_big, 1);
+        assert_eq!(
+            report.message().unwrap(),
+            "Files over 1 GB can't go in the Bucket"
+        );
+        // In the Bucket folder from outside, and from the phone.
+        fs::copy(&big, root.join("huge.bin")).unwrap();
+        let (found, _, _, skipped) = scan(&worker.pairs[0].pair).unwrap();
+        assert!(!found.contains_key("huge.bin"));
+        assert_eq!(skipped, ["huge.bin (over 1 GB)"]);
+        let mut packet = NetworkPacket::new(PACKET_TYPE_FOLDERS);
+        packet.set(
+            "entries",
+            json!([{"path": "p.bin", "size": MAX_FILE_BYTES + 1, "mtime": 1,
+                    "sha256": "a".repeat(64), "vv": {"desk": 0, "phone": 1}}]),
+        );
+        assert!(manifest_entries(&packet, &worker.pairs[0].pair).is_empty());
+        let folder = FolderRef {
+            folder: BUCKET_ID.into(),
+            relpath: "p.bin".into(),
+            mtime: None,
+        };
+        test_want("phone-b", &folder, &"a".repeat(64), MAX_FILE_BYTES + 1);
+        assert!(!accepts(
+            "phone-b",
+            &folder,
+            &"a".repeat(64),
+            MAX_FILE_BYTES + 1
+        ));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_add_is_limited_in_items_and_bytes_and_the_bucket_is_full_at_10_gb() {
+        let base = scratch("bucket-add-limits");
         let root = base.join("bucket");
         fs::create_dir_all(&root).unwrap();
         let outside = base.join("outside");
-        fs::create_dir_all(outside.join("nested/empty")).unwrap();
-        fs::write(outside.join("photo.jpg"), "jpeg").unwrap();
-        fs::write(outside.join("nested/inner.txt"), "inner").unwrap();
-        std::os::unix::fs::symlink(outside.join("photo.jpg"), outside.join("link.jpg")).unwrap();
-        fs::write(root.join("photo.jpg"), "already here").unwrap();
-        let (files, folder) = split_files(vec![
-            outside.join("photo.jpg"),
-            outside.join("nested"),
-            outside.join("link.jpg"),
-            outside.join("gone.txt"),
-        ]);
-        assert!(folder, "a folder was among them");
-        assert_eq!(
-            files,
-            [outside.join("photo.jpg")],
-            "no folder, link or missing file"
+        fs::create_dir_all(&outside).unwrap();
+        let many: Vec<PathBuf> = (0..MAX_ADD_ITEMS + 3)
+            .map(|index| {
+                let path = outside.join(format!("f{index:04}.txt"));
+                fs::write(&path, "x").unwrap();
+                path
+            })
+            .collect();
+        let mut report = Report::default();
+        let adds = collect(&many, &root, "", (0, 0), &mut report);
+        assert_eq!((adds.len(), report.over_items), (MAX_ADD_ITEMS, 3));
+        assert!(report
+            .message()
+            .unwrap()
+            .contains("Only 500 items can be added at once; 3 were left out"));
+        // 5 GB at once: six 1 GiB files, the sixth left out.
+        let big: Vec<PathBuf> = (0..6)
+            .map(|index| {
+                let path = outside.join(format!("big{index}.bin"));
+                fs::File::create(&path)
+                    .unwrap()
+                    .set_len(MAX_FILE_BYTES)
+                    .unwrap();
+                path
+            })
+            .collect();
+        let mut report = Report::default();
+        let adds = collect(&big, &root, "", (0, 0), &mut report);
+        assert_eq!((adds.len(), report.over_bytes), (5, 1));
+        // The Bucket would pass 10 GB.
+        let mut report = Report::default();
+        let adds = collect(
+            &big,
+            &root,
+            "",
+            (BUCKET_FULL_BYTES - 2 * MAX_FILE_BYTES, 10),
+            &mut report,
         );
-        let mut worker = bucket_worker(&base, &root);
+        assert_eq!(adds.len(), 2);
+        assert!(report.full);
+        assert!(report
+            .message()
+            .unwrap()
+            .contains("The Bucket is full (10 GB)"));
+        // The item cap of a Bucket.
+        let mut report = Report::default();
+        let adds = collect(
+            &many[..5],
+            &root,
+            "",
+            (0, MAX_BUCKET_ITEMS - 2),
+            &mut report,
+        );
+        assert_eq!((adds.len(), report.over_items), (2, 3));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn adding_a_folder_copies_what_is_in_it_within_the_depth() {
+        let (base, root, mut worker) = scratch_bucket("bucket-add-folder");
+        let outside = base.join("Holiday");
+        fs::create_dir_all(outside.join("Day 1/Raw")).unwrap();
+        fs::create_dir_all(outside.join("Empty")).unwrap();
+        fs::write(outside.join("Day 1/a.jpg"), "a").unwrap();
+        fs::write(outside.join("Day 1/Raw/r.cr2"), "r").unwrap();
+        std::os::unix::fs::symlink(outside.join("Day 1/a.jpg"), outside.join("link.jpg")).unwrap();
         worker.handle(Message::Import {
             device: "phone-b".into(),
-            sources: vec![outside.join("photo.jpg"), outside.join("nested")],
+            sources: vec![outside.clone()],
+            into: String::new(),
         });
         assert_eq!(
-            fs::read_to_string(root.join("photo (2).jpg")).unwrap(),
-            "jpeg"
+            fs::read_to_string(root.join("Holiday/Day 1/a.jpg")).unwrap(),
+            "a"
+        );
+        assert!(
+            root.join("Holiday/Empty").is_dir(),
+            "empty folders are copied"
+        );
+        assert!(
+            !root.join("Holiday/Day 1/Raw").exists(),
+            "level 3 is left out"
+        );
+        assert!(!root.join("Holiday/link.jpg").exists(), "links are skipped");
+        let message = take_report().expect("what was left out is said");
+        assert!(message.contains("left out (2)"), "{message}");
+        // Again: the name is taken, so it is a second folder.
+        worker.handle(Message::Import {
+            device: "phone-b".into(),
+            sources: vec![outside],
+            into: String::new(),
+        });
+        assert!(root.join("Holiday (2)/Empty").is_dir());
+        let _ = take_report();
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new_folder_is_refused_at_level_two_and_names_stay_unique() {
+        let (base, root, mut worker) = scratch_bucket("bucket-new-folder");
+        worker.handle(Message::NewFolder {
+            device: "phone-b".into(),
+            parent: String::new(),
+        });
+        worker.handle(Message::NewFolder {
+            device: "phone-b".into(),
+            parent: String::new(),
+        });
+        assert!(root.join("New Folder").is_dir() && root.join("New Folder (2)").is_dir());
+        worker.handle(Message::NewFolder {
+            device: "phone-b".into(),
+            parent: "New Folder".into(),
+        });
+        assert!(
+            root.join("New Folder/New Folder").is_dir(),
+            "level 2 is allowed"
+        );
+        let _ = take_report();
+        worker.handle(Message::NewFolder {
+            device: "phone-b".into(),
+            parent: "New Folder/New Folder".into(),
+        });
+        assert!(!root.join("New Folder/New Folder/New Folder").exists());
+        assert_eq!(
+            take_report().unwrap(),
+            "Folders can only go 2 levels deep in the Bucket"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn moving_into_a_folder_that_would_be_too_deep_is_refused_per_item() {
+        let (base, root, mut worker) = scratch_bucket("bucket-move");
+        fs::create_dir_all(root.join("A/B")).unwrap();
+        fs::create_dir_all(root.join("C/D")).unwrap();
+        fs::create_dir_all(root.join("E")).unwrap();
+        fs::write(root.join("f.txt"), "f").unwrap();
+        worker.rescan(0);
+        let _ = take_report();
+        worker.handle(Message::MoveItems {
+            device: "phone-b".into(),
+            paths: vec!["f.txt".into(), "E".into(), "C".into()],
+            dest: "A/B".into(),
+        });
+        assert!(root.join("A/B/f.txt").exists(), "a file fits at level 2");
+        assert!(!root.join("A/B/E").exists(), "a folder would be level 3");
+        assert!(
+            root.join("E").is_dir() && root.join("C/D").is_dir(),
+            "left where they are"
         );
         assert_eq!(
-            fs::read_to_string(root.join("photo.jpg")).unwrap(),
-            "already here"
+            take_report().unwrap(),
+            "2 items couldn't be moved: they would be more than 2 folders deep"
         );
-        assert!(!root.join("nested").exists(), "folders never copied in");
-        worker.rescan(0);
-        let items = &worker.pairs[0].view(true).items;
-        assert_eq!(items.len(), 2);
-        assert!(items.iter().all(|item| item.from == Side::Desk));
-        assert!(items
-            .iter()
-            .all(|item| item.state == ItemState::Synced || item.state == ItemState::Waiting));
+        // Into a level-1 folder, a folder with no subfolders fits; one with them does not.
+        worker.handle(Message::MoveItems {
+            device: "phone-b".into(),
+            paths: vec!["E".into(), "C".into()],
+            dest: "A".into(),
+        });
+        assert!(root.join("A/E").is_dir());
+        assert!(root.join("C/D").is_dir(), "C holds a folder: level 3");
+        assert_eq!(
+            take_report().unwrap(),
+            "1 item couldn't be moved: they would be more than 2 folders deep"
+        );
+        // Not into itself.
+        worker.handle(Message::MoveItems {
+            device: "phone-b".into(),
+            paths: vec!["A".into()],
+            dest: "A/B".into(),
+        });
+        assert_eq!(take_report().unwrap(), "A folder can't go inside itself");
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn two_transfers_are_in_flight_per_direction_and_the_rest_wait() {
+        // Sending: the queue fills two slots; an ended transfer frees one.
+        let mut queue: VecDeque<String> = (1..=5).map(|n| format!("f{n}")).collect();
+        let mut flight = HashMap::new();
+        let now = Instant::now();
+        assert_eq!(due_sends(&mut queue, &mut flight, &[], now), ["f1", "f2"]);
+        assert!(
+            due_sends(&mut queue, &mut flight, &[], now).is_empty(),
+            "full"
+        );
+        assert_eq!(
+            due_sends(&mut queue, &mut flight, &["f1".into()], now),
+            ["f3"]
+        );
+        assert_eq!(
+            due_sends(&mut queue, &mut flight, &["f2".into(), "f3".into()], now),
+            ["f4", "f5"]
+        );
+        assert_eq!(flight.len(), MAX_IN_FLIGHT);
+        // A transfer that never showed lapses, so a lost one cannot hold a slot.
+        let later = now + FLIGHT_LAPSES + Duration::from_secs(1);
+        queue.push_back("f6".into());
+        assert_eq!(due_sends(&mut queue, &mut flight, &[], later), ["f6"]);
+        // Receiving: only two paths are asked for at a time.
+        let (base, _root, mut worker) = scratch_bucket("bucket-flight");
+        worker.pairs[0].to_request = (1..=6).map(|n| format!("r{n}")).collect();
+        worker.request_more(0);
+        assert_eq!(worker.pairs[0].outstanding.len(), MAX_IN_FLIGHT);
+        assert_eq!(worker.pairs[0].to_request.len(), 4, "the rest are Waiting…");
+        worker.request_more(0);
+        assert_eq!(worker.pairs[0].outstanding.len(), MAX_IN_FLIGHT);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_file_still_being_written_waits_until_it_has_held_for_two_seconds() {
+        let now = 10_000_000i64;
+        let fresh = Stat {
+            size: 5,
+            mtime: now - 500,
+            dir: false,
+        };
+        let old = Stat {
+            size: 5,
+            mtime: now - 5_000,
+            dir: false,
+        };
+        let mut found: BTreeMap<String, Stat> = [
+            ("download.part2".to_string(), fresh),
+            ("settled.txt".to_string(), old),
+            ("edited.txt".to_string(), fresh),
+            (
+                "folder".to_string(),
+                Stat {
+                    size: 0,
+                    mtime: 0,
+                    dir: true,
+                },
+            ),
+        ]
+        .into();
+        let mut manifest = Manifest::new();
+        manifest.insert(
+            "edited.txt".into(),
+            Entry {
+                mtime: now - 90_000,
+                size: 4,
+                ..entry("old", (1, 0))
+            },
+        );
+        assert!(hold_unstable(&mut found, &manifest, now, 2_000));
+        assert!(
+            !found.contains_key("download.part2"),
+            "new and unstable: not yet"
+        );
+        assert!(found.contains_key("settled.txt") && found.contains_key("folder"));
+        assert_eq!(
+            found["edited.txt"].mtime,
+            now - 90_000,
+            "held at the old version"
+        );
+        // Two seconds later it is stable.
+        let mut found: BTreeMap<String, Stat> = [("download.part2".to_string(), fresh)].into();
+        assert!(!hold_unstable(&mut found, &manifest, now + 2_000, 2_000));
+        assert!(found.contains_key("download.part2"));
+        // The worker rescans soon rather than waiting a minute.
+        let (base, root, mut worker) = scratch_bucket("bucket-stable");
+        TEST_STABLE_MS.with(|window| window.set(STABLE_FOR.as_millis() as i64));
+        fs::write(root.join("new.bin"), "being written").unwrap();
+        worker.rescan(0);
+        assert!(
+            worker.pairs[0].book.manifest.is_empty(),
+            "too fresh to sync"
+        );
+        assert!(worker.pairs[0].dirty.is_some(), "scanned again soon");
+        TEST_STABLE_MS.with(|window| window.set(0));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_file_changed_after_it_was_asked_for_is_not_sent_and_is_scanned_again() {
+        let (base, root, mut worker) = scratch_bucket("bucket-changed");
+        fs::write(root.join("doc.txt"), "one").unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        let old = Duration::from_secs(10);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("doc.txt"))
+            .unwrap();
+        file.set_modified(SystemTime::now() - old).unwrap();
+        worker.rescan(0);
+        assert!(worker.pairs[0].book.manifest.contains_key("doc.txt"));
+        fs::write(root.join("doc.txt"), "two, longer").unwrap();
+        worker.pairs[0].dirty = None;
+        worker.pairs[0].send_queue.push_back("doc.txt".into());
+        worker.pump_sends(0, &[]);
+        let live = &worker.pairs[0];
+        assert!(live.flight.is_empty(), "not sent");
+        assert!(
+            live.dirty.is_some(),
+            "scanned again, so the new version is asked for"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn turning_the_bucket_off_keeps_every_file_and_on_again_resends_nothing_identical() {
+        let (base, root, mut worker) = scratch_bucket("bucket-off-on");
+        fs::create_dir_all(root.join("A")).unwrap();
+        fs::write(root.join("A/x.txt"), "x").unwrap();
+        worker.handle(Message::Remove {
+            device: "phone-b".into(),
+            id: BUCKET_ID.into(),
+        });
+        assert!(root.join("A/x.txt").exists(), "files stay");
+        assert!(worker.pairs.is_empty());
+        // Both sides hold the same file under unrelated version counters:
+        // taken as is, no transfer.
+        let mut desk = Manifest::new();
+        desk.insert("x.txt".into(), entry("same", (1, 0)));
+        let mut phone = Manifest::new();
+        phone.insert("x.txt".into(), entry("same", (0, 4)));
+        let steps = plan(Side::Desk, &desk, &phone, "P");
+        assert!(
+            steps.iter().all(|step| matches!(step, Step::Take { .. })),
+            "{steps:?}"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_folders_tile_adds_up_and_its_badge_rolls_up() {
+        let item = |path: &str, size: u64, state: ItemState, dir: bool| Item {
+            dir,
+            path: path.into(),
+            size,
+            mtime: 0,
+            from: Side::Desk,
+            state,
+        };
+        let items = vec![
+            item("A", 0, ItemState::Synced, true),
+            item("A/B", 0, ItemState::Synced, true),
+            item("A/B/x", 100, ItemState::Receiving, false),
+            item("A/y", 20, ItemState::Synced, false),
+            item("Ab", 7, ItemState::Synced, false),
+        ];
+        assert_eq!(totals(&items, "A"), (3, 120), "A/B, A/B/x, A/y; not Ab");
+        assert_eq!(totals(&items, "A/B"), (1, 100));
+        assert_eq!(parent_of("A/B/x"), "A/B");
+        assert_eq!(parent_of("x"), "");
+        use ItemState::*;
+        assert_eq!(rollup([Synced, Synced]), Synced);
+        assert_eq!(rollup([Synced, Waiting]), Waiting);
+        assert_eq!(rollup([Waiting, Sending]), Sending);
+        assert_eq!(rollup([Sending, Receiving, Waiting]), Receiving);
+        assert_eq!(rollup([Receiving, Conflict, Synced]), Conflict);
+        assert_eq!(rollup([]), Synced);
+    }
+
+    #[test]
+    fn what_an_add_left_out_is_said_plainly() {
+        let report = Report {
+            added: 3,
+            too_big: 2,
+            too_deep: 4,
+            bad_names: 1,
+            full: true,
+            over_items: 5,
+            over_bytes: 1,
+            not_moved: 2,
+            refused: Some("No.".into()),
+        };
+        let message = report.message().unwrap();
+        for part in [
+            "Added 3 items to the Bucket",
+            "No.",
+            "Files over 1 GB can't go in the Bucket (2)",
+            "Some items were more than 2 folders deep and were left out (4)",
+            "Some names can't sync, so they were left out (1)",
+            "The Bucket is full (10 GB)",
+            "Only 500 items can be added at once; 5 were left out",
+            "Only 5 GB can be added at once; 1 were left out",
+            "2 items couldn't be moved",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+        assert_eq!(Report::default().message(), None);
+        assert_eq!(
+            Report {
+                added: 1,
+                ..Report::default()
+            }
+            .message()
+            .unwrap(),
+            "Added 1 item to the Bucket"
+        );
     }
 
     #[test]
@@ -2697,8 +4444,8 @@ mod tests {
         assert_eq!(bytes, b"Door code 4471\nBring the keys");
         let (name, _) = pasted_text("see https://a.b and more", &now);
         assert!(name.ends_with(".txt"), "a sentence with a link is text");
-        assert!(import_bytes("p", "Text.txt", vec![b'x'; MAX_TEXT_ITEM_BYTES + 1]).is_err());
-        assert!(import_bytes("p", "Text.txt", Vec::new()).is_err());
+        assert!(import_bytes("p", "Text.txt", vec![b'x'; MAX_TEXT_ITEM_BYTES + 1], "").is_err());
+        assert!(import_bytes("p", "Text.txt", Vec::new(), "").is_err());
     }
 
     #[test]
@@ -2914,6 +4661,7 @@ mod tests {
             mtime: 1_700_000_000_000,
             sha256: sha.to_string(),
             deleted: false,
+            dir: false,
             vv: Vv {
                 desk: vv.0,
                 phone: vv.1,
@@ -2924,6 +4672,7 @@ mod tests {
     fn tomb(vv: (u64, u64)) -> Entry {
         Entry {
             deleted: true,
+            dir: false,
             sha256: String::new(),
             size: 0,
             ..entry("", vv)
@@ -3071,10 +4820,38 @@ mod tests {
             ("vanished", entry("v", (0, 2))),
         ]);
         let found: BTreeMap<String, Stat> = [
-            ("kept", Stat { size: 1, mtime: 5 }),
-            ("touched", Stat { size: 1, mtime: 9 }),
-            ("edited", Stat { size: 2, mtime: 9 }),
-            ("new", Stat { size: 3, mtime: 9 }),
+            (
+                "kept",
+                Stat {
+                    size: 1,
+                    mtime: 5,
+                    dir: false,
+                },
+            ),
+            (
+                "touched",
+                Stat {
+                    size: 1,
+                    mtime: 9,
+                    dir: false,
+                },
+            ),
+            (
+                "edited",
+                Stat {
+                    size: 2,
+                    mtime: 9,
+                    dir: false,
+                },
+            ),
+            (
+                "new",
+                Stat {
+                    size: 3,
+                    mtime: 9,
+                    dir: false,
+                },
+            ),
         ]
         .into_iter()
         .map(|(path, stat)| (path.to_string(), stat))
@@ -3207,6 +4984,8 @@ mod tests {
     }
 
     type Disk = BTreeMap<String, String>;
+    /// A folder on a simulated disk.
+    const DIR: &str = "\u{0}dir";
     struct Replica {
         side: Side,
         disk: Disk,
@@ -3218,11 +4997,13 @@ mod tests {
                 .disk
                 .iter()
                 .map(|(path, content)| {
+                    let dir = content == DIR;
                     (
                         path.clone(),
                         Stat {
-                            size: content.len() as u64,
-                            mtime: content_mtime(content),
+                            size: if dir { 0 } else { content.len() as u64 },
+                            mtime: if dir { 0 } else { content_mtime(content) },
+                            dir,
                         },
                     )
                 })
@@ -3232,7 +5013,7 @@ mod tests {
                 self.side,
                 &mut self.manifest,
                 &found,
-                &mut |path| disk.get(path).map(|c| sha(c)),
+                &mut |path| disk.get(path).filter(|c| *c != DIR).map(|c| sha(c)),
                 now,
             );
         }
@@ -3252,6 +5033,7 @@ mod tests {
     /// Applies `local`'s plan; downloads read the other side's disk.
     fn sync(local: &mut Replica, remote: &Replica) {
         let steps = plan(local.side, &local.manifest, &remote.manifest, "P");
+        let mut folder_deletes: Vec<(String, Entry)> = Vec::new();
         for step in steps {
             match step {
                 Step::Take { path, entry } => {
@@ -3262,8 +5044,13 @@ mod tests {
                         entry.vv = vv;
                     }
                 }
+                Step::Delete { path, entry } if entry.dir => folder_deletes.push((path, entry)),
                 Step::Delete { path, entry } => {
                     local.disk.remove(&path);
+                    local.manifest.insert(path, entry);
+                }
+                Step::Download { path, entry } if entry.dir => {
+                    local.disk.insert(path.clone(), DIR.to_string());
                     local.manifest.insert(path, entry);
                 }
                 Step::Download { path, entry } => {
@@ -3304,6 +5091,20 @@ mod tests {
                     }
                 }
                 Step::Conflict { .. } => {}
+            }
+        }
+        // Folders last, deepest first, only when empty; a kept one wins.
+        folder_deletes.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+        for (path, entry) in folder_deletes {
+            let below = format!("{path}/");
+            if local.disk.keys().any(|other| other.starts_with(&below)) {
+                if let Some(ours) = local.manifest.get(&path).cloned() {
+                    let vv = ours.vv.max(entry.vv).bumped(local.side);
+                    local.manifest.insert(path, Entry { vv, ..ours });
+                }
+            } else {
+                local.disk.remove(&path);
+                local.manifest.insert(path, entry);
             }
         }
     }
