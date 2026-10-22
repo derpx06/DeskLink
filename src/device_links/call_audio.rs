@@ -67,20 +67,30 @@ pub(crate) fn bonded_phones() -> Option<Vec<BondedPhone>> {
             gio::Cancellable::NONE,
         )
         .ok()?;
-    let objects = reply.child_value(0);
+    let mut phones = phones_in(&reply.child_value(0));
+    phones.sort_by(|a, b| a.name.cmp(&b.name));
+    Some(phones)
+}
+
+/// Bonded hands-free phones in a `GetManagedObjects` reply (`a{oa{sa{sv}}}`).
+fn phones_in(objects: &glib::Variant) -> Vec<BondedPhone> {
     let mut phones = Vec::new();
     for index in 0..objects.n_children() {
         let entry = objects.child_value(index);
         let Some(path) = entry.child_value(0).str().map(str::to_string) else {
             continue;
         };
-        let interfaces = glib::VariantDict::new(Some(&entry.child_value(1)));
-        if let Some(device) = interfaces.lookup_value("org.bluez.Device1", None) {
-            phones.extend(bonded_phone(&path, &glib::VariantDict::new(Some(&device))));
+        // a{sa{sv}}: VariantDict only takes a{sv}, and asserts (a crash
+        // inside a GLib callback) on anything else.
+        let interfaces = entry.child_value(1);
+        for interface in (0..interfaces.n_children()).map(|i| interfaces.child_value(i)) {
+            if interface.child_value(0).str() == Some("org.bluez.Device1") {
+                let device = glib::VariantDict::new(Some(&interface.child_value(1)));
+                phones.extend(bonded_phone(&path, &device));
+            }
         }
     }
-    phones.sort_by(|a, b| a.name.cmp(&b.name));
-    Some(phones)
+    phones
 }
 
 fn words(text: &str) -> String {
@@ -168,6 +178,29 @@ pub(crate) fn open_bluetooth_settings() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_objects_are_read_without_asserting_on_their_type() {
+        let device = device(true, &[HFP_AG_UUID], "Pixel").end();
+        let objects = glib::Variant::array_from_iter_with_type(
+            glib::VariantTy::new("{oa{sa{sv}}}").unwrap(),
+            [glib::Variant::from_dict_entry(
+                &glib::variant::ObjectPath::try_from("/org/bluez/hci0/dev_AA")
+                    .unwrap()
+                    .to_variant(),
+                &glib::Variant::array_from_iter_with_type(
+                    glib::VariantTy::new("{sa{sv}}").unwrap(),
+                    [glib::Variant::from_dict_entry(
+                        &"org.bluez.Device1".to_variant(),
+                        &device,
+                    )],
+                ),
+            )],
+        );
+        let phones = phones_in(&objects);
+        assert_eq!(phones.len(), 1);
+        assert_eq!(phones[0].name, "Pixel");
+    }
 
     fn device(paired: bool, uuids: &[&str], alias: &str) -> glib::VariantDict {
         let dict = glib::VariantDict::new(None);

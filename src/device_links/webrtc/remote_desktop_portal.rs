@@ -981,7 +981,8 @@ fn lookup<T: glib::variant::FromVariant>(
 }
 
 fn dict_value(values: &glib::Variant, key: &str) -> Option<glib::Variant> {
-    let dict = glib::VariantDict::new(Some(values));
+    let dict =
+        glib::VariantDict::new(Some(values).filter(|v| v.type_() == glib::VariantTy::VARDICT));
     dict.lookup_value(key, None)
 }
 

@@ -103,7 +103,8 @@ fn active<'a>(
 pub(crate) fn metadata(
     value: &glib::Variant,
 ) -> (String, String, String, i64, Option<String>, Option<String>) {
-    let dict = glib::VariantDict::new(Some(value));
+    let dict =
+        glib::VariantDict::new(Some(value).filter(|v| v.type_() == glib::VariantTy::VARDICT));
     let text = |key: &str| {
         dict.lookup::<String>(key)
             .ok()
@@ -227,7 +228,12 @@ fn all_properties(bus: &gio::DBusConnection, name: &str, interface: &str) -> gli
             gio::Cancellable::NONE,
         )
         .ok();
-    glib::VariantDict::new(reply.map(|reply| reply.child_value(0)).as_ref())
+    glib::VariantDict::new(
+        reply
+            .map(|reply| reply.child_value(0))
+            .filter(|v| v.type_() == glib::VariantTy::VARDICT)
+            .as_ref(),
+    )
 }
 
 fn read_player(bus: &gio::DBusConnection, bus_name: &str) -> Option<Player> {

@@ -768,7 +768,12 @@ fn call_extensions(
 
 /// The `a{sv}` of `GetExtensionInfo`, empty when not installed.
 fn extension_info(reply: &Variant) -> glib::VariantDict {
-    glib::VariantDict::new(reply.try_child_value(0).as_ref())
+    glib::VariantDict::new(
+        reply
+            .try_child_value(0)
+            .filter(|v| v.type_() == glib::VariantTy::VARDICT)
+            .as_ref(),
+    )
 }
 
 fn is_active(info: &glib::VariantDict) -> bool {
@@ -1134,7 +1139,10 @@ fn track_extension(connection: &gio::DBusConnection) {
         gio::DBusSignalFlags::NONE,
         move |_, _, _, _, _, params| {
             set(is_active(&glib::VariantDict::new(
-                params.try_child_value(1).as_ref(),
+                params
+                    .try_child_value(1)
+                    .filter(|v| v.type_() == glib::VariantTy::VARDICT)
+                    .as_ref(),
             )))
         },
     );
@@ -1167,7 +1175,12 @@ fn track_extension(connection: &gio::DBusConnection) {
             Some(uuid),
             gio::DBusSignalFlags::NONE,
             move |_, _, _, _, _, params| {
-                note(&glib::VariantDict::new(params.try_child_value(1).as_ref()))
+                note(&glib::VariantDict::new(
+                    params
+                        .try_child_value(1)
+                        .filter(|v| v.type_() == glib::VariantTy::VARDICT)
+                        .as_ref(),
+                ))
             },
         );
         call_extensions(connection, "GetExtensionInfo", uuid, move |reply| {
