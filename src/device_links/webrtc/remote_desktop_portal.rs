@@ -209,6 +209,152 @@ impl Drop for PortalSessionGuard {
 /// What `start` says when the portal granted no screen: with a restore
 /// token, usually a token for a screen layout that no longer exists.
 pub(crate) const NO_SCREEN_STREAM: &str = "Desktop portal returned no screen stream";
+/// What the phone is told when the portal offers no screens at all.
+pub(crate) const PORTAL_NOT_RESPONDING: &str =
+    "This computer's screen-sharing service isn't responding";
+/// The same, once DeskLink has restarted that service.
+pub(crate) const PORTAL_RESTARTING: &str =
+    "This computer's screen-sharing service isn't responding — restarting it";
+/// At most one restart of the portal frontend per this long.
+const PORTAL_RESTART_EVERY: Duration = Duration::from_secs(600);
+static LAST_PORTAL_RESTART: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// ScreenCast `cursor_mode` from the portal's `AvailableCursorModes`:
+/// embedded (2) when offered, else hidden (1), else metadata (4); `None`
+/// (leave it out) when the portal offers none — asking for a mode it lacks
+/// fails the whole share ("Unavailable cursor mode").
+pub(crate) fn pick_cursor_mode(available: u32) -> Option<u32> {
+    [2, 1, 4].into_iter().find(|mode| available & mode != 0)
+}
+
+/// A portal or D-Bus error as words for the phone. Raw GDBus text never
+/// leaves this computer; it stays in the desk's log.
+pub(crate) fn plain_portal_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if error.starts_with(PORTAL_NOT_RESPONDING) {
+        return error.to_string();
+    }
+    if lower.starts_with("desktop permission request") {
+        return "Screen sharing was declined on this computer".to_string();
+    }
+    if lower.contains("timed out") {
+        return "Nobody answered the screen-sharing prompt on this computer".to_string();
+    }
+    if error == NO_SCREEN_STREAM {
+        return "No screen was chosen on this computer".to_string();
+    }
+    if lower.contains("cursor mode")
+        || lower.contains("serviceunknown")
+        || lower.contains("unknownmethod")
+        || lower.contains("connect to the desktop portal")
+        || lower.contains("noreply")
+    {
+        return PORTAL_NOT_RESPONDING.to_string();
+    }
+    if lower.contains("gdbus")
+        || lower.contains("org.freedesktop")
+        || lower.contains("desktop portal")
+        || lower.contains("pipewire")
+        || lower.contains("invalidargument")
+    {
+        return "This computer couldn't start screen sharing".to_string();
+    }
+    error.to_string()
+}
+
+/// The ScreenCast portal's `(AvailableSourceTypes, AvailableCursorModes)`;
+/// `None` when the portal does not answer.
+fn screencast_offers(connection: &gio::DBusConnection) -> Option<(u32, u32)> {
+    let get = |name: &str| {
+        connection
+            .call_sync(
+                Some(PORTAL_BUS),
+                PORTAL_PATH,
+                "org.freedesktop.DBus.Properties",
+                "Get",
+                Some(&(SCREEN_INTERFACE, name).to_variant()),
+                None,
+                gio::DBusCallFlags::NONE,
+                3_000,
+                None::<&gio::Cancellable>,
+            )
+            .ok()
+            .and_then(|reply| reply.child_value(0).as_variant())
+            .and_then(|value| value.get::<u32>())
+    };
+    Some((
+        get("AvailableSourceTypes")?,
+        get("AvailableCursorModes").unwrap_or(0),
+    ))
+}
+
+/// Restarts the user's `xdg-desktop-portal.service` through systemd: after
+/// its GNOME backend crashes, the frontend keeps answering with no source
+/// types and no cursor modes until it restarts. Once per
+/// [`PORTAL_RESTART_EVERY`]; whether it was asked to.
+fn restart_portal_frontend(connection: &gio::DBusConnection) -> bool {
+    {
+        let Ok(mut last) = LAST_PORTAL_RESTART.lock() else {
+            return false;
+        };
+        if last.is_some_and(|at| at.elapsed() < PORTAL_RESTART_EVERY) {
+            eprintln!("[DeskLink] Screen-sharing portal offers no screens; restarted it recently, not again");
+            return false;
+        }
+        *last = Some(Instant::now());
+    }
+    eprintln!(
+        "[DeskLink] Screen-sharing portal offers no screens; restarting xdg-desktop-portal.service"
+    );
+    match connection.call_sync(
+        Some("org.freedesktop.systemd1"),
+        "/org/freedesktop/systemd1",
+        "org.freedesktop.systemd1.Manager",
+        "RestartUnit",
+        Some(&("xdg-desktop-portal.service", "replace").to_variant()),
+        None,
+        gio::DBusCallFlags::NONE,
+        10_000,
+        None::<&gio::Cancellable>,
+    ) {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("[DeskLink] Could not restart xdg-desktop-portal.service: {error}");
+            false
+        }
+    }
+}
+
+/// The cursor mode to ask for, once the portal offers `source_type`
+/// screens; restarts a portal that offers none (see
+/// [`restart_portal_frontend`]) and waits for it to come back.
+fn ready_portal(connection: &gio::DBusConnection, source_type: u32) -> Result<Option<u32>, String> {
+    match screencast_offers(connection) {
+        Some((types, modes)) if types & source_type != 0 => return Ok(pick_cursor_mode(modes)),
+        // It answers, just without this kind of source (no VIRTUAL, say):
+        // a restart would not add it.
+        Some((types, _)) if types != 0 => {
+            return Err(format!(
+                "Desktop portal offers source types {types}, not {source_type}"
+            ))
+        }
+        _ => {}
+    }
+    if !restart_portal_frontend(connection) {
+        return Err(PORTAL_NOT_RESPONDING.to_string());
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(500));
+        if let Some((types, modes)) = screencast_offers(connection) {
+            if types & source_type != 0 {
+                eprintln!("[DeskLink] Screen-sharing portal is back after its restart");
+                return Ok(pick_cursor_mode(modes));
+            }
+        }
+    }
+    Err(PORTAL_RESTARTING.to_string())
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PortalInputAction {
@@ -320,6 +466,7 @@ impl RemoteDesktopPortal {
     ) -> Result<(Self, PortalScreenSource), String> {
         let connection = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>)
             .map_err(|error| format!("Could not connect to the desktop portal: {error}"))?;
+        let cursor_mode = ready_portal(&connection, if virtual_size.is_some() { 4 } else { 1 })?;
         let context = glib::MainContext::new();
         context
             .with_thread_default(|| {
@@ -403,7 +550,9 @@ impl RemoteDesktopPortal {
                                                     // All screens may be shared at once; the phone switches.
                         dict.insert("multiple", true);
                     }
-                    dict.insert("cursor_mode", 2u32); // EMBEDDED
+                    if let Some(mode) = cursor_mode {
+                        dict.insert("cursor_mode", mode);
+                    }
                     dict.insert("handle_token", token());
                 });
                 request(
@@ -1068,6 +1217,45 @@ fn token() -> String {
 mod tests {
     use super::*;
     use crate::device_links::packet::NetworkPacket;
+
+    #[test]
+    fn the_cursor_mode_is_one_the_portal_offers() {
+        assert_eq!(pick_cursor_mode(1 | 2 | 4), Some(2), "embedded first");
+        assert_eq!(pick_cursor_mode(1 | 4), Some(1));
+        assert_eq!(pick_cursor_mode(4), Some(4));
+        assert_eq!(pick_cursor_mode(0), None, "left out, never asked for");
+    }
+
+    #[test]
+    fn portal_errors_reach_the_phone_as_plain_words() {
+        let raw = "Desktop portal SelectSources failed: GDBus.Error:org.freedesktop.DBus.Error.InvalidArgument: Unavailable cursor mode 2";
+        assert_eq!(plain_portal_error(raw), PORTAL_NOT_RESPONDING);
+        assert_eq!(plain_portal_error(PORTAL_RESTARTING), PORTAL_RESTARTING);
+        assert_eq!(
+            plain_portal_error("Desktop permission request Start was cancelled"),
+            "Screen sharing was declined on this computer"
+        );
+        assert_eq!(
+            plain_portal_error("Timed out waiting for desktop portal Start"),
+            "Nobody answered the screen-sharing prompt on this computer"
+        );
+        assert_eq!(
+            plain_portal_error("Desktop portal Start failed: GDBus.Error:org.freedesktop.portal.Error.Failed: boom"),
+            "This computer couldn't start screen sharing"
+        );
+        assert_eq!(
+            plain_portal_error("The desktop share was cancelled"),
+            "The desktop share was cancelled",
+            "already plain"
+        );
+        for message in [raw, "Could not keep the PipeWire connection: EBADF"] {
+            let plain = plain_portal_error(message);
+            assert!(
+                !plain.contains("GDBus") && !plain.contains("org."),
+                "{plain}"
+            );
+        }
+    }
 
     /// The phone's presenter remote: next/previous slide, start the show,
     /// leave it, and blank the screen ("b", sent as text).

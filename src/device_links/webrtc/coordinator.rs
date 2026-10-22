@@ -1586,7 +1586,7 @@ fn run_desktop_portal_worker(
                         session.next_sequence(),
                         now,
                     );
-                    denied.reason = Some(error);
+                    denied.reason = Some(super::remote_desktop_portal::plain_portal_error(&error));
                     let _ = session.accept(&denied, now);
                     denied
                 })
@@ -1970,7 +1970,7 @@ fn screen_stopped(
         sequence,
         now_millis(),
     );
-    stopped.reason = Some(reason);
+    stopped.reason = Some(super::remote_desktop_portal::plain_portal_error(&reason));
     stopped
 }
 
