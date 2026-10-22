@@ -93,6 +93,14 @@ impl TransferBoard {
 
     /// Adds (or replaces) a Bucket transfer.
     pub fn begin_synced(&mut self, row: TransferRow) {
+        // The same file restarted under a new id (it changed, or was offered
+        // again): the old row is superseded, not left paused for ever.
+        self.synced.retain(|known| {
+            known.id == row.id
+                || !(known.device_id == row.device_id
+                    && known.name == row.name
+                    && known.incoming == row.incoming)
+        });
         if let Some(existing) = self.synced.iter_mut().find(|known| known.id == row.id) {
             *existing = row;
             return;
@@ -485,6 +493,32 @@ mod tests {
         assert!(board.synced.is_empty());
         assert!(board.take_finished().is_empty(), "never in the history");
         assert_eq!(board.synced_failed, ["s2"]);
+    }
+
+    #[test]
+    fn a_bucket_transfer_restarted_under_a_new_id_replaces_its_old_row() {
+        let mut board = TransferBoard::default();
+        let named = |id: &str, name: &str, incoming| TransferRow {
+            name: name.into(),
+            ..row(id, "phone", incoming, 100)
+        };
+        board.begin_synced(named("old", "A/f.mov", true));
+        board.begin_synced(named("other-way", "A/f.mov", false));
+        board.begin_synced(named("other-file", "A/g.mov", true));
+        board.pause_device("phone");
+        board.begin_synced(named("new", "A/f.mov", true));
+        let ids: Vec<&str> = board.synced.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids, ["other-way", "other-file", "new"], "{ids:?}");
+        assert!(
+            !board
+                .synced
+                .iter()
+                .find(|row| row.id == "new")
+                .unwrap()
+                .paused
+        );
+        assert!(board.synced_ended.is_empty(), "superseded is not an ending");
+        assert!(board.synced_failed.is_empty());
     }
 
     #[test]

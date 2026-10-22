@@ -271,7 +271,7 @@ pub(crate) fn conflict_name(path: &str, phone: &str, mtime: i64) -> String {
         .unwrap_or_else(|| "1970-01-01".into());
     let phone: String = phone
         .chars()
-        .filter(|c| !matches!(c, '/' | '\\' | '\0') && !c.is_control())
+        .filter(|c| !matches!(c, '/' | '\\' | '\0' | ':') && !c.is_control())
         .take(40)
         .collect();
     let suffix = format!(" (conflict from {phone} {date}){extension}");
@@ -787,6 +787,13 @@ enum Message {
         sources: Vec<PathBuf>,
         into: String,
     },
+    /// A copy lane finished: scan the Bucket soon.
+    Touched(String),
+    /// A send could not start: its slot is free again.
+    SendFailed {
+        device: String,
+        path: String,
+    },
     NewFolder {
         device: String,
         parent: String,
@@ -1186,6 +1193,13 @@ pub(crate) fn import_bytes(
     if bytes.is_empty() {
         return Err("Nothing to add".into());
     }
+    // Said now, so the toast is truthful: the worker checks again.
+    if !name_ok(name) || !(into.is_empty() || bucket_path_ok(into, true)) {
+        return Err("That name cannot be used".into());
+    }
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err("Files over 1 GB can't go in the Bucket".into());
+    }
     send_message(Message::ImportBytes {
         device: device_id.to_string(),
         name: name.to_string(),
@@ -1195,6 +1209,51 @@ pub(crate) fn import_bytes(
     Ok(())
 }
 
+/// A name from `raw` that [`name_ok`] accepts: what it rejects becomes `-`,
+/// nothing trails with a dot or space, never empty.
+pub(crate) fn clean_name(raw: &str, fallback: &str) -> String {
+    let mut name: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':') {
+                '-'
+            } else {
+                c
+            }
+        })
+        .collect();
+    while name.len() > MAX_NAME_BYTES {
+        name.pop();
+    }
+    let name = name.trim_end_matches(['.', ' ']).trim_start();
+    if name.is_empty() || matches!(name, "." | "..") {
+        fallback.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// The host of a pasted link as a file name: no `user@`, no `:port`, an IPv6
+/// address without its brackets (`[::1]` → `1`).
+fn link_host(link: &str) -> String {
+    let authority = link
+        .split("://")
+        .nth(1)
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+        .unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match host.strip_prefix('[') {
+        Some(inside) => inside.split(']').next().unwrap_or(inside),
+        None => host.rsplit_once(':').map_or(host, |(name, _port)| name),
+    };
+    let host: String = host.chars().take(80).collect();
+    let name = clean_name(&host, "Link");
+    match name.trim_matches('-') {
+        "" => "Link".to_string(),
+        trimmed => trimmed.to_string(),
+    }
+}
+
 /// `Text <date time>.txt` for pasted text, `<host> <date>.url` (a
 /// freedesktop link) for a pasted link: the name and the bytes to save.
 pub(crate) fn pasted_text(text: &str, now: &gtk::glib::DateTime) -> (String, Vec<u8>) {
@@ -1202,15 +1261,7 @@ pub(crate) fn pasted_text(text: &str, now: &gtk::glib::DateTime) -> (String, Vec
     let link = (trimmed.starts_with("https://") || trimmed.starts_with("http://"))
         && !trimmed.contains(char::is_whitespace);
     if link {
-        let host: String = trimmed
-            .split("://")
-            .nth(1)
-            .and_then(|rest| rest.split(['/', '?', '#']).next())
-            .unwrap_or("Link")
-            .chars()
-            .filter(|c| !matches!(c, '/' | '\\' | '\0') && !c.is_control())
-            .take(80)
-            .collect();
+        let host = link_host(trimmed);
         let date = now
             .format("%Y-%m-%d")
             .map(|d| d.to_string())
@@ -1451,6 +1502,28 @@ fn scan(pair: &Pair) -> Result<Scanned, String> {
     Ok((found, directories, too_many, skipped))
 }
 
+/// A file that exists but is not in `found` — the scan stopped at its cap,
+/// or skipped it (over 1 GB, a name that can't sync) — is not gone: its entry
+/// is kept as it is, so nothing is tombstoned (and deleted on the phone) for
+/// it.
+fn keep_existing(found: &mut BTreeMap<String, Stat>, manifest: &Manifest, root: &Path) {
+    for (path, entry) in manifest {
+        if entry.deleted || found.contains_key(path) {
+            continue;
+        }
+        if read_path(root, path).is_ok_and(|full| fs::symlink_metadata(full).is_ok()) {
+            found.insert(
+                path.clone(),
+                Stat {
+                    size: entry.size,
+                    mtime: entry.mtime,
+                    dir: entry.dir,
+                },
+            );
+        }
+    }
+}
+
 /// [`STABLE_FOR`] in ms (tests write and scan at once: none unless asked).
 fn stable_ms() -> i64 {
     #[cfg(test)]
@@ -1477,7 +1550,7 @@ fn hold_unstable(
         .iter()
         .filter(|(path, stat)| {
             !stat.dir
-                && now_ms - stat.mtime < window
+                && (0..window).contains(&(now_ms - stat.mtime))
                 && manifest
                     .get(*path)
                     .is_none_or(|entry| entry.deleted || entry.mtime != stat.mtime)
@@ -1540,6 +1613,27 @@ fn target_path(root: &Path, relpath: &str) -> Result<PathBuf, String> {
             Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => return Err("A folder on the way is not a folder".into()),
             Err(_) => fs::create_dir(&path).map_err(|_| "Could not create a folder".to_string())?,
+        }
+    }
+    path.push(segments[segments.len() - 1]);
+    if fs::symlink_metadata(&path).is_ok_and(|metadata| !metadata.is_file()) {
+        return Err("Something that is not a file is in the way".into());
+    }
+    Ok(path)
+}
+
+/// [`target_path`] for reading, deleting and moving away: the same checks,
+/// but nothing is created (a path whose folders are missing is just absent).
+fn read_path(root: &Path, relpath: &str) -> Result<PathBuf, String> {
+    validate_relpath(relpath)?;
+    let mut path = root.to_path_buf();
+    let segments: Vec<&str> = relpath.split('/').collect();
+    for segment in &segments[..segments.len() - 1] {
+        path.push(segment);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err("A folder on the way is not a folder".into()),
+            Err(_) => {}
         }
     }
     path.push(segments[segments.len() - 1]);
@@ -1977,7 +2071,11 @@ fn send(device: &str, packet: &NetworkPacket) {
 fn manifest_packets(id: &str, manifest: &Manifest) -> Vec<NetworkPacket> {
     let mut parts: Vec<Vec<Value>> = vec![Vec::new()];
     let mut size = 0;
-    for (path, entry) in manifest {
+    // Live entries first, then removals newest first: if the parts run out,
+    // the oldest removals are what is left out.
+    let mut ordered: Vec<(&String, &Entry)> = manifest.iter().collect();
+    ordered.sort_by_key(|(_, entry)| (entry.deleted, std::cmp::Reverse(entry.mtime)));
+    for (path, entry) in ordered.into_iter().take(MAX_FILES) {
         let mut value = serde_json::to_value(entry).unwrap_or(Value::Null);
         value["path"] = path.clone().into();
         let length = value.to_string().len() + 1;
@@ -2371,7 +2469,14 @@ impl Worker {
                 name,
                 bytes,
                 into,
-            } => self.import_bytes(&device, &name, &bytes, &into),
+            } => self.import_bytes(&device, &name, bytes, &into),
+            Message::Touched(device) => self.touched(&device),
+            Message::SendFailed { device, path } => {
+                if let Some(index) = self.index_of(&device, BUCKET_ID) {
+                    self.pairs[index].flight.remove(&path);
+                    self.pump_sends(index, &[]);
+                }
+            }
             Message::NewFolder { device, parent } => self.new_folder(&device, &parent),
             Message::MoveItems {
                 device,
@@ -2488,26 +2593,38 @@ impl Worker {
             return;
         }
         let adds = collect(&sources, &dir, into, self.bucket_used(device), &mut report);
-        report.added = copy_adds(&adds, &dir);
-        tell(&report);
+        let owner = device.to_string();
+        let job = move || {
+            report.added = copy_adds(&adds, &dir);
+            tell(&report);
+            send_message(Message::Touched(owner));
+        };
+        if !offload(&COPY_LANE, "desklink-bucket-copy", Box::new(job)) {
+            tell(&Report {
+                refused: Some("Still copying. Try again in a moment".into()),
+                ..Report::default()
+            });
+        }
+        #[cfg(test)]
         self.touched(device);
     }
 
-    fn import_bytes(&mut self, device: &str, name: &str, bytes: &[u8], into: &str) {
+    fn import_bytes(&mut self, device: &str, name: &str, bytes: Vec<u8>, into: &str) {
         let Some(dir) = self.bucket_dir(device) else {
             return;
         };
         let (used_bytes, used_items) = self.bucket_used(device);
-        if used_items >= MAX_BUCKET_ITEMS
-            || used_bytes + bytes.len() as u64 > BUCKET_FULL_BYTES
-            || !name_ok(name)
-            || name.contains('/')
-            || !(into.is_empty() || bucket_path_ok(into, true))
+        let mut report = Report::default();
+        if !name_ok(name) || name.contains('/') || !(into.is_empty() || bucket_path_ok(into, true))
         {
-            tell(&Report {
-                full: true,
-                ..Report::default()
-            });
+            report.refused = Some("That name cannot be used".into());
+        } else if used_items >= MAX_BUCKET_ITEMS {
+            report.over_items = 1;
+        } else if used_bytes + bytes.len() as u64 > BUCKET_FULL_BYTES {
+            report.full = true;
+        }
+        if report != Report::default() {
+            tell(&report);
             return;
         }
         let Ok(folder) = make_dir(&dir, into).or_else(|_| {
@@ -2519,15 +2636,26 @@ impl Worker {
         }) else {
             return;
         };
-        let target = unique_in(&folder, name);
-        let staged =
-            target.with_file_name(format!(".desklink-{}.tmp", uuid::Uuid::new_v4().simple()));
-        let written =
-            fs::write(&staged, bytes).is_ok() && put_in_place(&staged, &target, now_ms()).is_ok();
-        if !written {
-            let _ = fs::remove_file(&staged);
-            log_limited("import", "Could not save a pasted item in the Bucket");
+        let (owner, name) = (device.to_string(), name.to_string());
+        let job = move || {
+            let target = unique_in(&folder, &name);
+            let staged =
+                target.with_file_name(format!(".desklink-{}.tmp", uuid::Uuid::new_v4().simple()));
+            let written = fs::write(&staged, &bytes).is_ok()
+                && put_in_place(&staged, &target, now_ms()).is_ok();
+            if !written {
+                let _ = fs::remove_file(&staged);
+                log_limited("import", "Could not save a pasted item in the Bucket");
+            }
+            send_message(Message::Touched(owner));
+        };
+        if !offload(&COPY_LANE, "desklink-bucket-copy", Box::new(job)) {
+            tell(&Report {
+                refused: Some("Still copying. Try again in a moment".into()),
+                ..Report::default()
+            });
         }
+        #[cfg(test)]
         self.touched(device);
     }
 
@@ -2623,6 +2751,7 @@ impl Worker {
         };
         let rows = super::webrtc::transfer_board::synced_rows();
         let live = &mut self.pairs[index];
+        let mut removed = false;
         for path in paths.iter().take(MAX_BUCKET_ITEMS) {
             if !bucket_path_ok(path, true) && !bucket_path_ok(path, false) {
                 continue;
@@ -2643,11 +2772,47 @@ impl Worker {
                 .retain(|asked| asked != path && !asked.starts_with(&below));
             live.to_request
                 .retain(|asked| asked != path && !asked.starts_with(&below));
+            // Files of it not fetched yet: gone for the phone too, or the
+            // next manifest would bring them back.
+            let unfetched: Vec<String> = live
+                .receiving
+                .keys()
+                .filter(|known| *known == path || known.starts_with(&below))
+                .cloned()
+                .collect();
+            for known in unfetched {
+                let Some(theirs) = live.receiving.remove(&known) else {
+                    continue;
+                };
+                live.remote.remove(&known);
+                live.sending.remove(&known);
+                if let Ok(mut wanted) = WANTED.lock() {
+                    wanted.remove(&(device.to_string(), live.pair.id.clone(), known.clone()));
+                }
+                live.book.manifest.insert(
+                    known,
+                    Entry {
+                        size: 0,
+                        mtime: now_ms(),
+                        sha256: String::new(),
+                        deleted: true,
+                        dir: false,
+                        vv: theirs.vv.bumped(Side::Desk),
+                    },
+                );
+                removed = true;
+            }
             if fs::symlink_metadata(root.join(path)).is_ok() {
-                trash(&root.join(path));
+                removed |= trash(&root.join(path));
             }
         }
+        // Everything removed on purpose: the empty folder is meant, so the
+        // next scan tells the phone (it is not an unmounted drive).
+        if removed && scan(&live.pair).is_ok_and(|(found, ..)| found.is_empty()) {
+            live.allow_empty = true;
+        }
         live.dirty = Some(Instant::now() - SETTLE);
+        self.save_book(index);
         self.publish();
     }
 
@@ -2665,12 +2830,13 @@ impl Worker {
             live.pair.id.clone(),
             live.pair.root.clone(),
         );
-        for path in due {
+        let mut due = due.into_iter();
+        while let Some(path) = due.next() {
             let Some(entry) = live.book.manifest.get(&path).filter(|entry| !entry.deleted) else {
                 live.flight.remove(&path);
                 continue;
             };
-            let Ok(source) = target_path(&root, &path) else {
+            let Ok(source) = read_path(&root, &path) else {
                 live.flight.remove(&path);
                 continue;
             };
@@ -2686,9 +2852,26 @@ impl Worker {
                 relpath: path.clone(),
                 mtime: Some(entry.mtime),
             };
-            if let Err(error) = super::desk_features::send_folder_file(&device, &source, folder) {
-                live.flight.remove(&path);
-                log_limited("send", &format!("A synced file was not sent: {error}"));
+            // Snapshotting a big file takes a while: not on this worker.
+            let (owner, sent) = (device.clone(), path.clone());
+            let job = move || {
+                if let Err(error) = super::desk_features::send_folder_file(&owner, &source, folder)
+                {
+                    log_limited("send", &format!("A synced file was not sent: {error}"));
+                    send_message(Message::SendFailed {
+                        device: owner,
+                        path: sent,
+                    });
+                }
+            };
+            if !offload(&SEND_LANE, "desklink-bucket-send", Box::new(job)) {
+                // Busy: this and the rest go back to the front of the queue,
+                // in order; the next tick retries.
+                for waiting in std::iter::once(path).chain(due).rev() {
+                    live.flight.remove(&waiting);
+                    live.send_queue.push_front(waiting);
+                }
+                break;
             }
         }
     }
@@ -2935,7 +3118,7 @@ impl Worker {
                     Step::Delete { path, entry } if entry.dir => {
                         folder_deletes.push((path, entry));
                     }
-                    Step::Delete { path, entry } => match target_path(&root, &path) {
+                    Step::Delete { path, entry } => match read_path(&root, &path) {
                         Ok(target) if unchanged(&target, manifest.get(&path)) => {
                             if !target.exists() || trash(&target) {
                                 manifest.insert(path, entry);
@@ -2953,7 +3136,7 @@ impl Worker {
                         entry,
                         tombstone,
                     } => {
-                        let moved = target_path(&root, &from)
+                        let moved = read_path(&root, &from)
                             .and_then(|source| Ok((source, target_path(&root, &to)?)))
                             .ok()
                             .filter(|(source, target)| {
@@ -2970,7 +3153,7 @@ impl Worker {
                         }
                     }
                     Step::Copy { from, to, entry } => {
-                        let copied = target_path(&root, &from)
+                        let copied = read_path(&root, &from)
                             .and_then(|source| Ok((source, target_path(&root, &to)?)))
                             .ok()
                             .filter(|(source, target)| {
@@ -3125,7 +3308,7 @@ impl Worker {
             else {
                 continue;
             };
-            let Ok(source) = target_path(&live.pair.root, &path) else {
+            let Ok(source) = read_path(&live.pair.root, &path) else {
                 continue;
             };
             if !unchanged(&source, Some(entry)) {
@@ -3234,14 +3417,14 @@ impl Worker {
         match how {
             Resolve::Both => {}
             Resolve::Desk => {
-                if let Ok(copy) = target_path(&root, &conflict.copy) {
+                if let Ok(copy) = read_path(&root, &conflict.copy) {
                     trash(&copy);
                 }
             }
             Resolve::Phone => {
                 if let (Ok(copy), Ok(original)) = (
-                    target_path(&root, &conflict.copy),
-                    target_path(&root, &conflict.path),
+                    read_path(&root, &conflict.copy),
+                    read_path(&root, &conflict.path),
                 ) {
                     let _ = fs::rename(copy, original);
                 }
@@ -3312,6 +3495,9 @@ impl Worker {
     fn rescan(&mut self, index: usize) {
         let first = self.pairs[index].scanned.is_none();
         let live = &mut self.pairs[index];
+        // Spent by this scan, whatever it finds: a later empty scan (an
+        // unmounted drive) is held again.
+        let allow_empty = std::mem::take(&mut live.allow_empty);
         live.dirty = None;
         live.scanned = Some(Instant::now());
         live.phase = Phase::Scanning;
@@ -3326,7 +3512,7 @@ impl Worker {
         };
         live.skipped = skipped;
         let had_files = live.book.manifest.values().any(|entry| !entry.deleted);
-        if found.is_empty() && had_files && !std::mem::take(&mut live.allow_empty) {
+        if found.is_empty() && had_files && !allow_empty {
             // An unmounted drive looks exactly like this: deleting every
             // file on the phone too would be the worst outcome.
             live.phase = Phase::EmptyHeld;
@@ -3337,6 +3523,7 @@ impl Worker {
             live.dirty = Some(Instant::now());
         }
         let root = pair.root.clone();
+        keep_existing(&mut found, &live.book.manifest, &root);
         let changed = apply_scan(
             Side::Desk,
             &mut live.book.manifest,
@@ -3387,6 +3574,41 @@ impl Worker {
         if changed || first {
             self.send_manifest(index);
         }
+    }
+}
+
+/// Work that copies or snapshots whole files runs on its own thread, so the
+/// folder worker keeps answering packets and ticks (and its queue of 512
+/// cannot fill while a gigabyte is copied).
+type Job = Box<dyn FnOnce() + Send>;
+/// Jobs waiting for a lane; past it the caller is told "busy".
+const LANE_QUEUE: usize = 8;
+static COPY_LANE: OnceLock<SyncSender<Job>> = OnceLock::new();
+static SEND_LANE: OnceLock<SyncSender<Job>> = OnceLock::new();
+
+/// Runs `job` on `lane`'s thread (tests: at once); false when the lane is
+/// full.
+fn offload(lane: &'static OnceLock<SyncSender<Job>>, name: &str, job: Job) -> bool {
+    #[cfg(test)]
+    {
+        let _ = (lane, name);
+        job();
+        true
+    }
+    #[cfg(not(test))]
+    {
+        let sender = lane.get_or_init(|| {
+            let (sender, jobs) = mpsc::sync_channel::<Job>(LANE_QUEUE);
+            let _ = std::thread::Builder::new()
+                .name(name.to_string())
+                .spawn(move || {
+                    for job in jobs {
+                        crate::guard("folder copy", (), job);
+                    }
+                });
+            sender
+        });
+        sender.try_send(job).is_ok()
     }
 }
 
@@ -3503,6 +3725,7 @@ mod tests {
         assert_eq!(MAX_NAME_BYTES, 255);
         assert_eq!(MAX_TEXT_ITEM_BYTES, 1 << 20);
         assert_eq!(STABLE_FOR, Duration::from_secs(2));
+        assert_eq!(LANE_QUEUE, 8, "copy jobs waiting before \"busy\"");
     }
 
     #[test]
@@ -3742,6 +3965,337 @@ mod tests {
             desk.disk
         );
         assert!(desk.disk.contains_key("B/f.txt"), "the rename is applied");
+    }
+
+    #[test]
+    fn removing_everything_reaches_the_phone_and_a_later_empty_scan_is_still_held() {
+        let (base, root, mut worker) = scratch_bucket("bucket-remove-all");
+        fs::create_dir_all(root.join("Folder")).unwrap();
+        fs::write(root.join("Folder/in.txt"), "i").unwrap();
+        fs::write(root.join("a.txt"), "a").unwrap();
+        worker.rescan(0);
+        // Select All → Remove from Both.
+        let all: Vec<String> = worker.pairs[0]
+            .view(true)
+            .items
+            .iter()
+            .filter(|item| !item.path.contains('/'))
+            .map(|item| item.path.clone())
+            .collect();
+        assert_eq!(all.len(), 2);
+        worker.handle(Message::RemoveItems {
+            device: "phone-b".into(),
+            paths: all,
+        });
+        assert!(
+            worker.pairs[0].allow_empty,
+            "a deliberate removal that empties the root"
+        );
+        worker.rescan(0);
+        assert_ne!(worker.pairs[0].phase, Phase::EmptyHeld);
+        assert!(worker.pairs[0]
+            .book
+            .manifest
+            .values()
+            .all(|entry| entry.deleted));
+        assert!(!worker.pairs[0].allow_empty, "spent by that scan");
+        // The same flag is spent even when the scan was not empty, so an
+        // unmounted drive later is held.
+        fs::write(root.join("b.txt"), "b").unwrap();
+        worker.pairs[0].allow_empty = true;
+        worker.rescan(0);
+        assert!(!worker.pairs[0].allow_empty);
+        fs::remove_file(root.join("b.txt")).unwrap();
+        worker.rescan(0);
+        assert_eq!(worker.pairs[0].phase, Phase::EmptyHeld);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn removing_a_folder_whose_files_are_not_fetched_yet_keeps_them_from_coming_back() {
+        let (base, root, mut worker) = scratch_bucket("bucket-remove-unfetched");
+        fs::create_dir_all(root.join("A")).unwrap();
+        let sha_a = "a".repeat(64);
+        let packet = folders_packet(
+            "manifest",
+            json!({"id": BUCKET_ID, "part": 1, "parts": 1, "entries": [
+                {"path": "A", "dir": true, "vv": {"desk": 0, "phone": 1}},
+                {"path": "A/x.txt", "size": 5, "mtime": 1, "sha256": sha_a,
+                 "vv": {"desk": 0, "phone": 3}},
+                {"path": "y.txt", "size": 5, "mtime": 1, "sha256": sha_a,
+                 "vv": {"desk": 0, "phone": 2}},
+            ]}),
+        );
+        worker.on_packet("phone-b", &packet);
+        assert_eq!(
+            worker.pairs[0].receiving.len(),
+            2,
+            "both asked for, not here"
+        );
+        let wanted = |path: &str| FolderRef {
+            folder: BUCKET_ID.into(),
+            relpath: path.into(),
+            mtime: None,
+        };
+        assert!(accepts("phone-b", &wanted("A/x.txt"), &sha_a, 5));
+        worker.handle(Message::RemoveItems {
+            device: "phone-b".into(),
+            paths: vec!["A".into(), "y.txt".into()],
+        });
+        let live = &worker.pairs[0];
+        assert!(live.receiving.is_empty() && live.outstanding.is_empty());
+        assert!(
+            !accepts("phone-b", &wanted("A/x.txt"), &sha_a, 5),
+            "no longer wanted"
+        );
+        let tomb = &live.book.manifest["A/x.txt"];
+        assert!(
+            tomb.deleted && tomb.vv == Vv { desk: 1, phone: 3 },
+            "{tomb:?}"
+        );
+        assert!(live.book.manifest["y.txt"].deleted);
+        assert!(live
+            .view(true)
+            .items
+            .iter()
+            .all(|item| item.state != ItemState::Receiving));
+        // The phone's next manifest still lists them: ours dominates.
+        let steps = plan(
+            Side::Desk,
+            &live.book.manifest,
+            &{
+                let mut theirs = Manifest::new();
+                theirs.insert(
+                    "A/x.txt".into(),
+                    Entry {
+                        vv: Vv { desk: 0, phone: 3 },
+                        ..entry(&sha_a, (0, 3))
+                    },
+                );
+                theirs
+            },
+            "P",
+        );
+        assert!(steps.is_empty(), "nothing comes back: {steps:?}");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_future_mtime_is_not_held_for_ever() {
+        let now = 10_000_000i64;
+        let mut found: BTreeMap<String, Stat> = [
+            (
+                "future.txt".to_string(),
+                Stat {
+                    size: 1,
+                    mtime: now + 3_600_000,
+                    dir: false,
+                },
+            ),
+            (
+                "fresh.txt".to_string(),
+                Stat {
+                    size: 1,
+                    mtime: now - 100,
+                    dir: false,
+                },
+            ),
+            (
+                "exact.txt".to_string(),
+                Stat {
+                    size: 1,
+                    mtime: now - 2_000,
+                    dir: false,
+                },
+            ),
+        ]
+        .into();
+        assert!(hold_unstable(&mut found, &Manifest::new(), now, 2_000));
+        assert_eq!(
+            found.keys().collect::<Vec<_>>(),
+            ["exact.txt", "future.txt"],
+            "only the fresh one waits"
+        );
+        let mut found: BTreeMap<String, Stat> = [(
+            "future.txt".to_string(),
+            Stat {
+                size: 1,
+                mtime: now + 1,
+                dir: false,
+            },
+        )]
+        .into();
+        assert!(!hold_unstable(&mut found, &Manifest::new(), now, 2_000));
+    }
+
+    #[test]
+    fn a_file_the_scan_skipped_or_never_reached_is_not_tombstoned() {
+        let (base, root, mut worker) = scratch_bucket("bucket-keep");
+        fs::write(root.join("grows.bin"), "small").unwrap();
+        fs::write(root.join("stays.txt"), "s").unwrap();
+        fs::write(root.join("other.txt"), "o").unwrap();
+        worker.rescan(0);
+        assert!(!worker.pairs[0].book.manifest["grows.bin"].deleted);
+        // It grows past 1 GB: skipped by the scan, listed, but not gone.
+        fs::File::create(root.join("grows.bin"))
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        worker.rescan(0);
+        let manifest = &worker.pairs[0].book.manifest;
+        assert!(!manifest["grows.bin"].deleted, "the phone keeps its copy");
+        assert!(worker.pairs[0]
+            .skipped
+            .iter()
+            .any(|line| line.starts_with("grows.bin (")));
+        // A scan cut short (past the cap) lists fewer files than exist.
+        let mut found: BTreeMap<String, Stat> = BTreeMap::new();
+        keep_existing(&mut found, manifest, &root);
+        assert_eq!(
+            found.keys().collect::<Vec<_>>(),
+            ["grows.bin", "other.txt", "stays.txt"]
+        );
+        let mut remote = manifest.clone();
+        let before = remote.clone();
+        let hash = |_: &str| Some("h".to_string());
+        assert!(!apply_scan(
+            Side::Desk,
+            &mut remote,
+            &found,
+            &mut |p| hash(p),
+            now_ms()
+        ));
+        assert_eq!(remote, before, "nothing tombstoned by a truncated scan");
+        // A really missing file is still a deletion.
+        fs::remove_file(root.join("stays.txt")).unwrap();
+        worker.rescan(0);
+        assert!(worker.pairs[0].book.manifest["stays.txt"].deleted);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reading_never_creates_folders() {
+        let (base, root, mut worker) = scratch_bucket("bucket-readonly");
+        assert_eq!(
+            read_path(&root, "ghost/deep/x.txt").unwrap(),
+            root.join("ghost/deep/x.txt")
+        );
+        assert!(!root.join("ghost").exists());
+        std::os::unix::fs::symlink(&base, root.join("link")).unwrap();
+        assert!(read_path(&root, "link/x").is_err() && read_path(&root, "../x").is_err());
+        // A removal of a file in a folder that is not here: no folder made.
+        let mut mine = entry("aaa", (1, 0));
+        mine.size = 3;
+        worker.pairs[0]
+            .book
+            .manifest
+            .insert("ghost/x.txt".into(), mine);
+        let packet = folders_packet(
+            "manifest",
+            json!({"id": BUCKET_ID, "part": 1, "parts": 1, "entries": [
+                {"path": "ghost/x.txt", "deleted": true, "vv": {"desk": 1, "phone": 1}},
+            ]}),
+        );
+        worker.on_packet("phone-b", &packet);
+        assert!(!root.join("ghost").exists(), "deleting made a folder");
+        assert!(
+            worker.pairs[0].book.manifest["ghost/x.txt"].deleted || worker.pairs[0].dirty.is_some()
+        );
+        // A request for a file that is not here makes none either.
+        worker.pairs[0]
+            .book
+            .manifest
+            .insert("nowhere/y.txt".into(), entry("bbb", (1, 0)));
+        let request = folders_packet(
+            "request",
+            json!({"id": BUCKET_ID, "paths": ["nowhere/y.txt"]}),
+        );
+        worker.on_packet("phone-b", &request);
+        assert!(!root.join("nowhere").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_manifest_keeps_every_live_entry_and_drops_the_oldest_removals_first() {
+        let mut manifest = Manifest::new();
+        let long = "\u{10348}".repeat(63);
+        for index in 0..MAX_BUCKET_ITEMS {
+            manifest.insert(
+                format!("{index:05} {long}/{long}/{long}.bin"),
+                entry(&"a".repeat(64), (3, 3)),
+            );
+        }
+        for index in 0..MAX_BUCKET_ITEMS {
+            let mut gone = tomb((4, 4));
+            gone.mtime = index as i64;
+            manifest.insert(format!("g{index:05} {long}/{long}/{long}.bin"), gone);
+        }
+        let packets = manifest_packets(BUCKET_ID, &manifest);
+        assert!(packets.len() <= MAX_PARTS, "{}", packets.len());
+        let sent: Vec<(String, bool)> = packets
+            .iter()
+            .flat_map(|packet| {
+                packet.body["entries"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .map(|value| {
+                (
+                    value["path"].as_str().unwrap().to_string(),
+                    value["deleted"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect();
+        assert_eq!(
+            sent.iter().filter(|(_, gone)| !gone).count(),
+            MAX_BUCKET_ITEMS,
+            "no live entry lost"
+        );
+        assert!(sent.len() <= MAX_FILES);
+        // The tombstones that fit are the newest.
+        let first_gone = sent.iter().find(|(_, gone)| *gone).unwrap();
+        assert!(
+            first_gone
+                .0
+                .starts_with(&format!("g{:05}", MAX_BUCKET_ITEMS - 1)),
+            "{}",
+            &first_gone.0[..8]
+        );
+        for packet in &packets {
+            assert!(crate::device_links::webrtc::fits_on_wire(packet));
+        }
+    }
+
+    #[test]
+    fn conflict_names_drop_what_another_system_refuses_and_measure_in_bytes() {
+        let name = conflict_name("docs/plan.md", "Pixel: 9\\x", 0);
+        assert_eq!(name, "docs/plan (conflict from Pixel 9x 1970-01-01).md");
+        assert!(name_ok(name.rsplit('/').next().unwrap()));
+        // 8 two-byte letters are 16 bytes: an extension; 9 are 18: not one.
+        let ext8 = "é".repeat(8);
+        let ext9 = "é".repeat(9);
+        assert!(conflict_name(&format!("a.{ext8}"), "P", 0).ends_with(&format!(").{ext8}")));
+        let long = conflict_name(&format!("a.{ext9}"), "P", 0);
+        assert!(
+            long.ends_with(")") && long.starts_with(&format!("a.{ext9} (conflict")),
+            "{long}"
+        );
+        assert!(name_ok(&long));
+    }
+
+    #[test]
+    fn a_send_that_could_not_start_frees_its_slot() {
+        let (base, _root, mut worker) = scratch_bucket("bucket-sendfailed");
+        worker.pairs[0]
+            .flight
+            .insert("a.txt".into(), Instant::now());
+        worker.handle(Message::SendFailed {
+            device: "phone-b".into(),
+            path: "a.txt".into(),
+        });
+        assert!(worker.pairs[0].flight.is_empty());
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -4442,10 +4996,48 @@ mod tests {
         let (name, bytes) = pasted_text("Door code 4471\nBring the keys", &now);
         assert_eq!(name, "Text 2026-10-22 14.05.09.txt");
         assert_eq!(bytes, b"Door code 4471\nBring the keys");
+        // Userinfo, ports and IPv6 never leave a name another system refuses.
+        for (link, host) in [
+            ("https://user:pw@example.com:8080/x", "example.com"),
+            ("http://[::1]:3000/", "1"),
+            ("http://[2001:db8::7]/p", "2001-db8--7"),
+            ("http://192.168.1.2:8000", "192.168.1.2"),
+            ("https://@/x", "Link"),
+        ] {
+            let (name, _) = pasted_text(link, &now);
+            assert_eq!(name, format!("{host} 2026-10-22.url"), "{link}");
+            assert!(name_ok(&name), "{name}");
+        }
         let (name, _) = pasted_text("see https://a.b and more", &now);
         assert!(name.ends_with(".txt"), "a sentence with a link is text");
         assert!(import_bytes("p", "Text.txt", vec![b'x'; MAX_TEXT_ITEM_BYTES + 1], "").is_err());
         assert!(import_bytes("p", "Text.txt", Vec::new(), "").is_err());
+        // Refused now, not after a success toast: a name the scan would drop.
+        assert_eq!(
+            import_bytes("p", "a:b.url", b"x".to_vec(), "").unwrap_err(),
+            "That name cannot be used"
+        );
+        assert!(import_bytes("p", "ok.url", b"x".to_vec(), "A/B/C").is_err());
+        assert!(import_bytes("p", "ok.txt", b"x".to_vec(), "").is_ok());
+        assert_eq!(clean_name("a:b\\c. ", "x"), "a-b-c");
+        assert_eq!(clean_name("...", "x"), "x");
+    }
+
+    #[test]
+    fn the_workers_refusals_say_what_is_wrong_not_full() {
+        let (base, root, mut worker) = scratch_bucket("bucket-bytes-refusal");
+        let refuse = |worker: &mut Worker, name: &str| {
+            worker.import_bytes("phone-b", name, b"x".to_vec(), "");
+            take_report()
+        };
+        assert_eq!(
+            refuse(&mut worker, "a:b.txt").unwrap(),
+            "That name cannot be used"
+        );
+        assert!(!root.join("a:b.txt").exists());
+        assert!(refuse(&mut worker, "fine.txt").is_none());
+        assert!(root.join("fine.txt").exists());
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

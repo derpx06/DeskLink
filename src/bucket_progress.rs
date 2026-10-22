@@ -477,6 +477,13 @@ pub(crate) fn summary(device: &str) -> Option<Summary> {
     with(|tracker| tracker.summary(device, now))
 }
 
+/// Tests that use the shared tracker hold this, so they cannot race.
+#[cfg(test)]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Tests elsewhere: one sample of these rows into the shared tracker.
 #[cfg(test)]
 pub(crate) fn sample_for_test(rows: Vec<TransferRow>) {

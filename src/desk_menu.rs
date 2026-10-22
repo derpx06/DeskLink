@@ -527,6 +527,7 @@ mod tests {
     #[test]
     fn the_bucket_sync_is_a_line_and_open_bucket_an_action() {
         use crate::device_links::folders::{self, Pair, PairView, Phase};
+        let _shared = crate::bucket_progress::test_lock();
         use crate::device_links::webrtc::transfer_board::TransferRow;
         let ready = phone("tray-bucket", true);
         let labels = |menu: &[TrayEntry]| -> Vec<String> {

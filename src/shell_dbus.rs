@@ -1447,6 +1447,7 @@ mod tests {
 
     #[test]
     fn a_bucket_sync_is_published_with_its_line_detail_and_fraction() {
+        let _shared = crate::bucket_progress::test_lock();
         use crate::device_links::webrtc::transfer_board::TransferRow;
         let mut device = phone();
         device.id = "shell-bucket".into();

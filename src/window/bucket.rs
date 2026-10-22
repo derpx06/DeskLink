@@ -423,7 +423,7 @@ pub(super) fn update(win: &DesklinkWindow, device: &DeviceView) {
         Some(view) if view.phase == Phase::Offered => {
             page.append(&waiting_card(&view, device));
             page.append(&empty_zone(device));
-            accept_drops(&page, &device.id);
+            accept_drops(&page, &device.id, Some(""));
         }
         Some(view) => fill(win, &page, &view, device),
         None => page.append(&off_card(device, offer.is_some())),
@@ -630,7 +630,7 @@ fn fill(win: &DesklinkWindow, page: &gtk::Box, view: &PairView, device: &DeviceV
     if !view.skipped.is_empty() {
         page.append(&not_synced(&view.skipped));
     }
-    accept_drops(page, &device.id);
+    accept_drops(page, &device.id, None);
     rubber_band(page);
     refresh_selection();
 }
@@ -1706,10 +1706,8 @@ fn rename(button: &gtk::Button, path: &Path) {
 
 /// Renames `path` to `name` beside it; refuses an unsafe or taken name.
 fn rename_to(path: &Path, name: &str) -> Result<(), String> {
-    if crate::device_links::webrtc::file_protocol::validate_relpath(name).is_err()
-        || name.contains('/')
-        || name.starts_with('.')
-    {
+    // What the scan would drop (and so delete on the phone) is refused here.
+    if !folders::name_ok(name) || name.starts_with('.') {
         return Err("That name cannot be used".into());
     }
     let target = path.with_file_name(name);
@@ -1741,8 +1739,8 @@ fn shown_path(path: &Path) -> String {
 
 /// Puts `paths` (files and folders) in the folder shown of `device`'s
 /// Bucket. What was left out is told when the copy is done.
-fn add_paths(device: &str, paths: Vec<PathBuf>) -> bool {
-    !paths.is_empty() && folders::import(device, paths, &current())
+fn add_paths(device: &str, paths: Vec<PathBuf>, into: &str) -> bool {
+    !paths.is_empty() && folders::import(device, paths, into)
 }
 
 /// "Add Files…".
@@ -1762,7 +1760,7 @@ fn choose(widget: &impl IsA<gtk::Widget>, device: &str) {
                 .flatten()
                 .filter_map(|file| file.path())
                 .collect();
-            add_paths(&device, paths);
+            add_paths(&device, paths, &current());
         }
     });
 }
@@ -1784,15 +1782,24 @@ fn choose_folder(widget: &impl IsA<gtk::Widget>, device: &str) {
                 .flatten()
                 .filter_map(|file| file.path())
                 .collect();
-            add_paths(&device, paths);
+            add_paths(&device, paths, &current());
         }
     });
 }
 
 /// Files dropped anywhere on `target` go in the Bucket.
-pub(super) fn accept_drops(target: &impl IsA<gtk::Widget>, device: &str) {
+/// Where a drop goes: the explicit folder of the target, else the one shown.
+fn drop_folder(explicit: Option<&str>, shown: &str) -> String {
+    explicit.unwrap_or(shown).to_string()
+}
+
+/// `into`: the folder they go in; `None` the one shown at the time of the
+/// drop, `Some("")` the top (the Overview card, whatever the Bucket page
+/// last showed).
+pub(super) fn accept_drops(target: &impl IsA<gtk::Widget>, device: &str, into: Option<&str>) {
     let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::COPY);
     let device = device.to_string();
+    let into = into.map(str::to_string);
     let shown = target.clone().upcast::<gtk::Widget>();
     drop.connect_enter(move |_, _, _| {
         shown.add_css_class("bucket-drop-hover");
@@ -1807,7 +1814,7 @@ pub(super) fn accept_drops(target: &impl IsA<gtk::Widget>, device: &str) {
             return false;
         };
         let paths: Vec<PathBuf> = list.files().iter().filter_map(|file| file.path()).collect();
-        add_paths(&device, paths)
+        add_paths(&device, paths, &drop_folder(into.as_deref(), &current()))
     });
     target.as_ref().add_controller(drop);
 }
@@ -1886,7 +1893,7 @@ fn paste(win: &DesklinkWindow, device: &str) {
                     .and_then(|value| value.get::<gdk::FileList>().ok())
                     .map(|list| list.files().iter().filter_map(|file| file.path()).collect())
                     .unwrap_or_default();
-                add_paths(&device, paths);
+                add_paths(&device, paths, &here);
             },
         );
     } else if formats.contains_type(gdk::Texture::static_type()) {
@@ -2022,7 +2029,7 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
         list.append(&row);
     }
     card.append(&list);
-    accept_drops(&card, &device.id);
+    accept_drops(&card, &device.id, Some(""));
     card
 }
 
@@ -2031,13 +2038,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_overview_card_drops_at_the_top_whatever_folder_the_page_showed() {
+        assert_eq!(drop_folder(Some(""), "Trips/Rome"), "");
+        assert_eq!(drop_folder(None, "Trips/Rome"), "Trips/Rome");
+        assert_eq!(drop_folder(Some("A"), "Trips"), "A");
+    }
+
+    #[test]
     fn renaming_refuses_unsafe_and_taken_names() {
         let dir = std::env::temp_dir().join(format!("desklink-rename-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a.txt");
         std::fs::write(&file, b"x").unwrap();
         std::fs::write(dir.join("taken.txt"), b"y").unwrap();
-        for bad in ["", "../a.txt", "x/y", ".hidden", "a\0b"] {
+        for bad in [
+            "", "../a.txt", "x/y", ".hidden", "a\0b", "a:b", "a\\b", "a\u{7}b", "trail.", "trail ",
+        ] {
             assert!(rename_to(&file, bad).is_err(), "{bad:?}");
         }
         assert!(rename_to(&file, "taken.txt").is_err());
