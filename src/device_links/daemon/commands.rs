@@ -44,6 +44,9 @@ pub enum DaemonCommand {
     /// Use the phone's camera as this computer's webcam: facing, size,
     /// and whether its microphone comes too.
     StartCamera(String, String, i32, i32, bool),
+    /// Insert from the phone (F3): photo / scan / text / qr into the
+    /// clipboard or a file, or "cancel" the open one.
+    Capture(String, String, String),
     /// Preferences → Sound: phones may hear this computer's microphone.
     SetDeskMicToPhone(bool),
     /// Sound (F1): `desk-sound` (this computer's sound to the phone),
@@ -185,6 +188,13 @@ impl DaemonWorker {
                 self.with_feature_transport(&id, |transport| {
                     transport.start_camera(&facing, width, height, audio)
                 });
+            }
+            DaemonCommand::Capture(id, kind, target) => {
+                let sent =
+                    self.with_feature_transport(&id, |transport| transport.capture(&kind, &target));
+                if !sent && kind == "cancel" {
+                    crate::device_links::webrtc::capture::end(&id);
+                }
             }
             DaemonCommand::SetDeskMicToPhone(on) => {
                 self.update_settings(|settings| settings.desk_mic_to_phone = on)

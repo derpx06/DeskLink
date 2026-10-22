@@ -43,6 +43,13 @@ pub enum DaemonEvent {
     CameraNotice { device_id: String, message: String },
     /// Sound to or from the phone was refused or ended there (F1).
     SoundNotice { device_id: String, message: String },
+    /// Insert from the phone (F3): what came back or why it did not.
+    CaptureNotice { device_id: String, message: String },
+    /// A QR code the phone scanned holds a Wi-Fi network: offer to join.
+    WifiFromPhone {
+        device_id: String,
+        network: crate::device_links::webrtc::capture::Wifi,
+    },
     /// The phone refused a call request, in the user's words.
     CallRefused { message: String },
 }
@@ -123,6 +130,13 @@ impl DaemonHandle {
             device.terminal_access = terminal_access_allowed(&device.id);
             device.terminal_sessions_attached = terminal_bridge::attached_count(&device.id);
             device.desktop_session = coordinator::desktop_session(&device.id);
+            device.capture =
+                crate::device_links::webrtc::capture::status(&device.id).map(|capture| {
+                    crate::device_links::device::CaptureUse {
+                        kind: capture.kind,
+                        receiving: capture.receiving,
+                    }
+                });
             device.sound = match crate::device_links::webrtc::audio_session::status(&device.id) {
                 (None, None) => None,
                 (sending, hearing) => {
@@ -181,9 +195,12 @@ impl DaemonHandle {
     }
 
     pub fn drain_events(&self) -> Vec<DaemonEvent> {
-        self.events
+        let mut events: Vec<DaemonEvent> = self
+            .events
             .lock()
             .map(|mut events| events.drain(..).collect())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        events.extend(crate::device_links::webrtc::capture::take_notices());
+        events
     }
 }

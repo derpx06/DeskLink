@@ -57,7 +57,7 @@ pub fn debug_remember(text: &str, from: Option<&str>) {
 #[cfg(debug_assertions)]
 pub fn debug_receive_image(path: &str) {
     if let Ok(bytes) = std::fs::read(path) {
-        image_from_phone(&bytes);
+        image_from_phone(&bytes, false);
     }
 }
 
@@ -278,7 +278,7 @@ fn set_x11(text: &str) -> bool {
 /// Wayland applications; GTK text from an unfocused (or windowless) client
 /// does not. With no X display at all, GTK is the last resort: it works
 /// while a DeskLink window has focus.
-pub(super) fn set_clipboard_text_from_remote(content: &str) {
+pub(crate) fn set_clipboard_text_from_remote(content: &str) {
     REMOTE_AT.store(now_ms(), Ordering::Release);
     LOCAL_CHANGED_AT.store(now_ms(), Ordering::Release);
     if let Ok(mut last) = get_last_clipboard().lock() {
@@ -312,6 +312,12 @@ const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
 pub(crate) fn is_png(bytes: &[u8]) -> bool {
     bytes.starts_with(&PNG_SIGNATURE)
+}
+
+/// JPEG files start with an SOI marker and another marker (a phone's
+/// photo or scan, F3).
+pub(crate) fn is_jpeg(bytes: &[u8]) -> bool {
+    bytes.len() > 3 && bytes[..3] == [0xff, 0xd8, 0xff]
 }
 
 /// The longest side of an image sent to a phone (as the phone does).
@@ -366,10 +372,12 @@ fn watch_owner_changes() {
         });
 }
 
-/// RGBA pixels (tightly packed) from a PNG, for `arboard`.
-fn png_to_rgba(png: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+/// RGBA pixels (tightly packed) from a PNG or JPEG, for `arboard`.
+fn image_to_rgba(image: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     use gtk::gdk_pixbuf::prelude::*;
-    let loader = gtk::gdk_pixbuf::PixbufLoader::with_type("png").ok()?;
+    let format = if is_png(image) { "png" } else { "jpeg" };
+    let loader = gtk::gdk_pixbuf::PixbufLoader::with_type(format).ok()?;
+    let png = image;
     loader.write(png).ok()?;
     loader.close().ok()?;
     let pixbuf = loader.pixbuf()?.add_alpha(false, 0, 0, 0).ok()?;
@@ -408,16 +416,18 @@ fn rgba_to_png(width: usize, height: usize, rgba: Vec<u8>) -> Option<Vec<u8>> {
     pixbuf.save_to_bufferv("png", &[]).ok()
 }
 
-/// A phone's copied image (C3): put on this clipboard — X11 first (Mutter
-/// mirrors it to Wayland apps), GTK's texture with no X display — and never
-/// saved or sent back. Ignored with clipboard sync off or not a PNG.
-pub(crate) fn image_from_phone(png: &[u8]) {
-    if !crate::device_links::config::app_settings().clipboard_sync {
+/// A phone's copied image (C3), or a photo or scan asked for from here
+/// (`asked`, F3, placed even with clipboard sync off): put on this
+/// clipboard — X11 first (Mutter mirrors it to Wayland apps), GTK's texture
+/// with no X display — and never saved or sent back. PNG or JPEG (a camera
+/// photo as PNG is too large), told apart by their first bytes.
+pub(crate) fn image_from_phone(png: &[u8], asked: bool) {
+    if !asked && !crate::device_links::config::app_settings().clipboard_sync {
         debug_log!("[Clipboard] Image from the phone ignored: clipboard sync is off");
         return;
     }
-    if !is_png(png) {
-        debug_log!("[Clipboard] Image from the phone ignored: not a PNG");
+    if !is_png(png) && !is_jpeg(png) {
+        debug_log!("[Clipboard] Image from the phone ignored: neither PNG nor JPEG");
         return;
     }
     // Tests see it here instead: never the real clipboard of whoever runs them.
@@ -440,7 +450,7 @@ fn place_image(png: &[u8]) {
     debug_log!("[Clipboard] Image from the phone: {} bytes", png.len());
     let png = png.to_vec();
     thread::spawn(move || {
-        let placed = png_to_rgba(&png).is_some_and(|(width, height, rgba)| {
+        let placed = image_to_rgba(&png).is_some_and(|(width, height, rgba)| {
             X11_CLIPBOARD.lock().is_ok_and(|mut held| {
                 if held.is_none() {
                     *held = arboard::Clipboard::new().ok();
@@ -758,11 +768,24 @@ mod tests {
         let rgba: Vec<u8> = (0..4 * 3 * 2).map(|n| n as u8).collect();
         let png = rgba_to_png(3, 2, rgba.clone()).unwrap();
         assert!(is_png(&png));
-        assert_eq!(png_to_rgba(&png), Some((3, 2, rgba)));
+        assert_eq!(image_to_rgba(&png), Some((3, 2, rgba)));
         assert!(!is_png(b"GIF89a"));
         let big = rgba_to_png(5000, 10, vec![255; 5000 * 10 * 4]).unwrap();
-        let (width, height, _) = png_to_rgba(&big).unwrap();
+        let (width, height, _) = image_to_rgba(&big).unwrap();
         assert_eq!((width, height), (4096, 8), "long side capped, shape kept");
+    }
+
+    /// A phone's photo arrives as JPEG (F3): recognised and decoded too.
+    #[test]
+    fn a_jpeg_photo_is_recognised_and_decoded() {
+        use gtk::gdk_pixbuf::{Colorspace, Pixbuf};
+        let pixbuf = Pixbuf::new(Colorspace::Rgb, false, 8, 6, 4).unwrap();
+        pixbuf.fill(0x3366_99ff);
+        let jpeg = pixbuf.save_to_bufferv("jpeg", &[]).unwrap();
+        assert!(is_jpeg(&jpeg) && !is_png(&jpeg));
+        let (width, height, rgba) = image_to_rgba(&jpeg).unwrap();
+        assert_eq!((width, height, rgba.len()), (6, 4, 6 * 4 * 4));
+        assert!(!is_jpeg(b"\x89PNG"));
     }
 
     #[test]

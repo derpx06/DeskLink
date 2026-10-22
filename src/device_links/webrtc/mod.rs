@@ -3,6 +3,7 @@
 pub(crate) mod audio;
 pub(crate) mod audio_session;
 pub(crate) mod camera;
+pub(crate) mod capture;
 pub(crate) mod coordinator;
 pub(crate) mod file_protocol;
 mod handover;

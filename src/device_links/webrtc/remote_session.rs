@@ -43,6 +43,9 @@ pub const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Widest clock skew the peer tolerates on a control message.
 const MAX_AGE: Duration = Duration::from_secs(60);
 
+/// The longest text a capture result may carry (the phone's cap, F3).
+pub const MAX_CAPTURE_TEXT_BYTES: usize = 32 * 1024;
+
 /// Body keys the peer requires on remote-input packets during a session.
 pub const FIELD_REMOTE_SESSION_ID: &str = "desklinkRemoteSessionId";
 pub const FIELD_LEASE_ID: &str = "desklinkLeaseId";
@@ -112,6 +115,12 @@ pub enum ControlKind {
     AudioControl,
     AudioStop,
     AudioDenied,
+    /// Insert from the phone (F3): desk → phone `capture-request`, phone →
+    /// desk `capture-result`, either way `capture-cancelled`. The capture id
+    /// is the message's `remoteSessionId`.
+    CaptureRequest,
+    CaptureResult,
+    CaptureCancelled,
 }
 
 impl ControlKind {
@@ -144,6 +153,9 @@ impl ControlKind {
             Self::AudioControl => "audio-control",
             Self::AudioStop => "audio-stop",
             Self::AudioDenied => "audio-denied",
+            Self::CaptureRequest => "capture-request",
+            Self::CaptureResult => "capture-result",
+            Self::CaptureCancelled => "capture-cancelled",
         }
     }
 
@@ -176,6 +188,9 @@ impl ControlKind {
             "audio-control" => Self::AudioControl,
             "audio-stop" => Self::AudioStop,
             "audio-denied" => Self::AudioDenied,
+            "capture-request" => Self::CaptureRequest,
+            "capture-result" => Self::CaptureResult,
+            "capture-cancelled" => Self::CaptureCancelled,
             _ => return None,
         })
     }
@@ -236,6 +251,14 @@ pub struct ControlMessage {
     pub sample_rate: Option<i32>,
     pub channels: Option<i32>,
     pub value: Option<i32>,
+    /// Insert from the phone (F3): `captureKind` (photo / scan / text / qr —
+    /// `kind` is the message's own), `target` (clipboard / file), recognised
+    /// or decoded `text`, and a photo or scan's `mimeType` and `pages`.
+    pub capture_kind: Option<String>,
+    pub target: Option<String>,
+    pub text: Option<String>,
+    pub mime_type: Option<String>,
+    pub pages: Option<i32>,
 }
 
 impl ControlKind {
@@ -244,6 +267,15 @@ impl ControlKind {
         matches!(
             self,
             Self::CameraRequest | Self::CameraReady | Self::CameraControl | Self::CameraStopped
+        )
+    }
+
+    /// Insert from the phone's kinds (F3), handled apart from the screen
+    /// session.
+    pub const fn is_capture(self) -> bool {
+        matches!(
+            self,
+            Self::CaptureRequest | Self::CaptureResult | Self::CaptureCancelled
         )
     }
 
@@ -301,6 +333,11 @@ impl ControlMessage {
             sample_rate: None,
             channels: None,
             value: None,
+            capture_kind: None,
+            target: None,
+            text: None,
+            mime_type: None,
+            pages: None,
         }
     }
 
@@ -395,6 +432,21 @@ impl ControlMessage {
         if let Some(value) = self.value {
             root.insert("value".into(), Value::from(value));
         }
+        if let Some(kind) = &self.capture_kind {
+            root.insert("captureKind".into(), Value::from(kind.clone()));
+        }
+        if let Some(target) = &self.target {
+            root.insert("target".into(), Value::from(target.clone()));
+        }
+        if let Some(text) = &self.text {
+            root.insert("text".into(), Value::from(text.clone()));
+        }
+        if let Some(mime) = &self.mime_type {
+            root.insert("mimeType".into(), Value::from(mime.clone()));
+        }
+        if let Some(pages) = self.pages {
+            root.insert("pages".into(), Value::from(pages));
+        }
         serde_json::to_vec(&Value::Object(root)).unwrap_or_default()
     }
 
@@ -454,6 +506,11 @@ impl ControlMessage {
             sample_rate: number("sampleRate").map(|value| value.clamp(0, 1 << 20) as i32),
             channels: number("channels").map(|value| value.clamp(0, 64) as i32),
             value: number("value").map(|value| value.clamp(-1, 1000) as i32),
+            capture_kind: optional_text("captureKind"),
+            target: optional_text("target"),
+            text: text("text"),
+            mime_type: optional_text("mimeType"),
+            pages: number("pages").map(|value| value.clamp(-1, 10_000) as i32),
         })
     }
 
@@ -536,6 +593,16 @@ impl ControlMessage {
             .is_some_and(|direction| !matches!(direction, "desk-to-phone" | "phone-to-desk"))
         {
             return Err("Unknown audio direction".to_string());
+        }
+        if self
+            .text
+            .as_ref()
+            .is_some_and(|text| text.len() > MAX_CAPTURE_TEXT_BYTES)
+        {
+            return Err("Captured text is too long".to_string());
+        }
+        if self.pages.is_some_and(|pages| !(1..=500).contains(&pages)) {
+            return Err("Capture page count is out of range".to_string());
         }
         if self.kind == ControlKind::AudioRequest && self.audio_direction.is_none() {
             return Err("audio-request needs a direction".to_string());
@@ -850,7 +917,10 @@ impl RemoteSession {
             | ControlKind::AudioReady
             | ControlKind::AudioControl
             | ControlKind::AudioStop
-            | ControlKind::AudioDenied => {
+            | ControlKind::AudioDenied
+            | ControlKind::CaptureRequest
+            | ControlKind::CaptureResult
+            | ControlKind::CaptureCancelled => {
                 return Err(
                     "Camera and sound controls are not part of the screen session".to_string(),
                 );

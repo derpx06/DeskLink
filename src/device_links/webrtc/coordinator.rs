@@ -1147,6 +1147,59 @@ fn handle_audio_message(
     Ok(())
 }
 
+/// A phone's `capture-*` message (F3): text goes on the clipboard (a Wi-Fi
+/// QR code also offers to join), a file is awaited, an end is said.
+fn handle_capture_message(device_id: &str, phone: &str, message: &remote_session::ControlMessage) {
+    use super::capture::{self, Outcome};
+    use crate::device_links::daemon::handle::DaemonEvent;
+    match capture::handle(device_id, phone, message) {
+        Outcome::Text { kind, text } => {
+            crate::device_links::daemon::clipboard::set_clipboard_text_from_remote(&text);
+            let wifi = (kind == "qr").then(|| capture::wifi(&text)).flatten();
+            let event = match wifi {
+                Some(network) => DaemonEvent::WifiFromPhone {
+                    device_id: device_id.to_string(),
+                    network,
+                },
+                None => DaemonEvent::CaptureNotice {
+                    device_id: device_id.to_string(),
+                    message: if kind == "qr" {
+                        format!("QR code from {phone} copied")
+                    } else {
+                        format!("Text from {phone} copied — paste it anywhere")
+                    },
+                },
+            };
+            capture::notify(event);
+        }
+        Outcome::Ended(Some(words)) => capture::notify(DaemonEvent::CaptureNotice {
+            device_id: device_id.to_string(),
+            message: words,
+        }),
+        Outcome::AwaitFile | Outcome::Ended(None) | Outcome::Ignored => {}
+    }
+}
+
+/// Asks the phone for a photo, scan, text or QR code (F3), or (`kind`
+/// "cancel") cancels the open one.
+pub(crate) fn capture_request(
+    sessions: &Arc<DeviceManager>,
+    transport: &FeatureTransportSnapshot,
+    kind: &str,
+    target: &str,
+) -> Result<(), String> {
+    let device_id = transport.binding.device_id.clone();
+    send_camera_message(sessions, transport, |build| {
+        if kind == "cancel" {
+            super::capture::cancel(&device_id, build)
+        } else if super::capture::KINDS.contains(&kind) {
+            Some(super::capture::begin(&device_id, kind, target, build))
+        } else {
+            None
+        }
+    })
+}
+
 /// What the desk's sound switches do (F1): `desk-sound` sends this
 /// computer's sound to the phone, `phone-sound` / `phone-mic` play the
 /// phone's sound here or publish its microphone as "DeskLink Microphone".
@@ -2600,6 +2653,7 @@ fn reset_device_webrtc_state(device_id: &str) {
     // and every sound session (the phone asks again on its next link).
     super::camera::end(device_id);
     super::audio_session::end_all(device_id);
+    super::capture::end(device_id);
     super::screen::clear_stream(device_id);
     super::screen::forget_parked(device_id);
     // The session state must not outlive its peer: a stale `Controlling`
@@ -3146,6 +3200,10 @@ fn handle_peer_envelope(
         }
         if message.kind.is_audio() {
             return handle_audio_message(binding, attempt_id, wire, &message, sessions, events);
+        }
+        if message.kind.is_capture() {
+            handle_capture_message(&wire.peer_device_id, &binding.link.info.name, &message);
+            return Ok(());
         }
         if message.kind == remote_session::ControlKind::OfferView {
             return take_up_phone_offer(binding, attempt_id, wire, &message, sessions, events);
@@ -3846,7 +3904,14 @@ fn send_transfer_events(
                     .map_err(|_| "DeskLink WebRTC file envelope was not UTF-8".to_string())?;
                 peer.send_text(WebRtcChannel::FileData, &text)?;
             }
-            TransferEvent::Completed { transfer_id, path } => {
+            TransferEvent::Completed {
+                transfer_id,
+                path,
+                capture_id,
+            } => {
+                if let Some(capture_id) = capture_id {
+                    super::capture::file_arrived(&capture_id);
+                }
                 debug_log!(
                     "[DeskLink] WebRTC transfer {transfer_id} completed at {}",
                     path.display()
@@ -4454,6 +4519,11 @@ mod tests {
             sample_rate: None,
             channels: None,
             value: None,
+            capture_kind: None,
+            target: None,
+            text: None,
+            mime_type: None,
+            pages: None,
         }
     }
 

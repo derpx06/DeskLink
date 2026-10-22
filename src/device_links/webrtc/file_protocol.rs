@@ -66,6 +66,10 @@ pub struct FileControl {
     pub clipboard: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// Offer only (F3): the photo or scan a desk asked for with this
+    /// `capture-request` id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_id: Option<String>,
 }
 
 impl FileControl {
@@ -284,6 +288,7 @@ mod tests {
             error: None,
             clipboard: None,
             mime_type: None,
+            capture_id: None,
         }
     }
 

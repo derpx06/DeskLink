@@ -83,6 +83,15 @@ pub struct SystemVolumeStatus {
     pub sinks: Vec<VolumeSink>,
 }
 
+/// A capture asked of the phone (F3), while open.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CaptureUse {
+    /// photo / scan / text / qr.
+    pub kind: String,
+    /// The result said its file is on the way.
+    pub receiving: bool,
+}
+
 /// Sound between this computer and the phone (F1).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SoundUse {
@@ -236,6 +245,9 @@ pub struct DeviceView {
     /// The phone's camera as this computer's webcam (C4), while asked or live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<CameraUse>,
+    /// Insert from the phone (F3), while a capture is open.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureUse>,
     /// Sound both ways (F1), while any flows or is asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sound: Option<SoundUse>,
@@ -289,6 +301,7 @@ impl DeviceView {
             keyboard_focused: None,
             camera: None,
             sound: None,
+            capture: None,
         }
     }
 

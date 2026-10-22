@@ -261,7 +261,7 @@ pub(crate) fn set_ui_wake(refresh: fn()) {
 /// Has the window handle an event now instead of at its next 1 s tick, so a
 /// ringing call (or a ping) shows within a frame. Coalesced: one refresh per
 /// burst.
-fn wake_ui() {
+pub(crate) fn wake_ui() {
     static PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let Some(refresh) = UI_WAKE.get().copied() else {
         return;

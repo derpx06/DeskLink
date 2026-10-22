@@ -26,6 +26,7 @@
 
 pub(crate) mod calls;
 mod camera;
+mod insert;
 mod sound;
 pub(crate) use calls::confirm_dial;
 mod clipboard;
@@ -664,7 +665,9 @@ impl DesklinkWindow {
                 } => calls::missed(self, &device_id, &device_name, caller, number),
                 DaemonEvent::CallRefused { message } => self.show_feature_toast(&message),
                 DaemonEvent::CameraNotice { message, .. }
-                | DaemonEvent::SoundNotice { message, .. } => self.show_feature_toast(&message),
+                | DaemonEvent::SoundNotice { message, .. }
+                | DaemonEvent::CaptureNotice { message, .. } => self.show_feature_toast(&message),
+                DaemonEvent::WifiFromPhone { network, .. } => self.offer_wifi(network),
                 // Handled by this refresh itself (the call card and notification).
                 DaemonEvent::CallChanged { .. } => {}
             }
@@ -1201,6 +1204,33 @@ impl DesklinkWindow {
             }
         });
         dialog.present(Some(self));
+    }
+
+    /// A Wi-Fi QR code from the phone (F3): its text is already copied;
+    /// Join adds the network through NetworkManager.
+    fn offer_wifi(&self, network: crate::device_links::webrtc::capture::Wifi) {
+        let toast = adw::Toast::new(&format!("Wi-Fi network “{}” scanned", network.ssid));
+        toast.set_use_markup(false);
+        toast.set_timeout(15);
+        toast.set_button_label(Some("Join"));
+        let window = self.downgrade();
+        toast.connect_button_clicked(move |_| {
+            let (network, window) = (network.clone(), window.clone());
+            let (sender, receiver) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = sender.send(crate::device_links::webrtc::capture::join_wifi(&network));
+            });
+            glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
+                let Ok(result) = receiver.try_recv() else {
+                    return glib::ControlFlow::Continue;
+                };
+                if let (Err(error), Some(window)) = (result, window.upgrade()) {
+                    window.show_feature_toast(&format!("Could not join: {error}"));
+                }
+                glib::ControlFlow::Break
+            });
+        });
+        self.imp().toast_overlay.add_toast(toast);
     }
 
     fn show_feature_toast(&self, message: &str) {

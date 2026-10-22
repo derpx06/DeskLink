@@ -83,6 +83,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         for sound in super::sound::bars(daemon, device) {
             page.append(&sound);
         }
+        if let Some(capture) = super::insert::bar(daemon, device) {
+            page.append(&capture);
+        }
         page.append(&hero(daemon, device, &minute));
         if let Some(bar) = now_playing_bar(daemon, device) {
             page.append(&bar);
@@ -360,15 +363,18 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         disable_with(&typing, reason.as_deref());
         round.append(&typing);
     }
-    // The phone as a webcam (C4), from a phone that can share its screen.
-    if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) && device.camera.is_none() {
+    // The phone's camera, from a phone that can share its screen: as a
+    // webcam (C4), or for a photo, scan, text or QR code here (F3).
+    if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
         let camera = round_action(
-            "camera-web-symbolic",
-            "Webcam",
-            &format!("Use {}'s camera as this computer's webcam", device.name),
+            "camera-photo-symbolic",
+            "Camera",
+            &format!(
+                "Use {}'s camera: a webcam, a photo, a scan, text or a QR code",
+                device.name
+            ),
         );
-        let (daemon, view) = (daemon.clone(), device.clone());
-        camera.connect_clicked(move |button| super::camera::ask(&daemon, &view, button));
+        super::insert::attach_menu(daemon, device, &camera);
         disable_with(&camera, reason.as_deref());
         round.append(&camera);
     }

@@ -35,7 +35,13 @@ pub const STALE_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 pub enum TransferEvent {
     SendControl(FileControl),
     SendChunk(Vec<u8>),
-    Completed { transfer_id: String, path: PathBuf },
+    /// `capture_id`: the photo or scan a desk asked for (F3), if this was
+    /// one.
+    Completed {
+        transfer_id: String,
+        path: PathBuf,
+        capture_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +61,9 @@ struct ReceiveCheckpoint {
     /// listed. Absent in older checkpoints.
     #[serde(default)]
     clipboard: bool,
+    /// The capture it answers (F3), from the offer.
+    #[serde(default)]
+    capture_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,10 +96,14 @@ struct SendCheckpoint {
 pub const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Whether an offer is a clipboard image this side places on its clipboard:
-/// both share fields, PNG, and within the size cap.
+/// both share fields, PNG or JPEG (a phone's photo, F3), and within the
+/// size cap.
 fn is_clipboard_offer(message: &FileControl) -> bool {
     message.clipboard == Some(true)
-        && message.mime_type.as_deref() == Some("image/png")
+        && matches!(
+            message.mime_type.as_deref(),
+            Some("image/png" | "image/jpeg")
+        )
         && message
             .total_size
             .is_some_and(|size| size <= MAX_CLIPBOARD_IMAGE_BYTES)
@@ -641,6 +654,7 @@ impl WebRtcTransferManager {
             error: Some(reason),
             clipboard: None,
             mime_type: None,
+            capture_id: None,
         })])
     }
 
@@ -745,6 +759,7 @@ impl WebRtcTransferManager {
                     error: Some("Too many simultaneous incoming transfers".to_string()),
                     clipboard: None,
                     mime_type: None,
+                    capture_id: None,
                 })]);
             }
         }
@@ -807,6 +822,10 @@ impl WebRtcTransferManager {
                     part_name,
                     destination_name,
                     clipboard: is_clipboard_offer(&message),
+                    capture_id: message
+                        .capture_id
+                        .clone()
+                        .filter(|id| uuid::Uuid::parse_str(id).is_ok()),
                 }
             }
         };
@@ -910,7 +929,10 @@ impl WebRtcTransferManager {
             let bytes = fs::read(self.part_path(checkpoint)?)
                 .map_err(|error| format!("Could not read DeskLink clipboard image: {error}"))?;
             self.discard_receive(checkpoint)?;
-            crate::device_links::daemon::clipboard::image_from_phone(&bytes);
+            crate::device_links::daemon::clipboard::image_from_phone(
+                &bytes,
+                checkpoint.capture_id.is_some(),
+            );
             PathBuf::from(&checkpoint.filename)
         } else {
             self.publish(checkpoint)?
@@ -935,6 +957,7 @@ impl WebRtcTransferManager {
         events.push(TransferEvent::Completed {
             transfer_id: checkpoint.transfer_id.clone(),
             path,
+            capture_id: checkpoint.capture_id.clone(),
         });
         Ok(events)
     }
@@ -1209,6 +1232,7 @@ impl WebRtcTransferManager {
         Ok(vec![TransferEvent::Completed {
             transfer_id: checkpoint.transfer_id,
             path: PathBuf::from(checkpoint.filename),
+            capture_id: None,
         }])
     }
 
@@ -1302,6 +1326,7 @@ impl WebRtcTransferManager {
                 .clipboard_mime
                 .clone()
                 .filter(|_| action == FileAction::Offer),
+            capture_id: None,
         }
     }
 
@@ -1330,6 +1355,7 @@ impl WebRtcTransferManager {
             error,
             clipboard: None,
             mime_type: None,
+            capture_id: None,
         }
     }
 
@@ -1708,6 +1734,7 @@ mod tests {
             error: None,
             clipboard: None,
             mime_type: None,
+            capture_id: None,
         }
     }
 
@@ -2133,6 +2160,42 @@ mod tests {
             ..offer_for("transfer_h", "clipboard.png", &data)
         };
         assert!(!is_clipboard_offer(&huge));
+    }
+
+    /// F3: a photo asked for the clipboard arrives as JPEG with its capture
+    /// id; it is placed (even with clipboard sync off) and the completion
+    /// names the capture. A GIF is still an ordinary file.
+    #[test]
+    fn a_captured_jpeg_for_the_clipboard_is_placed_and_names_its_capture() {
+        let sandbox = Sandbox::new("capture-jpeg");
+        let mut data = vec![0xff, 0xd8, 0xff, 0xe0];
+        data.extend(payload(1_000));
+        let manager = sandbox.manager();
+        let capture = uuid::Uuid::new_v4().to_string();
+        let offer = FileControl {
+            clipboard: Some(true),
+            mime_type: Some("image/jpeg".into()),
+            capture_id: Some(capture.clone()),
+            ..offer_for("transfer_j", "photo.jpg", &data)
+        };
+        assert!(is_clipboard_offer(&offer));
+        manager.handle_control(&wire(), offer).unwrap();
+        let events = feed(&manager, &wire(), "transfer_j", 0, &data).unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            TransferEvent::Completed { capture_id: Some(id), .. } if *id == capture
+        )));
+        assert!(names(&sandbox.downloads()).is_empty(), "not a download");
+        assert!(crate::device_links::daemon::clipboard::TEST_PLACED
+            .lock()
+            .unwrap()
+            .contains(&data));
+        let gif = FileControl {
+            clipboard: Some(true),
+            mime_type: Some("image/gif".into()),
+            ..offer_for("transfer_g", "a.gif", &data)
+        };
+        assert!(!is_clipboard_offer(&gif));
     }
 
     #[test]

@@ -151,6 +151,16 @@ impl FeatureTransport {
         )
     }
 
+    /// Insert from the phone (F3): see `coordinator::capture_request`.
+    pub(crate) fn capture(&self, kind: &str, target: &str) -> Result<(), String> {
+        crate::device_links::webrtc::coordinator::capture_request(
+            &self.sessions,
+            &self.snapshot,
+            kind,
+            target,
+        )
+    }
+
     /// Sound on or off (F1): see `coordinator::audio_switch`.
     pub(crate) fn sound(&self, what: &str, on: bool) -> Result<(), String> {
         crate::device_links::webrtc::coordinator::audio_switch(
