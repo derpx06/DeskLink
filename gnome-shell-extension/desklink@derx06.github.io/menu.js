@@ -423,6 +423,20 @@ export function fillMenu(menu, ctx) {
         }
     }
 
+    // Snippets: copied on click (the shell owns the clipboard).
+    const snippets = ctx.snippets ?? [];
+    if (snippets.length > 0) {
+        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Snippets'));
+        for (const snippet of snippets.slice(0, 5)) {
+            const item = new PopupMenu.PopupImageMenuItem(snippet.label, 'edit-copy-symbolic');
+            item.accessible_name = `Copy ${snippet.label}`;
+            item.connect('activate', () =>
+                St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, snippet.text));
+            menu.addMenuItem(item);
+        }
+    }
+
     menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+    menu.addAction('New Note', () => invoke('', 'new-note'), 'document-edit-symbolic');
     menu.addAction('Open DeskLink', () => invoke(selected.id, 'open'));
 }

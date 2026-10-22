@@ -424,6 +424,11 @@ impl Config {
         self.base_dir.join("webrtc-transfers")
     }
 
+    /// Snippets and notes (F6), encrypted; never removed on unpair.
+    pub fn notes_dir(&self) -> PathBuf {
+        self.base_dir.join("notes")
+    }
+
     /// The phones' contact caches (F5), encrypted.
     pub fn contacts_dir(&self) -> PathBuf {
         self.base_dir.join("contacts")

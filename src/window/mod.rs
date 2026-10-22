@@ -32,6 +32,7 @@ pub(crate) use calls::confirm_dial;
 mod clipboard;
 mod contacts;
 pub(crate) mod history;
+mod notes;
 pub(crate) mod notifications;
 mod overview;
 mod pairing;
@@ -64,6 +65,7 @@ const PAGES: &[(&str, &str, &str)] = &[
     ("transfers", "Transfers", "folder-download-symbolic"),
     ("clipboard", "Clipboard", "edit-paste-symbolic"),
     ("contacts", "Contacts", "x-office-address-book-symbolic"),
+    ("notes", "Notes", "document-edit-symbolic"),
     (
         "history",
         "Connection History",
@@ -73,7 +75,7 @@ const PAGES: &[(&str, &str, &str)] = &[
 ];
 
 /// How many of [`PAGES`] are in the sidebar's main list.
-const MAIN_PAGES: usize = 6;
+const MAIN_PAGES: usize = 7;
 
 mod imp {
     use super::*;
@@ -128,6 +130,9 @@ mod imp {
         pub(super) notifications: RefCell<Option<notifications::Page>>,
         pub(super) transfers: RefCell<Option<transfers::Page>>,
         pub(super) contacts: RefCell<Option<contacts::Page>>,
+        pub(super) notes: RefCell<Option<notes::Page>>,
+        /// Notes and Snippets on their own, with no phone to show pages for.
+        pub(super) solo: RefCell<Option<notes::Solo>>,
         /// The welcome page's pairing code is on show.
         pub welcome_qr: RefCell<Option<std::rc::Rc<Cell<bool>>>>,
         /// When each device's active session started ("14:02"), by id.
@@ -232,6 +237,12 @@ mod imp {
                         self.transfers.replace(Some(page));
                         root
                     }
+                    "notes" => {
+                        let page = notes::Page::new(&obj);
+                        let root = page.root.clone();
+                        self.notes.replace(Some(page));
+                        root
+                    }
                     "contacts" => {
                         let page = contacts::Page::new(&obj);
                         let root = page.root.clone();
@@ -255,6 +266,9 @@ mod imp {
                 };
                 self.page_stack.add_named(&child, Some(name));
             }
+            let solo = notes::Solo::new(&obj);
+            self.main_stack.add_named(&solo.root, Some("solo"));
+            self.solo.replace(Some(solo));
 
             obj.add_action_entries([
                 // "Show in folder" on a received-file toast or row.
@@ -400,6 +414,50 @@ impl DesklinkWindow {
         self.show_page("overview");
     }
 
+    /// A new note, open to type in (the + on Notes, the tray, the top bar).
+    pub fn new_note(&self) {
+        self.show_page("notes");
+        let imp = self.imp();
+        if imp.main_stack.visible_child_name().as_deref() == Some("solo") {
+            if let Some(solo) = imp.solo.borrow().as_ref() {
+                solo.notes.new_note();
+            }
+        } else if let Some(page) = imp.notes.borrow().as_ref() {
+            page.new_note();
+        }
+    }
+
+    /// Notes or Snippets ("notes", "snippets") full-window, for when no
+    /// paired phone has pages to show them in.
+    fn show_solo(&self, which: &str) {
+        let imp = self.imp();
+        if let Some(solo) = imp.solo.borrow().as_ref() {
+            solo.show(which);
+        }
+        imp.main_stack.set_visible_child_name("solo");
+        self.apply_layout();
+        self.refresh_soon();
+    }
+
+    /// Back from [`Self::show_solo`]: the next refresh picks the welcome
+    /// page or the devices.
+    pub(super) fn leave_solo(&self) {
+        let imp = self.imp();
+        imp.main_stack.set_visible_child_name("welcome");
+        imp.snapshots.borrow_mut().clear();
+        self.refresh_soon();
+    }
+
+    /// Whether the selected device is a paired one, with pages to show.
+    fn selected_is_paired(&self) -> bool {
+        let (Some(daemon), Some(id)) = (self.daemon(), self.selected_id()) else {
+            return false;
+        };
+        self.known_devices(&daemon)
+            .iter()
+            .any(|device| device.id == id && device.trusted)
+    }
+
     /// Shows one of `device_id`'s contacts (from GNOME search).
     pub fn show_contact(&self, device_id: &str, uid: &str) {
         self.select_device(device_id);
@@ -427,6 +485,20 @@ impl DesklinkWindow {
     /// Shows page `name`; false while there is no device to show pages for.
     pub fn show_page(&self, name: &str) -> bool {
         let imp = self.imp();
+        // Notes and snippets are the user's own, phone or not.
+        if matches!(name, "notes" | "snippets")
+            && (imp.main_stack.visible_child_name().as_deref() != Some("devices")
+                || !self.selected_is_paired())
+        {
+            self.show_solo(name);
+            return true;
+        }
+        // In the device pages, snippets are on Clipboard.
+        let name = if name == "snippets" {
+            "clipboard"
+        } else {
+            name
+        };
         if imp.main_stack.visible_child_name().as_deref() != Some("devices")
             || !PAGES.iter().any(|(page, _, _)| *page == name)
         {
@@ -773,6 +845,16 @@ impl DesklinkWindow {
             imp.snapshots.borrow_mut().clear();
         }
 
+        if imp.main_stack.visible_child_name().as_deref() == Some("solo") {
+            // Stays until Back, even if a phone pairs meanwhile.
+            if let Some(stop) = imp.welcome_qr.take() {
+                pairing::stop_welcome(&daemon, &stop);
+            }
+            if let Some(solo) = imp.solo.borrow().as_ref() {
+                solo.update();
+            }
+            return;
+        }
         if devices.is_empty() {
             imp.notified_pair_requests.borrow_mut().clear();
             imp.notified_remote_notifications.borrow_mut().clear();
@@ -839,6 +921,11 @@ impl DesklinkWindow {
             }
             "overview" => overview::update(self, daemon, device),
             "clipboard" => clipboard::update(self, device),
+            "notes" => {
+                if let Some(notes) = imp.notes.borrow().as_ref() {
+                    notes.update();
+                }
+            }
             "contacts" => {
                 if let Some(contacts) = imp.contacts.borrow().as_ref() {
                     contacts.update(self, daemon, device);
@@ -901,7 +988,7 @@ impl DesklinkWindow {
         } else {
             self.remove_css_class("narrow");
         }
-        let mut stack = vec![self.imp().page_stack.get().upcast::<gtk::Widget>()];
+        let mut stack = vec![self.imp().main_stack.get().upcast::<gtk::Widget>()];
         while let Some(widget) = stack.pop() {
             match widget.widget_name().as_str() {
                 "responsive" => {
@@ -925,6 +1012,19 @@ impl DesklinkWindow {
                 } else {
                     gtk::Align::End
                 }),
+                // Notes: the list or the note, one at a time, when narrow.
+                "notes-split" => {
+                    if let Some(split) = widget.downcast_ref::<adw::NavigationSplitView>() {
+                        split.set_collapsed(compact);
+                    }
+                }
+                // Notes and Snippets with no phone: the switcher.
+                "solo-switcher" => widget.set_visible(!narrow),
+                "solo-bar" => {
+                    if let Some(bar) = widget.downcast_ref::<adw::ViewSwitcherBar>() {
+                        bar.set_reveal(narrow);
+                    }
+                }
                 "hero-wrap" => widget.set_halign(if compact {
                     gtk::Align::Start
                 } else {
@@ -2000,6 +2100,34 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             crate::device_links::contacts::on_vcards(&device, &cards);
             win.refresh_soon();
         }
+        // "fake-snippet TEXT" (underscores for spaces) and "fake-note": F6
+        // content without a phone.
+        "fake-snippet" => {
+            let _ = crate::device_links::notes::add_snippet(&id.replace('_', " "));
+            win.refresh_soon();
+        }
+        "fake-note" => {
+            let verb_id = id;
+            let id = crate::device_links::notes::new_note(
+                "# Release checklist\nShip **F6** after the *real-phone* run.\n\n\
+                 - [x] contract\n- [ ] Android side\n- `cargo test` green\n1. tag\n2. push",
+            );
+            if let (Some(note), "pinned") = (id, verb_id) {
+                crate::device_links::notes::edit_note(&note, |note| note.pinned = true);
+            }
+            win.refresh_soon();
+        }
+        // "open-note N": the Nth note in the list, as if clicked.
+        "open-note" => {
+            let solo = win.imp().main_stack.visible_child_name().as_deref() == Some("solo");
+            if solo {
+                if let Some(solo) = win.imp().solo.borrow().as_ref() {
+                    solo.notes.open_nth(id.parse().unwrap_or(0));
+                }
+            } else if let Some(page) = win.imp().notes.borrow().as_ref() {
+                page.open_nth(id.parse().unwrap_or(0));
+            }
+        }
         // "open-contact UID": the selected device's contact, as from search.
         "open-contact" => {
             if let Some(device) = win.selected_id() {
@@ -2610,6 +2738,7 @@ mod tests {
                 "transfers",
                 "clipboard",
                 "contacts",
+                "notes",
                 "history",
                 "preferences"
             ]

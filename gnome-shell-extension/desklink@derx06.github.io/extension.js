@@ -49,6 +49,7 @@ const ShellProxy = Gio.DBusProxy.makeProxyWrapper(`<node>
     <property name="Desk" type="a{sv}" access="read"/>
     <property name="Notifications" type="aa{sv}" access="read"/>
     <property name="Transfers" type="aa{sv}" access="read"/>
+    <property name="Snippets" type="aa{sv}" access="read"/>
     <method name="Invoke">
       <arg name="device_id" type="s" direction="in"/>
       <arg name="action" type="s" direction="in"/>
@@ -306,16 +307,17 @@ export default class DeskLinkExtension extends Extension {
 
     _fillMenu(menu, devices, selected, desk, live_) {
         const transfers = this._read('Transfers', []);
+        const snippets = this._read('Snippets', []);
         // Rebuilt only when what it shows changed, so keyboard focus in an
         // open menu is not thrown away every second.
-        const menuKey = JSON.stringify([devices, selected?.id, desk, transfers, styleVariant()]);
+        const menuKey = JSON.stringify([devices, selected?.id, desk, transfers, snippets, styleVariant()]);
         if (menuKey === this._menuKey)
             return;
         this._menuKey = menuKey;
         this._tickers = [];
         const shown = new Set();
         fillMenu(menu, {
-            devices, selected, desk, transfers,
+            devices, selected, desk, transfers, snippets,
             ring: this._ring,
             invoke: (id, action) => this._invoke(id, action),
             call: (method, args) => this._call(method, args),

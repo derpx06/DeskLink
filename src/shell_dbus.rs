@@ -34,7 +34,9 @@ pub const INTERFACE: &str = "derx06.desklink.com.Shell1";
 /// says `calls` in `Hello`).
 /// 5: `Devices[].media` with the `media-play-pause` / `media-next` actions,
 /// and `Devices[].liveSince`.
-const VERSION: u32 = 5;
+/// 6: `Snippets` (id, label, text: the client copies the text itself) and
+/// the device-less `new-note` action.
+const VERSION: u32 = 6;
 const INVALID_ARGS: &str = "org.freedesktop.DBus.Error.InvalidArgs";
 
 const XML: &str = r#"<node>
@@ -44,6 +46,7 @@ const XML: &str = r#"<node>
     <property name="Desk" type="a{sv}" access="read"/>
     <property name="Notifications" type="aa{sv}" access="read"/>
     <property name="Transfers" type="aa{sv}" access="read"/>
+    <property name="Snippets" type="aa{sv}" access="read"/>
     <method name="Invoke">
       <arg name="device_id" type="s" direction="in"/>
       <arg name="action" type="s" direction="in"/>
@@ -74,8 +77,9 @@ const XML: &str = r#"<node>
 
 /// Actions that need no device (`device_id` ""): `end-sessions` then means
 /// every device.
-const DEVICELESS: [&str; 9] = [
+const DEVICELESS: [&str; 10] = [
     "open",
+    "new-note",
     "reconnect",
     "pair-new",
     "end-sessions",
@@ -412,6 +416,24 @@ fn transfers_variant(files: &[crate::device_links::transfer_log::LoggedFile]) ->
     Variant::array_from_iter_with_type(glib::VariantTy::VARDICT, dicts)
 }
 
+/// The snippets the menu shows (F6), newest first.
+fn snippets_variant() -> Variant {
+    let dicts = crate::device_links::notes::snippets()
+        .into_iter()
+        .take(RECENT_SNIPPETS)
+        .map(|snippet| {
+            let dict = glib::VariantDict::new(None);
+            dict.insert("id", &snippet.id);
+            dict.insert("label", snippet.label());
+            dict.insert("text", &snippet.text);
+            dict.end()
+        });
+    Variant::array_from_iter_with_type(glib::VariantTy::VARDICT, dicts)
+}
+
+/// How many snippets the top-bar menu gets.
+const RECENT_SNIPPETS: usize = 8;
+
 fn devices_variant(devices: &[ShellDevice]) -> Variant {
     Variant::array_from_iter_with_type(
         glib::VariantTy::VARDICT,
@@ -553,6 +575,7 @@ fn property_values(app: &DesklinkApplication) -> std::collections::HashMap<&'sta
             "Transfers",
             transfers_variant(&crate::device_links::transfer_log::recent()),
         ),
+        ("Snippets", snippets_variant()),
     ])
 }
 
@@ -687,6 +710,11 @@ fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str
                 .map(|device| device.name.as_str())
                 .unwrap_or_default();
             pick_and_send_files(app, &id, name);
+        }
+        ("new-note", _, _) => {
+            let window = app.main_window();
+            window.present();
+            window.new_note();
         }
         ("pair-new", _, _) => {
             if let Some(window) = main_window(app) {
@@ -1004,8 +1032,10 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 8] = [
-    // The current build (top-bar redesign: menu.js, the glyph icon).
+const KNOWN_BUILDS: [&str; 9] = [
+    // The current build (F6: Snippets and New Note in the menu).
+    "d15f25a0eaca4d3f37d6423d5eefafeadacd0dc3fb8e6c07389ce7861d701f50",
+    // Top-bar redesign: menu.js, the glyph icon.
     "299c2cbb85734c4379c74cf5afd4e6d3a73f3d9ab9fb4cc1738de0b165297da5",
     // be1b760, 2026-10-21.
     "fe350711d70ada59bc0428004409555265854e5c91d5cda444439823ac7707b2",

@@ -72,6 +72,9 @@ pub const PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID: &str =
 pub const PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS: &str =
     "desklink.contacts.response_uids_timestamps";
 pub const PACKET_TYPE_CONTACTS_RESPONSE_VCARDS: &str = "desklink.contacts.response_vcards";
+/// Snippets and notes (F6), both directions: `op` index, fetch or items.
+pub const PACKET_TYPE_SNIPPETS: &str = "desklink.snippets";
+pub const PACKET_TYPE_NOTES: &str = "desklink.notes";
 pub const PACKET_TYPE_SMS_REQUEST: &str = "desklink.sms.request";
 /// The phone's calls (a full snapshot), a missed call, or a refused request
 /// (phone → desk).

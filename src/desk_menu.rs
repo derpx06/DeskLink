@@ -338,10 +338,45 @@ pub(crate) fn entries(
                 .collect(),
         });
     }
+    // Snippets (F6): copied on click. And a new note, from anywhere.
+    let snippets = crate::device_links::notes::snippets();
+    if !snippets.is_empty() {
+        menu.push(TrayEntry::Submenu {
+            label: "Snippets".into(),
+            icon: "view-pin-symbolic".into(),
+            children: snippets
+                .iter()
+                .take(SNIPPETS)
+                .map(|snippet| {
+                    TrayEntry::action(snippet.label(), format!("copy-snippet:{}", snippet.id))
+                        .icon("edit-copy-symbolic")
+                })
+                .collect(),
+        });
+    }
+    if !phones.is_empty() {
+        menu.push(TrayEntry::action("New Note", "new-note").icon("document-edit-symbolic"));
+    }
     menu.push(TrayEntry::Separator);
     menu.push(TrayEntry::action("Open DeskLink", "open").icon("focus-windows-symbolic"));
     menu.push(TrayEntry::action("Quit", "quit").icon("application-exit-symbolic"));
     menu
+}
+
+/// How many snippets the menu lists.
+const SNIPPETS: usize = 12;
+
+/// Puts snippet `id` on this computer's clipboard.
+pub(crate) fn copy_snippet(id: &str) {
+    match crate::device_links::notes::snippets()
+        .into_iter()
+        .find(|snippet| snippet.id == id)
+    {
+        Some(snippet) => {
+            crate::device_links::daemon::clipboard::set_clipboard_text_from_remote(&snippet.text)
+        }
+        None => debug_log!("[DeskLink] No snippet {id} to copy"),
+    }
 }
 
 /// Runs a menu entry's action.
@@ -411,6 +446,12 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
             }
         }
         "lock-hand-off" => app.activate_action("lock-hand-off", None),
+        "copy-snippet" => copy_snippet(&target),
+        "new-note" => {
+            let window = app.main_window();
+            window.present();
+            window.new_note();
+        }
         "open-file" => {
             // Only a file the menu offered (a recent one), never any path.
             let offered = crate::device_links::transfer_log::recent()

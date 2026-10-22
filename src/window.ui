@@ -36,6 +36,17 @@
                     <child type="top">
                       <object class="AdwHeaderBar">
                         <property name="show-title">False</property>
+                        <child type="start">
+                          <object class="GtkButton">
+                            <property name="icon-name">document-edit-symbolic</property>
+                            <property name="tooltip-text" translatable="yes">Notes and Snippets</property>
+                            <property name="action-name">win.show-page</property>
+                            <property name="action-target">'notes'</property>
+                            <accessibility>
+                              <property name="label" translatable="yes">Notes and Snippets</property>
+                            </accessibility>
+                          </object>
+                        </child>
                         <child type="end">
                           <object class="GtkMenuButton">
                             <property name="primary">True</property>

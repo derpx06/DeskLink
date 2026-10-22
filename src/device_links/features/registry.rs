@@ -8,11 +8,12 @@ use crate::device_links::packet::{
     PACKET_TYPE_DIGITIZER, PACKET_TYPE_DIGITIZER_SESSION, PACKET_TYPE_FINDMYPHONE_REQUEST,
     PACKET_TYPE_HANDOFF, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST,
     PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS,
-    PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_ACTION,
-    PACKET_TYPE_NOTIFICATION_REPLY, PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING,
-    PACKET_TYPE_RUNCOMMAND, PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SCREEN_ERROR,
-    PACKET_TYPE_SCREEN_READY, PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP,
-    PACKET_TYPE_SETTINGS, PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_REQUEST,
+    PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTES, PACKET_TYPE_NOTIFICATION,
+    PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_REPLY,
+    PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_RUNCOMMAND,
+    PACKET_TYPE_RUNCOMMAND_REQUEST, PACKET_TYPE_SCREEN_ERROR, PACKET_TYPE_SCREEN_READY,
+    PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP, PACKET_TYPE_SETTINGS,
+    PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_SNIPPETS,
     PACKET_TYPE_TELEPHONY, PACKET_TYPE_TELEPHONY_REQUEST, PACKET_TYPE_UNLOCK_REQUEST,
 };
 
@@ -20,7 +21,10 @@ use crate::device_links::packet::{
 /// WebRTC transport. Each entry has a matching arm in
 /// `packet_handler::dispatch_webrtc_feature_packet` and a DeskLink Android
 /// plugin that actually sends it.
-const DESKTOP_INCOMING: [&str; 25] = [
+const DESKTOP_INCOMING: [&str; 27] = [
+    // Snippets and notes (F6): both ways.
+    PACKET_TYPE_NOTES,
+    PACKET_TYPE_SNIPPETS,
     PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS,
     PACKET_TYPE_CONTACTS_RESPONSE_VCARDS,
     PACKET_TYPE_BATTERY,
@@ -67,7 +71,10 @@ const DESKTOP_INCOMING: [&str; 25] = [
 /// Packets the desktop can construct from a command path, and that a DeskLink
 /// Android plugin can consume. `desklink.systemvolume.request` is absent: the
 /// phone has no receiver for it.
-const DESKTOP_OUTGOING: [&str; 25] = [
+const DESKTOP_OUTGOING: [&str; 27] = [
+    // Snippets and notes (F6): both ways.
+    PACKET_TYPE_NOTES,
+    PACKET_TYPE_SNIPPETS,
     PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS,
     PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID,
     PACKET_TYPE_CLIPBOARD,
@@ -117,7 +124,10 @@ const DESKTOP_OUTGOING: [&str; 25] = [
 /// control plane is `desklink.remote-session.v1` on the control channel, and
 /// the screen packet types exist only so the Android application loads its
 /// screen plugin (see `DESKTOP_INCOMING`). They never cross the wire.
-const WEBRTC_PROFILE: [&str; 30] = [
+const WEBRTC_PROFILE: [&str; 32] = [
+    // Snippets and notes (F6): both ways.
+    PACKET_TYPE_NOTES,
+    PACKET_TYPE_SNIPPETS,
     PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS,
     PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID,
     PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS,
@@ -310,6 +320,7 @@ mod tests {
                 "desklink.mousepad.request",
                 "desklink.mpris",
                 "desklink.mpris.request",
+                "desklink.notes",
                 "desklink.notification",
                 "desklink.notification.request",
                 "desklink.ping",
@@ -320,6 +331,7 @@ mod tests {
                 "desklink.screen.stop",
                 "desklink.settings.request",
                 "desklink.share.request",
+                "desklink.snippets",
                 "desklink.telephony",
                 "desklink.unlock.request",
             ])
@@ -338,6 +350,7 @@ mod tests {
                 "desklink.mousepad.request",
                 "desklink.mpris",
                 "desklink.mpris.request",
+                "desklink.notes",
                 "desklink.notification",
                 "desklink.notification.action",
                 "desklink.notification.reply",
@@ -350,6 +363,7 @@ mod tests {
                 "desklink.screen.stop",
                 "desklink.settings",
                 "desklink.share.request",
+                "desklink.snippets",
                 "desklink.telephony.request",
                 "desklink.unlock.request",
             ])
@@ -384,6 +398,7 @@ mod tests {
                 "desklink.mousepad.request",
                 "desklink.mpris",
                 "desklink.mpris.request",
+                "desklink.notes",
                 "desklink.notification",
                 "desklink.notification.action",
                 "desklink.notification.reply",
@@ -394,6 +409,7 @@ mod tests {
                 "desklink.settings",
                 "desklink.settings.request",
                 "desklink.share.request",
+                "desklink.snippets",
                 "desklink.telephony",
                 "desklink.telephony.request",
                 "desklink.unlock.request",

@@ -538,9 +538,6 @@ pub(crate) fn caller_name(
 
 // ── Encryption at rest ─────────────────────────────────────────────────────
 
-const NONCE_BYTES: usize = 12;
-const TAG_BYTES: usize = 16;
-
 fn book_path(dir: &Path, device_id: &str) -> PathBuf {
     let digest = openssl::sha::sha256(device_id.as_bytes());
     let name: String = digest[..16]
@@ -550,48 +547,14 @@ fn book_path(dir: &Path, device_id: &str) -> PathBuf {
     dir.join(format!("{name}.book"))
 }
 
-/// The cache key, made on first use (0600, in a 0700 directory).
-fn key(dir: &Path) -> Result<[u8; 32], String> {
-    let path = dir.join("key");
-    if let Ok(bytes) = std::fs::read(&path) {
-        return bytes
-            .try_into()
-            .map_err(|_| format!("{} is not a key", path.display()));
-    }
-    create_private_dir(dir)?;
-    let mut key = [0u8; 32];
-    openssl::rand::rand_bytes(&mut key).map_err(|error| error.to_string())?;
-    super::config::write_private(&path, &key)?;
-    Ok(key)
-}
-
-fn create_private_dir(dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|error| error.to_string())
-}
-
 fn save(dir: &Path, device_id: &str, book: &Book) -> Result<(), String> {
-    use openssl::symm::{encrypt_aead, Cipher};
-    let key = key(dir)?;
     let plain = serde_json::to_vec(book).map_err(|error| error.to_string())?;
-    let mut nonce = [0u8; NONCE_BYTES];
-    openssl::rand::rand_bytes(&mut nonce).map_err(|error| error.to_string())?;
-    let mut tag = [0u8; TAG_BYTES];
-    let sealed = encrypt_aead(
-        Cipher::aes_256_gcm(),
-        &key,
-        Some(&nonce),
+    super::vault::seal(
+        dir,
+        &book_path(dir, device_id),
         device_id.as_bytes(),
         &plain,
-        &mut tag,
     )
-    .map_err(|error| error.to_string())?;
-    let mut bytes = nonce.to_vec();
-    bytes.extend_from_slice(&sealed);
-    bytes.extend_from_slice(&tag);
-    super::config::write_private(&book_path(dir, device_id), &bytes)
 }
 
 fn save_logged(dir: &Path, device_id: &str, book: &Book) {
@@ -601,26 +564,7 @@ fn save_logged(dir: &Path, device_id: &str, book: &Book) {
 }
 
 fn load(dir: &Path, device_id: &str) -> Option<Book> {
-    use openssl::symm::{decrypt_aead, Cipher};
-    let bytes = std::fs::read(book_path(dir, device_id)).ok()?;
-    if bytes.len() < NONCE_BYTES + TAG_BYTES {
-        return None;
-    }
-    let key = key(dir).ok()?;
-    let (nonce, rest) = bytes.split_at(NONCE_BYTES);
-    let (sealed, tag) = rest.split_at(rest.len() - TAG_BYTES);
-    let plain = decrypt_aead(
-        Cipher::aes_256_gcm(),
-        &key,
-        Some(nonce),
-        device_id.as_bytes(),
-        sealed,
-        tag,
-    )
-    .map_err(|_| {
-        eprintln!("[Contacts] The contacts of {device_id} could not be read; starting over")
-    })
-    .ok()?;
+    let plain = super::vault::open(dir, &book_path(dir, device_id), device_id.as_bytes())?;
     serde_json::from_slice(&plain).ok()
 }
 

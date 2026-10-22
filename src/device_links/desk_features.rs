@@ -162,6 +162,10 @@ pub(crate) fn on_feature_ready(device_id: &str) {
         super::mpris::send_state_to(&device_id);
         // This computer's notifications (C1): the snapshot, then bodies.
         super::desk_notifications::send_snapshot(Some(&device_id));
+        // Snippets and notes (F6): what is here; the phone fetches.
+        for index in super::notes::indexes() {
+            send(&device_id, &index);
+        }
     });
 }
 

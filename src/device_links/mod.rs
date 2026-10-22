@@ -14,6 +14,7 @@ pub mod features;
 pub(crate) mod logind;
 pub(crate) mod media_art;
 pub(crate) mod mpris;
+pub(crate) mod notes;
 pub mod packet;
 pub mod pairing;
 pub mod pairing_qr;
@@ -23,6 +24,7 @@ pub mod session_lock;
 pub mod transfer_log;
 pub mod transport;
 pub(crate) mod unlock;
+pub(crate) mod vault;
 pub mod webrtc;
 
 /// Whether this device takes the leading role against `peer_device_id`.

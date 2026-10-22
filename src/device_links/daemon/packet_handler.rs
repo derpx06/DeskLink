@@ -752,6 +752,17 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             });
             Ok(())
         }
+        // Snippets and notes (F6): index, fetch or items, both ways.
+        crate::device_links::packet::PACKET_TYPE_SNIPPETS
+        | crate::device_links::packet::PACKET_TYPE_NOTES => {
+            let (device_id, packet) = (device_id.clone(), packet.clone());
+            crate::device_links::desk_features::run_later(move || {
+                for answer in crate::device_links::notes::on_packet(&device_id, &packet) {
+                    crate::device_links::desk_features::send(&device_id, &answer);
+                }
+            });
+            Ok(())
+        }
         crate::device_links::packet::PACKET_TYPE_CONTACTS_RESPONSE_VCARDS => {
             let (device_id, packet) = (device_id.clone(), packet.clone());
             // Dropped when the queue is full: the next snapshot asks again.
