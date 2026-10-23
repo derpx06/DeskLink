@@ -618,7 +618,7 @@ pub(crate) fn add_snippet(text: &str) -> Result<(), String> {
         return Err("Nothing to pin".into());
     }
     if text.len() > MAX_SNIPPET_BYTES {
-        return Err("Too long for a snippet (16 KB at most)".into());
+        return Err("Too long for a snippet (16 KiB at most)".into());
     }
     let id = with_shelf(|shelf| {
         let existing = shelf
@@ -760,7 +760,7 @@ pub(crate) fn edit_note(id: &str, change: impl FnOnce(&mut Note)) -> Result<(), 
 
 /// What the editor says when a note passes its size bound.
 pub(crate) const TOO_LONG: &str =
-    "This note is too long to save (20 KB at most). Shorten it: the last changes are not saved yet.";
+    "This note is too long to save (20 KiB at most). Shorten it: the last changes are not saved yet.";
 
 #[cfg(test)]
 mod tests {
@@ -827,7 +827,7 @@ mod tests {
         assert!(!valid_snippet(&long_id), "no control characters in an id");
         // Pinning from this side says so in words.
         let error = add_snippet(&"x".repeat(MAX_SNIPPET_BYTES + 1)).unwrap_err();
-        assert!(error.contains("16 KB"), "{error}");
+        assert!(error.contains("16 KiB"), "{error}");
         assert!(add_snippet("   \n").is_err());
         assert_eq!((MAX_SNIPPETS, MAX_NOTES), (500, 2000));
     }

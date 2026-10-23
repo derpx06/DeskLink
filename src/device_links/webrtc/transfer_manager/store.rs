@@ -287,6 +287,74 @@ impl Store {
         Ok(Some((checkpoint, hashes)))
     }
 
+    /// Bucket resume: a held partial file of the same *content* (peer, folder,
+    /// relpath, content hash, size) under another transfer id is renamed to
+    /// `id` with `token` and the new offer's `mtime`/`folder`, verified blocks
+    /// and hashes unchanged. Anything else held for the same path (another
+    /// hash, another size) is a different file and is dropped. Returns whether
+    /// something was adopted.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn adopt_bucket_partial(
+        &self,
+        id: &str,
+        token: &str,
+        device_id: &str,
+        folder: &FolderRef,
+        content_sha256: &str,
+        total: u64,
+        mtime: i64,
+    ) -> Result<bool, String> {
+        let entries = fs::read_dir(&self.state_root)
+            .map_err(|error| format!("Could not list DeskLink transfer state: {error}"))?;
+        let mut adopted = false;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(old) = name
+                .to_str()
+                .and_then(|name| name.strip_prefix(".desklink-"))
+                .and_then(|name| name.strip_suffix(".json"))
+                .filter(|old| !old.ends_with(".send") && *old != id)
+            else {
+                continue;
+            };
+            let Ok(Some((held, hashes))) = self.load_receive(old) else {
+                continue;
+            };
+            let same_place = held.device_id == device_id
+                && held.folder.as_ref().is_some_and(|known| {
+                    known.folder == folder.folder && known.relpath == folder.relpath
+                });
+            if !same_place {
+                continue;
+            }
+            let same_file = held
+                .content_sha256
+                .as_deref()
+                .is_some_and(|known| known.eq_ignore_ascii_case(content_sha256))
+                && held.total_size == total;
+            if !same_file || adopted {
+                // Another content for this path, or a second copy of the one
+                // adopted: not wanted any more.
+                self.remove_receive(old)?;
+                continue;
+            }
+            // Under the new name: the partial file first, then the sidecar and
+            // the checkpoint (which never claim more than the file holds).
+            fs::rename(self.part_path(old)?, self.part_path(id)?)
+                .map_err(|error| format!("Could not carry on a partial download: {error}"))?;
+            let mut moved = held;
+            moved.transfer_id = id.to_string();
+            moved.token = token.to_string();
+            moved.mtime = mtime;
+            moved.folder = Some(folder.clone());
+            self.save_receive(&moved, &hashes)?;
+            remove_if_present(&self.state_path(&Self::blocks_name(old))?)?;
+            remove_if_present(&self.state_path(&Self::checkpoint_name(old))?)?;
+            adopted = true;
+        }
+        Ok(adopted)
+    }
+
     /// Everything of an incoming transfer: partial file, sidecar, checkpoint.
     pub fn remove_receive(&self, id: &str) -> Result<(), String> {
         remove_if_present(&self.part_path(id)?)?;

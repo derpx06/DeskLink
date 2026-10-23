@@ -147,6 +147,17 @@ pub(super) struct Outgoing {
     reported: u64,
 }
 
+/// [`Outgoing::sync_key`] of a kept send.
+fn sync_key_of(kept: &SendCheckpoint) -> Option<(String, String, String, u64)> {
+    let folder = kept.folder.as_ref()?;
+    Some((
+        folder.folder.clone(),
+        folder.relpath.clone(),
+        kept.content_sha256.as_deref()?.to_ascii_lowercase(),
+        kept.total_size,
+    ))
+}
+
 impl Outgoing {
     /// Looks at the source and records the send, without reading it.
     pub fn prepare(
@@ -246,6 +257,18 @@ impl Outgoing {
             last_report: now,
             reported: 0,
         }
+    }
+
+    /// What a synced file is for resuming: its folder, path, content hash and
+    /// size, whatever transfer id it travels under.
+    fn sync_key(&self) -> Option<(String, String, String, u64)> {
+        let folder = self.folder.as_ref()?;
+        Some((
+            folder.folder.clone(),
+            folder.relpath.clone(),
+            self.content_sha256.as_deref()?.to_ascii_lowercase(),
+            self.total,
+        ))
     }
 
     fn record(&self) -> SendCheckpoint {
@@ -614,6 +637,40 @@ impl Engine {
             outgoing.discard(&self.store);
             return;
         };
+        // A synced file is one transfer however often the link drops
+        // ("Bucket resume", WEBRTC.md): asked for again, it is the send that
+        // is live, or else the one a checkpoint keeps, offered again.
+        if let Some(key) = outgoing.sync_key() {
+            if self
+                .outgoing
+                .iter()
+                .any(|live| live.id != outgoing.id && live.sync_key().as_ref() == Some(&key))
+            {
+                outgoing.discard(&self.store);
+                return;
+            }
+            let kept: Vec<_> = self
+                .store
+                .stored_sends()
+                .into_iter()
+                .filter(|kept| {
+                    kept.transfer_id != outgoing.id
+                        && kept.device_id == net.wire.peer_device_id
+                        && sync_key_of(kept).as_ref() == Some(&key)
+                })
+                .collect();
+            if let Some(first) = kept.first() {
+                // The new request's own record goes; the kept send carries on
+                // under its id and token (any other with the key is dropped).
+                outgoing.discard(&self.store);
+                outgoing.id = first.transfer_id.clone();
+                outgoing.token = first.token.clone();
+                outgoing.restarts = first.restarts;
+                for other in &kept[1..] {
+                    let _ = self.store.remove_send(&other.transfer_id);
+                }
+            }
+        }
         self.seq += 1;
         outgoing.seq = self.seq;
         // The record names its peer so only that device's sends are resumed.

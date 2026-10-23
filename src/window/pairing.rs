@@ -288,11 +288,13 @@ fn discovery_row(daemon: &DaemonHandle, device: DeviceView) -> adw::ActionRow {
     if let Some(error) = &device.last_error {
         subtitle_parts.push(friendly_error(error).0);
     }
+    // A phone's name is text, not markup: the row reads it as typed before
+    // anything is set on it.
     let row = adw::ActionRow::builder()
         .title(&device.name)
-        .subtitle(subtitle_parts.join(" · "))
+        .use_markup(false)
         .build();
-    row.set_use_markup(false);
+    row.set_subtitle(&subtitle_parts.join(" · "));
     row.set_activatable(false);
     row.add_prefix(&super::icon_square(
         device_type_icon(&device.device_type),
@@ -586,6 +588,14 @@ fn qr_code(daemon: &DaemonHandle) -> (gtk::Picture, Rc<Cell<bool>>) {
         }
         if paused.replace(false) {
             poll_daemon.send(DaemonCommand::StartQrPairing);
+            return glib::ControlFlow::Continue;
+        }
+        // A phone scanned a code that has run out: say so, and show the new one.
+        if crate::device_links::pairing_qr::take_expired_notice() {
+            super::toast_from(&picture, "That code has expired — scan the new one");
+            if shown.borrow_mut().take().is_some() {
+                poll_daemon.send(DaemonCommand::StartQrPairing);
+            }
             return glib::ControlFlow::Continue;
         }
         match crate::device_links::pairing_qr::current_uri() {

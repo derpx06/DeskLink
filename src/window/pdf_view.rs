@@ -259,7 +259,7 @@ impl PdfView {
                 let page = adw::StatusPage::builder()
                     .icon_name("x-office-document-symbolic")
                     .title("Can't preview this PDF here")
-                    .description(&error)
+                    .description(glib::markup_escape_text(&error))
                     .hexpand(true)
                     .build();
                 let open = gtk::Button::builder()

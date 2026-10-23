@@ -169,6 +169,26 @@ mod imp {
     impl AdwApplicationImpl for DesklinkApplication {}
 }
 
+/// The Bucket questions (a phone asked, the desk has not turned it on) not
+/// yet told about: each is returned once. `told` forgets a question once it is
+/// gone, so a phone that asks again later is told again.
+fn new_bucket_questions(
+    offers: &[crate::device_links::folders::Offer],
+    told: &mut std::collections::HashSet<String>,
+) -> Vec<crate::device_links::folders::Offer> {
+    told.retain(|device| {
+        offers
+            .iter()
+            .any(|offer| offer.bucket && &offer.device == device)
+    });
+    offers
+        .iter()
+        .filter(|offer| offer.bucket)
+        .filter(|offer| told.insert(offer.device.clone()))
+        .cloned()
+        .collect()
+}
+
 glib::wrapper! {
     pub struct DesklinkApplication(ObjectSubclass<imp::DesklinkApplication>)
         @extends gio::Application, gtk::Application, adw::Application,
@@ -231,6 +251,16 @@ impl DesklinkApplication {
                 window.show_page("files");
             })
             .build();
+        // "Turn On" on the notification that says a phone asked for a Bucket.
+        let turn_on_bucket_action = gio::ActionEntry::builder("bucket-turn-on")
+            .parameter_type(Some(glib::VariantTy::STRING))
+            .activate(move |app: &Self, _, target| {
+                if let Some(device) = target.and_then(|target| target.get::<String>()) {
+                    crate::device_links::folders::turn_on_bucket(&device);
+                    app.withdraw_notification(&format!("bucket-ask-{device}"));
+                }
+            })
+            .build();
         let history_action = gio::ActionEntry::builder("history")
             .activate(move |app: &Self, _, _| app.show_history())
             .build();
@@ -274,6 +304,7 @@ impl DesklinkApplication {
             lock_hand_off_action,
             history_action,
             open_bucket_action,
+            turn_on_bucket_action,
             call_action,
             dial_action,
         ]);
@@ -371,6 +402,7 @@ impl DesklinkApplication {
         }
 
         let mut notified = std::collections::HashSet::<String>::new();
+        let mut asked = std::collections::HashSet::<String>::new();
         crate::ticker::every_tick(move || {
             crate::guard("app tick", glib::ControlFlow::Continue, || {
                 let Some(app) = app.upgrade() else {
@@ -409,6 +441,36 @@ impl DesklinkApplication {
                     }
                 }
                 notified.retain(|id| active.iter().any(|(device, _)| &device.id == id));
+                // A phone that asks for a Bucket is answered with one click
+                // on a notification, once per ask (turning it on stays the
+                // person's choice).
+                for offer in
+                    new_bucket_questions(&crate::device_links::folders::offers(), &mut asked)
+                {
+                    let phone = daemon
+                        .devices()
+                        .into_iter()
+                        .find(|device| device.id == offer.device)
+                        .map_or(offer.name.clone(), |device| device.name);
+                    let notification =
+                        gio::Notification::new(&format!("{phone} wants to share a Bucket"));
+                    notification.set_body(Some(
+                        "One place for files, pictures, text and links on both devices.",
+                    ));
+                    notification.add_button_with_target_value(
+                        "Turn On",
+                        "app.bucket-turn-on",
+                        Some(&offer.device.to_variant()),
+                    );
+                    notification.set_default_action_and_target_value(
+                        "app.open-bucket",
+                        Some(&offer.device.to_variant()),
+                    );
+                    app.send_notification(
+                        Some(&format!("bucket-ask-{}", offer.device)),
+                        &notification,
+                    );
+                }
                 if let Some(tray) = app.imp().tray.borrow().as_ref() {
                     let devices = daemon.devices();
                     let hand_off = devices.iter().any(|device| device.feature_transport_ready)
@@ -892,6 +954,30 @@ fn take_unreported_crash(dir: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    fn ask(device: &str, bucket: bool) -> crate::device_links::folders::Offer {
+        crate::device_links::folders::Offer {
+            device: device.into(),
+            id: "bucket".into(),
+            name: "Bucket".into(),
+            bucket,
+        }
+    }
+
+    /// A phone asking for a Bucket is told about once; asking again after the
+    /// question went away is a new question; a folder offer is not a Bucket.
+    #[test]
+    fn a_bucket_question_is_notified_once_per_ask() {
+        let mut told = std::collections::HashSet::new();
+        let first = new_bucket_questions(&[ask("p1", true), ask("p2", false)], &mut told);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].device, "p1");
+        // Still asked on the next tick: not again.
+        assert!(new_bucket_questions(&[ask("p1", true)], &mut told).is_empty());
+        // Answered (the offer is gone), then asked again later.
+        assert!(new_bucket_questions(&[], &mut told).is_empty());
+        assert_eq!(new_bucket_questions(&[ask("p1", true)], &mut told).len(), 1);
+    }
+
     use super::*;
 
     #[test]

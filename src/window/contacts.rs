@@ -124,7 +124,8 @@ struct Source {
 
 /// Rebuilds the rows for the terms: at most [`MAX_ROWS`], in order.
 fn draw(list: &gtk::ListBox, count: &gtk::Label, source: &Source) {
-    while let Some(row) = list.first_child() {
+    // Rows only: `first_child` can be the list's placeholder.
+    while let Some(row) = list.row_at_index(0) {
         list.remove(&row);
     }
     let (shown, matched) = select(&source.all, &source.terms);
@@ -329,13 +330,16 @@ impl Page {
         draw(&self.list, &self.count, &self.source.borrow());
 
         if list.is_empty() {
-            self.empty
-                .set_title(&format!("No Contacts from {}", device.name));
-            self.empty.set_description(Some(&format!(
-                "Turn on “Share contacts” for this computer in DeskLink on {}. \
-                 They are kept here encrypted, and removed when you unpair.",
+            self.empty.set_title(&glib::markup_escape_text(&format!(
+                "No Contacts from {}",
                 device.name
             )));
+            self.empty
+                .set_description(Some(&glib::markup_escape_text(&format!(
+                    "Turn on “Share contacts” for this computer in DeskLink on {}. \
+                 They are kept here encrypted, and removed when you unpair.",
+                    device.name
+                ))));
             self.stack.set_visible_child_name("empty");
         } else {
             self.stack.set_visible_child_name("list");

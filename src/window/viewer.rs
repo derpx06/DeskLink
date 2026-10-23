@@ -569,6 +569,7 @@ impl Viewer {
 
     fn toast(&self, message: &str) {
         let toast = adw::Toast::new(message);
+        toast.set_use_markup(false);
         toast.set_timeout(2);
         self.toasts.add_toast(toast);
     }

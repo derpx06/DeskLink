@@ -107,8 +107,18 @@ pub(super) const GROUPS: [&str; 10] = [
     "Advanced",
 ];
 
+/// Text for a row, group or description that reads markup: escaped, so a
+/// device named `Pixel & <9>` reads as typed.
+fn esc(text: impl AsRef<str>) -> glib::GString {
+    glib::markup_escape_text(text.as_ref())
+}
+
 fn group(title: &str) -> adw::PreferencesGroup {
-    adw::PreferencesGroup::builder().title(title).build()
+    // A group's title is read as markup: "Privacy & security" is not valid
+    // markup as it is, and the heading was not drawn at all.
+    adw::PreferencesGroup::builder()
+        .title(glib::markup_escape_text(title))
+        .build()
 }
 
 fn groups(
@@ -127,7 +137,7 @@ fn groups(
         "Where phone notifications show, and which of this computer's go to the phone",
     ));
     let shown = adw::SwitchRow::builder()
-        .title(format!("Show {}'s notifications here", device.name))
+        .title(esc(format!("Show {}'s notifications here", device.name)))
         .subtitle("On this desktop, with replies")
         .active(settings.shows_notifications(&device.id))
         .build();
@@ -179,8 +189,8 @@ fn groups(
     advanced.add(&logs_row());
 
     // The group titles are fixed (see GROUPS); calls and sound build theirs.
-    calls.set_title(GROUPS[3]);
-    sound.set_title(GROUPS[4]);
+    calls.set_title(&glib::markup_escape_text(GROUPS[3]));
+    sound.set_title(&glib::markup_escape_text(GROUPS[4]));
     vec![
         connection,
         notifications,
@@ -292,15 +302,15 @@ fn calls_group(
 ) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::builder()
         .title("Calls")
-        .description(format!(
+        .description(glib::markup_escape_text(&format!(
             "Answer, decline and end {}'s calls here. Turn on Calls in DeskLink on the phone.",
             device.name
-        ))
+        )))
         .build();
     group.add(&pause_music_row(daemon, settings));
     // F5 K4: names from the contacts the phone shares, off until asked.
     let names = adw::SwitchRow::builder()
-        .title(format!("Name callers from {}'s contacts", device.name))
+        .title(esc(format!("Name callers from {}'s contacts", device.name)))
         .subtitle("Uses the contacts the phone shares with this computer")
         .active(settings.names_callers_from(&device.id))
         .build();
@@ -340,7 +350,7 @@ fn clipboard_row(
     device: &DeviceView,
 ) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
-        .title(format!("Share the clipboard with {}", device.name))
+        .title(esc(format!("Share the clipboard with {}", device.name)))
         .subtitle("Copy on one device, paste on the other. Passwords are never shared.")
         .active(settings.clipboard_sync)
         .build();
@@ -357,7 +367,7 @@ fn clipboard_row(
 fn bucket_row(device: &DeviceView) -> adw::SwitchRow {
     let on = crate::device_links::folders::bucket_on(&device.id);
     let row = adw::SwitchRow::builder()
-        .title(format!("Bucket with {}", device.name))
+        .title(esc(format!("Bucket with {}", device.name)))
         .subtitle("One place for files, pictures, text and links on both devices")
         .active(on)
         .build();
@@ -498,10 +508,12 @@ fn unlock_nearby_row(
     );
     let row = adw::SwitchRow::builder()
         .title(format!("Unlock with {phone} nearby"))
-        .subtitle(&explained)
         .use_markup(false)
         .active(settings.unlocks_from(&device.id))
         .build();
+    // Set after `use_markup(false)`: a subtitle given to the builder is read
+    // as markup first, and a phone named `A & B` was a warning.
+    row.set_subtitle(&explained);
     with_icon(&row, "changes-allow-symbolic");
     row.update_property(&[gtk::accessible::Property::Description(&explained)]);
     let (daemon, id) = (daemon.clone(), device.id.clone());
@@ -519,13 +531,13 @@ fn command_alerts_row(
 ) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
         .title("Command alerts")
-        .subtitle(format!(
-            "Tell {} when a terminal command that ran over 10 seconds finishes",
-            device.name
-        ))
         .use_markup(false)
         .active(settings.alerts_commands_to(&device.id))
         .build();
+    row.set_subtitle(&format!(
+        "Tell {} when a terminal command that ran over 10 seconds finishes",
+        device.name
+    ));
     with_icon(&row, "alarm-symbolic");
     let (daemon, id) = (daemon.clone(), device.id.clone());
     row.connect_active_notify(move |row| {
@@ -721,10 +733,10 @@ fn terminal_access_row(daemon: &DaemonHandle, device: &DeviceView) -> adw::Switc
     // from persisted state does not itself send a command.
     let row = adw::SwitchRow::builder()
         .title("Terminal access")
-        .subtitle(&warning)
         .use_markup(false)
         .active(device.terminal_access)
         .build();
+    row.set_subtitle(&warning);
     with_icon(&row, "utilities-terminal-symbolic");
     row.update_property(&[gtk::accessible::Property::Description(&warning)]);
     let (daemon, id) = (daemon.clone(), device.id.clone());
@@ -1192,7 +1204,7 @@ fn remote_control_row(device: &DeviceView, approving: bool) -> adw::ActionRow {
 /// "Unpair Pixel 9…", red, after asking.
 fn unpair_row(daemon: &DaemonHandle, device: &DeviceView) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(format!("Unpair {}…", device.name))
+        .title(esc(format!("Unpair {}…", device.name)))
         .subtitle("It can connect again only after pairing again")
         .activatable(true)
         .css_classes(["error"])
@@ -1230,8 +1242,8 @@ fn add_glide_rows(
         Availability::Checking => return,
         Availability::Unavailable(reason) => {
             let row = adw::ActionRow::builder()
-                .title(format!("Glide onto {}", device.name))
-                .subtitle(reason)
+                .title(esc(format!("Glide onto {}", device.name)))
+                .subtitle(esc(reason))
                 .build();
             with_icon(&row, "input-mouse-symbolic");
             row.update_property(&[gtk::accessible::Property::Description(reason)]);
@@ -1251,8 +1263,8 @@ fn add_glide_rows(
         .filter(|glide| glide.device == device.id)
         .map(|glide| glide.edge);
     let switch = adw::SwitchRow::builder()
-        .title(format!("Glide onto {phone}"))
-        .subtitle(&explained)
+        .title(esc(format!("Glide onto {phone}")))
+        .subtitle(esc(&explained))
         .active(current.is_some())
         .build();
     with_icon(&switch, "input-mouse-symbolic");
@@ -1353,7 +1365,7 @@ fn add_glide_rows(
     if let Some(problem) = status.problem.as_deref() {
         let row = adw::ActionRow::builder()
             .title("Glide is not working")
-            .subtitle(problem)
+            .subtitle(esc(problem))
             .build();
         row.add_prefix(&icon_square("dialog-warning-symbolic", 30, "row-icon"));
         group.add(&row);
@@ -1365,6 +1377,54 @@ mod tests {
     use super::*;
 
     /// The groups, in the order the phone's Settings uses too.
+    /// Every group title survives being read as markup, and so does a name
+    /// with the characters markup uses (a file, a contact, a phone).
+    #[test]
+    fn titles_and_names_with_markup_characters_read_as_typed() {
+        for title in GROUPS
+            .iter()
+            .copied()
+            .chain(["a&b<c>.txt", "Pixel & <9> \"x\"", "R&D's"])
+        {
+            let escaped = glib::markup_escape_text(title);
+            let (_, text, _) = gtk::pango::parse_markup(&escaped, '\0')
+                .unwrap_or_else(|error| panic!("{title:?} did not parse: {error}"));
+            assert_eq!(text.as_str(), title);
+        }
+        // Raw, the heading that went missing is not markup at all.
+        assert!(gtk::pango::parse_markup("Privacy & security", '\0').is_err());
+    }
+
+    /// With a display: a row given `esc`aped text shows it as typed, in the
+    /// title, the subtitle and a group's description, with no markup warning.
+    /// (Skipped without a display.)
+    #[test]
+    fn escaped_row_text_reads_as_typed() {
+        if adw::init().is_err() {
+            return;
+        }
+        let name = "a&b<c>.txt";
+        let row = adw::SwitchRow::builder()
+            .title(esc(format!("Show {name}")))
+            .subtitle(esc(format!("Tell {name}")))
+            .build();
+        let label = |text: &str| {
+            gtk::pango::parse_markup(text, '\0')
+                .map(|(_, plain, _)| plain.to_string())
+                .unwrap()
+        };
+        assert_eq!(label(&row.title()), format!("Show {name}"));
+        assert_eq!(
+            label(&row.subtitle().unwrap_or_default()),
+            format!("Tell {name}")
+        );
+        let group = adw::PreferencesGroup::builder()
+            .title(esc("Privacy & security"))
+            .description(esc(format!("Answer {name}'s calls")))
+            .build();
+        assert_eq!(label(&group.title()), "Privacy & security");
+    }
+
     #[test]
     fn settings_has_the_ten_groups_in_the_agreed_order() {
         assert_eq!(

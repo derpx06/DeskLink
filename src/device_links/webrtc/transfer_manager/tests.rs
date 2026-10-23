@@ -2538,3 +2538,327 @@ fn a_downloads_folder_that_is_a_symlink_works() {
     assert_eq!(path.parent().unwrap(), fs::canonicalize(&real).unwrap());
     let _ = fs::remove_dir_all(&base);
 }
+
+// ── What a phone's offer for a multi-block file looks like ─────────────────
+
+/// A phone sending a spooled content-URI file: no `contentSha256`, no
+/// folder, an `mtime` the phone makes up (0, or the time it was spooled),
+/// whatever frame size it likes. Every such offer for a 3 MiB file is
+/// accepted and the file arrives whole.
+#[test]
+fn a_phone_style_offer_for_a_three_mebibyte_file_is_accepted_and_arrives() {
+    let (data, hashes) = three_blocks(41);
+    let total = data.len() as u64;
+    // 2 MiB + 777 bytes is three blocks; use 3 MiB exactly as well.
+    let variants: [(&str, i64, Option<usize>); 5] = [
+        ("zero", 0, Some(FRAME_BYTES_PROVEN)),
+        ("negative", -1, Some(FRAME_BYTES_PROVEN)),
+        ("spooled-now", 1_760_000_000_123, None),
+        ("big-frame", 1_700_000_000_000, Some(196_608)),
+        ("max-frame", 1_700_000_000_000, Some(65_536)),
+    ];
+    for (n, (label, mtime, frame)) in variants.into_iter().enumerate() {
+        let hand = Hand::new(&format!("phone-offer-{label}"));
+        let mut offer = hand.offer(id(1), &format!("{label}.bin"), total);
+        offer.mtime = Some(mtime);
+        offer.max_frame_bytes = frame;
+        hand.send(offer);
+        let accept = eventually("the accept", || hand.reply(FileAction::Accept));
+        assert_eq!(accept.resume_block, Some(0), "{label} (variant {n})");
+        for index in 0..hashes.len() as u64 {
+            for frame in block_frames(id(1), 0, &data, index, false) {
+                hand.manager.on_frame(frame);
+            }
+        }
+        say_done(&hand, id(1), total, &hashes);
+        eventually("the complete", || hand.reply(FileAction::Complete));
+        assert_eq!(
+            fs::read(hand.base.join("dl").join(format!("{label}.bin"))).unwrap(),
+            data,
+            "{label}"
+        );
+        assert!(hand.link.sent(FileAction::Error).is_empty(), "{label}");
+    }
+}
+
+/// A frame with no transfer is dropped with its id and the reason: never
+/// offered, refused (and the person is shown the refusal), or already
+/// finished.
+#[test]
+fn a_dropped_frame_says_which_transfer_and_why() {
+    let hand = Hand::new("why-unknown");
+    let key = id_bytes(id(1)).unwrap();
+    let why = |hand: &Hand| hand.manager.probe(move |engine| engine.why_unknown(&key));
+    assert_eq!(why(&hand), "never offered");
+    // An offer that is refused (over 4 GiB) is listed as failed and remembered.
+    hand.send(hand.offer(id(1), "huge.bin", super::MAX_TRANSFER_BYTES + 1));
+    eventually("the refusal", || hand.reply(FileAction::Error));
+    assert!(failed_with(id(1)).is_some_and(|words| words.contains("4 GiB")));
+    assert_eq!(why(&hand), "refused");
+    // A finished one.
+    let (data, hashes) = three_blocks(51);
+    let key2 = id_bytes(id(2)).unwrap();
+    send_whole(&hand, id(2), "ok.bin", &data, &hashes);
+    eventually("the complete", || hand.reply(FileAction::Complete));
+    assert_eq!(
+        hand.manager.probe(move |engine| engine.why_unknown(&key2)),
+        "already finished"
+    );
+    // A frame for it now is dropped (and nothing changes).
+    for frame in block_frames(id(2), 0, &data, 0, false) {
+        hand.manager.on_frame(frame);
+    }
+    hand.settle();
+    assert!(hand.incoming().is_empty());
+}
+
+// ── Bucket resume is keyed by content, not by transfer id ──────────────────
+
+/// A Bucket file of `blocks` blocks (and a bit), asked for by `hand`'s
+/// manager; the offer for it under `id` and `token`.
+fn bucket_offer(
+    hand: &Hand,
+    id: &str,
+    token: &str,
+    relpath: &str,
+    sha: &str,
+    total: u64,
+) -> FileControl {
+    let mut offer = hand.offer(id, relpath.rsplit('/').next().unwrap(), total);
+    offer.transfer_token = token.to_string();
+    offer.folder = Some("bucket".into());
+    offer.relpath = Some(relpath.to_string());
+    offer.content_sha256 = Some(sha.to_string());
+    offer
+}
+
+fn want_bucket_file(relpath: &str, sha: &str, total: u64) {
+    use crate::device_links::webrtc::file_protocol::FolderRef;
+    crate::device_links::folders::test_want(
+        "alpha",
+        &FolderRef {
+            folder: "bucket".into(),
+            relpath: relpath.to_string(),
+            mtime: None,
+        },
+        sha,
+        total,
+    );
+}
+
+/// A cut at 30% of a Bucket file: asked for again under a new id, the
+/// receiver carries on from the verified blocks it holds (the whole 30%),
+/// whether it noticed the cut (the old id is closed and adopted) or not (the
+/// files are on disk). The rest arrives and the file completes.
+#[test]
+fn a_bucket_file_cut_at_thirty_percent_resumes_under_a_new_id_with_nothing_redone() {
+    for cut_noticed in [true, false] {
+        let hand = Hand::new("bucket-resume");
+        let relpath = format!("movies/{}.bin", uuid::Uuid::new_v4().simple());
+        let blocks = 30u64;
+        let total = blocks * BLOCK_BYTES + 5;
+        let data = payload(total as usize, 61);
+        let hashes: Vec<[u8; 32]> = data
+            .chunks(BLOCK_BYTES as usize)
+            .map(openssl::sha::sha256)
+            .collect();
+        let sha = hex(&openssl::sha::sha256(&data));
+        want_bucket_file(&relpath, &sha, total);
+        hand.send(bucket_offer(&hand, id(1), "token0", &relpath, &sha, total));
+        eventually("the accept", || hand.reply(FileAction::Accept));
+        let cut_at = 9; // 30% of 30 blocks
+        for index in 0..cut_at {
+            for frame in block_frames(id(1), 0, &data, index, false) {
+                hand.manager.on_frame(frame);
+            }
+        }
+        eventually("the acks", || {
+            (hand.link.sent(FileAction::BlockAck).len() as u64 == cut_at).then_some(())
+        });
+        if cut_noticed {
+            // The link drops: the receiver checkpoints what it holds.
+            hand.manager.detach();
+            hand.settle();
+            hand.manager
+                .attach(wire_of("beta", "alpha"), hand.link.clone());
+        }
+        // Asked for again, as the Bucket does after a rebuild: a new id.
+        hand.send(bucket_offer(&hand, id(2), "token1", &relpath, &sha, total));
+        let accept = eventually("the new accept", || {
+            hand.link
+                .sent(FileAction::Accept)
+                .into_iter()
+                .find(|accept| accept.transfer_id == id(2))
+        });
+        let resume = accept.resume_block.expect("a resume block");
+        let redone = cut_at * BLOCK_BYTES - resume * BLOCK_BYTES;
+        assert!(
+            redone < BLOCK_BYTES,
+            "cut noticed: {cut_noticed}; resumed at block {resume} of the {cut_at} held, {redone} bytes redone"
+        );
+        assert_eq!(
+            accept.prefix_sha256.as_deref(),
+            Some(hex(&hash_of_hashes(&hashes[..resume as usize])).as_str())
+        );
+        // The rest, from there, completes the file under the new id.
+        for index in resume..blocks + 1 {
+            for frame in block_frames(id(2), 0, &data, index, false) {
+                hand.manager.on_frame(frame);
+            }
+        }
+        let mut done =
+            FileControl::new(&wire_of("alpha", "beta"), FileAction::Done, id(2), "token1");
+        done.file_hash = Some(hex(&hash_of_hashes(&hashes)));
+        done.blocks = Some(blocks + 1);
+        done.total_size = Some(total);
+        hand.send(done);
+        eventually("the complete", || {
+            hand.link
+                .sent(FileAction::Complete)
+                .into_iter()
+                .find(|complete| complete.transfer_id == id(2))
+        });
+        assert!(
+            names(&hand.base.join("state"))
+                .iter()
+                .all(|name| !name.contains(id(1))),
+            "nothing of the old id is left"
+        );
+    }
+}
+
+/// The same path with different content is a different file: nothing of the
+/// old partial is reused, and it is dropped.
+#[test]
+fn a_bucket_file_with_other_content_does_not_resume_from_an_old_partial() {
+    let hand = Hand::new("bucket-other");
+    let relpath = format!("docs/{}.bin", uuid::Uuid::new_v4().simple());
+    let total = 4 * BLOCK_BYTES;
+    let old = payload(total as usize, 71);
+    let old_sha = hex(&openssl::sha::sha256(&old));
+    want_bucket_file(&relpath, &old_sha, total);
+    hand.send(bucket_offer(
+        &hand,
+        id(1),
+        "token0",
+        &relpath,
+        &old_sha,
+        total,
+    ));
+    eventually("the accept", || hand.reply(FileAction::Accept));
+    for index in 0..2 {
+        for frame in block_frames(id(1), 0, &old, index, false) {
+            hand.manager.on_frame(frame);
+        }
+    }
+    eventually("the acks", || {
+        (hand.link.sent(FileAction::BlockAck).len() == 2).then_some(())
+    });
+    hand.manager.detach();
+    hand.settle();
+    hand.manager
+        .attach(wire_of("beta", "alpha"), hand.link.clone());
+    // The file changed on the other side: another hash, the same path.
+    let new = payload(total as usize, 72);
+    let new_sha = hex(&openssl::sha::sha256(&new));
+    want_bucket_file(&relpath, &new_sha, total);
+    hand.send(bucket_offer(
+        &hand,
+        id(2),
+        "token1",
+        &relpath,
+        &new_sha,
+        total,
+    ));
+    let accept = eventually("the new accept", || {
+        hand.link
+            .sent(FileAction::Accept)
+            .into_iter()
+            .find(|accept| accept.transfer_id == id(2))
+    });
+    assert_eq!(
+        accept.resume_block,
+        Some(0),
+        "a different file starts again"
+    );
+    assert!(
+        names(&hand.base.join("state"))
+            .iter()
+            .all(|name| !name.contains(id(1))),
+        "the old partial is gone"
+    );
+}
+
+/// The sending half of the rule: a synced file asked for again after a cut
+/// is the same transfer, whether the connection already resumed it (the
+/// request is absorbed) or not (the kept checkpoint is offered again under
+/// its id). Cut at 30%, less than a block is sent twice.
+#[test]
+fn a_synced_file_asked_for_again_after_a_cut_goes_on_from_the_last_block_under_its_id() {
+    use crate::device_links::webrtc::file_protocol::FolderRef;
+    for resumed_first in [false, true] {
+        let mut rig = Rig::new("bucket-send-resume");
+        let blocks = 30usize;
+        let bytes = payload(blocks * BLOCK_BYTES as usize + 321, 81);
+        let relpath = format!("Trips/{}.mov", uuid::Uuid::new_v4().simple());
+        let source = rig.source("big.mov", &bytes);
+        let sha = hex(&openssl::sha::sha256(&bytes));
+        let folder = FolderRef {
+            folder: "bucket".into(),
+            relpath: relpath.clone(),
+            mtime: Some(1),
+        };
+        crate::device_links::folders::test_want("alpha", &folder, &sha, bytes.len() as u64);
+        pull_after_blocks(&rig, 9);
+        let id = rig
+            .a()
+            .start_send_folder(&source, folder.clone(), &sha)
+            .unwrap();
+        eventually("the link to be pulled", || {
+            (!rig.ab.up.load(Ordering::SeqCst)).then_some(())
+        });
+        let held = rig.b().probe(|engine| {
+            engine
+                .incoming
+                .values()
+                .map(|incoming| incoming.verified_blocks())
+                .max()
+                .unwrap_or(0)
+        });
+        assert!(held >= 8, "{held} blocks held");
+        rig.stop(false);
+        rig.connect();
+        if resumed_first {
+            rig.a().resume_sends();
+        }
+        // The Bucket asks for the file again: a request with a new id.
+        let again = rig
+            .a()
+            .start_send_folder(&source, folder.clone(), &sha)
+            .unwrap();
+        assert_ne!(again, id, "a new request, a new id of its own");
+        // It completes (to folder sync, not the downloads: no worker here).
+        let got = rig.received();
+        assert_eq!(got.transfer_id, id);
+        let offers = rig.ab.sent(FileAction::Offer);
+        assert!(
+            offers.iter().all(|offer| offer.transfer_id == id),
+            "resumed_first {resumed_first}: only ever offered as {id}: {:?}",
+            offers
+                .iter()
+                .map(|o| o.transfer_id.clone())
+                .collect::<Vec<_>>()
+        );
+        let accept = rig.ba.sent(FileAction::Accept).remove(0);
+        let resume = accept.resume_block.expect("a resume block");
+        assert!(
+            resume + 1 >= held,
+            "resumed at {resume}, {held} blocks were held"
+        );
+        let resent = rig.ab.frames.load(Ordering::SeqCst);
+        assert!(
+            resent < (blocks - held as usize + 3) * 18,
+            "{resent} frames after the reconnect (resumed first: {resumed_first})"
+        );
+    }
+}

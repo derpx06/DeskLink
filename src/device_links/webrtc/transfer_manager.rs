@@ -289,6 +289,7 @@ impl WebRtcTransferManager {
             resumed: false,
             link_down_until: None,
             faults: Faults::default(),
+            closed: std::collections::VecDeque::new(),
         };
         let thread = std::thread::Builder::new()
             .name("desklink-file".into())
@@ -481,9 +482,57 @@ struct Engine {
     /// A frame could not be sent (the channel is closing): wait a moment.
     link_down_until: Option<Instant>,
     faults: Faults,
+    /// Transfers that ended or were refused lately, and how: what a frame
+    /// that belongs to none is told apart by (the last 64).
+    closed: std::collections::VecDeque<([u8; 16], &'static str)>,
 }
 
 impl Engine {
+    /// Notes how the transfer `key` ended, for [`why_unknown`](Self::why_unknown).
+    fn note_closed(&mut self, key: [u8; 16], how: &'static str) {
+        self.closed.retain(|(known, _)| *known != key);
+        if self.closed.len() >= 64 {
+            self.closed.pop_front();
+        }
+        self.closed.push_back((key, how));
+    }
+
+    /// Why a frame for `key` has no transfer.
+    fn why_unknown(&self, key: &[u8; 16]) -> &'static str {
+        self.closed
+            .iter()
+            .rev()
+            .find(|(known, _)| known == key)
+            .map_or("never offered", |(_, how)| how)
+    }
+
+    /// An offer was refused: said in the log with its transfer id and why,
+    /// remembered, and (unless the sender just has to wait, or the Bucket
+    /// asked for nothing the person wants to hear about) shown in the list.
+    fn refused(&mut self, message: &FileControl, why: &'static str, shown: Option<&str>) {
+        crate::device_links::limits::log_limited(
+            "file-offer-refused",
+            &format!(
+                "Refused file offer {} ({}): {why}",
+                message.transfer_id,
+                message.filename.as_deref().unwrap_or("no name")
+            ),
+        );
+        if let Some(key) = id_bytes(&message.transfer_id) {
+            self.note_closed(key, "refused");
+        }
+        if let (Some(words), Some(net)) = (shown, self.net.as_ref()) {
+            board::record(board::Finished {
+                id: message.transfer_id.clone(),
+                device_id: net.wire.peer_device_id.clone(),
+                name: message.filename.clone().unwrap_or_default(),
+                incoming: true,
+                outcome: Outcome::Failed(words.to_string()),
+                retry: None,
+            });
+        }
+    }
+
     fn run(mut self, inbox: Receiver<Cmd>) {
         loop {
             let wait = self.wait_hint();
@@ -574,6 +623,18 @@ impl Engine {
                 && message.transfer_token.len() <= 256
                 && message.transfer_token.is_ascii();
             if message.action == FileAction::Offer && from_peer {
+                let too_big = message
+                    .total_size
+                    .is_some_and(|size| size > MAX_TRANSFER_BYTES);
+                self.refused(
+                    &message,
+                    "the offer was not valid",
+                    Some(if too_big {
+                        "That file is over 4 GiB, which DeskLink does not receive."
+                    } else {
+                        "The phone sent a file DeskLink could not accept."
+                    }),
+                );
                 let mut refusal = net.msg(
                     FileAction::Error,
                     &message.transfer_id,
@@ -695,6 +756,7 @@ impl Engine {
                 if let Some(incoming) = self.incoming.remove(&key) {
                     incoming.discard(&self.store);
                 }
+                self.note_closed(key, "ended by the peer");
                 board::finish(id, outcome);
                 return;
             }
@@ -721,6 +783,7 @@ impl Engine {
         };
         if let Some(key) = id_bytes(id) {
             if let Some(incoming) = self.incoming.remove(&key) {
+                self.note_closed(key, "cancelled here");
                 tell(&self.net, &incoming.token);
                 incoming.discard(&self.store);
                 board::finish(id, Outcome::Cancelled);

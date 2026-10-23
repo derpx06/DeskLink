@@ -359,9 +359,19 @@ impl Engine {
             net.send(error);
         };
         let (Some(filename), Some(total)) = (message.filename.clone(), message.total_size) else {
+            self.refused(
+                &message,
+                "the offer is incomplete",
+                Some("The phone's offer was incomplete."),
+            );
             return refuse(code::INTERNAL, Some("The offer is incomplete"));
         };
         if total > MAX_TRANSFER_BYTES {
+            self.refused(
+                &message,
+                "over 4 GiB",
+                Some("That file is over 4 GiB, which DeskLink does not receive."),
+            );
             return refuse(code::TOO_LARGE, None);
         }
         let Some(key) = id_bytes(&id) else {
@@ -377,12 +387,19 @@ impl Engine {
                 &content,
                 total,
             ) {
+                // The Bucket asks again by itself: logged, not listed.
+                self.refused(&message, "the Bucket did not ask for it", None);
                 return refuse(code::REFUSED, Some("folder-refused"));
             }
         }
         // The same transfer offered again: answered from where we are.
         if let Some(existing) = self.incoming.get_mut(&key) {
             if existing.token != token || existing.total != total || existing.filename != filename {
+                self.refused(
+                    &message,
+                    "it does not match the transfer already open under that id",
+                    Some("That file does not match a transfer already open."),
+                );
                 return refuse(code::REFUSED, Some("That transfer does not match"));
             }
             let blocks = existing.verified();
@@ -394,8 +411,39 @@ impl Engine {
             net.send(existing.accept_message(net));
             return;
         }
+        // A Bucket file asked for again under a new id while the old one is
+        // still open here (the cut was not noticed, or the link is down):
+        // checkpoint the old one and let the new offer adopt what it holds.
+        if let (Some(reference), Some(sha)) = (&folder, message.content_sha256.as_deref()) {
+            let same_file = |incoming: &Incoming| {
+                incoming.device_id == net.wire.peer_device_id
+                    && incoming.folder.as_ref().is_some_and(|known| {
+                        known.folder == reference.folder && known.relpath == reference.relpath
+                    })
+                    && incoming
+                        .content_sha256
+                        .as_deref()
+                        .is_some_and(|known| known.eq_ignore_ascii_case(sha))
+                    && incoming.total == total
+            };
+            let stale: Vec<[u8; 16]> = self
+                .incoming
+                .iter()
+                .filter(|(old, incoming)| **old != key && same_file(incoming))
+                .map(|(old, _)| *old)
+                .collect();
+            for old in stale {
+                if let Some(mut incoming) = self.incoming.remove(&old) {
+                    incoming.checkpoint_now(&self.store);
+                    board::discard(&incoming.id);
+                    self.note_closed(old, "replaced by a new request for the same file");
+                }
+            }
+        }
         // Two at once; the sender waits and offers again.
         if self.incoming.len() >= ACTIVE_PER_DIRECTION {
+            // Not a failure: the sender waits and offers again.
+            self.refused(&message, "two files are already arriving (busy)", None);
             return refuse(code::BUSY, None);
         }
         let now = Instant::now();
@@ -411,6 +459,7 @@ impl Engine {
                     outcome: Outcome::Failed(error.chars().take(256).collect()),
                     retry: None,
                 });
+                self.note_closed(key, "refused");
                 return refuse(code::INTERNAL, Some(&error));
             }
         };
@@ -433,15 +482,60 @@ impl Engine {
     ) -> Result<Incoming, String> {
         let id = &message.transfer_id;
         let mtime = message.mtime.unwrap_or_default();
-        let held = self.store.load_receive(id)?;
-        let resumed = held.filter(|(checkpoint, _)| {
-            checkpoint.device_id == net.wire.peer_device_id
-                && checkpoint.token == message.transfer_token
-                && checkpoint.filename == filename
-                && checkpoint.total_size == total
-                && checkpoint.mtime == mtime
-                && checkpoint.folder == folder
-        });
+        let mut held = self.store.load_receive(id)?;
+        // A Bucket file asked for again under a new id carries on from what
+        // is held for the same content (see "Bucket resume" in WEBRTC.md).
+        if let (None, Some(folder_ref), Some(sha)) =
+            (&held, &folder, message.content_sha256.as_deref())
+        {
+            if self.store.adopt_bucket_partial(
+                id,
+                &message.transfer_token,
+                &net.wire.peer_device_id,
+                folder_ref,
+                sha,
+                total,
+                mtime,
+            )? {
+                held = self.store.load_receive(id)?;
+            }
+        }
+        let resumed = held
+            .filter(|(checkpoint, _)| {
+                let same_file = checkpoint.device_id == net.wire.peer_device_id
+                    && checkpoint.filename == filename
+                    && checkpoint.total_size == total;
+                match (&folder, &checkpoint.folder) {
+                    // A Bucket file is its content at its path: not the token or
+                    // the time of the request ("Bucket resume", WEBRTC.md).
+                    (Some(new), Some(old)) => {
+                        same_file
+                            && new.folder == old.folder
+                            && new.relpath == old.relpath
+                            && checkpoint.content_sha256.as_deref().is_some_and(|known| {
+                                message
+                                    .content_sha256
+                                    .as_deref()
+                                    .is_some_and(|asked| known.eq_ignore_ascii_case(asked))
+                            })
+                    }
+                    (None, None) => {
+                        same_file
+                            && checkpoint.token == message.transfer_token
+                            && checkpoint.mtime == mtime
+                    }
+                    _ => false,
+                }
+            })
+            .map(|(mut checkpoint, hashes)| {
+                if folder.is_some() {
+                    // Carried on under this request.
+                    checkpoint.token = message.transfer_token.clone();
+                    checkpoint.mtime = mtime;
+                    checkpoint.folder = folder.clone();
+                }
+                (checkpoint, hashes)
+            });
         let (checkpoint, hashes, file) = match resumed {
             Some((checkpoint, hashes)) => {
                 let file = self.store.open_part(id)?;
@@ -544,9 +638,17 @@ impl Engine {
             faults: &self.faults,
             now: Instant::now(),
         };
+        if !self.incoming.contains_key(&key) {
+            // Unknown, finished or cancelled: nothing changes, but the log
+            // says which transfer and why it is not known.
+            let why = self.why_unknown(&key);
+            super::note_dropped(&format!(
+                "unknown transfer {}: {why}",
+                super::super::file_protocol::id_string(&key)
+            ));
+            return;
+        }
         let Some(incoming) = self.incoming.get_mut(&key) else {
-            // Unknown, finished or cancelled: nothing changes.
-            super::note_dropped("unknown transfer");
             return;
         };
         if let Err(ending) = incoming.on_frame(&ctx, &frame) {
@@ -622,6 +724,7 @@ impl Engine {
         let Some(incoming) = self.incoming.remove(&key) else {
             return;
         };
+        self.note_closed(key, "already finished");
         if let Err(error) = incoming.file.sync_all() {
             return self.fail_incoming_keeping_part(
                 incoming,
@@ -691,6 +794,7 @@ impl Engine {
     /// the person is shown why.
     pub(super) fn end_incoming(&mut self, key: [u8; 16], ending: Ending) {
         if let Some(incoming) = self.incoming.remove(&key) {
+            self.note_closed(key, "ended with an error");
             self.fail_incoming(incoming, ending);
         }
     }

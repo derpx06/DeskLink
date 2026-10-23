@@ -227,10 +227,20 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         info.append(&line);
     }
     if let Some(error) = &device.last_error {
-        let label = text(&super::friendly_error(error).0, &["caption", "error"]);
+        let (words, details) = super::hero_error_words(error);
+        let label = text(&words, &["caption", "error"]);
         label.set_wrap(true);
-        label.set_tooltip_text(Some(error));
         info.append(&label);
+        // The system's own words, one click away (selectable, for a bug report).
+        if let Some(details) = details {
+            let expander = gtk::Expander::builder().label("Details").build();
+            let raw = text(&details, &["caption", "text-dim"]);
+            raw.set_wrap(true);
+            raw.set_selectable(true);
+            raw.set_xalign(0.0);
+            expander.set_child(Some(&raw));
+            info.append(&expander);
+        }
         // The ladder gave up: this is what acts on "Try again".
         if crate::device_links::webrtc::coordinator::is_unavailable(error) {
             let retry = icon_button("view-refresh-symbolic", "Try Again", &["soft-button"]);
@@ -814,21 +824,33 @@ fn live_banner(
 
 /// "Pixel 9 is offline · your terminals keep running here", Try Again.
 fn offline_row(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
+    // The words and the action side by side; under each other when narrow
+    // (the `responsive` box turns vertical), the text wrapping rather than
+    // cut off with an ellipsis.
     let row = gtk::Box::builder()
-        .spacing(14)
+        .spacing(10)
         .css_classes(["state-banner"])
         .build();
-    row.append(&icon_square("network-offline-symbolic", 28, "state-icon"));
+    row.set_widget_name("responsive");
+    let lead = gtk::Box::builder().spacing(14).hexpand(true).build();
+    lead.append(&icon_square("network-offline-symbolic", 28, "state-icon"));
     let words = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
         .hexpand(true)
         .valign(gtk::Align::Center)
         .build();
-    words.append(&text(&format!("{} is offline", device.name), &["heading"]));
-    let detail = ellipsized(" · your terminals keep running here", &["text-dim"]);
-    detail.set_hexpand(true);
+    let name = text(&format!("{} is offline", device.name), &["heading"]);
+    name.set_wrap(true);
+    name.set_xalign(0.0);
+    words.append(&name);
+    let detail = text("Your terminals keep running here", &["text-dim"]);
+    detail.set_wrap(true);
+    detail.set_xalign(0.0);
     words.append(&detail);
-    row.append(&words);
+    lead.append(&words);
+    row.append(&lead);
     let retry = super::soft_button("Try Again");
+    retry.set_halign(gtk::Align::End);
     retry.set_css_classes(&["raised-button"]);
     let daemon = daemon.clone();
     retry.connect_clicked(move |button| {

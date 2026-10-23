@@ -95,9 +95,10 @@ pub(crate) fn history_content(
         }
         let row = adw::ActionRow::builder()
             .title(entry.event.label())
-            .subtitle(subtitle)
             .use_markup(false)
             .build();
+        // After `use_markup(false)`: a path or a name with `&` is not markup.
+        row.set_subtitle(&subtitle);
         // Colour is for failures only.
         let failed = matches!(
             entry.event,

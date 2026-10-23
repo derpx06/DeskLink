@@ -104,6 +104,11 @@ fn set_selecting(on: bool) {
     refresh_selection();
 }
 
+/// Whether a plain click on a card opens it: not while selecting.
+fn opens_on_click(selecting: bool) -> bool {
+    !selecting
+}
+
 /// Ctrl-click: one more in or out of the selection.
 fn toggle_item(path: &str) {
     BROWSE.with(|browse| {
@@ -1528,6 +1533,12 @@ fn tile(
             let Some(win) = win.upgrade() else {
                 return;
             };
+            // While selecting a click only selects (the capture-phase click
+            // below claims the press, but the button's own `clicked` still
+            // fires on release): it never opens the card or enters a folder.
+            if !opens_on_click(selecting()) {
+                return;
+            }
             if item.dir {
                 go_to(&win, &item.path);
             } else if item.state != ItemState::Receiving {
@@ -2127,6 +2138,14 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
 mod tests {
     /// Select All, Shift-click and Remove from Both only reach tiles that
     /// are drawn: items past the cap are never selected.
+    /// Selecting: a click never opens a card or enters a folder (checked with
+    /// real X events in the harness too; see `shots-w6c`).
+    #[test]
+    fn a_click_opens_a_card_only_when_not_selecting() {
+        assert!(super::opens_on_click(false));
+        assert!(!super::opens_on_click(true));
+    }
+
     #[test]
     fn selection_only_reaches_what_is_drawn() {
         use super::*;

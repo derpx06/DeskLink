@@ -309,9 +309,17 @@ impl Page {
             .css_classes(["navigation-sidebar"])
             .build();
         list.update_property(&[gtk::accessible::Property::Label("Notes")]);
-        let none = text("No notes", &["text-dim"]);
-        none.set_margin_top(18);
+        // Collapsed (a narrow window) this list is all that shows: with no notes
+        // it says so and how to start one, instead of an empty pane.
+        let none = adw::StatusPage::builder()
+            .icon_name("document-edit-symbolic")
+            .title("No Notes Yet")
+            .description("Write one with the + above. Notes sync with your phone, encrypted.")
+            .vexpand(true)
+            .build();
+        none.add_css_class("compact");
         list.set_placeholder(Some(&none));
+        list.set_vexpand(true);
         let sidebar_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
@@ -524,7 +532,9 @@ impl Page {
             return;
         }
         let open = self.editor.open.borrow().clone();
-        while let Some(row) = self.list.first_child() {
+        // Rows only: `first_child` can be the list's placeholder, and removing
+        // that is how the empty pane lost its "No Notes Yet" prompt.
+        while let Some(row) = self.list.row_at_index(0) {
             self.list.remove(&row);
         }
         for note in notes::notes() {

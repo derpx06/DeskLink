@@ -41,6 +41,43 @@ struct Pending {
 
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 
+/// The secret of the code that was last replaced, withdrawn or let expire, so
+/// a phone that scans it afterwards is told it *expired* (and the person is
+/// shown a new one) instead of "invalid". Only that one; only its secret.
+static RETIRED: Mutex<Option<[u8; 32]>> = Mutex::new(None);
+
+/// How many times a retired code was scanned and refused, for the pairing
+/// page to take (see [`take_expired_notice`]).
+static EXPIRED_SCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn retire(secret: [u8; 32]) {
+    if let Ok(mut retired) = RETIRED.lock() {
+        *retired = Some(secret);
+    }
+}
+
+/// Whether a phone scanned a code that has expired since the last call: the
+/// pairing page says so and shows the new code.
+pub fn take_expired_notice() -> bool {
+    EXPIRED_SCANS.swap(0, std::sync::atomic::Ordering::AcqRel) > 0
+}
+
+/// Whether `received` is the proof of the retired code.
+fn matches_retired(
+    received: &[u8],
+    desktop_id: &str,
+    phone_id: &str,
+    desktop_fp: &[u8; 32],
+    phone_fp: &[u8; 32],
+) -> bool {
+    let Some(secret) = RETIRED.lock().ok().and_then(|retired| *retired) else {
+        return false;
+    };
+    proof(&secret, desktop_id, phone_id, desktop_fp, phone_fp).is_ok_and(|expected| {
+        received.len() == expected.len() && openssl::memcmp::eq(received, &expected)
+    })
+}
+
 /// Tests that use the one live code take this first: they share it.
 #[cfg(test)]
 pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -86,6 +123,11 @@ pub fn start(
     let mut pending = PENDING
         .lock()
         .map_err(|_| "QR pairing state poisoned".to_string())?;
+    // The code on screen is replaced: the old one is spent, and scanning it
+    // is "expired".
+    if let Some(old) = pending.as_ref() {
+        retire(old.secret);
+    }
     *pending = Some(Pending {
         secret,
         expires_at: Instant::now() + LIFETIME,
@@ -98,6 +140,9 @@ pub fn start(
 /// Withdraws the live code (the dialog was closed).
 pub fn cancel() {
     if let Ok(mut pending) = PENDING.lock() {
+        if let Some(old) = pending.as_ref() {
+            retire(old.secret);
+        }
         *pending = None;
     }
 }
@@ -145,26 +190,49 @@ pub fn verify(
     let mut pending = PENDING
         .lock()
         .map_err(|_| "QR pairing state poisoned".to_string())?;
-    let Some(live) = pending.as_mut() else {
-        return Err("No QR pairing code is active".to_string());
+    let expired = || {
+        EXPIRED_SCANS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Err("The QR pairing code expired".to_string())
     };
-    if live.expires_at <= Instant::now() {
-        *pending = None;
-        return Err("The QR pairing code expired".to_string());
-    }
     let received = URL_SAFE_NO_PAD
         .decode(mac_b64.trim_end_matches('='))
         .map_err(|_| "Malformed QR pairing proof".to_string())?;
+    let Some(live) = pending.as_mut() else {
+        // Nothing is live: was the code that was, scanned late?
+        if matches_retired(&received, desktop_id, phone_id, desktop_fp, phone_fp) {
+            return expired();
+        }
+        return Err("No QR pairing code is active".to_string());
+    };
+    if live.expires_at <= Instant::now() {
+        retire(live.secret);
+        *pending = None;
+        return expired();
+    }
     let expected = proof(&live.secret, desktop_id, phone_id, desktop_fp, phone_fp)?;
     if received.len() == expected.len() && openssl::memcmp::eq(&received, &expected) {
         *pending = None;
         return Ok(());
+    }
+    // Not the live code: perhaps the one that was replaced a moment ago.
+    if matches_retired(&received, desktop_id, phone_id, desktop_fp, phone_fp) {
+        return expired();
     }
     live.failures += 1;
     if live.failures >= MAX_FAILURES {
         *pending = None;
     }
     Err("Invalid QR pairing proof".to_string())
+}
+
+/// Tests: the live code runs out now.
+#[cfg(test)]
+pub(crate) fn expire_live_for_test() {
+    if let Ok(mut pending) = PENDING.lock() {
+        if let Some(live) = pending.as_mut() {
+            live.expires_at = Instant::now() - Duration::from_secs(1);
+        }
+    }
 }
 
 /// QR modules as rows of booleans (true = dark), for the UI to rasterise.
@@ -247,6 +315,75 @@ mod tests {
 
         let (width, dark) = modules("desklink://pair?v=1").unwrap();
         assert_eq!(dark.len(), width * width);
+        cancel();
+    }
+
+    /// A phone that scans a code that has since expired (timed out, replaced
+    /// by a newer one, withdrawn) is refused as *expired*, once, so the pairing
+    /// page can say so and show the new code; a wrong proof is still just
+    /// invalid and says nothing.
+    #[test]
+    fn scanning_an_expired_code_is_told_apart_and_noticed_once() {
+        let _one_code = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (desktop_fp, phone_fp) = ([1u8; 32], [2u8; 32]);
+        let proof_for = |secret: [u8; 32]| {
+            URL_SAFE_NO_PAD.encode(proof(&secret, "desk", "phone", &desktop_fp, &phone_fp).unwrap())
+        };
+        take_expired_notice();
+        // Timed out.
+        start("desk", b"cert", None, &[], 1716).unwrap();
+        let old = live_secret().unwrap();
+        expire_live_for_test();
+        assert_eq!(
+            verify("desk", "phone", &desktop_fp, &phone_fp, &proof_for(old)),
+            Err("The QR pairing code expired".to_string())
+        );
+        assert!(take_expired_notice(), "the page is told");
+        assert!(!take_expired_notice(), "once");
+        // Replaced by a newer code (the page showed a fresh one).
+        start("desk", b"cert", None, &[], 1716).unwrap();
+        let older = live_secret().unwrap();
+        start("desk", b"cert", None, &[], 1716).unwrap();
+        assert_eq!(
+            verify("desk", "phone", &desktop_fp, &phone_fp, &proof_for(older)),
+            Err("The QR pairing code expired".to_string())
+        );
+        assert!(take_expired_notice());
+        assert!(current_uri().is_some(), "the new code is still live");
+        // A forgery is invalid, not expired, and not announced.
+        assert_eq!(
+            verify(
+                "desk",
+                "phone",
+                &desktop_fp,
+                &phone_fp,
+                &proof_for([9u8; 32])
+            ),
+            Err("Invalid QR pairing proof".to_string())
+        );
+        assert!(!take_expired_notice());
+        // Withdrawn (the dialog closed), then scanned.
+        let live = live_secret().unwrap();
+        cancel();
+        assert_eq!(
+            verify("desk", "phone", &desktop_fp, &phone_fp, &proof_for(live)),
+            Err("The QR pairing code expired".to_string())
+        );
+        assert!(take_expired_notice());
+        // Something never shown is just not active.
+        assert_eq!(
+            verify(
+                "desk",
+                "phone",
+                &desktop_fp,
+                &phone_fp,
+                &proof_for([5u8; 32])
+            ),
+            Err("No QR pairing code is active".to_string())
+        );
+        assert!(!take_expired_notice());
         cancel();
     }
 }

@@ -649,6 +649,28 @@ mod tests {
         }
     }
 
+    /// One size formatter for the whole app (the phone says "MiB" too): no
+    /// file shows a size through GLib's decimal one.
+    #[test]
+    fn no_size_is_shown_in_decimal_units() {
+        let needle = ["glib::format", "_size("].concat();
+        let mut found = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && std::fs::read_to_string(&path).unwrap().contains(&needle)
+                {
+                    found.push(path);
+                }
+            }
+        }
+        assert!(found.is_empty(), "decimal sizes in {found:?}");
+    }
+
     #[test]
     fn sizes_read_in_kib_mib_and_gib() {
         const MIB: u64 = 1 << 20;

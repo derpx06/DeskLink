@@ -63,8 +63,8 @@ fn subtitle(row: &TransferRow, device: &str) -> String {
     };
     format!(
         "{direction} · {} of {}",
-        glib::format_size(row.done),
-        glib::format_size(row.total)
+        crate::bucket_progress::size_words(row.done),
+        crate::bucket_progress::size_words(row.total)
     )
 }
 
@@ -81,7 +81,10 @@ fn rate_text(bytes_per_second: f64, remaining: u64) -> String {
     if bytes_per_second < 1.0 {
         return String::new();
     }
-    let speed = format!("{}/s", glib::format_size(bytes_per_second as u64));
+    let speed = format!(
+        "{}/s",
+        crate::bucket_progress::size_words(bytes_per_second as u64)
+    );
     let seconds = (remaining as f64 / bytes_per_second).ceil() as u64;
     let left = match seconds {
         0 => return speed,
@@ -414,7 +417,11 @@ impl Page {
 
 /// "2.4 MB · 12 min ago".
 pub(super) fn size_and_time(entry: &LoggedFile) -> String {
-    format!("{} · {}", glib::format_size(entry.size), when(entry))
+    format!(
+        "{} · {}",
+        crate::bucket_progress::size_words(entry.size),
+        when(entry)
+    )
 }
 
 fn when(entry: &LoggedFile) -> String {
@@ -715,7 +722,7 @@ fn file_card(
     button.update_property(&[gtk::accessible::Property::Label(&format!(
         "{}, {}, {verb} {}{place}",
         entry.name,
-        glib::format_size(entry.size),
+        crate::bucket_progress::size_words(entry.size),
         when(entry)
     ))]);
     let index = viewable

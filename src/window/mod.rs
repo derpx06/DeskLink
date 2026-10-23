@@ -1784,6 +1784,45 @@ fn friendly_error(raw: &str) -> (String, bool) {
             "The connection was interrupted. DeskLink will reconnect.",
             false,
         )
+    } else if has(&[
+        "certificate",
+        "unknown ca",
+        "bad_certificate",
+        "verify failed",
+        "unable to get local issuer",
+    ]) {
+        (
+            "This phone's identity could not be checked. If DeskLink was reinstalled on it, \
+             pair it again by scanning the QR code.",
+            true,
+        )
+    } else if has(&[
+        "handshake",
+        "tls error",
+        "tls alert",
+        "ssl",
+        "unexpected eof",
+        "unexpected end of file",
+        "end of file",
+        "eof",
+        "connection aborted",
+        "connection closed",
+        "early eof",
+    ]) {
+        (
+            "The connection dropped while it was being set up. DeskLink will try again.",
+            false,
+        )
+    } else if has(&[
+        "failed to lookup",
+        "name or service not known",
+        "no such host",
+        "resolve",
+    ]) {
+        (
+            "DeskLink could not find the device on the network. It will keep looking.",
+            false,
+        )
     } else if has(&["(os error 13)", "(os error 1)", "permission denied"]) {
         (
             "DeskLink was not allowed to do that. Check its permissions.",
@@ -1797,6 +1836,41 @@ fn friendly_error(raw: &str) -> (String, bool) {
         return (trimmed.to_string(), false);
     };
     (message.to_string(), lasting)
+}
+
+/// What the Home hero says about a connection error, and the technical text
+/// for a "Details" disclosure when it differs. Everything shown on the hero
+/// goes through here: nothing the system or a library said is shown as is.
+pub(crate) fn hero_error_words(raw: &str) -> (String, Option<String>) {
+    let (words, _) = friendly_error(raw);
+    // The table found nothing: the text is the library's own. It stays out of
+    // the hero (it is behind Details) unless it already reads as a sentence.
+    let own = words == raw.trim()
+        || raw
+            .rfind(" (os error ")
+            .is_some_and(|at| words == raw[..at]);
+    let readable = own && !looks_technical(raw);
+    if readable || !own {
+        let details = (words != raw.trim()).then(|| raw.trim().to_string());
+        return (words, details);
+    }
+    (
+        "Something went wrong with the connection. DeskLink will try again.".to_string(),
+        Some(raw.trim().to_string()),
+    )
+}
+
+/// Text a person would not write: library names, error codes, paths.
+fn looks_technical(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    text.contains("::")
+        || text.contains(": ")
+            && ["error", "failed", "errno", "code", "os error"]
+                .iter()
+                .any(|word| lower.contains(word))
+        || lower.contains("os error")
+        || lower.contains("panicked")
+        || text.contains('/') && text.contains(".rs")
 }
 
 /// A device's glyph and the word for it, from the identity packet's type
@@ -2974,7 +3048,12 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
         },
     ];
     match kind {
-        "unreachable" => device.status = DeviceStatus::Unreachable,
+        "unreachable" | "unreachable-eof" => {
+            device.status = DeviceStatus::Unreachable;
+            if kind == "unreachable-eof" {
+                device.last_error = Some("the handshake failed: unexpected EOF".to_string());
+            }
+        }
         "pair-request" => {
             device.trusted = false;
             device.status = DeviceStatus::PairRequestedByPeer;
@@ -3290,6 +3369,61 @@ mod tests {
     }
 
     /// A worker that panicked ends the wait; a slow one is waited for.
+    /// Every error on the Home hero reads as a sentence; the library's words
+    /// are only in the details.
+    #[test]
+    fn hero_errors_are_plain_words_with_the_details_kept_aside() {
+        let cases = [
+            (
+                "the handshake failed: unexpected EOF",
+                "dropped while it was being set up",
+            ),
+            (
+                "TLS error: peer closed connection without sending close_notify (eof)",
+                "dropped while it was being set up",
+            ),
+            ("early eof", "dropped while it was being set up"),
+            ("Connection timed out (os error 110)", "timed out"),
+            (
+                "Connection refused (os error 111)",
+                "refused the connection",
+            ),
+            ("Connection reset by peer (os error 104)", "interrupted"),
+            ("Trusted device certificate changed", "identity changed"),
+            (
+                "invalid peer certificate: UnknownIssuer",
+                "identity could not be checked",
+            ),
+            (
+                "failed to lookup address information: Name or service not known",
+                "could not find",
+            ),
+            ("Network is unreachable (os error 101)", "offline"),
+        ];
+        for (raw, expected) in cases {
+            let (words, details) = hero_error_words(raw);
+            assert!(
+                words.to_lowercase().contains(expected),
+                "{raw:?} read as {words:?}"
+            );
+            assert!(
+                !words.contains("EOF") && !words.contains("os error"),
+                "{words}"
+            );
+            assert!(details.is_some(), "{raw:?} keeps its details");
+        }
+        // Text nobody wrote for a person is never shown as is.
+        let (words, details) = hero_error_words("serde_json::Error: expected value at src/a.rs:4");
+        assert!(words.starts_with("Something went wrong"), "{words}");
+        assert!(details.is_some_and(|raw| raw.contains("serde_json")));
+        // A sentence already written for people stays, with no details.
+        let (words, details) = hero_error_words("Update DeskLink on Pixel 9");
+        assert_eq!(
+            (words.as_str(), details),
+            ("Update DeskLink on Pixel 9", None)
+        );
+    }
+
     #[test]
     fn a_dead_worker_ends_the_wait_for_its_result() {
         let (sender, receiver) = std::sync::mpsc::channel::<u32>();

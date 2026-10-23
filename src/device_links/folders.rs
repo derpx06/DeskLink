@@ -661,6 +661,40 @@ pub(crate) enum ItemState {
     Conflict,
 }
 
+/// Which directory a Bucket root is: its device and inode, taken only when the
+/// directory is there and can be listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RootStamp {
+    dev: u64,
+    ino: u64,
+}
+
+impl RootStamp {
+    /// `None` when the root is missing, is not a directory, or cannot be read.
+    pub(crate) fn of(root: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(root)
+            .ok()
+            .filter(|metadata| metadata.is_dir())?;
+        fs::read_dir(root).ok()?;
+        Some(Self {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
+    }
+}
+
+/// Whether an emptied Bucket folder was emptied by the person (files
+/// deleted one by one, the folder itself still the one that was there) and so
+/// is applied to the phone. It is not when the folder is missing or
+/// unreadable, was not known before, or is another directory on another
+/// device or another inode: a drive that is not mounted, a folder swapped
+/// for a new one. (Its modification time says nothing: deleting the last file
+/// changes it.)
+pub(crate) fn emptied_on_purpose(before: Option<RootStamp>, now: Option<RootStamp>) -> bool {
+    matches!((before, now), (Some(before), Some(now)) if before == now)
+}
+
 /// A pair the phone proposed, waiting for a folder here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Offer {
@@ -1196,7 +1230,7 @@ pub(crate) fn import_bytes(
 ) -> Result<(), String> {
     let text = name.ends_with(".txt") || name.ends_with(".url");
     if text && bytes.len() > MAX_TEXT_ITEM_BYTES {
-        return Err("That text is too long for the Bucket (1 MB at most)".into());
+        return Err("That text is too long for the Bucket (1 MiB at most)".into());
     }
     if bytes.is_empty() {
         return Err("Nothing to add".into());
@@ -1950,6 +1984,10 @@ struct Live {
     to_request: VecDeque<String>,
     /// The user confirmed an empty folder is meant: the next scan applies.
     allow_empty: bool,
+    /// Which directory the root was at the last scan that held files: an
+    /// emptied root that is still that directory is a deliberate removal; a
+    /// different one (a drive unmounted, a folder swapped) is held.
+    root_stamp: Option<RootStamp>,
     /// The other side's live files (path → sha256), from its last manifest.
     remote: HashMap<String, String>,
     /// Files the other side asked for, and their sha256: sending.
@@ -2169,6 +2207,7 @@ impl Live {
             outstanding: VecDeque::new(),
             to_request: VecDeque::new(),
             allow_empty: false,
+            root_stamp: None,
             remote: HashMap::new(),
             sending: HashMap::new(),
             receiving: BTreeMap::new(),
@@ -3529,11 +3568,19 @@ impl Worker {
         };
         live.skipped = skipped;
         let had_files = live.book.manifest.values().any(|entry| !entry.deleted);
-        if found.is_empty() && had_files && !allow_empty {
+        let stamp = RootStamp::of(&pair.root);
+        if found.is_empty()
+            && had_files
+            && !allow_empty
+            && !emptied_on_purpose(live.root_stamp, stamp)
+        {
             // An unmounted drive looks exactly like this: deleting every
             // file on the phone too would be the worst outcome.
             live.phase = Phase::EmptyHeld;
             return;
+        }
+        if stamp.is_some() {
+            live.root_stamp = stamp;
         }
         // A file still being written waits until it has held for 2 s.
         if hold_unstable(&mut found, &live.book.manifest, now_ms(), stable_ms()) {
@@ -4098,7 +4145,9 @@ mod tests {
         worker.pairs[0].allow_empty = true;
         worker.rescan(0);
         assert!(!worker.pairs[0].allow_empty);
-        fs::remove_file(root.join("b.txt")).unwrap();
+        // An unmounted drive: the folder is another directory now, empty.
+        fs::remove_dir_all(&root).unwrap();
+        fs::create_dir_all(&root).unwrap();
         worker.rescan(0);
         assert_eq!(worker.pairs[0].phase, Phase::EmptyHeld);
         let _ = fs::remove_dir_all(&base);
@@ -5289,6 +5338,91 @@ mod tests {
         worker
     }
 
+    /// Deleting the last file with `rm` is deliberate: the folder is the
+    /// same directory it was, so the deletion goes to the phone.
+    #[test]
+    fn removing_the_last_file_with_the_folder_still_there_is_applied() {
+        let base = std::env::temp_dir().join(format!("desklink-rm-{}", uuid::Uuid::new_v4()));
+        let root = base.join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), "one").unwrap();
+        fs::write(root.join("b.txt"), "two").unwrap();
+        let mut worker = worker_for(&base, &root);
+        worker.rescan(0);
+        // One at a time, then everything gone in one scan too.
+        fs::remove_file(root.join("a.txt")).unwrap();
+        worker.rescan(0);
+        assert_ne!(worker.pairs[0].phase, Phase::EmptyHeld);
+        fs::remove_file(root.join("b.txt")).unwrap();
+        worker.rescan(0);
+        assert_ne!(worker.pairs[0].phase, Phase::EmptyHeld);
+        assert!(worker.pairs[0].book.manifest["b.txt"].deleted, "tombstoned");
+        assert!(worker.pairs[0].book.manifest["a.txt"].deleted);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A folder that is gone, unreadable, or swapped for another is not a
+    /// deliberate removal: nothing is tombstoned.
+    #[test]
+    fn a_missing_unreadable_or_replaced_folder_is_not_a_deliberate_removal() {
+        use std::os::unix::fs::PermissionsExt;
+        for case in ["missing", "unreadable", "replaced"] {
+            if case == "unreadable" && unsafe { libc::geteuid() } == 0 {
+                continue;
+            }
+            let base = std::env::temp_dir().join(format!("desklink-gone-{}", uuid::Uuid::new_v4()));
+            let root = base.join("root");
+            fs::create_dir_all(&root).unwrap();
+            fs::write(root.join("a.txt"), "one").unwrap();
+            let mut worker = worker_for(&base, &root);
+            worker.rescan(0);
+            match case {
+                "missing" => fs::remove_dir_all(&root).unwrap(),
+                "unreadable" => {
+                    fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+                }
+                _ => {
+                    fs::remove_dir_all(&root).unwrap();
+                    fs::create_dir_all(&root).unwrap();
+                }
+            }
+            worker.rescan(0);
+            assert!(
+                !worker.pairs[0].book.manifest["a.txt"].deleted,
+                "{case}: nothing tombstoned"
+            );
+            assert!(
+                matches!(worker.pairs[0].phase, Phase::EmptyHeld | Phase::Problem(_)),
+                "{case}: held or a problem, not applied: {:?}",
+                worker.pairs[0].phase
+            );
+            let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
+            let _ = fs::remove_dir_all(&base);
+        }
+    }
+
+    /// The rule itself, for the cases a test cannot make on one disk: another
+    /// device (a drive mounted over the folder, or gone from it), another
+    /// inode, or nothing known before.
+    #[test]
+    fn an_emptied_folder_is_applied_only_when_it_is_the_same_directory() {
+        let here = RootStamp {
+            dev: 64768,
+            ino: 1234,
+        };
+        assert!(emptied_on_purpose(Some(here), Some(here)));
+        let other_device = RootStamp { dev: 2049, ..here };
+        let other_inode = RootStamp { ino: 99, ..here };
+        assert!(!emptied_on_purpose(Some(here), Some(other_device)));
+        assert!(!emptied_on_purpose(Some(here), Some(other_inode)));
+        assert!(!emptied_on_purpose(None, Some(here)), "not known before");
+        assert!(
+            !emptied_on_purpose(Some(here), None),
+            "missing or unreadable"
+        );
+        assert!(!emptied_on_purpose(None, None));
+    }
+
     #[test]
     fn an_empty_folder_is_held_until_confirmed() {
         let base = std::env::temp_dir().join(format!("desklink-hold-{}", uuid::Uuid::new_v4()));
@@ -5297,7 +5431,10 @@ mod tests {
         fs::write(root.join("a.txt"), "one").unwrap();
         let mut worker = worker_for(&base, &root);
         worker.rescan(0);
-        fs::remove_file(root.join("a.txt")).unwrap();
+        // The folder is swapped for an empty one (a drive that is not
+        // mounted): held, nothing tombstoned.
+        fs::remove_dir_all(&root).unwrap();
+        fs::create_dir_all(&root).unwrap();
         worker.rescan(0);
         assert_eq!(worker.pairs[0].phase, Phase::EmptyHeld);
         assert!(
