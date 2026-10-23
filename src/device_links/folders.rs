@@ -1427,6 +1427,96 @@ fn mtime_ms(metadata: &fs::Metadata) -> i64 {
 
 /// Every file under `root` that syncs: relative path → size and mtime.
 /// Symlinks are never followed; at most [`MAX_FILES`].
+/// Why a Bucket item is listed as not synced when another differs only in case.
+const CASE_CLASH: &str = "another file differs only in capital letters";
+
+/// "W3 — case clashes" (stageD-protocol.md): among the live items of one
+/// directory, names that differ only in case (`A.txt`, `a.txt`; Linux holds
+/// both, most other systems cannot) are one name. The one whose name sorts
+/// first in UTF-8 byte order (so `A` beats `a`) is synced; the others, and
+/// everything below them, are not. Files and folders count together, in a
+/// scan and in a received manifest alike, so both sides pick the same one.
+/// Returns the paths of the ones left out (not what is below them).
+fn drop_case_clashes<V>(items: &mut BTreeMap<String, V>, live: impl Fn(&V) -> bool) -> Vec<String> {
+    let mut first: HashSet<(String, String)> = HashSet::new();
+    let mut losers: Vec<String> = Vec::new();
+    for (path, value) in items.iter() {
+        if !live(value) {
+            continue;
+        }
+        // Below one that is already left out: no say.
+        let under_loser = path
+            .match_indices('/')
+            .any(|(at, _)| losers.iter().any(|loser| loser == &path[..at]));
+        if under_loser {
+            continue;
+        }
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if !first.insert((parent.to_string(), name.to_lowercase())) {
+            losers.push(path.clone());
+        }
+    }
+    items.retain(|path, value| {
+        !live(value)
+            || !losers.iter().any(|loser| {
+                path == loser
+                    || path
+                        .strip_prefix(loser.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+    });
+    losers
+}
+
+/// The directory and the lowercased name of `path`: what names must differ in
+/// to be different on a system that ignores case.
+fn case_key(path: &str) -> (&str, String) {
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    (parent, name.to_lowercase())
+}
+
+/// The other side's manifest, minus what clashes in case: within itself
+/// ([`drop_case_clashes`]), and with a different live path of `local` (this
+/// side's own, already synced or on disk). A remote path that clashes with a
+/// local one is never downloaded, whichever of the two would sort first: the
+/// local entry stays untouched and the two sides are not asked to agree on a
+/// winner that would put both names on a Linux disk. Returns the paths left
+/// out (not what is below them).
+fn left_out_of_remote(remote: &mut Manifest, local: &Manifest) -> Vec<String> {
+    let mut left_out = drop_case_clashes(remote, |entry| !entry.deleted);
+    let held: HashSet<(&str, String)> = local
+        .iter()
+        .filter(|(_, entry)| !entry.deleted)
+        .map(|(path, _)| case_key(path))
+        .collect();
+    let mut clashing: Vec<String> = Vec::new();
+    for (path, entry) in remote.iter() {
+        let under = path
+            .match_indices('/')
+            .any(|(at, _)| clashing.iter().any(|loser| loser == &path[..at]));
+        let (parent, key) = case_key(path);
+        if !entry.deleted
+            && !under
+            && held.contains(&(parent, key))
+            && local.get(path).is_none_or(|ours| ours.deleted)
+        {
+            clashing.push(path.clone());
+        }
+    }
+    remote.retain(|path, entry| {
+        entry.deleted
+            || !clashing.iter().any(|loser| {
+                path == loser
+                    || path
+                        .strip_prefix(loser.as_str())
+                        .is_some_and(|rest| rest.starts_with('/'))
+            })
+    });
+    left_out.extend(clashing);
+    left_out.sort();
+    left_out
+}
+
 /// A scan: the files, the directories to watch, whether there were more
 /// files than allowed, and (a Bucket) the folders in it left unsynced.
 type Scanned = (BTreeMap<String, Stat>, Vec<PathBuf>, bool, Vec<String>);
@@ -1538,6 +1628,13 @@ fn scan(pair: &Pair) -> Result<Scanned, String> {
                     dir: false,
                 },
             );
+        }
+    }
+    if pair.bucket {
+        for loser in drop_case_clashes(&mut found, |_| true) {
+            if skipped.len() < MAX_SKIPPED_SHOWN {
+                skipped.push(format!("{loser} ({CASE_CLASH})"));
+            }
         }
     }
     skipped.sort();
@@ -1997,6 +2094,9 @@ struct Live {
     /// What the Bucket does not sync, with why (too deep, a name that can't
     /// sync, over 1 GiB, a link).
     skipped: Vec<String>,
+    /// The other side's paths left out of its last manifest because they
+    /// differ only in case from another (see [`CASE_CLASH`]).
+    remote_clashes: Vec<String>,
     /// F8c: files the other side asked for, waiting for a free slot of
     /// [`MAX_IN_FLIGHT`].
     send_queue: VecDeque<String>,
@@ -2212,6 +2312,7 @@ impl Live {
             sending: HashMap::new(),
             receiving: BTreeMap::new(),
             skipped: Vec::new(),
+            remote_clashes: Vec::new(),
             send_queue: VecDeque::new(),
             flight: HashMap::new(),
         }
@@ -2241,7 +2342,13 @@ impl Live {
                 .filter(|entry| !entry.deleted)
                 .map(|entry| entry.size)
                 .sum(),
-            skipped: self.skipped.clone(),
+            skipped: self
+                .skipped
+                .iter()
+                .chain(&self.remote_clashes)
+                .take(MAX_SKIPPED_SHOWN)
+                .cloned()
+                .collect(),
         }
     }
 
@@ -3094,11 +3201,21 @@ impl Worker {
         if live.incoming.len() as i64 != parts {
             return;
         }
-        let remote: Manifest = std::mem::take(&mut live.incoming)
+        let mut remote: Manifest = std::mem::take(&mut live.incoming)
             .into_values()
             .flatten()
             .take(MAX_FILES)
             .collect();
+        if live.pair.bucket {
+            let left_out = left_out_of_remote(&mut remote, &live.book.manifest);
+            for path in &left_out {
+                debug_log!("[DeskLink] Bucket: {path} is not synced (differs only in case)");
+            }
+            live.remote_clashes = left_out
+                .into_iter()
+                .map(|path| format!("{path} ({CASE_CLASH})"))
+                .collect();
+        }
         self.apply_plan(index, &remote);
     }
 
@@ -6121,6 +6238,214 @@ mod tests {
                     desk.manifest, phone.manifest
                 );
             }
+        }
+    }
+
+    // ── W3 — case clashes ──────────────────────────────────────────────────
+
+    /// Names that differ only in case, files and folders alike: the one that
+    /// sorts first in byte order syncs; the others (and what is below them)
+    /// are listed, never offered.
+    #[test]
+    fn a_scan_syncs_the_first_of_names_that_differ_only_in_case() {
+        let (_base, root, worker) = scratch_bucket("bucket-case-scan");
+        for name in ["A.txt", "a.txt", "B.txt", "É.txt", "é.txt"] {
+            fs::write(root.join(name), name).unwrap();
+        }
+        fs::create_dir_all(root.join("Dir")).unwrap();
+        fs::create_dir_all(root.join("dir/sub")).unwrap();
+        fs::write(root.join("Dir/x.txt"), "x").unwrap();
+        fs::write(root.join("dir/y.txt"), "y").unwrap();
+        fs::write(root.join("dir/sub/z.txt"), "z").unwrap();
+        // The same name in two folders is not a clash.
+        fs::write(root.join("Dir/a.txt"), "1").unwrap();
+        fs::write(root.join("Dir/A.TXT"), "2").unwrap();
+        let (found, _, _, skipped) = scan(&worker.pairs[0].pair).unwrap();
+        assert_eq!(
+            found.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["A.txt", "B.txt", "Dir", "Dir/A.TXT", "Dir/x.txt", "É.txt"],
+            "Dir/a.txt lost to Dir/A.TXT, nothing below `dir` is listed"
+        );
+        let clash = |name: &str| format!("{name} (another file differs only in capital letters)");
+        assert_eq!(
+            skipped,
+            [
+                clash("Dir/a.txt"),
+                clash("a.txt"),
+                clash("dir"),
+                clash("é.txt")
+            ],
+        );
+    }
+
+    /// The phone's manifest can hold two paths that differ only in case (its
+    /// own scan or an older build): the later is not synced here either, and
+    /// a tombstone is never a clash.
+    #[test]
+    fn a_manifest_with_two_paths_that_differ_only_in_case_loses_the_later() {
+        let folder = |vv| Entry {
+            dir: true,
+            sha256: String::new(),
+            size: 0,
+            ..entry("", vv)
+        };
+        let mut remote = manifest(&[
+            ("A.txt", entry("a", (0, 1))),
+            ("a.txt", entry("b", (0, 1))),
+            ("Dir", folder((0, 1))),
+            ("dir", folder((0, 1))),
+            ("dir/y.txt", entry("y", (0, 1))),
+            ("Dir/x.txt", entry("x", (0, 1))),
+            ("B.txt", entry("c", (0, 1))),
+            ("b.txt", tomb((0, 2))),
+        ]);
+        let left_out = drop_case_clashes(&mut remote, |entry| !entry.deleted);
+        assert_eq!(left_out, ["a.txt", "dir"]);
+        assert_eq!(
+            remote.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["A.txt", "B.txt", "Dir", "Dir/x.txt", "b.txt"],
+            "the tombstone stays"
+        );
+        // Nothing is asked for under the left-out names.
+        let steps = plan(Side::Desk, &Manifest::new(), &remote, "Phone");
+        assert!(steps.iter().all(|step| !matches!(
+            step,
+            Step::Download { path, .. } if path == "a.txt" || path.starts_with("dir")
+        )));
+    }
+
+    /// The desk's own copy of the later name is listed as not synced and is
+    /// never an item, so it cannot read "Waiting…"; once the first name is
+    /// gone the other syncs.
+    #[test]
+    fn the_later_name_is_not_synced_never_waiting_and_syncs_once_alone() {
+        let (_base, root, mut worker) = scratch_bucket("bucket-case-ui");
+        fs::write(root.join("A.txt"), "1").unwrap();
+        fs::write(root.join("a.txt"), "2").unwrap();
+        worker.rescan(0);
+        for online in [false, true] {
+            let view = worker.pairs[0].view(online);
+            let paths: Vec<&str> = view.items.iter().map(|item| item.path.as_str()).collect();
+            assert_eq!(paths, ["A.txt"], "online: {online}");
+            assert_eq!(
+                view.skipped,
+                ["a.txt (another file differs only in capital letters)"]
+            );
+        }
+        assert!(!worker.pairs[0].book.manifest.contains_key("a.txt"));
+        // The manifest sent to the phone never names it.
+        let sent = manifest_packets("m", &worker.pairs[0].book.manifest);
+        assert!(
+            !format!("{:?}", sent.iter().map(|p| &p.body).collect::<Vec<_>>()).contains("a.txt")
+        );
+        fs::remove_file(root.join("A.txt")).unwrap();
+        worker.rescan(0);
+        let view = worker.pairs[0].view(true);
+        assert!(view.skipped.is_empty());
+        assert!(view
+            .items
+            .iter()
+            .any(|item| item.path == "a.txt" && !item.dir));
+    }
+
+    /// The vector both apps pin: these names in one directory.
+    const CASE_VECTOR: [&str; 7] = ["a.txt", "A.txt", "É", "é", "Dir", "dir", "b.txt"];
+    const CASE_WINNERS: [&str; 4] = ["A.txt", "É", "Dir", "b.txt"];
+    const CASE_LOSERS: [&str; 3] = ["a.txt", "é", "dir"];
+
+    /// Golden: the shared case-clash vector, from a disk scan and from a
+    /// manifest alike.
+    #[test]
+    fn the_shared_case_clash_vector_gives_the_same_winners_everywhere() {
+        let (_base, root, worker) = scratch_bucket("bucket-case-vector");
+        for name in CASE_VECTOR {
+            fs::write(root.join(name), name).unwrap();
+        }
+        let (found, _, _, skipped) = scan(&worker.pairs[0].pair).unwrap();
+        let winners: Vec<&str> = CASE_VECTOR
+            .into_iter()
+            .filter(|name| found.contains_key(*name))
+            .collect();
+        assert_eq!(winners, CASE_WINNERS);
+        assert_eq!(found.len(), CASE_WINNERS.len());
+        let mut listed = skipped.clone();
+        listed.sort();
+        let mut expected: Vec<String> = CASE_LOSERS
+            .iter()
+            .map(|name| format!("{name} (another file differs only in capital letters)"))
+            .collect();
+        expected.sort();
+        assert_eq!(listed, expected);
+        // The same, as a received manifest (and in any order of arrival).
+        let mut remote: Manifest = CASE_VECTOR
+            .iter()
+            .map(|name| (name.to_string(), entry(name, (0, 1))))
+            .collect();
+        let mut left_out = left_out_of_remote(&mut remote, &Manifest::new());
+        let winners: Vec<&str> = CASE_VECTOR
+            .into_iter()
+            .filter(|name| remote.contains_key(*name))
+            .collect();
+        assert_eq!(winners, CASE_WINNERS);
+        left_out.sort();
+        let mut losers = CASE_LOSERS.map(String::from).to_vec();
+        losers.sort();
+        assert_eq!(left_out, losers);
+    }
+
+    /// A phone path that clashes in case with one the desk already has is
+    /// never downloaded, whichever name would sort first; the desk's entry
+    /// and file are left alone and the phone's is listed as not synced.
+    #[test]
+    fn a_phone_path_that_clashes_with_a_desk_path_is_never_downloaded() {
+        // (desk has, phone sends): the phone's loses, then the phone's would win.
+        for (desk_has, phone_sends) in [("A.txt", "a.txt"), ("a.txt", "A.txt")] {
+            let (_base, root, mut worker) = scratch_bucket("bucket-case-remote");
+            fs::write(root.join(desk_has), "mine").unwrap();
+            fs::write(root.join("other.txt"), "o").unwrap();
+            worker.rescan(0);
+            let ours = worker.pairs[0].book.manifest.clone();
+            assert!(!ours[desk_has].deleted);
+            let phone = manifest(&[
+                (phone_sends, entry(&"1".repeat(64), (0, 1))),
+                ("other.txt", ours["other.txt"].clone()),
+                ("new.txt", entry(&"2".repeat(64), (0, 1))),
+            ]);
+            for packet in manifest_packets(BUCKET_ID, &phone) {
+                worker.on_manifest("phone-b", BUCKET_ID, &packet);
+            }
+            let live = &worker.pairs[0];
+            let manifest = &live.book.manifest;
+            assert_eq!(manifest[desk_has], ours[desk_has], "{desk_has} untouched");
+            assert!(
+                !manifest.contains_key(phone_sends),
+                "{phone_sends} not taken"
+            );
+            assert_eq!(fs::read(root.join(desk_has)).unwrap(), b"mine");
+            assert!(!root.join(phone_sends).exists());
+            let wanted: Vec<&str> = live.to_request.iter().map(|p| p.as_str()).collect();
+            assert!(
+                !wanted.contains(&phone_sends)
+                    && !live.outstanding.iter().any(|p| p == phone_sends),
+                "{phone_sends} is never asked for: {wanted:?}"
+            );
+            assert!(
+                live.view(true)
+                    .skipped
+                    .contains(&format!("{phone_sends} ({CASE_CLASH})")),
+                "{:?}",
+                live.view(true).skipped
+            );
+            assert!(
+                !live
+                    .view(true)
+                    .items
+                    .iter()
+                    .any(|item| item.path == phone_sends),
+                "and it is no item, so never Waiting"
+            );
+            // What does not clash is still taken.
+            assert!(wanted.contains(&"new.txt") || live.outstanding.iter().any(|p| p == "new.txt"));
         }
     }
 }
