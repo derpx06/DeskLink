@@ -269,6 +269,12 @@ impl Outgoing {
         !matches!(self.state, SendState::Queued)
     }
 
+    /// Every block is acknowledged and the receiver has not yet said the file
+    /// is placed.
+    pub fn is_finishing(&self) -> bool {
+        self.state == SendState::AwaitComplete
+    }
+
     pub fn was_offered(&self) -> bool {
         self.offered
     }

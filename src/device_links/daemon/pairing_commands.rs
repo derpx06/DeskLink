@@ -252,6 +252,9 @@ impl PairingContext {
         // Terminals outlive the WebRTC peer, so closing the peer below would
         // leave the phone's attachments and write leases behind.
         crate::device_links::webrtc::terminal_bridge::revoke_device(device_id);
+        if remove_trust {
+            crate::device_links::webrtc::coordinator::forget_liveness(device_id);
+        }
         // Offline: nothing to tell the peer, but the session must not keep
         // `Paired` for it to resume on reconnect.
         let offline = self.sessions.current_binding(device_id).is_none();

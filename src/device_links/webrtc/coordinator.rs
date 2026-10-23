@@ -3069,6 +3069,16 @@ pub(crate) fn data_silence(device_id: &str) -> Option<std::time::Duration> {
         .map(std::time::Instant::elapsed)
 }
 
+/// The device is gone (unpaired): what is remembered of its liveness goes.
+pub(crate) fn forget_liveness(device_id: &str) {
+    if let Ok(mut heard) = data_inbound().lock() {
+        heard.remove(device_id);
+    }
+    if let Ok(mut dozing) = dozing_devices().lock() {
+        dozing.remove(device_id);
+    }
+}
+
 /// The silence of a link seen through both clocks: whichever heard the phone
 /// most recently (a phone talks on the data channel, and answers the LAN
 /// probe).
@@ -4627,6 +4637,22 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// An unpaired phone leaves no liveness behind (the maps would only grow).
+    #[test]
+    fn unpairing_forgets_what_was_heard_from_a_phone() {
+        use super::{data_silence, forget_liveness, note_data_inbound};
+        let id = format!("forgotten-{}", uuid::Uuid::new_v4());
+        note_data_inbound(&id);
+        note_heartbeat(&id, &{
+            let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT);
+            packet.set("dozing", true);
+            packet
+        });
+        assert!(data_silence(&id).is_some() && is_dozing(&id));
+        forget_liveness(&id);
+        assert!(data_silence(&id).is_none() && !is_dozing(&id));
+    }
+
     use super::{
         apply_own_denial, authorize_desktop_remote_input, coalesce_motion, desktop_capture_needed,
         desktop_portal_services, effective_silence, end_screen_session, ensure_phone_view_allowed,

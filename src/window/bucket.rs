@@ -138,13 +138,26 @@ fn range_to(path: &str) {
 }
 
 fn select_all() {
-    BROWSE.with(|browse| {
-        let mut browse = browse.borrow_mut();
-        browse.selecting = true;
-        let all = browse.order.clone();
-        browse.selected = all.into_iter().collect();
-    });
+    BROWSE.with(|browse| browse.borrow_mut().select_all());
     refresh_selection();
+}
+
+impl Browse {
+    /// A level of the Bucket is drawn: what Select All and Shift-click reach
+    /// is the part that got a tile, and a selection keeps only what is drawn.
+    fn show_level<'a>(&mut self, paths: impl Iterator<Item = &'a str>) {
+        let (order, hidden) = drawn(paths);
+        self.hidden = hidden;
+        self.tiles.clear();
+        self.selected.retain(|path| order.contains(path));
+        self.order = order;
+    }
+
+    /// Everything drawn, and nothing that is not.
+    fn select_all(&mut self) {
+        self.selecting = true;
+        self.selected = self.order.iter().cloned().collect();
+    }
 }
 
 /// Makes the widgets say what the selection is (outside the borrow:
@@ -609,11 +622,7 @@ fn fill(win: &DesklinkWindow, page: &gtk::Box, view: &PairView, device: &DeviceV
     level.sort_by_key(|item| !item.dir);
     BROWSE.with(|browse| {
         let mut browse = browse.borrow_mut();
-        let (order, hidden) = drawn(level.iter().map(|item| item.path.as_str()));
-        browse.hidden = hidden;
-        browse.tiles.clear();
-        browse.selected.retain(|path| order.contains(path));
-        browse.order = order;
+        browse.show_level(level.iter().map(|item| item.path.as_str()));
     });
     page.append(&header(win, view, device));
     page.append(&selection_bar(win, view, device));
@@ -2122,20 +2131,28 @@ mod tests {
     fn selection_only_reaches_what_is_drawn() {
         use super::*;
         let paths: Vec<String> = (0..MAX_TILES + 50).map(|n| format!("f{n:04}")).collect();
-        let (order, hidden) = drawn(paths.iter().map(String::as_str));
-        assert_eq!((order.len(), hidden), (MAX_TILES, 50));
-        assert_eq!(order.last().map(String::as_str), Some("f0299"));
-        // The selection after a rebuild keeps only drawn paths.
-        let mut selected: std::collections::BTreeSet<String> = ["f0001", "f0299", "f0300", "f0349"]
-            .map(String::from)
-            .into();
-        selected.retain(|path| order.contains(path));
-        assert_eq!(selected.len(), 2);
-        // Select All takes the order, which is the drawn part only.
-        let all: std::collections::BTreeSet<String> = order.into_iter().collect();
-        assert!(!all.contains("f0300") && all.len() == MAX_TILES);
-        let (small, none) = drawn(["a", "b"].into_iter());
-        assert_eq!((small.len(), none), (2, 0));
+        let mut browse = Browse::default();
+        // An old selection holds a path that will not be drawn.
+        browse.selected.insert("f0001".into());
+        browse.selected.insert("f0349".into());
+        browse.show_level(paths.iter().map(String::as_str));
+        assert_eq!((browse.order.len(), browse.hidden), (MAX_TILES, 50));
+        assert_eq!(browse.order.last().map(String::as_str), Some("f0299"));
+        assert!(
+            !browse.selected.contains("f0349"),
+            "an undrawn item is dropped"
+        );
+        assert!(browse.selected.contains("f0001"));
+        // Select All (the real method) takes the drawn part only.
+        browse.select_all();
+        assert!(browse.selecting);
+        assert_eq!(browse.selected.len(), MAX_TILES);
+        assert!(!browse.selected.contains("f0300"));
+        // A small level hides nothing.
+        let mut small = Browse::default();
+        small.show_level(["a", "b"].into_iter());
+        small.select_all();
+        assert_eq!((small.selected.len(), small.hidden), (2, 0));
     }
 
     #[test]

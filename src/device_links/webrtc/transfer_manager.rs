@@ -758,25 +758,30 @@ impl Engine {
     fn watch_for_stalls(&mut self, now: Instant) {
         let limit = self.tun.no_progress;
         let net = self.net.clone();
-        let tell = |net: &Option<Arc<Net>>, change: &StallChange, id: &str, token: &str| {
+        let tell = |net: &Option<Arc<Net>>,
+                    change: &StallChange,
+                    id: &str,
+                    token: &str,
+                    finishing: bool| {
             let Some(net) = net else { return };
             match change {
                 StallChange::Began => {
                     let mut message = net.msg(FileAction::Pause, id, token);
                     message.reason = Some(reason::NO_PROGRESS.to_string());
                     net.send(message);
-                    board::set_note(id, Some(&words::no_progress()));
                 }
                 StallChange::Ended => {
                     net.send(net.msg(FileAction::Resume, id, token));
-                    board::set_note(id, None);
                 }
-                StallChange::None => {}
+                StallChange::None => return,
+            }
+            if let Some(note) = stall_note(change, finishing) {
+                board::set_note(id, note.as_deref());
             }
         };
         for incoming in self.incoming.values_mut() {
             let change = incoming.stall.check(now, limit, incoming.is_paused());
-            tell(&net, &change, &incoming.id, &incoming.token);
+            tell(&net, &change, &incoming.id, &incoming.token, false);
         }
         for outgoing in &mut self.outgoing {
             if !outgoing.is_active() {
@@ -785,7 +790,13 @@ impl Engine {
             let change = outgoing
                 .stall
                 .check(now, limit, outgoing.is_waiting_on_peer());
-            tell(&net, &change, &outgoing.id, &outgoing.token);
+            tell(
+                &net,
+                &change,
+                &outgoing.id,
+                &outgoing.token,
+                outgoing.is_finishing(),
+            );
         }
     }
 
@@ -809,6 +820,20 @@ impl Engine {
                 hook(&completed);
             }
         }
+    }
+}
+
+/// The note a stall puts on a transfer's row, if it changes it: `Some(note)`
+/// to set (`None` clears). A send whose last block is acknowledged and that
+/// waits for the receiver's `complete` keeps "Finishing…" until `complete` or
+/// `error`: no stall note covers it, and a stall's end puts it back.
+pub(super) fn stall_note(change: &StallChange, finishing: bool) -> Option<Option<String>> {
+    match (change, finishing) {
+        (StallChange::None, _) => None,
+        (StallChange::Began, true) => None,
+        (StallChange::Ended, true) => Some(Some(words::finishing())),
+        (StallChange::Began, false) => Some(Some(words::no_progress())),
+        (StallChange::Ended, false) => Some(None),
     }
 }
 

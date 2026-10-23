@@ -313,6 +313,11 @@ mod imp {
                         let Some(target) = parameter.and_then(|value| value.get::<String>()) else {
                             return;
                         };
+                        // Only a retry this window offered: any other process on
+                        // the session bus could call this action with a path.
+                        if !take_retry(&target) {
+                            return;
+                        }
                         if let (Some((device, path)), Some(daemon)) =
                             (target.split_once('\n'), window.daemon())
                         {
@@ -1421,11 +1426,11 @@ impl DesklinkWindow {
         } else if let (Outcome::Failed(_), Some(source)) = (&done.outcome, &done.retry) {
             // A send that failed after the last block (the phone could not
             // place the file) can be sent again.
+            let target = format!("{}\n{}", done.device_id, source.to_string_lossy());
+            offer_retry(&target);
             toast.set_button_label(Some("Try Again"));
             toast.set_action_name(Some("win.send-again"));
-            toast.set_action_target_value(Some(
-                &format!("{}\n{}", done.device_id, source.to_string_lossy()).to_variant(),
-            ));
+            toast.set_action_target_value(Some(&target.to_variant()));
         }
         self.imp().toast_overlay.add_toast(toast);
         if notify {
@@ -1578,14 +1583,57 @@ fn try_result<T>(receiver: &std::sync::mpsc::Receiver<T>) -> Poll<T> {
     }
 }
 
+thread_local! {
+    /// The "Try Again" buttons on offer: `device\npath`, newest last.
+    static RETRIES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// How many "Try Again" offers are remembered.
+const MAX_RETRIES: usize = 16;
+
+/// A failed send's "Try Again" is on screen: only these can be invoked.
+fn offer_retry(target: &str) {
+    RETRIES.with(|retries| {
+        let mut retries = retries.borrow_mut();
+        retries.retain(|known| known != target);
+        if retries.len() >= MAX_RETRIES {
+            retries.remove(0);
+        }
+        retries.push(target.to_string());
+    });
+}
+
+/// Whether `target` is an offered retry; it is used up (one try per offer).
+fn take_retry(target: &str) -> bool {
+    RETRIES.with(|retries| {
+        let mut retries = retries.borrow_mut();
+        let before = retries.len();
+        retries.retain(|known| known != target);
+        retries.len() != before
+    })
+}
+
 /// Where a received file is, for a person: "Downloads", or the folder's name.
 pub(crate) fn saved_in(path: &std::path::Path) -> String {
+    saved_in_with(
+        path,
+        glib::user_special_dir(glib::UserDirectory::Downloads).as_deref(),
+    )
+}
+
+/// [`saved_in`] given the Downloads folder. A Downloads that is a link is
+/// the same folder as the one its files were put in (the real directory).
+fn saved_in_with(path: &std::path::Path, downloads: Option<&std::path::Path>) -> String {
     let folder = path.parent();
-    if let (Some(folder), Some(downloads)) = (
-        folder,
-        glib::user_special_dir(glib::UserDirectory::Downloads),
-    ) {
-        if folder == downloads {
+    if let (Some(folder), Some(downloads)) = (folder, downloads) {
+        let same = |a: &std::path::Path, b: &std::path::Path| {
+            a == b
+                || std::fs::canonicalize(a)
+                    .ok()
+                    .zip(std::fs::canonicalize(b).ok())
+                    .is_some_and(|(a, b)| a == b)
+        };
+        if same(folder, downloads) {
             return "Downloads".to_string();
         }
     }
@@ -3205,6 +3253,42 @@ mod tests {
 
     /// The tabs of Notes & Clipboard are addressed by name, every other name
     /// is a page of the sidebar.
+    /// `win.send-again` acts only on a retry that was offered.
+    #[test]
+    fn send_again_ignores_a_path_nobody_offered() {
+        assert!(!take_retry("phone\n/etc/passwd"));
+        offer_retry("phone\n/home/u/a.bin");
+        assert!(
+            !take_retry("phone\n/etc/passwd"),
+            "another path stays refused"
+        );
+        assert!(take_retry("phone\n/home/u/a.bin"), "the offered one works");
+        assert!(!take_retry("phone\n/home/u/a.bin"), "once");
+        for n in 0..MAX_RETRIES + 5 {
+            offer_retry(&format!("p\n/f{n}"));
+        }
+        assert!(!take_retry("p\n/f0"), "the oldest offers are forgotten");
+        assert!(take_retry(&format!("p\n/f{}", MAX_RETRIES + 4)));
+    }
+
+    #[test]
+    fn a_saved_file_says_downloads_even_when_downloads_is_a_link() {
+        use std::path::Path;
+        let base = std::env::temp_dir().join(format!("desklink-saved-{}", uuid::Uuid::new_v4()));
+        let real = base.join("disk/files");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("Downloads");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let file = std::fs::canonicalize(&real).unwrap().join("a.pdf");
+        assert_eq!(saved_in_with(&file, Some(&link)), "Downloads");
+        assert_eq!(saved_in_with(&file, None), "files");
+        assert_eq!(
+            saved_in_with(Path::new("/home/u/Music/a.pdf"), Some(&link)),
+            "Music"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A worker that panicked ends the wait; a slow one is waited for.
     #[test]
     fn a_dead_worker_ends_the_wait_for_its_result() {

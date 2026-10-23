@@ -109,6 +109,12 @@ impl Store {
         fs::create_dir_all(&destination_root)
             .map_err(|error| format!("Could not create DeskLink download directory: {error}"))?;
         ensure_directory_not_symlink(&state_root)?;
+        // A downloads folder that is itself a link (a common arrangement:
+        // `~/Downloads` on another disk) is resolved once, here, and the real
+        // directory is what files go into; the check against a link swapped
+        // in later then applies to that real directory.
+        let destination_root = fs::canonicalize(&destination_root)
+            .map_err(|error| format!("Could not resolve DeskLink download directory: {error}"))?;
         ensure_directory_not_symlink(&destination_root)?;
         let store = Self {
             state_root,
@@ -126,6 +132,7 @@ impl Store {
         let Some(cutoff) = SystemTime::now().checked_sub(max_age) else {
             return;
         };
+        sweep_stages(&self.destination_root, cutoff);
         let Ok(entries) = fs::read_dir(&self.state_root) else {
             return;
         };
@@ -416,7 +423,7 @@ impl Store {
         let mut name = name.to_string();
         for _ in 0..16 {
             let target = self.destination_path(&name)?;
-            match place_file(&part, &target, &self.destination_root, link) {
+            match place_file(&part, &target, &self.destination_root, id, link) {
                 Ok(()) => {
                     // The download is already published; a leftover part
                     // file is only clutter, and a directory that will not
@@ -447,43 +454,92 @@ impl Store {
     }
 }
 
+/// The hidden file a copy is staged in beside its target: one per transfer
+/// (so two receives of the same name never share one) and always short (a
+/// long name never makes it too long for the filesystem).
+fn stage_name(id: &str) -> String {
+    format!(".desklink-{id}.stage")
+}
+
+/// Removes staging files in the downloads folder that nobody has touched since
+/// `cutoff`: what a process that died mid-copy leaves, up to a whole file's
+/// size. Only regular files named exactly `.desklink-<id>.stage`.
+fn sweep_stages(root: &Path, cutoff: SystemTime) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let is_stage = name
+            .to_str()
+            .is_some_and(|name| name.starts_with(".desklink-") && name.ends_with(".stage"));
+        if !is_stage {
+            continue;
+        }
+        let stale = fs::symlink_metadata(entry.path())
+            .ok()
+            .filter(|metadata| metadata.is_file())
+            .and_then(|metadata| metadata.modified().ok())
+            .is_some_and(|modified| modified < cutoff);
+        if stale {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 /// Puts the finished `part` at `target` without ever replacing anything: a
 /// hard link where the filesystem allows one. Where it does not (the
 /// downloads folder is on another filesystem, or one without links such as
-/// FAT), the bytes are copied to a hidden file beside the target, synced, and
-/// linked or renamed into place, so the file still appears whole.
+/// FAT), the bytes are copied to a hidden file of this transfer beside the
+/// target, synced, and linked or renamed into place, so the file still
+/// appears whole.
+///
+/// `AlreadyExists` is returned only when the *target* is taken. The staging
+/// file is this transfer's own and is removed only if this call made it.
 fn place_file(
     part: &Path,
     target: &Path,
     root: &Path,
+    id: &str,
     link: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
     match link(part, target) {
         Err(error) if cannot_link(&error) => {}
         other => return other,
     }
-    let name = target
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let staged = root.join(format!(
-        ".{}.desklink-part",
-        name.chars().take(100).collect::<String>()
-    ));
+    let staged = checked_child(root, &stage_name(id)).map_err(std::io::Error::other)?;
+    // A leftover of an earlier try of this very transfer (it died mid-copy):
+    // nobody else uses this name.
+    if fs::symlink_metadata(&staged).is_ok_and(|metadata| metadata.is_file()) {
+        let _ = fs::remove_file(&staged);
+    }
+    let mut copy = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+    {
+        Ok(copy) => copy,
+        // Not the target: never read as "taken", never removed.
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            return Err(std::io::Error::other(
+                "something else is in the way of the staging file",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    // From here the staging file is this call's own.
     let copied = (|| {
         let mut source = File::open(part)?;
-        let mut copy = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&staged)?;
         std::io::copy(&mut source, &mut copy)?;
         copy.sync_all()
     })();
+    drop(copy);
     let placed = copied.and_then(|()| match fs::hard_link(&staged, target) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == ErrorKind::AlreadyExists => Err(error),
         // No hard links here either: a rename, once nothing is in the way.
-        Err(_) if !target.exists() => fs::rename(&staged, target),
+        // (A dangling link at the target is something in the way.)
+        Err(_) if fs::symlink_metadata(target).is_err() => fs::rename(&staged, target),
         Err(error) => Err(error),
     });
     let _ = fs::remove_file(&staged);
@@ -910,13 +966,19 @@ mod tests {
     }
 
     #[test]
-    fn symlinked_state_or_download_directories_are_refused() {
+    fn a_symlinked_state_directory_is_refused_and_a_symlinked_downloads_one_is_resolved() {
         let base = root("symlink-dirs");
         let real = base.join("real");
         fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink(&real, base.join("link")).unwrap();
         assert!(Store::new(base.join("link"), base.join("downloads")).is_err());
-        assert!(Store::new(base.join("state"), base.join("link")).is_err());
+        // `~/Downloads` as a link works: the real directory is used (and was
+        // refused before, which stopped DeskLink receiving anything).
+        let store = Store::new(base.join("state"), base.join("link")).unwrap();
+        assert_eq!(
+            store.destination_path("a.bin").unwrap(),
+            fs::canonicalize(&real).unwrap().join("a.bin")
+        );
         let _ = fs::remove_dir_all(base);
     }
 

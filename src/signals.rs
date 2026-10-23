@@ -22,9 +22,98 @@ extern "C" fn on_signal(signal: c_int) {
     let fd = WRITE_FD.load(Ordering::Relaxed);
     if fd >= 0 {
         let byte = signal as u8;
-        // SAFETY: write(2) is async-signal-safe; the byte outlives the call.
+        // SAFETY: write(2) is async-signal-safe; the byte outlives the call;
+        // errno is saved and restored, so the interrupted code does not see
+        // this handler's failure (a full pipe: the byte is simply dropped,
+        // the pipe is non-blocking).
         unsafe {
+            let errno = libc::__errno_location();
+            let saved = *errno;
             libc::write(fd, (&byte as *const u8).cast(), 1);
+            *errno = saved;
+        }
+    }
+}
+
+/// What one wait on the pipe came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Wait {
+    /// A byte is there to read.
+    Ready,
+    /// The deadline passed.
+    Elapsed,
+    /// The pipe is gone.
+    Closed,
+}
+
+/// Waits for `fd` to be readable until `deadline` (`None`: for ever),
+/// carrying on when a signal interrupts the wait.
+fn wait_readable(fd: c_int, deadline: Option<std::time::Instant>) -> Wait {
+    loop {
+        let millis = match deadline {
+            None => -1,
+            Some(deadline) => {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return Wait::Elapsed;
+                }
+                // Rounded up: never a spin of zero-length waits.
+                left.as_millis().min(c_int::MAX as u128) as c_int + 1
+            }
+        };
+        let mut poll = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd.
+        let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+        match ready {
+            0 => {
+                // Timed out; the loop's deadline check decides (a wait of
+                // `None` never times out).
+                if deadline.is_none() {
+                    continue;
+                }
+            }
+            n if n > 0 => {
+                return if poll.revents & libc::POLLIN != 0 {
+                    Wait::Ready
+                } else {
+                    Wait::Closed
+                }
+            }
+            _ => {
+                if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                    return Wait::Closed;
+                }
+            }
+        }
+    }
+}
+
+/// Reads one byte, carrying on when a signal interrupts the read or the
+/// non-blocking pipe has nothing yet.
+fn read_byte(fd: c_int) -> Option<u8> {
+    loop {
+        let mut byte = 0u8;
+        // SAFETY: reads one byte into a local.
+        let got = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if got == 1 {
+            return Some(byte);
+        }
+        if got == 0 {
+            return None;
+        }
+        match std::io::Error::last_os_error().kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            // Non-blocking: wait for the next byte.
+            std::io::ErrorKind::WouldBlock => {
+                if wait_readable(fd, None) != Wait::Ready {
+                    return None;
+                }
+            }
+            _ => return None,
         }
     }
 }
@@ -66,7 +155,7 @@ pub(crate) fn watch(
 ) -> std::io::Result<()> {
     let mut fds = [0 as c_int; 2];
     // SAFETY: `fds` has room for the two descriptors pipe2 writes.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     let [read_fd, write_fd] = fds;
@@ -84,38 +173,27 @@ pub(crate) fn watch(
     std::thread::Builder::new()
         .name("desklink-signals".into())
         .spawn(move || {
-            let mut asked: Option<c_int> = None;
+            // The signal that asked for a quit, and when the grace ends.
+            let mut asked: Option<(c_int, std::time::Instant)> = None;
             loop {
-                let mut byte = 0u8;
-                // Waits for a signal, or (once one came) for the grace to end.
-                let ready = match asked {
-                    None => true,
-                    Some(_) => {
-                        let mut poll = libc::pollfd {
-                            fd: read_fd,
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        // SAFETY: one valid pollfd.
-                        unsafe { libc::poll(&mut poll, 1, grace.as_millis() as c_int) > 0 }
-                    }
+                let wait = wait_readable(read_fd, asked.map(|(_, deadline)| deadline));
+                if wait == Wait::Elapsed {
+                    actions.exit(asked.map_or(0, |(signal, _)| signal));
+                    return;
+                }
+                if wait == Wait::Closed {
+                    return;
+                }
+                let Some(byte) = read_byte(read_fd) else {
+                    return;
                 };
-                if !ready {
-                    actions.exit(asked.unwrap_or(0));
-                    return;
-                }
-                // SAFETY: reads one byte into a local.
-                let got = unsafe { libc::read(read_fd, (&mut byte as *mut u8).cast(), 1) };
-                if got != 1 {
-                    return;
-                }
                 let signal = c_int::from(byte);
                 if asked.is_some() {
                     // A second one: no more waiting.
                     actions.exit(signal);
                     return;
                 }
-                asked = Some(signal);
+                asked = Some((signal, std::time::Instant::now() + grace));
                 actions.quit(signal);
             }
         })?;
@@ -136,6 +214,7 @@ pub(crate) fn watch(
 mod tests {
     use super::*;
     use std::sync::mpsc::{channel, Sender};
+    use std::time::Instant;
 
     struct Record(Sender<(&'static str, c_int)>);
 
@@ -169,5 +248,53 @@ mod tests {
         // Watching twice is refused (one handler for the process).
         let (other, _) = channel();
         assert!(watch(&[libc::SIGUSR1], GRACE, Record(other)).is_err());
+    }
+
+    extern "C" fn nothing(_: c_int) {}
+
+    /// A signal arriving while the thread is waiting (the pipe's poll, or
+    /// its read) is not the end of the wait: the deadline is.
+    #[test]
+    fn an_interrupted_wait_goes_on_until_its_deadline() {
+        // SIGUSR2 with a handler that does nothing and no SA_RESTART, so poll
+        // returns EINTR.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = nothing as extern "C" fn(c_int) as usize;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(libc::SIGUSR2, &action, std::ptr::null_mut());
+        }
+        let mut fds = [0 as c_int; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        let [read_fd, write_fd] = fds;
+        let (thread, ready) = channel();
+        let waiter = std::thread::spawn(move || {
+            let _ = thread.send(unsafe { libc::pthread_self() } as usize);
+            let started = Instant::now();
+            let waited = wait_readable(read_fd, Some(started + Duration::from_millis(600)));
+            (waited, started.elapsed())
+        });
+        let target = ready.recv().unwrap() as libc::pthread_t;
+        // Interrupt it several times while it waits.
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(40));
+            unsafe { libc::pthread_kill(target, libc::SIGUSR2) };
+        }
+        let (waited, took) = waiter.join().unwrap();
+        assert_eq!(waited, Wait::Elapsed, "only the deadline ends it");
+        assert!(took >= Duration::from_millis(590), "{took:?}");
+        // And a byte that comes while being interrupted is still read.
+        let reader = std::thread::spawn(move || read_byte(read_fd));
+        std::thread::sleep(Duration::from_millis(60));
+        let byte = 7u8;
+        unsafe { libc::write(write_fd, (&byte as *const u8).cast(), 1) };
+        assert_eq!(reader.join().unwrap(), Some(7));
+        unsafe {
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
     }
 }

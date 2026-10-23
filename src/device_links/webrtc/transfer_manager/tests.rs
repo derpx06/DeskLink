@@ -2377,3 +2377,164 @@ fn a_send_is_finishing_until_the_receiver_says_complete_and_an_error_then_is_a_f
     );
     assert!(!was_sent(&id));
 }
+
+// ── Placing across filesystems, hostile names, links ───────────────────────
+
+fn exdev(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::from_raw_os_error(libc::EXDEV))
+}
+
+fn scratch(label: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "desklink-{label}-{}",
+        uuid::Uuid::new_v4().simple()
+    ))
+}
+
+/// A stall never replaces "Finishing…", and ending one puts it back.
+#[test]
+fn a_stall_note_never_overwrites_finishing() {
+    use super::{stall_note, StallChange};
+    assert_eq!(stall_note(&StallChange::Began, true), None);
+    assert_eq!(
+        stall_note(&StallChange::Ended, true),
+        Some(Some(words::finishing()))
+    );
+    assert_eq!(
+        stall_note(&StallChange::Began, false),
+        Some(Some(words::no_progress()))
+    );
+    assert_eq!(stall_note(&StallChange::Ended, false), Some(None));
+    assert_eq!(stall_note(&StallChange::None, true), None);
+}
+
+/// Two receives of the same name at once, on a downloads folder the link
+/// cannot cross into: both succeed (one as the next free name), each file
+/// whole, and nothing is left staged.
+#[test]
+fn two_same_name_receives_on_another_filesystem_both_succeed() {
+    use super::store::Store;
+    let base = scratch("stage-race");
+    let downloads = base.join("dl");
+    let store = Arc::new(Store::new(base.join("state"), downloads.clone()).unwrap());
+    let (one, two) = (payload(6 << 20, 31), payload(6 << 20, 32));
+    for (id, bytes) in [("race-a", &one), ("race-b", &two)] {
+        fs::write(store.part_path(id).unwrap(), bytes).unwrap();
+    }
+    let gate = Arc::new(std::sync::Barrier::new(2));
+    let runs: Vec<_> = ["race-a", "race-b"]
+        .into_iter()
+        .map(|id| {
+            let (store, gate) = (Arc::clone(&store), Arc::clone(&gate));
+            std::thread::spawn(move || {
+                gate.wait();
+                store.publish_with(id, "same.bin", "same.bin", &exdev)
+            })
+        })
+        .collect();
+    let paths: Vec<PathBuf> = runs
+        .into_iter()
+        .map(|run| run.join().unwrap().expect("both are placed"))
+        .collect();
+    assert_ne!(paths[0], paths[1]);
+    assert_eq!(fs::read(&paths[0]).unwrap(), one);
+    assert_eq!(fs::read(&paths[1]).unwrap(), two);
+    assert_eq!(names(&downloads).len(), 2, "no staging file left");
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// A name of 80 CJK letters (240 bytes) is a valid name, and its staging file
+/// is short: it can be received across filesystems.
+#[test]
+fn a_long_cjk_name_can_be_placed_across_filesystems() {
+    use super::store::Store;
+    let base = scratch("stage-cjk");
+    let downloads = base.join("dl");
+    let store = Store::new(base.join("state"), downloads.clone()).unwrap();
+    let name = format!("{}.bin", "界".repeat(80));
+    assert!(name.len() <= 255);
+    fs::write(store.part_path("cjk").unwrap(), b"cjk bytes").unwrap();
+    let path = store.publish_with("cjk", &name, &name, &exdev).unwrap();
+    assert_eq!(fs::read(path).unwrap(), b"cjk bytes");
+    assert_eq!(names(&downloads), [name]);
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// A link left at the name (pointing nowhere) is never written through or
+/// replaced: the file goes to the next free name, by either way of placing.
+#[test]
+fn a_dangling_symlink_at_the_name_is_never_replaced() {
+    use super::store::Store;
+    let base = scratch("stage-dangling");
+    let downloads = base.join("dl");
+    let store = Store::new(base.join("state"), downloads.clone()).unwrap();
+    let trap = downloads.join("trap.bin");
+    std::os::unix::fs::symlink("/nonexistent/desklink-nowhere", &trap).unwrap();
+    for (id, link) in [("d1", true), ("d2", false)] {
+        fs::write(store.part_path(id).unwrap(), id.as_bytes()).unwrap();
+        let path = if link {
+            store.publish(id, "trap.bin", "trap.bin").unwrap()
+        } else {
+            store
+                .publish_with(id, "trap.bin", "trap.bin", &exdev)
+                .unwrap()
+        };
+        assert_ne!(path, trap, "{id}");
+        assert_eq!(fs::read(&path).unwrap(), id.as_bytes());
+        assert_eq!(
+            fs::read_link(&trap).unwrap(),
+            Path::new("/nonexistent/desklink-nowhere"),
+            "the link is untouched"
+        );
+    }
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// A staging file a dead process left is swept once it is old; a fresh one,
+/// and anything that is not exactly a staging file, stays.
+#[test]
+fn an_old_stage_file_is_swept_and_a_fresh_one_is_kept() {
+    use super::store::Store;
+    let base = scratch("stage-sweep");
+    let downloads = base.join("dl");
+    fs::create_dir_all(&downloads).unwrap();
+    let old = downloads.join(".desklink-dead.stage");
+    let fresh = downloads.join(".desklink-live.stage");
+    fs::write(&old, b"x").unwrap();
+    fs::write(&fresh, b"y").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(8 * 24 * 3600))
+        .unwrap();
+    // Neither a regular file nor a stage name: untouched, however old.
+    let lookalike_dir = downloads.join(".desklink-dir.stage");
+    fs::create_dir(&lookalike_dir).unwrap();
+    let other = downloads.join(".desklink-notes.txt");
+    fs::write(&other, b"z").unwrap();
+    let link = downloads.join(".desklink-link.stage");
+    std::os::unix::fs::symlink(&fresh, &link).unwrap();
+    let _store = Store::new(base.join("state"), downloads.clone()).unwrap();
+    assert!(!old.exists(), "swept");
+    assert!(fresh.exists() && lookalike_dir.exists() && other.exists());
+    assert!(fs::symlink_metadata(&link).is_ok(), "a link is not touched");
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// `~/Downloads` as a link (to another disk, say): its target is used.
+#[test]
+fn a_downloads_folder_that_is_a_symlink_works() {
+    use super::store::Store;
+    let base = scratch("stage-linked");
+    let real = base.join("elsewhere");
+    fs::create_dir_all(&real).unwrap();
+    let linked = base.join("Downloads");
+    std::os::unix::fs::symlink(&real, &linked).unwrap();
+    let store = Store::new(base.join("state"), linked).unwrap();
+    fs::write(store.part_path("l1").unwrap(), b"through the link").unwrap();
+    let path = store.publish("l1", "l.bin", "l.bin").unwrap();
+    assert_eq!(fs::read(real.join("l.bin")).unwrap(), b"through the link");
+    assert_eq!(path.parent().unwrap(), fs::canonicalize(&real).unwrap());
+    let _ = fs::remove_dir_all(&base);
+}
