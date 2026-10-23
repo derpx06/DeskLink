@@ -481,7 +481,7 @@ pub fn start(app: &DesklinkApplication) {
     // The paired phones the scripts were last written for.
     let last = std::cell::RefCell::new(None::<Vec<(String, String)>>);
     let weak = app.downgrade();
-    glib::timeout_add_seconds_local(2, move || {
+    crate::ticker::every_tick(move || {
         let Some(app) = weak.upgrade().filter(|app| !app.is_remote()) else {
             return glib::ControlFlow::Break;
         };

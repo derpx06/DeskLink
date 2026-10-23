@@ -35,6 +35,43 @@ pub(crate) fn debug_logging() -> bool {
     })
 }
 
+/// Startup timing, for `DESKLINK_DEBUG=1`: each stage with the milliseconds
+/// since the process started (read from the kernel, so it includes the
+/// dynamic linking and everything before `main`).
+pub(crate) fn startup(stage: &str) {
+    if !debug_logging() {
+        return;
+    }
+    // The process start is when the shell that ran it was forked, so the
+    // figure to read is the one since `main`.
+    static MAIN: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    let now = since_process_start_ms();
+    let main = *MAIN.get_or_init(|| now);
+    eprintln!(
+        "[Startup] {:>5.0} ms since main ({:>6.0} ms since the process was forked)  {stage}",
+        now - main,
+        now
+    );
+}
+
+fn since_process_start_ms() -> f64 {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+    let started = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        // The command name may hold spaces and brackets: count from its end.
+        .and_then(|stat| {
+            let after = stat.rsplit_once(')')?.1.to_string();
+            after.split_whitespace().nth(19)?.parse::<f64>().ok()
+        });
+    let up = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|up| up.split_whitespace().next()?.parse::<f64>().ok());
+    match (started, up) {
+        (Some(started), Some(up)) if ticks > 0.0 => ((up - started / ticks) * 1000.0).max(0.0),
+        _ => 0.0,
+    }
+}
+
 mod application;
 mod autostart;
 mod bucket_progress;
@@ -52,6 +89,7 @@ mod send_to;
 mod shell_dbus;
 mod terminal_previews;
 mod thumbnails;
+mod ticker;
 mod tray;
 mod type_on_phone;
 mod window;
@@ -95,6 +133,7 @@ fn main() -> glib::ExitCode {
         return send_to::run_dial_cli(&args[1]);
     }
 
+    startup("main");
     install_crash_reporter();
 
     // Set up gettext translations
@@ -106,6 +145,7 @@ fn main() -> glib::ExitCode {
     // Load resources
     let resources = load_resources().expect("Could not load resources");
     gio::resources_register(&resources);
+    startup("resources loaded");
 
     // Create a new GtkApplication. The application manages our main loop,
     // application windows, integration with the window manager/compositor, and
@@ -117,6 +157,7 @@ fn main() -> glib::ExitCode {
     // exits. Upon return, we have our exit code to return to the shell. (This
     // is the code you see when you do `echo $?` after running a command in a
     // terminal.
+    startup("application created; running");
     app.run()
 }
 

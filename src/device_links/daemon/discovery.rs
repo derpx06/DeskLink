@@ -747,11 +747,11 @@ impl DaemonWorker {
                 let browser = daemon.browse(MDNS_SERVICE_TYPE).ok();
                 while !shutdown.load(Ordering::Acquire) {
                     let Some(browser) = browser.as_ref() else {
-                        thread::sleep(Duration::from_millis(500));
+                        thread::sleep(Duration::from_secs(5));
                         continue;
                     };
                     if let Ok(mdns_sd::ServiceEvent::ServiceResolved(found)) =
-                        browser.recv_timeout(Duration::from_millis(500))
+                        browser.recv_timeout(Duration::from_secs(2))
                     {
                         let Some(id) = found.get_property_val_str("id").map(str::to_string) else {
                             continue;

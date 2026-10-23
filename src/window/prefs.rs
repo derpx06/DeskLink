@@ -934,7 +934,7 @@ fn away_from_home_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::P
     };
     update(&status_label);
     let weak = status_label.downgrade();
-    glib::timeout_add_seconds_local(1, move || match weak.upgrade() {
+    crate::ticker::every_tick(move || match weak.upgrade() {
         Some(label) => {
             update(&label);
             glib::ControlFlow::Continue

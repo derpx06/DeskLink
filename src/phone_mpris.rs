@@ -363,7 +363,7 @@ impl Export {
 pub fn start(app: &DesklinkApplication) {
     let exports: Rc<RefCell<HashMap<String, Export>>> = Rc::default();
     let weak = app.downgrade();
-    glib::timeout_add_seconds_local(1, move || {
+    crate::ticker::every_tick(move || {
         let Some(app) = weak.upgrade().filter(|app| !app.is_remote()) else {
             for (_, export) in exports.borrow_mut().drain() {
                 export.stop();

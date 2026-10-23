@@ -1038,7 +1038,14 @@ mod tests {
         config
             .trust_device(&info(&old, &name, "phone"), "cert-old-2".into())
             .unwrap();
-        assert!(take_replacement_candidates().is_empty());
+        // (The queue is the process's: another test may have queued its own.)
+        let ours = |candidates: Vec<ReplacementCandidate>| {
+            candidates
+                .into_iter()
+                .filter(|candidate| candidate.name == name)
+                .count()
+        };
+        assert_eq!(ours(take_replacement_candidates()), 0);
         // The lookalike: new id, same name and type.
         config
             .trust_device(&info(&fresh, &name, "phone"), "cert-new".into())
@@ -1058,7 +1065,7 @@ mod tests {
             }],
             "only the same name and type"
         );
-        assert!(take_replacement_candidates().is_empty(), "taken once");
+        assert_eq!(ours(take_replacement_candidates()), 0, "taken once");
         let _ = fs::remove_dir_all(dir);
     }
 

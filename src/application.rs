@@ -51,22 +51,32 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
             let obj = self.obj();
+            crate::startup("application constructed");
             self.daemon.replace(Some(DaemonHandle::start()));
+            crate::startup("daemon started");
             // The desk side of shared terminals (it leaves a running
             // instance's socket alone if this launch is a second one).
             crate::device_links::pty::desk::start_server();
-            crate::device_links::connection_log::prune();
-            crate::device_links::transfer_log::prune();
-            crate::thumbnails::prune();
-            // GNOME integration files this install provides for itself.
-            crate::search_provider::install_description();
-            crate::kde::install_runner();
+            // Housekeeping that reads and rewrites files: off the main
+            // thread, so the window does not wait for it.
+            let _ = std::thread::Builder::new()
+                .name("desklink-housekeeping".into())
+                .spawn(|| {
+                    crate::device_links::connection_log::prune();
+                    crate::device_links::transfer_log::prune();
+                    crate::thumbnails::prune();
+                    // GNOME integration files this install provides for itself.
+                    crate::search_provider::install_description();
+                    crate::kde::install_runner();
+                });
             crate::send_to::start(&obj);
+            crate::startup("integration files written");
             obj.setup_gactions();
             self.hold.replace(Some(obj.hold()));
             obj.start_session_indicator();
             crate::bucket_progress::start(&obj);
             obj.watch_network();
+            crate::startup("indicators and network watch ready");
             obj.set_accels_for_action("app.quit", &["<control>q"]);
             obj.set_accels_for_action("app.shortcuts", &["<control>question"]);
             obj.set_accels_for_action("app.preferences", &["<control>comma"]);
@@ -86,6 +96,26 @@ mod imp {
             self.obj().report_previous_crash();
             register_bundled_fonts();
             install_brand_styles();
+            crate::startup("styles and fonts ready");
+            // A logout, a reboot or `kill` quits like File > Quit does, so
+            // glide gives the pointer back on the way out.
+            let app = self.obj().downgrade();
+            for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+                let app = app.clone();
+                glib::unix_signal_add_local(signal, move || {
+                    if let Some(app) = app.upgrade() {
+                        app.quit();
+                    }
+                    glib::ControlFlow::Break
+                });
+            }
+        }
+
+        fn shutdown(&self) {
+            // The pointer is never left on a phone: bounded, so a compositor
+            // that does not answer cannot hold the app open.
+            crate::device_links::glide::shutdown();
+            self.parent_shutdown();
         }
 
         // We connect to the activate callback to create a window when the application
@@ -94,9 +124,12 @@ mod imp {
         // to do that, we'll just present any existing window.
         fn activate(&self) {
             let application = self.obj();
+            crate::startup("activate");
             let window = application.main_window();
+            crate::startup("window built");
 
             // Ask the window manager/compositor to present the window
+            window.connect_map(|_| crate::startup("window mapped"));
             window.present();
         }
 
@@ -339,7 +372,7 @@ impl DesklinkApplication {
         }
 
         let mut notified = std::collections::HashSet::<String>::new();
-        glib::timeout_add_seconds_local(1, move || {
+        crate::ticker::every_tick(move || {
             crate::guard("app tick", glib::ControlFlow::Continue, || {
                 let Some(app) = app.upgrade() else {
                     return glib::ControlFlow::Break;

@@ -28,8 +28,11 @@ pub(super) struct Page {
     empty: adw::StatusPage,
     /// What is shown: the device, its name and the cache generation.
     shown: RefCell<(String, String, u64)>,
-    /// The listed contacts by uid, for the details and the search.
+    /// Every contact by uid, for the details (the list draws only some).
     contacts: Rc<RefCell<HashMap<String, Contact>>>,
+    /// Every contact in order, the phone's name, and the search terms: what
+    /// the list is drawn from.
+    source: Rc<RefCell<Source>>,
     /// The device the details act for: id and whether it can call.
     device: Rc<RefCell<(String, bool)>>,
 }
@@ -45,6 +48,50 @@ fn haystack(contact: &Contact) -> String {
     words.extend(contact.emails.iter().cloned());
     words.extend(contact.org.iter().cloned());
     words.join(" ").to_lowercase()
+}
+
+/// Rows built at once. A phone may share twenty thousand contacts, and a row
+/// is a dozen widgets: only this many are drawn, and a search draws the
+/// first of what matches.
+const MAX_ROWS: usize = 300;
+
+/// The contacts to draw for `terms` (lowercased, space-separated: every one
+/// must match), at most [`MAX_ROWS`], and how many matched in all.
+fn select<'a>(all: &'a [Contact], terms: &str) -> (Vec<&'a Contact>, usize) {
+    let words: Vec<&str> = terms.split_whitespace().collect();
+    let mut matched = 0;
+    let mut shown = Vec::new();
+    for contact in all {
+        if !words.is_empty() {
+            let haystack = haystack(contact);
+            if !words.iter().all(|word| haystack.contains(word)) {
+                continue;
+            }
+        }
+        matched += 1;
+        if shown.len() < MAX_ROWS {
+            shown.push(contact);
+        }
+    }
+    (shown, matched)
+}
+
+/// "300 of 1,204 contacts from Pixel 9. Search to find the rest." and its
+/// shorter forms.
+fn count_words(shown: usize, matched: usize, total: usize, searching: bool, phone: &str) -> String {
+    if searching {
+        return match (matched, shown < matched) {
+            (0, _) => String::new(),
+            (1, _) => "1 match".to_string(),
+            (_, false) => format!("{matched} matches"),
+            (_, true) => format!("{shown} of {matched} matches. Type more to narrow it down."),
+        };
+    }
+    match (total, shown < total) {
+        (1, _) => format!("1 contact from {phone}"),
+        (_, false) => format!("{total} contacts from {phone}"),
+        (_, true) => format!("{shown} of {total} contacts from {phone}. Search to find the rest."),
+    }
 }
 
 /// The section a name sorts under: its first letter, or "#".
@@ -65,6 +112,54 @@ fn avatar(contact: &Contact, size: i32) -> adw::Avatar {
         avatar.set_custom_image(Some(&texture));
     }
     avatar
+}
+
+/// What the list is drawn from.
+#[derive(Debug, Default)]
+struct Source {
+    all: Vec<Contact>,
+    phone: String,
+    terms: String,
+}
+
+/// Rebuilds the rows for the terms: at most [`MAX_ROWS`], in order.
+fn draw(list: &gtk::ListBox, count: &gtk::Label, source: &Source) {
+    while let Some(row) = list.first_child() {
+        list.remove(&row);
+    }
+    let (shown, matched) = select(&source.all, &source.terms);
+    for contact in &shown {
+        let row = adw::ActionRow::builder()
+            .title(&contact.name)
+            .use_markup(false)
+            .activatable(true)
+            .build();
+        let subtitle = contact
+            .phones
+            .first()
+            .map(|phone| phone.number.clone())
+            .or_else(|| contact.emails.first().cloned())
+            .or_else(|| contact.org.clone());
+        if let Some(subtitle) = subtitle {
+            row.set_subtitle(&subtitle);
+        }
+        row.add_prefix(&avatar(contact, 36));
+        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        row.set_widget_name(&contact.uid);
+        list.append(&row);
+    }
+    list.invalidate_headers();
+    count.set_label(&if source.all.is_empty() {
+        String::new()
+    } else {
+        count_words(
+            shown.len(),
+            matched,
+            source.all.len(),
+            !source.terms.is_empty(),
+            &source.phone,
+        )
+    });
 }
 
 impl Page {
@@ -128,22 +223,7 @@ impl Page {
             .build();
 
         let contacts: Rc<RefCell<HashMap<String, Contact>>> = Rc::default();
-        let terms = Rc::new(RefCell::new(String::new()));
-        {
-            let (contacts, terms) = (Rc::clone(&contacts), Rc::clone(&terms));
-            list.set_filter_func(move |row| {
-                let terms = terms.borrow();
-                if terms.is_empty() {
-                    return true;
-                }
-                let contacts = contacts.borrow();
-                let Some(found) = contacts.get(row.widget_name().as_str()) else {
-                    return false;
-                };
-                let haystack = haystack(found);
-                terms.split_whitespace().all(|term| haystack.contains(term))
-            });
-        }
+        let source: Rc<RefCell<Source>> = Rc::default();
         list.set_header_func(|row, before| {
             let title = |row: &gtk::ListBoxRow| {
                 row.downcast_ref::<adw::ActionRow>()
@@ -162,11 +242,10 @@ impl Page {
             }
         });
         {
-            let (list, terms) = (list.clone(), Rc::clone(&terms));
+            let (list, count, source) = (list.clone(), count.clone(), Rc::clone(&source));
             search.connect_search_changed(move |entry| {
-                terms.replace(entry.text().trim().to_lowercase());
-                list.invalidate_filter();
-                list.invalidate_headers();
+                source.borrow_mut().terms = entry.text().trim().to_lowercase();
+                draw(&list, &count, &source.borrow());
             });
         }
         let device: Rc<RefCell<(String, bool)>> = Rc::default();
@@ -194,6 +273,7 @@ impl Page {
             empty,
             shown: RefCell::default(),
             contacts,
+            source,
             device,
         };
         {
@@ -236,39 +316,19 @@ impl Page {
         self.shown.replace(shown);
 
         let list = contacts::list(&device.id);
-        while let Some(row) = self.list.first_child() {
-            self.list.remove(&row);
-        }
-        let mut by_uid = HashMap::new();
-        // ponytail: one row per contact, built at once; a GtkListView if
-        // address books of many thousands feel slow to open.
-        for contact in &list {
-            let row = adw::ActionRow::builder()
-                .title(&contact.name)
-                .use_markup(false)
-                .activatable(true)
-                .build();
-            let subtitle = contact
-                .phones
-                .first()
-                .map(|phone| phone.number.clone())
-                .or_else(|| contact.emails.first().cloned())
-                .or_else(|| contact.org.clone());
-            if let Some(subtitle) = subtitle {
-                row.set_subtitle(&subtitle);
-            }
-            row.add_prefix(&avatar(contact, 36));
-            row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
-            row.set_widget_name(&contact.uid);
-            self.list.append(&row);
-            by_uid.insert(contact.uid.clone(), contact.clone());
-        }
+        let by_uid: HashMap<String, Contact> = list
+            .iter()
+            .map(|contact| (contact.uid.clone(), contact.clone()))
+            .collect();
         self.contacts.replace(by_uid);
-        self.list.invalidate_filter();
-        self.list.invalidate_headers();
+        {
+            let mut source = self.source.borrow_mut();
+            source.all = list.clone();
+            source.phone = device.name.clone();
+        }
+        draw(&self.list, &self.count, &self.source.borrow());
 
         if list.is_empty() {
-            self.count.set_label("");
             self.empty
                 .set_title(&format!("No Contacts from {}", device.name));
             self.empty.set_description(Some(&format!(
@@ -278,10 +338,6 @@ impl Page {
             )));
             self.stack.set_visible_child_name("empty");
         } else {
-            self.count.set_label(&match list.len() {
-                1 => format!("1 contact from {}", device.name),
-                count => format!("{count} contacts from {}", device.name),
-            });
             self.stack.set_visible_child_name("list");
         }
     }
@@ -458,6 +514,49 @@ fn show_details(win: &DesklinkWindow, device_id: &str, can_call: bool, contact: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn many(count: usize) -> Vec<Contact> {
+        (0..count)
+            .map(|index| {
+                contacts::parse_vcard(
+                    &format!("u{index}"),
+                    &format!("FN:Person {index:05}\nTEL:555{index:05}"),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    /// Twenty thousand contacts draw 300 rows, and a search draws the first
+    /// 300 of what matches, counting all of it.
+    #[test]
+    fn a_huge_address_book_draws_a_bounded_list() {
+        let all = many(20_000);
+        let (shown, matched) = select(&all, "");
+        assert_eq!((shown.len(), matched), (MAX_ROWS, 20_000));
+        // Names Person 01230..01239, and the numbers that hold 0123 too.
+        let (shown, matched) = select(&all, "person 0123");
+        assert_eq!(shown.len(), matched);
+        assert!((10..30).contains(&matched), "{matched}");
+        let (shown, matched) = select(&all, "person");
+        assert_eq!((shown.len(), matched), (MAX_ROWS, 20_000));
+        let (shown, matched) = select(&all, "nobody");
+        assert_eq!((shown.len(), matched), (0, 0));
+    }
+
+    #[test]
+    fn the_count_says_what_is_hidden() {
+        assert_eq!(
+            count_words(3, 3, 3, false, "Pixel"),
+            "3 contacts from Pixel"
+        );
+        assert_eq!(count_words(1, 1, 1, false, "Pixel"), "1 contact from Pixel");
+        assert!(count_words(300, 300, 1204, false, "Pixel").contains("300 of 1204"));
+        assert_eq!(count_words(2, 2, 50, true, "Pixel"), "2 matches");
+        assert_eq!(count_words(1, 1, 50, true, "Pixel"), "1 match");
+        assert_eq!(count_words(0, 0, 50, true, "Pixel"), "");
+        assert!(count_words(300, 900, 5000, true, "Pixel").contains("narrow"));
+    }
 
     #[test]
     fn contacts_sort_into_letter_sections_and_match_any_field() {

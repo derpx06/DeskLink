@@ -367,7 +367,22 @@ struct Shown {
 
 static SHOWN: Mutex<Option<Shown>> = Mutex::new(None);
 
-/// Starts the once-a-second read of the local players, once.
+/// How long the player reader waits for a player's own signal before it
+/// looks anyway (players that do not announce their changes): short while
+/// something plays, long while players only sit there, longest with none.
+fn look_again_after(any_playing: bool, any_player: bool) -> Duration {
+    if any_playing {
+        Duration::from_secs(2)
+    } else if any_player {
+        Duration::from_secs(10)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
+/// Starts reading the local players, once: when a player says something
+/// changed (or appears or quits), and otherwise at the pace
+/// [`look_again_after`] gives.
 pub(crate) fn start() {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
@@ -378,9 +393,60 @@ pub(crate) fn start() {
                 else {
                     return;
                 };
+                let (changed, signals) = std::sync::mpsc::channel::<()>();
+                // Kept for as long as the thread lives.
+                let _subscriptions = [
+                    // A player starts or quits.
+                    bus.signal_subscribe(
+                        Some("org.freedesktop.DBus"),
+                        Some("org.freedesktop.DBus"),
+                        Some("NameOwnerChanged"),
+                        Some("/org/freedesktop/DBus"),
+                        Some(ROOT),
+                        gio::DBusSignalFlags::MATCH_ARG0_NAMESPACE,
+                        {
+                            let changed = changed.clone();
+                            move |_, _, _, _, _, _| {
+                                let _ = changed.send(());
+                            }
+                        },
+                    ),
+                    // A player's state, track or volume changes.
+                    bus.signal_subscribe(
+                        None,
+                        Some("org.freedesktop.DBus.Properties"),
+                        Some("PropertiesChanged"),
+                        Some(PATH),
+                        None,
+                        gio::DBusSignalFlags::NONE,
+                        move |_, _, _, _, _, _| {
+                            let _ = changed.send(());
+                        },
+                    ),
+                ];
                 loop {
                     poll(&bus);
-                    std::thread::sleep(Duration::from_secs(1));
+                    let (playing, any) = SHOWN
+                        .lock()
+                        .ok()
+                        .and_then(|shown| {
+                            shown.as_ref().map(|shown| {
+                                (
+                                    shown.players.iter().any(|player| player.playing),
+                                    !shown.players.is_empty(),
+                                )
+                            })
+                        })
+                        .unwrap_or_default();
+                    match signals.recv_timeout(look_again_after(playing, any)) {
+                        // A burst of signals is one look, a moment later.
+                        Ok(()) => {
+                            std::thread::sleep(Duration::from_millis(150));
+                            while signals.try_recv().is_ok() {}
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
                 }
             });
     });
@@ -641,6 +707,15 @@ fn call(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_player_reader_slows_down_when_nothing_plays() {
+        use super::look_again_after;
+        use std::time::Duration;
+        assert_eq!(look_again_after(true, true), Duration::from_secs(2));
+        assert!(look_again_after(false, true) > look_again_after(true, true));
+        assert!(look_again_after(false, false) > look_again_after(false, true));
+    }
+
     use super::*;
 
     fn player(name: &str, playing: bool) -> Player {

@@ -567,7 +567,7 @@ fn qr_code(daemon: &DaemonHandle) -> (gtk::Picture, Rc<Cell<bool>>) {
     let paused = Cell::new(false);
     let weak_picture = picture.downgrade();
     let poll_daemon = daemon.clone();
-    glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+    let step = Rc::new(move || {
         let Some(picture) = weak_picture.upgrade() else {
             return glib::ControlFlow::Break;
         };
@@ -581,7 +581,8 @@ fn qr_code(daemon: &DaemonHandle) -> (gtk::Picture, Rc<Cell<bool>>) {
                 shown.borrow_mut().take();
                 poll_daemon.send(DaemonCommand::CancelQrPairing);
             }
-            return glib::ControlFlow::Continue;
+            // Stops until the picture is shown again (its map starts it).
+            return glib::ControlFlow::Break;
         }
         if paused.replace(false) {
             poll_daemon.send(DaemonCommand::StartQrPairing);
@@ -604,6 +605,24 @@ fn qr_code(daemon: &DaemonHandle) -> (gtk::Picture, Rc<Cell<bool>>) {
         }
         glib::ControlFlow::Continue
     });
+    // A quarter-second look while the code is on screen, and none while it
+    // is not.
+    let running = Rc::new(Cell::new(false));
+    let start: Rc<dyn Fn()> = Rc::new(move || {
+        if running.replace(true) {
+            return;
+        }
+        let (step, running) = (Rc::clone(&step), Rc::clone(&running));
+        glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+            let flow = step();
+            if flow == glib::ControlFlow::Break {
+                running.set(false);
+            }
+            flow
+        });
+    });
+    start();
+    picture.connect_map(move |_| start());
     (picture, stopped)
 }
 

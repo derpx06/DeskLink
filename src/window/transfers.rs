@@ -125,6 +125,33 @@ pub(super) struct Page {
     window: glib::WeakRef<DesklinkWindow>,
     /// The selected device: id and name.
     device: Rc<RefCell<(String, String)>>,
+    /// Arms the progress timer (see [`follow`]).
+    kick: Kick,
+}
+
+/// The function that starts the progress timer.
+type Start = Rc<dyn Fn()>;
+
+/// What starts the progress timer, once the daemon is known.
+#[derive(Clone, Default)]
+struct Kick(Rc<RefCell<Option<Start>>>);
+
+impl std::fmt::Debug for Kick {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Kick")
+    }
+}
+
+impl Kick {
+    fn set(&self, start: Start) {
+        self.0.replace(Some(start));
+    }
+
+    fn run(&self) {
+        if let Some(start) = self.0.borrow().as_ref() {
+            start();
+        }
+    }
 }
 
 /// Cards a line in the grids: one to five, as wide allows.
@@ -242,14 +269,20 @@ impl Page {
                 }
             });
         }
+        let kick = Kick::default();
         if let Some(daemon) = win.daemon() {
-            follow(&moving, daemon, Rc::clone(&device));
+            kick.set(follow(&moving, daemon, Rc::clone(&device)));
         } else {
             // The daemon is handed over after construction.
-            let (window, moving, device) = (win.downgrade(), moving.clone(), Rc::clone(&device));
+            let (window, moving, device, kick) = (
+                win.downgrade(),
+                moving.clone(),
+                Rc::clone(&device),
+                kick.clone(),
+            );
             glib::idle_add_local_once(move || {
                 if let Some(daemon) = window.upgrade().and_then(|window| window.daemon()) {
-                    follow(&moving, daemon, device);
+                    kick.set(follow(&moving, daemon, device));
                 }
             });
         }
@@ -264,7 +297,14 @@ impl Page {
             pending: RefCell::default(),
             window: win.downgrade(),
             device,
+            kick,
         }
+    }
+
+    /// Starts following the transfers if something moves or the page shows
+    /// (the window calls it on every tick; nothing runs between).
+    pub(super) fn kick(&self) {
+        self.kick.run();
     }
 
     /// Makes `widget` (the whole Files page) take dropped files to send to
@@ -284,6 +324,13 @@ impl Page {
         });
     }
 
+    /// Empties the history cards (and their pictures); the next update
+    /// draws them again.
+    pub(super) fn release_cards(&self) {
+        self.history.remove_all();
+        self.invalidate();
+    }
+
     /// Redraws the history on its next update, e.g. after Remove from List.
     pub(super) fn invalidate(&self) {
         self.history_key.replace(String::new());
@@ -297,6 +344,7 @@ impl Page {
     ) {
         self.device
             .replace((device.id.clone(), device.name.clone()));
+        self.kick();
         self.zone_title
             .set_label(&format!("Drop files to send to {}", device.name));
         self.choose.set_sensitive(device.feature_transport_ready);
@@ -479,6 +527,13 @@ thread_local! {
     /// a redraw while it is being made never queues it twice.
     static WAITING: RefCell<HashMap<String, Vec<Waiter>>> = RefCell::default();
     static WINDOW: RefCell<glib::WeakRef<DesklinkWindow>> = RefCell::default();
+}
+
+/// Lets go of every decoded preview (a window nobody is looking at does not
+/// keep pictures; the next look decodes the few it shows, from the disk
+/// cache).
+pub(super) fn forget_pictures() {
+    SHOWN.with(|shown| shown.borrow_mut().clear());
 }
 
 /// The thumbnail worker's replies, on the main thread.
@@ -718,21 +773,62 @@ fn missing_card(win: &DesklinkWindow, entry: &LoggedFile, device: &str) -> gtk::
     card
 }
 
-/// Keeps `grid` showing the transfers moving now while it exists.
-fn follow(grid: &gtk::FlowBox, daemon: DaemonHandle, device: Rc<RefCell<(String, String)>>) {
+/// Keeps `grid` showing the transfers moving now: a quarter-second timer
+/// that runs only while something moves or the page shows, and stops
+/// otherwise. The returned function starts it again when it has stopped.
+fn follow(
+    grid: &gtk::FlowBox,
+    daemon: DaemonHandle,
+    device: Rc<RefCell<(String, String)>>,
+) -> Rc<dyn Fn()> {
     let rows: Rc<RefCell<HashMap<String, RowWidgets>>> = Rc::default();
     let weak = grid.downgrade();
-    glib::timeout_add_local(POLL_INTERVAL, move || {
-        let Some(grid) = weak.upgrade() else {
-            return glib::ControlFlow::Break;
-        };
-        // The grid is hidden while nothing moves: ask whether its page shows.
-        let shown = grid.parent().is_some_and(|page| page.is_mapped());
-        if shown || !rows.borrow().is_empty() {
-            refresh(&grid, &daemon, &rows, &device.borrow().1);
+    let running = Rc::new(Cell::new(false));
+    Rc::new(move || {
+        if running.get() {
+            return;
         }
-        glib::ControlFlow::Continue
-    });
+        let Some(grid) = weak.upgrade() else {
+            return;
+        };
+        if !needs_timer(&grid, &daemon, &rows) {
+            return;
+        }
+        running.set(true);
+        let (weak, daemon, rows, device, running) = (
+            weak.clone(),
+            daemon.clone(),
+            Rc::clone(&rows),
+            Rc::clone(&device),
+            Rc::clone(&running),
+        );
+        glib::timeout_add_local(POLL_INTERVAL, move || {
+            let Some(grid) = weak.upgrade() else {
+                running.set(false);
+                return glib::ControlFlow::Break;
+            };
+            if !needs_timer(&grid, &daemon, &rows) {
+                // One last pass clears cards whose transfer has ended.
+                refresh(&grid, &daemon, &rows, &device.borrow().1);
+                running.set(false);
+                return glib::ControlFlow::Break;
+            }
+            refresh(&grid, &daemon, &rows, &device.borrow().1);
+            glib::ControlFlow::Continue
+        });
+    })
+}
+
+/// Whether the progress cards need the timer: the page shows, or a card or
+/// a transfer is there.
+fn needs_timer(
+    grid: &gtk::FlowBox,
+    daemon: &DaemonHandle,
+    rows: &RefCell<HashMap<String, RowWidgets>>,
+) -> bool {
+    grid.parent().is_some_and(|page| page.is_mapped())
+        || !rows.borrow().is_empty()
+        || !super::transfers::rows(daemon).is_empty()
 }
 
 fn refresh(

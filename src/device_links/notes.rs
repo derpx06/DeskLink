@@ -798,6 +798,40 @@ mod tests {
         assert!(items_packets(Kind::Notes, vec![huge]).is_empty());
     }
 
+    /// What a peer may send, per item: over a bound is refused, not cut.
+    #[test]
+    fn a_snippet_or_note_over_its_bounds_is_refused() {
+        let snippet = |text: String, title: String| Snippet {
+            id: "a".into(),
+            text,
+            title,
+            modified: 1,
+            deleted: false,
+        };
+        assert!(valid_snippet(&snippet(
+            "x".repeat(MAX_SNIPPET_BYTES),
+            String::new()
+        )));
+        assert!(!valid_snippet(&snippet(
+            "x".repeat(MAX_SNIPPET_BYTES + 1),
+            String::new()
+        )));
+        assert!(!valid_snippet(&snippet(
+            "x".into(),
+            "t".repeat(MAX_SNIPPET_TITLE_CHARS + 1)
+        )));
+        let mut long_id = snippet("x".into(), String::new());
+        long_id.id = "i".repeat(MAX_ID_CHARS + 1);
+        assert!(!valid_snippet(&long_id));
+        long_id.id = "a\nb".into();
+        assert!(!valid_snippet(&long_id), "no control characters in an id");
+        // Pinning from this side says so in words.
+        let error = add_snippet(&"x".repeat(MAX_SNIPPET_BYTES + 1)).unwrap_err();
+        assert!(error.contains("16 KB"), "{error}");
+        assert!(add_snippet("   \n").is_err());
+        assert_eq!((MAX_SNIPPETS, MAX_NOTES), (500, 2000));
+    }
+
     #[test]
     fn a_peer_cannot_grow_the_shelf_past_its_bounds() {
         let mut shelf = Shelf::default();

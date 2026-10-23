@@ -579,7 +579,7 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
 
     let weak = app.downgrade();
     let connection = connection.clone();
-    glib::timeout_add_seconds_local(1, move || {
+    crate::ticker::every_tick(move || {
         crate::guard("top-bar tick", glib::ControlFlow::Continue, || {
             let Some(app) = weak.upgrade().filter(|app| !app.is_remote()) else {
                 return glib::ControlFlow::Break;

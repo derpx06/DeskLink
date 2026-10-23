@@ -49,6 +49,8 @@ const PENDING_MAX: usize = 256;
 const MOTION_EVERY: Duration = Duration::from_millis(4);
 /// How often the worker re-reads the setting and the phone's link.
 const CHECK_EVERY: Duration = Duration::from_millis(250);
+/// The worker's nap while a session is armed but the pointer is here.
+const ARMED_NAP: Duration = Duration::from_millis(50);
 /// Re-arming the barrier (after the compositor disabled it) at most this
 /// often per minute; then glide stops with a reason instead of looping.
 const REARMS_PER_MINUTE: usize = 6;
@@ -288,6 +290,9 @@ struct Glide {
     motion: (f64, f64),
     motion_sent: Option<Instant>,
     dropped: u64,
+    /// The left button is down on the phone (a drag): every way out lets it
+    /// go first, so the phone is never left holding a touch.
+    left_down: bool,
 }
 
 impl Glide {
@@ -301,7 +306,15 @@ impl Glide {
             motion: (0.0, 0.0),
             motion_sent: None,
             dropped: 0,
+            left_down: false,
         }
+    }
+
+    /// The release of a held left button, once, as the first thing sent when
+    /// the pointer leaves the phone.
+    fn let_go(&mut self) -> Option<Out> {
+        std::mem::take(&mut self.left_down)
+            .then(|| Out::Send(mousepad(|packet| packet.set("singlerelease", true))))
     }
 
     #[cfg(test)]
@@ -338,7 +351,10 @@ impl Glide {
         if self.active.take().is_none() {
             return Vec::new();
         }
-        vec![Out::Send(Self::taken_back()), Out::Gliding(false)]
+        let mut out: Vec<Out> = self.let_go().into_iter().collect();
+        out.push(Out::Send(Self::taken_back()));
+        out.push(Out::Gliding(false));
+        out
     }
 
     /// G4: the desk takes the pointer back (Esc+Super, link down, glide
@@ -349,11 +365,13 @@ impl Glide {
             return Vec::new();
         };
         let (x, y) = self.barrier.inside(self.crossed.0, self.crossed.1);
-        vec![
+        let mut out: Vec<Out> = self.let_go().into_iter().collect();
+        out.extend([
             Out::Send(Self::taken_back()),
             Out::Release { activation, x, y },
             Out::Gliding(false),
-        ]
+        ]);
+        out
     }
 
     fn taken_back() -> NetworkPacket {
@@ -369,7 +387,9 @@ impl Glide {
             return Vec::new();
         };
         let (x, y) = self.barrier.release_point(dx, dy);
-        vec![Out::Release { activation, x, y }, Out::Gliding(false)]
+        let mut out: Vec<Out> = self.let_go().into_iter().collect();
+        out.extend([Out::Release { activation, x, y }, Out::Gliding(false)]);
+        out
     }
 
     /// Motion waiting longer than [`MOTION_EVERY`] goes out.
@@ -425,8 +445,14 @@ impl Glide {
         match captured {
             Captured::Button(code, pressed) => {
                 let key = match (code, pressed) {
-                    (BTN_LEFT, true) => "singlehold",
-                    (BTN_LEFT, false) => "singlerelease",
+                    (BTN_LEFT, true) => {
+                        self.left_down = true;
+                        "singlehold"
+                    }
+                    (BTN_LEFT, false) => {
+                        self.left_down = false;
+                        "singlerelease"
+                    }
                     (BTN_RIGHT, true) => "rightclick",
                     (BTN_MIDDLE, true) => "middleclick",
                     (BTN_SIDE, true) => "backclick",
@@ -595,8 +621,13 @@ fn set_status(change: impl FnOnce(&mut Status)) {
 /// What reaches the worker.
 #[derive(Debug)]
 enum Command {
-    Captured(Captured),
-    Released { device: String, dx: f64, dy: f64 },
+    /// From the EIS reader of session `generation`.
+    Captured(u64, Captured),
+    Released {
+        device: String,
+        dx: f64,
+        dy: f64,
+    },
 }
 
 fn queue() -> &'static OnceLock<SyncSender<Command>> {
@@ -653,6 +684,24 @@ fn release_deltas(packet: &NetworkPacket) -> Option<(f64, f64)> {
     Some((number("releaseDeltax")?, number("releaseDeltay")?))
 }
 
+/// A reader's end is never dropped for a full queue: the worker waits for
+/// room (the reader has nothing else to do), so a dead reader is always
+/// noticed and the pointer released.
+fn send_closed(generation: u64) -> bool {
+    queue().get().is_some_and(|sender| {
+        sender
+            .send(Command::Captured(generation, Captured::Closed))
+            .is_ok()
+    })
+}
+
+/// Whether an event from reader `from` belongs to the session now open: the
+/// reader of a session that was just closed reports its end a moment later,
+/// and that must not stop the new one.
+fn is_current(from: u64, session: Option<u64>) -> bool {
+    session == Some(from)
+}
+
 fn send_command(command: Command) -> bool {
     let Some(sender) = queue().get() else {
         return false;
@@ -679,6 +728,9 @@ enum Signal {
 
 /// The live InputCapture session. Dropping it closes it.
 struct Portal {
+    /// Told to this session's EIS reader, so a late word from an older one
+    /// is ignored.
+    generation: u64,
     connection: gio::DBusConnection,
     handle: String,
     signals: std::rc::Rc<std::cell::RefCell<VecDeque<Signal>>>,
@@ -713,7 +765,10 @@ impl Portal {
             .ok_or_else(|| "The desktop did not start input capture".to_string())?;
         let granted = lookup::<u32>(&created, "capabilities")?.unwrap_or(0);
         let signals = std::rc::Rc::new(std::cell::RefCell::new(VecDeque::new()));
+        static GENERATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let generation = GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut portal = Self {
+            generation,
             connection: connection.clone(),
             handle,
             signals,
@@ -726,8 +781,12 @@ impl Portal {
         }
         portal.subscribe();
         let socket = portal.connect_to_eis()?;
-        eis::spawn_receiver(socket, "DeskLink", |captured| {
-            send_command(Command::Captured(captured))
+        eis::spawn_receiver(socket, "DeskLink", move |captured| {
+            if matches!(captured, Captured::Closed) {
+                send_closed(generation)
+            } else {
+                send_command(Command::Captured(generation, captured))
+            }
         })?;
         Ok(portal)
     }
@@ -991,6 +1050,15 @@ fn test_device(device: &str) -> bool {
     device.starts_with("e2e-") || device.starts_with("fake")
 }
 
+/// How long the phone has been silent (a test device never is).
+fn inbound_silence(device: &str) -> Option<Duration> {
+    #[cfg(debug_assertions)]
+    if test_device(device) {
+        return None;
+    }
+    crate::device_links::desk_features::inbound_silence(device)
+}
+
 /// Whether the phone's link is ready (debug builds: or a test device).
 fn ready(device: &str) -> bool {
     #[cfg(debug_assertions)]
@@ -1145,6 +1213,126 @@ fn perform(device: Option<&str>, outs: Vec<Out>, portal: Option<&mut Portal>) {
     }
 }
 
+/// Asked by [`shutdown`]: the worker releases everything and ends.
+static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set by the worker once it has released and closed everything.
+static ENDED: (Mutex<bool>, std::sync::Condvar) = (Mutex::new(false), std::sync::Condvar::new());
+
+/// How long [`shutdown`] waits for the pointer to be given back.
+const SHUTDOWN_WAIT: Duration = Duration::from_millis(2_500);
+
+/// How long a phone may be silent while the pointer is on it. A phone that
+/// is there answers the desk's 5 s liveness probe at once (the desk is the
+/// one talking during glide), so silence past the probe's time plus three
+/// seconds means the link is gone: the pointer comes back then, instead of
+/// waiting out the 15 s the general rule allows.
+pub(crate) const GLIDE_SILENT_AFTER: Duration =
+    Duration::from_secs(crate::device_links::webrtc::coordinator::PEER_PROBE_AFTER.as_secs() + 3);
+
+/// Whether a phone the pointer is on has gone quiet for too long.
+fn link_silent(gliding: bool, silence: Option<Duration>) -> bool {
+    gliding && silence.is_some_and(|silence| silence > GLIDE_SILENT_AFTER)
+}
+
+/// The app is quitting: if the pointer is on the phone, tell the phone and
+/// give the pointer back, then close the capture session. Bounded; a
+/// compositor that does not answer cannot hold the app open.
+pub(crate) fn shutdown() {
+    if queue().get().is_none() {
+        return;
+    }
+    SHUTDOWN.store(true, std::sync::atomic::Ordering::Release);
+    let Ok(mut ended) = ENDED.0.lock() else {
+        return;
+    };
+    let deadline = Instant::now() + SHUTDOWN_WAIT;
+    while !*ended {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match ENDED.1.wait_timeout(ended, left) {
+            Ok((guard, _)) => ended = guard,
+            Err(_) => return,
+        }
+    }
+}
+
+/// Everything the worker holds between turns.
+struct State {
+    portal: Option<Portal>,
+    glide: Option<Glide>,
+    /// The setting the session was made for.
+    current: Option<GlideSetting>,
+    /// The user (or the desktop) said no to it: not asked again until the
+    /// setting changes.
+    refused: bool,
+    /// Arming failed this many times in a row, and when to try again.
+    arm_failures: u32,
+    retry_at: Option<Instant>,
+}
+
+/// What a failed arming leads to: the desktop may be busy for a moment (a
+/// lock screen, a portal restarting), so it is tried again a few times, then
+/// glide says it is not working and waits for the user.
+#[derive(Debug, PartialEq, Eq)]
+enum ArmNext {
+    Retry(Duration),
+    GiveUp,
+}
+
+const ARM_RETRIES: u32 = 3;
+const ARM_RETRY_AFTER: Duration = Duration::from_secs(5);
+
+fn after_arm_error(failures: u32) -> ArmNext {
+    if failures < ARM_RETRIES {
+        ArmNext::Retry(ARM_RETRY_AFTER)
+    } else {
+        ArmNext::GiveUp
+    }
+}
+
+impl State {
+    /// Every way out ends here: the pointer goes back where it crossed, the
+    /// phone is told, the session is disabled and closed. Used when the
+    /// worker ends, however it ends.
+    fn release_all(&mut self) {
+        let back = self
+            .glide
+            .as_mut()
+            .map(Glide::take_back)
+            .unwrap_or_default();
+        perform(
+            self.current.as_ref().map(|setting| setting.device.as_str()),
+            back,
+            self.portal.as_mut(),
+        );
+        if let Some(mut portal) = self.portal.take() {
+            portal.disable();
+        }
+        self.glide = None;
+        set_status(|status| status.gliding = None);
+    }
+}
+
+/// How long the worker sleeps for the next event: short while the pointer
+/// may be on the phone (motion is coalesced to [`MOTION_EVERY`]) or a
+/// session is armed (its signals are only read between sleeps), long while
+/// glide is off, which is nearly always.
+fn nap(state: &State) -> Duration {
+    if state
+        .glide
+        .as_ref()
+        .is_some_and(|glide| glide.active.is_some())
+    {
+        MOTION_EVERY
+    } else if state.portal.is_some() {
+        ARMED_NAP
+    } else {
+        CHECK_EVERY
+    }
+}
+
 fn worker(context: &glib::MainContext, commands: &Receiver<Command>) {
     let connection = match gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) {
         Ok(connection) => connection,
@@ -1152,35 +1340,72 @@ fn worker(context: &glib::MainContext, commands: &Receiver<Command>) {
             set_status(|status| {
                 status.availability = Availability::Unavailable("The desktop bus is not running")
             });
+            end_worker();
             return;
         }
     };
     let availability = check_availability(&connection);
     set_status(|status| status.availability = availability.clone());
     if availability != Availability::Available {
+        end_worker();
         return;
     }
-    let mut portal: Option<Portal> = None;
-    let mut glide: Option<Glide> = None;
-    // The setting the session was made for, and whether the user (or the
-    // desktop) said no to it: not asked again until the setting changes.
-    let mut current: Option<GlideSetting> = None;
-    let mut refused = false;
+    let mut state = State {
+        portal: None,
+        glide: None,
+        current: None,
+        refused: false,
+        arm_failures: 0,
+        retry_at: None,
+    };
+    // A panic must not leave the pointer captured, nor the top bar saying
+    // glide is on: release, then say glide stopped.
+    let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run(context, commands, &connection, &mut state)
+    }));
+    state.release_all();
+    if ran.is_err() {
+        eprintln!("[DeskLink] Glide failed; the pointer was given back");
+        set_status(|status| {
+            status.availability = Availability::Unavailable("Glide stopped working");
+        });
+    }
+    end_worker();
+}
+
+fn end_worker() {
+    if let Ok(mut ended) = ENDED.0.lock() {
+        *ended = true;
+        ENDED.1.notify_all();
+    }
+}
+
+fn run(
+    context: &glib::MainContext,
+    commands: &Receiver<Command>,
+    connection: &gio::DBusConnection,
+    state: &mut State,
+) {
     let mut checked = Instant::now() - CHECK_EVERY;
     loop {
+        if SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) {
+            break;
+        }
         let mut outs = Vec::new();
         // Up to QUEUE events per turn, then the rest of the loop runs.
-        let first = commands.recv_timeout(MOTION_EVERY);
+        let first = commands.recv_timeout(nap(state));
         if matches!(first, Err(mpsc::RecvTimeoutError::Disconnected)) {
             break;
         }
-        let device = current.as_ref().map(|setting| setting.device.clone());
+        let device = state.current.as_ref().map(|setting| setting.device.clone());
+        let session = state.portal.as_ref().map(|portal| portal.generation);
         let mut events = Vec::new();
         for command in first.into_iter().chain(commands.try_iter().take(QUEUE)) {
             match command {
-                Command::Captured(Captured::Closed) => events.push(Event::ReaderClosed),
-                Command::Captured(captured) => {
-                    if let Some(glide) = glide.as_mut() {
+                Command::Captured(from, _) if !is_current(from, session) => {}
+                Command::Captured(_, Captured::Closed) => events.push(Event::ReaderClosed),
+                Command::Captured(_, captured) => {
+                    if let Some(glide) = state.glide.as_mut() {
                         outs.extend(glide.input(captured, &desk_key, Instant::now()));
                     }
                 }
@@ -1190,7 +1415,7 @@ fn worker(context: &glib::MainContext, commands: &Receiver<Command>) {
                     dy,
                 } => {
                     if device.as_deref() == Some(from.as_str()) {
-                        if let Some(glide) = glide.as_mut() {
+                        if let Some(glide) = state.glide.as_mut() {
                             outs.extend(glide.phone_released(dx, dy));
                         }
                     }
@@ -1200,125 +1425,180 @@ fn worker(context: &glib::MainContext, commands: &Receiver<Command>) {
         while context.pending() {
             context.iteration(false);
         }
-        let signals: Vec<Signal> = portal
+        let signals: Vec<Signal> = state
+            .portal
             .as_ref()
             .map(|portal| portal.signals.borrow_mut().drain(..).collect())
             .unwrap_or_default();
         events.extend(signals.into_iter().map(Event::Signal));
         for event in events {
-            let (more, after) = react(event, glide.as_mut());
+            let (more, after) = react(event, state.glide.as_mut());
             outs.extend(more);
             if after == After::Keep {
                 continue;
             }
             // The Release first, while the session that captured is open.
             perform(
-                current.as_ref().map(|setting| setting.device.as_str()),
+                state
+                    .current
+                    .as_ref()
+                    .map(|setting| setting.device.as_str()),
                 std::mem::take(&mut outs),
-                portal.as_mut(),
+                state.portal.as_mut(),
             );
             match after {
                 After::Keep => {}
                 After::Rearm => {
-                    if let Some(portal) = portal.as_mut() {
+                    if let Some(portal) = state.portal.as_mut() {
                         portal.disable();
                     }
                 }
                 After::Close(problem) => {
-                    if let Some(mut closing) = portal.take() {
+                    if let Some(mut closing) = state.portal.take() {
                         closing.disable();
                     }
-                    glide = None;
-                    refused = true;
-                    set_status(|status| status.problem = Some(problem.to_string()));
+                    state.glide = None;
+                    state.refused = true;
+                    set_status(|status| {
+                        status.gliding = None;
+                        status.problem = Some(problem.to_string());
+                    });
                 }
             }
         }
-        if let Some(glide) = glide.as_mut() {
+        if let Some(glide) = state.glide.as_mut() {
             outs.extend(glide.tick(Instant::now()));
         }
 
         if checked.elapsed() >= CHECK_EVERY {
             checked = Instant::now();
-            let setting = crate::device_links::config::app_settings().glide;
-            if setting != current {
-                // Done now, for the phone it was set for, while the
-                // session that captured is still open.
-                let mut back = std::mem::take(&mut outs);
-                if let Some(glide) = glide.as_mut() {
-                    back.extend(glide.take_back());
-                }
-                perform(
-                    current.as_ref().map(|setting| setting.device.as_str()),
-                    back,
-                    portal.as_mut(),
-                );
-                // Another phone or off: a new session (and consent) for it.
-                if setting.as_ref().map(|s| &s.device) != current.as_ref().map(|s| &s.device) {
-                    portal = None;
-                }
-                if let Some(portal) = portal.as_mut() {
-                    // A new edge: barriers are replaced on a disabled session.
-                    portal.disable();
-                    portal.armed_at.clear();
-                }
-                current = setting.clone();
-                refused = false;
-                set_status(|status| status.problem = None);
-            }
-            let want = !refused
-                && current
-                    .as_ref()
-                    .is_some_and(|setting| ready(&setting.device));
-            if want && portal.is_none() {
-                match Portal::open(context, &connection) {
-                    Ok(opened) => portal = Some(opened),
-                    Err(error) => {
-                        log_limited("open", &error);
-                        refused = true;
-                        set_status(|status| status.problem = Some(plain(&error)));
-                    }
-                }
-            }
-            if let (Some(open), Some(setting)) = (portal.as_mut(), current.as_ref()) {
-                if want && !open.enabled {
-                    match open.arm(context, setting.edge) {
-                        Ok(barrier) => {
-                            glide = Some(Glide::new(barrier));
-                            set_status(|status| status.problem = None);
-                        }
-                        Err(error) => {
-                            log_limited("arm", &error);
-                            refused = true;
-                            set_status(|status| status.problem = Some(plain(&error)));
-                        }
-                    }
-                } else if !want && open.enabled {
-                    // The Release (and telling the phone) before Disable.
-                    let mut back = std::mem::take(&mut outs);
-                    if let Some(glide) = glide.as_mut() {
-                        back.extend(glide.take_back());
-                    }
-                    perform(Some(setting.device.as_str()), back, Some(&mut *open));
-                    open.disable();
-                }
-            }
-            if current.is_none() {
-                portal = None;
-                glide = None;
-            }
+            check(context, connection, state, &mut outs);
         }
 
-        let target = current.as_ref().map(|setting| setting.device.clone());
-        perform(target.as_deref(), outs, portal.as_mut());
-        if glide.as_ref().is_some_and(|glide| glide.dropped > 0) {
-            if let Some(glide) = glide.as_mut() {
+        let target = state.current.as_ref().map(|setting| setting.device.clone());
+        perform(target.as_deref(), outs, state.portal.as_mut());
+        if let Some(glide) = state.glide.as_mut() {
+            if glide.dropped > 0 {
                 log_limited("pending", "Input before the capture started was dropped");
                 glide.dropped = 0;
             }
         }
     }
-    set_status(|status| status.gliding = None);
+}
+
+/// Every [`CHECK_EVERY`]: the setting and the link are compared with what
+/// the session was made for, and the session follows.
+fn check(
+    context: &glib::MainContext,
+    connection: &gio::DBusConnection,
+    state: &mut State,
+    outs: &mut Vec<Out>,
+) {
+    let setting = crate::device_links::config::app_settings().glide;
+    if setting != state.current {
+        // Done now, for the phone it was set for, while the session that
+        // captured is still open.
+        let mut back = std::mem::take(outs);
+        if let Some(glide) = state.glide.as_mut() {
+            back.extend(glide.take_back());
+        }
+        perform(
+            state
+                .current
+                .as_ref()
+                .map(|setting| setting.device.as_str()),
+            back,
+            state.portal.as_mut(),
+        );
+        // Another phone or off: a new session (and consent) for it.
+        if setting.as_ref().map(|s| &s.device) != state.current.as_ref().map(|s| &s.device) {
+            state.portal = None;
+            state.glide = None;
+        }
+        if let Some(portal) = state.portal.as_mut() {
+            // A new edge: barriers are replaced on a disabled session.
+            portal.disable();
+            portal.armed_at.clear();
+            state.glide = None;
+        }
+        state.current = setting;
+        state.refused = false;
+        state.arm_failures = 0;
+        state.retry_at = None;
+        set_status(|status| {
+            status.problem = None;
+            status.gliding = None;
+        });
+    }
+    let gliding = state
+        .glide
+        .as_ref()
+        .is_some_and(|glide| glide.active.is_some());
+    let silent = link_silent(
+        gliding,
+        state
+            .current
+            .as_ref()
+            .and_then(|setting| inbound_silence(&setting.device)),
+    );
+    let want = !state.refused
+        && !silent
+        && state
+            .current
+            .as_ref()
+            .is_some_and(|setting| ready(&setting.device));
+    if want && state.portal.is_none() {
+        match Portal::open(context, connection) {
+            Ok(opened) => state.portal = Some(opened),
+            Err(error) => {
+                log_limited("open", &error);
+                state.refused = true;
+                set_status(|status| status.problem = Some(plain(&error)));
+            }
+        }
+    }
+    if let (Some(open), Some(setting)) = (state.portal.as_mut(), state.current.as_ref()) {
+        if want && !open.enabled && state.retry_at.is_none_or(|at| Instant::now() >= at) {
+            match open.arm(context, setting.edge) {
+                Ok(barrier) => {
+                    state.glide = Some(Glide::new(barrier));
+                    state.arm_failures = 0;
+                    state.retry_at = None;
+                    set_status(|status| status.problem = None);
+                }
+                Err(error) => {
+                    log_limited("arm", &error);
+                    state.arm_failures += 1;
+                    // The rate limit is the desktop turning glide off over
+                    // and over: not retried.
+                    let next = if error.contains("keeps turning glide off") {
+                        ArmNext::GiveUp
+                    } else {
+                        after_arm_error(state.arm_failures)
+                    };
+                    match next {
+                        ArmNext::Retry(after) => state.retry_at = Some(Instant::now() + after),
+                        ArmNext::GiveUp => {
+                            state.refused = true;
+                            set_status(|status| status.problem = Some(plain(&error)));
+                        }
+                    }
+                }
+            }
+        } else if !want && open.enabled {
+            // The Release (and telling the phone) before Disable.
+            let mut back = std::mem::take(outs);
+            if let Some(glide) = state.glide.as_mut() {
+                back.extend(glide.take_back());
+            }
+            perform(Some(setting.device.as_str()), back, Some(&mut *open));
+            open.disable();
+        }
+    }
+    if state.current.is_none() {
+        state.portal = None;
+        state.glide = None;
+    }
 }
 
 #[cfg(test)]
@@ -1641,6 +1921,115 @@ mod tests {
         assert!(outs.is_empty() && matches!(after, After::Close(_)));
         let (_, after) = react(Event::Signal(Signal::Disabled), Some(&mut live()));
         assert_eq!(after, After::Rearm);
+    }
+
+    /// A drag in progress when the pointer comes back by any road: the phone
+    /// is told the button is up before anything else.
+    #[test]
+    fn a_held_button_is_let_go_on_every_way_out() {
+        let held = || {
+            let mut glide = Glide::new(Barrier::on(Edge::Right, &screen()).unwrap());
+            glide.activated(3, (1600.0, 200.0), &keys, Instant::now());
+            glide.input(Captured::Button(BTN_LEFT, true), &keys, Instant::now());
+            assert!(glide.left_down);
+            glide
+        };
+        let released = |outs: &[Out]| {
+            sent(outs)
+                .first()
+                .is_some_and(|body| body["singlerelease"] == true)
+        };
+        assert!(released(&held().take_back()));
+        assert!(released(&held().deactivated()));
+        assert!(released(&held().phone_released(0.0, 10.0)));
+        // Up before the way out: nothing extra.
+        let mut glide = held();
+        glide.input(Captured::Button(BTN_LEFT, false), &keys, Instant::now());
+        assert!(!released(&glide.take_back()));
+        // Once only.
+        let mut glide = held();
+        glide.take_back();
+        assert!(glide.let_go().is_none());
+    }
+
+    /// The reader of a session that was closed reports its end a moment
+    /// later; that must not stop the session opened since.
+    #[test]
+    fn a_late_word_from_an_old_reader_is_ignored() {
+        assert!(is_current(4, Some(4)));
+        assert!(!is_current(3, Some(4)));
+        assert!(!is_current(4, None));
+    }
+
+    /// The worker ending, for any reason, gives the pointer back and clears
+    /// what the top bar shows.
+    #[test]
+    fn ending_the_worker_releases_a_capture_that_is_live() {
+        let mut glide = Glide::new(Barrier::on(Edge::Right, &screen()).unwrap());
+        glide.activated(9, (1600.0, 200.0), &keys, Instant::now());
+        let mut state = State {
+            portal: None,
+            glide: Some(glide),
+            current: Some(GlideSetting {
+                device: "e2e-release-all".into(),
+                edge: Edge::Right,
+            }),
+            refused: false,
+            arm_failures: 0,
+            retry_at: None,
+        };
+        set_status(|status| status.gliding = Some("e2e-release-all".into()));
+        state.release_all();
+        assert!(state.glide.is_none() && state.portal.is_none());
+        assert_eq!(status().gliding, None);
+    }
+
+    /// A desktop that is busy for a moment is asked again; one that keeps
+    /// failing is given up on, with a reason shown.
+    #[test]
+    fn arming_is_retried_a_few_times_then_given_up() {
+        assert_eq!(after_arm_error(1), ArmNext::Retry(ARM_RETRY_AFTER));
+        assert_eq!(after_arm_error(2), ArmNext::Retry(ARM_RETRY_AFTER));
+        assert_eq!(after_arm_error(ARM_RETRIES), ArmNext::GiveUp);
+        assert_eq!(after_arm_error(ARM_RETRIES + 5), ArmNext::GiveUp);
+    }
+
+    /// A link that went quiet under the pointer gives it back; a quiet phone
+    /// the pointer is not on is simply idle.
+    #[test]
+    fn a_quiet_link_under_the_pointer_gives_it_back() {
+        let quiet = Some(GLIDE_SILENT_AFTER + Duration::from_millis(1));
+        assert!(link_silent(true, quiet));
+        assert!(!link_silent(false, quiet), "idle, not gone");
+        assert!(!link_silent(true, Some(Duration::from_secs(5))));
+        assert!(!link_silent(true, None));
+        // Longer than the liveness probe, shorter than the 15 s rebuild.
+        assert!(GLIDE_SILENT_AFTER > crate::device_links::webrtc::coordinator::PEER_PROBE_AFTER);
+        assert!(GLIDE_SILENT_AFTER < crate::device_links::webrtc::coordinator::PEER_DEAD_AFTER);
+    }
+
+    /// Nothing wakes the worker 250 times a second while glide is off.
+    #[test]
+    fn the_worker_sleeps_long_when_glide_is_off() {
+        let mut state = State {
+            portal: None,
+            glide: None,
+            current: None,
+            refused: false,
+            arm_failures: 0,
+            retry_at: None,
+        };
+        assert_eq!(nap(&state), CHECK_EVERY);
+        let mut glide = Glide::new(Barrier::on(Edge::Right, &screen()).unwrap());
+        state.glide = Some(Glide::new(Barrier::on(Edge::Right, &screen()).unwrap()));
+        assert_eq!(
+            nap(&state),
+            CHECK_EVERY,
+            "armed without a portal is still off"
+        );
+        glide.activated(1, (1600.0, 1.0), &keys, Instant::now());
+        state.glide = Some(glide);
+        assert_eq!(nap(&state), MOTION_EVERY);
     }
 
     #[test]

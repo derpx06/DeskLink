@@ -2036,7 +2036,14 @@ fn run(context: &gtk::glib::MainContext, dir: PathBuf, messages: &Receiver<Messa
     }
     worker.publish();
     loop {
-        match messages.recv_timeout(Duration::from_millis(500)) {
+        // Twice a second while a Bucket is on (file changes, transfers);
+        // every few seconds with none, when only a message can matter.
+        let nap = if worker.pairs.is_empty() {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(500)
+        };
+        match messages.recv_timeout(nap) {
             Ok(message) => worker.handle(message),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,

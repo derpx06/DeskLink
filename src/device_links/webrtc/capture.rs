@@ -19,6 +19,8 @@ pub(crate) const KINDS: [&str; 4] = ["photo", "scan", "text", "qr"];
 /// The phone gives up after 120 s; the desk forgets a capture a little
 /// after that, in case its cancellation never arrived.
 const FORGET_AFTER: Duration = Duration::from_secs(150);
+/// Notices kept for a window that is not there.
+const MAX_NOTICES: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Capture {
@@ -37,11 +39,22 @@ static SESSIONS: Mutex<Option<HashMap<String, Capture>>> = Mutex::new(None);
 static NOTICES: Mutex<Vec<DaemonEvent>> = Mutex::new(Vec::new());
 
 fn with<R>(run: impl FnOnce(&mut HashMap<String, Capture>) -> R) -> Option<R> {
-    SESSIONS.lock().ok().map(|mut sessions| {
+    let mut forgotten = 0;
+    let result = SESSIONS.lock().ok().map(|mut sessions| {
         let sessions = sessions.get_or_insert_with(HashMap::new);
+        let before = sessions.len();
         sessions.retain(|_, capture| capture.started.elapsed() < FORGET_AFTER);
+        forgotten = before - sessions.len();
         run(sessions)
-    })
+    });
+    // A capture nobody answered ends with a word, not by vanishing.
+    for _ in 0..forgotten {
+        notify(DaemonEvent::CaptureNotice {
+            device_id: String::new(),
+            message: "The phone did not answer in time".to_string(),
+        });
+    }
+    result
 }
 
 /// The phone's open capture, for the window.
@@ -189,6 +202,11 @@ pub(crate) fn reason_words(phone: &str, reason: Option<&str>) -> Option<String> 
 
 pub(crate) fn notify(event: DaemonEvent) {
     if let Ok(mut notices) = NOTICES.lock() {
+        // The window takes them once a second; with none open they must not
+        // pile up.
+        if notices.len() >= MAX_NOTICES {
+            notices.remove(0);
+        }
         notices.push(event);
     }
     crate::device_links::daemon::state::wake_ui();
@@ -256,9 +274,30 @@ pub(crate) fn wifi(text: &str) -> Option<Wifi> {
     })
 }
 
+/// What NetworkManager would refuse, said in plain words first: a name over
+/// 32 bytes, a WPA passphrase that is not 8 to 63 characters (or 64 hex
+/// digits), a WEP key of the wrong length.
+fn check_wifi(network: &Wifi) -> Result<(), String> {
+    if network.ssid.len() > 32 {
+        return Err("That network's name is too long to be a Wi-Fi network".to_string());
+    }
+    let key = network.password.as_str();
+    let hex64 = key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit());
+    match network.security.as_str() {
+        "WPA" if !(8..=63).contains(&key.chars().count()) && !hex64 => {
+            Err("That Wi-Fi password is not a valid one (8 to 63 characters)".to_string())
+        }
+        "WEP" if !matches!(key.len(), 5 | 10 | 13 | 26) => {
+            Err("That Wi-Fi key is not a valid one".to_string())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Joins a Wi-Fi network through NetworkManager (the user asked, from a QR
 /// code the phone scanned): a new connection on the first Wi-Fi device.
 pub fn join_wifi(network: &Wifi) -> Result<(), String> {
+    check_wifi(network)?;
     use gtk::gio;
     use gtk::glib::{self, prelude::ToVariant};
     let bus = gio::bus_get_sync(gio::BusType::System, None::<&gio::Cancellable>)
@@ -361,6 +400,13 @@ mod tests {
     use super::*;
     use crate::device_links::webrtc::WebRtcWireBinding;
 
+    /// The notices are one queue for the whole process: tests that read it
+    /// take turns.
+    fn notices_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn build(kind: ControlKind, id: &str, sequence: i64) -> ControlMessage {
         let wire = WebRtcWireBinding::from_attempt(
             "desktop",
@@ -408,6 +454,7 @@ mod tests {
 
     #[test]
     fn a_photo_waits_for_its_file_and_a_cancel_says_why() {
+        let _turn = notices_lock();
         let request = begin("cap-b", "photo", "file", &build);
         let id = request.remote_session_id.clone();
         let mut result = build(ControlKind::CaptureResult, &id, 1);
@@ -439,6 +486,68 @@ mod tests {
         assert_eq!(cancelled.remote_session_id, third.remote_session_id);
         assert_eq!(cancelled.reason.as_deref(), Some("user"));
         assert!(cancel("cap-b", &build).is_none());
+    }
+
+    #[test]
+    fn a_capture_nobody_answered_ends_with_a_word() {
+        let _turn = notices_lock();
+        take_notices();
+        with(|sessions| {
+            sessions.insert(
+                "slow-phone".into(),
+                Capture {
+                    id: "c".into(),
+                    kind: "photo".into(),
+                    target: "clipboard".into(),
+                    receiving: false,
+                    phone: String::new(),
+                    started: Instant::now() - FORGET_AFTER - Duration::from_secs(1),
+                    sequence: 1,
+                },
+            );
+        });
+        assert!(status("slow-phone").is_none());
+        let notices = take_notices();
+        assert!(notices.iter().any(|event| matches!(
+            event,
+            DaemonEvent::CaptureNotice { message, .. } if message.contains("did not answer")
+        )));
+    }
+
+    #[test]
+    fn a_wifi_code_nobody_could_join_is_refused_in_plain_words() {
+        let network = |security: &str, ssid: &str, password: &str| Wifi {
+            ssid: ssid.into(),
+            security: security.into(),
+            password: password.into(),
+            hidden: false,
+        };
+        assert!(check_wifi(&network("WPA", "home", "correct horse")).is_ok());
+        assert!(check_wifi(&network("WPA", "home", &"f".repeat(64))).is_ok());
+        assert!(check_wifi(&network("", "cafe", "")).is_ok());
+        assert!(check_wifi(&network("WPA", "home", "short")).is_err());
+        assert!(check_wifi(&network("WPA", "home", &"x".repeat(64))).is_err());
+        assert!(check_wifi(&network("WPA", &"n".repeat(33), "correct horse")).is_err());
+        assert!(check_wifi(&network("WEP", "old", "12345")).is_ok());
+        assert!(check_wifi(&network("WEP", "old", "123")).is_err());
+    }
+
+    #[test]
+    fn notices_for_a_window_that_is_not_there_do_not_pile_up() {
+        let _turn = notices_lock();
+        take_notices();
+        for index in 0..(MAX_NOTICES * 3) {
+            notify(DaemonEvent::CaptureNotice {
+                device_id: "p".into(),
+                message: index.to_string(),
+            });
+        }
+        let kept = take_notices();
+        assert_eq!(kept.len(), MAX_NOTICES);
+        assert!(matches!(
+            kept.last(),
+            Some(DaemonEvent::CaptureNotice { message, .. }) if *message == (MAX_NOTICES * 3 - 1).to_string()
+        ));
     }
 
     #[test]

@@ -50,10 +50,36 @@ pub(super) fn heartbeat_dead(dozing: bool) -> std::time::Duration {
 /// read every second instead of every five.
 static UI_VISIBLE: AtomicBool = AtomicBool::new(false);
 
-/// The window says whether it is showing (each refresh).
+/// The window says whether it is showing (each refresh, and when it is
+/// shown or hidden).
 pub(crate) fn set_ui_visible(visible: bool) {
     UI_VISIBLE.store(visible, Ordering::Relaxed);
 }
+
+/// Whether any phone is reachable now (set by the status reconciler).
+static PHONES_LIVE: AtomicBool = AtomicBool::new(false);
+
+/// How often the main-loop tickers look at the daemon: every second while a
+/// window shows or a phone is reachable, every five seconds when there is
+/// nothing to show and nobody to talk to (a change in who is reachable wakes
+/// the window at once, so the slow tick is only a safety net).
+pub(crate) fn tick_seconds() -> u32 {
+    tick_for(
+        UI_VISIBLE.load(Ordering::Relaxed),
+        PHONES_LIVE.load(Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn tick_for(window_shown: bool, phone_live: bool) -> u32 {
+    if window_shown || phone_live {
+        1
+    } else {
+        IDLE_TICK_SECONDS
+    }
+}
+
+/// The tick with nothing live.
+pub(crate) const IDLE_TICK_SECONDS: u32 = 5;
 
 /// Reads each connected device's ICE path into its view, logging changes.
 /// Every few seconds, off the UI thread: reading stats waits on webrtcbin.
@@ -260,6 +286,7 @@ impl DaemonWorker {
         thread::spawn(move || {
             let mut stay_awake = power::StayAwake::default();
             let mut tick: u32 = 0;
+            let mut last_reachable: Vec<(String, bool)> = Vec::new();
             while !shutdown.load(Ordering::Acquire) {
                 tick = tick.wrapping_add(1);
                 // Every second while a window shows them, else every five.
@@ -288,7 +315,27 @@ impl DaemonWorker {
                     );
                 }
                 run_liveness_tick(&sessions, &devices);
-                state::reconcile_connection_status(&devices, &sessions.connection_snapshot());
+                let connections = sessions.connection_snapshot();
+                state::reconcile_connection_status(&devices, &connections);
+                // Who is reachable: the tickers slow down when nobody is,
+                // and speed up (and the window refreshes) the moment that
+                // changes.
+                let mut reachable: Vec<(String, bool)> = connections
+                    .iter()
+                    .filter(|connection| connection.is_reachable())
+                    .map(|connection| {
+                        (
+                            connection.device_id.clone(),
+                            connection.feature_transport_ready,
+                        )
+                    })
+                    .collect();
+                reachable.sort();
+                PHONES_LIVE.store(!reachable.is_empty(), Ordering::Relaxed);
+                if reachable != last_reachable {
+                    last_reachable = reachable;
+                    state::wake_ui();
+                }
                 thread::sleep(std::time::Duration::from_millis(1000));
             }
         });

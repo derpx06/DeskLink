@@ -326,9 +326,17 @@ const MAX_IMAGE_SIDE: i32 = 4096;
 /// Bumped each time the X11 CLIPBOARD changes owner (XFixes): an image is
 /// read only after a change, never every second.
 static OWNER_GEN: AtomicU64 = AtomicU64::new(0);
+/// The owner watch is running, so "nothing changed" can be believed.
+static OWNER_WATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Watches CLIPBOARD owner changes on its own X11 connection. Without an X
 /// display nothing is watched and images are not sent from here.
+/// Whether the poll reads the clipboard now: always while the owner is not
+/// watched or a phone is connected; otherwise only after the owner changed.
+fn should_read(watched: bool, generation: u64, read: u64, nobody: bool) -> bool {
+    !(watched && nobody && generation == read)
+}
+
 fn watch_owner_changes() {
     let _ = thread::Builder::new()
         .name("desklink-clip-owner".into())
@@ -364,6 +372,7 @@ fn watch_owner_changes() {
             if watched.is_none() {
                 return;
             }
+            OWNER_WATCHED.store(true, Ordering::Release);
             while let Ok(event) = conn.wait_for_event() {
                 if let Event::XfixesSelectionNotify(_) = event {
                     OWNER_GEN.fetch_add(1, Ordering::AcqRel);
@@ -520,18 +529,45 @@ impl DaemonWorker {
             watch_owner_changes();
             // The owner change last looked at for an image.
             let mut image_gen = OWNER_GEN.load(Ordering::Acquire);
+            // One connection to the clipboard, kept (a new one every second
+            // was most of what an idle DeskLink did), and the owner change
+            // last read for text.
+            let mut handle: Option<arboard::Clipboard> = None;
+            let mut text_gen = u64::MAX;
             while !shutdown.load(Ordering::Acquire) {
                 thread::sleep(Duration::from_millis(1000));
                 if !crate::device_links::config::app_settings().clipboard_sync {
+                    handle = None;
                     continue;
                 }
-
-                let mut clipboard = match arboard::Clipboard::new() {
-                    Ok(c) => c,
-                    Err(_) => continue,
+                // Nobody to share with and the owner has not changed: there
+                // is nothing new to read (the history still records every
+                // copy, since a change always passes here).
+                let generation = OWNER_GEN.load(Ordering::Acquire);
+                if !should_read(
+                    OWNER_WATCHED.load(Ordering::Acquire),
+                    generation,
+                    text_gen,
+                    sessions.current_bindings().is_empty(),
+                ) {
+                    continue;
+                }
+                text_gen = generation;
+                if handle.is_none() {
+                    handle = arboard::Clipboard::new().ok();
+                }
+                let Some(clipboard) = handle.as_mut() else {
+                    continue;
                 };
 
-                let current_text = clipboard.get_text().unwrap_or_default();
+                let current_text = match clipboard.get_text() {
+                    Ok(text) => text,
+                    Err(arboard::Error::ContentNotAvailable) => String::new(),
+                    Err(_) => {
+                        handle = None;
+                        String::new()
+                    }
+                };
                 if current_text.is_empty() {
                     // No text: perhaps an image, read once per copy.
                     let generation = OWNER_GEN.load(Ordering::Acquire);
@@ -539,7 +575,7 @@ impl DaemonWorker {
                         image_gen = generation;
                         let seen = now_ms();
                         if !superseded(seen, REMOTE_AT.load(Ordering::Acquire)) {
-                            if let Some(path) = copied_image(&mut clipboard) {
+                            if let Some(path) = handle.as_mut().and_then(copied_image) {
                                 send_image(&sessions, &path);
                                 if let Some(dir) = path.parent() {
                                     let _ = std::fs::remove_dir_all(dir);
@@ -701,6 +737,17 @@ fn remember_if_sent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_idle_clipboard_is_not_read_until_it_changes() {
+        // Watched, nobody to share with, no change: not read.
+        assert!(!should_read(true, 4, 4, true));
+        // A change, a phone, or no watch at all: read.
+        assert!(should_read(true, 5, 4, true), "the owner changed");
+        assert!(should_read(true, 4, 4, false), "a phone is connected");
+        assert!(should_read(false, 4, 4, true), "no owner watch to trust");
+        assert!(should_read(true, 0, u64::MAX, true), "the first look");
+    }
 
     #[test]
     fn a_copy_counts_as_sent_only_after_a_real_send() {

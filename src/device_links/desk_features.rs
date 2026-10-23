@@ -49,6 +49,11 @@ pub(crate) fn install(
     });
 }
 
+/// How long `device_id` has been silent (no packet of any kind from it).
+pub(crate) fn inbound_silence(device_id: &str) -> Option<std::time::Duration> {
+    DAEMON.get()?.sessions.silence(device_id)
+}
+
 /// The phones with their encrypted connection up.
 pub(crate) fn ready_devices() -> Vec<String> {
     let Some(daemon) = DAEMON.get() else {

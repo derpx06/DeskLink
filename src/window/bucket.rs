@@ -631,6 +631,12 @@ fn fill(win: &DesklinkWindow, page: &gtk::Box, view: &PairView, device: &DeviceV
         page.append(&hint);
     } else {
         page.append(&grid(win, &level, view, device));
+        if let Some(note) = more_note(level.len()) {
+            let note = text(&note, &["caption", "text-dim"]);
+            note.set_wrap(true);
+            note.set_halign(gtk::Align::Center);
+            page.append(&note);
+        }
         let hint = text(
             "Drop files or folders anywhere here, or press Ctrl+V to paste.",
             &["caption", "text-faint"],
@@ -1132,6 +1138,27 @@ fn menu_item(label: &str) -> gtk::Button {
 }
 
 /// What needs the user: a size warning, a held empty folder, a problem.
+/// What the Bucket's size says: a warning from 8 GB, "full" at 10 GB, where
+/// adding more is refused.
+fn size_notice(bytes: u64) -> Option<(String, String)> {
+    if bytes >= folders::BUCKET_FULL_BYTES {
+        Some((
+            "The Bucket is full (10 GB)".to_string(),
+            "Nothing more can be added until you remove something.".to_string(),
+        ))
+    } else if bytes > folders::BUCKET_WARN_BYTES {
+        Some((
+            "The Bucket is getting big".to_string(),
+            format!(
+                "{} of 10 GB — the phone keeps a copy of everything in it.",
+                glib::format_size(bytes)
+            ),
+        ))
+    } else {
+        None
+    }
+}
+
 fn problem_banner(view: &PairView) -> Option<gtk::Box> {
     let (icon, headline, detail, confirm) = match &view.phase {
         Phase::EmptyHeld => (
@@ -1158,15 +1185,10 @@ fn problem_banner(view: &PairView) -> Option<gtk::Box> {
             "Turn on the Bucket in DeskLink on the phone.".to_string(),
             false,
         ),
-        _ if view.bytes > folders::BUCKET_WARN_BYTES => (
-            "drive-harddisk-symbolic",
-            "The Bucket is getting big".to_string(),
-            format!(
-                "{} — the phone keeps a copy of everything in it.",
-                glib::format_size(view.bytes)
-            ),
-            false,
-        ),
+        _ if size_notice(view.bytes).is_some() => {
+            let (headline, detail) = size_notice(view.bytes).unwrap_or_default();
+            ("drive-harddisk-symbolic", headline, detail, false)
+        }
         _ => return None,
     };
     let bar = gtk::Box::builder()
@@ -1250,6 +1272,22 @@ fn empty_zone(device: &DeviceView) -> gtk::Box {
 }
 
 /// Tiles: two a line at 360 px, more as the page allows.
+/// Tiles drawn at once (the grid is built whole, so a big folder must not
+/// cost a page of thousands of widgets); past it, a line says how many more
+/// there are and where they are.
+const MAX_TILES: usize = 300;
+
+/// "Showing 300 of 1,204. The rest are in the folder on this computer." once
+/// a level has more items than are drawn.
+fn more_note(count: usize) -> Option<String> {
+    (count > MAX_TILES).then(|| {
+        format!(
+            "Showing {MAX_TILES} of {count}. The rest are in the Bucket folder on this computer; \
+             put them in folders to see them here."
+        )
+    })
+}
+
 fn grid(
     win: &DesklinkWindow,
     items: &[Item],
@@ -1278,8 +1316,6 @@ fn grid(
             })
             .collect(),
     );
-    /// Tiles drawn; past it, the rest are in Files.
-    const MAX_TILES: usize = 300;
     for item in items.iter().take(MAX_TILES) {
         super::transfers::add_card(&grid, &tile(win, item, &root, device, &files, view));
     }
@@ -2059,6 +2095,24 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_big_folder_says_how_much_is_not_drawn() {
+        use super::*;
+        assert!(more_note(MAX_TILES).is_none());
+        let note = more_note(MAX_TILES + 904).unwrap();
+        assert!(note.contains("300 of 1204"), "{note}");
+    }
+
+    #[test]
+    fn the_size_warns_from_8_gb_and_says_full_at_10() {
+        use super::*;
+        assert!(size_notice(folders::BUCKET_WARN_BYTES).is_none());
+        let (headline, detail) = size_notice(folders::BUCKET_WARN_BYTES + 1).unwrap();
+        assert!(headline.contains("getting big") && detail.contains("of 10 GB"));
+        let (headline, _) = size_notice(folders::BUCKET_FULL_BYTES).unwrap();
+        assert!(headline.contains("full (10 GB)"));
+    }
+
     use super::*;
 
     /// The phone asked for a Bucket: the question shows on the Overview card

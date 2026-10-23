@@ -30,6 +30,9 @@ const LOGICAL_LONG_SIDE: (f64, f64) = (1280.0, 1600.0);
 /// level.
 const KEY_LEFTSHIFT: u32 = 42;
 const KEY_RIGHTALT: u32 = 100;
+/// How long a keysym's key is remembered, and how many are.
+const KEY_TTL: Duration = Duration::from_secs(30);
+const KEY_CACHE_MAX: usize = 1024;
 
 /// Whether this desktop can add a virtual monitor: a Wayland session whose
 /// ScreenCast portal offers the VIRTUAL source type.
@@ -163,8 +166,9 @@ fn try_apply_scale(before: &[String], pixels: (i32, i32)) -> Result<Option<f64>,
     let state = display_config("GetCurrentState", None, Some(CURRENT_STATE))?;
     let serial = state.child_value(0).get::<u32>().unwrap_or(0);
     let monitors = state.child_value(1);
-    // connector -> (current mode id, supported scales)
+    // connector -> (current mode id, supported scales), and its pixel size.
     let mut modes: HashMap<String, (String, Vec<f64>)> = HashMap::new();
+    let mut sizes: Vec<(String, (i32, i32))> = Vec::new();
     for i in 0..monitors.n_children() {
         let monitor = monitors.child_value(i);
         let Some(connector) = monitor
@@ -186,11 +190,14 @@ fn try_apply_scale(before: &[String], pixels: (i32, i32)) -> Result<Option<f64>,
             if current {
                 let id = mode.child_value(0).str().unwrap_or_default().to_string();
                 let scales = mode.child_value(5).get::<Vec<f64>>().unwrap_or_default();
+                let width = mode.child_value(1).get::<i32>().unwrap_or(0);
+                let height = mode.child_value(2).get::<i32>().unwrap_or(0);
+                sizes.push((connector.clone(), (width, height)));
                 modes.insert(connector.clone(), (id, scales));
             }
         }
     }
-    let Some(added) = modes.keys().find(|c| !before.contains(c)).cloned() else {
+    let Some(added) = pick_new(before, &sizes, pixels) else {
         return Ok(None);
     };
     let Some((_, scales)) = modes.get(&added).cloned() else {
@@ -243,17 +250,34 @@ fn try_apply_scale(before: &[String], pixels: (i32, i32)) -> Result<Option<f64>,
     Ok(Some(scale))
 }
 
+/// The monitor the capture created: of the connectors that were not there
+/// before, the one whose size is the phone's (a real monitor plugged in at the
+/// same moment must not get the phone's scale), else the first new one.
+fn pick_new(before: &[String], now: &[(String, (i32, i32))], pixels: (i32, i32)) -> Option<String> {
+    let mut new = now
+        .iter()
+        .filter(|(connector, _)| !before.contains(connector));
+    let first = new.clone().next()?;
+    let same = |size: (i32, i32)| size == pixels || (size.1, size.0) == pixels;
+    new.find(|(_, size)| same(*size))
+        .or(Some(first))
+        .map(|(c, _)| c.clone())
+}
+
 /// The keycode (evdev) and shift level that type `keysym` with the
 /// desktop's keymap, looked up once through GDK on the main thread.
 fn keycode_for(keysym: u32) -> Option<(u32, i32)> {
-    /// keysym → (evdev keycode, level), `None` when no key types it.
-    type Keys = HashMap<u32, Option<(u32, i32)>>;
+    /// keysym → (evdev keycode, level, when), `None` when no key types it.
+    /// An answer lasts [`KEY_TTL`]: the user may switch keyboard layout.
+    type Keys = HashMap<u32, (Option<(u32, i32)>, Instant)>;
     static CACHE: Mutex<Option<Keys>> = Mutex::new(None);
-    if let Some(known) = CACHE
-        .lock()
-        .ok()
-        .and_then(|cache| cache.as_ref().and_then(|cache| cache.get(&keysym).copied()))
-    {
+    if let Some(known) = CACHE.lock().ok().and_then(|cache| {
+        cache
+            .as_ref()
+            .and_then(|cache| cache.get(&keysym).copied())
+            .filter(|(_, at)| at.elapsed() < KEY_TTL)
+            .map(|(found, _)| found)
+    }) {
         return known;
     }
     let (sender, receiver) = std::sync::mpsc::channel();
@@ -272,9 +296,17 @@ fn keycode_for(keysym: u32) -> Option<(u32, i32)> {
             });
         let _ = sender.send(found);
     });
-    let found = receiver.recv_timeout(Duration::from_secs(1)).ok().flatten();
+    // A busy main thread that did not answer is "don't know", never cached
+    // as "no key types this".
+    let Ok(found) = receiver.recv_timeout(Duration::from_secs(1)) else {
+        return None;
+    };
     if let Ok(mut cache) = CACHE.lock() {
-        cache.get_or_insert_with(HashMap::new).insert(keysym, found);
+        let cache = cache.get_or_insert_with(HashMap::new);
+        if cache.len() >= KEY_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(keysym, (found, Instant::now()));
     }
     found
 }
@@ -525,6 +557,45 @@ pub(crate) fn selftest(pixels: (i32, i32)) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_phones_monitor_is_found_among_new_ones() {
+        let before = vec!["eDP-1".to_string()];
+        let now = |list: &[(&str, (i32, i32))]| -> Vec<(String, (i32, i32))> {
+            list.iter().map(|(c, s)| (c.to_string(), *s)).collect()
+        };
+        // Alone: it.
+        let only = now(&[("eDP-1", (1920, 1080)), ("Meta-0", (2400, 1080))]);
+        assert_eq!(
+            pick_new(&before, &only, (2400, 1080)).as_deref(),
+            Some("Meta-0")
+        );
+        // A real monitor plugged in at the same time: the one the phone's size.
+        let both = now(&[
+            ("eDP-1", (1920, 1080)),
+            ("HDMI-1", (3840, 2160)),
+            ("Meta-0", (2400, 1080)),
+        ]);
+        assert_eq!(
+            pick_new(&before, &both, (2400, 1080)).as_deref(),
+            Some("Meta-0")
+        );
+        // Rotated by the compositor: still it.
+        let rotated = now(&[
+            ("eDP-1", (1920, 1080)),
+            ("HDMI-1", (3840, 2160)),
+            ("Meta-0", (1080, 2400)),
+        ]);
+        assert_eq!(
+            pick_new(&before, &rotated, (2400, 1080)).as_deref(),
+            Some("Meta-0")
+        );
+        // Nothing new yet.
+        assert_eq!(
+            pick_new(&before, &now(&[("eDP-1", (1920, 1080))]), (2400, 1080)),
+            None
+        );
+    }
 
     #[test]
     fn the_extended_display_gets_a_readable_logical_size() {

@@ -87,17 +87,19 @@ pub(crate) fn start_watch() {
             .spawn(|| {
                 let mut jobs: HashMap<String, JobWatch> = HashMap::new();
                 loop {
-                    std::thread::sleep(Duration::from_secs(1));
-                    watch_once(&mut jobs);
+                    // Every second while a terminal is open, else every five.
+                    let busy = watch_once(&mut jobs);
+                    std::thread::sleep(Duration::from_secs(if busy { 1 } else { 5 }));
                 }
             });
     });
 }
 
-fn watch_once(jobs: &mut HashMap<String, JobWatch>) {
+/// One look at every terminal's foreground job; whether there is any.
+fn watch_once(jobs: &mut HashMap<String, JobWatch>) -> bool {
     let sessions: Vec<_> = {
         let Ok(registry) = super::registry::registry().lock() else {
-            return;
+            return false;
         };
         registry
             .list()
@@ -107,6 +109,7 @@ fn watch_once(jobs: &mut HashMap<String, JobWatch>) {
     };
     let live = |id: &String| sessions.iter().any(|session| session.id() == id);
     jobs.retain(|id, _| live(id));
+    let any = !sessions.is_empty();
     for session in sessions {
         let Some(shell) = session.shell_pid() else {
             continue;
@@ -128,6 +131,7 @@ fn watch_once(jobs: &mut HashMap<String, JobWatch>) {
             );
         }
     }
+    any
 }
 
 #[cfg(test)]

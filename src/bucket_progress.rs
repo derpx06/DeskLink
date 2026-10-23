@@ -514,7 +514,11 @@ fn schedule(app: glib::WeakRef<crate::application::DesklinkApplication>, delay: 
             return;
         };
         let busy = crate::guard("bucket progress", false, || tick(&strong));
-        schedule(app, if busy { BUSY_TICK } else { IDLE_TICK });
+        // Idle: at the pace of the other tickers (every second while a window
+        // shows or a phone is reachable, slowly with neither).
+        let idle = Duration::from_secs(u64::from(crate::device_links::daemon::tick_seconds()))
+            .max(IDLE_TICK);
+        schedule(app, if busy { BUSY_TICK } else { idle });
     });
 }
 

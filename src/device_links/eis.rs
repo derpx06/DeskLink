@@ -448,8 +448,11 @@ pub(crate) fn spawn_receiver(
     std::thread::Builder::new()
         .name("desklink-ei-capture".into())
         .spawn(move || {
+            // However this thread ends, even by a panic, the capture's owner
+            // is told: a reader that dies silently leaves the pointer
+            // captured with nobody reading it.
+            let _closed = CloseOnDrop(&forward);
             let Ok(context) = ei::Context::new(stream) else {
-                forward(Captured::Closed);
                 return;
             };
             let response = match reis::handshake::ei_handshake_blocking(
@@ -460,16 +463,23 @@ pub(crate) fn spawn_receiver(
                 Ok(response) => response,
                 Err(error) => {
                     eprintln!("[DeskLink] Input capture refused DeskLink: {error}");
-                    forward(Captured::Closed);
                     return;
                 }
             };
             let mut converter = EiEventConverter::new(&context, response);
             receive(&context, &mut converter, &forward);
-            forward(Captured::Closed);
         })
         .map(|_| ())
         .map_err(|error| format!("Could not start the input capture reader: {error}"))
+}
+
+/// Reports [`Captured::Closed`] when dropped.
+struct CloseOnDrop<'a, F: Fn(Captured) -> bool>(&'a F);
+
+impl<F: Fn(Captured) -> bool> Drop for CloseOnDrop<'_, F> {
+    fn drop(&mut self) {
+        (self.0)(Captured::Closed);
+    }
 }
 
 fn receive(

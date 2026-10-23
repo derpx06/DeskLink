@@ -715,12 +715,35 @@ impl DesklinkWindow {
                 .build()]);
         }
         self.imp().daemon.replace(Some(daemon));
+        // The tickers run every second while this window shows and slowly
+        // when it does not: showing it brings them back at once.
+        self.connect_map(|window| {
+            crate::device_links::daemon::set_ui_visible(true);
+            window.refresh_soon();
+        });
+        self.connect_unmap(|window| {
+            crate::device_links::daemon::set_ui_visible(false);
+            // A window that stays hidden gives its memory back: the pictures
+            // go, the page that held them is redrawn on the next look, and
+            // the allocator returns what it can.
+            let window = window.downgrade();
+            glib::timeout_add_seconds_local_once(HIDDEN_TRIM_SECONDS, move || {
+                let Some(window) = window.upgrade().filter(|window| !window.is_mapped()) else {
+                    return;
+                };
+                window.trim_memory();
+            });
+        });
+        // A window nobody is looking at (another desktop, behind others)
+        // stops its pulsing dots, so it costs no frames.
+        self.connect_is_active_notify(mark_focus);
+        mark_focus(self);
         self.refresh_devices();
         // Events (a call ringing, a ping) refresh at once, not at the tick.
         crate::device_links::daemon::state::set_ui_wake(refresh_open_windows);
 
         let weak = self.downgrade();
-        glib::timeout_add_seconds_local(1, move || {
+        crate::ticker::every_tick(move || {
             crate::guard("window refresh", glib::ControlFlow::Continue, || {
                 if let Some(window) = weak.upgrade() {
                     window.refresh_devices();
@@ -772,6 +795,11 @@ impl DesklinkWindow {
         // RAII rather than a set at the end: this returns early from several
         // places, and any missed reset would wedge the window permanently.
         let _guard = RefreshGuard(&imp.refreshing);
+
+        // The transfer cards' own timer runs only while something moves.
+        if let Some(transfers) = imp.transfers.borrow().as_ref() {
+            transfers.kick();
+        }
 
         let errors = daemon.drain_errors();
         for event in daemon.drain_events() {
@@ -1095,6 +1123,24 @@ impl DesklinkWindow {
 
     /// Runs `refresh_devices` once the current handler has returned, e.g.
     /// after a click whose own button the refresh may replace.
+    /// The window has been hidden a while: drops decoded pictures and the
+    /// Files page's cards (redrawn when it is shown again) and hands free
+    /// memory back to the system.
+    fn trim_memory(&self) {
+        let imp = self.imp();
+        transfers::forget_pictures();
+        if let Some(transfers) = imp.transfers.borrow().as_ref() {
+            transfers.release_cards();
+        }
+        // Redrawn on the next look.
+        imp.snapshots.borrow_mut().remove("bucket");
+        self.replace_body("bucket", &gtk::Box::new(gtk::Orientation::Vertical, 0));
+        // SAFETY: malloc_trim has no preconditions; it only returns free memory.
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+
     fn refresh_soon(&self) {
         let window = self.downgrade();
         glib::idle_add_local_once(move || {
@@ -1482,6 +1528,19 @@ enum QuickAction {
 }
 
 /// Refreshes every open DeskLink window soon (on the main loop).
+/// How long the window may stay hidden before it gives its memory back.
+const HIDDEN_TRIM_SECONDS: u32 = 20;
+
+/// The `unfocused` class (see `style.css`): on while the window is not the
+/// one in use.
+fn mark_focus(window: &DesklinkWindow) {
+    if window.is_active() {
+        window.remove_css_class("unfocused");
+    } else {
+        window.add_css_class("unfocused");
+    }
+}
+
 fn refresh_open_windows() {
     for window in gtk::Window::list_toplevels() {
         if let Ok(window) = window.downcast::<DesklinkWindow>() {

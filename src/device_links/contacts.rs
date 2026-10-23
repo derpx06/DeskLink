@@ -904,6 +904,60 @@ X-UNKNOWN:ignored\r\nREV:2026-10-01T10:00:00Z\r\nEND:VCARD\r\n";
         );
     }
 
+    /// Every bound a phone's contact data is held to: the rest is cut, the
+    /// contact stays.
+    #[test]
+    fn a_hostile_vcard_is_cut_to_its_bounds_and_never_dropped_whole() {
+        let many: String = (0..MAX_VALUES * 3)
+            .map(|index| format!("TEL:555{index:03}\r\nEMAIL:a{index}@example.org\r\n"))
+            .collect();
+        let long = "N".repeat(MAX_FIELD_CHARS * 3);
+        let note = "w".repeat(MAX_NOTE_CHARS * 3);
+        let card = format!(
+            "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:{long}\r\n{many}NOTE:{note}\r\nEND:VCARD\r\n"
+        );
+        let contact = parse_vcard("u", &card).unwrap();
+        assert_eq!(contact.name.chars().count(), MAX_FIELD_CHARS);
+        assert_eq!(contact.phones.len(), MAX_VALUES);
+        assert_eq!(contact.emails.len(), MAX_VALUES);
+        assert!(contact.note.unwrap().chars().count() <= MAX_NOTE_CHARS);
+    }
+
+    /// A card over the byte bound is skipped whole (never half-read), a photo
+    /// over its bound or not a JPEG is left out of an otherwise fine contact.
+    #[test]
+    fn oversize_cards_and_photos_are_refused() {
+        let mut book = Book::default();
+        book.wanted.insert("big".into(), "1".into());
+        book.wanted.insert("pic".into(), "1".into());
+        book.wanted.insert("png".into(), "1".into());
+        let mut packet = NetworkPacket::new("desklink.contacts.response_vcards");
+        packet.set(
+            "big",
+            format!(
+                "BEGIN:VCARD\r\nFN:Big\r\nNOTE:{}\r\nEND:VCARD\r\n",
+                "x".repeat(MAX_VCARD_BYTES)
+            ),
+        );
+        // A JPEG just over MAX_PHOTO_BYTES.
+        let jpeg = base64::engine::general_purpose::STANDARD
+            .encode([&[0xFFu8, 0xD8, 0xFF][..], &vec![0u8; MAX_PHOTO_BYTES][..]].concat());
+        packet.set(
+            "pic",
+            format!("BEGIN:VCARD\r\nFN:Pic\r\nPHOTO;ENCODING=b;TYPE=JPEG:{jpeg}\r\nEND:VCARD\r\n"),
+        );
+        let png = base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n....");
+        packet.set(
+            "png",
+            format!("BEGIN:VCARD\r\nFN:Png\r\nPHOTO;ENCODING=b;TYPE=PNG:{png}\r\nEND:VCARD\r\n"),
+        );
+        packet.set("uids", vec!["big", "pic", "png"]);
+        apply_vcards(&mut book, &packet);
+        assert!(!book.contacts.contains_key("big"), "over the card bound");
+        assert!(book.contacts["pic"].photo.is_none(), "over the photo bound");
+        assert!(book.contacts["png"].photo.is_none(), "not a JPEG");
+    }
+
     #[test]
     fn a_vcard_without_fn_is_named_from_n_or_what_it_has() {
         let card = "BEGIN:VCARD\nN:Doe;Jane;Q;Dr.;\nEND:VCARD";
