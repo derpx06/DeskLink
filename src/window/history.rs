@@ -1,71 +1,33 @@
 //! Connection history: every connection and session from a phone, grouped
-//! by day, newest first. Shown as the Connection History page, and as a
-//! dialog when no phone is paired yet.
+//! by day, newest first. Shown as a dialog from Settings -> Advanced.
 
 use adw::prelude::*;
 use gtk::glib;
 
-use super::DesklinkWindow;
-use crate::device_links::device::DeviceView;
-
-/// How many entries are listed before "Show Older".
-const PAGE: usize = 200;
-
-thread_local! {
-    /// How many the History page lists now; "Show Older" adds a page.
-    static LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(PAGE) };
-}
-
-/// "Show Older": the next [`PAGE`] entries.
-pub(super) fn show_more() {
-    LIMIT.with(|limit| limit.set(limit.get() + PAGE));
-}
-
-pub(super) fn update(win: &DesklinkWindow, device: &DeviceView) {
-    let entries = crate::device_links::connection_log::recent();
-    let minute = super::clock_time(glib::DateTime::now_local().ok());
-    let limit = LIMIT.with(std::cell::Cell::get);
-    let key = format!(
-        "{}\n{}\n{:?}\n{minute}\n{limit}",
-        device.id,
-        entries.len(),
-        entries.first().map(|entry| entry.ts)
-    );
-    if !win.page_changed("history", key) {
-        return;
-    }
-    let types = win
-        .daemon()
-        .map(|daemon| {
-            win.known_devices(&daemon)
-                .into_iter()
-                .map(|known| (known.id, known.device_type))
-                .collect()
-        })
-        .unwrap_or_default();
-    let page = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(4)
-        .margin_top(8)
-        .margin_start(16)
-        .margin_end(16)
+/// Connection History as a dialog: Settings -> Advanced, and the
+/// `app.history` action. `only` names one device; everything in the log (30
+/// days) is listed.
+pub(crate) fn show_dialog(
+    parent: &impl IsA<gtk::Widget>,
+    types: &std::collections::HashMap<String, String>,
+    only: Option<&str>,
+) {
+    let dialog = adw::Dialog::builder()
+        .title("Connection History")
+        .content_width(520)
+        .content_height(620)
+        .child(&crate::application::with_header(
+            &gtk::ScrolledWindow::builder()
+                .hscrollbar_policy(gtk::PolicyType::Never)
+                .child(
+                    &adw::Clamp::builder()
+                        .child(&history_content(types, only, usize::MAX))
+                        .build(),
+                )
+                .build(),
+        ))
         .build();
-    let note = super::text(
-        &format!(
-            "Every connection and session from {}, kept for 30 days on this computer.",
-            device.name
-        ),
-        &["text-dim", "body-small"],
-    );
-    note.set_wrap(true);
-    note.set_margin_start(12);
-    note.set_margin_end(12);
-    page.append(&note);
-    page.append(&history_content(&types, Some(&device.id), limit));
-    win.replace_body(
-        "history",
-        &adw::Clamp::builder().maximum_size(760).child(&page).build(),
-    );
+    dialog.present(Some(parent));
 }
 
 /// Connection history grouped by day, newest first, with a time for each:

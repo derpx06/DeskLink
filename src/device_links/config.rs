@@ -1062,6 +1062,22 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// Settings -> Calls: the switch writes `pause_media_on_call` (what
+    /// `DaemonCommand::SetPauseMediaOnCall` does) and it survives a restart.
+    #[test]
+    fn the_calls_switch_for_pausing_music_is_saved() {
+        let dir = std::env::temp_dir().join(format!("desklink-pause-{}", Uuid::new_v4()));
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        assert!(config.stored.settings.pause_media_on_call, "on by default");
+        config
+            .update_settings(|settings| settings.pause_media_on_call = false)
+            .unwrap();
+        drop(config);
+        let reloaded = Config::load_from_dir(dir.clone()).unwrap();
+        assert!(!reloaded.stored.settings.pause_media_on_call);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// "Pause music during calls" is on unless turned off, also for a
     /// config written before the switch existed.
     #[test]

@@ -66,9 +66,10 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         &settings.forward_apps,
         crate::device_links::desk_notifications::seen_apps(),
         settings.desk_mic_to_phone,
+        crate::device_links::folders::bucket_on(&device.id),
     ))
     .unwrap_or_default();
-    if !win.page_changed("preferences", key) {
+    if !win.page_changed("settings", key) {
         return;
     }
     LIVE.with(|live| live.borrow_mut().clear());
@@ -80,78 +81,144 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         .margin_start(28)
         .margin_end(28)
         .build();
+    for group in groups(daemon, &settings, device, &glide_status, approving) {
+        page.append(&group);
+    }
+    win.replace_body(
+        "settings",
+        &adw::Clamp::builder().maximum_size(720).child(&page).build(),
+    );
+}
 
-    let access = adw::PreferencesGroup::builder().title("Access").build();
-    access.add(&password_row(daemon, &settings));
-    access.add(&remote_control_row(device, approving));
-    access.add(&terminal_access_row(daemon, device));
-    access.add(&unlock_nearby_row(daemon, &settings, device));
-    access.add(&command_alerts_row(daemon, &settings, device));
-    page.append(&access);
+/// The groups of the Settings page, in the order the phone uses too:
+/// Connection, Notifications, Clipboard, Calls, Sound, Control, Files,
+/// Privacy & security, Appearance, Advanced. Only what people change is
+/// here; everything else is a fixed default.
+pub(super) const GROUPS: [&str; 10] = [
+    "Connection",
+    "Notifications",
+    "Clipboard",
+    "Calls",
+    "Sound",
+    "Control",
+    "Files",
+    "Privacy & security",
+    "Appearance",
+    "Advanced",
+];
 
-    let connection = adw::PreferencesGroup::builder().title("Connection").build();
-    connection.add(&away_row(daemon, &settings));
-    connection.add(&keep_awake_row(daemon, &settings));
-    let notifications = adw::SwitchRow::builder()
-        .title("Show phone notifications")
-        .subtitle("Here and on your desktop, with replies")
+fn group(title: &str) -> adw::PreferencesGroup {
+    adw::PreferencesGroup::builder().title(title).build()
+}
+
+fn groups(
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    device: &DeviceView,
+    glide_status: &crate::device_links::glide::Status,
+    approving: bool,
+) -> Vec<adw::PreferencesGroup> {
+    let connection = group(GROUPS[0]);
+    connection.add(&keep_awake_row(daemon, settings));
+    connection.add(&start_at_login_row(daemon, settings));
+
+    let notifications = group(GROUPS[1]);
+    notifications.set_description(Some(
+        "Where phone notifications show, and which of this computer's go to the phone",
+    ));
+    let shown = adw::SwitchRow::builder()
+        .title(format!("Show {}'s notifications here", device.name))
+        .subtitle("On this desktop, with replies")
         .active(settings.shows_notifications(&device.id))
         .build();
-    notifications.add_prefix(&icon_square(
+    shown.add_prefix(&icon_square(
         "preferences-system-notifications-symbolic",
         30,
         "row-icon",
     ));
     let (sender, id) = (daemon.clone(), device.id.clone());
-    notifications.connect_active_notify(move |row| {
+    shown.connect_active_notify(move |row| {
         sender.send(DaemonCommand::SetShowNotifications(
             id.clone(),
             row.is_active(),
         ));
     });
-    follow(&notifications, |settings, id| {
-        settings.shows_notifications(id)
-    });
-    connection.add(&notifications);
-    page.append(&connection);
+    follow(&shown, |settings, id| settings.shows_notifications(id));
+    notifications.add(&shown);
+    notifications.add(&command_alerts_row(daemon, settings, device));
+    add_forward_rows(&notifications, daemon, settings);
 
-    if let Some(glide) = glide_group(daemon, &settings, device, &glide_status) {
-        page.append(&glide);
-    }
-    page.append(&calls_group(daemon, &settings, device));
-    page.append(&forward_group(daemon, &settings));
-    page.append(&sound_group(daemon, &settings));
+    let clipboard = group(GROUPS[2]);
+    clipboard.add(&clipboard_row(daemon, settings, device));
 
-    let look = adw::PreferencesGroup::builder().title("Appearance").build();
-    look.add(&appearance_row());
-    look.add(&start_at_login_row(daemon, &settings));
-    page.append(&look);
-    page.append(&top_bar_group(daemon, &settings));
+    let calls = calls_group(daemon, settings, device);
 
-    page.append(&unpair_button(daemon, device));
-    win.replace_body(
-        "preferences",
-        &adw::Clamp::builder().maximum_size(720).child(&page).build(),
-    );
+    let sound = sound_group(daemon, settings);
+
+    let control = group(GROUPS[5]);
+    add_glide_rows(&control, daemon, settings, device, glide_status);
+    control.add(&remote_control_row(device, approving));
+
+    let files = group(GROUPS[6]);
+    files.add(&bucket_row(device));
+    files.add(&downloads_row());
+
+    let privacy = group(GROUPS[7]);
+    privacy.add(&password_row(daemon, settings));
+    privacy.add(&terminal_access_row(daemon, device));
+    privacy.add(&unlock_nearby_row(daemon, settings, device));
+    privacy.add(&unpair_row(daemon, device));
+
+    let appearance = group(GROUPS[8]);
+    appearance.add(&appearance_row());
+    add_top_bar_rows(&appearance, daemon, settings);
+
+    let advanced = group(GROUPS[9]);
+    advanced.add(&away_row(daemon, settings));
+    advanced.add(&history_row());
+    advanced.add(&logs_row());
+
+    // The group titles are fixed (see GROUPS); calls and sound build theirs.
+    calls.set_title(GROUPS[3]);
+    sound.set_title(GROUPS[4]);
+    vec![
+        connection,
+        notifications,
+        clipboard,
+        calls,
+        sound,
+        control,
+        files,
+        privacy,
+        appearance,
+        advanced,
+    ]
 }
 
-/// The computer-wide preferences as a dialog, for when no phone is paired.
+/// The computer-wide settings as a dialog, for when no phone is paired.
 pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>, daemon: &DaemonHandle) {
     let settings = crate::device_links::config::app_settings();
-    let dialog = adw::PreferencesDialog::builder().content_width(640).build();
+    let dialog = adw::PreferencesDialog::builder()
+        .title("Settings")
+        .content_width(640)
+        .build();
     let page = adw::PreferencesPage::new();
-    let access = adw::PreferencesGroup::builder().title("Access").build();
-    access.add(&password_row(daemon, &settings));
-    page.add(&access);
-    let connection = adw::PreferencesGroup::builder().title("Connection").build();
-    connection.add(&away_row(daemon, &settings));
+    let connection = group(GROUPS[0]);
     connection.add(&keep_awake_row(daemon, &settings));
+    connection.add(&start_at_login_row(daemon, &settings));
     page.add(&connection);
-    let look = adw::PreferencesGroup::builder().title("Appearance").build();
-    look.add(&appearance_row());
-    look.add(&start_at_login_row(daemon, &settings));
-    page.add(&look);
-    page.add(&top_bar_group(daemon, &settings));
+    let privacy = group(GROUPS[7]);
+    privacy.add(&password_row(daemon, &settings));
+    page.add(&privacy);
+    let appearance = group(GROUPS[8]);
+    appearance.add(&appearance_row());
+    add_top_bar_rows(&appearance, daemon, &settings);
+    page.add(&appearance);
+    let advanced = group(GROUPS[9]);
+    advanced.add(&away_row(daemon, &settings));
+    advanced.add(&history_row());
+    advanced.add(&logs_row());
+    page.add(&advanced);
     dialog.add(&page);
     dialog.present(Some(parent));
 }
@@ -176,13 +243,10 @@ fn sound_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Preference
 /// Notifications to Phone (C1): this computer's notifications on the
 /// phones, off by default and only from the apps ticked here (the apps seen
 /// since DeskLink started, and those already chosen).
-fn forward_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::builder()
-        .title("Notifications to Phone")
-        .description("Only from the apps you choose. The phone's own are never sent back.")
-        .build();
+fn add_forward_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settings: &AppSettings) {
     let on = adw::SwitchRow::builder()
-        .title("Send this computer's notifications")
+        .title("Send this computer's notifications to the phone")
+        .subtitle("Only from the apps you choose. The phone's own are never sent back.")
         .active(settings.forward_notifications)
         .build();
     with_icon(&on, "preferences-system-notifications-symbolic");
@@ -192,7 +256,7 @@ fn forward_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Preferen
     });
     group.add(&on);
     if !settings.forward_notifications {
-        return group;
+        return;
     }
     let mut apps = crate::device_links::desk_notifications::seen_apps();
     for key in &settings.forward_apps {
@@ -218,7 +282,6 @@ fn forward_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Preferen
         });
         group.add(&row);
     }
-    group
 }
 
 /// Calls: answered here; callers can be named from the phone's contacts.
@@ -234,6 +297,7 @@ fn calls_group(
             device.name
         ))
         .build();
+    group.add(&pause_music_row(daemon, settings));
     // F5 K4: names from the contacts the phone shares, off until asked.
     let names = adw::SwitchRow::builder()
         .title(format!("Name callers from {}'s contacts", device.name))
@@ -250,6 +314,158 @@ fn calls_group(
     });
     group.add(&names);
     group
+}
+
+/// "Pause music during calls": this computer's players pause while a call
+/// rings or runs on the phone, and play again after.
+fn pause_music_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::SwitchRow {
+    let row = adw::SwitchRow::builder()
+        .title("Pause music during calls")
+        .subtitle("This computer's players pause while a call rings or runs, and carry on after")
+        .active(settings.pause_media_on_call)
+        .build();
+    with_icon(&row, "media-playback-pause-symbolic");
+    let daemon = daemon.clone();
+    row.connect_active_notify(move |row| {
+        daemon.send(DaemonCommand::SetPauseMediaOnCall(row.is_active()))
+    });
+    follow(&row, |settings, _| settings.pause_media_on_call);
+    row
+}
+
+/// "Share the clipboard": the same switch as the Notes & Clipboard header.
+fn clipboard_row(
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    device: &DeviceView,
+) -> adw::SwitchRow {
+    let row = adw::SwitchRow::builder()
+        .title(format!("Share the clipboard with {}", device.name))
+        .subtitle("Copy on one device, paste on the other. Passwords are never shared.")
+        .active(settings.clipboard_sync)
+        .build();
+    with_icon(&row, "edit-paste-symbolic");
+    let daemon = daemon.clone();
+    row.connect_active_notify(move |row| {
+        daemon.send(DaemonCommand::SetClipboardSync(row.is_active()))
+    });
+    follow(&row, |settings, _| settings.clipboard_sync);
+    row
+}
+
+/// "The Bucket": on or off for this phone.
+fn bucket_row(device: &DeviceView) -> adw::SwitchRow {
+    let on = crate::device_links::folders::bucket_on(&device.id);
+    let row = adw::SwitchRow::builder()
+        .title(format!("Bucket with {}", device.name))
+        .subtitle("One place for files, pictures, text and links on both devices")
+        .active(on)
+        .build();
+    with_icon(&row, "folder-symbolic");
+    let id = device.id.clone();
+    row.connect_active_notify(move |row| {
+        if row.is_active() {
+            crate::device_links::folders::turn_on_bucket(&id);
+        } else if crate::device_links::folders::bucket_on(&id) {
+            crate::device_links::folders::remove(&id, crate::device_links::folders::BUCKET_ID);
+        }
+    });
+    row
+}
+
+/// Where received files land, one click away.
+fn downloads_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("Downloads folder")
+        .subtitle("Files from the phone land here; a name already taken becomes \"name (2)\"")
+        .activatable(true)
+        .build();
+    with_icon(&row, "folder-download-symbolic");
+    row.add_suffix(
+        &gtk::Image::builder()
+            .icon_name("go-next-symbolic")
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build(),
+    );
+    row.connect_activated(|row| {
+        let Some(dir) = glib::user_special_dir(glib::UserDirectory::Downloads) else {
+            return;
+        };
+        gtk::FileLauncher::new(Some(&gio::File::for_path(dir))).launch(
+            row.root().and_downcast_ref::<gtk::Window>(),
+            gio::Cancellable::NONE,
+            |result| {
+                if let Err(error) = result {
+                    eprintln!("[UI] Could not open Downloads: {error}");
+                }
+            },
+        );
+    });
+    row
+}
+
+/// "Connection history": the log of connections and sessions, in a dialog.
+fn history_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("Connection history")
+        .subtitle("Every connection and session from a phone, kept for 30 days")
+        .activatable(true)
+        .build();
+    with_icon(&row, "document-open-recent-symbolic");
+    row.add_suffix(
+        &gtk::Image::builder()
+            .icon_name("go-next-symbolic")
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build(),
+    );
+    row.connect_activated(|row| {
+        let types = row
+            .root()
+            .and_downcast::<DesklinkWindow>()
+            .and_then(|window| window.daemon().map(|daemon| (window, daemon)))
+            .map(|(window, daemon)| {
+                window
+                    .known_devices(&daemon)
+                    .into_iter()
+                    .map(|known| (known.id, known.device_type))
+                    .collect()
+            })
+            .unwrap_or_default();
+        super::history::show_dialog(row, &types, None);
+    });
+    row
+}
+
+/// "Logs": where crash reports are kept.
+fn logs_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("Crash reports")
+        .subtitle("Opens the folder DeskLink writes a report to if it ever crashes")
+        .activatable(true)
+        .build();
+    with_icon(&row, "text-x-generic-symbolic");
+    row.add_suffix(
+        &gtk::Image::builder()
+            .icon_name("go-next-symbolic")
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build(),
+    );
+    row.connect_activated(|row| {
+        let Some(dir) = crate::crash_dir() else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        gtk::FileLauncher::new(Some(&gio::File::for_path(dir))).launch(
+            row.root().and_downcast_ref::<gtk::Window>(),
+            gio::Cancellable::NONE,
+            |result| {
+                if let Err(error) = result {
+                    eprintln!("[UI] Could not open the crash folder: {error}");
+                }
+            },
+        );
+    });
+    row
 }
 
 fn with_icon(row: &impl IsA<adw::ActionRow>, icon: &str) {
@@ -378,9 +594,8 @@ fn log_out_button() -> gtk::Button {
 /// Top Bar: whether DeskLink shows there, and the one step that fixes it.
 /// The tray icon is the freedesktop way (KDE, most desktops; GNOME with the
 /// AppIndicator extension); GNOME also has DeskLink's own extension.
-fn top_bar_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::PreferencesGroup {
+fn add_top_bar_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settings: &AppSettings) {
     use crate::shell_dbus::ExtensionStatus;
-    let group = adw::PreferencesGroup::builder().title("Top Bar").build();
     let gnome = crate::shell_dbus::extension_possible();
 
     let tray = adw::ActionRow::builder().title("Tray icon").build();
@@ -419,7 +634,7 @@ fn top_bar_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Preferen
     group.add(&tray);
 
     if !gnome {
-        return group;
+        return;
     }
     let menu = adw::ActionRow::builder().title("GNOME extension").build();
     with_icon(&menu, "view-app-grid-symbolic");
@@ -468,7 +683,6 @@ fn top_bar_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Preferen
     }
     group.add(&menu);
     group.add(&top_bar_pill_row(daemon, settings));
-    group
 }
 
 /// System, Light or Dark.
@@ -602,7 +816,7 @@ fn away_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::ActionRow {
                 .and_then(|row| row.root())
                 .and_downcast::<DesklinkWindow>()
             {
-                window.imp().snapshots.borrow_mut().remove("preferences");
+                window.imp().snapshots.borrow_mut().remove("settings");
                 window.refresh_soon();
             }
         });
@@ -976,16 +1190,18 @@ fn remote_control_row(device: &DeviceView, approving: bool) -> adw::ActionRow {
 }
 
 /// "Unpair Pixel 9…", red, after asking.
-fn unpair_button(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Button {
-    let button = gtk::Button::builder()
-        .child(&super::text(&format!("Unpair {}…", device.name), &[]))
-        .css_classes(["danger-soft", "unpair"])
+fn unpair_row(daemon: &DaemonHandle, device: &DeviceView) -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title(format!("Unpair {}…", device.name))
+        .subtitle("It can connect again only after pairing again")
+        .activatable(true)
+        .css_classes(["error"])
         .build();
     let (daemon, id, name) = (daemon.clone(), device.id.clone(), device.name.clone());
-    button.connect_clicked(move |button| {
+    row.connect_activated(move |row| {
         let (daemon, id) = (daemon.clone(), id.clone());
         super::confirm(
-            button,
+            row,
             &format!("Unpair {name}?"),
             "It can connect again only after pairing again.",
             "_Unpair",
@@ -995,23 +1211,23 @@ fn unpair_button(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Button {
             },
         );
     });
-    button
+    row
 }
 
 /// Glide (F4): the pointer glides onto this phone past an edge of this
 /// screen. A switch, and where the phone sits (a small arrangement: this
 /// screen with a phone slot on each side). Hidden, with the reason, where
 /// the desktop cannot capture input.
-fn glide_group(
+fn add_glide_rows(
+    group: &adw::PreferencesGroup,
     daemon: &DaemonHandle,
     settings: &AppSettings,
     device: &DeviceView,
     status: &crate::device_links::glide::Status,
-) -> Option<adw::PreferencesGroup> {
+) {
     use crate::device_links::glide::{Availability, Edge};
-    let group = adw::PreferencesGroup::builder().title("Glide").build();
     match status.availability {
-        Availability::Checking => return None,
+        Availability::Checking => return,
         Availability::Unavailable(reason) => {
             let row = adw::ActionRow::builder()
                 .title(format!("Glide onto {}", device.name))
@@ -1020,7 +1236,7 @@ fn glide_group(
             with_icon(&row, "input-mouse-symbolic");
             row.update_property(&[gtk::accessible::Property::Description(reason)]);
             group.add(&row);
-            return Some(group);
+            return;
         }
         Availability::Available => {}
     }
@@ -1142,12 +1358,31 @@ fn glide_group(
         row.add_prefix(&icon_square("dialog-warning-symbolic", 30, "row-icon"));
         group.add(&row);
     }
-    Some(group)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The groups, in the order the phone's Settings uses too.
+    #[test]
+    fn settings_has_the_ten_groups_in_the_agreed_order() {
+        assert_eq!(
+            GROUPS,
+            [
+                "Connection",
+                "Notifications",
+                "Clipboard",
+                "Calls",
+                "Sound",
+                "Control",
+                "Files",
+                "Privacy & security",
+                "Appearance",
+                "Advanced",
+            ]
+        );
+    }
 
     #[test]
     fn the_relay_reads_as_its_host() {

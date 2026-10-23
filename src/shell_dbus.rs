@@ -99,7 +99,7 @@ struct Desk {
     clipboard: bool,
     /// A terminal is running and a phone is connected.
     hand_off: bool,
-    /// Preferences → "Phone in the top bar": the extension's own pill, on
+    /// Settings → Appearance → "Phone in the top bar": the extension's own pill, on
     /// top of the Quick Settings menu.
     pill: bool,
 }
@@ -882,7 +882,7 @@ thread_local! {
     static APPINDICATOR: RefCell<Option<(String, bool)>> = const { RefCell::new(None) };
 }
 
-/// The top bar on this desktop, for Preferences.
+/// The top bar on this desktop, for Settings.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum ExtensionStatus {
     Active,
@@ -1090,8 +1090,10 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 11] = [
-    // The current build (the Bucket's sync progress row).
+const KNOWN_BUILDS: [&str; 12] = [
+    // The current build (W4: the Files row, Settings in its comments).
+    "6a907b946c22e452a0853b683a98bef425482d0fe38181d4dce255e4cb7fc8da",
+    // The Bucket's sync progress row.
     "01fee36c261108ac481f15db17de0b7c860e79ba8e77d8a932540e07952a7f8a",
     // 35a2ff3, F4: glide in the live row.
     "1ce14fd319e5ac1654c16dfa8a79910c95da9bdcca33f880f5f3f62654de440d",

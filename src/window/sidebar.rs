@@ -243,7 +243,7 @@ impl Sidebar {
                 end.remove(&child);
             }
             // A device still pairing has only its overview.
-            row.set_sensitive(device.trusted || name == "overview");
+            row.set_sensitive(device.trusted || name == "home");
             let title = PAGES
                 .iter()
                 .find(|(page, _, _)| page == name)
@@ -261,7 +261,7 @@ impl Sidebar {
                     ));
                     label.push_str(&format!(", {} open", sessions.len()));
                 }
-                "bucket" if bucket_asked => {
+                "files" if bucket_asked => {
                     end.append(&super::text("1", &["count-badge"]));
                     label.push_str(", a question is waiting");
                 }

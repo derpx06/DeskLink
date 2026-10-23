@@ -33,6 +33,7 @@ mod clipboard;
 mod contacts;
 pub(crate) mod history;
 mod notes;
+mod notes_clipboard;
 pub(crate) mod notifications;
 mod overview;
 mod pairing;
@@ -55,28 +56,34 @@ use crate::device_links::webrtc::transfer_board::{Finished, Outcome};
 /// The pages, in sidebar order: (name, title, icon). The last two are the
 /// sidebar's footer.
 const PAGES: &[(&str, &str, &str)] = &[
-    ("overview", "Overview", "view-grid-symbolic"),
-    ("terminals", "Terminals", "utilities-terminal-symbolic"),
+    ("home", "Home", "user-home-symbolic"),
+    ("files", "Files", "folder-symbolic"),
+    ("notes", "Notes & Clipboard", "document-edit-symbolic"),
     (
         "notifications",
         "Notifications",
         "preferences-system-notifications-symbolic",
     ),
-    ("transfers", "Transfers", "folder-download-symbolic"),
-    ("clipboard", "Clipboard", "edit-paste-symbolic"),
     ("contacts", "Contacts", "x-office-address-book-symbolic"),
-    ("notes", "Notes", "document-edit-symbolic"),
-    ("bucket", "Bucket", "folder-symbolic"),
-    (
-        "history",
-        "Connection History",
-        "document-open-recent-symbolic",
-    ),
-    ("preferences", "Preferences", "emblem-system-symbolic"),
+    ("terminals", "Terminals", "utilities-terminal-symbolic"),
+    ("settings", "Settings", "emblem-system-symbolic"),
 ];
 
-/// How many of [`PAGES`] are in the sidebar's main list.
-const MAIN_PAGES: usize = 8;
+/// How many of [`PAGES`] are in the sidebar's main list; Settings is the
+/// footer.
+const MAIN_PAGES: usize = 6;
+
+/// The page a name opens, and the tab of Notes & Clipboard it means, if any:
+/// `clipboard` and `snippets` are tabs of Notes & Clipboard (the tray and the
+/// top-bar menu address them that way); every other name is a page of the
+/// sidebar.
+pub(crate) fn resolve_page(name: &str) -> (&str, Option<&'static str>) {
+    match name {
+        "clipboard" => ("notes", Some("clipboard")),
+        "snippets" => ("notes", Some("snippets")),
+        other => (other, None),
+    }
+}
 
 mod imp {
     use super::*;
@@ -131,7 +138,7 @@ mod imp {
         pub(super) notifications: RefCell<Option<notifications::Page>>,
         pub(super) transfers: RefCell<Option<transfers::Page>>,
         pub(super) contacts: RefCell<Option<contacts::Page>>,
-        pub(super) notes: RefCell<Option<notes::Page>>,
+        pub(super) notes: RefCell<Option<notes_clipboard::Page>>,
         /// Notes and Snippets on their own, with no phone to show pages for.
         pub(super) solo: RefCell<Option<notes::Solo>>,
         /// The welcome page's pairing code is on show.
@@ -185,7 +192,7 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
             let obj = self.obj();
-            self.page.replace("overview".to_string());
+            self.page.replace("home".to_string());
             self.selected_device_id.replace(sidebar::load_last_device());
 
             let window = obj.downgrade();
@@ -232,14 +239,41 @@ mod imp {
                         self.notifications.replace(Some(page));
                         root
                     }
-                    "transfers" => {
-                        let page = transfers::Page::new(&obj);
-                        let root = page.root.clone();
-                        self.transfers.replace(Some(page));
-                        root
+                    "files" => {
+                        // The Bucket above, the send zone and the recent
+                        // transfers below, in one scrolling page. The Bucket
+                        // fills its own slot like any simple page's body.
+                        let transfers = transfers::Page::new(&obj);
+                        let slot = gtk::Box::builder()
+                            .orientation(gtk::Orientation::Vertical)
+                            .build();
+                        let body = gtk::Box::builder()
+                            .orientation(gtk::Orientation::Vertical)
+                            .spacing(18)
+                            .margin_top(8)
+                            .margin_bottom(28)
+                            .build();
+                        body.append(&slot);
+                        body.append(
+                            &adw::Clamp::builder()
+                                .maximum_size(1000)
+                                .child(&transfers.content)
+                                .build(),
+                        );
+                        let scroll = gtk::ScrolledWindow::builder()
+                            .hscrollbar_policy(gtk::PolicyType::Never)
+                            .vexpand(true)
+                            .child(&body)
+                            .build();
+                        transfers.accept_drops_on(&scroll);
+                        self.bodies
+                            .borrow_mut()
+                            .insert("bucket".to_string(), (scroll.clone(), slot));
+                        self.transfers.replace(Some(transfers));
+                        scroll.upcast()
                     }
                     "notes" => {
-                        let page = notes::Page::new(&obj);
+                        let page = notes_clipboard::Page::new(&obj);
                         let root = page.root.clone();
                         self.notes.replace(Some(page));
                         root
@@ -361,13 +395,6 @@ mod imp {
                         }
                     })
                     .build(),
-                // "Show Older" on the History page.
-                gio::ActionEntry::builder("history-more")
-                    .activate(|window: &super::DesklinkWindow, _, _| {
-                        history::show_more();
-                        window.refresh_soon();
-                    })
-                    .build(),
                 // Ctrl+F: the terminal search.
                 gio::ActionEntry::builder("toggle-search")
                     .activate(|window: &super::DesklinkWindow, _, _| {
@@ -412,7 +439,7 @@ impl DesklinkWindow {
     /// Selects `device_id` and shows its overview (from the top-bar extension).
     pub fn show_device(&self, device_id: &str) {
         self.select_device(device_id);
-        self.show_page("overview");
+        self.show_page("home");
     }
 
     /// A new note, open to type in (the + on Notes, the tray, the top bar).
@@ -424,7 +451,8 @@ impl DesklinkWindow {
                 solo.notes.new_note();
             }
         } else if let Some(page) = imp.notes.borrow().as_ref() {
-            page.new_note();
+            page.show_tab("notes");
+            page.notes.new_note();
         }
     }
 
@@ -494,16 +522,15 @@ impl DesklinkWindow {
             self.show_solo(name);
             return true;
         }
-        // In the device pages, snippets are on Clipboard.
-        let name = if name == "snippets" {
-            "clipboard"
-        } else {
-            name
-        };
+        // Earlier names, and the tabs of Notes & Clipboard.
+        let (name, tab) = resolve_page(name);
         if imp.main_stack.visible_child_name().as_deref() != Some("devices")
             || !PAGES.iter().any(|(page, _, _)| *page == name)
         {
             return false;
+        }
+        if let (Some(tab), Some(page)) = (tab, imp.notes.borrow().as_ref()) {
+            page.show_tab(tab);
         }
         imp.page.replace(name.to_string());
         imp.page_stack.set_visible_child_name(name);
@@ -787,7 +814,7 @@ impl DesklinkWindow {
                     }
                     imp.selected_device_id.replace(Some(device_id.clone()));
                     sidebar::save_last_device(&device_id);
-                    imp.page.replace("overview".to_string());
+                    imp.page.replace("home".to_string());
                     imp.split_view.set_show_content(true);
                     self.show_feature_toast(&format!("Paired with {device_name}"));
                 }
@@ -924,8 +951,8 @@ impl DesklinkWindow {
         let imp = self.imp();
         let mut page = imp.page.borrow().clone();
         // A device still pairing has only its pairing view.
-        if !device.trusted && page != "overview" {
-            page = "overview".to_string();
+        if !device.trusted && page != "home" {
+            page = "home".to_string();
             imp.page.replace(page.clone());
             imp.page_stack.set_visible_child_name(&page);
             self.update_title();
@@ -941,16 +968,16 @@ impl DesklinkWindow {
                     notifications.update(self, daemon, device);
                 }
             }
-            "transfers" => {
+            "files" => {
+                bucket::update(self, device);
                 if let Some(transfers) = imp.transfers.borrow().as_ref() {
                     transfers.update(self, daemon, device);
                 }
             }
-            "overview" => overview::update(self, daemon, device),
-            "clipboard" => clipboard::update(self, device),
+            "home" => overview::update(self, daemon, device),
             "notes" => {
                 if let Some(notes) = imp.notes.borrow().as_ref() {
-                    notes.update();
+                    notes.update(device);
                 }
             }
             "contacts" => {
@@ -958,9 +985,7 @@ impl DesklinkWindow {
                     contacts.update(self, daemon, device);
                 }
             }
-            "history" => history::update(self, device),
-            "bucket" => bucket::update(self, device),
-            "preferences" => prefs::update(self, daemon, device),
+            "settings" => prefs::update(self, daemon, device),
             _ => {}
         }
     }
@@ -1047,8 +1072,8 @@ impl DesklinkWindow {
                     }
                 }
                 // Notes and Snippets with no phone: the switcher.
-                "solo-switcher" => widget.set_visible(!narrow),
-                "solo-bar" => {
+                "solo-switcher" | "tabs-switcher" => widget.set_visible(!narrow),
+                "solo-bar" | "tabs-bar" => {
                     if let Some(bar) = widget.downcast_ref::<adw::ViewSwitcherBar>() {
                         bar.set_reveal(narrow);
                     }
@@ -1299,7 +1324,7 @@ impl DesklinkWindow {
             self.announce_transfer(done, device);
         }
         // "Received here" has a new entry.
-        self.imp().snapshots.borrow_mut().remove("transfers");
+        self.imp().snapshots.borrow_mut().remove("files");
     }
 
     fn announce_transfer(&self, done: &Finished, device: &str) {
@@ -1687,6 +1712,22 @@ fn widget_at(root: &gtk::Widget, path: &[usize]) -> Option<gtk::Widget> {
         current = child?;
     }
     Some(current)
+}
+
+/// Whether any widget below `widget` is a label with text.
+fn has_label_descendant(widget: &gtk::Widget) -> bool {
+    let mut child = widget.first_child();
+    while let Some(next) = child {
+        if next
+            .downcast_ref::<gtk::Label>()
+            .is_some_and(|label| !label.label().is_empty())
+            || has_label_descendant(&next)
+        {
+            return true;
+        }
+        child = next.next_sibling();
+    }
+    false
 }
 
 /// Every widget under `root` whose name starts with `prefix`.
@@ -2334,7 +2375,7 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                     solo.notes.open_nth(id.parse().unwrap_or(0));
                 }
             } else if let Some(page) = win.imp().notes.borrow().as_ref() {
-                page.open_nth(id.parse().unwrap_or(0));
+                page.notes.open_nth(id.parse().unwrap_or(0));
             }
         }
         // "open-contact UID": the selected device's contact, as from search.
@@ -2526,6 +2567,17 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 imp.page_stack.width(),
                 imp.page_stack.height()
             );
+            if let Some((scroll, body)) = imp.bodies.borrow().get(id).cloned() {
+                let adjustment = scroll.vadjustment();
+                debug_log!(
+                    "[E2E] {id}: scroll upper {} page {} value {}, slot {}x{}",
+                    adjustment.upper(),
+                    adjustment.page_size(),
+                    adjustment.value(),
+                    body.width(),
+                    body.height()
+                );
+            }
             for widget in named_widgets(&imp.page_stack.get().upcast(), "hero-") {
                 let (min, nat, _, _) = widget.measure(gtk::Orientation::Horizontal, -1);
                 debug_log!(
@@ -2534,6 +2586,59 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                     widget.width()
                 );
             }
+        }
+        // "a11y": every button, switch and menu button on the shown page with
+        // no accessible name (its label, tooltip or an explicit one).
+        "a11y" => {
+            let mut bad = 0;
+            let mut stack = vec![win.clone().upcast::<gtk::Widget>()];
+            while let Some(widget) = stack.pop() {
+                let interactive = widget.is::<gtk::Button>()
+                    || widget.is::<gtk::MenuButton>()
+                    || widget.is::<gtk::Switch>()
+                    || widget.is::<gtk::ToggleButton>();
+                if interactive && widget.is_mapped() && widget.is_visible() {
+                    let named = widget
+                        .downcast_ref::<gtk::Button>()
+                        .map(|b| b.label().is_some_and(|l| !l.is_empty()))
+                        .unwrap_or(false)
+                        || widget.tooltip_text().is_some_and(|t| !t.is_empty())
+                        || widget.has_css_class("has-label")
+                        || widget.is::<gtk::Switch>()
+                            && widget
+                                .parent()
+                                .is_some_and(|p| p.is::<gtk::Box>() && p.parent().is_some());
+                    let labelled = has_label_descendant(&widget)
+                        || widget.type_().name() == "AdwViewSwitcherButton"
+                        || widget
+                            .ancestor(gtk::WindowControls::static_type())
+                            .is_some()
+                        || widget.ancestor(gtk::Calendar::static_type()).is_some()
+                        // The inner toggle of a menu button is named by it.
+                        || widget.parent().is_some_and(|p| {
+                            p.is::<gtk::MenuButton>() || p.type_().name() == "AdwSplitButton"
+                        });
+                    if !named && !labelled {
+                        bad += 1;
+                        debug_log!(
+                            "[E2E] a11y: unnamed {} {:?} in {}",
+                            widget.type_().name(),
+                            widget.css_classes(),
+                            widget
+                                .parent()
+                                .and_then(|p| p.parent())
+                                .map(|p| p.type_().name().to_string())
+                                .unwrap_or_default()
+                        );
+                    }
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    child = next.next_sibling();
+                    stack.push(next);
+                }
+            }
+            debug_log!("[E2E] a11y: {bad} unnamed");
         }
         "focus-info" => {
             let focus = gtk::prelude::RootExt::focus(win);
@@ -2949,25 +3054,41 @@ mod tests {
         }
     }
 
-    /// Every page in the sidebar has a body in the stack and a title.
+    /// The sidebar, top to bottom: Home, Files, Notes & Clipboard,
+    /// Notifications, Contacts, Terminals, then the Settings footer. The
+    /// phone's navigation uses the same names in the same order.
     #[test]
-    fn the_sidebar_lists_the_main_pages_then_history_and_preferences() {
-        let names: Vec<_> = PAGES.iter().map(|(name, _, _)| *name).collect();
+    fn the_sidebar_lists_the_six_pages_then_settings() {
+        let titles: Vec<_> = PAGES.iter().map(|(_, title, _)| *title).collect();
         assert_eq!(
-            names,
+            titles,
             [
-                "overview",
-                "terminals",
-                "notifications",
-                "transfers",
-                "clipboard",
-                "contacts",
-                "notes",
-                "bucket",
-                "history",
-                "preferences"
+                "Home",
+                "Files",
+                "Notes & Clipboard",
+                "Notifications",
+                "Contacts",
+                "Terminals",
+                "Settings"
             ]
         );
-        assert_eq!(&names[MAIN_PAGES..], ["history", "preferences"]);
+        let names: Vec<_> = PAGES.iter().map(|(name, _, _)| *name).collect();
+        assert_eq!(&names[MAIN_PAGES..], ["settings"]);
+        assert_eq!(MAIN_PAGES, 6);
+    }
+
+    /// The tabs of Notes & Clipboard are addressed by name, every other name
+    /// is a page of the sidebar.
+    #[test]
+    fn the_notes_and_clipboard_tabs_are_addressed_by_name() {
+        assert_eq!(resolve_page("clipboard"), ("notes", Some("clipboard")));
+        assert_eq!(resolve_page("snippets"), ("notes", Some("snippets")));
+        for (name, _, _) in PAGES {
+            assert_eq!(resolve_page(name), (*name, None));
+        }
+        let tabs: Vec<_> = notes_clipboard::TABS.iter().map(|(_, t, _)| *t).collect();
+        assert_eq!(tabs, ["Notes", "Snippets", "Clipboard history"]);
+        assert_eq!(notes_clipboard::tab_of("clipboard"), Some("clipboard"));
+        assert_eq!(notes_clipboard::tab_of("files"), None);
     }
 }

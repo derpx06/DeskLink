@@ -242,7 +242,7 @@ fn calling(devices: &[DeviceView]) -> Option<&DeviceView> {
 pub(super) fn update_bar(win: &DesklinkWindow, daemon: &DaemonHandle, devices: &[DeviceView]) {
     let imp = win.imp();
     let on_overview = |device: &DeviceView| {
-        imp.page.borrow().as_str() == "overview"
+        imp.page.borrow().as_str() == "home"
             && imp.selected_device_id.borrow().as_deref() == Some(device.id.as_str())
     };
     let shown = calling(devices).filter(|device| !on_overview(device));
@@ -264,7 +264,7 @@ pub(super) fn update_bar(win: &DesklinkWindow, daemon: &DaemonHandle, devices: &
         }
     }
     tick(&imp.call_bar.clone().upcast());
-    if let Some((_, body)) = imp.bodies.borrow().get("overview").cloned() {
+    if let Some((_, body)) = imp.bodies.borrow().get("home").cloned() {
         tick(&body.upcast());
     }
 }

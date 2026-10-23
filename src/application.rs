@@ -196,7 +196,7 @@ impl DesklinkApplication {
                 if let Some(device) = target.and_then(|target| target.get::<String>()) {
                     window.show_device(&device);
                 }
-                window.show_page("bucket");
+                window.show_page("files");
             })
             .build();
         let history_action = gio::ActionEntry::builder("history")
@@ -439,33 +439,14 @@ impl DesklinkApplication {
         self.send_notification(Some("crash-report"), &notification);
     }
 
-    /// The Connection History page, or a dialog while no phone is paired.
+    /// Connection History, a dialog (Settings -> Advanced opens the same).
     fn show_history(&self) {
         let window = self.main_window();
         window.present();
-        if window.show_page("history") || window.visible_dialog().is_some() {
+        if window.visible_dialog().is_some() {
             return;
         }
-        let dialog = adw::Dialog::builder()
-            .title("Connection History")
-            .content_width(520)
-            .content_height(620)
-            .child(&with_header(
-                &gtk::ScrolledWindow::builder()
-                    .hscrollbar_policy(gtk::PolicyType::Never)
-                    .child(
-                        &adw::Clamp::builder()
-                            .child(&crate::window::history::history_content(
-                                &self.device_types(),
-                                None,
-                                usize::MAX,
-                            ))
-                            .build(),
-                    )
-                    .build(),
-            ))
-            .build();
-        dialog.present(Some(&window));
+        crate::window::history::show_dialog(&window, &self.device_types(), None);
     }
 
     fn show_about(&self) {
@@ -486,12 +467,12 @@ impl DesklinkApplication {
         about.present(Some(&window));
     }
 
-    /// The Preferences page, or the computer-wide part as a dialog while no
+    /// The Settings page, or the computer-wide part as a dialog while no
     /// phone is paired.
     fn show_preferences(&self) {
         let window = self.main_window();
         window.present();
-        if window.show_page("preferences") || window.visible_dialog().is_some() {
+        if window.show_page("settings") || window.visible_dialog().is_some() {
             return;
         }
         if let Some(daemon) = self.daemon_handle() {
@@ -525,7 +506,7 @@ impl DesklinkApplication {
             ("Pair New Device", "Ctrl+N"),
             ("Search Terminals", "Ctrl+F"),
             ("Connection History", "Ctrl+H"),
-            ("Preferences", "Ctrl+,"),
+            ("Settings", "Ctrl+,"),
             ("Show Shortcuts", "Ctrl+?"),
             ("Close Window", "Ctrl+W"),
             ("Quit", "Ctrl+Q"),

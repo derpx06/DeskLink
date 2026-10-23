@@ -378,7 +378,7 @@ export function fillMenu(menu, ctx) {
         menu.addMenuItem(row(line));
     }
 
-    // The Bucket syncing: what, how fast, how long; opens the Bucket page.
+    // The Files sync (the Bucket): what, how fast, how long; opens Files.
     const bucket = selected.bucket;
     if (bucket) {
         const item = new PopupMenu.PopupBaseMenuItem({style_class: 'desklink-row desklink-bucket'});
@@ -404,7 +404,7 @@ export function fillMenu(menu, ctx) {
             line.text = now.line;
             detail.text = now.detail;
             fraction = Math.min(1, Math.max(0, now.fraction ?? 0));
-            item.accessible_name = `Bucket: ${now.line}, ${now.detail}, ${Math.round(fraction * 100)}%`;
+            item.accessible_name = `Files: ${now.line}, ${now.detail}, ${Math.round(fraction * 100)}%`;
             draw();
         };
         show(bucket);

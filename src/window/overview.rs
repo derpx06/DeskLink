@@ -22,13 +22,8 @@ use crate::link_glyph::{battery_ring, link_glyph, presence_dot, LinkState};
 
 pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &DeviceView) {
     let imp = win.imp();
-    let approving = imp.approving.borrow().contains(&device.id);
-    let approved = crate::device_links::config::remote_desktop_token(&device.id).is_some();
     let since = imp.session_since.borrow().get(&device.id).cloned();
     let settings = crate::device_links::config::app_settings();
-    let clip = crate::device_links::daemon::clipboard::history()
-        .first()
-        .map(|item| item.text.clone());
     // Sessions come and go here; their output is refreshed in place.
     let terminals: Vec<_> = crate::terminal_previews::sessions()
         .into_iter()
@@ -50,19 +45,16 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     };
     let key = serde_json::to_string(&(
         &steady,
-        approving,
-        approved,
         &since,
         &terminals,
         &transfers,
-        settings.clipboard_sync,
         settings.shows_notifications(&device.id),
-        &clip,
+        crate::device_links::folders::bucket_on(&device.id),
         &minute,
         gliding_onto(&device.id),
     ))
     .unwrap_or_default();
-    if !win.page_changed("overview", key) {
+    if !win.page_changed("home", key) {
         refresh_in_place(win, daemon);
         show_round_trip(win, device);
         return;
@@ -101,7 +93,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
             }
             _ => {}
         }
-        page.append(&columns(win, daemon, device, approving, approved, clip));
+        page.append(&columns(win, daemon, device));
     } else if device.status == DeviceStatus::PairRequestedByPeer {
         page.append(&super::pairing::pair_request_view(daemon, device));
     } else {
@@ -112,14 +104,14 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         .tightening_threshold(960)
         .child(&page)
         .build();
-    win.replace_body("overview", &clamp);
+    win.replace_body("home", &clamp);
     refresh_in_place(win, daemon);
     show_round_trip(win, device);
 }
 
 /// The hero's "· 12 ms", in place.
 fn show_round_trip(win: &DesklinkWindow, device: &DeviceView) {
-    let Some((_, body)) = win.imp().bodies.borrow().get("overview").cloned() else {
+    let Some((_, body)) = win.imp().bodies.borrow().get("home").cloned() else {
         return;
     };
     let rtt = LinkState::of(device).round_trip(device);
@@ -259,17 +251,16 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         .build();
     actions.set_widget_name("hero-actions");
     let reason = unavailable_reason(device);
-    // Both wrap rather than run off the page: the buttons onto two lines,
-    // the round actions onto as many rows as the width needs.
-    let buttons = wrap_row(1, 2);
-    buttons.set_row_spacing(8);
-    buttons.set_widget_name("hero-wrap");
+    // ONE row of primary actions, wrapping when the page is narrow: Show
+    // Phone Screen, Send Files, Ring, Lock, Type, Insert, Sound, and the
+    // overflow menu (Ping, Send link, Send clipboard).
+    let kind = device_type_label(&device.device_type);
+    let row = wrap_row(4, 8);
+    row.set_widget_name("hero-wrap");
+    row.set_homogeneous(true);
     if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
-        let show = icon_button(
-            "video-display-symbolic",
-            &format!("Show {} Screen", device_type_label(&device.device_type)),
-            &["soft-button"],
-        );
+        let name = format!("Show {kind} Screen");
+        let show = round_action("video-display-symbolic", "Screen", &name);
         let (daemon, id) = (daemon.clone(), device.id.clone());
         show.connect_clicked(move |button| {
             if let Some(root) = button.root().and_downcast::<gtk::Window>() {
@@ -281,83 +272,43 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
             }
         });
         disable_with(&show, reason.as_deref());
-        add_wrapped(&buttons, &show);
+        add_wrapped(&row, &show);
     }
     if can_send_feature(device, PACKET_TYPE_SHARE_REQUEST) {
-        let send = icon_button(
-            "document-send-symbolic",
-            "Send Files…",
-            &["suggested-action"],
-        );
+        let send = round_action("document-send-symbolic", "Files", "Send Files…");
+        send.add_css_class("primary");
         let (daemon, id) = (daemon.clone(), device.id.clone());
         send.connect_clicked(move |button| pick_and_send_files(&daemon, &id, button));
         disable_with(&send, reason.as_deref());
-        add_wrapped(&buttons, &send);
+        add_wrapped(&row, &send);
     }
-    actions.append(&buttons);
-
-    let round = wrap_row(3, 3);
-    round.set_homogeneous(true);
-    round.set_widget_name("hero-wrap");
-    let kind = device_type_label(&device.device_type);
     for (packet, icon, label, accessible, action) in [
         (
             PACKET_TYPE_FINDMYPHONE_REQUEST,
             "desklink-ring-symbolic",
             "Ring",
             format!("Ring {kind}"),
-            Some(QuickAction::Ring),
+            QuickAction::Ring,
         ),
         (
             PACKET_TYPE_LOCK_REQUEST,
             "system-lock-screen-symbolic",
             "Lock",
             format!("Lock {kind}"),
-            Some(QuickAction::Lock),
-        ),
-        (
-            PACKET_TYPE_PING,
-            "network-transmit-receive-symbolic",
-            "Ping",
-            "Ping".to_string(),
-            Some(QuickAction::Ping),
-        ),
-        (
-            crate::device_links::packet::PACKET_TYPE_CLIPBOARD,
-            "edit-paste-symbolic",
-            "Clipboard",
-            format!("Send the clipboard to {}", device.name),
-            Some(QuickAction::Clipboard),
-        ),
-        (
-            PACKET_TYPE_SHARE_REQUEST,
-            "insert-link-symbolic",
-            "Send link",
-            format!("Send a link to {}", device.name),
-            None,
+            QuickAction::Lock,
         ),
     ] {
         if !can_send_feature(device, packet) {
             continue;
         }
         let button = round_action(icon, label, &accessible);
-        match action {
-            Some(action) => {
-                button.connect_clicked(move |button| {
-                    if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {
-                        window.quick_action(action);
-                    }
-                });
+        button.connect_clicked(move |button| {
+            if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {
+                window.quick_action(action);
             }
-            None => {
-                let (daemon, id, name) = (daemon.clone(), device.id.clone(), device.name.clone());
-                button.connect_clicked(move |button| {
-                    show_send_link_dialog(daemon.clone(), id.clone(), &name, button)
-                });
-            }
-        }
+        });
         disable_with(&button, reason.as_deref());
-        add_wrapped(&round, &button);
+        add_wrapped(&row, &button);
     }
     // Type on the phone (C2), for a phone that reports its focused field.
     if crate::type_on_phone::supported(device) {
@@ -372,47 +323,46 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
             crate::type_on_phone::open(&daemon, &id, root.as_ref());
         });
         disable_with(&typing, reason.as_deref());
-        add_wrapped(&round, &typing);
+        add_wrapped(&row, &typing);
     }
-    // The phone's camera, from a phone that can share its screen: for a
-    // photo, scan, text or QR code here (F3).
+    // Insert from the phone (F3): a photo, scan, text or QR code, here.
     if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
-        let camera = round_action(
+        let insert = round_action(
             "camera-photo-symbolic",
-            "Camera",
+            "Insert",
             &format!(
-                "Use {}'s camera: a photo, a scan, text or a QR code",
+                "Insert from {}: a photo, a scan, text or a QR code",
                 device.name
             ),
         );
-        super::insert::attach_menu(daemon, device, &camera);
-        disable_with(&camera, reason.as_deref());
-        add_wrapped(&round, &camera);
-    }
-    // Sound both ways (F1): one round action, its two switches in a popover.
-    if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
-        let button = round_action(
+        super::insert::attach_menu(daemon, device, &insert);
+        disable_with(&insert, reason.as_deref());
+        add_wrapped(&row, &insert);
+        // Sound both ways (F1): its two switches in a popover.
+        let sound = round_action(
             "audio-speakers-symbolic",
             "Sound",
             &format!("Sound with {}", device.name),
         );
         if device.sound.is_some() {
-            button.add_css_class("on");
+            sound.add_css_class("on");
         }
-        super::sound::attach_menu(daemon, device, &button);
-        disable_with(&button, reason.as_deref());
-        add_wrapped(&round, &button);
+        super::sound::attach_menu(daemon, device, &sound);
+        disable_with(&sound, reason.as_deref());
+        add_wrapped(&row, &sound);
     }
-    // One row when the page has room for them all: a FlowBox's natural
-    // width is its maximum line.
+    if let Some(more) = overflow_menu(daemon, device, reason.as_deref()) {
+        add_wrapped(&row, &more);
+    }
+    // One row when the page has room for them all.
     let mut count = 0;
-    let mut cell = round.first_child();
+    let mut cell = row.first_child();
     while let Some(next) = cell {
         count += 1;
         cell = next.next_sibling();
     }
-    round.set_max_children_per_line(count.max(3));
-    actions.append(&round);
+    row.set_max_children_per_line(count.max(4));
+    actions.append(&row);
     band.append(&actions);
     band
 }
@@ -445,7 +395,82 @@ pub(super) fn add_wrapped(row: &gtk::FlowBox, widget: &impl IsA<gtk::Widget>) {
     }
 }
 
-/// A round icon with a caption under it: Ring, Lock, Ping, Send link.
+/// The "More" menu after the primary actions: Ping, Send link, Send
+/// clipboard. `None` when the phone takes none of them.
+fn overflow_menu(
+    daemon: &DaemonHandle,
+    device: &DeviceView,
+    reason: Option<&str>,
+) -> Option<gtk::MenuButton> {
+    let list = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .build();
+    let popover = gtk::Popover::builder().child(&list).build();
+    let mut any = false;
+    for (packet, icon, label, action) in [
+        (
+            PACKET_TYPE_PING,
+            "network-transmit-receive-symbolic",
+            "Ping",
+            Some(QuickAction::Ping),
+        ),
+        (
+            PACKET_TYPE_SHARE_REQUEST,
+            "insert-link-symbolic",
+            "Send Link…",
+            None,
+        ),
+        (
+            crate::device_links::packet::PACKET_TYPE_CLIPBOARD,
+            "edit-paste-symbolic",
+            "Send Clipboard",
+            Some(QuickAction::Clipboard),
+        ),
+    ] {
+        if !can_send_feature(device, packet) {
+            continue;
+        }
+        any = true;
+        let button = icon_button(icon, label, &["flat"]);
+        button.set_halign(gtk::Align::Fill);
+        button.set_sensitive(reason.is_none());
+        let (daemon, id, name) = (daemon.clone(), device.id.clone(), device.name.clone());
+        let popover = popover.downgrade();
+        button.connect_clicked(move |button| {
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
+            match action {
+                Some(action) => {
+                    if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {
+                        window.quick_action(action);
+                    }
+                }
+                None => show_send_link_dialog(daemon.clone(), id.clone(), &name, button),
+            }
+        });
+        list.append(&button);
+    }
+    if !any {
+        return None;
+    }
+    let more = gtk::MenuButton::builder()
+        .popover(&popover)
+        .icon_name("view-more-symbolic")
+        .tooltip_text("More actions")
+        .valign(gtk::Align::Start)
+        .halign(gtk::Align::Center)
+        .css_classes(["circular", "flat", "round-more"])
+        .build();
+    more.update_property(&[gtk::accessible::Property::Label(&format!(
+        "More actions for {}: ping, send a link, send the clipboard",
+        device.name
+    ))]);
+    Some(more)
+}
+
+/// A round icon with a caption under it: Ring, Lock, Type, Insert, Sound.
 fn round_action(icon: &str, label: &str, accessible: &str) -> gtk::Button {
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -460,7 +485,7 @@ fn round_action(icon: &str, label: &str, accessible: &str) -> gtk::Button {
     );
     let button = gtk::Button::builder()
         .child(&content)
-        .width_request(64)
+        .width_request(50)
         .tooltip_text(accessible)
         .css_classes(["round-action"])
         .build();
@@ -845,14 +870,7 @@ fn reconnecting_row(device: &DeviceView) -> gtk::Box {
 }
 
 /// "On this computer" and "On Pixel 9", side by side, or stacked when narrow.
-fn columns(
-    win: &DesklinkWindow,
-    daemon: &DaemonHandle,
-    device: &DeviceView,
-    approving: bool,
-    approved: bool,
-    clip: Option<String>,
-) -> gtk::Box {
+fn columns(win: &DesklinkWindow, daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
     let columns = gtk::Box::builder()
         .spacing(18)
         .homogeneous(true)
@@ -863,66 +881,26 @@ fn columns(
         .orientation(gtk::Orientation::Vertical)
         .spacing(14)
         .build();
-    left.append(&column_heading("On this computer", "computer-marker"));
+    left.append(&notifications_card(device));
     left.append(&terminals_card(win, device));
-    left.append(&screen_card(device, approving, approved));
-    left.append(&clipboard_card(daemon, clip));
     let right = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(14)
         .build();
-    right.append(&column_heading(
-        &format!("On {}", device.name),
-        "phone-marker",
-    ));
-    right.append(&notifications_card(device));
-    right.append(&transfer_card(daemon, device));
-    right.append(&super::bucket::overview_card(device));
-    if let Some(media) = device
-        .media_status
-        .as_ref()
-        .filter(|media| !media.is_playing)
-    {
-        let bottom = gtk::Box::builder().spacing(14).build();
-        bottom.append(&art(44, media.album_art.as_ref()));
-        let words = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(2)
-            .hexpand(true)
-            .valign(gtk::Align::Center)
-            .build();
-        words.append(&ellipsized(&media.title, &["heading"]));
-        words.append(&ellipsized(&media.artist, &["caption", "text-dim"]));
-        bottom.append(&words);
-        bottom.append(&media_controls(daemon, device, &media.player, false));
-        right.append(&feature_card(
-            "audio-x-generic-symbolic",
-            "Now Playing",
-            &text("Paused", &["text-dim"]),
-            None,
-            &bottom,
-        ));
-    }
+    right.append(&files_card(daemon, device));
     columns.append(&left);
     columns.append(&right);
     columns
 }
 
-fn column_heading(label: &str, marker: &str) -> gtk::Box {
-    let heading = gtk::Box::builder()
-        .spacing(10)
-        .margin_start(4)
-        .margin_end(4)
-        .build();
-    heading.append(
-        &gtk::Box::builder()
-            .valign(gtk::Align::Center)
-            .css_classes([marker])
-            .accessible_role(gtk::AccessibleRole::Presentation)
-            .build(),
-    );
-    heading.append(&ellipsized(label, &["column-heading"]));
-    heading
+/// The Files card: the Bucket's summary and drop target, and the transfer
+/// moving now, if one is.
+fn files_card(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
+    let card = super::bucket::overview_card(device);
+    if let Some(progress) = transfer_progress(daemon, device) {
+        card.append(&progress);
+    }
+    card
 }
 
 /// A 150 px card: icon, title, subtitle and an optional end widget on top,
@@ -1045,105 +1023,6 @@ fn terminals_card(win: &DesklinkWindow, device: &DeviceView) -> gtk::Box {
     )
 }
 
-fn screen_card(device: &DeviceView, approving: bool, approved: bool) -> gtk::Box {
-    let words = match device.desktop_session {
-        DesktopSession::None => "Not shared".to_string(),
-        DesktopSession::Viewing => format!("{} is viewing · view only", device.name),
-        DesktopSession::Controlling => format!("{} is viewing and controlling", device.name),
-    };
-    let bottom: gtk::Widget = if device.desktop_session == DesktopSession::None {
-        let label = text(
-            "Open Desk screen on the phone to view or control this computer.",
-            &["card-note"],
-        );
-        label.set_wrap(true);
-        label.upcast()
-    } else {
-        let row = gtk::Box::builder().spacing(10).build();
-        let chip = gtk::Box::builder()
-            .spacing(10)
-            .css_classes(["switch-chip"])
-            .build();
-        chip.append(&gtk::Label::new(Some("Allow Control")));
-        let switch = gtk::Switch::builder()
-            .active(approved)
-            .sensitive(!approving)
-            .valign(gtk::Align::Center)
-            .build();
-        switch.update_property(&[gtk::accessible::Property::Label("Allow Control")]);
-        let id = device.id.clone();
-        switch.connect_state_set(move |switch, on| {
-            if let Some(window) = switch.root().and_downcast::<DesklinkWindow>() {
-                if on {
-                    super::prefs::approve_remote_control(&window, &id);
-                } else {
-                    crate::device_links::config::set_remote_desktop_token(&id, None);
-                    window.refresh_soon();
-                }
-            }
-            gtk::glib::Propagation::Proceed
-        });
-        chip.append(&switch);
-        row.append(&chip);
-        let stop = super::soft_button("Stop Sharing");
-        stop.set_css_classes(&["coral-outline"]);
-        let id = device.id.clone();
-        stop.connect_clicked(move |button| {
-            crate::device_links::webrtc::coordinator::end_screen_session(&id);
-            toast_from(button, "Stopped sharing the screen");
-        });
-        row.append(&stop);
-        row.upcast()
-    };
-    feature_card(
-        "screen-shared-symbolic",
-        "Your screen",
-        &subtitle(&words),
-        None,
-        &bottom,
-    )
-}
-
-fn clipboard_card(daemon: &DaemonHandle, clip: Option<String>) -> gtk::Box {
-    let on = crate::device_links::config::app_settings().clipboard_sync;
-    let state = gtk::Box::builder().spacing(6).build();
-    state.append(
-        &gtk::Box::builder()
-            .valign(gtk::Align::Center)
-            .css_classes(["dot", if on { "mint" } else { "faint" }])
-            .accessible_role(gtk::AccessibleRole::Presentation)
-            .build(),
-    );
-    state.append(&subtitle(if on {
-        "In sync both ways"
-    } else {
-        "Off · not shared"
-    }));
-    let switch = clipboard_switch(daemon, on);
-    let last = clip
-        .as_deref()
-        .map(|text| text.lines().next().unwrap_or_default())
-        .unwrap_or("Copied text appears here");
-    let item = gtk::Button::builder()
-        .child(&ellipsized(&preview_line(last), &["mono"]))
-        .action_name("win.show-page")
-        .action_target(&"clipboard".to_variant())
-        .css_classes(if on {
-            vec!["clip-box"]
-        } else {
-            vec!["clip-box", "off"]
-        })
-        .build();
-    item.update_property(&[gtk::accessible::Property::Label("Clipboard history")]);
-    feature_card(
-        "edit-paste-symbolic",
-        "Clipboard",
-        &state,
-        Some(switch.upcast_ref()),
-        &item,
-    )
-}
-
 /// At most 200 characters of one line, so a huge copy cannot stretch a row.
 pub(super) fn preview_line(text: &str) -> String {
     let line = text.lines().next().unwrap_or_default();
@@ -1151,23 +1030,6 @@ pub(super) fn preview_line(text: &str) -> String {
         Some((at, _)) => format!("{}…", &line[..at]),
         None => line.to_string(),
     }
-}
-
-/// The clipboard on/off switch.
-pub(super) fn clipboard_switch(daemon: &DaemonHandle, on: bool) -> gtk::Switch {
-    let switch = gtk::Switch::builder()
-        .active(on)
-        .valign(gtk::Align::Center)
-        .build();
-    switch.update_property(&[gtk::accessible::Property::Label("Share the clipboard")]);
-    let daemon = daemon.clone();
-    switch.connect_active_notify(move |switch| {
-        daemon.send(DaemonCommand::SetClipboardSync(switch.is_active()));
-        if let Some(window) = switch.root().and_downcast::<DesklinkWindow>() {
-            window.refresh_soon();
-        }
-    });
-    switch
 }
 
 fn notifications_card(device: &DeviceView) -> gtk::Box {
@@ -1221,7 +1083,7 @@ fn notifications_card(device: &DeviceView) -> gtk::Box {
             if shown {
                 "You're all caught up."
             } else {
-                "Turn them on in Preferences."
+                "Turn them on in Settings."
             },
             &["card-note"],
         )
@@ -1236,68 +1098,42 @@ fn notifications_card(device: &DeviceView) -> gtk::Box {
     )
 }
 
-fn transfer_card(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
-    let current = super::transfers::rows(daemon)
+fn transfer_progress(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Box> {
+    let row = super::transfers::rows(daemon)
         .into_iter()
-        .find(|row| row.device_id == device.id || row.device_id.is_empty());
-    let bottom: gtk::Widget = match current {
-        Some(row) => {
-            let progress = gtk::Box::builder()
-                .orientation(gtk::Orientation::Vertical)
-                .spacing(8)
-                .build();
-            let line = gtk::Box::builder().spacing(8).build();
-            line.append(
-                &gtk::Image::builder()
-                    .icon_name(if row.incoming {
-                        "go-down-symbolic"
-                    } else {
-                        "go-up-symbolic"
-                    })
-                    .css_classes(["text-dim"])
-                    .accessible_role(gtk::AccessibleRole::Presentation)
-                    .build(),
-            );
-            let name = ellipsized(&row.name, &["mono"]);
-            name.set_hexpand(true);
-            line.append(&name);
-            let label = text(&progress_words(&row), &["caption", "text-dim"]);
-            label.set_widget_name("overview-transfer-label");
-            line.append(&label);
-            progress.append(&line);
-            let bar = gtk::ProgressBar::builder().css_classes(["thin"]).build();
-            bar.set_widget_name("overview-transfer-bar");
-            bar.update_property(&[gtk::accessible::Property::Label(&row.name)]);
-            if let Some(fraction) = super::transfers::fraction(&row) {
-                bar.set_fraction(fraction);
-            }
-            progress.append(&bar);
-            progress.upcast()
-        }
-        None => {
-            let drop = icon_button(
-                "document-send-symbolic",
-                "Drop files here to send",
-                &["dashed-button", "quiet"],
-            );
-            let (daemon, id) = (daemon.clone(), device.id.clone());
-            drop.connect_clicked(move |button| pick_and_send_files(&daemon, &id, button));
-            drop.set_sensitive(device.feature_transport_ready);
-            drop.upcast()
-        }
-    };
-    let card = feature_card(
-        "network-transmit-receive-symbolic",
-        "File transfer",
-        &subtitle("Send and receive, both ways"),
-        Some(page_link("History", "transfers").upcast_ref()),
-        &bottom,
+        .find(|row| row.device_id == device.id || row.device_id.is_empty())?;
+    let progress = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_top(4)
+        .build();
+    let line = gtk::Box::builder().spacing(8).build();
+    line.append(
+        &gtk::Image::builder()
+            .icon_name(if row.incoming {
+                "go-down-symbolic"
+            } else {
+                "go-up-symbolic"
+            })
+            .css_classes(["text-dim"])
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build(),
     );
-    if device.feature_transport_ready {
-        let (daemon, id) = (daemon.clone(), device.id.clone());
-        super::accept_dropped_files(&card, move || Some((daemon.clone(), id.clone())));
+    let name = ellipsized(&row.name, &["mono"]);
+    name.set_hexpand(true);
+    line.append(&name);
+    let label = text(&progress_words(&row), &["caption", "text-dim"]);
+    label.set_widget_name("overview-transfer-label");
+    line.append(&label);
+    progress.append(&line);
+    let bar = gtk::ProgressBar::builder().css_classes(["thin"]).build();
+    bar.set_widget_name("overview-transfer-bar");
+    bar.update_property(&[gtk::accessible::Property::Label(&row.name)]);
+    if let Some(fraction) = super::transfers::fraction(&row) {
+        bar.set_fraction(fraction);
     }
-    card
+    progress.append(&bar);
+    Some(progress)
 }
 
 /// "42% · sending", or "Preparing…".
@@ -1315,7 +1151,7 @@ fn progress_words(row: &TransferRow) -> String {
 /// Puts the latest terminal line and transfer progress in place, without
 /// redrawing the page.
 fn refresh_in_place(win: &DesklinkWindow, daemon: &DaemonHandle) {
-    let Some((_, body)) = win.imp().bodies.borrow().get("overview").cloned() else {
+    let Some((_, body)) = win.imp().bodies.borrow().get("home").cloned() else {
         return;
     };
     let root = body.upcast::<gtk::Widget>();

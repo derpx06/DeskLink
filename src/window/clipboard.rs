@@ -1,59 +1,35 @@
-//! The Clipboard page: sharing on or off, and the last 20 items shared,
-//! each with Copy. The history is held in memory only and never lists an
-//! item a password manager marked as a secret.
+//! The Clipboard history tab of Notes & Clipboard: the last 20 items shared,
+//! each with Copy and Pin as Snippet; and the Snippets tab's list. The
+//! history is held in memory only and never lists an item a password manager
+//! marked as a secret. The sharing switch is in the page header
+//! (`notes_clipboard`).
 
 use adw::prelude::*;
 
-use super::overview::{clipboard_switch, preview_line};
-use super::{card, ellipsized, icon_square, text, toast_from, DesklinkWindow};
-use crate::device_links::device::DeviceView;
+use super::overview::preview_line;
+use super::{ellipsized, text, toast_from};
 
-pub(super) fn update(win: &DesklinkWindow, device: &DeviceView) {
-    let Some(daemon) = win.daemon() else {
-        return;
-    };
-    let on = crate::device_links::config::app_settings().clipboard_sync;
-    let items = crate::device_links::daemon::clipboard::history();
-    let minute = super::clock_time(gtk::glib::DateTime::now_local().ok());
-    let key = serde_json::to_string(&(
+/// What the history tab was drawn from: it is redrawn only when this changes.
+pub(super) fn history_key(on: bool) -> String {
+    serde_json::to_string(&(
         on,
         crate::device_links::daemon::clipboard::password_detection(),
-        &device.name,
-        items
+        crate::device_links::daemon::clipboard::history()
             .iter()
-            .map(|item| (&item.text, &item.from, item.at))
+            .map(|item| (item.text.clone(), item.from.clone(), item.at))
             .collect::<Vec<_>>(),
-        minute,
-        crate::device_links::notes::generation(),
+        super::clock_time(gtk::glib::DateTime::now_local().ok()),
     ))
-    .unwrap_or_default();
-    if !win.page_changed("clipboard", key) {
-        return;
-    }
+    .unwrap_or_default()
+}
 
-    let page = gtk::Box::builder()
+/// The clipboard history: a line about passwords, then the list.
+pub(super) fn history_box(on: bool) -> gtk::Box {
+    let items = crate::device_links::daemon::clipboard::history();
+    let rows = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(16)
-        .margin_top(8)
-        .margin_bottom(28)
-        .margin_start(28)
-        .margin_end(28)
+        .spacing(10)
         .build();
-    let top = card(0);
-    top.set_orientation(gtk::Orientation::Horizontal);
-    top.set_spacing(14);
-    top.add_css_class("padded-card");
-    top.append(&icon_square("edit-paste-symbolic", 36, "feature-icon"));
-    let words = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
-        .hexpand(true)
-        .valign(gtk::Align::Center)
-        .build();
-    words.append(&ellipsized(
-        &format!("Share clipboard with {}", device.name),
-        &["card-title"],
-    ));
     let note = text(
         match crate::device_links::daemon::clipboard::password_detection() {
             Some(true) => "Copy on one device, paste on the other. Passwords are never shared.",
@@ -63,25 +39,16 @@ pub(super) fn update(win: &DesklinkWindow, device: &DeviceView) {
             }
             None => "Copy on one device, paste on the other.",
         },
-        &["card-subtitle"],
+        &["text-dim", "body-small"],
     );
     note.set_wrap(true);
-    words.append(&note);
-    top.append(&words);
-    top.append(&clipboard_switch(&daemon, on));
-    page.append(&top);
-
+    note.set_xalign(0.0);
+    rows.append(&note);
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list", "history-list"])
         .build();
     list.update_property(&[gtk::accessible::Property::Label("Clipboard history")]);
-    let heading = text("History", &["list-heading"]);
-    let rows = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .build();
-    rows.append(&heading);
     rows.append(&list);
     if items.is_empty() {
         let empty = text(
@@ -178,12 +145,7 @@ pub(super) fn update(win: &DesklinkWindow, device: &DeviceView) {
                 .build(),
         );
     }
-    page.append(&snippets_section());
-    page.append(&rows);
-    win.replace_body(
-        "clipboard",
-        &adw::Clamp::builder().maximum_size(760).child(&page).build(),
-    );
+    rows
 }
 
 /// Snippets (F6): texts kept to paste again, synced with the phone. Copy on

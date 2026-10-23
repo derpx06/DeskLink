@@ -174,7 +174,7 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
     }
     if crate::device_links::folders::bucket_on(&phone.id) {
         menu.push(
-            TrayEntry::action("Open Bucket", format!("open-bucket:{}", phone.id))
+            TrayEntry::action("Open Files", format!("open-bucket:{}", phone.id))
                 .icon("folder-symbolic"),
         );
     }

@@ -109,7 +109,10 @@ struct RowWidgets {
 
 #[derive(Debug)]
 pub(super) struct Page {
-    pub(super) root: gtk::Widget,
+    /// The transfers part of the Files page: the send zone, the transfers
+    /// moving now and the history. Not scrolled: Files scrolls it with the
+    /// Bucket above it.
+    pub(super) content: gtk::Box,
     zone_title: gtk::Label,
     choose: gtk::Button,
     history: gtk::FlowBox,
@@ -190,7 +193,7 @@ impl Page {
         moving.update_property(&[gtk::accessible::Property::Label("Moving now")]);
 
         let head = gtk::Box::builder().spacing(12).margin_top(6).build();
-        let title = text("Received and sent", &["card-title"]);
+        let title = text("Recent transfers", &["card-title"]);
         title.set_hexpand(true);
         head.append(&title);
         let open = gtk::Button::builder()
@@ -214,28 +217,21 @@ impl Page {
         });
         head.append(&open);
         let history = grid();
-        history.update_property(&[gtk::accessible::Property::Label("Received and sent")]);
+        history.update_property(&[gtk::accessible::Property::Label("Recent transfers")]);
         let empty = text("", &["text-faint", "body-small"]);
         empty.set_wrap(true);
 
         let page = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(16)
-            .margin_top(8)
-            .margin_bottom(28)
-            .margin_start(28)
-            .margin_end(28)
+            .margin_start(16)
+            .margin_end(16)
             .build();
         page.append(&zone);
-        page.append(&moving);
         page.append(&head);
+        page.append(&moving);
         page.append(&history);
         page.append(&empty);
-        let scroll = gtk::ScrolledWindow::builder()
-            .hscrollbar_policy(gtk::PolicyType::Never)
-            .vexpand(true)
-            .child(&page)
-            .build();
 
         let device: Rc<RefCell<(String, String)>> = Rc::default();
         {
@@ -257,22 +253,8 @@ impl Page {
                 }
             });
         }
-        {
-            let (window, device) = (win.downgrade(), Rc::clone(&device));
-            super::accept_dropped_files(&scroll, move || {
-                let window = window.upgrade()?;
-                let daemon = window.daemon()?;
-                let id = device.borrow().0.clone();
-                let ready = window
-                    .known_devices(&daemon)
-                    .into_iter()
-                    .any(|known| known.id == id && known.feature_transport_ready);
-                ready.then_some((daemon, id))
-            });
-        }
-
         Self {
-            root: scroll.upcast(),
+            content: page,
             zone_title,
             choose,
             history,
@@ -283,6 +265,23 @@ impl Page {
             window: win.downgrade(),
             device,
         }
+    }
+
+    /// Makes `widget` (the whole Files page) take dropped files to send to
+    /// the selected phone, once it is connected. The Bucket section has its
+    /// own drop target above this one, so drops over it go to the Bucket.
+    pub(super) fn accept_drops_on(&self, widget: &impl IsA<gtk::Widget>) {
+        let (window, device) = (self.window.clone(), Rc::clone(&self.device));
+        super::accept_dropped_files(widget, move || {
+            let window = window.upgrade()?;
+            let daemon = window.daemon()?;
+            let id = device.borrow().0.clone();
+            let ready = window
+                .known_devices(&daemon)
+                .into_iter()
+                .any(|known| known.id == id && known.feature_transport_ready);
+            ready.then_some((daemon, id))
+        });
     }
 
     /// Redraws the history on its next update, e.g. after Remove from List.

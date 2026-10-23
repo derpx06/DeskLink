@@ -626,6 +626,8 @@ fn fill(win: &DesklinkWindow, page: &gtk::Box, view: &PairView, device: &DeviceV
         hint.set_margin_top(40);
         hint.set_margin_bottom(40);
         hint.set_halign(gtk::Align::Center);
+        hint.set_wrap(true);
+        hint.set_justify(gtk::Justification::Center);
         page.append(&hint);
     } else {
         page.append(&grid(win, &level, view, device));
@@ -634,6 +636,8 @@ fn fill(win: &DesklinkWindow, page: &gtk::Box, view: &PairView, device: &DeviceV
             &["caption", "text-faint"],
         );
         hint.set_halign(gtk::Align::Center);
+        hint.set_wrap(true);
+        hint.set_justify(gtk::Justification::Center);
         page.append(&hint);
     }
     if !view.skipped.is_empty() {
@@ -960,7 +964,7 @@ fn header(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> gtk::Bo
     head.append(&words);
 
     let actions = gtk::Box::builder()
-        .spacing(8)
+        .spacing(6)
         .valign(gtk::Align::Center)
         .halign(gtk::Align::End)
         .build();
@@ -1046,11 +1050,7 @@ fn breadcrumb(win: &DesklinkWindow) -> gtk::Box {
 
 /// "Add Files…".
 fn add_button(device: &str) -> gtk::Button {
-    let button = icon_button(
-        "list-add-symbolic",
-        "Add Files…",
-        &["suggested-action", "pill"],
-    );
+    let button = icon_button("list-add-symbolic", "Add Files…", &["suggested-action"]);
     let device = device.to_string();
     button.connect_clicked(move |button| choose(button, &device));
     button
@@ -1841,7 +1841,7 @@ fn install_paste(win: &DesklinkWindow) {
         let Some(win) = widget.downcast_ref::<DesklinkWindow>() else {
             return glib::Propagation::Proceed;
         };
-        if win.imp().page.borrow().as_str() != "bucket" {
+        if win.imp().page.borrow().as_str() != "files" {
             return glib::Propagation::Proceed;
         }
         let Some(device) = win.selected_id().filter(|id| bucket_of(id).is_some()) else {
@@ -1858,7 +1858,7 @@ fn install_paste(win: &DesklinkWindow) {
     let on_bucket = |widget: &gtk::Widget| {
         widget
             .downcast_ref::<DesklinkWindow>()
-            .is_some_and(|win| win.imp().page.borrow().as_str() == "bucket")
+            .is_some_and(|win| win.imp().page.borrow().as_str() == "files")
     };
     controller.add_shortcut(gtk::Shortcut::new(
         gtk::ShortcutTrigger::parse_string("<Control>a"),
@@ -1962,7 +1962,7 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
         .hexpand(true)
         .valign(gtk::Align::Center)
         .build();
-    words.append(&ellipsized("Bucket", &["card-title"]));
+    words.append(&ellipsized("Files", &["card-title"]));
     let subtitle = match &view {
         Some(view) => format!(
             "{} · {}",
@@ -2002,7 +2002,7 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
     } else {
         head.append(&super::page_link(
             if view.is_some() { "Open" } else { "Set Up" },
-            "bucket",
+            "files",
         ));
     }
     card.append(&head);

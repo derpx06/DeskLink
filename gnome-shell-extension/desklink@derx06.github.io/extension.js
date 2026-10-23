@@ -13,7 +13,7 @@
 // a phone a critical banner with Answer and Decline (notifications.js).
 //
 // An extra pill in the top bar (the link glyph, a coral dot while a phone is
-// using this computer) is optional (DeskLink's Preferences, off by default).
+// using this computer) is optional (DeskLink's Settings, off by default).
 // On the lock screen it shows only "Unlock with <phone>", and only while the
 // app offers that; the phone still has to approve.
 //
