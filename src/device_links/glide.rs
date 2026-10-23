@@ -47,6 +47,15 @@ const QUEUE: usize = 1024;
 const PENDING_MAX: usize = 256;
 /// How long input that came before the crossing's Activated is still its own.
 const PENDING_FRESH: Duration = Duration::from_millis(300);
+/// After the desk says the pointer is entering, the phone has this long to
+/// accept (see "W6 — glide allowed state"). Nothing is streamed meanwhile, and
+/// no answer is a refusal: the pointer comes back where it crossed.
+const ENTER_WAIT: Duration = Duration::from_millis(300);
+/// After a refusal, the edge is left alone this long: a crossing then is
+/// released at once, with nothing sent.
+const REFUSED_BACKOFF: Duration = Duration::from_secs(5);
+/// Input held while the phone has not accepted yet; beyond this, dropped.
+const HELD_MAX: usize = 64;
 /// Motion is coalesced: at most one motion packet per this long (250/s).
 const MOTION_EVERY: Duration = Duration::from_millis(4);
 /// How often the worker re-reads the setting and the phone's link.
@@ -275,6 +284,8 @@ enum Out {
     Release { activation: u32, x: f64, y: f64 },
     /// Gliding started or ended (the indicator).
     Gliding(bool),
+    /// The phone did not accept the pointer: tell the person (once).
+    Refused,
 }
 
 /// One activation of the barrier, start to release (unit-tested).
@@ -295,11 +306,36 @@ struct Glide {
     /// The left button is down on the phone (a drag): every way out lets it
     /// go first, so the phone is never left holding a touch.
     left_down: bool,
+    /// The pointer crossed and the phone has not accepted yet (since when):
+    /// nothing is streamed, input is held.
+    entering: Option<Instant>,
+    /// Input held while entering, at most [`HELD_MAX`].
+    held: VecDeque<Captured>,
+    /// Production: the phone must accept before anything streams. Older
+    /// tests of the streaming itself skip it.
+    accept_needed: bool,
+    /// A refusal: crossings are released at once until then.
+    backoff_until: Option<Instant>,
+    /// The person was told of a refusal and no accept has come since.
+    told: bool,
 }
 
 impl Glide {
     fn new(barrier: Barrier) -> Self {
         Self {
+            accept_needed: true,
+            ..Self::accepting(barrier)
+        }
+    }
+
+    /// A glide that streams at once (tests of the streaming itself).
+    fn accepting(barrier: Barrier) -> Self {
+        Self {
+            entering: None,
+            held: VecDeque::new(),
+            accept_needed: false,
+            backoff_until: None,
+            told: false,
             barrier,
             active: None,
             crossed: (0.0, 0.0),
@@ -332,10 +368,22 @@ impl Glide {
         keys: &dyn Fn(u32, Mods) -> Option<gdk::Key>,
         now: Instant,
     ) -> Vec<Out> {
+        // A refusal just now: the pointer goes straight back, nothing is
+        // sent, nothing streams.
+        if self.backoff_until.is_some_and(|until| now < until) {
+            self.pending.clear();
+            let (x, y) = self.barrier.inside(cursor.0, cursor.1);
+            return vec![Out::Release { activation, x, y }];
+        }
         let was = self.active.replace(activation);
+        // Already on the phone (and accepted) when the portal activates again:
+        // nothing new to wait for.
+        let waiting = was.is_none() || self.entering.is_some();
         self.crossed = cursor;
         self.mods = Mods::default();
         self.motion = (0.0, 0.0);
+        self.held.clear();
+        self.entering = (self.accept_needed && waiting).then_some(now);
         let mut out = vec![Out::Send(self.barrier.enter_packet(cursor))];
         if was.is_none() {
             out.push(Out::Gliding(true));
@@ -355,6 +403,8 @@ impl Glide {
     /// The compositor ended the capture itself (lock screen, session end).
     fn deactivated(&mut self) -> Vec<Out> {
         self.pending.clear();
+        self.held.clear();
+        self.entering = None;
         if self.active.take().is_none() {
             return Vec::new();
         }
@@ -368,6 +418,8 @@ impl Glide {
     /// off), where it crossed.
     fn take_back(&mut self) -> Vec<Out> {
         self.pending.clear();
+        self.held.clear();
+        self.entering = None;
         let Some(activation) = self.active.take() else {
             return Vec::new();
         };
@@ -388,8 +440,12 @@ impl Glide {
     }
 
     /// G3: the phone hands the pointer back.
-    fn phone_released(&mut self, dx: f64, dy: f64) -> Vec<Out> {
+    fn phone_released(&mut self, dx: f64, dy: f64, now: Instant) -> Vec<Out> {
         self.pending.clear();
+        // Before it accepted, a hand-back is a refusal: back where it crossed.
+        if self.entering.is_some() {
+            return self.refused(now, false);
+        }
         let Some(activation) = self.active.take() else {
             return Vec::new();
         };
@@ -399,8 +455,66 @@ impl Glide {
         out
     }
 
+    /// The phone accepted the pointer: what was held goes out, in order.
+    fn accepted(&mut self, keys: &dyn Fn(u32, Mods) -> Option<gdk::Key>, now: Instant) -> Vec<Out> {
+        if self.entering.take().is_none() {
+            return Vec::new();
+        }
+        self.told = false;
+        self.mods = Mods::default();
+        let mut out = Vec::new();
+        for captured in std::mem::take(&mut self.held) {
+            out.extend(self.input(captured, keys, now));
+        }
+        out.extend(self.flush_motion(now));
+        out
+    }
+
+    /// The phone did not accept (it handed the pointer back, said it does not
+    /// allow glide, or did not answer in time): the pointer is released where
+    /// it crossed, nothing was streamed, and this edge is left alone for
+    /// [`REFUSED_BACKOFF`]. `tell_phone`: the phone is told to forget the
+    /// entry (it never answered).
+    fn refused(&mut self, now: Instant, tell_phone: bool) -> Vec<Out> {
+        self.pending.clear();
+        self.held.clear();
+        self.entering = None;
+        self.motion = (0.0, 0.0);
+        self.backoff_until = Some(now + REFUSED_BACKOFF);
+        let Some(activation) = self.active.take() else {
+            return Vec::new();
+        };
+        let (x, y) = self.barrier.inside(self.crossed.0, self.crossed.1);
+        let mut out = Vec::new();
+        if tell_phone {
+            out.push(Out::Send(Self::taken_back()));
+        }
+        out.extend([Out::Release { activation, x, y }, Out::Gliding(false)]);
+        if !std::mem::replace(&mut self.told, true) {
+            out.push(Out::Refused);
+        }
+        out
+    }
+
+    /// The phone says it no longer allows glide (a state report): a pointer
+    /// on it, or on its way, comes back at once.
+    fn disallowed(&mut self, now: Instant) -> Vec<Out> {
+        if self.entering.is_some() {
+            return self.refused(now, false);
+        }
+        self.take_back()
+    }
+
     /// Motion waiting longer than [`MOTION_EVERY`] goes out.
     fn tick(&mut self, now: Instant) -> Vec<Out> {
+        if let Some(since) = self.entering {
+            // No answer in time is a refusal.
+            return if now.saturating_duration_since(since) >= ENTER_WAIT {
+                self.refused(now, true)
+            } else {
+                Vec::new()
+            };
+        }
         let due = self
             .motion_sent
             .is_none_or(|sent| now.duration_since(sent) >= MOTION_EVERY);
@@ -435,6 +549,21 @@ impl Glide {
             }
             if self.pending.len() < PENDING_MAX {
                 self.pending.push_back((now, captured));
+            } else {
+                self.dropped += 1;
+            }
+            return Vec::new();
+        }
+        if self.entering.is_some() {
+            // Nothing streams before the phone accepts; Esc+Super still works.
+            if let Captured::Key(code, pressed) = captured {
+                if !self.mods.update(code, pressed) && pressed && code == KEY_ESC && self.mods.meta
+                {
+                    return self.take_back();
+                }
+            }
+            if self.held.len() < HELD_MAX {
+                self.held.push_back(captured);
             } else {
                 self.dropped += 1;
             }
@@ -666,6 +795,17 @@ enum Command {
         dx: f64,
         dy: f64,
     },
+    /// The phone's state report (`allowed`), and whether it also accepts the
+    /// pointer that just entered (`entered`).
+    State {
+        device: String,
+        allowed: bool,
+        entered: bool,
+    },
+    /// The phone hands the pointer back with `exitEdge: 0`: a refusal.
+    HandedBack {
+        device: String,
+    },
 }
 
 fn queue() -> &'static OnceLock<SyncSender<Command>> {
@@ -689,6 +829,77 @@ pub(crate) fn start() {
         set_status(|status| {
             status.availability = Availability::Unavailable("Glide could not start");
         });
+    }
+}
+
+/// What each phone last reported about glide (`allowed`). Unknown until it
+/// reports, and forgotten whenever its link is not ready: the phone reports
+/// on every feature-ready.
+static ALLOWED: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+
+/// Whether the phone has said it allows glide: `None` until it reports (an
+/// older phone never does).
+pub(crate) fn phone_allows(device_id: &str) -> Option<bool> {
+    ALLOWED.lock().ok().and_then(|known| {
+        known
+            .as_ref()
+            .and_then(|known| known.get(device_id).copied())
+    })
+}
+
+fn set_allowed(device_id: &str, allowed: Option<bool>) {
+    if let Ok(mut known) = ALLOWED.lock() {
+        let known = known.get_or_insert_with(HashMap::new);
+        match allowed {
+            Some(allowed) => {
+                if known.len() >= 64 && !known.contains_key(device_id) {
+                    return;
+                }
+                known.insert(device_id.to_string(), allowed);
+            }
+            None => {
+                known.remove(device_id);
+            }
+        }
+    }
+}
+
+/// Everything the phone says on `desklink.shareinputdevices` (W6): a state
+/// report (`allowed`, plus `entered: true` when it accepts the pointer that
+/// just crossed), a hand-back with `exitEdge: 0` (a refusal), or G3's release
+/// point. Each is a report, never an instruction to capture anything.
+pub(crate) fn on_phone_packet(device_id: &str, packet: &NetworkPacket) {
+    let release =
+        packet.body.contains_key("releaseDeltax") || packet.body.contains_key("releaseDeltay");
+    if let (false, Some(allowed)) = (
+        release,
+        packet
+            .body
+            .get("allowed")
+            .and_then(serde_json::Value::as_bool),
+    ) {
+        set_allowed(device_id, Some(allowed));
+        send_command(Command::State {
+            device: device_id.to_string(),
+            allowed,
+            entered: allowed
+                && packet
+                    .body
+                    .get("entered")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true),
+        });
+    } else if packet
+        .body
+        .get("exitEdge")
+        .and_then(serde_json::Value::as_i64)
+        == Some(0)
+    {
+        send_command(Command::HandedBack {
+            device: device_id.to_string(),
+        });
+    } else {
+        phone_released(device_id, packet);
     }
 }
 
@@ -1106,6 +1317,22 @@ fn inbound_silence(device: &str) -> Option<Duration> {
     crate::device_links::desk_features::inbound_silence(device)
 }
 
+/// The barrier is armed only for a phone whose link is ready, that is not
+/// silent, that has said it allows glide, and while glide was not refused.
+fn wants_barrier(refused: bool, silent: bool, ready: bool, allowed: bool) -> bool {
+    !refused && !silent && ready && allowed
+}
+
+/// Whether the phone has said it allows glide (debug builds: or a test
+/// device, which has no phone to say it).
+fn allows_glide(device: &str) -> bool {
+    #[cfg(debug_assertions)]
+    if test_device(device) {
+        return true;
+    }
+    phone_allows(device) == Some(true)
+}
+
 /// Whether the phone's link is ready (debug builds: or a test device).
 fn ready(device: &str) -> bool {
     #[cfg(debug_assertions)]
@@ -1252,6 +1479,19 @@ fn perform(device: Option<&str>, outs: Vec<Out>, portal: Option<&mut Portal>) {
                     }
                 }
             }
+            Out::Refused => {
+                let phone = crate::device_links::connection_log::name_of(device);
+                log_limited(
+                    "glide-refused",
+                    &format!("{phone} did not accept the pointer"),
+                );
+                crate::device_links::webrtc::capture::notify(
+                    crate::device_links::daemon::handle::DaemonEvent::GlideNotice {
+                        device_id: device.to_string(),
+                        message: format!("{phone} did not accept the pointer"),
+                    },
+                );
+            }
             Out::Gliding(on) => {
                 debug_log!("[Glide] {}", if on { "on the phone" } else { "back" });
                 set_status(|status| status.gliding = on.then(|| device.to_string()));
@@ -1320,6 +1560,9 @@ struct State {
     /// Arming failed this many times in a row, and when to try again.
     arm_failures: u32,
     retry_at: Option<Instant>,
+    /// A refusal's back-off and whether the person was told, kept across
+    /// re-armed sessions: (until, told).
+    refusal: (Option<Instant>, bool),
 }
 
 /// What a failed arming leads to: the desktop may be busy for a moment (a
@@ -1407,6 +1650,7 @@ fn worker(context: &glib::MainContext, commands: &Receiver<Command>) {
         refused: false,
         arm_failures: 0,
         retry_at: None,
+        refusal: (None, false),
     };
     // A panic must not leave the pointer captured, nor the top bar saying
     // glide is on: release, then say glide stopped.
@@ -1466,7 +1710,30 @@ fn run(
                 } => {
                     if device.as_deref() == Some(from.as_str()) {
                         if let Some(glide) = state.glide.as_mut() {
-                            outs.extend(glide.phone_released(dx, dy));
+                            outs.extend(glide.phone_released(dx, dy, Instant::now()));
+                        }
+                    }
+                }
+                Command::State {
+                    device: from,
+                    allowed,
+                    entered,
+                } => {
+                    if device.as_deref() == Some(from.as_str()) {
+                        if let Some(glide) = state.glide.as_mut() {
+                            let now = Instant::now();
+                            outs.extend(match (allowed, entered) {
+                                (false, _) => glide.disallowed(now),
+                                (true, true) => glide.accepted(&desk_key, now),
+                                (true, false) => Vec::new(),
+                            });
+                        }
+                    }
+                }
+                Command::HandedBack { device: from } => {
+                    if device.as_deref() == Some(from.as_str()) {
+                        if let Some(glide) = state.glide.as_mut() {
+                            outs.extend(glide.disallowed(Instant::now()));
                         }
                     }
                 }
@@ -1527,6 +1794,9 @@ fn run(
 
         let target = state.current.as_ref().map(|setting| setting.device.clone());
         perform(target.as_deref(), outs, state.portal.as_mut());
+        if let Some(glide) = state.glide.as_ref() {
+            state.refusal = (glide.backoff_until, glide.told);
+        }
         if let Some(glide) = state.glide.as_mut() {
             if glide.dropped > 0 {
                 log_limited("pending", "Input before the capture started was dropped");
@@ -1572,6 +1842,7 @@ fn check(
             state.glide = None;
         }
         state.current = setting;
+        state.refusal = (None, false);
         state.refused = false;
         state.arm_failures = 0;
         state.retry_at = None;
@@ -1595,12 +1866,22 @@ fn check(
             .as_ref()
             .is_some_and(|setting| is_dozing(&setting.device)),
     );
-    let want = !state.refused
-        && !silent
-        && state
-            .current
-            .as_ref()
-            .is_some_and(|setting| ready(&setting.device));
+    let is_ready = state
+        .current
+        .as_ref()
+        .is_some_and(|setting| ready(&setting.device));
+    // The phone reports on every feature-ready: what it said before the link
+    // went away is not known any more.
+    if let (false, Some(setting)) = (is_ready, state.current.as_ref()) {
+        set_allowed(&setting.device, None);
+    }
+    // The barrier is armed only while the phone says it allows glide: an
+    // unknown state (an older phone, no report yet) is not a yes.
+    let allowed = state
+        .current
+        .as_ref()
+        .is_some_and(|setting| allows_glide(&setting.device));
+    let want = wants_barrier(state.refused, silent, is_ready, allowed);
     if want && state.portal.is_none() {
         match Portal::open(context, connection) {
             Ok(opened) => state.portal = Some(opened),
@@ -1615,7 +1896,14 @@ fn check(
         if want && !open.enabled && state.retry_at.is_none_or(|at| Instant::now() >= at) {
             match open.arm(context, setting.edge) {
                 Ok(barrier) => {
-                    state.glide = Some(Glide::new(barrier));
+                    let mut glide = Glide::new(barrier);
+                    #[cfg(debug_assertions)]
+                    if test_device(&setting.device) {
+                        // A test device has no phone to answer.
+                        glide.accept_needed = false;
+                    }
+                    (glide.backoff_until, glide.told) = state.refusal;
+                    state.glide = Some(glide);
                     state.arm_failures = 0;
                     state.retry_at = None;
                     set_status(|status| status.problem = None);
@@ -1733,7 +2021,7 @@ mod tests {
 
     #[test]
     fn the_crossing_tells_the_phone_the_edge_and_where_along_it() {
-        let mut glide = Glide::new(Barrier::on(Edge::Right, &screen()).unwrap());
+        let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());
         let outs = glide.activated(7, (1603.0, 400.4), &keys, Instant::now());
         assert_eq!(
             sent(&outs),
@@ -1744,7 +2032,7 @@ mod tests {
         assert!(outs.contains(&Out::Gliding(true)));
         assert!(outs.contains(&Out::Clipboard));
         // The top edge is Qt's 1, and its along-the-edge delta is x.
-        let mut top = Glide::new(Barrier::on(Edge::Top, &screen()).unwrap());
+        let mut top = Glide::accepting(Barrier::on(Edge::Top, &screen()).unwrap());
         let outs = top.activated(1, (2000.0, -4.0), &keys, Instant::now());
         assert_eq!(sent(&outs)[0]["exitEdge"], 1);
         assert_eq!(sent(&outs)[0]["deltax"], 1600, "clamped to the edge");
@@ -1752,7 +2040,7 @@ mod tests {
 
     #[test]
     fn input_before_activation_waits_then_follows_the_crossing() {
-        let mut glide = Glide::new(Barrier::on(Edge::Left, &screen()).unwrap());
+        let mut glide = Glide::accepting(Barrier::on(Edge::Left, &screen()).unwrap());
         let now = Instant::now();
         assert!(glide
             .input(Captured::Motion(-5.0, 1.0), &keys, now)
@@ -1765,7 +2053,7 @@ mod tests {
         assert_eq!(bodies[1], serde_json::json!({"dx": -5.0, "dy": 1.0}));
         assert_eq!(bodies[2], serde_json::json!({"singlehold": true}));
         // Bounded while waiting.
-        let mut waiting = Glide::new(Barrier::on(Edge::Left, &screen()).unwrap());
+        let mut waiting = Glide::accepting(Barrier::on(Edge::Left, &screen()).unwrap());
         for _ in 0..PENDING_MAX + 10 {
             waiting.input(Captured::Motion(1.0, 0.0), &keys, now);
         }
@@ -1777,7 +2065,7 @@ mod tests {
     /// release) is dropped at the next crossing, not typed into the phone.
     #[test]
     fn stale_waiting_input_is_not_replayed_at_the_next_crossing() {
-        let mut glide = Glide::new(Barrier::on(Edge::Left, &screen()).unwrap());
+        let mut glide = Glide::accepting(Barrier::on(Edge::Left, &screen()).unwrap());
         let then = Instant::now();
         glide.input(Captured::Button(BTN_LEFT, true), &keys, then);
         glide.input(Captured::Key(30, true), &keys, then);
@@ -1797,7 +2085,7 @@ mod tests {
 
     #[test]
     fn motion_is_coalesced_to_one_packet_per_interval() {
-        let mut glide = Glide::new(Barrier::on(Edge::Right, &screen()).unwrap());
+        let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());
         let start = Instant::now();
         glide.activated(1, (1600.0, 0.0), &keys, start);
         let first = glide.input(Captured::Motion(1.0, 2.0), &keys, start);
@@ -1837,7 +2125,7 @@ mod tests {
 
     #[test]
     fn buttons_scroll_and_keys_use_the_kde_shapes() {
-        let mut glide = Glide::new(Barrier::on(Edge::Right, &screen()).unwrap());
+        let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());
         let now = Instant::now();
         glide.activated(1, (1600.0, 0.0), &keys, now);
         let mut bodies = Vec::new();
@@ -1886,7 +2174,7 @@ mod tests {
 
     #[test]
     fn esc_with_super_always_comes_back_where_it_crossed() {
-        let mut glide = Glide::new(Barrier::on(Edge::Right, &screen()).unwrap());
+        let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());
         let now = Instant::now();
         glide.activated(9, (1600.0, 300.0), &keys, now);
         assert!(sent(&glide.input(Captured::Key(125, true), &keys, now)).is_empty());
@@ -1908,10 +2196,13 @@ mod tests {
 
     #[test]
     fn the_phone_hands_back_at_its_release_point_inside_the_screen() {
-        let mut glide = Glide::new(Barrier::on(Edge::Left, &screen()).unwrap());
-        assert!(glide.phone_released(0.0, 10.0).is_empty(), "not gliding");
+        let mut glide = Glide::accepting(Barrier::on(Edge::Left, &screen()).unwrap());
+        assert!(
+            glide.phone_released(0.0, 10.0, Instant::now()).is_empty(),
+            "not gliding"
+        );
         glide.activated(4, (0.0, 10.0), &keys, Instant::now());
-        let outs = glide.phone_released(0.0, 640.0);
+        let outs = glide.phone_released(0.0, 640.0, Instant::now());
         assert_eq!(
             outs,
             vec![
@@ -1926,7 +2217,7 @@ mod tests {
         // An old phone's raw pixels past the screen are clamped into it.
         glide.activated(5, (0.0, 10.0), &keys, Instant::now());
         assert_eq!(
-            glide.phone_released(0.0, 2400.0)[0],
+            glide.phone_released(0.0, 2400.0, Instant::now())[0],
             Out::Release {
                 activation: 5,
                 x: 2.0,
@@ -1973,7 +2264,7 @@ mod tests {
     #[test]
     fn a_lost_reader_or_new_screens_release_the_pointer() {
         let live = || {
-            let mut glide = Glide::new(Barrier::on(Edge::Right, &screen()).unwrap());
+            let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());
             glide.activated(3, (1600.0, 200.0), &keys, Instant::now());
             glide
         };
@@ -2004,7 +2295,7 @@ mod tests {
     #[test]
     fn a_held_button_is_let_go_on_every_way_out() {
         let held = || {
-            let mut glide = Glide::new(Barrier::on(Edge::Right, &screen()).unwrap());
+            let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());
             glide.activated(3, (1600.0, 200.0), &keys, Instant::now());
             glide.input(Captured::Button(BTN_LEFT, true), &keys, Instant::now());
             assert!(glide.left_down);
@@ -2017,7 +2308,7 @@ mod tests {
         };
         assert!(released(&held().take_back()));
         assert!(released(&held().deactivated()));
-        assert!(released(&held().phone_released(0.0, 10.0)));
+        assert!(released(&held().phone_released(0.0, 10.0, Instant::now())));
         // Up before the way out: nothing extra.
         let mut glide = held();
         glide.input(Captured::Button(BTN_LEFT, false), &keys, Instant::now());
@@ -2041,7 +2332,7 @@ mod tests {
     /// what the top bar shows.
     #[test]
     fn ending_the_worker_releases_a_capture_that_is_live() {
-        let mut glide = Glide::new(Barrier::on(Edge::Right, &screen()).unwrap());
+        let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());
         glide.activated(9, (1600.0, 200.0), &keys, Instant::now());
         let mut state = State {
             portal: None,
@@ -2053,6 +2344,7 @@ mod tests {
             refused: false,
             arm_failures: 0,
             retry_at: None,
+            refusal: (None, false),
         };
         set_status(|status| status.gliding = Some("e2e-release-all".into()));
         state.release_all();
@@ -2196,10 +2488,13 @@ mod tests {
             refused: false,
             arm_failures: 0,
             retry_at: None,
+            refusal: (None, false),
         };
         assert_eq!(nap(&state), CHECK_EVERY);
-        let mut glide = Glide::new(Barrier::on(Edge::Right, &screen()).unwrap());
-        state.glide = Some(Glide::new(Barrier::on(Edge::Right, &screen()).unwrap()));
+        let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());
+        state.glide = Some(Glide::accepting(
+            Barrier::on(Edge::Right, &screen()).unwrap(),
+        ));
         assert_eq!(
             nap(&state),
             CHECK_EVERY,
@@ -2222,5 +2517,211 @@ mod tests {
             serde_json::from_str::<GlideSetting>(&json).unwrap(),
             setting
         );
+    }
+
+    // ── W6: the phone must allow glide, and accept each entry ───────────────
+
+    fn left() -> Glide {
+        Glide::new(Barrier::on(Edge::Left, &screen()).unwrap())
+    }
+
+    fn count_refused(outs: &[Out]) -> usize {
+        outs.iter().filter(|out| **out == Out::Refused).count()
+    }
+
+    fn released_at(outs: &[Out]) -> Option<(f64, f64)> {
+        outs.iter().find_map(|out| match out {
+            Out::Release { x, y, .. } => Some((*x, *y)),
+            _ => None,
+        })
+    }
+
+    /// A phone that hands the pointer back: it is released where it crossed,
+    /// nothing but the entry was streamed, this edge is left alone for 5 s
+    /// and the person is told once.
+    #[test]
+    fn a_phone_that_hands_the_pointer_back_gets_nothing_and_the_edge_rests() {
+        let mut glide = left();
+        let start = Instant::now();
+        let mut streamed = sent(&glide.activated(1, (-2.0, 300.0), &keys, start)).len();
+        assert_eq!(streamed, 1, "only the entry itself");
+        // The mouse keeps moving and clicking while the phone has not answered.
+        for step in 0..50 {
+            let at = start + Duration::from_millis(step);
+            streamed += sent(&glide.input(Captured::Motion(-3.0, 1.0), &keys, at)).len();
+            streamed += sent(&glide.input(Captured::Button(BTN_LEFT, true), &keys, at)).len();
+        }
+        assert_eq!(streamed, 1, "no event streams before an accept");
+        // The phone refuses 20 ms in.
+        let at = start + Duration::from_millis(20);
+        let outs = glide.phone_released(0.0, 0.0, at);
+        let (x, y) = released_at(&outs).expect("the pointer is given back");
+        assert!(
+            (0.0..=5.0).contains(&x) && (y - 300.0).abs() < 2.0,
+            "{x},{y}: at the crossing"
+        );
+        assert!(
+            sent(&outs).is_empty(),
+            "nothing is said to a phone that said no"
+        );
+        assert!(outs.contains(&Out::Gliding(false)));
+        assert_eq!(count_refused(&outs), 1, "one toast");
+        assert!(!glide.gliding());
+        // Pushing on the edge again within 5 s: released at once, silent.
+        let again = glide.activated(2, (-1.0, 310.0), &keys, start + Duration::from_secs(4));
+        assert!(sent(&again).is_empty() && released_at(&again).is_some());
+        assert!(!glide.gliding(), "never captured");
+        // After 5 s it tries again; a second refusal is not announced again.
+        let later = start + Duration::from_secs(6);
+        assert_eq!(
+            sent(&glide.activated(3, (-2.0, 300.0), &keys, later)).len(),
+            1
+        );
+        let outs = glide.phone_released(0.0, 0.0, later + Duration::from_millis(10));
+        assert_eq!(count_refused(&outs), 0, "told once");
+        // An accept ends the silence: the next refusal is announced.
+        let t = later + Duration::from_secs(6);
+        glide.activated(4, (-2.0, 300.0), &keys, t);
+        glide.accepted(&keys, t);
+        glide.take_back();
+        let t = t + Duration::from_secs(6);
+        glide.activated(5, (-2.0, 300.0), &keys, t);
+        let outs = glide.phone_released(0.0, 0.0, t);
+        assert_eq!(count_refused(&outs), 1);
+    }
+
+    /// No answer within 300 ms is a refusal too: the pointer is back where it
+    /// crossed, the phone is told to forget the entry.
+    #[test]
+    fn an_entry_the_phone_never_answers_is_given_back_after_300_ms() {
+        let mut glide = left();
+        let start = Instant::now();
+        glide.activated(1, (-2.0, 120.0), &keys, start);
+        glide.input(Captured::Motion(-9.0, 0.0), &keys, start);
+        assert!(glide.tick(start + Duration::from_millis(299)).is_empty());
+        assert!(glide.gliding());
+        let outs = glide.tick(start + ENTER_WAIT);
+        assert_eq!(sent(&outs), vec![serde_json::json!({"exitEdge": 0})]);
+        assert!(released_at(&outs).is_some());
+        assert_eq!(count_refused(&outs), 1);
+        assert!(!glide.gliding());
+        assert!(glide.tick(start + Duration::from_secs(1)).is_empty());
+    }
+
+    /// Accepted: what was held goes out in order, then it streams normally.
+    #[test]
+    fn an_accepted_entry_replays_what_was_held_and_then_streams() {
+        let mut glide = left();
+        let start = Instant::now();
+        glide.activated(1, (-2.0, 120.0), &keys, start);
+        glide.input(Captured::Motion(-4.0, 2.0), &keys, start);
+        glide.input(Captured::Button(BTN_LEFT, true), &keys, start);
+        glide.input(Captured::Button(BTN_LEFT, false), &keys, start);
+        let at = start + Duration::from_millis(40);
+        let outs = glide.accepted(&keys, at);
+        assert_eq!(
+            sent(&outs),
+            vec![
+                serde_json::json!({"dx": -4.0, "dy": 2.0}),
+                serde_json::json!({"singlehold": true}),
+                serde_json::json!({"singlerelease": true}),
+            ]
+        );
+        // After the accept: streaming at once, and no timeout any more.
+        assert!(glide.tick(start + Duration::from_secs(2)).is_empty());
+        assert!(glide.gliding());
+        let outs = glide.input(
+            Captured::Motion(1.0, 1.0),
+            &keys,
+            at + Duration::from_millis(10),
+        );
+        assert_eq!(sent(&outs).len(), 1);
+        // A second accept changes nothing.
+        assert!(glide.accepted(&keys, at).is_empty());
+    }
+
+    /// Held input is bounded, and Esc+Super still brings the pointer back
+    /// while the phone has not answered.
+    #[test]
+    fn held_input_is_bounded_and_esc_super_works_while_waiting() {
+        let mut glide = left();
+        let now = Instant::now();
+        glide.activated(1, (-2.0, 120.0), &keys, now);
+        for _ in 0..HELD_MAX + 20 {
+            glide.input(Captured::Motion(1.0, 0.0), &keys, now);
+        }
+        assert_eq!(glide.held.len(), HELD_MAX);
+        glide.input(Captured::Key(125, true), &keys, now);
+        let outs = glide.input(Captured::Key(KEY_ESC, true), &keys, now);
+        assert!(released_at(&outs).is_some(), "Esc+Super comes back");
+        assert!(!glide.gliding());
+        assert!(glide.held.is_empty());
+    }
+
+    /// The phone says glide is no longer allowed: a pointer on it, or on its
+    /// way, comes back at once.
+    #[test]
+    fn a_flip_to_not_allowed_gives_the_pointer_back_at_once() {
+        let now = Instant::now();
+        let mut on = left();
+        on.activated(1, (-2.0, 200.0), &keys, now);
+        on.accepted(&keys, now);
+        on.input(Captured::Button(BTN_LEFT, true), &keys, now);
+        let outs = on.disallowed(now);
+        assert_eq!(
+            sent(&outs),
+            vec![
+                serde_json::json!({"singlerelease": true}),
+                serde_json::json!({"exitEdge": 0})
+            ]
+        );
+        assert!(released_at(&outs).is_some() && !on.gliding());
+        // Still entering: a refusal, nothing said.
+        let mut entering = left();
+        entering.activated(1, (-2.0, 200.0), &keys, now);
+        let outs = entering.disallowed(now);
+        assert!(released_at(&outs).is_some() && sent(&outs).is_empty());
+    }
+
+    /// The barrier is armed only for a phone that reported "allowed: true";
+    /// unknown (an older phone) and false both leave it disabled.
+    #[test]
+    fn the_barrier_is_armed_only_when_the_phone_allows_glide() {
+        assert!(wants_barrier(false, false, true, true));
+        assert!(
+            !wants_barrier(false, false, true, false),
+            "not allowed or unknown"
+        );
+        assert!(!wants_barrier(false, false, false, true), "link not ready");
+        assert!(!wants_barrier(false, true, true, true), "link silent");
+        assert!(
+            !wants_barrier(true, false, true, true),
+            "refused by the desktop"
+        );
+        let phone = "w6f-phone-state";
+        assert_eq!(phone_allows(phone), None, "no report yet");
+        assert!(!allows_glide(phone));
+        let report = |allowed: bool| {
+            let mut packet =
+                NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_SHARE_INPUT_DEVICES);
+            packet.set("allowed", allowed);
+            packet
+        };
+        on_phone_packet(phone, &report(false));
+        assert_eq!(phone_allows(phone), Some(false));
+        assert!(!allows_glide(phone));
+        on_phone_packet(phone, &report(true));
+        assert!(allows_glide(phone));
+        on_phone_packet(phone, &report(false));
+        assert!(!allows_glide(phone), "a flip to false is seen at once");
+        // A release (G3) is not a state report.
+        let mut release =
+            NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_SHARE_INPUT_DEVICES);
+        release.set("releaseDeltax", 3);
+        release.set("releaseDeltay", 4);
+        on_phone_packet(phone, &release);
+        assert_eq!(phone_allows(phone), Some(false));
+        set_allowed(phone, None);
+        assert_eq!(phone_allows(phone), None, "forgotten when the link goes");
     }
 }

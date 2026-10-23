@@ -896,7 +896,8 @@ impl DesklinkWindow {
                     self.show_feature_toast(&text);
                 }
                 DaemonEvent::SoundNotice { message, .. }
-                | DaemonEvent::CaptureNotice { message, .. } => self.show_feature_toast(&message),
+                | DaemonEvent::CaptureNotice { message, .. }
+                | DaemonEvent::GlideNotice { message, .. } => self.show_feature_toast(&message),
                 DaemonEvent::WifiFromPhone { network, .. } => self.offer_wifi(network),
                 // Handled by this refresh itself (the call card and notification).
                 DaemonEvent::CallChanged { .. } => {}

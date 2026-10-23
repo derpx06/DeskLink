@@ -119,7 +119,7 @@ pub(crate) fn state_words(
 }
 
 /// This computer's name as the phone shows it (its host name).
-fn desk_name() -> String {
+pub(crate) fn desk_name() -> String {
     hostname::get()
         .ok()
         .and_then(|name| name.into_string().ok())

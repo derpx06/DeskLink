@@ -55,6 +55,8 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     let glide_status = crate::device_links::glide::status();
     let key = serde_json::to_string(&(
         format!("{:?}{:?}", glide_status.availability, glide_status.problem),
+        // The phone's "allowed" report changes the glide row's words.
+        crate::device_links::glide::phone_allows(&device.id),
         &device.id,
         &device.name,
         approving,
@@ -1226,6 +1228,19 @@ fn unpair_row(daemon: &DaemonHandle, device: &DeviceView) -> adw::ActionRow {
     row
 }
 
+/// The words under the glide switch: what it does, or (until the phone says
+/// it allows glide) what to do on the phone first. Glide stays off until then.
+fn glide_explained(phone: &str, allowed: Option<bool>, computer: &str) -> String {
+    if allowed == Some(true) {
+        format!(
+            "Move the pointer past the edge of this screen to use {phone} with this mouse and \
+             keyboard. Esc+Super brings it back."
+        )
+    } else {
+        format!("Turn on “Let {computer} control this phone” on the phone first.")
+    }
+}
+
 /// Glide (F4): the pointer glides onto this phone past an edge of this
 /// screen. A switch, and where the phone sits (a small arrangement: this
 /// screen with a phone slot on each side). Hidden, with the reason, where
@@ -1253,9 +1268,10 @@ fn add_glide_rows(
         Availability::Available => {}
     }
     let phone = device.name.clone();
-    let explained = format!(
-        "Move the pointer past the edge of this screen to use {phone} with this mouse and \
-         keyboard. Esc+Super brings it back."
+    let explained = glide_explained(
+        &phone,
+        crate::device_links::glide::phone_allows(&device.id),
+        &crate::type_on_phone::desk_name(),
     );
     let current = settings
         .glide
@@ -1452,5 +1468,13 @@ mod tests {
         );
         assert_eq!(relay_host("wss://10.0.0.2:8443?x=1"), "10.0.0.2:8443");
         assert_eq!(relay_host("relay.example"), "relay.example");
+    }
+
+    #[test]
+    fn the_glide_row_says_what_to_turn_on_until_the_phone_allows_it() {
+        let says = "Turn on “Let Desk control this phone” on the phone first.";
+        assert_eq!(glide_explained("Pixel", None, "Desk"), says);
+        assert_eq!(glide_explained("Pixel", Some(false), "Desk"), says);
+        assert!(glide_explained("Pixel", Some(true), "Desk").starts_with("Move the pointer past"));
     }
 }

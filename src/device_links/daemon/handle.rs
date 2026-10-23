@@ -43,6 +43,8 @@ pub enum DaemonEvent {
     SoundNotice { device_id: String, message: String },
     /// Insert from the phone (F3): what came back or why it did not.
     CaptureNotice { device_id: String, message: String },
+    /// Glide (W6): the phone did not accept the pointer.
+    GlideNotice { device_id: String, message: String },
     /// A QR code the phone scanned holds a Wi-Fi network: offer to join.
     WifiFromPhone {
         device_id: String,
