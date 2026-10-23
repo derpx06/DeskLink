@@ -391,27 +391,46 @@ impl Store {
     /// `name`, or the next free name if it was taken in the meantime. The
     /// hard link never replaces anything and the file appears whole.
     pub fn publish(&self, id: &str, name: &str, filename: &str) -> Result<PathBuf, String> {
+        self.publish_with(id, name, filename, &|part, target| {
+            fs::hard_link(part, target)
+        })
+    }
+
+    /// [`publish`](Self::publish) with the way a file is linked into place
+    /// given (tests make it fail the way another filesystem does).
+    ///
+    /// A failure leaves the partial file where it is: it is verified and a
+    /// retry only has to place it.
+    pub(super) fn publish_with(
+        &self,
+        id: &str,
+        name: &str,
+        filename: &str,
+        link: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+    ) -> Result<PathBuf, String> {
         let part = self.part_path(id)?;
+        // The folder may have gone while the file arrived (moved, unmounted).
+        fs::create_dir_all(&self.destination_root)
+            .map_err(|error| plain_io("make the downloads folder", &error))?;
         ensure_directory_not_symlink(&self.destination_root)?;
         let mut name = name.to_string();
         for _ in 0..16 {
             let target = self.destination_path(&name)?;
-            match fs::hard_link(&part, &target) {
+            match place_file(&part, &target, &self.destination_root, link) {
                 Ok(()) => {
                     // The download is already published; a leftover part
-                    // file is only clutter.
+                    // file is only clutter, and a directory that will not
+                    // sync does not unpublish it.
                     let _ = fs::remove_file(&part);
-                    sync_directory(&self.destination_root)?;
+                    if let Err(error) = sync_directory(&self.destination_root) {
+                        debug_log!("[DeskLink] {error}");
+                    }
                     return Ok(target);
                 }
                 Err(error) if error.kind() == ErrorKind::AlreadyExists => {
                     name = self.available_destination_name(filename)?;
                 }
-                Err(error) => {
-                    return Err(format!(
-                        "Could not atomically publish DeskLink download: {error}"
-                    ));
-                }
+                Err(error) => return Err(plain_io("save the download", &error)),
             }
         }
         Err("Could not allocate a collision-safe DeskLink download name".to_string())
@@ -425,6 +444,70 @@ impl Store {
         // SAFETY: `path` is a valid C string and `stat` a valid out pointer.
         let status = unsafe { libc::statvfs(path.as_ptr(), &mut stat) };
         (status == 0).then(|| (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+    }
+}
+
+/// Puts the finished `part` at `target` without ever replacing anything: a
+/// hard link where the filesystem allows one. Where it does not (the
+/// downloads folder is on another filesystem, or one without links such as
+/// FAT), the bytes are copied to a hidden file beside the target, synced, and
+/// linked or renamed into place, so the file still appears whole.
+fn place_file(
+    part: &Path,
+    target: &Path,
+    root: &Path,
+    link: &dyn Fn(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    match link(part, target) {
+        Err(error) if cannot_link(&error) => {}
+        other => return other,
+    }
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let staged = root.join(format!(
+        ".{}.desklink-part",
+        name.chars().take(100).collect::<String>()
+    ));
+    let copied = (|| {
+        let mut source = File::open(part)?;
+        let mut copy = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        std::io::copy(&mut source, &mut copy)?;
+        copy.sync_all()
+    })();
+    let placed = copied.and_then(|()| match fs::hard_link(&staged, target) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => Err(error),
+        // No hard links here either: a rename, once nothing is in the way.
+        Err(_) if !target.exists() => fs::rename(&staged, target),
+        Err(error) => Err(error),
+    });
+    let _ = fs::remove_file(&staged);
+    placed
+}
+
+/// Why a hard link may be refused for a reason a copy gets round.
+fn cannot_link(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EXDEV) | Some(libc::EPERM) | Some(libc::ENOTSUP) | Some(libc::EMLINK)
+    ) || error.kind() == ErrorKind::CrossesDevices
+}
+
+/// What went wrong, for a person: no room, not allowed, or the system's words.
+pub(super) fn plain_io(action: &str, error: &std::io::Error) -> String {
+    match error.raw_os_error() {
+        Some(libc::ENOSPC) | Some(libc::EDQUOT) => {
+            format!("There is no room to {action}. Free some space and try again.")
+        }
+        Some(libc::EACCES) | Some(libc::EPERM) | Some(libc::EROFS) => {
+            format!("DeskLink is not allowed to {action} in the downloads folder.")
+        }
+        _ => format!("Could not {action}: {error}"),
     }
 }
 

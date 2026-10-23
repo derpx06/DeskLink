@@ -260,10 +260,19 @@ pub(crate) fn wifi(text: &str) -> Option<Wifi> {
         }
     }
     let ssid = fields.remove("S").filter(|ssid| !ssid.is_empty())?;
-    let security = match fields.remove("T").as_deref() {
-        Some("WEP") => "WEP",
-        Some("nopass") | Some("") | None => "",
-        Some(_) => "WPA",
+    // What the code says, honestly: only open, WEP and WPA/WPA2 passphrase
+    // networks can be joined from here; WPA3 (SAE), enterprise and anything
+    // unknown are named as what they are and refused when joining.
+    let security = match fields.remove("T").as_deref().map(str::to_ascii_uppercase) {
+        Some(kind) => match kind.as_str() {
+            "WEP" => "WEP",
+            "NOPASS" | "" => "",
+            "WPA" | "WPA2" | "WPA/WPA2" | "WPA2-PSK" | "WPA-PSK" => "WPA",
+            "SAE" | "WPA3" | "WPA3-SAE" => "SAE",
+            "EAP" | "WPA-EAP" | "WPA2-EAP" | "WPA3-EAP" | "EAP-TLS" | "PEAP" => "EAP",
+            _ => "OTHER",
+        },
+        None => "",
     }
     .to_string();
     Some(Wifi {
@@ -283,9 +292,15 @@ fn check_wifi(network: &Wifi) -> Result<(), String> {
     }
     let key = network.password.as_str();
     let hex64 = key.len() == 64 && key.bytes().all(|byte| byte.is_ascii_hexdigit());
+    // A WPA passphrase is 8 to 63 printable ASCII characters (bytes: a
+    // letter with an accent is two), or 64 hex digits.
+    let ascii = key.bytes().all(|byte| (0x20..=0x7e).contains(&byte));
     match network.security.as_str() {
-        "WPA" if !(8..=63).contains(&key.chars().count()) && !hex64 => {
-            Err("That Wi-Fi password is not a valid one (8 to 63 characters)".to_string())
+        "SAE" => Err("That network uses WPA3, which DeskLink cannot join yet. Join it in the system's Wi-Fi settings".to_string()),
+        "EAP" => Err("That is a company or school network (it needs a login). Join it in the system's Wi-Fi settings".to_string()),
+        "OTHER" => Err("DeskLink does not know that kind of Wi-Fi security. Join it in the system's Wi-Fi settings".to_string()),
+        "WPA" if !(hex64 || ascii && (8..=63).contains(&key.len())) => {
+            Err("That Wi-Fi password is not a valid one (8 to 63 plain characters)".to_string())
         }
         "WEP" if !matches!(key.len(), 5 | 10 | 13 | 26) => {
             Err("That Wi-Fi key is not a valid one".to_string())
@@ -530,6 +545,16 @@ mod tests {
         assert!(check_wifi(&network("WPA", &"n".repeat(33), "correct horse")).is_err());
         assert!(check_wifi(&network("WEP", "old", "12345")).is_ok());
         assert!(check_wifi(&network("WEP", "old", "123")).is_err());
+        // Bytes, not characters: 32 two-byte letters are 64 bytes.
+        assert!(check_wifi(&network("WPA", "home", &"é".repeat(32))).is_err());
+        assert!(check_wifi(&network("WPA", "home", &"é".repeat(5))).is_err());
+        assert!(check_wifi(&network("WPA", "home", "tab\there1")).is_err());
+        // WPA3 and company networks are said to be what they are.
+        let sae = check_wifi(&network("SAE", "home", "correct horse")).unwrap_err();
+        assert!(sae.contains("WPA3"), "{sae}");
+        let eap = check_wifi(&network("EAP", "campus", "")).unwrap_err();
+        assert!(eap.contains("company or school"), "{eap}");
+        assert!(check_wifi(&network("OTHER", "odd", "x")).is_err());
     }
 
     #[test]
@@ -565,6 +590,12 @@ mod tests {
             wifi("WIFI:T:nopass;S:Cafe;;").map(|w| (w.ssid, w.security)),
             Some(("Cafe".into(), String::new()))
         );
+        let kind = |code: &str| wifi(code).map(|w| w.security);
+        assert_eq!(kind("WIFI:S:a;T:SAE;P:x;;").as_deref(), Some("SAE"));
+        assert_eq!(kind("WIFI:S:a;T:WPA3;P:x;;").as_deref(), Some("SAE"));
+        assert_eq!(kind("WIFI:S:a;T:WPA2-EAP;;").as_deref(), Some("EAP"));
+        assert_eq!(kind("WIFI:S:a;T:WPA2;P:x;;").as_deref(), Some("WPA"));
+        assert_eq!(kind("WIFI:S:a;T:mystery;;").as_deref(), Some("OTHER"));
         assert_eq!(wifi("https://example.com"), None);
         assert_eq!(wifi("WIFI:T:WPA;P:x;;"), None, "no network name");
     }

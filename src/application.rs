@@ -99,15 +99,14 @@ mod imp {
             crate::startup("styles and fonts ready");
             // A logout, a reboot or `kill` quits like File > Quit does, so
             // glide gives the pointer back on the way out.
-            let app = self.obj().downgrade();
-            for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
-                let app = app.clone();
-                glib::unix_signal_add_local(signal, move || {
-                    if let Some(app) = app.upgrade() {
-                        app.quit();
-                    }
-                    glib::ControlFlow::Break
-                });
+            // (Not GLib's signal sources: they run on the main loop, so a
+            // wedged main thread could never be ended by `kill`.)
+            if let Err(error) = crate::signals::watch(
+                &[libc::SIGTERM, libc::SIGINT, libc::SIGHUP],
+                crate::signals::GRACE,
+                crate::signals::Real,
+            ) {
+                eprintln!("[DeskLink] Could not watch for quit signals: {error}");
             }
         }
 

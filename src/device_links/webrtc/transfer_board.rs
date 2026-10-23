@@ -54,6 +54,8 @@ pub struct Finished {
     pub name: String,
     pub incoming: bool,
     pub outcome: Outcome,
+    /// For a send that failed: the file, so the person can try again.
+    pub retry: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -61,6 +63,7 @@ pub struct TransferBoard {
     /// Insertion order, so rows do not jump around as they update.
     rows: Vec<TransferRow>,
     finished: VecDeque<Finished>,
+    retry_sources: std::collections::HashMap<String, PathBuf>,
     /// Bucket files moving (F8b): not downloads, so not on the Transfers
     /// page and never in the history. `name` is the path in the Bucket.
     synced: Vec<TransferRow>,
@@ -177,12 +180,17 @@ impl TransferBoard {
         if self.finished.len() >= MAX_FINISHED {
             self.finished.pop_front();
         }
+        let retry = self
+            .retry_sources
+            .remove(&row.id)
+            .filter(|_| matches!(outcome, Outcome::Failed(_)));
         self.finished.push_back(Finished {
             id: row.id,
             device_id: row.device_id,
             name: row.name,
             incoming: row.incoming,
             outcome,
+            retry,
         });
     }
 
@@ -239,6 +247,16 @@ impl TransferBoard {
         }
     }
 
+    /// Remembers the file of a send, for a "Try Again" if it fails.
+    pub fn set_retry_source(&mut self, id: &str, path: PathBuf) {
+        if self.retry_sources.len() >= MAX_FINISHED {
+            if let Some(oldest) = self.retry_sources.keys().next().cloned() {
+                self.retry_sources.remove(&oldest);
+            }
+        }
+        self.retry_sources.insert(id.to_string(), path);
+    }
+
     pub fn take_finished(&mut self) -> Vec<Finished> {
         self.finished.drain(..).collect()
     }
@@ -259,6 +277,11 @@ pub fn begin(row: TransferRow) {
 
 pub fn progress(id: &str, done: u64) {
     board().progress(id, done);
+}
+
+/// Remembers the file of the send `id`, so a failure can offer to try again.
+pub fn set_retry_source(id: &str, path: PathBuf) {
+    board().set_retry_source(id, path);
 }
 
 pub fn finish(id: &str, outcome: Outcome) {

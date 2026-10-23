@@ -49,7 +49,65 @@ pub(super) enum Trouble {
 }
 
 /// One outgoing file.
+/// Where the time of a send went (for `DESKLINK_DEBUG=1`; nothing is
+/// measured otherwise): reading the source, hashing it, the call that hands a
+/// frame to the channel, and waiting (for the receiver's window, or for the
+/// channel's buffer to drain).
+#[derive(Debug, Default)]
+struct Stages {
+    started: Option<Instant>,
+    read: Duration,
+    hash: Duration,
+    send: Duration,
+    window: Duration,
+    buffer: Duration,
+    /// Blocked since, and whether on the window (else the buffer).
+    blocked: Option<(Instant, bool)>,
+}
+
+impl Stages {
+    fn on() -> bool {
+        crate::debug_logging()
+    }
+
+    /// The send was held up by the window (`true`) or the buffer.
+    fn blocked(&mut self, now: Instant, window: bool) {
+        if self.blocked.is_none() {
+            self.blocked = Some((now, window));
+        }
+    }
+
+    /// A frame went out: any wait ends.
+    fn flowing(&mut self, now: Instant) {
+        if let Some((since, window)) = self.blocked.take() {
+            let waited = now.saturating_duration_since(since);
+            if window {
+                self.window += waited;
+            } else {
+                self.buffer += waited;
+            }
+        }
+    }
+
+    /// "1000000000 bytes in 23.30 s = 42.9 MB/s: read 800 ms, …".
+    fn summary(&self, bytes: u64) -> String {
+        let seconds = self.started.map_or(0.0, |at| at.elapsed().as_secs_f64());
+        let ms = |duration: Duration| duration.as_millis();
+        format!(
+            "{bytes} bytes in {seconds:.2} s = {:.1} MB/s: read {} ms, hash {} ms, \
+             send call {} ms, waiting for the window {} ms, waiting for the buffer {} ms",
+            bytes as f64 / seconds.max(0.001) / 1e6,
+            ms(self.read),
+            ms(self.hash),
+            ms(self.send),
+            ms(self.window),
+            ms(self.buffer),
+        )
+    }
+}
+
 pub(super) struct Outgoing {
+    stages: Stages,
     pub id: String,
     pub token: String,
     source: std::path::PathBuf,
@@ -119,7 +177,7 @@ impl Outgoing {
             return Err("DeskLink shared path is not a regular file".to_string());
         }
         if metadata.len() > MAX_TRANSFER_BYTES {
-            return Err("DeskLink does not send files over 4 GB".to_string());
+            return Err("DeskLink does not send files over 4 GiB".to_string());
         }
         let source = std::path::absolute(source)
             .map_err(|error| format!("Could not resolve DeskLink shared file: {error}"))?;
@@ -155,6 +213,7 @@ impl Outgoing {
     fn new(checkpoint: SendCheckpoint, seq: u64) -> Self {
         let now = Instant::now();
         Self {
+            stages: Stages::default(),
             id: checkpoint.transfer_id,
             token: checkpoint.token,
             source: checkpoint.source,
@@ -452,9 +511,14 @@ impl Outgoing {
         header.write(&mut frame);
         frame.resize(FRAME_HEADER_BYTES + length as usize, 0);
         let offset = self.next_offset;
+        let timed = Stages::on().then(Instant::now);
         let read = self
             .source_file()?
             .read_exact_at(&mut frame[FRAME_HEADER_BYTES..], offset);
+        if let Some(at) = timed {
+            self.stages.read += at.elapsed();
+            self.stages.started.get_or_insert(at);
+        }
         match read {
             Ok(()) => {}
             // Shorter than offered: it changed.
@@ -467,8 +531,12 @@ impl Outgoing {
                 )))
             }
         }
+        let timed = Stages::on().then(Instant::now);
         if let Some(hasher) = self.hasher.as_mut() {
             hasher.update(&frame[FRAME_HEADER_BYTES..]);
+        }
+        if let Some(at) = timed {
+            self.stages.hash += at.elapsed();
         }
         if last {
             let hash = self.hasher.take().map(Sha256::finish).unwrap_or_default();
@@ -561,7 +629,10 @@ impl Engine {
                 name: folder.relpath.clone(),
                 ..row
             }),
-            None if outgoing.clipboard_mime.is_none() => board::begin(row),
+            None if outgoing.clipboard_mime.is_none() => {
+                board::begin(row);
+                board::set_retry_source(&outgoing.id, outgoing.source.clone());
+            }
             None => {}
         }
         board::set_note(&outgoing.id, Some(&words::waiting_for_a_slot()));
@@ -698,6 +769,13 @@ impl Engine {
         }
         let outgoing = self.outgoing.remove(index);
         let id = outgoing.id.clone();
+        if Stages::on() {
+            eprintln!(
+                "[DeskLink] Sent {}: {}",
+                outgoing.filename,
+                outgoing.stages.summary(outgoing.total)
+            );
+        }
         outgoing.discard(&self.store);
         board::finish(&id, Outcome::Sent);
         if outgoing.history {
@@ -765,6 +843,9 @@ impl Engine {
             net.send(done);
             outgoing.state = SendState::AwaitComplete;
             outgoing.stall.moved(Instant::now());
+            // Every block is acknowledged but the file is not placed yet: it
+            // is not "sent" until the receiver says it is (`complete`).
+            board::set_note(&outgoing.id, Some(&words::finishing()));
         }
         for (index, trouble) in troubled.into_iter().rev() {
             self.source_trouble(index, trouble);
@@ -791,12 +872,22 @@ impl Engine {
                     continue;
                 }
                 for _ in 0..16 {
-                    if !outgoing.can_send() || net.link.buffered() >= IN_FLIGHT_TARGET {
+                    let window_open = outgoing.can_send();
+                    if !window_open || net.link.buffered() >= IN_FLIGHT_TARGET {
+                        if Stages::on() && outgoing.state == SendState::Sending {
+                            outgoing.stages.blocked(now, !window_open);
+                        }
                         break;
                     }
                     match outgoing.next_frame() {
                         Ok(frame) => {
-                            if let Err(error) = net.link.send_frame(frame) {
+                            let timed = Stages::on().then(Instant::now);
+                            let sent_frame = net.link.send_frame(frame);
+                            if let Some(at) = timed {
+                                outgoing.stages.send += at.elapsed();
+                                outgoing.stages.flowing(at);
+                            }
+                            if let Err(error) = sent_frame {
                                 outgoing.rollback_block();
                                 crate::device_links::limits::log_limited(
                                     "file-frame-send",
@@ -959,6 +1050,7 @@ impl Engine {
                         name: stored.filename.clone(),
                         incoming: false,
                         outcome: Outcome::Failed(words),
+                        retry: stored.source.exists().then(|| stored.source.clone()),
                     });
                 }
                 continue;

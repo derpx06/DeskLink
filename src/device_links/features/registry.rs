@@ -475,6 +475,113 @@ mod tests {
         );
     }
 
+    /// What the desk puts in its own handover (`Capabilities` control): the
+    /// profile's part of each registry list, sorted. Pinned in full so a type
+    /// that drops out of one direction (the way `desklink.sync.have` once did
+    /// on the phone) fails here, and so the two lists can be compared with
+    /// the phone's by eye.
+    #[test]
+    fn the_desks_handover_lists_are_pinned_both_ways() {
+        let registry = FeatureRegistry::desktop();
+        let incoming = webrtc_capabilities(registry.incoming_capabilities());
+        let outgoing = webrtc_capabilities(registry.outgoing_capabilities());
+        // Delta resync is sent and received by both sides.
+        for list in [&incoming, &outgoing] {
+            assert!(
+                list.iter()
+                    .any(|capability| capability == PACKET_TYPE_SYNC_HAVE),
+                "desklink.sync.have must be in both of the desk's handover lists"
+            );
+        }
+        // Every profile type is in at least one list, and the ones in only
+        // one are exactly the directional pairs below (a type in one list on
+        // the desk and in neither on the phone is a feature that never
+        // arrives).
+        let mut one_way: Vec<String> = WEBRTC_PROFILE
+            .iter()
+            .filter(|capability| {
+                let (i, o) = (
+                    incoming.iter().any(|c| c == *capability),
+                    outgoing.iter().any(|c| c == *capability),
+                );
+                assert!(i || o, "{capability} is in no handover list");
+                i != o
+            })
+            .map(|capability| {
+                let side = if incoming.iter().any(|c| c == capability) {
+                    "incoming only"
+                } else {
+                    "outgoing only"
+                };
+                format!("{capability} ({side})")
+            })
+            .collect();
+        one_way.sort();
+        // The exact lists. The phone's `HandoverCapabilitiesTest` pins the same
+        // two (`deskAccepts` = these incoming, `deskSends` = these outgoing).
+        assert_eq!(
+            incoming,
+            [
+                "desklink.battery",
+                "desklink.clipboard",
+                "desklink.clipboard.connect",
+                "desklink.contacts.response_uids_timestamps",
+                "desklink.contacts.response_vcards",
+                "desklink.findmyphone.request",
+                "desklink.folders",
+                "desklink.lock.request",
+                "desklink.mousepad.keyboardstate",
+                "desklink.mousepad.request",
+                "desklink.mpris",
+                "desklink.mpris.request",
+                "desklink.notes",
+                "desklink.notification",
+                "desklink.notification.request",
+                "desklink.ping",
+                "desklink.settings.request",
+                "desklink.share.request",
+                "desklink.shareinputdevices",
+                "desklink.snippets",
+                "desklink.sync.have",
+                "desklink.telephony",
+                "desklink.unlock.request"
+            ]
+        );
+        assert_eq!(
+            outgoing,
+            [
+                "desklink.clipboard",
+                "desklink.clipboard.connect",
+                "desklink.contacts.request_all_uids_timestamps",
+                "desklink.contacts.request_vcards_by_uid",
+                "desklink.findmyphone.request",
+                "desklink.folders",
+                "desklink.handoff",
+                "desklink.lock",
+                "desklink.lock.request",
+                "desklink.mousepad.request",
+                "desklink.mpris",
+                "desklink.mpris.request",
+                "desklink.notes",
+                "desklink.notification",
+                "desklink.notification.action",
+                "desklink.notification.reply",
+                "desklink.notification.request",
+                "desklink.ping",
+                "desklink.settings",
+                "desklink.share.request",
+                "desklink.shareinputdevices.request",
+                "desklink.snippets",
+                "desklink.sync.have",
+                "desklink.telephony.request",
+                "desklink.unlock.request"
+            ]
+        );
+        // The types in one direction only are directional pairs: what the
+        // phone sends the desk accepts, what the desk sends the phone accepts.
+        assert_eq!(one_way.len(), 16, "{one_way:?}");
+    }
+
     /// Every type each registry lists, except the screen types, rides the
     /// bridge; nothing is in the profile that no direction implements.
     #[test]

@@ -335,6 +335,7 @@ impl DaemonWorker {
                 if reachable != last_reachable {
                     last_reachable = reachable;
                     state::wake_ui();
+                    state::nudge_tickers();
                 }
                 thread::sleep(std::time::Duration::from_millis(1000));
             }

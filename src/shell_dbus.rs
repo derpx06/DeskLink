@@ -1475,7 +1475,12 @@ mod tests {
         }]);
         let mapped = shell_device(&device, &AppSettings::default());
         let bucket = mapped.bucket.clone().expect("published while syncing");
-        assert_eq!(bucket.line, "Syncing 1 file · 300 MB of 1.2 GB");
+        let expected = format!(
+            "Syncing 1 file · {} of {}",
+            crate::bucket_progress::size_words(300_000_000),
+            crate::bucket_progress::size_words(1_200_000_000)
+        );
+        assert_eq!(bucket.line, expected);
         assert_eq!(bucket.detail, "Waiting…", "no speed after one sample");
         assert_eq!(bucket.permille, 250);
         let list = devices_variant(&[mapped]);
@@ -1483,7 +1488,7 @@ mod tests {
         let entry = glib::VariantDict::new(dict.lookup_value("bucket", None).as_ref());
         assert_eq!(
             entry.lookup::<String>("line").unwrap().as_deref(),
-            Some("Syncing 1 file · 300 MB of 1.2 GB")
+            Some(expected.as_str())
         );
         assert_eq!(entry.lookup::<f64>("fraction").unwrap(), Some(0.25));
         crate::bucket_progress::sample_for_test(Vec::new());

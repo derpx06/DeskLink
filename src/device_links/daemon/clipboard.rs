@@ -331,6 +331,22 @@ static OWNER_WATCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 
 /// Watches CLIPBOARD owner changes on its own X11 connection. Without an X
 /// display nothing is watched and images are not sent from here.
+/// Marks the owner watch as running for as long as it lives.
+struct Watching;
+
+impl Watching {
+    fn begin() -> Self {
+        OWNER_WATCHED.store(true, Ordering::Release);
+        Self
+    }
+}
+
+impl Drop for Watching {
+    fn drop(&mut self) {
+        OWNER_WATCHED.store(false, Ordering::Release);
+    }
+}
+
 /// Whether the poll reads the clipboard now: always while the owner is not
 /// watched or a phone is connected; otherwise only after the owner changed.
 fn should_read(watched: bool, generation: u64, read: u64, nobody: bool) -> bool {
@@ -372,7 +388,9 @@ fn watch_owner_changes() {
             if watched.is_none() {
                 return;
             }
-            OWNER_WATCHED.store(true, Ordering::Release);
+            // However the watch ends (a lost X connection, a panic), the poll
+            // must not go on believing "nothing changed".
+            let _watching = Watching::begin();
             while let Ok(event) = conn.wait_for_event() {
                 if let Event::XfixesSelectionNotify(_) = event {
                     OWNER_GEN.fetch_add(1, Ordering::AcqRel);
@@ -737,6 +755,29 @@ fn remember_if_sent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dead_owner_watch_sends_the_poll_back_to_reading() {
+        {
+            let _watching = Watching::begin();
+            assert!(OWNER_WATCHED.load(Ordering::Acquire));
+            assert!(!should_read(true, 1, 1, true), "trusted while it runs");
+        }
+        // The watcher ended: nothing is believed any more.
+        assert!(!OWNER_WATCHED.load(Ordering::Acquire));
+        assert!(should_read(
+            OWNER_WATCHED.load(Ordering::Acquire),
+            1,
+            1,
+            true
+        ));
+        // A panicking watcher clears it too.
+        let _ = std::panic::catch_unwind(|| {
+            let _watching = Watching::begin();
+            panic!("the watch fell over");
+        });
+        assert!(!OWNER_WATCHED.load(Ordering::Acquire));
+    }
 
     #[test]
     fn an_idle_clipboard_is_not_read_until_it_changes() {

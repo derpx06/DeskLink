@@ -249,6 +249,13 @@ pub(crate) fn push_event(events: &Arc<Mutex<Vec<DaemonEvent>>>, event: DaemonEve
     wake_ui();
 }
 
+/// Tells every main-loop ticker to look now (who is reachable changed): the
+/// window refreshes through [`wake_ui`], the others (tray, top bar, players,
+/// the Bucket's sampler) through this.
+pub(crate) fn nudge_tickers() {
+    gtk::glib::MainContext::default().invoke(crate::ticker::nudge_all);
+}
+
 /// What the window registers to be refreshed at once (see [`wake_ui`]).
 static UI_WAKE: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 

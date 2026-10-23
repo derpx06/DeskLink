@@ -409,6 +409,7 @@ impl Engine {
                     name: message.filename.clone().unwrap_or_default(),
                     incoming: true,
                     outcome: Outcome::Failed(error.chars().take(256).collect()),
+                    retry: None,
                 });
                 return refuse(code::INTERNAL, Some(&error));
             }
@@ -622,7 +623,7 @@ impl Engine {
             return;
         };
         if let Err(error) = incoming.file.sync_all() {
-            return self.fail_incoming(
+            return self.fail_incoming_keeping_part(
                 incoming,
                 Ending::internal(format!("Could not persist DeskLink download: {error}")),
             );
@@ -631,7 +632,12 @@ impl Engine {
         let placed = self.place(&incoming);
         let path = match placed {
             Ok(path) => path,
-            Err(error) => return self.fail_incoming(incoming, Ending::internal(error)),
+            // The file is whole and verified: the sender is told it was not
+            // placed (never "complete"), and the part and its checkpoint stay,
+            // so the same transfer offered again only has to be placed.
+            Err(error) => {
+                return self.fail_incoming_keeping_part(incoming, Ending::internal(error));
+            }
         };
         let mut complete = net.msg(FileAction::Complete, &id, &incoming.token);
         complete.file_hash = Some(hex(&hash_of_hashes(&incoming.hashes)));
@@ -687,6 +693,25 @@ impl Engine {
         if let Some(incoming) = self.incoming.remove(&key) {
             self.fail_incoming(incoming, ending);
         }
+    }
+
+    /// Like [`fail_incoming`](Self::fail_incoming) for a file that arrived
+    /// whole but could not be placed: the sender is told, the person is shown
+    /// why, and the verified partial file and its checkpoint are kept.
+    fn fail_incoming_keeping_part(&mut self, mut incoming: Incoming, ending: Ending) {
+        debug_log!(
+            "[DeskLink] Could not place incoming transfer {}: {}",
+            incoming.id,
+            ending.words
+        );
+        if let Some(net) = &self.net {
+            let mut error = net.msg(FileAction::Error, &incoming.id, &incoming.token);
+            error.code = Some(ending.code.to_string());
+            error.message = Some(ending.words.chars().take(256).collect());
+            net.send(error);
+        }
+        incoming.checkpoint_now(&self.store);
+        board::finish(&incoming.id, Outcome::Failed(ending.words));
     }
 
     fn fail_incoming(&mut self, incoming: Incoming, ending: Ending) {

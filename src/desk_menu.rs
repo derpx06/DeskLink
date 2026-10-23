@@ -589,7 +589,11 @@ mod tests {
             paused: false,
         }]);
         let menu = phone_section(&ready, &AppSettings::default());
-        assert!(labels(&menu).contains(&"Syncing 1 file · 1.1 GB of 2.4 GB".to_string()));
+        assert!(labels(&menu).contains(&format!(
+            "Syncing 1 file · {} of {}",
+            crate::bucket_progress::size_words(1_100_000_000),
+            crate::bucket_progress::size_words(2_400_000_000)
+        )));
         assert!(actions(&menu).contains(&"open-bucket:tray-bucket".to_string()));
         crate::bucket_progress::sample_for_test(Vec::new());
         let menu = phone_section(&ready, &AppSettings::default());

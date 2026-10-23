@@ -816,6 +816,11 @@ impl Engine {
 pub(super) mod words {
     use super::{code, FileControl};
 
+    /// Between the sender's `done` and the receiver's `complete`.
+    pub fn finishing() -> String {
+        "Finishing…".to_string()
+    }
+
     pub fn source_gone() -> String {
         "The file no longer exists.".to_string()
     }

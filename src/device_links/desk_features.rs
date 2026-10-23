@@ -49,9 +49,14 @@ pub(crate) fn install(
     });
 }
 
-/// How long `device_id` has been silent (no packet of any kind from it).
+/// How long `device_id` has been silent on every channel: the shorter of the
+/// LAN link's silence and the data channel's.
 pub(crate) fn inbound_silence(device_id: &str) -> Option<std::time::Duration> {
-    DAEMON.get()?.sessions.silence(device_id)
+    let lan = DAEMON.get()?.sessions.silence(device_id);
+    super::webrtc::coordinator::link_silence(
+        lan,
+        super::webrtc::coordinator::data_silence(device_id),
+    )
 }
 
 /// The phones with their encrypted connection up.

@@ -35,21 +35,22 @@ pub(crate) const NOTIFY_FROM_BYTES: u64 = 50_000_000;
 
 // ── Words ──────────────────────────────────────────────────────────────────
 
-/// "820 KB", "4.5 MB", "340 MB", "1.2 GB": decimal units, one decimal below
-/// ten, so a number never reads "1000 MB".
+/// "820 KiB", "4.5 MiB", "340 MiB", "1.2 GiB": binary units, as the limits
+/// (1 GiB a file, 10 GiB in all) are, one decimal below ten, so a number never
+/// reads "1024 MiB".
 pub(crate) fn size_words(bytes: u64) -> String {
-    if bytes < 1000 {
+    if bytes < 1024 {
         return format!("{bytes} bytes");
     }
-    let units = ["KB", "MB", "GB", "TB"];
+    let units = ["KiB", "MiB", "GiB", "TiB"];
     for (power, unit) in units.iter().enumerate() {
-        let value = bytes as f64 / 1000f64.powi(power as i32 + 1);
+        let value = bytes as f64 / 1024f64.powi(power as i32 + 1);
         let text = if value < 9.95 {
             format!("{value:.1}")
         } else {
             format!("{value:.0}")
         };
-        if value < 999.5 || power == units.len() - 1 {
+        if value < 1023.5 || power == units.len() - 1 {
             return format!("{text} {unit}");
         }
     }
@@ -79,7 +80,7 @@ fn about(seconds: u64) -> String {
     }
 }
 
-/// "12 MB/s".
+/// "12 MiB/s".
 pub(crate) fn speed_words(bytes_per_second: f64) -> String {
     format!("{}/s", size_words(bytes_per_second.max(0.0).round() as u64))
 }
@@ -175,7 +176,7 @@ pub(crate) struct Tile {
 }
 
 impl Tile {
-    /// "340 MB of 1.2 GB · 2 min left", "Waiting…", "Paused".
+    /// "340 MiB of 1.2 GiB · 2 min left", "Waiting…", "Paused".
     pub(crate) fn line(&self) -> String {
         if self.paused {
             return "Paused".to_string();
@@ -218,7 +219,7 @@ pub(crate) struct Summary {
 }
 
 impl Summary {
-    /// "Syncing 3 files · 1.1 GB of 2.4 GB".
+    /// "Syncing 3 files · 1.1 GiB of 2.4 GiB".
     pub(crate) fn head(&self) -> String {
         let what = match self.files {
             1 => "Syncing 1 file".to_string(),
@@ -236,7 +237,7 @@ impl Summary {
         )
     }
 
-    /// "Syncing 3 files · 1.1 GB of 2.4 GB · about 4 min left".
+    /// "Syncing 3 files · 1.1 GiB of 2.4 GiB · about 4 min left".
     pub(crate) fn line(&self) -> String {
         match self.eta {
             Some(eta) if !self.paused => format!("{} · {}", self.head(), about(eta)),
@@ -503,13 +504,31 @@ pub(crate) fn on_tick(listener: impl Fn() -> bool + 'static) {
     LISTENERS.with(|listeners| listeners.borrow_mut().push(Box::new(listener)));
 }
 
+thread_local! {
+    /// The sampler's wait now pending, and the application it samples for.
+    static PENDING: RefCell<Option<glib::SourceId>> = const { RefCell::new(None) };
+    static APP: RefCell<Option<glib::WeakRef<crate::application::DesklinkApplication>>> =
+        const { RefCell::new(None) };
+}
+
 /// Starts sampling, for as long as the application runs.
 pub(crate) fn start(app: &crate::application::DesklinkApplication) {
+    APP.with(|slot| slot.replace(Some(app.downgrade())));
+    // Who is reachable changed, or a window was shown: look now.
+    crate::ticker::on_nudge(|| {
+        let app = APP.with(|slot| slot.borrow().clone());
+        let waiting = PENDING.with(|pending| pending.take());
+        if let (Some(app), Some(waiting)) = (app, waiting) {
+            waiting.remove();
+            schedule(app, Duration::ZERO);
+        }
+    });
     schedule(app.downgrade(), IDLE_TICK);
 }
 
 fn schedule(app: glib::WeakRef<crate::application::DesklinkApplication>, delay: Duration) {
-    glib::timeout_add_local_once(delay, move || {
+    let id = glib::timeout_add_local_once(delay, move || {
+        PENDING.with(|pending| pending.take());
         let Some(strong) = app.upgrade() else {
             return;
         };
@@ -520,6 +539,7 @@ fn schedule(app: glib::WeakRef<crate::application::DesklinkApplication>, delay: 
             .max(IDLE_TICK);
         schedule(app, if busy { BUSY_TICK } else { idle });
     });
+    PENDING.with(|pending| pending.replace(Some(id)));
 }
 
 /// One sample: the board, the listeners, the notification. Whether
@@ -630,18 +650,24 @@ mod tests {
     }
 
     #[test]
-    fn sizes_read_in_kb_mb_and_gb() {
+    fn sizes_read_in_kib_mib_and_gib() {
+        const MIB: u64 = 1 << 20;
         assert_eq!(size_words(0), "0 bytes");
-        assert_eq!(size_words(999), "999 bytes");
-        assert_eq!(size_words(1000), "1.0 KB");
-        assert_eq!(size_words(820_000), "820 KB");
-        assert_eq!(size_words(4_540_000), "4.5 MB");
-        assert_eq!(size_words(9_960_000), "10 MB", "never 10.0");
-        assert_eq!(size_words(340 * MB), "340 MB");
-        assert_eq!(size_words(999_700_000), "1.0 GB", "never 1000 MB");
-        assert_eq!(size_words(1_200 * MB), "1.2 GB");
-        assert_eq!(size_words(24_400 * MB), "24 GB");
-        assert_eq!(speed_words(12.4e6), "12 MB/s");
+        assert_eq!(size_words(1023), "1023 bytes");
+        assert_eq!(size_words(1024), "1.0 KiB");
+        assert_eq!(size_words(820 * 1024), "820 KiB");
+        assert_eq!(size_words(4_718_592), "4.5 MiB");
+        assert_eq!(size_words(10 * MIB - 1), "10 MiB", "never 10.0");
+        assert_eq!(size_words(340 * MIB), "340 MiB");
+        assert_eq!(size_words(1024 * MIB - 1), "1.0 GiB", "never 1024 MiB");
+        assert_eq!(size_words(1_228 * MIB), "1.2 GiB");
+        assert_eq!(size_words(24_600 * MIB), "24 GiB");
+        assert_eq!(
+            size_words(10 << 30),
+            "10 GiB",
+            "the Bucket's limit reads as itself"
+        );
+        assert_eq!(speed_words(12.0 * MIB as f64), "12 MiB/s");
     }
 
     #[test]
@@ -663,14 +689,21 @@ mod tests {
             paused: false,
             eta: Some(118),
         };
-        assert_eq!(tile.line(), "340 MB of 1.2 GB · 2 min left");
+        assert_eq!(
+            tile.line(),
+            format!(
+                "{} of {} · 2 min left",
+                size_words(340 * MB),
+                size_words(1_200 * MB)
+            )
+        );
         assert_eq!(
             Tile {
                 eta: None,
                 ..tile.clone()
             }
             .line(),
-            "340 MB of 1.2 GB"
+            format!("{} of {}", size_words(340 * MB), size_words(1_200 * MB))
         );
         assert_eq!(
             Tile {
@@ -746,7 +779,10 @@ mod tests {
             )
             .is_empty());
         let summary = tracker.summary("phone", at(0)).unwrap();
-        assert_eq!(summary.head(), "Syncing 3 files · 0 bytes of 2.4 GB");
+        assert_eq!(
+            summary.head(),
+            format!("Syncing 3 files · 0 bytes of {}", size_words(2_400 * MB))
+        );
         assert_eq!(summary.rate_line(), "Waiting…");
         // Each file at 2 MB/s for 10 s; "a" then finishes.
         for second in 1..=10 {
@@ -766,9 +802,16 @@ mod tests {
         assert_eq!(summary.eta, Some(390));
         assert_eq!(
             summary.line(),
-            "Syncing 3 files · 60 MB of 2.4 GB · about 7 min left"
+            format!(
+                "Syncing 3 files · {} of {} · about 7 min left",
+                size_words(60 * MB),
+                size_words(2_400 * MB)
+            )
         );
-        assert_eq!(summary.rate_line(), "6.0 MB/s · about 7 min left");
+        assert_eq!(
+            summary.rate_line(),
+            format!("{} · about 7 min left", speed_words(6.0 * MB as f64))
+        );
         let ended = tracker.sample(
             vec![row("b", 22 * MB, 1_000 * MB), row("c", 22 * MB, 800 * MB)],
             &[],
@@ -793,7 +836,14 @@ mod tests {
         );
         let summary = tracker.summary("phone", at(12)).unwrap();
         assert!(summary.paused);
-        assert_eq!(summary.line(), "Paused, 3 files · 644 MB of 2.6 GB");
+        assert_eq!(
+            summary.line(),
+            format!(
+                "Paused, 3 files · {} of {}",
+                size_words(644 * MB),
+                size_words(2_600 * MB)
+            )
+        );
         // Everything ends: one Ended, and no summary.
         let ended = tracker.sample(Vec::new(), &[], at(13));
         assert_eq!(
@@ -837,7 +887,7 @@ mod tests {
             (24 * MB, 150 * MB),
             "both, not Other"
         );
-        assert_eq!(trips.eta, Some(21), "126 MB at 6 MB/s");
+        assert_eq!(trips.eta, Some(21), "126 MB at 6 MB/s (any unit)");
         assert_eq!(
             tracker.folder("phone", "Trips/Rome", now).unwrap().total,
             50 * MB
@@ -848,7 +898,11 @@ mod tests {
             "not a prefix match"
         );
         assert_eq!(tracker.folder("other-phone", "Trips", now), None);
-        assert!(trips.line().starts_with("24 MB of 150 MB"));
+        assert!(trips.line().starts_with(&format!(
+            "{} of {}",
+            size_words(24 * MB),
+            size_words(150 * MB)
+        )));
     }
 
     #[test]

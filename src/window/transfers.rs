@@ -464,6 +464,13 @@ fn card_words(entry: &LoggedFile, device: &str) -> gtk::Box {
     words.append(&name);
     words.append(&ellipsized(&size_and_time(entry), &["caption", "text-dim"]));
     words.append(&direction(entry, device));
+    // Where it went, so nobody has to look for it.
+    if entry.incoming {
+        words.append(&ellipsized(
+            &format!("Saved in {}", super::saved_in(&entry.path)),
+            &["caption", "text-dim"],
+        ));
+    }
     words
 }
 
@@ -700,8 +707,13 @@ fn file_card(
         .tooltip_text(&entry.name)
         .build();
     let verb = if entry.incoming { "received" } else { "sent" };
+    let place = if entry.incoming {
+        format!(", saved in {}", super::saved_in(&entry.path))
+    } else {
+        String::new()
+    };
     button.update_property(&[gtk::accessible::Property::Label(&format!(
-        "{}, {}, {verb} {}",
+        "{}, {}, {verb} {}{place}",
         entry.name,
         glib::format_size(entry.size),
         when(entry)

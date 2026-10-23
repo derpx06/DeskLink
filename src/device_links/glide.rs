@@ -45,6 +45,8 @@ const QUEUE: usize = 1024;
 /// Captured events kept while waiting for the portal's Activated signal
 /// (they may arrive first); beyond this they are dropped.
 const PENDING_MAX: usize = 256;
+/// How long input that came before the crossing's Activated is still its own.
+const PENDING_FRESH: Duration = Duration::from_millis(300);
 /// Motion is coalesced: at most one motion packet per this long (250/s).
 const MOTION_EVERY: Duration = Duration::from_millis(4);
 /// How often the worker re-reads the setting and the phone's link.
@@ -284,7 +286,7 @@ struct Glide {
     /// Where the pointer crossed: Esc+Super brings it back there.
     crossed: (f64, f64),
     /// Captured before the Activated signal arrived.
-    pending: VecDeque<Captured>,
+    pending: VecDeque<(Instant, Captured)>,
     mods: Mods,
     /// Motion not sent yet, and when motion was last sent.
     motion: (f64, f64),
@@ -339,8 +341,13 @@ impl Glide {
             out.push(Out::Gliding(true));
             out.push(Out::Clipboard);
         }
-        for captured in std::mem::take(&mut self.pending) {
-            out.extend(self.input(captured, keys, now));
+        // Only what came just before the crossing belongs to it: input that
+        // arrived after an earlier release and waited (a stale tail of the
+        // last capture, say) is not replayed onto the phone.
+        for (at, captured) in std::mem::take(&mut self.pending) {
+            if now.saturating_duration_since(at) <= PENDING_FRESH {
+                out.extend(self.input(captured, keys, now));
+            }
         }
         out
     }
@@ -427,7 +434,7 @@ impl Glide {
                 return Vec::new();
             }
             if self.pending.len() < PENDING_MAX {
-                self.pending.push_back(captured);
+                self.pending.push_back((now, captured));
             } else {
                 self.dropped += 1;
             }
@@ -534,8 +541,7 @@ fn key_packet(key: gdk::Key, mods: Mods) -> Option<NetworkPacket> {
 /// The key an evdev `code` types with `mods`, through this desktop's keymap
 /// (GDK, on the main thread; cached).
 fn desk_key(code: u32, mods: Mods) -> Option<gdk::Key> {
-    type Cache = HashMap<(u32, Mods), Option<u32>>;
-    static CACHE: Mutex<Option<Cache>> = Mutex::new(None);
+    static CACHE: Mutex<Option<KeyCache>> = Mutex::new(None);
     let level = Mods {
         shift: mods.shift,
         caps: mods.caps,
@@ -545,10 +551,12 @@ fn desk_key(code: u32, mods: Mods) -> Option<gdk::Key> {
     let known = CACHE.lock().ok().and_then(|cache| {
         cache
             .as_ref()
-            .and_then(|cache| cache.get(&(code, level)).copied())
+            .and_then(|cache| cache.get((code, level), Instant::now()))
     });
     let keyval = match known {
         Some(keyval) => keyval,
+        // Quitting: a key not known is not worth waiting for.
+        None if SHUTDOWN.load(std::sync::atomic::Ordering::Acquire) => None,
         None => {
             let (sender, receiver) = mpsc::sync_channel(1);
             glib::MainContext::default().invoke(move || {
@@ -559,19 +567,49 @@ fn desk_key(code: u32, mods: Mods) -> Option<gdk::Key> {
                 });
                 let _ = sender.send(found);
             });
-            let found = receiver.recv_timeout(KEY_LOOKUP).ok().flatten();
-            if let Ok(mut cache) = CACHE.lock() {
-                let cache = cache.get_or_insert_with(HashMap::new);
-                if cache.len() >= KEY_CACHE_MAX {
-                    cache.clear();
+            // A main thread that did not answer in time is "don't know", and
+            // is not remembered as "no key types this".
+            match receiver.recv_timeout(KEY_LOOKUP) {
+                Ok(found) => {
+                    if let Ok(mut cache) = CACHE.lock() {
+                        cache.get_or_insert_with(KeyCache::default).put(
+                            (code, level),
+                            found,
+                            Instant::now(),
+                        );
+                    }
+                    found
                 }
-                cache.insert((code, level), found);
+                Err(_) => None,
             }
-            found
         }
     }?;
     // SAFETY: any u32 is a valid GDK keyval number.
     Some(unsafe { glib::translate::from_glib::<u32, gdk::Key>(keyval) })
+}
+
+/// What the keymap said for each (key, level), for [`KEY_TTL`] (the user may
+/// switch layout), at most [`KEY_CACHE_MAX`] of them.
+#[derive(Default)]
+struct KeyCache(HashMap<(u32, Mods), (Option<u32>, Instant)>);
+
+/// How long a keymap answer is kept.
+const KEY_TTL: Duration = Duration::from_secs(30);
+
+impl KeyCache {
+    fn get(&self, key: (u32, Mods), now: Instant) -> Option<Option<u32>> {
+        self.0
+            .get(&key)
+            .filter(|(_, at)| now.duration_since(*at) < KEY_TTL)
+            .map(|(found, _)| *found)
+    }
+
+    fn put(&mut self, key: (u32, Mods), found: Option<u32>, now: Instant) {
+        if self.0.len() >= KEY_CACHE_MAX {
+            self.0.clear();
+        }
+        self.0.insert(key, (found, now));
+    }
 }
 
 use glib::translate::IntoGlib;
@@ -1050,6 +1088,15 @@ fn test_device(device: &str) -> bool {
     device.starts_with("e2e-") || device.starts_with("fake")
 }
 
+/// Whether the phone says it is dozing (a test device never is).
+fn is_dozing(device: &str) -> bool {
+    #[cfg(debug_assertions)]
+    if test_device(device) {
+        return false;
+    }
+    crate::device_links::webrtc::coordinator::is_dozing(device)
+}
+
 /// How long the phone has been silent (a test device never is).
 fn inbound_silence(device: &str) -> Option<Duration> {
     #[cfg(debug_assertions)]
@@ -1229,9 +1276,12 @@ const SHUTDOWN_WAIT: Duration = Duration::from_millis(2_500);
 pub(crate) const GLIDE_SILENT_AFTER: Duration =
     Duration::from_secs(crate::device_links::webrtc::coordinator::PEER_PROBE_AFTER.as_secs() + 3);
 
-/// Whether a phone the pointer is on has gone quiet for too long.
-fn link_silent(gliding: bool, silence: Option<Duration>) -> bool {
-    gliding && silence.is_some_and(|silence| silence > GLIDE_SILENT_AFTER)
+/// Whether a phone the pointer is on has gone quiet for too long. A dozing
+/// phone (screen off, frozen by its OS) is silent on the data channel by
+/// nature and is kept alive by the LAN heartbeat, so silence alone never
+/// hands the pointer back from one.
+fn link_silent(gliding: bool, silence: Option<Duration>, dozing: bool) -> bool {
+    gliding && !dozing && silence.is_some_and(|silence| silence > GLIDE_SILENT_AFTER)
 }
 
 /// The app is quitting: if the pointer is on the phone, tell the phone and
@@ -1540,6 +1590,10 @@ fn check(
             .current
             .as_ref()
             .and_then(|setting| inbound_silence(&setting.device)),
+        state
+            .current
+            .as_ref()
+            .is_some_and(|setting| is_dozing(&setting.device)),
     );
     let want = !state.refused
         && !silent
@@ -1717,6 +1771,28 @@ mod tests {
         }
         assert_eq!(waiting.pending.len(), PENDING_MAX);
         assert_eq!(waiting.dropped, 10);
+    }
+
+    /// Input that waited too long for an Activated (a tail left over after a
+    /// release) is dropped at the next crossing, not typed into the phone.
+    #[test]
+    fn stale_waiting_input_is_not_replayed_at_the_next_crossing() {
+        let mut glide = Glide::new(Barrier::on(Edge::Left, &screen()).unwrap());
+        let then = Instant::now();
+        glide.input(Captured::Button(BTN_LEFT, true), &keys, then);
+        glide.input(Captured::Key(30, true), &keys, then);
+        // A minute later the pointer crosses; two events just before it.
+        let now = then + Duration::from_secs(60);
+        glide.input(
+            Captured::Motion(-3.0, 0.0),
+            &keys,
+            now - Duration::from_millis(40),
+        );
+        let bodies = sent(&glide.activated(5, (-1.0, 4.0), &keys, now));
+        assert_eq!(bodies.len(), 2, "{bodies:?}");
+        assert_eq!(bodies[0]["exitEdge"], 2);
+        assert_eq!(bodies[1], serde_json::json!({"dx": -3.0, "dy": 0.0}));
+        assert!(glide.pending.is_empty());
     }
 
     #[test]
@@ -1994,18 +2070,120 @@ mod tests {
         assert_eq!(after_arm_error(ARM_RETRIES + 5), ArmNext::GiveUp);
     }
 
+    /// The keymap's answers are remembered for a while and then asked again;
+    /// an answer of "no such key" is one, but a lookup that timed out never
+    /// reaches the cache (it returns before `put`).
+    #[test]
+    fn the_key_cache_expires_and_is_bounded() {
+        let mut cache = KeyCache::default();
+        let now = Instant::now();
+        let key = (30, Mods::default());
+        assert_eq!(cache.get(key, now), None, "never asked");
+        cache.put(key, None, now);
+        assert_eq!(cache.get(key, now), Some(None), "no such key, answered");
+        cache.put((31, Mods::default()), Some(97), now);
+        assert_eq!(cache.get((31, Mods::default()), now), Some(Some(97)));
+        assert_eq!(
+            cache.get(key, now + KEY_TTL + Duration::from_secs(1)),
+            None,
+            "a layout switch is noticed"
+        );
+        for code in 0..(KEY_CACHE_MAX as u32 + 10) {
+            cache.put((code + 100, Mods::default()), Some(1), now);
+        }
+        assert!(cache.0.len() <= KEY_CACHE_MAX);
+    }
+
     /// A link that went quiet under the pointer gives it back; a quiet phone
     /// the pointer is not on is simply idle.
     #[test]
     fn a_quiet_link_under_the_pointer_gives_it_back() {
         let quiet = Some(GLIDE_SILENT_AFTER + Duration::from_millis(1));
-        assert!(link_silent(true, quiet));
-        assert!(!link_silent(false, quiet), "idle, not gone");
-        assert!(!link_silent(true, Some(Duration::from_secs(5))));
-        assert!(!link_silent(true, None));
+        assert!(link_silent(true, quiet, false));
+        assert!(!link_silent(false, quiet, false), "idle, not gone");
+        assert!(
+            !link_silent(true, quiet, true),
+            "a dozing phone is not handed back"
+        );
+        assert!(!link_silent(true, Some(Duration::from_secs(5)), false));
+        assert!(!link_silent(true, None, false));
         // Longer than the liveness probe, shorter than the 15 s rebuild.
         assert!(GLIDE_SILENT_AFTER > crate::device_links::webrtc::coordinator::PEER_PROBE_AFTER);
         assert!(GLIDE_SILENT_AFTER < crate::device_links::webrtc::coordinator::PEER_DEAD_AFTER);
+    }
+
+    /// A simulated minute, a tick a quarter second, with the two clocks the
+    /// way a real phone drives them: features and heartbeats on the data
+    /// channel, and only the reply to the desk's 10 s probe on the LAN (a
+    /// sawtooth of 0 to 10.x s). `data_every` is how often the data channel
+    /// speaks (None: never). Whether the pointer was ever handed back.
+    fn handed_back_within(data_every: Option<u64>, dozing: bool) -> Option<u64> {
+        use crate::device_links::webrtc::coordinator::link_silence;
+        const TICK_MS: u64 = 250;
+        let (mut lan_ms, mut data_ms) = (0u64, 0u64);
+        for tick in 1..=(60_000 / TICK_MS) {
+            let now = tick * TICK_MS;
+            lan_ms += TICK_MS;
+            data_ms += TICK_MS;
+            // The LAN probe goes out after 10 s of LAN silence and is
+            // answered a moment later.
+            if lan_ms > 10_500 {
+                lan_ms = 0;
+            }
+            if data_every.is_some_and(|every| now % (every * 1000) == 0) {
+                data_ms = 0;
+            }
+            let silence = link_silence(
+                Some(Duration::from_millis(lan_ms)),
+                data_every.map(|_| Duration::from_millis(data_ms)),
+            );
+            if link_silent(true, silence, dozing) {
+                return Some(now / 1000);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn a_healthy_phone_is_never_handed_back_and_a_silent_data_channel_is() {
+        // Talks every 2 s: not once in a minute (the LAN sawtooth alone would).
+        assert_eq!(handed_back_within(Some(2), false), None);
+        // Talks every 5 s (the liveness probe's pace): still never.
+        assert_eq!(handed_back_within(Some(5), false), None);
+        // The LAN clock alone, as it was: the bug (some second under 20).
+        let lan_alone = {
+            let mut handed = None;
+            let mut lan_ms = 0u64;
+            for tick in 1..=240u64 {
+                lan_ms += 250;
+                if lan_ms > 10_500 {
+                    lan_ms = 0;
+                }
+                if link_silent(true, Some(Duration::from_millis(lan_ms)), false) {
+                    handed = Some(tick / 4);
+                    break;
+                }
+            }
+            handed
+        };
+        assert!(lan_alone.is_some_and(|second| second < 20), "{lan_alone:?}");
+        // A phone whose data channel never speaks is handed back at 8 s or
+        // when the LAN probe's sawtooth next passes it (it never does here: it
+        // resets before 11 s, so it is the sawtooth's last stretch).
+        assert!(handed_back_within(None, false).is_some_and(|second| second <= 12));
+        // Dozing: never, whatever the clocks say.
+        assert_eq!(handed_back_within(None, true), None);
+    }
+
+    #[test]
+    fn the_two_clocks_say_the_shorter_silence() {
+        use crate::device_links::webrtc::coordinator::link_silence;
+        let s = Duration::from_secs;
+        assert_eq!(link_silence(Some(s(9)), Some(s(1))), Some(s(1)));
+        assert_eq!(link_silence(Some(s(1)), Some(s(9))), Some(s(1)));
+        assert_eq!(link_silence(Some(s(4)), None), Some(s(4)));
+        assert_eq!(link_silence(None, Some(s(4))), Some(s(4)));
+        assert_eq!(link_silence(None, None), None);
     }
 
     /// Nothing wakes the worker 250 times a second while glide is off.

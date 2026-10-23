@@ -87,6 +87,7 @@ mod remote_control;
 mod search_provider;
 mod send_to;
 mod shell_dbus;
+mod signals;
 mod terminal_previews;
 mod thumbnails;
 mod ticker;

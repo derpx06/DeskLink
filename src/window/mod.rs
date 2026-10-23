@@ -306,6 +306,23 @@ mod imp {
             self.solo.replace(Some(solo));
 
             obj.add_action_entries([
+                // "Try Again" on a failed send's toast: the device, a newline, the file.
+                gio::ActionEntry::builder("send-again")
+                    .parameter_type(Some(glib::VariantTy::STRING))
+                    .activate(|window: &super::DesklinkWindow, _, parameter| {
+                        let Some(target) = parameter.and_then(|value| value.get::<String>()) else {
+                            return;
+                        };
+                        if let (Some((device, path)), Some(daemon)) =
+                            (target.split_once('\n'), window.daemon())
+                        {
+                            daemon.send(DaemonCommand::SendFile(
+                                device.to_string(),
+                                std::path::PathBuf::from(path),
+                            ));
+                        }
+                    })
+                    .build(),
                 // "Show in folder" on a received-file toast or row.
                 gio::ActionEntry::builder("show-download")
                     .parameter_type(Some(glib::VariantTy::STRING))
@@ -720,6 +737,8 @@ impl DesklinkWindow {
         self.connect_map(|window| {
             crate::device_links::daemon::set_ui_visible(true);
             window.refresh_soon();
+            // Every ticker was waiting for a window nobody could see.
+            crate::ticker::nudge_all();
         });
         self.connect_unmap(|window| {
             crate::device_links::daemon::set_ui_visible(false);
@@ -1376,7 +1395,10 @@ impl DesklinkWindow {
     fn announce_transfer(&self, done: &Finished, device: &str) {
         let name = &done.name;
         let (message, notify) = match &done.outcome {
-            Outcome::Received(_) => (format!("Received {name} from {device}"), true),
+            Outcome::Received(path) => (
+                format!("Received {name} from {device}. Saved in {}", saved_in(path)),
+                true,
+            ),
             Outcome::Sent => (format!("Sent {name} to {device}"), false),
             Outcome::Cancelled => (format!("Cancelled {name}"), false),
             Outcome::Failed(reason) => {
@@ -1396,6 +1418,14 @@ impl DesklinkWindow {
             toast.set_button_label(Some("Show in Folder"));
             toast.set_action_name(Some("win.show-download"));
             toast.set_action_target_value(Some(&path.to_string_lossy().to_string().to_variant()));
+        } else if let (Outcome::Failed(_), Some(source)) = (&done.outcome, &done.retry) {
+            // A send that failed after the last block (the phone could not
+            // place the file) can be sent again.
+            toast.set_button_label(Some("Try Again"));
+            toast.set_action_name(Some("win.send-again"));
+            toast.set_action_target_value(Some(
+                &format!("{}\n{}", done.device_id, source.to_string_lossy()).to_variant(),
+            ));
         }
         self.imp().toast_overlay.add_toast(toast);
         if notify {
@@ -1490,8 +1520,11 @@ impl DesklinkWindow {
                 let _ = sender.send(crate::device_links::webrtc::capture::join_wifi(&network));
             });
             glib::timeout_add_local(std::time::Duration::from_millis(200), move || {
-                let Ok(result) = receiver.try_recv() else {
-                    return glib::ControlFlow::Continue;
+                let result = match try_result(&receiver) {
+                    Poll::Waiting => return glib::ControlFlow::Continue,
+                    Poll::Done(result) => result,
+                    // The worker died without answering: there is nothing to wait for.
+                    Poll::Gone => Err("NetworkManager did not answer".to_string()),
                 };
                 if let (Err(error), Some(window)) = (result, window.upgrade()) {
                     window.show_feature_toast(&format!("Could not join: {error}"));
@@ -1528,6 +1561,40 @@ enum QuickAction {
 }
 
 /// Refreshes every open DeskLink window soon (on the main loop).
+/// Where a result sent from a worker thread stands.
+#[derive(Debug, PartialEq, Eq)]
+enum Poll<T> {
+    Waiting,
+    Done(T),
+    /// The sender is gone without sending (the thread panicked).
+    Gone,
+}
+
+fn try_result<T>(receiver: &std::sync::mpsc::Receiver<T>) -> Poll<T> {
+    match receiver.try_recv() {
+        Ok(value) => Poll::Done(value),
+        Err(std::sync::mpsc::TryRecvError::Empty) => Poll::Waiting,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => Poll::Gone,
+    }
+}
+
+/// Where a received file is, for a person: "Downloads", or the folder's name.
+pub(crate) fn saved_in(path: &std::path::Path) -> String {
+    let folder = path.parent();
+    if let (Some(folder), Some(downloads)) = (
+        folder,
+        glib::user_special_dir(glib::UserDirectory::Downloads),
+    ) {
+        if folder == downloads {
+            return "Downloads".to_string();
+        }
+    }
+    folder
+        .and_then(std::path::Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "your downloads folder".to_string())
+}
+
 /// How long the window may stay hidden before it gives its memory back.
 const HIDDEN_TRIM_SECONDS: u32 = 20;
 
@@ -3138,6 +3205,21 @@ mod tests {
 
     /// The tabs of Notes & Clipboard are addressed by name, every other name
     /// is a page of the sidebar.
+    /// A worker that panicked ends the wait; a slow one is waited for.
+    #[test]
+    fn a_dead_worker_ends_the_wait_for_its_result() {
+        let (sender, receiver) = std::sync::mpsc::channel::<u32>();
+        assert_eq!(try_result(&receiver), Poll::Waiting);
+        sender.send(7).unwrap();
+        assert_eq!(try_result(&receiver), Poll::Done(7));
+        let worker = std::thread::spawn(move || {
+            let _sender = sender;
+            panic!("the worker fell over");
+        });
+        assert!(worker.join().is_err());
+        assert_eq!(try_result(&receiver), Poll::Gone);
+    }
+
     #[test]
     fn the_notes_and_clipboard_tabs_are_addressed_by_name() {
         assert_eq!(resolve_page("clipboard"), ("notes", Some("clipboard")));

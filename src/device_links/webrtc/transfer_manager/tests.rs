@@ -2154,3 +2154,226 @@ fn unknown_cancel_and_error_codes_from_a_peer_end_the_transfer_generically() {
         hand.incoming().is_empty().then_some(())
     });
 }
+
+// ── "complete" means placed: the glue, end to end ──────────────────────────
+
+/// A three-block file, with the hashes of its blocks.
+fn three_blocks(seed: u64) -> (Vec<u8>, Vec<[u8; 32]>) {
+    let data = payload(2 * BLOCK_BYTES as usize + 777, seed);
+    let hashes = data
+        .chunks(BLOCK_BYTES as usize)
+        .map(openssl::sha::sha256)
+        .collect();
+    (data, hashes)
+}
+
+/// Offers, sends every block of `data` and says `done`, as a sender would;
+/// the transfer is `id`, its token `token0`.
+fn send_whole(hand: &Hand, id: &str, name: &str, data: &[u8], hashes: &[[u8; 32]]) {
+    hand.send(hand.offer(id, name, data.len() as u64));
+    eventually("the accept", || {
+        (!hand.link.sent(FileAction::Accept).is_empty()).then_some(())
+    });
+    for index in 0..hashes.len() as u64 {
+        for frame in block_frames(id, 0, data, index, false) {
+            hand.manager.on_frame(frame);
+        }
+    }
+    say_done(hand, id, data.len() as u64, hashes);
+}
+
+fn say_done(hand: &Hand, id: &str, total: u64, hashes: &[[u8; 32]]) {
+    let mut done = FileControl::new(&wire_of("alpha", "beta"), FileAction::Done, id, "token0");
+    done.file_hash = Some(hex(&hash_of_hashes(hashes)));
+    done.blocks = Some(hashes.len() as u64);
+    done.total_size = Some(total);
+    hand.send(done);
+}
+
+/// A real receive through the manager, the store, the board and the
+/// history: three blocks, the bytes checked where they landed, the history
+/// row there, and "complete" only once all of it is true.
+#[test]
+fn a_received_file_is_complete_only_once_it_is_placed_recorded_and_listed() {
+    let hand = Hand::new("glue-ok");
+    let (data, hashes) = three_blocks(21);
+    send_whole(&hand, id(1), "three.bin", &data, &hashes);
+    let complete = eventually("the complete", || hand.reply(FileAction::Complete));
+    // At the moment the sender is told, the file is whole where it belongs.
+    let placed = hand.base.join("dl").join("three.bin");
+    assert_eq!(fs::read(&placed).unwrap(), data, "bytes at the destination");
+    assert_eq!(
+        complete.file_hash.as_deref(),
+        Some(hex(&hash_of_hashes(&hashes)).as_str())
+    );
+    // Listed on the board as received at that path, and in the history.
+    assert!(outcomes(id(1))
+        .iter()
+        .any(|outcome| matches!(outcome, board::Outcome::Received(path) if *path == placed)));
+    assert!(
+        crate::device_links::transfer_log::recent()
+            .iter()
+            .any(|entry| entry.path == placed && entry.incoming && entry.device_id == "alpha"),
+        "the history row"
+    );
+    assert!(
+        names(&hand.base.join("state")).is_empty(),
+        "no partial left"
+    );
+    assert!(hand.link.sent(FileAction::Error).is_empty());
+}
+
+/// A destination that refuses the file: the sender gets `error` and never
+/// `complete`, nothing is listed as received, the verified part stays, and
+/// the same transfer offered again only has to be placed.
+#[test]
+fn a_file_that_cannot_be_placed_is_an_error_never_a_complete_and_keeps_its_part() {
+    use std::os::unix::fs::PermissionsExt;
+    // Root writes anywhere: the refusal cannot be staged.
+    if unsafe { libc::geteuid() } == 0 {
+        return;
+    }
+    let hand = Hand::new("glue-refused");
+    let (data, hashes) = three_blocks(22);
+    let downloads = hand.base.join("dl");
+    fs::set_permissions(&downloads, fs::Permissions::from_mode(0o500)).unwrap();
+    send_whole(&hand, id(1), "refused.bin", &data, &hashes);
+    let error = eventually("the error", || hand.reply(FileAction::Error));
+    assert_eq!(error.code.as_deref(), Some(code::INTERNAL));
+    assert!(
+        error
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("not allowed")),
+        "{error:?}"
+    );
+    assert!(
+        hand.link.sent(FileAction::Complete).is_empty(),
+        "never complete"
+    );
+    assert!(names(&downloads).is_empty(), "nothing published");
+    let failed = eventually("the failure", || failed_with(id(1)));
+    assert!(failed.contains("not allowed"), "{failed}");
+    assert!(
+        !outcomes(id(1))
+            .iter()
+            .any(|outcome| matches!(outcome, board::Outcome::Received(_))),
+        "not listed as received"
+    );
+    // The verified part and its checkpoint are kept.
+    assert!(
+        !names(&hand.base.join("state")).is_empty(),
+        "the part is kept"
+    );
+    // The folder is allowed again; the same transfer, offered again, resumes
+    // at the end and only has to be placed.
+    fs::set_permissions(&downloads, fs::Permissions::from_mode(0o700)).unwrap();
+    hand.send(hand.offer(id(1), "refused.bin", data.len() as u64));
+    eventually("accepted again", || {
+        (hand.link.sent(FileAction::Accept).len() == 2).then_some(())
+    });
+    say_done(&hand, id(1), data.len() as u64, &hashes);
+    eventually("the complete", || hand.reply(FileAction::Complete));
+    assert_eq!(fs::read(downloads.join("refused.bin")).unwrap(), data);
+}
+
+/// The downloads folder is on another filesystem (the link fails with
+/// EXDEV), a name is taken, or the folder is gone: the file is still placed
+/// whole, never over anything, and the part goes only after.
+#[test]
+fn placing_copes_with_another_filesystem_a_taken_name_and_a_missing_folder() {
+    use super::store::Store;
+    let base =
+        std::env::temp_dir().join(format!("desklink-place-{}", uuid::Uuid::new_v4().simple()));
+    let (state, downloads) = (base.join("state"), base.join("dl"));
+    let store = Store::new(state, downloads.clone()).unwrap();
+    let exdev = |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(libc::EXDEV));
+    let write_part = |id: &str, bytes: &[u8]| {
+        fs::write(store.part_path(id).unwrap(), bytes).unwrap();
+    };
+    // Another filesystem: copied, synced, put in place; no staging file left.
+    write_part("p1", b"first file");
+    let path = store.publish_with("p1", "a.bin", "a.bin", &exdev).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"first file");
+    assert_eq!(names(&downloads), ["a.bin"], "no staging file left behind");
+    assert!(!store.part_path("p1").unwrap().exists(), "part goes after");
+    // The same name again: the next free one, the first untouched.
+    write_part("p2", b"second file");
+    let again = store.publish_with("p2", "a.bin", "a.bin", &exdev).unwrap();
+    assert_ne!(again, path);
+    assert_eq!(fs::read(&path).unwrap(), b"first file");
+    assert_eq!(fs::read(&again).unwrap(), b"second file");
+    // The folder vanished while the file arrived: made again.
+    fs::remove_dir_all(&downloads).unwrap();
+    write_part("p3", b"third file");
+    let third = store.publish("p3", "c.bin", "c.bin").unwrap();
+    assert_eq!(fs::read(third).unwrap(), b"third file");
+    // A refusal for any other reason keeps the part and says why in words.
+    write_part("p4", b"fourth file");
+    let nospace = |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(libc::ENOSPC));
+    let error = store
+        .publish_with("p4", "d.bin", "d.bin", &nospace)
+        .unwrap_err();
+    assert!(error.contains("no room"), "{error}");
+    assert!(store.part_path("p4").unwrap().exists(), "the part is kept");
+    let denied = |_: &Path, _: &Path| Err(std::io::Error::from_raw_os_error(libc::EACCES));
+    let error = store
+        .publish_with("p4", "d.bin", "d.bin", &denied)
+        .unwrap_err();
+    assert!(error.contains("not allowed"), "{error}");
+    let _ = fs::remove_dir_all(&base);
+}
+
+/// The sender: after its last block is acknowledged it says "Finishing…",
+/// not "sent"; "sent" waits for the receiver's `complete`. An `error` in
+/// place of it is a failure that can be tried again.
+#[test]
+fn a_send_is_finishing_until_the_receiver_says_complete_and_an_error_then_is_a_failure() {
+    let rig = Rig::new("finishing");
+    let (data, _) = three_blocks(23);
+    let source = rig.source("fin.bin", &data);
+    // The receiver never hears `done`: it has not placed anything, so the
+    // sender must not call the file sent.
+    *rig.ab.control_hook.lock().unwrap() = Some(Box::new(|control| {
+        if control.action == FileAction::Done {
+            Fate::Drop
+        } else {
+            Fate::Deliver
+        }
+    }));
+    let id = rig.a().start_send(&source).unwrap();
+    eventually("done sent", || {
+        (!rig.ab.sent(FileAction::Done).is_empty()).then_some(())
+    });
+    eventually("finishing", || {
+        (board::note(&id).as_deref() == Some("Finishing…")).then_some(())
+    });
+    // Every block was acknowledged, but the sender has not been told the
+    // file was placed: it is not "sent", not in its history, and nobody was
+    // notified.
+    assert!(!was_sent(&id));
+    assert!(rig.done_a.try_recv().is_err(), "no completion announced");
+    assert!(board::rows().iter().any(|row| row.id == id), "still listed");
+    // The receiver's word is an error: a failure, with the file to retry.
+    let mut error = FileControl::new(
+        &wire_of("beta", "alpha"),
+        FileAction::Error,
+        &id,
+        &rig.ab.sent(FileAction::Offer)[0].transfer_token,
+    );
+    error.code = Some(code::INTERNAL.to_string());
+    error.message = Some("There is no room to save the download.".to_string());
+    rig.a().on_control(error);
+    let reason = eventually("the failure", || failed_with(&id));
+    assert!(reason.contains("no room"), "{reason}");
+    let finished = board::peek_finished(&id)
+        .into_iter()
+        .find(|item| matches!(item.outcome, board::Outcome::Failed(_)))
+        .expect("the sender's failure");
+    assert_eq!(
+        finished.retry.as_deref(),
+        Some(source.as_path()),
+        "try again"
+    );
+    assert!(!was_sent(&id));
+}

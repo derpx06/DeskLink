@@ -2423,6 +2423,7 @@ fn spawn_event_worker(
                 Some(PeerEvent::Envelope { .. } | PeerEvent::Binary { .. })
             ) {
                 last_inbound = std::time::Instant::now();
+                note_data_inbound(&binding.device_id);
             }
             let ready = sessions
                 .webrtc_features_ready(&binding, &attempt_id)
@@ -2430,6 +2431,7 @@ fn spawn_event_worker(
             if ready && !was_ready {
                 // Start the silence budget at the moment features go live.
                 last_inbound = std::time::Instant::now();
+                note_data_inbound(&binding.device_id);
             }
             if ready && !was_ready {
                 ready_at = Some(std::time::Instant::now());
@@ -3037,6 +3039,47 @@ pub(crate) const PEER_DEAD_AFTER_DOZING: std::time::Duration = std::time::Durati
 /// builds never send it).
 pub(crate) fn reports_dozing(packet: &NetworkPacket) -> bool {
     packet.get_bool("dozing") == Some(true)
+}
+
+/// When each phone last sent anything on its data channel: features travel
+/// there and never on the LAN link, so this is the clock that says whether a
+/// phone being driven (glide) is still answering. The LAN clock
+/// (`DeviceManager::silence`) is deliberately left to the LAN heartbeat, whose
+/// silence is what thaws a dozing phone.
+fn data_inbound() -> &'static Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static HEARD: std::sync::OnceLock<
+        Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    HEARD.get_or_init(Default::default)
+}
+
+/// Records data-channel traffic from `device_id` now.
+pub(crate) fn note_data_inbound(device_id: &str) {
+    if let Ok(mut heard) = data_inbound().lock() {
+        heard.insert(device_id.to_string(), std::time::Instant::now());
+    }
+}
+
+/// How long the data channel of `device_id` has been silent, if it ever spoke.
+pub(crate) fn data_silence(device_id: &str) -> Option<std::time::Duration> {
+    data_inbound()
+        .lock()
+        .ok()?
+        .get(device_id)
+        .map(std::time::Instant::elapsed)
+}
+
+/// The silence of a link seen through both clocks: whichever heard the phone
+/// most recently (a phone talks on the data channel, and answers the LAN
+/// probe).
+pub(crate) fn link_silence(
+    lan: Option<std::time::Duration>,
+    data: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    match (lan, data) {
+        (Some(lan), Some(data)) => Some(lan.min(data)),
+        (lan, data) => lan.or(data),
+    }
 }
 
 fn dozing_devices() -> &'static Mutex<std::collections::HashSet<String>> {

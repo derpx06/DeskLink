@@ -35,7 +35,7 @@ use super::webrtc::file_protocol::{validate_relpath, FolderRef};
 pub(crate) const MAX_PAIRS_PER_DEVICE: usize = 8;
 /// Manifest entries per pair (live and tombstones).
 const MAX_FILES: usize = 20_000;
-/// F8c: a file larger than this can't go in the Bucket (1 GiB; "1 GB" to
+/// F8c: a file larger than this can't go in the Bucket (1 GiB; "1 GiB" to
 /// the user).
 pub(crate) const MAX_FILE_BYTES: u64 = 1 << 30;
 /// F8c: folder levels in a Bucket: folders `A` and `A/B`, with files in any.
@@ -84,9 +84,9 @@ const QUEUE: usize = 512;
 pub(crate) const BUCKET_ID: &str = "bucket";
 /// Items in one Bucket (the scan lists no more).
 pub(crate) const MAX_BUCKET_ITEMS: usize = 10_000;
-/// A Bucket larger than this shows a warning (8 GB)...
+/// A Bucket larger than this shows a warning (8 GiB)...
 pub(crate) const BUCKET_WARN_BYTES: u64 = 8 << 30;
-/// ...and takes no more additions past this (10 GB).
+/// ...and takes no more additions past this (10 GiB).
 pub(crate) const BUCKET_FULL_BYTES: u64 = 10 << 30;
 /// A pasted text or link item.
 pub(crate) const MAX_TEXT_ITEM_BYTES: usize = 1024 * 1024;
@@ -917,7 +917,7 @@ pub(crate) struct Report {
     pub(crate) bad_names: usize,
     pub(crate) over_items: usize,
     pub(crate) over_bytes: usize,
-    /// The Bucket would pass 10 GB.
+    /// The Bucket would pass 10 GiB.
     pub(crate) full: bool,
     pub(crate) not_moved: usize,
     pub(crate) refused: Option<String>,
@@ -936,7 +936,7 @@ impl Report {
         };
         if self.too_big > 0 {
             parts.push(counted(
-                "Files over 1 GB can't go in the Bucket",
+                "Files over 1 GiB can't go in the Bucket",
                 self.too_big,
             ));
         }
@@ -953,7 +953,7 @@ impl Report {
             ));
         }
         if self.full {
-            parts.push("The Bucket is full (10 GB)".to_string());
+            parts.push("The Bucket is full (10 GiB)".to_string());
         }
         if self.over_items > 0 {
             parts.push(format!(
@@ -963,7 +963,7 @@ impl Report {
         }
         if self.over_bytes > 0 {
             parts.push(format!(
-                "Only 5 GB can be added at once; {} were left out",
+                "Only 5 GiB can be added at once; {} were left out",
                 self.over_bytes
             ));
         }
@@ -1206,7 +1206,7 @@ pub(crate) fn import_bytes(
         return Err("That name cannot be used".into());
     }
     if bytes.len() as u64 > MAX_FILE_BYTES {
-        return Err("Files over 1 GB can't go in the Bucket".into());
+        return Err("Files over 1 GiB can't go in the Bucket".into());
     }
     send_message(Message::ImportBytes {
         device: device_id.to_string(),
@@ -1484,7 +1484,7 @@ fn scan(pair: &Pair) -> Result<Scanned, String> {
                 continue;
             }
             if metadata.len() > MAX_FILE_BYTES {
-                note(&path, "over 1 GB");
+                note(&path, "over 1 GiB");
                 continue;
             }
             let cap = if pair.bucket {
@@ -1511,7 +1511,7 @@ fn scan(pair: &Pair) -> Result<Scanned, String> {
 }
 
 /// A file that exists but is not in `found` — the scan stopped at its cap,
-/// or skipped it (over 1 GB, a name that can't sync) — is not gone: its entry
+/// or skipped it (over 1 GiB, a name that can't sync) — is not gone: its entry
 /// is kept as it is, so nothing is tombstoned (and deleted on the phone) for
 /// it.
 fn keep_existing(found: &mut BTreeMap<String, Stat>, manifest: &Manifest, root: &Path) {
@@ -1957,7 +1957,7 @@ struct Live {
     /// Files asked of the other side: receiving.
     receiving: BTreeMap<String, Entry>,
     /// What the Bucket does not sync, with why (too deep, a name that can't
-    /// sync, over 1 GB, a link).
+    /// sync, over 1 GiB, a link).
     skipped: Vec<String>,
     /// F8c: files the other side asked for, waiting for a free slot of
     /// [`MAX_IN_FLIGHT`].
@@ -3808,12 +3808,12 @@ mod tests {
 
     #[test]
     fn the_limits_are_the_documented_ones() {
-        assert_eq!(MAX_FILE_BYTES, 1 << 30, "1 GB per file");
+        assert_eq!(MAX_FILE_BYTES, 1 << 30, "1 GiB per file");
         assert_eq!(MAX_BUCKET_DEPTH, 2);
         assert_eq!(MAX_IN_FLIGHT, 2);
         assert_eq!((MAX_ADD_ITEMS, MAX_ADD_BYTES), (500, 5 << 30));
-        assert_eq!(BUCKET_WARN_BYTES, 8 << 30, "warning at 8 GB");
-        assert_eq!(BUCKET_FULL_BYTES, 10 << 30, "refusal at 10 GB");
+        assert_eq!(BUCKET_WARN_BYTES, 8 << 30, "warning at 8 GiB");
+        assert_eq!(BUCKET_FULL_BYTES, 10 << 30, "refusal at 10 GiB");
         assert_eq!(MAX_BUCKET_ITEMS, 10_000);
         assert_eq!(MAX_NAME_BYTES, 255);
         assert_eq!(MAX_TEXT_ITEM_BYTES, 1 << 20);
@@ -4229,7 +4229,7 @@ mod tests {
         fs::write(root.join("other.txt"), "o").unwrap();
         worker.rescan(0);
         assert!(!worker.pairs[0].book.manifest["grows.bin"].deleted);
-        // It grows past 1 GB: skipped by the scan, listed, but not gone.
+        // It grows past 1 GiB: skipped by the scan, listed, but not gone.
         fs::File::create(root.join("grows.bin"))
             .unwrap()
             .set_len(MAX_FILE_BYTES + 1)
@@ -4646,13 +4646,13 @@ mod tests {
         assert_eq!(report.too_big, 1);
         assert_eq!(
             report.message().unwrap(),
-            "Files over 1 GB can't go in the Bucket"
+            "Files over 1 GiB can't go in the Bucket"
         );
         // In the Bucket folder from outside, and from the phone.
         fs::copy(&big, root.join("huge.bin")).unwrap();
         let (found, _, _, skipped) = scan(&worker.pairs[0].pair).unwrap();
         assert!(!found.contains_key("huge.bin"));
-        assert_eq!(skipped, ["huge.bin (over 1 GB)"]);
+        assert_eq!(skipped, ["huge.bin (over 1 GiB)"]);
         let mut packet = NetworkPacket::new(PACKET_TYPE_FOLDERS);
         packet.set(
             "entries",
@@ -4696,7 +4696,7 @@ mod tests {
             .message()
             .unwrap()
             .contains("Only 500 items can be added at once; 3 were left out"));
-        // 5 GB at once: six 1 GiB files, the sixth left out.
+        // 5 GiB at once: six 1 GiB files, the sixth left out.
         let big: Vec<PathBuf> = (0..6)
             .map(|index| {
                 let path = outside.join(format!("big{index}.bin"));
@@ -4710,7 +4710,7 @@ mod tests {
         let mut report = Report::default();
         let adds = collect(&big, &root, "", (0, 0), &mut report);
         assert_eq!((adds.len(), report.over_bytes), (5, 1));
-        // The Bucket would pass 10 GB.
+        // The Bucket would pass 10 GiB.
         let mut report = Report::default();
         let adds = collect(
             &big,
@@ -4724,7 +4724,7 @@ mod tests {
         assert!(report
             .message()
             .unwrap()
-            .contains("The Bucket is full (10 GB)"));
+            .contains("The Bucket is full (10 GiB)"));
         // The item cap of a Bucket.
         let mut report = Report::default();
         let adds = collect(
@@ -5055,12 +5055,12 @@ mod tests {
         for part in [
             "Added 3 items to the Bucket",
             "No.",
-            "Files over 1 GB can't go in the Bucket (2)",
+            "Files over 1 GiB can't go in the Bucket (2)",
             "Some items were more than 2 folders deep and were left out (4)",
             "Some names can't sync, so they were left out (1)",
-            "The Bucket is full (10 GB)",
+            "The Bucket is full (10 GiB)",
             "Only 500 items can be added at once; 5 were left out",
-            "Only 5 GB can be added at once; 1 were left out",
+            "Only 5 GiB can be added at once; 1 were left out",
             "2 items couldn't be moved",
         ] {
             assert!(message.contains(part), "{part}: {message}");

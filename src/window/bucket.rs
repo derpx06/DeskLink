@@ -36,8 +36,12 @@ struct Browse {
     selected: BTreeSet<String>,
     /// For Shift-click ranges.
     anchor: Option<String>,
-    /// The visible items, in order.
+    /// The items drawn, in order (never more than [`MAX_TILES`]): what
+    /// Select All and Shift-click reach, so a destructive action only ever
+    /// acts on what was on screen.
     order: Vec<String>,
+    /// Items in this folder that are not drawn.
+    hidden: usize,
     tiles: Vec<TileRef>,
     bar: Option<glib::WeakRef<gtk::Box>>,
     count: Option<glib::WeakRef<gtk::Label>>,
@@ -226,7 +230,7 @@ pub(super) fn debug_select(paths: Vec<String>) {
 
 /// A progress widget kept current.
 enum Live {
-    /// One file moving: "340 MB of 1.2 GB · 2 min left" and its bar.
+    /// One file moving: "340 MB of 1.2 GiB · 2 min left" and its bar.
     Tile {
         device: String,
         path: String,
@@ -605,11 +609,11 @@ fn fill(win: &DesklinkWindow, page: &gtk::Box, view: &PairView, device: &DeviceV
     level.sort_by_key(|item| !item.dir);
     BROWSE.with(|browse| {
         let mut browse = browse.borrow_mut();
-        browse.order = level.iter().map(|item| item.path.clone()).collect();
+        let (order, hidden) = drawn(level.iter().map(|item| item.path.as_str()));
+        browse.hidden = hidden;
         browse.tiles.clear();
-        browse
-            .selected
-            .retain(|path| level.iter().any(|item| item.path == *path));
+        browse.selected.retain(|path| order.contains(path));
+        browse.order = order;
     });
     page.append(&header(win, view, device));
     page.append(&selection_bar(win, view, device));
@@ -753,7 +757,13 @@ fn selection_bar(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> 
     let add = |button: &gtk::Button| {
         actions.append(button);
     };
-    let all = menu_item("Select All");
+    // With more items than are drawn it says so, and reaches only those drawn.
+    let hidden = BROWSE.with(|browse| browse.borrow().hidden);
+    let all = menu_item(&if hidden > 0 {
+        format!("Select All {MAX_TILES} Shown")
+    } else {
+        "Select All".to_string()
+    });
     all.connect_clicked(|_| select_all());
     add(&all);
     let move_to = menu_item("Move to Folder…");
@@ -945,7 +955,7 @@ fn header(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> gtk::Bo
             device.name
         ));
     }
-    parts.push(glib::format_size(view.bytes).to_string());
+    parts.push(crate::bucket_progress::size_words(view.bytes).to_string());
     let idle = parts.join(" · ");
     let line = text(&idle, &["caption", "text-dim", "numeric"]);
     line.set_wrap(true);
@@ -1138,20 +1148,20 @@ fn menu_item(label: &str) -> gtk::Button {
 }
 
 /// What needs the user: a size warning, a held empty folder, a problem.
-/// What the Bucket's size says: a warning from 8 GB, "full" at 10 GB, where
+/// What the Bucket's size says: a warning from 8 GiB, "full" at 10 GiB, where
 /// adding more is refused.
 fn size_notice(bytes: u64) -> Option<(String, String)> {
     if bytes >= folders::BUCKET_FULL_BYTES {
         Some((
-            "The Bucket is full (10 GB)".to_string(),
+            "The Bucket is full (10 GiB)".to_string(),
             "Nothing more can be added until you remove something.".to_string(),
         ))
     } else if bytes > folders::BUCKET_WARN_BYTES {
         Some((
             "The Bucket is getting big".to_string(),
             format!(
-                "{} of 10 GB — the phone keeps a copy of everything in it.",
-                glib::format_size(bytes)
+                "{} of 10 GiB — the phone keeps a copy of everything in it.",
+                crate::bucket_progress::size_words(bytes)
             ),
         ))
     } else {
@@ -1276,6 +1286,17 @@ fn empty_zone(device: &DeviceView) -> gtk::Box {
 /// cost a page of thousands of widgets); past it, a line says how many more
 /// there are and where they are.
 const MAX_TILES: usize = 300;
+
+/// The paths of a level that get a tile, and how many do not.
+fn drawn<'a>(level: impl Iterator<Item = &'a str>) -> (Vec<String>, usize) {
+    let all: Vec<&str> = level.collect();
+    let shown: Vec<String> = all
+        .iter()
+        .take(MAX_TILES)
+        .map(|path| path.to_string())
+        .collect();
+    (shown, all.len().saturating_sub(MAX_TILES))
+}
 
 /// "Showing 300 of 1,204. The rest are in the folder on this computer." once
 /// a level has more items than are drawn.
@@ -1430,12 +1451,12 @@ fn tile(
                 1 => "1 item".to_string(),
                 count => format!("{count} items"),
             },
-            glib::format_size(bytes)
+            crate::bucket_progress::size_words(bytes)
         )
     } else {
         format!(
             "{} · {}",
-            glib::format_size(item.size),
+            crate::bucket_progress::size_words(item.size),
             from_words(item, device)
         )
     };
@@ -1455,7 +1476,7 @@ fn tile(
             bar: bar.downgrade(),
         });
     } else if matches!(item.state, ItemState::Sending | ItemState::Receiving) {
-        // "340 MB of 1.2 GB · 2 min left" and a bar, kept current.
+        // "340 MB of 1.2 GiB · 2 min left" and a bar, kept current.
         let line = ellipsized("Waiting…", &["caption", "text-dim", "numeric"]);
         words.append(&line);
         let bar = thin_bar(&format!("Progress of {}", leaf(&item.path)));
@@ -2006,7 +2027,7 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
                 1 => "1 item".to_string(),
                 count => format!("{count} items"),
             },
-            glib::format_size(view.bytes)
+            crate::bucket_progress::size_words(view.bytes)
         ),
         None if asked(&device.id) => format!("{} asked for a Bucket. Turn it on?", device.name),
         None => format!("Off · share anything with {}", device.name),
@@ -2095,6 +2116,28 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
 
 #[cfg(test)]
 mod tests {
+    /// Select All, Shift-click and Remove from Both only reach tiles that
+    /// are drawn: items past the cap are never selected.
+    #[test]
+    fn selection_only_reaches_what_is_drawn() {
+        use super::*;
+        let paths: Vec<String> = (0..MAX_TILES + 50).map(|n| format!("f{n:04}")).collect();
+        let (order, hidden) = drawn(paths.iter().map(String::as_str));
+        assert_eq!((order.len(), hidden), (MAX_TILES, 50));
+        assert_eq!(order.last().map(String::as_str), Some("f0299"));
+        // The selection after a rebuild keeps only drawn paths.
+        let mut selected: std::collections::BTreeSet<String> = ["f0001", "f0299", "f0300", "f0349"]
+            .map(String::from)
+            .into();
+        selected.retain(|path| order.contains(path));
+        assert_eq!(selected.len(), 2);
+        // Select All takes the order, which is the drawn part only.
+        let all: std::collections::BTreeSet<String> = order.into_iter().collect();
+        assert!(!all.contains("f0300") && all.len() == MAX_TILES);
+        let (small, none) = drawn(["a", "b"].into_iter());
+        assert_eq!((small.len(), none), (2, 0));
+    }
+
     #[test]
     fn a_big_folder_says_how_much_is_not_drawn() {
         use super::*;
@@ -2108,9 +2151,9 @@ mod tests {
         use super::*;
         assert!(size_notice(folders::BUCKET_WARN_BYTES).is_none());
         let (headline, detail) = size_notice(folders::BUCKET_WARN_BYTES + 1).unwrap();
-        assert!(headline.contains("getting big") && detail.contains("of 10 GB"));
+        assert!(headline.contains("getting big") && detail.contains("of 10 GiB"));
         let (headline, _) = size_notice(folders::BUCKET_FULL_BYTES).unwrap();
-        assert!(headline.contains("full (10 GB)"));
+        assert!(headline.contains("full (10 GiB)"));
     }
 
     use super::*;
