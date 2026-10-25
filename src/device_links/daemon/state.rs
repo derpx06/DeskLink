@@ -979,12 +979,6 @@ mod tests {
         });
         crate::device_links::calls::test_hold(&info.id);
         reconcile_connection_status(&devices, &[connection(false)]);
-        for _ in 0..100 {
-            if !crate::device_links::calls::test_holds(&info.id) {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
         assert!(!crate::device_links::calls::test_holds(&info.id));
     }
 

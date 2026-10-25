@@ -1316,13 +1316,20 @@ fn a_file_that_keeps_changing_fails_after_two_restarts() {
         Fate::Deliver
     }));
     rig.a().start_send(&source).unwrap();
-    let reasons = eventually("the failure", || {
+    // Both sides record a failure under the same id (the receiver's says the
+    // file changed, the sender's says it keeps changing): wait for the
+    // sender's, whichever was recorded first.
+    eventually("the failure", || {
         let cancels = rig.ab.sent(FileAction::Cancel);
         let offers = rig.ab.sent(FileAction::Offer);
         let last = offers.last()?;
-        failed_with(&last.transfer_id).filter(|_| cancels.len() == 3)
+        (cancels.len() == 3
+            && outcomes(&last.transfer_id).iter().any(|outcome| {
+                matches!(outcome, board::Outcome::Failed(reason)
+                    if *reason == words::source_changed_for_good())
+            }))
+        .then_some(())
     });
-    assert_eq!(reasons, words::source_changed_for_good());
     assert_eq!(
         rig.ab.sent(FileAction::Offer).len(),
         3,
@@ -1377,6 +1384,10 @@ fn a_receiver_far_behind_asks_the_sender_to_wait_and_then_restarts_it() {
     let rig = Rig::new("backlog");
     let bytes = payload(4 * BLOCK_BYTES as usize, 42);
     let source = rig.source("f.bin", &bytes);
+    // The receiver's answers are held, so the sender sends no data frame
+    // while the queue counter is set by hand below (a frame in flight
+    // decremented a counter that had been overwritten, and wrapped it).
+    rig.ba.freeze();
     let id = rig.a().start_send(&source).unwrap();
     eventually("the transfer to be open", || {
         rig.b()
@@ -1404,6 +1415,7 @@ fn a_receiver_far_behind_asks_the_sender_to_wait_and_then_restarts_it() {
         engine.shared.queued.store(0, Ordering::SeqCst);
         engine.apply_backlog();
     });
+    rig.ba.thaw();
     let got = rig.received();
     assert_eq!(fs::read(got.path).unwrap(), bytes);
     assert!(failed_with(&id).is_none(), "paused, never failed");
@@ -1971,6 +1983,27 @@ fn the_bucket_never_holds_the_last_slot_so_a_shared_file_goes_at_once() {
         "the shared file was offered"
     );
     rig.ab.thaw();
+}
+
+/// S4: a received file keeps the sender's modification time.
+#[test]
+fn a_received_file_keeps_the_senders_modification_time() {
+    let rig = Rig::new("mtime");
+    let source = rig.source("old.bin", &payload(10_000, 77));
+    let year_ago = std::time::SystemTime::now() - Duration::from_secs(365 * 24 * 3600);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_modified(year_ago)
+        .unwrap();
+    rig.a().start_send(&source).unwrap();
+    let got = rig.received();
+    let modified = fs::metadata(got.path).unwrap().modified().unwrap();
+    let difference = modified
+        .duration_since(year_ago)
+        .unwrap_or_else(|error| error.duration());
+    assert!(difference < Duration::from_secs(2), "{difference:?}");
 }
 
 #[test]

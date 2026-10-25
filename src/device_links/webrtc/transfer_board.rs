@@ -125,6 +125,15 @@ impl TransferBoard {
     /// Reports a transfer that ended without ever being listed, such as an
     /// offer refused on arrival.
     pub fn record(&mut self, finished: Finished) {
+        self.push_finished(finished);
+    }
+
+    fn push_finished(&mut self, finished: Finished) {
+        #[cfg(test)]
+        test_log()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(finished.clone());
         if self.finished.len() >= MAX_FINISHED {
             self.finished.pop_front();
         }
@@ -177,14 +186,11 @@ impl TransferBoard {
             return;
         };
         let row = self.rows.remove(position);
-        if self.finished.len() >= MAX_FINISHED {
-            self.finished.pop_front();
-        }
         let retry = self
             .retry_sources
             .remove(&row.id)
             .filter(|_| matches!(outcome, Outcome::Failed(_)));
-        self.finished.push_back(Finished {
+        self.push_finished(Finished {
             id: row.id,
             device_id: row.device_id,
             name: row.name,
@@ -358,12 +364,22 @@ pub fn take_finished() -> Vec<Finished> {
 /// this table, and draining it would steal each other's results.
 #[cfg(test)]
 pub fn peek_finished(id: &str) -> Vec<Finished> {
-    board()
-        .finished
+    test_log()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .iter()
         .filter(|item| item.id == id)
         .cloned()
         .collect()
+}
+
+/// Every outcome ever recorded in this test run, never drained or evicted:
+/// the daemon's event drain (`take_finished`) and the history cap used to take
+/// a result away from the test that was waiting for it.
+#[cfg(test)]
+fn test_log() -> &'static Mutex<Vec<Finished>> {
+    static LOG: OnceLock<Mutex<Vec<Finished>>> = OnceLock::new();
+    LOG.get_or_init(Default::default)
 }
 
 /// The listed row for `id`, if any.

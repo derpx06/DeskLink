@@ -801,8 +801,12 @@ impl Engine {
             );
             return Ok(std::path::PathBuf::from(&incoming.filename));
         }
-        self.store
-            .publish(id, &incoming.destination_name, &incoming.filename)
+        let placed = self
+            .store
+            .publish(id, &incoming.destination_name, &incoming.filename)?;
+        // The file keeps its own time: a photo taken last year is not "new".
+        apply_sender_mtime(&placed, incoming.mtime);
+        Ok(placed)
     }
 
     /// An incoming transfer ends badly: the sender is told, the files go and
@@ -918,6 +922,14 @@ impl Engine {
 
     /// A transfer paused for lack of space looks at the disk again.
     pub(super) fn retry_after_storage_full(&mut self, now: Instant) {
+        // `statvfs` only when a paused transfer is due to look (it used to run
+        // on every pass of the loop, whatever was going on).
+        let due = self.incoming.values().any(|incoming| {
+            matches!(incoming.paused, Some(Pause::Storage { retry_at }) if now >= retry_at)
+        });
+        if !due {
+            return;
+        }
         let free = self.faults.free_bytes.or_else(|| self.store.free_bytes());
         let wanted = BLOCK_BYTES + self.tun.storage_slack;
         let ctx = Ctx {
@@ -973,5 +985,24 @@ impl Engine {
             .keys()
             .map(super::super::file_protocol::id_string)
             .collect()
+    }
+}
+
+/// Sets `path`'s modification time to the sender's (`ms` since the epoch),
+/// when it is a plausible one: not zero, not more than a day ahead. Best
+/// effort; the download is already in place.
+fn apply_sender_mtime(path: &std::path::Path, ms: i64) {
+    let Ok(ms) = u64::try_from(ms) else {
+        return;
+    };
+    if ms == 0 {
+        return;
+    }
+    let time = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms);
+    if time > std::time::SystemTime::now() + std::time::Duration::from_secs(24 * 3600) {
+        return;
+    }
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_modified(time);
     }
 }

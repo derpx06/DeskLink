@@ -294,15 +294,17 @@ pub(crate) fn test_holds(device_id: &str) -> bool {
 // ponytail: the desk worker drops a job when 16 are waiting; a dropped
 // resume leaves the player paused (Play fixes it). A dedicated queue if seen.
 pub(crate) fn hold_media(device_id: &str, in_call: bool) {
-    let device_id = device_id.to_string();
+    // The bookkeeping is a lock and a set: done here, in call order, so a
+    // phone dropping out is counted at once; only the player actions (D-Bus,
+    // slow) are queued on the desk worker.
+    let step = HOLD
+        .lock()
+        .map(|mut hold| {
+            hold.get_or_insert_with(MediaHold::default)
+                .update(device_id, in_call)
+        })
+        .unwrap_or(HoldStep::Nothing);
     super::desk_features::run_later(move || {
-        let step = HOLD
-            .lock()
-            .map(|mut hold| {
-                hold.get_or_insert_with(MediaHold::default)
-                    .update(&device_id, in_call)
-            })
-            .unwrap_or(HoldStep::Nothing);
         match step {
             // "Pause music during calls" (on by default): off pauses nothing,
             // and a resume after it is harmless (nothing was recorded).

@@ -10,7 +10,7 @@ use crate::device_links::webrtc::transfer_board::Preparing;
 
 /// Files waiting to be queued with the transfer manager, or being queued. Each
 /// holds a row in the transfers window until the manager lists it itself.
-const MAX_QUEUED: usize = 64;
+const MAX_QUEUED: usize = 500;
 
 static QUEUED: AtomicUsize = AtomicUsize::new(0);
 
@@ -173,7 +173,7 @@ fn queue_send(
         QUEUED.fetch_sub(1, Ordering::AcqRel);
         push_error(
             errors,
-            format!("DeskLink is preparing {MAX_QUEUED} files already; send the rest in a moment"),
+            format!("Up to {MAX_QUEUED} files can be queued at once; send the rest when these have started"),
         );
         return;
     }
@@ -251,7 +251,7 @@ mod waiting_tests {
     /// I9: a file chosen while the phone is away is kept and goes out when it
     /// connects; the row says who it waits for.
     #[test]
-    fn a_file_for_an_absent_phone_waits_and_is_released_when_it_connects() {
+    fn a_file_for_an_absent_phone_waits_is_released_when_it_connects_and_expires_after_a_day() {
         let dir = std::env::temp_dir().join(format!("desklink-wait-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("a.txt");
@@ -276,13 +276,9 @@ mod waiting_tests {
         assert!(!crate::device_links::webrtc::transfer_board::rows()
             .iter()
             .any(|row| row.device_id == "wait-phone"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    #[test]
-    fn files_that_waited_a_day_are_dropped() {
-        let dir = std::env::temp_dir().join(format!("desklink-wait-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        // Same test, after the first half: the queue is shared, so two tests
+        // would take each other's files.
         let file = dir.join("b.txt");
         std::fs::write(&file, "x").unwrap();
         wait_for_phone("old-phone", "Pixel", file).unwrap();

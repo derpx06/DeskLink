@@ -954,6 +954,14 @@ pub(crate) struct Report {
     /// The Bucket would pass 10 GiB.
     pub(crate) full: bool,
     pub(crate) not_moved: usize,
+    /// Hidden, `.git`, `*.tmp`... items the Bucket never syncs: left out at
+    /// add time rather than copied and then never sent.
+    pub(crate) hidden: usize,
+    /// Copies that failed (unreadable, disk full, vanished).
+    pub(crate) failed: usize,
+    /// Files removed on this side that came back because the other side
+    /// changed them (a few names).
+    pub(crate) restored: Vec<String>,
     pub(crate) refused: Option<String>,
 }
 
@@ -1001,6 +1009,30 @@ impl Report {
                 self.over_bytes
             ));
         }
+        if let Some(first) = self.restored.first() {
+            parts.push(match self.restored.len() {
+                1 => format!("{first} was restored: it was changed on the other side"),
+                count => format!(
+                    "{first} and {} more were restored: they were changed on the other side",
+                    count - 1
+                ),
+            });
+        }
+        if self.hidden > 0 {
+            parts.push(format!(
+                "Hidden and temporary items don't sync, so they were left out ({})",
+                self.hidden
+            ));
+        }
+        if self.failed > 0 {
+            parts.push(format!(
+                "{} couldn't be copied",
+                match self.failed {
+                    1 => "1 item".to_string(),
+                    count => format!("{count} items"),
+                }
+            ));
+        }
         if self.not_moved > 0 {
             parts.push(format!(
                 "{} couldn't be moved: they would be more than {MAX_BUCKET_DEPTH} folders deep",
@@ -1024,23 +1056,40 @@ impl Report {
 }
 
 /// Messages for the user, waiting for the window (or a notification).
+/// (Tests keep one queue per test thread: they all run in one process and
+/// used to take each other's messages.)
+#[cfg(not(test))]
 static REPORTS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+#[cfg(test)]
+thread_local! {
+    static REPORTS_LOCAL: std::cell::RefCell<VecDeque<String>> = const { std::cell::RefCell::new(VecDeque::new()) };
+}
+
+fn with_reports<T>(job: impl FnOnce(&mut VecDeque<String>) -> T) -> Option<T> {
+    #[cfg(test)]
+    {
+        Some(REPORTS_LOCAL.with(|reports| job(&mut reports.borrow_mut())))
+    }
+    #[cfg(not(test))]
+    {
+        REPORTS.lock().ok().map(|mut reports| job(&mut reports))
+    }
+}
 
 fn tell(report: &Report) {
-    if let (Some(message), Ok(mut reports)) = (report.message(), REPORTS.lock()) {
-        if reports.len() >= 8 {
-            reports.pop_front();
-        }
-        reports.push_back(message);
+    if let Some(message) = report.message() {
+        with_reports(|reports| {
+            if reports.len() >= 8 {
+                reports.pop_front();
+            }
+            reports.push_back(message);
+        });
     }
 }
 
 /// The next message about what the Bucket left out, if any.
 pub(crate) fn take_report() -> Option<String> {
-    REPORTS
-        .lock()
-        .ok()
-        .and_then(|mut reports| reports.pop_front())
+    with_reports(|reports| reports.pop_front()).flatten()
 }
 
 /// One thing to copy into the Bucket.
@@ -1108,6 +1157,10 @@ impl Collector<'_> {
         }
         if !name_ok(name) {
             self.report.bad_names += 1;
+            return;
+        }
+        if ignored(rel, false, &[]) {
+            self.report.hidden += 1;
             return;
         }
         if metadata.is_dir() {
@@ -1196,9 +1249,11 @@ fn collect(
     collector.adds
 }
 
-/// Writes `adds` under `dest_root`; how many were written.
-fn copy_adds(adds: &[Add], dest_root: &Path) -> usize {
+/// Writes `adds` under `dest_root`; how many were written and how many
+/// failed.
+fn copy_adds(adds: &[Add], dest_root: &Path) -> (usize, usize) {
     let mut written = 0;
+    let mut failed = 0;
     for add in adds {
         let target = dest_root.join(&add.rel);
         let done = if add.dir {
@@ -1214,10 +1269,11 @@ fn copy_adds(adds: &[Add], dest_root: &Path) -> usize {
         if done {
             written += 1;
         } else {
+            failed += 1;
             log_limited("import", "Could not copy an item into the Bucket");
         }
     }
-    written
+    (written, failed)
 }
 
 /// F8b: saves pasted `bytes` as `name` in `device_id`'s Bucket. Text and
@@ -1868,7 +1924,25 @@ fn unique_in(dir: &Path, name: &str) -> PathBuf {
 
 /// [`unique_in`], also avoiding names in `taken` (picked, not yet written).
 fn unique_among(dir: &Path, name: &str, taken: &HashSet<PathBuf>) -> PathBuf {
-    let free = |path: &Path| fs::symlink_metadata(path).is_err() && !taken.contains(path);
+    // The phone's file system may not tell "Photo.jpg" from "photo.jpg"
+    // (and neither does a case-folding one here): the same rule as the case
+    // clashes of a sync, so a name that differs only by case is taken.
+    let lower = |path: &Path| path.to_string_lossy().to_lowercase();
+    let existing: HashSet<String> = fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| lower(&entry.path()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let taken_lower: HashSet<String> = taken.iter().map(|path| lower(path)).collect();
+    let free = |path: &Path| {
+        fs::symlink_metadata(path).is_err()
+            && !taken.contains(path)
+            && !existing.contains(&lower(path))
+            && !taken_lower.contains(&lower(path))
+    };
     let first = dir.join(name);
     if free(&first) {
         return first;
@@ -2327,7 +2401,7 @@ impl Live {
         }
     }
 
-    fn view(&self, online: bool) -> PairView {
+    fn view(&self, _online: bool) -> PairView {
         PairView {
             pair: self.pair.clone(),
             phase: self.phase.clone(),
@@ -2340,7 +2414,7 @@ impl Live {
             last_sync: self.book.last_sync,
             conflicts: self.book.conflicts.clone(),
             items: if self.pair.bucket {
-                self.items(online)
+                self.items()
             } else {
                 Vec::new()
             },
@@ -2362,7 +2436,7 @@ impl Live {
     }
 
     /// F8b: the Bucket's items, newest first, each with its state.
-    fn items(&self, online: bool) -> Vec<Item> {
+    fn items(&self) -> Vec<Item> {
         let conflicted: HashSet<&str> = self
             .book
             .conflicts
@@ -2382,7 +2456,11 @@ impl Live {
                     ItemState::Synced
                 } else if self.sending.contains_key(path) && !there {
                     ItemState::Sending
-                } else if !there && !online {
+                } else if !there {
+                    // "On the phone too" only once the phone's own manifest
+                    // lists this exact content: online, not sending, and not
+                    // there yet is waiting (queued, paused or declined), not
+                    // synced (S2-5).
                     ItemState::Waiting
                 } else {
                     ItemState::Synced
@@ -2765,7 +2843,7 @@ impl Worker {
         let adds = collect(&sources, &dir, into, self.bucket_used(device), &mut report);
         let owner = device.to_string();
         let job = move || {
-            report.added = copy_adds(&adds, &dir);
+            (report.added, report.failed) = copy_adds(&adds, &dir);
             tell(&report);
             send_message(Message::Touched(owner));
         };
@@ -3236,6 +3314,7 @@ impl Worker {
         let pair_id = self.pairs[index].pair.id.clone();
         let device = self.pairs[index].pair.device.clone();
         let mut downloads = Vec::new();
+        let mut restored: Vec<String> = Vec::new();
         let mut rescan = false;
         let mut kept = false;
         {
@@ -3363,7 +3442,17 @@ impl Worker {
                         }
                         Err(_) => rescan = true,
                     },
-                    Step::Download { path, entry } => downloads.push((path, entry)),
+                    Step::Download { path, entry } => {
+                        // A file removed here that the other side changed
+                        // comes back; the person is told (C10).
+                        if live.pair.bucket
+                            && manifest.get(&path).is_some_and(|ours| ours.deleted)
+                            && !entry.deleted
+                        {
+                            restored.push(path.clone());
+                        }
+                        downloads.push((path, entry));
+                    }
                     Step::Conflict { path, copy } => {
                         let conflicts = &mut live.book.conflicts;
                         if !conflicts.iter().any(|known| known.copy == copy)
@@ -3399,6 +3488,13 @@ impl Worker {
                         },
                     );
                 }
+            }
+            if !restored.is_empty() {
+                restored.truncate(MAX_SKIPPED_SHOWN);
+                tell(&Report {
+                    restored: std::mem::take(&mut restored),
+                    ..Report::default()
+                });
             }
             if let Ok(mut wanted) = WANTED.lock() {
                 for (path, entry) in &downloads {
@@ -3608,6 +3704,14 @@ impl Worker {
                     read_path(&root, &conflict.copy),
                     read_path(&root, &conflict.path),
                 ) {
+                    // This computer's version goes to the trash first: the
+                    // rename alone replaced it for good (S4). Without a
+                    // trash it stays, and the conflict with it.
+                    if original.exists() && !trash(&original) {
+                        live.book.conflicts.insert(position, conflict);
+                        self.publish();
+                        return;
+                    }
                     let _ = fs::rename(copy, original);
                 }
             }
@@ -4252,6 +4356,28 @@ mod tests {
             desk.disk
         );
         assert!(desk.disk.contains_key("B/f.txt"), "the rename is applied");
+    }
+
+    /// S2-5: "on <phone> too" only when the phone's own manifest lists the
+    /// file; online with the phone not having it yet is waiting.
+    #[test]
+    fn a_file_the_phone_does_not_have_is_not_shown_as_synced() {
+        let (base, root, mut worker) = scratch_bucket("bucket-not-there");
+        fs::write(root.join("a.txt"), "a").unwrap();
+        worker.rescan(0);
+        let state = |worker: &Worker| {
+            worker.pairs[0]
+                .view(true)
+                .items
+                .iter()
+                .find(|item| item.path == "a.txt")
+                .map(|item| item.state)
+        };
+        assert_eq!(state(&worker), Some(ItemState::Waiting));
+        let sha = worker.pairs[0].book.manifest["a.txt"].sha256.clone();
+        worker.pairs[0].remote.insert("a.txt".into(), sha);
+        assert_eq!(state(&worker), Some(ItemState::Synced));
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -5234,6 +5360,97 @@ mod tests {
         assert_eq!(rollup([]), Synced);
     }
 
+    /// S3: hidden/.git/.tmp items are left out at add time and counted; a
+    /// name differing only by case counts as taken (the phone's file system
+    /// may fold case).
+    /// C10: a file removed here that the phone changed comes back, and the
+    /// person is told which.
+    #[test]
+    fn a_file_that_comes_back_because_the_phone_changed_it_is_reported() {
+        let (base, _root, mut worker) = scratch_bucket("bucket-restored");
+        let name = format!("c10-{}.txt", uuid::Uuid::new_v4().simple());
+        worker.pairs[0].book.manifest.insert(
+            name.clone(),
+            Entry {
+                deleted: true,
+                sha256: String::new(),
+                size: 0,
+                dir: false,
+                mtime: 1,
+                vv: Vv { desk: 2, phone: 0 },
+            },
+        );
+        let packet = folders_packet(
+            "manifest",
+            json!({"id": BUCKET_ID, "part": 1, "parts": 1, "entries": [
+                {"path": name, "size": 5, "mtime": 2, "sha256": "a".repeat(64),
+                 "vv": {"desk": 1, "phone": 1}},
+            ]}),
+        );
+        worker.on_packet("phone-b", &packet);
+        let told: Vec<String> = with_reports(|reports| reports.iter().cloned().collect()).unwrap();
+        assert!(
+            told.iter()
+                .any(|message| message.contains(&format!("{name} was restored"))),
+            "{told:?}"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// S4: "Keep the phone's" trashes this computer's version first.
+    #[test]
+    fn keeping_the_phones_version_trashes_the_desks_first() {
+        let (base, root, mut worker) = scratch_bucket("bucket-keep-phone");
+        fs::write(root.join("a.txt"), "desk").unwrap();
+        fs::write(root.join("a (conflicted copy).txt"), "phone").unwrap();
+        worker.pairs[0].book.conflicts.push(Conflict {
+            path: "a.txt".into(),
+            copy: "a (conflicted copy).txt".into(),
+            at: 0,
+        });
+        let before = trashed();
+        worker.resolve("phone-b", BUCKET_ID, "a.txt", Resolve::Phone);
+        assert_eq!(
+            trashed(),
+            before + 1,
+            "the desk's version went to the trash"
+        );
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "phone");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_add_skips_what_never_syncs_and_names_ignore_case() {
+        let base = scratch("add-hidden");
+        let source = base.join("src");
+        fs::create_dir_all(source.join(".git")).unwrap();
+        fs::write(source.join(".git/config"), "x").unwrap();
+        fs::write(source.join(".hidden"), "x").unwrap();
+        fs::write(source.join("scratch.tmp"), "x").unwrap();
+        fs::write(source.join("keep.txt"), "x").unwrap();
+        let root = base.join("bucket");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Photo.JPG"), "x").unwrap();
+        let mut report = Report::default();
+        let adds = collect(
+            std::slice::from_ref(&source),
+            &root,
+            "",
+            (0, 0),
+            &mut report,
+        );
+        let rels: Vec<&str> = adds.iter().map(|add| add.rel.as_str()).collect();
+        assert!(rels.contains(&"src/keep.txt"), "{rels:?}");
+        assert!(!rels
+            .iter()
+            .any(|rel| rel.contains(".git") || rel.contains(".hidden")));
+        assert_eq!(report.hidden, 3, ".git, .hidden and scratch.tmp");
+        let taken = HashSet::new();
+        let unique = unique_among(&root, "photo.jpg", &taken);
+        assert_eq!(unique.file_name().unwrap(), "photo (2).jpg");
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn what_an_add_left_out_is_said_plainly() {
         let report = Report {
@@ -5245,6 +5462,9 @@ mod tests {
             over_items: 5,
             over_bytes: 1,
             not_moved: 2,
+            hidden: 6,
+            failed: 2,
+            restored: vec!["a.txt".into(), "b.txt".into()],
             refused: Some("No.".into()),
         };
         let message = report.message().unwrap();
@@ -5258,6 +5478,9 @@ mod tests {
             "Only 500 items can be added at once; 5 were left out",
             "Only 5 GiB can be added at once; 1 were left out",
             "2 items couldn't be moved",
+            "Hidden and temporary items don't sync, so they were left out (6)",
+            "2 items couldn't be copied",
+            "a.txt and 1 more were restored",
         ] {
             assert!(message.contains(part), "{part}: {message}");
         }
