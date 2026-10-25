@@ -57,6 +57,9 @@ pub(super) struct PdfView {
     /// 1 fits a page to the width.
     zoom: Cell<f64>,
     jobs: mpsc::Sender<Job>,
+    /// How many render jobs were asked of the worker, in all.
+    asked_total: Cell<u64>,
+    pump: RefCell<Option<Rc<Pump>>>,
 }
 
 /// The view for `path`. Opening and drawing start at once, off the main
@@ -134,6 +137,8 @@ pub(super) fn open(path: &Path) -> Rc<PdfView> {
         slots: RefCell::default(),
         zoom: Cell::new(1.0),
         jobs,
+        asked_total: Cell::new(0),
+        pump: RefCell::new(None),
     });
     let weak = Rc::downgrade(&view);
     zoom_out.connect_clicked(move |_| {
@@ -156,26 +161,62 @@ pub(super) fn open(path: &Path) -> Rc<PdfView> {
     let file = path.to_path_buf();
     open_default.connect_clicked(move |button| open_in_default_app(button, &file));
 
-    // Replies, layout and what to draw: checked a few times a frame's worth,
-    // for as long as the view is on screen.
-    let weak = Rc::downgrade(&view);
-    let width_seen = Cell::new(0);
-    glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
-        let Some(view) = weak.upgrade() else {
-            return glib::ControlFlow::Break;
-        };
-        while let Ok(reply) = replies.try_recv() {
-            view.take(reply);
-        }
-        let width = view.scroller.width();
-        if width != width_seen.get() {
-            width_seen.set(width);
-            view.lay_out();
-        }
-        view.draw_visible();
-        glib::ControlFlow::Continue
+    // Replies, layout and what to draw: checked every 40 ms while something is
+    // happening (opening, pages being drawn, scrolling, zooming, resizing)
+    // and not at all once it has been quiet for a moment: scanning every
+    // page 25 times a second for as long as the viewer was open cost a core
+    // on a long document.
+    let pump = Rc::new(Pump {
+        replies,
+        running: Cell::new(false),
+        quiet: Cell::new(0),
+        width_seen: Cell::new(0),
     });
+    *view.pump.borrow_mut() = Some(Rc::clone(&pump));
+    let weak = Rc::downgrade(&view);
+    let wake = move || {
+        if let Some(view) = weak.upgrade() {
+            view.wake();
+        }
+    };
+    let on_scroll = wake.clone();
+    view.scroller
+        .vadjustment()
+        .connect_value_changed(move |_| on_scroll());
+    let on_resize = wake.clone();
+    view.scroller
+        .vadjustment()
+        .connect_page_size_notify(move |_| on_resize());
+    let on_zoom = wake.clone();
+    view.scroller
+        .vadjustment()
+        .connect_upper_notify(move |_| on_zoom());
+    let on_width = wake.clone();
+    view.scroller
+        .hadjustment()
+        .connect_page_size_notify(move |_| on_width());
+    let on_map = wake.clone();
+    view.scroller.connect_map(move |_| on_map());
+    view.wake();
     view
+}
+
+/// What the poll needs between turns.
+struct Pump {
+    replies: mpsc::Receiver<Reply>,
+    running: Cell<bool>,
+    /// Turns in a row in which nothing arrived and nothing was asked.
+    quiet: Cell<u32>,
+    width_seen: Cell<i32>,
+}
+
+/// Quiet turns (40 ms each) after which the poll stops until something
+/// wakes it: long enough for the page just asked for to come back.
+const QUIET_TURNS: u32 = 25;
+
+/// Whether the poll goes on after `quiet` turns of nothing.
+fn keeps_polling(quiet: u32) -> bool {
+    quiet < QUIET_TURNS
 }
 
 fn tool(icon: &str, label: &str) -> gtk::Button {
@@ -233,6 +274,48 @@ fn work(path: &Path, jobs: &mpsc::Receiver<Job>, replies: &mpsc::Sender<Reply>) 
 }
 
 impl PdfView {
+    /// Something may have changed: poll (again) for replies, layout and what
+    /// to draw, until it has been quiet for a while.
+    fn wake(self: &Rc<Self>) {
+        let Some(pump) = self.pump.borrow().clone() else {
+            return;
+        };
+        pump.quiet.set(0);
+        if pump.running.replace(true) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(std::time::Duration::from_millis(40), move || {
+            let Some(view) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let Some(pump) = view.pump.borrow().clone() else {
+                return glib::ControlFlow::Break;
+            };
+            let mut busy = false;
+            while let Ok(reply) = pump.replies.try_recv() {
+                busy = true;
+                view.take(reply);
+            }
+            let width = view.scroller.width();
+            if width != pump.width_seen.get() {
+                pump.width_seen.set(width);
+                busy = true;
+                view.lay_out();
+            }
+            let before = view.asked_total.get();
+            view.draw_visible();
+            busy |= view.asked_total.get() != before;
+            pump.quiet.set(if busy { 0 } else { pump.quiet.get() + 1 });
+            if keeps_polling(pump.quiet.get()) {
+                glib::ControlFlow::Continue
+            } else {
+                pump.running.set(false);
+                glib::ControlFlow::Break
+            }
+        });
+    }
+
     fn take(&self, reply: Reply) {
         match reply {
             Reply::Opened(sizes) => {
@@ -373,6 +456,7 @@ impl PdfView {
             if on_screen {
                 if slot.drawn.get() == 0 && slot.asked.get() == 0 {
                     // Something at once, then sharp.
+                    self.asked_total.set(self.asked_total.get() + 1);
                     let _ = self.jobs.send(Job::Render {
                         index,
                         width: (target / 4).max(64),
@@ -380,6 +464,7 @@ impl PdfView {
                 }
                 if slot.asked.get() != target {
                     slot.asked.set(target);
+                    self.asked_total.set(self.asked_total.get() + 1);
                     let _ = self.jobs.send(Job::Render {
                         index,
                         width: target,
@@ -419,5 +504,18 @@ mod tests {
         assert_eq!(page_words(0, 12), "Page 1 / 12");
         assert_eq!(page_words(11, 12), "Page 12 / 12");
         assert_eq!(page_words(40, 12), "Page 12 / 12");
+    }
+
+    /// The page poll stops once it has been quiet for a second, so a viewer
+    /// left open on a long document costs nothing; any scroll, zoom, resize
+    /// or arriving page starts it again (`wake`).
+    #[test]
+    fn the_page_poll_stops_when_it_has_been_quiet() {
+        assert!(keeps_polling(0));
+        assert!(keeps_polling(QUIET_TURNS - 1));
+        assert!(!keeps_polling(QUIET_TURNS));
+        assert!(!keeps_polling(u32::MAX));
+        // 25 turns of 40 ms: about a second after the last thing happened.
+        assert_eq!(QUIET_TURNS * 40, 1000);
     }
 }

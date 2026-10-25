@@ -9,7 +9,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +101,9 @@ pub(super) struct Store {
     destination_root: PathBuf,
 }
 
+/// How often the stale-file sweep runs for one state directory.
+const SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
+
 impl Store {
     pub fn new(state_root: PathBuf, destination_root: PathBuf) -> Result<Self, String> {
         fs::create_dir_all(&state_root).map_err(|error| {
@@ -120,8 +123,34 @@ impl Store {
             state_root,
             destination_root,
         };
-        store.sweep_stale(STALE_AFTER);
+        // A manager is made for every negotiation attempt and inbound offer;
+        // reading Downloads and the state directory each time was waste (and
+        // slow with tens of thousands of entries). Once an hour is plenty for
+        // a seven-day rule.
+        if store.sweep_is_due(Instant::now()) {
+            store.sweep_stale(STALE_AFTER);
+        }
         Ok(store)
+    }
+
+    /// Whether the stale-file sweep of this store's state directory has not
+    /// run within [`SWEEP_EVERY`]; records that it runs now.
+    pub(super) fn sweep_is_due(&self, now: Instant) -> bool {
+        static SWEPT: std::sync::Mutex<Vec<(PathBuf, Instant)>> = std::sync::Mutex::new(Vec::new());
+        let Ok(mut swept) = SWEPT.lock() else {
+            return true;
+        };
+        match swept.iter_mut().find(|(root, _)| *root == self.state_root) {
+            Some((_, last)) if now.saturating_duration_since(*last) < SWEEP_EVERY => false,
+            Some((_, last)) => {
+                *last = now;
+                true
+            }
+            None => {
+                swept.push((self.state_root.clone(), now));
+                true
+            }
+        }
     }
 
     /// Removes the files of transfers nobody has touched for `max_age`: a
@@ -202,17 +231,28 @@ impl Store {
     /// Writes `bytes` to `name` in the state directory so that a crash leaves
     /// the old content or the new, never half of it.
     fn write_atomic(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        self.write_atomic_in(name, bytes, true)
+    }
+
+    /// [`Self::write_atomic`]; with `sync_dir` false the rename is left for a
+    /// later directory sync (one sync covers every rename in the directory),
+    /// which is how a checkpoint's two files cost one directory sync, not two.
+    fn write_atomic_in(&self, name: &str, bytes: &[u8], sync_dir: bool) -> Result<(), String> {
         let path = self.state_path(name)?;
         let temporary = self.state_path(&format!("{name}.tmp"))?;
         let mut file = create_fresh_file(&temporary)?;
         file.write_all(bytes)
             .map_err(|error| format!("Could not write DeskLink transfer state: {error}"))?;
-        file.sync_all()
+        // The file is new: its data and length are all there is to persist.
+        file.sync_data()
             .map_err(|error| format!("Could not persist DeskLink transfer state: {error}"))?;
         fs::rename(temporary, path).map_err(|error| {
             format!("Could not atomically update DeskLink transfer state: {error}")
         })?;
-        sync_directory(&self.state_root)
+        if sync_dir {
+            sync_directory(&self.state_root)?;
+        }
+        Ok(())
     }
 
     fn read_regular(&self, name: &str) -> Result<Option<Vec<u8>>, String> {
@@ -239,7 +279,10 @@ impl Store {
         hashes: &[[u8; 32]],
     ) -> Result<(), String> {
         let id = &checkpoint.transfer_id;
-        self.write_atomic(&Self::blocks_name(id), &hashes.concat())?;
+        // The directory is synced once, by the checkpoint's own write: it
+        // makes this rename durable too, and the order (sidecar renamed first)
+        // is what the checkpoint relies on.
+        self.write_atomic_in(&Self::blocks_name(id), &hashes.concat(), false)?;
         let bytes = serde_json::to_vec(checkpoint).map_err(|error| {
             format!("Could not serialize DeskLink transfer checkpoint: {error}")
         })?;

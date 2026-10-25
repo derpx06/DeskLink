@@ -26,12 +26,18 @@ pub fn process_instance_id() -> &'static str {
     INSTANCE.get_or_init(|| uuid::Uuid::new_v4().simple().to_string())
 }
 
-impl DeviceInfo {
-    pub fn local(id: String, name: String) -> Self {
+/// This desk's capability lists, sorted and de-duplicated, with the WebRTC
+/// signaling type every identity carries. They are fixed for the life of the
+/// process, and built once: an identity is read for every inbound packet and
+/// every beacon, and sorting ~100 strings twice each time was waste a noisy
+/// LAN host could multiply.
+fn local_capabilities() -> &'static (Vec<String>, Vec<String>) {
+    static CAPABILITIES: std::sync::OnceLock<(Vec<String>, Vec<String>)> =
+        std::sync::OnceLock::new();
+    CAPABILITIES.get_or_init(|| {
         let registry = FeatureRegistry::desktop();
         let mut incoming_capabilities = registry.incoming_capabilities().to_vec();
         let mut outgoing_capabilities = registry.outgoing_capabilities().to_vec();
-
         // WebRTC signaling is bootstrap transport metadata, not a feature
         // handler.  It must be present in every DeskLink v9 identity so a
         // peer can negotiate a fresh data-channel session after re-pairing or
@@ -42,6 +48,13 @@ impl DeviceInfo {
         incoming_capabilities.dedup();
         outgoing_capabilities.sort();
         outgoing_capabilities.dedup();
+        (incoming_capabilities, outgoing_capabilities)
+    })
+}
+
+impl DeviceInfo {
+    pub fn local(id: String, name: String) -> Self {
+        let (incoming_capabilities, outgoing_capabilities) = local_capabilities().clone();
         Self {
             id,
             name,
@@ -99,8 +112,12 @@ impl DeviceInfo {
 /// icon. Read from the firmware's SMBIOS chassis type, the same source
 /// `hostnamectl` uses; anything unreadable counts as a desktop.
 fn local_device_type() -> &'static str {
-    let chassis = std::fs::read_to_string("/sys/class/dmi/id/chassis_type").unwrap_or_default();
-    device_type_for_chassis(chassis.trim().parse().unwrap_or(0))
+    // Firmware data: read once, not from sysfs on every identity.
+    static TYPE: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+    TYPE.get_or_init(|| {
+        let chassis = std::fs::read_to_string("/sys/class/dmi/id/chassis_type").unwrap_or_default();
+        device_type_for_chassis(chassis.trim().parse().unwrap_or(0))
+    })
 }
 
 /// SMBIOS chassis types: 8 portable, 9 laptop, 10 notebook, 11 hand held,
@@ -224,5 +241,25 @@ mod tests {
         packet.set("deviceName", "Phone");
 
         assert!(DeviceInfo::from_identity_packet(&packet).is_none());
+    }
+
+    /// The identity is read for every packet and beacon: its capability lists
+    /// are built once (same allocation, sorted, signaling included) and a
+    /// second identity is the same as the first.
+    #[test]
+    fn the_local_identity_is_cheap_and_stable() {
+        let first = DeviceInfo::local("id-1".into(), "Desk".into());
+        let second = DeviceInfo::local("id-1".into(), "Desk".into());
+        assert_eq!(first, second);
+        assert!(std::ptr::eq(local_capabilities(), local_capabilities()));
+        let mut sorted = first.incoming_capabilities.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(first.incoming_capabilities, sorted);
+        assert!(first
+            .outgoing_capabilities
+            .iter()
+            .any(|kind| kind == PACKET_TYPE_WEBRTC_SIGNAL_V1));
+        assert_eq!(local_device_type(), local_device_type());
     }
 }

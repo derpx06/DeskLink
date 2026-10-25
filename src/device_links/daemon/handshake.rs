@@ -19,10 +19,11 @@ use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::device_links::device_info::DeviceInfo;
 use crate::device_links::packet::PACKET_TYPE_WEBRTC_SIGNAL_V1;
 
-/// Idle read timeout on an established device link. It also bounds how long a
-/// send can wait for the stream mutex the reader holds — signalling (SDP and
-/// ICE during a rebuild) included, so it is short. ~40 idle wakeups a
-/// second per link.
+/// Read timeout on an established device link: only a fallback. The reader
+/// waits for data with `poll(2)` outside the stream mutex (see
+/// `TlsLinkTransport::read_byte`), so an idle link wakes once a second and a
+/// send never waits behind it; this bounds the rare read that finds a TLS
+/// record only half arrived.
 pub(super) const READ_TIMEOUT: Duration = Duration::from_millis(20);
 
 #[allow(clippy::too_many_arguments)]

@@ -102,21 +102,43 @@ fn is_idle_read(error: &std::io::Error) -> bool {
 /// The LAN carrier: newline-framed packets over pinned TLS on TCP.
 pub(crate) struct TlsLinkTransport {
     stream: Arc<Mutex<SslStream<TcpStream>>>,
+    /// The socket's descriptor, to wait for data *without* the stream mutex.
+    /// Valid as long as `stream` is, and the transport owns an `Arc` of it.
+    fd: std::os::fd::RawFd,
 }
+
+/// How long the reader waits for data before it looks at the link again
+/// (shutdown and adoption wake it at once: the socket is shut down, which
+/// makes it readable). Not a poll rate: an idle link wakes once a second.
+pub(crate) const IDLE_POLL: Duration = Duration::from_secs(1);
 
 impl TlsLinkTransport {
     pub(crate) fn new(stream: Arc<Mutex<SslStream<TcpStream>>>) -> Self {
-        Self { stream }
+        use std::os::fd::AsRawFd;
+        let fd = stream
+            .lock()
+            .map(|stream| stream.get_ref().as_raw_fd())
+            .unwrap_or(-1);
+        Self { stream, fd }
     }
-}
 
-impl LinkTransport for TlsLinkTransport {
-    fn send_packet(&self, packet: &NetworkPacket) -> Result<(), String> {
-        send_packet(&self.stream, packet)
-    }
-
-    fn read_byte(&self) -> Result<ReadOutcome, String> {
+    /// Reads one byte, waiting up to `wait` for it (outside the stream mutex).
+    fn read_byte_waiting(&self, wait: Duration) -> Result<ReadOutcome, String> {
         let mut byte = [0u8; 1];
+        // Decrypted bytes TLS already holds are not on the socket: read them
+        // without waiting. Otherwise wait for the socket *outside* the stream
+        // mutex, so an idle link costs one wake-up a second and a send never
+        // waits behind the reader.
+        let buffered = self
+            .stream
+            .lock()
+            .map_err(|_| "Session stream lock failed".to_string())?
+            .ssl()
+            .pending()
+            > 0;
+        if !buffered && !self.readable_within(wait) {
+            return Ok(ReadOutcome::Idle);
+        }
         let mut stream = self
             .stream
             .lock()
@@ -127,6 +149,38 @@ impl LinkTransport for TlsLinkTransport {
             Err(error) if is_idle_read(&error) => Ok(ReadOutcome::Idle),
             Err(error) => Err(format!("Read error: {error}")),
         }
+    }
+
+    /// Whether the socket is readable (or has hung up) within `wait`.
+    fn readable_within(&self, wait: Duration) -> bool {
+        wait_readable(self.fd, wait)
+    }
+}
+
+/// `poll(2)` on one descriptor for input. Errors and hang-ups count as
+/// readable, so the read that follows reports them.
+pub(crate) fn wait_readable(fd: std::os::fd::RawFd, wait: Duration) -> bool {
+    if fd < 0 {
+        return true;
+    }
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = wait.as_millis().min(i32::MAX as u128) as i32;
+    // SAFETY: one valid pollfd, count 1.
+    let ready = unsafe { libc::poll(&mut poll, 1, millis) };
+    ready != 0
+}
+
+impl LinkTransport for TlsLinkTransport {
+    fn send_packet(&self, packet: &NetworkPacket) -> Result<(), String> {
+        send_packet(&self.stream, packet)
+    }
+
+    fn read_byte(&self) -> Result<ReadOutcome, String> {
+        self.read_byte_waiting(IDLE_POLL)
     }
 
     /// The real `Shutdown::Both`, not a flag.
@@ -483,5 +537,134 @@ mod tests {
         assert!(other.is_some());
         drop(slots);
         assert!(HandshakeSlot::claim(host).is_some());
+    }
+
+    /// A connected TLS pair over loopback: the server side's transport, and
+    /// the client's raw stream.
+    fn tls_pair() -> (TlsLinkTransport, SslStream<TcpStream>) {
+        use openssl::asn1::Asn1Time;
+        use openssl::ec::{EcGroup, EcKey};
+        use openssl::hash::MessageDigest;
+        use openssl::nid::Nid;
+        use openssl::pkey::PKey;
+        use openssl::x509::{X509Builder, X509NameBuilder};
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(Nid::COMMONNAME, "test").unwrap();
+        let name = name.build();
+        let mut cert = X509Builder::new().unwrap();
+        cert.set_version(2).unwrap();
+        cert.set_subject_name(&name).unwrap();
+        cert.set_issuer_name(&name).unwrap();
+        cert.set_pubkey(&key).unwrap();
+        cert.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        cert.set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        cert.sign(&key, MessageDigest::sha256()).unwrap();
+        let cert = cert.build();
+        let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+        acceptor.set_certificate(&cert).unwrap();
+        acceptor.set_private_key(&key).unwrap();
+        let acceptor = acceptor.build();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (tcp, _) = listener.accept().unwrap();
+            acceptor.accept(tcp).unwrap()
+        });
+        let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+        connector.set_verify(SslVerifyMode::NONE);
+        let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let client = connector
+            .build()
+            .configure()
+            .unwrap()
+            .verify_hostname(false)
+            .connect("test", tcp)
+            .unwrap();
+        let server = server.join().unwrap();
+        server
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        (TlsLinkTransport::new(Arc::new(Mutex::new(server))), client)
+    }
+
+    /// An idle link is read by waiting, not polling: the wait does not hold
+    /// the stream (a send goes through at once), one pass lasts the whole
+    /// wait, data and a shutdown end it at once, and bytes TLS already holds
+    /// are read without waiting.
+    #[test]
+    fn an_idle_link_waits_outside_the_stream_and_wakes_for_data() {
+        let (transport, mut client) = tls_pair();
+        let transport = Arc::new(transport);
+        let waiting = {
+            let transport = Arc::clone(&transport);
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let outcome = transport.read_byte_waiting(Duration::from_millis(400));
+                (outcome, started.elapsed())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        // A send while the reader waits is not held up behind it.
+        let sent = std::time::Instant::now();
+        transport
+            .send_packet(&NetworkPacket::new("desklink.heartbeat"))
+            .unwrap();
+        assert!(
+            sent.elapsed() < Duration::from_millis(50),
+            "the send waited {:?} for the reader",
+            sent.elapsed()
+        );
+        let (outcome, took) = waiting.join().unwrap();
+        assert!(matches!(outcome, Ok(ReadOutcome::Idle)));
+        assert!(
+            took >= Duration::from_millis(350),
+            "one idle pass took {took:?}: it polled"
+        );
+        // Data ends the wait at once; the rest of the line is already in TLS.
+        client.write_all(b"ab").unwrap();
+        let started = std::time::Instant::now();
+        assert!(matches!(
+            transport.read_byte_waiting(Duration::from_secs(5)),
+            Ok(ReadOutcome::Byte(b'a'))
+        ));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(matches!(
+            transport.read_byte_waiting(Duration::from_secs(5)),
+            Ok(ReadOutcome::Byte(b'b'))
+        ));
+        // A shutdown wakes a long wait.
+        let waiting = {
+            let transport = Arc::clone(&transport);
+            std::thread::spawn(move || {
+                let started = std::time::Instant::now();
+                let outcome = transport.read_byte_waiting(Duration::from_secs(30));
+                (outcome, started.elapsed())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        transport.shutdown();
+        let (outcome, took) = waiting.join().unwrap();
+        assert!(took < Duration::from_secs(2), "shutdown took {took:?}");
+        assert!(!matches!(outcome, Ok(ReadOutcome::Byte(_))));
+    }
+
+    /// Measured: the reader of an idle link used to wake 40-67 times a second
+    /// (a 20 ms timeout and a 5 ms nap); it now returns once a second.
+    #[test]
+    fn an_idle_link_is_read_about_once_a_second() {
+        let (transport, _client) = tls_pair();
+        let started = std::time::Instant::now();
+        let mut turns = 0;
+        while started.elapsed() < Duration::from_millis(3_200) {
+            assert!(matches!(transport.read_byte(), Ok(ReadOutcome::Idle)));
+            turns += 1;
+        }
+        eprintln!("[test] idle link: {turns} reader turns in 3.2 s (was ~170)");
+        assert!(turns <= 4, "{turns} reader turns in 3.2 s");
     }
 }

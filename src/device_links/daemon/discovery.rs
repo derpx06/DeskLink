@@ -870,7 +870,7 @@ fn handle_identity_packet(
     let local_id = config
         .lock()
         .ok()
-        .map(|config| config.local_device_info().id);
+        .map(|config| config.local_device_id().to_string());
     if local_id.as_deref() == Some(info.id.as_str()) {
         return;
     }

@@ -2290,8 +2290,14 @@ fn attach_transfer_manager(
         }),
     );
     // A sender waiting for room in the channel is woken when it drains.
-    let waking = Arc::clone(manager);
-    peer.set_file_wake(move || waking.wake());
+    // Weakly: the peer must never keep its manager (and the manager's thread)
+    // alive, nor the other way round.
+    let waking = Arc::downgrade(manager);
+    peer.set_file_wake(move || {
+        if let Some(manager) = waking.upgrade() {
+            manager.wake();
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2830,6 +2836,8 @@ fn spawn_event_worker(
         // The transfers ride this peer: receivers checkpoint now (a resume
         // loses less than a block), and nothing is sent into a closed channel.
         transfer_manager.detach();
+        // And its thread ends with it, whoever else still holds the manager.
+        transfer_manager.shut_down();
     });
     Ok(())
 }
@@ -4264,6 +4272,8 @@ const TERMINAL_HIGH_WATER: u64 = 256 * 1024;
 /// higher rate stops being perceptible, and coalescing at that interval keeps a
 /// flooding program from turning into a message storm.
 const TERMINAL_PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(8);
+/// How long an idle pump sleeps when nothing wakes it.
+const TERMINAL_PUMP_IDLE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Handles one `desklink-terminal-v1` envelope.
 ///
@@ -4358,7 +4368,15 @@ fn run_terminal_pump(
     token: u64,
 ) {
     loop {
-        thread::sleep(TERMINAL_PUMP_INTERVAL);
+        // Nothing attached and nothing queued: nothing can arrive by itself,
+        // so sleep until a request touches the bridge (or a second passes, to
+        // notice a peer that went away) instead of polling 125 times a second.
+        let seen = terminal_bridge::wake_generation();
+        match terminal_bridge::pump_is_idle(&wire.peer_device_id, token) {
+            Some(true) => terminal_bridge::wait_for_work(seen, TERMINAL_PUMP_IDLE),
+            Some(false) => thread::sleep(TERMINAL_PUMP_INTERVAL),
+            None => break,
+        }
         if !sessions.is_current(binding) {
             break;
         }

@@ -569,11 +569,9 @@ pub(super) fn packet_read_loop(
 
                 apply_lan_packet(&binding, packet, &devices, &sessions, &config, &events);
             }
-            Ok(ReadOutcome::Idle) => {
-                // Yield briefly so a concurrent feature send can take the
-                // transport's lock instead of contending with the next read.
-                thread::sleep(Duration::from_millis(5));
-            }
+            // The transport already waited for data (up to a second) without
+            // holding the stream: nothing to add here.
+            Ok(ReadOutcome::Idle) => {}
             Err(error) => {
                 if super::handshake::handle_reader_disconnect(
                     &binding,

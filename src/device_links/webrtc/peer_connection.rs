@@ -756,6 +756,18 @@ impl DesktopWebRtcPeer {
         // first would wait on that thread forever whenever the connection was
         // still coming up or recovering.
         let _ = self.pipeline.set_state(gst::State::Null);
+        // And let go of everything that could keep the pipeline alive: nothing
+        // may call back into a closed peer, and a replaced peer must be freed.
+        if let Some(bus) = self.pipeline.bus() {
+            bus.unset_sync_handler();
+        }
+        let _ = self.pipeline.remove(&self.webrtcbin);
+        if let Ok(mut pad) = self.audio_pad.lock() {
+            *pad = None;
+        }
+        if let Ok(mut held) = self.held.lock() {
+            held.file_wake = None;
+        }
         if let Ok(mut capture) = self.desktop_screen_capture.lock() {
             if let Some((_, capture)) = capture.take() {
                 capture.abandon();
@@ -1322,11 +1334,19 @@ fn install_webrtcbin_callbacks(
     // Inbound media. `webrtcbin` exposes a received stream as a new source pad
     // once it has been negotiated; until then there is nothing to attach to.
     let media_events = events.clone();
-    let media_pipeline = pipeline.clone();
+    //
+    // The pipeline owns `webrtcbin`, which owns this closure: holding the
+    // pipeline here made a reference cycle that `close()` never broke, so every
+    // replaced peer kept its whole pipeline, ICE agent, sockets and threads for
+    // the life of the process. The closure holds it weakly.
+    let media_pipeline = pipeline.downgrade();
     webrtcbin.connect_pad_added(move |_, pad| {
         if pad.direction() != gst::PadDirection::Src {
             return;
         }
+        let Some(media_pipeline) = media_pipeline.upgrade() else {
+            return; // the peer is gone
+        };
         // Sound (F1): parked until someone listens, never left unlinked.
         if pad_carries_audio(pad) {
             super::screen::park_pad(&media_pipeline, pad);
@@ -2187,6 +2207,76 @@ a=max-message-size:262144\r\n";
                 Err(_) => panic!("{pending:?} never opened over loopback"),
             }
         }
+    }
+
+    /// `(threads, open fds)` of this process.
+    fn process_counts() -> (usize, usize) {
+        let count = |path: &str| std::fs::read_dir(path).map_or(0, Iterator::count);
+        (count("/proc/self/task"), count("/proc/self/fd"))
+    }
+
+    fn lone_peer() -> (DesktopWebRtcPeer, mpsc::Receiver<PeerEvent>) {
+        let ice = IceServerConfig {
+            local_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+            ..IceServerConfig::default()
+        };
+        let (events, receiver) = mpsc::channel();
+        (
+            DesktopWebRtcPeer::new(true, events, &ice).expect("a peer builds"),
+            receiver,
+        )
+    }
+
+    /// The pipeline of a closed, dropped peer is finalized: nothing it made
+    /// (the `pad-added` closure above all) keeps it alive. A replaced peer used
+    /// to keep its whole pipeline, ICE agent, sockets and threads for ever.
+    #[test]
+    fn a_closed_peer_frees_its_pipeline() {
+        let (peer, _events) = lone_peer();
+        let pipeline = peer.pipeline.downgrade();
+        let webrtcbin = peer.webrtcbin.downgrade();
+        assert!(pipeline.upgrade().is_some());
+        peer.close();
+        drop(peer);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (pipeline.upgrade().is_some() || webrtcbin.upgrade().is_some())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(pipeline.upgrade().is_none(), "the pipeline leaked");
+        assert!(webrtcbin.upgrade().is_none(), "webrtcbin leaked");
+    }
+
+    /// Fifty peers built and closed one after another leave the process with
+    /// the threads and file descriptors it started with (a leaked peer cost a
+    /// thread and ten descriptors each, so about a hundred rebuilds reached
+    /// the 1024-descriptor limit).
+    #[test]
+    fn fifty_rebuilds_do_not_grow_threads_or_descriptors() {
+        // One to settle process-wide singletons (GStreamer, libnice).
+        drop(lone_peer());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let (threads, fds) = process_counts();
+        for _ in 0..50 {
+            let (peer, _events) = lone_peer();
+            peer.close();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (mut grown_threads, mut grown_fds);
+        loop {
+            let (now_threads, now_fds) = process_counts();
+            grown_threads = now_threads.saturating_sub(threads);
+            grown_fds = now_fds.saturating_sub(fds);
+            // Other tests run beside this one: allow their noise, not 50 leaks.
+            if (grown_threads <= 20 && grown_fds <= 60) || std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        eprintln!("[test] after 50 peers: +{grown_threads} threads, +{grown_fds} fds");
+        assert!(grown_threads <= 20, "+{grown_threads} threads");
+        assert!(grown_fds <= 60, "+{grown_fds} descriptors");
     }
 
     /// What a description says about the largest data-channel message: both

@@ -135,6 +135,11 @@ impl Document {
         }
         // SAFETY: `raw` is a live PopplerDocument.
         let count = unsafe { (poppler.n_pages)(raw) }.max(0);
+        if count > MAX_PDF_PAGES {
+            // SAFETY: the document reference taken above, released unused.
+            unsafe { glib::gobject_ffi::g_object_unref(raw.cast()) };
+            return Err(too_many_pages(count));
+        }
         let mut sizes = Vec::with_capacity(count as usize);
         for index in 0..count {
             // SAFETY: an index within the document; the page is a new
@@ -213,9 +218,14 @@ pub(crate) fn freedesktop_thumbnail(
     Some(cache.join(size).join(format!("{name}.png")))
 }
 
-/// The most pixels one rendered page may have (a 128 MiB surface): a page
-/// with an absurd aspect ratio is drawn smaller rather than allocating more.
-const MAX_PAGE_PIXELS: f64 = 32_000_000.0;
+/// The most pixels one rendered page may have (a 64 MiB surface; a copy of it
+/// is made to hand to the window): a page with an absurd aspect ratio, or at
+/// the highest zoom, is drawn smaller rather than allocating more.
+const MAX_PAGE_PIXELS: f64 = 16_000_000.0;
+
+/// The most pages one PDF is previewed with: every page is a widget and a
+/// layout entry. A longer one is opened in the default app instead.
+pub(crate) const MAX_PDF_PAGES: i32 = 500;
 
 /// A page of `points_w` × `points_h` points drawn about `width` px wide:
 /// its pixel size and scale, within the side and pixel bounds.
@@ -231,6 +241,32 @@ fn page_pixels(points_w: f64, points_h: f64, width: i32) -> (i32, i32, f64) {
     let width = ((points_w * scale).round() as i32).clamp(16, 8192);
     let height = ((points_h * scale).round() as i32).clamp(16, 16_384);
     (width, height, scale)
+}
+
+/// What the viewer says for a PDF of `count` pages, past [`MAX_PDF_PAGES`].
+pub(crate) fn too_many_pages(count: i32) -> String {
+    format!(
+        "This PDF has {count} pages, more than DeskLink previews ({MAX_PDF_PAGES}). \
+         Open it in your default app."
+    )
+}
+
+/// A PDF of `pages` empty pages, for tests.
+#[cfg(test)]
+pub(crate) fn pdf_of_pages(pages: usize) -> Vec<u8> {
+    let kids: String = (0..pages).map(|n| format!("{} 0 R ", 3 + n)).collect();
+    let mut text = format!(
+        "%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n\
+         2 0 obj<</Type/Pages/Kids[{kids}]/Count {pages}>>endobj\n"
+    );
+    for n in 0..pages {
+        text.push_str(&format!(
+            "{} 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]>>endobj\n",
+            3 + n
+        ));
+    }
+    text.push_str("trailer<</Root 1 0 R>>\n%%EOF\n");
+    text.into_bytes()
 }
 
 /// A one-page, 200×100 pt PDF with nothing on it, for tests.
@@ -278,6 +314,28 @@ mod tests {
             Some(cache.join("large").join(format!("{expected}.png")))
         );
         assert_eq!(expected.len(), 32);
+    }
+
+    /// A PDF past the page cap is refused with a plain sentence (and the
+    /// viewer's Open in Default App), not turned into thousands of widgets.
+    #[test]
+    fn a_pdf_with_too_many_pages_is_not_previewed() {
+        let dir = std::env::temp_dir().join(format!("desklink-pdf-long-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let long = dir.join("long.pdf");
+        std::fs::write(&long, pdf_of_pages(MAX_PDF_PAGES as usize + 1)).unwrap();
+        let fits = dir.join("fits.pdf");
+        std::fs::write(&fits, pdf_of_pages(3)).unwrap();
+        match Document::open(&long) {
+            Ok(_) => panic!("a {}-page PDF was opened", MAX_PDF_PAGES + 1),
+            Err(error) if available() => {
+                assert_eq!(error, too_many_pages(MAX_PDF_PAGES + 1));
+                assert!(Document::open(&fits).is_ok_and(|document| document.sizes().len() == 3));
+            }
+            Err(_) => {}
+        }
+        assert!(too_many_pages(501).contains("501"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Whatever this desktop has, opening a PDF either works or says why;

@@ -43,6 +43,34 @@ pub(crate) struct IceServerConfig {
     pub relay_only: bool,
 }
 
+/// libnice asks the router for a port mapping (UPnP IGD) by default: an SSDP
+/// socket on every interface and a `gupnp-igd` thread per ICE agent, for a
+/// LAN link that needs neither. Off, before gathering starts.
+fn disable_upnp(webrtcbin: &gst::Element) {
+    if !webrtcbin.has_property(ICE_AGENT_PROPERTY, None) {
+        return;
+    }
+    let ice = webrtcbin.property::<gst_webrtc::WebRTCICE>(ICE_AGENT_PROPERTY);
+    if !ice.has_property("agent", None) {
+        return;
+    }
+    let agent = ice.property::<gst::glib::Object>("agent");
+    if agent.has_property("upnp", None) {
+        agent.set_property("upnp", false);
+    }
+}
+
+/// Whether the agent of `webrtcbin` has UPnP on (tests); `None` when the
+/// agent does not expose it.
+#[cfg(test)]
+fn upnp_enabled(webrtcbin: &gst::Element) -> Option<bool> {
+    let ice = webrtcbin.property::<gst_webrtc::WebRTCICE>(ICE_AGENT_PROPERTY);
+    ice.has_property("agent", None)
+        .then(|| ice.property::<gst::glib::Object>("agent"))
+        .filter(|agent| agent.has_property("upnp", None))
+        .map(|agent| agent.property::<bool>("upnp"))
+}
+
 impl IceServerConfig {
     /// Reads comma- or newline-separated URI lists.
     ///
@@ -115,6 +143,7 @@ impl IceServerConfig {
         if self.relay_only {
             webrtcbin.set_property_from_str("ice-transport-policy", "relay");
         }
+        disable_upnp(webrtcbin);
         for local_ip in &self.local_ips {
             // `ice-agent`, not `ice`. The agent has never been exposed under
             // the latter name, and `property()` *panics* on a name webrtcbin
@@ -189,6 +218,23 @@ mod tests {
             ..IceServerConfig::default()
         };
         config.apply_to(&webrtcbin);
+    }
+
+    /// A LAN link never needs UPnP: every ICE agent has it off, so no SSDP
+    /// socket or `gupnp-igd` thread is made per peer.
+    #[test]
+    fn the_ice_agent_does_not_use_upnp() {
+        let Ok(()) = gst::init() else {
+            return;
+        };
+        let Ok(webrtcbin) = gst::ElementFactory::make("webrtcbin").build() else {
+            return;
+        };
+        IceServerConfig::default().apply_to(&webrtcbin);
+        match upnp_enabled(&webrtcbin) {
+            Some(on) => assert!(!on, "UPnP must be off"),
+            None => eprintln!("[test] this libnice has no `upnp` property"),
+        }
     }
 
     #[test]

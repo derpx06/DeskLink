@@ -240,9 +240,15 @@ enum Cmd {
     },
     ResumeSends,
     Wake,
+    /// The peer is gone: finish what is queued, then end the thread.
+    Stop,
     #[cfg(test)]
     Probe(Box<dyn FnOnce(&mut Engine) + Send>),
 }
+
+/// How long the file thread sleeps with no transfer in either direction: only
+/// a safety net, as every real reason to wake it arrives as a command.
+const IDLE_WAIT: Duration = Duration::from_secs(5);
 
 /// A restart-safe, bounded file transfer manager for one WebRTC peer. Cheap
 /// to call from any thread: every method queues work for the file thread.
@@ -319,6 +325,13 @@ impl WebRtcTransferManager {
     /// waiting for room tries again now.
     pub fn wake(&self) {
         let _ = self.commands.send(Cmd::Wake);
+    }
+
+    /// Ends the file thread once everything queued before this has been
+    /// handled (its checkpoints written), without waiting for it. A manager
+    /// belongs to one peer; whoever else still holds it keeps a quiet handle.
+    pub fn shut_down(&self) {
+        let _ = self.commands.send(Cmd::Stop);
     }
 
     /// One control message of the peer (already unwrapped from its envelope).
@@ -537,17 +550,26 @@ impl Engine {
         loop {
             let wait = self.wait_hint();
             match inbox.recv_timeout(wait) {
+                Ok(Cmd::Stop) => break,
                 Ok(command) => self.handle(command),
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
             // Whatever else is already waiting, before the next round of
             // sending: acknowledgements must not queue behind frames.
+            let mut stopping = false;
             for _ in 0..512 {
                 match inbox.try_recv() {
+                    Ok(Cmd::Stop) => {
+                        stopping = true;
+                        break;
+                    }
                     Ok(command) => self.handle(command),
                     Err(_) => break,
                 }
+            }
+            if stopping {
+                break;
             }
             crate::guard("file transfer", (), || self.tick());
         }
@@ -555,10 +577,14 @@ impl Engine {
     }
 
     /// How long the thread may sleep: briefly while a sender may be waiting
-    /// for room in the channel, else long enough for the timers.
+    /// for room in the channel, a little longer while a transfer is live (its
+    /// timers: checkpoints, stall notes, retries), and with nothing live not
+    /// at all on a timer — a command wakes it.
     fn wait_hint(&self) -> Duration {
         if self.outgoing.iter().any(Outgoing::is_pumping) {
             Duration::from_millis(2)
+        } else if self.outgoing.is_empty() && self.incoming.is_empty() {
+            IDLE_WAIT
         } else {
             Duration::from_millis(50)
         }
@@ -583,7 +609,7 @@ impl Engine {
                 let _ = reply.send(self.cancel(&id, code));
             }
             Cmd::ResumeSends => self.resume_sends(),
-            Cmd::Wake => {}
+            Cmd::Wake | Cmd::Stop => {}
             #[cfg(test)]
             Cmd::Probe(job) => job(self),
         });

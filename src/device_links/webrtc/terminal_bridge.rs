@@ -680,6 +680,43 @@ pub(crate) fn bridges() -> &'static Mutex<HashMap<String, TerminalBridge>> {
     BRIDGES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// What the pump threads sleep on while there is nothing to send: a counter
+/// bumped whenever any bridge is touched (a request, a reply, an alert, a
+/// revoke), so an idle pump neither polls nor misses a wake.
+static PUMP_WAKE: (Mutex<u64>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+
+/// Something may be waiting for a pump: wakes every idle one.
+pub(crate) fn wake_pumps() {
+    if let Ok(mut generation) = PUMP_WAKE.0.lock() {
+        *generation = generation.wrapping_add(1);
+        PUMP_WAKE.1.notify_all();
+    }
+}
+
+/// The wake counter now; hand it to [`wait_for_work`] *before* looking for
+/// work, so a wake in between is not lost.
+pub(crate) fn wake_generation() -> u64 {
+    PUMP_WAKE.0.lock().map_or(0, |generation| *generation)
+}
+
+/// Sleeps until a pump is woken after `seen`, or `timeout` passes.
+pub(crate) fn wait_for_work(seen: u64, timeout: std::time::Duration) {
+    if let Ok(generation) = PUMP_WAKE.0.lock() {
+        let _ = PUMP_WAKE
+            .1
+            .wait_timeout_while(generation, timeout, |generation| *generation == seen);
+    }
+}
+
+/// Whether the connection holding `token` has nothing a pump could send, now
+/// or by itself later: no attached terminal (only attached terminals produce
+/// output on their own) and no queued reply. `None` once superseded.
+pub(crate) fn pump_is_idle(device_id: &str, token: u64) -> Option<bool> {
+    let open = bridges().lock().ok()?;
+    let bridge = open.get(device_id).filter(|bridge| bridge.token == token)?;
+    Some(bridge.attached.is_empty() && bridge.outbox.is_empty())
+}
+
 /// Identifies one connection's claim on its device's bridge. A reconnect takes
 /// a new one, and everything the old connection's pump thread does afterwards
 /// is keyed by its own, now stale, token — so it can end its own attachments
@@ -757,7 +794,10 @@ fn with_bridge<R>(
     let mut registry = registry()
         .lock()
         .map_err(|_| "DeskLink terminal registry lock poisoned".to_string())?;
-    operation(bridge, &mut registry)
+    let result = operation(bridge, &mut registry);
+    drop((registry, open));
+    wake_pumps();
+    result
 }
 
 /// Handles one `desklink-terminal-v1` envelope from a peer.
@@ -871,6 +911,8 @@ fn with_open_bridge(
         .filter(|bridge| bridge.wire == *wire)
         .ok_or_else(|| "DeskLink terminal connection was replaced".to_string())?;
     operation(bridge);
+    drop(open);
+    wake_pumps();
     Ok(())
 }
 
@@ -885,6 +927,8 @@ pub(crate) fn revoke_device(device_id: &str) {
         Some(bridge) => bridge.revoke(&mut registry),
         None => registry.release_writer(device_id),
     }
+    drop((open, registry));
+    wake_pumps();
 }
 
 /// Detaches `device_id` from every terminal it watches, keeping its access:
@@ -897,6 +941,8 @@ pub(crate) fn end_device_sessions(device_id: &str) {
         Some(bridge) => bridge.end(&mut registry, TERMINAL_ENDED),
         None => registry.release_writer(device_id),
     }
+    drop((open, registry));
+    wake_pumps();
 }
 
 /// Terminals some phone other than `device_id` is attached to.
@@ -929,6 +975,8 @@ pub(crate) fn announce_finished(terminal_id: &str, job: &str, secs: u64) {
         finished.secs = Some(secs);
         bridge.queue_always(TerminalEvent::SendControl(finished));
     }
+    drop(open);
+    wake_pumps();
 }
 
 /// How many terminals `device_id` is watching right now.
@@ -2419,5 +2467,41 @@ mod tests {
         envelope.channel = WebRtcChannel::Events.label().to_string();
         assert!(connection.deliver(envelope).is_err());
         end(&phone, connection.token);
+    }
+
+    /// A pump with nothing attached and nothing queued is idle: it sleeps on
+    /// the wake counter instead of polling every 8 ms for as long as the peer
+    /// lives; a request, a reply or an alert makes it busy and wakes it.
+    #[test]
+    fn an_idle_terminal_pump_sleeps_until_something_touches_the_bridge() {
+        let phone = format!("pump-idle-{}", Uuid::new_v4().simple());
+        let wire = wire(&phone);
+        let token = begin(&wire);
+        assert_eq!(pump_is_idle(&phone, token), Some(true));
+        // Nothing wakes it: the wait lasts the whole timeout.
+        let seen = wake_generation();
+        let started = Instant::now();
+        wait_for_work(seen, Duration::from_millis(150));
+        assert!(started.elapsed() >= Duration::from_millis(140));
+        // A denial is queued on the bridge: busy, and the sleeper is woken.
+        let sleeper = std::thread::spawn(move || {
+            let started = Instant::now();
+            wait_for_work(seen, Duration::from_secs(10));
+            started.elapsed()
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        with_open_bridge(&wire, |bridge| bridge.deny(None)).unwrap();
+        assert!(
+            sleeper.join().unwrap() < Duration::from_secs(2),
+            "not woken"
+        );
+        assert_eq!(pump_is_idle(&phone, token), Some(false));
+        // The pump drains it and is idle again.
+        assert!(!pump_once(&phone, token, 1 << 20).unwrap().is_empty());
+        assert_eq!(pump_is_idle(&phone, token), Some(true));
+        // Superseded: no answer, so its thread ends.
+        let newer = begin(&wire);
+        assert_eq!(pump_is_idle(&phone, token), None);
+        end(&phone, newer);
     }
 }

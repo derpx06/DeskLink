@@ -432,6 +432,11 @@ impl Config {
         Ok(())
     }
 
+    /// This computer's id: all a caller wants when it only compares ids.
+    pub fn local_device_id(&self) -> &str {
+        &self.stored.device_id
+    }
+
     pub fn local_device_info(&self) -> DeviceInfo {
         DeviceInfo::local(
             self.stored.device_id.clone(),
