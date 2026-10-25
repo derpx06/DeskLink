@@ -1,0 +1,9 @@
+{
+  "_note": "QrPairing.proofBytes(secret, desk, phone, nonceDesk, noncePhone) -> HMAC proof, hex. Pinned by pairing_qr.rs and QrPairingTest.",
+  "secretByte": 7,
+  "desk": "desk",
+  "phone": "phone",
+  "nonceDeskByte": 1,
+  "noncePhoneByte": 2,
+  "proofHex": "bd84b158ada359358ce90dce45c314f15be4b48f00f8a96aae82b12769f9fc41"
+}

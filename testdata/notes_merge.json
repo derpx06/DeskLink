@@ -1,0 +1,21 @@
+{
+  "_note": "Written by the desk (desk reads: notes.rs merge_note; docs/protocol/stageD-protocol.md 'W7 - notes ancestors'). A note the receiver holds ('local') meets an incoming one. outcome: taken (incoming replaces), keptOurs, same, conflict (the loser is kept as a conflicted copy).",
+  "cases": [
+    {"name": "unknown id",                "local": null,
+     "incoming": {"id": "n", "body": "B", "modified": 200, "parent": 0},                                 "outcome": "taken"},
+    {"name": "same version",              "local": {"id": "n", "body": "A", "modified": 200, "parent": 100},
+     "incoming": {"id": "n", "body": "A", "modified": 200, "parent": 100},                               "outcome": "same"},
+    {"name": "edited from ours (parent)", "local": {"id": "n", "body": "A", "modified": 100, "parent": 0},
+     "incoming": {"id": "n", "body": "B", "modified": 200, "parent": 100},                              "outcome": "taken"},
+    {"name": "edited from ours (ancestors)", "local": {"id": "n", "body": "A", "modified": 100, "parent": 0},
+     "incoming": {"id": "n", "body": "C", "modified": 300, "parent": 50, "ancestors": [200, 100]},      "outcome": "taken"},
+    {"name": "a late old version (parent)", "local": {"id": "n", "body": "B", "modified": 200, "parent": 100},
+     "incoming": {"id": "n", "body": "A", "modified": 100, "parent": 0},                                "outcome": "keptOurs"},
+    {"name": "a late old version (ancestors)", "local": {"id": "n", "body": "C", "modified": 300, "parent": 50, "ancestors": [200, 100]},
+     "incoming": {"id": "n", "body": "A", "modified": 100, "parent": 0},                                "outcome": "keptOurs"},
+    {"name": "siblings, both edited",     "local": {"id": "n", "body": "L", "modified": 200, "parent": 100},
+     "incoming": {"id": "n", "body": "I", "modified": 210, "parent": 100},                              "outcome": "conflict"},
+    {"name": "their edit beats our deletion", "local": {"id": "n", "body": "", "modified": 200, "parent": 100, "deleted": true},
+     "incoming": {"id": "n", "body": "I", "modified": 210, "parent": 100},                              "outcome": "taken"}
+  ]
+}

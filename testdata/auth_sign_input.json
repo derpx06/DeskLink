@@ -1,0 +1,6 @@
+{
+  "_note": "relay auth: context, nonce, host, newline separated UTF-8",
+  "nonce": "nonce-AB",
+  "host": "relay.example.org",
+  "hex": "6465736b6c696e6b2d72656c61792d617574682d76310a6e6f6e63652d41420a72656c61792e6578616d706c652e6f7267"
+}

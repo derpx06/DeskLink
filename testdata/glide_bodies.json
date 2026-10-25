@@ -1,0 +1,15 @@
+{
+  "_note": "Written by the desk (desk reads: DeskLink/src/device_links/glide.rs classify_phone_packet). Bodies of desklink.shareinputdevices as the PHONE sends them, and what the desk makes of each. A report, never a command.",
+  "cases": [
+    {"name": "allowed on",           "body": {"allowed": true},                                   "report": "state", "allowed": true,  "entered": false},
+    {"name": "allowed and entered",  "body": {"allowed": true, "entered": true},                  "report": "state", "allowed": true,  "entered": true},
+    {"name": "allowed off",          "body": {"allowed": false},                                  "report": "state", "allowed": false, "entered": false},
+    {"name": "entered needs allowed", "body": {"allowed": false, "entered": true},                "report": "state", "allowed": false, "entered": false},
+    {"name": "hand back",            "body": {"exitEdge": 0},                                     "report": "handedBack"},
+    {"name": "release point",        "body": {"releaseDeltax": 0.5, "releaseDeltay": -0.25},     "report": "release"},
+    {"name": "release beats allowed", "body": {"allowed": true, "releaseDeltax": 1, "releaseDeltay": 2}, "report": "release"},
+    {"name": "release out of range", "body": {"releaseDeltax": 1000000, "releaseDeltay": 0},     "report": "ignored"},
+    {"name": "release missing a coordinate", "body": {"releaseDeltax": 1},                       "report": "ignored"},
+    {"name": "nothing it knows",     "body": {"x": 1},                                            "report": "ignored"}
+  ]
+}

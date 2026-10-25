@@ -87,6 +87,8 @@ mod protocol;
 mod remote_control;
 mod search_provider;
 mod send_to;
+#[cfg(test)]
+mod shared_fixtures;
 mod shell_dbus;
 mod signals;
 mod terminal_previews;

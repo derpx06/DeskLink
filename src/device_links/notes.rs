@@ -642,6 +642,30 @@ fn relay_targets(ready: &[String], source: &str) -> Vec<String> {
         .collect()
 }
 
+/// The shared `notes_merge.json` case: `local` (or null) meets `incoming`;
+/// the outcome as the fixture names it.
+#[cfg(test)]
+pub(crate) fn merge_for_fixture(local: &serde_json::Value, incoming: &serde_json::Value) -> String {
+    let note = |value: &serde_json::Value| -> Note {
+        let mut value = value.clone();
+        let object = value.as_object_mut().unwrap();
+        object.entry("created").or_insert(serde_json::json!(1));
+        serde_json::from_value(value).unwrap()
+    };
+    let mut shelf = Shelf::default();
+    if !local.is_null() {
+        let local = note(local);
+        shelf.notes.insert(local.id.clone(), local);
+    }
+    match merge_note(&mut shelf, note(incoming)) {
+        Merged::Taken => "taken",
+        Merged::KeptOurs => "keptOurs",
+        Merged::Same => "same",
+        Merged::Conflict => "conflict",
+    }
+    .to_string()
+}
+
 /// Both indexes, for a phone whose connection just came up: one group of
 /// packets per kind (a group is sent whole or not at all).
 pub(crate) fn indexes() -> Vec<Vec<NetworkPacket>> {

@@ -1,0 +1,19 @@
+{
+  "_note": "1.3 removed these. Outside both profiles, never advertised, refused at the boundary.",
+  "types": [
+    "desklink.automations",
+    "desklink.runcommand",
+    "desklink.runcommand.request",
+    "desklink.digitizer",
+    "desklink.digitizer.session",
+    "desklink.presenter",
+    "desklink.mousepad.echo",
+    "desklink.systemvolume",
+    "desklink.systemvolume.request",
+    "desklink.connectivity_report",
+    "desklink.share.request.update",
+    "desklink.notification.cancel",
+    "desklink.telephony.request_mute",
+    "desklink.sms.request"
+  ]
+}

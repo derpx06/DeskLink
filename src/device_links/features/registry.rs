@@ -236,6 +236,12 @@ pub(crate) fn handover_list_is_consistent(handover: &[String], identity: &[Strin
         .all(|capability| identity.contains(capability))
 }
 
+/// The WebRTC profile, for the shared-fixture test.
+#[cfg(test)]
+pub(crate) fn webrtc_profile() -> &'static [&'static str] {
+    &WEBRTC_PROFILE
+}
+
 pub(crate) fn is_webrtc_feature(packet_type: &str) -> bool {
     WEBRTC_PROFILE.contains(&packet_type)
 }

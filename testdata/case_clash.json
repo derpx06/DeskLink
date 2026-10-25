@@ -1,0 +1,18 @@
+{
+  "_note": "Per directory, lowercase(Locale.ROOT) groups; the UTF-8 byte-order first name wins; the others are left out.",
+  "names": [
+    "a.txt",
+    "A.txt",
+    "É",
+    "é",
+    "Dir",
+    "dir",
+    "b.txt"
+  ],
+  "winners": [
+    "A.txt",
+    "É",
+    "Dir",
+    "b.txt"
+  ]
+}

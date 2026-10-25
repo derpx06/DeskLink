@@ -1,0 +1,17 @@
+{
+  "_note": "docs/RELAY.md section 2. Scalars are 32 bytes of the given byte value; nonces likewise.",
+  "fpInitiator": "AAAAinitiator",
+  "fpResponder": "ZZZZresponder",
+  "scalarInitiatorByte": 17,
+  "scalarResponderByte": 34,
+  "nonceInitiatorByte": 51,
+  "nonceResponderByte": 68,
+  "identityInitiator": "{\"deviceId\":\"phone\"}",
+  "identityResponder": "{\"deviceId\":\"desktop\"}",
+  "plaintext": "{\"type\":\"desklink.heartbeat\"}",
+  "initiatorPublicPrefixHex": "040217e617f0b64439",
+  "transcriptSha256Hex": "b9ddecf9c6f46eaac3e6da802ad29be685b6ab572f38b3bdb633404b0a3aa10e",
+  "initiatorSendKeyHex": "780a247c92688ebe8dfd0fd01d527cd6bdcd9839f2dd6bb4ff689aaa901a4fcf",
+  "initiatorReceiveKeyHex": "058d8286624438b81cd9f2ce428b95ce9e4bce9bc97680c93bd4c1cf2d2404ec",
+  "sealedSeq1": "XBeya5M7xNZuQIiUpgn7aeVXgEVd4msLt1o9q/OUk3x0LpOVLZUm8KsVA8cm"
+}

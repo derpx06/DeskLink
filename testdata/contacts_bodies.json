@@ -1,0 +1,9 @@
+{
+  "_note": "Written by the desk (desk reads: contacts.rs parse_vcard). A vCard from the phone's desklink.contacts.response_vcards body and the contact the desk makes of it. The phone's generator should produce cards that read back like this.",
+  "cases": [
+    {"case": "name and a mobile", "uid": "u1", "card": "BEGIN:VCARD\nVERSION:3.0\nFN:Ada Lovelace\nTEL;TYPE=CELL:+44 20 7946 0958\nEND:VCARD",
+     "name": "Ada Lovelace", "phones": [["Mobile", "+44 20 7946 0958"]], "emails": []},
+    {"case": "two numbers and an e-mail", "uid": "u2", "card": "BEGIN:VCARD\nFN:Bo Peep\nTEL;TYPE=HOME:555 0100\nTEL;TYPE=WORK:555 0101\nEMAIL:bo@example.org\nEND:VCARD",
+     "name": "Bo Peep", "phones": [["Home", "555 0100"], ["Work", "555 0101"]], "emails": ["bo@example.org"]}
+  ]
+}

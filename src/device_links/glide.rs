@@ -874,6 +874,39 @@ pub(crate) fn forget_phone(device_id: &str) {
 /// just crossed), a hand-back with `exitEdge: 0` (a refusal), or G3's release
 /// point. Each is a report, never an instruction to capture anything.
 pub(crate) fn on_phone_packet(device_id: &str, packet: &NetworkPacket) {
+    match classify_phone_packet(packet) {
+        PhoneReport::State { allowed, entered } => {
+            set_allowed(device_id, Some(allowed));
+            send_command(Command::State {
+                device: device_id.to_string(),
+                allowed,
+                entered,
+            });
+        }
+        PhoneReport::HandedBack => {
+            send_command(Command::HandedBack {
+                device: device_id.to_string(),
+            });
+        }
+        PhoneReport::Release | PhoneReport::Ignored => phone_released(device_id, packet),
+    }
+}
+
+/// What a `desklink.shareinputdevices` body from the phone says (the shared
+/// `glide_bodies.json` pins it for both apps).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PhoneReport {
+    State {
+        allowed: bool,
+        entered: bool,
+    },
+    HandedBack,
+    /// A release point (or a body that is neither: `phone_released` drops it).
+    Release,
+    Ignored,
+}
+
+pub(crate) fn classify_phone_packet(packet: &NetworkPacket) -> PhoneReport {
     let release =
         packet.body.contains_key("releaseDeltax") || packet.body.contains_key("releaseDeltay");
     if let (false, Some(allowed)) = (
@@ -883,9 +916,7 @@ pub(crate) fn on_phone_packet(device_id: &str, packet: &NetworkPacket) {
             .get("allowed")
             .and_then(serde_json::Value::as_bool),
     ) {
-        set_allowed(device_id, Some(allowed));
-        send_command(Command::State {
-            device: device_id.to_string(),
+        PhoneReport::State {
             allowed,
             entered: allowed
                 && packet
@@ -893,18 +924,18 @@ pub(crate) fn on_phone_packet(device_id: &str, packet: &NetworkPacket) {
                     .get("entered")
                     .and_then(serde_json::Value::as_bool)
                     == Some(true),
-        });
+        }
     } else if packet
         .body
         .get("exitEdge")
         .and_then(serde_json::Value::as_i64)
         == Some(0)
     {
-        send_command(Command::HandedBack {
-            device: device_id.to_string(),
-        });
+        PhoneReport::HandedBack
+    } else if release_deltas(packet).is_some() {
+        PhoneReport::Release
     } else {
-        phone_released(device_id, packet);
+        PhoneReport::Ignored
     }
 }
 

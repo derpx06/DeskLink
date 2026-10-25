@@ -1,0 +1,12 @@
+{
+  "_note": "Written by the desk (desk reads: ScreenRequest::from_body in webrtc/screen.rs). The phone's desklink.screen.request body and what the desk serves: maxDimension is clamped to 640..2560 and fps to 1..60, absent values fall back to the defaults. A phone's request must stay inside these ranges to be served as asked.",
+  "ranges": {"maxDimension": [640, 2560], "fps": [1, 60]},
+  "defaults": {"maxDimension": 1280, "fps": 30},
+  "cases": [
+    {"name": "nothing asked",  "body": {},                                        "maxDimension": 1280, "fps": 30},
+    {"name": "inside",         "body": {"maxDimension": 1280, "fps": 24},         "maxDimension": 1280, "fps": 24},
+    {"name": "too large",      "body": {"maxDimension": 99999, "fps": 240},       "maxDimension": 2560, "fps": 60},
+    {"name": "too small",      "body": {"maxDimension": 100, "fps": 0},           "maxDimension": 640,  "fps": 1},
+    {"name": "only a size",    "body": {"maxDimension": 1600},                    "maxDimension": 1600, "fps": 30}
+  ]
+}

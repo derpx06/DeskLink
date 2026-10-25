@@ -1526,6 +1526,13 @@ fn drop_case_clashes<V>(items: &mut BTreeMap<String, V>, live: impl Fn(&V) -> bo
     losers
 }
 
+/// [`drop_case_clashes`] over names that are all live, for the shared
+/// fixture test.
+#[cfg(test)]
+pub(crate) fn drop_case_clashes_for_tests(items: &mut BTreeMap<String, ()>) -> Vec<String> {
+    drop_case_clashes(items, |_| true)
+}
+
 /// The directory and the lowercased name of `path`: what names must differ in
 /// to be different on a system that ignores case.
 fn case_key(path: &str) -> (&str, String) {

@@ -1,6 +1,8 @@
 mod registry;
 
 pub(crate) use registry::forget_peer_profile;
+#[cfg(test)]
+pub(crate) use registry::webrtc_profile;
 pub use registry::FeatureRegistry;
 #[cfg(test)]
 pub(crate) use registry::REMOVED_TYPES;
