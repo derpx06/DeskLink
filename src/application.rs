@@ -124,6 +124,14 @@ mod imp {
             // The pointer is never left on a phone: bounded, so a compositor
             // that does not answer cannot hold the app open.
             crate::device_links::glide::shutdown();
+            // What was being typed, and whatever the vault writer still
+            // holds, is saved on the way out.
+            for window in self.obj().windows() {
+                if let Ok(window) = window.downcast::<DesklinkWindow>() {
+                    window.flush_unsaved();
+                }
+            }
+            crate::device_links::vault::flush();
             self.parent_shutdown();
         }
 
@@ -942,13 +950,31 @@ pub(crate) fn session_line(device: &crate::device_links::device::DeviceView) -> 
         1 => Some("1 terminal".to_string()),
         count => Some(format!("{count} terminals")),
     };
-    let what = match (screen, terminals) {
-        (None, None) => return None,
-        (Some(screen), None) => screen.to_string(),
-        (None, Some(terminals)) => format!("using {terminals}"),
-        (Some(screen), Some(terminals)) => format!("{screen}, {terminals}"),
-    };
-    Some(format!("{} — {what}", device.name))
+    // Sound is a use of this computer too: its sound or microphone going to
+    // the phone, or the phone's playing here. With the window closed the
+    // top bar and the tray are all that say so.
+    let sound = device.sound.as_ref().and_then(|sound| {
+        match (sound.sending.as_deref(), sound.hearing.as_deref()) {
+            (Some("mic"), _) => Some("sending its microphone"),
+            (Some(_), _) => Some("sending its sound"),
+            (None, Some(_)) if sound.hearing_live => Some("playing the phone's sound"),
+            _ => None,
+        }
+    });
+    let mut parts: Vec<String> = Vec::new();
+    parts.extend(screen.map(str::to_string));
+    if let Some(terminals) = terminals {
+        parts.push(if screen.is_some() {
+            terminals
+        } else {
+            format!("using {terminals}")
+        });
+    }
+    parts.extend(sound.map(str::to_string));
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("{} — {}", device.name, parts.join(", ")))
 }
 
 /// Whether `dir` holds a crash report newer than the last one told, marking
@@ -1140,5 +1166,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The indicator also says when this computer's sound or microphone goes
+    /// to a phone, or the phone's sound plays here (not only the screen and
+    /// terminals), so a closed window does not hide it.
+    #[test]
+    fn the_session_line_includes_sound() {
+        use crate::device_links::device::{DeviceView, SoundUse};
+        let info = crate::device_links::device_info::DeviceInfo::local("p".into(), "Pixel".into());
+        let mut device = DeviceView::from_info(&info, "10.0.0.2".into(), true);
+        assert_eq!(session_line(&device), None);
+        device.sound = Some(SoundUse {
+            sending: Some("mic".into()),
+            hearing: None,
+            hearing_live: false,
+        });
+        assert_eq!(
+            session_line(&device).as_deref(),
+            Some("Pixel — sending its microphone")
+        );
+        device.sound = Some(SoundUse {
+            sending: Some("system".into()),
+            hearing: None,
+            hearing_live: false,
+        });
+        assert_eq!(
+            session_line(&device).as_deref(),
+            Some("Pixel — sending its sound")
+        );
+        device.sound = Some(SoundUse {
+            sending: None,
+            hearing: Some("system".into()),
+            hearing_live: true,
+        });
+        device.terminal_sessions_attached = 2;
+        assert_eq!(
+            session_line(&device).as_deref(),
+            Some("Pixel — using 2 terminals, playing the phone's sound")
+        );
+        // Asked for but not flowing yet: nothing to indicate.
+        device.terminal_sessions_attached = 0;
+        device.sound = Some(SoundUse {
+            sending: None,
+            hearing: Some("system".into()),
+            hearing_live: false,
+        });
+        assert_eq!(session_line(&device), None);
     }
 }

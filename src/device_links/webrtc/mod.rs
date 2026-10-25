@@ -29,6 +29,7 @@ pub use handover::{
     AuthenticationTranscript, HandoverControlKind, HandoverControlMessage, HandoverRuntime,
     HandoverState, HANDOVER_MESSAGE_TYPE,
 };
+pub(crate) use peer_connection::plugin_problem;
 #[allow(unused_imports)]
 pub use peer_connection::{DesktopWebRtcPeer, PeerEvent};
 #[allow(unused_imports)]

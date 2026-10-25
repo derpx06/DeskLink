@@ -402,16 +402,22 @@ fn initial_snapshots(
         packets.extend(notifications);
     }
     // Snippets and notes (F6): what is here; the phone fetches.
-    for mut index in super::notes::indexes() {
-        let feature = if index.packet_type == super::packet::PACKET_TYPE_SNIPPETS {
+    for mut group in super::notes::indexes() {
+        let Some(first) = group.first() else {
+            continue;
+        };
+        let feature = if first.packet_type == super::packet::PACKET_TYPE_SNIPPETS {
             "snippets"
         } else {
             "notes"
         };
-        let rev = super::sync::rev_of(std::slice::from_ref(&index), &[]);
-        index.set("rev", rev.as_str());
+        // One rev for every part of the index.
+        let rev = super::sync::rev_of(&group, &[]);
+        for part in &mut group {
+            part.set("rev", rev.as_str());
+        }
         if wanted(feature, &rev) {
-            packets.push(index);
+            packets.extend(group);
         }
     }
     (packets, media)

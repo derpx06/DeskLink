@@ -105,9 +105,14 @@ fn section(name: &str) -> String {
 
 fn avatar(contact: &Contact, size: i32) -> adw::Avatar {
     let avatar = adw::Avatar::new(size, Some(&contact.name), true);
+    // A photo is a phone's data: decoded only within bounds (a few KB of
+    // JPEG can claim gigapixels).
     if let Some(texture) = contact
         .photo_bytes()
-        .and_then(|bytes| gdk::Texture::from_bytes(&glib::Bytes::from_owned(bytes)).ok())
+        .and_then(|bytes| {
+            crate::image_limits::decode(&bytes, None, crate::image_limits::MAX_ART_PIXELS)
+        })
+        .map(|pixbuf| gdk::Texture::for_pixbuf(&pixbuf))
     {
         avatar.set_custom_image(Some(&texture));
     }

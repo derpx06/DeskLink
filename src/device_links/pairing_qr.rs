@@ -29,13 +29,22 @@ use openssl::pkey::PKey;
 use openssl::sign::Signer;
 
 const LIFETIME: Duration = Duration::from_secs(300);
+/// Wrong proofs one device (by the certificate fingerprint its link
+/// presented) may offer for one code. Counted per device, not for the code:
+/// three bad proofs from anybody on the network used to burn the code and
+/// leave the real phone "expired".
 const MAX_FAILURES: u8 = 3;
+/// Wrong proofs from all devices together that finally burn the code (the
+/// proof is a 256-bit MAC: this only bounds the noise).
+const MAX_TOTAL_FAILURES: u32 = 30;
 const MAC_LABEL: &str = "desklink-qr-v1";
 
 struct Pending {
     secret: [u8; 32],
     expires_at: Instant,
-    failures: u8,
+    /// Wrong proofs so far, by the presenting device's fingerprint.
+    failures: std::collections::HashMap<[u8; 32], u8>,
+    total_failures: u32,
     uri: String,
 }
 
@@ -131,7 +140,8 @@ pub fn start(
     *pending = Some(Pending {
         secret,
         expires_at: Instant::now() + LIFETIME,
-        failures: 0,
+        failures: std::collections::HashMap::new(),
+        total_failures: 0,
         uri: uri.clone(),
     });
     Ok(uri)
@@ -209,6 +219,9 @@ pub fn verify(
         *pending = None;
         return expired();
     }
+    if live.failures.get(phone_fp).copied().unwrap_or(0) >= MAX_FAILURES {
+        return Err("Too many wrong QR pairing proofs from this device".to_string());
+    }
     let expected = proof(&live.secret, desktop_id, phone_id, desktop_fp, phone_fp)?;
     if received.len() == expected.len() && openssl::memcmp::eq(&received, &expected) {
         *pending = None;
@@ -218,8 +231,10 @@ pub fn verify(
     if matches_retired(&received, desktop_id, phone_id, desktop_fp, phone_fp) {
         return expired();
     }
-    live.failures += 1;
-    if live.failures >= MAX_FAILURES {
+    let mine = live.failures.entry(*phone_fp).or_insert(0);
+    *mine = mine.saturating_add(1);
+    live.total_failures += 1;
+    if live.total_failures >= MAX_TOTAL_FAILURES {
         *pending = None;
     }
     Err("Invalid QR pairing proof".to_string())
@@ -268,7 +283,7 @@ mod tests {
 
     // The tests share the one global code, so they run as one sequence.
     #[test]
-    fn a_code_pairs_once_rejects_forgeries_and_burns_after_three_failures() {
+    fn a_code_pairs_once_and_is_not_burned_by_one_devices_wrong_proofs() {
         let _one_code = TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -307,11 +322,35 @@ mod tests {
             !without.contains("&a=") && !without.contains("&p="),
             "no addresses: no list"
         );
+        // A stranger's three wrong proofs shut the stranger out, not the code.
+        let stranger = [7u8; 32];
         for _ in 0..MAX_FAILURES {
-            assert!(verify("desk", "phone", &desktop_fp, &phone_fp, "AAAA").is_err());
+            assert!(verify("desk", "x", &desktop_fp, &stranger, "AAAA").is_err());
         }
-        // Burned: even the right proof for the burned secret no longer works.
-        assert_eq!(current_uri(), None);
+        assert!(
+            current_uri().is_some(),
+            "the code is not burned by a stranger"
+        );
+        let secret = PENDING.lock().unwrap().as_ref().unwrap().secret;
+        let stranger_good =
+            URL_SAFE_NO_PAD.encode(proof(&secret, "desk", "x", &desktop_fp, &stranger).unwrap());
+        assert!(
+            verify("desk", "x", &desktop_fp, &stranger, &stranger_good).is_err(),
+            "and it stays shut out for this code"
+        );
+        // The real phone still pairs.
+        let phone_good = URL_SAFE_NO_PAD
+            .encode(proof(&secret, "desk", "phone", &desktop_fp, &phone_fp).unwrap());
+        assert!(verify("desk", "phone", &desktop_fp, &phone_fp, &phone_good).is_ok());
+        assert_eq!(current_uri(), None, "used once");
+        // Only a flood from many devices burns a code.
+        start("desk", b"desktop-cert-der", None, &[], 1716).unwrap();
+        for n in 0..MAX_TOTAL_FAILURES {
+            let mut fp = [0u8; 32];
+            fp[..4].copy_from_slice(&n.to_be_bytes());
+            let _ = verify("desk", "y", &desktop_fp, &fp, "AAAA");
+        }
+        assert_eq!(current_uri(), None, "burned by the flood");
 
         let (width, dark) = modules("desklink://pair?v=1").unwrap();
         assert_eq!(dark.len(), width * width);

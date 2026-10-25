@@ -689,12 +689,17 @@ pub(crate) fn forget(device_id: &str) {
 /// Deletes `device_id`'s cache under `dir`, on disk and in memory:
 /// unpaired, a new identity, or the phone stopped sharing.
 pub(crate) fn forget_in(dir: &Path, device_id: &str) {
+    // The book is gone, so the rev remembered for it is a lie: the phone must
+    // send the snapshot again (with it kept, turning sharing off and on again
+    // left the desk empty).
+    super::sync::forget_feature(device_id, "contacts");
     if let Ok(mut store) = store().lock() {
         if let Some(store) = store.as_mut().filter(|store| store.dir == dir) {
             store.books.remove(device_id);
         }
     }
     let path = book_path(dir, device_id);
+    super::vault::cancel_pending(&path);
     if path.exists() {
         if let Err(error) = std::fs::remove_file(&path) {
             eprintln!("[Contacts] Could not delete {}: {error}", path.display());
@@ -781,14 +786,14 @@ fn book_path(dir: &Path, device_id: &str) -> PathBuf {
     dir.join(format!("{name}.book"))
 }
 
+/// Serialises the book (the caller holds the store lock for that only) and
+/// hands the sealing and the fsync to the vault's writer thread: a big book
+/// used to be encrypted and synced under the lock the page and the call
+/// naming wait on.
 fn save(dir: &Path, device_id: &str, book: &Book) -> Result<(), String> {
     let plain = serde_json::to_vec(book).map_err(|error| error.to_string())?;
-    super::vault::seal(
-        dir,
-        &book_path(dir, device_id),
-        device_id.as_bytes(),
-        &plain,
-    )
+    super::vault::seal_later(dir, &book_path(dir, device_id), device_id.as_bytes(), plain);
+    Ok(())
 }
 
 fn save_logged(dir: &Path, device_id: &str, book: &Book) {
@@ -1288,5 +1293,30 @@ X-UNKNOWN:ignored\r\nREV:2026-10-01T10:00:00Z\r\nEND:VCARD\r\n";
         let found = without_photo(contact);
         assert!(found.photo.is_none());
         assert_eq!(found.name, "Mara");
+    }
+
+    /// Forgetting a phone's contacts forgets the rev remembered for them, so
+    /// the snapshot is sent again after sharing is turned off and on.
+    #[test]
+    fn forgetting_the_book_forgets_its_rev() {
+        let dir =
+            std::env::temp_dir().join(format!("desklink-forget-rev-{}", uuid::Uuid::new_v4()));
+        let id = format!("phone-{}", uuid::Uuid::new_v4().simple());
+        let mut snapshot = crate::device_links::packet::NetworkPacket::new("desklink.contacts");
+        snapshot.set("rev", "R1");
+        crate::device_links::sync::note_received(&id, Some("inst"), "contacts", &snapshot);
+        let holds = |id: &str| {
+            crate::device_links::sync::have_packet(id, Some("inst"))
+                .body
+                .get("have")
+                .and_then(|have| have.as_object())
+                .is_some_and(|have| have.contains_key("contacts"))
+        };
+        assert!(holds(&id));
+        forget_in(&dir, &id);
+        assert!(
+            !holds(&id),
+            "the phone is no longer told the desk holds them"
+        );
     }
 }

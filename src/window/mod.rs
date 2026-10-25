@@ -1608,6 +1608,13 @@ impl DesklinkWindow {
         dialog.present(Some(self));
     }
 
+    /// Saves the note being typed, if any: before the app quits.
+    pub(crate) fn flush_unsaved(&self) {
+        if let Some(page) = self.imp().notes.borrow().as_ref() {
+            page.flush();
+        }
+    }
+
     /// Adds a toast, but never a backlog: at most [`TOASTS_AT_ONCE`] wait
     /// here (the oldest is dismissed for a new one), and the same words
     /// twice are one toast. A group chat of thirty messages, or Ring pressed

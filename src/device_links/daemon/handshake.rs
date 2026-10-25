@@ -78,7 +78,12 @@ pub(super) fn finish_secure_link(
     let qr_code = crate::device_links::pairing_qr::current_uri();
     let new_certificate = certificate_admission(pinned, qr_code.is_some())?;
     if !new_certificate {
-        enforce_unpaired_link_limit(&config, &sessions, &secure_info.id)?;
+        let from = stream
+            .get_ref()
+            .peer_addr()
+            .map(|addr| addr.ip().to_string())
+            .unwrap_or_default();
+        enforce_unpaired_link_limit(&config, &sessions, &devices, &secure_info.id, &from)?;
     }
 
     // A link presenting a new certificate is never paired, whatever the trust

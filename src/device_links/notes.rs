@@ -85,8 +85,28 @@ pub(crate) struct Note {
     /// The `modified` of the version this one was edited from (N1).
     #[serde(default)]
     pub(crate) parent: i64,
+    /// The `modified` values this note had before this version, newest first,
+    /// at most [`MAX_ANCESTORS`] (W7 "notes ancestors"). A peer that holds any
+    /// of them holds an ancestor of this version, so the version simply
+    /// replaces it: without them, only the *synced* base counted, and every
+    /// second edit made in a row made a "(conflicted copy)" of the first.
+    /// Absent from older builds, which then fall back to `parent`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) ancestors: Vec<i64>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub(crate) deleted: bool,
+}
+
+/// How many earlier versions a note names as ancestors.
+pub(crate) const MAX_ANCESTORS: usize = 8;
+
+/// `before` and what it already listed: the ancestors of the version made
+/// from it.
+fn ancestors_after(before: &Note) -> Vec<i64> {
+    std::iter::once(before.modified)
+        .chain(before.ancestors.iter().copied())
+        .take(MAX_ANCESTORS)
+        .collect()
 }
 
 impl Note {
@@ -145,6 +165,7 @@ fn valid_snippet(snippet: &Snippet) -> bool {
 
 fn valid_note(note: &Note) -> bool {
     valid_id(&note.id)
+        && note.ancestors.len() <= MAX_ANCESTORS
         && note.body.len() <= MAX_NOTE_BYTES
         && note.title.chars().count() <= MAX_NOTE_TITLE_CHARS
         && note.modified > 0
@@ -186,12 +207,14 @@ fn merge_note(shelf: &mut Shelf, incoming: Note) -> Merged {
         shelf.synced.insert(local.id.clone(), local.modified);
         return Merged::Same;
     }
-    if incoming.parent == local.modified {
+    // Edited from what we hold (directly, or some edits ago): ours is an
+    // ancestor of theirs, so theirs replaces it.
+    if incoming.parent == local.modified || incoming.ancestors.contains(&local.modified) {
         shelf.synced.insert(incoming.id.clone(), incoming.modified);
         shelf.notes.insert(incoming.id.clone(), incoming);
         return Merged::Taken;
     }
-    if local.parent == incoming.modified {
+    if local.parent == incoming.modified || local.ancestors.contains(&incoming.modified) {
         return Merged::KeptOurs;
     }
     // Siblings, edited from the same version.
@@ -284,8 +307,48 @@ impl Kind {
     }
 }
 
+/// The most JSON bytes of index entries in one packet (the phone splits the
+/// same way): over about 570 entries one packet no longer fitted the 64 KiB
+/// wire message and the phone never got the desk's index.
+const INDEX_BUDGET: usize = 40 * 1024;
+
+/// The index of `kind` as one or more packets, each within [`INDEX_BUDGET`]
+/// (at least one, even for an empty shelf).
+fn index_packets(shelf: &Shelf, kind: Kind) -> Vec<NetworkPacket> {
+    let entries = index_entries(shelf, kind);
+    let mut parts: Vec<Vec<Value>> = vec![Vec::new()];
+    let mut size = 0;
+    for entry in entries {
+        let length = entry.to_string().len() + 1;
+        if size + length > INDEX_BUDGET && parts.last().is_some_and(|part| !part.is_empty()) {
+            parts.push(Vec::new());
+            size = 0;
+        }
+        size += length;
+        if let Some(part) = parts.last_mut() {
+            part.push(entry);
+        }
+    }
+    parts
+        .into_iter()
+        .map(|items| {
+            let mut packet = NetworkPacket::new(kind.packet_type());
+            packet.set("op", "index");
+            packet.set("items", items);
+            packet
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn index_packet(shelf: &Shelf, kind: Kind) -> NetworkPacket {
-    let items: Vec<Value> = match kind {
+    let mut parts = index_packets(shelf, kind);
+    assert_eq!(parts.len(), 1, "a test index fits one packet");
+    parts.remove(0)
+}
+
+fn index_entries(shelf: &Shelf, kind: Kind) -> Vec<Value> {
+    match kind {
         Kind::Snippets => shelf
             .snippets
             .values()
@@ -296,11 +359,7 @@ fn index_packet(shelf: &Shelf, kind: Kind) -> NetworkPacket {
             .values()
             .map(|n| json!({"id": n.id, "modified": n.modified, "deleted": n.deleted}))
             .collect(),
-    };
-    let mut packet = NetworkPacket::new(kind.packet_type());
-    packet.set("op", "index");
-    packet.set("items", items);
-    packet
+    }
 }
 
 /// `items` packets for `values`, split to stay under the size bound.
@@ -560,13 +619,14 @@ pub(crate) fn on_packet(device_id: &str, packet: &NetworkPacket) -> Vec<NetworkP
     answers
 }
 
-/// Both indexes, for a phone whose connection just came up.
-pub(crate) fn indexes() -> Vec<NetworkPacket> {
+/// Both indexes, for a phone whose connection just came up: one group of
+/// packets per kind (a group is sent whole or not at all).
+pub(crate) fn indexes() -> Vec<Vec<NetworkPacket>> {
     with_shelf(|shelf| {
         (
             vec![
-                index_packet(shelf, Kind::Snippets),
-                index_packet(shelf, Kind::Notes),
+                index_packets(shelf, Kind::Snippets),
+                index_packets(shelf, Kind::Notes),
             ],
             false,
         )
@@ -621,25 +681,49 @@ pub(crate) fn add_snippet(text: &str) -> Result<(), String> {
         return Err("Too long for a snippet (16 KiB at most)".into());
     }
     let id = with_shelf(|shelf| {
-        let existing = shelf
+        let added = add_in_shelf(shelf, text);
+        let saved = added.is_ok();
+        (added, saved)
+    })
+    .ok_or("Snippets are not available")??;
+    push(Kind::Snippets, vec![id]);
+    Ok(())
+}
+
+/// The refusal when a shelf holds as many live snippets as it may.
+const TOO_MANY_SNIPPETS: &str = "You have 500 snippets. Unpin one first.";
+
+/// Pins `text` in `shelf`: its id. An identical snippet is moved to the top;
+/// a new one is refused at [`MAX_SNIPPETS`] live (it used to be dropped from
+/// view past that, and kept, hidden, in the file).
+fn add_in_shelf(shelf: &mut Shelf, text: &str) -> Result<String, String> {
+    let existing = shelf
+        .snippets
+        .values()
+        .find(|snippet| !snippet.deleted && snippet.text == text)
+        .map(|snippet| snippet.id.clone());
+    if existing.is_none()
+        && shelf
             .snippets
             .values()
-            .find(|snippet| !snippet.deleted && snippet.text == text)
-            .map(|snippet| snippet.id.clone());
-        let id = existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let snippet = Snippet {
+            .filter(|snippet| !snippet.deleted)
+            .count()
+            >= MAX_SNIPPETS
+    {
+        return Err(TOO_MANY_SNIPPETS.to_string());
+    }
+    let id = existing.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    shelf.snippets.insert(
+        id.clone(),
+        Snippet {
             id: id.clone(),
             text: text.to_string(),
             title: String::new(),
             modified: now_ms(),
             deleted: false,
-        };
-        shelf.snippets.insert(id.clone(), snippet);
-        (id, true)
-    })
-    .ok_or("Snippets are not available")?;
-    push(Kind::Snippets, vec![id]);
-    Ok(())
+        },
+    );
+    Ok(id)
 }
 
 pub(crate) fn delete_snippet(id: &str) {
@@ -709,6 +793,7 @@ pub(crate) fn new_note(body: &str) -> Option<String> {
                 created: now,
                 modified: now,
                 parent: 0,
+                ancestors: Vec::new(),
                 deleted: false,
             },
         );
@@ -719,41 +804,94 @@ pub(crate) fn new_note(body: &str) -> Option<String> {
     Some(id)
 }
 
+/// One local edit of note `id` in `shelf`: whether something changed.
+#[cfg(test)]
+fn edit_in_shelf(
+    shelf: &mut Shelf,
+    id: &str,
+    change: impl FnOnce(&mut Note),
+) -> Result<bool, String> {
+    edit_from_in_shelf(shelf, id, None, change).map(|(changed, _)| changed)
+}
+
+/// [`edit_in_shelf`] for an editor that loaded version `loaded` of the note:
+/// if the stored note has moved on since (the other side's edit landed while
+/// the person was typing), what arrived is kept as a "(conflicted copy)"
+/// instead of being overwritten silently. Also returns the copy's id.
+fn edit_from_in_shelf(
+    shelf: &mut Shelf,
+    id: &str,
+    loaded: Option<i64>,
+    change: impl FnOnce(&mut Note),
+) -> Result<(bool, Option<String>), String> {
+    let synced = shelf.synced.get(id).copied().unwrap_or(0);
+    let Some(note) = shelf.notes.get_mut(id) else {
+        return Ok((false, None));
+    };
+    let before = note.clone();
+    // The version the person typed over is not the one stored now.
+    let overtaken = loaded
+        .filter(|loaded| *loaded != before.modified)
+        .map(|_| Note {
+            id: format!("{}~{}", before.id, before.modified),
+            title: format!("{} (conflicted copy)", before.label()),
+            parent: before.modified,
+            ..before.clone()
+        });
+    change(note);
+    note.title = note.title.chars().take(MAX_NOTE_TITLE_CHARS).collect();
+    // The bound on what crosses the wire, escapes included.
+    if note.body.len() > MAX_NOTE_BYTES || !fits_one_packet(&*note) {
+        *note = before;
+        return Err(TOO_LONG.to_string());
+    }
+    if note.same_content(&before) {
+        return Ok((false, None));
+    }
+    if note.deleted {
+        note.title.clear();
+        note.body.clear();
+    }
+    note.parent = synced;
+    note.ancestors = ancestors_after(&before);
+    // Strictly later, even within one millisecond.
+    note.modified = now_ms().max(before.modified.saturating_add(1));
+    let copy_id = overtaken.map(|copy| {
+        let copy_id = copy.id.clone();
+        shelf.synced.insert(copy_id.clone(), copy.modified);
+        shelf.notes.insert(copy_id.clone(), copy);
+        copy_id
+    });
+    Ok((true, copy_id))
+}
+
 /// Saves an edit to note `id`: title, body, pinned, or deleted.
 /// Saves an edit to note `id`. Refused, in words the editor shows, when
 /// the note would pass 64 KB — never dropped silently.
 pub(crate) fn edit_note(id: &str, change: impl FnOnce(&mut Note)) -> Result<(), String> {
+    edit_note_from(id, None, change)
+}
+
+/// [`edit_note`] for an editor that loaded the version with this `modified`
+/// (see [`edit_from_in_shelf`]).
+pub(crate) fn edit_note_from(
+    id: &str,
+    loaded: Option<i64>,
+    change: impl FnOnce(&mut Note),
+) -> Result<(), String> {
     let changed = with_shelf(|shelf| {
-        let synced = shelf.synced.get(id).copied().unwrap_or(0);
-        let Some(note) = shelf.notes.get_mut(id) else {
-            return (Ok(false), false);
-        };
-        let before = note.clone();
-        change(note);
-        note.title = note.title.chars().take(MAX_NOTE_TITLE_CHARS).collect();
-        // The bound on what crosses the wire, escapes included.
-        if note.body.len() > MAX_NOTE_BYTES || !fits_one_packet(&*note) {
-            *note = before;
-            return (Err(TOO_LONG.to_string()), false);
-        }
-        if note.same_content(&before) {
-            return (Ok(false), false);
-        }
-        if note.deleted {
-            note.title.clear();
-            note.body.clear();
-        }
-        note.parent = synced;
-        // Strictly later, even within one millisecond.
-        note.modified = now_ms().max(before.modified.saturating_add(1));
-        (Ok(true), true)
+        let result = edit_from_in_shelf(shelf, id, loaded, change);
+        let saved = matches!(result, Ok((true, _)));
+        (result, saved)
     });
     match changed {
-        Some(Ok(true)) => {
-            push(Kind::Notes, vec![id.to_string()]);
+        Some(Ok((true, copy))) => {
+            let mut ids = vec![id.to_string()];
+            ids.extend(copy);
+            push(Kind::Notes, ids);
             Ok(())
         }
-        Some(Ok(false)) | None => Ok(()),
+        Some(Ok((false, _))) | None => Ok(()),
         Some(Err(error)) => Err(error),
     }
 }
@@ -779,6 +917,7 @@ mod tests {
                     created: i64::MAX,
                     modified: i64::MAX,
                     parent: i64::MAX,
+                    ancestors: vec![i64::MAX; MAX_ANCESTORS],
                     deleted: false,
                 })
                 .unwrap()
@@ -899,6 +1038,7 @@ mod tests {
             created: 1,
             modified,
             parent,
+            ancestors: Vec::new(),
             deleted: false,
         }
     }
@@ -1049,5 +1189,178 @@ mod tests {
         shelf.notes.insert("live".into(), note("live", "x", 1, 0));
         prune(&mut shelf, 100 * 24 * 3600 * 1000);
         assert!(!shelf.notes.contains_key("old") && shelf.notes.contains_key("live"));
+    }
+
+    /// **The conflicted-copy bug.** Two edits in a row by one side, merged
+    /// into the other side's shelf, are one lineage: the second used to make
+    /// a "(conflicted copy)" of the first, and so did the first edit of a new
+    /// note. Run through both sides' real edit and merge code.
+    #[test]
+    fn consecutive_edits_by_one_side_never_make_a_conflicted_copy() {
+        let mut desk = Shelf::default();
+        let mut phone = Shelf::default();
+        // A note created at the desk and pushed at once.
+        desk.notes.insert("n".into(), note("n", "", 100, 0));
+        assert_eq!(
+            merge_note(&mut phone, desk.notes["n"].clone()),
+            Merged::Taken
+        );
+        // Edit 1 and edit 2 in a row, before anything is acknowledged.
+        for (n, body) in ["one", "two", "three", "four"].into_iter().enumerate() {
+            assert_eq!(
+                edit_in_shelf(&mut desk, "n", |note| note.body = body.into()),
+                Ok(true)
+            );
+            assert!(desk.notes["n"].modified > 100 + n as i64);
+            let merged = merge_note(&mut phone, desk.notes["n"].clone());
+            assert_eq!(merged, Merged::Taken, "edit {n}: {body}");
+        }
+        assert_eq!(phone.notes.len(), 1, "no conflicted copy");
+        assert_eq!(phone.notes["n"].body, "four");
+        // And the other way round: the phone edits what it took.
+        assert_eq!(
+            edit_in_shelf(&mut phone, "n", |note| note.body = "five".into()),
+            Ok(true)
+        );
+        assert_eq!(
+            merge_note(&mut desk, phone.notes["n"].clone()),
+            Merged::Taken
+        );
+        assert_eq!(desk.notes.len(), 1);
+        // A real conflict (edited on both sides from the same version) still
+        // makes a copy.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut a = desk.clone();
+        let mut b = desk.clone();
+        edit_in_shelf(&mut a, "n", |note| note.body = "from a".into()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        edit_in_shelf(&mut b, "n", |note| note.body = "from b".into()).unwrap();
+        assert_eq!(merge_note(&mut a, b.notes["n"].clone()), Merged::Conflict);
+        assert_eq!(a.notes.len(), 2);
+    }
+
+    #[test]
+    fn a_note_names_at_most_eight_ancestors_and_older_peers_still_work() {
+        let mut shelf = Shelf::default();
+        shelf.notes.insert("n".into(), note("n", "", 100, 0));
+        for body in 0..20 {
+            edit_in_shelf(&mut shelf, "n", |note| note.body = body.to_string()).unwrap();
+        }
+        assert_eq!(shelf.notes["n"].ancestors.len(), MAX_ANCESTORS);
+        assert!(valid_note(&shelf.notes["n"]));
+        let mut too_many = shelf.notes["n"].clone();
+        too_many.ancestors = vec![1; MAX_ANCESTORS + 1];
+        assert!(!valid_note(&too_many));
+        // An older build sends none: `parent` alone decides, as before.
+        let json = serde_json::json!({"id": "x", "created": 1, "modified": 5});
+        let parsed: Note = serde_json::from_value(json).unwrap();
+        assert!(parsed.ancestors.is_empty());
+        assert!(!serde_json::to_string(&parsed)
+            .unwrap()
+            .contains("ancestors"));
+    }
+
+    /// A big shelf's index goes out in parts that each fit one wire message,
+    /// and together name every entry once: past ~570 entries a single packet
+    /// never reached the phone.
+    #[test]
+    fn a_big_shelfs_index_is_split_and_every_part_fits_the_wire() {
+        let mut shelf = Shelf::default();
+        for n in 0..MAX_NOTE_ENTRIES {
+            let id = format!("{n:08}-{}", uuid::Uuid::new_v4());
+            shelf
+                .notes
+                .insert(id.clone(), note(&id, "", 1_700_000_000_000 + n as i64, 0));
+        }
+        let parts = index_packets(&shelf, Kind::Notes);
+        assert!(
+            parts.len() > 1,
+            "{} entries in one packet",
+            MAX_NOTE_ENTRIES
+        );
+        let mut named = 0;
+        for part in &parts {
+            assert!(
+                crate::device_links::webrtc::fits_on_wire(part),
+                "a part of {} bytes",
+                part.serialize_line().map(|line| line.len()).unwrap_or(0)
+            );
+            assert!(part.serialize_line().unwrap().len() <= INDEX_BUDGET + 1024);
+            named += part
+                .body
+                .get("items")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+        }
+        assert_eq!(named, MAX_NOTE_ENTRIES);
+        // An empty shelf still says so, in one packet.
+        assert_eq!(index_packets(&Shelf::default(), Kind::Snippets).len(), 1);
+        // A phone takes the parts one by one, as it does the desk's own.
+        let mut phone = Shelf::default();
+        let mut wanted_total = 0;
+        for part in &parts {
+            let (fetches, _) = handle(&mut phone, Kind::Notes, part);
+            wanted_total += fetches
+                .iter()
+                .map(|fetch| {
+                    fetch
+                        .body
+                        .get("ids")
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len)
+                })
+                .sum::<usize>();
+        }
+        assert_eq!(wanted_total, MAX_NOTE_ENTRIES);
+    }
+
+    /// A shelf holds 500 live snippets; the 501st is refused in words, an
+    /// identical one still moves to the top, and the stored cap is 1000 on
+    /// both sides (the phone's was 2000).
+    #[test]
+    fn the_501st_snippet_is_refused_and_the_stored_cap_is_a_thousand() {
+        let mut shelf = Shelf::default();
+        for n in 0..MAX_SNIPPETS {
+            add_in_shelf(&mut shelf, &format!("snippet {n}")).unwrap();
+        }
+        assert_eq!(
+            add_in_shelf(&mut shelf, "one more"),
+            Err(TOO_MANY_SNIPPETS.to_string())
+        );
+        assert!(
+            add_in_shelf(&mut shelf, "snippet 7").is_ok(),
+            "an identical one moves"
+        );
+        assert_eq!(shelf.snippets.len(), MAX_SNIPPETS);
+        assert_eq!(MAX_SNIPPET_ENTRIES, 1000);
+    }
+
+    /// The other side's edit lands while the person is typing over the version
+    /// they loaded: both survive, the arrival as a conflicted copy, instead of
+    /// the save overwriting it silently.
+    #[test]
+    fn typing_over_a_note_that_changed_underneath_keeps_the_arrival_as_a_copy() {
+        let mut shelf = Shelf::default();
+        shelf.notes.insert("n".into(), note("n", "base", 100, 0));
+        // The editor loaded version 100; the phone's edit (200) then arrived.
+        shelf
+            .notes
+            .insert("n".into(), note("n", "the phone's words", 200, 100));
+        let (changed, copy) = edit_from_in_shelf(&mut shelf, "n", Some(100), |note| {
+            note.body = "what I typed".into()
+        })
+        .unwrap();
+        assert!(changed);
+        let copy = copy.expect("the arrival is kept");
+        assert_eq!(shelf.notes["n"].body, "what I typed");
+        assert_eq!(shelf.notes[&copy].body, "the phone's words");
+        assert!(shelf.notes[&copy].title.ends_with("(conflicted copy)"));
+        // No surprise when nothing changed underneath.
+        let current = shelf.notes["n"].modified;
+        let (_, none) = edit_from_in_shelf(&mut shelf, "n", Some(current), |note| {
+            note.body = "more".into()
+        })
+        .unwrap();
+        assert!(none.is_none());
     }
 }

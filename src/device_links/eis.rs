@@ -54,6 +54,39 @@ struct Shared {
 pub(crate) struct EisInput {
     commands: Sender<Command>,
     shared: Arc<Mutex<Shared>>,
+    /// Written to wake the worker (a command, or this being dropped): it
+    /// sleeps on the socket and this, not on a 4 ms timer.
+    wake: Arc<OwnedFd>,
+}
+
+/// An eventfd: counter, non-blocking, close-on-exec.
+fn wake_fd() -> Result<OwnedFd, String> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: eventfd returns a new descriptor or -1.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+    if fd < 0 {
+        return Err("Could not make the input wake-up".to_string());
+    }
+    // SAFETY: `fd` is new and owned here.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Wakes whoever polls `fd`.
+fn wake(fd: &OwnedFd) {
+    let one = 1u64.to_ne_bytes();
+    // SAFETY: a valid eventfd and an 8-byte buffer; a full counter is fine.
+    let _ = unsafe { libc::write(fd.as_raw_fd(), one.as_ptr().cast(), one.len()) };
+}
+
+/// How long the worker may sleep with nothing to do (a safety net: every
+/// reason to wake has its own wake-up).
+const IDLE_POLL_MS: i32 = 1_000;
+
+impl Drop for EisInput {
+    fn drop(&mut self) {
+        // The worker ends when it sees the commands' sender gone.
+        wake(&self.wake);
+    }
 }
 
 impl EisInput {
@@ -64,6 +97,8 @@ impl EisInput {
         let (commands, receiver) = mpsc::channel();
         let (started, handshake) = mpsc::channel();
         let (worker_shared, name) = (Arc::clone(&shared), name.to_string());
+        let wake = Arc::new(wake_fd()?);
+        let worker_wake = Arc::clone(&wake);
         // The connection's types are not `Send`: it is made and used on the
         // worker alone.
         std::thread::Builder::new()
@@ -87,7 +122,7 @@ impl EisInput {
                             shared.connected = true;
                         }
                         let _ = started.send(Ok(()));
-                        run(context, converter, receiver, worker_shared);
+                        run(context, converter, receiver, worker_shared, &worker_wake);
                     }
                     Err(error) => {
                         let _ = started.send(Err(error));
@@ -98,7 +133,11 @@ impl EisInput {
         handshake
             .recv_timeout(Duration::from_secs(5))
             .map_err(|_| "The input connection did not answer".to_string())??;
-        Ok(Self { commands, shared })
+        Ok(Self {
+            commands,
+            shared,
+            wake,
+        })
     }
 
     /// Waits until a resumed absolute region for `mapping_id` exists (of
@@ -140,7 +179,9 @@ impl EisInput {
         }
         self.commands
             .send(command)
-            .map_err(|_| "The input connection closed".to_string())
+            .map_err(|_| "The input connection closed".to_string())?;
+        wake(&self.wake);
+        Ok(())
     }
 }
 
@@ -162,19 +203,32 @@ fn run(
     mut converter: EiEventConverter,
     commands: Receiver<Command>,
     shared: Arc<Mutex<Shared>>,
+    wake: &OwnedFd,
 ) {
     let mut devices: Vec<Emulated> = Vec::new();
     let mut sequence = 1u32;
     'serve: loop {
         // The server's events.
-        let mut poll = libc::pollfd {
-            fd: context.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd for the duration of the call.
-        let ready = unsafe { libc::poll(&mut poll, 1, 4) };
-        if ready > 0 {
+        let mut polls = [
+            libc::pollfd {
+                fd: context.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: two valid pollfds for the duration of the call.
+        unsafe { libc::poll(polls.as_mut_ptr(), 2, IDLE_POLL_MS) };
+        if polls[1].revents != 0 {
+            let mut counter = [0u8; 8];
+            // SAFETY: a valid eventfd and an 8-byte buffer.
+            let _ = unsafe { libc::read(wake.as_raw_fd(), counter.as_mut_ptr().cast(), 8) };
+        }
+        if polls[0].revents != 0 {
             match context.read() {
                 Ok(0) => break 'serve,
                 Ok(_) => {}
@@ -589,5 +643,33 @@ mod tests {
             "never past the edge"
         );
         assert_eq!(region_point(&region, -3.0, 9.0), (1536.0, 539.0), "clamped");
+    }
+
+    /// The EIS worker no longer wakes 250 times a second: it sleeps on the
+    /// socket and a wake-up, and a command (or the end of the connection)
+    /// wakes it at once.
+    #[test]
+    fn the_worker_sleeps_until_woken() {
+        assert_eq!(IDLE_POLL_MS, 1_000);
+        let fd = Arc::new(wake_fd().unwrap());
+        let sleeper = {
+            let fd = Arc::clone(&fd);
+            std::thread::spawn(move || {
+                let mut poll = libc::pollfd {
+                    fd: fd.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let started = Instant::now();
+                // SAFETY: one valid pollfd.
+                unsafe { libc::poll(&mut poll, 1, 5_000) };
+                (started.elapsed(), poll.revents != 0)
+            })
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        wake(&fd);
+        let (waited, woken) = sleeper.join().unwrap();
+        assert!(woken, "woken by the write");
+        assert!(waited < Duration::from_secs(2), "slept {waited:?}");
     }
 }

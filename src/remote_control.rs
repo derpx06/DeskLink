@@ -130,6 +130,9 @@ pub fn show_remote_control_dialog(
             }
         })
     };
+    // A drag held on the phone (its finger is down). Whatever ends the window,
+    // the gesture or the session lets it go.
+    let held_drag = Rc::new(Cell::new(false));
     // Some phones (ColorOS) black out the status bar in any screen capture, so
     // its essentials — time, battery, charging — are shown here instead.
     let title = adw::WindowTitle::new("Phone Screen", "");
@@ -449,7 +452,10 @@ pub fn show_remote_control_dialog(
         let daemon = daemon.clone();
         let device = Rc::clone(&device);
         let speaker = speaker.downgrade();
+        let (held_drag, send) = (Rc::clone(&held_drag), Rc::clone(&send));
         window.connect_close_request(move |_| {
+            // Closing mid-drag: the finger comes up first.
+            release_held_drag(&held_drag, &*send);
             OPEN_WINDOWS.with(|open| open.borrow_mut().remove(device.as_str()));
             if speaker.upgrade().is_some_and(|speaker| speaker.is_active()) {
                 daemon.send(DaemonCommand::Sound(
@@ -494,7 +500,7 @@ pub fn show_remote_control_dialog(
             .build();
         let start = Rc::new(Cell::new((0.0, 0.0)));
         let pressed_at = Rc::new(Cell::new(std::time::Instant::now()));
-        let swiping = Rc::new(Cell::new(false));
+        let swiping = Rc::clone(&held_drag);
         let last = Rc::new(RefCell::new(None::<(i32, i32)>));
         {
             let (start, pressed_at, swiping) = (
@@ -573,6 +579,16 @@ pub fn show_remote_control_dialog(
                     }
                 }
                 swiping.set(false);
+            });
+        }
+        // The grab was lost mid-drag (another window took focus, the compositor
+        // cancelled the sequence): GTK says `cancel`, not `drag-end`, and the
+        // phone's finger stayed down.
+        {
+            let (swiping, last, send) = (Rc::clone(&held_drag), Rc::clone(&last), Rc::clone(&send));
+            drag.connect_cancel(move |_, _| {
+                last.borrow_mut().take();
+                release_held_drag(&swiping, &*send);
             });
         }
         picture.add_controller(drag);
@@ -760,6 +776,13 @@ pub(crate) fn map_gdk_key_to_special(keyval: Key) -> i32 {
         Key::F11 => 31,
         Key::F12 => 32,
         _ => 0,
+    }
+}
+
+/// Lets go of a drag held on the phone (a `singlerelease`), once, if one is.
+fn release_held_drag(held: &Cell<bool>, send: &dyn Fn(Map<String, Value>)) {
+    if held.replace(false) {
+        send(action("singlerelease"));
     }
 }
 
@@ -986,5 +1009,24 @@ mod tests {
         assert!(!fresh.step(None, true, start + Duration::from_secs(1)));
         assert!(fresh.step(None, true, start + Duration::from_secs(4)));
         assert!(!Restarter::default().step(None, false, start));
+    }
+
+    /// A drag cut off (a cancelled gesture, a closing window) lets go on the
+    /// phone, once; with nothing held nothing is sent.
+    #[test]
+    fn a_cancelled_drag_lets_go_of_the_phone_once() {
+        let sent = RefCell::new(Vec::new());
+        let held = Cell::new(true);
+        release_held_drag(&held, &|payload| sent.borrow_mut().push(payload));
+        release_held_drag(&held, &|payload| sent.borrow_mut().push(payload));
+        let sent = sent.into_inner();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].get("singlerelease"), Some(&Value::Bool(true)));
+        assert!(!held.get());
+        let idle = RefCell::new(Vec::new());
+        release_held_drag(&Cell::new(false), &|payload| {
+            idle.borrow_mut().push(payload)
+        });
+        assert!(idle.into_inner().is_empty());
     }
 }

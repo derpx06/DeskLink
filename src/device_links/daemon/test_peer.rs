@@ -775,6 +775,62 @@ mod tests {
         assert_eq!(answered, 0, "and must never provoke a not-paired notice");
     }
 
+    /// An unpaired link's heartbeats are liveness and nothing more: a stranger
+    /// alternating `dozing` true and false (as a real phone does on every
+    /// screen off and on) must leave no recovery state, wake no ladder and
+    /// start no WebRTC peer (a pipeline, a transfer manager and its thread).
+    #[test]
+    fn an_unpaired_links_heartbeats_start_nothing() {
+        use crate::device_links::packet::PACKET_TYPE_HEARTBEAT;
+        let net = TestNetwork::new();
+        let (mut desktop, phone) = peer_pair(&net, "desktop-unpaired-hb", "phone-unpaired-hb");
+        assert_eq!(desktop.pair_state(), PairState::NotPaired);
+        let id = desktop.peer_id();
+        for dozing in [true, false, true, false] {
+            let mut beat = NetworkPacket::new(PACKET_TYPE_HEARTBEAT);
+            beat.set("dozing", dozing);
+            phone.binding.link.send_packet(&beat).expect("phone sends");
+            net.advance(0);
+            desktop.pump();
+            assert!(
+                !crate::device_links::webrtc::coordinator::is_dozing(&id),
+                "a stranger's report is not recorded"
+            );
+        }
+        assert!(
+            desktop
+                .sessions
+                .active_webrtc_attempt(&desktop.binding)
+                .ok()
+                .flatten()
+                .is_none(),
+            "no peer was started for an unpaired link"
+        );
+        // And the explicit entry points refuse too.
+        crate::device_links::webrtc::coordinator::recovery_sign(
+            &id,
+            &desktop.sessions,
+            &desktop.config,
+            &desktop.devices,
+            &desktop.events,
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(desktop
+            .sessions
+            .active_webrtc_attempt(&desktop.binding)
+            .ok()
+            .flatten()
+            .is_none());
+        assert!(crate::device_links::webrtc::coordinator::start_initiator(
+            desktop.binding.clone(),
+            Arc::clone(&desktop.sessions),
+            Arc::clone(&desktop.config),
+            Arc::clone(&desktop.devices),
+            Arc::clone(&desktop.events),
+        )
+        .is_err());
+    }
+
     /// **The livelock.** A retained link that has gone silent must not be able
     /// to block the replacement the peer is offering.
     ///

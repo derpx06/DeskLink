@@ -89,7 +89,7 @@ struct DesktopPortalService {
     /// that is only now finishing can tell whether the registry entry is still
     /// its own before it removes anything.
     id: u64,
-    sender: mpsc::Sender<DesktopPortalCommand>,
+    sender: mpsc::SyncSender<DesktopPortalCommand>,
     can_control: bool,
     /// The phone is a second display (F2), not a mirror.
     extended: bool,
@@ -319,6 +319,9 @@ pub(crate) fn start_initiator(
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     events: Arc<Mutex<Vec<DaemonEvent>>>,
 ) -> Result<(), String> {
+    if !is_paired(&sessions, &binding) {
+        return Err("DeskLink does not start WebRTC with an unpaired device".to_string());
+    }
     // One start at a time per phone: the wake, the beacon, the network change
     // and the ladder's own timer can all arrive within milliseconds, and each
     // used to build a pipeline or send its own restart request.
@@ -429,6 +432,13 @@ pub(crate) fn handle_signaling_packet(
     if !message.verify(&remote_key) {
         return Err("Invalid paired identity signature on DeskLink WebRTC signaling".to_string());
     }
+
+    // Each signed request is taken once, now: a replayed offer must not tear
+    // down the live peer (the per-attempt check comes after the replacement),
+    // nor a replayed restart request force a rebuild.
+    sessions
+        .note_signal_request(binding, message.request_id.clone())
+        .map_err(|error| error.to_string())?;
 
     // Restart requests are handled before the attempt-bound peer lookup: they
     // carry the *sender's* attempt, which by definition no longer matches ours.
@@ -1424,7 +1434,7 @@ fn start_desktop_portal_session(
 
     let id = NEXT_PORTAL_SERVICE_ID.fetch_add(1, Ordering::Relaxed);
     let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (sender, receiver) = mpsc::channel();
+    let (sender, receiver) = mpsc::sync_channel(PORTAL_QUEUE);
     let (done_sender, done) = mpsc::channel();
     let previous_done = {
         let mut services = desktop_portal_services()
@@ -1435,7 +1445,7 @@ fn start_desktop_portal_session(
         // it as "already active" left every later request denied.
         let previous = services.remove(&device_id).map(|previous| {
             previous.cancel.store(true, Ordering::Release);
-            let _ = previous.sender.send(DesktopPortalCommand::Stop(None));
+            let _ = previous.sender.try_send(DesktopPortalCommand::Stop(None));
             previous.done
         });
         services.insert(
@@ -2051,10 +2061,55 @@ pub(crate) fn dispatch_desktop_remote_input(
             .ok_or_else(|| "DeskLink remote session has not started".to_string())?;
         authorize_desktop_remote_input(session, packet, &binding.device_id, now_millis())?
     };
-    sender
-        .send(DesktopPortalCommand::Input(actions))
-        .map_err(|_| "Desktop portal worker has stopped".to_string())
+    // Not past what a person (or glide, 500 a second) can produce, and never
+    // a backlog: while the portal is slow or wedged, input waiting seconds
+    // would be replayed as stale clicks and keys when it came back.
+    if !PORTAL_INPUT_RATE.allow(&binding.device_id) {
+        crate::device_links::limits::log_limited(
+            "portal-input-rate",
+            "Remote input arrived faster than it can be applied; some was dropped",
+        );
+        return Ok(());
+    }
+    match sender.try_send(DesktopPortalCommand::Input(actions)) {
+        Ok(()) => Ok(()),
+        Err(mpsc::TrySendError::Full(_)) => {
+            crate::device_links::limits::log_limited(
+                "portal-input-full",
+                "The desktop is not taking remote input; some was dropped",
+            );
+            Ok(())
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            Err("Desktop portal worker has stopped".to_string())
+        }
+    }
 }
+
+/// The largest second display accepted, in pixels (a 4K screen and a bit),
+/// and the smallest side.
+const MAX_EXTEND_PIXELS: i64 = 3840 * 2400;
+const MIN_EXTEND_SIDE: i32 = 240;
+
+/// Whether a second display of this size may be made.
+pub(crate) fn extend_size_ok(width: i32, height: i32) -> bool {
+    width >= MIN_EXTEND_SIDE
+        && height >= MIN_EXTEND_SIDE
+        && i64::from(width) * i64::from(height) <= MAX_EXTEND_PIXELS
+}
+
+/// Commands waiting for one device's share worker, at most. A command is an
+/// input burst, a screen switch or a stop: a worker that is this far behind
+/// is blocked on the portal.
+const PORTAL_QUEUE: usize = 256;
+
+/// Input packets accepted per second from one phone for the desktop share.
+const PORTAL_INPUT_PER_SECOND: u32 = 1_000;
+static PORTAL_INPUT_RATE: crate::device_links::limits::Buckets =
+    crate::device_links::limits::Buckets::new(
+        PORTAL_INPUT_PER_SECOND,
+        std::time::Duration::from_secs(1),
+    );
 
 /// Debug builds: feeds a mousepad body into the active share as if the phone
 /// had sent it, skipping the lease, so the GNOME side can be measured alone.
@@ -2073,8 +2128,8 @@ pub(crate) fn debug_inject_desktop_input(device_id: &str, body: &str) -> Result<
         .get(device_id)
         .ok_or("no active share")?
         .sender
-        .send(command)
-        .map_err(|_| "share worker stopped".to_string())
+        .try_send(command)
+        .map_err(|_| "share worker stopped or busy".to_string())
 }
 
 fn authorize_desktop_remote_input(
@@ -2157,7 +2212,7 @@ fn stop_desktop_portal_session(device_id: &str, tell: Option<&str>) {
         // Cancelling too: a worker still waiting on the consent dialog never
         // reads the `Stop` command until that dialog is answered.
         cancel.store(true, std::sync::atomic::Ordering::Release);
-        let _ = sender.send(DesktopPortalCommand::Stop(tell.map(str::to_string)));
+        let _ = sender.try_send(DesktopPortalCommand::Stop(tell.map(str::to_string)));
     }
 }
 
@@ -3429,6 +3484,15 @@ fn sign_is_new(device_id: &str, now: std::time::Instant) -> bool {
 /// Any sign of the phone — a network change, the phone waking, a beacon, an
 /// inbound dial or offer — starts the recovery ladder over and, when no peer
 /// is being built, reconnects at once instead of waiting out the backoff.
+/// Whether the session behind `binding` is a paired one.
+fn is_paired(sessions: &Arc<DeviceManager>, binding: &SessionBinding) -> bool {
+    sessions
+        .with_session(binding, |session| {
+            session.pairing.state == crate::device_links::pairing::PairState::Paired
+        })
+        .unwrap_or(false)
+}
+
 pub(crate) fn recovery_sign(
     device_id: &str,
     sessions: &Arc<DeviceManager>,
@@ -3443,6 +3507,11 @@ pub(crate) fn recovery_sign(
     else {
         return;
     };
+    // Only for a phone that is paired: an unpaired link must never make this
+    // side build a pipeline, a transfer manager and a thread.
+    if !is_paired(sessions, &binding) {
+        return;
+    }
     if !sign_is_new(device_id, std::time::Instant::now()) {
         return;
     }
@@ -3655,6 +3724,16 @@ fn handle_peer_envelope(
         if envelope.channel != WebRtcChannel::Control.label() {
             return Err("DeskLink remote-session control arrived on the wrong channel".to_string());
         }
+        // As for files, terminals and features: nothing before the handover
+        // has proved both sides (the phone gates the same way).
+        if !sessions
+            .webrtc_features_ready(binding, attempt_id)
+            .map_err(|error| error.to_string())?
+        {
+            return Err(
+                "DeskLink remote-session control arrived before feature handover".to_string(),
+            );
+        }
         let payload = envelope.validate(wire)?;
         sessions
             .accept_webrtc_envelope(binding, attempt_id, envelope.message_id.clone())
@@ -3729,7 +3808,12 @@ fn handle_peer_envelope(
             // A second display (F2) at the phone's own pixel size.
             if message.display.as_deref() == Some("extend") {
                 let size = message.screen_width.zip(message.screen_height);
-                match size.filter(|_| super::virtual_display::supported()) {
+                // The phone names the size: bounded here, not by 8192 x 8192
+                // (a 268 MB frame composited and encoded at up to 60 fps).
+                match size
+                    .filter(|(width, height)| extend_size_ok(*width, *height))
+                    .filter(|_| super::virtual_display::supported())
+                {
                     Some(size) => request.extend = Some(size),
                     None => {
                         return deny_view(
@@ -3770,7 +3854,7 @@ fn handle_peer_envelope(
             // The share's worker owns the portal; hand it the request.
             if let Ok(services) = desktop_portal_services().lock() {
                 if let Some(service) = services.get(&wire.peer_device_id) {
-                    let _ = service.sender.send(DesktopPortalCommand::SwitchScreen);
+                    let _ = service.sender.try_send(DesktopPortalCommand::SwitchScreen);
                 }
             }
             return Ok(());
@@ -3895,8 +3979,14 @@ fn handle_peer_envelope(
                 // A second view of the phone arrives on the pad the first one
                 // parked; show it again (the first view comes via pad-added).
                 super::screen::resume_parked(&wire.peer_device_id);
-                if let (Some(width), Some(height)) = (message.screen_width, message.screen_height) {
-                    session.set_phone_screen(width, height);
+                // A second `screen-ready` is the phone turning its screen:
+                // the size is taken (in `accept`), control is not asked again.
+                if matches!(
+                    session.state(),
+                    remote_session::SessionState::Controlling
+                        | remote_session::SessionState::RequestingControl
+                ) {
+                    return Ok(());
                 }
                 session.begin_control()?;
                 Some(remote_session::ControlMessage::new(
@@ -4698,7 +4788,7 @@ mod tests {
         id: u64,
     ) -> (Arc<AtomicBool>, mpsc::Receiver<DesktopPortalCommand>) {
         let cancel = Arc::new(AtomicBool::new(false));
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = mpsc::sync_channel(super::PORTAL_QUEUE);
         let (_, done) = mpsc::channel();
         desktop_portal_services().lock().unwrap().insert(
             device.to_string(),
@@ -5848,5 +5938,46 @@ mod tests {
             offer_attempt_disposition(Some("current"), "fresh").unwrap(),
             OfferAttemptDisposition::InstallNew
         );
+    }
+
+    /// A share worker that is not reading takes at most [`PORTAL_QUEUE`]
+    /// commands; the rest of an input flood is dropped, not queued without
+    /// bound (and later replayed as stale clicks).
+    #[test]
+    fn a_stalled_share_worker_does_not_build_a_backlog() {
+        let (sender, receiver) =
+            mpsc::sync_channel::<super::DesktopPortalCommand>(super::PORTAL_QUEUE);
+        let mut taken = 0;
+        for _ in 0..super::PORTAL_QUEUE * 4 {
+            if sender
+                .try_send(super::DesktopPortalCommand::Input(Vec::new()))
+                .is_ok()
+            {
+                taken += 1;
+            }
+        }
+        assert_eq!(taken, super::PORTAL_QUEUE);
+        drop(receiver);
+        // And the per-phone rate: more than a second's worth in one second is
+        // refused.
+        let key = "rate-test-phone";
+        let allowed = (0..super::PORTAL_INPUT_PER_SECOND + 500)
+            .filter(|_| super::PORTAL_INPUT_RATE.allow(key))
+            .count();
+        assert_eq!(allowed, super::PORTAL_INPUT_PER_SECOND as usize);
+    }
+
+    /// A phone asking for a second display of 8192 x 8192 is refused; real
+    /// phone and tablet sizes are not.
+    #[test]
+    fn an_extended_display_has_a_sane_size() {
+        assert!(super::extend_size_ok(1080, 2400));
+        assert!(super::extend_size_ok(2560, 1600));
+        assert!(super::extend_size_ok(3840, 2160));
+        assert!(!super::extend_size_ok(8192, 8192));
+        assert!(!super::extend_size_ok(4096, 4096));
+        assert!(!super::extend_size_ok(100, 2000));
+        assert!(!super::extend_size_ok(0, 0));
+        assert!(!super::extend_size_ok(-5, 1080));
     }
 }

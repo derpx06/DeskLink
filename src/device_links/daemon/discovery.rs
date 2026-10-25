@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use super::handle::DaemonEvent;
 use super::network::{bind_udp_listener, MAX_TCP_PORT, MIN_TCP_PORT};
-use super::state::{mark_error, push_error, upsert_device};
+use super::state::{mark_error, push_error, upsert_from_beacon};
 use super::validation::{connect_to_device, should_throttle_connection};
 use super::DaemonWorker;
 use crate::device_links::config::Config;
@@ -472,6 +472,11 @@ pub(super) fn note_address(device_id: &str, ip: std::net::IpAddr) {
 /// Records an address an unauthenticated packet claims (an mDNS answer): a
 /// candidate, dialled but never in place of a verified address.
 pub(super) fn note_candidate_address(device_id: &str, ip: std::net::IpAddr) {
+    // Only this network: an answer naming a public host would make this
+    // computer dial (and tell) a stranger.
+    if !beacon_source_ok(ip) {
+        return;
+    }
     if let Ok(mut book) = addresses().lock() {
         book.candidate(device_id, ip);
     }
@@ -852,6 +857,12 @@ fn beacon_unreachable_paired(
     }
 }
 
+/// Whether a beacon from `ip` may act at all: a private or link-local
+/// address (the local network), or loopback (the isolated test harness).
+fn beacon_source_ok(ip: std::net::IpAddr) -> bool {
+    ip.is_loopback() || crate::device_links::lan_scope::is_private_or_link_local(ip)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_identity_packet(
     packet: NetworkPacket,
@@ -872,6 +883,11 @@ fn handle_identity_packet(
         .ok()
         .map(|config| config.local_device_id().to_string());
     if local_id.as_deref() == Some(info.id.as_str()) {
+        return;
+    }
+    // Only this network: a spoofed source must not make this computer send
+    // its identity and a TLS hello to an arbitrary host.
+    if !beacon_source_ok(address.ip()) {
         return;
     }
     if should_throttle_connection(last_connections, &info.id) {
@@ -927,7 +943,7 @@ fn handle_identity_packet(
         );
         return;
     }
-    upsert_device(devices, &info, address.ip().to_string(), paired);
+    upsert_from_beacon(devices, &info, address.ip().to_string(), paired);
     remember_endpoint(&info, &packet, paired);
 
     let Some(remote_port) = packet
@@ -1391,5 +1407,35 @@ mod tests {
             .unwrap();
 
         assert!(!should_publish_outgoing_failure(&sessions, "phone-1"));
+    }
+
+    /// A beacon from outside this network does nothing, and one for a paired
+    /// phone never rewrites its card.
+    #[test]
+    fn beacons_are_local_and_never_rewrite_a_paired_card() {
+        let ip = |text: &str| text.parse::<std::net::IpAddr>().unwrap();
+        assert!(beacon_source_ok(ip("192.168.1.3")));
+        assert!(beacon_source_ok(ip("fe80::1")));
+        assert!(beacon_source_ok(ip("127.0.0.1")));
+        assert!(!beacon_source_ok(ip("8.8.8.8")));
+        assert!(!beacon_source_ok(ip("2a00:1450::1")));
+        let info = |name: &str| DeviceInfo {
+            id: "phone-1".into(),
+            name: name.into(),
+            device_type: "phone".into(),
+            protocol_version: 9,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+        };
+        let devices = Arc::new(Mutex::new(HashMap::new()));
+        upsert_from_beacon(&devices, &info("Pixel"), "192.168.1.3".into(), true);
+        // A spoofed beacon for the same id: card unchanged.
+        upsert_from_beacon(&devices, &info("EVIL PHONE"), "192.168.1.66".into(), true);
+        let card = devices.lock().unwrap().get("phone-1").cloned().unwrap();
+        assert_eq!(
+            (card.name.as_str(), card.address.as_str()),
+            ("Pixel", "192.168.1.3")
+        );
     }
 }

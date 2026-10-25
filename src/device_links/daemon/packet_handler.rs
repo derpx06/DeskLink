@@ -216,6 +216,17 @@ pub(super) fn apply_lan_packet(
     // healthy peer it was unpaired, once every ten seconds — the mechanism that
     // keeps links alive turned into one that tears pairings down.
     if packet.packet_type == PACKET_TYPE_HEARTBEAT {
+        // Only a paired phone's heartbeat means anything beyond "alive": a
+        // stranger's (or a hostile client's) must not wake the recovery
+        // machinery or leave state behind for an id nobody paired.
+        let paired = sessions
+            .with_session(&binding, |session| {
+                session.pairing.state == PairState::Paired
+            })
+            .unwrap_or(false);
+        if !paired {
+            return;
+        }
         // Its one field is a state report: whether the phone is dozing.
         if crate::device_links::webrtc::coordinator::note_heartbeat(&device_id, &packet) {
             // The phone woke: a sign of it, so a link that dropped while it

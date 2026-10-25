@@ -194,7 +194,48 @@ fn write_entry(device_id: &str, event: ConnectionEvent, path: Option<&str>, deta
         detail: detail.map(str::to_string),
     };
     if let Some(path) = log_path() {
-        append(&path, &entry);
+        // The caller may hold the session lock (a readiness edge is logged
+        // from inside it): the file write, and the lock the history dialog
+        // holds while it parses the log, happen on the logger thread.
+        if cfg!(test) {
+            append(&path, &entry);
+        } else {
+            on_logger_thread(Box::new(move || append(&path, &entry)));
+        }
+    }
+}
+
+type LogJob = Box<dyn FnOnce() + Send>;
+
+/// Entries waiting for the logger thread (a stalled disk drops the rest).
+const LOG_QUEUE: usize = 1024;
+
+/// Runs `job` on the `desklink-log` thread, in order; never blocks.
+pub(crate) fn on_logger_thread(job: LogJob) {
+    static QUEUE: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<LogJob>>> =
+        std::sync::OnceLock::new();
+    let queue = QUEUE.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<LogJob>(LOG_QUEUE);
+        std::thread::Builder::new()
+            .name("desklink-log".into())
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    job();
+                }
+            })
+            .ok()
+            .map(|_| sender)
+    });
+    match queue {
+        Some(queue) => {
+            if queue.try_send(job).is_err() {
+                crate::device_links::limits::log_limited(
+                    "log-queue",
+                    "The connection log is behind; an entry was dropped",
+                );
+            }
+        }
+        None => job(),
     }
 }
 
@@ -447,5 +488,29 @@ mod tests {
                 .unwrap()
                 .contains("detail")
         );
+    }
+
+    /// A log entry never makes its caller wait for the disk: the job runs on
+    /// the logger thread, in order, while the caller is released at once.
+    #[test]
+    fn logging_runs_on_its_own_thread_and_never_blocks_the_caller() {
+        let (started, wait) = std::sync::mpsc::channel::<()>();
+        let (done, finished) = std::sync::mpsc::channel();
+        let caller = std::thread::current().id();
+        // A slow first job (a stalled disk)...
+        on_logger_thread(Box::new(move || {
+            let _ = wait.recv_timeout(std::time::Duration::from_secs(5));
+        }));
+        let began = std::time::Instant::now();
+        // ... and the next entry queued behind it returns immediately.
+        on_logger_thread(Box::new(move || {
+            let _ = done.send(std::thread::current().id());
+        }));
+        assert!(began.elapsed() < std::time::Duration::from_millis(200));
+        started.send(()).unwrap();
+        let ran_on = finished
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(ran_on, caller);
     }
 }

@@ -1025,6 +1025,41 @@ impl Drop for DesktopWebRtcPeer {
     }
 }
 
+/// The GStreamer elements a WebRTC link cannot work without: webrtcbin
+/// (gst-plugins-bad), DTLS and libnice's ICE elements.
+const REQUIRED_ELEMENTS: [&str; 4] = ["webrtcbin", "dtlsdec", "dtlssrtpenc", "nicesrc"];
+
+/// The names in [`REQUIRED_ELEMENTS`] that `has` does not find.
+fn missing_elements(has: impl Fn(&str) -> bool) -> Vec<&'static str> {
+    REQUIRED_ELEMENTS
+        .iter()
+        .copied()
+        .filter(|name| !has(name))
+        .collect()
+}
+
+/// What to tell the person when elements are missing (plain words, what to
+/// install), or `None`.
+fn missing_words(missing: &[&str]) -> Option<String> {
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "DeskLink needs the GStreamer WebRTC plugins (gst-plugins-bad and libnice) installed on this computer. Missing: {}.",
+        missing.join(", ")
+    ))
+}
+
+/// The start-up check: `Some(words)` when this computer lacks what WebRTC
+/// needs. Without it every connection failed and the phone read "Can't reach"
+/// while the cause was here.
+pub(crate) fn plugin_problem() -> Option<String> {
+    gst::init().ok()?;
+    missing_words(&missing_elements(|name| {
+        gst::ElementFactory::find(name).is_some()
+    }))
+}
+
 fn ensure_gstreamer() -> Result<(), String> {
     GST_INIT
         .get_or_init(|| {
@@ -2271,6 +2306,24 @@ a=max-message-size:262144\r\n";
                 Err(_) => panic!("{pending:?} never opened over loopback"),
             }
         }
+    }
+
+    /// A computer without the WebRTC plugins is told so in words naming what to
+    /// install; one with them hears nothing.
+    #[test]
+    fn missing_gstreamer_plugins_are_named_in_plain_words() {
+        let has_all = |_: &str| true;
+        assert!(missing_elements(has_all).is_empty());
+        assert_eq!(missing_words(&[]), None);
+        let without_nice = |name: &str| name != "nicesrc" && name != "webrtcbin";
+        let missing = missing_elements(without_nice);
+        assert_eq!(missing, ["webrtcbin", "nicesrc"]);
+        let words = missing_words(&missing).unwrap();
+        assert!(words.starts_with("DeskLink needs the GStreamer WebRTC plugins"));
+        assert!(words.contains("gst-plugins-bad") && words.contains("libnice"));
+        assert!(words.contains("webrtcbin, nicesrc"));
+        // This machine has them (the loopback tests need them).
+        assert_eq!(plugin_problem(), None);
     }
 
     /// `(threads, open fds)` of this process.

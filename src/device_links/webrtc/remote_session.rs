@@ -46,6 +46,21 @@ const MAX_AGE: Duration = Duration::from_secs(60);
 /// The longest text a capture result may carry (the phone's cap, F3).
 pub const MAX_CAPTURE_TEXT_BYTES: usize = 32 * 1024;
 
+/// `text` cut at the last whole character within `max` bytes. A phone that
+/// counted characters (UTF-16 units) sends up to 32 K of them: for CJK text
+/// that is three times the bytes allowed, and refusing the whole message left
+/// the phone's capture closed as sent and this side waiting.
+pub(crate) fn cut_to_bytes(mut text: String, max: usize) -> String {
+    if text.len() > max {
+        let mut end = max;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    text
+}
+
 /// Body keys the peer requires on remote-input packets during a session.
 pub const FIELD_REMOTE_SESSION_ID: &str = "desklinkRemoteSessionId";
 pub const FIELD_LEASE_ID: &str = "desklinkLeaseId";
@@ -469,7 +484,7 @@ impl ControlMessage {
             value: number("value").map(|value| value.clamp(-1, 1000) as i32),
             capture_kind: optional_text("captureKind"),
             target: optional_text("target"),
-            text: text("text"),
+            text: text("text").map(|text| cut_to_bytes(text, MAX_CAPTURE_TEXT_BYTES)),
             mime_type: optional_text("mimeType"),
             pages: number("pages").map(|value| value.clamp(-1, 10_000) as i32),
             display: optional_text("display"),
@@ -890,7 +905,24 @@ impl RemoteSession {
             }
             ControlKind::ViewGranted | ControlKind::ScreenReady => {
                 self.direction = message.direction.or(self.direction);
-                self.set_state(SessionState::Viewing);
+                // The phone says what its screen is *now*: a rotation sends
+                // another `screen-ready` with the new size, which moves the
+                // mapping of every later tap but does not end control.
+                if message.kind == ControlKind::ScreenReady {
+                    if let (Some(width), Some(height)) =
+                        (message.screen_width, message.screen_height)
+                    {
+                        self.set_phone_screen(width, height);
+                    }
+                }
+                let already_in_control = message.kind == ControlKind::ScreenReady
+                    && matches!(
+                        self.state,
+                        SessionState::Controlling | SessionState::RequestingControl
+                    );
+                if !already_in_control {
+                    self.set_state(SessionState::Viewing);
+                }
             }
             ControlKind::ControlGranted | ControlKind::TakeoverGranted => {
                 let id = message
@@ -1825,5 +1857,52 @@ mod tests {
         assert_eq!(expired, Some(SessionState::RequestingControl));
         assert_eq!(session.state(), SessionState::Viewing);
         assert_eq!(session.remote_session_id(), Some(id.as_str()));
+    }
+
+    /// The phone is turned while its screen is shared: its second
+    /// `screen-ready` carries the new size, taps map into it from then on, and
+    /// control is not dropped or asked for again.
+    #[test]
+    fn a_rotation_moves_the_mapping_and_keeps_control() {
+        let mut session = RemoteSession::new();
+        let id = Uuid::new_v4().to_string();
+        let mut request = message(ControlKind::RequestView, &id);
+        request.direction = Some(ScreenDirection::PhoneToDesktop);
+        session.accept(&request, 1_000).unwrap();
+        let mut ready = message(ControlKind::ScreenReady, &id);
+        ready.direction = Some(ScreenDirection::PhoneToDesktop);
+        ready.screen_width = Some(1080);
+        ready.screen_height = Some(2400);
+        session.accept(&ready, 1_001).unwrap();
+        assert_eq!(session.phone_screen(), Some((1080, 2400)));
+        session.begin_control().unwrap();
+        let mut granted = message(ControlKind::ControlGranted, &id);
+        granted.direction = Some(ScreenDirection::PhoneToDesktop);
+        granted.lease_id = Some("lease".into());
+        granted.lease_expires_at = Some(31_000);
+        session.accept(&granted, 1_002).unwrap();
+        assert_eq!(session.state(), SessionState::Controlling);
+        // Turned to landscape.
+        let mut turned = message(ControlKind::ScreenReady, &id);
+        turned.direction = Some(ScreenDirection::PhoneToDesktop);
+        turned.screen_width = Some(2400);
+        turned.screen_height = Some(1080);
+        turned.screen_rotation = Some(90);
+        session.accept(&turned, 1_003).unwrap();
+        assert_eq!(session.phone_screen(), Some((2400, 1080)));
+        assert_eq!(session.state(), SessionState::Controlling, "control stays");
+    }
+
+    /// Captured text counted in characters by the phone can be more bytes than
+    /// the bound: it is cut at a whole character (and still accepted), not
+    /// refused whole.
+    #[test]
+    fn captured_text_is_cut_in_bytes_not_refused() {
+        let cjk = "字".repeat(12_000); // 36,000 bytes
+        let cut = cut_to_bytes(cjk.clone(), MAX_CAPTURE_TEXT_BYTES);
+        assert!(cut.len() <= MAX_CAPTURE_TEXT_BYTES);
+        assert!(cut.len() > MAX_CAPTURE_TEXT_BYTES - 3, "as much as fits");
+        assert!(cut.chars().all(|c| c == '字'), "never half a character");
+        assert_eq!(cut_to_bytes("short".into(), 100), "short");
     }
 }

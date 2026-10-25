@@ -64,10 +64,26 @@ pub(super) fn should_throttle_connection(
     false
 }
 
+/// Unpaired links one network address may hold at once. Without it one host
+/// opening 42 sessions under made-up ids kept every real phone out of pairing.
+const MAX_UNPAIRED_PER_ADDRESS: usize = 2;
+
+/// Whether `address` already holds its share of the unpaired links, given the
+/// addresses of the other unpaired links.
+pub(super) fn address_is_full(other_unpaired_addresses: &[String], address: &str) -> bool {
+    other_unpaired_addresses
+        .iter()
+        .filter(|held| held.as_str() == address)
+        .count()
+        >= MAX_UNPAIRED_PER_ADDRESS
+}
+
 pub(super) fn enforce_unpaired_link_limit(
     config: &Arc<Mutex<Config>>,
     sessions: &Arc<DeviceManager>,
+    devices: &Arc<Mutex<HashMap<String, crate::device_links::device::DeviceView>>>,
     device_id: &str,
+    address: &str,
 ) -> Result<(), String> {
     if config
         .lock()
@@ -76,12 +92,24 @@ pub(super) fn enforce_unpaired_link_limit(
     {
         return Ok(());
     }
-    let unpaired_count = sessions.unpaired_session_count();
-    if unpaired_count >= MAX_UNPAIRED_CONNECTIONS {
-        Err("Too many unpaired devices are connected".to_string())
-    } else {
-        Ok(())
+    let unpaired = sessions.unpaired_session_ids();
+    if unpaired.len() >= MAX_UNPAIRED_CONNECTIONS {
+        return Err("Too many unpaired devices are connected".to_string());
     }
+    let held: Vec<String> = devices
+        .lock()
+        .map(|devices| {
+            unpaired
+                .iter()
+                .filter(|id| id.as_str() != device_id)
+                .filter_map(|id| devices.get(id).map(|device| device.address.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    if address_is_full(&held, address) {
+        return Err("Too many unpaired devices are connected from this address".to_string());
+    }
+    Ok(())
 }
 
 pub(super) fn validate_pinned_certificate(
@@ -189,4 +217,25 @@ pub(super) fn connect_to_device(
         // This computer dialed the phone.
         true,
     )
+}
+
+#[cfg(test)]
+mod per_address_tests {
+    use super::*;
+
+    /// One address may hold two unpaired links, no more; others are unaffected.
+    #[test]
+    fn one_address_cannot_fill_the_unpaired_slots() {
+        let held = |addresses: &[&str]| addresses.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert!(!address_is_full(&held(&[]), "192.168.1.9"));
+        assert!(!address_is_full(&held(&["192.168.1.9"]), "192.168.1.9"));
+        assert!(address_is_full(
+            &held(&["192.168.1.9", "192.168.1.9"]),
+            "192.168.1.9"
+        ));
+        assert!(!address_is_full(
+            &held(&["192.168.1.9", "192.168.1.9"]),
+            "192.168.1.20"
+        ));
+    }
 }

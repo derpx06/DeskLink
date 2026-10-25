@@ -90,6 +90,8 @@ mod send_to;
 mod shell_dbus;
 mod signals;
 mod terminal_previews;
+#[cfg(test)]
+mod test_display;
 mod thumbnails;
 mod ticker;
 mod tray;

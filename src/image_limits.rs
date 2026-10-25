@@ -33,6 +33,48 @@ pub(crate) fn file_within_bounds(path: &Path, max_pixels: u64) -> bool {
     })
 }
 
+/// What is fed to a loader before its size is checked: more than any PNG,
+/// JPEG, GIF or WebP header, far less than a bomb's pixel data.
+const HEADER_BYTES: usize = 64 * 1024;
+
+/// What art and contact photos may have (the phone sends 640 px at most).
+pub(crate) const MAX_ART_PIXELS: u64 = 4_000_000;
+
+/// Decodes `bytes` (of `format`, or sniffed) unless the picture claims more
+/// than `max_pixels`: the size is read as soon as the header is, and the pixel
+/// data is never allocated for a picture over the bound.
+pub(crate) fn decode(
+    bytes: &[u8],
+    format: Option<&str>,
+    max_pixels: u64,
+) -> Option<gtk::gdk_pixbuf::Pixbuf> {
+    use gtk::gdk_pixbuf::prelude::*;
+    use gtk::gdk_pixbuf::PixbufLoader;
+    let loader = match format {
+        Some(format) => PixbufLoader::with_type(format).ok()?,
+        None => PixbufLoader::new(),
+    };
+    let too_big = std::rc::Rc::new(std::cell::Cell::new(false));
+    let flag = std::rc::Rc::clone(&too_big);
+    loader.connect_size_prepared(move |_, width, height| {
+        if !within_bounds(i64::from(width), i64::from(height), max_pixels) {
+            flag.set(true);
+        }
+    });
+    let header = &bytes[..bytes.len().min(HEADER_BYTES)];
+    let _ = loader.write(header);
+    if too_big.get() {
+        let _ = loader.close();
+        return None;
+    }
+    loader.write(&bytes[header.len()..]).ok()?;
+    loader.close().ok()?;
+    if too_big.get() {
+        return None;
+    }
+    loader.pixbuf()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,5 +133,33 @@ mod tests {
             }
         }
         !crc
+    }
+
+    /// A small picture decodes; one that claims 60,000 x 60,000 is refused
+    /// from its header, whatever else the bytes hold.
+    #[test]
+    fn decode_refuses_a_bomb_and_takes_a_small_picture() {
+        // A 2x2 PNG from the encoder.
+        let pixbuf =
+            gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 2, 2).unwrap();
+        let png = pixbuf.save_to_bufferv("png", &[]).unwrap();
+        assert!(decode(&png, Some("png"), MAX_ART_PIXELS).is_some());
+        assert!(decode(&png, None, MAX_ART_PIXELS).is_some());
+        assert!(decode(&png, Some("png"), 3).is_none(), "over the bound");
+        let dir = std::env::temp_dir().join(format!("desklink-bomb2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bomb = dir.join("b.png");
+        // Reuse the header-only bomb of the sibling test.
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13];
+        bytes.extend_from_slice(b"IHDR");
+        let mut header = Vec::new();
+        header.extend_from_slice(&60_000u32.to_be_bytes());
+        header.extend_from_slice(&60_000u32.to_be_bytes());
+        header.extend_from_slice(&[8, 6, 0, 0, 0]);
+        bytes.extend_from_slice(&header);
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        std::fs::write(&bomb, &bytes).unwrap();
+        assert!(decode(&bytes, Some("png"), MAX_DECODE_PIXELS).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

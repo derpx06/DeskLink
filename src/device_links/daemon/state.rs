@@ -59,6 +59,25 @@ pub(crate) fn upsert_device(
     }
 }
 
+/// Like [`upsert_device`], for an *unauthenticated* discovery beacon: what an
+/// existing paired phone's card says (its name, type, capabilities, address)
+/// comes from its authenticated links, never from a packet anybody on the
+/// network could have sent; a beacon only creates a card that is not there yet.
+pub(crate) fn upsert_from_beacon(
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    info: &DeviceInfo,
+    address: String,
+    paired: bool,
+) {
+    let known = devices
+        .lock()
+        .is_ok_and(|devices| devices.contains_key(&info.id));
+    if paired && known {
+        return;
+    }
+    upsert_device(devices, info, address, paired);
+}
+
 /// Lists every paired device from the trust store, so a phone that is away is
 /// shown (as offline) from startup, and one that reconnects only through the
 /// relay — which never passes discovery or the LAN handshake — still has a row

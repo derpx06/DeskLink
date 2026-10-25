@@ -278,9 +278,32 @@ fn set_x11(text: &str) -> bool {
 /// Wayland applications; GTK text from an unfocused (or windowless) client
 /// does not. With no X display at all, GTK is the last resort: it works
 /// while a DeskLink window has focus.
+/// Forgets what was sent to each phone: the clipboard moved on (a phone's
+/// copy arrived), so the same text copied again is news again.
+pub(crate) fn forget_sent_texts() {
+    if let Some(sent) = LAST_SENT_BY_DEVICE.get() {
+        if let Ok(mut sent) = sent.lock() {
+            sent.clear();
+        }
+    }
+}
+
+/// Whether the text last examined has to be examined again: it is what the
+/// clipboard held when it was last looked at, and the clipboard has since
+/// held something else (so a copy of it now is a new copy, not the old
+/// one).
+fn forget_examined(examined: &mut Option<(String, bool, u64)>, current: &str) {
+    if examined.as_ref().is_some_and(|(text, ..)| text != current) {
+        *examined = None;
+    }
+}
+
 pub(crate) fn set_clipboard_text_from_remote(content: &str) {
     REMOTE_AT.store(now_ms(), Ordering::Release);
     LOCAL_CHANGED_AT.store(now_ms(), Ordering::Release);
+    // What this desk sent before is no longer what the phone holds: copying
+    // it again must send it again.
+    forget_sent_texts();
     if let Ok(mut last) = get_last_clipboard().lock() {
         *last = content.to_string();
     }
@@ -400,41 +423,16 @@ fn watch_owner_changes() {
 }
 
 /// RGBA pixels (tightly packed) from a PNG or JPEG, for `arboard`.
-/// How much of a picture is fed to the loader before its size is checked: far
-/// more than any PNG or JPEG header, far less than a bomb's pixel data.
-const HEADER_BYTES: usize = 64 * 1024;
-
 fn image_to_rgba(image: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
-    use gtk::gdk_pixbuf::prelude::*;
     let format = if is_png(image) { "png" } else { "jpeg" };
-    let loader = gtk::gdk_pixbuf::PixbufLoader::with_type(format).ok()?;
-    // The size is known as soon as the header is read: a picture claiming
-    // more than a screenful is refused before its pixels are allocated.
-    let too_big = std::rc::Rc::new(std::cell::Cell::new(false));
-    let flag = std::rc::Rc::clone(&too_big);
-    loader.connect_size_prepared(move |_, width, height| {
-        if !crate::image_limits::within_bounds(
-            i64::from(width),
-            i64::from(height),
-            crate::image_limits::MAX_CLIPBOARD_PIXELS,
-        ) {
-            flag.set(true);
-        }
-    });
-    let png = image;
-    // The loader reads the header first; stop at it when it is too big.
-    let header = &png[..png.len().min(HEADER_BYTES)];
-    let _ = loader.write(header);
-    if too_big.get() {
-        let _ = loader.close();
-        return None;
-    }
-    loader.write(&png[header.len()..]).ok()?;
-    loader.close().ok()?;
-    if too_big.get() {
-        return None;
-    }
-    let pixbuf = loader.pixbuf()?.add_alpha(false, 0, 0, 0).ok()?;
+    // A picture claiming more than a screenful is refused from its header.
+    let pixbuf = crate::image_limits::decode(
+        image,
+        Some(format),
+        crate::image_limits::MAX_CLIPBOARD_PIXELS,
+    )?
+    .add_alpha(false, 0, 0, 0)
+    .ok()?;
     let (width, height) = (pixbuf.width() as usize, pixbuf.height() as usize);
     let stride = pixbuf.rowstride() as usize;
     let bytes = pixbuf.read_pixel_bytes();
@@ -613,6 +611,7 @@ impl DaemonWorker {
                         String::new()
                     }
                 };
+                forget_examined(&mut examined, &current_text);
                 if current_text.is_empty() {
                     // No text: perhaps an image, read once per copy.
                     let generation = OWNER_GEN.load(Ordering::Acquire);
@@ -635,6 +634,9 @@ impl DaemonWorker {
                     continue;
                 };
                 if *last == current_text {
+                    // The clipboard holds what a phone put there: what was
+                    // examined before is stale, a re-copy of it must be seen.
+                    examined = None;
                     continue;
                 }
                 drop(last);
@@ -920,5 +922,25 @@ mod tests {
         let mut secret = plain.clone();
         secret.push(PASSWORD_HINT.to_string());
         assert!(is_password_hint(&secret));
+    }
+
+    /// Copy A (sent), a phone's copy B arrives, copy A again: the second A is
+    /// a new copy and must be examined and sent again, not skipped for ever
+    /// because the first one was.
+    #[test]
+    fn copying_the_same_text_again_after_a_phones_copy_is_sent_again() {
+        let mut examined = Some(("A".to_string(), false, 100u64));
+        // The clipboard now holds B (what a phone sent): A is forgotten.
+        forget_examined(&mut examined, "B");
+        assert!(examined.is_none());
+        // The same text still on the clipboard keeps its verdict.
+        let mut same = Some(("A".to_string(), false, 100u64));
+        forget_examined(&mut same, "A");
+        assert!(same.is_some());
+        // And what was sent to each phone is cleared by a phone's copy.
+        let sent = LAST_SENT_BY_DEVICE.get_or_init(|| Mutex::new(Default::default()));
+        sent.lock().unwrap().insert("phone-x".into(), "A".into());
+        forget_sent_texts();
+        assert!(!sent.lock().unwrap().contains_key("phone-x"));
     }
 }

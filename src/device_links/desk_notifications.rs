@@ -551,10 +551,37 @@ fn rules(server: Option<&str>) -> Vec<String> {
     rules
 }
 
+/// The bus refused to let this app watch notifications.
+static MONITOR_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Why sending this computer's notifications to the phone cannot work here, in
+/// words for the Settings row, or `None`. Watching other apps' notifications
+/// is a bus monitor, which a sandboxed bus proxy never allows: the switch
+/// would be on and silent.
+pub(crate) fn unavailable() -> Option<&'static str> {
+    unavailable_because(
+        crate::device_links::pty::host::in_flatpak(),
+        MONITOR_REFUSED.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+fn unavailable_because(in_flatpak: bool, refused: bool) -> Option<&'static str> {
+    if in_flatpak {
+        Some("Not available in the Flatpak version: the sandbox does not let DeskLink watch notifications")
+    } else if refused {
+        Some("This desktop does not let DeskLink watch notifications")
+    } else {
+        None
+    }
+}
+
 /// Starts the monitor once (on first use: only after the user turned the
 /// feature on). It runs on its own connection, which can do nothing else.
 pub(crate) fn start() {
     static STARTED: std::sync::Once = std::sync::Once::new();
+    if unavailable().is_some() {
+        return;
+    }
     STARTED.call_once(rebuild);
 }
 
@@ -565,6 +592,7 @@ fn rebuild() {
         .name("desklink-notify-monitor".into())
         .spawn(|| {
             if let Err(error) = monitor() {
+                MONITOR_REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
                 eprintln!("[Notifications] Cannot watch this computer's notifications: {error}");
             }
         });
@@ -866,5 +894,15 @@ mod tests {
     fn the_monitor_also_reads_the_servers_replies_when_it_is_known() {
         assert_eq!(rules(None).len(), 5);
         assert!(rules(Some(":1.20")).contains(&"type='method_return',sender=':1.20'".to_string()));
+    }
+
+    /// A sandbox or a refused monitor says why in words; the Settings row
+    /// is then a reason, never a switch that is on and silent.
+    #[test]
+    fn forwarding_says_why_it_cannot_work_instead_of_staying_on_and_silent() {
+        assert_eq!(unavailable_because(false, false), None);
+        assert!(unavailable_because(true, false)
+            .is_some_and(|words| words.starts_with("Not available in the Flatpak version")));
+        assert!(unavailable_because(false, true).is_some());
     }
 }

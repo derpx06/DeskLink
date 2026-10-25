@@ -29,8 +29,24 @@ pub struct TrustedDevice {
     pub terminal_access: bool,
 }
 
+/// The format of `config.json` this build writes. A build meeting a *newer*
+/// file reads what it understands and does not rewrite it (a downgrade used to
+/// erase every setting it did not know); every build keeps the fields it does
+/// not know when it writes its own.
+const CONFIG_VERSION: u32 = 1;
+
+fn config_version() -> u32 {
+    CONFIG_VERSION
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredConfig {
+    #[serde(default = "config_version")]
+    version: u32,
+    /// Fields a newer build wrote and this one does not know, kept as they
+    /// were.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
     device_id: String,
     device_name: String,
     trusted_devices: HashMap<String, TrustedDevice>,
@@ -53,6 +69,9 @@ struct StoredConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppSettings {
+    /// Settings a newer build wrote that this one does not know.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
     /// Keep the computer awake, lid closed included, while a phone is paired,
     /// so it stays reachable from that phone.
     pub stay_awake: bool,
@@ -121,6 +140,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            extra: serde_json::Map::new(),
             stay_awake: false,
             session_password: None,
             relay_enabled: true,
@@ -284,15 +304,57 @@ pub(crate) fn set_remote_desktop_token(device_id: &str, token: Option<&str>) {
 
 /// What features removed in 1.3 left in `base_dir`: the automations' sealed
 /// rules and their key.
-const REMOVED_FEATURE_DIRS: [&str; 1] = ["automations"];
+const REMOVED_FEATURE_DIRS: [&str; 2] = ["automations", "transfers"];
+
+/// Files that older builds kept and nothing reads now: the screen-sharing
+/// restore tokens (grants are held in memory only, and cleared on unpair).
+const REMOVED_FEATURE_FILES: [&str; 1] = ["remote_desktop_tokens.json"];
 
 /// Deletes what removed features stored in `base_dir`. Whether any was there.
 fn remove_stored_removed_features(base_dir: &Path) -> bool {
-    REMOVED_FEATURE_DIRS
+    let dirs = REMOVED_FEATURE_DIRS
         .iter()
         .filter(|name| fs::remove_dir_all(base_dir.join(name)).is_ok())
-        .count()
-        > 0
+        .count();
+    let files = REMOVED_FEATURE_FILES
+        .iter()
+        .filter(|name| fs::remove_file(base_dir.join(name)).is_ok())
+        .count();
+    dirs + files > 0
+}
+
+/// Moves the resumable-transfer partials (up to a gigabyte each) out of the
+/// config directory, which backup and dotfile tools copy, into the state
+/// directory. Quiet and once: only when the new place does not exist yet.
+fn migrate_transfer_state(old: &Path, new: &Path) {
+    if !old.is_dir() || new.exists() {
+        return;
+    }
+    if let Some(parent) = new.parent() {
+        if super::private_fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    if fs::rename(old, new).is_ok() {
+        return;
+    }
+    // Another filesystem: copy what is there, then remove the old.
+    if super::private_fs::create_dir_all(new).is_err() {
+        return;
+    }
+    let mut all_copied = true;
+    if let Ok(entries) = fs::read_dir(old) {
+        for entry in entries.flatten() {
+            if entry.path().is_file()
+                && fs::copy(entry.path(), new.join(entry.file_name())).is_err()
+            {
+                all_copied = false;
+            }
+        }
+    }
+    if all_copied {
+        let _ = fs::remove_dir_all(old);
+    }
 }
 
 /// A pairing record that a newer pairing may be the reinstalled same phone
@@ -326,7 +388,23 @@ pub struct Config {
     stored: StoredConfig,
     key: PKey<Private>,
     certificate: X509,
+    /// The file was written by a newer build: read, never rewritten.
+    read_only: bool,
+    /// What start-up wants the person told (a damaged settings file set
+    /// aside, a newer file kept read-only), taken once.
+    load_notice: Option<String>,
 }
+
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default()
+}
+
+/// Settings that features removed in 1.3 stored (dropped on load; every other
+/// unknown key is kept for a build that knows it).
+const REMOVED_SETTING_KEYS: [&str; 3] = ["run_commands", "call_audio", "call_audio_devices"];
 
 impl Config {
     pub fn load() -> Result<Self, String> {
@@ -336,9 +414,47 @@ impl Config {
     pub fn load_from_dir(base_dir: PathBuf) -> Result<Self, String> {
         super::private_fs::create_dir_all(&base_dir).map_err(|err| err.to_string())?;
         let state_path = base_dir.join("config.json");
-        let stored = if state_path.exists() {
-            let bytes = fs::read(&state_path).map_err(|err| err.to_string())?;
-            serde_json::from_slice(&bytes).map_err(|err| err.to_string())?
+        let mut notice = None;
+        let parsed = if state_path.exists() {
+            let bytes = fs::read(&state_path).map_err(|error| {
+                format!(
+                    "DeskLink could not read its settings file {}: {error}",
+                    state_path.display()
+                )
+            })?;
+            match serde_json::from_slice::<StoredConfig>(&bytes) {
+                Ok(stored) => Some(stored),
+                Err(_) => {
+                    // Damaged by something else (a restore, an editor, a full
+                    // disk): kept beside it, never deleted, and DeskLink
+                    // starts fresh, saying so in words.
+                    let aside = base_dir.join(format!("config.corrupt-{}", now_millis()));
+                    let kept = fs::rename(&state_path, &aside).is_ok();
+                    notice = Some(format!(
+                        "DeskLink's settings file was damaged, so it started fresh. Your phones need pairing again.{}",
+                        if kept {
+                            format!(" The damaged file is kept as {}.", aside.display())
+                        } else {
+                            String::new()
+                        }
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let read_only = parsed
+            .as_ref()
+            .is_some_and(|stored| stored.version > CONFIG_VERSION);
+        if read_only {
+            notice = Some(
+                "These settings were written by a newer DeskLink. This version reads them but does not change them."
+                    .to_string(),
+            );
+        }
+        let mut stored = if let Some(stored) = parsed {
+            stored
         } else {
             let device_id = Uuid::new_v4().simple().to_string();
             let device_name = hostname::get()
@@ -347,6 +463,8 @@ impl Config {
                 .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| "DeskLink".to_string());
             StoredConfig {
+                version: CONFIG_VERSION,
+                extra: serde_json::Map::new(),
                 device_id,
                 device_name,
                 trusted_devices: HashMap::new(),
@@ -386,6 +504,10 @@ impl Config {
             _ => generate_certificate(&key, &stored.device_id).map_err(|err| err.to_string())?,
         };
 
+        // What features that no longer exist left among the settings.
+        for gone in REMOVED_SETTING_KEYS {
+            stored.settings.extra.remove(gone);
+        }
         for device in stored.trusted_devices.values() {
             mirror_terminal_access(&device.id, device.terminal_access);
         }
@@ -399,8 +521,21 @@ impl Config {
             stored,
             key,
             certificate,
+            read_only,
+            load_notice: notice,
         };
-        config.save()?;
+        if let Some(notice) = &config.load_notice {
+            eprintln!("[Config] {notice}");
+        }
+        // Written only when something differs, and a failure to write is no
+        // reason not to run: a full or read-only disk keeps the config in
+        // memory, and the next change tries again.
+        if let Err(error) = config.save() {
+            crate::device_links::limits::log_limited(
+                "config-save",
+                &format!("Could not save the settings; carrying on with them in memory: {error}"),
+            );
+        }
         Ok(config)
     }
 
@@ -410,9 +545,12 @@ impl Config {
     /// mid-write left a half-written config.json or private key, `load` then
     /// failed, and DeskLink never started again without losing every pairing.
     pub fn save(&self) -> Result<(), String> {
+        if self.read_only {
+            return Ok(());
+        }
         super::private_fs::create_dir_all(&self.base_dir).map_err(|err| err.to_string())?;
         // The pairing record and the session-password hash: this user only.
-        write_atomic(
+        write_atomic_if_changed(
             &self.base_dir.join("config.json"),
             &serde_json::to_vec_pretty(&self.stored).map_err(|err| err.to_string())?,
             0o600,
@@ -431,6 +569,16 @@ impl Config {
             0o600,
         )?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_device_name_for_test(&mut self, name: &str) {
+        self.stored.device_name = name.to_string();
+    }
+
+    /// The start-up notice for the person, once.
+    pub fn take_load_notice(&mut self) -> Option<String> {
+        self.load_notice.take()
     }
 
     /// This computer's id: all a caller wants when it only compares ids.
@@ -457,7 +605,20 @@ impl Config {
     /// the existing protocol directory so rebranding and transport migration
     /// never move identities or pairing records.
     pub fn transfer_state_dir(&self) -> PathBuf {
-        self.base_dir.join("webrtc-transfers")
+        let old = self.base_dir.join("webrtc-transfers");
+        if self.base_dir != config_dir() {
+            return old; // a test or another install root: where it always was
+        }
+        let new = dirs::state_dir()
+            .or_else(dirs::data_local_dir)
+            .map(|state| state.join("desklink").join("transfers"));
+        match new {
+            Some(new) => {
+                migrate_transfer_state(&old, &new);
+                new
+            }
+            None => old,
+        }
     }
 
     /// Snippets and notes (F6), encrypted; never removed on unpair.
@@ -589,6 +750,13 @@ impl Config {
             set_remote_desktop_token(&info.id, None);
             crate::device_links::contacts::forget_in(&self.contacts_dir(), &info.id);
             crate::device_links::session_lock::forget_unlock(&info.id);
+            // What the old identity said it already held is not what a new
+            // one has: its snapshots are sent again.
+            crate::device_links::sync::forget_device(&info.id);
+            // "Unlock with this phone" is a consent for that identity.
+            if self.stored.settings.unlock_devices.remove(&info.id) {
+                mirror_settings(&self.stored.settings);
+            }
         }
         mirror_terminal_access(&info.id, terminal_access);
         self.stored.trusted_devices.insert(
@@ -675,6 +843,14 @@ impl Config {
         set_remote_desktop_token(device_id, None);
         crate::device_links::contacts::forget_in(&self.contacts_dir(), device_id);
         crate::device_links::session_lock::forget_unlock(device_id);
+        // The revs of what the phone sent: a re-paired phone resends it all
+        // (a stale rev made the phone skip a snapshot the desk no longer had).
+        crate::device_links::sync::forget_device(device_id);
+        // Unlocking this computer from it, too: a later phone under the same
+        // id starts from off.
+        if self.stored.settings.unlock_devices.remove(device_id) {
+            mirror_settings(&self.stored.settings);
+        }
         // Glide onto it, too (F4).
         if self
             .stored
@@ -1279,5 +1455,212 @@ mod tests {
         walk(&dir, &mut bad);
         assert!(bad.is_empty(), "{bad:?}");
         let _ = fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    /// A remote unpair (the phone said `pair:false`) forgets the revs the desk
+    /// remembered, so the phone's snapshots are sent again after a re-pair:
+    /// with a stale `have` the contacts stayed empty.
+    #[test]
+    fn untrusting_a_device_forgets_the_snapshot_revs_it_sent() {
+        use crate::device_links::packet::NetworkPacket;
+        let dir = std::env::temp_dir().join(format!("desklink-forget-revs-{}", Uuid::new_v4()));
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        let id = format!("phone-{}", Uuid::new_v4().simple());
+        let info = DeviceInfo {
+            id: id.clone(),
+            name: "Pixel".into(),
+            device_type: "phone".into(),
+            protocol_version: 9,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+        };
+        config.trust_device(&info, "cert-1".into()).unwrap();
+        let mut snapshot = NetworkPacket::new("desklink.contacts");
+        snapshot.set("rev", "R1");
+        crate::device_links::sync::note_received(&id, Some("instance-a"), "contacts", &snapshot);
+        let have = |id: &str| {
+            crate::device_links::sync::have_packet(id, Some("instance-a"))
+                .body
+                .get("have")
+                .and_then(|have| have.as_object())
+                .is_some_and(|have| have.contains_key("contacts"))
+        };
+        assert!(have(&id), "remembered");
+        config.untrust_device(&id).unwrap();
+        assert!(!have(&id), "forgotten with the pairing");
+        // A new identity behind the same id forgets too.
+        config.trust_device(&info, "cert-1".into()).unwrap();
+        crate::device_links::sync::note_received(&id, Some("instance-a"), "contacts", &snapshot);
+        config.trust_device(&info, "cert-2".into()).unwrap();
+        assert!(!have(&id));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A settings file damaged by something else is set aside (never deleted),
+    /// DeskLink starts fresh and says so in words, and the file the next start
+    /// reads is a good one.
+    #[test]
+    fn a_corrupt_settings_file_is_set_aside_and_explained() {
+        let dir = std::env::temp_dir().join(format!("desklink-corrupt-{}", Uuid::new_v4()));
+        let first = Config::load_from_dir(dir.clone()).unwrap();
+        let id = first.local_device_id().to_string();
+        drop(first);
+        fs::write(dir.join("config.json"), b"{\"device_id\": \"abc\", \"trunc").unwrap();
+        let mut config =
+            Config::load_from_dir(dir.clone()).expect("a damaged file does not stop it");
+        assert_ne!(config.local_device_id(), id, "a fresh identity");
+        let notice = config.take_load_notice().expect("the person is told");
+        assert!(
+            notice.contains("damaged") && notice.contains("config.corrupt-"),
+            "{notice}"
+        );
+        assert!(
+            !notice.contains("EOF") && !notice.contains("serde"),
+            "plain words: {notice}"
+        );
+        let kept: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("config.corrupt-")
+            })
+            .collect();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            fs::read(kept[0].path()).unwrap(),
+            b"{\"device_id\": \"abc\", \"trunc"
+        );
+        assert!(serde_json::from_slice::<serde_json::Value>(
+            &fs::read(dir.join("config.json")).unwrap()
+        )
+        .is_ok());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The file has a version; fields this build does not know survive a save;
+    /// a file from a newer build is read but never rewritten.
+    #[test]
+    fn the_settings_file_is_versioned_forward_compatible_and_never_downgraded() {
+        let dir = std::env::temp_dir().join(format!("desklink-version-{}", Uuid::new_v4()));
+        let config = Config::load_from_dir(dir.clone()).unwrap();
+        drop(config);
+        let path = dir.join("config.json");
+        let read =
+            || serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(read()["version"], CONFIG_VERSION);
+        // A field from a newer build, at the top and among the settings.
+        let mut json = read();
+        json["from_the_future"] = serde_json::json!({"a": 1});
+        json["settings"]["glide_v2"] = serde_json::json!("keep me");
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        config.set_device_name_for_test("Renamed");
+        config.save().unwrap();
+        let after = read();
+        assert_eq!(after["from_the_future"]["a"], 1, "kept");
+        assert_eq!(after["settings"]["glide_v2"], "keep me", "kept");
+        assert_eq!(after["device_name"], "Renamed");
+        // A newer file is not touched at all.
+        let mut newer = read();
+        newer["version"] = (CONFIG_VERSION + 1).into();
+        newer["device_name"] = "Newer".into();
+        let bytes = serde_json::to_vec(&newer).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        assert!(config
+            .take_load_notice()
+            .is_some_and(|n| n.contains("newer DeskLink")));
+        config.set_device_name_for_test("Changed here");
+        config.save().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), bytes, "left exactly as it was");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A settings file that cannot be rewritten (a full or read-only disk)
+    /// does not stop DeskLink from starting.
+    #[test]
+    fn a_failed_save_at_start_is_not_fatal() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root writes anywhere
+        }
+        let dir = std::env::temp_dir().join(format!("desklink-nosave-{}", Uuid::new_v4()));
+        drop(Config::load_from_dir(dir.clone()).unwrap());
+        // Different bytes than a save would write, so a save is wanted.
+        let path = dir.join("config.json");
+        let json: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let loaded = Config::load_from_dir(dir.clone());
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(loaded.is_ok(), "{:?}", loaded.err());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// 1.3 cleans up after itself: the old restore-token file and the old
+    /// transfer folder go, quietly, once.
+    #[test]
+    fn leftover_tokens_and_old_transfer_state_are_removed() {
+        let dir = std::env::temp_dir().join(format!("desklink-left-{}", Uuid::new_v4()));
+        fs::create_dir_all(dir.join("transfers")).unwrap();
+        fs::write(dir.join("transfers/a.json"), b"{}").unwrap();
+        fs::write(dir.join("remote_desktop_tokens.json"), b"{}").unwrap();
+        assert!(remove_stored_removed_features(&dir));
+        assert!(!dir.join("transfers").exists());
+        assert!(!dir.join("remote_desktop_tokens.json").exists());
+        assert!(!remove_stored_removed_features(&dir), "once");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// The partials move to the state directory in one go and only when the
+    /// new place is not there yet.
+    #[test]
+    fn transfer_partials_move_out_of_the_config_directory_once() {
+        let base = std::env::temp_dir().join(format!("desklink-move-{}", Uuid::new_v4()));
+        let (old, new) = (
+            base.join("config/webrtc-transfers"),
+            base.join("state/desklink/transfers"),
+        );
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join(".desklink-1.part"), b"partial").unwrap();
+        migrate_transfer_state(&old, &new);
+        assert!(!old.exists());
+        assert_eq!(fs::read(new.join(".desklink-1.part")).unwrap(), b"partial");
+        // The new place exists: an old folder that appears again is left.
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("later"), b"x").unwrap();
+        migrate_transfer_state(&old, &new);
+        assert!(old.join("later").exists());
+        assert!(!new.join("later").exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// "Unlock with this phone" is gone with the pairing, and with the
+    /// identity: a different certificate behind the same id starts from off.
+    #[test]
+    fn unlock_with_a_phone_does_not_survive_unpair_or_a_new_identity() {
+        let dir = std::env::temp_dir().join(format!("desklink-unlock-{}", Uuid::new_v4()));
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        let id = format!("phone-{}", Uuid::new_v4().simple());
+        let info = DeviceInfo::local(id.clone(), "Pixel".into());
+        config.trust_device(&info, "cert-1".into()).unwrap();
+        config.stored.settings.unlock_devices.insert(id.clone());
+        config.trust_device(&info, "cert-1".into()).unwrap();
+        assert!(
+            config.stored.settings.unlocks_from(&id),
+            "same identity keeps it"
+        );
+        config.trust_device(&info, "cert-2".into()).unwrap();
+        assert!(
+            !config.stored.settings.unlocks_from(&id),
+            "a new identity starts from off"
+        );
+        config.stored.settings.unlock_devices.insert(id.clone());
+        config.untrust_device(&id).unwrap();
+        assert!(!config.stored.settings.unlocks_from(&id), "unpaired");
+        let _ = fs::remove_dir_all(dir);
     }
 }

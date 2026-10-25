@@ -91,6 +91,11 @@ pub struct DeviceSession {
     /// WebRTC peer. This is reset whenever its transport generation changes.
     pub webrtc_handover: Option<HandoverRuntime>,
     pub seen_webrtc_request_ids: ReplayCache,
+    /// Every signed signaling request id this session has taken, whatever
+    /// attempt it named: unlike the per-attempt cache above it survives a peer
+    /// being installed, so a recorded offer or restart request replayed later
+    /// cannot tear down a live peer before the per-attempt check runs.
+    pub seen_signal_request_ids: ReplayCache,
     /// Bounded idempotency cache for authenticated data-channel envelopes.
     pub seen_webrtc_message_ids: ReplayCache,
     pub cancellation: Arc<AtomicBool>,

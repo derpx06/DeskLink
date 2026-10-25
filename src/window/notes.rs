@@ -72,7 +72,7 @@ impl Editor {
     /// Saves now what is typed.
     fn save(&self) {
         self.cancel_save();
-        let Some((id, _)) = self.open.borrow().clone() else {
+        let Some((id, loaded)) = self.open.borrow().clone() else {
             return;
         };
         let buffer = self.body.buffer();
@@ -81,7 +81,7 @@ impl Editor {
             .to_string();
         let title = self.title.text().to_string();
         let pinned = self.pin.is_active();
-        if let Err(error) = notes::edit_note(&id, |note| {
+        if let Err(error) = notes::edit_note_from(&id, Some(loaded), |note| {
             note.title = title;
             note.body = body;
             note.pinned = pinned;
@@ -522,6 +522,13 @@ impl Page {
             });
         }
         page
+    }
+
+    /// Saves what is typed but not yet saved (the window is closing).
+    pub(super) fn flush(&self) {
+        if self.editor.pending.borrow().is_some() {
+            self.editor.save();
+        }
     }
 
     /// Redraws the list when the notes changed (here, or from the phone),

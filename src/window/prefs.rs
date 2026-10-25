@@ -256,6 +256,15 @@ fn sound_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Preference
 /// phones, off by default and only from the apps ticked here (the apps seen
 /// since DeskLink started, and those already chosen).
 fn add_forward_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settings: &AppSettings) {
+    if let Some(reason) = crate::device_links::desk_notifications::unavailable() {
+        let row = adw::ActionRow::builder()
+            .title("Send this computer's notifications to the phone")
+            .subtitle(esc(reason))
+            .build();
+        with_icon(&row, "preferences-system-notifications-symbolic");
+        group.add(&row);
+        return;
+    }
     let on = adw::SwitchRow::builder()
         .title("Send this computer's notifications to the phone")
         .subtitle("Only from the apps you choose. The phone's own are never sent back.")
@@ -1416,32 +1425,28 @@ mod tests {
     /// (Skipped without a display.)
     #[test]
     fn escaped_row_text_reads_as_typed() {
-        // No display: nothing to build on, and no second GTK init to race.
-        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none()
-            || adw::init().is_err()
-        {
-            return;
-        }
-        let name = "a&b<c>.txt";
-        let row = adw::SwitchRow::builder()
-            .title(esc(format!("Show {name}")))
-            .subtitle(esc(format!("Tell {name}")))
-            .build();
-        let label = |text: &str| {
-            gtk::pango::parse_markup(text, '\0')
-                .map(|(_, plain, _)| plain.to_string())
-                .unwrap()
-        };
-        assert_eq!(label(&row.title()), format!("Show {name}"));
-        assert_eq!(
-            label(&row.subtitle().unwrap_or_default()),
-            format!("Tell {name}")
-        );
-        let group = adw::PreferencesGroup::builder()
-            .title(esc("Privacy & security"))
-            .description(esc(format!("Answer {name}'s calls")))
-            .build();
-        assert_eq!(label(&group.title()), "Privacy & security");
+        crate::test_display::run(|| {
+            let name = "a&b<c>.txt";
+            let row = adw::SwitchRow::builder()
+                .title(esc(format!("Show {name}")))
+                .subtitle(esc(format!("Tell {name}")))
+                .build();
+            let label = |text: &str| {
+                gtk::pango::parse_markup(text, '\0')
+                    .map(|(_, plain, _)| plain.to_string())
+                    .unwrap()
+            };
+            assert_eq!(label(&row.title()), format!("Show {name}"));
+            assert_eq!(
+                label(&row.subtitle().unwrap_or_default()),
+                format!("Tell {name}")
+            );
+            let group = adw::PreferencesGroup::builder()
+                .title(esc("Privacy & security"))
+                .description(esc(format!("Answer {name}'s calls")))
+                .build();
+            assert_eq!(label(&group.title()), "Privacy & security");
+        });
     }
 
     #[test]

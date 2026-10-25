@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use base64::Engine;
-use gtk::gdk_pixbuf::{InterpType, Pixbuf, PixbufLoader};
+use gtk::gdk_pixbuf::{InterpType, Pixbuf};
 use gtk::gio;
 use gtk::prelude::*;
 
@@ -95,10 +95,86 @@ pub(crate) fn art_for(url: &str, ready: impl FnOnce() + Send + 'static) -> Optio
 fn read_source(url: &str) -> Result<Vec<u8>, String> {
     if url.to_ascii_lowercase().starts_with("file://") {
         let path = gio::File::for_uri(url).path().ok_or("not a local file")?;
+        // A regular file only: opening a FIFO would block this thread for ever.
+        if !std::fs::metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+            return Err("not a regular file".to_string());
+        }
         let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
         return read_capped(file);
     }
+    // A page-controlled URL must not make this computer ask its own network.
+    if !public_target(url) {
+        return Err("album art from a local address is not fetched".to_string());
+    }
     fetch_http(url)
+}
+
+/// Whether `ip` is somewhere other than the public internet: loopback,
+/// private, link-local, unique-local, unspecified, multicast, shared space.
+fn is_local_target(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, ..] = ip.octets();
+            ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || (a == 100 && (64..128).contains(&b))
+        }
+        IpAddr::V6(ip) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || first & 0xfe00 == 0xfc00
+                || first & 0xffc0 == 0xfe80
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|v4| is_local_target(IpAddr::V4(v4)))
+        }
+    }
+}
+
+/// The host part of an http(s) URL.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = if let Some(inner) = host.strip_prefix('[') {
+        inner.split(']').next()?
+    } else {
+        host.split(':').next()?
+    };
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// Whether every address `url`'s host resolves to is a public one.
+fn public_target(url: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let Some(host) = host_of(url) else {
+        return false;
+    };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return !is_local_target(ip);
+    }
+    if host.eq_ignore_ascii_case("localhost") || host.to_ascii_lowercase().ends_with(".local") {
+        return false;
+    }
+    (host.as_str(), 443)
+        .to_socket_addrs()
+        .map(|addresses| {
+            let addresses: Vec<_> = addresses.collect();
+            !addresses.is_empty()
+                && addresses
+                    .iter()
+                    .all(|address| !is_local_target(address.ip()))
+        })
+        .unwrap_or(false)
 }
 
 /// Everything `source` holds, or an error past [`MAX_SOURCE_BYTES`].
@@ -122,6 +198,8 @@ fn fetch_http(url: &str) -> Result<Vec<u8>, String> {
     gst::init().map_err(|error| error.to_string())?;
     let source = gst::ElementFactory::make("souphttpsrc")
         .property("location", url)
+        // A redirect could lead to a local address the check above never saw.
+        .property("automatic-redirect", false)
         .property("timeout", FETCH_TIMEOUT.as_secs() as u32)
         .build()
         .map_err(|error| format!("souphttpsrc unavailable: {error}"))?;
@@ -195,10 +273,9 @@ fn fetch_http(url: &str) -> Result<Vec<u8>, String> {
 /// Decodes `bytes`, scales to [`MAX_SIDE`], and encodes a JPEG of at most
 /// [`MAX_JPEG_BYTES`].
 fn encode(bytes: &[u8]) -> Result<Art, String> {
-    let loader = PixbufLoader::new();
-    loader.write(bytes).map_err(|error| error.to_string())?;
-    loader.close().map_err(|error| error.to_string())?;
-    let pixbuf = loader.pixbuf().ok_or("not an image")?;
+    // A player's art is page-controlled: a tiny file can claim gigapixels.
+    let pixbuf = crate::image_limits::decode(bytes, None, crate::image_limits::MAX_DECODE_PIXELS)
+        .ok_or("not an image, or too large")?;
     encode_pixbuf(&pixbuf)
 }
 
@@ -291,10 +368,8 @@ pub(crate) fn phone_art(data: &str) -> Option<PhoneArt> {
     {
         return Some(known);
     }
-    let loader = PixbufLoader::with_type("jpeg").ok()?;
-    loader.write(&jpeg).ok()?;
-    loader.close().ok()?;
-    let mut pixbuf = loader.pixbuf()?;
+    let mut pixbuf =
+        crate::image_limits::decode(&jpeg, Some("jpeg"), crate::image_limits::MAX_ART_PIXELS)?;
     let (width, height) = (pixbuf.width(), pixbuf.height());
     if width.max(height) > MAX_SIDE {
         let scale = f64::from(MAX_SIDE) / f64::from(width.max(height));
@@ -392,7 +467,7 @@ mod tests {
             .unwrap();
         assert!(jpeg.len() <= MAX_JPEG_BYTES, "{} bytes", jpeg.len());
         let decoded = {
-            let loader = PixbufLoader::new();
+            let loader = gtk::gdk_pixbuf::PixbufLoader::new();
             loader.write(&jpeg).unwrap();
             loader.close().unwrap();
             loader.pixbuf().unwrap()
@@ -467,5 +542,52 @@ mod tests {
         pixbuf.fill(0x9933_66ff);
         assert_ne!(encode_pixbuf(&pixbuf).unwrap().id, first.id);
         assert_eq!(art_id(b"abc"), art_id(b"abc"));
+    }
+
+    /// A player-supplied art URL never reaches a local address: not a literal
+    /// one, not `localhost`, not a name that resolves to one.
+    #[test]
+    fn art_is_never_fetched_from_a_local_address() {
+        for url in [
+            "http://127.0.0.1/a.jpg",
+            "http://localhost:8080/a.jpg",
+            "https://192.168.1.1/a.jpg",
+            "http://10.0.0.5/a.jpg",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/a.jpg",
+            "http://[fe80::1]/a.jpg",
+            "http://[fd00::1]/a.jpg",
+            "http://user:pw@127.0.0.1/a.jpg",
+            "http://100.64.0.1/a.jpg",
+            "http://printer.local/a.jpg",
+            "http://[::ffff:192.168.1.5]/a.jpg",
+            "http:///nohost",
+        ] {
+            assert!(!public_target(url), "{url}");
+        }
+        assert!(public_target("http://93.184.216.34/a.jpg"));
+        assert_eq!(
+            host_of("https://u:p@Example.com:8443/x?y#z").as_deref(),
+            Some("Example.com")
+        );
+        assert_eq!(
+            host_of("http://[2001:db8::1]:80/").as_deref(),
+            Some("2001:db8::1")
+        );
+    }
+
+    /// A FIFO (or anything not a regular file) is refused before it can block
+    /// the art thread for ever.
+    #[test]
+    fn a_fifo_is_not_read_as_art() {
+        let dir = std::env::temp_dir().join(format!("desklink-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let c_path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let url = gio::File::for_path(&fifo).uri().to_string();
+        assert!(read_source(&url).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

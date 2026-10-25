@@ -194,7 +194,19 @@ impl DaemonWorker {
         events: Arc<Mutex<Vec<handle::DaemonEvent>>>,
         command_rx: Receiver<DaemonCommand>,
     ) -> Result<Self, String> {
-        let config = Arc::new(Mutex::new(Config::load()?));
+        // What this computer must have for a link to work, said once and
+        // plainly (not as "Can't reach the phone", six rungs later).
+        if let Some(problem) = crate::device_links::webrtc::plugin_problem() {
+            eprintln!("[DeskLink] {problem}");
+            state::push_error(&errors, problem);
+        }
+        let mut loaded = Config::load()?;
+        // A damaged settings file set aside, or a newer one kept read-only:
+        // said in words, once.
+        if let Some(notice) = loaded.take_load_notice() {
+            state::push_error(&errors, notice);
+        }
+        let config = Arc::new(Mutex::new(loaded));
         if let Ok(config) = config.lock() {
             state::seed_trusted_devices(
                 &devices,

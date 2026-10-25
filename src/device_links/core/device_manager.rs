@@ -439,6 +439,7 @@ impl DeviceManager {
                     webrtc_handover: None,
                     webrtc_recovery_attempt: 0,
                     seen_webrtc_request_ids: ReplayCache::with_capacity(REPLAY_CACHE_CAPACITY),
+                    seen_signal_request_ids: ReplayCache::with_capacity(REPLAY_CACHE_CAPACITY),
                     seen_webrtc_message_ids: ReplayCache::with_capacity(REPLAY_CACHE_CAPACITY),
                     cancellation: Arc::new(AtomicBool::new(false)),
                     connected_at: Some(now),
@@ -1132,6 +1133,24 @@ impl DeviceManager {
         })?
     }
 
+    /// Takes a signed signaling request id once per session, before anything
+    /// is done for it (offers and restart requests included).
+    pub fn note_signal_request(
+        &self,
+        binding: &SessionBinding,
+        request_id: String,
+    ) -> Result<(), SessionError> {
+        self.with_session(binding, |session| {
+            if session.pairing.state != crate::device_links::pairing::PairState::Paired {
+                return Err(SessionError::NotPaired);
+            }
+            if !session.seen_signal_request_ids.accept(request_id) {
+                return Err(SessionError::ReplayDetected);
+            }
+            Ok(())
+        })?
+    }
+
     /// Accepts a data-channel envelope message ID exactly once for the active
     /// WebRTC attempt. The cache is session-owned so a stale peer callback
     /// cannot bypass replay protection after a link replacement.
@@ -1299,20 +1318,22 @@ impl DeviceManager {
             .collect()
     }
 
-    pub fn unpaired_session_count(&self) -> usize {
+    /// The ids of sessions with a live link that are not paired.
+    pub fn unpaired_session_ids(&self) -> Vec<String> {
         self.sessions
             .lock()
             .map(|sessions| {
                 sessions
-                    .values()
-                    .filter(|session| {
+                    .iter()
+                    .filter(|(_, session)| {
                         session.active_link.is_some()
                             && session.pairing.state
                                 != crate::device_links::pairing::PairState::Paired
                     })
-                    .count()
+                    .map(|(id, _)| id.clone())
+                    .collect()
             })
-            .unwrap_or(0)
+            .unwrap_or_default()
     }
 }
 
@@ -1392,6 +1413,44 @@ mod tests {
         assert!(!snapshot.web_rtc_ready);
         assert!(!manager.is_current(&snapshot.binding));
         assert!(manager.is_current(&replacement));
+    }
+
+    /// A signed request id is taken once per session, whatever attempt it
+    /// names: a replay is refused even after another peer was installed (the
+    /// per-attempt cache is cleared by an install, which let a recorded offer
+    /// replace the live peer).
+    #[test]
+    fn a_signaling_request_id_is_taken_once_even_across_installs() {
+        let manager = DeviceManager::new();
+        let binding = manager
+            .register_link("phone-1".to_string(), link("phone-1"), true)
+            .unwrap()
+            .binding;
+        assert!(manager
+            .note_signal_request(&binding, "request-1".into())
+            .is_ok());
+        assert!(matches!(
+            manager.note_signal_request(&binding, "request-1".into()),
+            Err(SessionError::ReplayDetected)
+        ));
+        // What an install does to the per-attempt cache does not touch it.
+        let _ = manager.with_session(&binding, |session| session.seen_webrtc_request_ids.clear());
+        assert!(matches!(
+            manager.note_signal_request(&binding, "request-1".into()),
+            Err(SessionError::ReplayDetected)
+        ));
+        assert!(manager
+            .note_signal_request(&binding, "request-2".into())
+            .is_ok());
+        // An unpaired session takes nothing.
+        let stranger = manager
+            .register_link("stranger".to_string(), link("stranger"), false)
+            .unwrap()
+            .binding;
+        assert!(matches!(
+            manager.note_signal_request(&stranger, "x".into()),
+            Err(SessionError::NotPaired)
+        ));
     }
 
     #[test]

@@ -62,6 +62,10 @@ fn tab_body(content: &gtk::Box) -> gtk::ScrolledWindow {
 }
 
 impl Page {
+    /// Saves a note being typed (the window is closing).
+    pub(super) fn flush(&self) {
+        self.notes.flush();
+    }
     pub(super) fn new(win: &DesklinkWindow) -> Self {
         let notes = notes::Page::new(win);
         let snippets = gtk::Box::builder()

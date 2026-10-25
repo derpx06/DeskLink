@@ -28,8 +28,7 @@
         "append-path" : "/usr/lib/sdk/rust-stable/bin",
         "env" : {
             "CARGO_HOME" : "/run/build/desklink/cargo",
-            "CARGO_NET_OFFLINE" : "true",
-            "DESKLINK_RELAY_URL" : "wss://relay.desklink.example/v1"
+            "CARGO_NET_OFFLINE" : "true"
         }
     },
     "cleanup" : [

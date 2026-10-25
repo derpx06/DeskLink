@@ -2298,51 +2298,47 @@ mod tests {
     /// With a display; skipped without.
     #[test]
     fn a_rebuilt_pages_menu_is_freed() {
-        // No display: nothing to build on, and no second GTK init to race.
-        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none()
-            || adw::init().is_err()
-        {
-            return;
-        }
-        use crate::device_links::folders::{Pair, PairView, Phase};
-        let view = PairView {
-            pair: Pair {
-                id: BUCKET_ID.into(),
-                name: "DeskLink Bucket".into(),
-                root: std::env::temp_dir(),
-                device: "leak-phone".into(),
-                include_hidden: false,
-                ignore: Vec::new(),
-                bucket: true,
-            },
-            phase: Phase::UpToDate,
-            files: 0,
-            last_sync: None,
-            conflicts: Vec::new(),
-            items: Vec::new(),
-            bytes: 0,
-            skipped: Vec::new(),
-        };
-        let info = crate::device_links::device_info::DeviceInfo::local(
-            "leak-phone".into(),
-            "Phone".into(),
-        );
-        let device = DeviceView::from_info(&info, "192.168.1.9".into(), true);
-        let weak: Vec<glib::WeakRef<gtk::Popover>> = (0..20)
-            .map(|_| {
-                let button = more_menu(&view, &device);
-                let popover = button.popover().and_downcast::<gtk::Popover>().unwrap();
-                popover.downgrade()
-            })
-            .collect();
-        let context = glib::MainContext::default();
-        for _ in 0..20 {
-            while context.iteration(false) {}
-        }
-        let leaked = weak
-            .iter()
-            .filter(|popover| popover.upgrade().is_some())
-            .count();
-        assert_eq!(leaked, 0, "{leaked} of 20 menus outlived their page");
+        crate::test_display::run(|| {
+            use crate::device_links::folders::{Pair, PairView, Phase};
+            let view = PairView {
+                pair: Pair {
+                    id: BUCKET_ID.into(),
+                    name: "DeskLink Bucket".into(),
+                    root: std::env::temp_dir(),
+                    device: "leak-phone".into(),
+                    include_hidden: false,
+                    ignore: Vec::new(),
+                    bucket: true,
+                },
+                phase: Phase::UpToDate,
+                files: 0,
+                last_sync: None,
+                conflicts: Vec::new(),
+                items: Vec::new(),
+                bytes: 0,
+                skipped: Vec::new(),
+            };
+            let info = crate::device_links::device_info::DeviceInfo::local(
+                "leak-phone".into(),
+                "Phone".into(),
+            );
+            let device = DeviceView::from_info(&info, "192.168.1.9".into(), true);
+            let weak: Vec<glib::WeakRef<gtk::Popover>> = (0..20)
+                .map(|_| {
+                    let button = more_menu(&view, &device);
+                    let popover = button.popover().and_downcast::<gtk::Popover>().unwrap();
+                    popover.downgrade()
+                })
+                .collect();
+            let context = glib::MainContext::default();
+            for _ in 0..20 {
+                while context.iteration(false) {}
+            }
+            let leaked = weak
+                .iter()
+                .filter(|popover| popover.upgrade().is_some())
+                .count();
+            assert_eq!(leaked, 0, "{leaked} of 20 menus outlived their page");
+        });
     }
 }
