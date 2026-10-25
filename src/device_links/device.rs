@@ -242,6 +242,10 @@ pub struct DeviceView {
     /// `allowed: false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keyboard_allowed: Option<bool>,
+    /// Whether Android lets the phone read notifications at all, from the
+    /// last snapshot; `None` from an older phone (J11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_access: Option<bool>,
 }
 
 /// The user-facing words for a `connection_path`, the one mapping every
@@ -288,6 +292,7 @@ impl DeviceView {
             call_status: None,
             keyboard_focused: None,
             keyboard_allowed: None,
+            notification_access: None,
             sound: None,
             capture: None,
         }

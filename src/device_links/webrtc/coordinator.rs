@@ -5543,6 +5543,55 @@ mod tests {
         );
     }
 
+    /// A peer never outlives its worker: the guard clears the session's
+    /// attempt even when the worker unwinds from a panic, and leaves a newer
+    /// attempt alone.
+    #[test]
+    fn the_worker_guard_clears_its_attempt_on_panic_but_not_a_newer_one() {
+        use super::PeerWorkerGuard;
+        use crate::device_links::core::test_link::TestNetwork;
+        use crate::device_links::daemon::test_peer::peer_pair;
+        let net = TestNetwork::new();
+        let (desktop, _phone) = peer_pair(&net, "guard-desk", "guard-phone");
+        let attempt = |desktop: &crate::device_links::daemon::test_peer::TestPeer| {
+            desktop
+                .sessions
+                .with_session(&desktop.binding, |session| {
+                    session.webrtc_attempt_id.clone()
+                })
+                .unwrap()
+        };
+        let set = |id: &str| {
+            desktop
+                .sessions
+                .with_session(&desktop.binding, |session| {
+                    session.webrtc_attempt_id = Some(id.to_string());
+                })
+                .unwrap();
+        };
+        set("a1");
+        let (binding, sessions) = (desktop.binding.clone(), Arc::clone(&desktop.sessions));
+        let worker = std::thread::spawn(move || {
+            let _guard = PeerWorkerGuard {
+                binding,
+                attempt_id: "a1".into(),
+                sessions,
+            };
+            panic!("the worker died");
+        });
+        assert!(worker.join().is_err());
+        assert_eq!(attempt(&desktop), None, "cleared by the unwinding guard");
+
+        // A newer attempt (a fresh offer) is not torn down by the old worker.
+        set("a2");
+        drop(PeerWorkerGuard {
+            binding: desktop.binding.clone(),
+            attempt_id: "a1".into(),
+            sessions: Arc::clone(&desktop.sessions),
+        });
+        assert_eq!(attempt(&desktop).as_deref(), Some("a2"));
+    }
+
     #[test]
     fn the_recovery_ladder_is_the_shared_one() {
         assert_eq!(

@@ -1595,8 +1595,10 @@ mod tests {
     #[test]
     fn a_failed_save_at_start_is_not_fatal() {
         use std::os::unix::fs::PermissionsExt;
-        if unsafe { libc::geteuid() } == 0 {
-            return; // root writes anywhere
+        if !crate::test_privileges::unprivileged(
+            "device_links::config::tests::a_failed_save_at_start_is_not_fatal",
+        ) {
+            return;
         }
         let dir = std::env::temp_dir().join(format!("desklink-nosave-{}", Uuid::new_v4()));
         drop(Config::load_from_dir(dir.clone()).unwrap());

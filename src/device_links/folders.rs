@@ -40,8 +40,10 @@ const MAX_FILES: usize = 20_000;
 pub(crate) const MAX_FILE_BYTES: u64 = 1 << 30;
 /// F8c: folder levels in a Bucket: folders `A` and `A/B`, with files in any.
 pub(crate) const MAX_BUCKET_DEPTH: usize = 2;
-/// F8c: transfers in flight per direction; the rest read "Waiting…".
-pub(crate) const MAX_IN_FLIGHT: usize = 2;
+/// F8c: transfers in flight per direction; the rest read "Waiting…". One:
+/// the other slot of the two per direction is kept for what the person
+/// chose (a share, insert-from-phone), and the phone mirrors it.
+pub(crate) const MAX_IN_FLIGHT: usize = super::webrtc::file_protocol::BUCKET_SLOTS_PER_DIRECTION;
 /// F8c: one add action (a drop, a paste, `--bucket`): at most this many
 /// items and bytes; the rest are left out and the user is told.
 pub(crate) const MAX_ADD_ITEMS: usize = 500;
@@ -4108,7 +4110,7 @@ mod tests {
     fn the_limits_are_the_documented_ones() {
         assert_eq!(MAX_FILE_BYTES, 1 << 30, "1 GiB per file");
         assert_eq!(MAX_BUCKET_DEPTH, 2);
-        assert_eq!(MAX_IN_FLIGHT, 2);
+        assert_eq!(MAX_IN_FLIGHT, 1, "the phone mirrors it");
         assert_eq!((MAX_ADD_ITEMS, MAX_ADD_BYTES), (500, 5 << 30));
         assert_eq!(BUCKET_WARN_BYTES, 8 << 30, "warning at 8 GiB");
         assert_eq!(BUCKET_FULL_BYTES, 10 << 30, "refusal at 10 GiB");
@@ -5180,35 +5182,35 @@ mod tests {
     }
 
     #[test]
-    fn two_transfers_are_in_flight_per_direction_and_the_rest_wait() {
-        // Sending: the queue fills two slots; an ended transfer frees one.
+    fn one_transfer_is_in_flight_per_direction_and_the_rest_wait() {
+        // Sending: the queue fills the slot; an ended transfer frees it.
         let mut queue: VecDeque<String> = (1..=5).map(|n| format!("f{n}")).collect();
         let mut flight = HashMap::new();
         let now = Instant::now();
-        assert_eq!(due_sends(&mut queue, &mut flight, &[], now), ["f1", "f2"]);
+        assert_eq!(due_sends(&mut queue, &mut flight, &[], now), ["f1"]);
         assert!(
             due_sends(&mut queue, &mut flight, &[], now).is_empty(),
             "full"
         );
         assert_eq!(
             due_sends(&mut queue, &mut flight, &["f1".into()], now),
-            ["f3"]
+            ["f2"]
         );
         assert_eq!(
-            due_sends(&mut queue, &mut flight, &["f2".into(), "f3".into()], now),
-            ["f4", "f5"]
+            due_sends(&mut queue, &mut flight, &["f2".into()], now),
+            ["f3"]
         );
         assert_eq!(flight.len(), MAX_IN_FLIGHT);
         // A transfer that never showed lapses, so a lost one cannot hold a slot.
         let later = now + FLIGHT_LAPSES + Duration::from_secs(1);
         queue.push_back("f6".into());
-        assert_eq!(due_sends(&mut queue, &mut flight, &[], later), ["f6"]);
-        // Receiving: only two paths are asked for at a time.
+        assert_eq!(due_sends(&mut queue, &mut flight, &[], later), ["f4"]);
+        // Receiving: only one path is asked for at a time.
         let (base, _root, mut worker) = scratch_bucket("bucket-flight");
         worker.pairs[0].to_request = (1..=6).map(|n| format!("r{n}")).collect();
         worker.request_more(0);
         assert_eq!(worker.pairs[0].outstanding.len(), MAX_IN_FLIGHT);
-        assert_eq!(worker.pairs[0].to_request.len(), 4, "the rest are Waiting…");
+        assert_eq!(worker.pairs[0].to_request.len(), 5, "the rest are Waiting…");
         worker.request_more(0);
         assert_eq!(worker.pairs[0].outstanding.len(), MAX_IN_FLIGHT);
         let _ = fs::remove_dir_all(&base);
@@ -5736,10 +5738,12 @@ mod tests {
     #[test]
     fn a_missing_unreadable_or_replaced_folder_is_not_a_deliberate_removal() {
         use std::os::unix::fs::PermissionsExt;
+        if !crate::test_privileges::unprivileged(
+            "device_links::folders::tests::a_missing_unreadable_or_replaced_folder_is_not_a_deliberate_removal",
+        ) {
+            return;
+        }
         for case in ["missing", "unreadable", "replaced"] {
-            if case == "unreadable" && unsafe { libc::geteuid() } == 0 {
-                continue;
-            }
             let base = std::env::temp_dir().join(format!("desklink-gone-{}", uuid::Uuid::new_v4()));
             let root = base.join("root");
             fs::create_dir_all(&root).unwrap();
@@ -6699,6 +6703,157 @@ mod tests {
             );
             // What does not clash is still taken.
             assert!(wanted.contains(&"new.txt") || live.outstanding.iter().any(|p| p == "new.txt"));
+        }
+    }
+}
+
+/// Property tests without a crate: a fixed-seed generator, so a failure
+/// repeats.
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn random_entry(rng: &mut Rng) -> Entry {
+        let deleted = rng.below(4) == 0;
+        Entry {
+            size: 1,
+            mtime: 1_700_000_000_000,
+            sha256: if deleted {
+                String::new()
+            } else {
+                format!("sha{}", rng.below(3))
+            },
+            deleted,
+            dir: false,
+            vv: Vv {
+                desk: rng.below(4),
+                phone: rng.below(4),
+            },
+        }
+    }
+
+    /// The planner never throws away a local edit: a file removed or
+    /// replaced here was dominated by the other side's version, or went
+    /// aside under a conflict name first.
+    #[test]
+    fn the_planner_never_loses_a_live_local_edit() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let paths = ["a.txt", "b.txt", "c/d.txt", "e.txt"];
+        for case in 0..3000 {
+            let mut local = Manifest::new();
+            let mut remote = Manifest::new();
+            for path in paths {
+                if rng.below(4) != 0 {
+                    local.insert(path.to_string(), random_entry(&mut rng));
+                }
+                if rng.below(4) != 0 {
+                    remote.insert(path.to_string(), random_entry(&mut rng));
+                }
+            }
+            for side in [Side::Desk, Side::Phone] {
+                let steps = plan(side, &local, &remote, "Pixel");
+                for step in &steps {
+                    let (path, replaces) = match step {
+                        Step::Delete { path, .. } | Step::Download { path, .. } => (path, true),
+                        _ => continue,
+                    };
+                    let (Some(ours), Some(theirs)) = (local.get(path), remote.get(path)) else {
+                        continue;
+                    };
+                    if ours.deleted || !replaces {
+                        continue;
+                    }
+                    let kept_aside = steps.iter().any(|other| {
+                        matches!(other, Step::Rename { from, .. } if from == path)
+                            || matches!(other, Step::Conflict { path: p, .. } if p == path)
+                    });
+                    assert!(
+                        theirs.vv.dominates(ours.vv) || kept_aside || ours.sha256 == theirs.sha256,
+                        "case {case} {side:?}: {path} {ours:?} replaced by {theirs:?}: {steps:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A path the Bucket accepts has no way out of its folder.
+    #[test]
+    fn no_accepted_bucket_path_can_leave_the_folder() {
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        let alphabet: Vec<char> = "ab./\\: \u{0}\u{7}\u{202e}é~".chars().collect();
+        for _ in 0..20_000 {
+            let length = rng.below(14) as usize;
+            let path: String = (0..length)
+                .map(|_| alphabet[rng.below(alphabet.len() as u64) as usize])
+                .collect();
+            for dir in [true, false] {
+                if bucket_path_ok(&path, dir) {
+                    assert!(!path.starts_with('/'), "{path:?}");
+                    assert!(!path.contains('\\'), "{path:?}");
+                    assert!(!path
+                        .split('/')
+                        .any(|s| s.is_empty() || s == "." || s == ".."));
+                    assert!(!path.chars().any(char::is_control), "{path:?}");
+                    assert!(path.split('/').count() <= MAX_BUCKET_DEPTH + 1);
+                }
+            }
+        }
+    }
+
+    /// Whatever bytes a peer sends, decoding a packet or a vCard never
+    /// panics.
+    #[test]
+    fn hostile_bytes_never_panic_the_packet_or_vcard_parsers() {
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        let pieces = [
+            "{",
+            "}",
+            "\"",
+            ":",
+            ",",
+            "[",
+            "]",
+            "null",
+            "type",
+            "body",
+            "desklink.ping",
+            "id",
+            "-1",
+            "BEGIN:VCARD",
+            "\r\n",
+            "FN:",
+            "TEL;TYPE=CELL:",
+            "PHOTO;ENCODING=b:",
+            "END:VCARD",
+            "é",
+        ];
+        for _ in 0..5_000 {
+            let count = rng.below(30);
+            let text: String = (0..count)
+                .map(|_| pieces[rng.below(pieces.len() as u64) as usize])
+                .collect();
+            let _ = crate::device_links::packet::NetworkPacket::deserialize(text.as_bytes());
+            let _ = crate::device_links::contacts::parse_vcard("u", &text);
+        }
+        let mut bytes = vec![0u8; 512];
+        for _ in 0..2_000 {
+            for byte in &mut bytes {
+                *byte = rng.next() as u8;
+            }
+            let _ = crate::device_links::packet::NetworkPacket::deserialize(&bytes);
         }
     }
 }

@@ -470,6 +470,7 @@ pub(super) fn replace_notifications(
     let mut missing: std::collections::HashSet<String> = ids.iter().cloned().collect();
     if let Ok(mut devices) = devices.lock() {
         if let Some(device) = devices.get_mut(device_id) {
+            device.notification_access = packet.get_bool("accessGranted");
             device
                 .notifications
                 .retain(|notification| ids.contains(&notification.id));
@@ -820,6 +821,25 @@ mod tests {
         packet.set("id", id);
         packet.set("appName", "Chat");
         packet
+    }
+
+    /// J11: the snapshot's `accessGranted` is kept (absent from an old phone).
+    #[test]
+    fn a_snapshot_reports_whether_the_phone_may_read_notifications() {
+        let (devices, info) = test_devices();
+        let access = || devices.lock().unwrap()[&info.id].notification_access;
+        let mut snapshot =
+            NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_NOTIFICATION);
+        snapshot.set("snapshot", true);
+        snapshot.set("ids", json!([]));
+        replace_notifications(&devices, &info.id, &snapshot);
+        assert_eq!(access(), None, "an old phone says nothing");
+        snapshot.set("accessGranted", false);
+        replace_notifications(&devices, &info.id, &snapshot);
+        assert_eq!(access(), Some(false));
+        snapshot.set("accessGranted", true);
+        replace_notifications(&devices, &info.id, &snapshot);
+        assert_eq!(access(), Some(true));
     }
 
     #[test]

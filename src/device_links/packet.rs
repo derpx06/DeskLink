@@ -195,3 +195,47 @@ mod tests {
         assert_eq!(parsed.get_str("message"), Some("hello"));
     }
 }
+
+#[cfg(test)]
+mod shared_fixture_tests {
+    /// The workspace fixture `protocol/testdata/desklink_v9/packet_types.json`
+    /// (copied to `testdata/packet_types.json`; the phone's test reads the
+    /// same list) names exactly the packet types this file defines.
+    #[test]
+    fn the_packet_types_are_the_shared_fixture() {
+        let source = include_str!("packet.rs");
+        let production = source
+            .split("#[cfg(test)]\nmod shared_fixture_tests")
+            .next()
+            .unwrap();
+        let mut ours: Vec<String> = Vec::new();
+        let mut lines = production.lines().peekable();
+        while let Some(line) = lines.next() {
+            if !line.trim_start().starts_with("pub const PACKET_TYPE_") {
+                continue;
+            }
+            // The string may be on the next line.
+            let mut text = line.to_string();
+            if !text.contains('"') {
+                text.push_str(lines.peek().copied().unwrap_or_default());
+            }
+            let start = text.find('"').unwrap() + 1;
+            let end = start + text[start..].find('"').unwrap();
+            ours.push(text[start..end].to_string());
+        }
+        ours.sort();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/packet_types.json")).unwrap();
+        let theirs: Vec<String> = fixture["packetTypes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ours, theirs, "packet.rs and the shared fixture differ");
+        assert!(
+            theirs.windows(2).all(|pair| pair[0] < pair[1]),
+            "sorted, unique"
+        );
+    }
+}

@@ -147,6 +147,9 @@ where
 type Pending =
     std::collections::HashMap<std::path::PathBuf, (std::path::PathBuf, Vec<u8>, Vec<u8>)>;
 
+/// Held by whoever is writing a batch (the writer thread, or `flush`).
+static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Files waiting for the writer thread (each with only its latest contents).
 static PENDING: std::sync::Mutex<Option<Pending>> = std::sync::Mutex::new(None);
 
@@ -164,6 +167,11 @@ pub(crate) fn cancel_pending(path: &Path) {
 /// the writer thread would be killed with its queue (typing in the last
 /// moments before a logout was lost).
 pub(crate) fn flush() {
+    // Behind a batch the writer thread is writing right now: when this
+    // returns, everything queued before the call is on disk.
+    let _writing = WRITING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let batch = PENDING
         .lock()
         .ok()
@@ -184,12 +192,6 @@ pub(crate) fn flush() {
 /// the latest contents per file are written.
 // A write still queued at shutdown is written by `flush()`.
 pub(crate) fn seal_later(dir: &Path, path: &Path, aad: &[u8], plain: Vec<u8>) {
-    if cfg!(test) {
-        if let Err(error) = seal(dir, path, aad, &plain) {
-            eprintln!("[DeskLink] Could not save: {error}");
-        }
-        return;
-    }
     static WAKE: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>> = std::sync::OnceLock::new();
     let wake = WAKE.get_or_init(|| {
         let (wake, woken) = std::sync::mpsc::sync_channel::<()>(1);
@@ -197,6 +199,9 @@ pub(crate) fn seal_later(dir: &Path, path: &Path, aad: &[u8], plain: Vec<u8>) {
             .name("desklink-vault".into())
             .spawn(move || {
                 while woken.recv().is_ok() {
+                    let _writing = WRITING
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     let batch = PENDING
                         .lock()
                         .ok()
@@ -250,6 +255,7 @@ mod tests {
             .any(|entry| entry.file_name().to_string_lossy().contains("corrupt"));
         assert!(aside, "the damaged file is kept beside it");
         seal_later(&dir, &path, b"purpose", b"[4]".to_vec());
+        flush();
         // A key that cannot be read (here: a directory in its place) is an
         // error, never a reason to make a new one.
         let unreadable = dir.join("other");
@@ -290,6 +296,55 @@ mod tests {
             try_open(&dir, &path, b"another purpose"),
             Err(OpenError::Damaged)
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sealed file cut short, or opened with another install's key, is
+    /// damaged (set aside), never read as something else.
+    #[test]
+    fn a_truncated_file_and_a_foreign_key_are_damage() {
+        let dir = std::env::temp_dir().join(format!("desklink-vault-cut-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("n.sealed");
+        seal(&dir, &path, b"purpose", b"[1,2,3,4,5,6,7,8,9]").unwrap();
+        let whole = std::fs::read(&path).unwrap();
+        for cut in [0, 1, whole.len() / 2, whole.len() - 1] {
+            std::fs::write(&path, &whole[..cut]).unwrap();
+            assert!(open(&dir, &path, b"purpose").is_none(), "cut at {cut}");
+        }
+        // Another install's key.
+        std::fs::write(&path, &whole).unwrap();
+        let other =
+            std::env::temp_dir().join(format!("desklink-vault-key2-{}", uuid::Uuid::new_v4()));
+        seal(&other, &other.join("x.sealed"), b"purpose", b"[0]").unwrap();
+        std::fs::copy(other.join("key"), dir.join("key")).unwrap();
+        assert!(open(&dir, &path, b"purpose").is_none(), "wrong key");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// Many writers to one file: the last queued contents win, nothing is
+    /// torn, and the file always opens.
+    #[test]
+    fn concurrent_writes_leave_a_whole_file_with_the_latest_contents() {
+        let dir = std::env::temp_dir().join(format!("desklink-vault-par-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("p.sealed");
+        let threads: Vec<_> = (0..8)
+            .map(|n| {
+                let (dir, path) = (dir.clone(), path.clone());
+                std::thread::spawn(move || {
+                    for round in 0..20 {
+                        seal_later(&dir, &path, b"p", format!("[{n},{round}]").into_bytes());
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        seal_later(&dir, &path, b"p", b"[99]".to_vec());
+        flush();
+        assert_eq!(open(&dir, &path, b"p").unwrap(), b"[99]");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

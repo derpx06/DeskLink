@@ -92,6 +92,8 @@ mod signals;
 mod terminal_previews;
 #[cfg(test)]
 mod test_display;
+#[cfg(test)]
+mod test_privileges;
 mod thumbnails;
 mod ticker;
 mod tray;

@@ -187,8 +187,11 @@ impl Page {
         }
         self.count.set_label(&count);
         self.empty.set_visible(notifications.is_empty());
-        self.empty_line
-            .set_label(&empty_line(&device.name, device.feature_transport_ready));
+        self.empty_line.set_label(&empty_line(
+            &device.name,
+            device.feature_transport_ready,
+            device.notification_access,
+        ));
         // Dismiss, reply and actions go to the phone: none while the link
         // is down (the list is what it last reported).
         let ready = device.feature_transport_ready;
@@ -253,8 +256,10 @@ impl Page {
 /// What the empty list says: an empty list with the phone connected may also
 /// mean the phone never got notification access (J11), which nothing else
 /// shows.
-fn empty_line(phone: &str, connected: bool) -> String {
-    if connected {
+fn empty_line(phone: &str, connected: bool, access: Option<bool>) -> String {
+    if access == Some(false) {
+        format!("Turn on notification access in DeskLink on {phone}.")
+    } else if connected {
         format!(
             "New phone notifications appear here. Nothing arriving? Allow notification access in DeskLink on {phone}."
         )
@@ -497,8 +502,13 @@ mod tests {
 
     #[test]
     fn an_empty_list_with_the_phone_connected_points_at_notification_access() {
-        assert!(empty_line("Pixel", true).contains("notification access in DeskLink on Pixel"));
-        assert!(!empty_line("Pixel", false).contains("access"));
+        assert!(
+            empty_line("Pixel", true, None).contains("notification access in DeskLink on Pixel")
+        );
+        assert!(!empty_line("Pixel", false, None).contains("access"));
+        // The phone said so: it is the answer, connected or not.
+        assert!(empty_line("Pixel", true, Some(false)).starts_with("Turn on notification access"));
+        assert!(!empty_line("Pixel", true, Some(true)).starts_with("Turn on"));
     }
 
     #[test]

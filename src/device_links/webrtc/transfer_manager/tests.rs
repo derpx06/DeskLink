@@ -2296,8 +2296,10 @@ fn a_received_file_is_complete_only_once_it_is_placed_recorded_and_listed() {
 #[test]
 fn a_file_that_cannot_be_placed_is_an_error_never_a_complete_and_keeps_its_part() {
     use std::os::unix::fs::PermissionsExt;
-    // Root writes anywhere: the refusal cannot be staged.
-    if unsafe { libc::geteuid() } == 0 {
+    // Root writes anywhere: the refusal is staged as `nobody` instead.
+    if !crate::test_privileges::unprivileged(
+        "device_links::webrtc::transfer_manager::tests::a_file_that_cannot_be_placed_is_an_error_never_a_complete_and_keeps_its_part",
+    ) {
         return;
     }
     let hand = Hand::new("glue-refused");

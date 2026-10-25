@@ -239,3 +239,94 @@ mod per_address_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod accept_path_tests {
+    use super::*;
+    use crate::device_links::device_info::DeviceInfo;
+    use openssl::asn1::Asn1Time;
+    use openssl::ec::{EcGroup, EcKey};
+    use openssl::hash::MessageDigest;
+    use openssl::pkey::PKey;
+    use openssl::x509::X509NameBuilder;
+
+    fn certificate(common_name: &str) -> X509 {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_nid(Nid::COMMONNAME, common_name)
+            .unwrap();
+        let name = name.build();
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+        builder.build()
+    }
+
+    /// The certificate presented on a link must be the one pinned at
+    /// pairing; an unknown device is judged by pairing, not here.
+    #[test]
+    fn a_paired_device_must_present_its_pinned_certificate() {
+        let dir = std::env::temp_dir().join(format!("desklink-pin-{}", uuid::Uuid::new_v4()));
+        let config = Arc::new(Mutex::new(Config::load_from_dir(dir.clone()).unwrap()));
+        let id = "abcdefgh_1234_abcdefgh_1234_abcd";
+        let pinned = certificate(id);
+        let pem = String::from_utf8(pinned.to_pem().unwrap()).unwrap();
+        assert!(
+            validate_pinned_certificate(&config, id, &pinned).is_ok(),
+            "not paired yet: nothing to compare"
+        );
+        config
+            .lock()
+            .unwrap()
+            .trust_device(&DeviceInfo::local(id.into(), "Phone".into()), pem)
+            .unwrap();
+        assert!(validate_pinned_certificate(&config, id, &pinned).is_ok());
+        let forged = certificate(id);
+        assert_eq!(
+            validate_pinned_certificate(&config, id, &forged).unwrap_err(),
+            "Trusted device certificate changed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_certificate_name_must_be_the_identitys_device_id() {
+        let cert = certificate("device-a");
+        assert!(validate_certificate_device_id(&cert, "device-a").is_ok());
+        assert!(validate_certificate_device_id(&cert, "device-b").is_err());
+        let nameless = {
+            let mut builder = X509::builder().unwrap();
+            let name = X509NameBuilder::new().unwrap().build();
+            let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+            let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+            builder.set_subject_name(&name).unwrap();
+            builder.set_issuer_name(&name).unwrap();
+            builder.set_pubkey(&key).unwrap();
+            builder.sign(&key, MessageDigest::sha256()).unwrap();
+            builder.build()
+        };
+        assert!(validate_certificate_device_id(&nameless, "device-a").is_err());
+    }
+
+    #[test]
+    fn a_second_attempt_inside_the_interval_is_throttled_and_the_map_stays_bounded() {
+        let map = Arc::new(Mutex::new(HashMap::new()));
+        assert!(!should_throttle_connection(&map, "phone"));
+        assert!(should_throttle_connection(&map, "phone"), "too soon");
+        // A flood of spoofed identities cannot grow it, nor lock real ones out.
+        for n in 0..(MAX_RATE_LIMIT_ENTRIES * 2) {
+            assert!(!should_throttle_connection(&map, &format!("spoof-{n}")));
+        }
+        assert!(map.lock().unwrap().len() <= MAX_RATE_LIMIT_ENTRIES);
+    }
+}

@@ -170,6 +170,21 @@ struct Peer {
 
 type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
+/// What follows a failed connection on rung `rung`: the next wait, or, once
+/// the six are used up, the explicit "unavailable" state (never an endless
+/// retry); only a reset (network, settings or pairing change) starts over.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    Retry(Duration),
+    Unavailable,
+}
+
+fn after_failure(rung: usize) -> Next {
+    LADDER
+        .get(rung)
+        .map_or(Next::Unavailable, |delay| Next::Retry(*delay))
+}
+
 struct Client {
     context: Context,
     commands: Receiver<Command>,
@@ -253,14 +268,17 @@ impl Client {
                     continue;
                 }
                 Err(Stop::Failed(reason)) => {
-                    if let Some(delay) = LADDER.get(self.rung) {
-                        self.rung += 1;
-                        self.retry_at = Some(Instant::now() + *delay);
-                        set_status(RelayStatus::Connecting);
-                    } else {
-                        eprintln!("[DeskLink] Relay unavailable: {reason}");
-                        self.stopped = true;
-                        set_status(RelayStatus::Unavailable(reason));
+                    match after_failure(self.rung) {
+                        Next::Retry(delay) => {
+                            self.rung += 1;
+                            self.retry_at = Some(Instant::now() + delay);
+                            set_status(RelayStatus::Connecting);
+                        }
+                        Next::Unavailable => {
+                            eprintln!("[DeskLink] Relay unavailable: {reason}");
+                            self.stopped = true;
+                            set_status(RelayStatus::Unavailable(reason));
+                        }
                     }
                     continue;
                 }
@@ -964,6 +982,25 @@ pub fn force_relay() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn six_failures_retry_on_the_ladder_and_the_seventh_is_unavailable() {
+        for (rung, delay) in LADDER.iter().enumerate() {
+            assert_eq!(after_failure(rung), Next::Retry(*delay), "rung {rung}");
+        }
+        assert_eq!(after_failure(LADDER.len()), Next::Unavailable);
+        assert_eq!(
+            after_failure(LADDER.len() + 5),
+            Next::Unavailable,
+            "stays so"
+        );
+        // A reset sets the rung back to 0: the ladder is whole again.
+        assert_eq!(after_failure(0), Next::Retry(LADDER[0]));
+        assert!(
+            LADDER.windows(2).all(|pair| pair[0] <= pair[1]),
+            "it only climbs"
+        );
+    }
 
     #[test]
     fn relay_urls_parse_host_and_port() {

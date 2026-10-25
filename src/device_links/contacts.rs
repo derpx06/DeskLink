@@ -857,6 +857,7 @@ mod tests {
         drop(sender);
         vcard_worker(&replies);
         assert_eq!(list("phone-v").len(), 300, "none dropped");
+        crate::device_links::vault::flush();
         assert_eq!(
             load(&dir, "phone-v").unwrap().contacts.len(),
             300,
@@ -1102,6 +1103,7 @@ X-UNKNOWN:ignored\r\nREV:2026-10-01T10:00:00Z\r\nEND:VCARD\r\n";
             parse_vcard("a", "FN:Secret Name\nTEL:555 0100").unwrap(),
         );
         save(&dir, "phone-1", &book).unwrap();
+        super::super::vault::flush();
         let path = book_path(&dir, "phone-1");
         let raw = std::fs::read(&path).unwrap();
         assert!(
