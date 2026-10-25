@@ -95,10 +95,13 @@ fn refresh_connection_paths(
         let reading = sessions
             .ready_peer(&id)
             .and_then(|(peer, via_relay)| peer.path(via_relay));
-        let (path, rtt) = reading.map_or((None, None), |(path, rtt)| (Some(path), rtt));
+        let (path, rtt, nearby) = reading.map_or((None, None, false), |reading| {
+            (Some(reading.label), reading.rtt, reading.nearby)
+        });
         let changed = devices.lock().ok().and_then(|mut devices| {
             let device = devices.get_mut(&id)?;
             device.rtt_ms = rtt;
+            device.connection_nearby = nearby;
             let path = path.map(str::to_string);
             (device.connection_path != path).then(|| {
                 device.connection_path = path.clone();
@@ -152,7 +155,7 @@ fn run_liveness_tick(
 pub use commands::DaemonCommand;
 pub use handle::{DaemonEvent, DaemonHandle};
 pub(crate) use packet_handler::{
-    admit_lock_operation, is_desktop_locked as desktop_locked, lock_desktop,
+    admit_lock_operation, is_desktop_locked as desktop_locked, lock_desktop, open_link_now,
 };
 pub(crate) use state::{push_error as push_user_error, push_event};
 

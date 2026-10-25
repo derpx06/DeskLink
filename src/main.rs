@@ -78,6 +78,7 @@ mod bucket_progress;
 mod config;
 mod desk_menu;
 mod device_links;
+mod image_limits;
 mod kde;
 mod link_glyph;
 mod pdf;
@@ -179,25 +180,86 @@ pub(crate) fn crash_dir() -> Option<std::path::PathBuf> {
     )
 }
 
-/// Writes every panic, with a backtrace, to a file the user can attach to a
-/// bug report (nothing is sent anywhere), then runs the default hook. The next
-/// start mentions it (`application.rs`).
+/// Crash reports kept: the newest this many.
+const CRASH_REPORTS_KEPT: usize = 20;
+
+thread_local! {
+    /// Depth of `guard()` calls on this thread: a panic inside one is caught
+    /// and the app carries on, so it is not a crash.
+    static GUARDED: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether this thread is inside a `guard()`.
+fn guarded() -> bool {
+    GUARDED.with(|depth| depth.get() > 0)
+}
+
+/// A report file name nobody else gets: the time to the nanosecond, the
+/// process and a counter, so two panics in one second never overwrite.
+fn crash_file_name(secs: u64, nanos: u32, pid: u32, counter: u64) -> String {
+    format!("crash-{secs}-{nanos:09}-{pid}-{counter}.txt")
+}
+
+/// Whether `name` is a crash report (not `crash-reported`, the marker).
+pub(crate) fn is_crash_report(name: &str) -> bool {
+    name.starts_with("crash-") && name.ends_with(".txt")
+}
+
+/// Keeps the newest `keep` crash reports in `dir`.
+fn prune_crash_reports(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut reports: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter(|entry| is_crash_report(&entry.file_name().to_string_lossy()))
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .collect();
+    reports.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, path) in reports.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Writes a panic that really ends the app, with a backtrace, to a file the
+/// user can attach to a bug report (nothing is sent anywhere), then runs the
+/// default hook. Only the first one of a process is kept (what follows is
+/// usually its echo), the directory keeps the newest [`CRASH_REPORTS_KEPT`],
+/// and a panic that a `guard()` catches is a log line, never a report. The
+/// next start mentions it (`application.rs`).
 fn install_crash_reporter() {
+    static WROTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        if let Some(dir) = crash_dir() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs())
-                .unwrap_or_default();
-            let report = format!(
-                "DeskLink {} crashed\nthread: {}\n{info}\n\n{}\n",
-                config::VERSION,
-                std::thread::current().name().unwrap_or("unnamed"),
-                std::backtrace::Backtrace::force_capture()
+        if guarded() {
+            device_links::limits::log_limited(
+                "caught-panic",
+                &format!("A handler failed and was caught: {info}"),
             );
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::write(dir.join(format!("crash-{now}.txt")), report);
+            return;
+        }
+        if let Some(dir) = crash_dir() {
+            if !WROTE.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default();
+                let report = format!(
+                    "DeskLink {} crashed\nthread: {}\n{info}\n\n{}\n",
+                    config::VERSION,
+                    std::thread::current().name().unwrap_or("unnamed"),
+                    std::backtrace::Backtrace::force_capture()
+                );
+                let _ = device_links::private_fs::create_dir_all(&dir);
+                prune_crash_reports(&dir, CRASH_REPORTS_KEPT - 1);
+                let name = crash_file_name(
+                    now.as_secs(),
+                    now.subsec_nanos(),
+                    std::process::id(),
+                    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                );
+                let _ = device_links::private_fs::write(&dir.join(name), report.as_bytes());
+            }
         }
         default(info);
     }));
@@ -206,9 +268,12 @@ fn install_crash_reporter() {
 /// Runs `body`, turning a panic into a logged error and `fallback`. For GLib
 /// callbacks fed by other processes or peers (D-Bus calls and signals, the
 /// timers that read what peers sent): a panic cannot unwind into C, so it
-/// would abort the whole app. The crash hook still writes its report.
+/// would abort the whole app. The crash hook records it in the log only.
 pub(crate) fn guard<T>(name: &str, fallback: T, body: impl FnOnce() -> T) -> T {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or_else(|_| {
+    GUARDED.with(|depth| depth.set(depth.get() + 1));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+    GUARDED.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    result.unwrap_or_else(|_| {
         eprintln!("[DeskLink] The {name} handler failed; carrying on");
         fallback
     })
@@ -220,5 +285,58 @@ mod guard_tests {
     fn a_panicking_callback_returns_its_fallback() {
         assert_eq!(super::guard("test", 7, || -> i32 { panic!("boom") }), 7);
         assert_eq!(super::guard("test", 7, || 3), 3);
+    }
+
+    #[test]
+    fn crash_reports_never_share_a_name_and_the_marker_is_not_one() {
+        let a = super::crash_file_name(1_700_000_000, 5, 42, 0);
+        let b = super::crash_file_name(1_700_000_000, 5, 42, 1);
+        let c = super::crash_file_name(1_700_000_000, 6, 42, 0);
+        assert!(a != b && a != c);
+        assert!(super::is_crash_report(&a));
+        assert!(!super::is_crash_report("crash-reported"));
+        assert!(!super::is_crash_report("crash-1700000000.log"));
+    }
+
+    #[test]
+    fn only_the_newest_twenty_reports_are_kept() {
+        let dir = std::env::temp_dir().join(format!("desklink-crash-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..30u64 {
+            let path = dir.join(super::crash_file_name(1_700_000_000 + n, 0, 1, 0));
+            std::fs::write(&path, b"x").unwrap();
+            let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000 + n);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        }
+        std::fs::write(dir.join("crash-reported"), b"").unwrap();
+        super::prune_crash_reports(&dir, super::CRASH_REPORTS_KEPT);
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| super::is_crash_report(n))
+            .collect();
+        left.sort();
+        assert_eq!(left.len(), 20);
+        assert!(left[0].contains("-1700000010-") || left[0].starts_with("crash-1700000010"));
+        assert!(dir.join("crash-reported").exists(), "the marker stays");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A panic inside `guard` is caught and is not a crash; the depth is
+    /// restored whether the body panics or not.
+    #[test]
+    fn a_guarded_panic_is_not_a_crash() {
+        assert!(!super::guarded());
+        assert_eq!(super::guard("t", 1, || -> i32 { panic!("caught") }), 1);
+        assert!(!super::guarded());
+        assert!(super::guard("t", false, super::guarded));
+        assert!(!super::guarded());
     }
 }

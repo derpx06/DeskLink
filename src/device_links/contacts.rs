@@ -713,6 +713,30 @@ pub(crate) fn list(device_id: &str) -> Vec<Contact> {
     contacts
 }
 
+/// A contact without its photo (up to 64 KiB of base64 each): what a search
+/// needs, so typing in Activities never copies the pictures.
+fn without_photo(mut contact: Contact) -> Contact {
+    contact.photo = None;
+    contact
+}
+
+/// [`list`] for search: names, numbers and e-mails, no photos or notes.
+pub(crate) fn list_for_search(device_id: &str) -> Vec<Contact> {
+    let mut contacts: Vec<Contact> = with_book(device_id, |book, _| {
+        book.contacts
+            .values()
+            .map(|contact| {
+                let mut contact = without_photo(contact.clone());
+                contact.note = None;
+                contact
+            })
+            .collect()
+    })
+    .unwrap_or_default();
+    contacts.sort_by_cached_key(|contact| contact.name.to_lowercase());
+    contacts
+}
+
 pub(crate) fn by_uid(device_id: &str, uid: &str) -> Option<Contact> {
     with_book(device_id, |book, _| book.contacts.get(uid).cloned()).flatten()
 }
@@ -1248,5 +1272,21 @@ X-UNKNOWN:ignored\r\nREV:2026-10-01T10:00:00Z\r\nEND:VCARD\r\n";
         assert!(assemble(&mut pending, "phone", &part("big", 2, 3, &entries), now).is_none());
         assert!(!pending.contains_key("phone"), "over the cap: dropped");
         assert!(assemble(&mut pending, "phone", &part("big", 3, 3, &[]), now).is_none());
+    }
+
+    #[test]
+    fn a_search_copy_of_a_contact_carries_no_photo() {
+        let contact = Contact {
+            uid: "u1".into(),
+            name: "Mara".into(),
+            phones: Vec::new(),
+            emails: Vec::new(),
+            org: None,
+            note: Some("private note".into()),
+            photo: Some("A".repeat(60_000)),
+        };
+        let found = without_photo(contact);
+        assert!(found.photo.is_none());
+        assert_eq!(found.name, "Mara");
     }
 }

@@ -50,13 +50,13 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         &transfers,
         settings.shows_notifications(&device.id),
         crate::device_links::folders::bucket_on(&device.id),
-        &minute,
         gliding_onto(&device.id),
     ))
     .unwrap_or_default();
     if !win.page_changed("home", key) {
         refresh_in_place(win, daemon);
         show_round_trip(win, device);
+        show_clock(win, &minute);
         return;
     }
     let page = gtk::Box::builder()
@@ -107,6 +107,22 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     win.replace_body("home", &clamp);
     refresh_in_place(win, daemon);
     show_round_trip(win, device);
+    show_clock(win, &minute);
+}
+
+/// The phone picture's clock, in place: the page is not rebuilt (and its
+/// open menus closed) every minute for it.
+fn show_clock(win: &DesklinkWindow, minute: &str) {
+    let Some((_, body)) = win.imp().bodies.borrow().get("home").cloned() else {
+        return;
+    };
+    for widget in named_widgets(body.upcast_ref(), "hero-clock") {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            if label.label() != minute {
+                label.set_label(minute);
+            }
+        }
+    }
 }
 
 /// The hero's "· 12 ms", in place.
@@ -176,6 +192,7 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
             .label(time)
             .margin_top(22)
             .css_classes(["phone-time"])
+            .name("hero-clock")
             .build(),
     );
     band.append(&phone);

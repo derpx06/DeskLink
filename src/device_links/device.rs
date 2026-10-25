@@ -206,6 +206,11 @@ pub struct DeviceView {
     /// (over the internet) or `"turn"`; `None` while not connected.
     #[serde(default)]
     pub connection_path: Option<String>,
+    /// The connection is on the local network proper: a private or
+    /// link-local pair on a subnet this computer is attached to (not a
+    /// routed or global path that merely used host candidates).
+    #[serde(default)]
+    pub connection_nearby: bool,
     /// The selected ICE pair's round-trip time, in milliseconds, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rtt_ms: Option<u32>,
@@ -272,6 +277,7 @@ impl DeviceView {
             desktop_session: DesktopSession::None,
             desktop_extended: false,
             connection_path: None,
+            connection_nearby: false,
             rtt_ms: None,
             last_seen: None,
             verification_key: None,

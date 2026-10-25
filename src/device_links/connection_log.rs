@@ -6,7 +6,7 @@
 //! fatal: a history view must not stop DeskLink starting.
 
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -14,6 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+/// The most entries a log keeps when it is pruned (at start).
+pub const MAX_LOG_ENTRIES: usize = 5_000;
 pub const RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// What happened. Serialized in kebab-case, so the file reads plainly.
@@ -208,9 +210,13 @@ pub(crate) fn append_line(path: &PathBuf, entry: &impl Serialize) {
     line.push(b'\n');
     let _guard = FILE_LOCK.lock();
     if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
+        let _ = super::private_fs::create_dir_all(dir);
     }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut file) = super::private_fs::options()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
         let _ = file.write_all(&line);
     }
 }
@@ -326,6 +332,9 @@ pub(crate) fn rewrite_lines<T: Serialize + serde::de::DeserializeOwned>(
     let _guard = FILE_LOCK.lock();
     let mut kept: Vec<T> = read_unlocked(path, now, ts);
     kept.retain(|entry| keep(entry));
+    // Newest first here: a flapping phone must not grow the log without
+    // bound inside the retention window.
+    kept.truncate(MAX_LOG_ENTRIES);
     kept.reverse();
     let mut text = String::new();
     for entry in kept {
@@ -335,7 +344,7 @@ pub(crate) fn rewrite_lines<T: Serialize + serde::de::DeserializeOwned>(
         }
     }
     let temporary = path.with_extension("jsonl.tmp");
-    if fs::write(&temporary, text).is_ok() {
+    if super::private_fs::write(&temporary, text.as_bytes()).is_ok() {
         let _ = fs::rename(&temporary, path);
     }
 }
@@ -353,6 +362,27 @@ mod tests {
             path: None,
             detail: None,
         }
+    }
+
+    /// A flapping phone's thousands of entries are cut to the newest
+    /// [`MAX_LOG_ENTRIES`] when the log is pruned.
+    #[test]
+    fn a_pruned_log_keeps_only_the_newest_entries() {
+        let dir = std::env::temp_dir().join(format!("desklink-log-cap-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("connections.jsonl");
+        let now = 100 * 24 * 60 * 60;
+        for n in 0..(MAX_LOG_ENTRIES as u64 + 300) {
+            append(&path, &entry(now - 100_000 + n, ConnectionEvent::Connected));
+        }
+        prune_file(&path, now);
+        let kept = read(&path, now);
+        assert_eq!(kept.len(), MAX_LOG_ENTRIES);
+        assert_eq!(
+            kept[0].ts,
+            now - 100_000 + MAX_LOG_ENTRIES as u64 + 299,
+            "the newest stays"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -284,19 +284,39 @@ pub fn show_remote_control_dialog(
         .css_classes(["dim-label"])
         .build();
     loading.append(&loading_label);
+    // After the phone declined or stopped sharing: nothing asks again by
+    // itself; the person does, here.
+    let ask_again = gtk::Button::builder()
+        .label("Ask Again")
+        .halign(gtk::Align::Center)
+        .css_classes(["pill", "suggested-action"])
+        .visible(false)
+        .build();
+    loading.append(&ask_again);
     let overlay = gtk::Overlay::builder().child(&picture).build();
     overlay.add_overlay(&loading);
     overlay.add_overlay(&status);
     toolbar.set_content(Some(&overlay));
 
     // A screen the phone offered is already being started under its id.
+    let restarter = Rc::new(RefCell::new(Restarter::default()));
     if matches!(
         session_state(device.as_str()),
         None | Some(SessionState::Idle | SessionState::Stopped)
     ) {
         daemon.send(DaemonCommand::StartPhoneRemoteControl(device.to_string()));
+        restarter.borrow_mut().sent(std::time::Instant::now());
     }
-    let last_start = Rc::new(Cell::new(std::time::Instant::now()));
+    {
+        let (restarter, daemon, device) =
+            (Rc::clone(&restarter), daemon.clone(), Rc::clone(&device));
+        ask_again.connect_clicked(move |_| {
+            restarter.borrow_mut().ask_again();
+            daemon.send(DaemonCommand::StartPhoneRemoteControl(device.to_string()));
+            restarter.borrow_mut().sent(std::time::Instant::now());
+        });
+    }
+    let link_ready = Rc::new(Cell::new(true));
     let last_control_request = Rc::new(Cell::new(std::time::Instant::now()));
 
     // State, picture and status, refreshed ~30 times a second.
@@ -307,7 +327,9 @@ pub fn show_remote_control_dialog(
         let status = status.downgrade();
         let loading = loading.downgrade();
         let loading_label = loading_label.downgrade();
-        let last_start = Rc::clone(&last_start);
+        let restarter = Rc::clone(&restarter);
+        let link_ready = Rc::clone(&link_ready);
+        let ask_again = ask_again.downgrade();
         let last_control_request = Rc::clone(&last_control_request);
         let title = title.downgrade();
         let route = route.downgrade();
@@ -321,6 +343,7 @@ pub fn show_remote_control_dialog(
             if tick.get() % 30 == 1 {
                 if let Some(title) = title.upgrade() {
                     if let Some(view) = daemon.devices().into_iter().find(|d| d.id == *device) {
+                        link_ready.set(view.feature_transport_ready);
                         title.set_title(&view.name);
                         if let Some(kind) = kind.upgrade() {
                             kind.set_icon_name(Some(crate::window::device_type_icon(
@@ -349,13 +372,18 @@ pub fn show_remote_control_dialog(
                 }
             }
             let state = session_state(device.as_str());
-            if matches!(
-                state,
-                None | Some(SessionState::Idle | SessionState::Stopped)
-            ) && last_start.get().elapsed() >= std::time::Duration::from_secs(3)
+            // Asked again only when nothing was refused: not after the phone
+            // declined or stopped sharing (the person asks again, with the
+            // button), only after a dropped link comes back.
+            if restarter
+                .borrow_mut()
+                .step(state, link_ready.get(), std::time::Instant::now())
             {
                 daemon.send(DaemonCommand::StartPhoneRemoteControl(device.to_string()));
-                last_start.set(std::time::Instant::now());
+            }
+            let gave_up = restarter.borrow().gave_up();
+            if let Some(button) = ask_again.upgrade() {
+                button.set_visible(gave_up);
             }
             // Viewing but not controlling: the phone refused (usually its
             // accessibility service is off) or the request was lost. Keep
@@ -390,6 +418,9 @@ pub fn show_remote_control_dialog(
                 }
                 Some(SessionState::Controlling) => None,
                 Some(SessionState::PausedLocked) => Some("Phone is locked · unlock it to continue"),
+                Some(SessionState::Stopped) if gave_up => {
+                    Some("The phone declined or stopped sharing its screen")
+                }
                 Some(SessionState::Stopped) => Some("Screen stopped · reconnecting…"),
                 _ => None,
             };
@@ -732,6 +763,73 @@ pub(crate) fn map_gdk_key_to_special(keyval: Key) -> i32 {
     }
 }
 
+/// When the Phone Screen window asks the phone to share its screen. It asks
+/// at the start and, when the link dropped and came back, again; it never asks
+/// again after the phone declined or stopped sharing (the consent dialog
+/// would come back every few seconds): that is the person's choice, through
+/// "Ask Again".
+#[derive(Default)]
+struct Restarter {
+    last_ask: Option<std::time::Instant>,
+    gave_up: bool,
+    /// The session ended while the link was down: ask again when it is back.
+    stopped_while_down: bool,
+}
+
+/// A fresh ask is left alone this long before the answer is judged.
+const ASK_SETTLE: std::time::Duration = std::time::Duration::from_secs(3);
+
+impl Restarter {
+    fn gave_up(&self) -> bool {
+        self.gave_up
+    }
+
+    fn sent(&mut self, now: std::time::Instant) {
+        self.last_ask = Some(now);
+    }
+
+    fn ask_again(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Whether to send a start request now.
+    fn step(
+        &mut self,
+        state: Option<SessionState>,
+        link_ready: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        if self
+            .last_ask
+            .is_some_and(|at| now.saturating_duration_since(at) < ASK_SETTLE)
+        {
+            return false;
+        }
+        let start = match state {
+            None | Some(SessionState::Idle) => link_ready && !self.gave_up,
+            Some(SessionState::Stopped) if self.gave_up => false,
+            Some(SessionState::Stopped) if !link_ready => {
+                self.stopped_while_down = true;
+                false
+            }
+            Some(SessionState::Stopped) if self.stopped_while_down => {
+                self.stopped_while_down = false;
+                true
+            }
+            // Stopped with the link up: the phone said no, or stopped.
+            Some(SessionState::Stopped) => {
+                self.gave_up = true;
+                false
+            }
+            _ => false,
+        };
+        if start {
+            self.last_ask = Some(now);
+        }
+        start
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -818,5 +916,75 @@ mod tests {
         // A move during a swipe is just a position.
         let step = at(Map::new(), (5, 6));
         assert_eq!(step.len(), 2);
+    }
+
+    /// A refusal or a stop by the phone is asked again by nobody but the
+    /// person; a dropped link that comes back is asked again once.
+    #[test]
+    fn the_phone_screen_never_asks_again_after_a_refusal() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut restarter = Restarter::default();
+        restarter.sent(start);
+        // The phone declined: Stopped with the link up. Nothing more, ever.
+        let mut asked = 0;
+        for second in 4..600 {
+            let now = start + Duration::from_secs(second);
+            if restarter.step(Some(SessionState::Stopped), true, now) {
+                asked += 1;
+            }
+        }
+        assert_eq!(asked, 0, "asked again after a refusal");
+        assert!(restarter.gave_up());
+        // The person asks again.
+        restarter.ask_again();
+        assert!(!restarter.gave_up());
+        restarter.sent(start + Duration::from_secs(700));
+        // Still settling: nothing is judged for 3 s.
+        assert!(!restarter.step(
+            Some(SessionState::Stopped),
+            true,
+            start + Duration::from_secs(701)
+        ));
+        assert!(!restarter.gave_up());
+    }
+
+    #[test]
+    fn a_dropped_link_that_comes_back_is_asked_once() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut restarter = Restarter::default();
+        restarter.sent(start);
+        // The link drops: the session reads Stopped while down.
+        assert!(!restarter.step(
+            Some(SessionState::Stopped),
+            false,
+            start + Duration::from_secs(5)
+        ));
+        assert!(!restarter.gave_up());
+        // It is back: one ask.
+        assert!(restarter.step(
+            Some(SessionState::Stopped),
+            true,
+            start + Duration::from_secs(10)
+        ));
+        // Not again until it settles; then (declined) it gives up.
+        assert!(!restarter.step(
+            Some(SessionState::Stopped),
+            true,
+            start + Duration::from_secs(11)
+        ));
+        assert!(!restarter.step(
+            Some(SessionState::Stopped),
+            true,
+            start + Duration::from_secs(14)
+        ));
+        assert!(restarter.gave_up());
+        // A session that never started asks while the link is up.
+        let mut fresh = Restarter::default();
+        assert!(fresh.step(None, true, start));
+        assert!(!fresh.step(None, true, start + Duration::from_secs(1)));
+        assert!(fresh.step(None, true, start + Duration::from_secs(4)));
+        assert!(!Restarter::default().step(None, false, start));
     }
 }

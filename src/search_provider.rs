@@ -231,7 +231,9 @@ pub(crate) fn matching(candidates: &[Candidate], terms: &[String]) -> Vec<String
         .map(|term| term.trim().to_lowercase())
         .filter(|term| !term.is_empty())
         .collect();
-    if terms.is_empty() {
+    // One letter matches nearly everything: nothing is answered until there
+    // are at least two characters to look for.
+    if terms.iter().all(|term| term.chars().count() < 2) {
         return Vec::new();
     }
     candidates
@@ -239,6 +241,18 @@ pub(crate) fn matching(candidates: &[Candidate], terms: &[String]) -> Vec<String
         .filter(|candidate| terms.iter().all(|term| candidate.haystack.contains(term)))
         .map(|candidate| candidate.id.clone())
         .collect()
+}
+
+type ContactCache = (
+    Option<u64>,
+    Vec<(String, String)>,
+    Vec<(String, String, crate::device_links::contacts::Contact)>,
+);
+
+thread_local! {
+    /// The contacts search looks through, and what they were built for.
+    static CONTACTS: std::cell::RefCell<ContactCache> =
+        const { std::cell::RefCell::new((None, Vec::new(), Vec::new())) };
 }
 
 pub(crate) fn current(app: &DesklinkApplication) -> Vec<Candidate> {
@@ -255,19 +269,33 @@ pub(crate) fn current(app: &DesklinkApplication) -> Vec<Candidate> {
                 .collect()
         })
         .unwrap_or_default();
-    // Paired phones' contacts, connected or not: the cache is local.
-    let contacts: Vec<_> = app
+    // Paired phones' contacts, connected or not: the cache is local. Built
+    // again only when the contacts or the phones changed, and without photos:
+    // a search runs several times per keystroke on the main loop.
+    let phones_now: Vec<(String, String)> = app
         .daemon_handle()
         .map(|daemon| daemon.devices())
         .unwrap_or_default()
         .into_iter()
         .filter(|device| device.trusted)
-        .flat_map(|device| {
-            crate::device_links::contacts::list(&device.id)
-                .into_iter()
-                .map(move |contact| (device.id.clone(), device.name.clone(), contact))
-        })
+        .map(|device| (device.id, device.name))
         .collect();
+    let generation = crate::device_links::contacts::generation();
+    let contacts = CONTACTS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.0 != Some(generation) || cache.1 != phones_now {
+            let list: Vec<_> = phones_now
+                .iter()
+                .flat_map(|(id, name)| {
+                    crate::device_links::contacts::list_for_search(id)
+                        .into_iter()
+                        .map(move |contact| (id.clone(), name.clone(), contact))
+                })
+                .collect();
+            *cache = (Some(generation), phones_now.clone(), list);
+        }
+        cache.2.clone()
+    });
     candidates(&Sources {
         terminals: &terminals,
         transfers: &transfers,
@@ -297,18 +325,13 @@ pub(crate) fn activate(app: &DesklinkApplication, id: &str) {
     let Some((kind, rest)) = id.split_once(':') else {
         return;
     };
-    // The user typed the number and chose Call: no second question.
+    // Asked first, in the window, like every dial: the search provider is on
+    // the session bus, where any process can call ActivateResult.
     if kind == "dial" {
-        if let (Some(_), Some((device, number)), Some(daemon)) = (
-            dial_from_id(&callers(app), id),
-            rest.split_once(':'),
-            app.daemon_handle(),
-        ) {
-            daemon.send(DaemonCommand::Telephony(
-                device.to_string(),
-                "dial".to_string(),
-                Some(number.to_string()),
-            ));
+        if let (Some(_), Some((device, number))) =
+            (dial_from_id(&callers(app), id), rest.split_once(':'))
+        {
+            app.dial_with(number, device);
         }
         return;
     }
@@ -591,5 +614,23 @@ mod tests {
         assert!(INI.contains("BusName=derx06.desklink.com"));
         assert!(INI.contains(&format!("ObjectPath={PATH}")));
         assert!(INI.contains("Version=2"));
+    }
+
+    /// One typed character matches nearly everything: it answers nothing.
+    #[test]
+    fn a_one_character_search_answers_nothing() {
+        let all = vec![Candidate::new(
+            "ring:p".into(),
+            "Ring Pixel".into(),
+            "Find your phone".into(),
+            "audio-volume-high-symbolic",
+            "ring find phone",
+        )];
+        assert!(matching(&all, &["r".to_string()]).is_empty());
+        assert_eq!(
+            matching(&all, &["ri".to_string()]),
+            vec!["ring:p".to_string()]
+        );
+        assert!(matching(&all, &["r".to_string(), " ".to_string()]).is_empty());
     }
 }

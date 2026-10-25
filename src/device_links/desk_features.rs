@@ -470,7 +470,10 @@ pub(crate) fn parse_settings_request(
         .iter()
         .filter_map(|(key, value)| Some((key.clone(), value.as_bool()?)))
         .filter(|(key, _)| match key.as_str() {
-            "keepAwake" | "clipboard" | "notifications" | "commandAlerts" => true,
+            // Not `keepAwake`: it holds the laptop awake with the lid closed,
+            // so only the person at this desk turns it on (a phone that asks
+            // was a flat battery and a hot bag).
+            "clipboard" | "notifications" | "commandAlerts" => true,
             "relay" => relay_configured,
             _ => false,
         })
@@ -507,7 +510,6 @@ fn real_changes(
 /// Applies `change` to `settings` for `device_id`.
 fn apply_change(settings: &mut AppSettings, device_id: &str, key: &str, value: bool) {
     match key {
-        "keepAwake" => settings.stay_awake = value,
         "clipboard" => settings.clipboard_sync = value,
         "notifications" => {
             if value {
@@ -628,7 +630,11 @@ fn device_conditions(device: Option<&DeviceView>) -> Conditions {
     Conditions {
         allowed: false,
         locked: false,
-        local: device.is_some_and(|device| device.connection_path.as_deref() == Some("lan")),
+        // "lan" is only the route type (host/prflx pair): a global IPv6 path or a
+        // VPN-routed subnet is one too. An unlock needs the phone to be near.
+        local: device.is_some_and(|device| {
+            device.connection_path.as_deref() == Some("lan") && device.connection_nearby
+        }),
         ready: device.is_some_and(|device| {
             device.status == DeviceStatus::Paired && device.feature_transport_ready
         }),
@@ -927,10 +933,9 @@ mod tests {
             vec![
                 ("clipboard".to_string(), false),
                 ("commandAlerts".to_string(), true),
-                ("keepAwake".to_string(), true),
                 ("notifications".to_string(), false),
             ],
-            "unlockNearby, unknown keys and relay without a server are ignored"
+            "keepAwake, unlockNearby, unknown keys and relay without a server are ignored"
         );
         let with_relay = parse_settings_request(&packet, true);
         assert!(with_relay.contains(&("relay".to_string(), true)));
@@ -940,7 +945,8 @@ mod tests {
         for (key, value) in with_relay {
             apply_change(&mut settings, "phone", &key, value);
         }
-        assert!(settings.stay_awake && !settings.clipboard_sync);
+        assert!(!settings.stay_awake, "a phone cannot turn keep-awake on");
+        assert!(!settings.clipboard_sync);
         assert!(!settings.shows_notifications("phone"));
         assert!(!settings.unlocks_from("phone"), "never from the phone");
     }
@@ -983,6 +989,7 @@ mod tests {
         device.status = DeviceStatus::Paired;
         device.feature_transport_ready = true;
         device.connection_path = Some("lan".into());
+        device.connection_nearby = true;
         assert!(
             !could_unlock(&device, &settings),
             "allowed for another phone only"
@@ -996,14 +1003,11 @@ mod tests {
         let settings = AppSettings::default();
         let changes = vec![
             ("clipboard".to_string(), settings.clipboard_sync),
-            ("keepAwake".to_string(), !settings.stay_awake),
             ("notifications".to_string(), true),
             ("commandAlerts".to_string(), true),
+            ("relay".to_string(), settings.relay_enabled),
         ];
-        assert_eq!(
-            real_changes(&settings, "phone", changes),
-            vec![("keepAwake".to_string(), !settings.stay_awake)]
-        );
+        assert!(real_changes(&settings, "phone", changes).is_empty());
     }
 
     #[test]

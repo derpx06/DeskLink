@@ -400,13 +400,40 @@ fn watch_owner_changes() {
 }
 
 /// RGBA pixels (tightly packed) from a PNG or JPEG, for `arboard`.
+/// How much of a picture is fed to the loader before its size is checked: far
+/// more than any PNG or JPEG header, far less than a bomb's pixel data.
+const HEADER_BYTES: usize = 64 * 1024;
+
 fn image_to_rgba(image: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
     use gtk::gdk_pixbuf::prelude::*;
     let format = if is_png(image) { "png" } else { "jpeg" };
     let loader = gtk::gdk_pixbuf::PixbufLoader::with_type(format).ok()?;
+    // The size is known as soon as the header is read: a picture claiming
+    // more than a screenful is refused before its pixels are allocated.
+    let too_big = std::rc::Rc::new(std::cell::Cell::new(false));
+    let flag = std::rc::Rc::clone(&too_big);
+    loader.connect_size_prepared(move |_, width, height| {
+        if !crate::image_limits::within_bounds(
+            i64::from(width),
+            i64::from(height),
+            crate::image_limits::MAX_CLIPBOARD_PIXELS,
+        ) {
+            flag.set(true);
+        }
+    });
     let png = image;
-    loader.write(png).ok()?;
+    // The loader reads the header first; stop at it when it is too big.
+    let header = &png[..png.len().min(HEADER_BYTES)];
+    let _ = loader.write(header);
+    if too_big.get() {
+        let _ = loader.close();
+        return None;
+    }
+    loader.write(&png[header.len()..]).ok()?;
     loader.close().ok()?;
+    if too_big.get() {
+        return None;
+    }
     let pixbuf = loader.pixbuf()?.add_alpha(false, 0, 0, 0).ok()?;
     let (width, height) = (pixbuf.width() as usize, pixbuf.height() as usize);
     let stride = pixbuf.rowstride() as usize;
@@ -521,10 +548,10 @@ fn copied_image(clipboard: &mut arboard::Clipboard) -> Option<std::path::PathBuf
         .join("desklink")
         .join("clipboard")
         .join(uuid::Uuid::new_v4().simple().to_string());
-    std::fs::create_dir_all(&dir).ok()?;
+    crate::device_links::private_fs::create_dir_all(&dir).ok()?;
     let path = dir.join("clipboard.png");
     debug_log!("[Clipboard] Image copied here: {} bytes of PNG", png.len());
-    std::fs::write(&path, png).ok()?;
+    crate::device_links::private_fs::write(&path, &png).ok()?;
     Some(path)
 }
 

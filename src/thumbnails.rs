@@ -273,7 +273,7 @@ fn make(key: String, path: &Path, kind: FileKind) -> Reply {
             .unwrap_or_else(|_| Err("The preview took too long".into())),
         Err(error) => Err(error.to_string()),
     };
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = crate::device_links::private_fs::create_dir_all(&dir);
     match result {
         Ok((bytes, width, height, stride, alpha, length)) => {
             let pixbuf = Pixbuf::from_bytes(
@@ -481,6 +481,10 @@ fn write_freedesktop(cache: &Path, path: &Path, mtime: &str, pixbuf: &Pixbuf) {
 
 /// An image scaled to fit [`SIZE`], the right way up.
 fn image(path: &Path) -> Result<Pixbuf, String> {
+    // The header says the size: a decompression bomb is refused, not decoded.
+    if !crate::image_limits::file_within_bounds(path, crate::image_limits::MAX_DECODE_PIXELS) {
+        return Err("The picture is too large to preview".to_string());
+    }
     let pixbuf =
         Pixbuf::from_file_at_scale(path, SIZE, SIZE, true).map_err(|error| error.to_string())?;
     Ok(pixbuf.apply_embedded_orientation().unwrap_or(pixbuf))

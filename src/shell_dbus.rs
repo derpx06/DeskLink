@@ -552,7 +552,20 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
                     if method == "Hello" {
                         let (_, capabilities) =
                             params.get::<(u32, Vec<String>)>().unwrap_or_default();
-                        client_said_hello(&connection, sender.unwrap_or_default(), capabilities);
+                        let sender = sender.unwrap_or_default();
+                        // Only the Shell itself (the extension runs inside it)
+                        // may say it shows the alerts: anyone else claiming so
+                        // would mute DeskLink's own call and notification alerts.
+                        if hello_is_from_the_shell(&connection, sender) {
+                            client_said_hello(&connection, sender, vetted(capabilities));
+                        } else {
+                            static TOLD: std::sync::Once = std::sync::Once::new();
+                            TOLD.call_once(|| {
+                                eprintln!(
+                                    "[Shell] Ignored a Hello from a client that is not GNOME Shell"
+                                );
+                            });
+                        }
                         return invocation.return_value(None);
                     }
                     match call(&app, method, &params) {
@@ -983,6 +996,44 @@ thread_local! {
     static CLIENT: RefCell<Option<Client>> = const { RefCell::new(None) };
 }
 
+/// What a top-bar client may say it handles.
+const KNOWN_CAPABILITIES: [&str; 3] = ["notifications", "quick-settings", "calls"];
+
+/// Only what DeskLink knows, at most once each.
+fn vetted(capabilities: Vec<String>) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for capability in capabilities {
+        if KNOWN_CAPABILITIES.contains(&capability.as_str()) && !kept.contains(&capability) {
+            kept.push(capability);
+        }
+    }
+    kept
+}
+
+/// Whether `sender` (a unique bus name) is the owner of `org.gnome.Shell`.
+fn is_the_shell(sender: &str, shell_owner: Option<&str>) -> bool {
+    !sender.is_empty() && shell_owner == Some(sender)
+}
+
+fn hello_is_from_the_shell(connection: &gio::DBusConnection, sender: &str) -> bool {
+    let owner = connection
+        .call_sync(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "GetNameOwner",
+            Some(&("org.gnome.Shell",).to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            500,
+            gio::Cancellable::NONE,
+        )
+        .ok()
+        .and_then(|reply| reply.get::<(String,)>())
+        .map(|(owner,)| owner);
+    is_the_shell(sender, owner.as_deref())
+}
+
 /// A top-bar client (the extension, on enable) says what it handles. Kept
 /// until its bus name goes away (Shell restart, extension disabled).
 fn client_said_hello(connection: &gio::DBusConnection, sender: &str, capabilities: Vec<String>) {
@@ -1059,7 +1110,9 @@ const EXTENSION_FILES: [(&str, &str); 6] = [
 
 /// Whether this desktop can show the top-bar menu at all.
 pub fn extension_possible() -> bool {
-    is_gnome(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
+    // A Flatpak cannot install into the host's shell: no offer, no failure.
+    !crate::device_links::pty::host::in_flatpak()
+        && is_gnome(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
         && gio::SettingsSchemaSource::default()
             .and_then(|source| source.lookup("org.gnome.shell", true))
             .is_some()
@@ -1090,8 +1143,11 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 12] = [
-    // The current build (W4: the Files row, Settings in its comments).
+const KNOWN_BUILDS: [&str; 13] = [
+    // The current build (w7c: no images decoded in the shell, follow-up
+    // messages announced, the reply dialog destroyed, accent fallback).
+    "73de6db35cf56eba8b413c3cca78d2a7389efdb1f3653f5178a02b67d8864607",
+    // W4: the Files row, Settings in its comments.
     "6a907b946c22e452a0853b683a98bef425482d0fe38181d4dce255e4cb7fc8da",
     // The Bucket's sync progress row.
     "01fee36c261108ac481f15db17de0b7c860e79ba8e77d8a932540e07952a7f8a",
@@ -1386,6 +1442,7 @@ fn offer_extension(app: &DesklinkApplication) {
     glib::timeout_add_seconds_local_once(10, move || {
         let Some(app) = weak.upgrade() else { return };
         let wanted = !app.is_remote()
+            && !crate::device_links::pty::host::in_flatpak()
             && is_gnome(&std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default())
             && !crate::device_links::config::app_settings().shell_extension_prompt_dismissed
             && !app.tray_hosted();
@@ -1501,6 +1558,7 @@ mod tests {
         device.status = DeviceStatus::Paired;
         device.feature_transport_ready = true;
         device.connection_path = Some("lan".into());
+        device.connection_nearby = true;
         device.desktop_session = DesktopSession::Controlling;
         device.terminal_sessions_attached = 2;
         device.battery_status = Some(BatteryStatus {
@@ -1629,6 +1687,7 @@ mod tests {
         device.status = DeviceStatus::Paired;
         device.feature_transport_ready = true;
         device.connection_path = Some("lan".into());
+        device.connection_nearby = true;
         assert!(actions(&device, &on()).contains(&"unlock-via-phone"));
         assert!(
             !actions(&device, &AppSettings::default()).contains(&"unlock-via-phone"),
@@ -1743,5 +1802,22 @@ mod tests {
         assert!(is_gnome("ubuntu:GNOME"));
         assert!(!is_gnome("KDE"));
         assert!(!is_gnome(""));
+    }
+
+    /// Only the Shell may say it shows DeskLink's alerts (so nobody else on the
+    /// bus can mute them), and only for capabilities DeskLink knows.
+    #[test]
+    fn only_the_shell_may_say_hello_and_only_for_known_capabilities() {
+        assert!(is_the_shell(":1.42", Some(":1.42")));
+        assert!(!is_the_shell(":1.99", Some(":1.42")), "another client");
+        assert!(!is_the_shell(":1.42", None), "no shell on the bus");
+        assert!(!is_the_shell("", Some("")));
+        let said = vec![
+            "notifications".to_string(),
+            "calls".to_string(),
+            "calls".to_string(),
+            "mute-everything".to_string(),
+        ];
+        assert_eq!(vetted(said), ["notifications", "calls"]);
     }
 }

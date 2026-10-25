@@ -270,6 +270,9 @@ enum Live {
     Summary {
         device: String,
         idle: String,
+        /// The idle words again, for a text that ages ("2 min ago"): the
+        /// page is not rebuilt for it.
+        idle_now: Option<std::rc::Rc<dyn Fn() -> String>>,
         line: glib::WeakRef<gtk::Label>,
         bar: glib::WeakRef<gtk::ProgressBar>,
         speed: Option<glib::WeakRef<gtk::Label>>,
@@ -349,6 +352,7 @@ fn update_live(live: &Live) -> bool {
         Live::Summary {
             device,
             idle,
+            idle_now,
             line,
             bar,
             speed,
@@ -377,7 +381,10 @@ fn update_live(live: &Live) -> bool {
                     }
                 }
                 None => {
-                    set_text(&line, idle);
+                    match idle_now {
+                        Some(now) => set_text(&line, &now()),
+                        None => set_text(&line, idle),
+                    }
                     bar.set_visible(false);
                     if let Some(speed) = speed {
                         speed.set_visible(false);
@@ -419,13 +426,12 @@ pub(super) fn update(win: &DesklinkWindow, device: &DeviceView) {
         }
     });
     let key = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}",
         current(),
         folders::generation(),
         device.id,
         device.name,
         device.feature_transport_ready,
-        super::clock_time(glib::DateTime::now_local().ok())
     );
     if !win.page_changed("bucket", key) {
         return;
@@ -951,6 +957,7 @@ fn header(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> gtk::Bo
             .build(),
     );
     let mut parts = Vec::new();
+    let mut ages = false;
     if connected {
         match &view.phase {
             Phase::Syncing(count) => parts.push(format!(
@@ -960,7 +967,7 @@ fn header(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> gtk::Bo
             Phase::Scanning => parts.push("Checking…".into()),
             _ => {
                 parts.push("Up to date".to_string());
-                parts.extend(synced_words(view.last_sync));
+                ages = true;
             }
         }
     } else {
@@ -969,8 +976,22 @@ fn header(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> gtk::Bo
             device.name
         ));
     }
-    parts.push(crate::bucket_progress::size_words(view.bytes).to_string());
-    let idle = parts.join(" · ");
+    let size = crate::bucket_progress::size_words(view.bytes).to_string();
+    // "Last synced 2 min ago" changes by itself: worked out again on each
+    // tick, so the page is not rebuilt (and its menus closed) every minute.
+    let last_sync = view.last_sync;
+    let idle_now: std::rc::Rc<dyn Fn() -> String> = {
+        let (parts, size) = (parts.clone(), size.clone());
+        std::rc::Rc::new(move || {
+            let mut words = parts.clone();
+            if ages {
+                words.extend(synced_words(last_sync));
+            }
+            words.push(size.clone());
+            words.join(" · ")
+        })
+    };
+    let idle = idle_now();
     let line = text(&idle, &["caption", "text-dim", "numeric"]);
     line.set_wrap(true);
     state.append(&line);
@@ -987,6 +1008,7 @@ fn header(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> gtk::Bo
     watch(Live::Summary {
         device: device.id.clone(),
         idle,
+        idle_now: Some(idle_now),
         line: line.downgrade(),
         bar: bar.downgrade(),
         speed: Some(speed.downgrade()),
@@ -1099,18 +1121,22 @@ fn more_menu(view: &PairView, device: &DeviceView) -> gtk::MenuButton {
     let popover = gtk::Popover::builder().child(&menu).build();
     let open_files = menu_item("Open in Files");
     {
-        let (root, pop) = (view.pair.root.clone(), popover.clone());
+        let (root, pop) = (view.pair.root.clone(), popover.downgrade());
         open_files.connect_clicked(move |button| {
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
             launch(button, &root);
         });
     }
     menu.append(&open_files);
     let add_folder = menu_item("Add Folder…");
     {
-        let (id, pop) = (device.id.clone(), popover.clone());
+        let (id, pop) = (device.id.clone(), popover.downgrade());
         add_folder.connect_clicked(move |button| {
-            pop.popdown();
+            if let Some(pop) = pop.upgrade() {
+                pop.popdown();
+            }
             choose_folder(button, &id);
         });
     }
@@ -1122,9 +1148,11 @@ fn more_menu(view: &PairView, device: &DeviceView) -> gtk::MenuButton {
         device.name.clone(),
         view.pair.root.clone(),
     );
-    let pop = popover.clone();
+    let pop = popover.downgrade();
     off.connect_clicked(move |button| {
-        pop.popdown();
+        if let Some(pop) = pop.upgrade() {
+            pop.popdown();
+        }
         let id = id.clone();
         super::confirm(
             button,
@@ -1644,9 +1672,11 @@ fn item_menu(item: &Item, path: &Path, device: &DeviceView, view: &PairView) -> 
     let popover = gtk::Popover::builder().child(&menu).build();
     let add = |label: &str, run: Box<dyn Fn(&gtk::Button)>| {
         let button = menu_item(label);
-        let popover = popover.clone();
+        let popover = popover.downgrade();
         button.connect_clicked(move |button| {
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
             run(button);
         });
         menu.append(&button);
@@ -2060,6 +2090,7 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
     watch(Live::Summary {
         device: device.id.clone(),
         idle: subtitle,
+        idle_now: None,
         line: line.downgrade(),
         bar: bar.downgrade(),
         speed: None,
@@ -2260,5 +2291,58 @@ mod tests {
         rename_to(&file, "b.txt").unwrap();
         assert!(dir.join("b.txt").exists() && !file.exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The page's menus are freed with the page: a rebuilt Bucket page used
+    /// to leave every "more" popover alive (its items held it strongly).
+    /// With a display; skipped without.
+    #[test]
+    fn a_rebuilt_pages_menu_is_freed() {
+        // No display: nothing to build on, and no second GTK init to race.
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none()
+            || adw::init().is_err()
+        {
+            return;
+        }
+        use crate::device_links::folders::{Pair, PairView, Phase};
+        let view = PairView {
+            pair: Pair {
+                id: BUCKET_ID.into(),
+                name: "DeskLink Bucket".into(),
+                root: std::env::temp_dir(),
+                device: "leak-phone".into(),
+                include_hidden: false,
+                ignore: Vec::new(),
+                bucket: true,
+            },
+            phase: Phase::UpToDate,
+            files: 0,
+            last_sync: None,
+            conflicts: Vec::new(),
+            items: Vec::new(),
+            bytes: 0,
+            skipped: Vec::new(),
+        };
+        let info = crate::device_links::device_info::DeviceInfo::local(
+            "leak-phone".into(),
+            "Phone".into(),
+        );
+        let device = DeviceView::from_info(&info, "192.168.1.9".into(), true);
+        let weak: Vec<glib::WeakRef<gtk::Popover>> = (0..20)
+            .map(|_| {
+                let button = more_menu(&view, &device);
+                let popover = button.popover().and_downcast::<gtk::Popover>().unwrap();
+                popover.downgrade()
+            })
+            .collect();
+        let context = glib::MainContext::default();
+        for _ in 0..20 {
+            while context.iteration(false) {}
+        }
+        let leaked = weak
+            .iter()
+            .filter(|popover| popover.upgrade().is_some())
+            .count();
+        assert_eq!(leaked, 0, "{leaked} of 20 menus outlived their page");
     }
 }

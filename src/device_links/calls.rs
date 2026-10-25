@@ -180,9 +180,11 @@ pub(crate) fn request(
     Ok(packet)
 }
 
-/// The number in a `tel:` URI or typed text: `+`, digits, `*` and `#`, with
+/// The number in a `tel:` URI or typed text: `+` (first only) and digits, with
 /// spaces, dashes, dots and brackets dropped. `None` for anything else, or
-/// fewer than three digits.
+/// fewer than three or more than 24 digits. `*` and `#` are refused outright:
+/// the phone hands the number to its telephony stack, where `**21*number#`
+/// (call forwarding), `**04*…#` (a SIM PIN change) and `*#06#` are not calls.
 pub(crate) fn dial_number(text: &str) -> Option<String> {
     let text = text.trim();
     let text = match text.get(..4) {
@@ -196,7 +198,7 @@ pub(crate) fn dial_number(text: &str) -> Option<String> {
     let mut number = String::new();
     for (index, c) in decoded.chars().enumerate() {
         match c {
-            '0'..='9' | '*' | '#' => number.push(c),
+            '0'..='9' => number.push(c),
             '+' if index == 0 => number.push(c),
             ' ' | '-' | '.' | '(' | ')' | '\u{a0}' => {}
             _ => return None,
@@ -412,6 +414,11 @@ mod tests {
         assert_eq!(dial.get_str("action"), Some("dial"));
         assert_eq!(dial.get_str("number"), Some("+15550100"));
         assert!(request(None, "dial", Some("call me")).is_err());
+        // MMI/USSD codes are never a call, whatever carries them.
+        for mmi in ["**21*+19005551234#", "*#06#", "tel:%2A%2A04%2A1%2A2%2A2%23"] {
+            assert!(request(None, "dial", Some(mmi)).is_err(), "{mmi}");
+            assert!(request(None, "message", Some(mmi)).is_err(), "{mmi}");
+        }
         let message = request(None, "message", Some("+1 555 0100")).unwrap();
         assert_eq!(message.get_str("action"), Some("message"));
         assert_eq!(message.get_str("number"), Some("+15550100"));
@@ -428,7 +435,13 @@ mod tests {
             ("tel:7042;phone-context=example.com", Some("7042")),
             ("(030) 123.456", Some("030123456")),
             ("*#06#", None),
-            ("*31#555123", Some("*31#555123")),
+            ("*31#555123", None),
+            ("**21*+19005551234#", None),
+            ("tel:%2A%2A21%2A1900555%23", None),
+            ("tel:**04*1234*5678*5678#", None),
+            ("tel:%23%2306%23", None),
+            ("555#0100", None),
+            ("+1 555 0100", Some("+15550100")),
             ("112", Some("112")),
             ("12", None),
             ("1+2", None),

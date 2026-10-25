@@ -62,6 +62,16 @@ mod imp {
             let _ = std::thread::Builder::new()
                 .name("desklink-housekeeping".into())
                 .spawn(|| {
+                    // Older versions made these world-readable.
+                    crate::device_links::private_fs::tighten_tree(
+                        &crate::device_links::config::desklink_config_root(),
+                    );
+                    if let Some(dir) = crate::crash_dir() {
+                        crate::device_links::private_fs::tighten_tree(&dir);
+                    }
+                    crate::device_links::private_fs::tighten_tree(
+                        &gtk::glib::user_cache_dir().join("desklink"),
+                    );
                     crate::device_links::connection_log::prune();
                     crate::device_links::transfer_log::prune();
                     crate::thumbnails::prune();
@@ -264,8 +274,10 @@ impl DesklinkApplication {
         let history_action = gio::ActionEntry::builder("history")
             .activate(move |app: &Self, _, _| app.show_history())
             .build();
-        // (device, action, number): a call button in a notification — the
-        // user's own tap, so it goes straight to the phone.
+        // (device, action, number): a call button in a notification. Answer,
+        // decline, end and the like go straight to the phone; a *dial* never
+        // does: anything on the session bus can activate this action, so
+        // starting a call is asked first, in the window, like every other dial.
         let call_action = gio::ActionEntry::builder("call")
             .parameter_type(Some(glib::VariantTy::new("(sss)").expect("valid type")))
             .activate(move |app: &Self, _, target| {
@@ -274,6 +286,10 @@ impl DesklinkApplication {
                 else {
                     return;
                 };
+                if action == "dial" {
+                    app.dial_with(&number, &device);
+                    return;
+                }
                 if let Some(daemon) = app.daemon_handle() {
                     daemon.send(crate::device_links::daemon::DaemonCommand::Telephony(
                         device,
@@ -308,6 +324,13 @@ impl DesklinkApplication {
             call_action,
             dial_action,
         ]);
+    }
+
+    /// Like [`Self::dial`], with the phone that must place the call.
+    pub(crate) fn dial_with(&self, number: &str, phone: &str) {
+        let window = self.main_window();
+        window.present();
+        crate::window::confirm_dial(&window, number, Some(phone));
     }
 
     /// Shows the window and asks before calling `number` with the phone.
@@ -940,7 +963,7 @@ fn take_unreported_crash(dir: &std::path::Path) -> bool {
         .ok();
     let newest = entries
         .flatten()
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("crash-1"))
+        .filter(|entry| crate::is_crash_report(&entry.file_name().to_string_lossy()))
         .filter_map(|entry| entry.metadata().ok()?.modified().ok())
         .max();
     let Some(newest) = newest else {

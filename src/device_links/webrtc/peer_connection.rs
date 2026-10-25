@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use gst::prelude::*;
 use gst_webrtc::{
@@ -563,31 +564,57 @@ impl DesktopWebRtcPeer {
         }
     }
 
-    /// How the selected ICE pair reaches the peer, per [`path_label`], and
-    /// its current round-trip time in milliseconds when known.
+    /// How the selected ICE pair reaches the peer, per [`path_label`], its
+    /// current round-trip time in milliseconds when known, and whether the
+    /// pair is on the local network proper (see [`lan_scope`]).
     /// `via_relay` is whether the bootstrap link is the relay.
     /// `None` until a pair is selected.
-    pub fn path(&self, via_relay: bool) -> Option<(&'static str, Option<u32>)> {
-        let (types, rtt) = self.selected_pair_types()?;
+    pub fn path(&self, via_relay: bool) -> Option<PathReading> {
+        let pair = self.selected_pair()?;
+        let types = &pair.types;
         // Until both candidates are resolved the path is unknown, not
         // "direct": guessing showed "over the internet" for a moment on
         // every LAN connect.
         if types.len() != 2 || types.iter().any(String::is_empty) {
             return None;
         }
-        Some((path_label(&types, via_relay), rtt))
+        let label = path_label(types, via_relay);
+        let nearby = label == "lan"
+            && match (pair.local_ip, pair.remote_ip) {
+                (Some(local), Some(remote)) => crate::device_links::lan_scope::is_nearby(
+                    local,
+                    remote,
+                    &crate::device_links::lan_scope::local_interfaces(),
+                ),
+                _ => false,
+            };
+        Some(PathReading {
+            label,
+            rtt: pair.rtt,
+            nearby,
+        })
     }
 
     /// The selected pair's two candidate types as webrtcbin spells them, and
     /// its round-trip time in milliseconds when known.
     pub fn selected_pair_types(&self) -> Option<(Vec<String>, Option<u32>)> {
-        let promise = gst::Promise::new();
-        self.webrtcbin
-            .emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
-        if promise.wait() != gst::PromiseResult::Replied {
+        self.selected_pair().map(|pair| (pair.types, pair.rtt))
+    }
+
+    /// Reads webrtcbin's stats, waiting at most [`STATS_WAIT`]: a peer that is
+    /// closing, or an ICE agent that never answers, must not hold the thread
+    /// that reads every device's path.
+    pub fn selected_pair(&self) -> Option<SelectedPair> {
+        if self.closed.load(Ordering::Acquire) {
             return None;
         }
-        let reply = promise.get_reply()?;
+        let (sender, receiver) = mpsc::channel();
+        let promise = gst::Promise::with_change_func(move |reply| {
+            let _ = sender.send(reply.ok().flatten().map(|stats| stats.to_owned()));
+        });
+        self.webrtcbin
+            .emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+        let reply = receiver.recv_timeout(STATS_WAIT).ok().flatten()?;
         let stats: Vec<gst::Structure> = reply
             .iter()
             .filter_map(|(_, value)| value.get::<gst::Structure>().ok())
@@ -602,17 +629,33 @@ impl DesktopWebRtcPeer {
             .iter()
             .find_map(|entry| field(entry, "selected-candidate-pair-id"))?;
         let pair = by_id(&pair_id)?;
-        let types: Vec<String> = ["local-candidate-id", "remote-candidate-id"]
+        let candidates: Vec<&gst::Structure> = ["local-candidate-id", "remote-candidate-id"]
             .iter()
             .filter_map(|key| field(pair, key))
-            .filter_map(|id| by_id(&id).and_then(|candidate| field(candidate, "candidate-type")))
+            .filter_map(|id| by_id(&id))
             .collect();
+        let types: Vec<String> = candidates
+            .iter()
+            .filter_map(|candidate| field(candidate, "candidate-type"))
+            .collect();
+        let address = |candidate: Option<&&gst::Structure>| {
+            candidate
+                .and_then(|candidate| {
+                    field(candidate, "address").or_else(|| field(candidate, "ip"))
+                })
+                .and_then(|text| crate::device_links::lan_scope::parse_candidate_ip(&text))
+        };
         let rtt = pair
             .get::<f64>("current-round-trip-time")
             .ok()
             .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
             .map(|seconds| (seconds * 1000.0).round().max(1.0) as u32);
-        Some((types, rtt))
+        Some(SelectedPair {
+            local_ip: address(candidates.first()),
+            remote_ip: address(candidates.get(1)),
+            types,
+            rtt,
+        })
     }
 
     /// Bytes already queued on `channel` and not yet handed to the network.
@@ -1613,6 +1656,27 @@ fn local_description_promise_field(
     }
 }
 
+/// How long a stats request may take before the reading is given up.
+const STATS_WAIT: Duration = Duration::from_secs(2);
+
+/// What the selected ICE pair says about the connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedPair {
+    pub types: Vec<String>,
+    pub rtt: Option<u32>,
+    pub local_ip: Option<std::net::IpAddr>,
+    pub remote_ip: Option<std::net::IpAddr>,
+}
+
+/// The path of the selected pair: its label (shared with the phone), its
+/// round-trip time, and whether it is the local network proper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PathReading {
+    pub label: &'static str,
+    pub rtt: Option<u32>,
+    pub nearby: bool,
+}
+
 /// A candidate type in its short spelling: webrtcbin's stats say
 /// "peer-reflexive", "server-reflexive" and "relayed", libwebrtc's SDP
 /// "prflx", "srflx" and "relay" (contract B5).
@@ -1695,7 +1759,7 @@ pub(crate) mod tests {
             "[test] candidate types: {:?}",
             pair.offerer.selected_pair_types()
         );
-        assert_eq!(path.map(|(label, _)| label), Some("lan"));
+        assert_eq!(path.map(|path| path.label), Some("lan"));
         pair.offerer.close();
         pair.answerer.close();
     }

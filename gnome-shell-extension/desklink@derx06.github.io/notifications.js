@@ -9,6 +9,7 @@
 
 import Clutter from 'gi://Clutter';
 import St from 'gi://St';
+import GLib from 'gi://GLib';
 
 import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -35,6 +36,11 @@ export class PhoneNotifications {
         // Closed here (dismissed, or acted on) while the phone still lists
         // it: not shown again unless its content changes.
         this._closed = new Map();
+        // When each conversation last raised a banner, and every recent one.
+        this._banners = new Map();
+        this._recent = [];
+        // Reply dialogs open now (destroyed when closed, and on disable).
+        this._dialogs = new Set();
     }
 
     /// Shows `entries` (the `Notifications` property). `quiet`: nothing new
@@ -52,7 +58,9 @@ export class PhoneNotifications {
             this._closed.delete(id);
             if (known)
                 this._withdraw(id);
-            this._show(id, entry, quiet || entry.silent || !!known);
+            // An update to a conversation (the same id, a new message) is
+            // announced like a new one, but never a flood of banners.
+            this._show(id, entry, quiet || entry.silent || !this._mayBanner(id));
         }
         for (const id of [...this._shown.keys()]) {
             if (!wanted.has(id))
@@ -64,7 +72,23 @@ export class PhoneNotifications {
         }
     }
 
+    /// Whether `id` may raise a banner now: not within a few seconds of its
+    /// last one, and not more than a handful in any ten seconds.
+    _mayBanner(id) {
+        const now = GLib.get_monotonic_time() / 1000;
+        const last = this._banners.get(id) ?? -Infinity;
+        this._recent = this._recent.filter(at => now - at < 10000);
+        if (now - last < 4000 || this._recent.length >= 5)
+            return false;
+        this._banners.set(id, now);
+        this._recent.push(now);
+        return true;
+    }
+
     destroy() {
+        for (const dialog of [...this._dialogs])
+            dialog.destroy();
+        this._dialogs.clear();
         for (const id of [...this._shown.keys()])
             this._withdraw(id);
         for (const source of this._sources.values())
@@ -149,6 +173,11 @@ export class PhoneNotifications {
 
     _reply(entry) {
         const dialog = new ModalDialog.ModalDialog({styleClass: 'desklink-reply-dialog'});
+        this._dialogs.add(dialog);
+        dialog.connect('closed', () => {
+            this._dialogs.delete(dialog);
+            dialog.destroy();
+        });
         const heading = new St.Label({
             text: `Reply to ${entry.title || entry.app}`,
             style_class: 'desklink-reply-heading',

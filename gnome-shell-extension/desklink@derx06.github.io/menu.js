@@ -20,7 +20,6 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 const MINT = [0x2f / 255, 0xbf / 255, 0x8f / 255];
 const CORAL = [0xe5 / 255, 0x53 / 255, 0x3d / 255];
 const ROUTE = {lan: 'Wi-Fi', direct: 'Internet', turn: 'Relay', relay: 'Relay'};
-const IMAGE = /\.(png|jpe?g|gif|webp|bmp|svg|avif|heic)$/i;
 
 export function lastSeen(device) {
     if (!device.lastSeen)
@@ -234,13 +233,17 @@ function tile(icon, text, {name = text, checked = null, enabled = true, variant 
     return button;
 }
 
-/// A file's picture: the image itself, else its type's icon.
+/// A file's icon: its type's symbolic icon, never the file itself. A file
+/// from a phone is not trusted to be decoded inside the shell (a decoder
+/// crash would end the whole session), and a stat of its path on a hung
+/// network folder would freeze the desktop.
 function fileIcon(file) {
-    const path = file.id;
-    if (IMAGE.test(file.name) && GLib.file_test(path, GLib.FileTest.EXISTS))
-        return Gio.FileIcon.new(Gio.File.new_for_path(path));
-    const [type] = Gio.content_type_guess(file.name, null);
-    return Gio.content_type_get_symbolic_icon(type);
+    try {
+        const [type] = Gio.content_type_guess(file.name, null);
+        return Gio.content_type_get_symbolic_icon(type);
+    } catch (error) {
+        return new Gio.ThemedIcon({name: 'text-x-generic-symbolic'});
+    }
 }
 
 /// Builds the menu. `ctx`: devices, selected, desk, transfers,

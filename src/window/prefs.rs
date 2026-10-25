@@ -1416,7 +1416,10 @@ mod tests {
     /// (Skipped without a display.)
     #[test]
     fn escaped_row_text_reads_as_typed() {
-        if adw::init().is_err() {
+        // No display: nothing to build on, and no second GTK init to race.
+        if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none()
+            || adw::init().is_err()
+        {
             return;
         }
         let name = "a&b<c>.txt";

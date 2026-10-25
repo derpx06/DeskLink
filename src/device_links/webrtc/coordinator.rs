@@ -2848,6 +2848,8 @@ fn spawn_event_worker(
 /// live one (the replaced worker skips it, see `PeerWorkerGuard`).
 fn reset_device_webrtc_state(device_id: &str) {
     stop_desktop_portal_session(device_id, None);
+    // What the phone proved to the session password belonged to this peer.
+    crate::device_links::session_lock::forget_unlock(device_id);
     // A lost or replaced peer ends every sound session (the phone asks
     // again on its next link).
     super::audio_session::end_all(device_id);
@@ -3708,7 +3710,7 @@ fn handle_peer_envelope(
             }
             if let Err(reason) = crate::device_links::session_lock::check(
                 &wire.peer_device_id,
-                wire.generation,
+                wire.session_id,
                 message.password.as_deref(),
             ) {
                 return deny_view(
@@ -3787,7 +3789,7 @@ fn handle_peer_envelope(
             // GTK main loop takes that lock too.
             let unlocked = crate::device_links::session_lock::check(
                 &wire.peer_device_id,
-                wire.generation,
+                wire.session_id,
                 message.password.as_deref(),
             );
             let response = {

@@ -12,6 +12,9 @@ pub(crate) fn show_dialog(
     types: &std::collections::HashMap<String, String>,
     only: Option<&str>,
 ) {
+    let clamp = adw::Clamp::builder().build();
+    let shown = std::rc::Rc::new(std::cell::Cell::new(PAGE));
+    fill(&clamp, types, only, &shown);
     let dialog = adw::Dialog::builder()
         .title("Connection History")
         .content_width(520)
@@ -19,15 +22,45 @@ pub(crate) fn show_dialog(
         .child(&crate::application::with_header(
             &gtk::ScrolledWindow::builder()
                 .hscrollbar_policy(gtk::PolicyType::Never)
-                .child(
-                    &adw::Clamp::builder()
-                        .child(&history_content(types, only, usize::MAX))
-                        .build(),
-                )
+                .child(&clamp)
                 .build(),
         ))
         .build();
     dialog.present(Some(parent));
+}
+
+/// Entries listed at first, and added by each "Show Older": the log keeps 30
+/// days, and a flapping phone makes thousands, each a widget row.
+const PAGE: usize = 200;
+
+/// Lists the newest `shown` entries in `clamp`; "Show Older" lists
+/// [`PAGE`] more.
+fn fill(
+    clamp: &adw::Clamp,
+    types: &std::collections::HashMap<String, String>,
+    only: Option<&str>,
+    shown: &std::rc::Rc<std::cell::Cell<usize>>,
+) {
+    let on_more: std::rc::Rc<dyn Fn()> = {
+        let (clamp, types, only, shown) = (
+            clamp.downgrade(),
+            types.clone(),
+            only.map(str::to_string),
+            std::rc::Rc::clone(shown),
+        );
+        std::rc::Rc::new(move || {
+            if let Some(clamp) = clamp.upgrade() {
+                shown.set(shown.get() + PAGE);
+                fill(&clamp, &types, only.as_deref(), &shown);
+            }
+        })
+    };
+    clamp.set_child(Some(&history_content(
+        types,
+        only,
+        shown.get(),
+        Some(on_more),
+    )));
 }
 
 /// Connection history grouped by day, newest first, with a time for each:
@@ -37,6 +70,7 @@ pub(crate) fn history_content(
     types: &std::collections::HashMap<String, String>,
     only: Option<&str>,
     limit: usize,
+    on_more: Option<std::rc::Rc<dyn Fn()>>,
 ) -> gtk::Widget {
     use crate::device_links::connection_log;
     let entries: Vec<_> = connection_log::recent()
@@ -140,14 +174,15 @@ pub(crate) fn history_content(
         }
     }
     if older > 0 {
-        page.append(
-            &gtk::Button::builder()
-                .label(format!("Show Older ({older} more)"))
-                .halign(gtk::Align::Center)
-                .action_name("win.history-more")
-                .css_classes(["soft-button"])
-                .build(),
-        );
+        let more = gtk::Button::builder()
+            .label(format!("Show Older ({older} more)"))
+            .halign(gtk::Align::Center)
+            .css_classes(["soft-button"])
+            .build();
+        if let Some(on_more) = on_more {
+            more.connect_clicked(move |_| on_more());
+        }
+        page.append(&more);
     }
     page.upcast()
 }
@@ -236,5 +271,13 @@ mod tests {
         assert_eq!(time_label(&now, &now), "Just now");
         assert_eq!(time_label(&now, &at(2026, 10, 20, 12, 30)), "2 h ago");
         assert_eq!(time_label(&now, &at(2026, 10, 20, 8, 5)), "08:05");
+    }
+}
+
+#[cfg(test)]
+mod page_tests {
+    #[test]
+    fn history_lists_two_hundred_at_a_time() {
+        assert_eq!(super::PAGE, 200);
     }
 }

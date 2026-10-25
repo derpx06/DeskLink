@@ -855,7 +855,7 @@ pub(crate) fn process_envelope(
             if control.action != TerminalAction::Detach {
                 if let Err(reason) = crate::device_links::session_lock::check(
                     &wire.peer_device_id,
-                    wire.generation,
+                    wire.session_id,
                     control.password.as_deref(),
                 ) {
                     return with_open_bridge(wire, |bridge| {
@@ -884,7 +884,7 @@ pub(crate) fn process_envelope(
             if !terminal_access_allowed(&wire.peer_device_id)
                 || !crate::device_links::session_lock::is_unlocked(
                     &wire.peer_device_id,
-                    wire.generation,
+                    wire.session_id,
                 )
             {
                 return Ok(());
@@ -965,7 +965,7 @@ pub(crate) fn announce_finished(terminal_id: &str, job: &str, secs: u64) {
         let device = bridge.device();
         if !settings.alerts_commands_to(device)
             || !terminal_access_allowed(device)
-            || !crate::device_links::session_lock::is_unlocked(device, bridge.wire.generation)
+            || !crate::device_links::session_lock::is_unlocked(device, bridge.wire.session_id)
         {
             continue;
         }
@@ -2478,11 +2478,21 @@ mod tests {
         let wire = wire(&phone);
         let token = begin(&wire);
         assert_eq!(pump_is_idle(&phone, token), Some(true));
-        // Nothing wakes it: the wait lasts the whole timeout.
-        let seen = wake_generation();
-        let started = Instant::now();
-        wait_for_work(seen, Duration::from_millis(150));
-        assert!(started.elapsed() >= Duration::from_millis(140));
+        // Nothing wakes it: the wait lasts the whole timeout. (Other tests
+        // touch bridges at the same time and wake every sleeper: one quiet
+        // wait in a few tries is the proof.)
+        let mut seen = wake_generation();
+        let mut slept = false;
+        for _ in 0..40 {
+            seen = wake_generation();
+            let started = Instant::now();
+            wait_for_work(seen, Duration::from_millis(150));
+            if started.elapsed() >= Duration::from_millis(140) {
+                slept = true;
+                break;
+            }
+        }
+        assert!(slept, "the wait never lasted its timeout");
         // A denial is queued on the bridge: busy, and the sleeper is woken.
         let sleeper = std::thread::spawn(move || {
             let started = Instant::now();

@@ -45,6 +45,9 @@ pub enum DaemonEvent {
     CaptureNotice { device_id: String, message: String },
     /// Glide (W6): the phone did not accept the pointer.
     GlideNotice { device_id: String, message: String },
+    /// A phone asks to open a link that is not a web page (mail, SMS, map,
+    /// call): the person at the desk is asked, naming what it is.
+    LinkRequest { phone: String, url: String },
     /// A QR code the phone scanned holds a Wi-Fi network: offer to join.
     WifiFromPhone {
         device_id: String,

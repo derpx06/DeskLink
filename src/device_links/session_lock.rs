@@ -5,9 +5,11 @@
 //! hash. A phone proves it once per connection: the password rides as an
 //! optional field on the remote-session and terminal requests it already
 //! sends, so no new packet type exists and the feature profile both apps must
-//! agree on is unchanged. A connection is identified by its WebRTC wire
-//! generation, so a reconnect — including a Wi-Fi/5G switch — asks again (the
-//! phone keeps the password in memory and resends it).
+//! agree on is unchanged. A connection is identified by its WebRTC
+//! `session_id` (derived from the attempt's UUID, fresh for every peer the two
+//! sides build), so a reconnect — a Wi-Fi/5G switch, a phone restart — asks
+//! again (the phone keeps the password in memory and resends it). The
+//! per-attempt `generation` is not used: it is the constant 1.
 //!
 //! Wrong guesses lock the device out: 5 failures, then 60 s, doubling to an
 //! hour. The lockout is per device and survives reconnects, so reconnecting is
@@ -77,8 +79,8 @@ fn matches(password: &str, stored: &PasswordHash) -> bool {
 
 #[derive(Default)]
 struct DeviceState {
-    /// The connection generation this device proved the password on.
-    unlocked_generation: Option<u64>,
+    /// The connection (`wire.session_id`) this device proved the password on.
+    unlocked_session: Option<u64>,
     failures: u32,
     locked_until: Option<Instant>,
     /// SHA-256 of the last wrong password counted. The same wrong password
@@ -117,7 +119,7 @@ impl SessionLock {
         &mut self,
         stored: Option<&PasswordHash>,
         device_id: &str,
-        generation: u64,
+        session: u64,
         offered: Option<&str>,
         now: Instant,
     ) -> Precheck {
@@ -125,7 +127,7 @@ impl SessionLock {
             return Precheck::Allowed;
         }
         let state = self.devices.entry(device_id.to_string()).or_default();
-        if state.unlocked_generation == Some(generation) {
+        if state.unlocked_session == Some(session) {
             return Precheck::Allowed;
         }
         if let Some(until) = state.locked_until.filter(|until| *until > now) {
@@ -150,7 +152,7 @@ impl SessionLock {
     pub fn finish(
         &mut self,
         device_id: &str,
-        generation: u64,
+        session: u64,
         offered: &str,
         correct: bool,
         now: Instant,
@@ -158,7 +160,7 @@ impl SessionLock {
         let state = self.devices.entry(device_id.to_string()).or_default();
         if correct {
             *state = DeviceState {
-                unlocked_generation: Some(generation),
+                unlocked_session: Some(session),
                 ..DeviceState::default()
             };
             return Ok(());
@@ -185,27 +187,44 @@ impl SessionLock {
         &mut self,
         stored: Option<&PasswordHash>,
         device_id: &str,
-        generation: u64,
+        session: u64,
         offered: Option<&str>,
         now: Instant,
     ) -> Result<(), String> {
-        match self.begin(stored, device_id, generation, offered, now) {
+        match self.begin(stored, device_id, session, offered, now) {
             Precheck::Allowed => Ok(()),
             Precheck::Denied(reason) => Err(reason),
             Precheck::Verify => {
                 let offered = offered.unwrap_or_default();
                 let correct = stored.is_some_and(|stored| matches(offered, stored));
-                self.finish(device_id, generation, offered, correct, now)
+                self.finish(device_id, session, offered, correct, now)
             }
+        }
+    }
+
+    /// Forgets `device_id`'s unlock (unpaired, or paired again under a new
+    /// identity). Its failures and lockout stay: they are a property of the
+    /// guessing, not of the connection.
+    pub fn forget_unlock(&mut self, device_id: &str) {
+        if let Some(state) = self.devices.get_mut(device_id) {
+            state.unlocked_session = None;
+            state.last_wrong = None;
         }
     }
 
     /// Forgets every unlock, e.g. when the password changes.
     pub fn relock_all(&mut self) {
         for state in self.devices.values_mut() {
-            state.unlocked_generation = None;
+            state.unlocked_session = None;
             state.last_wrong = None;
         }
+    }
+}
+
+/// `device_id` is no longer the phone that proved the password.
+pub fn forget_unlock(device_id: &str) {
+    if let Ok(mut lock) = shared().lock() {
+        lock.forget_unlock(device_id);
     }
 }
 
@@ -214,10 +233,10 @@ pub fn shared() -> &'static Mutex<SessionLock> {
     LOCK.get_or_init(Default::default)
 }
 
-/// Whether `device_id` may act on connection `generation` without offering
+/// Whether `device_id` may act on connection `session` without offering
 /// anything: no password is set, or it was already proved. Never counts as a
 /// guess.
-pub fn is_unlocked(device_id: &str, generation: u64) -> bool {
+pub fn is_unlocked(device_id: &str, session: u64) -> bool {
     if crate::device_links::config::app_settings()
         .session_password
         .is_none()
@@ -227,25 +246,19 @@ pub fn is_unlocked(device_id: &str, generation: u64) -> bool {
     shared().lock().is_ok_and(|lock| {
         lock.devices
             .get(device_id)
-            .is_some_and(|state| state.unlocked_generation == Some(generation))
+            .is_some_and(|state| state.unlocked_session == Some(session))
     })
 }
 
 /// Checks `device_id` against the current setting, logging failures. The
 /// slow part — hashing — runs outside the shared lock, so one phone guessing
 /// never stalls another phone's typing.
-pub fn check(device_id: &str, generation: u64, offered: Option<&str>) -> Result<(), String> {
+pub fn check(device_id: &str, session: u64, offered: Option<&str>) -> Result<(), String> {
     let stored = crate::device_links::config::app_settings().session_password;
     let precheck = shared()
         .lock()
         .map_err(|_| PASSWORD_REQUIRED.to_string())?
-        .begin(
-            stored.as_ref(),
-            device_id,
-            generation,
-            offered,
-            Instant::now(),
-        );
+        .begin(stored.as_ref(), device_id, session, offered, Instant::now());
     let result = match precheck {
         Precheck::Allowed => return Ok(()),
         Precheck::Denied(reason) => Err(reason),
@@ -257,7 +270,7 @@ pub fn check(device_id: &str, generation: u64, offered: Option<&str>) -> Result<
             shared()
                 .lock()
                 .map_err(|_| PASSWORD_REQUIRED.to_string())?
-                .finish(device_id, generation, offered, correct, Instant::now())
+                .finish(device_id, session, offered, correct, Instant::now())
         }
     };
     if result.is_err() && offered.is_some() {
@@ -309,6 +322,62 @@ mod tests {
         assert!(lock.check(Some(&stored), "other", 1, None, now).is_err());
         lock.relock_all();
         assert!(lock.check(Some(&stored), "p", 1, None, now).is_err());
+    }
+
+    fn session_of(attempt: &str) -> u64 {
+        crate::device_links::webrtc::WebRtcWireBinding::from_attempt("desk-id", "phone-id", attempt)
+            .unwrap()
+            .session_id
+    }
+
+    /// The real per-connection id, from three attempts of one device: what
+    /// one connection proved, the next (a rebuild, a phone restart) must prove
+    /// again; an unpair or a new identity forgets it; a password change
+    /// relocks everyone.
+    #[test]
+    fn a_proved_password_never_carries_to_the_next_connection_of_the_same_device() {
+        let stored = cheap("hunter2");
+        let first = session_of("4b6c0f6e-3d63-4d0e-9f4f-1d0a2f8e5a11");
+        let rebuilt = session_of("9a1e55a4-83f1-4a8e-b0a5-7c4f6a3d21c0");
+        let after_restart = session_of("0e3b9d44-6a52-4c1b-8d7c-52f1c9a07e63");
+        assert!(first != rebuilt && rebuilt != after_restart && first != after_restart);
+        let mut lock = SessionLock::default();
+        let now = Instant::now();
+        assert_eq!(
+            lock.check(Some(&stored), "phone-id", first, None, now),
+            Err(PASSWORD_REQUIRED.into())
+        );
+        assert!(lock
+            .check(Some(&stored), "phone-id", first, Some("hunter2"), now)
+            .is_ok());
+        assert!(lock
+            .check(Some(&stored), "phone-id", first, None, now)
+            .is_ok());
+        for next in [rebuilt, after_restart] {
+            assert_eq!(
+                lock.check(Some(&stored), "phone-id", next, None, now),
+                Err(PASSWORD_REQUIRED.into()),
+                "a new connection is asked again"
+            );
+        }
+        assert!(lock
+            .check(Some(&stored), "phone-id", rebuilt, Some("hunter2"), now)
+            .is_ok());
+        assert!(lock
+            .check(Some(&stored), "phone-id", first, None, now)
+            .is_err());
+        lock.forget_unlock("phone-id");
+        assert_eq!(
+            lock.check(Some(&stored), "phone-id", rebuilt, None, now),
+            Err(PASSWORD_REQUIRED.into())
+        );
+        assert!(lock
+            .check(Some(&stored), "phone-id", rebuilt, Some("hunter2"), now)
+            .is_ok());
+        lock.relock_all();
+        assert!(lock
+            .check(Some(&stored), "phone-id", rebuilt, None, now)
+            .is_err());
     }
 
     #[test]

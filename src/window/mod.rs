@@ -154,7 +154,7 @@ mod imp {
         /// The last error toast and when, so a repeating error toasts once.
         pub last_error_toast: RefCell<Option<(String, std::time::Instant)>>,
         pub notified_pair_requests: RefCell<HashSet<String>>,
-        pub notified_remote_notifications: RefCell<HashSet<String>>,
+        pub notified_remote_notifications: RefCell<HashMap<String, Announced>>,
         /// Ringing calls ("device:callId") whose notification is up.
         pub notified_calls: RefCell<HashSet<String>>,
         /// What the call bar was last drawn from.
@@ -898,6 +898,7 @@ impl DesklinkWindow {
                 DaemonEvent::SoundNotice { message, .. }
                 | DaemonEvent::CaptureNotice { message, .. }
                 | DaemonEvent::GlideNotice { message, .. } => self.show_feature_toast(&message),
+                DaemonEvent::LinkRequest { phone, url } => self.ask_to_open_link(&phone, &url),
                 DaemonEvent::WifiFromPhone { network, .. } => self.offer_wifi(network),
                 // Handled by this refresh itself (the call card and notification).
                 DaemonEvent::CallChanged { .. } => {}
@@ -992,6 +993,11 @@ impl DesklinkWindow {
         else {
             return;
         };
+        // Nothing to draw for a window nobody can see: pages are rebuilt (and
+        // were leaking menus) for no one. It redraws when it is shown again.
+        if !should_draw_pages(self.is_mapped()) {
+            return;
+        }
         if let Some(sidebar) = imp.sidebar.borrow().as_ref() {
             sidebar.update(self, &devices, &device);
         }
@@ -1278,24 +1284,51 @@ impl DesklinkWindow {
             .collect::<std::collections::HashSet<_>>();
         imp.notified_remote_notifications
             .borrow_mut()
-            .retain(|notification_id| current_notifications.contains(notification_id));
+            .retain(|notification_id, _| current_notifications.contains(notification_id));
+        let mut announced_now = 0;
         for device in devices {
             let shown = settings.shows_notifications(&device.id);
             for notification in &device.notifications {
                 let unique_id = format!("{}:{}", device.id, notification.id);
-                let is_new = imp
-                    .notified_remote_notifications
-                    .borrow_mut()
-                    .insert(unique_id.clone());
+                // A conversation's notification keeps its id while new
+                // messages change its text: what was announced is the text,
+                // not just the id.
+                let signature = notification_signature(
+                    &notification.title,
+                    &notification.text,
+                    &notification.ticker,
+                );
+                let now = std::time::Instant::now();
+                let announce = {
+                    let mut seen = imp.notified_remote_notifications.borrow_mut();
+                    let before = seen.get(&unique_id).copied();
+                    let verdict = announces(before, signature, now, announced_now);
+                    // Remembered whatever the verdict (hidden, a resync, held
+                    // back): turning mirroring back on replays nothing.
+                    seen.insert(
+                        unique_id.clone(),
+                        Announced {
+                            signature,
+                            at: if verdict {
+                                Some(now)
+                            } else {
+                                before.and_then(|b| b.at)
+                            },
+                        },
+                    );
+                    verdict
+                };
                 // Hidden: marked as seen, so turning mirroring back on does
                 // not replay the backlog. A resync (`silent`) never pops.
                 // With the top-bar extension on, it shows them as GNOME's
                 // own notifications: never twice.
-                if !pops_up(is_new, shown, notification.silent)
+                if !announce
+                    || !pops_up(true, shown, notification.silent)
                     || crate::shell_dbus::client_handles("notifications")
                 {
                     continue;
                 }
+                announced_now += 1;
                 let title = if notification.title.is_empty() {
                     format!("{} on {}", notification.app_name, device.name)
                 } else {
@@ -1314,7 +1347,7 @@ impl DesklinkWindow {
                     toast.set_button_label(Some("View"));
                     toast.set_action_name(Some("win.show-page"));
                     toast.set_action_target_value(Some(&"notifications".to_variant()));
-                    imp.toast_overlay.add_toast(toast);
+                    self.queue_toast(&toast);
                 } else {
                     self.send_app_notification(
                         &format!("phone-notification-{unique_id}"),
@@ -1433,7 +1466,7 @@ impl DesklinkWindow {
             toast.set_action_name(Some("win.send-again"));
             toast.set_action_target_value(Some(&target.to_variant()));
         }
-        self.imp().toast_overlay.add_toast(toast);
+        self.queue_toast(&toast);
         if notify {
             self.send_app_notification(
                 &format!("desklink-transfer-{}", done.id),
@@ -1479,7 +1512,7 @@ impl DesklinkWindow {
         toast.set_button_label(Some("Details"));
         toast.set_action_name(Some("win.error-details"));
         toast.set_action_target_value(Some(&raw.to_variant()));
-        imp.toast_overlay.add_toast(toast);
+        self.queue_toast(&toast);
         self.send_app_notification("desklink-error", "DeskLink", &message);
     }
 
@@ -1538,14 +1571,91 @@ impl DesklinkWindow {
                 glib::ControlFlow::Break
             });
         });
-        self.imp().toast_overlay.add_toast(toast);
+        self.queue_toast(&toast);
+    }
+
+    /// A phone wants to open `url`, which is not a web page: asked first, with
+    /// the kind named, Cancel as the default, and one question at a time.
+    fn ask_to_open_link(&self, phone: &str, url: &str) {
+        thread_local! {
+            static OPEN: std::cell::RefCell<Option<glib::WeakRef<adw::AlertDialog>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let already = OPEN.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .and_then(glib::WeakRef::upgrade)
+                .is_some_and(|dialog| dialog.is_mapped())
+        });
+        if already {
+            return;
+        }
+        let kind = link_kind_words(url);
+        let shown: String = url.chars().take(200).collect();
+        let dialog =
+            adw::AlertDialog::new(Some(&format!("Open {kind} from {phone}?")), Some(&shown));
+        dialog.add_response("cancel", "_Cancel");
+        dialog.add_response("open", "_Open");
+        dialog.set_default_response(Some("cancel"));
+        dialog.set_close_response("cancel");
+        let url = url.to_string();
+        dialog.connect_response(Some("open"), move |_, _| {
+            if let Err(error) = crate::device_links::daemon::open_link_now(&url) {
+                eprintln!("[UI] {error}");
+            }
+        });
+        OPEN.with(|slot| *slot.borrow_mut() = Some(dialog.downgrade()));
+        dialog.present(Some(self));
+    }
+
+    /// Adds a toast, but never a backlog: at most [`TOASTS_AT_ONCE`] wait
+    /// here (the oldest is dismissed for a new one), and the same words
+    /// twice are one toast. A group chat of thirty messages, or Ring pressed
+    /// five times, used to queue minutes of stale toasts.
+    fn queue_toast(&self, toast: &adw::Toast) {
+        thread_local! {
+            static LIVE: std::cell::RefCell<Vec<glib::WeakRef<adw::Toast>>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        LIVE.with(|live| {
+            let mut live = live.borrow_mut();
+            live.retain(|toast| toast.upgrade().is_some());
+            let titles: Vec<String> = live
+                .iter()
+                .filter_map(|toast| toast.upgrade())
+                .map(|toast| {
+                    toast
+                        .title()
+                        .map(|title| title.to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+            match toast_plan(
+                &titles,
+                &toast
+                    .title()
+                    .map(|title| title.to_string())
+                    .unwrap_or_default(),
+            ) {
+                ToastPlan::Skip => return,
+                ToastPlan::Dismiss(count) => {
+                    for old in live.drain(..count) {
+                        if let Some(old) = old.upgrade() {
+                            old.dismiss();
+                        }
+                    }
+                }
+                ToastPlan::Add => {}
+            }
+            live.push(toast.downgrade());
+            self.imp().toast_overlay.add_toast(toast.clone());
+        });
     }
 
     pub(crate) fn show_feature_toast(&self, message: &str) {
         let toast = adw::Toast::new(message);
         toast.set_use_markup(false);
         toast.set_timeout(3);
-        self.imp().toast_overlay.add_toast(toast);
+        self.queue_toast(&toast);
     }
 
     fn daemon(&self) -> Option<DaemonHandle> {
@@ -1554,6 +1664,49 @@ impl DesklinkWindow {
 
     fn selected_id(&self) -> Option<String> {
         self.imp().selected_device_id.borrow().clone()
+    }
+}
+
+/// How many toasts may be waiting or showing at once.
+const TOASTS_AT_ONCE: usize = 3;
+
+#[derive(Debug, PartialEq, Eq)]
+enum ToastPlan {
+    /// The same words are already up: nothing to add.
+    Skip,
+    /// Dismiss this many of the oldest first, then add.
+    Dismiss(usize),
+    Add,
+}
+
+/// What to do with a new toast titled `new` while `live` (oldest first) are up.
+fn toast_plan(live: &[String], new: &str) -> ToastPlan {
+    if live.iter().any(|title| title == new) {
+        ToastPlan::Skip
+    } else if live.len() >= TOASTS_AT_ONCE {
+        ToastPlan::Dismiss(live.len() + 1 - TOASTS_AT_ONCE)
+    } else {
+        ToastPlan::Add
+    }
+}
+
+/// Whether the pages are drawn now: only while the window is on screen.
+fn should_draw_pages(mapped: bool) -> bool {
+    mapped
+}
+
+/// What kind of link `url` is, in words for the question.
+pub(crate) fn link_kind_words(url: &str) -> &'static str {
+    match url
+        .split_once(':')
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("mailto") => "an email link",
+        Some("sms") => "a text message link",
+        Some("geo") => "a map location",
+        Some("tel") => "a phone number link",
+        _ => "a link",
     }
 }
 
@@ -1671,6 +1824,49 @@ struct RefreshGuard<'a>(&'a std::cell::Cell<bool>);
 impl Drop for RefreshGuard<'_> {
     fn drop(&mut self) {
         self.0.set(false);
+    }
+}
+
+/// What was last announced for one phone notification: its text, and when.
+#[derive(Debug, Clone, Copy)]
+pub struct Announced {
+    signature: u64,
+    at: Option<std::time::Instant>,
+}
+
+/// The same conversation notification, a new message: the id stays, the text
+/// changes.
+fn notification_signature(title: &str, text: &str, ticker: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (title, text, ticker).hash(&mut hasher);
+    hasher.finish()
+}
+
+/// A conversation is announced again at most this often, and a burst at most
+/// [`ANNOUNCE_PER_PASS`] at a time (a group chat of thirty messages is not
+/// thirty banners).
+const ANNOUNCE_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(4);
+const ANNOUNCE_PER_PASS: u32 = 3;
+
+/// Whether a notification whose id was `before` announced is announced now:
+/// first seen, or its text changed since and the last announcement is not
+/// recent; identical resends stay quiet.
+fn announces(
+    before: Option<Announced>,
+    signature: u64,
+    now: std::time::Instant,
+    announced_this_pass: u32,
+) -> bool {
+    if announced_this_pass >= ANNOUNCE_PER_PASS {
+        return false;
+    }
+    match before {
+        None => true,
+        Some(known) if known.signature == signature => false,
+        Some(known) => known
+            .at
+            .is_none_or(|at| now.saturating_duration_since(at) >= ANNOUNCE_AGAIN_AFTER),
     }
 }
 
@@ -2228,10 +2424,17 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             let device = debug_fake_device(id, arg);
             // Shown as already seen: no toasts in the screenshots.
             for notification in &device.notifications {
-                win.imp()
-                    .notified_remote_notifications
-                    .borrow_mut()
-                    .insert(format!("{}:{}", device.id, notification.id));
+                win.imp().notified_remote_notifications.borrow_mut().insert(
+                    format!("{}:{}", device.id, notification.id),
+                    Announced {
+                        signature: notification_signature(
+                            &notification.title,
+                            &notification.text,
+                            &notification.ticker,
+                        ),
+                        at: None,
+                    },
+                );
             }
             win.imp().fake_devices.borrow_mut().push(device);
             win.imp().snapshots.borrow_mut().clear();
@@ -3450,5 +3653,72 @@ mod tests {
         assert_eq!(tabs, ["Notes", "Snippets", "Clipboard history"]);
         assert_eq!(notes_clipboard::tab_of("clipboard"), Some("clipboard"));
         assert_eq!(notes_clipboard::tab_of("files"), None);
+    }
+
+    /// A follow-up message in a conversation keeps the notification's id and
+    /// changes its text: announced again (not for an identical resend, not
+    /// within seconds of the last, not past three at once).
+    #[test]
+    fn a_follow_up_message_is_announced_and_a_resend_is_not() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let first = notification_signature("Mara", "Are you deploying today?", "");
+        let second = notification_signature("Mara", "Ping me when it is out", "");
+        // Never seen: announced.
+        assert!(announces(None, first, t0, 0));
+        let told = Announced {
+            signature: first,
+            at: Some(t0),
+        };
+        // The same text again (a resend, a resync): quiet.
+        assert!(!announces(
+            Some(told),
+            first,
+            t0 + Duration::from_secs(60),
+            0
+        ));
+        // New text a minute later: announced.
+        assert!(announces(
+            Some(told),
+            second,
+            t0 + Duration::from_secs(60),
+            0
+        ));
+        // New text a second later: held back (the next change announces).
+        assert!(!announces(
+            Some(told),
+            second,
+            t0 + Duration::from_secs(1),
+            0
+        ));
+        // A burst: at most three in one pass.
+        assert!(!announces(None, first, t0, ANNOUNCE_PER_PASS));
+        // Marked seen without an announcement (hidden or a resync): the next
+        // message announces at once.
+        let quiet = Announced {
+            signature: first,
+            at: None,
+        };
+        assert!(announces(Some(quiet), second, t0, 0));
+    }
+
+    /// Toasts never pile up: repeats are one, and only the newest few stay.
+    #[test]
+    fn toasts_are_capped_and_repeats_coalesce() {
+        let live = |titles: &[&str]| titles.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+        assert_eq!(toast_plan(&live(&[]), "Ringing Pixel"), ToastPlan::Add);
+        assert_eq!(
+            toast_plan(&live(&["Ringing Pixel"]), "Ringing Pixel"),
+            ToastPlan::Skip
+        );
+        assert_eq!(toast_plan(&live(&["a", "b"]), "c"), ToastPlan::Add);
+        assert_eq!(
+            toast_plan(&live(&["a", "b", "c"]), "d"),
+            ToastPlan::Dismiss(1)
+        );
+        assert_eq!(
+            toast_plan(&live(&["a", "b", "c", "d"]), "e"),
+            ToastPlan::Dismiss(2)
+        );
     }
 }

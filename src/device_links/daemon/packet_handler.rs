@@ -137,9 +137,40 @@ fn openable_link(url: &str) -> bool {
         && !url.chars().any(char::is_control)
 }
 
-/// A phone's "Open on computer" (C3): the desktop's default handler opens
-/// it, through GIO (no `xdg-open` needed).
-fn open_link_from_phone(url: &str) -> Result<(), String> {
+/// Whether `url` opens without asking: a web page. Everything else a phone
+/// may send (a mail draft that can carry an attachment, an SMS draft, a map, a
+/// call) is a request to the person at the desk, who is told the scheme.
+pub(crate) fn opens_silently(url: &str) -> bool {
+    url.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    })
+}
+
+/// A phone's "Open on computer" (C3): a web link opens through the desktop's
+/// default handler (GIO, no `xdg-open` needed); any other kind is first shown
+/// to the person at the desk as a question naming what it is.
+fn open_link_from_phone(
+    url: &str,
+    phone: &str,
+    events: &Arc<Mutex<Vec<DaemonEvent>>>,
+) -> Result<(), String> {
+    if !openable_link(url) {
+        return Err("DeskLink refused a link it does not open from a phone".to_string());
+    }
+    if !opens_silently(url) {
+        if let Ok(mut events) = events.lock() {
+            events.push(DaemonEvent::LinkRequest {
+                phone: phone.to_string(),
+                url: url.to_string(),
+            });
+        }
+        return Ok(());
+    }
+    open_link_now(url)
+}
+
+/// Opens `url` in its default handler (after the check, or the person's yes).
+pub(crate) fn open_link_now(url: &str) -> Result<(), String> {
     if !openable_link(url) {
         return Err("DeskLink refused a link it does not open from a phone".to_string());
     }
@@ -663,10 +694,15 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         }
         PACKET_TYPE_SHARE_REQUEST => {
             if let Some(text) = packet.get_str("text") {
-                set_clipboard_text_from_remote(text);
+                // Off means off both ways, here as for clipboard packets.
+                if crate::device_links::config::app_settings().clipboard_sync {
+                    set_clipboard_text_from_remote(text);
+                } else {
+                    debug_log!("[Clipboard] Shared text from {device_id} ignored: sync is off");
+                }
                 Ok(())
             } else if let Some(url) = packet.get_str("url") {
-                open_link_from_phone(url)
+                open_link_from_phone(url, &binding.link.info.name, events)
             } else {
                 Err("DeskLink WebRTC file transfer requires the file-data channel".to_string())
             }
@@ -1111,6 +1147,36 @@ fn spawn_player(program: &str, args: &[&str]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_web_links_open_without_asking_and_the_rest_ask_first() {
+        for url in ["https://example.com/a", "HTTP://x.org", "http:rel"] {
+            assert!(super::opens_silently(url), "{url}");
+        }
+        for url in [
+            "mailto:a@b.c?attach=/etc/passwd",
+            "sms:555",
+            "geo:1,2",
+            "tel:+1555",
+            "file:///x",
+            "no-scheme",
+        ] {
+            assert!(!super::opens_silently(url), "{url}");
+        }
+        // A mail link is a question, not an open.
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(super::open_link_from_phone("mailto:a@b.c", "Pixel", &events).is_ok());
+        match events.lock().unwrap().as_slice() {
+            [crate::device_links::daemon::DaemonEvent::LinkRequest { phone, url }] => {
+                assert_eq!((phone.as_str(), url.as_str()), ("Pixel", "mailto:a@b.c"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A refused kind is an error and asks nothing.
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        assert!(super::open_link_from_phone("file:///etc/passwd", "Pixel", &events).is_err());
+        assert!(events.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn only_web_mail_phone_and_map_links_open_from_a_phone() {

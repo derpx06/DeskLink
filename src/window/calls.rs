@@ -4,6 +4,9 @@
 //! `desklink.telephony.request`; what it does comes back as its next
 //! snapshot.
 
+use std::cell::{Cell, RefCell};
+use std::time::{Duration, Instant};
+
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
@@ -406,13 +409,41 @@ pub(super) fn missed(
     );
 }
 
-/// Asks before calling `number` from a link (`tel:`), `desklink --dial` or
-/// a contact: a web page can open `tel:` links without the user meaning to
-/// call. With `phone`, that phone places the call; else the first that can.
+/// Whether a call confirmation may open now: not while one is open, and not
+/// within [`DIAL_ASK_EVERY`] of the last (a web page looping `tel:` links
+/// must not stack dialogs or keep the window raised).
+fn may_ask_to_dial(open: bool, last: Option<Instant>, now: Instant) -> bool {
+    !open && last.is_none_or(|last| now.duration_since(last) >= DIAL_ASK_EVERY)
+}
+
+const DIAL_ASK_EVERY: Duration = Duration::from_secs(3);
+
+thread_local! {
+    static DIAL_ASKED: Cell<Option<Instant>> = const { Cell::new(None) };
+    static DIAL_DIALOG: RefCell<Option<glib::WeakRef<adw::AlertDialog>>> = const { RefCell::new(None) };
+}
+
+/// Asks before calling `number` from a link (`tel:`), `desklink --dial`, the
+/// search provider, a missed-call button or a contact: a web page, or any
+/// process on the session bus, can start a call request without the user
+/// meaning to. Every dial goes through here and nowhere else. The default
+/// answer is Cancel, so a stray Enter never places a call. With `phone`, that
+/// phone places the call; else the first that can.
 pub(crate) fn confirm_dial(win: &DesklinkWindow, number: &str, phone: Option<&str>) {
     let Some(daemon) = win.imp().daemon.borrow().clone() else {
         return;
     };
+    let open = DIAL_DIALOG.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(glib::WeakRef::upgrade)
+            .is_some_and(|dialog| dialog.is_mapped())
+    });
+    let now = Instant::now();
+    if !may_ask_to_dial(open, DIAL_ASKED.with(Cell::get), now) {
+        return;
+    }
+    DIAL_ASKED.with(|last| last.set(Some(now)));
     let Some(number) = crate::device_links::calls::dial_number(number) else {
         win.show_feature_toast("That is not a phone number");
         return;
@@ -439,8 +470,10 @@ pub(crate) fn confirm_dial(win: &DesklinkWindow, number: &str, phone: Option<&st
     dialog.add_response("cancel", "_Cancel");
     dialog.add_response("call", "_Call");
     dialog.set_response_appearance("call", adw::ResponseAppearance::Suggested);
-    dialog.set_default_response(Some("call"));
+    // Cancel is the default: Enter or Space never places a call.
+    dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
+    DIAL_DIALOG.with(|slot| *slot.borrow_mut() = Some(dialog.downgrade()));
     dialog.connect_response(Some("call"), move |_, _| {
         daemon.send(DaemonCommand::Telephony(
             phone.id.clone(),
@@ -526,5 +559,48 @@ mod tests {
             detail_words("Pixel", &status(CallState::Dialing, false, false), 0),
             "Calling from Pixel… · +1 555 0100"
         );
+    }
+
+    /// A call confirmation does not open over another, nor again within three
+    /// seconds of the last: a page looping `tel:` links cannot stack dialogs.
+    #[test]
+    fn a_call_confirmation_never_stacks_and_is_rate_limited() {
+        let now = Instant::now();
+        assert!(may_ask_to_dial(false, None, now));
+        assert!(!may_ask_to_dial(true, None, now), "one at a time");
+        assert!(!may_ask_to_dial(
+            false,
+            Some(now),
+            now + Duration::from_secs(1)
+        ));
+        assert!(may_ask_to_dial(false, Some(now), now + DIAL_ASK_EVERY));
+    }
+
+    /// Nothing but the confirmation sends a dial: no other file builds a
+    /// `"dial"` telephony command (the daemon only validates).
+    #[test]
+    fn only_the_confirmation_dialog_places_a_call() {
+        fn scan(dir: &std::path::Path, found: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan(&path, found);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    // Production code only: stop at the test module.
+                    let text = text.split("#[cfg(test)]").next().unwrap_or_default();
+                    if text.contains("\"dial\".to_string()") {
+                        found.push(path.display().to_string());
+                    }
+                }
+            }
+        }
+        let mut found = Vec::new();
+        scan(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].ends_with("window/calls.rs"), "{found:?}");
     }
 }

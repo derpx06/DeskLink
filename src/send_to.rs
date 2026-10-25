@@ -455,7 +455,19 @@ fn sync_scripts(dir: &Path, exe: &Path, phones: &[(String, String)]) -> std::io:
 
 /// Keeps the scripts and the Open With entry in step with the paired phones
 /// while the app runs.
+/// Whether the file-manager integration (Open With, Nautilus scripts, the
+/// Dolphin menu) is written: not from a sandbox the host cannot see into.
+fn writes_host_integration(in_flatpak: bool) -> bool {
+    !in_flatpak
+}
+
 pub fn start(app: &DesklinkApplication) {
+    // Inside a Flatpak these files would land in the app's private data
+    // directory, which the host's file managers never read, with an `Exec=`
+    // that only exists in the sandbox: nothing is written.
+    if !writes_host_integration(crate::device_links::pty::host::in_flatpak()) {
+        return;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -668,5 +680,12 @@ mod tests {
         sync_scripts(&dir, exe, &renamed).unwrap();
         assert!(dir.join("Send to Pixel 9").exists() && !dir.join("Send to Pixel").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sandbox writes no host file-manager integration.
+    #[test]
+    fn a_flatpak_writes_no_host_integration() {
+        assert!(writes_host_integration(false));
+        assert!(!writes_host_integration(true));
     }
 }

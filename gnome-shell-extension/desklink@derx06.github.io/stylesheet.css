@@ -135,6 +135,10 @@
 }
 /* On: the accent, like a stock quick toggle (GNOME 47+). */
 .desklink-tile:checked, .desklink-chip:checked {
+  /* GNOME 45 and 46 have no accent colour: the declarations below are
+     dropped there, so the fallback comes first. */
+  background-color: #3584e4;
+  color: #ffffff;
   background-color: -st-accent-color;
   color: -st-accent-fg-color;
 }
@@ -202,5 +206,6 @@
 .desklink-progress-fill {
   height: 4px;
   border-radius: 2px;
+  background-color: #3584e4;
   background-color: -st-accent-color;
 }

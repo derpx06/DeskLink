@@ -334,7 +334,7 @@ impl Config {
     }
 
     pub fn load_from_dir(base_dir: PathBuf) -> Result<Self, String> {
-        fs::create_dir_all(&base_dir).map_err(|err| err.to_string())?;
+        super::private_fs::create_dir_all(&base_dir).map_err(|err| err.to_string())?;
         let state_path = base_dir.join("config.json");
         let stored = if state_path.exists() {
             let bytes = fs::read(&state_path).map_err(|err| err.to_string())?;
@@ -410,11 +410,12 @@ impl Config {
     /// mid-write left a half-written config.json or private key, `load` then
     /// failed, and DeskLink never started again without losing every pairing.
     pub fn save(&self) -> Result<(), String> {
-        fs::create_dir_all(&self.base_dir).map_err(|err| err.to_string())?;
+        super::private_fs::create_dir_all(&self.base_dir).map_err(|err| err.to_string())?;
+        // The pairing record and the session-password hash: this user only.
         write_atomic(
             &self.base_dir.join("config.json"),
             &serde_json::to_vec_pretty(&self.stored).map_err(|err| err.to_string())?,
-            0o644,
+            0o600,
         )?;
         write_atomic_if_changed(
             &self.base_dir.join("privateKey.pem"),
@@ -427,7 +428,7 @@ impl Config {
         write_atomic_if_changed(
             &self.base_dir.join("certificate.pem"),
             &self.certificate.to_pem().map_err(|err| err.to_string())?,
-            0o644,
+            0o600,
         )?;
         Ok(())
     }
@@ -587,6 +588,7 @@ impl Config {
             // nor the contacts the old one shared.
             set_remote_desktop_token(&info.id, None);
             crate::device_links::contacts::forget_in(&self.contacts_dir(), &info.id);
+            crate::device_links::session_lock::forget_unlock(&info.id);
         }
         mirror_terminal_access(&info.id, terminal_access);
         self.stored.trusted_devices.insert(
@@ -672,6 +674,7 @@ impl Config {
         // and so is the contacts cache.
         set_remote_desktop_token(device_id, None);
         crate::device_links::contacts::forget_in(&self.contacts_dir(), device_id);
+        crate::device_links::session_lock::forget_unlock(device_id);
         // Glide onto it, too (F4).
         if self
             .stored
@@ -754,6 +757,14 @@ fn write_atomic(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<(), S
         }
     }
     Ok(())
+}
+
+/// `~/.config/desklink`: the frozen storage root (the config lives in its
+/// `protocol` folder).
+pub(crate) fn desklink_config_root() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("desklink")
 }
 
 fn config_dir() -> PathBuf {
@@ -1237,5 +1248,36 @@ mod tests {
         config.trust_device(&info, "cert-b".to_string()).unwrap();
         assert!(!terminal_access_allowed(&id), "a re-pair inherited consent");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Everything a fresh config creates is for this user only: no group or
+    /// other bits on any file or directory (the session-password hash, every
+    /// pairing certificate and the partial transfers live here).
+    #[test]
+    fn a_fresh_config_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir()
+            .join(format!(
+                "desklink-private-config-{}",
+                uuid::Uuid::new_v4().simple()
+            ))
+            .join("protocol");
+        let config = Config::load_from_dir(dir.clone()).unwrap();
+        config.save().unwrap();
+        fn walk(path: &std::path::Path, bad: &mut Vec<String>) {
+            let mode = fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777;
+            if mode & 0o077 != 0 {
+                bad.push(format!("{} {mode:o}", path.display()));
+            }
+            if path.is_dir() {
+                for entry in fs::read_dir(path).unwrap().flatten() {
+                    walk(&entry.path(), bad);
+                }
+            }
+        }
+        let mut bad = Vec::new();
+        walk(&dir, &mut bad);
+        assert!(bad.is_empty(), "{bad:?}");
+        let _ = fs::remove_dir_all(dir.parent().unwrap());
     }
 }

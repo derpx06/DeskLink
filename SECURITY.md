@@ -29,6 +29,23 @@ ready, and the advisory is published once users can update.
   desktop prompt. An optional session password additionally guards screen
   viewing, control and terminals.
 
+## The Flatpak is not a sandbox
+
+The Flatpak build asks for `--talk-name=org.freedesktop.Flatpak` because
+shared terminals must start the user's shell **on the host**
+(`flatpak-spawn --host`). That permission lets the app run any command on the
+host, so the Flatpak gives no isolation from the rest of your session: treat
+it as a packaging format, not a confinement. (Flathub rejects this permission;
+a store build would have to drop terminals.) Pictures, PDFs and videos a phone
+sends are decoded inside DeskLink with a size bound, never trusted, but they
+share DeskLink's address space either way.
+
+## Where DeskLink keeps its files
+
+`~/.config/desklink`, `~/.local/state/desklink` and `~/.cache/desklink` are
+created `0700` and their files `0600` (older versions made them readable by
+other users; DeskLink tightens them once at start).
+
 ## What the relay can and cannot see
 
 The relay ([`relay/`](relay/)) only helps two paired devices find each other

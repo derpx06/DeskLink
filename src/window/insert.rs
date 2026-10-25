@@ -55,9 +55,13 @@ pub(super) fn attach_menu(daemon: &DaemonHandle, device: &DeviceView, button: &g
     let popover = gtk::Popover::builder().child(&list).build();
     for (kind, target, label, icon) in CAPTURES {
         let item = row(icon, label);
-        let (daemon, id, popover) = (daemon.clone(), device.id.clone(), popover.clone());
+        // Weakly: the popover owns this button, which owns this closure; a
+        // strong reference back kept every rebuilt page's menu alive.
+        let (daemon, id, popover) = (daemon.clone(), device.id.clone(), popover.downgrade());
         item.connect_clicked(move |_| {
-            popover.popdown();
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
             daemon.send(DaemonCommand::Capture(
                 id.clone(),
                 kind.into(),
@@ -71,7 +75,12 @@ pub(super) fn attach_menu(daemon: &DaemonHandle, device: &DeviceView, button: &g
         let popover = popover.clone();
         move |_| popover.unparent()
     });
-    button.connect_clicked(move |_| popover.popup());
+    let popover = popover.downgrade();
+    button.connect_clicked(move |_| {
+        if let Some(popover) = popover.upgrade() {
+            popover.popup();
+        }
+    });
 }
 
 /// The bar while a capture waits for the phone.

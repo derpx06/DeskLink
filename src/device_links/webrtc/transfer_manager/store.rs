@@ -106,7 +106,7 @@ const SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
 
 impl Store {
     pub fn new(state_root: PathBuf, destination_root: PathBuf) -> Result<Self, String> {
-        fs::create_dir_all(&state_root).map_err(|error| {
+        crate::device_links::private_fs::create_dir_all(&state_root).map_err(|error| {
             format!("Could not create DeskLink transfer state directory: {error}")
         })?;
         fs::create_dir_all(&destination_root)
@@ -721,7 +721,8 @@ pub(super) fn remove_if_present(path: &Path) -> Result<(), String> {
 /// through.
 pub(super) fn create_fresh_file(path: &Path) -> Result<File, String> {
     remove_if_present(path)?;
-    OpenOptions::new()
+    // 0600: a partial download is nobody else's to read.
+    crate::device_links::private_fs::options()
         .read(true)
         .write(true)
         .create_new(true)
