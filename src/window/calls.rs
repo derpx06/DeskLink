@@ -418,6 +418,31 @@ fn may_ask_to_dial(open: bool, last: Option<Instant>, now: Instant) -> bool {
 
 const DIAL_ASK_EVERY: Duration = Duration::from_secs(3);
 
+/// What becomes of a request to ask about `number`.
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    Ask(String),
+    NotANumber,
+    Throttled,
+    /// A question is on screen already.
+    Open,
+}
+
+/// The number is checked FIRST, so a request that is not a number costs
+/// nothing and cannot lock out a real one; only an accepted request counts.
+fn admit(number: &str, open: bool, last: Option<Instant>, now: Instant) -> Admit {
+    let Some(number) = crate::device_links::calls::dial_number(number) else {
+        return Admit::NotANumber;
+    };
+    if open {
+        Admit::Open
+    } else if !may_ask_to_dial(open, last, now) {
+        Admit::Throttled
+    } else {
+        Admit::Ask(number)
+    }
+}
+
 thread_local! {
     static DIAL_ASKED: Cell<Option<Instant>> = const { Cell::new(None) };
     static DIAL_DIALOG: RefCell<Option<glib::WeakRef<adw::AlertDialog>>> = const { RefCell::new(None) };
@@ -430,6 +455,24 @@ thread_local! {
 /// answer is Cancel, so a stray Enter never places a call. With `phone`, that
 /// phone places the call; else the first that can.
 pub(crate) fn confirm_dial(win: &DesklinkWindow, number: &str, phone: Option<&str>) {
+    confirm_telephony(win, number, phone, "dial");
+}
+
+/// The same question for a text message: the phone opens its composer for
+/// `number`, so a session-bus caller cannot do it unasked either.
+pub(crate) fn confirm_message(win: &DesklinkWindow, number: &str, phone: Option<&str>) {
+    confirm_telephony(win, number, phone, "message");
+}
+
+/// What a throttled request is told.
+pub(crate) const TOO_MANY_CALLS: &str = "Too many calls: wait a few seconds";
+
+fn confirm_telephony(
+    win: &DesklinkWindow,
+    number: &str,
+    phone: Option<&str>,
+    action: &'static str,
+) {
     let Some(daemon) = win.imp().daemon.borrow().clone() else {
         return;
     };
@@ -440,14 +483,20 @@ pub(crate) fn confirm_dial(win: &DesklinkWindow, number: &str, phone: Option<&st
             .is_some_and(|dialog| dialog.is_mapped())
     });
     let now = Instant::now();
-    if !may_ask_to_dial(open, DIAL_ASKED.with(Cell::get), now) {
-        return;
-    }
-    DIAL_ASKED.with(|last| last.set(Some(now)));
-    let Some(number) = crate::device_links::calls::dial_number(number) else {
-        win.show_feature_toast("That is not a phone number");
-        return;
+    let number = match admit(number, open, DIAL_ASKED.with(Cell::get), now) {
+        Admit::Ask(number) => number,
+        Admit::NotANumber => {
+            win.show_feature_toast("That is not a phone number");
+            return;
+        }
+        Admit::Throttled => {
+            win.show_feature_toast(TOO_MANY_CALLS);
+            return;
+        }
+        Admit::Open => return,
     };
+    // Only a request that will be asked uses up the allowance.
+    DIAL_ASKED.with(|last| last.set(Some(now)));
     let phone = daemon
         .devices()
         .into_iter()
@@ -463,21 +512,31 @@ pub(crate) fn confirm_dial(win: &DesklinkWindow, number: &str, phone: Option<&st
         dialog.present(Some(win));
         return;
     };
-    let dialog = adw::AlertDialog::new(
-        Some(&format!("Call {number}?")),
-        Some(&format!("{} places the call.", phone.name)),
-    );
+    let (title, body, button) = if action == "message" {
+        (
+            format!("Message {number}?"),
+            format!("{} opens a message to this number.", phone.name),
+            "_Message",
+        )
+    } else {
+        (
+            format!("Call {number}?"),
+            format!("{} places the call.", phone.name),
+            "_Call",
+        )
+    };
+    let dialog = adw::AlertDialog::new(Some(&title), Some(&body));
     dialog.add_response("cancel", "_Cancel");
-    dialog.add_response("call", "_Call");
-    dialog.set_response_appearance("call", adw::ResponseAppearance::Suggested);
+    dialog.add_response("go", button);
+    dialog.set_response_appearance("go", adw::ResponseAppearance::Suggested);
     // Cancel is the default: Enter or Space never places a call.
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");
     DIAL_DIALOG.with(|slot| *slot.borrow_mut() = Some(dialog.downgrade()));
-    dialog.connect_response(Some("call"), move |_, _| {
+    dialog.connect_response(Some("go"), move |_, _| {
         daemon.send(DaemonCommand::Telephony(
             phone.id.clone(),
-            "dial".to_string(),
+            action.to_string(),
             Some(number.clone()),
         ));
     });
@@ -501,6 +560,28 @@ mod tests {
             muted,
             silenced: false,
         }
+    }
+
+    #[test]
+    fn a_junk_request_never_uses_up_the_allowance_and_a_throttled_one_says_so() {
+        let now = Instant::now();
+        assert_eq!(admit("evil;rm", false, None, now), Admit::NotANumber);
+        // Junk right after a real ask is still "not a number", not "throttled".
+        assert_eq!(
+            admit("+1 555 0100", false, Some(now), now),
+            Admit::Throttled
+        );
+        assert_eq!(admit("junk", false, Some(now), now), Admit::NotANumber);
+        assert_eq!(
+            admit("+1 555 0100", false, None, now),
+            Admit::Ask("+15550100".into())
+        );
+        assert_eq!(
+            admit("+1 555 0100", false, Some(now), now + DIAL_ASK_EVERY),
+            Admit::Ask("+15550100".into())
+        );
+        assert_eq!(admit("+1 555 0100", true, None, now), Admit::Open);
+        assert!(TOO_MANY_CALLS.starts_with("Too many calls"));
     }
 
     #[test]
@@ -576,8 +657,10 @@ mod tests {
         assert!(may_ask_to_dial(false, Some(now), now + DIAL_ASK_EVERY));
     }
 
-    /// Nothing but the confirmation sends a dial: no other file builds a
-    /// `"dial"` telephony command (the daemon only validates).
+    /// Nothing but the confirmation starts a dial: the only production files
+    /// that mention both the `"dial"` verb and a telephony command are this
+    /// one (which asks first) and `application.rs`, whose `app.call` hands a
+    /// dial to the same confirmation (`call_action_kind`).
     #[test]
     fn only_the_confirmation_dialog_places_a_call() {
         fn scan(dir: &std::path::Path, found: &mut Vec<String>) {
@@ -589,7 +672,7 @@ mod tests {
                     let text = std::fs::read_to_string(&path).unwrap();
                     // Production code only: stop at the test module.
                     let text = text.split("#[cfg(test)]").next().unwrap_or_default();
-                    if text.contains("\"dial\".to_string()") {
+                    if text.contains("\"dial\"") && text.contains("Telephony(") {
                         found.push(path.display().to_string());
                     }
                 }
@@ -600,7 +683,17 @@ mod tests {
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
             &mut found,
         );
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert!(found[0].ends_with("window/calls.rs"), "{found:?}");
+        found.sort();
+        assert!(
+            found.iter().any(|path| path.ends_with("window/calls.rs")),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .all(|path| path.ends_with("window/calls.rs")
+                    || path.ends_with("src/application.rs")),
+            "{found:?}"
+        );
     }
 }

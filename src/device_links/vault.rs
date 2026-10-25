@@ -38,9 +38,44 @@ fn create_private_dir(dir: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+/// Files whose last read failed for a reason that says nothing about the
+/// file (the key or the disk could not be read): the caller got an empty
+/// value, and saving it would overwrite a perfectly good file. Saving to them
+/// is refused until the next start reads them (or [`start_fresh`]).
+static UNREADABLE: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+static NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn is_unreadable(path: &Path) -> bool {
+    UNREADABLE
+        .lock()
+        .is_ok_and(|paths| paths.iter().any(|known| known == path))
+}
+
+/// The person's choice to give up on `path`'s old contents: saving to it
+/// works again (its copy `*.corrupt-*` stays beside it).
+#[allow(dead_code)] // ponytail: no button yet; a restart retries the read
+pub(crate) fn start_fresh(path: &Path) {
+    if let Ok(mut paths) = UNREADABLE.lock() {
+        paths.retain(|known| known != path);
+    }
+}
+
+/// What the person should be told, once, about files that could not be read.
+pub(crate) fn take_notice() -> Option<String> {
+    NOTICES.lock().ok().and_then(|mut notices| {
+        (!notices.is_empty()).then(|| notices.drain(..).collect::<Vec<_>>().join(" "))
+    })
+}
+
 /// Writes `plain` to `path` (atomically, 0600), sealed with `dir`'s key.
 pub(crate) fn seal(dir: &Path, path: &Path, aad: &[u8], plain: &[u8]) -> Result<(), String> {
     use openssl::symm::{encrypt_aead, Cipher};
+    if is_unreadable(path) {
+        return Err(format!(
+            "{} could not be read at start, so changes to it are not saved (a copy is kept); restart DeskLink to try again",
+            path.display()
+        ));
+    }
     let key = key(dir)?;
     let mut nonce = [0u8; NONCE_BYTES];
     openssl::rand::rand_bytes(&mut nonce).map_err(|error| error.to_string())?;
@@ -130,8 +165,18 @@ where
             let aside = path.with_extension(format!("corrupt-{now}"));
             if unreadable {
                 // The file may be fine: copied, never moved, so a later good
-                // start still finds it where it was.
+                // start still finds it where it was. Nothing is saved over it
+                // meanwhile, and the person is told once.
                 let _ = std::fs::copy(path, &aside);
+                if let Ok(mut paths) = UNREADABLE.lock() {
+                    paths.push(path.to_path_buf());
+                }
+                if let Ok(mut notices) = NOTICES.lock() {
+                    notices.push(format!(
+                        "A saved file ({}) could not be read just now, so its contents are not shown and changes to it are not saved. Nothing was lost; restart DeskLink to try again.",
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                }
             } else {
                 let _ = std::fs::rename(path, &aside);
             }
@@ -223,7 +268,12 @@ pub(crate) fn seal_later(dir: &Path, path: &Path, aad: &[u8], plain: Vec<u8>) {
         let pending = pending.get_or_insert_with(Default::default);
         if pending.len() >= MAX_PENDING_WRITES && !pending.contains_key(path) {
             // Never dropped: written here instead.
-            let _ = seal(dir, path, aad, &plain);
+            if let Err(error) = seal(dir, path, aad, &plain) {
+                crate::device_links::limits::log_limited(
+                    "vault-save",
+                    &format!("Could not save an encrypted file: {error}"),
+                );
+            }
             return;
         }
         pending.insert(path.to_path_buf(), (dir.to_path_buf(), aad.to_vec(), plain));
@@ -345,6 +395,32 @@ mod tests {
         seal_later(&dir, &path, b"p", b"[99]".to_vec());
         flush();
         assert_eq!(open(&dir, &path, b"p").unwrap(), b"[99]");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A read that failed for a reason outside the file leaves the file alone:
+    /// saving is refused, a copy is kept, the person is told once.
+    #[test]
+    fn an_unreadable_read_never_lets_the_next_save_overwrite_the_good_file() {
+        let dir =
+            std::env::temp_dir().join(format!("desklink-vault-unread-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("n.sealed");
+        seal(&dir, &path, b"purpose", b"[7]").unwrap();
+        let key_file = dir.join("key");
+        let good = std::fs::read(&key_file).unwrap();
+        std::fs::remove_file(&key_file).unwrap();
+        std::fs::create_dir(&key_file).unwrap();
+        let value: Vec<u32> = open_or_quarantine(&dir, &path, b"purpose");
+        assert!(value.is_empty());
+        assert!(take_notice().is_some_and(|n| n.contains("Nothing was lost")));
+        assert!(seal(&dir, &path, b"purpose", b"[]").is_err(), "refused");
+        // The key returns; the file was never touched.
+        std::fs::remove_dir(&key_file).unwrap();
+        std::fs::write(&key_file, good).unwrap();
+        assert_eq!(open(&dir, &path, b"purpose").unwrap(), b"[7]");
+        // The person's choice lets saving work again.
+        start_fresh(&path);
+        seal(&dir, &path, b"purpose", b"[8]").unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

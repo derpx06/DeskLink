@@ -125,19 +125,43 @@ fn record_detection(available: bool) {
 /// being unavailable (see [`password_detection`]). Runs on the clipboard
 /// thread: the reply wait is bounded at 300 ms, never on the UI's thread.
 pub(crate) fn clipboard_is_password() -> bool {
-    let targets = clipboard_targets();
-    withhold(targets.as_deref(), password_detection())
+    clipboard_verdict().unwrap_or(true)
 }
 
-/// Whether the clipboard's text must stay on this computer. Marked as a
-/// password: yes. An owner that did not answer in time while the question
-/// can be asked: yes as well (fail closed: a secret from a slow password
-/// manager must not leave on a timeout). No display at all to ask: no, the
-/// UI says passwords cannot be recognised in this session.
-fn withhold(targets: Option<&[String]>, detection: Option<bool>) -> bool {
+/// Whether the clipboard holds a password: `Some(answer)` when it could be
+/// decided, `None` when the owner did not answer while the question can be
+/// asked (no display to ask counts as decided: "not a password").
+fn clipboard_verdict() -> Option<bool> {
+    let targets = clipboard_targets();
+    verdict_of(targets.as_deref(), password_detection())
+}
+
+/// [`clipboard_verdict`], asked once more after a second: a busy password
+/// manager answers late, and one slow answer must not decide a copy for good.
+fn clipboard_verdict_retrying() -> Option<bool> {
+    clipboard_verdict().or_else(|| {
+        thread::sleep(Duration::from_secs(1));
+        clipboard_verdict()
+    })
+}
+
+/// A copy that could not be checked is neither shared nor remembered as
+/// checked (the next look asks again); this is the quiet note for the user.
+static UNCHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn clipboard_unchecked() -> bool {
+    UNCHECKED.load(Ordering::Relaxed)
+}
+
+/// What the targets say: `Some(true)` a password, `Some(false)` not, `None`
+/// not decided (the owner did not answer while the question can be asked).
+/// No display at all to ask is decided: not a password (the UI says
+/// passwords cannot be recognised in this session).
+fn verdict_of(targets: Option<&[String]>, detection: Option<bool>) -> Option<bool> {
     match targets {
-        Some(targets) => is_password_hint(targets),
-        None => detection != Some(false),
+        Some(targets) => Some(is_password_hint(targets)),
+        None if detection == Some(false) => Some(false),
+        None => None,
     }
 }
 
@@ -666,7 +690,12 @@ impl DaemonWorker {
                     .as_ref()
                     .is_none_or(|(text, ..)| *text != current_text)
                 {
-                    let secret = clipboard_is_password();
+                    let Some(secret) = clipboard_verdict_retrying() else {
+                        // Not cached: the next poll asks again.
+                        UNCHECKED.store(true, Ordering::Relaxed);
+                        continue;
+                    };
+                    UNCHECKED.store(false, Ordering::Relaxed);
                     let seen = now_ms();
                     if !secret {
                         remember(&current_text, None);
@@ -941,11 +970,17 @@ mod tests {
     fn an_unanswered_question_withholds_the_clipboard_but_no_display_does_not() {
         let plain = vec!["text/plain".to_string()];
         let marked = vec![PASSWORD_HINT.to_string()];
-        assert!(!withhold(Some(&plain), Some(true)));
-        assert!(withhold(Some(&marked), Some(true)));
-        assert!(withhold(None, Some(true)), "timeout: fail closed");
-        assert!(withhold(None, None), "not yet known: fail closed");
-        assert!(!withhold(None, Some(false)), "no display to ask");
+        assert_eq!(verdict_of(Some(&plain), Some(true)), Some(false));
+        assert_eq!(verdict_of(Some(&marked), Some(true)), Some(true));
+        // Not decided: neither shared nor remembered as checked (the loop
+        // asks again, after a second, and shows "couldn't check it").
+        assert_eq!(verdict_of(None, Some(true)), None, "timeout");
+        assert_eq!(verdict_of(None, None), None, "not yet known");
+        assert_eq!(
+            verdict_of(None, Some(false)),
+            Some(false),
+            "no display to ask"
+        );
     }
 
     #[test]

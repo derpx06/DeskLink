@@ -82,6 +82,8 @@ pub enum DaemonCommand {
     SetStartAtLogin(bool),
     /// Tell this phone when a long terminal command finishes (device id).
     SetCommandAlerts(String, bool),
+    /// "Let <phone> keep this computer awake".
+    SetKeepAwakeFrom(String, bool),
     /// Let this phone, on this network, unlock this computer when approved.
     SetUnlockNearby(String, bool),
     /// Glide (F4): the pointer glides onto this phone past this edge, or
@@ -244,6 +246,13 @@ impl DaemonWorker {
                     settings.muted_command_alerts.remove(&id);
                 } else {
                     settings.muted_command_alerts.insert(id);
+                }
+            }),
+            DaemonCommand::SetKeepAwakeFrom(id, on) => self.update_settings(|settings| {
+                if on {
+                    settings.keep_awake_phones.insert(id);
+                } else {
+                    settings.keep_awake_phones.remove(&id);
                 }
             }),
             DaemonCommand::SetUnlockNearby(id, on) => self.update_settings(|settings| {

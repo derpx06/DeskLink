@@ -14,6 +14,7 @@ pub(super) fn history_key(on: bool) -> String {
     serde_json::to_string(&(
         on,
         crate::device_links::daemon::clipboard::password_detection(),
+        crate::device_links::daemon::clipboard::clipboard_unchecked(),
         crate::device_links::daemon::clipboard::history()
             .iter()
             .map(|item| (item.text.clone(), item.from.clone(), item.at))
@@ -44,6 +45,14 @@ pub(super) fn history_box(on: bool) -> gtk::Box {
     note.set_wrap(true);
     note.set_xalign(0.0);
     rows.append(&note);
+    if crate::device_links::daemon::clipboard::clipboard_unchecked() {
+        let quiet = text(
+            "Clipboard not shared: couldn't check it.",
+            &["text-faint", "body-small"],
+        );
+        quiet.set_xalign(0.0);
+        rows.append(&quiet);
+    }
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list", "history-list"])

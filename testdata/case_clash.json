@@ -1,5 +1,5 @@
 {
-  "_note": "Per directory, lowercase(Locale.ROOT) groups; the UTF-8 byte-order first name wins; the others are left out.",
+  "_note": "Fold per CODE POINT with the SIMPLE lowercase only (Kotlin: lowercase of the one code point, kept when it is one code point; Rust: char::to_lowercase() when it yields exactly one char), no locale, no final-sigma context, no normalisation; per directory, the UTF-8 byte-order first name wins and its members, and what lies below a loser, are left out. 'names'/'winners' is the original vector; 'cases' adds the rest. Winners are in input order.",
   "names": [
     "a.txt",
     "A.txt",
@@ -14,5 +14,147 @@
     "É",
     "Dir",
     "b.txt"
+  ],
+  "cases": [
+    {
+      "name": "ascii",
+      "names": [
+        "a.txt",
+        "A.txt",
+        "b.txt"
+      ],
+      "winners": [
+        "A.txt",
+        "b.txt"
+      ]
+    },
+    {
+      "name": "sharp s stays",
+      "names": [
+        "ß",
+        "SS",
+        "ss",
+        "ẞ"
+      ],
+      "winners": [
+        "ß",
+        "SS"
+      ]
+    },
+    {
+      "name": "dotted capital I stays",
+      "names": [
+        "İ",
+        "i",
+        "I",
+        "i̇"
+      ],
+      "winners": [
+        "İ",
+        "I",
+        "i̇"
+      ]
+    },
+    {
+      "name": "sigma family",
+      "names": [
+        "Σ",
+        "σ",
+        "ς",
+        "ΑΣ",
+        "ασ",
+        "ας"
+      ],
+      "winners": [
+        "Σ",
+        "ς",
+        "ΑΣ",
+        "ας"
+      ]
+    },
+    {
+      "name": "final sigma context gives no rule",
+      "names": [
+        "A.Σ",
+        "a.σ",
+        "a.ς"
+      ],
+      "winners": [
+        "A.Σ",
+        "a.ς"
+      ]
+    },
+    {
+      "name": "non-BMP letters",
+      "names": [
+        "𝐀",
+        "𝐚",
+        "𐐀",
+        "𐐨"
+      ],
+      "winners": [
+        "𝐀",
+        "𝐚",
+        "𐐀"
+      ]
+    },
+    {
+      "name": "emoji are their own",
+      "names": [
+        "😀",
+        "😀x",
+        "😁"
+      ],
+      "winners": [
+        "😀",
+        "😀x",
+        "😁"
+      ]
+    },
+    {
+      "name": "nested directories",
+      "names": [
+        "Dir/a.txt",
+        "dir/A.txt",
+        "Dir/b",
+        "Other/a.txt",
+        "other/a.txt",
+        "Other/sub/f"
+      ],
+      "winners": [
+        "Dir/a.txt",
+        "dir/A.txt",
+        "Dir/b",
+        "Other/a.txt",
+        "other/a.txt",
+        "Other/sub/f"
+      ]
+    },
+    {
+      "name": "combining character is not normalised",
+      "names": [
+        "é",
+        "é",
+        "É",
+        "É"
+      ],
+      "winners": [
+        "É",
+        "É"
+      ]
+    },
+    {
+      "name": "greek capital sigma folder",
+      "names": [
+        "Σ/x",
+        "σ/y",
+        "ς/z"
+      ],
+      "winners": [
+        "Σ/x",
+        "σ/y",
+        "ς/z"
+      ]
+    }
   ]
 }

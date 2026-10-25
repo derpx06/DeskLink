@@ -2366,6 +2366,19 @@ fn placing_copes_with_another_filesystem_a_taken_name_and_a_missing_folder() {
     assert_eq!(fs::read(&path).unwrap(), b"first file");
     assert_eq!(names(&downloads), ["a.bin"], "no staging file left behind");
     assert!(!store.part_path("p1").unwrap().exists(), "part goes after");
+    // A delivered file is 0666 & !umask whichever way it got there.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), super::store::download_mode(), "copy fallback");
+        write_part("p1b", b"linked");
+        let linked = store
+            .publish_with("p1b", "linked.bin", "linked.bin", &|from, to| {
+                fs::hard_link(from, to)
+            })
+            .unwrap();
+        assert_eq!(mode(&linked), super::store::download_mode(), "hard link");
+    }
     // The same name again: the next free one, the first untouched.
     write_part("p2", b"second file");
     let again = store.publish_with("p2", "a.bin", "a.bin", &exdev).unwrap();

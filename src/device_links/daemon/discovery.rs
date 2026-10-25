@@ -149,10 +149,11 @@ pub(super) fn persist_paired_endpoint(
 /// the connection history).
 fn endpoints_path() -> Option<std::path::PathBuf> {
     if cfg!(test) {
-        return Some(std::env::temp_dir().join(format!(
-            "desklink-test-endpoints-{}.json",
-            std::process::id()
-        )));
+        return Some(
+            std::env::temp_dir()
+                .join(format!("desklink-test-endpoints-{}", std::process::id()))
+                .join("endpoints.json"),
+        );
     }
     Some(
         dirs::state_dir()
@@ -206,9 +207,10 @@ fn persist_endpoint(
     let written = serde_json::to_string(&all)
         .map_err(|error| error.to_string())
         .and_then(|text| {
+            // Where phones were seen is private to this user (0700 / 0600).
             path.parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::write(&path, text))
+                .map_or(Ok(()), crate::device_links::private_fs::create_dir_all)
+                .and_then(|()| crate::device_links::private_fs::write(&path, text.as_bytes()))
                 .map_err(|error| error.to_string())
         });
     if let Err(error) = written {
@@ -1153,6 +1155,19 @@ mod tests {
 
     /// A network change starts the beacon burst at once and gives every dead
     /// address a fresh chance.
+    /// Where phones were seen is written 0600 in a 0700 folder.
+    #[test]
+    fn remembered_addresses_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let trusted: std::collections::HashSet<String> = ["private-phone".to_string()].into();
+        persist_endpoint("private-phone", "10.1.2.3:1716".parse().unwrap(), &trusted);
+        let path = endpoints_path().unwrap();
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
+
     #[test]
     fn network_up_restarts_the_beacons_and_wakes_every_backed_off_address() {
         let id = "network-up-phone";

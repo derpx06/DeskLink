@@ -571,6 +571,15 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
                         }
                         return invocation.return_value(None);
                     }
+                    // Every verb has an outward effect (ring or lock the phone,
+                    // send the clipboard, change what is shared): only the
+                    // Shell, which the extension runs inside, may ask.
+                    if !is_the_shell_caller(&connection, sender) {
+                        return invocation.return_dbus_error(
+                            "org.freedesktop.DBus.Error.AccessDenied",
+                            "Only GNOME Shell may use the top-bar interface",
+                        );
+                    }
                     match call(&app, method, &params) {
                         Ok(()) => invocation.return_value(None),
                         Err(error) => invocation.return_dbus_error(INVALID_ARGS, &error),
@@ -1021,6 +1030,12 @@ fn vetted(capabilities: Vec<String>) -> Vec<String> {
 /// Whether `sender` (a unique bus name) is the owner of `org.gnome.Shell`.
 fn is_the_shell(sender: &str, shell_owner: Option<&str>) -> bool {
     !sender.is_empty() && shell_owner == Some(sender)
+}
+
+/// Whether a method call came from the Shell. The one gate for every
+/// top-bar verb; a test pins that no verb is reachable around it.
+fn is_the_shell_caller(connection: &gio::DBusConnection, sender: Option<&str>) -> bool {
+    sender.is_some_and(|sender| hello_is_from_the_shell(connection, sender))
 }
 
 fn hello_is_from_the_shell(connection: &gio::DBusConnection, sender: &str) -> bool {
@@ -1864,6 +1879,25 @@ mod tests {
         assert!(handles(&caps, "notifications", None), "state not known yet");
         assert!(!handles(&caps, "notifications", Some(false)), "turned off");
         assert!(!handles(&caps, "calls", Some(true)), "never said so");
+    }
+
+    /// Every top-bar verb passes the sender check first (no path around it).
+    #[test]
+    fn the_sender_is_checked_before_any_verb_runs() {
+        let source = include_str!("shell_dbus.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let gate = source
+            .find("is_the_shell_caller(&connection, sender)")
+            .unwrap();
+        let run = source.find("match call(&app, method, &params)").unwrap();
+        assert!(gate < run, "the gate comes before the verbs");
+        assert_eq!(
+            source.matches("match call(&app, method, &params)").count(),
+            1,
+            "and there is one way in"
+        );
     }
 
     #[test]

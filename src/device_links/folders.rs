@@ -774,8 +774,12 @@ pub(crate) enum Resolve {
     Both,
     /// Keep this computer's (the copy goes to the trash).
     Desk,
-    /// Keep the phone's (the copy replaces the original).
+    /// Keep the phone's (the copy replaces the original; this computer's
+    /// goes to the trash first, and without a trash nothing is replaced).
     Phone,
+    /// Keep the phone's even though there is no trash to put this computer's
+    /// in: it is replaced for good. Offered only after `Phone` said why not.
+    PhoneAnyway,
 }
 
 #[derive(Debug)]
@@ -1510,7 +1514,7 @@ fn drop_case_clashes<V>(items: &mut BTreeMap<String, V>, live: impl Fn(&V) -> bo
             continue;
         }
         let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-        if !first.insert((parent.to_string(), name.to_lowercase())) {
+        if !first.insert((parent.to_string(), fold_name(name))) {
             losers.push(path.clone());
         }
     }
@@ -1526,6 +1530,25 @@ fn drop_case_clashes<V>(items: &mut BTreeMap<String, V>, live: impl Fn(&V) -> bo
     losers
 }
 
+/// The case folding both apps use to decide that two names are "the same
+/// name" ("W3 — case clashes (folding)" in stageD-protocol.md): per code
+/// point, the SIMPLE lowercase mapping only, taken when it yields exactly one
+/// character and otherwise left as it is; no locale, no final-sigma context
+/// (which `str::to_lowercase` applies), no normalisation. So `Σ` is `σ`
+/// everywhere (never `ς`), `İ` and `ß` stay, `𐐀` becomes `𐐨`, and `é` typed
+/// as `e` + U+0301 is another name than the precomposed one.
+pub(crate) fn fold_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            let mut lower = c.to_lowercase();
+            match (lower.next(), lower.next()) {
+                (Some(single), None) => single,
+                _ => c,
+            }
+        })
+        .collect()
+}
+
 /// [`drop_case_clashes`] over names that are all live, for the shared
 /// fixture test.
 #[cfg(test)]
@@ -1537,7 +1560,7 @@ pub(crate) fn drop_case_clashes_for_tests(items: &mut BTreeMap<String, ()>) -> V
 /// to be different on a system that ignores case.
 fn case_key(path: &str) -> (&str, String) {
     let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
-    (parent, name.to_lowercase())
+    (parent, fold_name(name))
 }
 
 /// The other side's manifest, minus what clashes in case: within itself
@@ -1936,7 +1959,7 @@ fn unique_among(dir: &Path, name: &str, taken: &HashSet<PathBuf>) -> PathBuf {
     // The phone's file system may not tell "Photo.jpg" from "photo.jpg"
     // (and neither does a case-folding one here): the same rule as the case
     // clashes of a sync, so a name that differs only by case is taken.
-    let lower = |path: &Path| path.to_string_lossy().to_lowercase();
+    let lower = |path: &Path| fold_name(&path.to_string_lossy());
     let existing: HashSet<String> = fs::read_dir(dir)
         .map(|entries| {
             entries
@@ -3708,7 +3731,7 @@ impl Worker {
                     trash(&copy);
                 }
             }
-            Resolve::Phone => {
+            Resolve::Phone | Resolve::PhoneAnyway => {
                 if let (Ok(copy), Ok(original)) = (
                     read_path(&root, &conflict.copy),
                     read_path(&root, &conflict.path),
@@ -3716,8 +3739,15 @@ impl Worker {
                     // This computer's version goes to the trash first: the
                     // rename alone replaced it for good (S4). Without a
                     // trash it stays, and the conflict with it.
-                    if original.exists() && !trash(&original) {
+                    if original.exists() && !trash(&original) && how != Resolve::PhoneAnyway {
                         live.book.conflicts.insert(position, conflict);
+                        tell(&Report {
+                            refused: Some(
+                                "There is no trash to put this computer's version in, so nothing was replaced. Choose Replace Anyway to replace it for good."
+                                    .to_string(),
+                            ),
+                            ..Report::default()
+                        });
                         self.publish();
                         return;
                     }
@@ -5372,6 +5402,29 @@ mod tests {
     /// S3: hidden/.git/.tmp items are left out at add time and counted; a
     /// name differing only by case counts as taken (the phone's file system
     /// may fold case).
+    /// S3: with no trash "Keep the phone's" says why and changes nothing;
+    /// "Replace Anyway" does it.
+    #[test]
+    fn keeping_the_phones_version_without_a_trash_says_so_and_can_be_forced() {
+        let (base, root, mut worker) = scratch_bucket("bucket-no-trash");
+        fs::write(root.join("a.txt"), "desk").unwrap();
+        fs::write(root.join("a (conflicted copy).txt"), "phone").unwrap();
+        worker.pairs[0].book.conflicts.push(Conflict {
+            path: "a.txt".into(),
+            copy: "a (conflicted copy).txt".into(),
+            at: 0,
+        });
+        TEST_TRASH_FAILS.with(|fails| fails.set(true));
+        worker.resolve("phone-b", BUCKET_ID, "a.txt", Resolve::Phone);
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "desk");
+        assert_eq!(worker.pairs[0].book.conflicts.len(), 1, "still a conflict");
+        assert!(take_report().is_some_and(|m| m.contains("Replace Anyway")));
+        worker.resolve("phone-b", BUCKET_ID, "a.txt", Resolve::PhoneAnyway);
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "phone");
+        TEST_TRASH_FAILS.with(|fails| fails.set(false));
+        let _ = fs::remove_dir_all(&base);
+    }
+
     /// C10: a file removed here that the phone changed comes back, and the
     /// person is told which.
     #[test]

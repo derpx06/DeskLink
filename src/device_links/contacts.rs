@@ -526,6 +526,30 @@ pub(crate) fn install(dir: PathBuf) {
     }
 }
 
+/// Phones whose book was deleted (unpaired, a new identity, sharing turned
+/// off) and that have not sent a fresh snapshot since: a late reply or a
+/// queued save for them must not bring the book back.
+fn forgotten() -> &'static Mutex<std::collections::HashSet<String>> {
+    static FORGOTTEN: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    FORGOTTEN.get_or_init(Default::default)
+}
+
+fn is_forgotten(device_id: &str) -> bool {
+    forgotten()
+        .lock()
+        .is_ok_and(|forgotten| forgotten.contains(device_id))
+}
+
+/// [`with_book`] for the late arrivals of a conversation (queued vCards, a
+/// deferred save): nothing happens for a phone whose book was deleted.
+fn with_live_book<T>(device_id: &str, job: impl FnOnce(&mut Book, &Path) -> T) -> Option<T> {
+    if is_forgotten(device_id) {
+        return None;
+    }
+    with_book(device_id, job)
+}
+
 /// Runs `job` on `device_id`'s book (loaded from disk on first use).
 fn with_book<T>(device_id: &str, job: impl FnOnce(&mut Book, &Path) -> T) -> Option<T> {
     let mut guard = store().lock().ok()?;
@@ -553,6 +577,12 @@ pub(crate) fn on_snapshot(
             std::time::Instant::now(),
         )
     });
+    if complete.is_some() {
+        // A fresh conversation: the book may be made again.
+        if let Ok(mut forgotten) = forgotten().lock() {
+            forgotten.remove(device_id);
+        }
+    }
     let Some((snapshot, sharing)) = complete else {
         return Vec::new();
     };
@@ -622,7 +652,7 @@ fn vcard_worker(replies: &std::sync::mpsc::Receiver<(String, NetworkPacket)>) {
     let mut saved = std::time::Instant::now();
     let save = |dirty: &mut std::collections::HashSet<String>| {
         for device_id in dirty.drain() {
-            with_book(&device_id, |book, dir| save_logged(dir, &device_id, book));
+            with_live_book(&device_id, |book, dir| save_logged(dir, &device_id, book));
         }
     };
     loop {
@@ -659,7 +689,7 @@ const QUIET: std::time::Duration = std::time::Duration::from_millis(500);
 /// vCards from `device_id` (K3), applied in memory; whether they changed
 /// the book (the caller saves).
 fn on_vcards_unsaved(device_id: &str, packet: &NetworkPacket) -> bool {
-    let changed = with_book(device_id, |book, _| apply_vcards(book, packet)).unwrap_or(false);
+    let changed = with_live_book(device_id, |book, _| apply_vcards(book, packet)).unwrap_or(false);
     if changed {
         GENERATION.fetch_add(1, Ordering::Relaxed);
     }
@@ -693,6 +723,9 @@ pub(crate) fn forget_in(dir: &Path, device_id: &str) {
     // send the snapshot again (with it kept, turning sharing off and on again
     // left the desk empty).
     super::sync::forget_feature(device_id, "contacts");
+    if let Ok(mut forgotten) = forgotten().lock() {
+        forgotten.insert(device_id.to_string());
+    }
     if let Ok(mut store) = store().lock() {
         if let Some(store) = store.as_mut().filter(|store| store.dir == dir) {
             store.books.remove(device_id);
@@ -814,6 +847,15 @@ fn load(dir: &Path, device_id: &str) -> Option<Book> {
 mod tests {
     use super::*;
 
+    /// The store is one global: the tests that `install` a directory take
+    /// turns (a second install under a running one emptied its books).
+    static ONE_STORE: Mutex<()> = Mutex::new(());
+    fn one_store() -> std::sync::MutexGuard<'static, ()> {
+        ONE_STORE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn every_vcard_request_fits_one_wire_message() {
         let uids: Vec<String> = (0..1000)
@@ -836,8 +878,13 @@ mod tests {
 
     #[test]
     fn a_burst_of_replies_is_kept_and_saved_once_it_settles() {
+        let _store = one_store();
         let dir = std::env::temp_dir().join(format!("desklink-vcards-{}", uuid::Uuid::new_v4()));
         install(dir.clone());
+        // Another test may have forgotten this fixed id; a snapshot clears it.
+        if let Ok(mut forgotten) = forgotten().lock() {
+            forgotten.remove("phone-v");
+        }
         let uids: Vec<String> = (0..300).map(|index| index.to_string()).collect();
         with_book("phone-v", |book, _| {
             for uid in &uids {
@@ -1081,6 +1128,28 @@ X-UNKNOWN:ignored\r\nREV:2026-10-01T10:00:00Z\r\nEND:VCARD\r\n";
         let (stamps, _) = parse_snapshot(&junk).unwrap();
         assert_eq!(stamps.keys().collect::<Vec<_>>(), vec!["ok"]);
         assert!(parse_snapshot(&NetworkPacket::new("x")).is_none());
+    }
+
+    /// A vCard reply that arrives after the phone was unpaired does not make
+    /// the book again.
+    #[test]
+    fn late_replies_do_not_bring_a_forgotten_book_back() {
+        let _store = one_store();
+        let dir = std::env::temp_dir().join(format!("desklink-late-{}", uuid::Uuid::new_v4()));
+        install(dir.clone());
+        let id = format!("late-phone-{}", uuid::Uuid::new_v4().simple());
+        with_book(&id, |book, _| {
+            book.wanted.insert("1".into(), "1".into());
+        });
+        forget_in(&dir, &id);
+        let mut packet = NetworkPacket::new("desklink.contacts.response_vcards");
+        packet.set("uids", vec!["1".to_string()]);
+        packet.set("1", "BEGIN:VCARD\r\nFN:Late\r\nTEL:555\r\nEND:VCARD\r\n");
+        assert!(!on_vcards_unsaved(&id, &packet), "ignored");
+        assert!(list(&id).is_empty() || with_live_book(&id, |_, _| ()).is_none());
+        crate::device_links::vault::flush();
+        assert!(!book_path(&dir, &id).exists(), "no file came back");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -83,6 +83,11 @@ mod imp {
                     crate::device_links::private_fs::tighten_tree(
                         &gtk::glib::user_cache_dir().join("desklink"),
                     );
+                    // Where the phones were last seen (older versions made
+                    // this folder and endpoints.json world-readable).
+                    if let Some(state) = dirs::state_dir().or_else(dirs::data_local_dir) {
+                        crate::device_links::private_fs::tighten_tree(&state.join("desklink"));
+                    }
                     crate::device_links::connection_log::prune();
                     crate::device_links::transfer_log::prune();
                     crate::thumbnails::prune();
@@ -287,6 +292,11 @@ impl DesklinkApplication {
             .parameter_type(Some(glib::VariantTy::STRING))
             .activate(move |app: &Self, _, target| {
                 if let Some(device) = target.and_then(|target| target.get::<String>()) {
+                    // Any process on the session bus can activate this: it
+                    // only answers an ask the phone actually made.
+                    if !bucket_ask_pending(&crate::device_links::folders::offers(), &device) {
+                        return;
+                    }
                     crate::device_links::folders::turn_on_bucket(&device);
                     app.withdraw_notification(&format!("bucket-ask-{device}"));
                 }
@@ -307,16 +317,17 @@ impl DesklinkApplication {
                 else {
                     return;
                 };
-                if action == "dial" {
-                    app.dial_with(&number, &device);
-                    return;
-                }
-                if let Some(daemon) = app.daemon_handle() {
-                    daemon.send(crate::device_links::daemon::DaemonCommand::Telephony(
-                        device,
-                        action,
-                        Some(number).filter(|number| !number.is_empty()),
-                    ));
+                match call_action_kind(&action) {
+                    CallAction::Dial => app.dial_with(&number, &device),
+                    CallAction::Message => app.message_with(&number, &device),
+                    CallAction::OnTheCall => {
+                        if let Some(daemon) = app.daemon_handle() {
+                            daemon.send(crate::device_links::daemon::DaemonCommand::Telephony(
+                                device, action, None,
+                            ));
+                        }
+                    }
+                    CallAction::Refused => {}
                 }
             })
             .build();
@@ -345,6 +356,13 @@ impl DesklinkApplication {
             call_action,
             dial_action,
         ]);
+    }
+
+    /// Like [`Self::dial_with`], for a text message.
+    pub(crate) fn message_with(&self, number: &str, phone: &str) {
+        let window = self.main_window();
+        window.present();
+        crate::window::confirm_message(&window, number, Some(phone));
     }
 
     /// Like [`Self::dial`], with the phone that must place the call.
@@ -1300,5 +1318,74 @@ mod primary_only_tests {
         );
         assert!(!constructed.contains("start_server"));
         assert!(source.contains("fn start_primary"));
+    }
+}
+
+/// What `app.call` may do for whoever activates it (any process on the
+/// session bus can).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CallAction {
+    /// Asked first, in the window.
+    Dial,
+    /// Asked first, in the window.
+    Message,
+    /// Acts on a call that is already going: no number, nothing outward.
+    OnTheCall,
+    Refused,
+}
+
+pub(crate) fn call_action_kind(action: &str) -> CallAction {
+    match action {
+        "dial" => CallAction::Dial,
+        "message" => CallAction::Message,
+        "answer" | "decline" | "silence" | "end" | "mute" | "unmute" => CallAction::OnTheCall,
+        _ => CallAction::Refused,
+    }
+}
+
+#[cfg(test)]
+mod call_action_tests {
+    use super::{call_action_kind, CallAction};
+
+    /// Nothing that starts something outward runs unasked through `app.call`.
+    #[test]
+    fn only_calls_already_going_skip_the_question() {
+        assert_eq!(call_action_kind("dial"), CallAction::Dial);
+        assert_eq!(call_action_kind("message"), CallAction::Message);
+        for action in ["answer", "decline", "silence", "end", "mute", "unmute"] {
+            assert_eq!(call_action_kind(action), CallAction::OnTheCall, "{action}");
+        }
+        for action in ["sms", "send", "dial ", "", "reply", "hangup-all"] {
+            assert_eq!(call_action_kind(action), CallAction::Refused, "{action}");
+        }
+    }
+}
+
+/// Whether `device` has asked to turn on a Bucket and is waiting for the
+/// answer.
+pub(crate) fn bucket_ask_pending(
+    offers: &[crate::device_links::folders::Offer],
+    device: &str,
+) -> bool {
+    offers
+        .iter()
+        .any(|offer| offer.bucket && offer.device == device)
+}
+
+#[cfg(test)]
+mod bucket_ask_tests {
+    use crate::device_links::folders::Offer;
+
+    #[test]
+    fn turning_on_a_bucket_answers_only_an_ask_that_was_made() {
+        let offers = vec![Offer {
+            device: "phone-a".into(),
+            id: "bucket".into(),
+            name: "Bucket".into(),
+            bucket: true,
+        }];
+        assert!(super::bucket_ask_pending(&offers, "phone-a"));
+        assert!(!super::bucket_ask_pending(&offers, "phone-b"));
+        assert!(!super::bucket_ask_pending(&[], "phone-a"));
     }
 }

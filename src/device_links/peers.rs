@@ -85,6 +85,9 @@ mod tests {
             "device_links/config.rs:TOKENS",
             // A snapshot being assembled; times out.
             "device_links/contacts.rs:PENDING",
+            // A marker that a deleted book must not come back from a late
+            // reply; cleared by the phone's next snapshot.
+            "device_links/contacts.rs:FORGOTTEN",
         ];
         fn scan(dir: &std::path::Path, root: &std::path::Path, found: &mut Vec<String>) {
             for entry in std::fs::read_dir(dir).unwrap().flatten() {

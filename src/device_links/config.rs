@@ -27,6 +27,9 @@ pub struct TrustedDevice {
     /// existed, which therefore load as off.
     #[serde(default)]
     pub terminal_access: bool,
+    /// Fields a newer build wrote for this phone, kept as they were.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The format of `config.json` this build writes. A build meeting a *newer*
@@ -34,6 +37,11 @@ pub struct TrustedDevice {
 /// erase every setting it did not know); every build keeps the fields it does
 /// not know when it writes its own.
 const CONFIG_VERSION: u32 = 1;
+
+/// The words for a settings file this build cannot read because a newer
+/// DeskLink wrote it.
+const NEWER_UNREADABLE: &str =
+    "This settings file is from a newer DeskLink; changes will not be saved. Update DeskLink, or move the file aside to start fresh.";
 
 fn config_version() -> u32 {
     CONFIG_VERSION
@@ -102,6 +110,11 @@ pub struct AppSettings {
     /// every phone is by default.
     #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub muted_command_alerts: std::collections::BTreeSet<String>,
+    /// The phones that may switch "keep this computer awake" on or off from
+    /// their side. None until turned on here, per phone: holding a laptop
+    /// awake with the lid closed is the person at this desk's decision.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub keep_awake_phones: std::collections::BTreeSet<String>,
     /// The phones that may unlock this computer from this network, approved
     /// on the phone each time. None until turned on here, per phone; never
     /// from the phone.
@@ -151,6 +164,7 @@ impl Default for AppSettings {
             clipboard_sync: true,
             hidden_notifications: Default::default(),
             muted_command_alerts: Default::default(),
+            keep_awake_phones: Default::default(),
             unlock_devices: Default::default(),
             top_bar_pill: false,
             recent_folders: Vec::new(),
@@ -188,6 +202,10 @@ impl AppSettings {
     }
 
     /// Whether `device_id` hears about long commands finishing.
+    pub fn lets_keep_awake(&self, device_id: &str) -> bool {
+        self.keep_awake_phones.contains(device_id)
+    }
+
     pub fn alerts_commands_to(&self, device_id: &str) -> bool {
         !self.muted_command_alerts.contains(device_id)
     }
@@ -325,9 +343,11 @@ fn remove_stored_removed_features(base_dir: &Path) -> bool {
 
 /// Moves the resumable-transfer partials (up to a gigabyte each) out of the
 /// config directory, which backup and dotfile tools copy, into the state
-/// directory. Quiet and once: only when the new place does not exist yet.
+/// directory. Quiet. A move that failed half way (another filesystem, a full
+/// disk) is finished at the next start: the old folder is only removed once
+/// everything in it is in the new one, and files already there are kept.
 fn migrate_transfer_state(old: &Path, new: &Path) {
-    if !old.is_dir() || new.exists() {
+    if !old.is_dir() {
         return;
     }
     if let Some(parent) = new.parent() {
@@ -335,7 +355,7 @@ fn migrate_transfer_state(old: &Path, new: &Path) {
             return;
         }
     }
-    if fs::rename(old, new).is_ok() {
+    if !new.exists() && fs::rename(old, new).is_ok() {
         return;
     }
     // Another filesystem: copy what is there, then remove the old.
@@ -345,8 +365,10 @@ fn migrate_transfer_state(old: &Path, new: &Path) {
     let mut all_copied = true;
     if let Ok(entries) = fs::read_dir(old) {
         for entry in entries.flatten() {
+            let target = new.join(entry.file_name());
             if entry.path().is_file()
-                && fs::copy(entry.path(), new.join(entry.file_name())).is_err()
+                && !target.exists()
+                && fs::copy(entry.path(), &target).is_err()
             {
                 all_copied = false;
             }
@@ -415,6 +437,11 @@ impl Config {
         super::private_fs::create_dir_all(&base_dir).map_err(|err| err.to_string())?;
         let state_path = base_dir.join("config.json");
         let mut notice = None;
+        // A file whose `version` is newer than ours and which we cannot read
+        // is "newer", not "damaged": it is left exactly as it is, and this
+        // run neither starts a fresh identity nor writes anything.
+        let mut newer_unreadable = false;
+        let mut kept_device_id = None;
         let parsed = if state_path.exists() {
             let bytes = fs::read(&state_path).map_err(|error| {
                 format!(
@@ -422,8 +449,23 @@ impl Config {
                     state_path.display()
                 )
             })?;
+            let raw: Option<serde_json::Value> = serde_json::from_slice(&bytes).ok();
+            let raw_version = raw
+                .as_ref()
+                .and_then(|value| value.get("version"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
             match serde_json::from_slice::<StoredConfig>(&bytes) {
                 Ok(stored) => Some(stored),
+                Err(_) if raw_version > u64::from(CONFIG_VERSION) => {
+                    newer_unreadable = true;
+                    kept_device_id = raw
+                        .as_ref()
+                        .and_then(|value| value.get("device_id"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    None
+                }
                 Err(_) => {
                     // Damaged by something else (a restore, an editor, a full
                     // disk): kept beside it, never deleted, and DeskLink
@@ -444,19 +486,33 @@ impl Config {
         } else {
             None
         };
-        let read_only = parsed
-            .as_ref()
-            .is_some_and(|stored| stored.version > CONFIG_VERSION);
-        if read_only {
+        // Newer and readable: used as it is, its unknown fields kept and its
+        // `version` written back unchanged (a newer build reads it again).
+        let newer = newer_unreadable
+            || parsed
+                .as_ref()
+                .is_some_and(|stored| stored.version > CONFIG_VERSION);
+        let read_only = newer_unreadable;
+        if newer_unreadable {
+            notice = Some(NEWER_UNREADABLE.to_string());
+        } else if newer {
             notice = Some(
-                "These settings were written by a newer DeskLink. This version reads them but does not change them."
+                "These settings were written by a newer DeskLink. Settings this version does not know are kept as they are."
                     .to_string(),
             );
         }
+        // A new identity (no file, or a damaged one) comes with its own key
+        // and certificate: the certificate's name is the device id, and a
+        // phone refuses a link whose certificate names another id. The old
+        // ones are kept beside, never deleted.
+        let fresh_identity = parsed.is_none() && !newer_unreadable;
         let mut stored = if let Some(stored) = parsed {
             stored
         } else {
-            let device_id = Uuid::new_v4().simple().to_string();
+            let device_id = kept_device_id
+                .take()
+                .filter(|id| !id.is_empty())
+                .unwrap_or_else(|| Uuid::new_v4().simple().to_string());
             let device_name = hostname::get()
                 .ok()
                 .and_then(|name| name.into_string().ok())
@@ -476,6 +532,15 @@ impl Config {
 
         let key_path = base_dir.join("privateKey.pem");
         let cert_path = base_dir.join("certificate.pem");
+        if fresh_identity {
+            let stamp = now_millis();
+            for path in [&key_path, &cert_path] {
+                if path.exists() {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    let _ = fs::rename(path, base_dir.join(format!("{name}.old-{stamp}")));
+                }
+            }
+        }
         let key = if key_path.exists() {
             PKey::private_key_from_pem(&fs::read(&key_path).map_err(|err| err.to_string())?)
                 .map_err(|err| err.to_string())?
@@ -505,8 +570,10 @@ impl Config {
         };
 
         // What features that no longer exist left among the settings.
-        for gone in REMOVED_SETTING_KEYS {
-            stored.settings.extra.remove(gone);
+        if !newer {
+            for gone in REMOVED_SETTING_KEYS {
+                stored.settings.extra.remove(gone);
+            }
         }
         for device in stored.trusted_devices.values() {
             mirror_terminal_access(&device.id, device.terminal_access);
@@ -515,7 +582,9 @@ impl Config {
         // Features that were removed: what they stored goes, quietly. The
         // settings that went with them are dropped by the save below
         // (unknown keys are not kept); pairing records and the rest stay.
-        remove_stored_removed_features(&base_dir);
+        if !newer {
+            remove_stored_removed_features(&base_dir);
+        }
         let config = Self {
             base_dir,
             stored,
@@ -530,11 +599,15 @@ impl Config {
         // Written only when something differs, and a failure to write is no
         // reason not to run: a full or read-only disk keeps the config in
         // memory, and the next change tries again.
-        if let Err(error) = config.save() {
-            crate::device_links::limits::log_limited(
-                "config-save",
-                &format!("Could not save the settings; carrying on with them in memory: {error}"),
-            );
+        if !config.read_only {
+            if let Err(error) = config.save() {
+                crate::device_links::limits::log_limited(
+                    "config-save",
+                    &format!(
+                        "Could not save the settings; carrying on with them in memory: {error}"
+                    ),
+                );
+            }
         }
         Ok(config)
     }
@@ -546,7 +619,9 @@ impl Config {
     /// failed, and DeskLink never started again without losing every pairing.
     pub fn save(&self) -> Result<(), String> {
         if self.read_only {
-            return Ok(());
+            // Not "saved": the person is told, and every command that saves
+            // reports it (a pairing made now would be lost on restart).
+            return Err(NEWER_UNREADABLE.to_string());
         }
         super::private_fs::create_dir_all(&self.base_dir).map_err(|err| err.to_string())?;
         // The pairing record and the session-password hash: this user only.
@@ -768,6 +843,10 @@ impl Config {
                 protocol_version: info.protocol_version,
                 certificate_pem,
                 terminal_access,
+                extra: previous
+                    .as_ref()
+                    .map(|record| record.extra.clone())
+                    .unwrap_or_default(),
             },
         );
         let is_new_record = previous.is_none();
@@ -855,6 +934,7 @@ impl Config {
             // phone under the same id.
             settings.hidden_notifications.remove(device_id),
             settings.muted_command_alerts.remove(device_id),
+            settings.keep_awake_phones.remove(device_id),
             settings.contact_caller_names.remove(device_id),
         ];
         if cleared.contains(&true) {
@@ -1574,20 +1654,117 @@ mod tests {
         assert_eq!(after["from_the_future"]["a"], 1, "kept");
         assert_eq!(after["settings"]["glide_v2"], "keep me", "kept");
         assert_eq!(after["device_name"], "Renamed");
-        // A newer file is not touched at all.
+        // A newer file we can read is kept compatibly: its version and every
+        // field we do not know survive our save.
         let mut newer = read();
         newer["version"] = (CONFIG_VERSION + 1).into();
         newer["device_name"] = "Newer".into();
-        let bytes = serde_json::to_vec(&newer).unwrap();
-        fs::write(&path, &bytes).unwrap();
+        newer["added_in_v2"] = serde_json::json!([1, 2]);
+        fs::write(&path, serde_json::to_vec(&newer).unwrap()).unwrap();
         let mut config = Config::load_from_dir(dir.clone()).unwrap();
         assert!(config
             .take_load_notice()
             .is_some_and(|n| n.contains("newer DeskLink")));
         config.set_device_name_for_test("Changed here");
         config.save().unwrap();
-        assert_eq!(fs::read(&path).unwrap(), bytes, "left exactly as it was");
+        let after = read();
+        assert_eq!(after["version"], CONFIG_VERSION + 1, "not downgraded");
+        assert_eq!(after["added_in_v2"], serde_json::json!([1, 2]));
+        assert_eq!(after["device_name"], "Changed here", "and saved");
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A newer file this build cannot even parse is "newer", not "damaged":
+    /// nothing is set aside or regenerated, the device id is kept, and saving
+    /// says it cannot.
+    #[test]
+    fn an_unreadable_newer_file_is_not_treated_as_damage() {
+        let dir = std::env::temp_dir().join(format!("desklink-newer-{}", Uuid::new_v4()));
+        drop(Config::load_from_dir(dir.clone()).unwrap());
+        let path = dir.join("config.json");
+        let key_before = fs::read(dir.join("privateKey.pem")).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        let id = json["device_id"].as_str().unwrap().to_string();
+        json["version"] = (CONFIG_VERSION + 1).into();
+        json["trusted_devices"] = serde_json::json!("a shape this build does not know");
+        let bytes = serde_json::to_vec(&json).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        assert!(config
+            .take_load_notice()
+            .is_some_and(|n| n.contains("newer DeskLink")));
+        assert_eq!(config.local_device_info().id, id, "same identity");
+        assert!(config.save().unwrap_err().contains("newer DeskLink"));
+        assert_eq!(fs::read(&path).unwrap(), bytes, "left exactly as it was");
+        assert_eq!(fs::read(dir.join("privateKey.pem")).unwrap(), key_before);
+        let aside = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains("corrupt"));
+        assert!(!aside, "not set aside as damaged");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A damaged config.json starts a new identity with its own key and
+    /// certificate: the certificate names the new id (what the phone checks:
+    /// the CN must equal the id the peer claims), and the old pair is kept.
+    #[test]
+    fn a_new_identity_gets_a_matching_key_and_certificate_and_keeps_the_old_pair() {
+        let dir = std::env::temp_dir().join(format!("desklink-newid-{}", Uuid::new_v4()));
+        let first = Config::load_from_dir(dir.clone()).unwrap();
+        let old_id = first.local_device_info().id;
+        drop(first);
+        fs::write(dir.join("config.json"), b"{ not json").unwrap();
+        let second = Config::load_from_dir(dir.clone()).unwrap();
+        let new_id = second.local_device_info().id;
+        assert_ne!(new_id, old_id);
+        let common_name = |config: &Config| {
+            config
+                .certificate()
+                .subject_name()
+                .entries_by_nid(openssl::nid::Nid::COMMONNAME)
+                .next()
+                .unwrap()
+                .data()
+                .to_string()
+                .unwrap()
+        };
+        assert_eq!(common_name(&second), new_id, "CN == the id it will claim");
+        assert!(certificate_matches_key(second.certificate(), second.key()));
+        // And the same after a restart.
+        drop(second);
+        let third = Config::load_from_dir(dir.clone()).unwrap();
+        assert_eq!(third.local_device_info().id, new_id);
+        assert_eq!(common_name(&third), new_id);
+        let kept = |prefix: &str| {
+            fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+        };
+        assert!(kept("privateKey.pem.old-") && kept("certificate.pem.old-"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// S3: a move that stopped half way is finished at the next start.
+    #[test]
+    fn a_half_finished_transfer_state_move_is_finished_later() {
+        let base = std::env::temp_dir().join(format!("desklink-migrate-{}", Uuid::new_v4()));
+        let (old, new) = (base.join("old"), base.join("new"));
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(old.join("a.part"), "old a").unwrap();
+        fs::write(old.join("b.part"), "old b").unwrap();
+        fs::write(new.join("a.part"), "already moved").unwrap();
+        migrate_transfer_state(&old, &new);
+        assert!(!old.exists(), "the old folder goes once all is in the new");
+        assert_eq!(
+            fs::read_to_string(new.join("a.part")).unwrap(),
+            "already moved"
+        );
+        assert_eq!(fs::read_to_string(new.join("b.part")).unwrap(), "old b");
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// A settings file that cannot be rewritten (a full or read-only disk)
@@ -1642,12 +1819,13 @@ mod tests {
         migrate_transfer_state(&old, &new);
         assert!(!old.exists());
         assert_eq!(fs::read(new.join(".desklink-1.part")).unwrap(), b"partial");
-        // The new place exists: an old folder that appears again is left.
+        // The new place exists: an old folder that appears again (a move that
+        // stopped half way, a restored backup) is merged in and goes.
         fs::create_dir_all(&old).unwrap();
         fs::write(old.join("later"), b"x").unwrap();
         migrate_transfer_state(&old, &new);
-        assert!(old.join("later").exists());
-        assert!(!new.join("later").exists());
+        assert!(!old.exists());
+        assert!(new.join("later").exists());
         let _ = fs::remove_dir_all(base);
     }
 

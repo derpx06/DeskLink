@@ -1,0 +1,40 @@
+{
+  "_note": "Written by the desk (rule: docs/protocol/stageD-protocol.md 'W3 - case clashes (folding)': per code point, SIMPLE lowercase only when it yields exactly one char, else unchanged; no locale, no final-sigma context, no normalisation; per directory, the UTF-8 byte-order first name wins, a folder that loses takes everything below it). 'names' are live paths of one manifest; 'winners' what stays.",
+  "names": [
+    "a.txt",
+    "A.txt",
+    "ΑΣ",
+    "Ασ",
+    "ας",
+    "A.Σ",
+    "a.σ",
+    "a.ς",
+    "İ",
+    "ß",
+    "SS",
+    "ss",
+    "𐐀",
+    "𐐨",
+    "é",
+    "é",
+    "D",
+    "D/x",
+    "d",
+    "d/x"
+  ],
+  "winners": [
+    "A.txt",
+    "ΑΣ",
+    "ας",
+    "A.Σ",
+    "a.ς",
+    "İ",
+    "ß",
+    "SS",
+    "𐐀",
+    "é",
+    "é",
+    "D",
+    "D/x"
+  ]
+}

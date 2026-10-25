@@ -247,16 +247,22 @@ impl DeviceManager {
     /// Links to phones that are not paired and are not pairing, open for
     /// `max` or longer: a stranger's socket that only idles holds a reader
     /// thread and a slot for ever, since its heartbeats keep it "alive".
+    ///
+    /// A phone that is paired in the trust store is never swept, whatever its
+    /// session says: a paired phone redialling after a sleep or a network
+    /// change must not be cut by this.
     pub fn idle_unpaired_links(
         &self,
         now: Instant,
         max: std::time::Duration,
+        is_trusted: impl Fn(&str) -> bool,
     ) -> Vec<SessionBinding> {
         use crate::device_links::pairing::PairState;
         self.reconciler_sessions()
             .values()
             .filter(|session| {
                 session.state != SessionState::Terminated
+                    && !is_trusted(&session.device_id)
                     && session.pairing.state == PairState::NotPaired
                     && now.saturating_duration_since(session.linked_at) >= max
             })

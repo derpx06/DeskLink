@@ -28,7 +28,7 @@ mod bucket;
 pub(crate) mod calls;
 pub(crate) mod insert;
 mod sound;
-pub(crate) use calls::confirm_dial;
+pub(crate) use calls::{confirm_dial, confirm_message};
 mod clipboard;
 mod contacts;
 pub(crate) mod history;

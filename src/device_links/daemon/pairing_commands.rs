@@ -391,6 +391,8 @@ pub(super) fn consider_replacement(
         super::state::push_error(errors, error);
         return;
     }
+    // What waited for the old id now waits for the new one.
+    super::file_transfer::move_waiting(&candidate.old_id, &candidate.new_id);
     forget_replaced(sessions, devices, &candidate.old_id);
     super::state::push_event(
         events,

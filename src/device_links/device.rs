@@ -313,7 +313,7 @@ impl DeviceView {
             keyboard_focused: None,
             keyboard_allowed: None,
             notification_access: None,
-            app_version: info.app_version.clone(),
+            app_version: None,
             sound: None,
             capture: None,
         }

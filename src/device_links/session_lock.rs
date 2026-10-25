@@ -94,12 +94,17 @@ pub enum Precheck {
     Allowed,
     Denied(String),
     /// Hash `offered` (outside any lock) and report with [`SessionLock::finish`].
-    Verify,
+    /// Carries the lock's epoch: if an unpair or a password change happens
+    /// while hashing, the answer no longer counts.
+    Verify(u64),
 }
 
 #[derive(Default)]
 pub struct SessionLock {
     devices: HashMap<String, DeviceState>,
+    /// Bumped by every unlock-forgetting event (unpair, new identity,
+    /// password change).
+    epoch: u64,
 }
 
 fn digest(password: &str) -> [u8; 32] {
@@ -145,7 +150,7 @@ impl SessionLock {
         if state.last_wrong == Some(digest(offered)) {
             return Precheck::Denied(PASSWORD_WRONG.to_string());
         }
-        Precheck::Verify
+        Precheck::Verify(self.epoch)
     }
 
     /// Records the outcome of hashing `offered`.
@@ -155,9 +160,17 @@ impl SessionLock {
         session: u64,
         offered: &str,
         correct: bool,
+        epoch: u64,
         now: Instant,
     ) -> Result<(), String> {
+        let changed = epoch != self.epoch;
         let state = self.devices.entry(device_id.to_string()).or_default();
+        // A right answer to a question asked before the password changed or
+        // the phone was unpaired unlocks nothing; nor does one that arrives
+        // while a lockout (started by a concurrent wrong guess) runs.
+        if correct && (changed || state.locked_until.is_some_and(|until| until > now)) {
+            return Err(PASSWORD_REQUIRED.to_string());
+        }
         if correct {
             *state = DeviceState {
                 unlocked_session: Some(session),
@@ -194,10 +207,10 @@ impl SessionLock {
         match self.begin(stored, device_id, session, offered, now) {
             Precheck::Allowed => Ok(()),
             Precheck::Denied(reason) => Err(reason),
-            Precheck::Verify => {
+            Precheck::Verify(epoch) => {
                 let offered = offered.unwrap_or_default();
                 let correct = stored.is_some_and(|stored| matches(offered, stored));
-                self.finish(device_id, session, offered, correct, now)
+                self.finish(device_id, session, offered, correct, epoch, now)
             }
         }
     }
@@ -206,6 +219,7 @@ impl SessionLock {
     /// identity). Its failures and lockout stay: they are a property of the
     /// guessing, not of the connection.
     pub fn forget_unlock(&mut self, device_id: &str) {
+        self.epoch += 1;
         if let Some(state) = self.devices.get_mut(device_id) {
             state.unlocked_session = None;
             state.last_wrong = None;
@@ -214,6 +228,7 @@ impl SessionLock {
 
     /// Forgets every unlock, e.g. when the password changes.
     pub fn relock_all(&mut self) {
+        self.epoch += 1;
         for state in self.devices.values_mut() {
             state.unlocked_session = None;
             state.last_wrong = None;
@@ -262,7 +277,7 @@ pub fn check(device_id: &str, session: u64, offered: Option<&str>) -> Result<(),
     let result = match precheck {
         Precheck::Allowed => return Ok(()),
         Precheck::Denied(reason) => Err(reason),
-        Precheck::Verify => {
+        Precheck::Verify(epoch) => {
             let offered = offered.unwrap_or_default();
             let correct = stored
                 .as_ref()
@@ -270,7 +285,7 @@ pub fn check(device_id: &str, session: u64, offered: Option<&str>) -> Result<(),
             shared()
                 .lock()
                 .map_err(|_| PASSWORD_REQUIRED.to_string())?
-                .finish(device_id, session, offered, correct, Instant::now())
+                .finish(device_id, session, offered, correct, epoch, Instant::now())
         }
     };
     if result.is_err() && offered.is_some() {
@@ -322,6 +337,90 @@ mod tests {
         assert!(lock.check(Some(&stored), "other", 1, None, now).is_err());
         lock.relock_all();
         assert!(lock.check(Some(&stored), "p", 1, None, now).is_err());
+    }
+
+    /// W7: every gate keys the proved password by the connection's
+    /// `session_id` (fresh per peer). The per-attempt `generation` is the
+    /// constant 1, so a gate that reverted to it would let one connection's
+    /// proof carry to the next. Pinned at the five call sites.
+    #[test]
+    fn every_gate_passes_the_session_id_never_the_generation() {
+        let sources = [
+            (
+                "coordinator.rs",
+                include_str!("webrtc/coordinator.rs"),
+                2usize,
+            ),
+            (
+                "terminal_bridge.rs",
+                include_str!("webrtc/terminal_bridge.rs"),
+                3usize,
+            ),
+        ];
+        for (name, source, expected) in sources {
+            let production = source.split("#[cfg(test)]\nmod ").next().unwrap();
+            let mut seen = 0;
+            for needle in ["session_lock::check(", "session_lock::is_unlocked("] {
+                for (at, _) in production.match_indices(needle) {
+                    seen += 1;
+                    let call: String = production[at..].chars().take(160).collect();
+                    let call = call.split(')').next().unwrap_or_default().to_string();
+                    assert!(call.contains("session_id"), "{name}: {call}");
+                    assert!(!call.contains("generation"), "{name}: {call}");
+                }
+            }
+            assert_eq!(seen, expected, "{name}: a gate was added or removed");
+        }
+    }
+
+    /// Two sessions that share a generation are still two connections.
+    #[test]
+    fn two_sessions_with_one_generation_do_not_share_a_proof() {
+        let stored = cheap("hunter2");
+        let mut lock = SessionLock::default();
+        let now = Instant::now();
+        let (one, two) = (
+            session_of("4b6c0f6e-3d63-4d0e-9f4f-1d0a2f8e5a11"),
+            session_of("9a1e55a4-83f1-4a8e-b0a5-7c4f6a3d21c0"),
+        );
+        assert!(lock
+            .check(Some(&stored), "p", one, Some("hunter2"), now)
+            .is_ok());
+        assert_eq!(
+            lock.check(Some(&stored), "p", two, None, now),
+            Err(PASSWORD_REQUIRED.into())
+        );
+    }
+
+    /// The window between `begin` and `finish` (hashing runs outside the
+    /// lock): a right answer to a question asked before an unpair or a
+    /// password change unlocks nothing.
+    #[test]
+    fn an_answer_that_straddles_an_unpair_or_a_password_change_unlocks_nothing() {
+        let stored = cheap("hunter2");
+        let now = Instant::now();
+        for event in ["unpair", "password change"] {
+            let mut lock = SessionLock::default();
+            let Precheck::Verify(epoch) = lock.begin(Some(&stored), "p", 1, Some("hunter2"), now)
+            else {
+                panic!("a first offer is verified");
+            };
+            // ... hashing happens here, outside the lock ...
+            if event == "unpair" {
+                lock.forget_unlock("p");
+            } else {
+                lock.relock_all();
+            }
+            assert_eq!(
+                lock.finish("p", 1, "hunter2", true, epoch, now),
+                Err(PASSWORD_REQUIRED.into()),
+                "{event}"
+            );
+            assert!(
+                lock.check(Some(&stored), "p", 1, None, now).is_err(),
+                "{event}"
+            );
+        }
     }
 
     fn session_of(attempt: &str) -> u64 {

@@ -73,10 +73,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - name: The manifest is releasable (tag, commit, permissions)
+        run: python3 flatpak/check-manifest.py --release || { echo "::error::finish the TODO(owner) lines (flatpak/check-manifest.py --release)"; exit 1; }
+
       - name: Generate cargo sources and a manifest for this checkout
         run: |
           dnf install -y git python3-aiohttp python3-tomlkit
-          git clone --depth 1 https://github.com/flatpak/flatpak-builder-tools /tmp/fbt
+          # Pinned: this script runs with the release's credentials.
+          git clone https://github.com/flatpak/flatpak-builder-tools /tmp/fbt
+          git -C /tmp/fbt checkout 9d86d336a39b9af38b86f114b6ce5820fe260f91
           python3 /tmp/fbt/cargo/flatpak-cargo-generator.py Cargo.lock -o flatpak/cargo-sources.json
           python3 - <<'PY'
           import json, os

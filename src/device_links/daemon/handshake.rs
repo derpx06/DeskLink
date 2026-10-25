@@ -175,6 +175,7 @@ pub(super) fn finish_secure_link(
         }
     }
     upsert_device(&devices, &secure_info, address, paired);
+    super::state::note_app_version(&devices, &secure_info);
 
     // A relay link is standby capacity: a working LAN socket always replaces
     // it, even while it is live and answering.
@@ -608,6 +609,7 @@ pub(crate) fn promote_qr_link(
     let _ = link.send_packet(&reply);
     let info = link.info.clone();
     upsert_device(&context.devices, &info, address, true);
+    super::state::note_app_version(&context.devices, &info);
     attach_bootstrap_link(
         &info.id,
         link,

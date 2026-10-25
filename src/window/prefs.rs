@@ -132,6 +132,7 @@ fn groups(
 ) -> Vec<adw::PreferencesGroup> {
     let connection = group(GROUPS[0]);
     connection.add(&keep_awake_row(daemon, settings));
+    connection.add(&phone_keep_awake_row(daemon, settings, device));
     connection.add(&start_at_login_row(daemon, settings));
 
     let notifications = group(GROUPS[1]);
@@ -559,6 +560,31 @@ fn command_alerts_row(
         daemon.send(DaemonCommand::SetCommandAlerts(id.clone(), row.is_active()))
     });
     follow(&row, |settings, id| settings.alerts_commands_to(id));
+    row
+}
+
+/// Whether this phone may switch keep-awake from its side: off, with the
+/// reason in the subtitle.
+fn phone_keep_awake_row(
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    device: &DeviceView,
+) -> adw::SwitchRow {
+    let row = adw::SwitchRow::builder()
+        .title("Let this phone keep the computer awake")
+        .use_markup(false)
+        .active(settings.lets_keep_awake(&device.id))
+        .build();
+    row.set_subtitle(&format!(
+        "{} may turn \"keep awake\" on, lid closed included. A laptop kept awake in a bag gets hot and flattens its battery.",
+        device.name
+    ));
+    with_icon(&row, "weather-clear-night-symbolic");
+    let (daemon, id) = (daemon.clone(), device.id.clone());
+    row.connect_active_notify(move |row| {
+        daemon.send(DaemonCommand::SetKeepAwakeFrom(id.clone(), row.is_active()))
+    });
+    follow(&row, |settings, id| settings.lets_keep_awake(id));
     row
 }
 

@@ -749,16 +749,23 @@ mod tests {
         let now = std::time::Instant::now();
         assert!(desktop
             .sessions
-            .idle_unpaired_links(now, UNPAIRED_LINK_MAX)
+            .idle_unpaired_links(now, UNPAIRED_LINK_MAX, |_| false)
             .is_empty());
         let later = now + UNPAIRED_LINK_MAX;
         assert_eq!(
             desktop
                 .sessions
-                .idle_unpaired_links(later, UNPAIRED_LINK_MAX)
+                .idle_unpaired_links(later, UNPAIRED_LINK_MAX, |_| false)
                 .len(),
             1
         );
+        // A phone paired in the trust store is never swept, even if its
+        // session has not yet marked it paired (it is redialling).
+        let id = desktop.binding.device_id.clone();
+        assert!(desktop
+            .sessions
+            .idle_unpaired_links(later, UNPAIRED_LINK_MAX, |candidate| candidate == id)
+            .is_empty());
     }
 
     /// A heartbeat is consumed as liveness and never dispatched as a feature.

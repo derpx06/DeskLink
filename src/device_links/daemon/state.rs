@@ -38,9 +38,6 @@ pub(crate) fn upsert_device(
                 device.device_type = info.device_type.clone();
                 device.address = address.clone();
                 device.protocol_version = info.protocol_version;
-                if info.app_version.is_some() {
-                    device.app_version = info.app_version.clone();
-                }
                 device.incoming_capabilities = info.incoming_capabilities.clone();
                 device.outgoing_capabilities = info.outgoing_capabilities.clone();
                 // Trust is a stored fact, so it is safe to refresh here.
@@ -59,6 +56,20 @@ pub(crate) fn upsert_device(
                 // the session (or the trust store) every second.
             })
             .or_insert_with(|| DeviceView::from_info(info, address, paired));
+    }
+}
+
+/// Records the version a phone said it runs. Only from an *authenticated*
+/// identity (the TLS handshake, pinned for a paired phone): a beacon is
+/// anyone's packet, and would make "Update DeskLink" appear on demand.
+pub(crate) fn note_app_version(
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    info: &DeviceInfo,
+) {
+    if let (Some(version), Ok(mut devices)) = (&info.app_version, devices.lock()) {
+        if let Some(device) = devices.get_mut(&info.id) {
+            device.app_version = Some(version.clone());
+        }
     }
 }
 
@@ -151,7 +162,8 @@ pub(crate) fn reconcile_connection_status(
         device.feature_transport_ready = ready;
         // A phone on another major.minor that has not become ready is most
         // likely an update away (J15); said in the words the ladder uses.
-        if !ready
+        if reachable
+            && !ready
             && device.last_error.is_none()
             && device.app_version.as_deref().is_some_and(|theirs| {
                 crate::device_links::device::versions_skew(crate::config::VERSION, theirs)
@@ -1008,7 +1020,19 @@ mod tests {
         };
         let mut skewed = info.clone();
         skewed.app_version = Some("0.9.0".into());
+        // A beacon (upsert) says nothing about the version...
         upsert_device(&devices, &skewed, "10.0.0.2".into(), true);
+        reconcile_connection_status(&devices, std::slice::from_ref(&connection));
+        assert_eq!(devices.lock().unwrap()[&info.id].last_error, None);
+        // ...an authenticated identity does.
+        note_app_version(&devices, &skewed);
+        // Offline: no message about a phone that is not there.
+        let offline = DeviceConnection {
+            linked: false,
+            ..connection.clone()
+        };
+        reconcile_connection_status(&devices, std::slice::from_ref(&offline));
+        assert_eq!(devices.lock().unwrap()[&info.id].last_error, None);
         reconcile_connection_status(&devices, std::slice::from_ref(&connection));
         let error = devices.lock().unwrap()[&info.id].last_error.clone();
         assert_eq!(

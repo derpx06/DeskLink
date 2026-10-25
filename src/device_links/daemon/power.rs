@@ -17,12 +17,6 @@ use gtk::glib::variant::ToVariant;
 const WHAT: &str = "sleep:idle:handle-lid-switch";
 const WHY: &str = "Staying reachable from your phone";
 
-/// While a transfer or Bucket sync moves: a *delay* lock on sleep only, so
-/// a suspend waits the few seconds logind allows for a checkpoint instead of
-/// cutting a file mid-block (I17). It never blocks sleep or the lid.
-const TRANSFER_WHAT: &str = "sleep";
-const TRANSFER_WHY: &str = "A file is being transferred";
-
 /// How long to wait before asking logind again after a refusal.
 const RETRY_AFTER: Duration = Duration::from_secs(10);
 
@@ -40,13 +34,6 @@ pub(super) const REACHABLE: Lock = Lock {
     why: WHY,
     mode: "block",
 };
-/// Let a transfer finish its block before sleep (delays only).
-pub(super) const TRANSFERRING: Lock = Lock {
-    what: TRANSFER_WHAT,
-    why: TRANSFER_WHY,
-    mode: "delay",
-};
-
 /// Holds the inhibitor while it is wanted.
 pub(super) struct StayAwake {
     lock: Lock,

@@ -454,8 +454,12 @@ impl Engine {
                 })
             })
             .count();
+        // A board with no room refuses (the sender waits and offers again)
+        // rather than run a transfer nobody can see or cancel.
+        let unlisted = folder.is_none() && !is_clipboard_offer(&message) && !board::has_room();
         if self.incoming.len() >= ACTIVE_PER_DIRECTION
             || (folder.is_some() && bucket_active >= BUCKET_SLOTS_PER_DIRECTION)
+            || unlisted
         {
             // Not a failure: the sender waits and offers again.
             self.refused(&message, "two files are already arriving (busy)", None);
@@ -629,7 +633,9 @@ impl Engine {
                 name: folder.relpath.clone(),
                 ..row
             }),
-            None if !incoming.clipboard => board::begin(row),
+            None if !incoming.clipboard => {
+                board::begin(row);
+            }
             None => {}
         }
         Ok(incoming)

@@ -70,12 +70,61 @@ const MAX_WAITING_AGE: std::time::Duration = std::time::Duration::from_secs(24 *
 
 struct Waiting {
     device_id: String,
+    phone: String,
     path: PathBuf,
     since: std::time::Instant,
-    preparing: Preparing,
 }
 
 static WAITING: Mutex<Vec<Waiting>> = Mutex::new(Vec::new());
+
+/// The transfers page lists waiting files as ONE row per phone ("N files
+/// waiting for <phone>"), not one each: 200 waiting files must not push live
+/// transfers off the board.
+fn waiting_row_id(device_id: &str) -> String {
+    format!("waiting-{device_id}")
+}
+
+/// Brings the aggregate rows in line with the queue (called with the queue
+/// lock held, after every change).
+fn refresh_waiting_rows(waiting: &[Waiting], shown: &mut Vec<String>) {
+    use crate::device_links::webrtc::transfer_board as board;
+    let mut now_shown = Vec::new();
+    for file in waiting {
+        if now_shown.contains(&file.device_id) {
+            continue;
+        }
+        let count = waiting
+            .iter()
+            .filter(|other| other.device_id == file.device_id)
+            .count();
+        board::begin(board::TransferRow {
+            id: waiting_row_id(&file.device_id),
+            device_id: file.device_id.clone(),
+            name: match count {
+                1 => format!("1 file waiting for {}", file.phone),
+                count => format!("{count} files waiting for {}", file.phone),
+            },
+            incoming: false,
+            done: 0,
+            total: 0,
+            preparing: true,
+            paused: false,
+        });
+        now_shown.push(file.device_id.clone());
+    }
+    for gone in shown.iter().filter(|id| !now_shown.contains(id)) {
+        board::discard(&waiting_row_id(gone));
+    }
+    *shown = now_shown;
+}
+
+static SHOWN_ROWS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn refresh_locked(waiting: &[Waiting]) {
+    if let Ok(mut shown) = SHOWN_ROWS.lock() {
+        refresh_waiting_rows(waiting, &mut shown);
+    }
+}
 
 /// Keeps `path` for `device_id` until it connects. `Err` is a message for the
 /// person.
@@ -90,21 +139,13 @@ fn wait_for_phone(device_id: &str, phone: &str, path: PathBuf) -> Result<(), Str
             "{MAX_WAITING_FILES} files are already waiting for a phone to connect"
         ));
     }
-    let name = path.file_name().map_or_else(
-        || "file".to_string(),
-        |name| name.to_string_lossy().into_owned(),
-    );
-    let preparing = Preparing::new(device_id, &name);
-    crate::device_links::webrtc::transfer_board::set_note(
-        preparing.id(),
-        Some(&format!("Waiting for {phone}")),
-    );
     waiting.push(Waiting {
         device_id: device_id.to_string(),
+        phone: phone.to_string(),
         path,
         since: std::time::Instant::now(),
-        preparing,
     });
+    refresh_locked(&waiting);
     Ok(())
 }
 
@@ -112,42 +153,81 @@ fn wait_for_phone(device_id: &str, phone: &str, path: PathBuf) -> Result<(), Str
 pub(crate) fn forget_waiting(device_id: &str) {
     if let Ok(mut waiting) = WAITING.lock() {
         waiting.retain(|file| file.device_id != device_id);
+        refresh_locked(&waiting);
     }
 }
 
-/// The waiting files of phones that are connected now, oldest first; files
-/// that waited longer than a day are dropped (their rows go).
+/// A phone paired again under a new id replaces the old record: what waited
+/// for the old id now waits for the new one.
+pub(crate) fn move_waiting(old_id: &str, new_id: &str) {
+    if let Ok(mut waiting) = WAITING.lock() {
+        for file in waiting.iter_mut().filter(|file| file.device_id == old_id) {
+            file.device_id = new_id.to_string();
+        }
+        refresh_locked(&waiting);
+    }
+}
+
+/// Drops what waited a day. Run on every tick, whether or not a phone is
+/// connected.
+fn expire_waiting(now: std::time::Instant) {
+    if let Ok(mut waiting) = WAITING.lock() {
+        let before = waiting.len();
+        waiting.retain(|file| now.saturating_duration_since(file.since) < MAX_WAITING_AGE);
+        if waiting.len() != before {
+            refresh_locked(&waiting);
+        }
+    }
+}
+
+/// The waiting files of phones that are connected now, oldest first. They
+/// leave the queue only once taken here; a file the send then refuses is put
+/// back by [`flush_waiting`].
 fn take_waiting(ready: &[String], now: std::time::Instant) -> Vec<Waiting> {
+    expire_waiting(now);
     let Ok(mut waiting) = WAITING.lock() else {
         return Vec::new();
     };
-    waiting.retain(|file| now.saturating_duration_since(file.since) < MAX_WAITING_AGE);
     let (go, stay): (Vec<_>, Vec<_>) = std::mem::take(&mut *waiting)
         .into_iter()
         .partition(|file| ready.contains(&file.device_id));
     *waiting = stay;
+    refresh_locked(&waiting);
     go
 }
 
+fn put_back(files: Vec<Waiting>) {
+    if files.is_empty() {
+        return;
+    }
+    if let Ok(mut waiting) = WAITING.lock() {
+        let mut restored = files;
+        restored.append(&mut waiting);
+        *waiting = restored;
+        refresh_locked(&waiting);
+    }
+}
+
 /// Sends what was waiting for the phones in `ready` (called every second by
-/// the status reconciler).
+/// the status reconciler; expiry runs even with nobody connected).
 pub(super) fn flush_waiting(
     sessions: &Arc<crate::device_links::core::DeviceManager>,
     errors: &Arc<Mutex<Vec<String>>>,
     ready: &[String],
 ) {
+    expire_waiting(std::time::Instant::now());
     if ready.is_empty() {
         return;
     }
+    let mut refused = Vec::new();
     for file in take_waiting(ready, std::time::Instant::now()) {
-        let Waiting {
-            device_id,
-            path,
-            preparing,
-            ..
-        } = file;
-        queue_send(sessions, errors, &device_id, path, Some(preparing));
+        // A refusal (not connected after all, the queue full) keeps the file
+        // waiting: it is dropped only by age or by the person.
+        if !queue_send(sessions, errors, &file.device_id, file.path.clone(), true) {
+            refused.push(file);
+        }
     }
+    put_back(refused);
 }
 
 /// Queues `path` with the transfer manager of `device_id`'s ready transport.
@@ -156,26 +236,30 @@ fn queue_send(
     errors: &Arc<Mutex<Vec<String>>>,
     device_id: &str,
     file_path: PathBuf,
-    waiting_row: Option<Preparing>,
-) {
+    from_waiting: bool,
+) -> bool {
     let transport = match FeatureTransport::for_device(sessions, device_id) {
         Ok(transport) if transport.is_ready() => transport,
         Ok(_) | Err(_) => {
             debug_log!("[Daemon] File transfer for {device_id} was not started: not connected");
-            push_error(
-                errors,
-                "That phone isn't connected, so the file was not sent".to_string(),
-            );
-            return;
+            if !from_waiting {
+                push_error(
+                    errors,
+                    "That phone isn't connected, so the file was not sent".to_string(),
+                );
+            }
+            return false;
         }
     };
     if QUEUED.fetch_add(1, Ordering::AcqRel) >= MAX_QUEUED {
         QUEUED.fetch_sub(1, Ordering::AcqRel);
-        push_error(
-            errors,
-            format!("Up to {MAX_QUEUED} files can be queued at once; send the rest when these have started"),
-        );
-        return;
+        if !from_waiting {
+            push_error(
+                errors,
+                format!("Up to {MAX_QUEUED} files can be queued at once; send the rest when these have started"),
+            );
+        }
+        return false;
     }
     let name = file_path.file_name().map_or_else(
         || "file".to_string(),
@@ -186,7 +270,7 @@ fn queue_send(
         path: file_path,
         device_id: device_id.to_string(),
         errors: Arc::clone(errors),
-        preparing: waiting_row.unwrap_or_else(|| Preparing::new(device_id, &name)),
+        preparing: Preparing::new(device_id, &name),
     };
     if preparer().send(job).is_err() {
         QUEUED.fetch_sub(1, Ordering::AcqRel);
@@ -194,7 +278,9 @@ fn queue_send(
             errors,
             "DeskLink could not queue the file transfer".to_string(),
         );
+        return false;
     }
+    true
 }
 
 impl DaemonWorker {
@@ -221,7 +307,7 @@ impl DaemonWorker {
             }
             return;
         }
-        queue_send(&self.sessions, &self.errors, device_id, file_path, None);
+        queue_send(&self.sessions, &self.errors, device_id, file_path, false);
     }
 
     pub(super) fn cancel_transfer(&self, device_id: &str, transfer_id: &str) {
@@ -247,43 +333,58 @@ impl DaemonWorker {
 #[cfg(test)]
 mod waiting_tests {
     use super::*;
+    use crate::device_links::webrtc::transfer_board as board;
 
-    /// I9: a file chosen while the phone is away is kept and goes out when it
-    /// connects; the row says who it waits for.
+    /// I9 + S3: files for an absent phone wait as ONE row; they are released
+    /// only when taken, can be put back when refused, expire after a day even
+    /// with nobody connected, and follow a phone paired again under a new id.
     #[test]
-    fn a_file_for_an_absent_phone_waits_is_released_when_it_connects_and_expires_after_a_day() {
+    fn waiting_files_are_one_row_survive_a_refusal_expire_and_follow_a_new_id() {
         let dir = std::env::temp_dir().join(format!("desklink-wait-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("a.txt");
-        std::fs::write(&file, "x").unwrap();
-        wait_for_phone("wait-phone", "Pixel", file.clone()).unwrap();
+        let make = |name: &str| {
+            let file = dir.join(name);
+            std::fs::write(&file, "x").unwrap();
+            file
+        };
+        let (a, b) = (make("a.txt"), make("b.txt"));
+        wait_for_phone("wait-phone", "Pixel", a.clone()).unwrap();
+        wait_for_phone("wait-phone", "Pixel", b).unwrap();
         assert!(wait_for_phone("wait-phone", "Pixel", dir.join("missing")).is_err());
-        let rows = crate::device_links::webrtc::transfer_board::rows();
-        let row = rows
-            .iter()
-            .find(|row| row.device_id == "wait-phone")
-            .unwrap();
-        assert_eq!(
-            crate::device_links::webrtc::transfer_board::note(&row.id).as_deref(),
-            Some("Waiting for Pixel")
-        );
+        let rows: Vec<_> = board::rows()
+            .into_iter()
+            .filter(|row| row.device_id == "wait-phone")
+            .collect();
+        assert_eq!(rows.len(), 1, "one aggregate row, not one per file");
+        assert_eq!(rows[0].name, "2 files waiting for Pixel");
+
         let now = std::time::Instant::now();
         assert!(take_waiting(&["other".to_string()], now).is_empty());
         let go = take_waiting(&["wait-phone".to_string()], now);
-        assert_eq!(go.len(), 1);
-        assert_eq!(go[0].path, file);
-        drop(go);
-        assert!(!crate::device_links::webrtc::transfer_board::rows()
+        assert_eq!(go.len(), 2);
+        assert_eq!(go[0].path, a, "oldest first");
+        assert!(board::rows()
             .iter()
-            .any(|row| row.device_id == "wait-phone"));
+            .all(|row| row.device_id != "wait-phone"));
+        // The send refused them (the cap, not connected after all): back.
+        put_back(go);
+        assert!(board::rows()
+            .iter()
+            .any(|row| row.name == "2 files waiting for Pixel"));
 
-        // Same test, after the first half: the queue is shared, so two tests
-        // would take each other's files.
-        let file = dir.join("b.txt");
-        std::fs::write(&file, "x").unwrap();
-        wait_for_phone("old-phone", "Pixel", file).unwrap();
-        let later = std::time::Instant::now() + MAX_WAITING_AGE;
-        assert!(take_waiting(&["old-phone".to_string()], later).is_empty());
+        // A phone paired again under a new id inherits them.
+        move_waiting("wait-phone", "wait-phone-new");
+        assert!(take_waiting(&["wait-phone".to_string()], now).is_empty());
+        let moved = take_waiting(&["wait-phone-new".to_string()], now);
+        assert_eq!(moved.len(), 2);
+        put_back(moved);
+
+        // A day later they are gone, whoever is connected.
+        expire_waiting(std::time::Instant::now() + MAX_WAITING_AGE);
+        assert!(take_waiting(&["wait-phone-new".to_string()], now).is_empty());
+        assert!(board::rows()
+            .iter()
+            .all(|row| row.device_id != "wait-phone-new"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -117,9 +117,40 @@ fn the_relay_auth_sign_input_is_the_phones() {
     assert_eq!(hex(&bytes), f["hex"].as_str().unwrap());
 }
 
+/// Winners of one vector, in input order.
+fn winners_of(names: &Value) -> Vec<String> {
+    let input = strings(names);
+    let mut items: std::collections::BTreeMap<String, ()> =
+        input.iter().cloned().map(|name| (name, ())).collect();
+    crate::device_links::folders::drop_case_clashes_for_tests(&mut items);
+    input
+        .into_iter()
+        .filter(|name| items.contains_key(name))
+        .collect()
+}
+
 #[test]
 fn the_case_clash_winners_are_the_phones() {
     let f = load(include_str!("../testdata/case_clash.json"));
+    assert_eq!(
+        winners_of(&f["names"]),
+        strings(&f["winners"]),
+        "the original vector"
+    );
+    let cases = f["cases"].as_array().map_or(&[][..], Vec::as_slice);
+    for case in cases {
+        assert_eq!(
+            winners_of(&case["names"]),
+            strings(&case["winners"]),
+            "{}",
+            case["name"]
+        );
+    }
+}
+
+#[test]
+fn the_desk_case_clash_vectors_fold_by_the_agreed_rule() {
+    let f = load(include_str!("../testdata/case_clash_desk.json"));
     let mut items: std::collections::BTreeMap<String, ()> = strings(&f["names"])
         .into_iter()
         .map(|name| (name, ()))
@@ -130,6 +161,18 @@ fn the_case_clash_winners_are_the_phones() {
     ours.sort();
     theirs.sort();
     assert_eq!(ours, theirs);
+    // The rule itself, spelled out.
+    use crate::device_links::folders::fold_name;
+    assert_eq!(fold_name("A.\u{3a3}"), fold_name("a.\u{3c3}"), "Σ is σ");
+    assert_ne!(fold_name("\u{3a3}"), "\u{3c2}", "never the final sigma");
+    assert_eq!(fold_name("\u{130}"), "\u{130}", "İ has no single lowercase");
+    assert_eq!(fold_name("\u{df}"), "\u{df}");
+    assert_eq!(fold_name("\u{10400}"), "\u{10428}");
+    assert_ne!(
+        fold_name("\u{e9}"),
+        fold_name("e\u{301}"),
+        "no normalisation"
+    );
 }
 
 #[test]

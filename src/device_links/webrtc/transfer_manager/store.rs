@@ -541,6 +541,10 @@ impl Store {
                     // file is only clutter, and a directory that will not
                     // sync does not unpublish it.
                     let _ = fs::remove_file(&part);
+                    // The partials are 0600; a finished download is an
+                    // ordinary file (0666 minus the umask), whichever way it
+                    // was put in place.
+                    set_download_mode(&target);
                     if let Err(error) = sync_directory(&self.destination_root) {
                         debug_log!("[DeskLink] {error}");
                     }
@@ -656,6 +660,30 @@ fn place_file(
     });
     let _ = fs::remove_file(&staged);
     placed
+}
+
+/// This process's umask, from `/proc` (reading it with `umask(2)` would
+/// change it for a moment, for every thread).
+fn current_umask() -> u32 {
+    fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("Umask:"))
+                .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
+        })
+        .unwrap_or(0o022)
+}
+
+/// The mode of a delivered file: `0666 & !umask`.
+pub(super) fn download_mode() -> u32 {
+    0o666 & !current_umask()
+}
+
+fn set_download_mode(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(download_mode()));
 }
 
 /// Why a hard link may be refused for a reason a copy gets round.

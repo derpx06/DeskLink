@@ -13,6 +13,8 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 /// Rows are bounded by the manager's own limits; this only stops a bug there
 /// from growing the table without end.
 const MAX_ROWS: usize = 64;
+/// Rows kept free of "preparing" placeholders, for real transfers.
+const PLACEHOLDER_RESERVE: usize = 12;
 /// Outcomes the UI has not collected yet. Oldest are dropped first. (Tests
 /// share this queue across threads and never collect it.)
 #[cfg(not(test))]
@@ -91,15 +93,31 @@ pub struct SyncedEnd {
 impl TransferBoard {
     /// Adds a transfer, or replaces the row of one already listed (a resumed
     /// transfer is offered again under the same id).
-    pub fn begin(&mut self, row: TransferRow) {
+    ///
+    /// A live transfer is never pushed off the board to make room: a full
+    /// board gives up a "preparing" placeholder (cosmetic) instead, and when
+    /// there is none the new row is refused (`false`).
+    pub fn begin(&mut self, row: TransferRow) -> bool {
         if let Some(existing) = self.rows.iter_mut().find(|known| known.id == row.id) {
             *existing = row;
-            return;
+            return true;
         }
         if self.rows.len() >= MAX_ROWS {
-            self.rows.remove(0);
+            let Some(placeholder) = self.rows.iter().position(|known| known.preparing) else {
+                return false;
+            };
+            if row.preparing {
+                return false;
+            }
+            self.rows.remove(placeholder);
         }
         self.rows.push(row);
+        true
+    }
+
+    /// Whether a real transfer can be listed now.
+    pub fn has_room(&self) -> bool {
+        self.rows.len() < MAX_ROWS || self.rows.iter().any(|row| row.preparing)
     }
 
     /// Adds (or replaces) a Bucket transfer.
@@ -277,8 +295,14 @@ fn board() -> MutexGuard<'static, TransferBoard> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-pub fn begin(row: TransferRow) {
-    board().begin(row);
+pub fn begin(row: TransferRow) -> bool {
+    board().begin(row)
+}
+
+/// Whether one more real transfer can be listed (a send or an offer is
+/// refused in words when not, instead of running unseen and uncancellable).
+pub fn has_room() -> bool {
+    board().has_room()
 }
 
 pub fn progress(id: &str, done: u64) {
@@ -409,6 +433,11 @@ impl Preparing {
             "preparing-{}",
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
+        // Placeholders leave room for real transfers: past this many they
+        // are not listed at all (the file is still sent).
+        if board().rows.len() >= MAX_ROWS - PLACEHOLDER_RESERVE {
+            return Self { id };
+        }
         begin(TransferRow {
             id: id.clone(),
             device_id: device_id.to_string(),
@@ -527,6 +556,38 @@ mod tests {
         assert!(!board.rows()[0].paused);
     }
 
+    /// S2: 500 files queued behind 20 live transfers never push a live one
+    /// off the board; placeholders yield, and a full board refuses.
+    #[test]
+    fn a_long_queue_never_evicts_a_live_transfer() {
+        let mut board = TransferBoard::default();
+        for n in 0..20 {
+            assert!(board.begin(row(&format!("live-{n}"), "phone", true, 10)));
+        }
+        for n in 0..500 {
+            let mut placeholder = row(&format!("preparing-{n}"), "phone", false, 0);
+            placeholder.preparing = true;
+            board.begin(placeholder);
+        }
+        let ids: Vec<_> = board.rows().into_iter().map(|row| row.id).collect();
+        assert!(ids.len() <= MAX_ROWS);
+        for n in 0..20 {
+            assert!(ids.contains(&format!("live-{n}")), "live-{n} was evicted");
+        }
+        // Real transfers still get in by taking a placeholder's place...
+        assert!(board.begin(row("real", "phone", true, 10)));
+        assert!(board.rows().iter().any(|row| row.id == "real"));
+        // ...and with only live rows left the board says no.
+        let mut full = TransferBoard::default();
+        for n in 0..MAX_ROWS {
+            assert!(full.begin(row(&format!("r{n}"), "phone", true, 10)));
+        }
+        assert!(!full.has_room());
+        assert!(!full.begin(row("one-more", "phone", true, 10)));
+        assert!(full.rows().iter().all(|row| row.id != "one-more"));
+        assert!(full.rows().iter().any(|row| row.id == "r0"), "r0 kept");
+    }
+
     /// I7: unpairing a phone ends its listed transfers (nothing called
     /// `finish_device` in production, so they stayed for ever).
     #[test]
@@ -561,6 +622,7 @@ mod tests {
             board.begin(row(&format!("t{index}"), "phone", true, 10));
         }
         assert_eq!(board.rows().len(), MAX_ROWS);
+        let mut board = TransferBoard::default();
         for index in 0..(MAX_FINISHED + 10) {
             board.begin(row(&format!("f{index}"), "phone", true, 10));
             board.finish(&format!("f{index}"), Outcome::Sent);

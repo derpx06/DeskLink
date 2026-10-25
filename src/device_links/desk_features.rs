@@ -442,6 +442,9 @@ fn send_initial_snapshots(device_id: &str) {
 pub(crate) fn settings_packet(settings: &AppSettings, device_id: &str) -> NetworkPacket {
     let mut packet = NetworkPacket::new(PACKET_TYPE_SETTINGS);
     packet.set("keepAwake", settings.stay_awake);
+    // Whether this phone may change it (off until turned on at the desk):
+    // the phone shows its switch disabled, "Turn on at <computer>", else.
+    packet.set("keepAwakeAllowed", settings.lets_keep_awake(device_id));
     packet.set("clipboard", settings.clipboard_sync);
     packet.set("notifications", settings.shows_notifications(device_id));
     packet.set("relayConfigured", settings.relay_configured());
@@ -468,6 +471,7 @@ pub(crate) fn push_settings() {
 pub(crate) fn parse_settings_request(
     packet: &NetworkPacket,
     relay_configured: bool,
+    keep_awake_allowed: bool,
 ) -> Vec<(String, bool)> {
     let Some(Value::Object(set)) = packet.body.get("set") else {
         return Vec::new();
@@ -476,10 +480,10 @@ pub(crate) fn parse_settings_request(
         .iter()
         .filter_map(|(key, value)| Some((key.clone(), value.as_bool()?)))
         .filter(|(key, _)| match key.as_str() {
-            // Not `keepAwake`: it holds the laptop awake with the lid closed,
-            // so only the person at this desk turns it on (a phone that asks
-            // was a flat battery and a hot bag).
             "clipboard" | "notifications" | "commandAlerts" => true,
+            // It holds the laptop awake with the lid closed (a flat battery
+            // and a hot bag): only a phone the person at this desk let.
+            "keepAwake" => keep_awake_allowed,
             "relay" => relay_configured,
             _ => false,
         })
@@ -516,6 +520,7 @@ fn real_changes(
 /// Applies `change` to `settings` for `device_id`.
 fn apply_change(settings: &mut AppSettings, device_id: &str, key: &str, value: bool) {
     match key {
+        "keepAwake" => settings.stay_awake = value,
         "clipboard" => settings.clipboard_sync = value,
         "notifications" => {
             if value {
@@ -546,7 +551,11 @@ pub(crate) fn handle_settings_request(device_id: &str, packet: &NetworkPacket) {
     let changes = real_changes(
         &settings,
         device_id,
-        parse_settings_request(packet, settings.relay_configured()),
+        parse_settings_request(
+            packet,
+            settings.relay_configured(),
+            settings.lets_keep_awake(device_id),
+        ),
     );
     if !changes.is_empty() {
         let saved = daemon
@@ -933,7 +942,7 @@ mod tests {
                 "clipboardNotBool": "yes",
             }),
         );
-        let without_relay = parse_settings_request(&packet, false);
+        let without_relay = parse_settings_request(&packet, false, false);
         assert_eq!(
             without_relay,
             vec![
@@ -943,7 +952,7 @@ mod tests {
             ],
             "keepAwake, unlockNearby, unknown keys and relay without a server are ignored"
         );
-        let with_relay = parse_settings_request(&packet, true);
+        let with_relay = parse_settings_request(&packet, true, false);
         assert!(with_relay.contains(&("relay".to_string(), true)));
         assert!(!with_relay.iter().any(|(key, _)| key == "unlockNearby"));
 
@@ -955,6 +964,24 @@ mod tests {
         assert!(!settings.clipboard_sync);
         assert!(!settings.shows_notifications("phone"));
         assert!(!settings.unlocks_from("phone"), "never from the phone");
+
+        // A phone the person let may switch keep-awake; one that was not may not.
+        let allowed = parse_settings_request(&packet, false, true);
+        assert!(allowed.contains(&("keepAwake".to_string(), true)));
+        let mut settings = AppSettings::default();
+        settings.keep_awake_phones.insert("phone".into());
+        assert_eq!(
+            settings_packet(&settings, "phone").get_bool("keepAwakeAllowed"),
+            Some(true)
+        );
+        assert_eq!(
+            settings_packet(&settings, "other").get_bool("keepAwakeAllowed"),
+            Some(false)
+        );
+        for (key, value) in allowed {
+            apply_change(&mut settings, "phone", &key, value);
+        }
+        assert!(settings.stay_awake, "the allowed phone turned it on");
     }
 
     #[test]

@@ -411,6 +411,11 @@ impl WebRtcTransferManager {
         if !self.shared.attached.load(Ordering::Acquire) {
             return Err("DeskLink WebRTC file transport is unavailable".to_string());
         }
+        if folder.is_none() && clipboard_mime.is_none() && !board::has_room() {
+            return Err(
+                "Too many transfers are listed. Send the rest when some have finished.".to_string(),
+            );
+        }
         let outgoing = Outgoing::prepare(
             &self.store,
             source,

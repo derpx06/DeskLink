@@ -7,9 +7,27 @@
 set -e
 cd "$(dirname "$0")/.."
 out=${1:-THIRD_PARTY_LICENSES}
-cargo metadata --format-version 1 --locked --offline | python3 -c '
+# The app and the relay binary the release also ships have separate lock
+# files; both sets of crates are listed.
+{ cargo metadata --format-version 1 --locked --offline
+  cargo metadata --format-version 1 --locked --offline --manifest-path relay/Cargo.toml
+} | python3 -c '
 import sys, json, os, glob, hashlib
-meta = json.load(sys.stdin)
+decoder = json.JSONDecoder()
+raw = sys.stdin.read()
+documents, at = [], 0
+while at < len(raw):
+    while at < len(raw) and raw[at].isspace():
+        at += 1
+    if at >= len(raw):
+        break
+    document, at = decoder.raw_decode(raw, at)
+    documents.append(document)
+packages = {}
+for meta in documents:
+    for pkg in meta["packages"]:
+        packages[(pkg["name"], pkg["version"])] = pkg
+meta = {"packages": list(packages.values())}
 texts = {}      # sha -> (text, [crates])
 rows = []
 for pkg in sorted(meta["packages"], key=lambda p: (p["name"], p["version"])):
