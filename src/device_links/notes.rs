@@ -609,7 +609,21 @@ pub(crate) fn on_packet(device_id: &str, packet: &NetworkPacket) -> Vec<NetworkP
         super::limits::log_limited("notes-rate", "Too many note packets from a phone; dropped");
         return Vec::new();
     }
+    let before = GENERATION.load(Ordering::Relaxed);
     let answers = with_shelf(|shelf| handle(shelf, kind, packet)).unwrap_or_default();
+    // What one phone changed reaches the others now, not when they next
+    // reconnect (I15).
+    if packet.get_str("op") == Some("items") && GENERATION.load(Ordering::Relaxed) != before {
+        let others = relay_targets(&super::desk_features::ready_devices(), device_id);
+        if !others.is_empty() {
+            let relayed = packet.clone();
+            super::desk_features::run_later(move || {
+                for device in &others {
+                    super::desk_features::send(device, &relayed);
+                }
+            });
+        }
+    }
     debug_log!(
         "[Notes] {} {} from {device_id}: {} answers",
         packet.packet_type,
@@ -617,6 +631,15 @@ pub(crate) fn on_packet(device_id: &str, packet: &NetworkPacket) -> Vec<NetworkP
         answers.len()
     );
     answers
+}
+
+/// The ready phones other than `source`: where a change it made goes next.
+fn relay_targets(ready: &[String], source: &str) -> Vec<String> {
+    ready
+        .iter()
+        .filter(|device| device.as_str() != source)
+        .cloned()
+        .collect()
 }
 
 /// Both indexes, for a phone whose connection just came up: one group of
@@ -899,6 +922,16 @@ pub(crate) fn edit_note_from(
 /// What the editor says when a note passes its size bound.
 pub(crate) const TOO_LONG: &str =
     "This note is too long to save (20 KiB at most). Shorten it: the last changes are not saved yet.";
+
+#[cfg(test)]
+mod relay_tests {
+    #[test]
+    fn a_change_from_one_phone_goes_to_every_other_ready_phone() {
+        let ready = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(super::relay_targets(&ready, "a"), ["b", "c"]);
+        assert!(super::relay_targets(&["a".to_string()], "a").is_empty());
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -121,11 +121,24 @@ fn record_detection(available: bool) {
 /// Whether the clipboard's owner marked its content as a password. Read
 /// from the X11 CLIPBOARD selection's TARGETS, the same selection `arboard`
 /// reads (GNOME mirrors Wayland's clipboard into it). An owner that does not
-/// answer counts as unmarked; no display at all is recorded as detection
+/// answer counts as a secret (see [`withhold`]); no display at all is recorded as detection
 /// being unavailable (see [`password_detection`]). Runs on the clipboard
 /// thread: the reply wait is bounded at 300 ms, never on the UI's thread.
-fn clipboard_is_password() -> bool {
-    clipboard_targets().is_some_and(|targets| is_password_hint(&targets))
+pub(crate) fn clipboard_is_password() -> bool {
+    let targets = clipboard_targets();
+    withhold(targets.as_deref(), password_detection())
+}
+
+/// Whether the clipboard's text must stay on this computer. Marked as a
+/// password: yes. An owner that did not answer in time while the question
+/// can be asked: yes as well (fail closed: a secret from a slow password
+/// manager must not leave on a timeout). No display at all to ask: no, the
+/// UI says passwords cannot be recognised in this session.
+fn withhold(targets: Option<&[String]>, detection: Option<bool>) -> bool {
+    match targets {
+        Some(targets) => is_password_hint(targets),
+        None => detection != Some(false),
+    }
 }
 
 fn clipboard_targets() -> Option<Vec<String>> {
@@ -922,6 +935,17 @@ mod tests {
         let (width, height, rgba) = image_to_rgba(&jpeg).unwrap();
         assert_eq!((width, height, rgba.len()), (6, 4, 6 * 4 * 4));
         assert!(!is_jpeg(b"\x89PNG"));
+    }
+
+    #[test]
+    fn an_unanswered_question_withholds_the_clipboard_but_no_display_does_not() {
+        let plain = vec!["text/plain".to_string()];
+        let marked = vec![PASSWORD_HINT.to_string()];
+        assert!(!withhold(Some(&plain), Some(true)));
+        assert!(withhold(Some(&marked), Some(true)));
+        assert!(withhold(None, Some(true)), "timeout: fail closed");
+        assert!(withhold(None, None), "not yet known: fail closed");
+        assert!(!withhold(None, Some(false)), "no display to ask");
     }
 
     #[test]

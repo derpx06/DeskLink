@@ -57,6 +57,11 @@ pub const CHECKPOINT_MS: u64 = 2_000;
 pub const NO_PROGRESS_MS: u64 = 60_000;
 /// Files moving at once in each direction; the rest wait.
 pub const ACTIVE_PER_DIRECTION: usize = 2;
+
+/// How many of those a Bucket sync may hold at once: one slot stays free for
+/// a file the person chose (a share, insert-from-phone), which would
+/// otherwise wait behind two Bucket files and a 2 s busy retry (I16).
+pub const BUCKET_SLOTS_PER_DIRECTION: usize = ACTIVE_PER_DIRECTION - 1;
 pub const MAX_REWINDS: u32 = 3;
 pub const MAX_RESTARTS: u32 = 2;
 /// Frames received and not yet handled by the file thread.

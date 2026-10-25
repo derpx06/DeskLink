@@ -134,7 +134,12 @@ pub(crate) fn reconcile_connection_status(
             // A call is never kept stale: it cannot be answered without the
             // link, and would ring here forever. Paused players stay paused
             // until the phone's next snapshot (sent on feature-ready).
-            device.call_status = None;
+            if device.call_status.take().is_some() {
+                // ...nor kept as "in a call" in the pause/resume bookkeeping:
+                // a phone that never comes back would block the resume for
+                // every other phone (I13).
+                crate::device_links::calls::hold_media(device_id, false);
+            }
             device.keyboard_focused = None;
             device.keyboard_allowed = None;
         } else if ready {
@@ -948,6 +953,39 @@ mod tests {
             None,
             "live again"
         );
+    }
+
+    /// I13: a phone that drops out mid-call no longer counts as in a call, so
+    /// the other phones' calls can still resume the music.
+    #[test]
+    fn losing_the_link_ends_the_phones_call_in_the_pause_bookkeeping() {
+        let (devices, info) = test_devices();
+        let connection = |ready: bool| DeviceConnection {
+            device_id: info.id.clone(),
+            linked: ready,
+            paired: true,
+            feature_transport_ready: ready,
+        };
+        reconcile_connection_status(&devices, &[connection(true)]);
+        devices
+            .lock()
+            .unwrap()
+            .get_mut(&info.id)
+            .unwrap()
+            .call_status = Some(crate::device_links::device::CallStatus {
+            calls: Vec::new(),
+            muted: false,
+            silenced: false,
+        });
+        crate::device_links::calls::test_hold(&info.id);
+        reconcile_connection_status(&devices, &[connection(false)]);
+        for _ in 0..100 {
+            if !crate::device_links::calls::test_holds(&info.id) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!crate::device_links::calls::test_holds(&info.id));
     }
 
     #[test]

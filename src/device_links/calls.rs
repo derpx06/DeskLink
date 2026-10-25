@@ -243,6 +243,12 @@ pub(crate) enum HoldStep {
 }
 
 impl MediaHold {
+    /// Whether `device_id` is counted as in a call.
+    #[cfg(test)]
+    pub(crate) fn holds(&self, device_id: &str) -> bool {
+        self.in_call.contains(device_id)
+    }
+
     pub(crate) fn update(&mut self, device_id: &str, in_call: bool) -> HoldStep {
         let before = !self.in_call.is_empty();
         if in_call {
@@ -263,6 +269,24 @@ impl MediaHold {
 }
 
 static HOLD: Mutex<Option<MediaHold>> = Mutex::new(None);
+
+/// Test hook: counts `device_id` as in a call without touching any player.
+#[cfg(test)]
+pub(crate) fn test_hold(device_id: &str) {
+    HOLD.lock()
+        .unwrap()
+        .get_or_insert_with(MediaHold::default)
+        .in_call
+        .insert(device_id.to_string());
+}
+
+#[cfg(test)]
+pub(crate) fn test_holds(device_id: &str) -> bool {
+    HOLD.lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|hold| hold.holds(device_id))
+}
 
 /// Pauses this computer's players when `device_id`'s first call starts and
 /// resumes them after the last one ends. Runs on the desk worker, which also

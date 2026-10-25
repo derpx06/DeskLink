@@ -17,12 +17,39 @@ use gtk::glib::variant::ToVariant;
 const WHAT: &str = "sleep:idle:handle-lid-switch";
 const WHY: &str = "Staying reachable from your phone";
 
+/// While a transfer or Bucket sync moves: a *delay* lock on sleep only, so
+/// a suspend waits the few seconds logind allows for a checkpoint instead of
+/// cutting a file mid-block (I17). It never blocks sleep or the lid.
+const TRANSFER_WHAT: &str = "sleep";
+const TRANSFER_WHY: &str = "A file is being transferred";
+
 /// How long to wait before asking logind again after a refusal.
 const RETRY_AFTER: Duration = Duration::from_secs(10);
 
+/// What a lock asks logind for.
+#[derive(Clone, Copy)]
+pub(super) struct Lock {
+    what: &'static str,
+    why: &'static str,
+    mode: &'static str,
+}
+
+/// Keep the computer reachable (blocks sleep, idle and the lid).
+pub(super) const REACHABLE: Lock = Lock {
+    what: WHAT,
+    why: WHY,
+    mode: "block",
+};
+/// Let a transfer finish its block before sleep (delays only).
+pub(super) const TRANSFERRING: Lock = Lock {
+    what: TRANSFER_WHAT,
+    why: TRANSFER_WHY,
+    mode: "delay",
+};
+
 /// Holds the inhibitor while it is wanted.
-#[derive(Default)]
 pub(super) struct StayAwake {
+    lock: Lock,
     held: Option<OwnedFd>,
     /// When to ask again after logind refused. A refusal is not final: asking
     /// while the machine is already going to sleep fails with
@@ -33,11 +60,27 @@ pub(super) struct StayAwake {
     reported: bool,
 }
 
+impl Default for StayAwake {
+    fn default() -> Self {
+        Self::new(REACHABLE)
+    }
+}
+
 impl StayAwake {
+    pub(super) fn new(lock: Lock) -> Self {
+        Self {
+            lock,
+            held: None,
+            retry_at: None,
+            reported: false,
+        }
+    }
+
     /// Makes the inhibitor match `wanted`. Returns an error only for the first
     /// lasting refusal after the wish became true.
     pub(super) fn apply(&mut self, wanted: bool) -> Result<(), String> {
-        self.apply_with(wanted, Instant::now(), inhibit)
+        let lock = self.lock;
+        self.apply_with(wanted, Instant::now(), move || inhibit(lock))
     }
 
     fn apply_with(
@@ -47,7 +90,7 @@ impl StayAwake {
         acquire: impl FnOnce() -> Result<OwnedFd, String>,
     ) -> Result<(), String> {
         if !wanted {
-            *self = Self::default();
+            *self = Self::new(self.lock);
             return Ok(());
         }
         if self.held.is_some() || self.retry_at.is_some_and(|at| now < at) {
@@ -57,7 +100,7 @@ impl StayAwake {
             Ok(fd) => {
                 *self = Self {
                     held: Some(fd),
-                    ..Self::default()
+                    ..Self::new(self.lock)
                 };
                 Ok(())
             }
@@ -74,7 +117,7 @@ impl StayAwake {
     }
 }
 
-fn inhibit() -> Result<OwnedFd, String> {
+fn inhibit(lock: Lock) -> Result<OwnedFd, String> {
     let bus = gio::bus_get_sync(gio::BusType::System, None::<&gio::Cancellable>)
         .map_err(|error| error.to_string())?;
     let (reply, fds) = bus
@@ -83,7 +126,7 @@ fn inhibit() -> Result<OwnedFd, String> {
             "/org/freedesktop/login1",
             "org.freedesktop.login1.Manager",
             "Inhibit",
-            Some(&(WHAT, "DeskLink", WHY, "block").to_variant()),
+            Some(&(lock.what, "DeskLink", lock.why, lock.mode).to_variant()),
             Some(gtk::glib::VariantTy::new("(h)").map_err(|error| error.to_string())?),
             gio::DBusCallFlags::NONE,
             5000,

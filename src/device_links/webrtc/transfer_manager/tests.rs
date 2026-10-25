@@ -1939,6 +1939,40 @@ fn one_gibibyte_crosses_intact() {
     let _ = fs::remove_dir_all(base);
 }
 
+/// I16: two Bucket files cannot hold both slots; a file the person chose
+/// gets the free one at once.
+#[test]
+fn the_bucket_never_holds_the_last_slot_so_a_shared_file_goes_at_once() {
+    use crate::device_links::webrtc::file_protocol::FolderRef;
+    let rig = Rig::new("bucket-reserve");
+    rig.ab.freeze();
+    for n in 0..2u64 {
+        let bytes = payload(200_000, 70 + n);
+        let source = rig.source(&format!("b{n}.jpg"), &bytes);
+        let sha = hex(&openssl::sha::sha256(&bytes));
+        let folder = FolderRef {
+            folder: "bucket".into(),
+            relpath: format!("Res/{n}-{}.jpg", uuid::Uuid::new_v4().simple()),
+            mtime: Some(1),
+        };
+        crate::device_links::folders::test_want("alpha", &folder, &sha, bytes.len() as u64);
+        rig.a().start_send_folder(&source, folder, &sha).unwrap();
+    }
+    let shared = rig.source("shared.bin", &payload(100_000, 5));
+    rig.a().start_send(&shared).unwrap();
+    eventually("two offers", || {
+        (rig.ab.sent(FileAction::Offer).len() >= 2).then_some(())
+    });
+    std::thread::sleep(Duration::from_millis(150));
+    let offers = rig.ab.sent(FileAction::Offer);
+    assert_eq!(offers.len(), 2, "the second Bucket file waits");
+    assert!(
+        offers.iter().any(|offer| offer.folder.is_none()),
+        "the shared file was offered"
+    );
+    rig.ab.thaw();
+}
+
 #[test]
 fn a_synced_file_is_offered_with_its_pair_path_and_hash_and_taken_when_asked_for() {
     use crate::device_links::webrtc::file_protocol::FolderRef;

@@ -382,6 +382,11 @@ pub struct Preparing {
 }
 
 impl Preparing {
+    /// The row's id, to say why it waits (see [`set_note`]).
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
     pub fn new(device_id: &str, name: &str) -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = format!(
@@ -504,6 +509,16 @@ mod tests {
         board.pause_device("phone");
         board.progress("p", 4);
         assert!(!board.rows()[0].paused);
+    }
+
+    /// I7: unpairing a phone ends its listed transfers (nothing called
+    /// `finish_device` in production, so they stayed for ever).
+    #[test]
+    fn unpairing_a_phone_clears_its_transfer_rows() {
+        super::begin(row("unpair-row", "phone-unpair-row", true, 10));
+        assert!(super::rows().iter().any(|row| row.id == "unpair-row"));
+        crate::device_links::peers::forget_peer("phone-unpair-row");
+        assert!(!super::rows().iter().any(|row| row.id == "unpair-row"));
     }
 
     #[test]

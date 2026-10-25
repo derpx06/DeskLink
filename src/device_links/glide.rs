@@ -1384,9 +1384,15 @@ fn send_clipboard(device: &str) {
     let spawned = std::thread::Builder::new()
         .name("desklink-glide-clip".into())
         .spawn(move || {
-            let text = arboard::Clipboard::new()
-                .and_then(|mut clipboard| clipboard.get_text())
-                .unwrap_or_default();
+            // The same guard as the clipboard sync: a password manager's
+            // secret never follows the pointer (I6).
+            let text = if crate::device_links::daemon::clipboard::clipboard_is_password() {
+                String::new()
+            } else {
+                arboard::Clipboard::new()
+                    .and_then(|mut clipboard| clipboard.get_text())
+                    .unwrap_or_default()
+            };
             if let Some(packet) = clipboard_packet(text) {
                 deliver(&device, &packet);
             }

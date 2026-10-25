@@ -50,6 +50,17 @@ mod imp {
     impl ObjectImpl for DesklinkApplication {
         fn constructed(&self) {
             self.parent_constructed();
+            crate::startup("application constructed");
+        }
+    }
+
+    impl DesklinkApplication {
+        /// Everything that must run in the primary instance only: the
+        /// daemon (port 1717, beacons, relay client), the terminal server
+        /// and the indicators. `constructed` runs in a second launch too,
+        /// before GApplication knows it is not primary (I14); `startup`
+        /// does not.
+        fn start_primary(&self) {
             let obj = self.obj();
             crate::startup("application constructed");
             self.daemon.replace(Some(DaemonHandle::start()));
@@ -102,6 +113,7 @@ mod imp {
     impl ApplicationImpl for DesklinkApplication {
         fn startup(&self) {
             self.parent_startup();
+            self.start_primary();
             // Registered now (startup runs only in the primary instance), so
             // the notice is really shown before the crash is marked told.
             self.obj().report_previous_crash();
@@ -1266,5 +1278,27 @@ mod first_hide_tests {
         assert!(super::take_first_hide(&dir));
         assert!(!super::take_first_hide(&dir));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod primary_only_tests {
+    /// I14: `constructed` runs in a second launch too, so it must not start
+    /// the daemon (port 1717, beacons, relay client) or the terminal server.
+    #[test]
+    fn a_second_launch_does_not_start_the_daemon() {
+        let source = include_str!("application.rs");
+        let start = source.find("fn constructed(&self)").unwrap();
+        let end = start
+            + source[start..]
+                .find("fn startup")
+                .map_or(600, |i| i.min(600));
+        let constructed = &source[start..end];
+        assert!(
+            !constructed.contains("DaemonHandle::start"),
+            "{constructed}"
+        );
+        assert!(!constructed.contains("start_server"));
+        assert!(source.contains("fn start_primary"));
     }
 }

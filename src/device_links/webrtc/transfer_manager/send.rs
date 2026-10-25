@@ -10,8 +10,9 @@ use openssl::sha::Sha256;
 use super::super::file_protocol::{
     blocks_for, code, hash_of_hashes, hex, id_bytes, next_pass, payload_capacity, reason, unhex32,
     validate_filename, FileAction, FileControl, FolderRef, FrameHeader, ACTIVE_PER_DIRECTION,
-    BLOCK_BYTES, BLOCK_TRAILER_BYTES, FRAME_BYTES_DEFAULT, FRAME_BYTES_PROVEN, FRAME_HEADER_BYTES,
-    IN_FLIGHT_TARGET, MAX_RESTARTS, MAX_REWINDS, MAX_TRANSFER_BYTES, UNACKED_MAX,
+    BLOCK_BYTES, BLOCK_TRAILER_BYTES, BUCKET_SLOTS_PER_DIRECTION, FRAME_BYTES_DEFAULT,
+    FRAME_BYTES_PROVEN, FRAME_HEADER_BYTES, IN_FLIGHT_TARGET, MAX_RESTARTS, MAX_REWINDS,
+    MAX_TRANSFER_BYTES, UNACKED_MAX,
 };
 use super::store::{modified_ms, SendCheckpoint, Store};
 use super::{board, row_for, words, Completed, Ending, Engine, Net, Outcome, Stall};
@@ -708,6 +709,12 @@ impl Engine {
             return;
         };
         let active = self.outgoing.iter().filter(|o| o.is_active()).count();
+        let mut bucket_free = BUCKET_SLOTS_PER_DIRECTION.saturating_sub(
+            self.outgoing
+                .iter()
+                .filter(|o| o.is_active() && o.folder.is_some())
+                .count(),
+        );
         let mut free = ACTIVE_PER_DIRECTION.saturating_sub(active);
         if free == 0 {
             return;
@@ -718,12 +725,20 @@ impl Engine {
                     && self.outgoing[i].retry_at.is_none_or(|at| at <= now)
             })
             .collect();
-        order.sort_by_key(|&i| self.outgoing[i].seq);
+        // What the person chose goes first; the Bucket never holds the last
+        // slot.
+        order.sort_by_key(|&i| (self.outgoing[i].folder.is_some(), self.outgoing[i].seq));
         for index in order {
             if free == 0 {
                 break;
             }
             let outgoing = &mut self.outgoing[index];
+            if outgoing.folder.is_some() {
+                if bucket_free == 0 {
+                    continue;
+                }
+                bucket_free -= 1;
+            }
             net.send(outgoing.offer_message(&net));
             outgoing.state = SendState::Offered;
             outgoing.offered = true;

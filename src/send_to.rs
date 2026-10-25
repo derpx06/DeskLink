@@ -263,7 +263,10 @@ fn send(app: &DesklinkApplication, device: &str, paths: &[String]) {
             };
             let notification = gio::Notification::new(&format!("Sending {what} to {}", phone.name));
             if !phone.feature_transport_ready {
-                notification.set_body(Some("It starts as soon as the phone is connected."));
+                notification.set_body(Some(&format!(
+                    "Waiting for {}: it is sent as soon as the phone is connected.",
+                    phone.name
+                )));
             }
             notification
         }

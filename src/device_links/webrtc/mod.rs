@@ -127,6 +127,21 @@ impl WebRtcChannel {
         Self::Liveness,
     ];
 
+    /// Interactive channels outrank the bulk one. webrtcbin 1.28 records the
+    /// priority (and sends it in the channel-open message) but its SCTP layer
+    /// has no stream scheduler, so today this is a declaration; the real
+    /// protection of glide, terminal echo and liveness from a file burst is
+    /// the file window (4 MiB buffered, 8 MiB unacknowledged) and liveness
+    /// having its own channel. A scheduler would make it effective.
+    pub const fn priority(self) -> gst_webrtc::WebRTCPriorityType {
+        use gst_webrtc::WebRTCPriorityType as P;
+        match self {
+            Self::Control | Self::Liveness | Self::InputRealtime | Self::InputReliable => P::High,
+            Self::Events | Self::Terminal | Self::FileControl => P::Medium,
+            Self::FileData => P::Low,
+        }
+    }
+
     pub const fn label(self) -> &'static str {
         match self {
             Self::Control => "desklink-control-v1",
@@ -540,5 +555,25 @@ mod tests {
         envelope.message_id = "not-a-uuid".to_string();
 
         assert!(WebRtcPacketBridge::decode(&binding, &envelope).is_err());
+    }
+}
+
+#[cfg(test)]
+mod priority_tests {
+    use super::WebRtcChannel;
+    use gst_webrtc::glib::translate::IntoGlib;
+    use gst_webrtc::WebRTCPriorityType as P;
+
+    /// The bulk channel ranks below every interactive one.
+    #[test]
+    fn file_data_is_the_lowest_priority_and_liveness_the_highest() {
+        for channel in WebRtcChannel::ALL {
+            assert!(
+                channel.priority().into_glib() >= WebRtcChannel::FileData.priority().into_glib(),
+                "{channel:?}"
+            );
+        }
+        assert_eq!(WebRtcChannel::Liveness.priority(), P::High);
+        assert_eq!(WebRtcChannel::FileData.priority(), P::Low);
     }
 }

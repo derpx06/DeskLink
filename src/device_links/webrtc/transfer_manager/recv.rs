@@ -10,7 +10,7 @@ use openssl::sha::Sha256;
 use super::super::file_protocol::{
     blocks_for, code, hash_of_hashes, hex, id_bytes, next_pass, parse_frame, reason, unhex32,
     FileAction, FileControl, FolderRef, Frame, ACTIVE_PER_DIRECTION, BLOCK_BYTES,
-    FRAME_BYTES_PROVEN, MAX_REWINDS, MAX_TRANSFER_BYTES,
+    BUCKET_SLOTS_PER_DIRECTION, FRAME_BYTES_PROVEN, MAX_REWINDS, MAX_TRANSFER_BYTES,
 };
 use super::store::{is_storage_full, ReceiveCheckpoint, Store};
 use super::{
@@ -441,7 +441,22 @@ impl Engine {
             }
         }
         // Two at once; the sender waits and offers again.
-        if self.incoming.len() >= ACTIVE_PER_DIRECTION {
+        let bucket_active = self
+            .incoming
+            .values()
+            .filter(|incoming| {
+                // Another file of the Bucket; an older copy of this very path
+                // is being replaced by this offer, not competing with it.
+                incoming.folder.as_ref().is_some_and(|known| {
+                    folder
+                        .as_ref()
+                        .is_none_or(|reference| known.relpath != reference.relpath)
+                })
+            })
+            .count();
+        if self.incoming.len() >= ACTIVE_PER_DIRECTION
+            || (folder.is_some() && bucket_active >= BUCKET_SLOTS_PER_DIRECTION)
+        {
             // Not a failure: the sender waits and offers again.
             self.refused(&message, "two files are already arriving (busy)", None);
             return refuse(code::BUSY, None);

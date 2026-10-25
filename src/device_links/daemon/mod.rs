@@ -72,6 +72,23 @@ pub(crate) fn tick_seconds() -> u32 {
     )
 }
 
+/// Whether any listed transfer (a download, a share, a Bucket file) is
+/// actually moving bytes: not paused, not waiting for a phone.
+pub(crate) fn transfer_is_moving() -> bool {
+    use crate::device_links::webrtc::transfer_board;
+    transfer_board::rows()
+        .iter()
+        .chain(transfer_board::synced_rows().iter())
+        .any(|row| row_is_moving(row, transfer_board::note(&row.id).is_some()))
+}
+
+fn row_is_moving(
+    row: &crate::device_links::webrtc::transfer_board::TransferRow,
+    noted: bool,
+) -> bool {
+    !row.paused && !row.preparing && !noted
+}
+
 /// Whether the computer is held awake: the setting is on and at least one
 /// *paired* phone is connected right now.
 pub(crate) fn keep_awake_wanted<'a>(
@@ -329,6 +346,7 @@ impl DaemonWorker {
         let events = Arc::clone(&self.events);
         thread::spawn(move || {
             let mut stay_awake = power::StayAwake::default();
+            let mut transferring = power::StayAwake::new(power::TRANSFERRING);
             let mut tick: u32 = 0;
             let mut last_reachable: Vec<(String, bool)> = Vec::new();
             while !shutdown.load(Ordering::Acquire) {
@@ -354,6 +372,13 @@ impl DaemonWorker {
                 run_liveness_tick(&sessions, &devices);
                 let connections = sessions.connection_snapshot();
                 state::reconcile_connection_status(&devices, &connections);
+                // Files chosen while a phone was away go out now.
+                let ready: Vec<String> = connections
+                    .iter()
+                    .filter(|connection| connection.feature_transport_ready && connection.paired)
+                    .map(|connection| connection.device_id.clone())
+                    .collect();
+                file_transfer::flush_waiting(&sessions, &errors, &ready);
                 // Held only while a paired phone is actually connected: a
                 // laptop shut in a bag with the phone away must sleep (it was
                 // held for as long as any phone was merely paired).
@@ -367,6 +392,10 @@ impl DaemonWorker {
                 );
                 if let Err(error) = stay_awake.apply(wanted) {
                     state::push_error(&errors, error);
+                }
+                // A transfer or Bucket sync moving: ask sleep to wait for it.
+                if let Err(error) = transferring.apply(transfer_is_moving()) {
+                    debug_log!("[Daemon] {error}");
                 }
                 // Who is reachable: the tickers slow down when nobody is,
                 // and speed up (and the window refreshes) the moment that
@@ -458,5 +487,29 @@ mod keep_awake_tests {
             "off"
         );
         assert!(!crate::device_links::config::AppSettings::default().stay_awake);
+    }
+}
+
+#[cfg(test)]
+mod transfer_lock_tests {
+    use super::row_is_moving;
+    use crate::device_links::webrtc::transfer_board::TransferRow;
+
+    #[test]
+    fn only_a_row_moving_bytes_asks_sleep_to_wait() {
+        let row = |paused, preparing| TransferRow {
+            id: "t".into(),
+            device_id: "d".into(),
+            name: "f".into(),
+            incoming: false,
+            done: 1,
+            total: 2,
+            preparing,
+            paused,
+        };
+        assert!(row_is_moving(&row(false, false), false));
+        assert!(!row_is_moving(&row(true, false), false), "paused");
+        assert!(!row_is_moving(&row(false, true), false), "preparing");
+        assert!(!row_is_moving(&row(false, false), true), "waiting (noted)");
     }
 }

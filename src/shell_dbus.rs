@@ -1066,12 +1066,22 @@ fn forget_client() {
 /// `notifications`). An older extension says nothing, so the app keeps
 /// showing them itself until the new one is running.
 pub fn client_handles(capability: &str) -> bool {
+    let state = EXTENSION_KNOWN
+        .with(|known| known.get())
+        .then(|| EXTENSION_IS_ACTIVE.with(|active| active.get()));
     CLIENT.with(|client| {
         client
             .borrow()
             .as_ref()
-            .is_some_and(|client| client.capabilities.iter().any(|known| known == capability))
+            .is_some_and(|client| handles(&client.capabilities, capability, state))
     })
+}
+
+/// A client said it shows `capability`; but the extension may have been
+/// turned off or crashed since (the bus name it said Hello from is the
+/// Shell's, which stays), so a state known to be "not active" wins (I4).
+fn handles(capabilities: &[String], capability: &str, extension_active: Option<bool>) -> bool {
+    extension_active != Some(false) && capabilities.iter().any(|known| known == capability)
 }
 
 /// Whether DeskLink's top-bar extension is running, so it already shows
@@ -1834,6 +1844,15 @@ mod tests {
         assert_eq!(with_extension(enabled.clone()), enabled);
         // Turning off removes only ours.
         assert_eq!(without_extension(enabled), vec!["other@x".to_string()]);
+    }
+
+    #[test]
+    fn a_disabled_extension_no_longer_handles_notifications() {
+        let caps = vec!["notifications".to_string()];
+        assert!(handles(&caps, "notifications", Some(true)));
+        assert!(handles(&caps, "notifications", None), "state not known yet");
+        assert!(!handles(&caps, "notifications", Some(false)), "turned off");
+        assert!(!handles(&caps, "calls", Some(true)), "never said so");
     }
 
     #[test]

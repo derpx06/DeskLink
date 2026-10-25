@@ -1105,7 +1105,8 @@ fn local_ice_event(sdp_m_line_index: u32, candidate: String) -> PeerEvent {
 
 fn channel_options(channel: WebRtcChannel) -> gst::Structure {
     let mut builder = gst::Structure::builder("application/x-desklink-data-channel")
-        .field("ordered", channel.ordered());
+        .field("ordered", channel.ordered())
+        .field("priority", channel.priority());
     if let Some(max_retransmits) = channel.max_retransmits() {
         builder = builder.field("max-retransmits", i32::from(max_retransmits));
     }
