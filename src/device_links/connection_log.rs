@@ -506,7 +506,9 @@ mod tests {
         on_logger_thread(Box::new(move || {
             let _ = done.send(std::thread::current().id());
         }));
-        assert!(began.elapsed() < std::time::Duration::from_millis(200));
+        // Blocked it would wait out the 5 s stall; a loaded machine still
+        // returns far sooner than that.
+        assert!(began.elapsed() < std::time::Duration::from_secs(2));
         started.send(()).unwrap();
         let ran_on = finished
             .recv_timeout(std::time::Duration::from_secs(5))

@@ -577,3 +577,88 @@ mod priority_tests {
         assert_eq!(WebRtcChannel::FileData.priority(), P::Low);
     }
 }
+
+#[cfg(test)]
+mod shared_envelope_tests {
+    use super::*;
+
+    const FIXTURE: &str = include_str!("../../../testdata/envelope.json");
+
+    fn binding() -> WebRtcWireBinding {
+        WebRtcWireBinding {
+            sender_device_id: "desk".into(),
+            peer_device_id: "phone-test-device".into(),
+            session_id: 12,
+            generation: 4,
+        }
+    }
+
+    /// The phone's envelope (`protocol/testdata/desklink_v9/envelope.json`,
+    /// the same bytes in both repos) is read, validated and written back
+    /// field for field.
+    #[test]
+    fn the_phones_envelope_fixture_validates_and_round_trips() {
+        let envelope: WebRtcEnvelope = serde_json::from_str(FIXTURE).unwrap();
+        assert_eq!(envelope.validate(&binding()).unwrap(), b"hello");
+        let again = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(
+            again,
+            serde_json::from_str::<serde_json::Value>(FIXTURE).unwrap()
+        );
+    }
+
+    /// Whatever a peer sends in place of an envelope, parsing and validating
+    /// it never panics, and only the fixture's own shape is accepted.
+    #[test]
+    fn mutated_envelopes_never_panic_and_never_validate_by_accident() {
+        let original: serde_json::Value = serde_json::from_str(FIXTURE).unwrap();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let junk = [
+            serde_json::json!(null),
+            serde_json::json!(-1),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(""),
+            serde_json::json!("not base64!!"),
+            serde_json::json!([1, 2]),
+            serde_json::json!({"a": 1}),
+        ];
+        let keys: Vec<String> = original.as_object().unwrap().keys().cloned().collect();
+        for _ in 0..3000 {
+            let mut value = original.clone();
+            for _ in 0..(1 + next() % 3) {
+                let key = &keys[(next() % keys.len() as u64) as usize];
+                let object = value.as_object_mut().unwrap();
+                match next() % 3 {
+                    0 => {
+                        object.remove(key);
+                    }
+                    _ => {
+                        object.insert(
+                            key.clone(),
+                            junk[(next() % junk.len() as u64) as usize].clone(),
+                        );
+                    }
+                }
+            }
+            if let Ok(envelope) = serde_json::from_value::<WebRtcEnvelope>(value.clone()) {
+                if envelope.validate(&binding()).is_ok() {
+                    // Only a mutation that left the meaning alone passes.
+                    assert_eq!(
+                        envelope.payload_length,
+                        envelope.payload_base64.len() * 3 / 4 - padding(&envelope.payload_base64)
+                    );
+                }
+            }
+        }
+    }
+
+    fn padding(text: &str) -> usize {
+        text.bytes().rev().take_while(|byte| *byte == b'=').count()
+    }
+}

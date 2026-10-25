@@ -223,16 +223,24 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static CACHE: Mutex<LauncherCache> = Mutex::new(LauncherCache::EMPTY);
         static PROBES: AtomicUsize = AtomicUsize::new(0);
+        static RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         fn slow_probe() -> Vec<String> {
             PROBES.fetch_add(1, Ordering::SeqCst);
-            thread::sleep(Duration::from_millis(300));
+            // Held until the test has shown the callers did not wait for it.
+            let until = Instant::now() + Duration::from_secs(10);
+            while !RELEASE.load(Ordering::SeqCst) && Instant::now() < until {
+                thread::sleep(Duration::from_millis(5));
+            }
             vec!["claude".to_string()]
         }
 
         let started = Instant::now();
         assert!(cached_or_refresh(&CACHE, slow_probe).is_empty());
         assert!(cached_or_refresh(&CACHE, slow_probe).is_empty());
-        assert!(started.elapsed() < Duration::from_millis(200));
+        // Both calls returned while the probe was still held: they did not
+        // wait for it (a wait would last the full 10 s, whatever the load).
+        assert!(started.elapsed() < Duration::from_secs(5));
+        RELEASE.store(true, Ordering::SeqCst);
 
         let deadline = Instant::now() + Duration::from_secs(5);
         while cached_or_refresh(&CACHE, slow_probe).is_empty() {

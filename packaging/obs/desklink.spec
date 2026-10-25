@@ -88,7 +88,7 @@ CARGOEOF
 %meson_test
 
 %files
-%license COPYING
+%license COPYING THIRD_PARTY_LICENSES
 %doc README.md
 %{_bindir}/%{name}
 %{_datadir}/%{name}/

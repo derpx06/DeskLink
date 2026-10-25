@@ -38,6 +38,9 @@ pub(crate) fn upsert_device(
                 device.device_type = info.device_type.clone();
                 device.address = address.clone();
                 device.protocol_version = info.protocol_version;
+                if info.app_version.is_some() {
+                    device.app_version = info.app_version.clone();
+                }
                 device.incoming_capabilities = info.incoming_capabilities.clone();
                 device.outgoing_capabilities = info.outgoing_capabilities.clone();
                 // Trust is a stored fact, so it is safe to refresh here.
@@ -146,6 +149,18 @@ pub(crate) fn reconcile_connection_status(
             device.last_seen = None;
         }
         device.feature_transport_ready = ready;
+        // A phone on another major.minor that has not become ready is most
+        // likely an update away (J15); said in the words the ladder uses.
+        if !ready
+            && device.last_error.is_none()
+            && device.app_version.as_deref().is_some_and(|theirs| {
+                crate::device_links::device::versions_skew(crate::config::VERSION, theirs)
+            })
+        {
+            device.last_error = Some(crate::device_links::webrtc::coordinator::update_words(
+                &device.name,
+            ));
+        }
 
         let awaiting_pair_decision = matches!(
             device.status,
@@ -972,6 +987,33 @@ mod tests {
             devices.lock().unwrap()[&info.id].last_seen,
             None,
             "live again"
+        );
+    }
+
+    /// J15: a phone on another major.minor that is not connected reads as
+    /// "Update DeskLink on <phone>"; the same version, or no version, does not.
+    #[test]
+    fn a_phone_on_another_minor_version_is_asked_to_update() {
+        use crate::device_links::device::versions_skew;
+        assert!(versions_skew("1.3.0", "1.4.0"));
+        assert!(versions_skew("1.3.0", "2.3.0"));
+        assert!(!versions_skew("1.3.0", "1.3.7"), "a patch is not skew");
+        assert!(!versions_skew("1.3.0", "garbage"));
+        let (devices, info) = test_devices();
+        let connection = DeviceConnection {
+            device_id: info.id.clone(),
+            linked: true,
+            paired: true,
+            feature_transport_ready: false,
+        };
+        let mut skewed = info.clone();
+        skewed.app_version = Some("0.9.0".into());
+        upsert_device(&devices, &skewed, "10.0.0.2".into(), true);
+        reconcile_connection_status(&devices, std::slice::from_ref(&connection));
+        let error = devices.lock().unwrap()[&info.id].last_error.clone();
+        assert_eq!(
+            error.as_deref(),
+            Some(crate::device_links::webrtc::coordinator::update_words(&info.name).as_str())
         );
     }
 

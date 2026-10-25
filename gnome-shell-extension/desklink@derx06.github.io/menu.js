@@ -341,6 +341,7 @@ export function fillMenu(menu, ctx) {
         tile('audio-volume-high-symbolic', 'Ring', {variant, name: `Ring ${selected.name}`, enabled: ready && can(selected, 'ring'), onClick: () => invoke(selected.id, 'ring')}),
         tile('system-lock-screen-symbolic', 'Lock', {variant, name: `Lock ${selected.name}`, enabled: ready && can(selected, 'lock'), onClick: () => invoke(selected.id, 'lock')}),
         tile('document-send-symbolic', 'Files', {variant, name: `Send files to ${selected.name}`, enabled: ready && can(selected, 'send-files'), onClick: () => invoke(selected.id, 'send-files')}),
+        tile('camera-photo-symbolic', 'Photo', {variant, name: `Take a photo with ${selected.name} and put it on the clipboard`, enabled: ready && can(selected, 'insert-photo'), onClick: () => invoke(selected.id, 'insert-photo')}),
         tile('edit-paste-symbolic', 'Clipboard', {variant, name: `Send the clipboard to ${selected.name}`, enabled: ready && can(selected, 'send-clipboard'), onClick: () => invoke(selected.id, 'send-clipboard')}),
     ];
     if (desk.keepAwake !== undefined) {

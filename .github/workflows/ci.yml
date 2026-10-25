@@ -4,6 +4,13 @@ on:
   push:
     branches: [master, webrtc-stabilisation]
   pull_request:
+  # The release workflow runs this first and publishes only if it passes.
+  workflow_call:
+
+# One run per branch; a newer push cancels the older one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -22,9 +29,9 @@ jobs:
             gst-plugin-pipewire gst-plugin-gtk4 gst-libav \
             desktop-file-utils appstream xorg-server-xvfb
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -43,6 +50,14 @@ jobs:
           Xvfb :56 -screen 0 1280x800x24 >/dev/null 2>&1 &
           sleep 1
           env -u DISPLAY -u WAYLAND_DISPLAY DESKLINK_TEST_DISPLAY=:56 cargo test --locked
+
+      - name: Third-party licences are current
+        run: |
+          scripts/third-party-licenses.sh /tmp/THIRD_PARTY_LICENSES
+          diff -q /tmp/THIRD_PARTY_LICENSES THIRD_PARTY_LICENSES
+
+      - name: Flatpak manifest agrees with the version and SECURITY.md
+        run: python3 flatpak/check-manifest.py
 
       - name: Relay
         working-directory: relay
@@ -97,9 +112,9 @@ jobs:
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -112,3 +127,12 @@ jobs:
         run: |
           cargo build --locked
           cargo test --locked
+
+  # Licences, banned crates and sources (deny.toml), and known advisories.
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check

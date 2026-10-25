@@ -40,6 +40,24 @@ a store build would have to drop terminals.) Pictures, PDFs and videos a phone
 sends are decoded inside DeskLink with a size bound, never trusted, but they
 share DeskLink's address space either way.
 
+### Flatpak permissions, one by one
+
+`flatpak/check-manifest.py` fails CI when the manifest asks for a permission that is not in this list.
+
+| Permission | Why |
+|---|---|
+| `--share=network` | The LAN link to the phone, discovery, the optional relay and TURN. |
+| `--share=ipc` | GTK/X11 shared memory. |
+| `--socket=wayland`, `--socket=fallback-x11`, `--device=dri` | The window and hardware-accelerated video decode of the phone's screen. |
+| `--talk-name=org.freedesktop.Flatpak` | Shared terminals start the shell on the host (see above). The one permission that removes the sandbox. |
+| `--system-talk-name=org.freedesktop.login1` | Unlock with the phone and keep awake while a phone is connected. |
+| `--talk-name=org.freedesktop.ScreenSaver`, `--talk-name=org.gnome.ScreenSaver` | Lock the screen from the phone and see its lock state. |
+| `--talk-name=org.kde.StatusNotifierWatcher`, `--own-name=org.kde.StatusNotifierItem-2-1` | The tray icon. |
+| `--talk-name=org.gnome.Shell.Extensions` | The optional top-bar extension (turn on, turn off, state). |
+| `--talk-name=org.a11y.Bus` | Accessibility (screen readers). |
+| `--filesystem=xdg-download` | Where received files land. |
+| `--filesystem=~/DeskLink Bucket:create` | The Bucket folder, created on first use. |
+
 ## Where DeskLink keeps its files
 
 `~/.config/desklink`, `~/.local/state/desklink` and `~/.cache/desklink` are

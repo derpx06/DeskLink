@@ -36,7 +36,9 @@ of the tag, temporarily replace the git source with
 
 1. Tag the release: `git tag -s v1.3.0 && git push origin v1.3.0`.
 2. Add `"commit": "<full sha of v1.3.0>"` next to `"tag"` in the manifest.
-   Flathub requires both. JSON has no comments, so this file is the reminder.
+   Flathub requires both. JSON has no comments, so `flatpak/check-manifest.py`
+   is the reminder: it prints the TODO(owner) lines, and
+   `flatpak/check-manifest.py --release` fails until they are done.
 3. Set `DESKLINK_RELAY_URL` in the manifest's build `env` to the deployed
    relay (`relay/deploy/DEPLOY.md`). Release builds always set it: it is baked
    in as the default relay, and the manifest's `wss://relay.desklink.example/v1`

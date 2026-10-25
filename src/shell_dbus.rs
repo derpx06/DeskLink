@@ -38,7 +38,8 @@ pub const INTERFACE: &str = "derx06.desklink.com.Shell1";
 /// the device-less `new-note` action.
 /// 7: `Devices[].bucket` (`line`, `detail`, `fraction`) while the Bucket
 /// syncs, and the `open-bucket` action.
-const VERSION: u32 = 7;
+/// 8: the `insert-photo` action (a photo from the phone onto the clipboard).
+const VERSION: u32 = 8;
 const INVALID_ARGS: &str = "org.freedesktop.DBus.Error.InvalidArgs";
 
 const XML: &str = r#"<node>
@@ -314,6 +315,8 @@ fn actions(device: &DeviceView, settings: &AppSettings) -> Vec<&'static str> {
             "send-files",
             "send-clipboard",
             "new-terminal",
+            // A photo from the phone into whatever is open (F3, C2).
+            "insert-photo",
         ]);
     }
     // The lock-screen button: only with "Unlock with … nearby" on and the
@@ -779,6 +782,11 @@ fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str
                 .unwrap_or_default();
             pick_and_send_files(app, &id, name);
         }
+        ("insert-photo", Some(id), Some(daemon)) => daemon.send(DaemonCommand::Capture(
+            id,
+            "photo".into(),
+            "clipboard".into(),
+        )),
         ("open-bucket", Some(id), _) => {
             app.activate_action("open-bucket", Some(&id.to_variant()));
         }
@@ -1153,9 +1161,11 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 13] = [
-    // The current build (w7c: no images decoded in the shell, follow-up
-    // messages announced, the reply dialog destroyed, accent fallback).
+const KNOWN_BUILDS: [&str; 14] = [
+    // The current build (w8: the Photo tile, `insert-photo`).
+    "72517e77af7844b6b0e0acc6bce2694a7f3653cd38ef5131b437abf01f8e9d9a",
+    // w7c: no images decoded in the shell, follow-up messages announced,
+    // the reply dialog destroyed, accent fallback.
     "73de6db35cf56eba8b413c3cca78d2a7389efdb1f3653f5178a02b67d8864607",
     // W4: the Files row, Settings in its comments.
     "6a907b946c22e452a0853b683a98bef425482d0fe38181d4dce255e4cb7fc8da",
@@ -1646,6 +1656,7 @@ mod tests {
                 "send-files",
                 "send-clipboard",
                 "new-terminal",
+                "insert-photo",
                 "end-sessions"
             ]
         );

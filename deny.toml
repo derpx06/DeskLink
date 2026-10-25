@@ -1,0 +1,60 @@
+# cargo-deny (https://embarkstudios.github.io/cargo-deny/): `cargo deny check`.
+# Needs the advisory database (network) for `advisories`; `licenses`, `bans`
+# and `sources` work offline.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+# Unmaintained crates are reported, not fatal; vulnerabilities are fatal.
+unmaintained = "workspace"
+yanked = "deny"
+ignore = [
+  # gettext-rs 0.7: `setlocale`/`TextDomain::init` read the environment
+  # unsynchronised. DeskLink calls them once at start-up, before any other
+  # thread exists; 0.8 is a breaking upgrade, to do with the next toolkit bump.
+  { id = "RUSTSEC-2026-0244", reason = "called once, single-threaded, at start-up" },
+]
+
+[licenses]
+version = 2
+# DeskLink is GPL-3.0-or-later: every permissive licence below can be linked
+# into it. No GPL-incompatible or network-copyleft (AGPL, SSPL, proprietary)
+# licence is allowed. Add a licence here only after checking it against the
+# GPL-3.0 compatibility list.
+allow = [
+  "GPL-3.0-or-later",
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "0BSD",
+  "Unlicense",
+  "BSL-1.0",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0",
+  "LGPL-2.1-or-later",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# `desklink-relay = { path = "relay" }` has no version to pin.
+allow-wildcard-paths = true
+deny = [
+  # Known-unsound or abandoned crates that must not creep back in.
+  { name = "atty" },
+  { name = "time", version = "<0.2.23" },
+  { name = "chrono", version = "<0.4.20" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

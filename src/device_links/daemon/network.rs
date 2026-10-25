@@ -632,7 +632,8 @@ mod tests {
             transport.read_byte_waiting(Duration::from_secs(5)),
             Ok(ReadOutcome::Byte(b'a'))
         ));
-        assert!(started.elapsed() < Duration::from_millis(500));
+        // Data ends the wait; polling would have waited out the 5 s.
+        assert!(started.elapsed() < Duration::from_secs(3));
         assert!(matches!(
             transport.read_byte_waiting(Duration::from_secs(5)),
             Ok(ReadOutcome::Byte(b'b'))

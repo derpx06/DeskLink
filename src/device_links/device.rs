@@ -246,6 +246,26 @@ pub struct DeviceView {
     /// last snapshot; `None` from an older phone (J11).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification_access: Option<bool>,
+    /// The product version the phone said it runs (identity `appVersion`),
+    /// from an authenticated link; `None` until then or from an older build.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
+}
+
+/// Whether two product versions differ in major or minor ("1.3.0" and
+/// "1.4.1" do; "1.3.0" and "1.3.2" do not). Unreadable versions never skew.
+pub fn versions_skew(ours: &str, theirs: &str) -> bool {
+    let major_minor = |version: &str| {
+        let mut parts = version.split('.');
+        Some((
+            parts.next()?.parse::<u32>().ok()?,
+            parts.next()?.parse::<u32>().ok()?,
+        ))
+    };
+    match (major_minor(ours), major_minor(theirs)) {
+        (Some(ours), Some(theirs)) => ours != theirs,
+        _ => false,
+    }
 }
 
 /// The user-facing words for a `connection_path`, the one mapping every
@@ -293,6 +313,7 @@ impl DeviceView {
             keyboard_focused: None,
             keyboard_allowed: None,
             notification_access: None,
+            app_version: info.app_version.clone(),
             sound: None,
             capture: None,
         }

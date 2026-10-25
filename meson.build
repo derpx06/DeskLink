@@ -22,3 +22,9 @@ gnome.post_install(
 install_subdir('gnome-shell-extension/desklink@derx06.github.io',
   install_dir: get_option('datadir') / 'gnome-shell' / 'extensions',
 )
+
+# The licences of the libraries linked in (scripts/third-party-licenses.sh),
+# beside DeskLink's own COPYING.
+install_data('COPYING', 'THIRD_PARTY_LICENSES',
+  install_dir: get_option('datadir') / 'licenses' / 'desklink',
+)

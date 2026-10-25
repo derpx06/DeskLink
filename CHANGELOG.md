@@ -15,6 +15,9 @@
   it on changes.
 - Hardening from the audit: config forward-compatibility, notes ancestors,
   bounded image decoding, private file modes, session-password binding.
+- A Photo tile in the top-bar menu and an Insert from Phone submenu in the tray.
+- The Flatpak, CI and releases: checks run before a release is built, actions are pinned,
+  `deny.toml` checks licences and advisories, THIRD_PARTY_LICENSES ships with the app.
 - Version 1.3.0 matches the Android app (1.3.0, versionCode 20300).
 
 ## 1.0.0 — 2026-10-19
