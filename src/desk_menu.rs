@@ -168,6 +168,21 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
                 .icon("media-skip-forward-symbolic"),
         );
     }
+    // Insert from the phone (F3, C2): a photo, a scan, text, a QR code into
+    // whatever is open here, without the window.
+    if phone.feature_transport_ready {
+        menu.push(TrayEntry::Submenu {
+            label: "Insert from Phone".into(),
+            children: crate::window::insert::CAPTURES
+                .iter()
+                .enumerate()
+                .map(|(index, (_, _, label, icon))| {
+                    TrayEntry::action(*label, format!("insert-{index}:{}", phone.id)).icon(icon)
+                })
+                .collect(),
+            icon: "camera-photo-symbolic".into(),
+        });
+    }
     // The Bucket (F8b): how its sync is going, and the way to it.
     if let Some(summary) = crate::bucket_progress::summary(&phone.id) {
         menu.push(TrayEntry::Label(summary.line()));
@@ -406,6 +421,20 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
             None,
         )),
         "lock" => daemon.send(DaemonCommand::SendLockRequest(target, true)),
+        verb if verb.starts_with("insert-") => {
+            let capture = verb
+                .trim_start_matches("insert-")
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| crate::window::insert::CAPTURES.get(index));
+            if let Some((kind, destination, _, _)) = capture {
+                daemon.send(DaemonCommand::Capture(
+                    target,
+                    (*kind).into(),
+                    (*destination).into(),
+                ));
+            }
+        }
         "type" => crate::type_on_phone::open(&daemon, &target, None),
         "desk-sound-on" | "desk-sound-off" | "phone-mic-on" | "phone-mic-off" => {
             let (what, state) = verb.rsplit_once('-').unwrap_or((verb, "off"));
@@ -499,6 +528,7 @@ mod tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         let mut device = DeviceView::from_info(&info, "10.0.0.2".into(), true);
         device.feature_transport_ready = ready;
@@ -523,6 +553,21 @@ mod tests {
                 _ => Vec::new(),
             })
             .collect()
+    }
+
+    /// C2: the tray reaches "insert from phone" without the window, for a
+    /// connected phone only.
+    #[test]
+    fn the_tray_offers_insert_from_phone_when_connected() {
+        let tray =
+            |device: DeviceView| actions(&entries(&[device], &AppSettings::default(), &[], false));
+        let connected = tray(phone("tray-insert", true));
+        for index in 0..crate::window::insert::CAPTURES.len() {
+            assert!(connected.contains(&format!("insert-{index}:tray-insert")));
+        }
+        assert!(!tray(phone("tray-insert", false))
+            .iter()
+            .any(|action| action.starts_with("insert-")));
     }
 
     /// Review finding D: once the ladder gives up, the tray has a button.

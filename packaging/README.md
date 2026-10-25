@@ -39,7 +39,7 @@ sudo apt install devscripts equivs
 cp -r packaging/debian debian         # dpkg-buildpackage wants ./debian
 sudo mk-build-deps -ir debian/control # installs the Build-Depends
 dpkg-buildpackage -us -uc -b
-sudo apt install ../desklink_1.0.0_*.deb
+sudo apt install ../desklink_1.3.0_*.deb
 ```
 
 The package is `3.0 (native)`: bump `debian/changelog` (`dch -v <version>`)
@@ -57,7 +57,7 @@ GStreamer plugins, `gstreamer1.0-nice`, `gstreamer1.0-pipewire` and
 
 ```sh
 mkdir -p ~/rpmbuild/SOURCES
-git archive --prefix=desklink-1.0.0/ -o ~/rpmbuild/SOURCES/desklink-1.0.0.tar.gz HEAD
+git archive --prefix=desklink-1.3.0/ -o ~/rpmbuild/SOURCES/desklink-1.3.0.tar.gz HEAD
 cargo vendor --locked vendor && tar -czf ~/rpmbuild/SOURCES/vendor.tar.gz vendor
 sudo dnf builddep packaging/obs/desklink.spec   # openSUSE: zypper source-install -d, or install the BuildRequires
 rpmbuild -ba packaging/obs/desklink.spec

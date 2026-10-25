@@ -1,6 +1,6 @@
 //! The main loop's periodic look at the daemon, at the pace the moment needs:
-//! every second while a window shows or a phone is reachable, every five
-//! seconds when there is nothing to show and nobody to talk to. A change in
+//! every second while a window shows, every three while a phone is reachable
+//! but nothing is shown, every five when there is nobody to talk to. A change in
 //! who is reachable wakes the window at once (see `daemon::state::wake_ui`),
 //! so the slow tick is only a safety net.
 
@@ -116,7 +116,11 @@ mod tests {
     fn the_tick_is_slow_only_with_nothing_shown_and_nobody_reachable() {
         assert_eq!(tick_for(true, true), 1);
         assert_eq!(tick_for(true, false), 1, "a window shows its clock");
-        assert_eq!(tick_for(false, true), 1, "a phone is live");
+        assert_eq!(
+            tick_for(false, true),
+            crate::device_links::daemon::LIVE_HIDDEN_TICK_SECONDS,
+            "a phone is live, nothing shown: not a 1 Hz poll"
+        );
         assert_eq!(tick_for(false, false), IDLE_TICK_SECONDS);
         const { assert!(IDLE_TICK_SECONDS > 1) };
     }

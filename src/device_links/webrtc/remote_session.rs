@@ -1181,6 +1181,13 @@ impl RemoteSession {
 ///
 /// Shared for the same reason as the screen streams: the producer is a data
 /// channel callback and the consumer is the GTK main loop.
+/// Forgets the session state kept for `device_id` (no longer paired).
+pub(crate) fn forget(device_id: &str) {
+    if let Ok(mut open) = sessions().lock() {
+        open.remove(device_id);
+    }
+}
+
 pub fn sessions() -> &'static Mutex<std::collections::HashMap<String, RemoteSession>> {
     static SESSIONS: std::sync::OnceLock<Mutex<std::collections::HashMap<String, RemoteSession>>> =
         std::sync::OnceLock::new();

@@ -864,6 +864,11 @@ fn set_allowed(device_id: &str, allowed: Option<bool>) {
     }
 }
 
+/// The phone is no longer ours: what it said about glide goes.
+pub(crate) fn forget_phone(device_id: &str) {
+    set_allowed(device_id, None);
+}
+
 /// Everything the phone says on `desklink.shareinputdevices` (W6): a state
 /// report (`allowed`, plus `entered: true` when it accepts the pointer that
 /// just crossed), a hand-back with `exitEdge: 0` (a refusal), or G3's release

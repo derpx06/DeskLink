@@ -1233,6 +1233,43 @@ fn with_extension(enabled: Vec<String>) -> Vec<String> {
     enabled
 }
 
+/// `enabled-extensions` without ours; every other extension stays.
+fn without_extension(enabled: Vec<String>) -> Vec<String> {
+    enabled
+        .into_iter()
+        .filter(|uuid| uuid != EXTENSION_UUID)
+        .collect()
+}
+
+/// "Turn off": disables only DeskLink's extension. The system-wide
+/// `disable-user-extensions` switch that "Turn On" may have flipped is left
+/// as it is (other extensions may depend on it now).
+pub fn turn_off_extension() -> Result<(), String> {
+    let settings = gio::Settings::new("org.gnome.shell");
+    let strings = |key: &str| -> Vec<String> {
+        settings
+            .strv(key)
+            .iter()
+            .map(|uuid| uuid.to_string())
+            .collect()
+    };
+    settings
+        .set_strv(
+            "enabled-extensions",
+            without_extension(strings("enabled-extensions")),
+        )
+        .map_err(|error| error.to_string())?;
+    let mut disabled = strings("disabled-extensions");
+    if !disabled.iter().any(|uuid| uuid == EXTENSION_UUID) {
+        disabled.push(EXTENSION_UUID.to_string());
+    }
+    settings
+        .set_strv("disabled-extensions", disabled)
+        .map_err(|error| error.to_string())?;
+    gio::Settings::sync();
+    Ok(())
+}
+
 /// "Turn on top-bar menu", only ever from the user's click: installs the
 /// built-in extension for this user (when missing or outdated), turns user
 /// extensions on and enables it. `Ok(true)` when the Shell must be restarted
@@ -1509,6 +1546,7 @@ mod tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         DeviceView::from_info(&info, "10.0.0.2".into(), true)
     }
@@ -1794,6 +1832,8 @@ mod tests {
         let enabled = with_extension(vec!["other@x".into()]);
         assert_eq!(enabled, ["other@x", EXTENSION_UUID]);
         assert_eq!(with_extension(enabled.clone()), enabled);
+        // Turning off removes only ours.
+        assert_eq!(without_extension(enabled), vec!["other@x".to_string()]);
     }
 
     #[test]

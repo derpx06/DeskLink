@@ -258,6 +258,7 @@ mod tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         DeviceView::from_info(&info, String::new(), true)
     }

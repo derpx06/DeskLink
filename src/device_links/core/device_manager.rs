@@ -244,6 +244,27 @@ impl DeviceManager {
         tick
     }
 
+    /// Links to phones that are not paired and are not pairing, open for
+    /// `max` or longer: a stranger's socket that only idles holds a reader
+    /// thread and a slot for ever, since its heartbeats keep it "alive".
+    pub fn idle_unpaired_links(
+        &self,
+        now: Instant,
+        max: std::time::Duration,
+    ) -> Vec<SessionBinding> {
+        use crate::device_links::pairing::PairState;
+        self.reconciler_sessions()
+            .values()
+            .filter(|session| {
+                session.state != SessionState::Terminated
+                    && session.pairing.state == PairState::NotPaired
+                    && now.saturating_duration_since(session.linked_at) >= max
+            })
+            .filter_map(|session| session.binding())
+            .filter(|binding| !binding.link.is_closed())
+            .collect()
+    }
+
     /// Adopt a replacement bootstrap socket into the existing session.
     ///
     /// Returns the *unchanged* binding when adopted, so the caller starts a
@@ -415,6 +436,7 @@ impl DeviceManager {
                 // this the staleness clock would carry over from the socket
                 // this one replaced and immediately declare the fresh link dead.
                 session.last_inbound_at = now;
+                session.linked_at = now;
                 let binding = session
                     .binding()
                     .expect("registered session always has a link");
@@ -450,6 +472,7 @@ impl DeviceManager {
                     last_not_paired_notice: None,
                     pending_features: Default::default(),
                     last_inbound_at: now,
+                    linked_at: now,
                 };
                 let binding = session.binding().expect("new session always has a link");
                 sessions.insert(device_id, session);

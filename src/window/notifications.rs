@@ -31,6 +31,7 @@ pub(super) struct Page {
     count: gtk::Label,
     clear: gtk::Button,
     empty: gtk::Box,
+    empty_line: gtk::Label,
     hidden: gtk::Box,
     hidden_title: gtk::Label,
     cards: RefCell<Vec<Card>>,
@@ -53,13 +54,12 @@ impl Page {
             .orientation(gtk::Orientation::Vertical)
             .spacing(14)
             .build();
-        let empty = status(
+        let (empty, _, empty_line) = status(
             "preferences-system-notifications-symbolic",
             "You're all caught up",
             "New phone notifications appear here.",
-        )
-        .0;
-        let (hidden, hidden_title) = status(
+        );
+        let (hidden, hidden_title, _) = status(
             "preferences-system-notifications-symbolic",
             "",
             "Turn them on to see them here and on your desktop.",
@@ -133,6 +133,7 @@ impl Page {
             count,
             clear,
             empty,
+            empty_line,
             hidden,
             hidden_title,
             cards: RefCell::default(),
@@ -186,6 +187,8 @@ impl Page {
         }
         self.count.set_label(&count);
         self.empty.set_visible(notifications.is_empty());
+        self.empty_line
+            .set_label(&empty_line(&device.name, device.feature_transport_ready));
         // Dismiss, reply and actions go to the phone: none while the link
         // is down (the list is what it last reported).
         let ready = device.feature_transport_ready;
@@ -247,8 +250,21 @@ impl Page {
     }
 }
 
+/// What the empty list says: an empty list with the phone connected may also
+/// mean the phone never got notification access (J11), which nothing else
+/// shows.
+fn empty_line(phone: &str, connected: bool) -> String {
+    if connected {
+        format!(
+            "New phone notifications appear here. Nothing arriving? Allow notification access in DeskLink on {phone}."
+        )
+    } else {
+        "New phone notifications appear here.".to_string()
+    }
+}
+
 /// An icon, a title and a line, centred: an empty or hidden list.
-fn status(icon: &str, title: &str, description: &str) -> (gtk::Box, gtk::Label) {
+fn status(icon: &str, title: &str, description: &str) -> (gtk::Box, gtk::Label, gtk::Label) {
     let status = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
@@ -263,15 +279,14 @@ fn status(icon: &str, title: &str, description: &str) -> (gtk::Box, gtk::Label) 
         .css_classes(["title-4"])
         .build();
     status.append(&title);
-    status.append(
-        &gtk::Label::builder()
-            .label(description)
-            .justify(gtk::Justification::Center)
-            .wrap(true)
-            .css_classes(["text-dim"])
-            .build(),
-    );
-    (status, title)
+    let line = gtk::Label::builder()
+        .label(description)
+        .justify(gtk::Justification::Center)
+        .wrap(true)
+        .css_classes(["text-dim"])
+        .build();
+    status.append(&line);
+    (status, title, line)
 }
 
 /// A glyph for the notifying app, from its name.
@@ -479,6 +494,12 @@ fn build_card(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_list_with_the_phone_connected_points_at_notification_access() {
+        assert!(empty_line("Pixel", true).contains("notification access in DeskLink on Pixel"));
+        assert!(!empty_line("Pixel", false).contains("access"));
+    }
 
     #[test]
     fn each_kind_of_app_has_a_glyph() {

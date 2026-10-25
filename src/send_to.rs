@@ -610,6 +610,7 @@ mod tests {
                 incoming_capabilities: Vec::new(),
                 outgoing_capabilities: Vec::new(),
                 instance_id: None,
+                app_version: None,
             };
             let mut device =
                 crate::device_links::device::DeviceView::from_info(&info, String::new(), trusted);

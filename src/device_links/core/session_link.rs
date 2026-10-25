@@ -254,6 +254,7 @@ impl SessionLink {
                 incoming_capabilities: Vec::new(),
                 outgoing_capabilities: Vec::new(),
                 instance_id: None,
+                app_version: None,
             },
             closed: AtomicBool::new(false),
             epoch: AtomicU64::new(0),

@@ -182,6 +182,13 @@ fn peer_profiles() -> &'static Mutex<HashMap<String, PeerProfile>> {
     PROFILES.get_or_init(Default::default)
 }
 
+/// Forgets what `device_id` confirmed in its handover.
+pub(crate) fn forget_peer_profile(device_id: &str) {
+    if let Ok(mut profiles) = peer_profiles().lock() {
+        profiles.remove(device_id);
+    }
+}
+
 /// Records what `device_id` confirmed in its handover. From then on only the
 /// intersection of its lists and ours is sent to it or accepted from it.
 pub(crate) fn record_peer_profile(device_id: &str, incoming: &[String], outgoing: &[String]) {

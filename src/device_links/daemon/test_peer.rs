@@ -139,6 +139,7 @@ impl TestPeer {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         devices.lock().unwrap().insert(
             peer_id.to_string(),
@@ -735,6 +736,28 @@ mod tests {
             after(Duration::from_secs(90), true).dead.len(),
             1,
             "dozing: 90 s"
+        );
+    }
+
+    /// A link that never pairs is cut after a minute (its heartbeats keep it
+    /// "alive" otherwise); a paired one is not.
+    #[test]
+    fn an_unpaired_link_idle_for_a_minute_is_closed() {
+        use crate::device_links::daemon::UNPAIRED_LINK_MAX;
+        let net = TestNetwork::new();
+        let (desktop, _phone) = peer_pair(&net, "desktop-1", "phone-1");
+        let now = std::time::Instant::now();
+        assert!(desktop
+            .sessions
+            .idle_unpaired_links(now, UNPAIRED_LINK_MAX)
+            .is_empty());
+        let later = now + UNPAIRED_LINK_MAX;
+        assert_eq!(
+            desktop
+                .sessions
+                .idle_unpaired_links(later, UNPAIRED_LINK_MAX)
+                .len(),
+            1
         );
     }
 

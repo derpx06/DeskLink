@@ -18,6 +18,8 @@ pub struct DeviceInfo {
     /// is dead and must be dropped at once rather than after the 15 s silence
     /// budget. Optional on the wire: older builds omit it.
     pub instance_id: Option<String>,
+    /// The product version the peer says it runs (J15): shown, never trusted.
+    pub app_version: Option<String>,
 }
 
 /// This process's restart epoch; see [`DeviceInfo::instance_id`].
@@ -63,6 +65,7 @@ impl DeviceInfo {
             incoming_capabilities,
             outgoing_capabilities,
             instance_id: Some(process_instance_id().to_string()),
+            app_version: Some(crate::config::VERSION.to_string()),
         }
     }
 
@@ -77,6 +80,9 @@ impl DeviceInfo {
         packet.set("tcpPort", i64::from(tcp_port));
         if let Some(instance_id) = &self.instance_id {
             packet.set("instanceId", instance_id.clone());
+        }
+        if let Some(version) = &self.app_version {
+            packet.set("appVersion", version.clone());
         }
         packet
     }
@@ -103,6 +109,10 @@ impl DeviceInfo {
             instance_id: packet
                 .get_str("instanceId")
                 .filter(|id| !id.is_empty() && id.len() <= 64)
+                .map(str::to_string),
+            app_version: packet
+                .get_str("appVersion")
+                .filter(|version| !version.is_empty() && version.len() <= 32)
                 .map(str::to_string),
         })
     }
@@ -159,6 +169,24 @@ fn is_valid_device_id(id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_app_version_travels_in_the_identity_and_is_optional() {
+        let info =
+            super::DeviceInfo::local("abcdefgh_1234_abcdefgh_1234_abcd".into(), "Desk".into());
+        let packet = info.to_identity_packet(1716);
+        assert_eq!(packet.get_str("appVersion"), Some(crate::config::VERSION));
+        let back = super::DeviceInfo::from_identity_packet(&packet).unwrap();
+        assert_eq!(back.app_version.as_deref(), Some(crate::config::VERSION));
+        let mut old = packet.clone();
+        old.body.remove("appVersion");
+        assert_eq!(
+            super::DeviceInfo::from_identity_packet(&old)
+                .unwrap()
+                .app_version,
+            None
+        );
+    }
+
     #[test]
     fn laptops_and_convertibles_report_as_laptops() {
         for chassis in [8, 9, 10, 14, 31, 32] {

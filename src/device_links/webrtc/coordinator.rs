@@ -3142,6 +3142,15 @@ pub(crate) fn forget_liveness(device_id: &str) {
     if let Ok(mut dozing) = dozing_devices().lock() {
         dozing.remove(device_id);
     }
+    if let Ok(mut woke) = probe_now().lock() {
+        woke.remove(device_id);
+    }
+    if let Ok(mut streaks) = lacking_streaks().lock() {
+        streaks.remove(device_id);
+    }
+    if let Ok(mut used) = ice_addresses().lock() {
+        used.remove(device_id);
+    }
 }
 
 /// The silence of a link seen through both clocks: whichever heard the phone
@@ -3175,6 +3184,15 @@ pub(crate) fn note_heartbeat(device_id: &str, packet: &NetworkPacket) -> bool {
         }
     }
     woke
+}
+
+/// Probes `device_id`'s data channel at the next pass instead of after the
+/// silence budget: this computer (not the phone) just came back from sleep or
+/// changed network, so a peer it still believes in may be dead.
+pub(crate) fn probe_soon(device_id: &str) {
+    if let Ok(mut woke) = probe_now().lock() {
+        woke.insert(device_id.to_string());
+    }
 }
 
 /// The silence clock after the phone woke: restarted, so the silence that
@@ -5577,6 +5595,7 @@ mod tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         let mut card =
             crate::device_links::device::DeviceView::from_info(&info, "10.0.0.2".into(), true);
@@ -5646,6 +5665,7 @@ mod tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         let mut card =
             crate::device_links::device::DeviceView::from_info(&info, "10.0.0.2".into(), true);
@@ -5872,6 +5892,15 @@ mod tests {
         assert!(crate::device_links::local_goes_first("a", "b"));
         assert!(!crate::device_links::local_goes_first("b", "a"));
         assert!(!crate::device_links::local_goes_first("a", "a"));
+    }
+
+    #[test]
+    fn a_resume_or_network_change_probes_the_peer_at_once() {
+        let id = "probe-soon-phone";
+        assert!(!super::take_probe_now(id));
+        super::probe_soon(id);
+        assert!(super::take_probe_now(id), "probed on the next pass");
+        assert!(!super::take_probe_now(id), "once");
     }
 
     #[test]

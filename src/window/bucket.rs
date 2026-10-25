@@ -1258,6 +1258,29 @@ fn problem_banner(view: &PairView) -> Option<gtk::Box> {
     detail_label.set_wrap(true);
     words.append(&detail_label);
     bar.append(&words);
+    if matches!(&view.phase, Phase::Problem(problem) if problem == folders::FOLDER_MISSING) {
+        let create = super::soft_button("Create Folder");
+        let root = view.pair.root.clone();
+        create.connect_clicked(move |button| {
+            if let Err(error) = folders::recreate_root(&root) {
+                super::toast_from(button, &format!("Could not create the folder: {error}"));
+            }
+        });
+        bar.append(&create);
+        let off = super::soft_button("Turn Off");
+        let id = view.pair.device.clone();
+        off.connect_clicked(move |button| {
+            let id = id.clone();
+            super::confirm(
+                button,
+                "Turn off the Bucket?",
+                "The phone keeps its copy; nothing is deleted on either side.",
+                "Turn Off",
+                move || folders::remove(&id, BUCKET_ID),
+            );
+        });
+        bar.append(&off);
+    }
     if confirm {
         let button = super::soft_button("It's Empty on Purpose");
         let id = view.pair.device.clone();

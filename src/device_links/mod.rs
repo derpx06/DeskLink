@@ -21,6 +21,7 @@ pub(crate) mod notes;
 pub mod packet;
 pub mod pairing;
 pub mod pairing_qr;
+pub(crate) mod peers;
 pub(crate) mod private_fs;
 pub mod pty;
 pub mod relay_link;

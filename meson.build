@@ -1,5 +1,5 @@
 project('desklink', 'rust',
-          version: '1.0.0',
+          version: '1.3.0',
     meson_version: '>= 1.0.0',
   default_options: [ 'buildtype=release', 'warning_level=2', 'werror=false', ],
 )

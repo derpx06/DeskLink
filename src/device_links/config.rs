@@ -848,7 +848,16 @@ impl Config {
         crate::device_links::sync::forget_device(device_id);
         // Unlocking this computer from it, too: a later phone under the same
         // id starts from off.
-        if self.stored.settings.unlock_devices.remove(device_id) {
+        let settings = &mut self.stored.settings;
+        let cleared = [
+            settings.unlock_devices.remove(device_id),
+            // What was chosen for that phone alone: not inherited by a later
+            // phone under the same id.
+            settings.hidden_notifications.remove(device_id),
+            settings.muted_command_alerts.remove(device_id),
+            settings.contact_caller_names.remove(device_id),
+        ];
+        if cleared.contains(&true) {
             mirror_settings(&self.stored.settings);
         }
         // Glide onto it, too (F4).
@@ -1211,6 +1220,7 @@ mod tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         let tag = Uuid::new_v4().simple().to_string();
         let (old, fresh) = (format!("old-{tag}"), format!("new-{tag}"));
@@ -1474,6 +1484,7 @@ mod tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         config.trust_device(&info, "cert-1".into()).unwrap();
         let mut snapshot = NetworkPacket::new("desklink.contacts");
@@ -1659,8 +1670,26 @@ mod tests {
             "a new identity starts from off"
         );
         config.stored.settings.unlock_devices.insert(id.clone());
+        config
+            .stored
+            .settings
+            .hidden_notifications
+            .insert(id.clone());
+        config
+            .stored
+            .settings
+            .muted_command_alerts
+            .insert(id.clone());
+        config
+            .stored
+            .settings
+            .contact_caller_names
+            .insert(id.clone());
         config.untrust_device(&id).unwrap();
         assert!(!config.stored.settings.unlocks_from(&id), "unpaired");
+        assert!(config.stored.settings.shows_notifications(&id));
+        assert!(config.stored.settings.alerts_commands_to(&id));
+        assert!(!config.stored.settings.contact_caller_names.contains(&id));
         let _ = fs::remove_dir_all(dir);
     }
 }

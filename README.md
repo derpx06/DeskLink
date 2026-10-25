@@ -76,8 +76,8 @@ needs a glibc at least as new as Arch's; elsewhere use the Flatpak or a native
 package. Install it with:
 
 ```sh
-tar -xzf desklink-1.0.0-x86_64.tar.gz
-sudo cp -r desklink-1.0.0-x86_64/usr/. /usr/
+tar -xzf desklink-1.3.0-x86_64.tar.gz
+sudo cp -r desklink-1.3.0-x86_64/usr/. /usr/
 sudo gtk-update-icon-cache -qtf /usr/share/icons/hicolor
 ```
 

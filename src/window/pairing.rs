@@ -51,7 +51,7 @@ pub(super) fn welcome_page(win: &DesklinkWindow, daemon: &DaemonHandle) -> Rc<Ce
     );
     words.append(
         &gtk::Label::builder()
-            .label("Open DeskLink on your Android phone and scan this code.")
+            .label(PHONE_WELCOME)
             .wrap(true)
             .max_width_chars(40)
             .justify(gtk::Justification::Center)
@@ -96,6 +96,10 @@ pub(super) fn welcome_page(win: &DesklinkWindow, daemon: &DaemonHandle) -> Rc<Ce
     body.append(&footer);
     stopped
 }
+
+/// What the welcome page says, with where to get the phone app (J16).
+pub(super) const PHONE_WELCOME: &str = "Open DeskLink on your Android phone and scan this code. \
+     No app yet? Get DeskLink for Android from github.com/derpx06/DeskLink/releases.";
 
 /// Takes the welcome page's code off the air.
 pub(super) fn stop_welcome(daemon: &DaemonHandle, stopped: &Cell<bool>) {
@@ -662,4 +666,12 @@ fn qr_texture(uri: &str) -> Option<gdk::MemoryTexture> {
         &glib::Bytes::from_owned(pixels),
         side * 3,
     ))
+}
+
+#[cfg(test)]
+mod welcome_tests {
+    #[test]
+    fn the_welcome_says_where_to_get_the_phone_app() {
+        assert!(super::PHONE_WELCOME.contains("github.com/derpx06/DeskLink/releases"));
+    }
 }

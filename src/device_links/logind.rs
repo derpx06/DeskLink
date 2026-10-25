@@ -81,6 +81,39 @@ fn display_session(bus: &gio::DBusConnection) -> Result<String, String> {
     Ok(path)
 }
 
+/// Whether a `PrepareForSleep` signal says the computer has just resumed
+/// (its one argument is `true` going to sleep, `false` coming back).
+pub(crate) fn is_resume(parameters: &glib::Variant) -> bool {
+    parameters
+        .get::<(bool,)>()
+        .is_some_and(|(sleeping,)| !sleeping)
+}
+
+/// Calls `on_resume` (on the main loop) whenever the computer wakes. A brief
+/// sleep on the same Wi-Fi emits no network change, so without this a dead
+/// peer was found only by the 15 s silence rule instead of at once.
+pub(crate) fn watch_resume(on_resume: impl Fn() + 'static) {
+    let Ok(bus) = system_bus() else {
+        return;
+    };
+    let subscription = bus.signal_subscribe(
+        Some(LOGIND),
+        Some("org.freedesktop.login1.Manager"),
+        Some("PrepareForSleep"),
+        Some("/org/freedesktop/login1"),
+        None,
+        gio::DBusSignalFlags::NONE,
+        move |_, _, _, _, _, parameters| {
+            if is_resume(parameters) {
+                on_resume();
+            }
+        },
+    );
+    // Never unsubscribed: it lives as long as the process (dropping the id
+    // does not unsubscribe).
+    let _ = subscription;
+}
+
 /// Whether our display session is locked; `None` when logind cannot say.
 pub(crate) fn locked() -> Option<bool> {
     let bus = system_bus().ok()?;
@@ -102,4 +135,17 @@ pub(crate) fn unlock() -> Result<(), String> {
     let bus = system_bus()?;
     let session = display_session(&bus)?;
     call(&bus, &session, SESSION, "Unlock", None).map(|_| ())
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::is_resume;
+    use gtk::glib::prelude::ToVariant;
+
+    #[test]
+    fn only_waking_up_counts_as_a_resume() {
+        assert!(is_resume(&(false,).to_variant()), "PrepareForSleep(false)");
+        assert!(!is_resume(&(true,).to_variant()), "going to sleep");
+        assert!(!is_resume(&"x".to_variant()), "anything else");
+    }
 }

@@ -34,8 +34,8 @@ of the tag, temporarily replace the git source with
 
 ## Submitting to Flathub
 
-1. Tag the release: `git tag -s v1.0.0 && git push origin v1.0.0`.
-2. Add `"commit": "<full sha of v1.0.0>"` next to `"tag"` in the manifest.
+1. Tag the release: `git tag -s v1.3.0 && git push origin v1.3.0`.
+2. Add `"commit": "<full sha of v1.3.0>"` next to `"tag"` in the manifest.
    Flathub requires both. JSON has no comments, so this file is the reminder.
 3. Set `DESKLINK_RELAY_URL` in the manifest's build `env` to the deployed
    relay (`relay/deploy/DEPLOY.md`). Release builds always set it: it is baked

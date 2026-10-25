@@ -95,6 +95,7 @@ pub(super) fn seed_trusted_devices(
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         upsert_device(devices, &info, String::new(), true);
     }
@@ -480,6 +481,25 @@ pub(super) fn upsert_notification(
     device_id: &str,
     packet: &NetworkPacket,
 ) -> Option<DeviceNotification> {
+    upsert_notification_for(
+        &crate::device_links::config::app_settings(),
+        devices,
+        device_id,
+        packet,
+    )
+}
+
+/// A phone whose notifications are hidden here keeps none in memory either
+/// (J12: hiding them hid only the drawing).
+pub(super) fn upsert_notification_for(
+    settings: &crate::device_links::config::AppSettings,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    device_id: &str,
+    packet: &NetworkPacket,
+) -> Option<DeviceNotification> {
+    if !settings.shows_notifications(device_id) {
+        return None;
+    }
     let id = sanitize_text(packet.get_str("id")?, 240);
     let notification = DeviceNotification {
         id: id.clone(),
@@ -940,6 +960,20 @@ mod tests {
             "only the session or trust store decides"
         );
         assert_eq!(devices[&info.id].address, "10.0.0.9");
+    }
+
+    #[test]
+    fn a_hidden_phones_notifications_are_not_kept() {
+        let (devices, info) = test_devices();
+        let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_NOTIFICATION);
+        packet.set("id", "n1");
+        packet.set("appName", "Chat");
+        let mut settings = crate::device_links::config::AppSettings::default();
+        settings.hidden_notifications.insert(info.id.clone());
+        assert!(upsert_notification_for(&settings, &devices, &info.id, &packet).is_none());
+        assert!(devices.lock().unwrap()[&info.id].notifications.is_empty());
+        settings.hidden_notifications.clear();
+        assert!(upsert_notification_for(&settings, &devices, &info.id, &packet).is_some());
     }
 
     #[test]

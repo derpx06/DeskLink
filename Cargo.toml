@@ -1,6 +1,6 @@
 [package]
 name = "desklink"
-version = "1.0.0"
+version = "1.3.0"
 edition = "2021"
 # Debian 13's rustc. Cargo.lock pins idna_adapter 1.1 and image 0.25.6 to stay
 # under it; check before `cargo update` raises them.

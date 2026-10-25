@@ -278,6 +278,15 @@ fn set_x11(text: &str) -> bool {
 /// Wayland applications; GTK text from an unfocused (or windowless) client
 /// does not. With no X display at all, GTK is the last resort: it works
 /// while a DeskLink window has focus.
+/// Forgets what was sent to `device_id` (it is no longer paired).
+pub(crate) fn forget_sent_to(device_id: &str) {
+    if let Some(sent) = LAST_SENT_BY_DEVICE.get() {
+        if let Ok(mut sent) = sent.lock() {
+            sent.remove(device_id);
+        }
+    }
+}
+
 /// Forgets what was sent to each phone: the clipboard moved on (a phone's
 /// copy arrived), so the same text copied again is news again.
 pub(crate) fn forget_sent_texts() {

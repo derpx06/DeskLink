@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.3.0 — 2026-10-25
+
+- Keep awake is off for new installs and holds the computer awake only while a
+  paired phone is connected (it used to hold for as long as any phone was
+  paired).
+- One cleanup for every unpair, from either side, replaced phone or changed
+  identity: addresses, sync state, liveness, per-phone choices and open
+  sessions are forgotten together.
+- Pairing by code closes its dialog, opens the new phone and says so.
+- The empty notifications page points at notification access on the phone.
+- Computer-wide switches on a phone's page say they apply to every phone.
+- The GNOME top-bar menu can be turned off again; the row says what turning
+  it on changes.
+- Hardening from the audit: config forward-compatibility, notes ancestors,
+  bounded image decoding, private file modes, session-password binding.
+- Version 1.3.0 matches the Android app (1.3.0, versionCode 20300).
+
 ## 1.0.0 — 2026-10-19
 
 First public release.

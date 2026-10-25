@@ -77,6 +77,18 @@
   </branding>
 
   <releases>
+    <release version="1.3.0" date="2026-10-25">
+      <description translate="no">
+        <p>Safer pairing and sessions, and a steadier connection.</p>
+        <ul>
+          <li>The computer is kept awake only while a paired phone is connected, and the setting starts off</li>
+          <li>Unpairing from either side forgets everything kept for that phone</li>
+          <li>Pairing by code now closes its dialog and opens the new phone</li>
+          <li>The top-bar menu can be turned off again from Preferences</li>
+          <li>Hardened pairing, config, notes, contacts, clipboard and remote sessions</li>
+        </ul>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-10-19">
       <description translate="no">
         <p>First public release.</p>

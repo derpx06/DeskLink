@@ -51,7 +51,7 @@
                 {
                     "type" : "git",
                     "url" : "https://github.com/derpx06/DeskLink.git",
-                    "tag" : "v1.0.0"
+                    "tag" : "v1.3.0"
                 },
                 "flatpak/cargo-sources.json"
             ]

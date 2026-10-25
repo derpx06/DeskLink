@@ -377,8 +377,28 @@ pub(super) fn apply_lan_packet(
                 if let Ok(mut config) = config.lock() {
                     let _ = config.untrust_device(&device_id);
                 }
+                // The same cleanup as an unpair made here: addresses, revs,
+                // liveness, what it proved and was sent. (Outside the config
+                // lock: stopping a share waits on the main loop.)
+                crate::device_links::peers::forget_peer(&device_id);
             }
             update_pair_state(&devices, &device_id, state, verification_key);
+            if pairing_just_completed(previous_state, state) {
+                // Pairing by code ends like pairing by QR: the dialog closes,
+                // the phone is selected and the user is told (J8).
+                let name = devices
+                    .lock()
+                    .ok()
+                    .and_then(|devices| devices.get(&device_id).map(|d| d.name.clone()))
+                    .unwrap_or_default();
+                super::state::push_event(
+                    &events,
+                    DaemonEvent::PairedByQr {
+                        device_id: device_id.clone(),
+                        device_name: name,
+                    },
+                );
+            }
             if state == PairState::Paired {
                 start_webrtc_after_pairing(&binding, &sessions, &config, &devices, &events);
             }
@@ -389,6 +409,32 @@ pub(super) fn apply_lan_packet(
         // were deleted so a future change to `authorize` cannot silently
         // re-expose them on the unauthenticated-handover path.
         debug_log!("[Daemon] Unhandled packet type: {}", packet.packet_type);
+    }
+}
+
+/// A transition into `Paired` (not a re-confirmation of an existing one).
+fn pairing_just_completed(previous: PairState, now: PairState) -> bool {
+    now == PairState::Paired && previous != PairState::Paired
+}
+
+#[cfg(test)]
+mod pairing_done_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_new_pairing_reports_done() {
+        assert!(pairing_just_completed(
+            PairState::NotPaired,
+            PairState::Paired
+        ));
+        assert!(!pairing_just_completed(
+            PairState::Paired,
+            PairState::Paired
+        ));
+        assert!(!pairing_just_completed(
+            PairState::Paired,
+            PairState::NotPaired
+        ));
     }
 }
 

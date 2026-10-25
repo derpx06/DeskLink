@@ -161,7 +161,7 @@ fn groups(
     add_forward_rows(&notifications, daemon, settings);
 
     let clipboard = group(GROUPS[2]);
-    clipboard.add(&clipboard_row(daemon, settings, device));
+    clipboard.add(&clipboard_row(daemon, settings));
 
     let calls = calls_group(daemon, settings, device);
 
@@ -342,7 +342,7 @@ fn calls_group(
 fn pause_music_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
         .title("Pause music during calls")
-        .subtitle("This computer's players pause while a call rings or runs, and carry on after")
+        .subtitle(COMPUTER_WIDE_MUSIC_SUBTITLE)
         .active(settings.pause_media_on_call)
         .build();
     with_icon(&row, "media-playback-pause-symbolic");
@@ -355,14 +355,18 @@ fn pause_music_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Switch
 }
 
 /// "Share the clipboard": the same switch as the Notes & Clipboard header.
-fn clipboard_row(
-    daemon: &DaemonHandle,
-    settings: &AppSettings,
-    device: &DeviceView,
-) -> adw::SwitchRow {
+/// A computer-wide switch on a per-phone page says so (J18): it was read as
+/// belonging to the phone whose page it sits on.
+const COMPUTER_WIDE_CLIPBOARD_TITLE: &str = "Share this computer's clipboard with phones";
+const COMPUTER_WIDE_CLIPBOARD_SUBTITLE: &str =
+    "Applies to every paired phone. Copy on one device, paste on the other. Passwords are never shared.";
+const COMPUTER_WIDE_MUSIC_SUBTITLE: &str =
+    "Applies to every paired phone. This computer's players pause while a call rings or runs, and carry on after";
+
+fn clipboard_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
-        .title(esc(format!("Share the clipboard with {}", device.name)))
-        .subtitle("Copy on one device, paste on the other. Passwords are never shared.")
+        .title(COMPUTER_WIDE_CLIPBOARD_TITLE)
+        .subtitle(COMPUTER_WIDE_CLIPBOARD_SUBTITLE)
         .active(settings.clipboard_sync)
         .build();
     with_icon(&row, "edit-paste-symbolic");
@@ -495,8 +499,8 @@ fn with_icon(row: &impl IsA<adw::ActionRow>, icon: &str) {
 
 fn keep_awake_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
-        .title("Keep awake while connected")
-        .subtitle("So the phone can always reach it, lid closed included")
+        .title("Keep this computer awake while a phone is connected")
+        .subtitle("Lid closed included, only while a paired phone is connected; it sleeps again when the phone goes away. Applies to every phone.")
         .active(settings.stay_awake)
         .build();
     with_icon(&row, "weather-clear-night-symbolic");
@@ -663,7 +667,24 @@ fn add_top_bar_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settin
     with_icon(&menu, "view-app-grid-symbolic");
     match crate::shell_dbus::extension_status() {
         ExtensionStatus::Active => {
-            menu.set_subtitle("Active — your phone, live sessions and quick actions in the top bar")
+            menu.set_subtitle(
+                "Active — your phone, live sessions and quick actions in the top bar",
+            );
+            let off = gtk::Button::builder()
+                .label("Turn Off")
+                .valign(gtk::Align::Center)
+                .build();
+            off.update_property(&[gtk::accessible::Property::Label(
+                "Turn off the top-bar menu",
+            )]);
+            off.connect_clicked(|button| match crate::shell_dbus::turn_off_extension() {
+                Ok(()) => {
+                    button.set_sensitive(false);
+                    super::toast_from(button, "Top-bar menu turned off");
+                }
+                Err(error) => super::toast_from(button, &format!("Could not turn it off: {error}")),
+            });
+            menu.add_suffix(&off);
         }
         ExtensionStatus::NeedsLogin => {
             menu.set_subtitle("Installed — it appears after you log in again");
@@ -671,7 +692,7 @@ fn add_top_bar_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settin
         }
         ExtensionStatus::Off => {
             menu.set_subtitle(
-                "Off — your phone, live sessions and quick actions in the top bar, and Unlock on the lock screen",
+                "Off — your phone, live sessions and quick actions in the top bar, and Unlock on the lock screen. Turning it on also allows GNOME user extensions (a setting for all of them); Turn Off disables only this one.",
             );
             let button = gtk::Button::builder()
                 .label("Turn On")
@@ -1400,6 +1421,18 @@ fn add_glide_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Computer-wide switches on a per-phone page say they are (J18).
+    #[test]
+    fn computer_wide_rows_say_they_apply_to_every_phone() {
+        for text in [
+            COMPUTER_WIDE_CLIPBOARD_SUBTITLE,
+            COMPUTER_WIDE_MUSIC_SUBTITLE,
+        ] {
+            assert!(text.contains("every paired phone"), "{text}");
+        }
+        assert!(COMPUTER_WIDE_CLIPBOARD_TITLE.contains("this computer"));
+    }
 
     /// The groups, in the order the phone's Settings uses too.
     /// Every group title survives being read as markup, and so does a name

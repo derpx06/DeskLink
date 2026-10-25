@@ -68,6 +68,15 @@ pub(crate) fn forget_addresses(device_id: &str) {
     if let Ok(mut book) = addresses().lock() {
         book.forget(device_id);
     }
+    // What it last said about itself, and where it was last reached.
+    if let Ok(mut known) = known_endpoints().lock() {
+        known.remove(device_id);
+    }
+    if let Ok(mut cached) = PERSISTED.lock() {
+        if let Some(cached) = cached.as_mut() {
+            cached.remove(device_id);
+        }
+    }
 }
 
 /// What a paired phone last said about itself and the TCP port it listens
@@ -514,6 +523,7 @@ fn redial_targets(
                     incoming_capabilities: Vec::new(),
                     outgoing_capabilities: Vec::new(),
                     instance_id: None,
+                    app_version: None,
                 },
                 address.port(),
             ),
@@ -1018,6 +1028,7 @@ mod tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         let view = |id: &str, address: &str, trusted: bool| {
             DeviceView::from_info(&info(id), address.to_string(), trusted)
@@ -1177,6 +1188,7 @@ mod tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         let mut view = DeviceView::from_info(&info, "10.0.0.8".to_string(), true);
         view.trusted = true;
@@ -1211,6 +1223,7 @@ mod tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         }
     }
 
@@ -1362,6 +1375,7 @@ mod tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         let mut beacon = NetworkPacket::new(PACKET_TYPE_IDENTITY);
         beacon.set("tcpPort", 1716);
@@ -1427,6 +1441,7 @@ mod tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         let devices = Arc::new(Mutex::new(HashMap::new()));
         upsert_from_beacon(&devices, &info("Pixel"), "192.168.1.3".into(), true);

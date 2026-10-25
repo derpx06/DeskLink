@@ -988,6 +988,7 @@ mod tests {
                 incoming_capabilities: Vec::new(),
                 outgoing_capabilities: Vec::new(),
                 instance_id: None,
+                app_version: None,
             },
             "10.0.0.3".into(),
             true,

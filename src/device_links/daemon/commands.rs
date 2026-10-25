@@ -633,6 +633,9 @@ impl DaemonWorker {
         // A network change is a sign of every phone: ladders start over, and
         // a phone with no peer is dialled at once.
         for binding in self.sessions.current_bindings() {
+            // A brief sleep on the same network leaves a dead peer looking
+            // alive for the whole silence budget; ask it now.
+            crate::device_links::webrtc::coordinator::probe_soon(&binding.device_id);
             crate::device_links::webrtc::coordinator::recovery_sign(
                 &binding.device_id,
                 &self.sessions,

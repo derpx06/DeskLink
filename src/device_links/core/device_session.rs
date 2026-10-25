@@ -114,6 +114,9 @@ pub struct DeviceSession {
     /// Updated by *any* inbound packet, not only heartbeats, so a busy link
     /// needs no probing at all.
     pub last_inbound_at: Instant,
+    /// When the current link was registered; with `pairing`, tells a link
+    /// that never became a pairing from one in the middle of it.
+    pub linked_at: Instant,
     /// When this side last told the peer it is not paired.
     ///
     /// Damped, because a peer that believes it is still paired will happily

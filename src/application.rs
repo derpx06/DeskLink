@@ -86,6 +86,7 @@ mod imp {
             obj.start_session_indicator();
             crate::bucket_progress::start(&obj);
             obj.watch_network();
+            obj.watch_resume();
             crate::startup("indicators and network watch ready");
             obj.set_accels_for_action("app.quit", &["<control>q"]);
             obj.set_accels_for_action("app.shortcuts", &["<control>question"]);
@@ -391,6 +392,21 @@ impl DesklinkApplication {
         // Closing hides: the window's poll keeps delivering pings,
         // find-my-phone and errors, and reopening is instant.
         window.set_hide_on_close(true);
+        // Once, ever: closing did not quit, and nothing said so (J16).
+        let app = self.downgrade();
+        window.connect_close_request(move |_| {
+            if let Some(app) = app.upgrade() {
+                if take_first_hide(&crate::device_links::config::desklink_config_root()) {
+                    let note = gio::Notification::new("DeskLink is still running");
+                    note.set_body(Some(
+                        "Closing the window keeps DeskLink connected in the background. \
+                         Quit it from the tray or the app menu.",
+                    ));
+                    app.send_notification(Some("desklink-background"), &note);
+                }
+            }
+            glib::Propagation::Proceed
+        });
         window
     }
 
@@ -525,6 +541,21 @@ impl DesklinkApplication {
                 }
                 glib::ControlFlow::Continue
             })
+        });
+    }
+
+    /// A resume from sleep is a sign of the network changing under the
+    /// links: after the network has had two seconds to come back, the same
+    /// recovery runs as for a network change.
+    fn watch_resume(&self) {
+        let app = self.downgrade();
+        crate::device_links::logind::watch_resume(move || {
+            let app = app.clone();
+            glib::timeout_add_seconds_local_once(2, move || {
+                if let Some(daemon) = app.upgrade().and_then(|app| app.daemon_handle()) {
+                    daemon.send(crate::device_links::daemon::DaemonCommand::NetworkChanged);
+                }
+            });
         });
     }
 
@@ -1213,5 +1244,27 @@ mod tests {
             hearing_live: false,
         });
         assert_eq!(session_line(&device), None);
+    }
+}
+
+/// Whether this is the first time the window was closed (and remembers it):
+/// the note about DeskLink staying in the background is shown once.
+pub(crate) fn take_first_hide(dir: &std::path::Path) -> bool {
+    let marker = dir.join(".background-told");
+    if marker.exists() {
+        return false;
+    }
+    let _ = std::fs::create_dir_all(dir);
+    std::fs::write(&marker, b"").is_ok()
+}
+
+#[cfg(test)]
+mod first_hide_tests {
+    #[test]
+    fn the_background_note_is_for_the_first_close_only() {
+        let dir = std::env::temp_dir().join(format!("desklink-hide-{}", uuid::Uuid::new_v4()));
+        assert!(super::take_first_hide(&dir));
+        assert!(!super::take_first_hide(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -19,6 +19,8 @@ fn unix_secs() -> i64 {
 /// Probe a bootstrap link that has been silent this long.
 ///
 /// Only silence is probed, so an active link never sends one of these.
+/// How long a link that is not paired, and not pairing, may stay open.
+pub(super) const UNPAIRED_LINK_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 pub(super) const HEARTBEAT_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Declare a peer gone after this much silence — three missed probes.
@@ -60,8 +62,8 @@ pub(crate) fn set_ui_visible(visible: bool) {
 static PHONES_LIVE: AtomicBool = AtomicBool::new(false);
 
 /// How often the main-loop tickers look at the daemon: every second while a
-/// window shows or a phone is reachable, every five seconds when there is
-/// nothing to show and nobody to talk to (a change in who is reachable wakes
+/// window shows, every three while a phone is reachable and nothing is shown,
+/// every five seconds when there is nobody to talk to either (a change in who is reachable wakes
 /// the window at once, so the slow tick is only a safety net).
 pub(crate) fn tick_seconds() -> u32 {
     tick_for(
@@ -70,13 +72,31 @@ pub(crate) fn tick_seconds() -> u32 {
     )
 }
 
+/// Whether the computer is held awake: the setting is on and at least one
+/// *paired* phone is connected right now.
+pub(crate) fn keep_awake_wanted<'a>(
+    setting: bool,
+    mut connected: impl Iterator<Item = &'a str>,
+    trusted: impl Fn(&str) -> bool,
+) -> bool {
+    setting && connected.any(trusted)
+}
+
 pub(crate) fn tick_for(window_shown: bool, phone_live: bool) -> u32 {
-    if window_shown || phone_live {
+    if window_shown {
         1
+    } else if phone_live {
+        // Nothing to draw: events and who-is-reachable already wake the UI at
+        // once (`wake_ui`, `nudge_tickers`); the tray and top bar only need a
+        // gentle look, and the daemon (not this tick) owns liveness.
+        LIVE_HIDDEN_TICK_SECONDS
     } else {
         IDLE_TICK_SECONDS
     }
 }
+
+/// The tick with a phone live but no window showing (C7).
+pub(crate) const LIVE_HIDDEN_TICK_SECONDS: u32 = 3;
 
 /// The tick with nothing live.
 pub(crate) const IDLE_TICK_SECONDS: u32 = 5;
@@ -135,6 +155,15 @@ fn run_liveness_tick(
         // Best effort: a send failure here is itself evidence, and the dead
         // branch below will act on it once the silence budget runs out.
         let _ = binding.link.send_packet(&packet);
+    }
+
+    // An unpaired link that never started pairing is cut after a minute.
+    for binding in sessions.idle_unpaired_links(std::time::Instant::now(), UNPAIRED_LINK_MAX) {
+        eprintln!(
+            "[Daemon] {} did not pair within a minute; closing",
+            binding.device_id
+        );
+        handshake::handle_disconnect(&binding, devices, sessions, "Not paired".to_string());
     }
 
     for binding in tick.dead {
@@ -308,13 +337,6 @@ impl DaemonWorker {
                 if tick % 5 == 0 || UI_VISIBLE.load(Ordering::Relaxed) {
                     refresh_connection_paths(&devices, &sessions);
                 }
-                let wanted = super::config::app_settings().stay_awake
-                    && config
-                        .lock()
-                        .is_ok_and(|config| config.has_trusted_devices());
-                if let Err(error) = stay_awake.apply(wanted) {
-                    state::push_error(&errors, error);
-                }
                 // A pairing negotiation nobody answered is abandoned on the
                 // same tick, so the prompt clears without waiting for the
                 // device to go unreachable — and the peer is told, so it stops
@@ -332,6 +354,20 @@ impl DaemonWorker {
                 run_liveness_tick(&sessions, &devices);
                 let connections = sessions.connection_snapshot();
                 state::reconcile_connection_status(&devices, &connections);
+                // Held only while a paired phone is actually connected: a
+                // laptop shut in a bag with the phone away must sleep (it was
+                // held for as long as any phone was merely paired).
+                let wanted = keep_awake_wanted(
+                    super::config::app_settings().stay_awake,
+                    connections
+                        .iter()
+                        .filter(|connection| connection.is_reachable())
+                        .map(|connection| connection.device_id.as_str()),
+                    |id| config.lock().is_ok_and(|config| config.is_trusted(id)),
+                );
+                if let Err(error) = stay_awake.apply(wanted) {
+                    state::push_error(&errors, error);
+                }
                 // Who is reachable: the tickers slow down when nobody is,
                 // and speed up (and the window refreshes) the moment that
                 // changes.
@@ -396,5 +432,31 @@ impl DaemonWorker {
             link.close();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod keep_awake_tests {
+    use super::keep_awake_wanted;
+
+    /// Held only for a connected, paired phone; a laptop in a bag with the
+    /// phone away sleeps; new installs start with it off.
+    #[test]
+    fn the_computer_is_held_awake_only_while_a_paired_phone_is_connected() {
+        let trusted = |id: &str| id == "mine";
+        assert!(keep_awake_wanted(true, ["mine"].into_iter(), trusted));
+        assert!(
+            !keep_awake_wanted(true, std::iter::empty(), trusted),
+            "phone away"
+        );
+        assert!(
+            !keep_awake_wanted(true, ["stranger"].into_iter(), trusted),
+            "unpaired"
+        );
+        assert!(
+            !keep_awake_wanted(false, ["mine"].into_iter(), trusted),
+            "off"
+        );
+        assert!(!crate::device_links::config::AppSettings::default().stay_awake);
     }
 }

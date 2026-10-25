@@ -297,8 +297,8 @@ impl PairingContext {
 
         update_pair_state(&self.devices, device_id, PairState::NotPaired, None);
         if remove_trust {
-            super::discovery::forget_addresses(device_id);
-            crate::device_links::sync::forget_device(device_id);
+            // Every unpair forgets the same things (see `peers`).
+            crate::device_links::peers::forget_peer(device_id);
         }
         // Unpairing a device that is not connected succeeded: it is told the
         // next time it reaches us (it gets pair:false for its signaling).
@@ -425,8 +425,7 @@ pub(super) fn forget_replaced(
     if let Ok(mut devices) = devices.lock() {
         devices.remove(device_id);
     }
-    super::discovery::forget_addresses(device_id);
-    crate::device_links::sync::forget_device(device_id);
+    crate::device_links::peers::forget_peer(device_id);
 }
 
 #[cfg(test)]
@@ -443,6 +442,7 @@ mod replaced_tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         }
     }
 
@@ -590,6 +590,7 @@ mod replaced_tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         let devices: Arc<Mutex<HashMap<String, DeviceView>>> = Arc::default();
         devices.lock().unwrap().insert(

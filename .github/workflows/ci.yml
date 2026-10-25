@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, webrtc-stabilisation]
   pull_request:
 
 permissions:
@@ -20,7 +20,7 @@ jobs:
             base-devel rust meson gtk4 libadwaita openssl libnice \
             gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
             gst-plugin-pipewire gst-plugin-gtk4 gst-libav \
-            desktop-file-utils appstream
+            desktop-file-utils appstream xorg-server-xvfb
 
       - uses: actions/checkout@v4
 
@@ -38,7 +38,11 @@ jobs:
         run: |
           cargo fmt --check
           cargo clippy --all-targets --locked -- -D warnings
-          cargo test --locked
+          # Never a real session: widget tests run only on a dedicated Xvfb
+          # (DESKLINK_TEST_DISPLAY), otherwise they skip.
+          Xvfb :56 -screen 0 1280x800x24 >/dev/null 2>&1 &
+          sleep 1
+          env -u DISPLAY -u WAYLAND_DISPLAY DESKLINK_TEST_DISPLAY=:56 cargo test --locked
 
       - name: Relay
         working-directory: relay

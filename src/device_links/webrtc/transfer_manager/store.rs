@@ -194,6 +194,7 @@ impl Store {
                 let _ = fs::remove_file(entry.path());
             }
         }
+        enforce_partial_cap(&self.state_root, MAX_PARTIAL_BYTES);
     }
 
     pub fn state_root(&self) -> &Path {
@@ -830,6 +831,80 @@ fn looks_technical(text: &str) -> bool {
         let word = word.trim_end_matches(':');
         word.matches('.').count() >= 2 && (word.ends_with("Error") || word.ends_with("Exception"))
     })
+}
+
+/// All unfinished downloads together may hold this much disk (their ages
+/// alone allowed several 4 GiB files to pile up for the whole retention).
+pub const MAX_PARTIAL_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+/// Removes the oldest `.part` files (and the records beside them) until the
+/// partials fit `cap`. A removed download restarts from its beginning, which
+/// is the honest outcome of a spent disk budget.
+pub fn enforce_partial_cap(root: &Path, cap: u64) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let mut parts: Vec<(SystemTime, u64, PathBuf)> = entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(".desklink-") && name.ends_with(".part")
+        })
+        .filter_map(|entry| {
+            let metadata = fs::symlink_metadata(entry.path()).ok()?;
+            metadata.is_file().then(|| {
+                (
+                    metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                    metadata.len(),
+                    entry.path(),
+                )
+            })
+        })
+        .collect();
+    let mut total: u64 = parts.iter().map(|part| part.1).sum();
+    parts.sort();
+    for (_, size, path) in parts {
+        if total <= cap {
+            break;
+        }
+        let stem = path.with_extension("");
+        for suffix in ["json", "blocks", "sync"] {
+            let _ = fs::remove_file(stem.with_extension(suffix));
+        }
+        if fs::remove_file(&path).is_ok() {
+            total -= size;
+        }
+    }
+}
+
+#[cfg(test)]
+mod partial_cap_tests {
+    use super::*;
+
+    #[test]
+    fn the_oldest_partials_go_first_until_the_total_fits() {
+        let dir = std::env::temp_dir().join(format!("desklink-cap-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(1000);
+        for (name, age) in [
+            (".desklink-a.part", 300u64),
+            (".desklink-b.part", 200),
+            (".desklink-c.part", 100),
+        ] {
+            let file = File::create(dir.join(name)).unwrap();
+            file.set_len(10).unwrap();
+            file.set_modified(old + Duration::from_secs(1000 - age))
+                .unwrap();
+        }
+        fs::write(dir.join(".desklink-a.json"), "{}").unwrap();
+        enforce_partial_cap(&dir, 20);
+        assert!(!dir.join(".desklink-a.part").exists(), "oldest removed");
+        assert!(!dir.join(".desklink-a.json").exists(), "with its record");
+        assert!(dir.join(".desklink-b.part").exists());
+        assert!(dir.join(".desklink-c.part").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

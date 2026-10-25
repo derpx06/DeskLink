@@ -1517,6 +1517,16 @@ fn left_out_of_remote(remote: &mut Manifest, local: &Manifest) -> Vec<String> {
     left_out
 }
 
+/// The problem text of a folder that is gone (C4: the banner offers a fix).
+pub(crate) const FOLDER_MISSING: &str = "The folder is missing";
+
+/// The fix for [`FOLDER_MISSING`]: makes the folder again. It comes back
+/// empty, which the engine holds (nothing is deleted on the phone) until the
+/// person confirms or the files return.
+pub(crate) fn recreate_root(root: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(root)
+}
+
 /// A scan: the files, the directories to watch, whether there were more
 /// files than allowed, and (a Bucket) the folders in it left unsynced.
 type Scanned = (BTreeMap<String, Stat>, Vec<PathBuf>, bool, Vec<String>);
@@ -1526,10 +1536,9 @@ fn scan(pair: &Pair) -> Result<Scanned, String> {
     let mut directories = Vec::new();
     let mut skipped = Vec::new();
     let mut too_many = false;
-    let root_meta =
-        fs::symlink_metadata(&pair.root).map_err(|_| "The folder is missing".to_string())?;
+    let root_meta = fs::symlink_metadata(&pair.root).map_err(|_| FOLDER_MISSING.to_string())?;
     if !root_meta.is_dir() {
-        return Err("The folder is missing".into());
+        return Err(FOLDER_MISSING.into());
     }
     let mut note = |path: &str, why: &str| {
         if skipped.len() < MAX_SKIPPED_SHOWN {
@@ -3849,6 +3858,27 @@ mod tests {
                 crate::device_links::webrtc::enveloped_len(packet)
             );
         }
+    }
+
+    /// C4: a gone folder reads "The folder is missing", and the fix button's
+    /// action makes it again (empty, which the engine then holds).
+    #[test]
+    fn a_missing_bucket_folder_can_be_created_again() {
+        let base = std::env::temp_dir().join(format!("desklink-missing-{}", uuid::Uuid::new_v4()));
+        let root = base.join("Bucket");
+        let pair = Pair {
+            id: BUCKET_ID.into(),
+            name: "DeskLink Bucket".into(),
+            root: root.clone(),
+            device: "phone-b".into(),
+            include_hidden: false,
+            ignore: Vec::new(),
+            bucket: true,
+        };
+        assert_eq!(scan(&pair).err().as_deref(), Some(FOLDER_MISSING));
+        recreate_root(&root).unwrap();
+        assert!(scan(&pair).is_ok());
+        let _ = fs::remove_dir_all(&base);
     }
 
     fn bucket_worker(base: &Path, root: &Path) -> Worker {

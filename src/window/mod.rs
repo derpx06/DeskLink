@@ -26,7 +26,7 @@
 
 mod bucket;
 pub(crate) mod calls;
-mod insert;
+pub(crate) mod insert;
 mod sound;
 pub(crate) use calls::confirm_dial;
 mod clipboard;
@@ -859,10 +859,21 @@ impl DesklinkWindow {
                 } => {
                     // The scan is done: leave "Pair New Device" for the phone
                     // it just paired. The page renders later in this refresh.
+                    let mut was_pairing = false;
                     if let Some(dialog) = self.visible_dialog() {
-                        if dialog.title() == "Pair New Device" {
+                        if matches!(
+                            dialog.title().as_str(),
+                            "Pair New Device" | "Pair with a Code"
+                        ) {
                             dialog.close();
+                            was_pairing = true;
                         }
+                    }
+                    // Both the code path and the QR path report; once is enough.
+                    if !was_pairing
+                        && imp.selected_device_id.borrow().as_deref() == Some(device_id.as_str())
+                    {
+                        continue;
                     }
                     imp.selected_device_id.replace(Some(device_id.clone()));
                     sidebar::save_last_device(&device_id);
@@ -1941,6 +1952,11 @@ fn friendly_error(raw: &str) -> (String, bool) {
         "no route to host",
     ]) {
         (OFFLINE, true)
+    } else if has(&["downgraded protocol"]) {
+        (
+            "That device runs an older DeskLink. Update DeskLink on it to connect.",
+            true,
+        )
     } else if has(&["trusted device certificate changed"]) {
         (
             "This phone's identity changed. If DeskLink was reinstalled on it, pair it again \
@@ -3214,6 +3230,7 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
         incoming_capabilities: FeatureRegistry::desktop().outgoing_capabilities().to_vec(),
         outgoing_capabilities: FeatureRegistry::desktop().incoming_capabilities().to_vec(),
         instance_id: None,
+        app_version: None,
     };
     let mut device = DeviceView::from_info(&info, "192.168.1.41".to_string(), true);
     device.battery_status = Some(BatteryStatus {
@@ -3387,6 +3404,7 @@ mod tests {
             incoming_capabilities: vec![PACKET_TYPE_PING.to_string()],
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         DeviceView::from_info(&info, "127.0.0.1".to_string(), true)
     }
@@ -3478,6 +3496,9 @@ mod tests {
             friendly_error("connect 10.0.0.2:1716: Connection refused (os error 111)");
         assert!(refused.starts_with("The device refused"), "{refused}");
         assert!(!lasting);
+        assert!(friendly_error("Refusing downgraded protocol from Pixel: 8")
+            .0
+            .contains("Update DeskLink"));
         assert!(friendly_error("operation timed out")
             .0
             .contains("timed out"));

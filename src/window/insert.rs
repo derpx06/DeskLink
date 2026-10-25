@@ -9,7 +9,7 @@ use super::{ellipsized, icon_square, DeviceView};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 
 /// What each row asks for: kind, target, label, icon.
-const CAPTURES: [(&str, &str, &str, &str); 5] = [
+pub(crate) const CAPTURES: [(&str, &str, &str, &str); 5] = [
     (
         "photo",
         "clipboard",

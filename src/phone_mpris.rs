@@ -420,6 +420,7 @@ mod tests {
             incoming_capabilities: Vec::new(),
             outgoing_capabilities: Vec::new(),
             instance_id: None,
+            app_version: None,
         };
         let mut device = DeviceView::from_info(&info, "10.0.0.2".into(), true);
         device.feature_transport_ready = ready;
