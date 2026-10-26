@@ -15,6 +15,8 @@
   it on changes.
 - Hardening from the audit: config forward-compatibility, notes ancestors,
   bounded image decoding, private file modes, session-password binding.
+- A copy made on the phone a second time (same text, after the computer copied something else) is placed again; it was
+  dropped as "unchanged". The Clipboard page shows a phone's copy at once.
 - A Photo tile in the top-bar menu and an Insert from Phone submenu in the tray.
 - The Flatpak, CI and releases: checks run before a release is built, actions are pinned,
   `deny.toml` checks licences and advisories, THIRD_PARTY_LICENSES ships with the app.

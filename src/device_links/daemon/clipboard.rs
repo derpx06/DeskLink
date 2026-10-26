@@ -262,20 +262,58 @@ pub(super) fn clipboard_from_phone(
     if !crate::device_links::config::app_settings().clipboard_sync {
         return "ignored: clipboard sync is off";
     }
-    if get_last_clipboard()
-        .lock()
-        .is_ok_and(|last| *last == content)
-    {
-        return "unchanged";
-    }
-    if let Some(timestamp) = connect_timestamp {
-        if !connect_is_newer(timestamp, LOCAL_CHANGED_AT.load(Ordering::Acquire)) {
-            return "ignored: older than this computer's clipboard";
+    match connect_timestamp {
+        // A copy made now is always news, even when it is the text the
+        // phone sent last time and this computer has copied something else
+        // since (it used to be dropped as "unchanged": compared with the
+        // last text a *phone* placed, not with what the clipboard holds).
+        // Only a duplicate delivery of the copy just placed is skipped.
+        None => {
+            if just_placed(content, now_ms()) {
+                return "unchanged: just placed";
+            }
+        }
+        // The phone's clipboard as of connecting: it replaces this one only
+        // when it differs and is newer than this computer's last change.
+        Some(timestamp) => {
+            if current_text().is_some_and(|current| current == content) {
+                return "unchanged";
+            }
+            if !connect_is_newer(timestamp, LOCAL_CHANGED_AT.load(Ordering::Acquire)) {
+                return "ignored: older than this computer's clipboard";
+            }
         }
     }
     remember(content, Some(device_name));
     set_clipboard_text_from_remote(content);
+    // The Clipboard page shows it now, not at its next one-second look.
+    super::state::nudge_tickers();
     "placed on the clipboard"
+}
+
+/// The text the clipboard held when it was last looked at or set (what the
+/// poll saw, or what a phone placed).
+static CURRENT: Mutex<Option<String>> = Mutex::new(None);
+
+fn current_text() -> Option<String> {
+    CURRENT.lock().ok().and_then(|current| current.clone())
+}
+
+fn note_current(text: &str) {
+    if let Ok(mut current) = CURRENT.lock() {
+        *current = Some(text.to_string());
+    }
+}
+
+/// The text last placed from a phone, and when.
+static PLACED: Mutex<(String, u64)> = Mutex::new((String::new(), 0));
+const DUPLICATE_WITHIN_MS: u64 = 2000;
+
+/// Whether `content` is what was placed from a phone moments ago.
+fn just_placed(content: &str, now: u64) -> bool {
+    PLACED.lock().is_ok_and(|placed| {
+        placed.0 == content && now.saturating_sub(placed.1) < DUPLICATE_WITHIN_MS
+    })
 }
 
 /// The X11 clipboard context, kept for the life of the process: `arboard`
@@ -284,10 +322,15 @@ pub(super) fn clipboard_from_phone(
 /// XWayland) to every Wayland application.
 static X11_CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
 
-fn set_x11(text: &str) -> bool {
+fn set_x11(text: &str, still_latest: &dyn Fn() -> bool) -> bool {
     let Ok(mut held) = X11_CLIPBOARD.lock() else {
         return false;
     };
+    // Checked under the lock that serialises every set: a slower thread
+    // holding an older copy must not land after a newer one.
+    if !still_latest() {
+        return true;
+    }
     // A second try with a fresh context: the first may be dead (XWayland
     // restarted), and a dead one would refuse every later copy.
     for _ in 0..2 {
@@ -305,16 +348,6 @@ fn set_x11(text: &str) -> bool {
     false
 }
 
-/// Publishes clipboard text received from a paired device.
-///
-/// Through X11 first. A Wayland client cannot do this: Mutter (and KWin)
-/// accept a Wayland clipboard only from the focused window, and the phone's
-/// copy arrives while DeskLink is hidden or in the background — GTK's
-/// `Gdk.Clipboard` then claims it locally and nobody else ever sees it.
-/// Verified on GNOME Shell 50: X11 text from an unfocused client pastes in
-/// Wayland applications; GTK text from an unfocused (or windowless) client
-/// does not. With no X display at all, GTK is the last resort: it works
-/// while a DeskLink window has focus.
 /// Forgets what was sent to `device_id` (it is no longer paired).
 pub(crate) fn forget_sent_to(device_id: &str) {
     if let Some(sent) = LAST_SENT_BY_DEVICE.get() {
@@ -344,9 +377,23 @@ fn forget_examined(examined: &mut Option<(String, bool, u64)>, current: &str) {
     }
 }
 
+/// Publishes clipboard text received from a paired device.
+///
+/// Through X11 first. A Wayland client cannot do this: Mutter (and KWin)
+/// accept a Wayland clipboard only from the focused window, and the phone's
+/// copy arrives while DeskLink is hidden or in the background — GTK's
+/// `Gdk.Clipboard` then claims it locally and nobody else ever sees it.
+/// Verified on GNOME Shell 50: X11 text from an unfocused client pastes in
+/// Wayland applications; GTK text from an unfocused (or windowless) client
+/// does not. With no X display at all, GTK is the last resort: it works
+/// while a DeskLink window has focus.
 pub(crate) fn set_clipboard_text_from_remote(content: &str) {
     REMOTE_AT.store(now_ms(), Ordering::Release);
     LOCAL_CHANGED_AT.store(now_ms(), Ordering::Release);
+    if let Ok(mut placed) = PLACED.lock() {
+        *placed = (content.to_string(), now_ms());
+    }
+    note_current(content);
     // What this desk sent before is no longer what the phone holds: copying
     // it again must send it again.
     forget_sent_texts();
@@ -362,7 +409,7 @@ pub(crate) fn set_clipboard_text_from_remote(content: &str) {
                 .lock()
                 .is_ok_and(|last| *last == content)
         };
-        if !latest() || set_x11(&content) {
+        if !latest() || set_x11(&content, &latest) {
             return;
         }
         debug_log!("[Clipboard] No X11 clipboard here; placing it through GTK instead");
@@ -657,6 +704,7 @@ impl DaemonWorker {
                         String::new()
                     }
                 };
+                note_current(&current_text);
                 forget_examined(&mut examined, &current_text);
                 if current_text.is_empty() {
                     // No text: perhaps an image, read once per copy.
@@ -981,6 +1029,143 @@ mod tests {
             Some(false),
             "no display to ask"
         );
+    }
+
+    /// The owner's report: copying the same text on the phone a second time
+    /// (after the computer's clipboard held something else) was dropped as
+    /// "unchanged", because it was compared with the last text a phone placed.
+    #[test]
+    fn the_same_text_copied_again_on_the_phone_is_placed_again() {
+        let text = format!("copy-me-{}", uuid::Uuid::new_v4().simple());
+        assert_eq!(
+            clipboard_from_phone(&text, "Pixel", None),
+            "placed on the clipboard"
+        );
+        // A duplicate delivery of that very copy is skipped...
+        assert_eq!(
+            clipboard_from_phone(&text, "Pixel", None),
+            "unchanged: just placed"
+        );
+        // ...but, a few seconds later and after the computer copied
+        // something else, the phone copying it again is news.
+        note_current("something copied at this computer");
+        if let Ok(mut placed) = PLACED.lock() {
+            placed.1 = now_ms().saturating_sub(DUPLICATE_WITHIN_MS + 1000);
+        }
+        assert_eq!(
+            clipboard_from_phone(&text, "Pixel", None),
+            "placed on the clipboard"
+        );
+        // The history lists it once, newest first.
+        let listed: Vec<_> = history()
+            .into_iter()
+            .filter(|item| item.text == text)
+            .collect();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(history()[0].text, text);
+        assert_eq!(history()[0].from.as_deref(), Some("Pixel"));
+    }
+
+    /// `clipboard.connect` replaces the computer's clipboard only when it
+    /// differs from what is there and is newer than this computer's change.
+    #[test]
+    fn a_connect_snapshot_is_placed_only_when_different_and_newer() {
+        let text = format!("connect-{}", uuid::Uuid::new_v4().simple());
+        note_current(&text);
+        assert_eq!(
+            clipboard_from_phone(&text, "Pixel", Some(Some(now_ms() + 10_000))),
+            "unchanged",
+            "already the clipboard"
+        );
+        note_current("something else");
+        LOCAL_CHANGED_AT.store(now_ms(), Ordering::Release);
+        assert_eq!(
+            clipboard_from_phone(&text, "Pixel", Some(Some(1))),
+            "ignored: older than this computer's clipboard"
+        );
+        assert_eq!(
+            clipboard_from_phone(&text, "Pixel", Some(None)),
+            "ignored: older than this computer's clipboard",
+            "an unknown time never replaces"
+        );
+        assert_eq!(
+            clipboard_from_phone(&text, "Pixel", Some(Some(now_ms() + 60_000))),
+            "placed on the clipboard"
+        );
+    }
+
+    /// Two copies arriving close together: the newest is what stays (the
+    /// older setter, if slower, steps aside under the lock).
+    #[test]
+    fn a_slow_older_set_never_lands_after_a_newer_one() {
+        let stale = || false;
+        // Not the latest any more: nothing is set, and nothing is retried.
+        assert!(set_x11("older", &stale));
+    }
+
+    /// Packet arrival to the clipboard being set, over a real X11 display (a
+    /// dedicated Xvfb named by `DESKLINK_TEST_DISPLAY`; never the real
+    /// session). The test re-runs itself with `DISPLAY` set, because `arboard`
+    /// reads it from the environment of the whole process. Prints the
+    /// latencies (run with `--nocapture`).
+    #[test]
+    fn a_phones_copy_reaches_a_real_x11_clipboard_within_a_second() {
+        const CHILD: &str = "DESKLINK_CLIPBOARD_LATENCY_CHILD";
+        let name = "device_links::daemon::clipboard::tests::a_phones_copy_reaches_a_real_x11_clipboard_within_a_second";
+        if std::env::var_os(CHILD).is_none() {
+            let Some(display) = std::env::var_os("DESKLINK_TEST_DISPLAY") else {
+                eprintln!("SKIPPED {name}: DESKLINK_TEST_DISPLAY names no dedicated display");
+                return;
+            };
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([name, "--exact", "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("DISPLAY", display)
+                .env_remove("WAYLAND_DISPLAY")
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&output.stdout);
+            eprintln!("{text}");
+            assert!(
+                output.status.success(),
+                "{text}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut reader = arboard::Clipboard::new().expect("an X11 display");
+        let mut latencies = Vec::new();
+        for round in 0..5 {
+            let text = format!("latency-{round}-{}", uuid::Uuid::new_v4().simple());
+            // Move the clock past the duplicate window between rounds.
+            if let Ok(mut placed) = PLACED.lock() {
+                placed.1 = 0;
+            }
+            let started = std::time::Instant::now();
+            assert_eq!(
+                clipboard_from_phone(&text, "Pixel", None),
+                "placed on the clipboard"
+            );
+            let in_history = started.elapsed();
+            let landed = loop {
+                if reader.get_text().is_ok_and(|now| now == text) {
+                    break started.elapsed();
+                }
+                assert!(
+                    started.elapsed() < std::time::Duration::from_secs(5),
+                    "{text} never landed"
+                );
+                thread::sleep(Duration::from_millis(1));
+            };
+            println!(
+                "round {round}: history {:.1} ms, clipboard {:.1} ms",
+                in_history.as_secs_f64() * 1000.0,
+                landed.as_secs_f64() * 1000.0
+            );
+            latencies.push(landed);
+        }
+        let worst = latencies.iter().max().copied().unwrap();
+        assert!(worst < Duration::from_secs(1), "{worst:?}");
     }
 
     #[test]
