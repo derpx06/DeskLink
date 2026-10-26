@@ -253,6 +253,31 @@ fn connect_is_newer(timestamp: Option<u64>, local_changed_ms: u64) -> bool {
     timestamp.is_some_and(|at| at > 0 && at > local_changed_ms)
 }
 
+/// A phone's `desklink.clipboard` / `desklink.clipboard.connect` packet,
+/// exactly as the incoming path reads it: what it did here, or why it is
+/// not a clipboard packet.
+pub(super) fn apply_phone_packet(
+    packet: &NetworkPacket,
+    device_name: &str,
+) -> Result<&'static str, String> {
+    let content = packet
+        .get_str("content")
+        .ok_or_else(|| "DeskLink WebRTC clipboard packet has no content".to_string())?;
+    let number = |key: &str| packet.body.get(key).and_then(serde_json::Value::as_u64);
+    // `connect` (every connection) says when the phone's copy was made: its
+    // `timestamp` (the same moment as `copiedAt`, which an older phone lacks).
+    // A plain `clipboard` is a copy made at `copiedAt`, or now when absent.
+    let connect = (packet.packet_type
+        == crate::device_links::packet::PACKET_TYPE_CLIPBOARD_CONNECT)
+        .then(|| number("timestamp").or_else(|| number("copiedAt")));
+    Ok(clipboard_from_phone_at(
+        content,
+        device_name,
+        connect,
+        number("copiedAt"),
+    ))
+}
+
 /// What a phone's clipboard packet did here, for the debug log.
 pub(super) fn clipboard_from_phone(
     content: &str,
@@ -312,8 +337,6 @@ pub(super) fn clipboard_from_phone_at(
     }
     remember(content, Some(device_name));
     set_clipboard_text_from_remote(content);
-    // The Clipboard page shows it now, not at its next one-second look.
-    super::state::nudge_tickers();
     "placed on the clipboard"
 }
 
@@ -491,6 +514,12 @@ impl Drop for Watching {
 
 /// Whether the poll reads the clipboard now: always while the owner is not
 /// watched or a phone is connected; otherwise only after the owner changed.
+/// The owner change "last read" after a copy that could not be checked:
+/// one that matches no generation, so the next poll reads it again.
+fn read_again() -> u64 {
+    u64::MAX
+}
+
 fn should_read(watched: bool, generation: u64, read: u64, nobody: bool) -> bool {
     !(watched && nobody && generation == read)
 }
@@ -765,8 +794,11 @@ impl DaemonWorker {
                     .is_none_or(|(text, ..)| *text != current_text)
                 {
                     let Some(secret) = clipboard_verdict_retrying() else {
-                        // Not cached: the next poll asks again.
+                        // Not cached: the next poll asks again, even with
+                        // nobody to share with (which would otherwise skip
+                        // an unchanged owner).
                         UNCHECKED.store(true, Ordering::Relaxed);
+                        text_gen = read_again();
                         continue;
                     };
                     UNCHECKED.store(false, Ordering::Relaxed);
@@ -1058,11 +1090,18 @@ mod tests {
         );
     }
 
+    /// The tests that move the shared clipboard clocks take turns.
+    fn clipboard_globals() -> std::sync::MutexGuard<'static, ()> {
+        static TURN: Mutex<()> = Mutex::new(());
+        TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The owner's report: copying the same text on the phone a second time
     /// (after the computer's clipboard held something else) was dropped as
     /// "unchanged", because it was compared with the last text a phone placed.
     #[test]
     fn the_same_text_copied_again_on_the_phone_is_placed_again() {
+        let _globals = clipboard_globals();
         let text = format!("copy-me-{}", uuid::Uuid::new_v4().simple());
         assert_eq!(
             clipboard_from_phone(&text, "Pixel", None),
@@ -1097,6 +1136,7 @@ mod tests {
     /// differs from what is there and is newer than this computer's change.
     #[test]
     fn a_connect_snapshot_is_placed_only_when_different_and_newer() {
+        let _globals = clipboard_globals();
         let text = format!("connect-{}", uuid::Uuid::new_v4().simple());
         note_current(&text);
         assert_eq!(
@@ -1125,6 +1165,7 @@ mod tests {
     /// copies made at this computer; without it, or close in time, it is news.
     #[test]
     fn a_late_copy_does_not_replace_a_newer_copy_made_here() {
+        let _globals = clipboard_globals();
         let base = now_ms();
         LOCAL_COPY_AT.store(base, Ordering::Release);
         let text = |tag: &str| format!("{tag}-{}", uuid::Uuid::new_v4().simple());
@@ -1164,6 +1205,97 @@ mod tests {
                 "NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_CLIPBOARD_CONNECT"
             ));
         }
+    }
+
+    /// The phone's real bodies (`clipboard_bodies.json`, built by the phone's
+    /// own code) through the real incoming path, ordered by `copiedAt` with
+    /// the 10 s skew margin.
+    #[test]
+    fn the_phones_clipboard_bodies_are_ordered_by_when_they_were_copied() {
+        let _globals = clipboard_globals();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../testdata/clipboard_bodies.json")).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let now = now_ms();
+            let kind = case["type"].as_str().unwrap();
+            // The body as the phone builds it: only the expected keys.
+            let mut packet = NetworkPacket::new(kind);
+            let before = |key: &str| case[key].as_i64().map(|ms| (now as i64 - ms).max(0) as u64);
+            for key in case["expectKeys"].as_array().unwrap() {
+                match key.as_str().unwrap() {
+                    "content" => packet.set("content", case["content"].as_str().unwrap()),
+                    "copiedAt" => {
+                        let at = before("copiedAtMsBeforeNow")
+                            .or_else(|| before("timestampMsBeforeNow"))
+                            .unwrap();
+                        packet.set("copiedAt", at);
+                    }
+                    "timestamp" => packet.set("timestamp", before("timestampMsBeforeNow").unwrap()),
+                    _ => {}
+                }
+            }
+            if case["copiedAtEqualsTimestamp"].as_bool() == Some(true) {
+                assert_eq!(
+                    packet.get_i64("copiedAt"),
+                    packet.get_i64("timestamp"),
+                    "{name}"
+                );
+            }
+            if kind == "desklink.share.request" {
+                // An image offer: the contract is the key set; the desk reads
+                // its `copiedAt` where the picture is placed.
+                assert!(packet.body.contains_key("copiedAt"), "{name}");
+                continue;
+            }
+            let content = case["content"].as_str().unwrap();
+            let reset = |desk_copy_ago_ms: u64| {
+                if let Ok(mut placed) = PLACED.lock() {
+                    placed.1 = 0;
+                }
+                note_current("what the desk holds");
+                LOCAL_COPY_AT.store(now.saturating_sub(desk_copy_ago_ms), Ordering::Release);
+                LOCAL_CHANGED_AT.store(now.saturating_sub(desk_copy_ago_ms), Ordering::Release);
+            };
+            if kind == "desklink.clipboard.connect" {
+                reset(60_000);
+                assert_eq!(
+                    apply_phone_packet(&packet, "Pixel"),
+                    Ok("placed on the clipboard"),
+                    "{name}: newer than the desk's last change"
+                );
+                reset(10_000);
+                assert_eq!(
+                    apply_phone_packet(&packet, "Pixel"),
+                    Ok("ignored: older than this computer's clipboard"),
+                    "{name}: older than the desk's last change"
+                );
+                continue;
+            }
+            // The desk copied just now: a phone copy made 5 s earlier is
+            // within the skew margin and placed; one made 2 minutes earlier
+            // lost, unless it was clamped to now.
+            reset(0);
+            let outcome = apply_phone_packet(&packet, "Pixel").unwrap();
+            let age = case["copiedAtMsBeforeNow"].as_i64().unwrap().max(0) as u64;
+            if age + 500 > CLOCK_SKEW_MS && age > 0 {
+                assert_eq!(
+                    outcome, "ignored: older than a copy made at this computer",
+                    "{name}"
+                );
+            } else {
+                assert_eq!(outcome, "placed on the clipboard", "{name}");
+            }
+            // The desk copied long before the phone: always placed.
+            reset(600_000);
+            assert_eq!(
+                apply_phone_packet(&packet, "Pixel"),
+                Ok("placed on the clipboard"),
+                "{name}: nothing newer at the desk"
+            );
+            assert!(history().iter().any(|item| item.text == content), "{name}");
+        }
+        LOCAL_COPY_AT.store(0, Ordering::Release);
     }
 
     /// Two copies arriving close together: the newest is what stays (the
@@ -1238,6 +1370,21 @@ mod tests {
         }
         let worst = latencies.iter().max().copied().unwrap();
         assert!(worst < Duration::from_secs(1), "{worst:?}");
+    }
+
+    /// An undecided copy is looked at again at the next poll even with nobody
+    /// connected and the owner unchanged.
+    #[test]
+    fn an_undecided_copy_is_read_again_with_nobody_connected() {
+        let generation = 7;
+        assert!(
+            !should_read(true, generation, generation, true),
+            "decided: idle"
+        );
+        assert!(
+            should_read(true, generation, read_again(), true),
+            "undecided: again"
+        );
     }
 
     #[test]

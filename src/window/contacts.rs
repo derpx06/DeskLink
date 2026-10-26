@@ -35,6 +35,7 @@ pub(super) struct Page {
     source: Rc<RefCell<Source>>,
     /// The device the details act for: id and whether it can call.
     device: Rc<RefCell<(String, bool)>>,
+    vault: Rc<super::vault_banner::VaultBanner>,
 }
 
 /// What a search term is matched against: name, numbers (digits too),
@@ -214,6 +215,13 @@ impl Page {
             .margin_start(28)
             .margin_end(28)
             .build();
+        let vault = Rc::new(super::vault_banner::VaultBanner::new(
+            "contacts",
+            "contacts",
+            crate::device_links::contacts::retry_blocked,
+            crate::device_links::contacts::start_fresh_blocked,
+        ));
+        page.append(&vault.root);
         page.append(&header);
         page.append(&count);
         page.append(&stack);
@@ -281,6 +289,7 @@ impl Page {
             contacts,
             source,
             device,
+            vault,
         };
         {
             let device = Rc::clone(&page.device);
@@ -303,6 +312,7 @@ impl Page {
         _daemon: &DaemonHandle,
         device: &DeviceView,
     ) {
+        self.vault.update();
         let ready = device.feature_transport_ready;
         let can_refresh =
             ready && can_send_feature(device, PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS);

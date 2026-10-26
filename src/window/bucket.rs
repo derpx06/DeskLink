@@ -1752,11 +1752,16 @@ fn item_menu(item: &Item, path: &Path, device: &DeviceView, view: &PairView) -> 
                 ("Keep Both".to_string(), folders::Resolve::Both),
                 ("Keep This Computer's".to_string(), folders::Resolve::Desk),
                 (format!("Keep {}'s", device.name), folders::Resolve::Phone),
-                (
-                    format!("Replace with {}'s Anyway", device.name),
-                    folders::Resolve::PhoneAnyway,
-                ),
-            ] {
+            ]
+            .into_iter()
+            .chain(
+                folders::replace_anyway_offered(&device.id, &conflict.path).then(|| {
+                    (
+                        format!("Replace with {}'s Anyway", device.name),
+                        folders::Resolve::PhoneAnyway,
+                    )
+                }),
+            ) {
                 let (id, conflict) = (device.id.clone(), conflict.clone());
                 add(
                     &label,

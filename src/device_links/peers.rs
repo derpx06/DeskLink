@@ -18,6 +18,7 @@ pub(crate) fn forget_peer(device_id: &str) {
     webrtc::coordinator::forget_liveness(device_id);
     daemon::discovery::forget_addresses(device_id);
     daemon::file_transfer::forget_waiting(device_id);
+    daemon::pairing_commands::forget_proven(device_id);
     sync::forget_device(device_id);
     session_lock::forget_unlock(device_id);
     glide::forget_phone(device_id);
@@ -50,6 +51,7 @@ mod tests {
             "device_links/webrtc/screen.rs:STREAMS",
             "device_links/webrtc/coordinator.rs:USED",
             "device_links/webrtc/coordinator.rs:DOZING",
+            "device_links/daemon/pairing_commands.rs:PROVEN",
             "device_links/webrtc/coordinator.rs:HEARD",
             "device_links/webrtc/screen.rs:PARKED",
             "device_links/webrtc/coordinator.rs:PROBE_NOW",

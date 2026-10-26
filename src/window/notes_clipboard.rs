@@ -30,6 +30,7 @@ pub(super) fn tab_of(name: &str) -> Option<&'static str> {
 pub(super) struct Page {
     pub(super) root: gtk::Widget,
     pub(super) notes: notes::Page,
+    vault: super::vault_banner::VaultBanner,
     stack: adw::ViewStack,
     snippets: gtk::Box,
     history: gtk::Box,
@@ -120,6 +121,13 @@ impl Page {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
+        let vault = super::vault_banner::VaultBanner::new(
+            "notes",
+            "notes and snippets",
+            crate::device_links::notes::retry_blocked,
+            crate::device_links::notes::start_fresh_blocked,
+        );
+        root.append(&vault.root);
         root.append(&top);
         root.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
         stack.set_vexpand(true);
@@ -129,6 +137,7 @@ impl Page {
         let page = Self {
             root: root.upcast(),
             notes,
+            vault,
             stack,
             snippets,
             history,
@@ -170,6 +179,7 @@ impl Page {
             self.syncing.set(false);
         }
         self.notes.update();
+        self.vault.update();
         let generation = crate::device_links::notes::generation();
         if self.snippets_shown.replace(generation) != generation {
             while let Some(child) = self.snippets.first_child() {

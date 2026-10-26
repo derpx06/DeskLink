@@ -705,6 +705,32 @@ pub(crate) fn on_vcards(device_id: &str, packet: &NetworkPacket) {
     }
 }
 
+/// "Try Again" for contact caches that could not be read: they are read
+/// again from disk the next time they are used.
+pub(crate) fn retry_blocked() -> bool {
+    let cleared = super::vault::clear_blocked_under("contacts");
+    if cleared.is_empty() {
+        return true;
+    }
+    if let Ok(mut guard) = store().lock() {
+        if let Some(store) = guard.as_mut() {
+            let dir = store.dir.clone();
+            store
+                .books
+                .retain(|id, _| !cleared.contains(&book_path(&dir, id)));
+        }
+    }
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// "Start Fresh": the old caches are given up (a copy stays beside each);
+/// the phone's next snapshot fills them again.
+pub(crate) fn start_fresh_blocked() {
+    super::vault::clear_blocked_under("contacts");
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Deletes `device_id`'s cache: the phone stopped sharing.
 pub(crate) fn forget(device_id: &str) {
     let dir = store()
@@ -733,6 +759,7 @@ pub(crate) fn forget_in(dir: &Path, device_id: &str) {
     }
     let path = book_path(dir, device_id);
     super::vault::cancel_pending(&path);
+    super::vault::file_deleted(&path);
     if path.exists() {
         if let Err(error) = std::fs::remove_file(&path) {
             eprintln!("[Contacts] Could not delete {}: {error}", path.display());

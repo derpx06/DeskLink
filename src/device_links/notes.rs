@@ -567,6 +567,46 @@ pub(crate) fn install(dir: PathBuf) {
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
+/// "Try Again" after the shelf could not be read: reads the file again; if
+/// that works, what was typed meanwhile (kept in memory) is merged into what
+/// the file holds and saved. `true` when the shelf can be saved again.
+pub(crate) fn retry_blocked() -> bool {
+    let cleared = super::vault::clear_blocked_under("notes");
+    if cleared.is_empty() {
+        return true;
+    }
+    let Ok(mut guard) = store().lock() else {
+        return false;
+    };
+    let Some(store) = guard.as_mut() else {
+        return false;
+    };
+    let mut disk: Shelf = super::vault::open_or_quarantine(&store.dir, &store.dir.join(FILE), AAD);
+    if !super::vault::blocked_under("notes").is_empty() {
+        return false;
+    }
+    let typed = std::mem::take(&mut store.shelf);
+    for (_, snippet) in typed.snippets {
+        merge_snippet(&mut disk, snippet);
+    }
+    for (_, note) in typed.notes {
+        merge_note(&mut disk, note);
+    }
+    store.shelf = disk;
+    if let Ok(plain) = serde_json::to_vec(&store.shelf) {
+        super::vault::seal_later(&store.dir, &store.dir.join(FILE), AAD, plain);
+    }
+    GENERATION.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// "Start Fresh": gives up on the old file (a copy of it is kept beside it)
+/// and saves what is in memory, typed since, over it.
+pub(crate) fn start_fresh_blocked() {
+    super::vault::clear_blocked_under("notes");
+    with_shelf(|_| ((), true));
+}
+
 /// Drops tombstones older than [`TOMBSTONE_DAYS`].
 fn prune(shelf: &mut Shelf, now: i64) {
     let cutoff = now - TOMBSTONE_DAYS * 24 * 3600 * 1000;
@@ -1070,8 +1110,52 @@ mod tests {
         assert_eq!(empty.snippets.len(), MAX_ITEMS_PER_PACKET);
     }
 
+    /// The tests that `install` the one global shelf take turns.
+    static ONE_SHELF: Mutex<()> = Mutex::new(());
+
+    /// S2: a shelf that could not be read is not saved over; what is typed
+    /// meanwhile is kept, and Try Again merges it into the file once it reads.
+    #[test]
+    fn typed_notes_survive_an_unreadable_start_and_try_again_merges_them() {
+        let _shelf = ONE_SHELF.lock().unwrap_or_else(|p| p.into_inner());
+        let base = std::env::temp_dir().join(format!("desklink-blocked-{}", uuid::Uuid::new_v4()));
+        let dir = base.join("notes");
+        install(dir.clone());
+        let earlier = new_note("written before").unwrap();
+        crate::device_links::vault::flush();
+        // The key goes unreadable (a directory stands in) and DeskLink restarts.
+        let key_file = dir.join("key");
+        let good = std::fs::read(&key_file).unwrap();
+        std::fs::remove_file(&key_file).unwrap();
+        std::fs::create_dir(&key_file).unwrap();
+        install(dir.clone());
+        assert!(
+            super::note(&earlier).is_none(),
+            "not shown: it could not be read"
+        );
+        assert!(!crate::device_links::vault::blocked_under("notes").is_empty());
+        let typed = new_note("typed meanwhile").unwrap();
+        crate::device_links::vault::flush();
+        assert!(!retry_blocked(), "still unreadable: nothing changes");
+        assert!(super::note(&typed).is_some(), "what was typed is kept");
+        // The key comes back.
+        std::fs::remove_dir(&key_file).unwrap();
+        std::fs::write(&key_file, good).unwrap();
+        assert!(retry_blocked());
+        assert!(super::note(&earlier).is_some(), "the file's notes are back");
+        assert!(super::note(&typed).is_some(), "and the typed one merged in");
+        crate::device_links::vault::flush();
+        install(dir.clone());
+        assert!(
+            super::note(&earlier).is_some() && super::note(&typed).is_some(),
+            "saved"
+        );
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn a_note_too_long_is_refused_out_loud_and_kept_as_it_was() {
+        let _shelf = ONE_SHELF.lock().unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("desklink-notes-{}", uuid::Uuid::new_v4()));
         install(dir.clone());
         let id = new_note("short").unwrap();

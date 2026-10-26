@@ -628,6 +628,7 @@ pub(crate) fn promote_qr_link(
         None,
     );
     debug_log!("[Daemon] Paired with {} by QR code", info.id);
+    super::pairing_commands::note_proven_pairing(&info.id);
     super::state::push_event(
         &context.events,
         DaemonEvent::PairedByQr {

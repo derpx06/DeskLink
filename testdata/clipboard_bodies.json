@@ -1,0 +1,62 @@
+{
+  "_note": "Bodies the phone builds (W11 clipboard copiedAt). copiedAt is Unix ms on the PHONE's clock: when the user copied, never the send time, never in the future. 'copiedAt' in a case is given as an offset in ms before 'now' (now is the moment the test builds the packet); the desk reads the same bodies with a copiedAt of now-offset. Packet types: plain text/link, clipboard.connect, image offer meta.",
+  "cases": [
+    {
+      "name": "plain text",
+      "type": "desklink.clipboard",
+      "content": "hello",
+      "copiedAtMsBeforeNow": 5000,
+      "expectKeys": [
+        "content",
+        "copiedAt"
+      ]
+    },
+    {
+      "name": "link",
+      "type": "desklink.clipboard",
+      "content": "https://example.org/a?b=c",
+      "copiedAtMsBeforeNow": 120000,
+      "expectKeys": [
+        "content",
+        "copiedAt"
+      ]
+    },
+    {
+      "name": "copy time in the future is clamped to now",
+      "type": "desklink.clipboard",
+      "content": "x",
+      "copiedAtMsBeforeNow": -600000,
+      "expectCopiedAtMsBeforeNow": 0,
+      "expectKeys": [
+        "content",
+        "copiedAt"
+      ]
+    },
+    {
+      "name": "connect",
+      "type": "desklink.clipboard.connect",
+      "content": "on connect",
+      "timestampMsBeforeNow": 30000,
+      "expectKeys": [
+        "content",
+        "timestamp",
+        "copiedAt"
+      ],
+      "copiedAtEqualsTimestamp": true
+    },
+    {
+      "name": "image offer meta",
+      "type": "desklink.share.request",
+      "copiedAtMsBeforeNow": 2000,
+      "expectKeys": [
+        "filename",
+        "clipboard",
+        "mimeType",
+        "copiedAt"
+      ],
+      "filename": "clipboard.png",
+      "clipboard": true,
+      "mimeType": "image/png"
+    }
+  ]
+}

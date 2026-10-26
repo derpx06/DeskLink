@@ -358,18 +358,37 @@ fn migrate_transfer_state(old: &Path, new: &Path) {
     if !new.exists() && fs::rename(old, new).is_ok() {
         return;
     }
-    // Another filesystem: copy what is there, then remove the old.
+    // Another filesystem: copy what is there, then remove the old. Each file
+    // is copied under a temporary name, synced, checked against the original
+    // (size and SHA-256) and only then renamed into place, so a copy that
+    // failed half way (a full disk) leaves no file that looks complete; the
+    // original is removed only when everything in it is verifiably in the
+    // new place.
     if super::private_fs::create_dir_all(new).is_err() {
         return;
     }
     let mut all_copied = true;
     if let Ok(entries) = fs::read_dir(old) {
         for entry in entries.flatten() {
+            let source = entry.path();
             let target = new.join(entry.file_name());
-            if entry.path().is_file()
-                && !target.exists()
-                && fs::copy(entry.path(), &target).is_err()
+            if !source.is_file() {
+                // Nothing here has subfolders; one that does is left alone,
+                // and so is the folder that holds it.
+                all_copied = false;
+                continue;
+            }
+            // Already there and at least as long (identical, or progressed
+            // since by the new place's own resumed transfer): kept. A
+            // shorter one is what a failed copy leaves, and is replaced.
+            if fs::metadata(&target)
+                .ok()
+                .zip(fs::metadata(&source).ok())
+                .is_some_and(|(there, here)| there.is_file() && there.len() >= here.len())
             {
+                continue;
+            }
+            if copy_verified(&source, &target).is_err() {
                 all_copied = false;
             }
         }
@@ -377,6 +396,50 @@ fn migrate_transfer_state(old: &Path, new: &Path) {
     if all_copied {
         let _ = fs::remove_dir_all(old);
     }
+}
+
+fn sha256_of(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut hasher = openssl::hash::Hasher::new(openssl::hash::MessageDigest::sha256()).ok()?;
+    let mut file = fs::File::open(path).ok()?;
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut buffer).ok()?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]).ok()?;
+    }
+    hasher.finish().ok().map(|digest| digest.to_vec())
+}
+
+/// Whether `target` already holds exactly `source`'s bytes.
+fn same_file_contents(source: &Path, target: &Path) -> bool {
+    let (Ok(a), Ok(b)) = (fs::metadata(source), fs::metadata(target)) else {
+        return false;
+    };
+    a.len() == b.len() && sha256_of(source).is_some() && sha256_of(source) == sha256_of(target)
+}
+
+/// Copies `source` to `target` so that `target` is either absent (or what it
+/// was) or complete: temp name, fsync, verify, rename.
+fn copy_verified(source: &Path, target: &Path) -> Result<(), String> {
+    let staged = target.with_extension("migrating");
+    let copied = (|| {
+        let mut from = fs::File::open(source)?;
+        let mut to = super::private_fs::create(&staged)?;
+        std::io::copy(&mut from, &mut to)?;
+        to.sync_all()
+    })();
+    let verified = copied.is_ok() && same_file_contents(source, &staged);
+    if !verified {
+        let _ = fs::remove_file(&staged);
+        return Err("the copy is not complete".to_string());
+    }
+    fs::rename(&staged, target).map_err(|error| {
+        let _ = fs::remove_file(&staged);
+        error.to_string()
+    })
 }
 
 /// A pairing record that a newer pairing may be the reinstalled same phone
@@ -530,6 +593,16 @@ impl Config {
             }
         };
 
+        // The phone still holds the old identity of this computer under its
+        // name; it refuses a link from the new one until that entry is gone.
+        if fresh_identity {
+            if let Some(notice) = notice.as_mut() {
+                notice.push_str(&format!(
+                    " On each phone, unpair \"{}\" in DeskLink and pair again.",
+                    stored.device_name
+                ));
+            }
+        }
         let key_path = base_dir.join("privateKey.pem");
         let cert_path = base_dir.join("certificate.pem");
         if fresh_identity {
@@ -1610,6 +1683,10 @@ mod tests {
             !notice.contains("EOF") && !notice.contains("serde"),
             "plain words: {notice}"
         );
+        assert!(
+            notice.contains("unpair") && notice.contains("pair again"),
+            "tells the person to remove the old entry on the phone: {notice}"
+        );
         let kept: Vec<_> = fs::read_dir(&dir)
             .unwrap()
             .flatten()
@@ -1677,6 +1754,33 @@ mod tests {
     /// A newer file this build cannot even parse is "newer", not "damaged":
     /// nothing is set aside or regenerated, the device id is kept, and saving
     /// says it cannot.
+    /// Unknown fields inside a pairing record survive load and save.
+    #[test]
+    fn unknown_fields_in_a_pairing_record_survive_a_round_trip() {
+        let dir = std::env::temp_dir().join(format!("desklink-extra-{}", Uuid::new_v4()));
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        let id = "abcdefgh_1234_abcdefgh_1234_abcd";
+        config
+            .trust_device(&DeviceInfo::local(id.into(), "Phone".into()), "PEM".into())
+            .unwrap();
+        drop(config);
+        let path = dir.join("config.json");
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        json["trusted_devices"][id]["from_the_future"] = serde_json::json!({"nested": [1, 2, 3]});
+        fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        config.set_device_name_for_test("Renamed so that it saves");
+        config.save().unwrap();
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            after["trusted_devices"][id]["from_the_future"],
+            serde_json::json!({"nested": [1, 2, 3]})
+        );
+        assert_eq!(after["trusted_devices"][id]["name"], "Phone");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn an_unreadable_newer_file_is_not_treated_as_damage() {
         let dir = std::env::temp_dir().join(format!("desklink-newer-{}", Uuid::new_v4()));
@@ -1745,6 +1849,40 @@ mod tests {
         };
         assert!(kept("privateKey.pem.old-") && kept("certificate.pem.old-"));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// A copy that fails leaves the original alone; a truncated file from an
+    /// earlier failure is replaced by a verified one before the original goes.
+    #[test]
+    fn a_failed_or_truncated_copy_never_costs_the_only_good_partial() {
+        let base = std::env::temp_dir().join(format!("desklink-verify-{}", Uuid::new_v4()));
+        let (old, new) = (base.join("old"), base.join("new"));
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        let good = vec![7u8; 100_000];
+        fs::write(old.join("a.part"), &good).unwrap();
+        // The target is in the way as a folder: the copy cannot be placed.
+        fs::create_dir_all(new.join("a.part")).unwrap();
+        migrate_transfer_state(&old, &new);
+        assert_eq!(fs::read(old.join("a.part")).unwrap(), good, "original kept");
+        assert!(
+            fs::read_dir(&new)
+                .unwrap()
+                .flatten()
+                .all(|entry| entry.file_name() != "a.migrating"),
+            "no temp left"
+        );
+        // A truncated target from an earlier failed copy is not believed.
+        fs::remove_dir_all(new.join("a.part")).unwrap();
+        fs::write(new.join("a.part"), &good[..1000]).unwrap();
+        migrate_transfer_state(&old, &new);
+        assert_eq!(
+            fs::read(new.join("a.part")).unwrap(),
+            good,
+            "replaced, verified"
+        );
+        assert!(!old.exists(), "and only then is the original removed");
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// S3: a move that stopped half way is finished at the next start.

@@ -13,6 +13,8 @@ use gtk::glib;
 use crate::device_links::daemon::tick_seconds;
 
 struct Ticker {
+    /// Seconds between looks (the daemon's pace; a test gives its own).
+    pace: fn() -> u32,
     run: RefCell<Box<dyn FnMut() -> glib::ControlFlow>>,
     /// The wait now pending (`None` while it is running).
     waiting: RefCell<Option<glib::SourceId>>,
@@ -27,12 +29,18 @@ thread_local! {
 /// Runs `run` on the main loop at the daemon's pace until it says
 /// [`glib::ControlFlow::Break`].
 pub(crate) fn every_tick(run: impl FnMut() -> glib::ControlFlow + 'static) {
+    every_tick_at(tick_seconds, run);
+}
+
+/// [`every_tick`] at a pace of the caller's (seconds between looks).
+pub(crate) fn every_tick_at(pace: fn() -> u32, run: impl FnMut() -> glib::ControlFlow + 'static) {
     let ticker = Rc::new(Ticker {
+        pace,
         run: RefCell::new(Box::new(run)),
         waiting: RefCell::new(None),
     });
     TICKERS.with(|tickers| tickers.borrow_mut().push(Rc::downgrade(&ticker)));
-    arm(&ticker, Duration::from_secs(u64::from(tick_seconds())));
+    arm(&ticker, Duration::from_secs(u64::from(pace())));
 }
 
 fn arm(ticker: &Rc<Ticker>, after: Duration) {
@@ -41,7 +49,7 @@ fn arm(ticker: &Rc<Ticker>, after: Duration) {
         this.waiting.take();
         let flow = (this.run.borrow_mut())();
         if flow == glib::ControlFlow::Continue {
-            arm(&this, Duration::from_secs(u64::from(tick_seconds())));
+            arm(&this, Duration::from_secs(u64::from((this.pace)())));
         }
     });
     ticker.waiting.replace(Some(id));
@@ -80,7 +88,7 @@ mod tests {
     /// ticker look now, not when its slow wait ends.
     #[test]
     fn a_nudge_runs_a_slow_ticker_at_once() {
-        use super::{every_tick, nudge_all, on_nudge};
+        use super::{every_tick_at, nudge_all, on_nudge};
         use std::cell::Cell;
         use std::rc::Rc;
         // The timers attach to the default context: this test owns it.
@@ -90,14 +98,19 @@ mod tests {
         let hooked = Rc::new(Cell::new(0));
         {
             let looked = Rc::clone(&looked);
-            every_tick(move || {
-                looked.set(looked.get() + 1);
-                gtk::glib::ControlFlow::Continue
-            });
+            // An hour between looks, whatever other tests did to the daemon's
+            // pace and however slow the machine is.
+            every_tick_at(
+                || 3600,
+                move || {
+                    looked.set(looked.get() + 1);
+                    gtk::glib::ControlFlow::Continue
+                },
+            );
             let hooked = Rc::clone(&hooked);
             on_nudge(move || hooked.set(hooked.get() + 1));
         }
-        // Nothing yet: the wait is seconds long.
+        // Nothing yet: the wait is long.
         while context.iteration(false) {}
         assert_eq!(looked.get(), 0);
         nudge_all();

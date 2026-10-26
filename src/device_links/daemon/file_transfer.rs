@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -149,12 +149,57 @@ fn wait_for_phone(device_id: &str, phone: &str, path: PathBuf) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(test)]
+pub(super) fn wait_for_phone_for_tests(device_id: &str, phone: &str, path: PathBuf) {
+    wait_for_phone(device_id, phone, path).unwrap();
+}
+
 /// An unpaired phone's waiting files are forgotten with it.
 pub(crate) fn forget_waiting(device_id: &str) {
     if let Ok(mut waiting) = WAITING.lock() {
         waiting.retain(|file| file.device_id != device_id);
         refresh_locked(&waiting);
     }
+}
+
+/// The files waiting for `device_id`, oldest first: what the aggregate row's
+/// list shows, so each can be taken off.
+pub(crate) fn waiting_files(device_id: &str) -> Vec<PathBuf> {
+    WAITING.lock().map_or_else(
+        |_| Vec::new(),
+        |waiting| {
+            waiting
+                .iter()
+                .filter(|file| file.device_id == device_id)
+                .map(|file| file.path.clone())
+                .collect()
+        },
+    )
+}
+
+/// Takes one waiting file off the queue (the person's choice). `true` when
+/// it was there.
+pub(crate) fn remove_waiting_file(device_id: &str, path: &Path) -> bool {
+    let Ok(mut waiting) = WAITING.lock() else {
+        return false;
+    };
+    let before = waiting.len();
+    waiting.retain(|file| !(file.device_id == device_id && file.path == path));
+    let removed = waiting.len() != before;
+    if removed {
+        refresh_locked(&waiting);
+    }
+    removed
+}
+
+/// "Cancel": every file waiting for `device_id` is dropped.
+pub(crate) fn clear_waiting(device_id: &str) {
+    forget_waiting(device_id);
+}
+
+/// Whether a board row is the aggregate "N files waiting for <phone>".
+pub(crate) fn is_waiting_row(id: &str) -> bool {
+    id.starts_with("waiting-")
 }
 
 /// A phone paired again under a new id replaces the old record: what waited
@@ -311,6 +356,11 @@ impl DaemonWorker {
     }
 
     pub(super) fn cancel_transfer(&self, device_id: &str, transfer_id: &str) {
+        // The aggregate "N files waiting" row: cancelling it drops the queue.
+        if is_waiting_row(transfer_id) {
+            clear_waiting(device_id);
+            return;
+        }
         let result =
             FeatureTransport::for_device(&self.sessions, device_id).and_then(|transport| {
                 transport.cancel_transfer(
@@ -371,6 +421,28 @@ mod waiting_tests {
         assert!(board::rows()
             .iter()
             .any(|row| row.name == "2 files waiting for Pixel"));
+
+        // The person can take one off, or all.
+        assert_eq!(
+            waiting_files("wait-phone"),
+            vec![a.clone(), dir.join("b.txt")]
+        );
+        assert!(remove_waiting_file("wait-phone", &a));
+        assert!(!remove_waiting_file("wait-phone", &a), "once");
+        assert_eq!(waiting_files("wait-phone").len(), 1);
+        assert!(board::rows()
+            .iter()
+            .any(|row| row.name == "1 file waiting for Pixel"));
+        wait_for_phone("wait-phone", "Pixel", a.clone()).unwrap();
+        clear_waiting("wait-phone");
+        assert!(waiting_files("wait-phone").is_empty());
+        assert!(board::rows()
+            .iter()
+            .all(|row| row.device_id != "wait-phone"));
+        wait_for_phone("wait-phone", "Pixel", a.clone()).unwrap();
+        wait_for_phone("wait-phone", "Pixel", dir.join("b.txt")).unwrap();
+        let go = take_waiting(&["wait-phone".to_string()], now);
+        put_back(go);
 
         // A phone paired again under a new id inherits them.
         move_waiting("wait-phone", "wait-phone-new");

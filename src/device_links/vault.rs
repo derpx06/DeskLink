@@ -14,11 +14,20 @@ const TAG_BYTES: usize = 16;
 fn key(dir: &Path) -> Result<[u8; 32], String> {
     let path = dir.join("key");
     match std::fs::read(&path) {
-        Ok(bytes) => {
-            return bytes
-                .try_into()
-                .map_err(|_| format!("{} is not a key", path.display()));
-        }
+        Ok(bytes) => match <[u8; 32]>::try_from(bytes) {
+            Ok(key) => return Ok(key),
+            // Present but not a key (cut short, emptied): nothing can be
+            // opened with it, and it will not mend by itself. It is kept as
+            // `key.old-<ms>` and a new one is made below; whatever it sealed
+            // is then found damaged and kept aside like any damaged file.
+            Err(_) => {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_millis());
+                let _ = std::fs::rename(&path, dir.join(format!("key.old-{stamp}")));
+                prune_set_aside(dir, "key.old-");
+            }
+        },
         // Only a key that is not there is made: any other failure (too many
         // open files, an I/O error) must not orphan every sealed file.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -53,11 +62,45 @@ fn is_unreadable(path: &Path) -> bool {
 
 /// The person's choice to give up on `path`'s old contents: saving to it
 /// works again (its copy `*.corrupt-*` stays beside it).
-#[allow(dead_code)] // ponytail: no button yet; a restart retries the read
 pub(crate) fn start_fresh(path: &Path) {
     if let Ok(mut paths) = UNREADABLE.lock() {
         paths.retain(|known| known != path);
     }
+}
+
+/// The sealed files under a folder named `folder` ("notes", "contacts")
+/// whose last read failed: what the page's banner is about.
+pub(crate) fn blocked_under(folder: &str) -> Vec<std::path::PathBuf> {
+    UNREADABLE.lock().map_or_else(
+        |_| Vec::new(),
+        |paths| {
+            paths
+                .iter()
+                .filter(|path| {
+                    path.parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|name| name == folder)
+                })
+                .cloned()
+                .collect()
+        },
+    )
+}
+
+/// "Try Again": forgets that those files failed, so the owner reads them
+/// again (and refuses again if they still cannot be read).
+pub(crate) fn clear_blocked_under(folder: &str) -> Vec<std::path::PathBuf> {
+    let cleared = blocked_under(folder);
+    for path in &cleared {
+        start_fresh(path);
+    }
+    cleared
+}
+
+/// The file is gone on purpose (an unpair deleted it): nothing is waiting
+/// for it to become readable.
+pub(crate) fn file_deleted(path: &Path) {
+    start_fresh(path);
 }
 
 /// What the person should be told, once, about files that could not be read.
@@ -126,6 +169,51 @@ fn try_open(dir: &Path, path: &Path, aad: &[u8]) -> Result<Vec<u8>, OpenError> {
     })
 }
 
+/// How many set-aside copies of a file are kept (`<name>.corrupt-<ms>`,
+/// `key.old-<ms>`): the newest.
+const KEEP_ASIDE: usize = 3;
+
+/// Removes all but the newest [`KEEP_ASIDE`] files in `dir` whose names start
+/// with `prefix` (the rest of the name is the time in ms).
+fn prune_set_aside(dir: &Path, prefix: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut asides: Vec<(u128, std::path::PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let stamp = name.to_str()?.strip_prefix(prefix)?.parse::<u128>().ok()?;
+            Some((stamp, entry.path()))
+        })
+        .collect();
+    asides.sort();
+    let excess = asides.len().saturating_sub(KEEP_ASIDE);
+    for (_, path) in asides.into_iter().take(excess) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Whether a `<name>.corrupt-*` copy of `length` bytes is already beside `path`.
+fn has_aside_of_length(path: &Path, length: Option<u64>) -> bool {
+    let (Some(dir), Some(prefix)) = (
+        path.parent(),
+        path.with_extension("corrupt-")
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned()),
+    ) else {
+        return false;
+    };
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            entry.file_name().to_string_lossy().starts_with(&prefix)
+                && entry.metadata().ok().map(|meta| meta.len()) == length
+        })
+}
+
 /// Sealed files waiting for the writer thread, at most this many (each
 /// holds only its latest contents).
 const MAX_PENDING_WRITES: usize = 64;
@@ -167,18 +255,32 @@ where
                 // The file may be fine: copied, never moved, so a later good
                 // start still finds it where it was. Nothing is saved over it
                 // meanwhile, and the person is told once.
-                let _ = std::fs::copy(path, &aside);
+                // Not again for each start: a copy of this length is kept.
+                let length = std::fs::metadata(path).map(|meta| meta.len()).ok();
+                if !has_aside_of_length(path, length) {
+                    let _ = std::fs::copy(path, &aside);
+                }
                 if let Ok(mut paths) = UNREADABLE.lock() {
-                    paths.push(path.to_path_buf());
+                    if !paths.iter().any(|known| known == path) {
+                        paths.push(path.to_path_buf());
+                    }
                 }
                 if let Ok(mut notices) = NOTICES.lock() {
                     notices.push(format!(
-                        "A saved file ({}) could not be read just now, so its contents are not shown and changes to it are not saved. Nothing was lost; restart DeskLink to try again.",
+                        "A saved file ({}) could not be read just now, so its contents are not shown and changes to it are not saved. Nothing was lost: use Try Again on the page, or restart DeskLink.",
                         path.file_name().unwrap_or_default().to_string_lossy()
                     ));
                 }
             } else {
                 let _ = std::fs::rename(path, &aside);
+            }
+            if let (Some(dir), Some(prefix)) = (
+                path.parent(),
+                path.with_extension("corrupt-")
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned()),
+            ) {
+                prune_set_aside(dir, &prefix);
             }
             crate::device_links::limits::log_limited(
                 "vault-corrupt",
@@ -395,6 +497,57 @@ mod tests {
         seal_later(&dir, &path, b"p", b"[99]".to_vec());
         flush();
         assert_eq!(open(&dir, &path, b"p").unwrap(), b"[99]");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key file that is not a key (cut short, emptied) is damage, not a
+    /// reason to refuse for ever: it is set aside as `key.old-<ms>` (at most
+    /// three kept) and a new one is made.
+    #[test]
+    fn a_cut_short_key_is_set_aside_and_replaced() {
+        let dir =
+            std::env::temp_dir().join(format!("desklink-vault-badkey-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for round in 0..5 {
+            std::fs::write(dir.join("key"), vec![1u8; 5 + round]).unwrap();
+            let made = key(&dir).expect("replaced, not refused");
+            assert_eq!(std::fs::read(dir.join("key")).unwrap().len(), 32);
+            assert_eq!(made.len(), 32);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let old = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("key.old-"))
+            .count();
+        assert_eq!(old, KEEP_ASIDE, "the newest three kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Restarts do not pile up copies: one per distinct file, three at most.
+    #[test]
+    fn set_aside_copies_are_capped_and_not_repeated() {
+        let dir = std::env::temp_dir().join(format!("desklink-vault-cap-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("n.sealed");
+        seal(&dir, &path, b"purpose", b"[1]").unwrap();
+        let key_file = dir.join("key");
+        let good = std::fs::read(&key_file).unwrap();
+        std::fs::remove_file(&key_file).unwrap();
+        std::fs::create_dir(&key_file).unwrap();
+        for _ in 0..6 {
+            // A "restart": the marker is gone, the read fails again.
+            start_fresh(&path);
+            let _: Vec<u32> = open_or_quarantine(&dir, &path, b"purpose");
+        }
+        let copies = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt-"))
+            .count();
+        assert_eq!(copies, 1, "one copy of the same file");
+        std::fs::remove_dir(&key_file).unwrap();
+        std::fs::write(&key_file, good).unwrap();
+        assert_eq!(open(&dir, &path, b"purpose").unwrap(), b"[1]");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

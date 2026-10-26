@@ -910,6 +910,86 @@ fn refresh(
     grid.set_visible(!rows.is_empty());
 }
 
+/// The aggregate "N files waiting for <phone>" card's button: a list of
+/// the files with a remove button each, and Cancel All.
+fn waiting_menu(device_id: &str, name: &str) -> gtk::MenuButton {
+    let list = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(8)
+        .margin_end(8)
+        .build();
+    let popover = gtk::Popover::builder().child(&list).build();
+    let id = device_id.to_string();
+    let fill = {
+        let (list, id, popover) = (list.clone(), id.clone(), popover.downgrade());
+        move || {
+            use crate::device_links::daemon::file_transfer as queue;
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            for path in queue::waiting_files(&id) {
+                let label = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let line = gtk::Box::builder().spacing(8).build();
+                let name = ellipsized(&label, &[]);
+                name.set_hexpand(true);
+                line.append(&name);
+                let remove = gtk::Button::builder()
+                    .icon_name("edit-delete-symbolic")
+                    .tooltip_text("Don't send this file")
+                    .css_classes(["flat", "circular"])
+                    .build();
+                remove.update_property(&[gtk::accessible::Property::Label(&format!(
+                    "Don't send {label}"
+                ))]);
+                let (id, path, popover) = (id.clone(), path.clone(), popover.clone());
+                remove.connect_clicked(move |_| {
+                    queue::remove_waiting_file(&id, &path);
+                    if let Some(popover) = popover.upgrade() {
+                        popover.popdown();
+                    }
+                });
+                line.append(&remove);
+                list.append(&line);
+            }
+            let cancel = gtk::Button::with_label("Cancel All");
+            cancel.add_css_class("destructive-action");
+            let (id, popover) = (id.clone(), popover.clone());
+            cancel.connect_clicked(move |_| {
+                queue::clear_waiting(&id);
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
+            });
+            list.append(&cancel);
+        }
+    };
+    fill();
+    popover.connect_show({
+        let fill = fill.clone();
+        move |_| fill()
+    });
+    let button = gtk::MenuButton::builder()
+        .icon_name("view-list-symbolic")
+        .tooltip_text("Waiting files")
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Start)
+        .margin_top(6)
+        .margin_end(6)
+        .css_classes(["circular", "osd"])
+        .popover(&popover)
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label(&format!(
+        "{name}: choose which to send or cancel them all"
+    ))]);
+    button
+}
+
 /// A transfer moving now, as a card: its type, name, progress and Cancel.
 fn new_row(daemon: &DaemonHandle, row: &TransferRow) -> RowWidgets {
     let card = gtk::Box::builder()
@@ -918,6 +998,9 @@ fn new_row(daemon: &DaemonHandle, row: &TransferRow) -> RowWidgets {
         .build();
     let (preview, _) = preview_area();
     preview.add_overlay(&type_icon(&row.name));
+    if crate::device_links::daemon::file_transfer::is_waiting_row(&row.id) {
+        preview.add_overlay(&waiting_menu(&row.device_id, &row.name));
+    }
     // A file still being copied has no transfer to cancel yet.
     if !row.preparing {
         let cancel = gtk::Button::builder()

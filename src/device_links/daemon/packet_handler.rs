@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use super::clipboard::{clipboard_from_phone_at, set_clipboard_text_from_remote};
+use super::clipboard::{apply_phone_packet, set_clipboard_text_from_remote};
 use super::dispatcher::{PacketSource, SharedPacketDispatcher};
 use super::handle::DaemonEvent;
 use super::state::{
@@ -384,6 +384,7 @@ pub(super) fn apply_lan_packet(
             }
             update_pair_state(&devices, &device_id, state, verification_key);
             if pairing_just_completed(previous_state, state) {
+                super::pairing_commands::note_proven_pairing(&device_id);
                 // Pairing by code ends like pairing by QR: the dialog closes,
                 // the phone is selected and the user is told (J8).
                 let name = devices
@@ -543,6 +544,7 @@ fn handle_qr_pairing_proof(
     match verified {
         Ok(()) => {
             debug_log!("[Daemon] Paired with {device_id} by QR code");
+            super::pairing_commands::note_proven_pairing(device_id);
             update_pair_state(devices, device_id, PairState::Paired, None);
             super::state::push_event(
                 events,
@@ -729,28 +731,12 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             Ok(())
         }
         PACKET_TYPE_CLIPBOARD | PACKET_TYPE_CLIPBOARD_CONNECT => {
-            let content = packet
-                .get_str("content")
-                .ok_or_else(|| "DeskLink WebRTC clipboard packet has no content".to_string())?;
-            // `connect` (every connection) carries when the phone's copy was
-            // made; a plain `clipboard` is a copy made now.
-            let connect = (packet.packet_type == PACKET_TYPE_CLIPBOARD_CONNECT).then(|| {
-                packet
-                    .body
-                    .get("timestamp")
-                    .and_then(serde_json::Value::as_u64)
-            });
-            // Off means off both ways: the phone's copies are dropped there.
-            let copied_at = packet
-                .body
-                .get("copiedAt")
-                .and_then(serde_json::Value::as_u64);
-            let outcome =
-                clipboard_from_phone_at(content, &binding.link.info.name, connect, copied_at);
+            let outcome = apply_phone_packet(&packet, &binding.link.info.name)?;
+            // The Clipboard page shows it now, not at its next look.
+            super::state::nudge_tickers();
             debug_log!(
-                "[Clipboard] {} from {device_id}: {} chars, {outcome}",
-                packet.packet_type,
-                content.chars().count()
+                "[Clipboard] {} from {device_id}: {outcome}",
+                packet.packet_type
             );
             Ok(())
         }

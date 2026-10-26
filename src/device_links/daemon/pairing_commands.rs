@@ -308,6 +308,57 @@ impl PairingContext {
     }
 }
 
+/// Phones whose pairing in this run was confirmed by a proof: the QR code's
+/// MAC, or the code both screens showed and the person accepted. Only these
+/// may inherit what waited for the phone they replace.
+fn proven_pairings() -> &'static Mutex<std::collections::HashSet<String>> {
+    static PROVEN: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    PROVEN.get_or_init(Default::default)
+}
+
+pub(super) fn note_proven_pairing(device_id: &str) {
+    if let Ok(mut proven) = proven_pairings().lock() {
+        proven.insert(device_id.to_string());
+    }
+}
+
+pub(crate) fn forget_proven(device_id: &str) {
+    if let Ok(mut proven) = proven_pairings().lock() {
+        proven.remove(device_id);
+    }
+}
+
+fn pairing_was_proven(device_id: &str) -> bool {
+    proven_pairings()
+        .lock()
+        .is_ok_and(|proven| proven.contains(device_id))
+}
+
+/// What becomes of the files that waited for the replaced phone: they move
+/// to the new one only when its pairing was proven in this run (and the
+/// person is told how many); else they are dropped, and the person is told.
+fn carry_waiting_over(old_id: &str, new_id: &str, name: &str) -> Option<String> {
+    let count = super::file_transfer::waiting_files(old_id).len();
+    if count == 0 {
+        return None;
+    }
+    if pairing_was_proven(new_id) {
+        super::file_transfer::move_waiting(old_id, new_id);
+        Some(format!(
+            "{count} waiting file{} moved to {name}",
+            if count == 1 { "" } else { "s" }
+        ))
+    } else {
+        super::file_transfer::forget_waiting(old_id);
+        Some(format!(
+            "{count} file{} waiting for the replaced phone {} dropped",
+            if count == 1 { "" } else { "s" },
+            if count == 1 { "was" } else { "were" }
+        ))
+    }
+}
+
 /// What to do with an older record that a new pairing of the same name and
 /// type might replace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,8 +442,11 @@ pub(super) fn consider_replacement(
         super::state::push_error(errors, error);
         return;
     }
-    // What waited for the old id now waits for the new one.
-    super::file_transfer::move_waiting(&candidate.old_id, &candidate.new_id);
+    // Files that waited for the old phone: carried over only on a proven
+    // pairing, and the person is told either way.
+    if let Some(told) = carry_waiting_over(&candidate.old_id, &candidate.new_id, &candidate.name) {
+        super::state::push_error(errors, told);
+    }
     forget_replaced(sessions, devices, &candidate.old_id);
     super::state::push_event(
         events,
@@ -428,6 +482,45 @@ pub(super) fn forget_replaced(
         devices.remove(device_id);
     }
     crate::device_links::peers::forget_peer(device_id);
+}
+
+#[cfg(test)]
+mod carry_over_tests {
+    use super::*;
+
+    fn waiting(old: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("desklink-carry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        super::super::file_transfer::wait_for_phone_for_tests(old, "Old", file.clone());
+        file
+    }
+
+    /// Files that waited for a replaced phone follow only a proven pairing.
+    #[test]
+    fn waiting_files_follow_a_proven_replacement_and_are_dropped_otherwise() {
+        let file = waiting("carry-old-1");
+        let told = carry_waiting_over("carry-old-1", "carry-new-unproven", "Pixel").unwrap();
+        assert!(told.contains("dropped"), "{told}");
+        assert!(super::super::file_transfer::waiting_files("carry-old-1").is_empty());
+        assert!(super::super::file_transfer::waiting_files("carry-new-unproven").is_empty());
+
+        let file2 = waiting("carry-old-2");
+        note_proven_pairing("carry-new-proven");
+        let told = carry_waiting_over("carry-old-2", "carry-new-proven", "Pixel").unwrap();
+        assert_eq!(told, "1 waiting file moved to Pixel");
+        assert_eq!(
+            super::super::file_transfer::waiting_files("carry-new-proven"),
+            vec![file2]
+        );
+        super::super::file_transfer::forget_waiting("carry-new-proven");
+        assert!(
+            carry_waiting_over("carry-old-3", "x", "y").is_none(),
+            "nothing waiting: nothing said"
+        );
+        let _ = file;
+    }
 }
 
 #[cfg(test)]

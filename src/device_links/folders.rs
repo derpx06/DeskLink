@@ -767,6 +767,20 @@ pub(crate) fn debug_show(pairs: Vec<PairView>, offers: Vec<Offer>) {
 
 // ── Messages to the worker ─────────────────────────────────────────────────
 
+/// Conflicts for which "Keep the phone's" was refused for want of a trash:
+/// only then is "Replace Anyway" offered.
+fn refused_trash() -> &'static Mutex<HashSet<(String, String)>> {
+    static REFUSED: OnceLock<Mutex<HashSet<(String, String)>>> = OnceLock::new();
+    REFUSED.get_or_init(Default::default)
+}
+
+/// Whether "Replace Anyway" is offered for `path`'s conflict with `device`.
+pub(crate) fn replace_anyway_offered(device: &str, path: &str) -> bool {
+    refused_trash()
+        .lock()
+        .is_ok_and(|set| set.contains(&(device.to_string(), path.to_string())))
+}
+
 /// How a conflict is resolved (P6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Resolve {
@@ -3723,6 +3737,9 @@ impl Worker {
             return;
         };
         let conflict = live.book.conflicts.remove(position);
+        if let Ok(mut set) = refused_trash().lock() {
+            set.remove(&(device.to_string(), conflict.path.clone()));
+        }
         let root = live.pair.root.clone();
         match how {
             Resolve::Both => {}
@@ -3740,6 +3757,10 @@ impl Worker {
                     // rename alone replaced it for good (S4). Without a
                     // trash it stays, and the conflict with it.
                     if original.exists() && !trash(&original) && how != Resolve::PhoneAnyway {
+                        refused_trash()
+                            .lock()
+                            .map(|mut set| set.insert((device.to_string(), conflict.path.clone())))
+                            .ok();
                         live.book.conflicts.insert(position, conflict);
                         tell(&Report {
                             refused: Some(
@@ -5407,20 +5428,32 @@ mod tests {
     #[test]
     fn keeping_the_phones_version_without_a_trash_says_so_and_can_be_forced() {
         let (base, root, mut worker) = scratch_bucket("bucket-no-trash");
-        fs::write(root.join("a.txt"), "desk").unwrap();
-        fs::write(root.join("a (conflicted copy).txt"), "phone").unwrap();
+        fs::write(root.join("nt.txt"), "desk").unwrap();
+        fs::write(root.join("nt (conflicted copy).txt"), "phone").unwrap();
         worker.pairs[0].book.conflicts.push(Conflict {
-            path: "a.txt".into(),
-            copy: "a (conflicted copy).txt".into(),
+            path: "nt.txt".into(),
+            copy: "nt (conflicted copy).txt".into(),
             at: 0,
         });
         TEST_TRASH_FAILS.with(|fails| fails.set(true));
-        worker.resolve("phone-b", BUCKET_ID, "a.txt", Resolve::Phone);
-        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "desk");
+        assert!(
+            !replace_anyway_offered("phone-b", "nt.txt"),
+            "not before a refusal"
+        );
+        worker.resolve("phone-b", BUCKET_ID, "nt.txt", Resolve::Phone);
+        assert_eq!(fs::read_to_string(root.join("nt.txt")).unwrap(), "desk");
         assert_eq!(worker.pairs[0].book.conflicts.len(), 1, "still a conflict");
         assert!(take_report().is_some_and(|m| m.contains("Replace Anyway")));
-        worker.resolve("phone-b", BUCKET_ID, "a.txt", Resolve::PhoneAnyway);
-        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "phone");
+        assert!(
+            replace_anyway_offered("phone-b", "nt.txt"),
+            "offered after the refusal"
+        );
+        worker.resolve("phone-b", BUCKET_ID, "nt.txt", Resolve::PhoneAnyway);
+        assert!(
+            !replace_anyway_offered("phone-b", "nt.txt"),
+            "and not after"
+        );
+        assert_eq!(fs::read_to_string(root.join("nt.txt")).unwrap(), "phone");
         TEST_TRASH_FAILS.with(|fails| fails.set(false));
         let _ = fs::remove_dir_all(&base);
     }

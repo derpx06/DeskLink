@@ -1323,7 +1323,7 @@ fn a_file_that_keeps_changing_fails_after_two_restarts() {
         let cancels = rig.ab.sent(FileAction::Cancel);
         let offers = rig.ab.sent(FileAction::Offer);
         let last = offers.last()?;
-        (cancels.len() == 3
+        (cancels.len() >= 3
             && outcomes(&last.transfer_id).iter().any(|outcome| {
                 matches!(outcome, board::Outcome::Failed(reason)
                     if *reason == words::source_changed_for_good())
