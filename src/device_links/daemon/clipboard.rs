@@ -259,6 +259,27 @@ pub(super) fn clipboard_from_phone(
     device_name: &str,
     connect_timestamp: Option<Option<u64>>,
 ) -> &'static str {
+    clipboard_from_phone_at(content, device_name, connect_timestamp, None)
+}
+
+/// A phone's copy that reached us late (it queued while the phone slept)
+/// must not replace a copy made here since. The phone's clock and this one
+/// may differ a little: only a copy older by more than this loses.
+const CLOCK_SKEW_MS: u64 = 10_000;
+
+/// When this computer's clipboard last changed because of a copy made *here*
+/// (not a placement from a phone): what a phone's `copiedAt` is ordered by.
+static LOCAL_COPY_AT: AtomicU64 = AtomicU64::new(0);
+
+/// [`clipboard_from_phone`] with the phone's `copiedAt` (when it said): the
+/// time the phone's copy was made, which orders it against the copies made
+/// here. Absent (an older phone), a plain copy is news, as before.
+pub(super) fn clipboard_from_phone_at(
+    content: &str,
+    device_name: &str,
+    connect_timestamp: Option<Option<u64>>,
+    copied_at: Option<u64>,
+) -> &'static str {
     if !crate::device_links::config::app_settings().clipboard_sync {
         return "ignored: clipboard sync is off";
     }
@@ -271,6 +292,11 @@ pub(super) fn clipboard_from_phone(
         None => {
             if just_placed(content, now_ms()) {
                 return "unchanged: just placed";
+            }
+            if copied_at.is_some_and(|at| {
+                at > 0 && at.saturating_add(CLOCK_SKEW_MS) < LOCAL_COPY_AT.load(Ordering::Acquire)
+            }) {
+                return "ignored: older than a copy made at this computer";
             }
         }
         // The phone's clipboard as of connecting: it replaces this one only
@@ -750,6 +776,7 @@ impl DaemonWorker {
                     }
                     if !superseded(seen, REMOTE_AT.load(Ordering::Acquire)) {
                         LOCAL_CHANGED_AT.store(seen, Ordering::Release);
+                        LOCAL_COPY_AT.store(seen, Ordering::Release);
                     }
                     examined = Some((current_text.clone(), secret, seen));
                 }
@@ -1092,6 +1119,51 @@ mod tests {
             clipboard_from_phone(&text, "Pixel", Some(Some(now_ms() + 60_000))),
             "placed on the clipboard"
         );
+    }
+
+    /// W11: a plain copy that carries `copiedAt` is ordered by it against the
+    /// copies made at this computer; without it, or close in time, it is news.
+    #[test]
+    fn a_late_copy_does_not_replace_a_newer_copy_made_here() {
+        let base = now_ms();
+        LOCAL_COPY_AT.store(base, Ordering::Release);
+        let text = |tag: &str| format!("{tag}-{}", uuid::Uuid::new_v4().simple());
+        let (old, near, none) = (text("old"), text("near"), text("none"));
+        assert_eq!(
+            clipboard_from_phone_at(&old, "Pixel", None, Some(base - 60_000)),
+            "ignored: older than a copy made at this computer",
+            "made a minute before the desk's copy"
+        );
+        assert_eq!(
+            clipboard_from_phone_at(&near, "Pixel", None, Some(base - 2_000)),
+            "placed on the clipboard",
+            "within the clock skew"
+        );
+        assert_eq!(
+            clipboard_from_phone_at(&none, "Pixel", None, None),
+            "placed on the clipboard",
+            "an older phone says nothing: news"
+        );
+        let newer = text("newer");
+        assert_eq!(
+            clipboard_from_phone_at(&newer, "Pixel", None, Some(base + 5_000)),
+            "placed on the clipboard"
+        );
+        LOCAL_COPY_AT.store(0, Ordering::Release);
+    }
+
+    /// The desk never sends `clipboard.connect`, so it cannot claim a newer
+    /// copy than it has: what it sends is a plain copy, with no time.
+    #[test]
+    fn the_desk_sends_plain_clipboard_packets_only() {
+        let sources = [include_str!("clipboard.rs"), include_str!("commands.rs")];
+        for source in sources {
+            let production = source.split("#[cfg(test)]").next().unwrap();
+            assert!(!production.contains("NetworkPacket::new(PACKET_TYPE_CLIPBOARD_CONNECT"));
+            assert!(!production.contains(
+                "NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_CLIPBOARD_CONNECT"
+            ));
+        }
     }
 
     /// Two copies arriving close together: the newest is what stays (the

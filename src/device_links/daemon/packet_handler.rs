@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use super::clipboard::{clipboard_from_phone, set_clipboard_text_from_remote};
+use super::clipboard::{clipboard_from_phone_at, set_clipboard_text_from_remote};
 use super::dispatcher::{PacketSource, SharedPacketDispatcher};
 use super::handle::DaemonEvent;
 use super::state::{
@@ -741,7 +741,12 @@ pub(crate) fn dispatch_webrtc_feature_packet(
                     .and_then(serde_json::Value::as_u64)
             });
             // Off means off both ways: the phone's copies are dropped there.
-            let outcome = clipboard_from_phone(content, &binding.link.info.name, connect);
+            let copied_at = packet
+                .body
+                .get("copiedAt")
+                .and_then(serde_json::Value::as_u64);
+            let outcome =
+                clipboard_from_phone_at(content, &binding.link.info.name, connect, copied_at);
             debug_log!(
                 "[Clipboard] {} from {device_id}: {} chars, {outcome}",
                 packet.packet_type,
