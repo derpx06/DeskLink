@@ -179,6 +179,16 @@ fn grants() -> &'static Mutex<Grants> {
     GRANTS.get_or_init(Default::default)
 }
 
+/// A lane's first line is at most [`LINE_MAX`] bytes. The listener reads it
+/// with the identity packet's larger bound (it cannot know the type before
+/// reading), so the lane's own bound is enforced before anything else.
+pub(crate) fn first_line_within_bound(line: &[u8]) -> Result<(), String> {
+    if line.len() > LINE_MAX {
+        return Err("a lane first line over its bound".to_string());
+    }
+    Ok(())
+}
+
 /// Spends a token the way the listener does (tests of the engine's layers).
 #[cfg(test)]
 pub(crate) fn spend_token_for_test(token: &str, transfer_id: &str, dialler_id: &str) -> bool {
@@ -563,6 +573,20 @@ mod tests {
 
     fn fixture() -> Value {
         serde_json::from_str(include_str!("../../../testdata/filelane_bodies.json")).unwrap()
+    }
+
+    /// The listener reads a first line with the identity bound (512 KiB); a
+    /// lane's is held to 4 KiB.
+    #[test]
+    fn a_lane_first_line_over_four_kib_is_refused() {
+        assert!(first_line_within_bound(&vec![b'x'; LINE_MAX]).is_ok());
+        assert!(first_line_within_bound(&vec![b'x'; LINE_MAX + 1]).is_err());
+        let padded = format!(
+            "{{\"id\":1,\"type\":\"{FIRST_LINE_TYPE}\",\"body\":{{\"v\":1,\"deviceId\":\"{}\",\"targetDeviceId\":\"b\"}}}}",
+            "a".repeat(LINE_MAX)
+        );
+        assert!(first_line_within_bound(padded.as_bytes()).is_err());
+        assert!(first_line_within_bound(first_line("a", "b", 1).as_bytes()).is_ok());
     }
 
     #[test]

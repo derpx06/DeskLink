@@ -168,6 +168,8 @@ fn accept_incoming_device(
     // A file lane (W18) names itself in the first line: not an identity, not
     // a device to list. It carries file frames and nothing else.
     if packet.packet_type == crate::device_links::webrtc::file_lane::FIRST_LINE_TYPE {
+        // The identity reader allows far more than a lane line may be.
+        crate::device_links::webrtc::file_lane::first_line_within_bound(&line)?;
         return crate::device_links::webrtc::file_lane::accept(stream, &config, &packet);
     }
     let info = DeviceInfo::from_identity_packet(&packet)
