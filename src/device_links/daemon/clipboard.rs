@@ -1318,7 +1318,13 @@ mod tests {
         let name = "device_links::daemon::clipboard::tests::a_phones_copy_reaches_a_real_x11_clipboard_within_a_second";
         if std::env::var_os(CHILD).is_none() {
             let Some(display) = std::env::var_os("DESKLINK_TEST_DISPLAY") else {
-                eprintln!("SKIPPED {name}: DESKLINK_TEST_DISPLAY names no dedicated display");
+                // A green run must mean it ran: only the explicit opt-out skips.
+                assert!(
+                    std::env::var_os("DESKLINK_TEST_NO_DISPLAY").is_some_and(|v| !v.is_empty()),
+                    "{name}: DESKLINK_TEST_DISPLAY names no dedicated display (set \
+                     DESKLINK_TEST_NO_DISPLAY=1 to skip this test on purpose)"
+                );
+                eprintln!("SKIPPED {name}: DESKLINK_TEST_NO_DISPLAY is set");
                 return;
             };
             let output = std::process::Command::new(std::env::current_exe().unwrap())
