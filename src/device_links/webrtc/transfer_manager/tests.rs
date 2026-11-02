@@ -3928,3 +3928,38 @@ fn stale_lane_frames_after_a_failover_are_dropped() {
     hand.settle();
     assert_eq!(verified_of(&hand), Some(4));
 }
+
+/// The receiver's word about a lane: a look at a lane changes nothing; a lane
+/// that opened is the one that can end it; a late word about another does not.
+#[test]
+fn only_the_lane_that_is_up_can_end_it_and_a_look_changes_nothing() {
+    let hand = Hand::new("lane-identity");
+    hand.send(hand.offer(STALE_ID, "lane.bin", 4 * BLOCK_BYTES));
+    let body = super::super::file_lane::TokenBody {
+        transfer_id: STALE_ID.into(),
+        token: String::new(),
+        pass: 0,
+        start_block: 0,
+    };
+    let (checked, up, late, current) = hand.manager.probe(move |engine| {
+        let key = id_bytes(STALE_ID).unwrap();
+        engine.incoming.get_mut(&key).unwrap().lane_wanted = true;
+        let checked = engine.lane_check(&body);
+        let after_check = engine.incoming[&key].on_lane;
+        engine.lane_opened(&body, 5);
+        let up = engine.incoming[&key].on_lane;
+        // The lane before this one, ending late.
+        engine.lane_lost(STALE_ID, 4);
+        let late = engine.incoming[&key].on_lane;
+        engine.lane_lost(STALE_ID, 5);
+        let current = engine.incoming[&key].on_lane;
+        (checked, (after_check, up), late, current)
+    });
+    assert_eq!(checked, Ok(()));
+    assert_eq!(up, (false, true), "opened by the open, not by the look");
+    assert!(late, "an older lane's end changes nothing");
+    assert!(!current, "the current lane's end does");
+    let nacks = hand.link.sent(FileAction::BlockNack);
+    assert_eq!(nacks.len(), 1, "told once");
+    assert_eq!(nacks[0].reason.as_deref(), Some("lane"));
+}

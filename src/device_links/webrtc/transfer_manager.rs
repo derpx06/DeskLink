@@ -259,7 +259,15 @@ enum Cmd {
         reply: SyncSender<Result<(), super::file_lane::Refusal>>,
     },
     /// The lane of this transfer ended under the receiver.
-    LaneLost(String),
+    /// The lane connection `serial` is open for this transfer (before its frames).
+    LaneOpened {
+        body: super::file_lane::TokenBody,
+        serial: u64,
+    },
+    LaneLost {
+        id: String,
+        serial: u64,
+    },
     Wake,
     /// The peer is gone: finish what is queued, then end the thread.
     Stop,
@@ -326,8 +334,14 @@ impl super::file_lane::Receiver for LaneIn {
                     .set_read_timeout(Some(Duration::from_secs(30)));
                 let transfer =
                     super::file_protocol::id_bytes(&body.transfer_id).unwrap_or_default();
-                read_lane_frames(&mut stream, &commands, &shared, transfer);
-                let _ = commands.send(Cmd::LaneLost(body.transfer_id));
+                static SERIALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                let serial = SERIALS.fetch_add(1, Ordering::Relaxed);
+                let id = body.transfer_id.clone();
+                // Before any frame of it (one queue, in order).
+                if commands.send(Cmd::LaneOpened { body, serial }).is_ok() {
+                    read_lane_frames(&mut stream, &commands, &shared, transfer);
+                    let _ = commands.send(Cmd::LaneLost { id, serial });
+                }
                 super::file_lane::lane_closed(&peer);
             });
         if spawned.is_err() {
@@ -784,7 +798,8 @@ impl Engine {
             Cmd::LaneCheck { body, reply } => {
                 let _ = reply.send(self.lane_check(&body));
             }
-            Cmd::LaneLost(id) => self.lane_lost(&id),
+            Cmd::LaneOpened { body, serial } => self.lane_opened(&body, serial),
+            Cmd::LaneLost { id, serial } => self.lane_lost(&id, serial),
             Cmd::Wake | Cmd::Stop => {}
             #[cfg(test)]
             Cmd::Probe(job) => job(self),

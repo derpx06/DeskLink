@@ -51,9 +51,12 @@ pub(super) struct Incoming {
     gallery: bool,
     /// The sender offered a lane and this side can take one (W18): every
     /// accept carries a fresh token.
-    lane_wanted: bool,
+    pub(super) lane_wanted: bool,
     /// A lane connection delivers this transfer's frames now.
-    on_lane: bool,
+    pub(super) on_lane: bool,
+    /// Which lane connection that is (0: none). A late word about an older
+    /// one is not about this one.
+    lane_serial: u64,
     capture_id: Option<String>,
     file: File,
     /// The pass frames must carry (see `file_protocol`).
@@ -192,6 +195,7 @@ impl Incoming {
         // still holds. A lane that was up is not any more: a new accept is a
         // new start.
         self.on_lane = false;
+        self.lane_serial = 0;
         if self.lane_wanted {
             if let (Some(target), true) = (
                 net.link.lane_target(),
@@ -573,21 +577,43 @@ impl Engine {
         if !incoming.lane_wanted {
             return Err(Refusal::Transfer);
         }
-        if body.start_block != incoming.verified() {
+        if body.start_block > incoming.verified() {
             return Err(Refusal::Range);
         }
-        if !(incoming.adopt_any || body.pass == incoming.pass) {
+        if !(incoming.adopt_any
+            || body.pass == incoming.pass
+            || body.pass == next_pass(incoming.pass))
+        {
             return Err(Refusal::Range);
+        }
+        // Only a look: the answer may not reach the dialler (or the lane may
+        // never open), so nothing here changes the transfer.
+        Ok(())
+    }
+
+    /// The lane connection `serial` is open and its frames follow: from here
+    /// the transfer is on it, starting where the sender says.
+    pub(super) fn lane_opened(&mut self, body: &super::super::file_lane::TokenBody, serial: u64) {
+        let Some(key) = id_bytes(&body.transfer_id) else {
+            return;
+        };
+        let Some(incoming) = self.incoming.get_mut(&key) else {
+            return;
+        };
+        let start = body.start_block.min(incoming.verified());
+        if incoming.restart_at(start, body.pass).is_err() {
+            return;
         }
         incoming.on_lane = true;
+        incoming.lane_serial = serial;
+        incoming.stall.moved(Instant::now());
         board::set_lane(&incoming.id, Some(words::fast_lane()));
-        Ok(())
     }
 
     /// The lane under a transfer ended: if it did not finish, the receiver
     /// asks the sender to carry on over the data channel from the last
     /// verified block.
-    pub(super) fn lane_lost(&mut self, id: &str) {
+    pub(super) fn lane_lost(&mut self, id: &str, serial: u64) {
         let Some(key) = id_bytes(id) else {
             return;
         };
@@ -602,7 +628,11 @@ impl Engine {
         // The sender is told, and answers with a `lane` action naming the
         // block it carries on from over the data channel.
         if let (Some(incoming), Some(net)) = (self.incoming.get_mut(&key), ctx.net) {
-            if std::mem::take(&mut incoming.on_lane) {
+            // Only the lane that is up now can end it; a late word from an
+            // older one (or from one the sender already left) is nothing.
+            if incoming.on_lane && incoming.lane_serial == serial {
+                incoming.on_lane = false;
+                incoming.lane_serial = 0;
                 let mut nack = net.msg(FileAction::BlockNack, &incoming.id, &incoming.token);
                 nack.block_index = Some(incoming.verified());
                 nack.pass = Some(incoming.pass);
@@ -633,24 +663,18 @@ impl Engine {
         if incoming.token != message.transfer_token || start > incoming.verified() {
             return;
         }
-        // The lane's own connection already put the transfer on it (the two
-        // arrive by different roads, in either order): nothing to undo.
-        if kind == "tcp" && incoming.on_lane {
+        // `tcp`: the lane's own connection puts the transfer on it when it
+        // opens (the two arrive by different roads, in either order).
+        if kind == "tcp" {
             return;
         }
         if incoming.restart_at(start, pass).is_err() {
             return;
         }
-        incoming.on_lane = kind == "tcp";
+        incoming.on_lane = false;
+        incoming.lane_serial = 0;
         incoming.stall.moved(Instant::now());
-        board::set_lane(
-            &incoming.id,
-            Some(if incoming.on_lane {
-                words::fast_lane()
-            } else {
-                words::over_webrtc()
-            }),
-        );
+        board::set_lane(&incoming.id, Some(words::over_webrtc()));
     }
 
     /// Opens the files of a new incoming transfer, resuming a checkpoint of
@@ -770,6 +794,7 @@ impl Engine {
             gallery: checkpoint.gallery,
             lane_wanted: false,
             on_lane: false,
+            lane_serial: 0,
             capture_id: checkpoint.capture_id.clone(),
             file,
             pass: 0,
