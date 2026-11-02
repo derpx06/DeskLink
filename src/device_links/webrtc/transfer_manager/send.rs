@@ -114,7 +114,9 @@ impl LaneWriter {
         #[cfg(test)]
         let frame = {
             let mut frame = frame;
-            if super::tests::CORRUPT_NEXT_LANE_FRAME.swap(false, Ordering::SeqCst) {
+            if super::tests::CORRUPT_NEXT_LANE_FRAME.swap(false, Ordering::SeqCst)
+                || super::tests::CORRUPT_EVERY_LANE_FRAME.load(Ordering::SeqCst)
+            {
                 // A bit flipped in memory before the lane: TLS would not notice.
                 let at = frame.len() / 2;
                 frame[at] ^= 0x40;
@@ -262,6 +264,8 @@ pub(super) struct Outgoing {
     lane_failed: Option<Instant>,
     /// Lanes that failed in a row (a delivered block clears it).
     lane_failures: u32,
+    /// Blocks refused on the lane since the last one accepted.
+    lane_nacks: u32,
     /// When the receiver last acknowledged a block (for the lane's stall).
     lane_ack_at: Instant,
 }
@@ -379,6 +383,7 @@ impl Outgoing {
             lane: LaneTx::Off,
             lane_failed: None,
             lane_failures: 0,
+            lane_nacks: 0,
             lane_ack_at: now,
         }
     }
@@ -1142,6 +1147,7 @@ impl Engine {
         }
         outgoing.acked = outgoing.acked.max(block + 1);
         outgoing.lane_ack_at = Instant::now();
+        outgoing.lane_nacks = 0;
         if outgoing.on_lane() {
             outgoing.lane_failures = 0;
         }
@@ -1165,6 +1171,20 @@ impl Engine {
             outgoing.stall.moved(Instant::now());
             if outgoing.on_lane() {
                 outgoing.leave_lane(net, "closed by the receiver");
+            }
+            return;
+        }
+        if outgoing.on_lane() && block <= outgoing.hashes.len() as u64 {
+            // A block that failed its hash on the lane: sent once more on the
+            // lane; failing again, the lane is not to be trusted and the data
+            // channel takes over (never the three rewinds and an error).
+            outgoing.lane_nacks += 1;
+            outgoing.stall.moved(Instant::now());
+            if outgoing.lane_nacks >= 2 {
+                outgoing.lane_nacks = 0;
+                outgoing.leave_lane(net, "a block failed its hash twice");
+            } else {
+                outgoing.rewind_to(block, pass);
             }
             return;
         }

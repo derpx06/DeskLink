@@ -26,6 +26,8 @@ type Manager = WebRtcTransferManager;
 
 /// A test sets this to flip one bit in the next frame a lane writes.
 pub(super) static CORRUPT_NEXT_LANE_FRAME: AtomicBool = AtomicBool::new(false);
+/// ...and this one, in every frame a lane writes.
+pub(super) static CORRUPT_EVERY_LANE_FRAME: AtomicBool = AtomicBool::new(false);
 
 fn wire_of(me: &str, peer: &str) -> WebRtcWireBinding {
     WebRtcWireBinding {
@@ -3370,6 +3372,7 @@ mod lane {
         fn new(pace: Duration) -> Self {
             let guard = LANE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             CORRUPT_NEXT_LANE_FRAME.store(false, Ordering::SeqCst);
+            CORRUPT_EVERY_LANE_FRAME.store(false, Ordering::SeqCst);
             let (sender, receiver) = (side(), side());
             pair(&sender, &receiver);
             let stop = Arc::new(AtomicBool::new(false));
@@ -3684,6 +3687,26 @@ mod lane {
         );
         assert_eq!(rig.ab.frames.load(Ordering::SeqCst), 0, "still on the lane");
         assert_eq!(lane_actions(&rig).len(), 1);
+    }
+
+    /// A lane that corrupts every block is given up after the second refusal
+    /// of a block: the data channel finishes the file; no error, no rewinds.
+    #[test]
+    fn a_lane_whose_blocks_keep_failing_hands_over_to_webrtc() {
+        let env = Env::new(Duration::ZERO);
+        let rig = env.rig("lane-bad", fast());
+        CORRUPT_EVERY_LANE_FRAME.store(true, Ordering::SeqCst);
+        let bytes = payload(12 * MIB + 7, 32);
+        let source = rig.source("big.bin", &bytes);
+        rig.a().start_send(&source).unwrap();
+        let got = rig.received();
+        CORRUPT_EVERY_LANE_FRAME.store(false, Ordering::SeqCst);
+        assert_eq!(fs::read(&got.path).unwrap(), bytes);
+        let kinds: Vec<String> = lane_actions(&rig).into_iter().map(|a| a.0).collect();
+        assert_eq!(kinds.first().map(String::as_str), Some("tcp"));
+        assert!(kinds.contains(&"webrtc".to_string()), "{kinds:?}");
+        assert!(rig.ab.frames.load(Ordering::SeqCst) > 0);
+        assert_eq!(rig.ba.sent(FileAction::BlockNack).len(), 2);
     }
 
     #[test]
