@@ -111,8 +111,24 @@ pub(crate) struct Watch {
 }
 
 impl Watch {
-    /// One look at `id` at `now` (the daemon looks every few seconds).
+    /// [`Self::observe_when_idle`] for a desk that is idle.
+    #[cfg(test)]
     pub(crate) fn observe(&mut self, id: &str, seen: Seen, now: Instant) -> Option<Step> {
+        self.observe_when_idle(id, seen, now, &mut || true)
+    }
+
+    /// One look at `id` at `now` (the daemon looks every few seconds). `idle`
+    /// says whether nobody is using this computer (logind's IdleHint); it is
+    /// asked only when a count that began with the phone dozing is about to
+    /// warn or lock: a phone that went to sleep on the desk, its radio with
+    /// it, must not lock the computer on the person using it.
+    pub(crate) fn observe_when_idle(
+        &mut self,
+        id: &str,
+        seen: Seen,
+        now: Instant,
+        idle: &mut dyn FnMut() -> bool,
+    ) -> Option<Step> {
         if !seen.enabled {
             return self.phones.remove(id).and_then(|phone| clears(&phone));
         }
@@ -148,12 +164,23 @@ impl Watch {
         let away = now.saturating_duration_since(since);
         match phone.warned_at {
             None if away >= warn_after => {
+                // A dozing phone counts only while the desk is idle.
+                if seen.dozing && !idle() {
+                    return None;
+                }
                 phone.warned_at = Some(now);
                 Some(Step::Warn)
             }
             Some(warned)
                 if away >= lock_after && now.saturating_duration_since(warned) >= WARN_FOR =>
             {
+                if seen.dozing && !idle() {
+                    // Someone is at the keyboard after all: the warning goes
+                    // and the count starts again.
+                    phone.warned_at = None;
+                    phone.away_since = Some(now);
+                    return Some(Step::ClearWarning);
+                }
                 phone.warned_at = None;
                 phone.done = true;
                 Some(Step::Lock)
@@ -200,7 +227,12 @@ fn with<R>(use_watch: impl FnOnce(&mut Watch) -> R) -> Option<R> {
 }
 
 pub(crate) fn observe(id: &str, seen: Seen) -> Option<Step> {
-    with(|watch| watch.observe(id, seen, Instant::now())).flatten()
+    with(|watch| {
+        watch.observe_when_idle(id, seen, Instant::now(), &mut || {
+            crate::device_links::logind::idle_hint().unwrap_or(false)
+        })
+    })
+    .flatten()
 }
 
 pub(crate) fn cancel(id: &str) -> bool {
@@ -300,6 +332,48 @@ mod tests {
             ..HERE
         };
         assert_eq!(run(&mut watch, &clock, linked, 0, 1000), []);
+    }
+
+    /// A phone that fell asleep on the desk with its radio off does not lock
+    /// the computer on the person using it: a dozing count warns and locks
+    /// only while the desk is idle (logind's IdleHint), and an unknown idle
+    /// state is not idle.
+    #[test]
+    fn a_dozing_phone_never_locks_a_desk_that_is_in_use() {
+        let (mut watch, clock) = (Watch::default(), clock());
+        run(&mut watch, &clock, HERE, 0, 0);
+        let dozing = Seen {
+            dozing: true,
+            ..AWAY
+        };
+        let mut busy = || false;
+        let mut at = |watch: &mut Watch, second, idle: &mut dyn FnMut() -> bool| {
+            watch.observe_when_idle("p", dozing, clock.at(second), idle)
+        };
+        // Typing the whole time: not even a warning.
+        for second in 1..=400 {
+            assert_eq!(at(&mut watch, second, &mut busy), None);
+        }
+        // The person stops: the warning, then the lock, ten seconds on.
+        let mut idle = || true;
+        assert_eq!(at(&mut watch, 401, &mut idle), Some(Step::Warn));
+        // Back at the keyboard during the warning: it goes, the count restarts.
+        assert_eq!(at(&mut watch, 405, &mut busy), None);
+        assert_eq!(at(&mut watch, 411, &mut busy), Some(Step::ClearWarning));
+        assert_eq!(at(&mut watch, 412, &mut idle), None, "a fresh count");
+        assert_eq!(at(&mut watch, 411 + 170, &mut idle), Some(Step::Warn));
+        assert_eq!(at(&mut watch, 411 + 180, &mut idle), Some(Step::Lock));
+        // An awake phone's minute does not depend on idleness.
+        let (mut awake, clock2) = (Watch::default(), Clock(Instant::now()));
+        run(&mut awake, &clock2, HERE, 0, 0);
+        assert_eq!(
+            awake.observe_when_idle("p", AWAY, clock2.at(1), &mut busy),
+            None
+        );
+        assert_eq!(
+            awake.observe_when_idle("p", AWAY, clock2.at(51), &mut busy),
+            Some(Step::Warn)
+        );
     }
 
     /// Waking ends a doze: the count goes on with the ordinary minute from

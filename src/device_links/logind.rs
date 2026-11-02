@@ -123,6 +123,16 @@ pub(crate) fn locked() -> Option<bool> {
         .get::<bool>()
 }
 
+/// Whether logind thinks our display session is idle (no input for the
+/// session's idle delay); `None` when it cannot say.
+pub(crate) fn idle_hint() -> Option<bool> {
+    let bus = system_bus().ok()?;
+    let session = display_session(&bus).ok()?;
+    property(&bus, &session, SESSION, "IdleHint")
+        .ok()?
+        .get::<bool>()
+}
+
 /// Asks logind to lock our display session.
 pub(crate) fn lock() -> Result<(), String> {
     let bus = system_bus()?;
