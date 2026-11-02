@@ -344,13 +344,23 @@ mod tests {
                 gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 3, 2)
                     .unwrap();
             std::fs::write(&path, pixbuf.save_to_bufferv("png", &[]).unwrap()).unwrap();
+            // Other tests share this queue on this thread: let theirs finish.
+            let context = glib::MainContext::default();
+            for _ in 0..500 {
+                while context.iteration(false) {}
+                if DECODING.with(std::cell::Cell::get) == 0
+                    && WAITING.with(|w| w.borrow().is_empty())
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             let pictures: Vec<gtk::Picture> = (0..12).map(|_| gtk::Picture::new()).collect();
             for picture in &pictures {
                 load_thumbnail(picture, path.clone());
             }
             assert_eq!(DECODING.with(std::cell::Cell::get), MAX_DECODING);
             assert_eq!(WAITING.with(|w| w.borrow().len()), 12 - MAX_DECODING);
-            let context = glib::MainContext::default();
             for _ in 0..200 {
                 while context.iteration(false) {}
                 if pictures.iter().all(|p| p.paintable().is_some()) {
