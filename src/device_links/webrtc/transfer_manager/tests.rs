@@ -3450,6 +3450,46 @@ mod lane {
         }));
     }
 
+    /// A frame of another transfer than the one the token was for ends the
+    /// lane; the frames before it were delivered.
+    #[test]
+    fn a_lane_frame_for_another_transfer_ends_the_lane() {
+        use super::super::super::file_protocol::FrameHeader;
+        let mine = id_bytes("0f8fad5b-d9cb-469f-a165-70867728950e").unwrap();
+        let other = id_bytes("1f8fad5b-d9cb-469f-a165-70867728950e").unwrap();
+        let frame = |transfer| {
+            let mut out = Vec::new();
+            FrameHeader {
+                last_of_block: false,
+                pass: 0,
+                transfer,
+                block_index: 0,
+                offset: 0,
+                length: 4,
+            }
+            .write(&mut out);
+            out.extend_from_slice(b"data");
+            out
+        };
+        let mut wire = Vec::new();
+        wire.extend(frame(mine));
+        wire.extend(frame(mine));
+        wire.extend(frame(other));
+        wire.extend(frame(mine));
+        let (commands, inbox) = channel();
+        let shared = super::super::Shared {
+            queued: AtomicUsize::new(0),
+            overflow: AtomicBool::new(false),
+            queue_max: super::super::FILE_QUEUE_MAX_BYTES,
+            attached: AtomicBool::new(true),
+            hook: Mutex::new(None),
+        };
+        super::super::read_lane_frames(&mut std::io::Cursor::new(wire), &commands, &shared, mine);
+        drop(commands);
+        let delivered = inbox.iter().count();
+        assert_eq!(delivered, 2, "the two frames before the stranger");
+    }
+
     #[test]
     fn a_big_file_between_paired_devices_goes_over_the_lane() {
         let env = Env::new(Duration::from_millis(1));

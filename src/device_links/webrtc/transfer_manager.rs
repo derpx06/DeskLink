@@ -324,7 +324,9 @@ impl super::file_lane::Receiver for LaneIn {
                 let _ = stream
                     .get_ref()
                     .set_read_timeout(Some(Duration::from_secs(30)));
-                read_lane_frames(&mut stream, &commands, &shared);
+                let transfer =
+                    super::file_protocol::id_bytes(&body.transfer_id).unwrap_or_default();
+                read_lane_frames(&mut stream, &commands, &shared, transfer);
                 let _ = commands.send(Cmd::LaneLost(body.transfer_id));
                 super::file_lane::lane_closed(&peer);
             });
@@ -368,8 +370,18 @@ pub(super) fn read_lane_frame(stream: &mut impl std::io::Read) -> Result<Vec<u8>
 /// Reads frames until the lane ends, feeding the file thread's queue. Unlike
 /// the data channel's callback it waits for room instead of dropping: TCP
 /// pushes back on the sender, and a dropped frame would restart the transfer.
-fn read_lane_frames(stream: &mut impl std::io::Read, commands: &Sender<Cmd>, shared: &Shared) {
+fn read_lane_frames(
+    stream: &mut impl std::io::Read,
+    commands: &Sender<Cmd>,
+    shared: &Shared,
+    transfer: [u8; 16],
+) {
     while let Ok(frame) = read_lane_frame(stream) {
+        // The token authorised this transfer and no other: a frame that names
+        // another ends the lane (W18, section 3).
+        if frame[8..24] != transfer {
+            return;
+        }
         let length = frame.len();
         let mut waited = 0;
         while shared.queued.load(Ordering::Acquire) + length > shared.queue_max / 2 {
