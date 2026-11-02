@@ -64,15 +64,146 @@ fn preparer() -> &'static Sender<SendJob> {
 }
 
 /// Files chosen for a phone that is not connected: kept (bounded) and sent
-/// when it is (I9). The row shows "Waiting for <phone>" meanwhile.
+/// when it is (I9). The row shows "Waiting for <phone>" meanwhile. The queue
+/// is kept in the state folder, so it survives a restart of DeskLink.
 const MAX_WAITING_FILES: usize = 200;
 const MAX_WAITING_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
+/// What is kept of a waiting file: where it is and how it was when it was
+/// chosen. It is sent only if it still is that file.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Waiting {
+    #[serde(rename = "device")]
     device_id: String,
     phone: String,
     path: PathBuf,
-    since: std::time::Instant,
+    size: u64,
+    /// Modification time, nanoseconds since the epoch.
+    mtime_ns: u64,
+    /// When it was chosen, seconds since the epoch.
+    queued_at: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedQueue {
+    version: u32,
+    files: Vec<Waiting>,
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+fn mtime_ns(meta: &std::fs::Metadata) -> u64 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| since.as_nanos().min(u128::from(u64::MAX)) as u64)
+}
+
+/// `$XDG_STATE_HOME/desklink/send-queue.json`. Tests get a file of their own,
+/// never the person's.
+fn queue_path() -> Option<PathBuf> {
+    if cfg!(test) {
+        return Some(std::env::temp_dir().join(format!(
+            "desklink-test-send-queue-{}.json",
+            std::process::id()
+        )));
+    }
+    Some(
+        dirs::state_dir()
+            .or_else(dirs::data_local_dir)?
+            .join("desklink")
+            .join("send-queue.json"),
+    )
+}
+
+/// The queue saved at `path`, as of `now`: nothing when it is missing or
+/// damaged (it is rewritten at the next change), and without what waited a
+/// day or more or what is past the cap.
+fn load_queue(path: &Path, now: u64) -> Vec<Waiting> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    let Ok(saved) = serde_json::from_slice::<SavedQueue>(&bytes) else {
+        debug_log!("[Daemon] The send queue in {path:?} is unreadable and was ignored");
+        return Vec::new();
+    };
+    saved
+        .files
+        .into_iter()
+        .filter(|file| now.saturating_sub(file.queued_at) < MAX_WAITING_AGE.as_secs())
+        .take(MAX_WAITING_FILES)
+        .collect()
+}
+
+/// Writes the queue to `path` (owner only); an empty queue removes the file.
+fn save_queue(path: &Path, files: &[Waiting]) {
+    if files.is_empty() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let saved = SavedQueue {
+        version: 1,
+        files: files.to_vec(),
+    };
+    let written = serde_json::to_vec(&saved)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| {
+            if let Some(dir) = path.parent() {
+                std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
+            }
+            crate::device_links::config::write_private(path, &bytes)
+        });
+    if let Err(error) = written {
+        debug_log!("[Daemon] The send queue could not be saved: {error}");
+    }
+}
+
+/// Brings back, at start, what waited when DeskLink last ran, for phones
+/// still paired (`trusted`).
+pub(crate) fn restore_waiting(trusted: impl Fn(&str) -> bool) {
+    if let Some(path) = queue_path() {
+        restore_from(&path, unix_now(), trusted);
+    }
+}
+
+fn restore_from(path: &Path, now: u64, trusted: impl Fn(&str) -> bool) {
+    let restored: Vec<Waiting> = load_queue(path, now)
+        .into_iter()
+        .filter(|file| trusted(&file.device_id))
+        .collect();
+    if let Ok(mut waiting) = WAITING.lock() {
+        let room = MAX_WAITING_FILES.saturating_sub(waiting.len());
+        waiting.extend(restored.into_iter().take(room));
+        refresh_locked(&waiting);
+    }
+}
+
+/// The files that are no longer what was chosen: gone, or another size or
+/// time. Split from `files`, with a sentence for the person for each.
+fn split_changed(files: Vec<Waiting>) -> (Vec<Waiting>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut messages = Vec::new();
+    for file in files {
+        let same = std::fs::metadata(&file.path)
+            .is_ok_and(|meta| meta.len() == file.size && mtime_ns(&meta) == file.mtime_ns);
+        if same {
+            kept.push(file);
+        } else {
+            let name = file.path.file_name().map_or_else(
+                || "A file".to_string(),
+                |name| name.to_string_lossy().into_owned(),
+            );
+            messages.push(format!(
+                "“{name}” changed or was moved after it was chosen, so it was not sent to {}",
+                file.phone
+            ));
+        }
+    }
+    (kept, messages)
 }
 
 static WAITING: Mutex<Vec<Waiting>> = Mutex::new(Vec::new());
@@ -124,6 +255,9 @@ fn refresh_locked(waiting: &[Waiting]) {
     if let Ok(mut shown) = SHOWN_ROWS.lock() {
         refresh_waiting_rows(waiting, &mut shown);
     }
+    if let Some(path) = queue_path() {
+        save_queue(&path, waiting);
+    }
 }
 
 /// Keeps `path` for `device_id` until it connects. `Err` is a message for the
@@ -143,7 +277,9 @@ fn wait_for_phone(device_id: &str, phone: &str, path: PathBuf) -> Result<(), Str
         device_id: device_id.to_string(),
         phone: phone.to_string(),
         path,
-        since: std::time::Instant::now(),
+        size: meta.len(),
+        mtime_ns: mtime_ns(&meta),
+        queued_at: unix_now(),
     });
     refresh_locked(&waiting);
     Ok(())
@@ -213,12 +349,12 @@ pub(crate) fn move_waiting(old_id: &str, new_id: &str) {
     }
 }
 
-/// Drops what waited a day. Run on every tick, whether or not a phone is
-/// connected.
-fn expire_waiting(now: std::time::Instant) {
+/// Drops what waited a day (`now` in seconds since the epoch). Run on every
+/// tick, whether or not a phone is connected.
+fn expire_waiting(now: u64) {
     if let Ok(mut waiting) = WAITING.lock() {
         let before = waiting.len();
-        waiting.retain(|file| now.saturating_duration_since(file.since) < MAX_WAITING_AGE);
+        waiting.retain(|file| now.saturating_sub(file.queued_at) < MAX_WAITING_AGE.as_secs());
         if waiting.len() != before {
             refresh_locked(&waiting);
         }
@@ -228,7 +364,7 @@ fn expire_waiting(now: std::time::Instant) {
 /// The waiting files of phones that are connected now, oldest first. They
 /// leave the queue only once taken here; a file the send then refuses is put
 /// back by [`flush_waiting`].
-fn take_waiting(ready: &[String], now: std::time::Instant) -> Vec<Waiting> {
+fn take_waiting(ready: &[String], now: u64) -> Vec<Waiting> {
     expire_waiting(now);
     let Ok(mut waiting) = WAITING.lock() else {
         return Vec::new();
@@ -237,7 +373,10 @@ fn take_waiting(ready: &[String], now: std::time::Instant) -> Vec<Waiting> {
         .into_iter()
         .partition(|file| ready.contains(&file.device_id));
     *waiting = stay;
-    refresh_locked(&waiting);
+    // Called every second for connected phones: write only on a change.
+    if !go.is_empty() {
+        refresh_locked(&waiting);
+    }
     go
 }
 
@@ -260,12 +399,29 @@ pub(super) fn flush_waiting(
     errors: &Arc<Mutex<Vec<String>>>,
     ready: &[String],
 ) {
-    expire_waiting(std::time::Instant::now());
+    expire_waiting(unix_now());
     if ready.is_empty() {
         return;
     }
     let mut refused = Vec::new();
-    for file in take_waiting(ready, std::time::Instant::now()) {
+    // A file that is no longer what was chosen (it may be days old, from
+    // before a restart) is dropped, out loud, not sent.
+    let (go, changed) = split_changed(take_waiting(ready, unix_now()));
+    // Three at most are named; more are one sentence.
+    if changed.len() > 3 {
+        push_error(
+            errors,
+            format!(
+                "{} waiting files changed or were moved after they were chosen, so they were not sent",
+                changed.len()
+            ),
+        );
+    } else {
+        for message in changed {
+            push_error(errors, message);
+        }
+    }
+    for file in go {
         // A refusal (not connected after all, the queue full) keeps the file
         // waiting: it is dropped only by age or by the person.
         if !queue_send(sessions, errors, &file.device_id, file.path.clone(), true) {
@@ -408,7 +564,7 @@ mod waiting_tests {
         assert_eq!(rows.len(), 1, "one aggregate row, not one per file");
         assert_eq!(rows[0].name, "2 files waiting for Pixel");
 
-        let now = std::time::Instant::now();
+        let now = unix_now();
         assert!(take_waiting(&["other".to_string()], now).is_empty());
         let go = take_waiting(&["wait-phone".to_string()], now);
         assert_eq!(go.len(), 2);
@@ -452,11 +608,157 @@ mod waiting_tests {
         put_back(moved);
 
         // A day later they are gone, whoever is connected.
-        expire_waiting(std::time::Instant::now() + MAX_WAITING_AGE);
+        // (Only these two have waited that long: the queue is shared with
+        // the tests running beside this one.)
+        for file in WAITING.lock().unwrap().iter_mut() {
+            if file.device_id == "wait-phone-new" {
+                file.queued_at = unix_now() - MAX_WAITING_AGE.as_secs();
+            }
+        }
+        expire_waiting(unix_now());
         assert!(take_waiting(&["wait-phone-new".to_string()], now).is_empty());
         assert!(board::rows()
             .iter()
             .all(|row| row.device_id != "wait-phone-new"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("desklink-queue-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn entry(device: &str, path: &Path, queued_at: u64) -> Waiting {
+        let meta = std::fs::metadata(path).unwrap();
+        Waiting {
+            device_id: device.into(),
+            phone: "Pixel".into(),
+            path: path.to_path_buf(),
+            size: meta.len(),
+            mtime_ns: mtime_ns(&meta),
+            queued_at,
+        }
+    }
+
+    /// G14: the queue is written to the state folder (owner only), comes
+    /// back whole, and a restart restores it for paired phones only.
+    #[test]
+    fn the_queue_survives_a_restart() {
+        let dir = scratch("round");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let state = dir.join("state").join("send-queue.json");
+        let files = vec![
+            entry("restart-phone", &file, 1_000),
+            entry("gone", &file, 1_000),
+        ];
+        save_queue(&state, &files);
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&state).unwrap().permissions().mode();
+            assert_eq!(mode & 0o077, 0, "owner only, was {mode:o}");
+        }
+        assert_eq!(load_queue(&state, 2_000), files, "round trip");
+
+        // A restart: only the phone still paired gets its files back.
+        restore_from(&state, 2_000, |id| id == "restart-phone");
+        assert_eq!(waiting_files("restart-phone"), vec![file.clone()]);
+        assert!(waiting_files("gone").is_empty());
+        // And it can be cancelled like any other.
+        clear_waiting("restart-phone");
+        assert!(waiting_files("restart-phone").is_empty());
+
+        // Emptied, the file goes.
+        save_queue(&state, &[]);
+        assert!(!state.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_waited_a_day_is_dropped_at_load_and_the_cap_holds() {
+        let dir = scratch("expiry");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let day = MAX_WAITING_AGE.as_secs();
+        let state = dir.join("send-queue.json");
+        save_queue(
+            &state,
+            &[
+                entry("p", &file, 10),
+                entry("p", &file, 11),
+                entry("p", &file, 10 + day),
+            ],
+        );
+        let kept = load_queue(&state, 10 + day);
+        assert_eq!(
+            kept.iter().map(|file| file.queued_at).collect::<Vec<_>>(),
+            vec![11, 10 + day],
+            "10 has waited a full day, 11 not yet"
+        );
+        let many: Vec<Waiting> = (0..250).map(|_| entry("p", &file, 100)).collect();
+        save_queue(&state, &many);
+        assert_eq!(load_queue(&state, 100).len(), MAX_WAITING_FILES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_queue_file_is_ignored_not_fatal() {
+        let dir = scratch("corrupt");
+        let state = dir.join("send-queue.json");
+        for bytes in [
+            &b"{\"version\":1,\"files\":[{\"device\":"[..],
+            b"",
+            b"\xff\xfe not json",
+            b"[]",
+        ] {
+            std::fs::write(&state, bytes).unwrap();
+            assert!(load_queue(&state, 1).is_empty());
+            restore_from(&state, 1, |_| true);
+        }
+        assert!(load_queue(&dir.join("missing.json"), 1).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// G14: at send time a file that is no longer the one chosen (changed,
+    /// replaced, gone) is dropped with a sentence naming it; the rest go.
+    #[test]
+    fn a_changed_file_is_dropped_with_a_message_at_send_time() {
+        let dir = scratch("changed");
+        let (same, grown, touched, gone) = (
+            dir.join("same.txt"),
+            dir.join("grown.txt"),
+            dir.join("touched.txt"),
+            dir.join("gone.txt"),
+        );
+        for file in [&same, &grown, &touched, &gone] {
+            std::fs::write(file, "x").unwrap();
+        }
+        let files: Vec<Waiting> = [&same, &grown, &touched, &gone]
+            .into_iter()
+            .map(|file| entry("p", file, 1))
+            .collect();
+        std::fs::write(&grown, "xy").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&touched)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        std::fs::remove_file(&gone).unwrap();
+        let (kept, messages) = split_changed(files);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].path, same);
+        assert_eq!(messages.len(), 3);
+        for name in ["grown.txt", "touched.txt", "gone.txt"] {
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.contains(name) && m.contains("not sent to Pixel")),
+                "{name}: {messages:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

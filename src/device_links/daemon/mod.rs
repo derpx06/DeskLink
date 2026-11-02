@@ -254,6 +254,12 @@ impl DaemonWorker {
                 }),
             );
         }
+        // Files that waited for a phone when DeskLink last ran.
+        if !cfg!(test) {
+            if let Ok(config) = config.lock() {
+                file_transfer::restore_waiting(|id| config.is_trusted(id));
+            }
+        }
         let tcp_listener = network::bind_tcp_listener()?;
         let tcp_port = tcp_listener
             .local_addr()
