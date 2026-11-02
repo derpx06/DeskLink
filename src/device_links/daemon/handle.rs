@@ -123,18 +123,19 @@ impl DaemonHandle {
         }
     }
 
-    /// A handle with no worker behind it, for tests of the windows: commands
-    /// go nowhere and nothing comes back.
+    /// A handle with no worker behind it, for tests of the windows: the
+    /// commands it is given are read from the receiver, nothing comes back.
     #[cfg(test)]
-    pub(crate) fn detached() -> Self {
-        let (command_tx, _commands) = mpsc::channel();
-        Self {
+    pub(crate) fn detached() -> (Self, mpsc::Receiver<DaemonCommand>) {
+        let (command_tx, commands) = mpsc::channel();
+        let handle = Self {
             _stop_guard: Arc::new(DaemonStopGuard(command_tx.clone())),
             command_tx,
             devices: Arc::default(),
             errors: Arc::default(),
             events: Arc::default(),
-        }
+        };
+        (handle, commands)
     }
 
     pub fn devices(&self) -> Vec<DeviceView> {

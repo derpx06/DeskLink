@@ -3383,6 +3383,37 @@ mod tests {
 
     use super::*;
 
+    /// The "This phone's identity changed" notice is a banner that stays
+    /// until the situation does, with one button, Details, which opens the
+    /// raw error to read or copy. (Skipped without a display.)
+    #[test]
+    fn the_identity_notice_is_a_banner_whose_details_button_shows_the_error() {
+        crate::test_display::run(|| {
+            let resources = crate::load_resources().expect("the bundled resources");
+            gio::resources_register(&resources);
+            let app = adw::Application::builder()
+                .application_id("derx06.desklink.com.test")
+                .build();
+            let window = DesklinkWindow::new(&app);
+            let (daemon, _commands) = DaemonHandle::detached();
+            window.set_daemon(daemon);
+            let raw = "Trusted device certificate changed";
+            window.report_error(raw, false);
+            let banner = &window.imp().error_banner;
+            assert!(banner.is_revealed(), "a lasting state is a banner");
+            assert!(banner.title().contains("identity changed"));
+            assert_eq!(banner.button_label().as_deref(), Some("Details"));
+            banner.emit_by_name::<()>("button-clicked", &[]);
+            let dialog = window
+                .visible_dialog()
+                .and_downcast::<adw::AlertDialog>()
+                .expect("Details opens the error");
+            assert_eq!(dialog.heading().as_deref(), Some("Error Details"));
+            assert!(dialog.body().contains("identity changed"));
+            dialog.close();
+        });
+    }
+
     #[test]
     fn resynced_notifications_never_pop_up() {
         assert!(pops_up(true, true, false));

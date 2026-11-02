@@ -1105,6 +1105,45 @@ mod tests {
         );
     }
 
+    /// A paused row (the link dropped mid-file) still has its Cancel button:
+    /// one click sends one `CancelTransfer` and the button then rests.
+    /// (Skipped without a display.)
+    #[test]
+    fn a_paused_rows_cancel_button_asks_the_daemon_once() {
+        crate::test_display::run(|| {
+            use crate::device_links::daemon::DaemonCommand;
+            let (daemon, commands) = DaemonHandle::detached();
+            let mut paused = row(true, 1_000, 4_000);
+            paused.paused = true;
+            let shown = new_row(&daemon, &paused);
+            fn find(widget: &gtk::Widget) -> Option<gtk::Button> {
+                if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                    if button.tooltip_text().as_deref() == Some("Cancel this transfer") {
+                        return Some(button.clone());
+                    }
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    if let Some(found) = find(&next) {
+                        return Some(found);
+                    }
+                    child = next.next_sibling();
+                }
+                None
+            }
+            let cancel = find(shown.row.upcast_ref()).expect("a paused row can be cancelled");
+            assert!(cancel.is_sensitive());
+            cancel.emit_clicked();
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(DaemonCommand::CancelTransfer(device, id)) if device == "phone" && id == "t"
+            ));
+            assert!(!cancel.is_sensitive(), "once is enough");
+            cancel.emit_clicked();
+            assert!(commands.try_recv().is_err(), "no second request");
+        });
+    }
+
     #[test]
     fn a_file_being_copied_has_no_size_to_measure() {
         let mut copying = row(false, 0, 0);

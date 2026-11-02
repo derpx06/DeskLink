@@ -2325,6 +2325,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// "Replace with <phone>'s Anyway" is on a conflict's menu only after
+    /// "Keep the phone's" was refused for want of a trash; the three plain
+    /// choices are always there. (Skipped without a display.)
+    #[test]
+    fn replace_anyway_is_offered_only_after_a_trash_refusal() {
+        crate::test_display::run(|| {
+            use crate::device_links::folders::{Conflict, Pair, PairView, Phase, Side};
+            let view = PairView {
+                pair: Pair {
+                    id: BUCKET_ID.into(),
+                    name: "DeskLink Bucket".into(),
+                    root: std::env::temp_dir(),
+                    device: "gate-phone".into(),
+                    include_hidden: false,
+                    ignore: Vec::new(),
+                    bucket: true,
+                },
+                phase: Phase::UpToDate,
+                files: 1,
+                last_sync: None,
+                conflicts: vec![Conflict {
+                    path: "c.txt".into(),
+                    copy: "c (conflicted copy).txt".into(),
+                    at: 0,
+                }],
+                items: Vec::new(),
+                bytes: 0,
+                skipped: Vec::new(),
+            };
+            let item = Item {
+                dir: false,
+                path: "c.txt".into(),
+                size: 1,
+                mtime: 0,
+                from: Side::Desk,
+                state: ItemState::Conflict,
+            };
+            let info = crate::device_links::device_info::DeviceInfo::local(
+                "gate-phone".into(),
+                "Pixel".into(),
+            );
+            let device = DeviceView::from_info(&info, "192.168.1.9".into(), true);
+            let labels = || -> Vec<String> {
+                let button = item_menu(&item, Path::new("/tmp/c.txt"), &device, &view);
+                let popover = button.popover().and_downcast::<gtk::Popover>().unwrap();
+                let menu = popover.child().unwrap();
+                let mut labels = Vec::new();
+                let mut child = menu.first_child();
+                while let Some(next) = child {
+                    if let Some(button) = next.downcast_ref::<gtk::Button>() {
+                        labels.extend(button.label().map(|label| label.to_string()));
+                    }
+                    child = next.next_sibling();
+                }
+                labels
+            };
+            let before = labels();
+            for choice in ["Keep Both", "Keep This Computer's", "Keep Pixel's"] {
+                assert!(before.iter().any(|label| label == choice), "{before:?}");
+            }
+            assert!(
+                before.iter().all(|label| !label.contains("Anyway")),
+                "not before a refusal: {before:?}"
+            );
+            folders::mark_trash_refused("gate-phone", "c.txt");
+            assert!(
+                labels()
+                    .iter()
+                    .any(|label| label == "Replace with Pixel's Anyway"),
+                "offered after the refusal"
+            );
+        });
+    }
+
     /// The page's menus are freed with the page: a rebuilt Bucket page used
     /// to leave every "more" popover alive (its items held it strongly).
     /// With a display; skipped without.

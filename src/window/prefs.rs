@@ -1567,13 +1567,8 @@ mod tests {
                 gliding: None,
                 problem: None,
             };
-            let groups = groups(
-                &DaemonHandle::detached(),
-                &AppSettings::default(),
-                &device,
-                &status,
-                false,
-            );
+            let (daemon, _commands) = DaemonHandle::detached();
+            let groups = groups(&daemon, &AppSettings::default(), &device, &status, false);
             let table: [(&str, &[&str]); 10] = [
                 (
                     "Connection",
@@ -1623,7 +1618,12 @@ mod tests {
                 ),
                 (
                     "Appearance",
-                    &["Style", "Phone in the top bar", "Tray icon", "GNOME extension"],
+                    &[
+                        "Style",
+                        "Phone in the top bar",
+                        "Tray icon",
+                        "GNOME extension",
+                    ],
                 ),
                 (
                     "Advanced",

@@ -1318,6 +1318,20 @@ mod primary_only_tests {
         );
         assert!(!constructed.contains("start_server"));
         assert!(source.contains("fn start_primary"));
+        // And the only caller of `start_primary` is `startup`, which GApplication
+        // runs in the primary instance only.
+        let startup = source
+            .find("fn startup(&self) {\n            self.parent_startup();")
+            .unwrap();
+        let calls: Vec<usize> = source
+            .match_indices(concat!("self.start_primary", "()"))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(calls.len(), 1, "one call");
+        assert!(
+            calls[0] > startup && calls[0] < startup + 200,
+            "made from `startup`"
+        );
     }
 }
 

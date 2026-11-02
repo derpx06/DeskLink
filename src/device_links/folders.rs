@@ -781,6 +781,15 @@ pub(crate) fn replace_anyway_offered(device: &str, path: &str) -> bool {
         .is_ok_and(|set| set.contains(&(device.to_string(), path.to_string())))
 }
 
+/// Tests of the Bucket page: as if "Keep the phone's" had been refused for
+/// want of a trash.
+#[cfg(test)]
+pub(crate) fn mark_trash_refused(device: &str, path: &str) {
+    if let Ok(mut set) = refused_trash().lock() {
+        set.insert((device.to_string(), path.to_string()));
+    }
+}
+
 /// How a conflict is resolved (P6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Resolve {
