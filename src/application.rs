@@ -590,24 +590,23 @@ impl DesklinkApplication {
     /// Walk-away lock: the look at every phone, and what it asks for (a
     /// warning with Cancel, then the lock). See `walk_away`.
     fn walk_away_step(&self, devices: &[crate::device_links::device::DeviceView]) {
-        use crate::device_links::device::DeviceStatus;
-        use crate::device_links::walk_away::{observe, Seen, Step};
+        use crate::device_links::walk_away::{network_is_up, observe, Seen, Step};
         let settings = crate::device_links::config::app_settings();
         for device in devices.iter().filter(|device| device.trusted) {
-            let seen = Seen {
-                enabled: settings.locks_when_away(&device.id),
-                reachable: matches!(device.status, DeviceStatus::Paired),
-                ready: device.feature_transport_ready,
-                dozing: crate::device_links::webrtc::coordinator::is_dozing(&device.id),
-            };
+            let seen = Seen::of(
+                device,
+                settings.locks_when_away(&device.id),
+                crate::device_links::webrtc::coordinator::is_dozing(&device.id),
+                network_is_up(gio::NetworkMonitor::default().connectivity()),
+            );
             let id = format!("walk-away-{}", device.id);
             match observe(&device.id, seen) {
                 Some(Step::Warn) => {
                     let notification =
                         gio::Notification::new("Locking this computer in 10 seconds");
                     notification.set_body(Some(&format!(
-                        "{} has been out of reach for a minute. Cancel to stay unlocked.",
-                        device.name
+                        "{} has been out of reach. Cancel to stay unlocked.",
+                        glib::markup_escape_text(&device.name)
                     )));
                     notification.set_priority(gio::NotificationPriority::Urgent);
                     notification.add_button_with_target_value(

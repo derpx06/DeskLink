@@ -4,14 +4,25 @@
 //!
 //! Only a phone that was feature-ready can walk away, and only when *nothing*
 //! reaches it any more (the kernel's keepalive has given the link up). It is
-//! never judged by silence, so: a phone that says it is dozing is never
-//! counted (its Wi-Fi may sleep with it); a network change or the computer
-//! waking starts the count again ([`reset`]); and any sign of the phone (a
-//! link back, authenticated) ends the absence. A beacon is not a sign here:
-//! anyone on the network can send one, and ending the count is what keeps the
-//! computer unlocked. Ten seconds before the lock a notification says so and
-//! offers Cancel. The computer is only ever locked, never unlocked, and once
-//! per absence.
+//! never judged by silence. Every choice here errs towards *not* locking:
+//!
+//! - A phone that reported `dozing` (screen off: the usual way a phone leaves
+//!   in a pocket) is counted too, but for [`DOZING_LOCK_AFTER`] instead of a
+//!   minute: its link is only given up after the 90 s a dozing phone is
+//!   allowed on the LAN link, so a dead link is already positive evidence, and
+//!   the longer count covers a phone whose Wi-Fi sleeps at the desk.
+//! - A link through the relay is a link: leaving the LAN with the relay on
+//!   does not lock (the phone is still in touch). Only a phone nothing reaches
+//!   is away.
+//! - While this computer's own network is down, or has just changed, or the
+//!   computer has just woken, nothing is counted ([`reset`]).
+//! - Any sign of the phone (an authenticated link back) ends the absence. A
+//!   beacon is not a sign here: anyone on the network can send one, and ending
+//!   the count is what keeps the computer unlocked.
+//!
+//! Ten seconds before the lock a notification says so and offers Cancel. The
+//! computer is only ever locked, never unlocked, and once per absence. With
+//! two phones switched on, either one walking away locks it.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -23,6 +34,9 @@ pub(crate) const WARN_AFTER: Duration = Duration::from_secs(50);
 pub(crate) const WARN_FOR: Duration = Duration::from_secs(10);
 /// Out of reach this long (and warned for [`WARN_FOR`]), the computer locks.
 pub(crate) const LOCK_AFTER: Duration = Duration::from_secs(60);
+/// The same for a phone whose last heartbeat said it was dozing.
+pub(crate) const DOZING_WARN_AFTER: Duration = Duration::from_secs(170);
+pub(crate) const DOZING_LOCK_AFTER: Duration = Duration::from_secs(180);
 
 /// What is known of one phone right now.
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +49,37 @@ pub(crate) struct Seen {
     pub(crate) ready: bool,
     /// Its last heartbeat said it is dozing (screen off, frozen).
     pub(crate) dozing: bool,
+    /// This computer has a network of its own right now. Without one nothing
+    /// says the phone left.
+    pub(crate) network_up: bool,
+}
+
+impl Seen {
+    /// What the daemon's view of a phone says, with the person's setting, the
+    /// phone's last doze report and this computer's network. Any link counts
+    /// as reachable (the relay too).
+    pub(crate) fn of(
+        device: &crate::device_links::device::DeviceView,
+        enabled: bool,
+        dozing: bool,
+        network_up: bool,
+    ) -> Seen {
+        Seen {
+            enabled,
+            reachable: matches!(
+                device.status,
+                crate::device_links::device::DeviceStatus::Paired
+            ),
+            ready: device.feature_transport_ready,
+            dozing,
+            network_up,
+        }
+    }
+}
+
+/// Whether the network monitor's answer is a network: `Local` is none.
+pub(crate) fn network_is_up(connectivity: gtk::gio::NetworkConnectivity) -> bool {
+    connectivity != gtk::gio::NetworkConnectivity::Local
 }
 
 /// What to do now about one phone.
@@ -87,22 +132,27 @@ impl Watch {
         if !phone.armed || phone.done {
             return None;
         }
-        if seen.dozing {
-            // Not counted, however long: it may be asleep in the next room.
+        if !seen.network_up {
+            // Our own network is gone: the phone did not leave, we did.
             let step = clears(phone);
             phone.away_since = None;
             phone.warned_at = None;
             return step;
         }
+        let (warn_after, lock_after) = if seen.dozing {
+            (DOZING_WARN_AFTER, DOZING_LOCK_AFTER)
+        } else {
+            (WARN_AFTER, LOCK_AFTER)
+        };
         let since = *phone.away_since.get_or_insert(now);
         let away = now.saturating_duration_since(since);
         match phone.warned_at {
-            None if away >= WARN_AFTER => {
+            None if away >= warn_after => {
                 phone.warned_at = Some(now);
                 Some(Step::Warn)
             }
             Some(warned)
-                if away >= LOCK_AFTER && now.saturating_duration_since(warned) >= WARN_FOR =>
+                if away >= lock_after && now.saturating_duration_since(warned) >= WARN_FOR =>
             {
                 phone.warned_at = None;
                 phone.done = true;
@@ -115,12 +165,13 @@ impl Watch {
     /// The person chose Cancel: no lock for this absence. `true` when a
     /// warning was showing.
     pub(crate) fn cancel(&mut self, id: &str) -> bool {
-        let Some(phone) = self.phones.get_mut(id) else {
+        // A Cancel with no warning up (a stale click) changes nothing.
+        let Some(phone) = self.phones.get_mut(id).filter(|p| p.warned_at.is_some()) else {
             return false;
         };
-        let warned = phone.warned_at.take().is_some();
+        phone.warned_at = None;
         phone.done = true;
-        warned
+        true
     }
 
     /// A network change, or the computer woke: every count starts again,
@@ -174,12 +225,14 @@ mod tests {
         reachable: false,
         ready: false,
         dozing: false,
+        network_up: true,
     };
     const HERE: Seen = Seen {
         enabled: true,
         reachable: true,
         ready: true,
         dozing: false,
+        network_up: true,
     };
 
     /// A fake clock: seconds after a fixed start.
@@ -225,19 +278,102 @@ mod tests {
         assert_eq!(watch.observe("p", AWAY, clock.at(110)), Some(Step::Lock));
     }
 
+    /// F1: a phone that went dozing in a pocket and left is counted, for three
+    /// minutes instead of one (its link was already given up after the dozing
+    /// allowance); a dozing phone whose link is still up never counts.
     #[test]
-    fn a_dozing_phone_never_locks() {
+    fn a_dozing_phone_that_left_locks_after_three_minutes() {
         let (mut watch, clock) = (Watch::default(), clock());
         run(&mut watch, &clock, HERE, 0, 0);
         let dozing = Seen {
             dozing: true,
             ..AWAY
         };
-        assert_eq!(run(&mut watch, &clock, dozing, 1, 600), []);
-        // Awake and still gone: counted from when it stopped dozing.
+        assert_eq!(
+            run(&mut watch, &clock, dozing, 1, 400),
+            [(171, Step::Warn), (181, Step::Lock)]
+        );
+        // Still linked and dozing (it answers the LAN heartbeat): never.
+        let (mut watch, clock) = (Watch::default(), Clock(Instant::now()));
+        let linked = Seen {
+            dozing: true,
+            ..HERE
+        };
+        assert_eq!(run(&mut watch, &clock, linked, 0, 1000), []);
+    }
+
+    /// Waking ends a doze: the count goes on with the ordinary minute from
+    /// when it began.
+    #[test]
+    fn a_phone_that_stops_dozing_while_gone_is_counted_as_awake() {
+        let (mut watch, clock) = (Watch::default(), clock());
+        run(&mut watch, &clock, HERE, 0, 0);
+        let dozing = Seen {
+            dozing: true,
+            ..AWAY
+        };
+        assert_eq!(run(&mut watch, &clock, dozing, 1, 100), []);
+        // At 101 it reports awake (it is back on a network somewhere, but not
+        // reachable): 100 s already elapsed, so the minute is long over.
+        assert_eq!(watch.observe("p", AWAY, clock.at(101)), Some(Step::Warn));
+        assert_eq!(watch.observe("p", AWAY, clock.at(111)), Some(Step::Lock));
+    }
+
+    /// F3: this computer's own network being down is not the phone leaving;
+    /// nothing is counted, and the count starts fresh when it is back.
+    #[test]
+    fn nothing_is_counted_while_this_computers_network_is_down() {
+        let (mut watch, clock) = (Watch::default(), clock());
+        run(&mut watch, &clock, HERE, 0, 0);
+        let down = Seen {
+            network_up: false,
+            ..AWAY
+        };
+        assert_eq!(run(&mut watch, &clock, down, 1, 600), []);
+        // Back: a fresh minute from the first look with the network up.
         assert_eq!(
             run(&mut watch, &clock, AWAY, 601, 700),
             [(651, Step::Warn), (661, Step::Lock)]
+        );
+        // A warning up when the network goes comes down.
+        let (mut watch, clock) = (Watch::default(), Clock(Instant::now()));
+        run(&mut watch, &clock, HERE, 0, 0);
+        assert_eq!(run(&mut watch, &clock, AWAY, 1, 55), [(51, Step::Warn)]);
+        assert_eq!(
+            watch.observe("p", down, clock.at(56)),
+            Some(Step::ClearWarning)
+        );
+    }
+
+    /// F2: a link through the relay is still a link; leaving the LAN with the
+    /// relay on is not walking away.
+    #[test]
+    fn a_relay_link_is_a_link() {
+        use crate::device_links::device::{DeviceStatus, DeviceView};
+        let info = crate::device_links::device_info::DeviceInfo::local("p".into(), "Pixel".into());
+        let mut device = DeviceView::from_info(&info, "10.0.0.2".into(), true);
+        device.status = DeviceStatus::Paired;
+        device.feature_transport_ready = true;
+        device.connection_path = Some("relay".into());
+        let seen = Seen::of(&device, true, false, true);
+        assert!(seen.reachable && seen.ready);
+        device.status = DeviceStatus::Unreachable;
+        device.feature_transport_ready = false;
+        assert!(!Seen::of(&device, true, false, true).reachable);
+        assert!(network_is_up(gtk::gio::NetworkConnectivity::Full));
+        assert!(network_is_up(gtk::gio::NetworkConnectivity::Limited));
+        assert!(!network_is_up(gtk::gio::NetworkConnectivity::Local));
+    }
+
+    /// A stale Cancel click (no warning up) does not end the next absence.
+    #[test]
+    fn a_cancel_with_no_warning_up_changes_nothing() {
+        let (mut watch, clock) = (Watch::default(), clock());
+        run(&mut watch, &clock, HERE, 0, 0);
+        assert!(!watch.cancel("p"));
+        assert_eq!(
+            run(&mut watch, &clock, AWAY, 1, 80),
+            [(51, Step::Warn), (61, Step::Lock)]
         );
     }
 

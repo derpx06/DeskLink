@@ -549,8 +549,9 @@ fn walk_away_row(
 ) -> adw::SwitchRow {
     let phone = &device.name;
     let explained = format!(
-        "Locks this computer if {phone} is out of reach for a minute, after a ten second \
-         warning you can cancel. Never while the phone is asleep, and it never unlocks."
+        "Locks this computer if nothing reaches {phone} for a minute (three if its screen \
+         was off), after a ten second warning you can cancel. Not while this computer has no \
+         network, and it never unlocks."
     );
     let row = adw::SwitchRow::builder()
         .title(format!("Lock when I walk away with {phone}"))
