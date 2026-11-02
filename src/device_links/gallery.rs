@@ -491,7 +491,6 @@ mod tests {
             .map(|i| i.name)
             .collect();
         assert_eq!(names.len(), 3);
-        let names = names;
         assert_eq!(names[2], "a b.png", "a path in the name is only a name");
         // The type is the file's own: a ".html" name on a PNG is kept as .png,
         // and a file that is not a picture is not kept at all.

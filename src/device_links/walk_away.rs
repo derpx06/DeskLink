@@ -347,7 +347,7 @@ mod tests {
             ..AWAY
         };
         let mut busy = || false;
-        let mut at = |watch: &mut Watch, second, idle: &mut dyn FnMut() -> bool| {
+        let at = |watch: &mut Watch, second, idle: &mut dyn FnMut() -> bool| {
             watch.observe_when_idle("p", dozing, clock.at(second), idle)
         };
         // Typing the whole time: not even a warning.
