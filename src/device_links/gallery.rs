@@ -42,9 +42,10 @@ pub(crate) struct Ledger {
 }
 
 impl Ledger {
-    /// Whether `device`'s offer of `bytes` of `mime` is accepted at `now`
-    /// (seconds); if so it is counted.
-    pub(crate) fn admit(
+    /// Whether `device`'s offer of `bytes` of `mime` would be accepted at
+    /// `now` (seconds). Nothing is counted: a busy refusal or a re-offer of a
+    /// transfer already open costs the phone nothing ([`Self::commit`] does).
+    pub(crate) fn check(
         &mut self,
         accepts: bool,
         device: &str,
@@ -69,8 +70,20 @@ impl Ledger {
         if hour.len() >= HOURLY_FILES || used + bytes > HOURLY_BYTES {
             return Err(LIMIT);
         }
-        hour.push_back((now, bytes));
         Ok(())
+    }
+
+    /// A new transfer was accepted: it counts against the hour.
+    pub(crate) fn commit(&mut self, device: &str, bytes: u64, now: u64) {
+        self.sent
+            .entry(device.to_string())
+            .or_default()
+            .push_back((now, bytes));
+    }
+
+    #[cfg(test)]
+    fn charged(&self, device: &str) -> usize {
+        self.sent.get(device).map_or(0, VecDeque::len)
     }
 }
 
@@ -83,7 +96,8 @@ pub(crate) fn unix_now() -> u64 {
 }
 
 /// The transfer manager asks before it accepts an offer flagged `gallery`.
-pub(crate) fn admit_offer(
+/// Nothing is counted until [`commit_offer`].
+pub(crate) fn check_offer(
     settings: &AppSettings,
     device: &str,
     mime: Option<&str>,
@@ -92,13 +106,32 @@ pub(crate) fn admit_offer(
     let Ok(mut ledger) = LEDGER.lock() else {
         return Err(LIMIT);
     };
-    ledger.get_or_insert_with(Ledger::default).admit(
+    ledger.get_or_insert_with(Ledger::default).check(
         settings.accepts_gallery_from(device),
         device,
         mime,
         bytes,
         unix_now(),
     )
+}
+
+/// A gallery transfer of `bytes` was accepted (new, not a re-offer).
+pub(crate) fn commit_offer(device: &str, bytes: u64) {
+    if let Ok(mut ledger) = LEDGER.lock() {
+        ledger
+            .get_or_insert_with(Ledger::default)
+            .commit(device, bytes, unix_now());
+    }
+}
+
+/// Tests: how many accepted transfers `device` has been charged for.
+#[cfg(test)]
+pub(crate) fn charged(device: &str) -> usize {
+    LEDGER
+        .lock()
+        .ok()
+        .and_then(|ledger| ledger.as_ref().map(|l| l.charged(device)))
+        .unwrap_or(0)
 }
 
 /// Bumped on every change: the Files page redraws its strip when it moves.
@@ -135,17 +168,49 @@ pub(crate) struct Item {
     pub(crate) arrived: u64,
 }
 
-fn safe(text: &str, max: usize) -> String {
-    text.chars()
-        .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | ':') {
-                '_'
-            } else {
-                c
-            }
-        })
-        .take(max)
-        .collect()
+/// `text` with control characters and path separators replaced, cut to at
+/// most `max_bytes` bytes on a character boundary (a file name is bytes).
+fn safe(text: &str, max_bytes: usize) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        let c = if c.is_control() || matches!(c, '/' | '\\' | ':') {
+            '_'
+        } else {
+            c
+        };
+        if out.len() + c.len_utf8() > max_bytes {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The extension of the image type `path` really is, from its first bytes:
+/// whatever name or type the sender gave, a file that is not one of these is
+/// not kept.
+pub(crate) fn sniff(path: &Path) -> Option<&'static str> {
+    use std::io::Read;
+    let mut head = [0u8; 32];
+    let n = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+    let head = &head[..n];
+    if head.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("jpg")
+    } else if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if head.starts_with(b"GIF87a") || head.starts_with(b"GIF89a") {
+        Some("gif")
+    } else if head.len() >= 12 && &head[..4] == b"RIFF" && &head[8..12] == b"WEBP" {
+        Some("webp")
+    } else if head.len() >= 12 && &head[4..8] == b"ftyp" {
+        match &head[8..12] {
+            b"heic" | b"heix" | b"hevc" | b"hevx" => Some("heic"),
+            b"mif1" | b"msf1" | b"heif" => Some("heif"),
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 fn device_dir(root: &Path, device: &str) -> PathBuf {
@@ -215,12 +280,20 @@ pub(crate) fn store_in(
         .mode(0o700)
         .create(&dir)
         .map_err(|error| format!("Could not make the photos folder: {error}"))?;
-    let name = safe(filename.rsplit('/').next().unwrap_or(filename), 120);
-    let mut target = dir.join(format!("{now}-{name}"));
+    // Kept under the type it really is, never the extension the sender chose
+    // (Open and Save would otherwise carry a peer's ".html" or ".desktop").
+    let ext = sniff(part).ok_or_else(|| "That file is not a picture".to_string())?;
+    let base = filename.rsplit('/').next().unwrap_or(filename);
+    let stem = base.rsplit_once('.').map_or(base, |(stem, _)| stem);
+    let mut stem = safe(stem, 100);
+    if stem.is_empty() {
+        stem = "image".to_string();
+    }
+    let mut target = dir.join(format!("{now}-{stem}.{ext}"));
     let mut n = 1;
     while target.exists() {
         n += 1;
-        target = dir.join(format!("{now}-{n}-{name}"));
+        target = dir.join(format!("{now}-{n}-{stem}.{ext}"));
     }
     if std::fs::rename(part, &target).is_err() {
         std::fs::copy(part, &target)
@@ -272,7 +345,14 @@ pub(crate) fn trim() {
 
 /// "Remove": one kept image goes. Only a file under the gallery folder.
 pub(crate) fn remove_in(root: &Path, path: &Path) -> bool {
-    let inside = path.parent().and_then(Path::parent) == Some(root);
+    use std::path::Component;
+    // Strictly `root/<phone>/<file>`, by components: no `..`, no `.`, nothing
+    // that only looks like it from outside.
+    let inside = path.parent().and_then(Path::parent) == Some(root)
+        && path.starts_with(root)
+        && path
+            .components()
+            .all(|c| !matches!(c, Component::ParentDir | Component::CurDir));
     if inside && std::fs::remove_file(path).is_ok() {
         GENERATION.fetch_add(1, Ordering::Relaxed);
         return true;
@@ -333,9 +413,12 @@ mod tests {
         dir
     }
 
+    /// A file that starts like a PNG, `size` bytes long.
     fn file(dir: &Path, name: &str, size: usize) -> PathBuf {
         let path = dir.join(name);
-        std::fs::write(&path, vec![7u8; size]).unwrap();
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.resize(size.max(8), 7);
+        std::fs::write(&path, bytes).unwrap();
         path
     }
 
@@ -343,7 +426,7 @@ mod tests {
     fn an_offer_needs_the_switch_an_image_type_and_a_size() {
         let mut ledger = Ledger::default();
         let ok =
-            |ledger: &mut Ledger, on, mime, bytes, now| ledger.admit(on, "p", mime, bytes, now);
+            |ledger: &mut Ledger, on, mime, bytes, now| ledger.check(on, "p", mime, bytes, now);
         assert_eq!(ok(&mut ledger, false, Some("image/png"), 10, 0), Err(OFF));
         assert_eq!(
             ok(&mut ledger, true, Some("application/pdf"), 10, 0),
@@ -358,45 +441,38 @@ mod tests {
         assert_eq!(ok(&mut ledger, true, Some("image/heic"), 10, 0), Ok(()));
     }
 
-    /// 20 files or 200 MB an hour per phone, on a rolling hour (fake clock).
+    /// 20 files or 200 MB an hour per phone, on a rolling hour (fake clock);
+    /// only accepted transfers are charged, so a busy refusal and its re-offers
+    /// cost nothing.
     #[test]
     fn a_phone_may_send_twenty_files_or_two_hundred_megabytes_an_hour() {
         let mut ledger = Ledger::default();
-        for n in 0..HOURLY_FILES as u64 {
-            assert_eq!(ledger.admit(true, "p", Some("image/png"), 1000, n), Ok(()));
+        let png = Some("image/png");
+        // A busy engine: the phone offers again and again; nothing is charged.
+        for n in 0..60 {
+            assert_eq!(ledger.check(true, "p", png, 1000, n), Ok(()));
         }
-        assert_eq!(
-            ledger.admit(true, "p", Some("image/png"), 1000, 100),
-            Err(LIMIT)
-        );
+        assert_eq!(ledger.charged("p"), 0);
+        for n in 0..HOURLY_FILES as u64 {
+            assert_eq!(ledger.check(true, "p", png, 1000, n), Ok(()));
+            ledger.commit("p", 1000, n);
+        }
+        assert_eq!(ledger.check(true, "p", png, 1000, 100), Err(LIMIT));
         // Another phone has its own count.
-        assert_eq!(
-            ledger.admit(true, "q", Some("image/png"), 1000, 100),
-            Ok(())
-        );
+        assert_eq!(ledger.check(true, "q", png, 1000, 100), Ok(()));
         // The first leaves the hour: room for one.
-        assert_eq!(
-            ledger.admit(true, "p", Some("image/png"), 1000, 3600),
-            Ok(())
-        );
-        assert_eq!(
-            ledger.admit(true, "p", Some("image/png"), 1000, 3600),
-            Err(LIMIT)
-        );
+        assert_eq!(ledger.check(true, "p", png, 1000, 3600), Ok(()));
+        ledger.commit("p", 1000, 3600);
+        assert_eq!(ledger.check(true, "p", png, 1000, 3600), Err(LIMIT));
         // Bytes: four of 50 MB fit, the fifth does not.
         let mut big = Ledger::default();
         for n in 0..4 {
-            assert_eq!(
-                big.admit(true, "p", Some("image/png"), MAX_FILE_BYTES, n),
-                Ok(())
-            );
+            assert_eq!(big.check(true, "p", png, MAX_FILE_BYTES, n), Ok(()));
+            big.commit("p", MAX_FILE_BYTES, n);
         }
+        assert_eq!(big.check(true, "p", png, MAX_FILE_BYTES, 5), Err(LIMIT));
         assert_eq!(
-            big.admit(true, "p", Some("image/png"), MAX_FILE_BYTES, 5),
-            Err(LIMIT)
-        );
-        assert_eq!(
-            big.admit(true, "p", Some("image/png"), 1, 4000),
+            big.check(true, "p", png, 1, 4000),
             Ok(()),
             "the hour passed"
         );
@@ -415,7 +491,26 @@ mod tests {
             .map(|i| i.name)
             .collect();
         assert_eq!(names.len(), 3);
+        let names = names;
         assert_eq!(names[2], "a b.png", "a path in the name is only a name");
+        // The type is the file's own: a ".html" name on a PNG is kept as .png,
+        // and a file that is not a picture is not kept at all.
+        let named = store_in(&root, "ph/one", "evil.html", &file(&src, "p4", 9), 3000).unwrap();
+        assert_eq!(named.extension().unwrap(), "png");
+        let text = src.join("text");
+        std::fs::write(&text, b"<script>alert(1)</script>").unwrap();
+        assert!(store_in(&root, "ph/one", "x.png", &text, 3001).is_err());
+        // A long name of wide characters is cut by bytes, so it can be written.
+        let wide = "\u{1F4F7}".repeat(100);
+        let kept = store_in(
+            &root,
+            "ph/one",
+            &format!("{wide}.png"),
+            &file(&src, "p5", 9),
+            3002,
+        )
+        .unwrap();
+        assert!(kept.file_name().unwrap().len() <= 255);
         assert!(a.starts_with(&root) && !a.to_string_lossy().contains(".."));
         assert_eq!(
             std::fs::metadata(&a).unwrap().permissions().mode() & 0o077,

@@ -75,9 +75,30 @@ pub(crate) fn decode(
     loader.pixbuf()
 }
 
+/// Tests: the bytes of a PNG whose header claims 60,000 x 60,000.
+#[cfg(test)]
+pub(crate) fn test_bomb_png() -> Vec<u8> {
+    tests::bomb_png()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    pub(super) fn bomb_png() -> Vec<u8> {
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        let mut header = Vec::new();
+        header.extend_from_slice(&60_000u32.to_be_bytes());
+        header.extend_from_slice(&60_000u32.to_be_bytes());
+        header.extend_from_slice(&[8, 6, 0, 0, 0]);
+        png.extend_from_slice(&header);
+        let mut crc_input = b"IHDR".to_vec();
+        crc_input.extend_from_slice(&header);
+        png.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+        png
+    }
 
     #[test]
     fn a_picture_past_the_bounds_is_refused() {

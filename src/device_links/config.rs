@@ -942,6 +942,8 @@ impl Config {
             crate::device_links::session_lock::forget_unlock(&info.id);
             // Files chosen for the old identity are not for the new one.
             crate::device_links::daemon::file_transfer::forget_waiting(&info.id);
+            // Nor are the photos and the count of the old one.
+            crate::device_links::gallery::forget(&info.id);
             // What the old identity said it already held is not what a new
             // one has: its snapshots are sent again.
             crate::device_links::sync::forget_device(&info.id);

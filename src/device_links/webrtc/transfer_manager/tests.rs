@@ -868,7 +868,7 @@ fn block_frames(id: &str, pass: u8, file: &[u8], index: u64, damaged: bool) -> V
 }
 
 thread_local! {
-    static TEST_IDS: [&'static str; 3] = std::array::from_fn(|_| {
+    static TEST_IDS: [&'static str; 4] = std::array::from_fn(|_| {
         &*Box::leak(uuid::Uuid::new_v4().hyphenated().to_string().into_boxed_str())
     });
 }
@@ -1763,8 +1763,20 @@ fn a_gallery_image_is_refused_unless_turned_on_and_is_kept_in_the_gallery() {
         Some(gallery::TYPE)
     );
     // On and an image: accepted, whole, kept in the gallery.
+    let before = gallery::charged("alpha");
     hand.send(gallery_offer(id(3), "image/jpeg"));
     eventually("the accept", || hand.reply(FileAction::Accept));
+    assert_eq!(
+        gallery::charged("alpha"),
+        before + 1,
+        "charged once accepted"
+    );
+    // The phone offers it again (a cut link): answered, not charged again.
+    hand.send(gallery_offer(id(3), "image/jpeg"));
+    eventually("the second accept", || {
+        (hand.link.sent(FileAction::Accept).len() == 2).then_some(())
+    });
+    assert_eq!(gallery::charged("alpha"), before + 1, "a re-offer is free");
     hand.manager
         .on_frame(frame_of(id(3), 0, 0, &data, data.len() as u64));
     let mut message =
@@ -1791,6 +1803,29 @@ fn a_gallery_image_is_refused_unless_turned_on_and_is_kept_in_the_gallery() {
                 .iter()
                 .any(|n| n.ends_with(".jpg"))
     );
+    // Turned off while a second one is on its way, or not a picture at all:
+    // not kept, and the sender is told.
+    let junk = b"<html>not a picture</html>".to_vec();
+    hand.send({
+        let mut offer = hand.offer(id(4), "x.png", junk.len() as u64);
+        offer.gallery = Some(true);
+        offer.mime_type = Some("image/png".into());
+        offer
+    });
+    eventually("the third accept", || {
+        (hand.link.sent(FileAction::Accept).len() == 3).then_some(())
+    });
+    hand.manager
+        .on_frame(frame_of(id(4), 0, 0, &junk, junk.len() as u64));
+    let mut done = FileControl::new(&wire_of("alpha", "beta"), FileAction::Done, id(4), "token0");
+    done.file_hash = Some(hex(&hash_of_hashes(&[openssl::sha::sha256(&junk)])));
+    done.blocks = Some(1);
+    done.total_size = Some(junk.len() as u64);
+    hand.send(done);
+    eventually("the refusal to keep it", || {
+        (!hand.link.sent(FileAction::Error).is_empty()).then_some(())
+    });
+    assert_eq!(gallery::list("alpha").len(), 1, "the junk was not kept");
     crate::device_links::config::set_gallery_for_tests("alpha", false);
     gallery::forget("alpha");
     assert!(gallery::list("alpha").is_empty());

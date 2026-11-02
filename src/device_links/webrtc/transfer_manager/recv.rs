@@ -398,7 +398,7 @@ impl Engine {
         // the door unless the person turned it on for this phone, and held to
         // an image type, a size and an hourly count.
         if message.gallery == Some(true) {
-            if let Err(why) = crate::device_links::gallery::admit_offer(
+            if let Err(why) = crate::device_links::gallery::check_offer(
                 &crate::device_links::config::app_settings(),
                 &net.wire.peer_device_id,
                 message.mime_type.as_deref(),
@@ -485,6 +485,8 @@ impl Engine {
             return refuse(code::BUSY, None);
         }
         let now = Instant::now();
+        // A transfer held from before (a restart, a cut link) is not new.
+        let resumed = matches!(self.store.load_receive(&id), Ok(Some(_)));
         let incoming = match self.begin_incoming(net, &message, filename, total, folder, now) {
             Ok(incoming) => incoming,
             Err(error) => {
@@ -501,6 +503,11 @@ impl Engine {
                 return refuse(code::INTERNAL, Some(&error));
             }
         };
+        // Only a transfer that is really begun counts against the hour (a
+        // busy refusal and a re-offer of an open transfer returned above).
+        if message.gallery == Some(true) && !resumed {
+            crate::device_links::gallery::commit_offer(&net.wire.peer_device_id, total);
+        }
         self.incoming.insert(key, incoming);
         if let Some(incoming) = self.incoming.get_mut(&key) {
             net.send(incoming.accept_message(net));
@@ -821,6 +828,19 @@ impl Engine {
         if incoming.gallery {
             // W12: kept under the gallery folder (never Downloads), where the
             // Files page lists it.
+            let part = self.store.part_path(id)?;
+            // Turned off (or unpaired) while it was on its way: not kept.
+            if !crate::device_links::config::app_settings()
+                .accepts_gallery_from(&incoming.device_id)
+            {
+                let _ = std::fs::remove_file(&part);
+                return Err("Photos from this phone were turned off".to_string());
+            }
+            // Not a picture, whatever the name and the type said: not kept.
+            if crate::device_links::gallery::sniff(&part).is_none() {
+                let _ = std::fs::remove_file(&part);
+                return Err("That file is not a picture".to_string());
+            }
             let kept = crate::device_links::gallery::store_in(
                 &crate::device_links::gallery::root()
                     .ok_or_else(|| "Could not find the photos folder".to_string())?,

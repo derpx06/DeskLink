@@ -141,58 +141,105 @@ fn tile(item: &Item, downloads: Option<PathBuf>) -> gtk::Box {
     tile
 }
 
-/// Reads and scales off the main thread, then paints (a picture gdk-pixbuf
-/// cannot read, or one claiming too many pixels, stays blank).
-fn load_thumbnail(picture: &gtk::Picture, path: PathBuf) {
-    let weak = picture.downgrade();
-    glib::spawn_future_local(async move {
-        let decoded = gio::spawn_blocking(move || {
-            if !crate::image_limits::file_within_bounds(
-                &path,
-                crate::image_limits::MAX_DECODE_PIXELS,
-            ) {
-                return None;
-            }
-            let pixbuf =
-                gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(&path, THUMB_W * 2, THUMB_H * 2, true)
-                    .ok()?;
-            Some((
-                pixbuf.width(),
-                pixbuf.height(),
-                pixbuf.rowstride(),
-                pixbuf.has_alpha(),
-                pixbuf.read_pixel_bytes(),
-            ))
-        })
-        .await;
-        let (Some(picture), Ok(Some((w, h, stride, alpha, bytes)))) = (weak.upgrade(), decoded)
-        else {
-            return;
-        };
-        let format = if alpha {
+/// What a decode hands back to the main thread.
+struct Decoded {
+    width: i32,
+    height: i32,
+    stride: usize,
+    alpha: bool,
+    bytes: glib::Bytes,
+}
+
+/// Decodes `path` (scaled to fit `fit`, or whole), unless its header claims
+/// more than the clipboard bound of pixels. Runs on a worker thread.
+fn decode_bounded(path: &Path, fit: Option<(i32, i32)>) -> Option<Decoded> {
+    if !crate::image_limits::file_within_bounds(path, crate::image_limits::MAX_CLIPBOARD_PIXELS) {
+        return None;
+    }
+    let pixbuf = match fit {
+        Some((w, h)) => gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(path, w, h, true),
+        None => gtk::gdk_pixbuf::Pixbuf::from_file(path),
+    }
+    .ok()?;
+    Some(Decoded {
+        width: pixbuf.width(),
+        height: pixbuf.height(),
+        stride: pixbuf.rowstride() as usize,
+        alpha: pixbuf.has_alpha(),
+        bytes: pixbuf.read_pixel_bytes(),
+    })
+}
+
+impl Decoded {
+    fn texture(&self) -> gdk::MemoryTexture {
+        let format = if self.alpha {
             gdk::MemoryFormat::R8g8b8a8
         } else {
             gdk::MemoryFormat::R8g8b8
         };
-        picture.set_paintable(Some(&gdk::MemoryTexture::new(
-            w,
-            h,
-            format,
-            &bytes,
-            stride as usize,
-        )));
-    });
+        gdk::MemoryTexture::new(self.width, self.height, format, &self.bytes, self.stride)
+    }
 }
 
-/// The picture to the clipboard.
-pub(super) fn copy_image(widget: &impl IsA<gtk::Widget>, path: &Path) {
-    match gdk::Texture::from_filename(path) {
-        Ok(texture) => {
-            widget.clipboard().set_texture(&texture);
-            toast_from(widget, "Copied");
+/// How many thumbnails decode at once: a phone can send twenty a minute, and
+/// each decode is a transient allocation.
+const MAX_DECODING: usize = 2;
+
+thread_local! {
+    static WAITING: std::cell::RefCell<std::collections::VecDeque<(glib::WeakRef<gtk::Picture>, PathBuf)>> =
+        const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    static DECODING: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Queues a thumbnail: read and scaled off the main thread, two at a time
+/// (a picture gdk-pixbuf cannot read, or one claiming too many pixels, stays
+/// blank).
+fn load_thumbnail(picture: &gtk::Picture, path: PathBuf) {
+    WAITING.with(|waiting| waiting.borrow_mut().push_back((picture.downgrade(), path)));
+    pump_thumbnails();
+}
+
+fn pump_thumbnails() {
+    while DECODING.with(std::cell::Cell::get) < MAX_DECODING {
+        let Some((weak, path)) = WAITING.with(|waiting| waiting.borrow_mut().pop_front()) else {
+            return;
+        };
+        // A tile that has gone is not decoded.
+        if weak.upgrade().is_none() {
+            continue;
         }
-        Err(error) => toast_from(widget, &format!("Could not copy it: {error}")),
+        DECODING.with(|n| n.set(n.get() + 1));
+        glib::spawn_future_local(async move {
+            let decoded = gio::spawn_blocking(move || {
+                decode_bounded(&path, Some((THUMB_W * 2, THUMB_H * 2)))
+            })
+            .await;
+            DECODING.with(|n| n.set(n.get().saturating_sub(1)));
+            if let (Some(picture), Ok(Some(decoded))) = (weak.upgrade(), decoded) {
+                picture.set_paintable(Some(&decoded.texture()));
+            }
+            pump_thumbnails();
+        });
     }
+}
+
+/// The picture to the clipboard: decoded off the main thread and bounded (an
+/// image that claims more than the clipboard bound is not decoded).
+pub(super) fn copy_image(widget: &impl IsA<gtk::Widget>, path: &Path) {
+    let (widget, path) = (widget.clone().upcast::<gtk::Widget>(), path.to_path_buf());
+    glib::spawn_future_local(async move {
+        let decoded = gio::spawn_blocking(move || decode_bounded(&path, None)).await;
+        match decoded {
+            Ok(Some(decoded)) => {
+                widget.clipboard().set_texture(&decoded.texture());
+                toast_from(&widget, "Copied");
+            }
+            _ => toast_from(
+                &widget,
+                "Could not copy it: it is not a picture DeskLink can read",
+            ),
+        }
+    });
 }
 
 fn open_image(widget: &impl IsA<gtk::Widget>, path: &Path) {
@@ -262,6 +309,63 @@ mod tests {
         dir
     }
 
+    /// Copy and thumbnails never decode what claims more than the bound: a
+    /// 60,000 x 60,000 header is refused unread, a small picture is decoded.
+    /// (Needs a display for the pixbuf loaders.)
+    #[test]
+    fn a_decompression_bomb_is_not_decoded_for_copy_or_thumbnail() {
+        crate::test_display::run(|| {
+            let d = dir();
+            let bomb = d.join("bomb.png");
+            std::fs::write(&bomb, crate::image_limits::test_bomb_png()).unwrap();
+            assert!(decode_bounded(&bomb, None).is_none(), "copy");
+            assert!(
+                decode_bounded(&bomb, Some((320, 240))).is_none(),
+                "thumbnail"
+            );
+            let small = d.join("small.png");
+            let pixbuf =
+                gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 3, 2)
+                    .unwrap();
+            std::fs::write(&small, pixbuf.save_to_bufferv("png", &[]).unwrap()).unwrap();
+            let whole = decode_bounded(&small, None).expect("a small picture");
+            assert_eq!((whole.width, whole.height), (3, 2));
+            assert!(decode_bounded(&small, Some((320, 240))).is_some());
+        });
+    }
+
+    /// At most two thumbnails decode at once, however many tiles are waiting.
+    #[test]
+    fn thumbnails_decode_two_at_a_time() {
+        crate::test_display::run(|| {
+            let d = dir();
+            let path = d.join("t.png");
+            let pixbuf =
+                gtk::gdk_pixbuf::Pixbuf::new(gtk::gdk_pixbuf::Colorspace::Rgb, false, 8, 3, 2)
+                    .unwrap();
+            std::fs::write(&path, pixbuf.save_to_bufferv("png", &[]).unwrap()).unwrap();
+            let pictures: Vec<gtk::Picture> = (0..12).map(|_| gtk::Picture::new()).collect();
+            for picture in &pictures {
+                load_thumbnail(picture, path.clone());
+            }
+            assert_eq!(DECODING.with(std::cell::Cell::get), MAX_DECODING);
+            assert_eq!(WAITING.with(|w| w.borrow().len()), 12 - MAX_DECODING);
+            let context = glib::MainContext::default();
+            for _ in 0..200 {
+                while context.iteration(false) {}
+                if pictures.iter().all(|p| p.paintable().is_some()) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                pictures.iter().all(|p| p.paintable().is_some()),
+                "all painted"
+            );
+            assert_eq!(DECODING.with(std::cell::Cell::get), 0);
+        });
+    }
+
     #[test]
     fn saving_never_overwrites_and_keeps_the_extension() {
         let (from, downloads) = (dir(), dir());
@@ -304,7 +408,7 @@ mod tests {
             let root = gallery::root().unwrap();
             for n in 0..14u64 {
                 let part = src.join(format!("p{n}"));
-                std::fs::write(&part, b"not really a png").unwrap();
+                std::fs::write(&part, b"\x89PNG\r\n\x1a\nxxxx").unwrap();
                 gallery::store_in(&root, &device.id, &format!("s{n}.png"), &part, 1000 + n)
                     .unwrap();
             }
