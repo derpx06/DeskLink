@@ -24,6 +24,9 @@ use crate::device_links::webrtc::WebRtcWireBinding;
 
 type Manager = WebRtcTransferManager;
 
+/// A test sets this to flip one bit in the next frame a lane writes.
+pub(super) static CORRUPT_NEXT_LANE_FRAME: AtomicBool = AtomicBool::new(false);
+
 fn wire_of(me: &str, peer: &str) -> WebRtcWireBinding {
     WebRtcWireBinding {
         sender_device_id: me.to_string(),
@@ -106,6 +109,8 @@ struct Pipe {
     controls: Mutex<Vec<FileControl>>,
     frame_hook: Mutex<Option<FrameHook>>,
     control_hook: Mutex<Option<ControlHook>>,
+    /// Where a fast lane could go from this side (W18); `None`: no lane.
+    lane: Mutex<Option<super::super::file_lane::LaneTarget>>,
 }
 
 impl Pipe {
@@ -121,6 +126,7 @@ impl Pipe {
             controls: Mutex::new(Vec::new()),
             frame_hook: Mutex::new(None),
             control_hook: Mutex::new(None),
+            lane: Mutex::new(None),
         })
     }
 
@@ -227,6 +233,10 @@ impl FileLink for Pipe {
     fn buffered(&self) -> u64 {
         self.buffered.load(Ordering::SeqCst)
     }
+
+    fn lane_target(&self) -> Option<super::super::file_lane::LaneTarget> {
+        self.lane.lock().unwrap().clone()
+    }
 }
 
 /// Two managers and the link between them. `a` is "alpha", `b` is "beta".
@@ -242,6 +252,13 @@ struct Rig {
     tun_a: Tunables,
     tun_b: Tunables,
     queue_b: usize,
+    /// The two device ids on the wire.
+    ids: (String, String),
+    /// Lane targets handed to the pipes at every connect (W18).
+    lanes: Option<(
+        super::super::file_lane::LaneTarget,
+        super::super::file_lane::LaneTarget,
+    )>,
 }
 
 impl Rig {
@@ -250,6 +267,27 @@ impl Rig {
     }
 
     fn with(label: &str, tun_a: Tunables, tun_b: Tunables, queue_b: usize) -> Self {
+        Self::build(
+            label,
+            tun_a,
+            tun_b,
+            queue_b,
+            ("alpha".into(), "beta".into()),
+            None,
+        )
+    }
+
+    fn build(
+        label: &str,
+        tun_a: Tunables,
+        tun_b: Tunables,
+        queue_b: usize,
+        ids: (String, String),
+        lanes: Option<(
+            super::super::file_lane::LaneTarget,
+            super::super::file_lane::LaneTarget,
+        )>,
+    ) -> Self {
         let base = std::env::temp_dir().join(format!(
             "desklink-v2-{label}-{}",
             uuid::Uuid::new_v4().simple()
@@ -268,6 +306,8 @@ impl Rig {
             tun_a,
             tun_b,
             queue_b,
+            ids,
+            lanes,
         };
         rig.connect();
         rig
@@ -309,8 +349,12 @@ impl Rig {
         });
         self.done_a = done_a;
         self.done_b = done_b;
-        a.attach(wire_of("alpha", "beta"), self.ab.clone());
-        b.attach(wire_of("beta", "alpha"), self.ba.clone());
+        if let Some((from_a, from_b)) = &self.lanes {
+            *self.ab.lane.lock().unwrap() = Some(from_a.clone());
+            *self.ba.lane.lock().unwrap() = Some(from_b.clone());
+        }
+        a.attach(wire_of(&self.ids.0, &self.ids.1), self.ab.clone());
+        b.attach(wire_of(&self.ids.1, &self.ids.0), self.ba.clone());
         self.a = Some(a);
         self.b = Some(b);
     }
@@ -3125,4 +3169,536 @@ fn an_idle_file_thread_wakes_less_than_once_a_second() {
     let woke = wakeups_of(tid) - before;
     eprintln!("[test] idle file thread: {woke} wakeups in 3 s (was ~60)");
     assert!(woke <= 3, "{woke} wakeups in 3 s");
+}
+
+// ── Fast lane (W18) ────────────────────────────────────────────────────────
+
+/// The engine over a real Lane A: two paired devices with real certificates,
+/// the daemon's listener behaviour, a pacing/cutting proxy in front of it, and
+/// the usual scriptable pipes as the WebRTC data channel.
+mod lane {
+    use super::super::super::file_lane::{self, LaneTarget};
+    use super::*;
+    use crate::device_links::config::Config;
+    use crate::device_links::device_info::DeviceInfo;
+    use crate::device_links::packet::NetworkPacket;
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+    use std::sync::MutexGuard;
+
+    /// The listen port and the corruption flag are process-wide: lane tests
+    /// run one at a time.
+    static LANE_LOCK: Mutex<()> = Mutex::new(());
+
+    const MIB: usize = 1 << 20;
+
+    struct Side {
+        config: Arc<Mutex<Config>>,
+        id: String,
+        dir: PathBuf,
+    }
+
+    fn side() -> Side {
+        let dir = std::env::temp_dir().join(format!("desklink-lane-eng-{}", uuid::Uuid::new_v4()));
+        let config = Config::load_from_dir(dir.clone()).unwrap();
+        let id = config.local_device_info().id;
+        Side {
+            config: Arc::new(Mutex::new(config)),
+            id,
+            dir,
+        }
+    }
+
+    fn pem(side: &Side) -> String {
+        String::from_utf8(side.config.lock().unwrap().certificate().to_pem().unwrap()).unwrap()
+    }
+
+    fn pair(a: &Side, b: &Side) {
+        let (pem_a, pem_b) = (pem(a), pem(b));
+        a.config
+            .lock()
+            .unwrap()
+            .trust_device(&DeviceInfo::local(b.id.clone(), "b".into()), pem_b)
+            .unwrap();
+        b.config
+            .lock()
+            .unwrap()
+            .trust_device(&DeviceInfo::local(a.id.clone(), "a".into()), pem_a)
+            .unwrap();
+    }
+
+    /// What the proxy does to the sender-to-receiver direction of one lane
+    /// connection (connections take these in order; then `Pass`).
+    #[derive(Clone, Copy)]
+    enum Plan {
+        Pass,
+        /// Closes both directions after this many bytes.
+        Cut(u64),
+        /// Stops forwarding after this many bytes and keeps the sockets open.
+        Blackhole(u64),
+    }
+
+    struct Proxy {
+        port: u16,
+        plans: Arc<Mutex<VecDeque<Plan>>>,
+        connections: Arc<AtomicUsize>,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Proxy {
+        fn start(target: SocketAddr, pace: Duration) -> Self {
+            let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let port = socket.local_addr().unwrap().port();
+            let plans = Arc::new(Mutex::new(VecDeque::new()));
+            let connections = Arc::new(AtomicUsize::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (plans2, count, stop2) = (plans.clone(), connections.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop2.load(Ordering::SeqCst) {
+                    let Ok((client, _)) = socket.accept() else {
+                        std::thread::sleep(Duration::from_millis(3));
+                        continue;
+                    };
+                    client.set_nonblocking(false).unwrap();
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let plan = plans2.lock().unwrap().pop_front().unwrap_or(Plan::Pass);
+                    let Ok(server) = TcpStream::connect(target) else {
+                        continue;
+                    };
+                    for stream in [&client, &server] {
+                        let _ = stream.set_nodelay(true);
+                    }
+                    let (c_read, s_write) =
+                        (client.try_clone().unwrap(), server.try_clone().unwrap());
+                    let (s_read, c_write) =
+                        (server.try_clone().unwrap(), client.try_clone().unwrap());
+                    std::thread::spawn(move || {
+                        let (mut from, mut to) = (c_read, s_write);
+                        let mut moved = 0u64;
+                        let mut buffer = vec![0u8; 32 * 1024];
+                        while let Ok(read) = from.read(&mut buffer) {
+                            if read == 0 {
+                                break;
+                            }
+                            match plan {
+                                Plan::Cut(limit) if moved + read as u64 > limit => {
+                                    let keep = (limit - moved) as usize;
+                                    let _ = to.write_all(&buffer[..keep]);
+                                    break;
+                                }
+                                Plan::Blackhole(limit) if moved >= limit => {
+                                    moved += read as u64;
+                                    continue;
+                                }
+                                _ => {}
+                            }
+                            if to.write_all(&buffer[..read]).is_err() {
+                                break;
+                            }
+                            moved += read as u64;
+                            if !pace.is_zero() {
+                                std::thread::sleep(pace);
+                            }
+                        }
+                        if !matches!(plan, Plan::Blackhole(_)) {
+                            let _ = to.shutdown(Shutdown::Both);
+                            let _ = from.shutdown(Shutdown::Both);
+                        }
+                    });
+                    std::thread::spawn(move || {
+                        let (mut from, mut to) = (s_read, c_write);
+                        let _ = std::io::copy(&mut from, &mut to);
+                        let _ = to.shutdown(Shutdown::Write);
+                    });
+                }
+            });
+            Self {
+                port,
+                plans,
+                connections,
+                stop,
+            }
+        }
+
+        fn plan(&self, plans: &[Plan]) {
+            self.plans.lock().unwrap().extend(plans.iter().copied());
+        }
+    }
+
+    /// The daemon's listener, as far as lanes go: read the first line, branch
+    /// on its type, hand a lane to `file_lane::accept`.
+    fn listener(config: Arc<Mutex<Config>>, stop: Arc<AtomicBool>) -> SocketAddr {
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let addr = socket.local_addr().unwrap();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                let Ok((stream, _)) = socket.accept() else {
+                    std::thread::sleep(Duration::from_millis(3));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let config = Arc::clone(&config);
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let Ok(line) = file_lane::read_line(&mut stream) else {
+                        return;
+                    };
+                    if let Ok(packet) = NetworkPacket::deserialize(&line) {
+                        if packet.packet_type == file_lane::FIRST_LINE_TYPE {
+                            let _ = file_lane::accept(stream, &config, &packet);
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    struct Env {
+        _guard: MutexGuard<'static, ()>,
+        sender: Side,
+        receiver: Side,
+        proxy: Proxy,
+    }
+
+    impl Env {
+        /// `pace`: the proxy sleeps this long per 32 KiB it forwards.
+        fn new(pace: Duration) -> Self {
+            let guard = LANE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            CORRUPT_NEXT_LANE_FRAME.store(false, Ordering::SeqCst);
+            let (sender, receiver) = (side(), side());
+            pair(&sender, &receiver);
+            let stop = Arc::new(AtomicBool::new(false));
+            let real = listener(Arc::clone(&receiver.config), stop);
+            let proxy = Proxy::start(real, pace);
+            file_lane::set_listen_port(proxy.port);
+            Self {
+                _guard: guard,
+                sender,
+                receiver,
+                proxy,
+            }
+        }
+
+        fn rig(&self, label: &str, tun: Tunables) -> Rig {
+            let target = |me: &Side, peer: &Side| LaneTarget {
+                addr: std::net::IpAddr::from([127, 0, 0, 1]),
+                config: Arc::clone(&me.config),
+                local_id: me.id.clone(),
+                peer_id: peer.id.clone(),
+            };
+            Rig::build(
+                label,
+                tun.clone(),
+                tun,
+                super::super::FILE_QUEUE_MAX_BYTES,
+                (self.sender.id.clone(), self.receiver.id.clone()),
+                Some((
+                    target(&self.sender, &self.receiver),
+                    target(&self.receiver, &self.sender),
+                )),
+            )
+        }
+    }
+
+    impl Drop for Env {
+        fn drop(&mut self) {
+            self.proxy.stop.store(true, Ordering::SeqCst);
+            file_lane::set_listen_port(0);
+            for side in [&self.sender, &self.receiver] {
+                let _ = fs::remove_dir_all(&side.dir);
+            }
+        }
+    }
+
+    fn lane_actions(rig: &Rig) -> Vec<(String, u64, u8)> {
+        rig.ab
+            .sent(FileAction::Lane)
+            .into_iter()
+            .map(|control| {
+                let lane = control.lane.unwrap();
+                (
+                    lane.kind.unwrap(),
+                    lane.start_block.unwrap(),
+                    lane.pass.unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn verified(rig: &Rig) -> u64 {
+        rig.b().probe(|engine| {
+            engine
+                .incoming
+                .values()
+                .map(|incoming| incoming.verified_blocks())
+                .max()
+                .unwrap_or(0)
+        })
+    }
+
+    /// The sender with a lane for as long as `until` says so: a hook that
+    /// slows the data channel so a failover is visibly a failover.
+    fn slow_pipe(rig: &Rig, per_frame: Duration) {
+        *rig.ab.frame_hook.lock().unwrap() = Some(Box::new(move |_| {
+            std::thread::sleep(per_frame);
+            Fate::Deliver
+        }));
+    }
+
+    #[test]
+    fn a_big_file_between_paired_devices_goes_over_the_lane() {
+        let env = Env::new(Duration::from_millis(1));
+        let rig = env.rig("lane-basic", fast());
+        let bytes = payload(24 * MIB + 4321, 11);
+        let source = rig.source("big.bin", &bytes);
+        let id = rig.a().start_send(&source).unwrap();
+        eventually("the lane label", || {
+            (board::lane_of(&id) == Some("fast lane")).then_some(())
+        });
+        let got = rig.received();
+        assert_eq!(fs::read(&got.path).unwrap(), bytes);
+        rig.sent_ok();
+        // Not one frame went over the data channel; the control plane did
+        // all of its usual work on it.
+        assert_eq!(rig.ab.frames.load(Ordering::SeqCst), 0);
+        let offer = rig.ab.sent(FileAction::Offer).remove(0);
+        assert_eq!(offer.lane.as_ref().and_then(|lane| lane.v), Some(1));
+        let accept = rig.ba.sent(FileAction::Accept).remove(0).lane.unwrap();
+        assert_eq!(accept.port, Some(env.proxy.port));
+        assert_eq!(accept.ttl_ms, Some(60_000));
+        assert_eq!(accept.token.as_deref().map(str::len), Some(32));
+        assert_eq!(
+            lane_actions(&rig)
+                .iter()
+                .map(|a| a.0.as_str())
+                .collect::<Vec<_>>(),
+            ["tcp"]
+        );
+        assert_eq!(rig.ba.sent(FileAction::BlockAck).len(), 25);
+        assert_eq!(env.proxy.connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_lane_that_drops_mid_block_falls_back_and_resumes_at_the_last_verified_block() {
+        let env = Env::new(Duration::from_millis(1));
+        // Cut after about 10.5 blocks of ciphertext.
+        env.proxy.plan(&[Plan::Cut(10 * MIB as u64 + 600_000)]);
+        let mut tun = fast();
+        tun.lane_retry = Duration::from_secs(600);
+        let rig = env.rig("lane-drop", tun);
+        let bytes = payload(24 * MIB + 17, 12);
+        let source = rig.source("big.bin", &bytes);
+        rig.a().start_send(&source).unwrap();
+        let got = rig.received();
+        assert_eq!(
+            fs::read(&got.path).unwrap(),
+            bytes,
+            "the final bytes are the file"
+        );
+        rig.sent_ok();
+        let actions = lane_actions(&rig);
+        assert_eq!(actions.len(), 2, "{actions:?}");
+        assert_eq!(actions[0].0, "tcp");
+        assert_eq!(actions[1].0, "webrtc");
+        assert_ne!(actions[1].2, actions[0].2, "a new pass");
+        let from = actions[1].1;
+        assert!(
+            (1..=11).contains(&from),
+            "resumed at block {from}, not from 0 and not past the cut"
+        );
+        // The data channel carried only what the lane had not delivered
+        // and verified: no block twice.
+        let carried = rig.ab.frame_bytes.load(Ordering::SeqCst);
+        let rest = bytes.len() as u64 - from * BLOCK_BYTES;
+        let overhead = rig.ab.frames.load(Ordering::SeqCst) as u64 * 40 + 25 * 32;
+        assert!(
+            carried <= rest + overhead,
+            "{carried} bytes over WebRTC for {rest} left"
+        );
+        assert!(rig.ab.frames.load(Ordering::SeqCst) > 0);
+        assert!(rig
+            .ba
+            .sent(FileAction::BlockNack)
+            .iter()
+            .all(|nack| nack.reason.as_deref() == Some("lane")));
+    }
+
+    #[test]
+    fn a_lane_that_goes_silent_is_left_after_five_seconds() {
+        let env = Env::new(Duration::ZERO);
+        env.proxy.plan(&[Plan::Blackhole(5 * MIB as u64)]);
+        let mut tun = fast();
+        tun.lane_retry = Duration::from_secs(600);
+        let rig = env.rig("lane-silent", tun);
+        let bytes = payload(16 * MIB, 13);
+        let source = rig.source("big.bin", &bytes);
+        let started = Instant::now();
+        rig.a().start_send(&source).unwrap();
+        let got = rig.received();
+        assert_eq!(fs::read(&got.path).unwrap(), bytes);
+        assert!(
+            started.elapsed() >= Duration::from_secs(4),
+            "the sender waited for the lane"
+        );
+        let actions = lane_actions(&rig);
+        assert_eq!(actions.last().map(|a| a.0.as_str()), Some("webrtc"));
+    }
+
+    #[test]
+    fn after_a_failure_the_lane_comes_back_at_a_block_boundary() {
+        let env = Env::new(Duration::from_millis(1));
+        env.proxy.plan(&[Plan::Cut(6 * MIB as u64), Plan::Pass]);
+        let mut tun = fast();
+        tun.lane_retry = Duration::from_millis(150);
+        let rig = env.rig("lane-promote", tun);
+        slow_pipe(&rig, Duration::from_millis(2));
+        let bytes = payload(64 * MIB + 5, 14);
+        let source = rig.source("big.bin", &bytes);
+        rig.a().start_send(&source).unwrap();
+        let got = rig.received();
+        assert_eq!(fs::read(&got.path).unwrap(), bytes);
+        let kinds: Vec<String> = lane_actions(&rig).into_iter().map(|a| a.0).collect();
+        assert_eq!(&kinds[..3], ["tcp", "webrtc", "tcp"], "{kinds:?}");
+        assert!(env.proxy.connections.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn a_block_corrupted_on_the_lane_is_sent_once_more_on_the_lane() {
+        let env = Env::new(Duration::ZERO);
+        let rig = env.rig("lane-corrupt", fast());
+        CORRUPT_NEXT_LANE_FRAME.store(true, Ordering::SeqCst);
+        let bytes = payload(12 * MIB + 1, 15);
+        let source = rig.source("big.bin", &bytes);
+        rig.a().start_send(&source).unwrap();
+        let got = rig.received();
+        assert_eq!(fs::read(&got.path).unwrap(), bytes);
+        let nacks = rig.ba.sent(FileAction::BlockNack);
+        assert_eq!(nacks.len(), 1, "refused once");
+        assert_eq!(
+            nacks[0].reason.as_deref(),
+            Some("hash-mismatch"),
+            "a damaged block, not a lost lane"
+        );
+        assert_eq!(rig.ab.frames.load(Ordering::SeqCst), 0, "still on the lane");
+        assert_eq!(lane_actions(&rig).len(), 1);
+    }
+
+    #[test]
+    fn cancel_ends_a_laned_transfer_on_both_sides_and_leaves_nothing() {
+        let env = Env::new(Duration::from_millis(2));
+        let rig = env.rig("lane-cancel", fast());
+        let bytes = payload(48 * MIB, 16);
+        let source = rig.source("big.bin", &bytes);
+        let id = rig.a().start_send(&source).unwrap();
+        eventually("some blocks over the lane", || {
+            (board::lane_of(&id) == Some("fast lane") && verified(&rig) >= 2).then_some(())
+        });
+        rig.a().cancel_transfer(&id, code::USER).unwrap();
+        eventually("cancelled", || was_cancelled(&id).then_some(()));
+        eventually("no partial file", || {
+            names(&rig.downloads("b")).is_empty().then_some(())
+        });
+        eventually("no checkpoint", || {
+            names(&rig.state("b")).is_empty().then_some(())
+        });
+        assert_eq!(board::lane_of(&id), None);
+    }
+
+    #[test]
+    fn two_transfers_at_once_each_get_a_lane() {
+        let env = Env::new(Duration::from_millis(1));
+        let rig = env.rig("lane-two", fast());
+        let (one, two) = (payload(16 * MIB + 3, 17), payload(12 * MIB + 9, 18));
+        let (path_one, path_two) = (rig.source("one.bin", &one), rig.source("two.bin", &two));
+        rig.a().start_send(&path_one).unwrap();
+        rig.a().start_send(&path_two).unwrap();
+        let first = rig.received();
+        let second = rig.received();
+        let mut got = vec![
+            fs::read(&first.path).unwrap(),
+            fs::read(&second.path).unwrap(),
+        ];
+        got.sort_by_key(Vec::len);
+        assert_eq!(got, [two, one]);
+        assert_eq!(rig.ab.frames.load(Ordering::SeqCst), 0);
+        assert_eq!(env.proxy.connections.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn small_files_and_peers_without_a_lane_stay_on_the_data_channel() {
+        let env = Env::new(Duration::ZERO);
+        // Just under 8 MiB: no lane field at all.
+        let rig = env.rig("lane-small", fast());
+        let small = payload(8 * MIB - 1, 19);
+        let source = rig.source("small.bin", &small);
+        rig.a().start_send(&source).unwrap();
+        assert_eq!(fs::read(rig.received().path).unwrap(), small);
+        assert!(rig.ab.sent(FileAction::Offer)[0].lane.is_none());
+        assert!(rig.ba.sent(FileAction::Accept)[0].lane.is_none());
+        assert_eq!(env.proxy.connections.load(Ordering::SeqCst), 0);
+        // Exactly 8 MiB: a lane.
+        let rig = env.rig("lane-edge", fast());
+        let edge = payload(8 * MIB, 20);
+        let source = rig.source("edge.bin", &edge);
+        rig.a().start_send(&source).unwrap();
+        assert_eq!(fs::read(rig.received().path).unwrap(), edge);
+        assert!(rig.ab.sent(FileAction::Offer)[0].lane.is_some());
+        assert_eq!(rig.ab.frames.load(Ordering::SeqCst), 0);
+        // The receiver cannot take a lane (no listener): the accept says
+        // nothing and the data channel carries it.
+        file_lane::set_listen_port(0);
+        let rig = env.rig("lane-nolistener", fast());
+        let source = rig.source("edge.bin", &edge);
+        rig.a().start_send(&source).unwrap();
+        assert_eq!(fs::read(rig.received().path).unwrap(), edge);
+        assert!(rig.ba.sent(FileAction::Accept)[0].lane.is_none());
+        assert!(rig.ab.frames.load(Ordering::SeqCst) > 0);
+    }
+
+    #[test]
+    fn without_a_local_path_no_lane_is_offered_or_dialled() {
+        // A relay or TURN pair, or a peer without the capability: the link
+        // reports no lane target, which is all the engine looks at.
+        let rig = Rig::new("lane-relay");
+        let bytes = payload(20 * MIB, 21);
+        let source = rig.source("big.bin", &bytes);
+        rig.a().start_send(&source).unwrap();
+        assert_eq!(fs::read(rig.received().path).unwrap(), bytes);
+        assert!(rig.ab.sent(FileAction::Offer)[0].lane.is_none());
+        assert!(rig.ba.sent(FileAction::Accept)[0].lane.is_none());
+        assert!(rig.ab.sent(FileAction::Lane).is_empty());
+        assert!(rig.ab.frames.load(Ordering::SeqCst) > 0);
+    }
+
+    /// Measured, with a floor: the engine over a real TLS lane on loopback.
+    /// `DESKLINK_LANE_ENGINE_FLOOR` (MB/s, default 60) lowers it on a
+    /// machine that is busy; 0 turns the check off.
+    #[test]
+    fn the_engine_over_a_loopback_lane_is_fast() {
+        let env = Env::new(Duration::ZERO);
+        let rig = env.rig("lane-bench", fast());
+        let size = 160 * MIB;
+        let bytes = payload(size, 22);
+        let source = rig.source("bench.bin", &bytes);
+        let started = Instant::now();
+        rig.a().start_send(&source).unwrap();
+        rig.received();
+        let seconds = started.elapsed().as_secs_f64();
+        let rate = size as f64 / 1e6 / seconds;
+        eprintln!("[bench] engine over a loopback lane: {rate:.0} MB/s ({seconds:.2} s)");
+        assert_eq!(rig.ab.frames.load(Ordering::SeqCst), 0);
+        let floor: f64 = std::env::var("DESKLINK_LANE_ENGINE_FLOOR")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(60.0);
+        assert!(
+            rate >= floor,
+            "{rate:.0} MB/s is under the floor of {floor}"
+        );
+    }
 }

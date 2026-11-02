@@ -90,6 +90,9 @@ pub mod reason {
     pub const BACKLOG: &str = "backlog";
     pub const NO_PROGRESS: &str = "no-progress";
     pub const USER: &str = "user";
+    /// A `block-nack` reason: the lane under the frames ended (W18). It is
+    /// not a damaged block and does not count towards the rewinds.
+    pub const LANE: &str = "lane";
     pub const ALL: [&str; 4] = [STORAGE_FULL, BACKLOG, NO_PROGRESS, USER];
 }
 
@@ -120,6 +123,79 @@ pub enum FileAction {
     Complete,
     Cancel,
     Error,
+    /// Sender to receiver: "from now on I send from this block, at this
+    /// pass, over this lane" (W18).
+    Lane,
+}
+
+/// The fast lane's part of an offer, an accept or a resume (W18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaneField {
+    /// 1 in an offer and an accept; a `lane` switch does not carry it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v: Option<u32>,
+    /// Accept: the receiver's LAN listener port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Accept: the one-time token (32 lowercase hex).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    /// A `lane` action: `"tcp"` or `"webrtc"`, "from now on I send over...".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_block: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass: Option<u8>,
+}
+
+impl LaneField {
+    /// "I can use a lane" (an offer).
+    pub fn offer() -> Self {
+        Self {
+            v: Some(1),
+            port: None,
+            token: None,
+            ttl_ms: None,
+            kind: None,
+            start_block: None,
+            pass: None,
+        }
+    }
+
+    /// "From block `start_block` at `pass` I send over `kind`".
+    pub fn switch(kind: &str, start_block: u64, pass: u8) -> Self {
+        Self {
+            kind: Some(kind.into()),
+            start_block: Some(start_block),
+            pass: Some(pass),
+            ..Self::offer()
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.v.is_some_and(|v| v != 1) {
+            return Err("Unsupported DeskLink file lane version".to_string());
+        }
+        if self
+            .token
+            .as_deref()
+            .is_some_and(|token| !super::file_lane::token_is_well_formed(token))
+        {
+            return Err("Invalid DeskLink file lane token".to_string());
+        }
+        if self
+            .kind
+            .as_deref()
+            .is_some_and(|kind| kind != "webrtc" && kind != "tcp")
+        {
+            return Err("Unknown DeskLink file lane kind".to_string());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,6 +229,9 @@ pub struct FileControl {
     /// gallery, never in Downloads. Refused unless the person turned it on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gallery: Option<bool>,
+    /// The fast lane (W18): in an offer, an accept, or a resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane: Option<LaneField>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
     /// The photo or scan a desk asked for (F3).
@@ -277,6 +356,7 @@ impl FileControl {
             max_frame_bytes: None,
             clipboard: None,
             gallery: None,
+            lane: None,
             mime_type: None,
             capture_id: None,
             folder: None,
@@ -345,6 +425,19 @@ impl FileControl {
         {
             if text.chars().count() > MAX_MESSAGE_CHARS {
                 return Err("Oversized DeskLink WebRTC file text".to_string());
+            }
+        }
+        if let Some(lane) = &self.lane {
+            if !matches!(
+                self.action,
+                FileAction::Offer | FileAction::Accept | FileAction::Lane
+            ) {
+                return Err("A file lane field on a message that has no place for it".to_string());
+            }
+            lane.validate()?;
+            // An offer and an accept say which version they speak.
+            if self.action != FileAction::Lane && lane.v != Some(1) {
+                return Err("Unsupported DeskLink file lane version".to_string());
             }
         }
         for hash in [
@@ -419,6 +512,14 @@ impl FileControl {
                 }
                 Ok(())
             }
+            FileAction::Lane => match &self.lane {
+                Some(lane)
+                    if lane.kind.is_some() && lane.start_block.is_some() && lane.pass.is_some() =>
+                {
+                    Ok(())
+                }
+                _ => Err("Malformed DeskLink file lane switch".to_string()),
+            },
             FileAction::Cancel | FileAction::Error => Ok(()),
         }
     }
@@ -473,8 +574,8 @@ pub struct FrameHeader {
     pub length: u32,
 }
 
-const MAGIC: &[u8; 4] = b"DLF2";
-const FLAG_LAST_OF_BLOCK: u8 = 1;
+pub(crate) const MAGIC: &[u8; 4] = b"DLF2";
+pub(crate) const FLAG_LAST_OF_BLOCK: u8 = 1;
 
 impl FrameHeader {
     /// Appends the 40 header bytes (big-endian) to `out`.
@@ -641,6 +742,86 @@ mod tests {
             block_size: Some(BLOCK_BYTES),
             max_frame_bytes: Some(FRAME_BYTES_DEFAULT),
             ..from_phone(FileAction::Offer)
+        }
+    }
+
+    /// The lane's bodies are the shared vectors (W18): what an offer, an accept
+    /// and a `lane` switch carry, read both ways, and what is refused.
+    #[test]
+    fn the_lane_fields_are_the_shared_vectors() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../../../testdata/filelane_bodies.json")).unwrap();
+        let field = |name: &str| -> LaneField {
+            serde_json::from_value(vectors[name]["lane"].clone()).unwrap()
+        };
+        // An offer says only that a lane would do.
+        let mut offered = offer();
+        offered.lane = Some(LaneField::offer());
+        assert_eq!(
+            serde_json::to_value(offered.lane.as_ref()).unwrap(),
+            vectors["offer_lane"]["lane"]
+        );
+        assert_eq!(offered.validate(&wire()), Ok(()));
+        // An accept carries the port, the token and the time to live.
+        let accept: FileControl = serde_json::from_value({
+            let mut body = serde_json::to_value(from_phone(FileAction::Accept)).unwrap();
+            body["resumeBlock"] = 0.into();
+            body["prefixSha256"] = hex(&[0u8; 32]).into();
+            body["lane"] = vectors["accept_lane"]["lane"].clone();
+            body
+        })
+        .unwrap();
+        assert_eq!(accept.lane, Some(field("accept_lane")));
+        assert_eq!(accept.validate(&wire()), Ok(()));
+        // The switches.
+        for case in vectors["lane_actions"].as_array().unwrap() {
+            let mut switch = from_phone(FileAction::Lane);
+            switch.lane = Some(serde_json::from_value(case["lane"].clone()).unwrap());
+            assert_eq!(switch.validate(&wire()), Ok(()), "{}", case["name"]);
+            assert_eq!(
+                serde_json::to_value(switch.lane.as_ref()).unwrap(),
+                case["lane"]
+            );
+            let again = FileControl::from_json(&switch.to_json().unwrap()).unwrap();
+            assert_eq!(again, switch);
+        }
+        // A switch without its parts, a lane where it has no place, a bad
+        // version, a bad kind and a bad token are all refused.
+        let mut bare = from_phone(FileAction::Lane);
+        assert!(bare.validate(&wire()).is_err(), "no lane at all");
+        bare.lane = Some(LaneField::offer());
+        assert!(bare.validate(&wire()).is_err(), "no kind");
+        let mut misplaced = from_phone(FileAction::Cancel);
+        misplaced.lane = Some(LaneField::offer());
+        assert!(misplaced.validate(&wire()).is_err());
+        let mut wrong = from_phone(FileAction::Lane);
+        wrong.lane = Some(LaneField::switch("udp", 1, 0));
+        assert!(wrong.validate(&wire()).is_err());
+        let mut unversioned = offer();
+        unversioned.lane = Some(LaneField {
+            v: None,
+            ..LaneField::offer()
+        });
+        assert!(
+            unversioned.validate(&wire()).is_err(),
+            "an offer names its version"
+        );
+        let mut future = offer();
+        future.lane = Some(LaneField {
+            v: Some(2),
+            ..LaneField::offer()
+        });
+        assert!(future.validate(&wire()).is_err());
+        for bad in vectors["refused_tokens"].as_array().unwrap() {
+            let mut accept = from_phone(FileAction::Accept);
+            accept.resume_block = Some(0);
+            accept.prefix_sha256 = Some(hex(&[0u8; 32]));
+            accept.lane = Some(LaneField {
+                port: Some(1717),
+                token: Some(bad.as_str().unwrap().to_string()),
+                ..LaneField::offer()
+            });
+            assert!(accept.validate(&wire()).is_err(), "{bad}");
         }
     }
 

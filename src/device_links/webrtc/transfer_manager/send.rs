@@ -49,6 +49,111 @@ pub(super) enum Trouble {
     Failed(String),
 }
 
+/// The sender's side of a fast lane (W18) for one transfer.
+enum LaneTx {
+    /// No lane: the data channel carries it.
+    Off,
+    /// The receiver's accept carried a token: dial once the transfer is
+    /// sending from a settled block.
+    Pending { port: u16, token: String },
+    /// The connection is being made on a thread of its own (3 s at most).
+    Dialing {
+        result: std::sync::mpsc::Receiver<Result<LaneWriter, String>>,
+        since: Instant,
+    },
+    /// Frames go over the lane.
+    Up(LaneWriter),
+}
+
+/// A lane connection and the thread that writes to it. Frames queue here
+/// (counted, so the file thread knows how much waits) and go out in order.
+struct LaneWriter {
+    frames: std::sync::mpsc::Sender<Vec<u8>>,
+    queued: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// To close the socket from here.
+    socket: Option<std::net::TcpStream>,
+}
+
+impl LaneWriter {
+    fn start(stream: openssl::ssl::SslStream<std::net::TcpStream>) -> Self {
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
+        let (frames, inbox) = std::sync::mpsc::channel::<Vec<u8>>();
+        let queued = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let socket = stream.get_ref().try_clone().ok();
+        let (counted, flag) = (queued.clone(), failed.clone());
+        let spawned = std::thread::Builder::new()
+            .name("desklink-lane-out".into())
+            .spawn(move || {
+                let mut stream = stream;
+                while let Ok(frame) = inbox.recv() {
+                    let length = frame.len() as u64;
+                    if stream.write_all(&frame).is_err() {
+                        flag.store(true, Ordering::Release);
+                        break;
+                    }
+                    counted.fetch_sub(length, Ordering::AcqRel);
+                }
+                let _ = stream.flush();
+            });
+        if spawned.is_err() {
+            failed.store(true, Ordering::Release);
+        }
+        Self {
+            frames,
+            queued,
+            failed,
+            socket,
+        }
+    }
+
+    fn send(&self, frame: Vec<u8>) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        #[cfg(test)]
+        let frame = {
+            let mut frame = frame;
+            if super::tests::CORRUPT_NEXT_LANE_FRAME.swap(false, Ordering::SeqCst) {
+                // A bit flipped in memory before the lane: TLS would not notice.
+                let at = frame.len() / 2;
+                frame[at] ^= 0x40;
+            }
+            frame
+        };
+        if self.failed.load(Ordering::Acquire) {
+            return Err("the lane failed".to_string());
+        }
+        let length = frame.len() as u64;
+        self.queued.fetch_add(length, Ordering::AcqRel);
+        self.frames.send(frame).map_err(|_| {
+            self.queued.fetch_sub(length, Ordering::AcqRel);
+            "the lane is closed".to_string()
+        })
+    }
+
+    fn buffered(&self) -> u64 {
+        self.queued.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn has_failed(&self) -> bool {
+        self.failed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Ends the connection now (the writer thread finds the socket dead).
+    fn close(&self) {
+        if let Some(socket) = &self.socket {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+impl Drop for LaneWriter {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// One outgoing file.
 /// Where the time of a send went (always measured; one line per transfer is
 /// logged when it ends): reading the source, hashing it, the call that hands a
@@ -149,6 +254,16 @@ pub(super) struct Outgoing {
     pub stall: Stall,
     last_report: Instant,
     reported: u64,
+    /// The offer said a lane would do (W18).
+    lane_offered: bool,
+    lane: LaneTx,
+    /// A lane failed for this transfer: it is not tried again until the
+    /// receiver's next accept (a resume) brings a token.
+    lane_failed: Option<Instant>,
+    /// Lanes that failed in a row (a delivered block clears it).
+    lane_failures: u32,
+    /// When the receiver last acknowledged a block (for the lane's stall).
+    lane_ack_at: Instant,
 }
 
 /// [`Outgoing::sync_key`] of a kept send.
@@ -260,6 +375,11 @@ impl Outgoing {
             stall: Stall::new(now),
             last_report: now,
             reported: 0,
+            lane_offered: false,
+            lane: LaneTx::Off,
+            lane_failed: None,
+            lane_failures: 0,
+            lane_ack_at: now,
         }
     }
 
@@ -329,6 +449,7 @@ impl Outgoing {
 
     fn can_send(&self) -> bool {
         self.state == SendState::Sending
+            && !matches!(self.lane, LaneTx::Pending { .. } | LaneTx::Dialing { .. })
             && !self.is_held()
             && self.next_offset < self.total
             && self
@@ -369,7 +490,7 @@ impl Outgoing {
     }
 
     /// The offer message.
-    fn offer_message(&self, net: &Net) -> FileControl {
+    fn offer_message(&mut self, net: &Net) -> FileControl {
         let mut offer = net.msg(FileAction::Offer, &self.id, &self.token);
         offer.filename = Some(self.filename.clone());
         offer.total_size = Some(self.total);
@@ -385,7 +506,163 @@ impl Outgoing {
             offer.relpath = Some(folder.relpath.clone());
             offer.content_sha256 = self.content_sha256.clone();
         }
+        // A big file between two devices on the same network asks for the
+        // fast lane (W18); the receiver's accept says whether it takes one.
+        self.lane_offered = false;
+        if self.total >= super::super::file_lane::MIN_FILE_BYTES
+            && self.clipboard_mime.is_none()
+            && net.link.lane_target().is_some()
+        {
+            offer.lane = Some(super::super::file_protocol::LaneField::offer());
+            self.lane_offered = true;
+        }
         offer
+    }
+
+    fn lane_gave_up(&mut self) {
+        self.lane_failed = Some(Instant::now());
+        self.lane_failures = self.lane_failures.saturating_add(1);
+    }
+
+    /// A transfer whose lane failed asks for one again (a re-offer: the
+    /// receiver answers with where it is and a fresh token), after `retry`,
+    /// doubling with each failure in a row, while the LAN path still holds.
+    fn maybe_promote(&mut self, now: Instant, net: &Net, retry: Duration) {
+        let Some(failed) = self.lane_failed else {
+            return;
+        };
+        let wait = retry * 2u32.pow(self.lane_failures.saturating_sub(1).min(5));
+        if self.state != SendState::Sending
+            || !matches!(self.lane, LaneTx::Off)
+            || !self.lane_offered
+            || now.saturating_duration_since(failed) < wait
+            || net.link.lane_target().is_none()
+        {
+            return;
+        }
+        self.lane_failed = None;
+        self.state = SendState::Offered;
+        net.send(self.offer_message(net));
+    }
+
+    /// The lane carries the frames now.
+    fn on_lane(&self) -> bool {
+        matches!(self.lane, LaneTx::Up(_))
+    }
+
+    /// Back to the data channel from the last acknowledged block, under the
+    /// next pass (the receiver adopts it, as it does any rewind of ours).
+    fn leave_lane(&mut self, net: &Net, why: &str) {
+        if let LaneTx::Up(writer) = &self.lane {
+            writer.close();
+        }
+        self.lane = LaneTx::Off;
+        self.lane_gave_up();
+        crate::device_links::limits::log_limited(
+            "file-lane-ended",
+            &format!("A file lane ended ({why}); carrying on over WebRTC"),
+        );
+        board::set_lane(&self.id, Some(words::over_webrtc()));
+        let (acked, pass) = (self.acked, next_pass(self.pass));
+        self.begin_at(acked, pass);
+        self.tell_lane(net, "webrtc");
+    }
+
+    /// Tells the receiver which lane the frames come over from now on, and
+    /// from where.
+    fn tell_lane(&self, net: &Net, kind: &str) {
+        let mut message = net.msg(FileAction::Lane, &self.id, &self.token);
+        message.lane = Some(super::super::file_protocol::LaneField::switch(
+            kind,
+            self.next_offset / BLOCK_BYTES,
+            self.pass,
+        ));
+        net.send(message);
+    }
+
+    /// One look at the lane: dial when the accept brought a token and the
+    /// transfer is sending from a settled block, take the result of the dial,
+    /// give up on a lane that failed or stopped being acknowledged.
+    fn lane_step(&mut self, now: Instant, net: &Net) {
+        if let LaneTx::Pending { .. } = &self.lane {
+            if self.state != SendState::Sending {
+                return;
+            }
+            let LaneTx::Pending { port, token } = std::mem::replace(&mut self.lane, LaneTx::Off)
+            else {
+                return;
+            };
+            let Some(target) = net.link.lane_target() else {
+                return;
+            };
+            let body = super::super::file_lane::TokenBody {
+                transfer_id: self.id.clone(),
+                token,
+                pass: self.pass,
+                start_block: self.next_offset / BLOCK_BYTES,
+            };
+            let (tx, result) = std::sync::mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("desklink-lane-dial".into())
+                .spawn(move || {
+                    let dialed = super::super::file_lane::dial(
+                        &target.config,
+                        &target.local_id,
+                        &target.peer_id,
+                        std::net::SocketAddr::new(target.addr, port),
+                        &body,
+                    )
+                    .map(LaneWriter::start);
+                    let _ = tx.send(dialed);
+                });
+            if spawned.is_ok() {
+                self.lane = LaneTx::Dialing { result, since: now };
+            } else {
+                self.lane_gave_up();
+            }
+            return;
+        }
+        match &self.lane {
+            LaneTx::Dialing { result, since } => match result.try_recv() {
+                Ok(Ok(writer)) => {
+                    self.lane = LaneTx::Up(writer);
+                    self.lane_ack_at = now;
+                    board::set_lane(&self.id, Some(words::fast_lane()));
+                    self.tell_lane(net, "tcp");
+                }
+                Ok(Err(why)) => {
+                    debug_log!("[DeskLink] No file lane ({why}); WebRTC carries it");
+                    self.lane = LaneTx::Off;
+                    self.lane_gave_up();
+                    board::set_lane(&self.id, Some(words::over_webrtc()));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty)
+                    if now.saturating_duration_since(*since)
+                        > super::super::file_lane::HANDSHAKE_LIMIT * 2 =>
+                {
+                    self.lane = LaneTx::Off;
+                    self.lane_gave_up();
+                    board::set_lane(&self.id, Some(words::over_webrtc()));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(_) => {
+                    self.lane = LaneTx::Off;
+                    self.lane_gave_up();
+                    board::set_lane(&self.id, Some(words::over_webrtc()));
+                }
+            },
+            LaneTx::Up(writer) => {
+                let unacked = self.next_offset > self.acked * BLOCK_BYTES;
+                let stalled = unacked
+                    && now.saturating_duration_since(self.lane_ack_at)
+                        > super::super::file_lane::STALL_LIMIT;
+                if writer.has_failed() || stalled {
+                    let why = if stalled { "stalled" } else { "write failed" };
+                    self.leave_lane(net, why);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// The receiver told us to hold still (or that it waits).
@@ -774,7 +1051,27 @@ impl Engine {
         // the next pass.
         let pass = outgoing.pass;
         if let Err(ending) = outgoing.restart_from(blocks, prefix, pass, next_pass(pass)) {
-            self.end_outgoing(index, Some(net), ending);
+            return self.end_outgoing(index, Some(net), ending);
+        }
+        // The accept brings a lane (W18) when the receiver takes one: nothing
+        // is sent until it is up (3 s at most) or has failed.
+        let outgoing = &mut self.outgoing[index];
+        if let LaneTx::Up(_) = outgoing.lane {
+            outgoing.lane = LaneTx::Off;
+        }
+        outgoing.lane_failed = None;
+        match message.lane.as_ref() {
+            Some(lane) if outgoing.lane_offered && lane.kind.is_none() => {
+                if let (Some(port), Some(token)) = (lane.port, lane.token.clone()) {
+                    if port != 0 && net.link.lane_target().is_some() {
+                        outgoing.lane = LaneTx::Pending { port, token };
+                    }
+                }
+            }
+            _ => board::set_lane(
+                &outgoing.id,
+                words::data_channel(net.link.relayed(), outgoing.lane_offered),
+            ),
         }
     }
 
@@ -812,6 +1109,10 @@ impl Engine {
             return;
         }
         outgoing.acked = outgoing.acked.max(block + 1);
+        outgoing.lane_ack_at = Instant::now();
+        if outgoing.on_lane() {
+            outgoing.lane_failures = 0;
+        }
     }
 
     /// The receiver refused a block (it arrived damaged): sent again.
@@ -823,6 +1124,18 @@ impl Engine {
             return;
         };
         let outgoing = &mut self.outgoing[index];
+        if message.reason.as_deref() == Some(super::super::file_protocol::reason::LANE) {
+            // The lane ended under the receiver: carry on over the data
+            // channel from its last verified block; no damage, no rewind.
+            if block > outgoing.hashes.len() as u64 {
+                return;
+            }
+            outgoing.stall.moved(Instant::now());
+            if outgoing.on_lane() {
+                outgoing.leave_lane(net, "closed by the receiver");
+            }
+            return;
+        }
         outgoing.rewinds += 1;
         if outgoing.rewinds > MAX_REWINDS || block > outgoing.hashes.len() as u64 {
             let ending = Ending {
@@ -950,6 +1263,10 @@ impl Engine {
             return;
         };
         let now = Instant::now();
+        for outgoing in &mut self.outgoing {
+            outgoing.lane_step(now, &net);
+            outgoing.maybe_promote(now, &net, self.tun.lane_retry);
+        }
         if self.link_down_until.is_some_and(|until| until > now) {
             return;
         }
@@ -964,7 +1281,11 @@ impl Engine {
                 }
                 for _ in 0..16 {
                     let window_open = outgoing.can_send();
-                    if !window_open || net.link.buffered() >= IN_FLIGHT_TARGET {
+                    let queued = match &outgoing.lane {
+                        LaneTx::Up(writer) => writer.buffered(),
+                        _ => net.link.buffered(),
+                    };
+                    if !window_open || queued >= IN_FLIGHT_TARGET {
                         if Stages::on() && outgoing.state == SendState::Sending {
                             outgoing.stages.blocked(now, !window_open);
                         }
@@ -973,10 +1294,19 @@ impl Engine {
                     match outgoing.next_frame() {
                         Ok(frame) => {
                             let timed = Stages::on().then(Instant::now);
-                            let sent_frame = net.link.send_frame(frame);
+                            let sent_frame = match &outgoing.lane {
+                                LaneTx::Up(writer) => writer.send(frame),
+                                _ => net.link.send_frame(frame),
+                            };
                             if let Some(at) = timed {
                                 outgoing.stages.send += at.elapsed();
                                 outgoing.stages.flowing(at);
+                            }
+                            if sent_frame.is_err() && outgoing.on_lane() {
+                                // The lane broke under the write: not the
+                                // peer's link. Carry on over the data channel.
+                                outgoing.leave_lane(&net, "write failed");
+                                break;
                             }
                             if let Err(error) = sent_frame {
                                 outgoing.rollback_block();

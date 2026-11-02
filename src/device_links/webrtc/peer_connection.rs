@@ -595,6 +595,35 @@ impl DesktopWebRtcPeer {
         })
     }
 
+    /// The peer's address on the selected ICE pair, when that pair is the
+    /// local network proper (host or prflx on both ends, both addresses
+    /// private and on an attached subnet): where a fast lane (W18) may
+    /// connect. Never a relay or reflexive pair. Also whether the pair goes
+    /// through a relay (the transfer says so).
+    pub fn lane_address(&self) -> (Option<std::net::IpAddr>, bool) {
+        let Some(pair) = self.selected_pair() else {
+            return (None, false);
+        };
+        let label = path_label(&pair.types, false);
+        (Self::lane_address_of(&pair, label), label == "turn")
+    }
+
+    fn lane_address_of(pair: &SelectedPair, label: &str) -> Option<std::net::IpAddr> {
+        if pair.types.len() != 2 || label != "lan" {
+            return None;
+        }
+        let (local, remote) = (pair.local_ip?, pair.remote_ip?);
+        let scoped =
+            matches!(remote, std::net::IpAddr::V6(ip) if ip.segments()[0] & 0xffc0 == 0xfe80);
+        (!scoped
+            && crate::device_links::lan_scope::is_nearby(
+                local,
+                remote,
+                &crate::device_links::lan_scope::local_interfaces(),
+            ))
+        .then_some(remote)
+    }
+
     /// The selected pair's two candidate types as webrtcbin spells them, and
     /// its round-trip time in milliseconds when known.
     pub fn selected_pair_types(&self) -> Option<(Vec<String>, Option<u32>)> {

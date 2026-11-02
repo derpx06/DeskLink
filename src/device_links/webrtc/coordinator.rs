@@ -385,7 +385,7 @@ pub(crate) fn start_initiator(
         wire.clone(),
         receiver,
         Arc::clone(&sessions),
-        config,
+        Arc::clone(&config),
         devices,
         events,
         Arc::clone(&transfer_manager),
@@ -393,7 +393,7 @@ pub(crate) fn start_initiator(
     let peer = sessions
         .active_webrtc_peer(&binding, &attempt_id)
         .map_err(|error| error.to_string())?;
-    attach_transfer_manager(&transfer_manager, &peer, &wire);
+    attach_transfer_manager(&transfer_manager, &peer, &wire, Some(config));
     peer.create_offer()
 }
 
@@ -2291,11 +2291,39 @@ pub(crate) fn cancel_file_transfer(
         .cancel_transfer(transfer_id, why)
 }
 
+/// A lane's address on the ICE pair, and whether the pair is relayed.
+type LanePath = (Option<std::net::IpAddr>, bool);
+
 /// One peer's file channels, for the transfer manager. Holds the peer weakly:
 /// the peer owns the manager, not the other way round.
 struct PeerFileLink {
     peer: std::sync::Weak<DesktopWebRtcPeer>,
     wire: WebRtcWireBinding,
+    /// For fast lanes (W18): the stored pairing certificates. `None`: no lane.
+    config: Option<Arc<Mutex<Config>>>,
+    /// The last look at the ICE path (reading it asks webrtcbin for stats).
+    lane_seen: Mutex<Option<(std::time::Instant, LanePath)>>,
+}
+
+impl PeerFileLink {
+    /// The ICE pair's address for a lane and whether it is relayed, read at
+    /// most every two seconds (it asks webrtcbin for stats).
+    fn path(&self) -> LanePath {
+        let Ok(mut seen) = self.lane_seen.lock() else {
+            return (None, false);
+        };
+        match *seen {
+            Some((at, path)) if at.elapsed() < std::time::Duration::from_secs(2) => path,
+            _ => {
+                let path = self
+                    .peer
+                    .upgrade()
+                    .map_or((None, false), |peer| peer.lane_address());
+                *seen = Some((std::time::Instant::now(), path));
+                path
+            }
+        }
+    }
 }
 
 impl FileLink for PeerFileLink {
@@ -2329,6 +2357,28 @@ impl FileLink for PeerFileLink {
             peer.buffered_amount(WebRtcChannel::FileData)
         })
     }
+
+    fn relayed(&self) -> bool {
+        self.path().1
+    }
+
+    fn lane_target(&self) -> Option<super::file_lane::LaneTarget> {
+        use crate::device_links::features::peer_sends;
+        let config = self.config.clone()?;
+        let marker = crate::device_links::packet::PACKET_TYPE_FILE_LANE;
+        let peer_id = &self.wire.peer_device_id;
+        // Both sides advertise it: the intersection of the handover lists.
+        if !(peer_accepts(peer_id, marker) && peer_sends(peer_id, marker)) {
+            return None;
+        }
+        let addr = self.path().0?;
+        Some(super::file_lane::LaneTarget {
+            addr,
+            config,
+            local_id: self.wire.sender_device_id.clone(),
+            peer_id: peer_id.clone(),
+        })
+    }
 }
 
 /// Binds the peer's file channels to its transfer manager.
@@ -2336,12 +2386,15 @@ fn attach_transfer_manager(
     manager: &Arc<WebRtcTransferManager>,
     peer: &Arc<DesktopWebRtcPeer>,
     wire: &WebRtcWireBinding,
+    config: Option<Arc<Mutex<Config>>>,
 ) {
     manager.attach(
         wire.clone(),
         Arc::new(PeerFileLink {
             peer: Arc::downgrade(peer),
             wire: wire.clone(),
+            config,
+            lane_seen: Mutex::new(None),
         }),
     );
     // A sender waiting for room in the channel is woken when it drains.
@@ -2391,7 +2444,7 @@ fn install_responder(
         wire.clone(),
         receiver,
         Arc::clone(&sessions),
-        config,
+        Arc::clone(&config),
         devices,
         events,
         Arc::clone(&transfer_manager),
@@ -2399,7 +2452,7 @@ fn install_responder(
     let peer = sessions
         .active_webrtc_peer(&binding, &attempt_id)
         .map_err(|error| error.to_string())?;
-    attach_transfer_manager(&transfer_manager, &peer, &wire);
+    attach_transfer_manager(&transfer_manager, &peer, &wire, Some(config));
     Ok(peer)
 }
 
@@ -5013,8 +5066,8 @@ mod tests {
             answerer.set_completion_hook(move |c| {
                 let _ = tx_a.lock().unwrap().send(c.clone());
             });
-            super::attach_transfer_manager(&offerer, &pair.offerer, &wire_o);
-            super::attach_transfer_manager(&answerer, &pair.answerer, &wire_a);
+            super::attach_transfer_manager(&offerer, &pair.offerer, &wire_o, None);
+            super::attach_transfer_manager(&answerer, &pair.answerer, &wire_a, None);
             let stop = Arc::new(AtomicBool::new(false));
             let slowest = Arc::new(Mutex::new((Duration::ZERO, Duration::ZERO)));
             let epoch = Instant::now();
@@ -6070,5 +6123,46 @@ mod tests {
         assert!(!super::extend_size_ok(100, 2000));
         assert!(!super::extend_size_ok(0, 0));
         assert!(!super::extend_size_ok(-5, 1080));
+    }
+
+    /// A lane needs the capability on both sides, a config to pin with, and an
+    /// ICE pair that is the local network: without any one, no lane target.
+    #[test]
+    fn a_link_offers_a_lane_only_with_the_capability_a_config_and_a_local_pair() {
+        use crate::device_links::features::{forget_peer_profile, record_peer_profile};
+        use crate::device_links::packet::PACKET_TYPE_FILE_LANE;
+        use crate::device_links::webrtc::transfer_manager::FileLink;
+        let dir = std::env::temp_dir().join(format!("desklink-lane-link-{}", uuid::Uuid::new_v4()));
+        let config = Arc::new(Mutex::new(Config::load_from_dir(dir.clone()).unwrap()));
+        let peer = format!("lane-peer-{}", uuid::Uuid::new_v4());
+        let link = |config: Option<Arc<Mutex<Config>>>| super::PeerFileLink {
+            peer: std::sync::Weak::new(),
+            wire: WebRtcWireBinding {
+                sender_device_id: "desk".into(),
+                peer_device_id: peer.clone(),
+                session_id: 1,
+                generation: 1,
+            },
+            config,
+            lane_seen: Mutex::new(None),
+        };
+        let with = |marker: bool| {
+            let mut types = vec!["desklink.heartbeat".to_string()];
+            if marker {
+                types.push(PACKET_TYPE_FILE_LANE.to_string());
+            }
+            record_peer_profile(&peer, &types, &types);
+        };
+        // The peer's handover lacks the marker: no lane, whatever the path.
+        with(false);
+        assert!(link(Some(config.clone())).lane_target().is_none());
+        // It has it, but there is no ICE pair to be local: still none.
+        with(true);
+        assert!(link(Some(config.clone())).lane_target().is_none());
+        assert!(!link(Some(config.clone())).relayed());
+        // And with no config to pin with, none either.
+        assert!(link(None).lane_target().is_none());
+        forget_peer_profile(&peer);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

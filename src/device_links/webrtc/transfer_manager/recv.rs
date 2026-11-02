@@ -49,6 +49,11 @@ pub(super) struct Incoming {
     content_sha256: Option<String>,
     clipboard: bool,
     gallery: bool,
+    /// The sender offered a lane and this side can take one (W18): every
+    /// accept carries a fresh token.
+    lane_wanted: bool,
+    /// A lane connection delivers this transfer's frames now.
+    on_lane: bool,
     capture_id: Option<String>,
     file: File,
     /// The pass frames must carry (see `file_protocol`).
@@ -183,6 +188,35 @@ impl Incoming {
         accept.resume_block = Some(blocks);
         accept.prefix_sha256 = Some(self.prefix_hex(blocks));
         accept.max_frame_bytes = Some(FRAME_BYTES_PROVEN);
+        // The fast lane (W18): a token for this transfer, while the LAN path
+        // still holds. A lane that was up is not any more: a new accept is a
+        // new start.
+        self.on_lane = false;
+        if self.lane_wanted {
+            if let (Some(target), true) = (
+                net.link.lane_target(),
+                super::super::file_lane::listen_port() != 0,
+            ) {
+                accept.lane = Some(super::super::file_protocol::LaneField {
+                    v: Some(1),
+                    port: Some(super::super::file_lane::listen_port()),
+                    token: Some(super::super::file_lane::issue_token(
+                        &self.id,
+                        &target.peer_id,
+                    )),
+                    ttl_ms: Some(super::super::file_lane::TOKEN_TTL.as_millis() as u64),
+                    kind: None,
+                    start_block: None,
+                    pass: None,
+                });
+            }
+        }
+        if accept.lane.is_none() {
+            board::set_lane(
+                &self.id,
+                words::data_channel(net.link.relayed(), self.lane_wanted),
+            );
+        }
         accept
     }
 
@@ -510,8 +544,106 @@ impl Engine {
         }
         self.incoming.insert(key, incoming);
         if let Some(incoming) = self.incoming.get_mut(&key) {
+            // A lane (W18) is taken for a big file when the sender offered one
+            // and this side sees the LAN path too.
+            incoming.lane_wanted = message.lane.is_some()
+                && total >= super::super::file_lane::MIN_FILE_BYTES
+                && net.link.lane_target().is_some();
             net.send(incoming.accept_message(net));
         }
+    }
+
+    /// A lane connection asks to deliver `body.transfer_id` from a block (the
+    /// token was checked by the listener): the transfer must be here, wanting
+    /// a lane, and be exactly at that block under that pass.
+    pub(super) fn lane_check(
+        &mut self,
+        body: &super::super::file_lane::TokenBody,
+    ) -> Result<(), super::super::file_lane::Refusal> {
+        use super::super::file_lane::Refusal;
+        let key = id_bytes(&body.transfer_id).ok_or(Refusal::Transfer)?;
+        let incoming = self.incoming.get_mut(&key).ok_or(Refusal::Transfer)?;
+        if !incoming.lane_wanted {
+            return Err(Refusal::Transfer);
+        }
+        if body.start_block != incoming.verified() {
+            return Err(Refusal::Range);
+        }
+        if !(incoming.adopt_any || body.pass == incoming.pass) {
+            return Err(Refusal::Range);
+        }
+        incoming.on_lane = true;
+        board::set_lane(&incoming.id, Some(words::fast_lane()));
+        Ok(())
+    }
+
+    /// The lane under a transfer ended: if it did not finish, the receiver
+    /// asks the sender to carry on over the data channel from the last
+    /// verified block.
+    pub(super) fn lane_lost(&mut self, id: &str) {
+        let Some(key) = id_bytes(id) else {
+            return;
+        };
+        let now = Instant::now();
+        let ctx = Ctx {
+            net: self.net.as_deref(),
+            store: &self.store,
+            tun: &self.tun,
+            faults: &self.faults,
+            now,
+        };
+        // The sender is told, and answers with a `lane` action naming the
+        // block it carries on from over the data channel.
+        if let (Some(incoming), Some(net)) = (self.incoming.get_mut(&key), ctx.net) {
+            if std::mem::take(&mut incoming.on_lane) {
+                let mut nack = net.msg(FileAction::BlockNack, &incoming.id, &incoming.token);
+                nack.block_index = Some(incoming.verified());
+                nack.pass = Some(incoming.pass);
+                nack.reason = Some(super::super::file_protocol::reason::LANE.to_string());
+                net.send(nack);
+                board::set_lane(&incoming.id, Some(words::over_webrtc()));
+            }
+        }
+    }
+
+    /// The sender changed lane: it sends from `start_block` at `pass` now.
+    /// What the receiver holds of a block beyond that is dropped.
+    pub(super) fn on_lane_switch(&mut self, message: &FileControl) {
+        let Some(lane) = message.lane.as_ref() else {
+            return;
+        };
+        let (Some(kind), Some(start), Some(pass)) =
+            (lane.kind.as_deref(), lane.start_block, lane.pass)
+        else {
+            return;
+        };
+        let Some(key) = id_bytes(&message.transfer_id) else {
+            return;
+        };
+        let Some(incoming) = self.incoming.get_mut(&key) else {
+            return;
+        };
+        if incoming.token != message.transfer_token || start > incoming.verified() {
+            return;
+        }
+        // The lane's own connection already put the transfer on it (the two
+        // arrive by different roads, in either order): nothing to undo.
+        if kind == "tcp" && incoming.on_lane {
+            return;
+        }
+        if incoming.restart_at(start, pass).is_err() {
+            return;
+        }
+        incoming.on_lane = kind == "tcp";
+        incoming.stall.moved(Instant::now());
+        board::set_lane(
+            &incoming.id,
+            Some(if incoming.on_lane {
+                words::fast_lane()
+            } else {
+                words::over_webrtc()
+            }),
+        );
     }
 
     /// Opens the files of a new incoming transfer, resuming a checkpoint of
@@ -629,6 +761,8 @@ impl Engine {
             content_sha256: checkpoint.content_sha256.clone(),
             clipboard: checkpoint.clipboard,
             gallery: checkpoint.gallery,
+            lane_wanted: false,
+            on_lane: false,
             capture_id: checkpoint.capture_id.clone(),
             file,
             pass: 0,

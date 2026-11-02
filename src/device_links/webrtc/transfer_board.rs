@@ -81,6 +81,9 @@ pub struct TransferBoard {
     /// to follow them: the desktop notification. Numbered from 1.
     ended: VecDeque<(u64, Finished)>,
     ended_seq: u64,
+    /// Which lane a listed transfer is on, in the person's words ("fast
+    /// lane", "over WebRTC"), by transfer id.
+    lanes: std::collections::HashMap<String, &'static str>,
 }
 
 /// A Bucket transfer that ended (F8c: frees an in-flight slot).
@@ -190,6 +193,7 @@ impl TransferBoard {
     /// report it once.
     pub fn finish(&mut self, id: &str, outcome: Outcome) {
         self.notes.remove(id);
+        self.lanes.remove(id);
         if let Some(position) = self.synced.iter().position(|row| row.id == id) {
             let row = self.synced.remove(position);
             if self.synced_ended.len() >= MAX_FINISHED {
@@ -324,6 +328,8 @@ pub fn set_retry_source(id: &str, path: PathBuf) {
 }
 
 pub fn finish(id: &str, outcome: Outcome) {
+    // A lane token of a transfer that is over opens nothing (W18).
+    super::file_lane::void_tokens(id);
     let received = match &outcome {
         Outcome::Received(path) => board()
             .rows
@@ -386,6 +392,29 @@ pub fn snapshot(seen: u64) -> (Vec<TransferRow>, Vec<Finished>, u64) {
         .map(|(_, finished)| finished.clone())
         .collect();
     (board.rows(), news, board.ended_seq)
+}
+
+/// Says which lane `id` is on now (`None`: not said).
+pub fn set_lane(id: &str, lane: Option<&'static str>) {
+    let mut board = board();
+    match lane {
+        Some(lane) => {
+            board.lanes.insert(id.to_string(), lane);
+        }
+        None => {
+            board.lanes.remove(id);
+        }
+    }
+}
+
+/// Every listed transfer's lane, for the notification.
+pub fn lanes() -> std::collections::HashMap<String, &'static str> {
+    board().lanes.clone()
+}
+
+/// The lane `id` is on, in words.
+pub fn lane_of(id: &str) -> Option<&'static str> {
+    board().lanes.get(id).copied()
 }
 
 /// Why `id` is waiting, if it is.
@@ -500,6 +529,28 @@ impl Drop for Preparing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transfer that is over takes its lane tokens with it, and says no lane.
+    #[test]
+    fn finishing_a_transfer_voids_its_lane_token_and_forgets_its_lane() {
+        let id = "lane-board-1";
+        let token = super::super::file_lane::issue_token(id, "phone");
+        set_lane(id, Some("fast lane"));
+        assert_eq!(lane_of(id), Some("fast lane"));
+        assert_eq!(lanes().get(id).copied(), Some("fast lane"));
+        finish(id, Outcome::Sent);
+        assert_eq!(lane_of(id), None);
+        assert!(!super::super::file_lane::spend_token_for_test(
+            &token, id, "phone"
+        ));
+        // A token of a transfer still going is good once.
+        let live = super::super::file_lane::issue_token("lane-board-2", "phone");
+        assert!(super::super::file_lane::spend_token_for_test(
+            &live,
+            "lane-board-2",
+            "phone"
+        ));
+    }
 
     fn row(id: &str, device: &str, incoming: bool, total: u64) -> TransferRow {
         TransferRow {

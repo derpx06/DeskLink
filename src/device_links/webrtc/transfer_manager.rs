@@ -70,6 +70,16 @@ pub trait FileLink: Send + Sync {
     fn send_frame(&self, frame: Vec<u8>) -> Result<(), String>;
     /// Bytes queued on the data channel and not yet on the network.
     fn buffered(&self) -> u64;
+    /// Where a fast lane (W18) to the peer could go, when everything allows
+    /// one: the capability on both sides, and the selected ICE pair a direct
+    /// host/prflx pair on the local network (never a relay). `None`: no lane.
+    fn lane_target(&self) -> Option<super::file_lane::LaneTarget> {
+        None
+    }
+    /// The ICE pair goes through a relay (TURN): said on the transfer.
+    fn relayed(&self) -> bool {
+        false
+    }
 }
 
 /// A transfer that finished.
@@ -141,6 +151,8 @@ pub(super) struct Tunables {
     pub report_every: Duration,
     /// Free bytes a receiver wants before it resumes after "storage full".
     pub storage_slack: u64,
+    /// How long after a lane failed the sender asks for one again.
+    pub lane_retry: Duration,
 }
 
 impl Default for Tunables {
@@ -155,6 +167,7 @@ impl Default for Tunables {
             queue_resume: FILE_QUEUE_MAX_BYTES / 8,
             report_every: Duration::from_millis(250),
             storage_slack: 8 * 1024 * 1024,
+            lane_retry: Duration::from_secs(10),
         }
     }
 }
@@ -239,6 +252,14 @@ enum Cmd {
         reply: SyncSender<Result<(), String>>,
     },
     ResumeSends,
+    /// A lane connection asks whether this transfer is there and the range
+    /// right (W18); answered on the reply.
+    LaneCheck {
+        body: super::file_lane::TokenBody,
+        reply: SyncSender<Result<(), super::file_lane::Refusal>>,
+    },
+    /// The lane of this transfer ended under the receiver.
+    LaneLost(String),
     Wake,
     /// The peer is gone: finish what is queued, then end the thread.
     Stop,
@@ -257,6 +278,113 @@ pub struct WebRtcTransferManager {
     shared: Arc<Shared>,
     store: Store,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The peer whose lanes this manager takes (registered at attach).
+    lane_peer: Mutex<Option<String>>,
+}
+
+/// The engine's side of the lane listener (W18): a lane for a transfer of this
+/// peer is checked on the file thread, and its frames are read here into the
+/// same queue the data channel feeds.
+struct LaneIn {
+    commands: Sender<Cmd>,
+    shared: Arc<Shared>,
+    peer: String,
+}
+
+impl super::file_lane::Receiver for LaneIn {
+    fn check(&self, body: &super::file_lane::TokenBody) -> Result<(), super::file_lane::Refusal> {
+        let (reply, answer) = mpsc::sync_channel(1);
+        self.commands
+            .send(Cmd::LaneCheck {
+                body: body.clone(),
+                reply,
+            })
+            .map_err(|_| super::file_lane::Refusal::Transfer)?;
+        answer
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| super::file_lane::Refusal::Transfer)?
+    }
+
+    fn open(
+        &self,
+        stream: openssl::ssl::SslStream<std::net::TcpStream>,
+        body: super::file_lane::TokenBody,
+    ) {
+        let (commands, shared, peer) = (
+            self.commands.clone(),
+            Arc::clone(&self.shared),
+            self.peer.clone(),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("desklink-file-lane".into())
+            .spawn(move || {
+                let mut stream = stream;
+                // A lane silent for this long is gone (the other side left
+                // the network): its slot must not be held for ever.
+                let _ = stream
+                    .get_ref()
+                    .set_read_timeout(Some(Duration::from_secs(30)));
+                read_lane_frames(&mut stream, &commands, &shared);
+                let _ = commands.send(Cmd::LaneLost(body.transfer_id));
+                super::file_lane::lane_closed(&peer);
+            });
+        if spawned.is_err() {
+            super::file_lane::lane_closed(&self.peer);
+        }
+    }
+}
+
+/// One `DLF2` frame from a lane: the header says how long it is (plus the
+/// 32-byte block hash on a block's last frame). Nothing longer than the
+/// frames the data channel carries is read.
+pub(super) fn read_lane_frame(stream: &mut impl std::io::Read) -> Result<Vec<u8>, String> {
+    use super::file_protocol::{
+        BLOCK_TRAILER_BYTES, FLAG_LAST_OF_BLOCK, FRAME_BYTES_PROVEN, FRAME_HEADER_BYTES, MAGIC,
+    };
+    let mut frame = vec![0u8; FRAME_HEADER_BYTES];
+    stream
+        .read_exact(&mut frame)
+        .map_err(|error| error.to_string())?;
+    if &frame[..4] != MAGIC {
+        return Err("not a file frame".to_string());
+    }
+    let length = u32::from_be_bytes([frame[36], frame[37], frame[38], frame[39]]) as usize;
+    let trailer = if frame[4] & FLAG_LAST_OF_BLOCK != 0 {
+        BLOCK_TRAILER_BYTES
+    } else {
+        0
+    };
+    let total = FRAME_HEADER_BYTES + length + trailer;
+    if length == 0 || total > FRAME_BYTES_PROVEN {
+        return Err("a file frame of the wrong size".to_string());
+    }
+    frame.resize(total, 0);
+    stream
+        .read_exact(&mut frame[FRAME_HEADER_BYTES..])
+        .map_err(|error| error.to_string())?;
+    Ok(frame)
+}
+
+/// Reads frames until the lane ends, feeding the file thread's queue. Unlike
+/// the data channel's callback it waits for room instead of dropping: TCP
+/// pushes back on the sender, and a dropped frame would restart the transfer.
+fn read_lane_frames(stream: &mut impl std::io::Read, commands: &Sender<Cmd>, shared: &Shared) {
+    while let Ok(frame) = read_lane_frame(stream) {
+        let length = frame.len();
+        let mut waited = 0;
+        while shared.queued.load(Ordering::Acquire) + length > shared.queue_max / 2 {
+            if waited >= 10_000 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            waited += 1;
+        }
+        shared.queued.fetch_add(length, Ordering::AcqRel);
+        if commands.send(Cmd::Frame(frame)).is_err() {
+            shared.queued.fetch_sub(length, Ordering::AcqRel);
+            return;
+        }
+    }
 }
 
 impl WebRtcTransferManager {
@@ -306,18 +434,34 @@ impl WebRtcTransferManager {
             shared,
             store,
             thread: Mutex::new(Some(thread)),
+            lane_peer: Mutex::new(None),
         })
     }
 
     /// Binds the manager to a peer's channels. Until then nothing is sent.
     pub fn attach(&self, wire: WebRtcWireBinding, link: Arc<dyn FileLink>) {
         self.shared.attached.store(true, Ordering::Release);
+        // This peer's lanes (W18) come to this manager.
+        super::file_lane::register_receiver(
+            &wire.peer_device_id,
+            Arc::new(LaneIn {
+                commands: self.commands.clone(),
+                shared: Arc::clone(&self.shared),
+                peer: wire.peer_device_id.clone(),
+            }),
+        );
+        if let Ok(mut peer) = self.lane_peer.lock() {
+            *peer = Some(wire.peer_device_id.clone());
+        }
         let _ = self.commands.send(Cmd::Attach(wire, link));
     }
 
     /// The peer is gone: receivers checkpoint at once, nothing more is sent.
     pub fn detach(&self) {
         self.shared.attached.store(false, Ordering::Release);
+        if let Some(peer) = self.lane_peer.lock().ok().and_then(|mut peer| peer.take()) {
+            super::file_lane::unregister_receiver(&peer);
+        }
         let _ = self.commands.send(Cmd::Detach);
     }
 
@@ -331,6 +475,9 @@ impl WebRtcTransferManager {
     /// handled (its checkpoints written), without waiting for it. A manager
     /// belongs to one peer; whoever else still holds it keeps a quiet handle.
     pub fn shut_down(&self) {
+        if let Some(peer) = self.lane_peer.lock().ok().and_then(|mut peer| peer.take()) {
+            super::file_lane::unregister_receiver(&peer);
+        }
         let _ = self.commands.send(Cmd::Stop);
     }
 
@@ -463,9 +610,14 @@ impl WebRtcTransferManager {
     /// disk when this returns.
     #[cfg(test)]
     fn stop(self) {
+        if let Some(peer) = self.lane_peer.lock().ok().and_then(|mut peer| peer.take()) {
+            super::file_lane::unregister_receiver(&peer);
+        }
         let Self {
             commands, thread, ..
         } = self;
+        // A lane's reader holds a sender too: the channel alone would not close.
+        let _ = commands.send(Cmd::Stop);
         drop(commands);
         if let Some(handle) = thread.lock().ok().and_then(|mut slot| slot.take()) {
             let _ = handle.join();
@@ -614,6 +766,10 @@ impl Engine {
                 let _ = reply.send(self.cancel(&id, code));
             }
             Cmd::ResumeSends => self.resume_sends(),
+            Cmd::LaneCheck { body, reply } => {
+                let _ = reply.send(self.lane_check(&body));
+            }
+            Cmd::LaneLost(id) => self.lane_lost(&id),
             Cmd::Wake | Cmd::Stop => {}
             #[cfg(test)]
             Cmd::Probe(job) => job(self),
@@ -693,6 +849,7 @@ impl Engine {
             FileAction::Complete => self.on_complete(&message),
             FileAction::Pause => self.on_pause(&message),
             FileAction::Resume => self.on_resume(&net, &message),
+            FileAction::Lane => self.on_lane_switch(&message),
             FileAction::Cancel => self.on_cancel(&message),
             FileAction::Error => self.on_error(&message),
         }
@@ -958,6 +1115,29 @@ pub(super) mod words {
 
     pub fn storage_full() -> String {
         "Storage is full. The transfer continues when there is space.".to_string()
+    }
+
+    /// What the board says a transfer is riding on.
+    pub fn fast_lane() -> &'static str {
+        "fast lane"
+    }
+
+    pub fn over_webrtc() -> &'static str {
+        "over WebRTC"
+    }
+
+    pub fn through_a_relay() -> &'static str {
+        "through a relay"
+    }
+
+    /// What a transfer riding the data channel says: only a transfer a lane
+    /// could have served (big, or on a relay) says anything at all.
+    pub fn data_channel(relayed: bool, lane_possible: bool) -> Option<&'static str> {
+        if relayed {
+            Some(through_a_relay())
+        } else {
+            lane_possible.then(over_webrtc)
+        }
     }
 
     pub fn waiting_for_a_slot() -> String {

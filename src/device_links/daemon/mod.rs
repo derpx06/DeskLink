@@ -269,6 +269,8 @@ impl DaemonWorker {
             .local_addr()
             .map_err(|err| err.to_string())?
             .port();
+        // Lane A connections (W18) arrive on this very listener.
+        crate::device_links::webrtc::file_lane::set_listen_port(tcp_port);
         let sessions = Arc::new(DeviceManager::new());
         let shutdown = Arc::new(AtomicBool::new(false));
         // Blocking: a phone's connection is taken the moment it arrives, not

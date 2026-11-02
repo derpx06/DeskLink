@@ -39,6 +39,27 @@ pub(crate) const LINE_MAX: usize = 4096;
 /// Lane connections per peer.
 pub(crate) const LANES_PER_PEER: usize = 2;
 
+/// Where and as whom a lane would connect.
+#[derive(Clone)]
+pub(crate) struct LaneTarget {
+    /// The peer's address on the path ICE selected (the LAN address).
+    pub(crate) addr: std::net::IpAddr,
+    pub(crate) config: Arc<Mutex<Config>>,
+    pub(crate) local_id: String,
+    pub(crate) peer_id: String,
+}
+
+static LISTEN_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// The LAN listener's port (set by the daemon at start; 0 until then).
+pub(crate) fn set_listen_port(port: u16) {
+    LISTEN_PORT.store(port, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn listen_port() -> u16 {
+    LISTEN_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 // ── Tokens ─────────────────────────────────────────────────────────────────
 
 /// 32 lowercase hex characters (128 random bits).
@@ -156,6 +177,16 @@ impl Grants {
 fn grants() -> &'static Mutex<Grants> {
     static GRANTS: std::sync::OnceLock<Mutex<Grants>> = std::sync::OnceLock::new();
     GRANTS.get_or_init(Default::default)
+}
+
+/// Spends a token the way the listener does (tests of the engine's layers).
+#[cfg(test)]
+pub(crate) fn spend_token_for_test(token: &str, transfer_id: &str, dialler_id: &str) -> bool {
+    grants().lock().is_ok_and(|mut grants| {
+        grants
+            .redeem(token, transfer_id, dialler_id, Instant::now())
+            .is_ok()
+    })
 }
 
 /// Issues a token (receiver side, at the accept).
