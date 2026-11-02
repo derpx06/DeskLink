@@ -200,6 +200,22 @@ pub(crate) fn first_line_within_bound(line: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// The throughput floor a benchmark test enforces. Measured rates are only
+/// meaningful on an idle machine, so in the ordinary (parallel) suite the
+/// floor is off and the test checks correctness only; set `DESKLINK_BENCH=1`
+/// and run the lane tests alone (`--test-threads=1`) to enforce it. `var`
+/// overrides the default; 0 turns it off.
+#[cfg(test)]
+pub(crate) fn bench_floor(var: &str, default: f64) -> f64 {
+    if std::env::var_os("DESKLINK_BENCH").is_none() {
+        return 0.0;
+    }
+    std::env::var(var)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
 /// Spends a token the way the listener does (tests of the engine's layers).
 #[cfg(test)]
 pub(crate) fn spend_token_for_test(token: &str, transfer_id: &str, dialler_id: &str) -> bool {
@@ -957,10 +973,7 @@ mod tests {
         assert_eq!(reader.join().unwrap(), total);
         let rate = total as f64 / started.elapsed().as_secs_f64() / 1e6;
         eprintln!("[bench] lane A over loopback TLS: {rate:.0} MB/s");
-        let floor: f64 = std::env::var("DESKLINK_LANE_FLOOR")
-            .ok()
-            .and_then(|text| text.parse().ok())
-            .unwrap_or(100.0);
+        let floor = bench_floor("DESKLINK_LANE_FLOOR", 100.0);
         assert!(
             rate >= floor,
             "{rate:.0} MB/s is under the floor of {floor} MB/s"
