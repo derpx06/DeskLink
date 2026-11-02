@@ -110,7 +110,6 @@ mod imp {
             obj.set_accels_for_action("app.preferences", &["<control>comma"]);
             obj.set_accels_for_action("app.history", &["<control>h"]);
             obj.set_accels_for_action("win.pair-new", &["<control>n"]);
-            obj.set_accels_for_action("win.type-on-phone", &["<control><shift>k"]);
             obj.set_accels_for_action("win.toggle-search", &["<control>f"]);
             obj.set_accels_for_action("window.close", &["<control>w"]);
         }
@@ -359,6 +358,7 @@ impl DesklinkApplication {
             .build();
         crate::send_to::add_action(self);
         crate::send_to::add_bucket_action(self);
+        crate::send_to::add_direct_actions(self);
         self.add_action_entries([
             quit_action,
             about_action,

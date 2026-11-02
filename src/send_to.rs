@@ -120,6 +120,105 @@ pub fn run_dial_cli(number: &str) -> glib::ExitCode {
     activate_running("dial", number.to_variant(), "--dial")
 }
 
+/// What the Insert buttons ask for: the name on the command line, then the
+/// capture kind and where the result goes (the same pairs as the menu's rows,
+/// `window::insert::CAPTURES`).
+const INSERT_VERBS: [(&str, &str, &str); 5] = [
+    ("photo", "photo", "clipboard"),
+    ("photo-file", "photo", "file"),
+    ("scan", "scan", "file"),
+    ("text", "text", "clipboard"),
+    ("qr", "qr", "clipboard"),
+];
+
+/// The Sound menu's switches, as the command line spells them: the name, the
+/// `DaemonCommand::Sound` source and whether it turns on.
+const SOUND_VERBS: [(&str, &str, bool); 6] = [
+    ("desk-on", "desk-sound", true),
+    ("desk-off", "desk-sound", false),
+    ("phone-mic-on", "phone-mic", true),
+    ("phone-mic-off", "phone-mic", false),
+    ("phone-sound-on", "phone-sound", true),
+    ("phone-sound-off", "phone-sound", false),
+];
+
+/// `[verb] [--to <device id>]` in either order; exactly one verb.
+fn parse_verb_and_device(args: &[String]) -> Result<(String, Option<String>), String> {
+    let (mut verb, mut device) = (None, None);
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--to" => {
+                device = Some(rest.next().ok_or("--to needs a device id")?.clone());
+            }
+            other if other.starts_with('-') => return Err(format!("unknown option {other}")),
+            other => {
+                if verb.replace(other.to_string()).is_some() {
+                    return Err("only one verb at a time".to_string());
+                }
+            }
+        }
+    }
+    Ok((verb.ok_or("a verb is needed")?, device))
+}
+
+/// `--insert` arguments: `(device, kind, target)`.
+pub(crate) fn parse_insert(args: &[String]) -> Result<(String, String, String), String> {
+    let (verb, device) = parse_verb_and_device(args)?;
+    let (_, kind, target) = INSERT_VERBS
+        .iter()
+        .find(|(name, _, _)| *name == verb)
+        .ok_or_else(|| {
+            let names: Vec<&str> = INSERT_VERBS.iter().map(|(name, _, _)| *name).collect();
+            format!("\"{verb}\" is not one of: {}", names.join(", "))
+        })?;
+    Ok((
+        device.unwrap_or_default(),
+        (*kind).to_string(),
+        (*target).to_string(),
+    ))
+}
+
+/// `--sound` arguments: `(device, source, on)`.
+pub(crate) fn parse_sound(args: &[String]) -> Result<(String, String, bool), String> {
+    let (verb, device) = parse_verb_and_device(args)?;
+    let (_, what, on) = SOUND_VERBS
+        .iter()
+        .find(|(name, _, _)| *name == verb)
+        .ok_or_else(|| {
+            let names: Vec<&str> = SOUND_VERBS.iter().map(|(name, _, _)| *name).collect();
+            format!("\"{verb}\" is not one of: {}", names.join(", "))
+        })?;
+    Ok((device.unwrap_or_default(), (*what).to_string(), *on))
+}
+
+/// `desklink --insert <photo|photo-file|scan|text|qr> [--to <device id>]`.
+pub fn run_insert_cli(args: &[String]) -> glib::ExitCode {
+    match parse_insert(args) {
+        Ok((device, kind, target)) => {
+            activate_running("insert", (device, kind, target).to_variant(), "--insert")
+        }
+        Err(error) => {
+            eprintln!("desklink --insert: {error}");
+            glib::ExitCode::from(2)
+        }
+    }
+}
+
+/// `desklink --sound <desk-on|desk-off|phone-mic-on|phone-mic-off|
+/// phone-sound-on|phone-sound-off> [--to <device id>]`.
+pub fn run_sound_cli(args: &[String]) -> glib::ExitCode {
+    match parse_sound(args) {
+        Ok((device, what, on)) => {
+            activate_running("sound", (device, what, on).to_variant(), "--sound")
+        }
+        Err(error) => {
+            eprintln!("desklink --sound: {error}");
+            glib::ExitCode::from(2)
+        }
+    }
+}
+
 /// Activates `app.<action>` on the running DeskLink, starting it first when
 /// it is not running.
 fn activate_running(action: &str, parameter: Variant, flag: &str) -> glib::ExitCode {
@@ -184,6 +283,71 @@ pub(crate) fn add_action(app: &DesklinkApplication) {
         send(&app, &device, &paths);
     });
     app.add_action(&action);
+}
+
+/// The `app.insert` and `app.sound` actions: what the Insert and Sound
+/// buttons do, for the phone named (or the connected one). They send the same
+/// commands, so the same gates and the same consent on the phone apply; a
+/// phone that is not connected is told as a notification.
+pub(crate) fn add_direct_actions(app: &DesklinkApplication) {
+    use crate::device_links::daemon::DaemonCommand;
+    let insert = gio::SimpleAction::new("insert", Some(glib::VariantTy::new("(sss)").unwrap()));
+    let weak = app.downgrade();
+    insert.connect_activate(move |_, parameter| {
+        let (Some(app), Some((device, kind, target))) = (
+            weak.upgrade(),
+            parameter.and_then(|value| value.get::<(String, String, String)>()),
+        ) else {
+            return;
+        };
+        // Only what the menu offers.
+        if !INSERT_VERBS
+            .iter()
+            .any(|(_, k, t)| *k == kind && *t == target)
+        {
+            return;
+        }
+        if let Some(id) = ready_phone(&app, &device) {
+            if let Some(daemon) = app.daemon_handle() {
+                daemon.send(DaemonCommand::Capture(id, kind, target));
+            }
+        }
+    });
+    app.add_action(&insert);
+    let sound = gio::SimpleAction::new("sound", Some(glib::VariantTy::new("(ssb)").unwrap()));
+    let weak = app.downgrade();
+    sound.connect_activate(move |_, parameter| {
+        let (Some(app), Some((device, what, on))) = (
+            weak.upgrade(),
+            parameter.and_then(|value| value.get::<(String, String, bool)>()),
+        ) else {
+            return;
+        };
+        if !SOUND_VERBS.iter().any(|(_, w, _)| *w == what) {
+            return;
+        }
+        if let Some(id) = ready_phone(&app, &device) {
+            if let Some(daemon) = app.daemon_handle() {
+                daemon.send(DaemonCommand::Sound(id, what, on));
+            }
+        }
+    });
+    app.add_action(&sound);
+}
+
+/// The id of the phone to act on, or a notification saying there is none.
+fn ready_phone(app: &DesklinkApplication, named: &str) -> Option<String> {
+    let devices = app.daemon_handle()?.devices();
+    match choose_phone(&devices, named).filter(|phone| phone.feature_transport_ready) {
+        Some(phone) => Some(phone.id.clone()),
+        None => {
+            let notification = gio::Notification::new("No phone is connected");
+            notification.set_body(Some("Connect your phone to DeskLink first."));
+            notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+            app.send_notification(Some("direct-action"), &notification);
+            None
+        }
+    }
 }
 
 /// The `app.bucket` action: `(device, paths)` into that phone's Bucket
@@ -545,6 +709,78 @@ pub fn start(app: &DesklinkApplication) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    /// `--insert`: the verb in any place relative to `--to`, only the verbs
+    /// the Insert menu has, and each one asks for what its row asks for.
+    #[test]
+    fn insert_arguments_name_a_menu_row_and_optionally_a_phone() {
+        assert_eq!(
+            parse_insert(&strings(&["photo"])),
+            Ok((String::new(), "photo".into(), "clipboard".into()))
+        );
+        assert_eq!(
+            parse_insert(&strings(&["--to", "p1", "scan"])),
+            Ok(("p1".into(), "scan".into(), "file".into()))
+        );
+        assert_eq!(
+            parse_insert(&strings(&["qr", "--to", "p2"])),
+            Ok(("p2".into(), "qr".into(), "clipboard".into()))
+        );
+        assert_eq!(parse_insert(&strings(&["photo-file"])).unwrap().2, "file");
+        for bad in [
+            strings(&[]),
+            strings(&["video"]),
+            strings(&["photo", "scan"]),
+            strings(&["photo", "--to"]),
+            strings(&["--wat", "photo"]),
+        ] {
+            assert!(parse_insert(&bad).is_err(), "{bad:?}");
+        }
+        // Every verb is a row of the menu: nothing the buttons cannot do.
+        for (name, kind, target) in INSERT_VERBS {
+            assert!(
+                crate::window::insert::CAPTURES
+                    .iter()
+                    .any(|(k, t, _, _)| *k == kind && *t == target),
+                "{name}"
+            );
+        }
+    }
+
+    /// `--sound`: the six switches of the Sound menu, on and off.
+    #[test]
+    fn sound_arguments_name_a_switch_and_optionally_a_phone() {
+        assert_eq!(
+            parse_sound(&strings(&["desk-on"])),
+            Ok((String::new(), "desk-sound".into(), true))
+        );
+        assert_eq!(
+            parse_sound(&strings(&["phone-mic-off", "--to", "p1"])),
+            Ok(("p1".into(), "phone-mic".into(), false))
+        );
+        assert_eq!(
+            parse_sound(&strings(&["phone-sound-on"])),
+            Ok((String::new(), "phone-sound".into(), true))
+        );
+        for bad in [
+            strings(&[]),
+            strings(&["on"]),
+            strings(&["desk-sound-on"]),
+            strings(&["desk-on", "phone-mic-on"]),
+            strings(&["-x"]),
+        ] {
+            assert!(parse_sound(&bad).is_err(), "{bad:?}");
+        }
+        let names: Vec<_> = SOUND_VERBS.iter().map(|(name, _, _)| *name).collect();
+        assert_eq!(names.len(), 6);
+        for (_, what, _) in SOUND_VERBS {
+            assert!(["desk-sound", "phone-mic", "phone-sound"].contains(&what));
+        }
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|arg| arg.to_string()).collect()

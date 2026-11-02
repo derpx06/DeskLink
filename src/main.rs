@@ -99,7 +99,6 @@ mod test_privileges;
 mod thumbnails;
 mod ticker;
 mod tray;
-mod type_on_phone;
 mod window;
 
 use self::application::DesklinkApplication;
@@ -126,6 +125,15 @@ fn main() -> glib::ExitCode {
     // `desklink --bucket [--to <phone>] <files…>`: into the Bucket (F8b).
     if args.get(1).is_some_and(|arg| arg == "--bucket") {
         return send_to::run_bucket_cli(&args[2..]);
+    }
+    // `desklink --insert <photo|photo-file|scan|text|qr>` and `desklink --sound
+    // <verb>`: what the Insert and Sound buttons do, for a script or a
+    // terminal. Handed to the running app like `--send-files`.
+    if args.get(1).is_some_and(|arg| arg == "--insert") {
+        return send_to::run_insert_cli(&args[2..]);
+    }
+    if args.get(1).is_some_and(|arg| arg == "--sound") {
+        return send_to::run_sound_cli(&args[2..]);
     }
     // `desklink --dial <number>`, or a `tel:` link from a launcher that does
     // not use D-Bus activation: the running DeskLink asks, then the phone
