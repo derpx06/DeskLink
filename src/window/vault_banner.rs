@@ -146,6 +146,8 @@ mod tests {
             assert_eq!(dialog.heading().as_deref(), Some("Start fresh?"));
             // Cancel (the close response) gives nothing up.
             dialog.close();
+            let context = gtk::glib::MainContext::default();
+            while context.iteration(false) {}
             assert_eq!(FRESH.load(Ordering::SeqCst), 0);
 
             // Asked again and confirmed, it does.
@@ -161,7 +163,6 @@ mod tests {
                 .find(|button| button.label().as_deref() == Some("Start Fresh"))
                 .expect("the dialog's Start Fresh button");
             go.emit_clicked();
-            let context = gtk::glib::MainContext::default();
             while context.iteration(false) {}
             assert_eq!(FRESH.load(Ordering::SeqCst), 1, "confirmed");
         });

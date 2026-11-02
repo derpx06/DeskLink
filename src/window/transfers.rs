@@ -1019,7 +1019,11 @@ fn new_row(daemon: &DaemonHandle, row: &TransferRow) -> RowWidgets {
         let (daemon, device_id, transfer_id) =
             (daemon.clone(), row.device_id.clone(), row.id.clone());
         cancel.connect_clicked(move |button| {
-            // Once is enough; the card goes when the daemon has done it.
+            // Once is enough; the card goes when the daemon has done it. (A
+            // second activation, however it arrives, asks for nothing.)
+            if !button.is_sensitive() {
+                return;
+            }
             button.set_sensitive(false);
             daemon.send(DaemonCommand::CancelTransfer(
                 device_id.clone(),
@@ -1139,6 +1143,8 @@ mod tests {
                 Ok(DaemonCommand::CancelTransfer(device, id)) if device == "phone" && id == "t"
             ));
             assert!(!cancel.is_sensitive(), "once is enough");
+            // `emit_clicked` ignores sensitivity, as a keyboard activation can.
+            cancel.emit_clicked();
             assert!(commands.try_recv().is_err(), "no second request");
         });
     }
