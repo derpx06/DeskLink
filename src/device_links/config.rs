@@ -120,6 +120,10 @@ pub struct AppSettings {
     /// from the phone.
     #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub unlock_devices: std::collections::BTreeSet<String>,
+    /// The phones whose walking away locks this computer (a minute out of
+    /// reach, after a warning). None until turned on here, per phone.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub walk_away_devices: std::collections::BTreeSet<String>,
     /// Show the phone as its own item in the top bar too (the extension's
     /// pill), besides the Quick Settings menu. Off by default.
     #[serde(default)]
@@ -166,6 +170,7 @@ impl Default for AppSettings {
             muted_command_alerts: Default::default(),
             keep_awake_phones: Default::default(),
             unlock_devices: Default::default(),
+            walk_away_devices: Default::default(),
             top_bar_pill: false,
             recent_folders: Vec::new(),
             forward_notifications: false,
@@ -218,6 +223,11 @@ impl AppSettings {
     /// Whether `device_id` may unlock this computer (Preferences, per phone).
     pub fn unlocks_from(&self, device_id: &str) -> bool {
         self.unlock_devices.contains(device_id)
+    }
+
+    /// Whether this computer locks when `device_id` walks away (per phone).
+    pub fn locks_when_away(&self, device_id: &str) -> bool {
+        self.walk_away_devices.contains(device_id)
     }
 
     /// The relay's address; empty when none is set up.
@@ -902,7 +912,9 @@ impl Config {
             // one has: its snapshots are sent again.
             crate::device_links::sync::forget_device(&info.id);
             // "Unlock with this phone" is a consent for that identity.
-            if self.stored.settings.unlock_devices.remove(&info.id) {
+            let unlock = self.stored.settings.unlock_devices.remove(&info.id);
+            let walk_away = self.stored.settings.walk_away_devices.remove(&info.id);
+            if unlock || walk_away {
                 mirror_settings(&self.stored.settings);
             }
         }
@@ -1003,6 +1015,7 @@ impl Config {
         let settings = &mut self.stored.settings;
         let cleared = [
             settings.unlock_devices.remove(device_id),
+            settings.walk_away_devices.remove(device_id),
             // What was chosen for that phone alone: not inherited by a later
             // phone under the same id.
             settings.hidden_notifications.remove(device_id),
@@ -1965,6 +1978,34 @@ mod tests {
         assert!(!old.exists());
         assert!(new.join("later").exists());
         let _ = fs::remove_dir_all(base);
+    }
+
+    /// The walk-away lock is off until turned on for a phone, stays out of
+    /// the file while off, and is gone with the pairing and with the identity.
+    #[test]
+    fn the_walk_away_lock_is_per_phone_off_by_default_and_does_not_survive_unpair() {
+        let old: AppSettings = serde_json::from_str(r#"{"stay_awake":true}"#).unwrap();
+        assert!(!old.locks_when_away("phone"));
+        let written = serde_json::to_string(&AppSettings::default()).unwrap();
+        assert!(!written.contains("walk_away_devices"), "{written}");
+
+        let dir = std::env::temp_dir().join(format!("desklink-walk-{}", Uuid::new_v4()));
+        let mut config = Config::load_from_dir(dir).unwrap();
+        let id = format!("phone-{}", Uuid::new_v4().simple());
+        let info = DeviceInfo::local(id.clone(), "Pixel".into());
+        config.trust_device(&info, "cert-1".into()).unwrap();
+        config.stored.settings.walk_away_devices.insert(id.clone());
+        config.trust_device(&info, "cert-1".into()).unwrap();
+        assert!(config.stored.settings.locks_when_away(&id), "same identity");
+        assert!(
+            !config.stored.settings.locks_when_away("other"),
+            "per phone"
+        );
+        config.trust_device(&info, "cert-2".into()).unwrap();
+        assert!(!config.stored.settings.locks_when_away(&id), "new identity");
+        config.stored.settings.walk_away_devices.insert(id.clone());
+        config.untrust_device(&id).unwrap();
+        assert!(!config.stored.settings.locks_when_away(&id), "unpaired");
     }
 
     /// "Unlock with this phone" is gone with the pairing, and with the

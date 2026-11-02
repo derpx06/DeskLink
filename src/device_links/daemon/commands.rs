@@ -86,6 +86,8 @@ pub enum DaemonCommand {
     SetKeepAwakeFrom(String, bool),
     /// Let this phone, on this network, unlock this computer when approved.
     SetUnlockNearby(String, bool),
+    /// Lock this computer when the phone walks away (per phone).
+    SetWalkAwayLock(String, bool),
     /// Glide (F4): the pointer glides onto this phone past this edge, or
     /// off (`None`) for it.
     SetGlide(String, Option<crate::device_links::glide::Edge>),
@@ -260,6 +262,13 @@ impl DaemonWorker {
                     settings.unlock_devices.insert(id);
                 } else {
                     settings.unlock_devices.remove(&id);
+                }
+            }),
+            DaemonCommand::SetWalkAwayLock(id, on) => self.update_settings(|settings| {
+                if on {
+                    settings.walk_away_devices.insert(id);
+                } else {
+                    settings.walk_away_devices.remove(&id);
                 }
             }),
             DaemonCommand::SetGlide(id, edge) => self.update_settings(|settings| match edge {
@@ -612,6 +621,9 @@ impl DaemonWorker {
     /// whose addresses all went; the redialer and the phones' answers to the
     /// beacons bring the links back.
     fn network_changed(&self) {
+        // A network change (or the computer waking) is never a walk away:
+        // the count of a minute out of reach starts again.
+        crate::device_links::walk_away::reset();
         crate::device_links::relay_link::client::reset();
         super::discovery::beacon_again();
         let present: Vec<std::net::IpAddr> = super::network::local_interfaces()

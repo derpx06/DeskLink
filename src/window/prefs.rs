@@ -180,6 +180,7 @@ fn groups(
     privacy.add(&password_row(daemon, settings));
     privacy.add(&terminal_access_row(daemon, device));
     privacy.add(&unlock_nearby_row(daemon, settings, device));
+    privacy.add(&walk_away_row(daemon, settings, device));
     privacy.add(&unpair_row(daemon, device));
 
     let appearance = group(GROUPS[8]);
@@ -537,6 +538,33 @@ fn unlock_nearby_row(
         daemon.send(DaemonCommand::SetUnlockNearby(id.clone(), row.is_active()))
     });
     follow(&row, |settings, id| settings.unlocks_from(id));
+    row
+}
+
+/// Walk-away lock: off unless turned on here, and explained.
+fn walk_away_row(
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    device: &DeviceView,
+) -> adw::SwitchRow {
+    let phone = &device.name;
+    let explained = format!(
+        "Locks this computer if {phone} is out of reach for a minute, after a ten second \
+         warning you can cancel. Never while the phone is asleep, and it never unlocks."
+    );
+    let row = adw::SwitchRow::builder()
+        .title(format!("Lock when I walk away with {phone}"))
+        .use_markup(false)
+        .active(settings.locks_when_away(&device.id))
+        .build();
+    row.set_subtitle(&explained);
+    with_icon(&row, "system-lock-screen-symbolic");
+    row.update_property(&[gtk::accessible::Property::Description(&explained)]);
+    let (daemon, id) = (daemon.clone(), device.id.clone());
+    row.connect_active_notify(move |row| {
+        daemon.send(DaemonCommand::SetWalkAwayLock(id.clone(), row.is_active()))
+    });
+    follow(&row, |settings, id| settings.locks_when_away(id));
     row
 }
 
@@ -1613,6 +1641,7 @@ mod tests {
                         "Ask before terminal and screen access",
                         "Terminal access",
                         "Unlock with Pixel 9 nearby",
+                        "Lock when I walk away with Pixel 9",
                         "Unpair Pixel 9…",
                     ],
                 ),

@@ -302,6 +302,17 @@ impl DesklinkApplication {
                 }
             })
             .build();
+        // "Cancel" on the walk-away warning. It only ever keeps the computer
+        // unlocked for one absence; nothing outward.
+        let walk_away_cancel_action = gio::ActionEntry::builder("walk-away-cancel")
+            .parameter_type(Some(glib::VariantTy::STRING))
+            .activate(move |app: &Self, _, target| {
+                if let Some(device) = target.and_then(|target| target.get::<String>()) {
+                    crate::device_links::walk_away::cancel(&device);
+                    app.withdraw_notification(&format!("walk-away-{device}"));
+                }
+            })
+            .build();
         let history_action = gio::ActionEntry::builder("history")
             .activate(move |app: &Self, _, _| app.show_history())
             .build();
@@ -353,6 +364,7 @@ impl DesklinkApplication {
             history_action,
             open_bucket_action,
             turn_on_bucket_action,
+            walk_away_cancel_action,
             call_action,
             dial_action,
         ]);
@@ -548,6 +560,7 @@ impl DesklinkApplication {
                         &notification,
                     );
                 }
+                app.walk_away_step(&daemon.devices());
                 if let Some(tray) = app.imp().tray.borrow().as_ref() {
                     let devices = daemon.devices();
                     let hand_off = devices.iter().any(|device| device.feature_transport_ready)
@@ -572,6 +585,49 @@ impl DesklinkApplication {
                 glib::ControlFlow::Continue
             })
         });
+    }
+
+    /// Walk-away lock: the look at every phone, and what it asks for (a
+    /// warning with Cancel, then the lock). See `walk_away`.
+    fn walk_away_step(&self, devices: &[crate::device_links::device::DeviceView]) {
+        use crate::device_links::device::DeviceStatus;
+        use crate::device_links::walk_away::{observe, Seen, Step};
+        let settings = crate::device_links::config::app_settings();
+        for device in devices.iter().filter(|device| device.trusted) {
+            let seen = Seen {
+                enabled: settings.locks_when_away(&device.id),
+                reachable: matches!(device.status, DeviceStatus::Paired),
+                ready: device.feature_transport_ready,
+                dozing: crate::device_links::webrtc::coordinator::is_dozing(&device.id),
+            };
+            let id = format!("walk-away-{}", device.id);
+            match observe(&device.id, seen) {
+                Some(Step::Warn) => {
+                    let notification =
+                        gio::Notification::new("Locking this computer in 10 seconds");
+                    notification.set_body(Some(&format!(
+                        "{} has been out of reach for a minute. Cancel to stay unlocked.",
+                        device.name
+                    )));
+                    notification.set_priority(gio::NotificationPriority::Urgent);
+                    notification.add_button_with_target_value(
+                        "Cancel",
+                        "app.walk-away-cancel",
+                        Some(&device.id.to_variant()),
+                    );
+                    self.send_notification(Some(&id), &notification);
+                }
+                Some(Step::ClearWarning) => self.withdraw_notification(&id),
+                Some(Step::Lock) => {
+                    self.withdraw_notification(&id);
+                    // D-Bus with a timeout: not on the main loop.
+                    let _ = std::thread::Builder::new()
+                        .name("desklink-walk-away".into())
+                        .spawn(crate::device_links::daemon::packet_handler::lock_desktop);
+                }
+                None => {}
+            }
+        }
     }
 
     /// A resume from sleep is a sign of the network changing under the

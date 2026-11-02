@@ -31,6 +31,7 @@ pub mod transfer_log;
 pub mod transport;
 pub(crate) mod unlock;
 pub(crate) mod vault;
+pub(crate) mod walk_away;
 pub mod webrtc;
 
 /// Whether this device takes the leading role against `peer_device_id`.
