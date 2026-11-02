@@ -3559,6 +3559,168 @@ mod lane {
         assert!(sending);
     }
 
+    /// The acknowledgements of the first five blocks never arrive, then the
+    /// lane drops: the receiver verified five, the sender saw none. The
+    /// data channel takes over from the receiver's five, not the sender's none.
+    #[test]
+    fn a_failover_restarts_at_what_the_receiver_verified_not_what_the_sender_saw() {
+        let env = Env::new(Duration::from_millis(1));
+        env.proxy.plan(&[Plan::Cut(5 * MIB as u64 + 600_000)]);
+        let mut tun = fast();
+        tun.lane_retry = Duration::from_secs(600);
+        let rig = env.rig("lane-verified", tun);
+        let lost = Arc::new(AtomicUsize::new(0));
+        let counter = lost.clone();
+        *rig.ba.control_hook.lock().unwrap() = Some(Box::new(move |control| {
+            if control.action == FileAction::BlockAck && counter.fetch_add(1, Ordering::SeqCst) < 5
+            {
+                Fate::Drop
+            } else {
+                Fate::Deliver
+            }
+        }));
+        let bytes = payload(24 * MIB + 99, 61);
+        let source = rig.source("big.bin", &bytes);
+        rig.a().start_send(&source).unwrap();
+        let got = rig.received();
+        assert_eq!(fs::read(&got.path).unwrap(), bytes);
+        let said: Vec<u64> = rig
+            .ba
+            .sent(FileAction::BlockNack)
+            .into_iter()
+            .filter(|nack| nack.reason.as_deref() == Some("lane"))
+            .filter_map(|nack| nack.block_index)
+            .collect();
+        let verified = said
+            .iter()
+            .copied()
+            .max()
+            .expect("the receiver said where it was");
+        assert!(verified >= 4, "the receiver had verified {verified}");
+        // Nothing the receiver verified went again over the data channel.
+        let carried = rig.ab.frame_bytes.load(Ordering::SeqCst);
+        let overhead = rig.ab.frames.load(Ordering::SeqCst) as u64 * 40 + 25 * 32;
+        assert!(
+            carried
+                <= bytes.len() as u64 - (verified * BLOCK_BYTES).min(bytes.len() as u64) + overhead,
+            "{carried} bytes over WebRTC with {verified} blocks verified"
+        );
+        assert!(rig.ab.frames.load(Ordering::SeqCst) > 0);
+    }
+
+    /// Three lane failures and the transfer stays on the data channel.
+    #[test]
+    fn a_transfer_gives_the_lane_three_failures_and_then_stays_on_webrtc() {
+        let env = Env::new(Duration::from_millis(1));
+        env.proxy.plan(&[
+            Plan::Cut(2 * MIB as u64),
+            Plan::Cut(2 * MIB as u64),
+            Plan::Cut(2 * MIB as u64),
+            Plan::Cut(2 * MIB as u64),
+        ]);
+        let mut tun = fast();
+        tun.lane_retry = Duration::from_millis(20);
+        let rig = env.rig("lane-flap", tun);
+        slow_pipe(&rig, Duration::from_millis(1));
+        let bytes = payload(96 * MIB + 5, 62);
+        let source = rig.source("big.bin", &bytes);
+        rig.a().start_send(&source).unwrap();
+        let got = rig.received();
+        assert_eq!(fs::read(&got.path).unwrap(), bytes);
+        let kinds: Vec<String> = lane_actions(&rig).into_iter().map(|a| a.0).collect();
+        assert_eq!(
+            kinds.iter().filter(|kind| *kind == "tcp").count(),
+            3,
+            "{kinds:?}"
+        );
+        assert_eq!(kinds.last().map(String::as_str), Some("webrtc"));
+        assert_eq!(env.proxy.connections.load(Ordering::SeqCst), 3);
+    }
+
+    /// A peer that failed lanes is held back (no lane offered) until its
+    /// back-off is over; a clean lane transfer clears it.
+    #[test]
+    fn a_peer_in_back_off_is_not_offered_a_lane_and_a_clean_transfer_clears_it() {
+        let env = Env::new(Duration::ZERO);
+        file_lane::penalize_peer(&env.receiver.id, Duration::from_secs(600), Instant::now());
+        let rig = env.rig("lane-backoff", fast());
+        let bytes = payload(10 * MIB, 63);
+        let source = rig.source("big.bin", &bytes);
+        rig.a().start_send(&source).unwrap();
+        assert_eq!(fs::read(rig.received().path).unwrap(), bytes);
+        assert!(rig.ab.sent(FileAction::Offer)[0].lane.is_none());
+        assert!(rig.ab.frames.load(Ordering::SeqCst) > 0);
+        file_lane::forgive_peer(&env.receiver.id);
+        // Clear: the next transfer gets its lane, and finishing clean leaves
+        // the peer unpunished.
+        let rig = env.rig("lane-cleared", fast());
+        let source = rig.source("big2.bin", &bytes);
+        rig.a().start_send(&source).unwrap();
+        assert_eq!(fs::read(rig.received().path).unwrap(), bytes);
+        rig.sent_ok();
+        assert!(rig.ab.sent(FileAction::Offer)[0].lane.is_some());
+        assert_eq!(rig.ab.frames.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            file_lane::peer_wait_for_test(&env.receiver.id, Instant::now()),
+            Duration::ZERO
+        );
+    }
+
+    /// A token minted before a long prefix check is not dialled with when it
+    /// is about to lapse: a fresh one is asked for first.
+    #[test]
+    fn an_old_token_is_replaced_before_it_is_dialled() {
+        let env = Env::new(Duration::ZERO);
+        let mut tun = fast();
+        tun.lane_token_fresh = Duration::ZERO;
+        let rig = env.rig("lane-slow-prefix", tun);
+        let bytes = payload(10 * MIB, 64);
+        let source = rig.source("big.bin", &bytes);
+        rig.a().start_send(&source).unwrap();
+        assert_eq!(fs::read(rig.received().path).unwrap(), bytes);
+        let tokens: Vec<String> = rig
+            .ba
+            .sent(FileAction::Accept)
+            .into_iter()
+            .filter_map(|accept| accept.lane.and_then(|lane| lane.token))
+            .collect();
+        assert_eq!(tokens.len(), 3, "the accept, and two asked-for refreshes");
+        let mut distinct = tokens.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 3, "each a fresh token");
+        assert_eq!(rig.ab.sent(FileAction::Offer).len(), 3);
+        assert_eq!(rig.ab.frames.load(Ordering::SeqCst), 0, "and then the lane");
+        assert_eq!(env.proxy.connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn the_back_off_doubles_to_five_minutes_and_a_default_token_is_fresh_for_fifty_seconds() {
+        let peer = format!("backoff-{}", uuid::Uuid::new_v4());
+        let t0 = Instant::now();
+        let waits: Vec<u64> = (0..8)
+            .map(|_| {
+                file_lane::penalize_peer(&peer, Duration::from_secs(10), t0);
+                file_lane::peer_wait_for_test(&peer, t0).as_secs()
+            })
+            .collect();
+        assert_eq!(waits, [10, 20, 40, 80, 160, 300, 300, 300]);
+        assert!(file_lane::peer_blocked(
+            &peer,
+            t0 + Duration::from_secs(299)
+        ));
+        assert!(!file_lane::peer_blocked(
+            &peer,
+            t0 + Duration::from_secs(300)
+        ));
+        file_lane::forgive_peer(&peer);
+        assert!(!file_lane::peer_blocked(&peer, t0));
+        assert_eq!(
+            Tunables::default().lane_token_fresh,
+            file_lane::TOKEN_TTL - Duration::from_secs(10)
+        );
+    }
+
     #[test]
     fn a_big_file_between_paired_devices_goes_over_the_lane() {
         let env = Env::new(Duration::from_millis(1));
@@ -3933,6 +4095,35 @@ fn stale_lane_frames_after_a_failover_are_dropped() {
     }
     hand.settle();
     assert_eq!(verified_of(&hand), Some(4));
+}
+
+/// A failover whose start is below what the receiver verified (acknowledgements
+/// still on their way) keeps the verified blocks and says where it is.
+#[test]
+fn a_failover_below_the_receivers_verified_blocks_keeps_them_and_says_where_it_is() {
+    let (hand, _file, _blocks) = hand_part_way("lane-keeps");
+    let mut switch = FileControl::new(
+        &wire_of("alpha", "beta"),
+        FileAction::Lane,
+        STALE_ID,
+        "token0",
+    );
+    switch.lane = Some(super::super::file_protocol::LaneField::switch(
+        "webrtc", 0, 1,
+    ));
+    hand.send(switch);
+    hand.settle();
+    assert_eq!(
+        verified_of(&hand),
+        Some(2),
+        "nothing verified is thrown away"
+    );
+    let said = hand.link.sent(FileAction::BlockNack);
+    assert_eq!(said.len(), 1);
+    assert_eq!(
+        (said[0].block_index, said[0].pass, said[0].reason.as_deref()),
+        (Some(2), Some(1), Some("lane"))
+    );
 }
 
 /// The receiver's word about a lane: a look at a lane changes nothing; a lane

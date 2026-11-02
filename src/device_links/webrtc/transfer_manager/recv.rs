@@ -657,7 +657,7 @@ impl Engine {
 
     /// The sender changed lane: it sends from `start_block` at `pass` now.
     /// What the receiver holds of a block beyond that is dropped.
-    pub(super) fn on_lane_switch(&mut self, message: &FileControl) {
+    pub(super) fn on_lane_switch(&mut self, net: &Net, message: &FileControl) {
         let Some(lane) = message.lane.as_ref() else {
             return;
         };
@@ -680,8 +680,20 @@ impl Engine {
         if kind == "tcp" {
             return;
         }
-        if incoming.restart_at(start, pass).is_err() {
+        // What was verified stays verified, whatever the sender saw acknowledged
+        // (the acknowledgements may be on their way): the restart is at our own
+        // count, and the sender is told it so that nothing verified is sent
+        // again and nothing unverified is skipped.
+        let from = incoming.verified();
+        if incoming.restart_at(from, pass).is_err() {
             return;
+        }
+        if start < from {
+            let mut position = net.msg(FileAction::BlockNack, &incoming.id, &incoming.token);
+            position.block_index = Some(from);
+            position.pass = Some(pass);
+            position.reason = Some(super::super::file_protocol::reason::LANE.to_string());
+            net.send(position);
         }
         incoming.on_lane = false;
         incoming.lane_serial = 0;

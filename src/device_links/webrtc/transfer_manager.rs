@@ -153,6 +153,9 @@ pub(super) struct Tunables {
     pub storage_slack: u64,
     /// How long after a lane failed the sender asks for one again.
     pub lane_retry: Duration,
+    /// How old a lane token may be when the sender is ready to dial; older,
+    /// and a fresh one is asked for (a long prefix check outlasts the token).
+    pub lane_token_fresh: Duration,
 }
 
 impl Default for Tunables {
@@ -168,6 +171,7 @@ impl Default for Tunables {
             report_every: Duration::from_millis(250),
             storage_slack: 8 * 1024 * 1024,
             lane_retry: Duration::from_secs(10),
+            lane_token_fresh: super::file_lane::TOKEN_TTL - Duration::from_secs(10),
         }
     }
 }
@@ -879,7 +883,7 @@ impl Engine {
             FileAction::Complete => self.on_complete(&message),
             FileAction::Pause => self.on_pause(&message),
             FileAction::Resume => self.on_resume(&net, &message),
-            FileAction::Lane => self.on_lane_switch(&message),
+            FileAction::Lane => self.on_lane_switch(&net, &message),
             FileAction::Cancel => self.on_cancel(&message),
             FileAction::Error => self.on_error(&message),
         }

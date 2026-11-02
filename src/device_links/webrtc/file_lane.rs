@@ -301,6 +301,68 @@ pub(crate) fn receiver_for_test(peer: &str) -> Option<()> {
         .and_then(|registry| registry.receivers.get(peer).map(|_| ()))
 }
 
+/// A peer's lanes that failed: when the next one may be tried. Doubles with
+/// each failure in a row (the base, then twice, ...) up to five minutes; a
+/// transfer a lane carried without a failure clears it.
+#[derive(Default)]
+struct Penalties {
+    by_peer: HashMap<String, (u32, Instant)>,
+}
+
+/// The longest a peer's lanes are held back.
+pub(crate) const PENALTY_MAX: Duration = Duration::from_secs(300);
+
+fn penalties() -> &'static Mutex<Penalties> {
+    static PENALTIES: std::sync::OnceLock<Mutex<Penalties>> = std::sync::OnceLock::new();
+    PENALTIES.get_or_init(Default::default)
+}
+
+/// `peer`'s lane failed at `now`; the next try waits `base`, doubled for each
+/// failure in a row, at most [`PENALTY_MAX`].
+pub(crate) fn penalize_peer(peer: &str, base: Duration, now: Instant) {
+    if let Ok(mut penalties) = penalties().lock() {
+        let failures = penalties
+            .by_peer
+            .get(peer)
+            .map_or(0, |(failures, _)| *failures)
+            + 1;
+        let wait = (base * 2u32.saturating_pow((failures - 1).min(16))).min(PENALTY_MAX);
+        penalties
+            .by_peer
+            .insert(peer.to_string(), (failures, now + wait));
+    }
+}
+
+/// Whether `peer`'s lanes are still held back at `now`.
+pub(crate) fn peer_blocked(peer: &str, now: Instant) -> bool {
+    penalties().lock().is_ok_and(|penalties| {
+        penalties
+            .by_peer
+            .get(peer)
+            .is_some_and(|(_, until)| now < *until)
+    })
+}
+
+/// A clean lane transfer: `peer` starts afresh.
+pub(crate) fn forgive_peer(peer: &str) {
+    if let Ok(mut penalties) = penalties().lock() {
+        penalties.by_peer.remove(peer);
+    }
+}
+
+/// How long `peer` is held back from `now` (tests).
+#[cfg(test)]
+pub(crate) fn peer_wait_for_test(peer: &str, now: Instant) -> Duration {
+    penalties().lock().map_or(Duration::ZERO, |penalties| {
+        penalties
+            .by_peer
+            .get(peer)
+            .map_or(Duration::ZERO, |(_, until)| {
+                until.saturating_duration_since(now)
+            })
+    })
+}
+
 /// Takes one of `peer`'s lane slots if there is one. Taken with the count
 /// checked under one lock; given back by [`lane_closed`].
 pub(crate) fn reserve_lane(peer: &str) -> bool {
