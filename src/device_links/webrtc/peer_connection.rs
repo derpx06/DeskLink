@@ -604,24 +604,11 @@ impl DesktopWebRtcPeer {
         let Some(pair) = self.selected_pair() else {
             return (None, false);
         };
-        let label = path_label(&pair.types, false);
-        (Self::lane_address_of(&pair, label), label == "turn")
-    }
-
-    fn lane_address_of(pair: &SelectedPair, label: &str) -> Option<std::net::IpAddr> {
-        if pair.types.len() != 2 || label != "lan" {
-            return None;
-        }
-        let (local, remote) = (pair.local_ip?, pair.remote_ip?);
-        let scoped =
-            matches!(remote, std::net::IpAddr::V6(ip) if ip.segments()[0] & 0xffc0 == 0xfe80);
-        (!scoped
-            && crate::device_links::lan_scope::is_nearby(
-                local,
-                remote,
-                &crate::device_links::lan_scope::local_interfaces(),
-            ))
-        .then_some(remote)
+        let relayed = path_label(&pair.types, false) == "turn";
+        (
+            lane_address_of(&pair, &crate::device_links::lan_scope::local_interfaces()),
+            relayed,
+        )
     }
 
     /// The selected pair's two candidate types as webrtcbin spells them, and
@@ -1783,6 +1770,25 @@ pub struct SelectedPair {
     pub remote_ip: Option<std::net::IpAddr>,
 }
 
+/// Where a fast lane (W18) may connect on `pair`: the remote address, only
+/// when the pair is host or peer-reflexive on both ends, both addresses are
+/// private (not public, loopback or carrier-grade), the remote is on a subnet
+/// of one of our own `interfaces`, and it is not a scoped link-local IPv6
+/// address (which cannot be dialled without its zone). Anything else is
+/// `None`: the lane is never offered.
+pub(crate) fn lane_address_of(
+    pair: &SelectedPair,
+    interfaces: &[(std::net::IpAddr, u8)],
+) -> Option<std::net::IpAddr> {
+    if pair.types.len() != 2 || path_label(&pair.types, false) != "lan" {
+        return None;
+    }
+    let (local, remote) = (pair.local_ip?, pair.remote_ip?);
+    let scoped = matches!(remote, std::net::IpAddr::V6(ip) if ip.segments()[0] & 0xffc0 == 0xfe80);
+    (!scoped && crate::device_links::lan_scope::is_nearby(local, remote, interfaces))
+        .then_some(remote)
+}
+
 /// The path of the selected pair: its label (shared with the phone), its
 /// round-trip time, and whether it is the local network proper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1834,6 +1840,111 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// The whole LAN-only guarantee of the fast lane: which pairs get an
+    /// address to dial, over interfaces the test states.
+    #[test]
+    fn a_lane_address_comes_only_from_a_local_host_or_prflx_pair() {
+        let ip = |text: &str| -> std::net::IpAddr { text.parse().unwrap() };
+        let interfaces = vec![
+            (ip("192.168.1.2"), 24),
+            (ip("fd00::2"), 64),
+            (ip("8.8.8.8"), 24),
+            (ip("127.0.0.1"), 8),
+            (ip("100.64.0.2"), 10),
+            (ip("fe80::2"), 64),
+        ];
+        let pair = |types: &[&str], local: Option<&str>, remote: Option<&str>| SelectedPair {
+            types: types.iter().map(|kind| kind.to_string()).collect(),
+            rtt: None,
+            local_ip: local.map(ip),
+            remote_ip: remote.map(ip),
+        };
+        let some = |p: SelectedPair| lane_address_of(&p, &interfaces);
+        // Good ones.
+        assert_eq!(
+            some(pair(
+                &["host", "host"],
+                Some("192.168.1.2"),
+                Some("192.168.1.3")
+            )),
+            Some(ip("192.168.1.3"))
+        );
+        assert_eq!(
+            some(pair(
+                &["host", "peer-reflexive"],
+                Some("192.168.1.2"),
+                Some("192.168.1.9")
+            )),
+            Some(ip("192.168.1.9"))
+        );
+        assert_eq!(
+            some(pair(&["host", "host"], Some("fd00::2"), Some("fd00::5"))),
+            Some(ip("fd00::5")),
+            "a unique-local IPv6 pair is local"
+        );
+        // Not a direct local pair.
+        for types in [
+            ["host", "server-reflexive"],
+            ["server-reflexive", "host"],
+            ["relayed", "host"],
+            ["host", "relayed"],
+            ["server-reflexive", "server-reflexive"],
+        ] {
+            assert_eq!(
+                some(pair(&types, Some("192.168.1.2"), Some("192.168.1.3"))),
+                None,
+                "{types:?}"
+            );
+        }
+        assert_eq!(
+            some(pair(&["host"], Some("192.168.1.2"), Some("192.168.1.3"))),
+            None
+        );
+        assert_eq!(
+            some(pair(&[], Some("192.168.1.2"), Some("192.168.1.3"))),
+            None
+        );
+        // Addresses that are not the local network.
+        let host = ["host", "host"];
+        assert_eq!(
+            some(pair(&host, Some("8.8.8.8"), Some("8.8.8.9"))),
+            None,
+            "public"
+        );
+        assert_eq!(
+            some(pair(&host, Some("127.0.0.1"), Some("127.0.0.2"))),
+            None,
+            "loopback"
+        );
+        assert_eq!(
+            some(pair(&host, Some("100.64.0.2"), Some("100.64.0.3"))),
+            None,
+            "carrier-grade"
+        );
+        assert_eq!(
+            some(pair(&host, Some("192.168.1.2"), Some("192.168.2.3"))),
+            None,
+            "private, but not on our subnet"
+        );
+        assert_eq!(
+            some(pair(&host, Some("192.168.1.77"), Some("192.168.1.3"))),
+            None,
+            "not one of our own addresses"
+        );
+        assert_eq!(
+            some(pair(&host, Some("192.168.1.2"), Some("8.8.8.9"))),
+            None,
+            "a public remote"
+        );
+        assert_eq!(
+            some(pair(&host, Some("fe80::2"), Some("fe80::9"))),
+            None,
+            "scoped link-local needs its zone"
+        );
+        assert_eq!(some(pair(&host, None, Some("192.168.1.3"))), None);
+        assert_eq!(some(pair(&host, Some("192.168.1.2"), None)), None);
+    }
 
     #[test]
     fn path_label_follows_the_shared_rule() {
