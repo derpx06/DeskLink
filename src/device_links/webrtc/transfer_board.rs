@@ -122,6 +122,27 @@ impl TransferBoard {
         true
     }
 
+    /// Says which lane a listed transfer is on (`None`: not said). A transfer
+    /// that is not listed has none: the map holds only what the board lists.
+    pub fn set_lane(&mut self, id: &str, lane: Option<&'static str>) {
+        match lane {
+            Some(lane) if self.rows.iter().chain(&self.synced).any(|row| row.id == id) => {
+                self.lanes.insert(id.to_string(), lane);
+            }
+            _ => {
+                self.lanes.remove(id);
+            }
+        }
+    }
+
+    /// Drops the lane of every transfer that is no longer listed (a row that
+    /// was superseded, evicted or discarded never reaches `finish`).
+    fn prune_lanes(&mut self) {
+        let (rows, synced) = (&self.rows, &self.synced);
+        self.lanes
+            .retain(|id, _| rows.iter().chain(synced).any(|row| row.id == *id));
+    }
+
     /// Whether a real transfer can be listed now.
     pub fn has_room(&self) -> bool {
         self.rows.len() < MAX_ROWS || self.rows.iter().any(|row| row.preparing)
@@ -139,12 +160,14 @@ impl TransferBoard {
         });
         if let Some(existing) = self.synced.iter_mut().find(|known| known.id == row.id) {
             *existing = row;
+            self.prune_lanes();
             return;
         }
         if self.synced.len() >= MAX_ROWS {
             self.synced.remove(0);
         }
         self.synced.push(row);
+        self.prune_lanes();
     }
 
     /// Reports a transfer that ended without ever being listed, such as an
@@ -243,6 +266,8 @@ impl TransferBoard {
             .filter(|row| row.device_id == device_id)
         {
             row.paused = true;
+            // Not on any lane while the connection is gone.
+            self.lanes.remove(&row.id);
         }
     }
 
@@ -268,6 +293,7 @@ impl TransferBoard {
     /// under another id (a changed file begun again).
     pub fn discard(&mut self, id: &str) {
         self.notes.remove(id);
+        self.lanes.remove(id);
         self.rows.retain(|row| row.id != id);
         self.synced.retain(|row| row.id != id);
     }
@@ -396,15 +422,7 @@ pub fn snapshot(seen: u64) -> (Vec<TransferRow>, Vec<Finished>, u64) {
 
 /// Says which lane `id` is on now (`None`: not said).
 pub fn set_lane(id: &str, lane: Option<&'static str>) {
-    let mut board = board();
-    match lane {
-        Some(lane) => {
-            board.lanes.insert(id.to_string(), lane);
-        }
-        None => {
-            board.lanes.remove(id);
-        }
-    }
+    board().set_lane(id, lane);
 }
 
 /// Every listed transfer's lane, for the notification.
@@ -535,6 +553,7 @@ mod tests {
     fn finishing_a_transfer_voids_its_lane_token_and_forgets_its_lane() {
         let id = "lane-board-1";
         let token = super::super::file_lane::issue_token(id, "phone").unwrap();
+        assert!(begin(row(id, "lane-dev-1", false, 9 << 20)));
         set_lane(id, Some("fast lane"));
         assert_eq!(lane_of(id), Some("fast lane"));
         assert_eq!(lanes().get(id).copied(), Some("fast lane"));
@@ -550,6 +569,44 @@ mod tests {
             "lane-board-2",
             "phone"
         ));
+    }
+
+    /// Lanes belong to listed transfers only: whatever way a transfer leaves
+    /// the board (ended, discarded, superseded, evicted, its device gone or
+    /// paused), nothing is left in the map. A thousand, created and aborted.
+    #[test]
+    fn the_lane_map_returns_to_empty_however_a_thousand_transfers_end() {
+        let mut board = TransferBoard::default();
+        // Not listed: nothing is kept.
+        board.set_lane("ghost", Some("fast lane"));
+        assert!(board.lanes.is_empty());
+        for n in 0..1000 {
+            let id = format!("t-{n}");
+            let device = format!("dev-{}", n % 7);
+            let synced = n % 5 == 0;
+            if synced {
+                board.begin_synced(row(&id, &device, false, 9 << 20));
+            } else {
+                // A full board refuses a new row; then there is no lane either.
+                let _ = board.begin(row(&id, &device, false, 9 << 20));
+            }
+            board.set_lane(&id, Some("fast lane"));
+            match n % 6 {
+                0 => board.finish(&id, Outcome::Sent),
+                1 => board.finish(&id, Outcome::Cancelled),
+                2 => board.discard(&id),
+                3 => board.pause_device(&device),
+                // 4: left listed (cleaned with its device below).
+                _ => {}
+            }
+            assert!(board.lanes.len() <= 2 * MAX_ROWS, "bounded while running");
+        }
+        // The paired device goes away (unpair, a dead peer): all its rows end.
+        for d in 0..7 {
+            board.finish_device(&format!("dev-{d}"), "gone");
+        }
+        assert!(board.rows().is_empty());
+        assert_eq!(board.lanes.len(), 0, "{:?}", board.lanes);
     }
 
     fn row(id: &str, device: &str, incoming: bool, total: u64) -> TransferRow {
