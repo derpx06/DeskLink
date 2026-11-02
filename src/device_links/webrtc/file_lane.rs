@@ -172,6 +172,98 @@ pub(crate) fn void_tokens(transfer_id: &str) {
     }
 }
 
+// ── Who receives a lane ────────────────────────────────────────────────────
+
+/// The side of the transfer engine that takes a lane connection for a peer:
+/// asked whether the transfer is there and the range right, then handed the
+/// stream (to read frames from).
+pub(crate) trait Receiver: Send + Sync {
+    fn check(&self, body: &TokenBody) -> Result<(), Refusal>;
+    fn open(&self, stream: SslStream<TcpStream>, body: TokenBody);
+}
+
+#[derive(Default)]
+struct Registry {
+    receivers: HashMap<String, Arc<dyn Receiver>>,
+    /// Lane connections open per peer.
+    open: HashMap<String, usize>,
+}
+
+fn registry() -> &'static Mutex<Registry> {
+    static REGISTRY: std::sync::OnceLock<Mutex<Registry>> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(Default::default)
+}
+
+/// `peer`'s engine takes lanes from now on.
+pub(crate) fn register_receiver(peer: &str, receiver: Arc<dyn Receiver>) {
+    if let Ok(mut registry) = registry().lock() {
+        registry.receivers.insert(peer.to_string(), receiver);
+    }
+}
+
+pub(crate) fn unregister_receiver(peer: &str) {
+    if let Ok(mut registry) = registry().lock() {
+        registry.receivers.remove(peer);
+    }
+}
+
+/// A lane of `peer` has ended (the engine tells).
+pub(crate) fn lane_closed(peer: &str) {
+    if let Ok(mut registry) = registry().lock() {
+        if let Some(open) = registry.open.get_mut(peer) {
+            *open = open.saturating_sub(1);
+        }
+    }
+}
+
+/// What the listener does with a lane first line: [`serve`], then the token,
+/// the engine's `check`, the answer and, if it is yes, `open`. Anything that
+/// is not a paired device with a good token ends here, quietly.
+pub(crate) fn accept(
+    stream: TcpStream,
+    config: &Arc<Mutex<Config>>,
+    packet: &crate::device_links::packet::NetworkPacket,
+) -> Result<(), String> {
+    let (dialler, target) = parse_first_line(packet).ok_or("a lane line that is not one")?;
+    let local = config
+        .lock()
+        .map_err(|_| "config lock poisoned".to_string())?
+        .local_device_info()
+        .id;
+    if target != local {
+        return Err("a lane for another device".into());
+    }
+    let paired = config
+        .lock()
+        .map(|config| config.is_trusted(&dialler))
+        .unwrap_or(false);
+    if !paired {
+        return Err("a lane from a device that is not paired".into());
+    }
+    let request = serve(stream, config, &dialler)?;
+    let receiver = registry()
+        .lock()
+        .ok()
+        .and_then(|registry| registry.receivers.get(&dialler).cloned());
+    let busy = registry().lock().map_or(true, |registry| {
+        registry.open.get(&dialler).copied().unwrap_or(0) >= LANES_PER_PEER
+    });
+    let answered = request.answer(|body| {
+        let receiver = receiver.as_ref().ok_or(Refusal::Transfer)?;
+        if busy {
+            return Err(Refusal::Busy);
+        }
+        receiver.check(body)
+    });
+    if let (Some((ssl, body)), Some(receiver)) = (answered, receiver) {
+        if let Ok(mut registry) = registry().lock() {
+            *registry.open.entry(dialler).or_default() += 1;
+        }
+        receiver.open(ssl, body);
+    }
+    Ok(())
+}
+
 // ── The lines ──────────────────────────────────────────────────────────────
 
 /// The plaintext first line, without its newline.
@@ -806,6 +898,87 @@ mod tests {
         )
         .is_err());
         assert!(got.recv_timeout(Duration::from_secs(5)).unwrap().is_none());
+    }
+
+    struct Recording {
+        opened: Mutex<Vec<TokenBody>>,
+        refuse: Mutex<Option<Refusal>>,
+    }
+
+    impl Receiver for Recording {
+        fn check(&self, _: &TokenBody) -> Result<(), Refusal> {
+            self.refuse.lock().unwrap().map_or(Ok(()), Err)
+        }
+
+        fn open(&self, _stream: SslStream<TcpStream>, body: TokenBody) {
+            self.opened.lock().unwrap().push(body);
+        }
+    }
+
+    /// The listener's whole path, as the daemon runs it: refused with no
+    /// engine registered, refused as the engine says, opened when it agrees,
+    /// and at most two lanes open for one peer.
+    #[test]
+    fn the_listener_hands_a_good_lane_to_the_engine_and_refuses_the_rest() {
+        let (sender, receiver) = (side(), side());
+        pair(&sender, &receiver);
+        let serve_one = |config: &Arc<Mutex<Config>>| {
+            let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = socket.local_addr().unwrap();
+            let config = Arc::clone(config);
+            let handle = std::thread::spawn(move || {
+                let (mut stream, _) = socket.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let line = read_line(&mut stream).unwrap();
+                let packet = NetworkPacket::deserialize(&line).unwrap();
+                accept(stream, &config, &packet)
+            });
+            (addr, handle)
+        };
+        let dial_with = |addr, transfer: &str| {
+            let token = issue_token(transfer, &sender.id);
+            dial(
+                &sender.config,
+                &sender.id,
+                &receiver.id,
+                addr,
+                &body(transfer, &token),
+            )
+        };
+        // No engine for this peer: refused.
+        let (addr, handle) = serve_one(&receiver.config);
+        assert_eq!(dial_with(addr, "t-none").unwrap_err(), "transfer");
+        handle.join().unwrap().unwrap();
+        // An engine that says no.
+        let engine = Arc::new(Recording {
+            opened: Mutex::new(Vec::new()),
+            refuse: Mutex::new(Some(Refusal::Range)),
+        });
+        register_receiver(&sender.id, engine.clone());
+        let (addr, handle) = serve_one(&receiver.config);
+        assert_eq!(dial_with(addr, "t-range").unwrap_err(), "range");
+        handle.join().unwrap().unwrap();
+        // An engine that says yes: the lane is opened, twice, not a third time.
+        *engine.refuse.lock().unwrap() = None;
+        let mut lanes = Vec::new();
+        for transfer in ["t-1", "t-2"] {
+            let (addr, handle) = serve_one(&receiver.config);
+            lanes.push(dial_with(addr, transfer).unwrap());
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(engine.opened.lock().unwrap().len(), 2);
+        let (addr, handle) = serve_one(&receiver.config);
+        assert_eq!(dial_with(addr, "t-3").unwrap_err(), "busy");
+        handle.join().unwrap().unwrap();
+        // One ends: there is room again.
+        lane_closed(&sender.id);
+        let (addr, handle) = serve_one(&receiver.config);
+        lanes.push(dial_with(addr, "t-4").unwrap());
+        handle.join().unwrap().unwrap();
+        assert_eq!(engine.opened.lock().unwrap().len(), 3);
+        unregister_receiver(&sender.id);
     }
 
     /// Nothing listens: the dial fails inside the limit and says so.

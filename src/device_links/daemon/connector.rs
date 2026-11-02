@@ -165,6 +165,11 @@ fn accept_incoming_device(
     let mut reader = BufReader::new(stream.try_clone().map_err(|err| err.to_string())?);
     let line = read_identity_line(&mut reader)?;
     let packet = NetworkPacket::deserialize(&line).map_err(|err| err.to_string())?;
+    // A file lane (W18) names itself in the first line: not an identity, not
+    // a device to list. It carries file frames and nothing else.
+    if packet.packet_type == crate::device_links::webrtc::file_lane::FIRST_LINE_TYPE {
+        return crate::device_links::webrtc::file_lane::accept(stream, &config, &packet);
+    }
     let info = DeviceInfo::from_identity_packet(&packet)
         .ok_or_else(|| format!("Invalid identity packet (type {})", packet.packet_type))?;
     let local_id = config
