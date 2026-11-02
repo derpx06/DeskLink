@@ -14,7 +14,7 @@ network. The phone must still approve each unlock.
 
 While the phone has something ongoing (a timer, a download, navigation) the pill appears even when it is
 otherwise off and shows the first item with its live countdown or progress (`Activities` property; the
-text is worked out in `activity.js`, tested with `node --test gnome-shell-extension/tests/activity.test.mjs`).
+text is worked out by the helpers in `extension.js`, tested with `node --test gnome-shell-extension/tests/activity.test.mjs`).
 
 The extension only talks to the app over D-Bus
 (`derx06.desklink.com.Shell1` at `/derx06/desklink/com/Shell`, see

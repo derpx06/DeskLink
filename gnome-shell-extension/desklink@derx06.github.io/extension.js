@@ -35,7 +35,6 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
 import {BatteryRing, fillMenu, sessionLine, shortStatus, statusLine, styleVariant} from './menu.js';
-import {liveItems, liveText} from './activity.js';
 import {PhoneCalls, PhoneNotifications} from './notifications.js';
 
 const BUS_NAME = 'derx06.desklink.com';
@@ -158,6 +157,32 @@ class DeskLinkButton extends PanelMenu.Button {
         this._label.visible = !!text;
     }
 });
+
+// BEGIN activity helpers (pure; tested by tests/activity.test.mjs)
+/// "4:32", or "1:05:09" from an hour; a countdown rounds up.
+export function clockText(ms) {
+    const seconds = Math.ceil(Math.max(0, ms) / 1000);
+    const h = Math.floor(seconds / 3600), m = Math.floor(seconds / 60) % 60, s = seconds % 60;
+    const two = n => String(n).padStart(2, '0');
+    return h > 0 ? `${h}:${two(m)}:${two(s)}` : `${m}:${two(s)}`;
+}
+
+/// The live part of an ongoing item ("4:32 left", "0:12 elapsed", "42%"), or
+/// '' when it has none. `base` is on this computer's clock.
+export function liveText(item, now) {
+    if (item.base > 0) {
+        if (item.countdown)
+            return item.base - now <= 0 ? 'Done' : `${clockText(item.base - now)} left`;
+        return `${clockText(now - item.base)} elapsed`;
+    }
+    return item.progress >= 0 ? `${item.progress}%` : '';
+}
+
+/// The items still worth showing: a countdown over for a minute is not.
+export function liveItems(items, now) {
+    return items.filter(item => !(item.countdown && item.base > 0 && now - item.base > 60000));
+}
+// END activity helpers
 
 export default class DeskLinkExtension extends Extension {
     // "unlock-dialog" is in session-modes for one item: on the lock screen

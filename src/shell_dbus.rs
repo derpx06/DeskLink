@@ -1222,8 +1222,10 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 14] = [
-    // The current build (w8: the Photo tile, `insert-photo`).
+const KNOWN_BUILDS: [&str; 15] = [
+    // The current build (wave 2: the ongoing-items chip in the pill).
+    "5d08c8ef21c098ca152651985b89344f5e858367025b34f383d703f28bf40aef",
+    // w8: the Photo tile, `insert-photo`.
     "72517e77af7844b6b0e0acc6bce2694a7f3653cd38ef5131b437abf01f8e9d9a",
     // w7c: no images decoded in the shell, follow-up messages announced,
     // the reply dialog destroyed, accent fallback.

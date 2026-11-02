@@ -2,7 +2,18 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import {clockText, liveItems, liveText} from '../desklink@derx06.github.io/activity.js';
+import {readFileSync} from 'node:fs';
+import {fileURLToPath} from 'node:url';
+
+// The helpers live in extension.js (between the markers), which imports GNOME
+// modules and so cannot be loaded here: the block is cut out and evaluated.
+const source = readFileSync(
+    fileURLToPath(new URL('../desklink@derx06.github.io/extension.js', import.meta.url)), 'utf8');
+const block = source.split('// BEGIN activity helpers')[1].split('\n').slice(1).join('\n')
+    .split('// END activity helpers')[0]
+    .replace(/export function/g, 'function');
+const {clockText, liveItems, liveText} = new Function(
+    `${block}; return {clockText, liveItems, liveText};`)();
 
 test('a countdown reads minutes and seconds, rounding up', () => {
     assert.equal(clockText(272000), '4:32');
