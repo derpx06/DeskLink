@@ -279,6 +279,7 @@ pub(super) fn apply_phone_packet(
 }
 
 /// What a phone's clipboard packet did here, for the debug log.
+#[cfg(any(test, debug_assertions))]
 pub(super) fn clipboard_from_phone(
     content: &str,
     device_name: &str,

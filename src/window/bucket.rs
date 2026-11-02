@@ -233,10 +233,12 @@ fn refresh_selection() {
 }
 
 /// Debug builds: shots without clicking.
+#[cfg(debug_assertions)]
 pub(super) fn debug_open(win: &DesklinkWindow, path: &str) {
     go_to(win, path);
 }
 
+#[cfg(debug_assertions)]
 pub(super) fn debug_select(paths: Vec<String>) {
     BROWSE.with(|browse| {
         let mut browse = browse.borrow_mut();

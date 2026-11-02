@@ -2178,6 +2178,7 @@ fn widget_at(root: &gtk::Widget, path: &[usize]) -> Option<gtk::Widget> {
 }
 
 /// Whether any widget below `widget` is a label with text.
+#[cfg(debug_assertions)]
 fn has_label_descendant(widget: &gtk::Widget) -> bool {
     let mut child = widget.first_child();
     while let Some(next) = child {
