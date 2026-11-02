@@ -1527,6 +1527,124 @@ mod tests {
         );
     }
 
+    /// The rows of each group, in order (nested rows of an expander are not
+    /// listed), with markup read.
+    fn row_titles(group: &adw::PreferencesGroup) -> Vec<String> {
+        fn walk(widget: &gtk::Widget, titles: &mut Vec<String>) {
+            if let Some(row) = widget.downcast_ref::<adw::PreferencesRow>() {
+                let title = row.title();
+                titles.push(
+                    gtk::pango::parse_markup(&title, '\0')
+                        .map_or_else(|_| title.to_string(), |(_, plain, _)| plain.to_string()),
+                );
+                return;
+            }
+            let mut child = widget.first_child();
+            while let Some(next) = child {
+                walk(&next, titles);
+                child = next.next_sibling();
+            }
+        }
+        let mut titles = Vec::new();
+        walk(group.upcast_ref(), &mut titles);
+        titles
+    }
+
+    /// The desk's Settings are the reference for the phone's: the titles of
+    /// every group, in order, are the table in `docs/protocol/stageD-protocol.md`
+    /// ("W7 - settings parity (rows)"). Changing a row here means changing
+    /// that table and telling the phone. (Skipped without a display.)
+    #[test]
+    fn each_settings_group_holds_the_rows_the_contract_lists() {
+        crate::test_display::run(|| {
+            let info = crate::device_links::device_info::DeviceInfo::local(
+                "parity-phone".into(),
+                "Pixel 9".into(),
+            );
+            let device = DeviceView::from_info(&info, "192.168.1.9".into(), true);
+            let status = crate::device_links::glide::Status {
+                availability: crate::device_links::glide::Availability::Unavailable("test"),
+                gliding: None,
+                problem: None,
+            };
+            let groups = groups(
+                &DaemonHandle::detached(),
+                &AppSettings::default(),
+                &device,
+                &status,
+                false,
+            );
+            let table: [(&str, &[&str]); 10] = [
+                (
+                    "Connection",
+                    &[
+                        "Keep this computer awake while a phone is connected",
+                        "Let this phone keep the computer awake",
+                        "Start at Login",
+                    ],
+                ),
+                (
+                    "Notifications",
+                    &[
+                        "Show Pixel 9's notifications here",
+                        "Command alerts",
+                        "Send this computer's notifications to the phone",
+                    ],
+                ),
+                (
+                    "Clipboard",
+                    &["Share this computer's clipboard with phones"],
+                ),
+                (
+                    "Calls",
+                    &[
+                        "Calls",
+                        "Name callers from Pixel 9's contacts",
+                        "Pause music during calls",
+                    ],
+                ),
+                ("Sound", &["Phones may hear this computer's microphone"]),
+                (
+                    "Control",
+                    &[
+                        "Glide onto Pixel 9",
+                        "Let the phone control mouse and keyboard",
+                    ],
+                ),
+                ("Files", &["Bucket with Pixel 9", "Downloads folder"]),
+                (
+                    "Privacy & security",
+                    &[
+                        "Ask before terminal and screen access",
+                        "Terminal access",
+                        "Unlock with Pixel 9 nearby",
+                        "Unpair Pixel 9…",
+                    ],
+                ),
+                (
+                    "Appearance",
+                    &["Style", "Phone in the top bar", "Tray icon", "GNOME extension"],
+                ),
+                (
+                    "Advanced",
+                    &[
+                        "Reach this computer from anywhere",
+                        "Connection history",
+                        "Crash reports",
+                    ],
+                ),
+            ];
+            assert_eq!(groups.len(), table.len());
+            for (group, (title, rows)) in groups.iter().zip(table) {
+                let shown = gtk::pango::parse_markup(&group.title(), '\0')
+                    .map(|(_, plain, _)| plain.to_string())
+                    .unwrap();
+                assert_eq!(shown, title);
+                assert_eq!(row_titles(group), rows, "rows of {title}");
+            }
+        });
+    }
+
     #[test]
     fn the_relay_reads_as_its_host() {
         assert_eq!(

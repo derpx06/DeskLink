@@ -123,6 +123,20 @@ impl DaemonHandle {
         }
     }
 
+    /// A handle with no worker behind it, for tests of the windows: commands
+    /// go nowhere and nothing comes back.
+    #[cfg(test)]
+    pub(crate) fn detached() -> Self {
+        let (command_tx, _commands) = mpsc::channel();
+        Self {
+            _stop_guard: Arc::new(DaemonStopGuard(command_tx.clone())),
+            command_tx,
+            devices: Arc::default(),
+            errors: Arc::default(),
+            events: Arc::default(),
+        }
+    }
+
     pub fn devices(&self) -> Vec<DeviceView> {
         let mut devices: Vec<_> = self
             .devices
