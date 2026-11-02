@@ -459,6 +459,11 @@ impl Outgoing {
     }
 
     pub fn requeue(&mut self, retry_at: Instant) {
+        // The lane goes with the connection it was agreed over.
+        if let LaneTx::Up(writer) = &self.lane {
+            writer.close();
+        }
+        self.lane = LaneTx::Off;
         self.state = SendState::Queued;
         self.offered = false;
         self.retry_at = Some(retry_at);
@@ -558,6 +563,12 @@ impl Outgoing {
         }
         self.lane = LaneTx::Off;
         self.lane_gave_up();
+        // Not moving (queued again, offered, verifying): nothing to carry on
+        // from; the next accept starts it afresh, and must not be forced into
+        // Sending here.
+        if !matches!(self.state, SendState::Sending | SendState::AwaitComplete) {
+            return;
+        }
         crate::device_links::limits::log_limited(
             "file-lane-ended",
             &format!("A file lane ended ({why}); carrying on over WebRTC"),
@@ -578,6 +589,18 @@ impl Outgoing {
             self.pass,
         ));
         net.send(message);
+    }
+
+    /// Tests: ten silent seconds with data unacknowledged, looked at while
+    /// `held` by the peer or not. Returns whether the lane is still up and
+    /// whether the transfer is sending.
+    #[cfg(test)]
+    pub(super) fn silent_lane_check(&mut self, held: bool, net: &Net) -> (bool, bool) {
+        self.peer_pause = held.then(|| reason::STORAGE_FULL.to_string());
+        self.next_offset = (self.acked + 1) * BLOCK_BYTES;
+        self.lane_ack_at = Instant::now() - Duration::from_secs(10);
+        self.lane_step(Instant::now(), net);
+        (self.on_lane(), self.state == SendState::Sending)
     }
 
     /// One look at the lane: dial when the accept brought a token and the
@@ -652,8 +675,17 @@ impl Outgoing {
                 }
             },
             LaneTx::Up(writer) => {
+                // Silence is judged only while the transfer is meant to be
+                // moving: a receiver that paused (storage, backlog, the
+                // person) is not a dead lane, and the clock starts afresh
+                // when it carries on.
+                let active = self.state == SendState::Sending && !self.is_held();
+                if !active {
+                    self.lane_ack_at = now;
+                }
                 let unacked = self.next_offset > self.acked * BLOCK_BYTES;
-                let stalled = unacked
+                let stalled = active
+                    && unacked
                     && now.saturating_duration_since(self.lane_ack_at)
                         > super::super::file_lane::STALL_LIMIT;
                 if writer.has_failed() || stalled {

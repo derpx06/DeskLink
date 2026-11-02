@@ -3523,6 +3523,31 @@ mod lane {
         assert_eq!(delivered, 2, "the two frames before the stranger");
     }
 
+    /// A receiver that paused is not a dead lane: five quiet seconds under a
+    /// pause leave the lane up; the same quiet while sending end it.
+    #[test]
+    fn a_paused_receiver_does_not_make_a_lane_look_dead() {
+        let env = Env::new(Duration::from_millis(2));
+        let rig = env.rig("lane-pause", fast());
+        let bytes = payload(48 * MIB, 31);
+        let source = rig.source("big.bin", &bytes);
+        let id = rig.a().start_send(&source).unwrap();
+        eventually("some blocks over the lane", || {
+            (board::lane_of(&id) == Some("fast lane") && verified(&rig) >= 2).then_some(())
+        });
+        let step = |held: bool| {
+            rig.a().probe(move |engine| {
+                let net = engine.net.clone().unwrap();
+                engine.outgoing[0].silent_lane_check(held, &net)
+            })
+        };
+        let (still_up, _) = step(true);
+        assert!(still_up, "a pause is not silence");
+        let (up_after, sending) = step(false);
+        assert!(!up_after, "but silence while sending is");
+        assert!(sending);
+    }
+
     #[test]
     fn a_big_file_between_paired_devices_goes_over_the_lane() {
         let env = Env::new(Duration::from_millis(1));
