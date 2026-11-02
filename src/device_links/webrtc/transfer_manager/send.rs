@@ -67,8 +67,11 @@ struct Stages {
 }
 
 impl Stages {
+    /// Always: the clock reads per frame cost microseconds, and the one line
+    /// per transfer is what says whether a slow send was the disk, the hash,
+    /// the window or the network.
     fn on() -> bool {
-        crate::debug_logging()
+        true
     }
 
     /// The send was held up by the window (`true`) or the buffer.
@@ -848,9 +851,10 @@ impl Engine {
         let outgoing = self.outgoing.remove(index);
         let id = outgoing.id.clone();
         if Stages::on() {
+            // No file name: this goes to the journal, which outlives the file.
             eprintln!(
-                "[DeskLink] Sent {}: {}",
-                outgoing.filename,
+                "[DeskLink] Sent transfer {}: {}",
+                outgoing.id.chars().take(8).collect::<String>(),
                 outgoing.stages.summary(outgoing.total)
             );
         }

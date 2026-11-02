@@ -5320,9 +5320,22 @@ mod tests {
         let sizes: Vec<u64> = megabytes.iter().map(|mb| mb * 1_000_000).collect();
         let total: u64 = sizes.iter().sum();
         let seconds = live_transfer(label, true, &sizes, bench_base(label));
+        let rate = total as f64 / seconds.max(0.001) / 1e6;
+        // A floor, for a regression in the sender (a lock, a sync in the hot
+        // path): the v2 stack does about 110 MB/s on loopback. Over a shaped
+        // link (see docs/testing/RELIABILITY.md) the network is the limit, so
+        // set DESKLINK_BENCH_FLOOR=0 there.
+        let floor: f64 = std::env::var("DESKLINK_BENCH_FLOOR")
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(30.0);
         eprintln!(
             "[bench] {label}: {megabytes:?} MB in {seconds:.2} s = {:.1} MB/s",
             total as f64 / seconds / 1e6
+        );
+        assert!(
+            rate >= floor,
+            "{label}: {rate:.1} MB/s is under the floor of {floor} MB/s"
         );
     }
 
