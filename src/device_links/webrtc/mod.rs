@@ -4,6 +4,7 @@ pub(crate) mod audio;
 pub(crate) mod audio_session;
 pub(crate) mod capture;
 pub(crate) mod coordinator;
+pub(crate) mod file_lane;
 pub(crate) mod file_protocol;
 mod handover;
 pub(crate) mod ice;

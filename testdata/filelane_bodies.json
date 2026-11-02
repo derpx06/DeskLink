@@ -1,5 +1,5 @@
 {
-  "_note": "W18 fast lane. Lines are exactly what is written (without the final newline). 'accept' and 'lane' are FileControl fragments on the WebRTC control channel; the other lines run on the lane connection. Tokens are 32 lowercase hex characters.",
+  "_note": "W18 fast lane. Lines are JSON objects (compared as values, not as key order; the final newline is not shown). 'accept' and 'lane' are FileControl fragments on the WebRTC control channel; the other lines run on the lane connection. Tokens are 32 lowercase hex characters.",
   "first_line": {
     "line": "{\"id\":1730000000000,\"type\":\"desklink.filelane\",\"body\":{\"v\":1,\"deviceId\":\"phone-id\",\"targetDeviceId\":\"desk-id\"}}",
     "deviceId": "phone-id",

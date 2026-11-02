@@ -357,12 +357,12 @@ pub(super) const HANDSHAKE_LIMIT: Duration = Duration::from_secs(5);
 /// Shuts a socket down unless dropped within `limit`: one deadline for the
 /// TLS handshake and secure identity, which OpenSSL reads with only the
 /// socket's per-read timeout.
-pub(super) struct HandshakeDeadline {
+pub(crate) struct HandshakeDeadline {
     _done: std::sync::mpsc::Sender<()>,
 }
 
 impl HandshakeDeadline {
-    pub(super) fn arm(stream: &TcpStream, limit: Duration) -> Self {
+    pub(crate) fn arm(stream: &TcpStream, limit: Duration) -> Self {
         let (done, wait) = std::sync::mpsc::channel::<()>();
         if let Ok(socket) = stream.try_clone() {
             let _ = std::thread::Builder::new()
@@ -408,7 +408,7 @@ pub(super) fn read_ssl_packet(stream: &mut SslStream<TcpStream>) -> Result<Netwo
     NetworkPacket::deserialize(&line).map_err(|err| err.to_string())
 }
 
-pub(super) fn ssl_acceptor(config: &Arc<Mutex<Config>>) -> Result<SslAcceptor, String> {
+pub(crate) fn ssl_acceptor(config: &Arc<Mutex<Config>>) -> Result<SslAcceptor, String> {
     let config = config
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())?;
@@ -424,7 +424,7 @@ pub(super) fn ssl_acceptor(config: &Arc<Mutex<Config>>) -> Result<SslAcceptor, S
     Ok(builder.build())
 }
 
-pub(super) fn ssl_connector(config: &Arc<Mutex<Config>>) -> Result<SslConnector, String> {
+pub(crate) fn ssl_connector(config: &Arc<Mutex<Config>>) -> Result<SslConnector, String> {
     let config = config
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())?;
