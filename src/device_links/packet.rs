@@ -43,6 +43,9 @@ pub const PACKET_TYPE_SETTINGS: &str = "desklink.settings";
 /// Live activities (W13): the phone's ongoing items, phone to desk.
 /// Must match `DeskLinkProtocol.PACKET_TYPE_ACTIVITY` on Android.
 pub const PACKET_TYPE_ACTIVITY: &str = "desklink.activity";
+/// The fast file lane (W18): a capability marker in the profile, never a
+/// packet. Must match `DeskLinkProtocol.PACKET_TYPE_FILE_LANE` on Android.
+pub const PACKET_TYPE_FILE_LANE: &str = "desklink.filelane.v1";
 /// Delta resync (W2): the snapshot revs a side already holds, sent first on
 /// every feature-ready, both ways.
 pub const PACKET_TYPE_SYNC_HAVE: &str = "desklink.sync.have";

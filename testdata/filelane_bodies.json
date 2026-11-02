@@ -1,0 +1,37 @@
+{
+  "_note": "W18 fast lane. Lines are exactly what is written (without the final newline). 'accept' and 'lane' are FileControl fragments on the WebRTC control channel; the other lines run on the lane connection. Tokens are 32 lowercase hex characters.",
+  "first_line": {
+    "line": "{\"id\":1730000000000,\"type\":\"desklink.filelane\",\"body\":{\"v\":1,\"deviceId\":\"phone-id\",\"targetDeviceId\":\"desk-id\"}}",
+    "deviceId": "phone-id",
+    "targetDeviceId": "desk-id"
+  },
+  "token_line": {
+    "line": "{\"type\":\"desklink.filelane.token\",\"body\":{\"transferId\":\"0f8fad5b-d9cb-469f-a165-70867728950e\",\"token\":\"00112233445566778899aabbccddeeff\",\"pass\":0,\"startBlock\":3}}",
+    "transferId": "0f8fad5b-d9cb-469f-a165-70867728950e",
+    "token": "00112233445566778899aabbccddeeff",
+    "pass": 0,
+    "startBlock": 3
+  },
+  "ready_ok": "{\"type\":\"desklink.filelane.ready\",\"body\":{\"ok\":true}}",
+  "ready_refusals": [
+    {"reason": "token", "line": "{\"type\":\"desklink.filelane.ready\",\"body\":{\"ok\":false,\"reason\":\"token\"}}"},
+    {"reason": "transfer", "line": "{\"type\":\"desklink.filelane.ready\",\"body\":{\"ok\":false,\"reason\":\"transfer\"}}"},
+    {"reason": "range", "line": "{\"type\":\"desklink.filelane.ready\",\"body\":{\"ok\":false,\"reason\":\"range\"}}"},
+    {"reason": "busy", "line": "{\"type\":\"desklink.filelane.ready\",\"body\":{\"ok\":false,\"reason\":\"busy\"}}"},
+    {"reason": "path", "line": "{\"type\":\"desklink.filelane.ready\",\"body\":{\"ok\":false,\"reason\":\"path\"}}"}
+  ],
+  "offer_lane": {"lane": {"v": 1}},
+  "accept_lane": {"lane": {"v": 1, "port": 1717, "token": "00112233445566778899aabbccddeeff", "ttlMs": 60000}},
+  "lane_actions": [
+    {"name": "failover to WebRTC", "lane": {"kind": "webrtc", "startBlock": 7, "pass": 1}},
+    {"name": "promotion to the fast lane", "lane": {"kind": "tcp", "startBlock": 12, "pass": 1}}
+  ],
+  "refused_tokens": [
+    "",
+    "short",
+    "00112233445566778899AABBCCDDEEFF",
+    "00112233445566778899aabbccddeef",
+    "zz112233445566778899aabbccddeeff"
+  ],
+  "limits": {"minFileBytes": 8388608, "connectMs": 3000, "tokenTtlMs": 60000, "stallMs": 5000, "firstLineBytes": 4096, "lanesPerPeer": 2}
+}

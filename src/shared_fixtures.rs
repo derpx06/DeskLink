@@ -183,7 +183,7 @@ fn the_webrtc_profile_is_the_phones_and_the_removed_types_stay_out() {
         .map(|name| name.to_string())
         .collect();
     ours.sort();
-    assert_eq!(ours.len(), 32);
+    assert_eq!(ours.len(), 33);
     assert_eq!(ours, strings(&f["desk"]), "the desk's profile");
     assert_eq!(ours, strings(&f["phone"]), "and the phone's, equal today");
 

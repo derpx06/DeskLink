@@ -5,10 +5,10 @@ use crate::device_links::packet::{
     PACKET_TYPE_ACTIVITY, PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT, PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS,
     PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID, PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS,
-    PACKET_TYPE_CONTACTS_RESPONSE_VCARDS, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_FOLDERS,
-    PACKET_TYPE_HANDOFF, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST, PACKET_TYPE_MOUSEPAD_REQUEST,
-    PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTES, PACKET_TYPE_NOTIFICATION,
-    PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_REPLY,
+    PACKET_TYPE_CONTACTS_RESPONSE_VCARDS, PACKET_TYPE_FILE_LANE, PACKET_TYPE_FINDMYPHONE_REQUEST,
+    PACKET_TYPE_FOLDERS, PACKET_TYPE_HANDOFF, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST,
+    PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTES,
+    PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_REPLY,
     PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_SCREEN_ERROR,
     PACKET_TYPE_SCREEN_READY, PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP,
     PACKET_TYPE_SETTINGS, PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_INPUT_DEVICES,
@@ -21,9 +21,11 @@ use crate::device_links::packet::{
 /// WebRTC transport. Each entry has a matching arm in
 /// `packet_handler::dispatch_webrtc_feature_packet` and a DeskLink Android
 /// plugin that actually sends it.
-const DESKTOP_INCOMING: [&str; 27] = [
+const DESKTOP_INCOMING: [&str; 28] = [
     // Live activities (W13): the phone's ongoing items.
     PACKET_TYPE_ACTIVITY,
+    // The fast file lane (W18): a marker both ways.
+    PACKET_TYPE_FILE_LANE,
     // Folder sync (F8): both ways.
     PACKET_TYPE_FOLDERS,
     // Delta resync (W2): the revs the phone holds, first on every ready.
@@ -72,8 +74,9 @@ const DESKTOP_INCOMING: [&str; 27] = [
 /// Packets the desktop can construct from a command path, and that a DeskLink
 /// Android plugin can consume. `desklink.systemvolume.request` is absent: the
 /// phone has no receiver for it.
-const DESKTOP_OUTGOING: [&str; 29] = [
+const DESKTOP_OUTGOING: [&str; 30] = [
     // Folder sync (F8): both ways.
+    PACKET_TYPE_FILE_LANE,
     PACKET_TYPE_FOLDERS,
     // Delta resync (W2): the revs this desk holds.
     PACKET_TYPE_SYNC_HAVE,
@@ -129,10 +132,11 @@ const DESKTOP_OUTGOING: [&str; 29] = [
 /// control plane is `desklink.remote-session.v1` on the control channel, and
 /// the screen packet types exist only so the Android application loads its
 /// screen plugin (see `DESKTOP_INCOMING`). They never cross the wire.
-const WEBRTC_PROFILE: [&str; 32] = [
+const WEBRTC_PROFILE: [&str; 33] = [
     // Live activities (W13).
     PACKET_TYPE_ACTIVITY,
     // Folder sync (F8).
+    PACKET_TYPE_FILE_LANE,
     PACKET_TYPE_FOLDERS,
     // Delta resync (W2).
     PACKET_TYPE_SYNC_HAVE,
@@ -356,6 +360,7 @@ mod tests {
                 "desklink.clipboard.connect",
                 "desklink.contacts.response_uids_timestamps",
                 "desklink.contacts.response_vcards",
+                "desklink.filelane.v1",
                 "desklink.findmyphone.request",
                 "desklink.folders",
                 "desklink.lock.request",
@@ -386,6 +391,7 @@ mod tests {
                 "desklink.clipboard.connect",
                 "desklink.contacts.request_all_uids_timestamps",
                 "desklink.contacts.request_vcards_by_uid",
+                "desklink.filelane.v1",
                 "desklink.findmyphone.request",
                 "desklink.folders",
                 "desklink.handoff",
@@ -434,6 +440,7 @@ mod tests {
                 "desklink.contacts.request_vcards_by_uid",
                 "desklink.contacts.response_uids_timestamps",
                 "desklink.contacts.response_vcards",
+                "desklink.filelane.v1",
                 "desklink.findmyphone.request",
                 "desklink.folders",
                 "desklink.handoff",
@@ -485,7 +492,7 @@ mod tests {
         assert!(webrtc_capabilities(&advertised).is_empty());
         assert_eq!(
             WEBRTC_PROFILE.len(),
-            32,
+            33,
             "Android's WebRtcFeatureProfile.enabled"
         );
     }
@@ -543,6 +550,7 @@ mod tests {
                 "desklink.clipboard.connect",
                 "desklink.contacts.response_uids_timestamps",
                 "desklink.contacts.response_vcards",
+                "desklink.filelane.v1",
                 "desklink.findmyphone.request",
                 "desklink.folders",
                 "desklink.lock.request",
@@ -569,6 +577,7 @@ mod tests {
                 "desklink.clipboard.connect",
                 "desklink.contacts.request_all_uids_timestamps",
                 "desklink.contacts.request_vcards_by_uid",
+                "desklink.filelane.v1",
                 "desklink.findmyphone.request",
                 "desklink.folders",
                 "desklink.handoff",
