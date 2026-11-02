@@ -98,6 +98,7 @@ mod test_display;
 mod test_privileges;
 mod thumbnails;
 mod ticker;
+mod transfer_notice;
 mod tray;
 mod window;
 

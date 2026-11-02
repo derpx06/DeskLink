@@ -471,6 +471,41 @@ impl DaemonWorker {
         };
         for id in ids {
             crate::device_links::webrtc::coordinator::end_phone_sessions(&id);
+            // What the phone asked of this computer's screen is ended above;
+            // what is running with its sound or camera is stopped too, so one
+            // "End" in the tray or the notification means everything.
+            let view = self
+                .devices
+                .lock()
+                .ok()
+                .and_then(|devices| devices.get(&id).cloned());
+            let Some(view) = view else {
+                continue;
+            };
+            if let Some(sound) = &view.sound {
+                if sound.sending.is_some() {
+                    self.handle_command(DaemonCommand::Sound(
+                        id.clone(),
+                        "desk-sound".into(),
+                        false,
+                    ));
+                }
+                if let Some(source) = &sound.hearing {
+                    let what = if source == "mic" {
+                        "phone-mic"
+                    } else {
+                        "phone-sound"
+                    };
+                    self.handle_command(DaemonCommand::Sound(id.clone(), what.into(), false));
+                }
+            }
+            if view.capture.is_some() {
+                self.handle_command(DaemonCommand::Capture(
+                    id.clone(),
+                    "cancel".into(),
+                    String::new(),
+                ));
+            }
         }
     }
 

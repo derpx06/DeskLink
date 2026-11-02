@@ -71,7 +71,7 @@ pub(crate) fn time_left(seconds: u64) -> String {
 }
 
 /// "about 4 min left"; under a minute is said plainly.
-fn about(seconds: u64) -> String {
+pub(crate) fn about(seconds: u64) -> String {
     let words = time_left(seconds);
     if seconds < 60 {
         words

@@ -317,6 +317,46 @@ impl DesklinkApplication {
                 }
             })
             .build();
+        // "Cancel" on the file transfer notification: every transfer with that
+        // phone that is running or waiting (never the Bucket's own sync).
+        let cancel_transfers_action = gio::ActionEntry::builder("cancel-transfers")
+            .parameter_type(Some(glib::VariantTy::STRING))
+            .activate(move |app: &Self, _, target| {
+                let (Some(device), Some(daemon)) = (
+                    target.and_then(|target| target.get::<String>()),
+                    app.daemon_handle(),
+                ) else {
+                    return;
+                };
+                for row in crate::device_links::webrtc::transfer_board::rows() {
+                    if row.device_id == device {
+                        daemon.send(crate::device_links::daemon::DaemonCommand::CancelTransfer(
+                            device.clone(),
+                            row.id,
+                        ));
+                    }
+                }
+            })
+            .build();
+        // "Open" and "Show in Files" on a received file's notification. Any
+        // process on the session bus can activate them, so only a file that is
+        // in the received history opens.
+        let open_received_action = gio::ActionEntry::builder("open-received")
+            .parameter_type(Some(glib::VariantTy::STRING))
+            .activate(move |app: &Self, _, target| {
+                if let Some(path) = target.and_then(|target| target.get::<String>()) {
+                    app.open_received(&path, false);
+                }
+            })
+            .build();
+        let show_received_action = gio::ActionEntry::builder("show-received")
+            .parameter_type(Some(glib::VariantTy::STRING))
+            .activate(move |app: &Self, _, target| {
+                if let Some(path) = target.and_then(|target| target.get::<String>()) {
+                    app.open_received(&path, true);
+                }
+            })
+            .build();
         let history_action = gio::ActionEntry::builder("history")
             .activate(move |app: &Self, _, _| app.show_history())
             .build();
@@ -370,6 +410,9 @@ impl DesklinkApplication {
             open_bucket_action,
             turn_on_bucket_action,
             walk_away_cancel_action,
+            cancel_transfers_action,
+            open_received_action,
+            show_received_action,
             call_action,
             dial_action,
         ]);
@@ -497,6 +540,7 @@ impl DesklinkApplication {
 
         let mut notified = std::collections::HashSet::<String>::new();
         let mut asked = std::collections::HashSet::<String>::new();
+        let mut notices = crate::transfer_notice::Notices::default();
         crate::ticker::every_tick(move || {
             crate::guard("app tick", glib::ControlFlow::Continue, || {
                 let Some(app) = app.upgrade() else {
@@ -568,6 +612,7 @@ impl DesklinkApplication {
                 {
                     let devices = daemon.devices();
                     app.walk_away_step(&devices);
+                    app.transfer_notices(&mut notices, &devices);
                     let settings = crate::device_links::config::app_settings();
                     let paired = || devices.iter().filter(|device| device.trusted);
                     if let Some(problem) = crate::device_links::dnd::step(
@@ -650,6 +695,103 @@ impl DesklinkApplication {
                 }
                 None => {}
             }
+        }
+    }
+
+    /// The "DeskLink" notification for files moving (see `transfer_notice`):
+    /// progress while they move, how they ended after.
+    fn transfer_notices(
+        &self,
+        notices: &mut crate::transfer_notice::Notices,
+        devices: &[crate::device_links::device::DeviceView],
+    ) {
+        use crate::device_links::webrtc::transfer_board as board;
+        use crate::transfer_notice::Action;
+        let (news, seen) = board::ended_since(notices.seen());
+        notices.set_seen(seen);
+        let mut rows = board::rows();
+        rows.extend(board::synced_rows());
+        let name_of = |id: &str| {
+            devices
+                .iter()
+                .find(|device| device.id == id)
+                .map_or_else(|| "your phone".to_string(), |device| device.name.clone())
+        };
+        let actions = notices.look(std::time::Instant::now(), &rows, &news, &name_of, &|id| {
+            board::note(id)
+        });
+        // Do Not Disturb on: the desktop keeps banners back, and a progress
+        // line every few seconds is not worth interrupting for.
+        let quiet = crate::device_links::dnd::desk_state() == Some(true);
+        for action in actions {
+            match action {
+                Action::Progress { device, body } if !quiet => {
+                    let notification = gio::Notification::new("DeskLink");
+                    notification.set_body(Some(&body));
+                    notification.set_priority(gio::NotificationPriority::Low);
+                    notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+                    notification.add_button_with_target_value(
+                        "Cancel",
+                        "app.cancel-transfers",
+                        Some(&device.to_variant()),
+                    );
+                    notification.set_default_action_and_target_value(
+                        "app.open-bucket",
+                        Some(&device.to_variant()),
+                    );
+                    self.send_notification(Some(&format!("transfers-{device}")), &notification);
+                }
+                Action::Progress { .. } => {}
+                Action::Ended {
+                    device,
+                    title,
+                    path,
+                } => {
+                    let notification = gio::Notification::new("DeskLink");
+                    notification.set_body(Some(&title));
+                    notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+                    notification.set_default_action_and_target_value(
+                        "app.open-bucket",
+                        Some(&device.to_variant()),
+                    );
+                    if let Some(path) = path {
+                        let target = path.to_string_lossy().to_variant();
+                        notification.add_button_with_target_value(
+                            "Open",
+                            "app.open-received",
+                            Some(&target),
+                        );
+                        notification.add_button_with_target_value(
+                            "Show in Files",
+                            "app.show-received",
+                            Some(&target),
+                        );
+                    }
+                    self.send_notification(Some(&format!("transfers-{device}")), &notification);
+                }
+                Action::Clear { device } => {
+                    self.withdraw_notification(&format!("transfers-{device}"));
+                }
+            }
+        }
+    }
+
+    /// Opens a received file, or the folder it is in: only one the received
+    /// history knows.
+    fn open_received(&self, path: &str, show_folder: bool) {
+        let path = std::path::PathBuf::from(path);
+        let known = crate::device_links::transfer_log::recent()
+            .iter()
+            .any(|file| file.path == path);
+        if !known || !path.exists() {
+            return;
+        }
+        let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(&path)));
+        let window = self.active_window();
+        if show_folder {
+            launcher.open_containing_folder(window.as_ref(), gio::Cancellable::NONE, |_| {});
+        } else {
+            launcher.launch(window.as_ref(), gio::Cancellable::NONE, |_| {});
         }
     }
 
@@ -1101,6 +1243,16 @@ pub(crate) fn session_line(device: &crate::device_links::device::DeviceView) -> 
             _ => None,
         }
     });
+    // An Insert waiting on the phone (a photo, a scan) is a use too.
+    let capture = device
+        .capture
+        .as_ref()
+        .map(|capture| match capture.kind.as_str() {
+            "scan" => "waiting for a scan",
+            "text" => "waiting for text from a picture",
+            "qr" => "waiting for a QR code",
+            _ => "waiting for a photo",
+        });
     let mut parts: Vec<String> = Vec::new();
     parts.extend(screen.map(str::to_string));
     if let Some(terminals) = terminals {
@@ -1111,6 +1263,7 @@ pub(crate) fn session_line(device: &crate::device_links::device::DeviceView) -> 
         });
     }
     parts.extend(sound.map(str::to_string));
+    parts.extend(capture.map(str::to_string));
     if parts.is_empty() {
         return None;
     }
@@ -1306,6 +1459,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An Insert waiting on the phone shows in the indicator too, so the tray
+    /// and the notification offer to end it.
+    #[test]
+    fn the_session_line_includes_a_capture_waiting_on_the_phone() {
+        use crate::device_links::device::{CaptureUse, DeviceView};
+        let info = crate::device_links::device_info::DeviceInfo::local("p".into(), "Pixel".into());
+        let mut device = DeviceView::from_info(&info, "10.0.0.2".into(), true);
+        device.capture = Some(CaptureUse {
+            kind: "scan".into(),
+            receiving: false,
+        });
+        assert_eq!(
+            session_line(&device).as_deref(),
+            Some("Pixel — waiting for a scan")
+        );
+        device.capture = Some(CaptureUse {
+            kind: "photo".into(),
+            receiving: true,
+        });
+        assert_eq!(
+            session_line(&device).as_deref(),
+            Some("Pixel — waiting for a photo")
+        );
     }
 
     /// The indicator also says when this computer's sound or microphone goes

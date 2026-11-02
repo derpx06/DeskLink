@@ -77,6 +77,10 @@ pub struct TransferBoard {
     /// ("Storage is full. The transfer continues when there is space."), by
     /// transfer id. Dropped when the transfer ends.
     notes: std::collections::HashMap<String, String>,
+    /// The last outcomes, kept (not drained) for a second reader that wants
+    /// to follow them: the desktop notification. Numbered from 1.
+    ended: VecDeque<(u64, Finished)>,
+    ended_seq: u64,
 }
 
 /// A Bucket transfer that ended (F8c: frees an in-flight slot).
@@ -152,6 +156,11 @@ impl TransferBoard {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(finished.clone());
+        self.ended_seq += 1;
+        if self.ended.len() >= 64 {
+            self.ended.pop_front();
+        }
+        self.ended.push_back((self.ended_seq, finished.clone()));
         if self.finished.len() >= MAX_FINISHED {
             self.finished.pop_front();
         }
@@ -350,6 +359,19 @@ pub fn discard(id: &str) {
 /// Says why a listed transfer is waiting; `None` clears it.
 pub fn set_note(id: &str, note: Option<&str>) {
     board().set_note(id, note.map(str::to_string));
+}
+
+/// The outcomes recorded after number `seen` (0: all kept), and the number to
+/// ask from next time. Nothing is drained: the window's own queue is separate.
+pub fn ended_since(seen: u64) -> (Vec<Finished>, u64) {
+    let board = board();
+    let news = board
+        .ended
+        .iter()
+        .filter(|(seq, _)| *seq > seen)
+        .map(|(_, finished)| finished.clone())
+        .collect();
+    (news, board.ended_seq)
 }
 
 /// Why `id` is waiting, if it is.
@@ -679,6 +701,34 @@ mod tests {
         );
         assert!(board.synced_ended.is_empty(), "superseded is not an ending");
         assert!(board.synced_failed.is_empty());
+    }
+
+    /// A second reader follows the outcomes by number without draining them:
+    /// the window's queue is untouched.
+    #[test]
+    fn the_outcomes_can_be_followed_without_taking_them() {
+        let (_, mark) = ended_since(0);
+        let id = format!("follow-{}", uuid::Uuid::new_v4());
+        begin(TransferRow {
+            id: id.clone(),
+            device_id: "follow-phone".into(),
+            name: "f.bin".into(),
+            incoming: false,
+            done: 0,
+            total: 10,
+            preparing: false,
+            paused: false,
+        });
+        finish(&id, Outcome::Sent);
+        let (news, next) = ended_since(mark);
+        assert!(news
+            .iter()
+            .any(|f| f.id == id && f.outcome == Outcome::Sent));
+        assert!(next > mark);
+        let (again, _) = ended_since(next);
+        assert!(again.iter().all(|f| f.id != id), "each is returned once");
+        // The window's own queue still has it.
+        assert!(peek_finished(&id).iter().any(|f| f.id == id));
     }
 
     #[test]
