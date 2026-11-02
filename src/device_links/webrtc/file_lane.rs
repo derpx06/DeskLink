@@ -471,6 +471,11 @@ pub(crate) fn read_line(reader: &mut impl Read) -> Result<Vec<u8>, String> {
 
 // ── The two handshakes ─────────────────────────────────────────────────────
 
+/// What the bootstrap says of a paired device that shows another certificate;
+/// the listener shows this one to the person (it may be an impersonator), and
+/// a lane says it the same way.
+pub(crate) const CERTIFICATE_CHANGED: &str = "Trusted device certificate changed";
+
 /// The peer's certificate must be the one stored at pairing, for this device:
 /// a device that is not paired, or whose certificate differs, is refused (no
 /// QR admission here, unlike the bootstrap).
@@ -490,7 +495,7 @@ fn check_pinned(
         .map_err(|_| "config lock poisoned".to_string())?
         .trusted_certificate_pem(peer_id);
     if stored.as_deref() != Some(pem.as_str()) {
-        return Err("not the paired certificate".to_string());
+        return Err(CERTIFICATE_CHANGED.to_string());
     }
     let common_name = certificate
         .subject_name()
@@ -498,7 +503,7 @@ fn check_pinned(
         .next()
         .and_then(|entry| entry.data().to_string().ok());
     if common_name.as_deref() != Some(peer_id) {
-        return Err("the certificate is for another device".to_string());
+        return Err(CERTIFICATE_CHANGED.to_string());
     }
     Ok(())
 }
@@ -961,6 +966,39 @@ mod tests {
             "{rate:.0} MB/s is under the floor of {floor} MB/s"
         );
         let _ = (&sender.dir, &receiver.dir);
+    }
+
+    /// A device that claims a paired device's id with another certificate is
+    /// refused with the words the bootstrap uses, which the listener shows the
+    /// person; an unpaired device is only logged.
+    #[test]
+    fn an_impersonator_on_a_lane_is_refused_in_the_words_the_listener_shows() {
+        let (sender, receiver, stranger) = (side(), side(), side());
+        pair(&sender, &receiver);
+        let socket = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let config = Arc::clone(&receiver.config);
+        let claimed = sender.id.clone();
+        let served = std::thread::spawn(move || {
+            let (mut stream, _) = socket.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let _ = read_line(&mut stream).unwrap();
+            serve(stream, &config, &claimed).map(|_| ())
+        });
+        // The stranger dials as the sender, with its own certificate.
+        let token = issue_token("t-imp", &sender.id).unwrap();
+        let _ = dial(
+            &stranger.config,
+            &sender.id,
+            &receiver.id,
+            addr,
+            &body("t-imp", &token),
+        );
+        let error = served.join().unwrap().unwrap_err();
+        assert!(error.contains(CERTIFICATE_CHANGED), "{error}");
+        let _ = (&sender.dir, &receiver.dir, &stranger.dir);
     }
 
     #[test]
