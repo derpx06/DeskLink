@@ -182,6 +182,12 @@ export function liveText(item, now) {
 export function liveItems(items, now) {
     return items.filter(item => !(item.countdown && item.base > 0 && now - item.base > 60000));
 }
+/// The pill's text cut to `max` characters (a navigation instruction can be
+/// 240): the panel does not shorten a label, so it would push its neighbours.
+export function chipLabel(text, max = 28) {
+    const chars = Array.from(text);
+    return chars.length > max ? `${chars.slice(0, max - 1).join('').trimEnd()}…` : text;
+}
 // END activity helpers
 
 export default class DeskLinkExtension extends Extension {
@@ -439,7 +445,7 @@ export default class DeskLinkExtension extends Extension {
             return null;
         const live = liveText(item, Date.now());
         const name = item.title || item.app;
-        return live ? `${name} ${live}` : name;
+        return chipLabel(live ? `${name} ${live}` : name);
     }
 
     /// One tick a second, only while something is ongoing.

@@ -730,18 +730,22 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         // last. Kept in memory only, and not at all while this phone's
         // notifications are hidden here.
         PACKET_TYPE_ACTIVITY => {
-            super::state::update_activity(
+            let kept = super::state::update_activity(
                 &crate::device_links::config::app_settings(),
                 devices,
                 device_id,
                 &packet,
             );
-            crate::device_links::sync::note_received(
-                device_id,
-                binding.link.info.instance_id.as_deref(),
-                "activity",
-                &packet,
-            );
+            if kept {
+                crate::device_links::sync::note_received(
+                    device_id,
+                    binding.link.info.instance_id.as_deref(),
+                    "activity",
+                    &packet,
+                );
+            } else {
+                crate::device_links::sync::forget_feature(device_id, "activity");
+            }
             super::state::nudge_tickers();
             Ok(())
         }

@@ -156,6 +156,11 @@ pub(crate) fn reconcile_connection_status(
             }
             device.keyboard_focused = None;
             device.keyboard_allowed = None;
+            // Its ongoing items are as old as the link: gone, and the phone
+            // sends them again when it is back (its digest forgets them).
+            if device.activity.take().is_some() {
+                crate::device_links::sync::forget_feature(device_id, "activity");
+            }
         } else if ready {
             device.last_seen = None;
         }
@@ -489,8 +494,9 @@ pub(super) fn update_activity(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     device_id: &str,
     packet: &NetworkPacket,
-) {
-    let snapshot = settings.shows_notifications(device_id).then(|| {
+) -> bool {
+    let kept = settings.shows_notifications(device_id);
+    let snapshot = kept.then(|| {
         crate::device_links::activity::snapshot_from(
             &packet.body,
             crate::device_links::activity::now_ms(),
@@ -501,6 +507,9 @@ pub(super) fn update_activity(
             device.activity = snapshot;
         }
     }
+    // Whether it was kept: one that was dropped is not "held" in the delta
+    // digest, or the phone would not send it again when the switch is on.
+    kept
 }
 
 /// `desklink.telephony {calls, muted, silenced}`: the phone's calls now.
@@ -743,6 +752,23 @@ mod tests {
         assert!(device.trusted, "trust must survive a disconnect");
     }
 
+    /// W13: a phone's ongoing items are as old as its link: gone when it
+    /// stops being ready (and forgotten by the delta digest, so the phone
+    /// sends them again).
+    #[test]
+    fn ongoing_items_do_not_outlive_the_link() {
+        let (devices, info) = test_devices();
+        reconcile_connection_status(&devices, &[connection(&info.id, true, true)]);
+        let settings = crate::device_links::config::AppSettings::default();
+        let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_ACTIVITY);
+        packet.set("items", serde_json::json!([{"id": "a", "kind": "timer"}]));
+        assert!(update_activity(&settings, &devices, &info.id, &packet));
+        reconcile_connection_status(&devices, &[connection(&info.id, true, true)]);
+        assert!(devices.lock().unwrap()[&info.id].activity.is_some());
+        reconcile_connection_status(&devices, &[]);
+        assert!(devices.lock().unwrap()[&info.id].activity.is_none());
+    }
+
     #[test]
     fn discovery_alone_never_reports_a_paired_device_as_connected() {
         let (devices, info) = test_devices();
@@ -835,7 +861,7 @@ mod tests {
             "items",
             serde_json::json!([{"id": "a", "title": "Pasta", "kind": "timer"}]),
         );
-        update_activity(&settings, &devices, &info.id, &one);
+        assert!(update_activity(&settings, &devices, &info.id, &one));
         let held = |devices: &Arc<Mutex<HashMap<String, DeviceView>>>| {
             devices
                 .lock()
@@ -848,14 +874,14 @@ mod tests {
         assert_eq!(held(&devices).unwrap().items[0].title, "Pasta");
         let mut none = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_ACTIVITY);
         none.set("items", serde_json::json!([]));
-        update_activity(&settings, &devices, &info.id, &none);
+        assert!(update_activity(&settings, &devices, &info.id, &none));
         assert!(
             held(&devices).unwrap().items.is_empty(),
             "an empty snapshot clears"
         );
         let mut hidden = settings.clone();
         hidden.hidden_notifications.insert(info.id.clone());
-        update_activity(&hidden, &devices, &info.id, &one);
+        assert!(!update_activity(&hidden, &devices, &info.id, &one));
         assert_eq!(held(&devices), None, "hidden notifications keep none");
     }
 

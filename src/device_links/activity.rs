@@ -8,6 +8,8 @@ use serde_json::Value;
 
 /// Items kept from one snapshot.
 pub(crate) const MAX_ITEMS: usize = 5;
+/// A phone clock reading past this (the year 2100) is not a clock.
+pub(crate) const MAX_CLOCK_MS: i64 = 4_102_444_800_000;
 /// A countdown that ended this long ago is no longer news.
 const ENDED_VISIBLE_MS: i64 = 60_000;
 
@@ -69,7 +71,7 @@ pub(crate) fn parse_items(body: &serde_json::Map<String, Value>) -> Vec<Activity
         let base = item
             .get("chronometerBase")
             .and_then(Value::as_i64)
-            .filter(|base| *base > 0)
+            .filter(|base| (1..=MAX_CLOCK_MS).contains(base))
             .unwrap_or(-1);
         let kind = match item.get("kind").and_then(Value::as_str) {
             Some(kind @ ("timer" | "progress" | "navigation" | "call")) => kind.to_string(),
@@ -97,24 +99,28 @@ pub(crate) fn snapshot_from(
     body: &serde_json::Map<String, Value>,
     now_ms: i64,
 ) -> ActivitySnapshot {
-    let at = body.get("at").and_then(Value::as_i64).filter(|at| *at > 0);
+    let at = body
+        .get("at")
+        .and_then(Value::as_i64)
+        .filter(|at| (1..=MAX_CLOCK_MS).contains(at));
     ActivitySnapshot {
         items: parse_items(body),
-        clock_offset_ms: at.map_or(0, |at| now_ms - at),
+        clock_offset_ms: at.map_or(0, |at| now_ms.saturating_sub(at)),
     }
 }
 
 impl Activity {
     /// The phone's clock now, as far as this computer can tell.
     fn phone_now(snapshot: &ActivitySnapshot, now_ms: i64) -> i64 {
-        now_ms - snapshot.clock_offset_ms
+        now_ms.saturating_sub(snapshot.clock_offset_ms)
     }
 
     /// Whether to show it at `now_ms`: a countdown that ended long ago is not.
     pub fn visible(&self, snapshot: &ActivitySnapshot, now_ms: i64) -> bool {
         !(self.countdown
             && self.chronometer_base > 0
-            && Self::phone_now(snapshot, now_ms) - self.chronometer_base > ENDED_VISIBLE_MS)
+            && Self::phone_now(snapshot, now_ms).saturating_sub(self.chronometer_base)
+                > ENDED_VISIBLE_MS)
     }
 
     /// The live part, in words: "4:32 left", "0:12 elapsed", "42%", or none.
@@ -122,7 +128,7 @@ impl Activity {
         if self.chronometer_base > 0 {
             let phone_now = Self::phone_now(snapshot, now_ms);
             return Some(if self.countdown {
-                let left = self.chronometer_base - phone_now;
+                let left = self.chronometer_base.saturating_sub(phone_now);
                 if left <= 0 {
                     "Done".to_string()
                 } else {
@@ -131,7 +137,7 @@ impl Activity {
             } else {
                 format!(
                     "{} elapsed",
-                    clock((phone_now - self.chronometer_base).max(0))
+                    clock(phone_now.saturating_sub(self.chronometer_base).max(0))
                 )
             });
         }
@@ -142,7 +148,7 @@ impl Activity {
 /// "m:ss", or "h:mm:ss" from an hour (rounded up to the next second for a
 /// countdown's sake: 0.4 s left reads 0:01).
 fn clock(ms: i64) -> String {
-    let seconds = (ms.max(0) + 999) / 1000;
+    let seconds = ms.max(0).saturating_add(999) / 1000;
     let (h, m, s) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
     if h > 0 {
         format!("{h}:{m:02}:{s:02}")
@@ -281,6 +287,30 @@ mod tests {
             u.visible(&snapshot, phone_at + 10 * 3_600_000),
             "a count-up stays"
         );
+    }
+
+    /// Hostile numbers neither wrap nor panic: out-of-range clocks are none.
+    #[test]
+    fn hostile_clock_numbers_are_none_and_arithmetic_saturates() {
+        let mut it = item("h", "timer");
+        it["chronometerBase"] = Value::from(i64::MAX);
+        let mut b = body(Value::Array(vec![it]));
+        b.insert("at".into(), Value::from(i64::MAX));
+        let snapshot = snapshot_from(&b, i64::MIN);
+        assert_eq!(snapshot.items[0].chronometer_base, -1, "out of range");
+        assert_eq!(snapshot.clock_offset_ms, 0, "an `at` out of range is none");
+        // A snapshot whose offset is extreme still computes without panic.
+        let extreme = ActivitySnapshot {
+            items: vec![Activity {
+                chronometer_base: MAX_CLOCK_MS,
+                countdown: true,
+                ..snapshot.items[0].clone()
+            }],
+            clock_offset_ms: i64::MIN,
+        };
+        let _ = extreme.items[0].live_text(&extreme, i64::MAX);
+        let _ = extreme.items[0].visible(&extreme, i64::MAX);
+        assert_eq!(clock(i64::MAX), clock(i64::MAX));
     }
 
     #[test]
