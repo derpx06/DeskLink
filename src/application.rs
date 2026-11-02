@@ -143,6 +143,14 @@ mod imp {
             // Do Not Disturb DeskLink set on a phone's behalf is put back
             // first, so nothing slower below can cost it.
             crate::device_links::dnd::quit_main();
+            // A "Sending…" line must not outlive the process: its Cancel would
+            // start a new one that can do nothing.
+            if let Some(daemon) = self.obj().daemon_handle() {
+                for device in daemon.devices() {
+                    self.obj()
+                        .withdraw_notification(&format!("transfers-{}", device.id));
+                }
+            }
             // The pointer is never left on a phone: bounded, so a compositor
             // that does not answer cannot hold the app open.
             crate::device_links::glide::shutdown();
@@ -707,10 +715,10 @@ impl DesklinkApplication {
     ) {
         use crate::device_links::webrtc::transfer_board as board;
         use crate::transfer_notice::Action;
-        let (news, seen) = board::ended_since(notices.seen());
+        // Together, under one lock; the Bucket's own sync is not here (its
+        // module announces it).
+        let (rows, news, seen) = board::snapshot(notices.seen());
         notices.set_seen(seen);
-        let mut rows = board::rows();
-        rows.extend(board::synced_rows());
         let name_of = |id: &str| {
             devices
                 .iter()
@@ -742,6 +750,7 @@ impl DesklinkApplication {
                     self.send_notification(Some(&format!("transfers-{device}")), &notification);
                 }
                 Action::Progress { .. } => {}
+                Action::Ended { .. } if quiet => {}
                 Action::Ended {
                     device,
                     title,

@@ -374,6 +374,20 @@ pub fn ended_since(seen: u64) -> (Vec<Finished>, u64) {
     (news, board.ended_seq)
 }
 
+/// The listed transfers and the outcomes after number `seen`, read together
+/// under one lock: a transfer that ends between two separate reads would have
+/// left the list without its outcome in hand. The number to ask from next time.
+pub fn snapshot(seen: u64) -> (Vec<TransferRow>, Vec<Finished>, u64) {
+    let board = board();
+    let news = board
+        .ended
+        .iter()
+        .filter(|(seq, _)| *seq > seen)
+        .map(|(_, finished)| finished.clone())
+        .collect();
+    (board.rows(), news, board.ended_seq)
+}
+
 /// Why `id` is waiting, if it is.
 pub fn note(id: &str) -> Option<String> {
     board().notes.get(id).cloned()

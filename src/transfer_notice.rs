@@ -17,13 +17,17 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::bucket_progress::{about, size_words, speed_words, Rate};
+use crate::bucket_progress::{about, speed_words, Rate};
 use crate::device_links::webrtc::transfer_board::{Finished, Outcome, TransferRow};
 
 /// A transfer shorter than this is not worth a notification.
 pub(crate) const QUALIFIES_AFTER: Duration = Duration::from_secs(2);
 /// The progress words change at most this often.
 pub(crate) const UPDATE_EVERY: Duration = Duration::from_secs(5);
+/// A row that left the board without a recorded outcome is waited for this
+/// long: the outcome may be a moment behind, or the same transfer may come
+/// back under a new id (a changed file begun again).
+pub(crate) const VANISHED_GRACE: Duration = Duration::from_secs(3);
 
 /// What to post.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +48,9 @@ pub(crate) enum Action {
 
 struct Tracked {
     first_seen: Instant,
+    /// Since when the board has not listed it (it ended, or carries on under
+    /// another id): given [`VANISHED_GRACE`] to show which.
+    vanished: Option<Instant>,
     rate: Rate,
     row: TransferRow,
     note: Option<String>,
@@ -69,6 +76,8 @@ struct Phone {
 pub(crate) struct Notices {
     phones: HashMap<String, Phone>,
     seen: u64,
+    /// Outcomes taken from the board that no tracked row has claimed yet.
+    pending: Vec<Finished>,
 }
 
 fn per_second(seconds: u64) -> String {
@@ -92,6 +101,11 @@ impl Notices {
         note_of: &dyn Fn(&str) -> Option<String>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
+        self.pending.extend(ended.iter().cloned());
+        if self.pending.len() > 128 {
+            let excess = self.pending.len() - 128;
+            self.pending.drain(..excess);
+        }
         // The rows that exist now.
         let mut present: HashMap<&str, ()> = HashMap::new();
         for row in rows.iter().filter(|row| !row.preparing) {
@@ -101,17 +115,20 @@ impl Notices {
                 phone.batch_seen += 1;
                 Tracked {
                     first_seen: now,
+                    vanished: None,
                     rate: Rate::new(row.done, now),
                     row: row.clone(),
                     note: None,
                 }
             });
+            tracked.vanished = None;
             tracked.rate.sample(row.done, now);
             tracked.row = row.clone();
             tracked.note = note_of(&row.id);
         }
-        // The rows that were here and are gone have ended.
-        for (device, phone) in &mut self.phones {
+        // The rows that were here and are gone have ended, or carry on under
+        // another id: told by their outcome, or after a grace, by neither.
+        for phone in self.phones.values_mut() {
             let gone: Vec<String> = phone
                 .rows
                 .keys()
@@ -119,18 +136,25 @@ impl Notices {
                 .cloned()
                 .collect();
             for id in gone {
-                let Some(tracked) = phone.rows.remove(&id) else {
+                let Some(tracked) = phone.rows.get_mut(&id) else {
                     continue;
                 };
+                let since = *tracked.vanished.get_or_insert(now);
+                let outcome = self
+                    .pending
+                    .iter()
+                    .position(|finished| finished.id == id)
+                    .map(|index| self.pending.remove(index));
+                if outcome.is_none() && now.saturating_duration_since(since) < VANISHED_GRACE {
+                    continue;
+                }
+                let tracked = phone.rows.remove(&id).expect("tracked above");
                 let long = now.saturating_duration_since(tracked.first_seen) >= QUALIFIES_AFTER;
                 phone.qualified |= long;
                 phone.batch_done += 1;
-                if let Some(finished) = ended.iter().find(|finished| finished.id == id) {
-                    if long {
-                        phone.outcomes.push(finished.clone());
-                    }
+                if let (Some(finished), true) = (outcome, long) {
+                    phone.outcomes.push(finished);
                 }
-                let _ = device;
             }
         }
         // Say something per phone.
@@ -138,12 +162,16 @@ impl Notices {
         devices.sort();
         for device in devices {
             let phone = self.phones.get_mut(&device).unwrap();
-            let phone_name = name_of(&device);
+            let phone_name = plain_name(&name_of(&device));
             if phone.rows.is_empty() {
                 if phone.qualified || phone.shown {
                     actions.extend(finish(&device, &phone_name, phone));
                 }
                 *phone = Phone::default();
+                continue;
+            }
+            // Rows waiting out their grace are not moving: nothing to say yet.
+            if phone.rows.values().all(|t| t.vanished.is_some()) {
                 continue;
             }
             let long = phone
@@ -186,7 +214,11 @@ impl Notices {
 
 /// The words of the progress notification.
 fn progress_body(phone: &str, state: &Phone, now: Instant) -> String {
-    let rows: Vec<&Tracked> = state.rows.values().collect();
+    let rows: Vec<&Tracked> = state
+        .rows
+        .values()
+        .filter(|tracked| tracked.vanished.is_none())
+        .collect();
     // Waiting for the phone, or for room on it: said as it is.
     if rows.iter().all(|tracked| tracked.row.paused) {
         let note = rows.iter().find_map(|tracked| tracked.note.clone());
@@ -223,9 +255,8 @@ fn progress_body(phone: &str, state: &Phone, now: Instant) -> String {
             ("Sending", "to")
         };
         format!(
-            "{verb} {} {preposition} {phone} ({})",
-            tracked.row.name,
-            size_words(tracked.row.total)
+            "{verb} {} {preposition} {phone}",
+            plain_name(&tracked.row.name)
         )
     } else {
         let all = state.batch_seen.max(rows.len() as u32 + state.batch_done);
@@ -234,8 +265,6 @@ fn progress_body(phone: &str, state: &Phone, now: Instant) -> String {
             (state.batch_done + 1).min(all)
         )
     };
-    // The one-file form reads "Sending X to Y · 45% · 6.5 MiB/s · about 40 s left".
-    let head = head.split(" (").next().unwrap_or(&head).to_string();
     format!("{head} · {}", tail.join(" · "))
 }
 
@@ -246,12 +275,10 @@ fn finish(device: &str, phone: &str, state: &mut Phone) -> Option<Action> {
         .iter()
         .all(|finished| matches!(finished.outcome, Outcome::Cancelled));
     if outcomes.is_empty() {
-        // Ended without an outcome of its own to read (a Bucket file, a
-        // transfer that carried on under another id): nothing went wrong.
-        return state.shown.then(|| Action::Ended {
+        // Ended without an outcome to read: nothing true to say, so the
+        // progress comes down.
+        return state.shown.then(|| Action::Clear {
             device: device.to_string(),
-            title: format!("Up to date with {phone}"),
-            path: None,
         });
     }
     if cancelled {
@@ -269,7 +296,11 @@ fn finish(device: &str, phone: &str, state: &mut Phone) -> Option<Action> {
         let verb = if failed.incoming { "receive" } else { "send" };
         return Some(Action::Ended {
             device: device.to_string(),
-            title: format!("Couldn't {verb} {}: {}", failed.name, plain(why)),
+            title: format!(
+                "Couldn't {verb} {}: {}",
+                plain_name(&failed.name),
+                plain(why)
+            ),
             path: None,
         });
     }
@@ -282,8 +313,8 @@ fn finish(device: &str, phone: &str, state: &mut Phone) -> Option<Action> {
         ok.iter().filter(|f| !f.incoming).count(),
     );
     let title = match (ok.len(), incoming, outgoing) {
-        (1, 1, _) => format!("Received {} from {phone}", ok[0].name),
-        (1, _, 1) => format!("Sent {} to {phone}", ok[0].name),
+        (1, 1, _) => format!("Received {} from {phone}", plain_name(&ok[0].name)),
+        (1, _, 1) => format!("Sent {} to {phone}", plain_name(&ok[0].name)),
         (n, i, 0) if i == n => format!("Received {n} files from {phone}"),
         (n, 0, o) if o == n => format!("Sent {n} files to {phone}"),
         (n, _, _) => format!("Finished {n} transfers with {phone}"),
@@ -299,6 +330,20 @@ fn finish(device: &str, phone: &str, state: &mut Phone) -> Option<Action> {
         title,
         path,
     })
+}
+
+/// A name from the phone, safe in a notification body on any desktop: no
+/// control characters, and no angle brackets (some notification servers read
+/// a little markup).
+pub(crate) fn plain_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_control())
+        .map(|c| match c {
+            '<' => '\u{2039}',
+            '>' => '\u{203a}',
+            other => other,
+        })
+        .collect()
 }
 
 /// A reason, one line, no stop at the end that a title would double.
@@ -504,6 +549,92 @@ mod tests {
                 body: "Phone storage is full".into()
             }]
         );
+    }
+
+    /// A name with " (" in it (the usual duplicate suffix, a phone called
+    /// "Galaxy S21 (5G)") is kept whole, and angle brackets are made harmless.
+    #[test]
+    fn names_with_brackets_and_markup_are_kept_whole_and_harmless() {
+        let (mut notices, t0) = (Notices::default(), Instant::now());
+        let galaxy = |_: &str| "Galaxy S21 (5G) <b>".to_string();
+        let r = |done| [row("t", "p", "Document (2).pdf", false, done, 10 * MB)];
+        notices.look(at(t0, 0.0), &r(0), &[], &galaxy, &none);
+        let actions = notices.look(at(t0, 3.0), &r(2 * MB), &[], &galaxy, &none);
+        let Action::Progress { body, .. } = &actions[0] else {
+            panic!("{actions:?}")
+        };
+        assert!(
+            body.starts_with(
+                "Sending Document (2).pdf to Galaxy S21 (5G) \u{2039}b\u{203a} · 20% · "
+            ),
+            "{body}"
+        );
+        assert!(!body.contains('<'));
+        let ended = [finished("t", "p", "<i>x</i> (1).bin", false, Outcome::Sent)];
+        let mut other = Notices::default();
+        let r2 = |done| [row("t", "p", "<i>x</i> (1).bin", false, done, 10 * MB)];
+        other.look(at(t0, 0.0), &r2(0), &[], &name, &none);
+        other.look(at(t0, 3.0), &r2(MB), &[], &name, &none);
+        let actions = other.look(at(t0, 4.0), &[], &ended, &name, &none);
+        assert_eq!(
+            actions,
+            [Action::Ended {
+                device: "p".into(),
+                title: "Sent \u{2039}i\u{203a}x\u{2039}/i\u{203a} (1).bin to Pixel".into(),
+                path: None
+            }]
+        );
+    }
+
+    /// The outcome may be recorded a moment after the row is gone (two reads
+    /// of the board): it is still found, and it is "Received", not a guess.
+    #[test]
+    fn an_outcome_a_moment_behind_its_row_is_still_found() {
+        let (mut notices, t0) = (Notices::default(), Instant::now());
+        let r = |done| [row("t", "p", "a.bin", true, done, 10 * MB)];
+        notices.look(at(t0, 0.0), &r(0), &[], &name, &none);
+        notices.look(at(t0, 3.0), &r(5 * MB), &[], &name, &none);
+        assert!(notices.look(at(t0, 4.0), &[], &[], &name, &none).is_empty());
+        let ended = [finished(
+            "t",
+            "p",
+            "a.bin",
+            true,
+            Outcome::Received("/d/a.bin".into()),
+        )];
+        let actions = notices.look(at(t0, 5.0), &[], &ended, &name, &none);
+        assert_eq!(
+            actions,
+            [Action::Ended {
+                device: "p".into(),
+                title: "Received a.bin from Pixel".into(),
+                path: Some("/d/a.bin".into())
+            }]
+        );
+    }
+
+    /// A send that begins again under another id (its file changed) does not
+    /// flip the notification to anything in between; and one that just
+    /// disappears is taken down, never called "up to date".
+    #[test]
+    fn a_row_that_carries_on_under_a_new_id_or_just_vanishes_says_nothing_false() {
+        let (mut notices, t0) = (Notices::default(), Instant::now());
+        let old = |done| [row("old", "p", "a.bin", false, done, 10 * MB)];
+        notices.look(at(t0, 0.0), &old(0), &[], &name, &none);
+        notices.look(at(t0, 3.0), &old(4 * MB), &[], &name, &none);
+        // Discarded; the new id is listed a moment later.
+        assert!(notices.look(at(t0, 4.0), &[], &[], &name, &none).is_empty());
+        let new = [row("new", "p", "a.bin", false, MB, 10 * MB)];
+        let actions = notices.look(at(t0, 4.5), &new, &[], &name, &none);
+        assert!(
+            actions.iter().all(|a| matches!(a, Action::Progress { .. })),
+            "{actions:?}"
+        );
+        // Gone for good with no outcome: the progress comes down.
+        let actions = notices.look(at(t0, 5.0), &[], &[], &name, &none);
+        assert!(actions.is_empty(), "inside the grace: {actions:?}");
+        let actions = notices.look(at(t0, 9.0), &[], &[], &name, &none);
+        assert_eq!(actions, [Action::Clear { device: "p".into() }]);
     }
 
     /// Several files at once: "N files · k of N", one notification for the
