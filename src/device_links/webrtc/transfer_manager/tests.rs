@@ -1729,6 +1729,73 @@ fn a_clipboard_image_is_placed_and_not_saved() {
     assert_eq!(offer.mime_type.as_deref(), Some("image/png"));
 }
 
+/// W12: a gallery offer is refused at the door when the person has not turned
+/// photos on for the phone (nothing stored), and when it is not an image;
+/// accepted otherwise, and the finished image is kept under the gallery folder,
+/// not in Downloads and not on the Transfers page.
+#[test]
+fn a_gallery_image_is_refused_unless_turned_on_and_is_kept_in_the_gallery() {
+    use crate::device_links::gallery;
+    let hand = Hand::new("gallery");
+    let mut data = vec![0xff, 0xd8, 0xff, 0xe0];
+    data.extend(payload(900, 71));
+    let gallery_offer = |id: &str, mime: &str| {
+        let mut offer = hand.offer(id, "Screenshot_1.jpg", data.len() as u64);
+        offer.gallery = Some(true);
+        offer.mime_type = Some(mime.into());
+        offer
+    };
+    // Off: refused, with the reason, and nothing is stored.
+    crate::device_links::config::set_gallery_for_tests("alpha", false);
+    hand.send(gallery_offer(id(1), "image/jpeg"));
+    let refusal = eventually("the refusal", || hand.reply(FileAction::Error));
+    assert_eq!(refusal.code.as_deref(), Some(code::REFUSED));
+    assert_eq!(refusal.message.as_deref(), Some(gallery::OFF));
+    assert!(hand.incoming().is_empty());
+    // On, but not an image: refused as well.
+    crate::device_links::config::set_gallery_for_tests("alpha", true);
+    hand.send(gallery_offer(id(2), "application/pdf"));
+    eventually("the second refusal", || {
+        (hand.link.sent(FileAction::Error).len() == 2).then_some(())
+    });
+    assert_eq!(
+        hand.link.sent(FileAction::Error)[1].message.as_deref(),
+        Some(gallery::TYPE)
+    );
+    // On and an image: accepted, whole, kept in the gallery.
+    hand.send(gallery_offer(id(3), "image/jpeg"));
+    eventually("the accept", || hand.reply(FileAction::Accept));
+    hand.manager
+        .on_frame(frame_of(id(3), 0, 0, &data, data.len() as u64));
+    let mut message =
+        FileControl::new(&wire_of("alpha", "beta"), FileAction::Done, id(3), "token0");
+    message.file_hash = Some(hex(&hash_of_hashes(&[openssl::sha::sha256(&data)])));
+    message.blocks = Some(1);
+    message.total_size = Some(data.len() as u64);
+    hand.send(message);
+    eventually("the image in the gallery", || {
+        (!gallery::list("alpha").is_empty()).then_some(())
+    });
+    let kept = gallery::list("alpha");
+    assert_eq!(kept[0].name, "Screenshot_1.jpg");
+    assert_eq!(std::fs::read(&kept[0].path).unwrap(), data);
+    assert!(
+        crate::device_links::webrtc::transfer_board::rows()
+            .iter()
+            .all(|row| row.name != "Screenshot_1.jpg"),
+        "no row on the Transfers page"
+    );
+    assert!(
+        names(&hand.base.join("state")).is_empty()
+            || !names(&hand.base.join("state"))
+                .iter()
+                .any(|n| n.ends_with(".jpg"))
+    );
+    crate::device_links::config::set_gallery_for_tests("alpha", false);
+    gallery::forget("alpha");
+    assert!(gallery::list("alpha").is_empty());
+}
+
 #[test]
 fn a_capture_id_on_an_offer_reaches_the_completion() {
     let hand = Hand::new("capture");

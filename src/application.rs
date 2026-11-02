@@ -89,6 +89,7 @@ mod imp {
                         crate::device_links::private_fs::tighten_tree(&state.join("desklink"));
                     }
                     crate::device_links::connection_log::prune();
+                    crate::device_links::gallery::trim();
                     crate::device_links::transfer_log::prune();
                     crate::thumbnails::prune();
                     // GNOME integration files this install provides for itself.

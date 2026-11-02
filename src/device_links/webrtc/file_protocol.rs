@@ -149,6 +149,10 @@ pub struct FileControl {
     /// A clipboard copy (C3): placed on the receiver's clipboard, not saved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clipboard: Option<bool>,
+    /// A photo or screenshot the phone sends on its own (W12): kept in the
+    /// gallery, never in Downloads. Refused unless the person turned it on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gallery: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
     /// The photo or scan a desk asked for (F3).
@@ -272,6 +276,7 @@ impl FileControl {
             block_size: None,
             max_frame_bytes: None,
             clipboard: None,
+            gallery: None,
             mime_type: None,
             capture_id: None,
             folder: None,

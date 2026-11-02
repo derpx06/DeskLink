@@ -303,6 +303,7 @@ impl Run {
                             mtime: 1_700_000_000_000,
                             blocks_done: blocks,
                             clipboard: false,
+                            gallery: false,
                             capture_id: None,
                             folder: None,
                             content_sha256: None,

@@ -48,6 +48,7 @@ pub(super) struct Incoming {
     folder: Option<FolderRef>,
     content_sha256: Option<String>,
     clipboard: bool,
+    gallery: bool,
     capture_id: Option<String>,
     file: File,
     /// The pass frames must carry (see `file_protocol`).
@@ -105,6 +106,7 @@ impl Incoming {
             mtime: self.mtime,
             blocks_done: self.verified(),
             clipboard: self.clipboard,
+            gallery: self.gallery,
             capture_id: self.capture_id.clone(),
             folder: self.folder.clone(),
             content_sha256: self.content_sha256.clone(),
@@ -392,6 +394,20 @@ impl Engine {
                 return refuse(code::REFUSED, Some("folder-refused"));
             }
         }
+        // W12: a photo or screenshot the phone sends on its own. Refused at
+        // the door unless the person turned it on for this phone, and held to
+        // an image type, a size and an hourly count.
+        if message.gallery == Some(true) {
+            if let Err(why) = crate::device_links::gallery::admit_offer(
+                &crate::device_links::config::app_settings(),
+                &net.wire.peer_device_id,
+                message.mime_type.as_deref(),
+                total,
+            ) {
+                self.refused(&message, "a gallery offer that was not allowed", None);
+                return refuse(code::REFUSED, Some(why));
+            }
+        }
         // The same transfer offered again: answered from where we are.
         if let Some(existing) = self.incoming.get_mut(&key) {
             if existing.token != token || existing.total != total || existing.filename != filename {
@@ -456,7 +472,10 @@ impl Engine {
             .count();
         // A board with no room refuses (the sender waits and offers again)
         // rather than run a transfer nobody can see or cancel.
-        let unlisted = folder.is_none() && !is_clipboard_offer(&message) && !board::has_room();
+        let unlisted = folder.is_none()
+            && !is_clipboard_offer(&message)
+            && message.gallery != Some(true)
+            && !board::has_room();
         if self.incoming.len() >= ACTIVE_PER_DIRECTION
             || (folder.is_some() && bucket_active >= BUCKET_SLOTS_PER_DIRECTION)
             || unlisted
@@ -578,6 +597,7 @@ impl Engine {
                     mtime,
                     blocks_done: 0,
                     clipboard: is_clipboard_offer(message),
+                    gallery: message.gallery == Some(true),
                     capture_id: message
                         .capture_id
                         .clone()
@@ -601,6 +621,7 @@ impl Engine {
             folder: checkpoint.folder.clone(),
             content_sha256: checkpoint.content_sha256.clone(),
             clipboard: checkpoint.clipboard,
+            gallery: checkpoint.gallery,
             capture_id: checkpoint.capture_id.clone(),
             file,
             pass: 0,
@@ -633,7 +654,7 @@ impl Engine {
                 name: folder.relpath.clone(),
                 ..row
             }),
-            None if !incoming.clipboard => {
+            None if !incoming.clipboard && !incoming.gallery => {
                 board::begin(row);
             }
             None => {}
@@ -796,6 +817,20 @@ impl Engine {
                 incoming.total,
             );
             return Ok(stash);
+        }
+        if incoming.gallery {
+            // W12: kept under the gallery folder (never Downloads), where the
+            // Files page lists it.
+            let kept = crate::device_links::gallery::store_in(
+                &crate::device_links::gallery::root()
+                    .ok_or_else(|| "Could not find the photos folder".to_string())?,
+                &incoming.device_id,
+                &incoming.filename,
+                &self.store.part_path(id)?,
+                crate::device_links::gallery::unix_now(),
+            )?;
+            crate::device_links::gallery::announce(&incoming.device_id, &kept);
+            return Ok(kept);
         }
         if incoming.clipboard {
             // Placed on the clipboard from memory; the file goes at once.

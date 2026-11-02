@@ -37,6 +37,9 @@ pub(super) struct ReceiveCheckpoint {
     pub blocks_done: u64,
     #[serde(default)]
     pub clipboard: bool,
+    /// A gallery image (W12): kept under the gallery folder when it is whole.
+    #[serde(default)]
+    pub gallery: bool,
     #[serde(default)]
     pub capture_id: Option<String>,
     #[serde(default)]
@@ -970,6 +973,7 @@ mod tests {
             mtime: 1,
             blocks_done,
             clipboard: false,
+            gallery: false,
             capture_id: None,
             folder: None,
             content_sha256: None,

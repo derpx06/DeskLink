@@ -24,6 +24,7 @@ pub(crate) fn forget_peer(device_id: &str) {
     glide::forget_phone(device_id);
     crate::device_links::walk_away::forget(device_id);
     crate::device_links::dnd::forget(device_id);
+    crate::device_links::gallery::forget(device_id);
     mpris::forget_art_sent(device_id);
     features::forget_peer_profile(device_id);
     daemon::clipboard::forget_sent_to(device_id);

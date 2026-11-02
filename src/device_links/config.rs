@@ -283,6 +283,18 @@ pub fn app_settings() -> AppSettings {
         .unwrap_or_default()
 }
 
+/// Tests: turns photos from `device_id` on or off in the process-wide view.
+#[cfg(test)]
+pub(crate) fn set_gallery_for_tests(device_id: &str, on: bool) {
+    if let Ok(mut mirror) = settings_mirror().lock() {
+        if on {
+            mirror.gallery_devices.insert(device_id.to_string());
+        } else {
+            mirror.gallery_devices.remove(device_id);
+        }
+    }
+}
+
 fn mirror_settings(settings: &AppSettings) {
     if let Ok(mut mirror) = settings_mirror().lock() {
         *mirror = settings.clone();

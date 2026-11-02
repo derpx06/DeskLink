@@ -13,6 +13,7 @@ pub(crate) mod dnd;
 pub(crate) mod eis;
 pub mod features;
 pub(crate) mod folders;
+pub(crate) mod gallery;
 pub(crate) mod glide;
 pub(crate) mod lan_scope;
 pub(crate) mod limits;
