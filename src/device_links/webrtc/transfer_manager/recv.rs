@@ -197,17 +197,16 @@ impl Incoming {
         self.on_lane = false;
         self.lane_serial = 0;
         if self.lane_wanted {
-            if let (Some(target), true) = (
-                net.link.lane_target(),
-                super::super::file_lane::listen_port() != 0,
-            ) {
+            let token = net.link.lane_target().and_then(|target| {
+                (super::super::file_lane::listen_port() != 0)
+                    .then(|| super::super::file_lane::issue_token(&self.id, &target.peer_id))
+                    .flatten()
+            });
+            if let Some(token) = token {
                 accept.lane = Some(super::super::file_protocol::LaneField {
                     v: Some(1),
                     port: Some(super::super::file_lane::listen_port()),
-                    token: Some(super::super::file_lane::issue_token(
-                        &self.id,
-                        &target.peer_id,
-                    )),
+                    token: Some(token),
                     ttl_ms: Some(super::super::file_lane::TOKEN_TTL.as_millis() as u64),
                     kind: None,
                     start_block: None,

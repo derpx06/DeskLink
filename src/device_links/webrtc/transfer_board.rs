@@ -534,7 +534,7 @@ mod tests {
     #[test]
     fn finishing_a_transfer_voids_its_lane_token_and_forgets_its_lane() {
         let id = "lane-board-1";
-        let token = super::super::file_lane::issue_token(id, "phone");
+        let token = super::super::file_lane::issue_token(id, "phone").unwrap();
         set_lane(id, Some("fast lane"));
         assert_eq!(lane_of(id), Some("fast lane"));
         assert_eq!(lanes().get(id).copied(), Some("fast lane"));
@@ -544,7 +544,7 @@ mod tests {
             &token, id, "phone"
         ));
         // A token of a transfer still going is good once.
-        let live = super::super::file_lane::issue_token("lane-board-2", "phone");
+        let live = super::super::file_lane::issue_token("lane-board-2", "phone").unwrap();
         assert!(super::super::file_lane::spend_token_for_test(
             &live,
             "lane-board-2",

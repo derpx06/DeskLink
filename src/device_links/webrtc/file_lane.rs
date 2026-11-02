@@ -115,17 +115,28 @@ pub(crate) struct Grants {
     by_token: HashMap<String, Grant>,
 }
 
-/// More than this at once is a bug or an attack: the oldest go.
-const MAX_GRANTS: usize = 64;
+/// More than this for one device at once is a bug or an attack: its oldest
+/// go. (Another device's tokens are not touched.)
+const MAX_GRANTS_PER_DEVICE: usize = 16;
+/// And the table as a whole.
+const MAX_GRANTS: usize = 256;
 
 impl Grants {
     /// A token for `dialler_id` to send `transfer_id` over a lane.
     pub(crate) fn issue(&mut self, transfer_id: &str, dialler_id: &str, now: Instant) -> String {
-        self.by_token.retain(|_, grant| grant.expires > now);
-        if self.by_token.len() >= MAX_GRANTS {
+        // A transfer has one live token: the newest accept's.
+        self.by_token
+            .retain(|_, grant| grant.expires > now && grant.transfer_id != transfer_id);
+        let mine = self
+            .by_token
+            .values()
+            .filter(|grant| grant.dialler_id == dialler_id)
+            .count();
+        if mine >= MAX_GRANTS_PER_DEVICE || self.by_token.len() >= MAX_GRANTS {
             let oldest = self
                 .by_token
                 .iter()
+                .filter(|(_, grant)| mine < MAX_GRANTS_PER_DEVICE || grant.dialler_id == dialler_id)
                 .min_by_key(|(_, grant)| grant.expires)
                 .map(|(token, _)| token.clone());
             if let Some(oldest) = oldest {
@@ -200,11 +211,13 @@ pub(crate) fn spend_token_for_test(token: &str, transfer_id: &str, dialler_id: &
 }
 
 /// Issues a token (receiver side, at the accept).
-pub(crate) fn issue_token(transfer_id: &str, dialler_id: &str) -> String {
+/// `None` if the table cannot be used: no lane is offered then (a made-up
+/// empty token would only fail the transfer's accept).
+pub(crate) fn issue_token(transfer_id: &str, dialler_id: &str) -> Option<String> {
     grants()
         .lock()
         .map(|mut grants| grants.issue(transfer_id, dialler_id, Instant::now()))
-        .unwrap_or_default()
+        .ok()
 }
 
 pub(crate) fn void_tokens(transfer_id: &str) {
@@ -272,6 +285,19 @@ pub(crate) fn receiver_for_test(peer: &str) -> Option<()> {
         .and_then(|registry| registry.receivers.get(peer).map(|_| ()))
 }
 
+/// Takes one of `peer`'s lane slots if there is one. Taken with the count
+/// checked under one lock; given back by [`lane_closed`].
+pub(crate) fn reserve_lane(peer: &str) -> bool {
+    registry().lock().is_ok_and(|mut registry| {
+        let open = registry.open.entry(peer.to_string()).or_default();
+        if *open >= LANES_PER_PEER {
+            return false;
+        }
+        *open += 1;
+        true
+    })
+}
+
 /// A lane of `peer` has ended (the engine tells).
 pub(crate) fn lane_closed(peer: &str) {
     if let Ok(mut registry) = registry().lock() {
@@ -310,21 +336,21 @@ pub(crate) fn accept(
         .lock()
         .ok()
         .and_then(|registry| registry.receivers.get(&dialler).map(|(_, r)| r.clone()));
-    let busy = registry().lock().map_or(true, |registry| {
-        registry.open.get(&dialler).copied().unwrap_or(0) >= LANES_PER_PEER
-    });
+    // The slot is taken before the answer, in one step with the count: two
+    // handshakes at once cannot both find room for the last one.
+    let reserved = reserve_lane(&dialler);
     let answered = request.answer(|body| {
         let receiver = receiver.as_ref().ok_or(Refusal::Transfer)?;
-        if busy {
+        if !reserved {
             return Err(Refusal::Busy);
         }
         receiver.check(body)
     });
-    if let (Some((ssl, body)), Some(receiver)) = (answered, receiver) {
-        if let Ok(mut registry) = registry().lock() {
-            *registry.open.entry(dialler).or_default() += 1;
-        }
-        receiver.open(ssl, body);
+    match (answered, receiver) {
+        (Some((ssl, body)), Some(receiver)) => receiver.open(ssl, body),
+        // Refused, or never answered: the slot goes back.
+        _ if reserved => lane_closed(&dialler),
+        _ => {}
     }
     Ok(())
 }
@@ -689,6 +715,60 @@ mod tests {
     }
 
     /// One use, 60 s, this transfer and this device; any attempt spends it.
+    /// Two handshakes at once cannot both take the last slot of a peer.
+    #[test]
+    fn lane_slots_are_taken_atomically() {
+        let peer = format!("slots-{}", new_token());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (peer, barrier) = (peer.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    reserve_lane(&peer)
+                })
+            })
+            .collect();
+        let taken = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .filter(|taken| *taken)
+            .count();
+        assert_eq!(taken, LANES_PER_PEER);
+        lane_closed(&peer);
+        assert!(reserve_lane(&peer), "a slot given back is free again");
+        assert!(!reserve_lane(&peer));
+    }
+
+    /// A transfer has one live token; one device cannot crowd out another's.
+    #[test]
+    fn a_new_token_replaces_the_transfers_old_one_and_devices_are_counted_apart() {
+        let (mut grants, t0) = (Grants::default(), Instant::now());
+        let first = grants.issue("t1", "phone", t0);
+        let second = grants.issue("t1", "phone", t0);
+        assert_eq!(
+            grants.redeem(&first, "t1", "phone", t0),
+            Err(Refusal::Token),
+            "the earlier accept's token is gone"
+        );
+        assert_eq!(grants.redeem(&second, "t1", "phone", t0), Ok(()));
+        let tablet = grants.issue("tab-1", "tablet", t0);
+        for n in 0..(MAX_GRANTS_PER_DEVICE * 3) {
+            grants.issue(&format!("flood-{n}"), "phone", t0);
+        }
+        assert_eq!(
+            grants.redeem(&tablet, "tab-1", "tablet", t0),
+            Ok(()),
+            "a flood by one device leaves another's token alone"
+        );
+        let held = grants
+            .by_token
+            .values()
+            .filter(|grant| grant.dialler_id == "phone")
+            .count();
+        assert_eq!(held, MAX_GRANTS_PER_DEVICE);
+    }
+
     #[test]
     fn a_token_is_single_use_expires_and_is_bound() {
         let (mut grants, t0) = (Grants::default(), Instant::now());
@@ -833,7 +913,7 @@ mod tests {
     fn a_paired_device_with_a_good_token_gets_a_lane_and_it_carries_bytes_fast() {
         let (sender, receiver) = (side(), side());
         pair(&sender, &receiver);
-        let token = issue_token("t-fast", &sender.id);
+        let token = issue_token("t-fast", &sender.id).unwrap();
         let (addr, got) = listener(&receiver, |_| Ok(()));
         let mut lane = dial(
             &sender.config,
@@ -888,7 +968,7 @@ mod tests {
         let (sender, receiver, stranger) = (side(), side(), side());
         pair(&sender, &receiver);
         // A token used once is dead.
-        let token = issue_token("t-replay", &sender.id);
+        let token = issue_token("t-replay", &sender.id).unwrap();
         let (addr, got) = listener(&receiver, |_| Ok(()));
         dial(
             &sender.config,
@@ -911,7 +991,7 @@ mod tests {
         assert_eq!(error, "token");
         assert!(got.recv_timeout(Duration::from_secs(5)).unwrap().is_none());
         // A token for another transfer.
-        let token = issue_token("t-a", &sender.id);
+        let token = issue_token("t-a", &sender.id).unwrap();
         let (addr, _got) = listener(&receiver, |_| Ok(()));
         assert_eq!(
             dial(
@@ -925,7 +1005,7 @@ mod tests {
             "token"
         );
         // A token issued for another device.
-        let token = issue_token("t-c", "someone-else");
+        let token = issue_token("t-c", "someone-else").unwrap();
         let (addr, _got) = listener(&receiver, |_| Ok(()));
         assert_eq!(
             dial(
@@ -939,7 +1019,7 @@ mod tests {
             "token"
         );
         // The transfer is not there / the range is wrong: the engine's answer.
-        let token = issue_token("t-d", &sender.id);
+        let token = issue_token("t-d", &sender.id).unwrap();
         let (addr, _got) = listener(&receiver, |_| Err(Refusal::Range));
         assert_eq!(
             dial(
@@ -953,7 +1033,7 @@ mod tests {
             "range"
         );
         // A device that is not paired is refused before any token is read.
-        let token = issue_token("t-e", &stranger.id);
+        let token = issue_token("t-e", &stranger.id).unwrap();
         let (addr, got) = listener(&receiver, |_| Ok(()));
         assert!(dial(
             &stranger.config,
@@ -965,7 +1045,7 @@ mod tests {
         .is_err());
         assert!(got.recv_timeout(Duration::from_secs(5)).unwrap().is_none());
         // A device that claims a paired device's id with its own certificate.
-        let token = issue_token("t-f", &sender.id);
+        let token = issue_token("t-f", &sender.id).unwrap();
         let (addr, got) = listener(&receiver, |_| Ok(()));
         assert!(dial(
             &stranger.config,
@@ -1016,7 +1096,7 @@ mod tests {
             (addr, handle)
         };
         let dial_with = |addr, transfer: &str| {
-            let token = issue_token(transfer, &sender.id);
+            let token = issue_token(transfer, &sender.id).unwrap();
             dial(
                 &sender.config,
                 &sender.id,
