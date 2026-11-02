@@ -1519,6 +1519,9 @@ fn install_webrtcbin_callbacks(
     Ok(())
 }
 
+/// The callbacks set here run on the streaming thread that `close()` waits for
+/// (`shut_inbound_data`): they must never block, and only send on an
+/// unbounded channel.
 fn install_data_channel(
     channel: WebRTCDataChannel,
     channels: Arc<Mutex<HashMap<WebRtcChannel, WebRTCDataChannel>>>,
@@ -1533,7 +1536,10 @@ fn install_data_channel(
     if channel.is_ordered() != channel_kind.ordered()
         || channel.max_retransmits() != channel_kind.max_retransmits().map(i32::from).unwrap_or(-1)
     {
-        channel.close();
+        // Not closed: closing takes the stream's `sctpdec` pad away while the
+        // far side may still be sending on it, and `sctpdec` aborts the
+        // process on data for a stream with no pad (see `shut_inbound_data`).
+        // Nothing is connected to it, so what it sends is dropped.
         return Err(format!(
             "Invalid DeskLink WebRTC reliability settings for {label}"
         ));
@@ -1546,7 +1552,7 @@ fn install_data_channel(
         // and then closed the *new* one, so a duplicate label left the map
         // holding a closed entry and permanently broke that channel.
         if channels.contains_key(&channel_kind) {
-            channel.close();
+            // Left open and unconnected, for the reason above.
             return Err(format!("Duplicate DeskLink WebRTC data channel: {label}"));
         }
         channels.insert(channel_kind, channel.clone());
@@ -2888,10 +2894,76 @@ a=max-message-size:262144\r\n";
     /// stream it receives on, and closing a channel removes that pad (see
     /// `shut_inbound_data`). A hundred real pairs, traffic in flight both ways
     /// from threads of their own, one side closed first and the other still
-    /// sending. (Before the fix this aborted about one run in thirteen under
-    /// load; here the point is that the whole test returns.)
+    /// sending. Before the fix this aborted about one run in thirteen under
+    /// load. It runs in a process of its own (the inner test below), so an
+    /// abort fails this test instead of taking every other test with it.
     #[test]
     fn real_peers_torn_down_with_traffic_in_flight_never_abort_the_process() {
+        let exe = std::env::current_exe().unwrap();
+        // The test's name without the crate's.
+        let inner = format!(
+            "{}::real_peers_torn_down_inner",
+            module_path!().split_once("::").map_or("", |(_, rest)| rest)
+        );
+        let output = std::process::Command::new(exe)
+            .args([
+                inner.as_str(),
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "the teardown stress run failed or aborted ({:?}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // And it really ran (a name that matches nothing also "succeeds").
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "the inner stress test did not run:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// After `shut_inbound_data` an `sctpdec` of a live pair has its way in
+    /// shut: found (a rename of the element would make the guard a silent
+    /// no-op) and inactive.
+    #[test]
+    fn closing_a_peer_shuts_every_sctpdec_it_has() {
+        let _alone = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
+        let pair = loopback();
+        wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+        let sctpdecs = |peer: &DesktopWebRtcPeer| -> Vec<gst::Element> {
+            let bin = peer.pipeline.dynamic_cast_ref::<gst::Bin>().unwrap();
+            bin.iterate_recurse()
+                .into_iter()
+                .flatten()
+                .filter(|e| e.factory().is_some_and(|f| f.name() == "sctpdec"))
+                .collect()
+        };
+        let found = sctpdecs(&pair.offerer);
+        assert!(!found.is_empty(), "no sctpdec in a connected peer");
+        assert!(found
+            .iter()
+            .all(|e| e.static_pad("sink").unwrap().is_active()));
+        pair.offerer.shut_inbound_data();
+        assert!(
+            found
+                .iter()
+                .all(|e| !e.static_pad("sink").unwrap().is_active()),
+            "the way in is not shut"
+        );
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
+    #[test]
+    #[ignore = "run by real_peers_torn_down_with_traffic_in_flight_never_abort_the_process, in its own process"]
+    fn real_peers_torn_down_inner() {
         let _alone = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
         for round in 0..100u64 {
             let pair = loopback();
