@@ -254,6 +254,10 @@ pub struct DeviceView {
     /// while it is ready. In memory only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<crate::device_links::activity::ActivitySnapshot>,
+    /// Whether the phone says the desk may set its Do Not Disturb (W14);
+    /// `None` until it reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dnd_can_set: Option<bool>,
 }
 
 /// Whether two product versions differ in major or minor ("1.3.0" and
@@ -319,6 +323,7 @@ impl DeviceView {
             notification_access: None,
             app_version: None,
             activity: None,
+            dnd_can_set: None,
             sound: None,
             capture: None,
         }

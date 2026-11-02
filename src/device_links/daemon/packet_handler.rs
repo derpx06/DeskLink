@@ -747,6 +747,14 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         }
         PACKET_TYPE_BATTERY => {
             update_battery_status(devices, device_id, &packet);
+            super::state::note_phone_dnd(
+                &crate::device_links::config::app_settings(),
+                devices,
+                device_id,
+                &packet,
+            );
+            // The desk looks at once, not at its next tick.
+            super::state::nudge_tickers();
             Ok(())
         }
         PACKET_TYPE_CLIPBOARD | PACKET_TYPE_CLIPBOARD_CONNECT => {

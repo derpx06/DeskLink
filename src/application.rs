@@ -119,6 +119,7 @@ mod imp {
         fn startup(&self) {
             self.parent_startup();
             self.start_primary();
+            crate::device_links::dnd::init();
             // Registered now (startup runs only in the primary instance), so
             // the notice is really shown before the crash is marked told.
             self.obj().report_previous_crash();
@@ -150,6 +151,8 @@ mod imp {
                 }
             }
             crate::device_links::vault::flush();
+            // Do Not Disturb DeskLink set on a phone's behalf is put back.
+            crate::device_links::dnd::quit_main();
             self.parent_shutdown();
         }
 
@@ -560,7 +563,22 @@ impl DesklinkApplication {
                         &notification,
                     );
                 }
-                app.walk_away_step(&daemon.devices());
+                {
+                    let devices = daemon.devices();
+                    app.walk_away_step(&devices);
+                    let settings = crate::device_links::config::app_settings();
+                    let paired = || devices.iter().filter(|device| device.trusted);
+                    crate::device_links::dnd::step(
+                        &paired()
+                            .filter(|d| settings.shares_dnd_with(&d.id))
+                            .map(|d| d.id.clone())
+                            .collect(),
+                        &paired()
+                            .filter(|d| d.feature_transport_ready)
+                            .map(|d| d.id.clone())
+                            .collect(),
+                    );
+                }
                 if let Some(tray) = app.imp().tray.borrow().as_ref() {
                     let devices = daemon.devices();
                     let hand_off = devices.iter().any(|device| device.feature_transport_ready)

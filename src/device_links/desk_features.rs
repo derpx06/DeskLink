@@ -452,6 +452,15 @@ pub(crate) fn settings_packet(settings: &AppSettings, device_id: &str) -> Networ
     packet.set("commandAlerts", settings.alerts_commands_to(device_id));
     packet.set("unlockNearby", settings.unlocks_from(device_id));
     packet.set("sessionPasswordSet", settings.session_password.is_some());
+    // Photos and screenshots from the phone (W12): the desk's switch for it.
+    packet.set("galleryAccepted", settings.accepts_gallery_from(device_id));
+    // Do Not Disturb sharing (W14): the switch, and while it is on and the
+    // desktop has a setting for it, the desk's own state.
+    let desk_dnd = super::dnd::desk_state().filter(|_| settings.shares_dnd_with(device_id));
+    packet.set("dndSync", desk_dnd.is_some());
+    if let Some(dnd) = desk_dnd {
+        packet.set("dnd", dnd);
+    }
     let rev = super::sync::rev_of(std::slice::from_ref(&packet), &[]);
     packet.set("rev", rev);
     packet
@@ -1042,6 +1051,46 @@ mod tests {
             ("relay".to_string(), settings.relay_enabled),
         ];
         assert!(real_changes(&settings, "phone", changes).is_empty());
+    }
+
+    /// W12/W14: the settings packet carries the gallery switch always and the
+    /// Do Not Disturb keys only while the switch is on and the desktop has a
+    /// setting for it.
+    #[test]
+    fn the_settings_packet_carries_the_gallery_and_do_not_disturb_keys() {
+        let mut settings = AppSettings::default();
+        let packet = settings_packet(&settings, "phone");
+        assert_eq!(packet.get_bool("galleryAccepted"), Some(false));
+        assert_eq!(packet.get_bool("dndSync"), Some(false));
+        assert_eq!(
+            packet.get_bool("dnd"),
+            None,
+            "no state while sharing is off"
+        );
+        settings.gallery_devices.insert("phone".into());
+        settings.dnd_devices.insert("phone".into());
+        super::super::dnd::set_desk_state_for_tests(None);
+        let none = settings_packet(&settings, "phone");
+        assert_eq!(none.get_bool("galleryAccepted"), Some(true));
+        assert_eq!(
+            none.get_bool("dndSync"),
+            Some(false),
+            "no desktop setting: no promise"
+        );
+        super::super::dnd::set_desk_state_for_tests(Some(true));
+        let on = settings_packet(&settings, "phone");
+        assert_eq!(on.get_bool("dndSync"), Some(true));
+        assert_eq!(on.get_bool("dnd"), Some(true));
+        assert_eq!(
+            settings_packet(&settings, "tablet").get_bool("dndSync"),
+            Some(false)
+        );
+        assert_ne!(
+            on.get_str("rev"),
+            none.get_str("rev"),
+            "a change is a new rev"
+        );
+        super::super::dnd::set_desk_state_for_tests(None);
     }
 
     #[test]

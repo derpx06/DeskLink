@@ -454,6 +454,34 @@ pub(super) fn update_battery_status(
     }
 }
 
+/// A phone's Do Not Disturb, from its `desklink.battery` packet (W14): read
+/// only while the desk's switch for it is on, else forgotten.
+pub(super) fn note_phone_dnd(
+    settings: &crate::device_links::config::AppSettings,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    device_id: &str,
+    packet: &NetworkPacket,
+) {
+    let (dnd, can_set) = if settings.shares_dnd_with(device_id) {
+        (
+            packet.get_bool("dnd"),
+            packet.get_bool("dndCanSet").unwrap_or(false),
+        )
+    } else {
+        (None, false)
+    };
+    if settings.shares_dnd_with(device_id) {
+        crate::device_links::dnd::on_phone(device_id, dnd, can_set);
+    } else {
+        crate::device_links::dnd::forget(device_id);
+    }
+    if let Ok(mut devices) = devices.lock() {
+        if let Some(device) = devices.get_mut(device_id) {
+            device.dnd_can_set = dnd.map(|_| can_set);
+        }
+    }
+}
+
 /// `desklink.activity`: the phone's ongoing items now (W13). A phone whose
 /// notifications are hidden here keeps none in memory either.
 pub(super) fn update_activity(
@@ -829,6 +857,31 @@ mod tests {
         hidden.hidden_notifications.insert(info.id.clone());
         update_activity(&hidden, &devices, &info.id, &one);
         assert_eq!(held(&devices), None, "hidden notifications keep none");
+    }
+
+    /// W14: the keys are read only while the switch is on; a battery packet
+    /// without them leaves what was said.
+    #[test]
+    fn a_phones_do_not_disturb_is_read_only_while_the_switch_is_on() {
+        let (devices, info) = test_devices();
+        let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_BATTERY);
+        packet.set("currentCharge", -1);
+        packet.set("dnd", true);
+        packet.set("dndCanSet", true);
+        let mut settings = crate::device_links::config::AppSettings::default();
+        note_phone_dnd(&settings, &devices, &info.id, &packet);
+        let can_set = |devices: &Arc<Mutex<HashMap<String, DeviceView>>>| {
+            devices.lock().unwrap().get(&info.id).unwrap().dnd_can_set
+        };
+        assert_eq!(can_set(&devices), None, "switch off: nothing kept");
+        settings.dnd_devices.insert(info.id.clone());
+        note_phone_dnd(&settings, &devices, &info.id, &packet);
+        assert_eq!(can_set(&devices), Some(true));
+        let mut cannot = packet.clone();
+        cannot.set("dndCanSet", false);
+        note_phone_dnd(&settings, &devices, &info.id, &cannot);
+        assert_eq!(can_set(&devices), Some(false));
+        crate::device_links::dnd::forget(&info.id);
     }
 
     #[test]

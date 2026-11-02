@@ -153,12 +153,12 @@ fn clock(ms: i64) -> String {
 
 /// What to show for a phone: its visible items at `now_ms`, when it is ready
 /// and the person has not hidden its notifications.
-pub fn shown<'a>(
-    snapshot: Option<&'a ActivitySnapshot>,
+pub fn shown(
+    snapshot: Option<&ActivitySnapshot>,
     ready: bool,
     notifications_shown: bool,
     now_ms: i64,
-) -> Vec<&'a Activity> {
+) -> Vec<&Activity> {
     match snapshot {
         Some(snapshot) if ready && notifications_shown => snapshot
             .items

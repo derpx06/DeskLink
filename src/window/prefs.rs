@@ -160,6 +160,7 @@ fn groups(
     notifications.add(&shown);
     notifications.add(&command_alerts_row(daemon, settings, device));
     add_forward_rows(&notifications, daemon, settings);
+    notifications.add(&dnd_row(daemon, settings, device));
 
     let clipboard = group(GROUPS[2]);
     clipboard.add(&clipboard_row(daemon, settings));
@@ -538,6 +539,40 @@ fn unlock_nearby_row(
         daemon.send(DaemonCommand::SetUnlockNearby(id.clone(), row.is_active()))
     });
     follow(&row, |settings, id| settings.unlocks_from(id));
+    row
+}
+
+/// Do Not Disturb shared with the phone (W14): off unless turned on here.
+fn dnd_row(daemon: &DaemonHandle, settings: &AppSettings, device: &DeviceView) -> adw::SwitchRow {
+    let phone = &device.name;
+    let supported = crate::device_links::dnd::desk_state().is_some();
+    let mut explained = if supported {
+        format!(
+            "{phone}'s Do Not Disturb turns off banners here, and turning them off here asks \
+             {phone} to do the same. Put back when you stop sharing or {phone} is gone for a minute."
+        )
+    } else {
+        "Not available on this desktop (it needs GNOME's notification settings)".to_string()
+    };
+    if supported && settings.shares_dnd_with(&device.id) && device.dnd_can_set == Some(false) {
+        explained.push_str(&format!(
+            " {phone} can't be controlled from here until you allow Do Not Disturb access on it."
+        ));
+    }
+    let row = adw::SwitchRow::builder()
+        .title(format!("Share Do Not Disturb with {phone}"))
+        .use_markup(false)
+        .active(settings.shares_dnd_with(&device.id))
+        .sensitive(supported)
+        .build();
+    row.set_subtitle(&explained);
+    with_icon(&row, "notifications-disabled-symbolic");
+    row.update_property(&[gtk::accessible::Property::Description(&explained)]);
+    let (daemon, id) = (daemon.clone(), device.id.clone());
+    row.connect_active_notify(move |row| {
+        daemon.send(DaemonCommand::SetDndShare(id.clone(), row.is_active()))
+    });
+    follow(&row, |settings, id| settings.shares_dnd_with(id));
     row
 }
 
