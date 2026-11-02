@@ -54,6 +54,8 @@ struct Tracked {
     rate: Rate,
     row: TransferRow,
     note: Option<String>,
+    /// "fast lane" or "over WebRTC", when the board says which.
+    lane: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -78,6 +80,8 @@ pub(crate) struct Notices {
     seen: u64,
     /// Outcomes taken from the board that no tracked row has claimed yet.
     pending: Vec<Finished>,
+    /// The lane each listed transfer is on (set before each look).
+    lanes: HashMap<String, &'static str>,
 }
 
 fn per_second(seconds: u64) -> String {
@@ -119,12 +123,14 @@ impl Notices {
                     rate: Rate::new(row.done, now),
                     row: row.clone(),
                     note: None,
+                    lane: None,
                 }
             });
             tracked.vanished = None;
             tracked.rate.sample(row.done, now);
             tracked.row = row.clone();
             tracked.note = note_of(&row.id);
+            tracked.lane = self.lanes.get(&row.id).copied();
         }
         // The rows that were here and are gone have ended, or carry on under
         // another id: told by their outcome, or after a grace, by neither.
@@ -203,6 +209,11 @@ impl Notices {
     }
 
     /// Numbers the outcomes already taken, so each is looked at once.
+    /// Which lane each transfer is on, for the next look.
+    pub(crate) fn set_lanes(&mut self, lanes: HashMap<String, &'static str>) {
+        self.lanes = lanes;
+    }
+
     pub(crate) fn seen(&self) -> u64 {
         self.seen
     }
@@ -265,6 +276,16 @@ fn progress_body(phone: &str, state: &Phone, now: Instant) -> String {
             (state.batch_done + 1).min(all)
         )
     };
+    // Which lane, when every file moving is on the same one.
+    let mut lanes = rows
+        .iter()
+        .filter(|tracked| !tracked.row.paused)
+        .map(|tracked| tracked.lane);
+    if let Some(Some(lane)) = lanes.next() {
+        if lanes.all(|other| other == Some(lane)) {
+            tail.push(lane.to_string());
+        }
+    }
     format!("{head} · {}", tail.join(" · "))
 }
 
@@ -439,6 +460,47 @@ mod tests {
         assert!(look(7.4, 60 * MB).is_empty());
         let next = look(7.6, 62 * MB);
         assert_eq!(next.len(), 1, "five seconds after the last");
+    }
+
+    /// The lane a file rides is said in the detail, when all files moving ride
+    /// the same one (W18).
+    #[test]
+    fn the_progress_says_which_lane_the_file_is_on() {
+        let (mut notices, t0) = (Notices::default(), Instant::now());
+        let big = |done| [row("t", "p", "big.bin", false, done, 300 * MB)];
+        notices.set_lanes(HashMap::from([("t".to_string(), "fast lane")]));
+        notices.look(at(t0, 0.0), &big(0), &[], &name, &none);
+        let shown = notices.look(at(t0, 2.5), &big(16 * MB), &[], &name, &none);
+        let Action::Progress { body, .. } = &shown[0] else {
+            panic!("{shown:?}")
+        };
+        assert!(body.ends_with(" · fast lane"), "{body}");
+        // Two files on different lanes: nothing is claimed.
+        let two = |done| {
+            [
+                row("t", "p", "a.bin", false, done, 300 * MB),
+                row("u", "p", "b.bin", false, done, 300 * MB),
+            ]
+        };
+        notices.set_lanes(HashMap::from([
+            ("t".to_string(), "fast lane"),
+            ("u".to_string(), "over WebRTC"),
+        ]));
+        let shown = notices.look(at(t0, 8.0), &two(40 * MB), &[], &name, &none);
+        let Action::Progress { body, .. } = &shown[0] else {
+            panic!("{shown:?}")
+        };
+        assert!(!body.contains("lane") && !body.contains("WebRTC"), "{body}");
+        // Both over WebRTC: that is said.
+        notices.set_lanes(HashMap::from([
+            ("t".to_string(), "over WebRTC"),
+            ("u".to_string(), "over WebRTC"),
+        ]));
+        let shown = notices.look(at(t0, 14.0), &two(60 * MB), &[], &name, &none);
+        let Action::Progress { body, .. } = &shown[0] else {
+            panic!("{shown:?}")
+        };
+        assert!(body.ends_with(" · over WebRTC"), "{body}");
     }
 
     /// The send ends: the progress is replaced by what happened, in words.

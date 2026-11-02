@@ -61,8 +61,11 @@ fn subtitle(row: &TransferRow, device: &str) -> String {
     } else {
         format!("Sending to {device}")
     };
+    let lane = crate::device_links::webrtc::transfer_board::lane_of(&row.id)
+        .map(|lane| format!(" · {lane}"))
+        .unwrap_or_default();
     format!(
-        "{direction} · {} of {}",
+        "{direction} · {} of {}{lane}",
         crate::bucket_progress::size_words(row.done),
         crate::bucket_progress::size_words(row.total)
     )

@@ -719,6 +719,7 @@ impl DesklinkApplication {
         // module announces it).
         let (rows, news, seen) = board::snapshot(notices.seen());
         notices.set_seen(seen);
+        notices.set_lanes(board::lanes());
         let name_of = |id: &str| {
             devices
                 .iter()
