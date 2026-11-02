@@ -1,6 +1,7 @@
 {
   "_note": "WebRtcFeatureProfile.enabled (phone) and WEBRTC_PROFILE (desk), sorted.",
   "phone": [
+    "desklink.activity",
     "desklink.battery",
     "desklink.clipboard",
     "desklink.clipboard.connect",
@@ -35,6 +36,7 @@
     "desklink.unlock.request"
   ],
   "desk": [
+    "desklink.activity",
     "desklink.battery",
     "desklink.clipboard",
     "desklink.clipboard.connect",

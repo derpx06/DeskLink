@@ -50,6 +50,7 @@ const XML: &str = r#"<node>
     <property name="Notifications" type="aa{sv}" access="read"/>
     <property name="Transfers" type="aa{sv}" access="read"/>
     <property name="Snippets" type="aa{sv}" access="read"/>
+    <property name="Activities" type="aa{sv}" access="read"/>
     <method name="Invoke">
       <arg name="device_id" type="s" direction="in"/>
       <arg name="action" type="s" direction="in"/>
@@ -450,6 +451,47 @@ fn notifications_variant(devices: &[DeviceView], settings: &AppSettings) -> Vari
     Variant::array_from_iter_with_type(glib::VariantTy::VARDICT, dicts)
 }
 
+/// The phones' ongoing items (W13) that show now, for the top-bar chip. `base`
+/// is on THIS computer's clock (milliseconds since the epoch), -1 for none,
+/// so the extension needs no offset of its own.
+fn activities_variant(devices: &[DeviceView], settings: &AppSettings, now_ms: i64) -> Variant {
+    let dicts = devices
+        .iter()
+        .filter(|device| device.trusted)
+        .flat_map(|device| {
+            let offset = device.activity.as_ref().map_or(0, |a| a.clock_offset_ms);
+            crate::device_links::activity::shown(
+                device.activity.as_ref(),
+                device.feature_transport_ready,
+                settings.shows_notifications(&device.id),
+                now_ms,
+            )
+            .into_iter()
+            .map(move |item| {
+                let dict = glib::VariantDict::new(None);
+                dict.insert("device", &device.id);
+                dict.insert("deviceName", &device.name);
+                dict.insert("id", &item.id);
+                dict.insert("app", &item.app_label);
+                dict.insert("title", &item.title);
+                dict.insert("kind", &item.kind);
+                dict.insert("progress", i64::from(item.progress));
+                dict.insert(
+                    "base",
+                    if item.chronometer_base > 0 {
+                        item.chronometer_base + offset
+                    } else {
+                        -1
+                    },
+                );
+                dict.insert("countdown", item.countdown);
+                dict.end()
+            })
+            .collect::<Vec<_>>()
+        });
+    Variant::array_from_iter_with_type(glib::VariantTy::VARDICT, dicts)
+}
+
 /// How many recent files the menu lists.
 const RECENT_TRANSFERS: usize = 5;
 
@@ -655,6 +697,10 @@ fn property_values(app: &DesklinkApplication) -> std::collections::HashMap<&'sta
             transfers_variant(&crate::device_links::transfer_log::recent()),
         ),
         ("Snippets", snippets_variant()),
+        (
+            "Activities",
+            activities_variant(&views, &settings, crate::device_links::activity::now_ms()),
+        ),
     ])
 }
 
@@ -1562,6 +1608,45 @@ fn offer_extension(app: &DesklinkApplication) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W13: the top bar gets a phone's shown items with `base` on this
+    /// computer's clock; nothing while it is not ready or its notifications
+    /// are hidden.
+    #[test]
+    fn the_top_bar_gets_the_ongoing_items_on_this_computers_clock() {
+        let info = crate::device_links::device_info::DeviceInfo::local("p".into(), "Pixel".into());
+        let mut device = DeviceView::from_info(&info, "10.0.0.2".into(), true);
+        device.trusted = true;
+        device.feature_transport_ready = true;
+        let (phone_at, now) = (5_000_000_i64, 9_000_000_i64);
+        let mut body = serde_json::Map::new();
+        body.insert("at".into(), serde_json::json!(phone_at));
+        body.insert(
+            "items".into(),
+            serde_json::json!([{"id": "t", "appLabel": "Clock", "title": "Pasta", "kind": "timer",
+                "chronometerBase": phone_at + 60_000, "countdown": true}]),
+        );
+        device.activity = Some(crate::device_links::activity::snapshot_from(&body, now));
+        let settings = AppSettings::default();
+        let one = activities_variant(std::slice::from_ref(&device), &settings, now);
+        assert_eq!(one.n_children(), 1);
+        let item = one.child_value(0);
+        let dict = glib::VariantDict::new(Some(&item));
+        let get = |key: &str| dict.lookup_value(key, None).unwrap();
+        assert_eq!(get("title").str(), Some("Pasta"));
+        assert_eq!(get("base").get::<i64>(), Some(now + 60_000), "this clock");
+        assert_eq!(get("countdown").get::<bool>(), Some(true));
+        device.feature_transport_ready = false;
+        assert_eq!(
+            activities_variant(std::slice::from_ref(&device), &settings, now).n_children(),
+            0
+        );
+        device.feature_transport_ready = true;
+        let mut hidden = settings;
+        hidden.hidden_notifications.insert("p".into());
+        assert_eq!(activities_variant(&[device], &hidden, now).n_children(), 0);
+    }
+
     use crate::device_links::device::BatteryStatus;
     use crate::device_links::device_info::DeviceInfo;
 

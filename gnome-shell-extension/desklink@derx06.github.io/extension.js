@@ -35,6 +35,7 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
 import {BatteryRing, fillMenu, sessionLine, shortStatus, statusLine, styleVariant} from './menu.js';
+import {liveItems, liveText} from './activity.js';
 import {PhoneCalls, PhoneNotifications} from './notifications.js';
 
 const BUS_NAME = 'derx06.desklink.com';
@@ -50,6 +51,7 @@ const ShellProxy = Gio.DBusProxy.makeProxyWrapper(`<node>
     <property name="Notifications" type="aa{sv}" access="read"/>
     <property name="Transfers" type="aa{sv}" access="read"/>
     <property name="Snippets" type="aa{sv}" access="read"/>
+    <property name="Activities" type="aa{sv}" access="read"/>
     <method name="Invoke">
       <arg name="device_id" type="s" direction="in"/>
       <arg name="action" type="s" direction="in"/>
@@ -203,6 +205,7 @@ export default class DeskLinkExtension extends Extension {
         if (this._tickId)
             GLib.source_remove(this._tickId);
         this._tickId = 0;
+        this._stopChipTimer();
         Gio.bus_unwatch_name(this._watchId);
         this._watchId = 0;
         Main.sessionMode.disconnect(this._modeId);
@@ -369,23 +372,73 @@ export default class DeskLinkExtension extends Extension {
         if (locked) {
             const unlockers = devices.filter(device => device.actions.includes('unlock-via-phone'));
             this._button.visible = running && unlockers.length > 0;
+            this._chipItems = [];
+            this._stopChipTimer();
             this._button.showState(true, false, 'unlock with your phone');
             this._button.showLabel(unlockers.length === 1 ? `Unlock with ${unlockers[0].name}` : 'Unlock');
             for (const device of unlockers)
                 menu.addAction(`Unlock with ${device.name}`, () => this._invoke(device.id, 'unlock-via-phone'));
             return;
         }
-        this._button.visible = running && !!desk.pill && devices.length > 0;
-        this._button.showLabel(null);
+        // Ongoing items on the phone (timers, downloads, navigation): the pill
+        // shows the first one's live countdown or progress, even when the
+        // pill is otherwise off, and goes when nothing is ongoing.
+        const items = running ? liveItems(this._read('Activities', []), Date.now()) : [];
+        this._chipItems = items;
+        this._button.visible = running && (!!desk.pill || items.length > 0) && devices.length > 0;
+        this._button.showLabel(this._chipText());
         this._button.showState(!!selected?.ready, live.length > 0,
             selected ? `${selected.name}, ${statusLine(selected)}` : 'no phone connected');
+        if (items.length > 0)
+            this._startChipTimer();
+        else
+            this._stopChipTimer();
         const head = new PopupMenu.PopupMenuItem(
             selected ? `${selected.name} · ${statusLine(selected)}` : 'No phone connected',
             {reactive: false});
         menu.addMenuItem(head);
         for (const device of live)
             menu.addMenuItem(this._liveRow(device));
+        for (const item of this._chipItems ?? []) {
+            menu.addMenuItem(new PopupMenu.PopupMenuItem(
+                `${item.title || item.app} · ${liveText(item, Date.now())}`.replace(/ · $/, ''),
+                {reactive: false}));
+        }
         menu.addAction('Open DeskLink', () => this._invoke(selected?.id ?? '', 'open'));
+    }
+
+    /// The pill's text: the first ongoing item and its live part.
+    _chipText() {
+        const item = this._chipItems?.[0];
+        if (!item)
+            return null;
+        const live = liveText(item, Date.now());
+        const name = item.title || item.app;
+        return live ? `${name} ${live}` : name;
+    }
+
+    /// One tick a second, only while something is ongoing.
+    _startChipTimer() {
+        if (this._chipId)
+            return;
+        this._chipId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+            const before = this._chipItems?.length ?? 0;
+            this._chipItems = liveItems(this._chipItems ?? [], Date.now());
+            if (this._chipItems.length !== before) {
+                // A countdown ran out: the whole pill is worked out again.
+                this._chipId = 0;
+                this._sync();
+                return GLib.SOURCE_REMOVE;
+            }
+            this._button?.showLabel(this._chipText());
+            return GLib.SOURCE_CONTINUE;
+        });
+    }
+
+    _stopChipTimer() {
+        if (this._chipId)
+            GLib.source_remove(this._chipId);
+        this._chipId = 0;
     }
 
     _call(method, args) {

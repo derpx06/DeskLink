@@ -1,0 +1,366 @@
+{
+  "_note": "W13 desklink.activity bodies. 'items' is the body's items array as the phone builds it; 'expect' is what the desk keeps from it (caps: 5 items; progress 0..100 or -1; chronometerBase > 0 or -1; kind timer|progress|navigation|call|other; ids unique, non-empty). String lengths (id 240, appLabel 120, title 240, text 500) are cut by the desk and tested there.",
+  "cases": [
+    {
+      "name": "a countdown timer",
+      "items": [
+        {
+          "id": "t1",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": 1730000600000,
+          "countdown": true,
+          "kind": "timer"
+        }
+      ],
+      "expect": [
+        {
+          "id": "t1",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": 1730000600000,
+          "countdown": true,
+          "kind": "timer"
+        }
+      ]
+    },
+    {
+      "name": "an empty snapshot clears",
+      "items": [],
+      "expect": []
+    },
+    {
+      "name": "more than five items keep the first five",
+      "items": [
+        {
+          "id": "i0",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        },
+        {
+          "id": "i1",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        },
+        {
+          "id": "i2",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        },
+        {
+          "id": "i3",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        },
+        {
+          "id": "i4",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        },
+        {
+          "id": "i5",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        },
+        {
+          "id": "i6",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        }
+      ],
+      "expect": [
+        {
+          "id": "i0",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        },
+        {
+          "id": "i1",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        },
+        {
+          "id": "i2",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        },
+        {
+          "id": "i3",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        },
+        {
+          "id": "i4",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        }
+      ]
+    },
+    {
+      "name": "progress is clamped to 0..100, junk is none",
+      "items": [
+        {
+          "id": "p1",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": 150,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "progress"
+        },
+        {
+          "id": "p2",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -5,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "progress"
+        },
+        {
+          "id": "p3",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": "x",
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "progress"
+        },
+        {
+          "id": "p4",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": 42,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "progress"
+        }
+      ],
+      "expect": [
+        {
+          "id": "p1",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": 100,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "progress"
+        },
+        {
+          "id": "p2",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "progress"
+        },
+        {
+          "id": "p3",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "progress"
+        },
+        {
+          "id": "p4",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": 42,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "progress"
+        }
+      ]
+    },
+    {
+      "name": "an unknown kind reads as other",
+      "items": [
+        {
+          "id": "k1",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "alarm"
+        }
+      ],
+      "expect": [
+        {
+          "id": "k1",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "other"
+        }
+      ]
+    },
+    {
+      "name": "an item without an id is skipped, a repeated id keeps the first",
+      "items": [
+        {
+          "appLabel": "X",
+          "title": "no id"
+        },
+        {
+          "id": "d1",
+          "appLabel": "Clock",
+          "title": "first",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        },
+        {
+          "id": "d1",
+          "appLabel": "Clock",
+          "title": "second",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        }
+      ],
+      "expect": [
+        {
+          "id": "d1",
+          "appLabel": "Clock",
+          "title": "first",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        }
+      ]
+    },
+    {
+      "name": "a non-positive chronometer base is none",
+      "items": [
+        {
+          "id": "c1",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": 0,
+          "countdown": true,
+          "kind": "timer"
+        },
+        {
+          "id": "c2",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -7,
+          "countdown": false,
+          "kind": "timer"
+        }
+      ],
+      "expect": [
+        {
+          "id": "c1",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": true,
+          "kind": "timer"
+        },
+        {
+          "id": "c2",
+          "appLabel": "Clock",
+          "title": "Pasta",
+          "text": "",
+          "progress": -1,
+          "chronometerBase": -1,
+          "countdown": false,
+          "kind": "timer"
+        }
+      ]
+    }
+  ]
+}

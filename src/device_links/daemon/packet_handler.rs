@@ -15,9 +15,9 @@ use crate::device_links::config::Config;
 use crate::device_links::core::{DeviceManager, ReadOutcome, SessionBinding};
 use crate::device_links::device::DeviceView;
 use crate::device_links::packet::{
-    NetworkPacket, PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
-    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_HEARTBEAT, PACKET_TYPE_LOCK,
-    PACKET_TYPE_LOCK_REQUEST, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS,
+    NetworkPacket, PACKET_TYPE_ACTIVITY, PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD,
+    PACKET_TYPE_CLIPBOARD_CONNECT, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_HEARTBEAT,
+    PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS,
     PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_REQUEST,
     PACKET_TYPE_PAIR, PACKET_TYPE_PING, PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_REQUEST,
     PACKET_TYPE_TELEPHONY, PACKET_TYPE_UNLOCK_REQUEST, PACKET_TYPE_WEBRTC_SIGNAL_V1,
@@ -724,6 +724,25 @@ pub(crate) fn dispatch_webrtc_feature_packet(
                     message: packet.get_str("message").map(str::to_string),
                 },
             );
+            Ok(())
+        }
+        // The phone's ongoing items (W13): the latest snapshot replaces the
+        // last. Kept in memory only, and not at all while this phone's
+        // notifications are hidden here.
+        PACKET_TYPE_ACTIVITY => {
+            super::state::update_activity(
+                &crate::device_links::config::app_settings(),
+                devices,
+                device_id,
+                &packet,
+            );
+            crate::device_links::sync::note_received(
+                device_id,
+                binding.link.info.instance_id.as_deref(),
+                "activity",
+                &packet,
+            );
+            super::state::nudge_tickers();
             Ok(())
         }
         PACKET_TYPE_BATTERY => {

@@ -454,6 +454,27 @@ pub(super) fn update_battery_status(
     }
 }
 
+/// `desklink.activity`: the phone's ongoing items now (W13). A phone whose
+/// notifications are hidden here keeps none in memory either.
+pub(super) fn update_activity(
+    settings: &crate::device_links::config::AppSettings,
+    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
+    device_id: &str,
+    packet: &NetworkPacket,
+) {
+    let snapshot = settings.shows_notifications(device_id).then(|| {
+        crate::device_links::activity::snapshot_from(
+            &packet.body,
+            crate::device_links::activity::now_ms(),
+        )
+    });
+    if let Ok(mut devices) = devices.lock() {
+        if let Some(device) = devices.get_mut(device_id) {
+            device.activity = snapshot;
+        }
+    }
+}
+
 /// `desklink.telephony {calls, muted, silenced}`: the phone's calls now.
 /// Returns whether it is in a call.
 /// `desklink.mousepad.keyboardstate {state}`: a text field has focus on
@@ -773,6 +794,41 @@ mod tests {
         let device = devices.get(&info.id).unwrap();
         assert_ne!(device.status, DeviceStatus::PairRequestedByPeer);
         assert_eq!(device.verification_key, None);
+    }
+
+    /// W13: a snapshot replaces the last, an empty one clears, and a phone
+    /// whose notifications are hidden here keeps nothing.
+    #[test]
+    fn an_activity_snapshot_replaces_the_last_and_hidden_phones_keep_none() {
+        let (devices, info) = test_devices();
+        let settings = crate::device_links::config::AppSettings::default();
+        let mut one = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_ACTIVITY);
+        one.set(
+            "items",
+            serde_json::json!([{"id": "a", "title": "Pasta", "kind": "timer"}]),
+        );
+        update_activity(&settings, &devices, &info.id, &one);
+        let held = |devices: &Arc<Mutex<HashMap<String, DeviceView>>>| {
+            devices
+                .lock()
+                .unwrap()
+                .get(&info.id)
+                .unwrap()
+                .activity
+                .clone()
+        };
+        assert_eq!(held(&devices).unwrap().items[0].title, "Pasta");
+        let mut none = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_ACTIVITY);
+        none.set("items", serde_json::json!([]));
+        update_activity(&settings, &devices, &info.id, &none);
+        assert!(
+            held(&devices).unwrap().items.is_empty(),
+            "an empty snapshot clears"
+        );
+        let mut hidden = settings.clone();
+        hidden.hidden_notifications.insert(info.id.clone());
+        update_activity(&hidden, &devices, &info.id, &one);
+        assert_eq!(held(&devices), None, "hidden notifications keep none");
     }
 
     #[test]

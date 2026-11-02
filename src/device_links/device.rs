@@ -250,6 +250,10 @@ pub struct DeviceView {
     /// from an authenticated link; `None` until then or from an older build.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_version: Option<String>,
+    /// The phone's ongoing items (W13), from its last snapshot; shown only
+    /// while it is ready. In memory only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<crate::device_links::activity::ActivitySnapshot>,
 }
 
 /// Whether two product versions differ in major or minor ("1.3.0" and
@@ -314,6 +318,7 @@ impl DeviceView {
             keyboard_allowed: None,
             notification_access: None,
             app_version: None,
+            activity: None,
             sound: None,
             capture: None,
         }

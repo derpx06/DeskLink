@@ -1,6 +1,7 @@
 {
   "_note": "One copy per repo: DeskLink/src/device_links/packet.rs and desklink-mobile DeskLinkProtocol.kt must hold exactly these packet-type strings. Change it here, then copy to both repos' test resources.",
   "packetTypes": [
+    "desklink.activity",
     "desklink.battery",
     "desklink.clipboard",
     "desklink.clipboard.connect",

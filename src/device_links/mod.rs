@@ -1,3 +1,4 @@
+pub mod activity;
 pub(crate) mod calls;
 pub mod config;
 pub mod connection_log;

@@ -43,9 +43,16 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         rtt_ms: None,
         ..device.clone()
     };
+    // What is ongoing on the phone, by id: the card is redrawn when an item
+    // comes or goes, and its live text changes in place.
+    let activity_ids: Vec<String> = shown_activities(device, &settings)
+        .into_iter()
+        .map(|item| item.id.clone())
+        .collect();
     let key = serde_json::to_string(&(
         &steady,
         &since,
+        &activity_ids,
         &terminals,
         &transfers,
         settings.shows_notifications(&device.id),
@@ -55,6 +62,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     .unwrap_or_default();
     if !win.page_changed("home", key) {
         refresh_in_place(win, daemon);
+        show_activities(win, device, &settings);
         show_round_trip(win, device);
         show_clock(win, &minute);
         return;
@@ -80,6 +88,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
             page.append(&capture);
         }
         page.append(&hero(daemon, device, &minute));
+        if let Some(card) = activity_card(device, &settings) {
+            page.append(&card);
+        }
         if let Some(bar) = now_playing_bar(daemon, device) {
             page.append(&bar);
         }
@@ -120,6 +131,128 @@ fn show_clock(win: &DesklinkWindow, minute: &str) {
         if let Some(label) = widget.downcast_ref::<gtk::Label>() {
             if label.label() != minute {
                 label.set_label(minute);
+            }
+        }
+    }
+}
+
+/// The phone's ongoing items that show now (W13).
+fn shown_activities<'a>(
+    device: &'a DeviceView,
+    settings: &crate::device_links::config::AppSettings,
+) -> Vec<&'a crate::device_links::activity::Activity> {
+    crate::device_links::activity::shown(
+        device.activity.as_ref(),
+        device.feature_transport_ready,
+        settings.shows_notifications(&device.id),
+        crate::device_links::activity::now_ms(),
+    )
+}
+
+/// "Happening on <phone>": its timers, downloads and navigation, each with
+/// its live countdown or progress. `None` when nothing is ongoing.
+fn activity_card(
+    device: &DeviceView,
+    settings: &crate::device_links::config::AppSettings,
+) -> Option<gtk::Box> {
+    let items = shown_activities(device, settings);
+    if items.is_empty() {
+        return None;
+    }
+    let card = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(10)
+        .css_classes(["dl-card"])
+        .build();
+    card.append(&text(
+        &format!("Happening on {}", device.name),
+        &["heading"],
+    ));
+    for (index, item) in items.into_iter().enumerate() {
+        let row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(3)
+            .build();
+        let head = gtk::Box::builder().spacing(12).build();
+        let title = if item.title.is_empty() {
+            &item.app_label
+        } else {
+            &item.title
+        };
+        let name = ellipsized(title, &["body"]);
+        name.set_hexpand(true);
+        head.append(&name);
+        let live = text("", &["numeric", "text-dim"]);
+        live.set_widget_name(&format!("activity-live:{index}"));
+        head.append(&live);
+        row.append(&head);
+        if !item.app_label.is_empty() || !item.text.is_empty() {
+            let detail = if item.text.is_empty() {
+                item.app_label.clone()
+            } else {
+                format!("{} · {}", item.app_label, item.text)
+            };
+            row.append(&ellipsized(&detail, &["caption", "text-dim"]));
+        }
+        if item.progress >= 0 {
+            let bar = gtk::ProgressBar::builder().css_classes(["thin"]).build();
+            bar.set_widget_name(&format!("activity-bar:{index}"));
+            row.append(&bar);
+        }
+        row.update_property(&[gtk::accessible::Property::Label(&format!(
+            "{}, {}",
+            title, item.app_label
+        ))]);
+        card.append(&row);
+    }
+    Some(card)
+}
+
+/// The activity card's countdowns and bars, in place (every tick).
+fn show_activities(
+    win: &DesklinkWindow,
+    device: &DeviceView,
+    settings: &crate::device_links::config::AppSettings,
+) {
+    let Some((_, body)) = win.imp().bodies.borrow().get("home").cloned() else {
+        return;
+    };
+    paint_activities(
+        body.upcast_ref(),
+        device,
+        settings,
+        crate::device_links::activity::now_ms(),
+    );
+}
+
+/// [`show_activities`] on any root, at the clock `now_ms`.
+fn paint_activities(
+    root: &gtk::Widget,
+    device: &DeviceView,
+    settings: &crate::device_links::config::AppSettings,
+    now_ms: i64,
+) {
+    let Some(snapshot) = device.activity.as_ref() else {
+        return;
+    };
+    let items = crate::device_links::activity::shown(
+        Some(snapshot),
+        device.feature_transport_ready,
+        settings.shows_notifications(&device.id),
+        now_ms,
+    );
+    for (index, item) in items.into_iter().enumerate() {
+        for widget in named_widgets(root, &format!("activity-live:{index}")) {
+            if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                let words = item.live_text(snapshot, now_ms).unwrap_or_default();
+                if label.label() != words {
+                    label.set_label(&words);
+                }
+            }
+        }
+        for widget in named_widgets(root, &format!("activity-bar:{index}")) {
+            if let Some(bar) = widget.downcast_ref::<gtk::ProgressBar>() {
+                bar.set_fraction(f64::from(item.progress.clamp(0, 100)) / 100.0);
             }
         }
     }
@@ -1303,5 +1436,73 @@ mod tests {
         assert_eq!(shown.chars().count(), 201);
         assert!(shown.ends_with('…'));
         assert_eq!(preview_line("short\nmore"), "short");
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    use crate::device_links::activity::snapshot_from;
+
+    fn device_with(items: serde_json::Value, at: i64, now: i64) -> DeviceView {
+        let info = crate::device_links::device_info::DeviceInfo::local("p".into(), "Pixel".into());
+        let mut device = DeviceView::from_info(&info, "10.0.0.2".into(), true);
+        device.feature_transport_ready = true;
+        let mut body = serde_json::Map::new();
+        body.insert("items".into(), items);
+        body.insert("at".into(), serde_json::json!(at));
+        device.activity = Some(snapshot_from(&body, now));
+        device
+    }
+
+    fn labels(root: &gtk::Widget, prefix: &str) -> Vec<String> {
+        let mut found: Vec<_> = named_widgets(root, prefix)
+            .into_iter()
+            .filter_map(|w| w.downcast::<gtk::Label>().ok())
+            .map(|l| (l.widget_name().to_string(), l.label().to_string()))
+            .collect();
+        found.sort();
+        found.into_iter().map(|(_, label)| label).collect()
+    }
+
+    /// The card names the phone, shows each item, and its countdown and bar
+    /// move in place; nothing ongoing, or a hidden phone, draws no card.
+    /// (Needs a display.)
+    #[test]
+    fn the_activity_card_shows_items_and_counts_down_in_place() {
+        crate::test_display::run(|| {
+            let at = crate::device_links::activity::now_ms();
+            let now = at;
+            let device = device_with(
+                serde_json::json!([
+                    {"id": "t", "appLabel": "Clock", "title": "Pasta", "kind": "timer",
+                     "chronometerBase": at + 272_000, "countdown": true},
+                    {"id": "d", "appLabel": "Files", "title": "Download", "kind": "progress",
+                     "progress": 40}
+                ]),
+                at,
+                now,
+            );
+            let settings = crate::device_links::config::AppSettings::default();
+            let card = activity_card(&device, &settings).expect("a card");
+            let root = card.clone().upcast::<gtk::Widget>();
+            paint_activities(&root, &device, &settings, now);
+            assert_eq!(labels(&root, "activity-live:"), ["4:32 left", "40%"]);
+            paint_activities(&root, &device, &settings, now + 10_000);
+            assert_eq!(labels(&root, "activity-live:")[0], "4:22 left", "in place");
+            let bars = named_widgets(&root, "activity-bar:");
+            assert_eq!(bars.len(), 1);
+            let bar = bars[0].downcast_ref::<gtk::ProgressBar>().unwrap();
+            assert!((bar.fraction() - 0.4).abs() < 1e-9);
+
+            let mut hidden = settings.clone();
+            hidden.hidden_notifications.insert("p".into());
+            assert!(activity_card(&device, &hidden).is_none());
+            let mut offline = device.clone();
+            offline.feature_transport_ready = false;
+            assert!(activity_card(&offline, &settings).is_none());
+            let empty = device_with(serde_json::json!([]), at, now);
+            assert!(activity_card(&empty, &settings).is_none());
+        });
     }
 }

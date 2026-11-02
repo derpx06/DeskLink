@@ -88,6 +88,10 @@ pub enum DaemonCommand {
     SetUnlockNearby(String, bool),
     /// Lock this computer when the phone walks away (per phone).
     SetWalkAwayLock(String, bool),
+    /// Accept screenshots and photos from the phone (per phone).
+    SetGalleryAccept(String, bool),
+    /// Share Do Not Disturb with the phone (per phone).
+    SetDndShare(String, bool),
     /// Glide (F4): the pointer glides onto this phone past this edge, or
     /// off (`None`) for it.
     SetGlide(String, Option<crate::device_links::glide::Edge>),
@@ -269,6 +273,20 @@ impl DaemonWorker {
                     settings.walk_away_devices.insert(id);
                 } else {
                     settings.walk_away_devices.remove(&id);
+                }
+            }),
+            DaemonCommand::SetGalleryAccept(id, on) => self.update_settings(|settings| {
+                if on {
+                    settings.gallery_devices.insert(id);
+                } else {
+                    settings.gallery_devices.remove(&id);
+                }
+            }),
+            DaemonCommand::SetDndShare(id, on) => self.update_settings(|settings| {
+                if on {
+                    settings.dnd_devices.insert(id);
+                } else {
+                    settings.dnd_devices.remove(&id);
                 }
             }),
             DaemonCommand::SetGlide(id, edge) => self.update_settings(|settings| match edge {

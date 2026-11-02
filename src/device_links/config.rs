@@ -124,6 +124,14 @@ pub struct AppSettings {
     /// reach, after a warning). None until turned on here, per phone.
     #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub walk_away_devices: std::collections::BTreeSet<String>,
+    /// The phones whose new screenshots and photos are accepted (W12). None
+    /// until turned on here, per phone.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub gallery_devices: std::collections::BTreeSet<String>,
+    /// The phones Do Not Disturb is shared with (W14). None until turned on
+    /// here, per phone.
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub dnd_devices: std::collections::BTreeSet<String>,
     /// Show the phone as its own item in the top bar too (the extension's
     /// pill), besides the Quick Settings menu. Off by default.
     #[serde(default)]
@@ -171,6 +179,8 @@ impl Default for AppSettings {
             keep_awake_phones: Default::default(),
             unlock_devices: Default::default(),
             walk_away_devices: Default::default(),
+            gallery_devices: Default::default(),
+            dnd_devices: Default::default(),
             top_bar_pill: false,
             recent_folders: Vec::new(),
             forward_notifications: false,
@@ -228,6 +238,16 @@ impl AppSettings {
     /// Whether this computer locks when `device_id` walks away (per phone).
     pub fn locks_when_away(&self, device_id: &str) -> bool {
         self.walk_away_devices.contains(device_id)
+    }
+
+    /// Whether screenshots and photos from `device_id` are accepted (W12).
+    pub fn accepts_gallery_from(&self, device_id: &str) -> bool {
+        self.gallery_devices.contains(device_id)
+    }
+
+    /// Whether Do Not Disturb is shared with `device_id` (W14).
+    pub fn shares_dnd_with(&self, device_id: &str) -> bool {
+        self.dnd_devices.contains(device_id)
     }
 
     /// The relay's address; empty when none is set up.
@@ -914,9 +934,14 @@ impl Config {
             // one has: its snapshots are sent again.
             crate::device_links::sync::forget_device(&info.id);
             // "Unlock with this phone" is a consent for that identity.
-            let unlock = self.stored.settings.unlock_devices.remove(&info.id);
-            let walk_away = self.stored.settings.walk_away_devices.remove(&info.id);
-            if unlock || walk_away {
+            let settings = &mut self.stored.settings;
+            let cleared = [
+                settings.unlock_devices.remove(&info.id),
+                settings.walk_away_devices.remove(&info.id),
+                settings.gallery_devices.remove(&info.id),
+                settings.dnd_devices.remove(&info.id),
+            ];
+            if cleared.contains(&true) {
                 mirror_settings(&self.stored.settings);
             }
         }
@@ -1018,6 +1043,8 @@ impl Config {
         let cleared = [
             settings.unlock_devices.remove(device_id),
             settings.walk_away_devices.remove(device_id),
+            settings.gallery_devices.remove(device_id),
+            settings.dnd_devices.remove(device_id),
             // What was chosen for that phone alone: not inherited by a later
             // phone under the same id.
             settings.hidden_notifications.remove(device_id),
@@ -2036,6 +2063,45 @@ mod tests {
             "a new identity does not"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Photos from a phone and Do Not Disturb sharing are off until turned on
+    /// per phone, stay out of the file while off, and go with the pairing and
+    /// with the identity.
+    #[test]
+    fn gallery_and_dnd_sharing_are_per_phone_off_by_default_and_do_not_survive_unpair() {
+        let old: AppSettings = serde_json::from_str(r#"{"stay_awake":true}"#).unwrap();
+        assert!(!old.accepts_gallery_from("phone") && !old.shares_dnd_with("phone"));
+        let written = serde_json::to_string(&AppSettings::default()).unwrap();
+        assert!(!written.contains("gallery_devices") && !written.contains("dnd_devices"));
+
+        let dir = std::env::temp_dir().join(format!("desklink-gallery-{}", Uuid::new_v4()));
+        let mut config = Config::load_from_dir(dir).unwrap();
+        let id = format!("phone-{}", Uuid::new_v4().simple());
+        let info = DeviceInfo::local(id.clone(), "Pixel".into());
+        config.trust_device(&info, "cert-1".into()).unwrap();
+        let on = |config: &mut Config| {
+            config.stored.settings.gallery_devices.insert(id.clone());
+            config.stored.settings.dnd_devices.insert(id.clone());
+        };
+        on(&mut config);
+        config.trust_device(&info, "cert-1".into()).unwrap();
+        assert!(config.stored.settings.accepts_gallery_from(&id));
+        assert!(config.stored.settings.shares_dnd_with(&id));
+        assert!(!config.stored.settings.accepts_gallery_from("other"));
+        config.trust_device(&info, "cert-2".into()).unwrap();
+        assert!(
+            !config.stored.settings.accepts_gallery_from(&id),
+            "new identity"
+        );
+        assert!(!config.stored.settings.shares_dnd_with(&id), "new identity");
+        on(&mut config);
+        config.untrust_device(&id).unwrap();
+        assert!(
+            !config.stored.settings.accepts_gallery_from(&id),
+            "unpaired"
+        );
+        assert!(!config.stored.settings.shares_dnd_with(&id), "unpaired");
     }
 
     /// "Unlock with this phone" is gone with the pairing, and with the

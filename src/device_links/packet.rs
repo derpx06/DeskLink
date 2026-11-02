@@ -41,6 +41,9 @@ pub const PACKET_TYPE_NOTIFICATION_REPLY: &str = "desklink.notification.reply";
 pub const PACKET_TYPE_NOTIFICATION_ACTION: &str = "desklink.notification.action";
 /// The desk's own settings, reported to a phone (desk → phone).
 pub const PACKET_TYPE_SETTINGS: &str = "desklink.settings";
+/// Live activities (W13): the phone's ongoing items, phone to desk.
+/// Must match `DeskLinkProtocol.PACKET_TYPE_ACTIVITY` on Android.
+pub const PACKET_TYPE_ACTIVITY: &str = "desklink.activity";
 /// Delta resync (W2): the snapshot revs a side already holds, sent first on
 /// every feature-ready, both ways.
 pub const PACKET_TYPE_SYNC_HAVE: &str = "desklink.sync.have";

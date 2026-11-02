@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::device_links::packet::{
-    PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_CLIPBOARD_CONNECT,
-    PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS, PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID,
-    PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS, PACKET_TYPE_CONTACTS_RESPONSE_VCARDS,
-    PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_FOLDERS, PACKET_TYPE_HANDOFF, PACKET_TYPE_LOCK,
-    PACKET_TYPE_LOCK_REQUEST, PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE, PACKET_TYPE_MOUSEPAD_REQUEST,
-    PACKET_TYPE_MPRIS, PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTES, PACKET_TYPE_NOTIFICATION,
+    PACKET_TYPE_ACTIVITY, PACKET_TYPE_BATTERY, PACKET_TYPE_CLIPBOARD,
+    PACKET_TYPE_CLIPBOARD_CONNECT, PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS,
+    PACKET_TYPE_CONTACTS_REQUEST_VCARDS_BY_UID, PACKET_TYPE_CONTACTS_RESPONSE_UIDS_TIMESTAMPS,
+    PACKET_TYPE_CONTACTS_RESPONSE_VCARDS, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_FOLDERS,
+    PACKET_TYPE_HANDOFF, PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST,
+    PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS,
+    PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTES, PACKET_TYPE_NOTIFICATION,
     PACKET_TYPE_NOTIFICATION_ACTION, PACKET_TYPE_NOTIFICATION_REPLY,
     PACKET_TYPE_NOTIFICATION_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_SCREEN_ERROR,
     PACKET_TYPE_SCREEN_READY, PACKET_TYPE_SCREEN_REQUEST, PACKET_TYPE_SCREEN_STOP,
@@ -21,7 +22,9 @@ use crate::device_links::packet::{
 /// WebRTC transport. Each entry has a matching arm in
 /// `packet_handler::dispatch_webrtc_feature_packet` and a DeskLink Android
 /// plugin that actually sends it.
-const DESKTOP_INCOMING: [&str; 27] = [
+const DESKTOP_INCOMING: [&str; 28] = [
+    // Live activities (W13): the phone's ongoing items.
+    PACKET_TYPE_ACTIVITY,
     // Folder sync (F8): both ways.
     PACKET_TYPE_FOLDERS,
     // Delta resync (W2): the revs the phone holds, first on every ready.
@@ -129,7 +132,9 @@ const DESKTOP_OUTGOING: [&str; 29] = [
 /// control plane is `desklink.remote-session.v1` on the control channel, and
 /// the screen packet types exist only so the Android application loads its
 /// screen plugin (see `DESKTOP_INCOMING`). They never cross the wire.
-const WEBRTC_PROFILE: [&str; 32] = [
+const WEBRTC_PROFILE: [&str; 33] = [
+    // Live activities (W13).
+    PACKET_TYPE_ACTIVITY,
     // Folder sync (F8).
     PACKET_TYPE_FOLDERS,
     // Delta resync (W2).
@@ -348,6 +353,7 @@ mod tests {
         assert_eq!(
             registry.incoming_capabilities(),
             strings(&[
+                "desklink.activity",
                 "desklink.battery",
                 "desklink.clipboard",
                 "desklink.clipboard.connect",
@@ -424,6 +430,7 @@ mod tests {
         assert_eq!(
             profile,
             vec![
+                "desklink.activity",
                 "desklink.battery",
                 "desklink.clipboard",
                 "desklink.clipboard.connect",
@@ -483,7 +490,7 @@ mod tests {
         assert!(webrtc_capabilities(&advertised).is_empty());
         assert_eq!(
             WEBRTC_PROFILE.len(),
-            32,
+            33,
             "Android's WebRtcFeatureProfile.enabled"
         );
     }
@@ -535,6 +542,7 @@ mod tests {
         assert_eq!(
             incoming,
             [
+                "desklink.activity",
                 "desklink.battery",
                 "desklink.clipboard",
                 "desklink.clipboard.connect",
@@ -592,7 +600,7 @@ mod tests {
         );
         // The types in one direction only are directional pairs: what the
         // phone sends the desk accepts, what the desk sends the phone accepts.
-        assert_eq!(one_way.len(), 16, "{one_way:?}");
+        assert_eq!(one_way.len(), 17, "{one_way:?}");
     }
 
     /// Every type each registry lists, except the screen types, rides the

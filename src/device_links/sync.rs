@@ -22,8 +22,9 @@ use super::packet::{NetworkPacket, PACKET_TYPE_SYNC_HAVE};
 
 /// The features that are digested; battery, telephony, lock and ping are
 /// always sent. Fixed set, each key at most [`MAX_FEATURE_CHARS`].
-pub(crate) const FEATURES: [&str; 6] = [
+pub(crate) const FEATURES: [&str; 7] = [
     "notifications",
+    "activity",
     "contacts",
     "media",
     "notes",
