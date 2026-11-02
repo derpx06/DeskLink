@@ -269,6 +269,13 @@ impl Incoming {
                     super::note_dropped("another pass");
                     return Ok(());
                 }
+                // Still the old stream, in flight when we asked the sender to
+                // start again (a re-offer, a lane promotion): its frames are
+                // ahead of where we now are, and are not the new start.
+                None if header.offset > self.next_offset => {
+                    super::note_dropped("the old stream, after a restart");
+                    return Ok(());
+                }
                 None => self.adopt_any = false,
             }
         } else if header.pass != self.pass {

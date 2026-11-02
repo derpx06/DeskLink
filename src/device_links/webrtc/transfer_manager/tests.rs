@@ -3823,3 +3823,108 @@ mod lane {
         );
     }
 }
+
+// ── Stale frames around a restart or a lane switch ─────────────────────────
+
+const STALE_ID: &str = "0f8fad5b-d9cb-469f-a165-70867728950e";
+
+/// A receiver with blocks 0 and 1 verified, and part of block 2 in.
+fn hand_part_way(label: &str) -> (Hand, Vec<u8>, Vec<Vec<Vec<u8>>>) {
+    let hand = Hand::new(label);
+    let file = payload(4 * BLOCK_BYTES as usize, 41);
+    hand.send(hand.offer(STALE_ID, "stale.bin", file.len() as u64));
+    let blocks: Vec<Vec<Vec<u8>>> = (0..4)
+        .map(|index| block_frames(STALE_ID, 0, &file, index, false))
+        .collect();
+    for block in &blocks[..2] {
+        for frame in block {
+            hand.manager.on_frame(frame.clone());
+        }
+    }
+    for frame in &blocks[2][..5] {
+        hand.manager.on_frame(frame.clone());
+    }
+    hand.settle();
+    (hand, file, blocks)
+}
+
+fn verified_of(hand: &Hand) -> Option<u64> {
+    hand.manager.probe(|engine| {
+        engine
+            .incoming
+            .values()
+            .next()
+            .map(|incoming| incoming.verified_blocks())
+    })
+}
+
+/// A promotion re-offers while the old stream is still in flight on the data
+/// channel (a different SCTP stream from the control channel): its frames
+/// reach the receiver after the new accept, and must change nothing.
+#[test]
+fn stale_frames_of_the_old_stream_after_a_re_offer_are_dropped_not_fatal() {
+    let (hand, file, blocks) = hand_part_way("stale-reoffer");
+    assert_eq!(verified_of(&hand), Some(2));
+    hand.send(hand.offer(STALE_ID, "stale.bin", file.len() as u64));
+    // The rest of the old stream, mid-block, then block 3 whole: all of it
+    // stale (the sender has not answered the accept yet).
+    for frame in &blocks[2][5..] {
+        hand.manager.on_frame(frame.clone());
+    }
+    for frame in &blocks[3] {
+        hand.manager.on_frame(frame.clone());
+    }
+    hand.settle();
+    assert!(
+        hand.reply(FileAction::Error).is_none(),
+        "no error to the sender"
+    );
+    assert_eq!(hand.incoming().len(), 1, "the transfer lives");
+    assert_eq!(verified_of(&hand), Some(2));
+    // The new stream, under the next pass, from the receiver's own prefix.
+    for index in [2, 3] {
+        for frame in block_frames(STALE_ID, 1, &file, index, false) {
+            hand.manager.on_frame(frame);
+        }
+    }
+    hand.settle();
+    assert_eq!(verified_of(&hand), Some(4));
+    assert!(hand.reply(FileAction::Error).is_none());
+}
+
+/// The reverse: after a failover to the data channel, frames of the lane that
+/// were already on the wire arrive under the old pass and are dropped.
+#[test]
+fn stale_lane_frames_after_a_failover_are_dropped() {
+    let (hand, file, blocks) = hand_part_way("stale-lane");
+    let mut switch = FileControl::new(
+        &wire_of("alpha", "beta"),
+        FileAction::Lane,
+        STALE_ID,
+        "token0",
+    );
+    switch.lane = Some(super::super::file_protocol::LaneField::switch(
+        "webrtc", 2, 1,
+    ));
+    hand.send(switch);
+    for frame in &blocks[2][5..] {
+        hand.manager.on_frame(frame.clone());
+    }
+    for frame in &blocks[3] {
+        hand.manager.on_frame(frame.clone());
+    }
+    hand.settle();
+    assert!(hand.reply(FileAction::Error).is_none());
+    assert_eq!(
+        verified_of(&hand),
+        Some(2),
+        "nothing of the old pass counted"
+    );
+    for index in [2, 3] {
+        for frame in block_frames(STALE_ID, 1, &file, index, false) {
+            hand.manager.on_frame(frame);
+        }
+    }
+    hand.settle();
+    assert_eq!(verified_of(&hand), Some(4));
+}
