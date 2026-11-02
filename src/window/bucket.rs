@@ -425,10 +425,12 @@ pub(super) fn update(win: &DesklinkWindow, device: &DeviceView) {
             };
         }
     });
+    let photos = crate::device_links::config::app_settings().accepts_gallery_from(&device.id);
     let key = format!(
-        "{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{:?}\n{}\n{}\n{}",
         current(),
         folders::generation(),
+        (photos, crate::device_links::gallery::generation()),
         device.id,
         device.name,
         device.feature_transport_ready,
@@ -444,6 +446,10 @@ pub(super) fn update(win: &DesklinkWindow, device: &DeviceView) {
         .margin_start(16)
         .margin_end(16)
         .build();
+    // W12: the phone's own screenshots and photos, above the Bucket.
+    if let Some(strip) = super::gallery::strip(device) {
+        page.append(&strip);
+    }
     let offer = folders::offers()
         .into_iter()
         .find(|offer| offer.device == device.id && offer.bucket);

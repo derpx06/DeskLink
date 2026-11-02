@@ -26,6 +26,7 @@
 
 mod bucket;
 pub(crate) mod calls;
+mod gallery;
 pub(crate) mod insert;
 mod sound;
 mod vault_banner;
@@ -918,6 +919,7 @@ impl DesklinkWindow {
         }
 
         self.follow_transfers(&daemon);
+        self.show_gallery_arrivals(&daemon.devices());
 
         let devices = self.known_devices(&daemon);
         // A device connected over the network proves the network is up: an

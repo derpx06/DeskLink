@@ -176,6 +176,7 @@ fn groups(
     let files = group(GROUPS[6]);
     files.add(&bucket_row(device));
     files.add(&downloads_row());
+    files.add(&gallery_row(daemon, settings, device));
 
     let privacy = group(GROUPS[7]);
     privacy.add(&password_row(daemon, settings));
@@ -539,6 +540,34 @@ fn unlock_nearby_row(
         daemon.send(DaemonCommand::SetUnlockNearby(id.clone(), row.is_active()))
     });
     follow(&row, |settings, id| settings.unlocks_from(id));
+    row
+}
+
+/// Photos and screenshots the phone sends on its own (W12): off unless turned
+/// on here (the phone has its own switch too).
+fn gallery_row(
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    device: &DeviceView,
+) -> adw::SwitchRow {
+    let phone = &device.name;
+    let explained = format!(
+        "New screenshots and photos {phone} sends on its own appear on the Files page. They are \
+         kept here for 30 days, up to 200 MB, and never in Downloads. {phone} has its own switch too."
+    );
+    let row = adw::SwitchRow::builder()
+        .title(format!("Accept photos and screenshots from {phone}"))
+        .use_markup(false)
+        .active(settings.accepts_gallery_from(&device.id))
+        .build();
+    row.set_subtitle(&explained);
+    with_icon(&row, "image-x-generic-symbolic");
+    row.update_property(&[gtk::accessible::Property::Description(&explained)]);
+    let (daemon, id) = (daemon.clone(), device.id.clone());
+    row.connect_active_notify(move |row| {
+        daemon.send(DaemonCommand::SetGalleryAccept(id.clone(), row.is_active()))
+    });
+    follow(&row, |settings, id| settings.accepts_gallery_from(id));
     row
 }
 

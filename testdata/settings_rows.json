@@ -7,7 +7,7 @@
     {"title": "Calls", "rows": ["Pause music during calls", "Name callers from {phone}'s contacts"]},
     {"title": "Sound", "rows": ["Phones may hear this computer's microphone"]},
     {"title": "Control", "rows": ["Glide onto {phone}", "Let the phone control mouse and keyboard"]},
-    {"title": "Files", "rows": ["Bucket with {phone}", "Downloads folder"]},
+    {"title": "Files", "rows": ["Bucket with {phone}", "Downloads folder", "Accept photos and screenshots from {phone}"]},
     {"title": "Privacy & security", "rows": ["Ask before terminal and screen access", "Terminal access", "Unlock with {phone} nearby", "Lock when I walk away with {phone}", "Unpair {phone}…"]},
     {"title": "Appearance", "rows": ["Style", "Tray icon"], "gnomeRows": ["GNOME extension", "Phone in the top bar"]},
     {"title": "Advanced", "rows": ["Reach this computer from anywhere", "Connection history", "Crash reports"]}
