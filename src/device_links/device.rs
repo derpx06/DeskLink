@@ -233,15 +233,6 @@ pub struct DeviceView {
     /// Sound both ways (F1), while any flows or is asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sound: Option<SoundUse>,
-    /// Whether a text field has focus on the phone ("Type on phone", C2);
-    /// `None` until it says, and while its link is down.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keyboard_focused: Option<bool>,
-    /// False when the phone said this computer may not type on it ("Let
-    /// <desk> type on this phone" off); cleared by its next report without
-    /// `allowed: false`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub keyboard_allowed: Option<bool>,
     /// Whether Android lets the phone read notifications at all, from the
     /// last snapshot; `None` from an older phone (J11).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -318,8 +309,6 @@ impl DeviceView {
             battery_status: None,
             notifications: Vec::new(),
             call_status: None,
-            keyboard_focused: None,
-            keyboard_allowed: None,
             notification_access: None,
             app_version: None,
             activity: None,

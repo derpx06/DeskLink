@@ -14,6 +14,7 @@
     "desklink.share.request.update",
     "desklink.notification.cancel",
     "desklink.telephony.request_mute",
-    "desklink.sms.request"
+    "desklink.sms.request",
+    "desklink.mousepad.keyboardstate"
   ]
 }

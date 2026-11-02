@@ -25,7 +25,6 @@ pub const PACKET_TYPE_PAIR_QR: &str = "desklink.pair.qr";
 pub const PACKET_TYPE_HEARTBEAT: &str = "desklink.heartbeat";
 pub const PACKET_TYPE_PING: &str = "desklink.ping";
 pub const PACKET_TYPE_MOUSEPAD_REQUEST: &str = "desklink.mousepad.request";
-pub const PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE: &str = "desklink.mousepad.keyboardstate";
 pub const PACKET_TYPE_SHARE_REQUEST: &str = "desklink.share.request";
 pub const PACKET_TYPE_CLIPBOARD: &str = "desklink.clipboard";
 pub const PACKET_TYPE_CLIPBOARD_CONNECT: &str = "desklink.clipboard.connect";

@@ -154,8 +154,6 @@ pub(crate) fn reconcile_connection_status(
                 // every other phone (I13).
                 crate::device_links::calls::hold_media(device_id, false);
             }
-            device.keyboard_focused = None;
-            device.keyboard_allowed = None;
             // Its ongoing items are as old as the link: gone, and the phone
             // sends them again when it is back (its digest forgets them).
             if device.activity.take().is_some() {
@@ -514,22 +512,6 @@ pub(super) fn update_activity(
 
 /// `desklink.telephony {calls, muted, silenced}`: the phone's calls now.
 /// Returns whether it is in a call.
-/// `desklink.mousepad.keyboardstate {state}`: a text field has focus on
-/// the phone, or not.
-pub(super) fn update_keyboard_state(
-    devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
-    device_id: &str,
-    focused: Option<bool>,
-    allowed: Option<bool>,
-) {
-    if let Ok(mut devices) = devices.lock() {
-        if let Some(device) = devices.get_mut(device_id) {
-            device.keyboard_focused = focused;
-            device.keyboard_allowed = allowed.filter(|allowed| !allowed);
-        }
-    }
-}
-
 pub(super) fn update_call_status(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     device_id: &str,
@@ -713,21 +695,6 @@ mod tests {
             paired: true,
             feature_transport_ready: ready,
         }
-    }
-
-    /// `allowed: false` sticks until a report without it.
-    #[test]
-    fn a_refused_typing_permission_is_cleared_by_the_next_report() {
-        let (devices, info) = test_devices();
-        let allowed = |devices: &Arc<Mutex<HashMap<String, DeviceView>>>| {
-            devices.lock().unwrap()[&info.id].keyboard_allowed
-        };
-        update_keyboard_state(&devices, &info.id, Some(false), Some(false));
-        assert_eq!(allowed(&devices), Some(false));
-        update_keyboard_state(&devices, &info.id, Some(true), None);
-        assert_eq!(allowed(&devices), None);
-        update_keyboard_state(&devices, &info.id, Some(false), Some(true));
-        assert_eq!(allowed(&devices), None, "only a refusal is kept");
     }
 
     /// The reported symptom: the app kept showing "Connected" for a paired

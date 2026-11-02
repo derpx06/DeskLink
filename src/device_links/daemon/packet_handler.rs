@@ -8,8 +8,7 @@ use super::dispatcher::{PacketSource, SharedPacketDispatcher};
 use super::handle::DaemonEvent;
 use super::state::{
     push_event, remove_notification, replace_notifications, update_battery_status,
-    update_call_status, update_keyboard_state, update_media_from_packet, update_pair_state,
-    upsert_notification,
+    update_call_status, update_media_from_packet, update_pair_state, upsert_notification,
 };
 use crate::device_links::config::Config;
 use crate::device_links::core::{DeviceManager, ReadOutcome, SessionBinding};
@@ -972,16 +971,6 @@ pub(crate) fn dispatch_webrtc_feature_packet(
         }
         PACKET_TYPE_FINDMYPHONE_REQUEST => {
             find_device_received(events, device_id, &binding.link.info.name, spawn_player);
-            Ok(())
-        }
-        // A report of the phone's focus ("Type on phone"), never an input.
-        crate::device_links::packet::PACKET_TYPE_MOUSEPAD_KEYBOARDSTATE => {
-            update_keyboard_state(
-                devices,
-                device_id,
-                packet.get_bool("state"),
-                packet.get_bool("allowed"),
-            );
             Ok(())
         }
         PACKET_TYPE_MOUSEPAD_REQUEST => {

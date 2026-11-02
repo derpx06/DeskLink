@@ -1420,7 +1420,7 @@ fn add_glide_rows(
     let explained = glide_explained(
         &phone,
         crate::device_links::glide::phone_allows(&device.id),
-        &crate::type_on_phone::desk_name(),
+        &crate::device_links::glide::desk_name(),
     );
     let current = settings
         .glide

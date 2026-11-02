@@ -218,12 +218,6 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
             });
         }
     }
-    if crate::type_on_phone::supported(phone) {
-        menu.push(
-            TrayEntry::action("Type on Phone…", format!("type:{}", phone.id))
-                .icon("input-keyboard-symbolic"),
-        );
-    }
     let unread = phone.notifications.len();
     if unread > 0 && settings.shows_notifications(&phone.id) {
         menu.push(
@@ -435,7 +429,6 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
                 ));
             }
         }
-        "type" => crate::type_on_phone::open(&daemon, &target, None),
         "desk-sound-on" | "desk-sound-off" | "phone-mic-on" | "phone-mic-off" => {
             let (what, state) = verb.rsplit_once('-').unwrap_or((verb, "off"));
             daemon.send(DaemonCommand::Sound(target, what.into(), state == "on"))

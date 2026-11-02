@@ -470,21 +470,6 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         disable_with(&button, reason.as_deref());
         add_wrapped(&row, &button);
     }
-    // Type on the phone (C2), for a phone that reports its focused field.
-    if crate::type_on_phone::supported(device) {
-        let typing = round_action(
-            "input-keyboard-symbolic",
-            "Type",
-            &format!("Type on {} with this keyboard (Ctrl+Shift+K)", device.name),
-        );
-        let (daemon, id) = (daemon.clone(), device.id.clone());
-        typing.connect_clicked(move |button| {
-            let root = button.root().and_downcast::<gtk::Window>();
-            crate::type_on_phone::open(&daemon, &id, root.as_ref());
-        });
-        disable_with(&typing, reason.as_deref());
-        add_wrapped(&row, &typing);
-    }
     // Insert from the phone (F3): a photo, scan, text or QR code, here.
     if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
         let insert = round_action(

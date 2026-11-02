@@ -629,6 +629,15 @@ impl Glide {
     }
 }
 
+/// This computer's name as the phone shows it (its host name).
+pub(crate) fn desk_name() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "this computer".to_string())
+}
+
 fn mousepad(build: impl FnOnce(&mut NetworkPacket)) -> NetworkPacket {
     let mut packet = NetworkPacket::new(PACKET_TYPE_MOUSEPAD_REQUEST);
     build(&mut packet);
