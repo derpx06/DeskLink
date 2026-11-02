@@ -779,10 +779,54 @@ impl DesktopWebRtcPeer {
             .map_err(|error| format!("Could not send DeskLink WebRTC file data: {error}"))
     }
 
+    /// Drops every buffer that arrives at any `sctpdec` in this peer from now
+    /// on (a pad probe on its sink; it stays until the element is freed).
+    ///
+    /// GStreamer's `sctpdec` has a `g_assert (src_pad)` in `on_receive`: data
+    /// on an SCTP stream whose source pad is gone aborts the process. The
+    /// pad goes when a data channel is closed, and the far side (the phone,
+    /// or the other peer in a test) can still have data in flight for that
+    /// stream for about a round trip. Ceiling: data usrsctp delivers from a
+    /// thread of its own, outside the pad's chain function, is not covered,
+    /// and neither is an element built after this call (none is, once the
+    /// peer is closed).
+    fn shut_inbound_data(&self) {
+        let Some(bin) = self.pipeline.dynamic_cast_ref::<gst::Bin>() else {
+            return;
+        };
+        for element in bin.iterate_recurse().into_iter().flatten() {
+            let is_sctpdec = element
+                .factory()
+                .is_some_and(|factory| factory.name() == "sctpdec");
+            if !is_sctpdec {
+                continue;
+            }
+            if let Some(sink) = element.static_pad("sink") {
+                let _ = sink.add_probe(
+                    gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                    |_, _| gst::PadProbeReturn::Drop,
+                );
+                // A buffer that got past the probe before it was added may be
+                // anywhere between the pad and `on_receive` (a busy machine
+                // makes that long): deactivating the pad waits for the
+                // streaming thread to leave the chain function, so nothing is
+                // in flight when this returns. The callbacks below it only
+                // send on a channel, so the wait is short.
+                let _ = sink.set_active(false);
+            }
+        }
+    }
+
     pub fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
+        // Nothing more is wanted from the far side, and nothing it still sends
+        // may reach a data channel's `sctpdec` pad once closing the channels
+        // takes the pads away: `sctpdec` asserts that a pad exists for every
+        // stream it receives on, and the assertion aborts the whole process.
+        // So the way in is shut first.
+        self.shut_inbound_data();
         // Sound first: its sources are live and push into webrtcbin.
         self.stop_audio_send();
         self.stop_audio_playback();
@@ -2366,12 +2410,18 @@ a=max-message-size:262144\r\n";
         assert!(webrtcbin.upgrade().is_none(), "webrtcbin leaked");
     }
 
+    /// The tests that count the process's threads and descriptors, and the one
+    /// that makes a hundred pairs, take turns.
+    static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Fifty peers built and closed one after another leave the process with
     /// the threads and file descriptors it started with (a leaked peer cost a
     /// thread and ten descriptors each, so about a hundred rebuilds reached
     /// the 1024-descriptor limit).
     #[test]
     fn fifty_rebuilds_do_not_grow_threads_or_descriptors() {
+        // Not beside the teardown stress test, whose threads would count.
+        let _alone = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
         // One to settle process-wide singletons (GStreamer, libnice).
         drop(lone_peer());
         std::thread::sleep(std::time::Duration::from_millis(300));
@@ -2831,6 +2881,52 @@ a=max-message-size:262144\r\n";
 
         pair.offerer.close();
         pair.answerer.close();
+    }
+
+    /// Tearing a real peer down while the far side is still sending must never
+    /// abort the process: `sctpdec` asserts a source pad exists for every
+    /// stream it receives on, and closing a channel removes that pad (see
+    /// `shut_inbound_data`). A hundred real pairs, traffic in flight both ways
+    /// from threads of their own, one side closed first and the other still
+    /// sending. (Before the fix this aborted about one run in thirteen under
+    /// load; here the point is that the whole test returns.)
+    #[test]
+    fn real_peers_torn_down_with_traffic_in_flight_never_abort_the_process() {
+        let _alone = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
+        for round in 0..100u64 {
+            let pair = loopback();
+            wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+            wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let senders: Vec<_> = [Arc::clone(&pair.offerer), Arc::clone(&pair.answerer)]
+                .into_iter()
+                .map(|peer| {
+                    let stop = Arc::clone(&stop);
+                    std::thread::spawn(move || {
+                        let text = "x".repeat(900);
+                        while !stop.load(Ordering::Acquire) {
+                            let _ = peer.send_text(WebRtcChannel::Control, &text);
+                            let _ = peer.send_text(WebRtcChannel::Events, &text);
+                            std::thread::sleep(std::time::Duration::from_micros(300));
+                        }
+                    })
+                })
+                .collect();
+            std::thread::sleep(std::time::Duration::from_millis(5 + round % 25));
+            // One side goes first and the other keeps sending into it.
+            let (first, second) = if round % 2 == 0 {
+                (&pair.offerer, &pair.answerer)
+            } else {
+                (&pair.answerer, &pair.offerer)
+            };
+            first.close();
+            std::thread::sleep(std::time::Duration::from_millis(round % 7));
+            second.close();
+            stop.store(true, Ordering::Release);
+            for sender in senders {
+                sender.join().unwrap();
+            }
+        }
     }
 
     /// Screen video from the *answerer* — the role the desktop plays when the
