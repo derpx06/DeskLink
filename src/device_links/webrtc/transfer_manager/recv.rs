@@ -63,6 +63,9 @@ pub(super) struct Incoming {
     pass: u8,
     /// After an `accept`: the first frame, whatever its pass, sets it.
     adopt_any: bool,
+    /// The transfer was offered again while a stream may be in flight: until
+    /// the sender's new start, frames ahead of us are that stream's.
+    old_stream_possible: bool,
     /// Where the next frame must start.
     next_offset: u64,
     /// Hashes of the verified blocks.
@@ -160,6 +163,7 @@ impl Incoming {
         self.next_offset = keep;
         self.pass = pass;
         self.adopt_any = false;
+        self.old_stream_possible = false;
         // The checkpoint never claims more than the file holds.
         self.checkpointed_blocks = self.checkpointed_blocks.min(blocks);
         Ok(())
@@ -280,11 +284,14 @@ impl Incoming {
                 // Still the old stream, in flight when we asked the sender to
                 // start again (a re-offer, a lane promotion): its frames are
                 // ahead of where we now are, and are not the new start.
-                None if header.offset > self.next_offset => {
+                None if self.old_stream_possible && header.offset > self.next_offset => {
                     super::note_dropped("the old stream, after a restart");
                     return Ok(());
                 }
-                None => self.adopt_any = false,
+                None => {
+                    self.adopt_any = false;
+                    self.old_stream_possible = false;
+                }
             }
         } else if header.pass != self.pass {
             let Some(block) = self.adopts(frame) else {
@@ -472,6 +479,7 @@ impl Engine {
                 debug_log!("[DeskLink] {error}");
             }
             existing.adopt_any = true;
+            existing.old_stream_possible = true;
             existing.paused = None;
             net.send(existing.accept_message(net));
             return;
@@ -803,6 +811,7 @@ impl Engine {
             file,
             pass: 0,
             adopt_any: true,
+            old_stream_possible: false,
             next_offset: (blocks * BLOCK_BYTES).min(total),
             hashes,
             hasher: None,
