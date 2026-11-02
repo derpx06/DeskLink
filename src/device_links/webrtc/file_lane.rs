@@ -677,6 +677,8 @@ mod tests {
 
     // ── Over a real TLS connection between two paired configs ──
 
+    type Handshake = Option<(SslStream<TcpStream>, TokenBody)>;
+
     struct Side {
         config: Arc<Mutex<Config>>,
         id: String,
@@ -718,10 +720,7 @@ mod tests {
     fn listener(
         side: &Side,
         accept: fn(&TokenBody) -> Result<(), Refusal>,
-    ) -> (
-        SocketAddr,
-        std::sync::mpsc::Receiver<Option<(SslStream<TcpStream>, TokenBody)>>,
-    ) {
+    ) -> (SocketAddr, std::sync::mpsc::Receiver<Handshake>) {
         let socket = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = socket.local_addr().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
