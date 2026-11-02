@@ -306,6 +306,10 @@ pub(crate) fn handle(
 pub(crate) fn reason_words(phone: &str, reason: &str) -> String {
     match reason {
         "busy" => format!("{phone}'s sound is already in use"),
+        "timeout" => format!("{phone} did not answer. Open DeskLink on {phone} and try again"),
+        "notifications" => {
+            format!("Turn on notifications for DeskLink on {phone} so it can ask, then try again")
+        }
         "permission" => format!("DeskLink may not record sound on {phone}"),
         "unsupported" => format!("{phone} cannot share its sound (it needs Android 10)"),
         _ => format!("{phone} did not share its sound"),
@@ -315,6 +319,27 @@ pub(crate) fn reason_words(phone: &str, reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_the_phone_gives_is_said_in_plain_words_and_an_unknown_one_is_generic() {
+        assert_eq!(
+            reason_words("Pixel", "notifications"),
+            "Turn on notifications for DeskLink on Pixel so it can ask, then try again"
+        );
+        assert_eq!(
+            reason_words("Pixel", "timeout"),
+            "Pixel did not answer. Open DeskLink on Pixel and try again"
+        );
+        assert_eq!(
+            reason_words("Pixel", "busy"),
+            "Pixel's sound is already in use"
+        );
+        assert_eq!(
+            reason_words("Pixel", "<i>raw</i>"),
+            "Pixel did not share its sound",
+            "never the raw string"
+        );
+    }
     use crate::device_links::webrtc::WebRtcWireBinding;
 
     fn build(kind: ControlKind, id: &str, sequence: i64) -> ControlMessage {

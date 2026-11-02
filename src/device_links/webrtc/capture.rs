@@ -193,7 +193,12 @@ pub(crate) fn file_arrived(capture_id: &str) {
 pub(crate) fn reason_words(phone: &str, reason: Option<&str>) -> Option<String> {
     Some(match reason {
         Some("user") => return None,
-        Some("timeout") => format!("{phone} was not used in time"),
+        Some("timeout") => {
+            format!("{phone} did not answer. Open DeskLink on {phone} and try again")
+        }
+        Some("notifications") => {
+            format!("Turn on notifications for DeskLink on {phone} so it can ask, then try again")
+        }
         Some("permission") => format!("DeskLink may not use the camera on {phone}"),
         Some("unsupported") => format!("{phone} cannot do that"),
         _ => format!("{phone} stopped"),
@@ -494,7 +499,9 @@ mod tests {
         timeout.reason = Some("timeout".into());
         assert_eq!(
             handle("cap-b", "Pixel", &timeout),
-            Outcome::Ended(Some("Pixel was not used in time".into()))
+            Outcome::Ended(Some(
+                "Pixel did not answer. Open DeskLink on Pixel and try again".into()
+            ))
         );
         let third = begin("cap-b", "qr", "clipboard", &build);
         let cancelled = cancel("cap-b", &build).unwrap();
@@ -527,6 +534,29 @@ mod tests {
             event,
             DaemonEvent::CaptureNotice { message, .. } if message.contains("did not answer")
         )));
+    }
+
+    /// The refusals the phone gives when nobody can see its question are said
+    /// in plain words; a reason this build does not know is a generic
+    /// sentence, never the raw string.
+    #[test]
+    fn the_phones_refusal_reasons_are_said_in_plain_words() {
+        assert_eq!(
+            reason_words("Pixel", Some("notifications")).as_deref(),
+            Some("Turn on notifications for DeskLink on Pixel so it can ask, then try again")
+        );
+        assert_eq!(
+            reason_words("Pixel", Some("timeout")).as_deref(),
+            Some("Pixel did not answer. Open DeskLink on Pixel and try again")
+        );
+        assert_eq!(reason_words("Pixel", Some("user")), None);
+        let odd = "<b>raw_reason</b>\u{7}";
+        let unknown = reason_words("Pixel", Some(odd)).unwrap();
+        assert_eq!(unknown, "Pixel stopped");
+        assert_eq!(
+            reason_words("Pixel", None).as_deref(),
+            Some("Pixel stopped")
+        );
     }
 
     #[test]
