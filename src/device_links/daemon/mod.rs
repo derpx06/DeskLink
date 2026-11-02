@@ -257,7 +257,11 @@ impl DaemonWorker {
         // Files that waited for a phone when DeskLink last ran.
         if !cfg!(test) {
             if let Ok(config) = config.lock() {
-                file_transfer::restore_waiting(|id| config.is_trusted(id));
+                file_transfer::restore_waiting(|id| {
+                    config
+                        .trusted_certificate_pem(id)
+                        .map(|pem| file_transfer::identity_of(&pem))
+                });
             }
         }
         let tcp_listener = network::bind_tcp_listener()?;

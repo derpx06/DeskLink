@@ -82,6 +82,19 @@ struct Waiting {
     mtime_ns: u64,
     /// When it was chosen, seconds since the epoch.
     queued_at: u64,
+    /// Which phone it was chosen for (a hash of its pairing certificate): a
+    /// phone that comes back under the same id with another certificate is
+    /// not that phone.
+    #[serde(default)]
+    identity: String,
+}
+
+/// The identity a waiting file is kept for: a hash of the pairing certificate.
+pub(crate) fn identity_of(certificate_pem: &str) -> String {
+    openssl::sha::sha256(certificate_pem.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -131,6 +144,10 @@ fn load_queue(path: &Path, now: u64) -> Vec<Waiting> {
         debug_log!("[Daemon] The send queue in {path:?} is unreadable and was ignored");
         return Vec::new();
     };
+    if saved.version != 1 {
+        debug_log!("[Daemon] The send queue is of another version and was ignored");
+        return Vec::new();
+    }
     saved
         .files
         .into_iter()
@@ -164,16 +181,18 @@ fn save_queue(path: &Path, files: &[Waiting]) {
 
 /// Brings back, at start, what waited when DeskLink last ran, for phones
 /// still paired (`trusted`).
-pub(crate) fn restore_waiting(trusted: impl Fn(&str) -> bool) {
+pub(crate) fn restore_waiting(identity: impl Fn(&str) -> Option<String>) {
     if let Some(path) = queue_path() {
-        restore_from(&path, unix_now(), trusted);
+        restore_from(&path, unix_now(), identity);
     }
 }
 
-fn restore_from(path: &Path, now: u64, trusted: impl Fn(&str) -> bool) {
+/// `identity(device)` is the identity of a phone still paired; a file waits
+/// again only for the very phone it was chosen for.
+fn restore_from(path: &Path, now: u64, identity: impl Fn(&str) -> Option<String>) {
     let restored: Vec<Waiting> = load_queue(path, now)
         .into_iter()
-        .filter(|file| trusted(&file.device_id))
+        .filter(|file| identity(&file.device_id).is_some_and(|now| now == file.identity))
         .collect();
     if let Ok(mut waiting) = WAITING.lock() {
         let room = MAX_WAITING_FILES.saturating_sub(waiting.len());
@@ -262,7 +281,12 @@ fn refresh_locked(waiting: &[Waiting]) {
 
 /// Keeps `path` for `device_id` until it connects. `Err` is a message for the
 /// person.
-fn wait_for_phone(device_id: &str, phone: &str, path: PathBuf) -> Result<(), String> {
+fn wait_for_phone(
+    device_id: &str,
+    phone: &str,
+    identity: &str,
+    path: PathBuf,
+) -> Result<(), String> {
     let meta = std::fs::metadata(&path).map_err(|_| "That file can't be read".to_string())?;
     if !meta.is_file() {
         return Err("Only files can be sent".to_string());
@@ -280,14 +304,15 @@ fn wait_for_phone(device_id: &str, phone: &str, path: PathBuf) -> Result<(), Str
         size: meta.len(),
         mtime_ns: mtime_ns(&meta),
         queued_at: unix_now(),
+        identity: identity.to_string(),
     });
     refresh_locked(&waiting);
     Ok(())
 }
 
 #[cfg(test)]
-pub(super) fn wait_for_phone_for_tests(device_id: &str, phone: &str, path: PathBuf) {
-    wait_for_phone(device_id, phone, path).unwrap();
+pub(crate) fn wait_for_phone_for_tests(device_id: &str, phone: &str, path: PathBuf) {
+    wait_for_phone(device_id, phone, "", path).unwrap();
 }
 
 /// An unpaired phone's waiting files are forgotten with it.
@@ -503,7 +528,14 @@ impl DaemonWorker {
                 .ok()
                 .and_then(|devices| devices.get(device_id).map(|device| device.name.clone()))
                 .unwrap_or_else(|| "the phone".to_string());
-            if let Err(message) = wait_for_phone(device_id, &phone, file_path) {
+            let identity = self
+                .config
+                .lock()
+                .ok()
+                .and_then(|config| config.trusted_certificate_pem(device_id))
+                .map(|pem| identity_of(&pem))
+                .unwrap_or_default();
+            if let Err(message) = wait_for_phone(device_id, &phone, &identity, file_path) {
                 push_error(&self.errors, message);
             }
             return;
@@ -554,9 +586,9 @@ mod waiting_tests {
             file
         };
         let (a, b) = (make("a.txt"), make("b.txt"));
-        wait_for_phone("wait-phone", "Pixel", a.clone()).unwrap();
-        wait_for_phone("wait-phone", "Pixel", b).unwrap();
-        assert!(wait_for_phone("wait-phone", "Pixel", dir.join("missing")).is_err());
+        wait_for_phone("wait-phone", "Pixel", "", a.clone()).unwrap();
+        wait_for_phone("wait-phone", "Pixel", "", b).unwrap();
+        assert!(wait_for_phone("wait-phone", "Pixel", "", dir.join("missing")).is_err());
         let rows: Vec<_> = board::rows()
             .into_iter()
             .filter(|row| row.device_id == "wait-phone")
@@ -589,14 +621,14 @@ mod waiting_tests {
         assert!(board::rows()
             .iter()
             .any(|row| row.name == "1 file waiting for Pixel"));
-        wait_for_phone("wait-phone", "Pixel", a.clone()).unwrap();
+        wait_for_phone("wait-phone", "Pixel", "", a.clone()).unwrap();
         clear_waiting("wait-phone");
         assert!(waiting_files("wait-phone").is_empty());
         assert!(board::rows()
             .iter()
             .all(|row| row.device_id != "wait-phone"));
-        wait_for_phone("wait-phone", "Pixel", a.clone()).unwrap();
-        wait_for_phone("wait-phone", "Pixel", dir.join("b.txt")).unwrap();
+        wait_for_phone("wait-phone", "Pixel", "", a.clone()).unwrap();
+        wait_for_phone("wait-phone", "Pixel", "", dir.join("b.txt")).unwrap();
         let go = take_waiting(&["wait-phone".to_string()], now);
         put_back(go);
 
@@ -639,6 +671,7 @@ mod waiting_tests {
             size: meta.len(),
             mtime_ns: mtime_ns(&meta),
             queued_at,
+            identity: "cert-a".into(),
         }
     }
 
@@ -663,7 +696,9 @@ mod waiting_tests {
         assert_eq!(load_queue(&state, 2_000), files, "round trip");
 
         // A restart: only the phone still paired gets its files back.
-        restore_from(&state, 2_000, |id| id == "restart-phone");
+        restore_from(&state, 2_000, |id| {
+            (id == "restart-phone").then(|| "cert-a".to_string())
+        });
         assert_eq!(waiting_files("restart-phone"), vec![file.clone()]);
         assert!(waiting_files("gone").is_empty());
         // And it can be cancelled like any other.
@@ -715,9 +750,18 @@ mod waiting_tests {
         ] {
             std::fs::write(&state, bytes).unwrap();
             assert!(load_queue(&state, 1).is_empty());
-            restore_from(&state, 1, |_| true);
+            restore_from(&state, 1, |_| Some("cert-a".to_string()));
         }
         assert!(load_queue(&dir.join("missing.json"), 1).is_empty());
+        // Another version is not read as this one.
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        save_queue(&state, &[entry("p", &file, 1)]);
+        let text = std::fs::read_to_string(&state)
+            .unwrap()
+            .replace("\"version\":1", "\"version\":2");
+        std::fs::write(&state, text).unwrap();
+        assert!(load_queue(&state, 2).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -759,6 +803,28 @@ mod waiting_tests {
                 "{name}: {messages:?}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F7: a phone that comes back under the same id with another pairing
+    /// certificate is not the phone the files were chosen for.
+    #[test]
+    fn files_are_not_restored_for_a_phone_with_another_certificate() {
+        let dir = scratch("identity");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let state = dir.join("send-queue.json");
+        save_queue(&state, &[entry("reinstalled-phone", &file, 1_000)]);
+        // Same id, a different certificate: nothing comes back.
+        restore_from(&state, 2_000, |_| Some("cert-b".to_string()));
+        assert!(waiting_files("reinstalled-phone").is_empty());
+        // Unpaired since: nothing either.
+        restore_from(&state, 2_000, |_| None);
+        assert!(waiting_files("reinstalled-phone").is_empty());
+        // The same certificate: back.
+        restore_from(&state, 2_000, |_| Some("cert-a".to_string()));
+        assert_eq!(waiting_files("reinstalled-phone"), vec![file]);
+        clear_waiting("reinstalled-phone");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

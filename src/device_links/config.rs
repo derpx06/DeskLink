@@ -908,6 +908,8 @@ impl Config {
             set_remote_desktop_token(&info.id, None);
             crate::device_links::contacts::forget_in(&self.contacts_dir(), &info.id);
             crate::device_links::session_lock::forget_unlock(&info.id);
+            // Files chosen for the old identity are not for the new one.
+            crate::device_links::daemon::file_transfer::forget_waiting(&info.id);
             // What the old identity said it already held is not what a new
             // one has: its snapshots are sent again.
             crate::device_links::sync::forget_device(&info.id);
@@ -2006,6 +2008,34 @@ mod tests {
         config.stored.settings.walk_away_devices.insert(id.clone());
         config.untrust_device(&id).unwrap();
         assert!(!config.stored.settings.locks_when_away(&id), "unpaired");
+    }
+
+    /// F7: files waiting for a phone are for that identity: a new pairing
+    /// certificate behind the same id drops them, the same one keeps them.
+    #[test]
+    fn a_new_certificate_drops_the_files_waiting_for_the_phone() {
+        use crate::device_links::daemon::file_transfer as queue;
+        let dir = std::env::temp_dir().join(format!("desklink-waitcert-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        let id = format!("phone-{}", Uuid::new_v4().simple());
+        let info = DeviceInfo::local(id.clone(), "Pixel".into());
+        config.trust_device(&info, "cert-1".into()).unwrap();
+        queue::wait_for_phone_for_tests(&id, "Pixel", file);
+        config.trust_device(&info, "cert-1".into()).unwrap();
+        assert_eq!(
+            queue::waiting_files(&id).len(),
+            1,
+            "same identity keeps them"
+        );
+        config.trust_device(&info, "cert-2".into()).unwrap();
+        assert!(
+            queue::waiting_files(&id).is_empty(),
+            "a new identity does not"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// "Unlock with this phone" is gone with the pairing, and with the
