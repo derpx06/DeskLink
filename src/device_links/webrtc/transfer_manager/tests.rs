@@ -3450,6 +3450,39 @@ mod lane {
         }));
     }
 
+    /// A manager replaced by a newer one (a rebuilt WebRTC peer) shuts down
+    /// after the new one attached: the new one still takes lanes.
+    #[test]
+    fn a_replaced_manager_shutting_down_leaves_its_successor_registered() {
+        let _guard = LANE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let base =
+            std::env::temp_dir().join(format!("desklink-v2-replace-{}", uuid::Uuid::new_v4()));
+        let make = |name: &str| {
+            Manager::with(
+                base.join(format!("{name}-state")),
+                base.join(format!("{name}-dl")),
+                fast(),
+                super::super::FILE_QUEUE_MAX_BYTES,
+            )
+            .unwrap()
+        };
+        let peer = format!("replaced-{}", uuid::Uuid::new_v4());
+        let (old, new) = (make("old"), make("new"));
+        let (pipe_old, pipe_new) = (Pipe::new(), Pipe::new());
+        old.attach(wire_of("desk", &peer), pipe_old);
+        new.attach(wire_of("desk", &peer), pipe_new);
+        // The old worker exits only now.
+        old.detach();
+        old.shut_down();
+        old.stop();
+        // The successor is still the registered engine.
+        assert!(file_lane::receiver_for_test(&peer).is_some());
+        new.detach();
+        assert!(file_lane::receiver_for_test(&peer).is_none());
+        new.stop();
+        let _ = fs::remove_dir_all(base);
+    }
+
     /// A frame of another transfer than the one the token was for ends the
     /// lane; the frames before it were delivered.
     #[test]

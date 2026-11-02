@@ -279,7 +279,7 @@ pub struct WebRtcTransferManager {
     store: Store,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// The peer whose lanes this manager takes (registered at attach).
-    lane_peer: Mutex<Option<String>>,
+    lane_peer: Mutex<Option<(String, u64)>>,
 }
 
 /// The engine's side of the lane listener (W18): a lane for a transfer of this
@@ -454,7 +454,7 @@ impl WebRtcTransferManager {
     pub fn attach(&self, wire: WebRtcWireBinding, link: Arc<dyn FileLink>) {
         self.shared.attached.store(true, Ordering::Release);
         // This peer's lanes (W18) come to this manager.
-        super::file_lane::register_receiver(
+        let instance = super::file_lane::register_receiver(
             &wire.peer_device_id,
             Arc::new(LaneIn {
                 commands: self.commands.clone(),
@@ -463,7 +463,7 @@ impl WebRtcTransferManager {
             }),
         );
         if let Ok(mut peer) = self.lane_peer.lock() {
-            *peer = Some(wire.peer_device_id.clone());
+            *peer = Some((wire.peer_device_id.clone(), instance));
         }
         let _ = self.commands.send(Cmd::Attach(wire, link));
     }
@@ -471,8 +471,9 @@ impl WebRtcTransferManager {
     /// The peer is gone: receivers checkpoint at once, nothing more is sent.
     pub fn detach(&self) {
         self.shared.attached.store(false, Ordering::Release);
-        if let Some(peer) = self.lane_peer.lock().ok().and_then(|mut peer| peer.take()) {
-            super::file_lane::unregister_receiver(&peer);
+        if let Some((peer, instance)) = self.lane_peer.lock().ok().and_then(|mut peer| peer.take())
+        {
+            super::file_lane::unregister_receiver(&peer, instance);
         }
         let _ = self.commands.send(Cmd::Detach);
     }
@@ -487,8 +488,9 @@ impl WebRtcTransferManager {
     /// handled (its checkpoints written), without waiting for it. A manager
     /// belongs to one peer; whoever else still holds it keeps a quiet handle.
     pub fn shut_down(&self) {
-        if let Some(peer) = self.lane_peer.lock().ok().and_then(|mut peer| peer.take()) {
-            super::file_lane::unregister_receiver(&peer);
+        if let Some((peer, instance)) = self.lane_peer.lock().ok().and_then(|mut peer| peer.take())
+        {
+            super::file_lane::unregister_receiver(&peer, instance);
         }
         let _ = self.commands.send(Cmd::Stop);
     }
@@ -622,8 +624,9 @@ impl WebRtcTransferManager {
     /// disk when this returns.
     #[cfg(test)]
     fn stop(self) {
-        if let Some(peer) = self.lane_peer.lock().ok().and_then(|mut peer| peer.take()) {
-            super::file_lane::unregister_receiver(&peer);
+        if let Some((peer, instance)) = self.lane_peer.lock().ok().and_then(|mut peer| peer.take())
+        {
+            super::file_lane::unregister_receiver(&peer, instance);
         }
         let Self {
             commands, thread, ..

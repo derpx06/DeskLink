@@ -225,7 +225,8 @@ pub(crate) trait Receiver: Send + Sync {
 
 #[derive(Default)]
 struct Registry {
-    receivers: HashMap<String, Arc<dyn Receiver>>,
+    /// By peer: the registration's instance and its engine.
+    receivers: HashMap<String, (u64, Arc<dyn Receiver>)>,
     /// Lane connections open per peer.
     open: HashMap<String, usize>,
 }
@@ -235,17 +236,40 @@ fn registry() -> &'static Mutex<Registry> {
     REGISTRY.get_or_init(Default::default)
 }
 
-/// `peer`'s engine takes lanes from now on.
-pub(crate) fn register_receiver(peer: &str, receiver: Arc<dyn Receiver>) {
+/// `peer`'s engine takes lanes from now on, in place of any before it. The
+/// returned instance is what [`unregister_receiver`] must be given: a manager
+/// that was replaced must not take its successor's registration with it.
+pub(crate) fn register_receiver(peer: &str, receiver: Arc<dyn Receiver>) -> u64 {
+    static INSTANCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let instance = INSTANCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut registry) = registry().lock() {
-        registry.receivers.insert(peer.to_string(), receiver);
+        registry
+            .receivers
+            .insert(peer.to_string(), (instance, receiver));
+    }
+    instance
+}
+
+/// Removes the registration `instance` made, if it is still the current one.
+pub(crate) fn unregister_receiver(peer: &str, instance: u64) {
+    if let Ok(mut registry) = registry().lock() {
+        if registry
+            .receivers
+            .get(peer)
+            .is_some_and(|(current, _)| *current == instance)
+        {
+            registry.receivers.remove(peer);
+        }
     }
 }
 
-pub(crate) fn unregister_receiver(peer: &str) {
-    if let Ok(mut registry) = registry().lock() {
-        registry.receivers.remove(peer);
-    }
+/// Whether an engine is registered for `peer` (tests).
+#[cfg(test)]
+pub(crate) fn receiver_for_test(peer: &str) -> Option<()> {
+    registry()
+        .lock()
+        .ok()
+        .and_then(|registry| registry.receivers.get(peer).map(|_| ()))
 }
 
 /// A lane of `peer` has ended (the engine tells).
@@ -285,7 +309,7 @@ pub(crate) fn accept(
     let receiver = registry()
         .lock()
         .ok()
-        .and_then(|registry| registry.receivers.get(&dialler).cloned());
+        .and_then(|registry| registry.receivers.get(&dialler).map(|(_, r)| r.clone()));
     let busy = registry().lock().map_or(true, |registry| {
         registry.open.get(&dialler).copied().unwrap_or(0) >= LANES_PER_PEER
     });
@@ -1010,7 +1034,7 @@ mod tests {
             opened: Mutex::new(Vec::new()),
             refuse: Mutex::new(Some(Refusal::Range)),
         });
-        register_receiver(&sender.id, engine.clone());
+        let instance = register_receiver(&sender.id, engine.clone());
         let (addr, handle) = serve_one(&receiver.config);
         assert_eq!(dial_with(addr, "t-range").unwrap_err(), "range");
         handle.join().unwrap().unwrap();
@@ -1032,7 +1056,20 @@ mod tests {
         lanes.push(dial_with(addr, "t-4").unwrap());
         handle.join().unwrap().unwrap();
         assert_eq!(engine.opened.lock().unwrap().len(), 3);
-        unregister_receiver(&sender.id);
+        // A manager that was replaced cannot take its successor with it.
+        let successor = register_receiver(&sender.id, engine.clone());
+        unregister_receiver(&sender.id, instance);
+        let (addr, handle) = serve_one(&receiver.config);
+        assert_eq!(
+            dial_with(addr, "t-6").unwrap_err(),
+            "busy",
+            "found, and full: the successor is still registered"
+        );
+        handle.join().unwrap().unwrap();
+        unregister_receiver(&sender.id, successor);
+        let (addr, handle) = serve_one(&receiver.config);
+        assert_eq!(dial_with(addr, "t-5").unwrap_err(), "transfer");
+        handle.join().unwrap().unwrap();
     }
 
     /// Nothing listens: the dial fails inside the limit and says so.
