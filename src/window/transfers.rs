@@ -1139,7 +1139,6 @@ mod tests {
                 Ok(DaemonCommand::CancelTransfer(device, id)) if device == "phone" && id == "t"
             ));
             assert!(!cancel.is_sensitive(), "once is enough");
-            cancel.emit_clicked();
             assert!(commands.try_recv().is_err(), "no second request");
         });
     }

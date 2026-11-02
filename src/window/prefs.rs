@@ -1621,9 +1621,8 @@ mod tests {
                 (
                     "Calls",
                     &[
-                        "Calls",
-                        "Name callers from Pixel 9's contacts",
                         "Pause music during calls",
+                        "Name callers from Pixel 9's contacts",
                     ],
                 ),
                 ("Sound", &["Phones may hear this computer's microphone"]),
@@ -1645,14 +1644,19 @@ mod tests {
                         "Unpair Pixel 9…",
                     ],
                 ),
+                // The two GNOME rows are there on a GNOME desktop only.
                 (
                     "Appearance",
-                    &[
-                        "Style",
-                        "Phone in the top bar",
-                        "Tray icon",
-                        "GNOME extension",
-                    ],
+                    if crate::shell_dbus::extension_possible() {
+                        &[
+                            "Style",
+                            "Tray icon",
+                            "GNOME extension",
+                            "Phone in the top bar",
+                        ]
+                    } else {
+                        &["Style", "Tray icon"]
+                    },
                 ),
                 (
                     "Advanced",

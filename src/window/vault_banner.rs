@@ -154,11 +154,15 @@ mod tests {
                 .visible_dialog()
                 .and_downcast::<adw::AlertDialog>()
                 .expect("asked again");
-            dialog.emit_by_name_with_details::<()>(
-                "response",
-                gtk::glib::Quark::from_str("go"),
-                &[&"go"],
-            );
+            let mut found = Vec::new();
+            buttons(dialog.upcast_ref(), &mut found);
+            let go = found
+                .iter()
+                .find(|button| button.label().as_deref() == Some("Start Fresh"))
+                .expect("the dialog's Start Fresh button");
+            go.emit_clicked();
+            let context = gtk::glib::MainContext::default();
+            while context.iteration(false) {}
             assert_eq!(FRESH.load(Ordering::SeqCst), 1, "confirmed");
         });
     }
