@@ -285,12 +285,234 @@ pub(crate) fn add_action(app: &DesklinkApplication) {
     app.add_action(&action);
 }
 
-/// The `app.insert` and `app.sound` actions: what the Insert and Sound
-/// buttons do, for the phone named (or the connected one). They send the same
-/// commands, so the same gates and the same consent on the phone apply; a
-/// phone that is not connected is told as a notification.
-pub(crate) fn add_direct_actions(app: &DesklinkApplication) {
+/// What a command line request asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Direct {
+    Insert { kind: String, target: String },
+    Sound { what: String, on: bool },
+}
+
+impl Direct {
+    /// The verb the rate limit counts.
+    fn key(&self) -> String {
+        match self {
+            Direct::Insert { kind, target } => format!("insert:{kind}:{target}"),
+            Direct::Sound { what, on } => format!("sound:{what}:{on}"),
+        }
+    }
+
+    /// The packet type the phone must take for this to work, if any (the
+    /// Insert button's own gate).
+    fn needs(&self) -> Option<&'static str> {
+        match self {
+            Direct::Insert { .. } => {
+                Some(crate::device_links::packet::PACKET_TYPE_MOUSEPAD_REQUEST)
+            }
+            Direct::Sound { .. } => None,
+        }
+    }
+
+    /// The notification title: never silent.
+    pub(crate) fn asking(&self, phone: &str) -> String {
+        match self {
+            Direct::Insert { kind, target } => {
+                let what = match (kind.as_str(), target.as_str()) {
+                    ("photo", "file") => "a photo as a file",
+                    ("photo", _) => "a photo",
+                    ("scan", _) => "a document scan",
+                    ("text", _) => "text from a picture",
+                    ("qr", _) => "a QR code",
+                    _ => "something",
+                };
+                format!("Asking {phone} for {what}")
+            }
+            Direct::Sound { what, on } => {
+                let thing = match what.as_str() {
+                    "desk-sound" => "this computer's sound to play there",
+                    "phone-mic" => "its microphone",
+                    _ => "its sound",
+                };
+                if *on {
+                    format!("Asking {phone} for {thing}")
+                } else {
+                    format!("Telling {phone} to stop {thing}")
+                }
+            }
+        }
+    }
+}
+
+/// At most one request per verb in 5 s and ten in a minute: a script cannot
+/// flood the phone with questions. Extra ones are ignored (and said).
+#[derive(Default)]
+pub(crate) struct Limiter {
+    last: std::collections::HashMap<String, std::time::Instant>,
+    recent: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl Limiter {
+    pub(crate) const PER_VERB: std::time::Duration = std::time::Duration::from_secs(5);
+    pub(crate) const PER_MINUTE: usize = 10;
+
+    pub(crate) fn allow(&mut self, key: &str, now: std::time::Instant) -> bool {
+        let minute = std::time::Duration::from_secs(60);
+        while self
+            .recent
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= minute)
+        {
+            self.recent.pop_front();
+        }
+        if self.recent.len() >= Self::PER_MINUTE
+            || self
+                .last
+                .get(key)
+                .is_some_and(|at| now.saturating_duration_since(*at) < Self::PER_VERB)
+        {
+            return false;
+        }
+        self.last.insert(key.to_string(), now);
+        self.recent.push_back(now);
+        true
+    }
+}
+
+/// Which phone a request goes to.
+#[derive(Debug)]
+pub(crate) enum Pick<'a> {
+    Phone(&'a crate::device_links::device::DeviceView),
+    /// Several are connected and none was named.
+    Many,
+    /// None that is connected (yet) and able.
+    None,
+}
+
+pub(crate) fn pick<'a>(
+    devices: &'a [crate::device_links::device::DeviceView],
+    named: &str,
+    needs: Option<&str>,
+) -> Pick<'a> {
+    let mut able = devices.iter().filter(|phone| {
+        phone.trusted
+            && phone.feature_transport_ready
+            && (named.is_empty() || phone.id == named)
+            && needs.is_none_or(|packet| crate::window::can_send_feature(phone, packet))
+    });
+    match (able.next(), able.next()) {
+        (Some(phone), None) => Pick::Phone(phone),
+        (Some(_), Some(_)) => Pick::Many,
+        _ => Pick::None,
+    }
+}
+
+/// What to do after a look for the phone.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Step {
+    Send,
+    Wait,
+    GiveUp,
+    TooMany,
+}
+
+/// A DeskLink that has only just started has no phone ready yet: it waits
+/// (this many looks, a quarter second apart: five seconds) before saying so.
+const LOOKS: u32 = 20;
+
+pub(crate) fn next_step(found: &Pick, looks_left: u32) -> Step {
+    match found {
+        Pick::Phone(_) => Step::Send,
+        Pick::Many => Step::TooMany,
+        Pick::None if looks_left > 0 => Step::Wait,
+        Pick::None => Step::GiveUp,
+    }
+}
+
+thread_local! {
+    static LIMITER: std::cell::RefCell<Limiter> = std::cell::RefCell::default();
+}
+
+fn say(app: &DesklinkApplication, title: &str, body: &str) {
+    let notification = gio::Notification::new(title);
+    notification.set_body(Some(body));
+    notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+    app.send_notification(Some("direct-action"), &notification);
+}
+
+/// One request: rate limited, then sent to the phone as soon as one is ready
+/// (a cold start gets five seconds), and always said on the desk.
+fn run_direct(app: &DesklinkApplication, device: String, request: Direct) {
+    let allowed = LIMITER.with(|limiter| {
+        limiter
+            .borrow_mut()
+            .allow(&request.key(), std::time::Instant::now())
+    });
+    if !allowed {
+        say(
+            app,
+            "Too many requests",
+            "DeskLink ignored a request from the command line: wait a few seconds.",
+        );
+        return;
+    }
+    look_for_phone(app.downgrade(), device, request, LOOKS);
+}
+
+fn look_for_phone(
+    weak: glib::WeakRef<DesklinkApplication>,
+    device: String,
+    request: Direct,
+    looks_left: u32,
+) {
     use crate::device_links::daemon::DaemonCommand;
+    let Some(app) = weak.upgrade() else {
+        return;
+    };
+    let devices = app
+        .daemon_handle()
+        .map(|daemon| daemon.devices())
+        .unwrap_or_default();
+    let found = pick(&devices, &device, request.needs());
+    match next_step(&found, looks_left) {
+        Step::Send => {
+            let (Pick::Phone(phone), Some(daemon)) = (found, app.daemon_handle()) else {
+                return;
+            };
+            say(
+                &app,
+                &request.asking(&phone.name),
+                "On the phone, answer the question there.",
+            );
+            daemon.send(match request {
+                Direct::Insert { kind, target } => {
+                    DaemonCommand::Capture(phone.id.clone(), kind, target)
+                }
+                Direct::Sound { what, on } => DaemonCommand::Sound(phone.id.clone(), what, on),
+            });
+        }
+        Step::Wait => {
+            glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+                look_for_phone(weak, device, request, looks_left - 1)
+            });
+        }
+        Step::TooMany => say(
+            &app,
+            "More than one phone is connected",
+            "Say which with --to <device id>.",
+        ),
+        Step::GiveUp => say(
+            &app,
+            "No phone is connected",
+            "Connect your phone to DeskLink first (or it does not support this).",
+        ),
+    }
+}
+
+/// The `app.insert` and `app.sound` actions: what the Insert and Sound
+/// buttons do, for the phone named (or the only connected one). They send the
+/// same commands, so the same gates and the same consent on the phone apply;
+/// what they skip is a person at the desk's window, so they are rate limited
+/// and never silent.
+pub(crate) fn add_direct_actions(app: &DesklinkApplication) {
     let insert = gio::SimpleAction::new("insert", Some(glib::VariantTy::new("(sss)").unwrap()));
     let weak = app.downgrade();
     insert.connect_activate(move |_, parameter| {
@@ -307,11 +529,7 @@ pub(crate) fn add_direct_actions(app: &DesklinkApplication) {
         {
             return;
         }
-        if let Some(id) = ready_phone(&app, &device) {
-            if let Some(daemon) = app.daemon_handle() {
-                daemon.send(DaemonCommand::Capture(id, kind, target));
-            }
-        }
+        run_direct(&app, device, Direct::Insert { kind, target });
     });
     app.add_action(&insert);
     let sound = gio::SimpleAction::new("sound", Some(glib::VariantTy::new("(ssb)").unwrap()));
@@ -326,28 +544,9 @@ pub(crate) fn add_direct_actions(app: &DesklinkApplication) {
         if !SOUND_VERBS.iter().any(|(_, w, _)| *w == what) {
             return;
         }
-        if let Some(id) = ready_phone(&app, &device) {
-            if let Some(daemon) = app.daemon_handle() {
-                daemon.send(DaemonCommand::Sound(id, what, on));
-            }
-        }
+        run_direct(&app, device, Direct::Sound { what, on });
     });
     app.add_action(&sound);
-}
-
-/// The id of the phone to act on, or a notification saying there is none.
-fn ready_phone(app: &DesklinkApplication, named: &str) -> Option<String> {
-    let devices = app.daemon_handle()?.devices();
-    match choose_phone(&devices, named).filter(|phone| phone.feature_transport_ready) {
-        Some(phone) => Some(phone.id.clone()),
-        None => {
-            let notification = gio::Notification::new("No phone is connected");
-            notification.set_body(Some("Connect your phone to DeskLink first."));
-            notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
-            app.send_notification(Some("direct-action"), &notification);
-            None
-        }
-    }
 }
 
 /// The `app.bucket` action: `(device, paths)` into that phone's Bucket
@@ -716,6 +915,130 @@ mod tests {
 
     /// `--insert`: the verb in any place relative to `--to`, only the verbs
     /// the Insert menu has, and each one asks for what its row asks for.
+    fn phone(id: &str, ready: bool) -> crate::device_links::device::DeviceView {
+        let info = crate::device_links::device_info::DeviceInfo::local(
+            id.to_string(),
+            format!("Name {id}"),
+        );
+        let mut device =
+            crate::device_links::device::DeviceView::from_info(&info, "10.0.0.2".into(), true);
+        device.trusted = true;
+        device.feature_transport_ready = ready;
+        device.incoming_capabilities =
+            vec![crate::device_links::packet::PACKET_TYPE_MOUSEPAD_REQUEST.to_string()];
+        device
+    }
+
+    /// One a verb every five seconds, ten in a minute, and the rest ignored
+    /// (fake clock).
+    #[test]
+    fn requests_from_a_script_are_rate_limited() {
+        use std::time::{Duration, Instant};
+        let (mut limiter, t0) = (Limiter::default(), Instant::now());
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        assert!(limiter.allow("insert:photo:clipboard", at(0)));
+        assert!(
+            !limiter.allow("insert:photo:clipboard", at(4)),
+            "same verb, too soon"
+        );
+        assert!(limiter.allow("sound:phone-mic:true", at(4)), "another verb");
+        assert!(limiter.allow("insert:photo:clipboard", at(5)));
+        // Ten in the minute: the eleventh is ignored, whichever verb.
+        let mut limiter = Limiter::default();
+        for n in 0..10u64 {
+            assert!(limiter.allow(&format!("v{n}"), at(n)), "{n}");
+        }
+        assert!(
+            !limiter.allow("fresh", at(30)),
+            "ten already in this minute"
+        );
+        assert!(
+            limiter.allow("fresh", at(60)),
+            "the first has left the minute"
+        );
+    }
+
+    /// Never silent: every request says what is being asked, of whom.
+    #[test]
+    fn every_request_is_worded_on_the_desk() {
+        let ask = |d: Direct| d.asking("Pixel");
+        assert_eq!(
+            ask(Direct::Insert {
+                kind: "photo".into(),
+                target: "clipboard".into()
+            }),
+            "Asking Pixel for a photo"
+        );
+        assert_eq!(
+            ask(Direct::Insert {
+                kind: "scan".into(),
+                target: "file".into()
+            }),
+            "Asking Pixel for a document scan"
+        );
+        assert_eq!(
+            ask(Direct::Sound {
+                what: "phone-mic".into(),
+                on: true
+            }),
+            "Asking Pixel for its microphone"
+        );
+        assert_eq!(
+            ask(Direct::Sound {
+                what: "desk-sound".into(),
+                on: true
+            }),
+            "Asking Pixel for this computer's sound to play there"
+        );
+        assert_eq!(
+            ask(Direct::Sound {
+                what: "phone-sound".into(),
+                on: false
+            }),
+            "Telling Pixel to stop its sound"
+        );
+    }
+
+    /// The phone: the one named, else the only connected one; two connected
+    /// and none named is refused; an Insert needs the Insert button's gate.
+    #[test]
+    fn a_request_goes_to_one_ready_phone() {
+        let mousepad = Some(crate::device_links::packet::PACKET_TYPE_MOUSEPAD_REQUEST);
+        let one = [phone("a", true), phone("b", false)];
+        assert!(matches!(pick(&one, "", mousepad), Pick::Phone(p) if p.id == "a"));
+        assert!(matches!(pick(&one, "a", None), Pick::Phone(_)));
+        assert!(
+            matches!(pick(&one, "b", None), Pick::None),
+            "named but not connected"
+        );
+        let two = [phone("a", true), phone("b", true)];
+        assert!(matches!(pick(&two, "", None), Pick::Many));
+        assert!(matches!(pick(&two, "b", None), Pick::Phone(p) if p.id == "b"));
+        let mut old = phone("c", true);
+        old.incoming_capabilities.clear();
+        assert!(
+            matches!(pick(&[old.clone()], "", mousepad), Pick::None),
+            "cannot do Insert"
+        );
+        assert!(
+            matches!(pick(&[old], "", None), Pick::Phone(_)),
+            "Sound has no such gate"
+        );
+    }
+
+    /// A cold start: no phone is ready yet, so it waits (five seconds of
+    /// looks) before saying there is none; one that shows up is used.
+    #[test]
+    fn a_cold_start_waits_for_a_phone_before_giving_up() {
+        assert_eq!(next_step(&Pick::None, LOOKS), Step::Wait);
+        assert_eq!(next_step(&Pick::None, 1), Step::Wait);
+        assert_eq!(next_step(&Pick::None, 0), Step::GiveUp);
+        let ready = phone("a", true);
+        assert_eq!(next_step(&Pick::Phone(&ready), 0), Step::Send);
+        assert_eq!(next_step(&Pick::Many, LOOKS), Step::TooMany);
+        assert_eq!(LOOKS as u64 * 250, 5000);
+    }
+
     #[test]
     fn insert_arguments_name_a_menu_row_and_optionally_a_phone() {
         assert_eq!(

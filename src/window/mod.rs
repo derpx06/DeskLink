@@ -2211,7 +2211,7 @@ fn named_widgets(root: &gtk::Widget, prefix: &str) -> Vec<gtk::Widget> {
     found
 }
 
-fn can_send_feature(device: &DeviceView, packet_type: &str) -> bool {
+pub(crate) fn can_send_feature(device: &DeviceView, packet_type: &str) -> bool {
     FeatureRegistry::desktop()
         .outgoing_capabilities()
         .iter()
