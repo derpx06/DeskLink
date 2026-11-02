@@ -50,8 +50,8 @@ pub(super) enum Trouble {
 }
 
 /// One outgoing file.
-/// Where the time of a send went (for `DESKLINK_DEBUG=1`; nothing is
-/// measured otherwise): reading the source, hashing it, the call that hands a
+/// Where the time of a send went (always measured; one line per transfer is
+/// logged when it ends): reading the source, hashing it, the call that hands a
 /// frame to the channel, and waiting (for the receiver's window, or for the
 /// channel's buffer to drain).
 #[derive(Debug, Default)]
@@ -850,7 +850,16 @@ impl Engine {
         }
         let outgoing = self.outgoing.remove(index);
         let id = outgoing.id.clone();
-        if Stages::on() {
+        // One line per transfer, but not one per small Bucket file: a sync of
+        // many files would fill the journal. A Bucket file is told when it was
+        // big or slow (the lines that explain a slow sync).
+        let worth_a_line = outgoing.folder.is_none()
+            || outgoing.total >= 8 << 20
+            || outgoing
+                .stages
+                .started
+                .is_some_and(|at| at.elapsed() >= Duration::from_secs(2));
+        if worth_a_line {
             // No file name: this goes to the journal, which outlives the file.
             eprintln!(
                 "[DeskLink] Sent transfer {}: {}",
