@@ -1597,83 +1597,37 @@ mod tests {
             };
             let (daemon, _commands) = DaemonHandle::detached();
             let groups = groups(&daemon, &AppSettings::default(), &device, &status, false);
-            let table: [(&str, &[&str]); 10] = [
-                (
-                    "Connection",
-                    &[
-                        "Keep this computer awake while a phone is connected",
-                        "Let this phone keep the computer awake",
-                        "Start at Login",
-                    ],
-                ),
-                (
-                    "Notifications",
-                    &[
-                        "Show Pixel 9's notifications here",
-                        "Command alerts",
-                        "Send this computer's notifications to the phone",
-                    ],
-                ),
-                (
-                    "Clipboard",
-                    &["Share this computer's clipboard with phones"],
-                ),
-                (
-                    "Calls",
-                    &[
-                        "Pause music during calls",
-                        "Name callers from Pixel 9's contacts",
-                    ],
-                ),
-                ("Sound", &["Phones may hear this computer's microphone"]),
-                (
-                    "Control",
-                    &[
-                        "Glide onto Pixel 9",
-                        "Let the phone control mouse and keyboard",
-                    ],
-                ),
-                ("Files", &["Bucket with Pixel 9", "Downloads folder"]),
-                (
-                    "Privacy & security",
-                    &[
-                        "Ask before terminal and screen access",
-                        "Terminal access",
-                        "Unlock with Pixel 9 nearby",
-                        "Lock when I walk away with Pixel 9",
-                        "Unpair Pixel 9…",
-                    ],
-                ),
-                // The two GNOME rows are there on a GNOME desktop only.
-                (
-                    "Appearance",
+            // The table is `testdata/settings_rows.json`, which the contract
+            // doc mirrors; the Appearance group has two GNOME-only rows.
+            let table: serde_json::Value =
+                serde_json::from_str(include_str!("../../testdata/settings_rows.json")).unwrap();
+            let table: Vec<(String, Vec<String>)> = table["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|group| {
+                    let names = |key: &str| -> Vec<String> {
+                        group[key]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .map(|row| row.as_str().unwrap().replace("{phone}", "Pixel 9"))
+                            .collect()
+                    };
+                    let mut rows = names("rows");
                     if crate::shell_dbus::extension_possible() {
-                        &[
-                            "Style",
-                            "Tray icon",
-                            "GNOME extension",
-                            "Phone in the top bar",
-                        ]
-                    } else {
-                        &["Style", "Tray icon"]
-                    },
-                ),
-                (
-                    "Advanced",
-                    &[
-                        "Reach this computer from anywhere",
-                        "Connection history",
-                        "Crash reports",
-                    ],
-                ),
-            ];
+                        rows.extend(names("gnomeRows"));
+                    }
+                    (group["title"].as_str().unwrap().to_string(), rows)
+                })
+                .collect();
             assert_eq!(groups.len(), table.len());
-            for (group, (title, rows)) in groups.iter().zip(table) {
+            for (group, (title, rows)) in groups.iter().zip(&table) {
                 let shown = gtk::pango::parse_markup(&group.title(), '\0')
                     .map(|(_, plain, _)| plain.to_string())
                     .unwrap();
-                assert_eq!(shown, title);
-                assert_eq!(row_titles(group), rows, "rows of {title}");
+                assert_eq!(&shown, title);
+                assert_eq!(&row_titles(group), rows, "rows of {title}");
             }
         });
     }
