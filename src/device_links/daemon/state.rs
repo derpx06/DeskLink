@@ -476,7 +476,7 @@ pub(super) fn note_phone_dnd(
         (None, false)
     };
     if settings.shares_dnd_with(device_id) {
-        crate::device_links::dnd::on_phone(device_id, dnd, can_set);
+        crate::device_links::dnd::on_phone(device_id, dnd);
     } else {
         crate::device_links::dnd::forget(device_id);
     }

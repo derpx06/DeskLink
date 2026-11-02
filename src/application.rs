@@ -141,6 +141,9 @@ mod imp {
         }
 
         fn shutdown(&self) {
+            // Do Not Disturb DeskLink set on a phone's behalf is put back
+            // first, so nothing slower below can cost it.
+            crate::device_links::dnd::quit_main();
             // The pointer is never left on a phone: bounded, so a compositor
             // that does not answer cannot hold the app open.
             crate::device_links::glide::shutdown();
@@ -152,8 +155,6 @@ mod imp {
                 }
             }
             crate::device_links::vault::flush();
-            // Do Not Disturb DeskLink set on a phone's behalf is put back.
-            crate::device_links::dnd::quit_main();
             self.parent_shutdown();
         }
 
@@ -569,7 +570,7 @@ impl DesklinkApplication {
                     app.walk_away_step(&devices);
                     let settings = crate::device_links::config::app_settings();
                     let paired = || devices.iter().filter(|device| device.trusted);
-                    crate::device_links::dnd::step(
+                    if let Some(problem) = crate::device_links::dnd::step(
                         &paired()
                             .filter(|d| settings.shares_dnd_with(&d.id))
                             .map(|d| d.id.clone())
@@ -578,7 +579,11 @@ impl DesklinkApplication {
                             .filter(|d| d.feature_transport_ready)
                             .map(|d| d.id.clone())
                             .collect(),
-                    );
+                    ) {
+                        let notification = gio::Notification::new("Do Not Disturb was not shared");
+                        notification.set_body(Some(&problem));
+                        app.send_notification(Some("dnd-problem"), &notification);
+                    }
                 }
                 if let Some(tray) = app.imp().tray.borrow().as_ref() {
                     let devices = daemon.devices();
