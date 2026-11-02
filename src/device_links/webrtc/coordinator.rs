@@ -2302,26 +2302,67 @@ struct PeerFileLink {
     /// For fast lanes (W18): the stored pairing certificates. `None`: no lane.
     config: Option<Arc<Mutex<Config>>>,
     /// The last look at the ICE path (reading it asks webrtcbin for stats).
-    lane_seen: Mutex<Option<(std::time::Instant, LanePath)>>,
+    lane_seen: Arc<Mutex<Option<(std::time::Instant, LanePath)>>>,
+    /// A refresh of `lane_seen` is running on its own thread.
+    refreshing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PeerFileLink {
-    /// The ICE pair's address for a lane and whether it is relayed, read at
-    /// most every two seconds (it asks webrtcbin for stats).
+    /// The ICE pair's address for a lane and whether it is relayed. Reading it
+    /// asks webrtcbin for stats (up to two seconds if it is slow), and this is
+    /// asked on the file thread: the first look waits, every later one answers
+    /// from the last reading at once and refreshes it on a thread of its own
+    /// when it is more than two seconds old.
     fn path(&self) -> LanePath {
-        let Ok(mut seen) = self.lane_seen.lock() else {
-            return (None, false);
-        };
-        match *seen {
-            Some((at, path)) if at.elapsed() < std::time::Duration::from_secs(2) => path,
-            _ => {
+        let seen = self.lane_seen.lock().ok().and_then(|seen| *seen);
+        match seen {
+            Some((at, path)) => {
+                if at.elapsed() >= std::time::Duration::from_secs(2) {
+                    self.refresh_in_background();
+                }
+                path
+            }
+            None => {
                 let path = self
                     .peer
                     .upgrade()
                     .map_or((None, false), |peer| peer.lane_address());
-                *seen = Some((std::time::Instant::now(), path));
+                if let Ok(mut seen) = self.lane_seen.lock() {
+                    *seen = Some((std::time::Instant::now(), path));
+                }
                 path
             }
+        }
+    }
+
+    fn refresh_in_background(&self) {
+        if self
+            .refreshing
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let (peer, seen, refreshing) = (
+            self.peer.clone(),
+            Arc::clone(&self.lane_seen),
+            Arc::clone(&self.refreshing),
+        );
+        let spawned = std::thread::Builder::new()
+            .name("desklink-lane-path".into())
+            .spawn({
+                let refreshing = Arc::clone(&refreshing);
+                move || {
+                    let path = peer
+                        .upgrade()
+                        .map_or((None, false), |peer| peer.lane_address());
+                    if let Ok(mut seen) = seen.lock() {
+                        *seen = Some((std::time::Instant::now(), path));
+                    }
+                    refreshing.store(false, std::sync::atomic::Ordering::Release);
+                }
+            });
+        if spawned.is_err() {
+            refreshing.store(false, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -2394,7 +2435,8 @@ fn attach_transfer_manager(
             peer: Arc::downgrade(peer),
             wire: wire.clone(),
             config,
-            lane_seen: Mutex::new(None),
+            lane_seen: Arc::new(Mutex::new(None)),
+            refreshing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }),
     );
     // A sender waiting for room in the channel is woken when it drains.
@@ -6144,7 +6186,8 @@ mod tests {
                 generation: 1,
             },
             config,
-            lane_seen: Mutex::new(None),
+            lane_seen: Arc::new(Mutex::new(None)),
+            refreshing: Arc::new(AtomicBool::new(false)),
         };
         let with = |marker: bool| {
             let mut types = vec!["desklink.heartbeat".to_string()];
@@ -6164,5 +6207,35 @@ mod tests {
         assert!(link(None).lane_target().is_none());
         forget_peer_profile(&peer);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The path is read once, waiting; after that an old reading answers at
+    /// once and is refreshed behind the caller's back.
+    #[test]
+    fn a_stale_path_reading_answers_at_once_and_is_refreshed_in_the_background() {
+        let link = super::PeerFileLink {
+            peer: std::sync::Weak::new(),
+            wire: WebRtcWireBinding {
+                sender_device_id: "desk".into(),
+                peer_device_id: "phone".into(),
+                session_id: 1,
+                generation: 1,
+            },
+            config: None,
+            lane_seen: Arc::new(Mutex::new(None)),
+            refreshing: Arc::new(AtomicBool::new(false)),
+        };
+        assert_eq!(link.path(), (None, false), "the first look reads");
+        // An old reading that says relayed, with a pair address.
+        let old = (Some(std::net::IpAddr::from([192, 168, 1, 3])), true);
+        *link.lane_seen.lock().unwrap() =
+            Some((std::time::Instant::now() - Duration::from_secs(30), old));
+        assert_eq!(link.path(), old, "the old reading, without waiting");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while link.path() == old {
+            assert!(Instant::now() < deadline, "never refreshed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(link.path(), (None, false), "the refresh replaced it");
     }
 }

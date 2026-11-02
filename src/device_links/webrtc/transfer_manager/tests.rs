@@ -113,6 +113,8 @@ struct Pipe {
     control_hook: Mutex<Option<ControlHook>>,
     /// Where a fast lane could go from this side (W18); `None`: no lane.
     lane: Mutex<Option<super::super::file_lane::LaneTarget>>,
+    /// How often the engine asked this link whether it is relayed.
+    relayed_asked: AtomicUsize,
 }
 
 impl Pipe {
@@ -129,6 +131,7 @@ impl Pipe {
             frame_hook: Mutex::new(None),
             control_hook: Mutex::new(None),
             lane: Mutex::new(None),
+            relayed_asked: AtomicUsize::new(0),
         })
     }
 
@@ -238,6 +241,11 @@ impl FileLink for Pipe {
 
     fn lane_target(&self) -> Option<super::super::file_lane::LaneTarget> {
         self.lane.lock().unwrap().clone()
+    }
+
+    fn relayed(&self) -> bool {
+        self.relayed_asked.fetch_add(1, Ordering::SeqCst);
+        false
     }
 }
 
@@ -3962,4 +3970,22 @@ fn only_the_lane_that_is_up_can_end_it_and_a_look_changes_nothing() {
     let nacks = hand.link.sent(FileAction::BlockNack);
     assert_eq!(nacks.len(), 1, "told once");
     assert_eq!(nacks[0].reason.as_deref(), Some("lane"));
+}
+
+/// Asking a link for its path can wait on webrtcbin: a small file (a Bucket
+/// sync of many) never does.
+#[test]
+fn small_transfers_never_ask_the_link_for_its_path() {
+    let rig = Rig::new("path-small");
+    let source = rig.source("small.bin", &payload(2 * BLOCK_BYTES as usize, 51));
+    rig.a().start_send(&source).unwrap();
+    rig.received();
+    rig.sent_ok();
+    assert_eq!(rig.ab.relayed_asked.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.ba.relayed_asked.load(Ordering::SeqCst), 0);
+    let big = Rig::new("path-big");
+    let source = big.source("big.bin", &payload(9 * BLOCK_BYTES as usize, 52));
+    big.a().start_send(&source).unwrap();
+    big.received();
+    assert!(big.ab.relayed_asked.load(Ordering::SeqCst) > 0);
 }

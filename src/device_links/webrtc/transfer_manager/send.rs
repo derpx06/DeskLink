@@ -1107,7 +1107,10 @@ impl Engine {
             }
             _ => board::set_lane(
                 &outgoing.id,
-                words::data_channel(net.link.relayed(), outgoing.lane_offered),
+                words::data_channel(
+                    outgoing.total >= super::super::file_lane::MIN_FILE_BYTES && net.link.relayed(),
+                    outgoing.lane_offered,
+                ),
             ),
         }
     }

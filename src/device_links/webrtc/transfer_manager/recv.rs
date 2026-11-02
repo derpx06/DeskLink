@@ -217,7 +217,12 @@ impl Incoming {
         if accept.lane.is_none() {
             board::set_lane(
                 &self.id,
-                words::data_channel(net.link.relayed(), self.lane_wanted),
+                words::data_channel(
+                    // Only a transfer a lane could have served says; the rest
+                    // never ask the link for its path.
+                    self.total >= super::super::file_lane::MIN_FILE_BYTES && net.link.relayed(),
+                    self.lane_wanted,
+                ),
             );
         }
         accept
