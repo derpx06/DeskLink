@@ -77,6 +77,27 @@ pub(crate) fn forget_addresses(device_id: &str) {
             cached.remove(device_id);
         }
     }
+    // And from `endpoints.json`, or its last address would come back after a
+    // restart. Written off the caller's thread, like the other writes.
+    let device_id = device_id.to_string();
+    let _ = thread::Builder::new()
+        .name("desklink-endpoints".into())
+        .spawn(move || {
+            let _writing = WRITING.lock();
+            unpersist_endpoint(&device_id);
+        });
+}
+
+/// Rewrites `endpoints.json` without `device_id`.
+fn unpersist_endpoint(device_id: &str) {
+    let mut all = persisted_endpoints();
+    if all.remove(device_id).is_none() {
+        return;
+    }
+    if let Ok(mut cached) = PERSISTED.lock() {
+        *cached = Some(all.clone());
+    }
+    write_endpoints(&all);
 }
 
 /// What a paired phone last said about itself and the TCP port it listens
@@ -138,11 +159,13 @@ pub(super) fn persist_paired_endpoint(
         .spawn(move || {
             // One writer at a time: two links authenticating together must
             // not interleave read-modify-write.
-            static WRITING: Mutex<()> = Mutex::new(());
             let _writing = WRITING.lock();
             persist_endpoint(&device_id, SocketAddr::new(ip, port), &trusted);
         });
 }
+
+/// Serialises the read-modify-write of `endpoints.json`.
+static WRITING: Mutex<()> = Mutex::new(());
 
 /// Where each paired phone was last reachable, kept across restarts so the
 /// first dial after a restart needs no discovery (`endpoints.json` beside
@@ -193,9 +216,6 @@ fn persist_endpoint(
     address: SocketAddr,
     trusted: &std::collections::HashSet<String>,
 ) {
-    let Some(path) = endpoints_path() else {
-        return;
-    };
     let before = persisted_endpoints();
     let all = updated_endpoints(before.clone(), device_id, address, trusted);
     if let Ok(mut cached) = PERSISTED.lock() {
@@ -204,7 +224,14 @@ fn persist_endpoint(
     if all == before {
         return;
     }
-    let written = serde_json::to_string(&all)
+    write_endpoints(&all);
+}
+
+fn write_endpoints(all: &HashMap<String, SocketAddr>) {
+    let Some(path) = endpoints_path() else {
+        return;
+    };
+    let written = serde_json::to_string(all)
         .map_err(|error| error.to_string())
         .and_then(|text| {
             // Where phones were seen is private to this user (0700 / 0600).
@@ -214,7 +241,7 @@ fn persist_endpoint(
                 .map_err(|error| error.to_string())
         });
     if let Err(error) = written {
-        eprintln!("[Daemon] Could not remember {device_id}'s address: {error}");
+        eprintln!("[Daemon] Could not remember the phones' addresses: {error}");
     }
 }
 
@@ -1170,6 +1197,20 @@ mod tests {
             |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
+
+    /// An unpaired phone's last address must not return after a restart.
+    #[test]
+    fn an_unpaired_phones_endpoint_leaves_the_file() {
+        let trusted: std::collections::HashSet<String> =
+            ["gone-phone".to_string(), "kept-phone".to_string()].into();
+        persist_endpoint("gone-phone", "10.1.2.4:1716".parse().unwrap(), &trusted);
+        persist_endpoint("kept-phone", "10.1.2.5:1716".parse().unwrap(), &trusted);
+        unpersist_endpoint("gone-phone");
+        let after = persisted_endpoints();
+        assert!(!after.contains_key("gone-phone"));
+        assert!(after.contains_key("kept-phone"), "only that phone's");
+        assert!(!persisted_snapshot().contains_key("gone-phone"));
     }
 
     #[test]
