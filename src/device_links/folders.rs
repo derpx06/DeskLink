@@ -1666,6 +1666,17 @@ fn scan(pair: &Pair) -> Result<Scanned, String> {
         };
         for entry in entries.flatten() {
             let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                // A name that is not text cannot go on the wire: a Bucket says
+                // so instead of leaving the file silently unsynced.
+                if pair.bucket {
+                    let shown = entry.file_name().to_string_lossy().into_owned();
+                    let shown = if prefix.is_empty() {
+                        shown
+                    } else {
+                        format!("{prefix}/{shown}")
+                    };
+                    note(&shown, "the name can't sync");
+                }
                 continue;
             };
             let path = if prefix.is_empty() {
@@ -1770,7 +1781,9 @@ fn keep_existing(found: &mut BTreeMap<String, Stat>, manifest: &Manifest, root: 
         if entry.deleted || found.contains_key(path) {
             continue;
         }
-        if read_path(root, path).is_ok_and(|full| fs::symlink_metadata(full).is_ok()) {
+        if read_path(root, path).is_ok_and(|full| fs::symlink_metadata(full).is_ok())
+            || inside_unreadable_folder(root, path)
+        {
             found.insert(
                 path.clone(),
                 Stat {
@@ -1781,6 +1794,25 @@ fn keep_existing(found: &mut BTreeMap<String, Stat>, manifest: &Manifest, root: 
             );
         }
     }
+}
+
+/// Whether `path` lies in a folder that exists but cannot be listed (a
+/// permission change, an I/O error): its files are not gone, the scan just
+/// could not see them, and tombstoning them would delete them on the phone.
+fn inside_unreadable_folder(root: &Path, path: &str) -> bool {
+    let mut parent = Path::new(path).parent();
+    while let Some(relative) = parent.filter(|relative| !relative.as_os_str().is_empty()) {
+        let full = root.join(relative);
+        match fs::symlink_metadata(&full) {
+            Ok(metadata) if metadata.is_dir() => return fs::read_dir(&full).is_err(),
+            Ok(_) => return false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // Cannot even look: not a folder that is known to be gone.
+            Err(_) => return true,
+        }
+        parent = relative.parent();
+    }
+    false
 }
 
 /// [`STABLE_FOR`] in ms (tests write and scan at once: none unless asked).
@@ -3754,7 +3786,18 @@ impl Worker {
             Resolve::Both => {}
             Resolve::Desk => {
                 if let Ok(copy) = read_path(&root, &conflict.copy) {
-                    trash(&copy);
+                    // Without a trash the phone's copy stays (a file is never
+                    // deleted for good because someone chose a side): said, so
+                    // the person does not think it is gone.
+                    if copy.exists() && !trash(&copy) {
+                        tell(&Report {
+                            refused: Some(
+                                "There is no trash to put the phone's copy in, so it was kept as a file here."
+                                    .to_string(),
+                            ),
+                            ..Report::default()
+                        });
+                    }
                 }
             }
             Resolve::Phone | Resolve::PhoneAnyway => {
@@ -4214,9 +4257,18 @@ mod tests {
         fs::write(root.join("ok.txt"), "1").unwrap();
         fs::write(root.join("a:b.txt"), "1").unwrap();
         fs::write(root.join("dot."), "1").unwrap();
+        // Not text (Linux allows it): listed too, not skipped in silence.
+        {
+            use std::os::unix::ffi::OsStrExt;
+            fs::write(
+                root.join(std::ffi::OsStr::from_bytes(b"bad\xffname.txt")),
+                "1",
+            )
+            .unwrap();
+        }
         let (found, _, _, skipped) = scan(&worker.pairs[0].pair).unwrap();
         assert_eq!(found.keys().collect::<Vec<_>>(), ["ok.txt"]);
-        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        assert_eq!(skipped.len(), 3, "{skipped:?}");
         assert!(skipped
             .iter()
             .all(|line| line.contains("the name can't sync")));
@@ -5464,6 +5516,54 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(root.join("nt.txt")).unwrap(), "phone");
         TEST_TRASH_FAILS.with(|fails| fails.set(false));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Keeping this computer's version with no trash cannot discard the phone's
+    /// copy: it stays, and the person is told so.
+    #[test]
+    fn keeping_the_desks_version_without_a_trash_says_the_phones_copy_was_kept() {
+        let (base, root, mut worker) = scratch_bucket("bucket-no-trash-desk");
+        fs::write(root.join("nd.txt"), "desk").unwrap();
+        fs::write(root.join("nd (conflicted copy).txt"), "phone").unwrap();
+        worker.pairs[0].book.conflicts.push(Conflict {
+            path: "nd.txt".into(),
+            copy: "nd (conflicted copy).txt".into(),
+            at: 0,
+        });
+        let _ = take_report();
+        TEST_TRASH_FAILS.with(|fails| fails.set(true));
+        worker.resolve("phone-b", BUCKET_ID, "nd.txt", Resolve::Desk);
+        TEST_TRASH_FAILS.with(|fails| fails.set(false));
+        assert!(root.join("nd (conflicted copy).txt").exists());
+        assert!(take_report().is_some_and(|m| m.contains("kept as a file")));
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A folder that cannot be listed is not an empty one: its files are kept
+    /// in the scan (nothing is tombstoned, so nothing is deleted on the phone);
+    /// a folder that is really gone still takes its files with it.
+    #[test]
+    fn files_in_a_folder_that_cannot_be_listed_are_kept_not_tombstoned() {
+        use std::os::unix::fs::PermissionsExt;
+        let (base, root, _worker) = scratch_bucket("bucket-unreadable");
+        fs::create_dir_all(root.join("A")).unwrap();
+        fs::create_dir_all(root.join("B")).unwrap();
+        fs::write(root.join("A/f.txt"), "1").unwrap();
+        let mut manifest = Manifest::new();
+        for path in ["A/f.txt", "B/g.txt"] {
+            manifest.insert(path.into(), entry(&"a".repeat(64), (1, 0)));
+        }
+        fs::set_permissions(root.join("A"), fs::Permissions::from_mode(0o000)).unwrap();
+        let listable = fs::read_dir(root.join("A")).is_ok();
+        let mut found = BTreeMap::new();
+        keep_existing(&mut found, &manifest, &root);
+        fs::set_permissions(root.join("A"), fs::Permissions::from_mode(0o755)).unwrap();
+        if !listable {
+            assert!(found.contains_key("A/f.txt"), "{found:?}");
+        }
+        // B holds nothing and lists fine: g.txt really is gone.
+        assert!(!found.contains_key("B/g.txt"));
         let _ = fs::remove_dir_all(&base);
     }
 

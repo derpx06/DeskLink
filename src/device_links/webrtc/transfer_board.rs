@@ -164,7 +164,23 @@ impl TransferBoard {
             return;
         }
         if self.synced.len() >= MAX_ROWS {
-            self.synced.remove(0);
+            // Pushed off the list, not forgotten: the Bucket's slot for it is
+            // freed and the file counts as not synced (it is asked for again).
+            let evicted = self.synced.remove(0);
+            self.notes.remove(&evicted.id);
+            if self.synced_ended.len() >= MAX_FINISHED {
+                self.synced_ended.pop_front();
+            }
+            self.synced_ended.push_back(SyncedEnd {
+                device: evicted.device_id,
+                name: evicted.name,
+                incoming: evicted.incoming,
+                ok: false,
+            });
+            if self.synced_failed.len() >= MAX_FINISHED {
+                self.synced_failed.pop_front();
+            }
+            self.synced_failed.push_back(evicted.id);
         }
         self.synced.push(row);
         self.prune_lanes();
@@ -271,8 +287,9 @@ impl TransferBoard {
         }
     }
 
-    /// Ends everything a device had running.
-    pub fn finish_device(&mut self, device_id: &str, reason: &str) {
+    /// Ends everything a device had running. Returns the transfers ended. A
+    /// failed row of a device that is gone offers no "Try Again".
+    pub fn finish_device(&mut self, device_id: &str, reason: &str) -> Vec<String> {
         let ids: Vec<String> = self
             .rows
             .iter()
@@ -280,9 +297,11 @@ impl TransferBoard {
             .filter(|row| row.device_id == device_id)
             .map(|row| row.id.clone())
             .collect();
-        for id in ids {
-            self.finish(&id, Outcome::Failed(reason.to_string()));
+        for id in &ids {
+            self.retry_sources.remove(id);
+            self.finish(id, Outcome::Failed(reason.to_string()));
         }
+        ids
     }
 
     pub fn rows(&self) -> Vec<TransferRow> {
@@ -294,6 +313,7 @@ impl TransferBoard {
     pub fn discard(&mut self, id: &str) {
         self.notes.remove(id);
         self.lanes.remove(id);
+        self.retry_sources.remove(id);
         self.rows.retain(|row| row.id != id);
         self.synced.retain(|row| row.id != id);
     }
@@ -376,7 +396,11 @@ pub fn record(finished: Finished) {
 }
 
 pub fn finish_device(device_id: &str, reason: &str) {
-    board().finish_device(device_id, reason);
+    let ended = board().finish_device(device_id, reason);
+    // The lane tokens of what ended open nothing (W18), as in `finish`.
+    for id in ended {
+        super::file_lane::void_tokens(&id);
+    }
 }
 
 pub fn pause_device(device_id: &str) {
@@ -863,5 +887,49 @@ mod tests {
         drop(guard);
         assert!(!rows().iter().any(|row| row.name == name));
         assert!(!board().finished.iter().any(|item| item.name == name));
+    }
+
+    /// A Bucket row pushed off a full list is reported ended (its slot is
+    /// freed) and failed (the file is asked for again), never just forgotten.
+    #[test]
+    fn a_synced_row_pushed_off_a_full_list_is_reported_ended_and_failed() {
+        let mut board = TransferBoard::default();
+        for n in 0..=MAX_ROWS {
+            board.begin_synced(row(&format!("s{n}"), "phone", true, 9 << 20));
+        }
+        assert_eq!(board.synced.len(), MAX_ROWS);
+        assert!(board
+            .synced_ended
+            .iter()
+            .any(|end| end.name == "s0.bin" && !end.ok && end.incoming));
+        assert_eq!(board.synced_failed.front().map(String::as_str), Some("s0"));
+    }
+
+    /// An unpair ends the phone's transfers: their lane tokens are void, and a
+    /// failed row offers no "Try Again" for a phone that is gone.
+    #[test]
+    fn ending_a_devices_transfers_voids_their_tokens_and_their_retry() {
+        let (id, device) = ("unpair-board-1", "unpair-board-dev");
+        let token = super::super::file_lane::issue_token(id, device).unwrap();
+        assert!(begin(row(id, device, false, 9 << 20)));
+        set_retry_source(id, PathBuf::from("/tmp/x"));
+        finish_device(device, "The phone was unpaired");
+        assert!(!super::super::file_lane::spend_token_for_test(
+            &token, id, device
+        ));
+        let ended = peek_finished(id);
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert_eq!(ended[0].retry, None);
+    }
+
+    /// A row taken off the board without an outcome (a changed file begun
+    /// again under a new id) takes its retry source with it.
+    #[test]
+    fn a_discarded_row_forgets_its_retry_source() {
+        let mut board = TransferBoard::default();
+        board.begin(row("r1", "phone", false, 5));
+        board.set_retry_source("r1", PathBuf::from("/tmp/x"));
+        board.discard("r1");
+        assert!(board.retry_sources.is_empty());
     }
 }

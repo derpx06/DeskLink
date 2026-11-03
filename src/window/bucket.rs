@@ -1873,6 +1873,21 @@ fn rename_to(path: &Path, name: &str) -> Result<(), String> {
     if target.exists() {
         return Err("Something with that name is already there".into());
     }
+    // A name that differs from a neighbour's only in capital letters is one
+    // name to the phone: one of the two would silently stop syncing.
+    let own = path.file_name().map(|own| own.to_os_string());
+    let wanted = folders::fold_name(name);
+    let clashes = target.parent().is_some_and(|dir| {
+        std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                Some(entry.file_name()) != own
+                    && folders::fold_name(&entry.file_name().to_string_lossy()) == wanted
+            })
+        })
+    });
+    if clashes {
+        return Err("A name that differs only in capital letters is already there".into());
+    }
     std::fs::rename(path, &target).map_err(|_| "Could not rename it".to_string())
 }
 
@@ -2328,6 +2343,13 @@ mod tests {
             assert!(rename_to(&file, bad).is_err(), "{bad:?}");
         }
         assert!(rename_to(&file, "taken.txt").is_err());
+        assert!(
+            rename_to(&file, "TAKEN.TXT").is_err(),
+            "capitals alone do not make a different name"
+        );
+        // Its own name in other capitals is fine: it is the same file.
+        rename_to(&file, "A.txt").unwrap();
+        rename_to(&dir.join("A.txt"), "a.txt").unwrap();
         rename_to(&file, "b.txt").unwrap();
         assert!(dir.join("b.txt").exists() && !file.exists());
         let _ = std::fs::remove_dir_all(dir);

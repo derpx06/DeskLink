@@ -34,6 +34,8 @@ pub(super) enum SendState {
 /// Lane failures one transfer is given; after the third it stays on the data
 /// channel.
 const MAX_LANE_FAILURES: u32 = 3;
+/// How long a promotion waits for the blocks in flight to be acknowledged.
+const PROMOTE_DRAIN: Duration = Duration::from_secs(2);
 
 /// A prefix being re-hashed from the source.
 struct Verify {
@@ -276,11 +278,14 @@ pub(super) struct Outgoing {
     /// Lane failures of this transfer, all told (never reset): three and it
     /// stays on the data channel.
     lane_failures_total: u32,
+    /// Times a long pause let the lane go (no failure, but a lane that keeps
+    /// being let go is not asked for again for ever: the same three).
+    lane_releases: u32,
     /// A lane carried this transfer and none failed.
     lane_clean: bool,
     /// The peer, the retry base and how old a token may be before the sender
     /// asks for a fresh one: set from the engine each tick.
-    peer: String,
+    pub(super) peer: String,
     lane_retry: Duration,
     token_fresh: Duration,
     /// Fresh tokens asked for after a slow prefix check.
@@ -292,6 +297,14 @@ pub(super) struct Outgoing {
     lane_nacks: u32,
     /// When the receiver last acknowledged a block (for the lane's stall).
     lane_ack_at: Instant,
+    /// A promotion is waiting for the blocks in flight to be acknowledged
+    /// (since when): the block in progress is finished, then nothing new is
+    /// sent, so the re-offer lands on a boundary with nothing to throw away.
+    promote_drain: Option<Instant>,
+    /// Tests: bytes sent and not yet acknowledged when the last promotion
+    /// re-offered.
+    #[cfg(test)]
+    pub(super) promoted_with_in_flight: Option<u64>,
 }
 
 /// [`Outgoing::sync_key`] of a kept send.
@@ -408,6 +421,7 @@ impl Outgoing {
             lane_failed: None,
             lane_failures: 0,
             lane_failures_total: 0,
+            lane_releases: 0,
             lane_clean: false,
             peer: String::new(),
             lane_retry: Duration::from_secs(10),
@@ -416,6 +430,9 @@ impl Outgoing {
             lane_await: None,
             lane_nacks: 0,
             lane_ack_at: now,
+            promote_drain: None,
+            #[cfg(test)]
+            promoted_with_in_flight: None,
         }
     }
 
@@ -488,6 +505,8 @@ impl Outgoing {
             && !matches!(self.lane, LaneTx::Pending { .. } | LaneTx::Dialing { .. })
             && self.lane_await.is_none()
             && !self.is_held()
+            // A promotion waits for acknowledgements: no new block starts.
+            && !(self.promote_drain.is_some() && self.next_offset % BLOCK_BYTES == 0)
             && self.next_offset < self.total
             && self
                 .next_offset
@@ -579,21 +598,85 @@ impl Outgoing {
     /// back-off is over, while the LAN path still holds, and never after the
     /// third failure: that transfer then stays on the data channel.
     fn maybe_promote(&mut self, now: Instant, net: &Net) {
-        if self.lane_failed.is_none() {
+        let Some(failed_at) = self.lane_failed else {
+            self.promote_drain = None;
             return;
-        }
+        };
+        // A lane let go by a pause waits as long as a failed one (and longer
+        // each time): a disk that is nearly full pauses and resumes every few
+        // seconds, and that must not cost a re-offer, a token and a TLS dial
+        // each cycle.
+        let wait = self
+            .lane_retry
+            .checked_mul(1 << self.lane_releases.saturating_sub(1).min(5))
+            .unwrap_or(self.lane_retry);
         if self.state != SendState::Sending
+            || self.is_held()
+            || self.lane_releases >= MAX_LANE_FAILURES
+            || (self.lane_releases > 0 && now.saturating_duration_since(failed_at) < wait)
             || !matches!(self.lane, LaneTx::Off)
             || !self.lane_offered
             || self.lane_failures_total >= MAX_LANE_FAILURES
             || super::super::file_lane::peer_blocked(&self.peer, now)
             || net.link.lane_target().is_none()
         {
+            self.promote_drain = None;
             return;
+        }
+        // The receiver restarts at its verified block, and what is in flight
+        // past it is thrown away: finish the block in progress and let the
+        // acknowledgements catch up first (two seconds at most, then it goes
+        // ahead anyway).
+        let since = *self.promote_drain.get_or_insert(now);
+        let sent_to = self.next_offset.min(self.total);
+        let in_flight = sent_to.saturating_sub((self.acked * BLOCK_BYTES).min(self.total));
+        let boundary = self.next_offset % BLOCK_BYTES == 0 || self.next_offset >= self.total;
+        if !(boundary && in_flight == 0) && now.saturating_duration_since(since) < PROMOTE_DRAIN {
+            return;
+        }
+        self.promote_drain = None;
+        #[cfg(test)]
+        {
+            self.promoted_with_in_flight = Some(in_flight);
         }
         self.lane_failed = None;
         self.state = SendState::Offered;
         net.send(self.offer_message(net));
+    }
+
+    /// Tests: the lane being agreed (a token waits), the transfer held.
+    #[cfg(test)]
+    pub(super) fn pretend_lane_pending(&mut self) {
+        self.lane = LaneTx::Pending {
+            port: 1,
+            token: "0".repeat(32),
+            at: Instant::now(),
+        };
+    }
+
+    /// Tests: no lane, how often one was let go, whether a re-offer is wanted,
+    /// whether a promotion is waiting for acknowledgements, whether every
+    /// block is acknowledged and the receiver's `complete` awaited.
+    #[cfg(test)]
+    pub(super) fn lane_facts(&self) -> (bool, u32, bool, bool, bool) {
+        (
+            matches!(self.lane, LaneTx::Off),
+            self.lane_releases,
+            self.lane_failed.is_some(),
+            self.promote_drain.is_some(),
+            self.state == SendState::AwaitComplete,
+        )
+    }
+
+    /// Tests: a promotion that waits for acknowledgements, with no lane failed
+    /// (the condition that started it is gone), and a transfer that is waiting
+    /// for `complete`.
+    #[cfg(test)]
+    pub(super) fn pretend(&mut self, draining: bool, awaiting_complete: bool) {
+        self.promote_drain = draining.then(Instant::now);
+        if awaiting_complete {
+            self.state = SendState::AwaitComplete;
+        }
     }
 
     /// The lane carries the frames now.
@@ -613,6 +696,34 @@ impl Outgoing {
         }
         self.lane = LaneTx::Off;
         self.lane_gave_up();
+        self.fall_back(net, why, verified);
+    }
+
+    /// The receiver holds the transfer still for a long while (no space, the
+    /// person): its lane is let go, which is no failure (no count, no back-off)
+    /// and is asked for again once the transfer moves (`maybe_promote`).
+    fn release_lane(&mut self, net: &Net) {
+        // Up, or being agreed (a token waiting, a dial under way): all of them
+        // end here. A dial that completes later finds nobody to hand its
+        // connection to and closes it.
+        let was_up = self.on_lane();
+        if let LaneTx::Up(writer) = &self.lane {
+            writer.close();
+        }
+        if matches!(self.lane, LaneTx::Off) {
+            return;
+        }
+        self.lane = LaneTx::Off;
+        self.lane_failed = Some(Instant::now());
+        self.lane_releases = self.lane_releases.saturating_add(1);
+        // Nothing left to send (every block is acknowledged) or nothing was on
+        // the lane yet: there is no stream to move, and `done` is not said again.
+        if was_up && self.state != SendState::AwaitComplete {
+            self.fall_back(net, "the transfer is paused", None);
+        }
+    }
+
+    fn fall_back(&mut self, net: &Net, why: &str, verified: Option<u64>) {
         // Not moving (queued again, offered, verifying): nothing to carry on
         // from; the next accept starts it afresh, and must not be forced into
         // Sending here.
@@ -785,9 +896,17 @@ impl Outgoing {
     }
 
     /// The receiver told us to hold still (or that it waits).
-    pub fn on_peer_pause(&mut self, why: &str) {
+    pub fn on_peer_pause(&mut self, why: &str, net: Option<&Net>) {
         if why != reason::NO_PROGRESS {
             self.peer_pause = Some(why.to_string());
+        }
+        // A short hold (a backlog) keeps its lane; a long one lets it go: an
+        // idle lane would only be found silent by the receiver and counted a
+        // failure.
+        if let Some(net) = net {
+            if why != reason::BACKLOG && why != reason::NO_PROGRESS {
+                self.release_lane(net);
+            }
         }
         board::set_note(&self.id, super::note_for_peer_pause(why).as_deref());
     }
@@ -1073,6 +1192,7 @@ impl Engine {
         }
         self.seq += 1;
         outgoing.seq = self.seq;
+        outgoing.peer.clone_from(&net.wire.peer_device_id);
         // The record names its peer so only that device's sends are resumed.
         let mut record = outgoing.record();
         record.device_id = net.wire.peer_device_id.clone();

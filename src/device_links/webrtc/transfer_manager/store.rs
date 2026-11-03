@@ -122,6 +122,7 @@ impl Store {
         let destination_root = fs::canonicalize(&destination_root)
             .map_err(|error| format!("Could not resolve DeskLink download directory: {error}"))?;
         ensure_directory_not_symlink(&destination_root)?;
+        note_state_root(&state_root);
         let store = Self {
             state_root,
             destination_root,
@@ -578,6 +579,115 @@ impl Store {
 /// long name never makes it too long for the filesystem).
 fn stage_name(id: &str) -> String {
     format!(".desklink-{id}.stage")
+}
+
+/// State directories transfer state may be in: those managers were made for,
+/// and the one the daemon installs at start (so an unpair purges the files
+/// even when no manager has existed in this run).
+fn state_roots() -> &'static std::sync::Mutex<Vec<PathBuf>> {
+    static ROOTS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(Default::default)
+}
+
+fn note_state_root(root: &Path) {
+    if let Ok(mut roots) = state_roots().lock() {
+        if !roots.iter().any(|known| known == root) {
+            roots.push(root.to_path_buf());
+        }
+    }
+}
+
+/// The daemon's transfer state directory, known from the start.
+pub(crate) fn install_state_dir(root: &Path) {
+    note_state_root(root);
+}
+
+/// The live engines and the phone each belongs to, with the flag that tells an
+/// engine its phone was unpaired. Weak: an engine that is gone is forgotten.
+type EngineFlags = Vec<(String, std::sync::Weak<std::sync::atomic::AtomicBool>)>;
+
+fn engines() -> &'static std::sync::Mutex<EngineFlags> {
+    static ENGINES: std::sync::OnceLock<std::sync::Mutex<EngineFlags>> = std::sync::OnceLock::new();
+    ENGINES.get_or_init(Default::default)
+}
+
+/// Lets `forget_device` reach the engine of `peer` (once per engine).
+pub(super) fn register_engine(peer: &str, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    if let Ok(mut engines) = engines().lock() {
+        engines.retain(|(_, known)| known.strong_count() > 0);
+        let weak = std::sync::Arc::downgrade(flag);
+        if !engines.iter().any(|(_, known)| known.ptr_eq(&weak)) {
+            engines.push((peer.to_string(), weak));
+        }
+    }
+}
+
+/// A phone was unpaired (or replaced by a new identity): its partial downloads
+/// and send records go with it, instead of waiting out the seven-day sweep,
+/// and the engine of its closing peer is told to drop what it still holds and
+/// not write it back. A phone paired again later gets a new engine, which this
+/// never touches.
+pub(crate) fn forget_device(device_id: &str) {
+    // The engines first: whatever they write before they notice is removed by
+    // the purge below, or by their own purge once they do.
+    if let Ok(engines) = engines().lock() {
+        for (peer, flag) in engines.iter() {
+            if peer == device_id {
+                if let Some(flag) = flag.upgrade() {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+    }
+    let roots = state_roots()
+        .lock()
+        .map(|roots| roots.clone())
+        .unwrap_or_default();
+    for root in roots {
+        purge_device(&root, device_id);
+    }
+}
+
+/// Removes every record in `root` that names `device_id`, with its partial
+/// file and sidecar. Returns how many transfers went.
+pub(super) fn purge_device(root: &Path, device_id: &str) -> usize {
+    let store = Store {
+        state_root: root.to_path_buf(),
+        destination_root: root.to_path_buf(),
+    };
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    let mut gone = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(inner) = name.strip_prefix(".desklink-") else {
+            continue;
+        };
+        if let Some(id) = inner.strip_suffix(".send.json") {
+            let owned = store
+                .read_regular(name)
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<SendCheckpoint>(&bytes).ok())
+                .is_some_and(|record| record.device_id == device_id);
+            if owned && store.remove_send(id).is_ok() {
+                gone += 1;
+            }
+        } else if let Some(id) = inner.strip_suffix(".json") {
+            let owned = store
+                .read_regular(name)
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<ReceiveCheckpoint>(&bytes).ok())
+                .is_some_and(|record| record.device_id == device_id);
+            if owned && store.remove_receive(id).is_ok() {
+                gone += 1;
+            }
+        }
+    }
+    gone
 }
 
 /// Removes staging files in the downloads folder that nobody has touched since
@@ -1057,6 +1167,75 @@ mod tests {
         // A symlink where the checkpoint belongs is not a checkpoint.
         std::os::unix::fs::symlink("/etc/hostname", &path).unwrap();
         assert!(store.load_receive(ID).unwrap().is_none());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// An unpair deletes that phone's partial downloads and send records, and
+    /// only that phone's; and its closing peer may not write them back.
+    #[test]
+    fn an_unpaired_phones_partials_and_send_records_go_and_another_phones_stay() {
+        const OTHER: &str = "1f8fad5b-d9cb-469f-a165-70867728950f";
+        let (store, base) = store("purge");
+        let mine = checkpoint(2);
+        let mut theirs = checkpoint(1);
+        theirs.transfer_id = OTHER.to_string();
+        theirs.device_id = "tablet".to_string();
+        for held in [&mine, &theirs] {
+            store.create_part(&held.transfer_id).unwrap();
+            store
+                .save_receive(held, &vec![[7u8; 32]; held.blocks_done as usize])
+                .unwrap();
+        }
+        let send = |id: &str, device: &str| SendCheckpoint {
+            transfer_id: id.to_string(),
+            device_id: device.to_string(),
+            token: "token".to_string(),
+            filename: "a.txt".to_string(),
+            total_size: 3,
+            mtime: 5,
+            source: PathBuf::from("/home/me/a.txt"),
+            history: true,
+            clipboard_mime: None,
+            folder: None,
+            content_sha256: None,
+            restarts: 0,
+        };
+        store.save_send(&send(ID, "phone")).unwrap();
+        store.save_send(&send(OTHER, "tablet")).unwrap();
+        assert_eq!(purge_device(store.state_root(), "phone"), 2);
+        assert!(store.load_receive(ID).unwrap().is_none());
+        assert!(!store.part_path(ID).unwrap().exists());
+        assert!(store.load_receive(OTHER).unwrap().is_some());
+        assert_eq!(store.stored_sends().len(), 1);
+        assert_eq!(store.stored_sends()[0].transfer_id, OTHER);
+        // The public entry point finds the directory by itself and remembers.
+        forget_device("tablet");
+        assert!(store.load_receive(OTHER).unwrap().is_none());
+        assert!(store.stored_sends().is_empty());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// An unpair from the desk while the phone is away: no manager has been
+    /// made in this run, but the directory the daemon installed is purged.
+    #[test]
+    fn an_unpair_purges_the_installed_state_directory_even_when_no_manager_exists() {
+        let (store, base) = store("offline");
+        let device = format!("offline-{}", uuid::Uuid::new_v4().simple());
+        let mut held = checkpoint(1);
+        held.device_id = device.clone();
+        store.create_part(&held.transfer_id).unwrap();
+        store.save_receive(&held, &[[3u8; 32]]).unwrap();
+        // As if no manager had been made for this directory in this run.
+        state_roots()
+            .lock()
+            .unwrap()
+            .retain(|known| known != store.state_root());
+        forget_device(&device);
+        assert!(store.load_receive(ID).unwrap().is_some(), "not known yet");
+        install_state_dir(store.state_root());
+        forget_device(&device);
+        assert!(store.load_receive(ID).unwrap().is_none());
+        assert!(!store.part_path(ID).unwrap().exists());
         let _ = fs::remove_dir_all(base);
     }
 

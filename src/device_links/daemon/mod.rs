@@ -300,6 +300,13 @@ impl DaemonWorker {
             crate::device_links::contacts::install(config.contacts_dir());
             crate::device_links::notes::install(config.notes_dir());
             if !cfg!(test) {
+                // So an unpair purges its partial downloads even when no
+                // transfer manager has been made in this run.
+                crate::device_links::webrtc::transfer_manager::install_state_dir(
+                    &config.transfer_state_dir(),
+                );
+            }
+            if !cfg!(test) {
                 crate::device_links::folders::start(config.folders_dir());
             }
         }
