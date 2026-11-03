@@ -218,7 +218,12 @@ impl Page {
         let attached: Vec<Vec<String>> =
             all.iter().map(|info| attached_devices(&info.id)).collect();
         let phone_attached = attached.iter().any(|devices| devices.contains(&device.id));
-        self.detach.set_label(&format!("Detach {}", device.name));
+        // The button says "Detach"; whose it is is its tooltip and its name for
+        // a screen reader, so a long phone name cannot widen the page.
+        let whole = format!("Detach {} from its terminals", device.name);
+        self.detach.set_tooltip_text(Some(&whole));
+        self.detach
+            .update_property(&[gtk::accessible::Property::Label(&whole)]);
         self.detach.set_visible(phone_attached);
         self.count.set_label(&format!("{} open", all.len()));
         self.note.set_label(&format!(
