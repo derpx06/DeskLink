@@ -301,6 +301,22 @@ pub(super) fn apply_lan_packet(
             packet.get_bool("pair"),
             packet.get_i64("timestamp")
         );
+        // An unpair written on a link this side has since replaced (a redial
+        // adopted, a link race lost) is still the paired phone speaking: the
+        // link was authenticated against the stored certificate when it was
+        // made. Dropping it as stale left the record, and the device retrying
+        // ICE, until some later packet happened to arrive on the new link.
+        // Only a link that still presents the stored certificate counts.
+        let binding = if packet.get_bool("pair") == Some(false)
+            && sessions.with_session(&binding, |_| ()).is_err()
+            && config.lock().is_ok_and(|config| {
+                config.trusted_certificate_pem(&device_id).as_deref()
+                    == Some(binding.link.certificate_pem.as_str())
+            }) {
+            sessions.current_binding(&device_id).unwrap_or(binding)
+        } else {
+            binding
+        };
         let pairing = sessions.with_session(&binding, |session| {
             let previous_state = session.pairing.state;
             session.pairing.receive(

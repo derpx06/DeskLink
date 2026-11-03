@@ -949,6 +949,70 @@ mod tests {
         );
     }
 
+    fn paired_pair(net: &Arc<TestNetwork>) -> (TestPeer, TestPeer) {
+        let (mut desktop, mut phone) = peer_pair(net, "desktop-1", "phone-1");
+        desktop.request_pair();
+        net.advance(0);
+        phone.pump();
+        phone.accept();
+        net.advance(0);
+        desktop.pump();
+        assert!(desktop.is_trusted() && phone.is_trusted());
+        (desktop, phone)
+    }
+
+    /// The phone unpairs: the desk drops the record on the same link.
+    #[test]
+    fn a_peers_unpair_drops_the_pairing() {
+        let net = TestNetwork::new();
+        let (mut desktop, phone) = paired_pair(&net);
+        phone.unpair();
+        net.advance(0);
+        desktop.pump();
+        assert!(!desktop.is_trusted(), "the trust record is gone");
+        assert!(!desktop.sessions.holds_paired_transport(&desktop.peer_id()));
+    }
+
+    /// The first link died (a surviving WebRTC peer keeps the session); the
+    /// phone unpairs on the replacement link. The desk must honour it there.
+    #[test]
+    fn an_unpair_on_a_replacement_link_is_honoured() {
+        let net = TestNetwork::new();
+        let (mut desktop, mut phone) = paired_pair(&net);
+        desktop.drop_link();
+        phone.drop_link();
+        desktop.relink();
+        phone.relink();
+        phone.unpair();
+        net.advance(0);
+        desktop.pump();
+        assert!(!desktop.is_trusted());
+    }
+
+    /// An unpair that was written on a link the desk has since replaced still
+    /// came from the pinned, authenticated peer: it is honoured, not dropped
+    /// as stale.
+    #[test]
+    fn an_unpair_that_arrives_on_a_superseded_link_is_honoured() {
+        let net = TestNetwork::new();
+        let (mut desktop, _phone) = paired_pair(&net);
+        let old = desktop.binding.clone();
+        // A replacement link is adopted while the old reader holds the line.
+        desktop.relink();
+        let mut unpair = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_PAIR);
+        unpair.set("pair", false);
+        apply_lan_packet(
+            &old,
+            unpair,
+            &desktop.devices,
+            &desktop.sessions,
+            &desktop.config,
+            &desktop.events,
+        );
+        assert!(!desktop.is_trusted());
+        assert_eq!(desktop.pair_state(), PairState::NotPaired);
+    }
+
     /// The notice is damped: a peer that still believes it is paired will send
     /// at typing speed, and answering every packet would turn a stale pairing
     /// into a packet storm.
