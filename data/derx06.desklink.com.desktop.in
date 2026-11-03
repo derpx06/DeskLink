@@ -9,6 +9,7 @@ Categories=Network;RemoteAccess;FileTransfer;
 # Translators: Search terms to find this application. Do NOT translate or localize the semicolons. The list MUST also end with a semicolon.
 Keywords=phone;android;remote;terminal;clipboard;notifications;file;transfer;screen;
 StartupNotify=true
+StartupWMClass=derx06.desklink.com
 DBusActivatable=true
 # `tel:` links: DeskLink asks, then the phone calls.
 MimeType=x-scheme-handler/tel;

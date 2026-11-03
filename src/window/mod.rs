@@ -29,6 +29,7 @@ pub(crate) mod calls;
 mod gallery;
 pub(crate) mod insert;
 mod sound;
+mod system_check;
 mod vault_banner;
 pub(crate) use calls::{confirm_dial, confirm_message};
 mod clipboard;
@@ -1972,6 +1973,21 @@ fn friendly_error(raw: &str) -> (String, bool) {
         (
             "That QR code is not from this computer. Scan the one shown here.",
             false,
+        )
+    } else if has(&["gstreamer webrtc plugins"]) {
+        // The start-up check's own words: what to install, kept whole.
+        return (raw.to_string(), true);
+    } else if has(&["(os error 30)", "read-only file system"]) {
+        (
+            "DeskLink cannot save anything: its settings folder is on a read-only file \
+             system. Make your home folder writable, or point XDG_CONFIG_HOME at a folder \
+             that is, then restart DeskLink.",
+            true,
+        )
+    } else if has(&["(os error 28)", "no space left"]) {
+        (
+            "The disk is full, so DeskLink cannot save its settings. Free some space.",
+            true,
         )
     } else if has(&["(os error 98)", "address already in use"]) {
         (

@@ -1,7 +1,7 @@
 #
 # spec file for package desklink
 #
-# Builds on Fedora 43+ and openSUSE (Tumbleweed, Leap 16), locally with
+# Builds on Fedora 43+ and openSUSE (Tumbleweed; Leap 16 untested), locally with
 # rpmbuild or on the openSUSE Build Service. Sources: see packaging/README.md.
 #
 
@@ -11,7 +11,7 @@
 %global debug_package %{nil}
 
 Name:           desklink
-Version:        1.0.0
+Version:        1.3.0
 Release:        0%{?dist}
 Summary:        Use an Android phone and a Linux desktop together
 License:        GPL-3.0-or-later
@@ -92,6 +92,8 @@ CARGOEOF
 %doc README.md
 %{_bindir}/%{name}
 %{_datadir}/%{name}/
+%{_datadir}/gnome-shell/extensions/desklink@derx06.github.io/
+%{_datadir}/gnome-shell/search-providers/%{appid}.search-provider.ini
 %{_datadir}/applications/%{appid}.desktop
 %{_datadir}/metainfo/%{appid}.metainfo.xml
 %{_datadir}/glib-2.0/schemas/%{appid}.gschema.xml

@@ -1087,7 +1087,7 @@ impl Drop for DesktopWebRtcPeer {
 
 /// The GStreamer elements a WebRTC link cannot work without: webrtcbin
 /// (gst-plugins-bad), DTLS and libnice's ICE elements.
-const REQUIRED_ELEMENTS: [&str; 4] = ["webrtcbin", "dtlsdec", "dtlssrtpenc", "nicesrc"];
+pub(crate) const REQUIRED_ELEMENTS: [&str; 4] = ["webrtcbin", "dtlsdec", "dtlssrtpenc", "nicesrc"];
 
 /// The names in [`REQUIRED_ELEMENTS`] that `has` does not find.
 fn missing_elements(has: impl Fn(&str) -> bool) -> Vec<&'static str> {

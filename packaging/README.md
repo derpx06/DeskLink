@@ -4,7 +4,7 @@
 |---|---|
 | `aur/` | Arch Linux (AUR): `desklink` (source) and `desklink-bin` |
 | `debian/` | Debian 13, Ubuntu 24.04 and newer (`.deb`) |
-| `obs/` | Fedora 43+, openSUSE Tumbleweed / Leap 16 (`.rpm`), and the openSUSE Build Service |
+| `obs/` | Fedora 43+, openSUSE Tumbleweed (`.rpm`; Leap 16 is untested), and the openSUSE Build Service |
 | `../flatpak/` | Flatpak, any distribution |
 | `../flake.nix` | Nix and NixOS |
 

@@ -27,12 +27,21 @@ fn entry_path() -> Option<PathBuf> {
 
 /// The autostart entry for a native install.
 fn entry(executable: &str) -> String {
+    // The `Exec` path is quoted (an AppImage's mount point or a home folder
+    // can hold spaces). `TryExec` makes every desktop skip the entry once the
+    // program is gone, so an uninstall leaves no broken autostart behind.
+    let exec = if executable.contains(char::is_whitespace) {
+        crate::send_to::desktop_exec_quoted(std::path::Path::new(executable))
+    } else {
+        executable.to_string()
+    };
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=DeskLink\n\
          Comment=Keep this computer reachable from your phone\n\
-         Exec={executable} --gapplication-service\n\
+         TryExec={executable}\n\
+         Exec={exec} --gapplication-service\n\
          Icon={APP_ID}\n\
          X-GNOME-Autostart-enabled=true\n\
          NoDisplay=true\n"
@@ -98,7 +107,12 @@ fn request_background(enabled: bool) -> Result<(), String> {
         gio::DBusCallFlags::NONE,
         -1,
         None::<&gio::Cancellable>,
-        |_| {},
+        |reply| {
+            if let Err(error) = reply {
+                // No Background portal (no xdg-desktop-portal in this session).
+                eprintln!("[DeskLink] Start at login could not be set: {error}");
+            }
+        },
     );
     Ok(())
 }
@@ -110,5 +124,14 @@ mod tests {
         let entry = super::entry("/usr/bin/desklink");
         assert!(entry.contains("Exec=/usr/bin/desklink --gapplication-service\n"));
         assert!(entry.contains("NoDisplay=true"));
+    }
+
+    #[test]
+    fn the_entry_skips_itself_once_uninstalled_and_quotes_odd_paths() {
+        let plain = super::entry("desklink");
+        assert!(plain.contains("TryExec=desklink\n"));
+        let spaced = super::entry("/tmp/My Apps/desklink");
+        assert!(spaced.contains("TryExec=/tmp/My Apps/desklink\n"));
+        assert!(spaced.contains("Exec=\"/tmp/My Apps/desklink\" --gapplication-service\n"));
     }
 }

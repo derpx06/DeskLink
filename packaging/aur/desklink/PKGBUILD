@@ -4,9 +4,9 @@ pkgname=desklink
 # The relay the app uses away from home unless the user sets their own.
 # Set it to the deployed server (relay/deploy/DEPLOY.md) before publishing.
 _relay_url='wss://relay.example.com/v1'
-pkgver=1.0.0
+pkgver=1.3.0
 pkgrel=1
-pkgdesc='Use your Android phone and GNOME desktop together'
+pkgdesc='Use your Android phone and Linux desktop together'
 arch=('x86_64' 'aarch64')
 url='https://github.com/derpx06/DeskLink'
 license=('GPL-3.0-or-later' 'GPL-2.0-or-later')  # app; GNOME Shell extension
@@ -31,6 +31,12 @@ checkdepends=('appstream' 'desktop-file-utils')
 optdepends=(
   'gst-plugin-gtk4: system video sink (a copy is bundled otherwise)'
   'xdg-desktop-portal-gnome: screen sharing and remote control on GNOME'
+  'xdg-desktop-portal-kde: the same on KDE Plasma'
+  'xdg-desktop-portal-gtk: the same on Xfce, MATE, Cinnamon, Budgie'
+  'xdg-desktop-portal-wlr: screen sharing on sway and other wlroots compositors'
+  'xdg-desktop-portal-cosmic: the same on COSMIC'
+  'pipewire-pulse: PulseAudio clients alongside PipeWire (sound with the phone needs PipeWire)'
+  'dunst: a notification daemon, where the desktop has none'
   'gst-plugin-va: hardware video decoding'
 )
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")

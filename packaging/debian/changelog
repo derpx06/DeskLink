@@ -1,3 +1,10 @@
+desklink (1.3.0) unstable; urgency=medium
+
+  * Release 1.3.0 (see the AppStream release notes).
+  * Recommends gstreamer1.0-x: screen sharing on X11 sessions without a portal.
+
+ -- derpx06 <manaskhairnar1511@gmail.com>  Sun, 25 Oct 2026 12:00:00 +0000
+
 desklink (1.0.0) unstable; urgency=medium
 
   * Initial native package.

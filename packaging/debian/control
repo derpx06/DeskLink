@@ -33,6 +33,7 @@ Depends: ${shlibs:Depends},
          gstreamer1.0-pipewire,
          xdg-desktop-portal,
 Recommends: gstreamer1.0-libav,
+            gstreamer1.0-x,
             xdg-desktop-portal-gnome | xdg-desktop-portal-backend,
 Description: use an Android phone and a Linux desktop together
  DeskLink pairs a Linux desktop with the DeskLink Android app over the local
