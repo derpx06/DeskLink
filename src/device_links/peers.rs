@@ -21,6 +21,7 @@ pub(crate) fn forget_peer(device_id: &str) {
     daemon::pairing_commands::forget_proven(device_id);
     sync::forget_device(device_id);
     session_lock::forget_unlock(device_id);
+    crate::device_links::unlock::forget(device_id);
     glide::forget_phone(device_id);
     crate::device_links::walk_away::forget(device_id);
     crate::device_links::dnd::forget(device_id);

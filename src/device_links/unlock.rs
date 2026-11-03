@@ -100,6 +100,14 @@ pub(crate) fn issue(device_id: &str) -> String {
     nonce
 }
 
+/// Drops every nonce issued to `device_id` (it was unpaired, replaced or
+/// re-paired): an approval it was offered earlier must not outlive the pairing.
+pub(crate) fn forget(device_id: &str) {
+    if let Ok(mut issued) = ISSUED.lock() {
+        issued.retain(|entry| entry.device_id != device_id);
+    }
+}
+
 /// Checks an approval from `device_id` carrying `nonce`, consuming the nonce.
 pub(crate) fn approve(
     device_id: &str,
@@ -161,6 +169,18 @@ mod tests {
             at,
             used: false,
         }]
+    }
+
+    /// An unpair (or a replace, or a re-pair) takes the phone's unspent nonces
+    /// with it, and leaves the other phones' alone.
+    #[test]
+    fn forgetting_a_phone_voids_the_nonces_it_was_offered() {
+        let mine = issue("forget-me-phone");
+        let theirs = issue("keep-me-phone");
+        crate::device_links::peers::forget_peer("forget-me-phone");
+        let ok = |device: &str, nonce: &str| approve(device, Some(nonce), ALL_GOOD);
+        assert_eq!(ok("forget-me-phone", &mine), Err(Refusal::NoNonce));
+        assert_eq!(ok("keep-me-phone", &theirs), Ok(()));
     }
 
     #[test]

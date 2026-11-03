@@ -237,6 +237,23 @@ pub(super) fn apply_lan_packet(
         return;
     }
 
+    // The entrance of the pairing state machine, for whatever carrier
+    // delivered the packet: a pairing packet a carrier may not hold (a relay
+    // link, until off-LAN pairing is compiled in) never reaches it.
+    if (packet.packet_type == PACKET_TYPE_PAIR
+        || packet.packet_type == crate::device_links::packet::PACKET_TYPE_PAIR_QR)
+        && !crate::device_links::pairing_transport::admits(
+            binding.link.pairing_transport(),
+            &packet,
+        )
+    {
+        eprintln!(
+            "[Daemon] Dropped {} from {device_id}: pairing does not travel over this link",
+            packet.packet_type
+        );
+        return;
+    }
+
     let local_info = match config.lock() {
         Ok(config) => config.local_device_info(),
         Err(_) => {
@@ -338,6 +355,23 @@ pub(super) fn apply_lan_packet(
             )
         });
         if let Ok((previous_state, state, verification_key, reconfirm)) = pairing {
+            if crate::device_links::pairing::request_refused_for_clock(
+                previous_state,
+                state,
+                &packet,
+            ) {
+                // Said, not swallowed: the phone would otherwise wait out its
+                // 30 s and report a timeout, and nothing would tell either
+                // person that the clocks are the cause.
+                let mut refusal = NetworkPacket::new(PACKET_TYPE_PAIR);
+                refusal.set("pair", false);
+                let _ = binding.link.send_packet(&refusal);
+                super::state::mark_error(
+                    &devices,
+                    &device_id,
+                    crate::device_links::pairing::CLOCKS_DIFFER.to_string(),
+                );
+            }
             if reconfirm {
                 debug_log!(
                     "[Daemon] Re-confirming an existing pairing for {}",

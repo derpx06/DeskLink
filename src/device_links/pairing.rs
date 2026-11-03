@@ -274,6 +274,26 @@ pub fn needs_pair_reconfirmation(
         && packet.get_i64("timestamp").is_some()
 }
 
+/// A pairing request that was dropped only because its timestamp is too far
+/// from this clock: nothing else leaves a `NotPaired` handler `NotPaired` when
+/// a request carrying a timestamp arrives. The caller says so (a refusal to the
+/// peer and words on the card) instead of letting the peer wait out its timeout.
+pub fn request_refused_for_clock(
+    previous_state: PairState,
+    current_state: PairState,
+    packet: &NetworkPacket,
+) -> bool {
+    previous_state == PairState::NotPaired
+        && current_state == PairState::NotPaired
+        && packet.get_bool("pair") == Some(true)
+        && packet.get_i64("timestamp").is_some()
+}
+
+/// What the card says when [`request_refused_for_clock`] holds. The wording is
+/// matched by `friendly_error`.
+pub const CLOCKS_DIFFER: &str =
+    "Pairing refused: the clocks of this computer and the phone differ by more than 30 minutes";
+
 fn unix_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

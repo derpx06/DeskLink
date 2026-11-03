@@ -213,6 +213,15 @@ impl SessionLink {
         self.transport().ok()?.local_ip()
     }
 
+    /// Which carrier this link travels over (see `pairing_transport.rs`).
+    pub fn pairing_transport(
+        &self,
+    ) -> crate::device_links::pairing_transport::PairingTransportKind {
+        self.transport()
+            .map(|transport| transport.pairing_transport())
+            .unwrap_or(crate::device_links::pairing_transport::PairingTransportKind::Lan)
+    }
+
     pub fn verification_key(&self, timestamp: i64) -> String {
         PairingHandler::verification_key(&self.local_public_der, &self.remote_public_der, timestamp)
     }

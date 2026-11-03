@@ -1638,4 +1638,172 @@ mod tests {
             &error
         ));
     }
+
+    fn pair_request(timestamp: i64) -> NetworkPacket {
+        let mut request = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_PAIR);
+        request.set("pair", true);
+        request.set("timestamp", timestamp);
+        request
+    }
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// Clock skew: a request stamped more than 30 minutes off used to be
+    /// dropped without a word, so the asking phone waited out its 30 s and said
+    /// "timed out". Now it is refused at once and the card says why. A replayed
+    /// request from hours ago is the same case.
+    #[test]
+    fn a_request_from_a_skewed_clock_is_refused_in_words_and_never_prompts() {
+        for skew in [-7_200, 7_200, -86_400] {
+            let net = TestNetwork::new();
+            let (mut desktop, mut phone) = peer_pair(&net, "desktop-1", "phone-1");
+            phone
+                .binding
+                .link
+                .send_packet(&pair_request(now_secs() + skew))
+                .unwrap();
+            net.advance(0);
+            desktop.pump();
+            assert_eq!(desktop.pair_state(), PairState::NotPaired, "no prompt");
+            assert!(desktop.displayed_verification_key().is_none());
+            let error = desktop.devices.lock().unwrap()[&desktop.peer_id()]
+                .last_error
+                .clone()
+                .unwrap_or_default();
+            assert_eq!(error, crate::device_links::pairing::CLOCKS_DIFFER);
+            // The asking side hears it at once, not after its timeout.
+            net.advance(0);
+            phone.pump();
+            assert_eq!(phone.pair_state(), PairState::NotPaired);
+            assert!(!desktop.is_trusted() && !phone.is_trusted());
+        }
+        // Inside the window it prompts as ever.
+        let net = TestNetwork::new();
+        let (mut desktop, phone) = peer_pair(&net, "desktop-1", "phone-1");
+        phone
+            .binding
+            .link
+            .send_packet(&pair_request(now_secs() - 600))
+            .unwrap();
+        net.advance(0);
+        desktop.pump();
+        assert_eq!(desktop.pair_state(), PairState::RequestedByPeer);
+    }
+
+    /// Defence at the pairing state machine's entrance: whatever carrier a
+    /// pairing packet arrives on, a relay link cannot start, answer or QR-prove
+    /// a pairing while off-LAN pairing is compiled out; its `pair:false` still
+    /// unpairs.
+    #[test]
+    fn a_relay_link_cannot_start_or_answer_a_pairing_and_can_still_unpair() {
+        use crate::device_links::packet::{PACKET_TYPE_PAIR, PACKET_TYPE_PAIR_QR};
+        use crate::device_links::relay_link::transport::RelayLinkTransport;
+        let dir = temp_dir("relay-gate");
+        let config = Arc::new(Mutex::new(Config::load_from_dir(dir.clone()).unwrap()));
+        let sessions = Arc::new(DeviceManager::new());
+        let devices: Arc<Mutex<HashMap<String, DeviceView>>> = Arc::default();
+        let events: Arc<Mutex<Vec<DaemonEvent>>> = Arc::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let info = DeviceInfo {
+            id: "relay-phone".into(),
+            name: "relay-phone".into(),
+            device_type: "phone".into(),
+            protocol_version: PROTOCOL_VERSION,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+            app_version: None,
+        };
+        let link = SessionLink::new(
+            Arc::new(RelayLinkTransport::new("fp".into(), tx)),
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            info,
+        );
+        let binding = sessions
+            .register_link("relay-phone".into(), link, false)
+            .unwrap()
+            .binding;
+        let state = || {
+            sessions
+                .with_session(&binding, |session| session.pairing.state)
+                .unwrap()
+        };
+        let apply = |packet: NetworkPacket| {
+            apply_lan_packet(&binding, packet, &devices, &sessions, &config, &events)
+        };
+        apply(pair_request(now_secs()));
+        assert_eq!(
+            state(),
+            PairState::NotPaired,
+            "a request over a relay is dropped"
+        );
+        let mut accept = NetworkPacket::new(PACKET_TYPE_PAIR);
+        accept.set("pair", true);
+        let _ = sessions.with_session(&binding, |session| {
+            session.pairing.request_packet().unwrap();
+        });
+        apply(accept);
+        assert_eq!(
+            state(),
+            PairState::Requested,
+            "an acceptance over a relay is dropped"
+        );
+        let mut proof = NetworkPacket::new(PACKET_TYPE_PAIR_QR);
+        proof.set("mac", "AAAA");
+        apply(proof);
+        assert!(!config.lock().unwrap().is_trusted("relay-phone"));
+        let mut unpair = NetworkPacket::new(PACKET_TYPE_PAIR);
+        unpair.set("pair", false);
+        apply(unpair);
+        assert_eq!(
+            state(),
+            PairState::NotPaired,
+            "pair:false is the one pairing packet it carries"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Re-pair after an unpair, from either side: the record is made again with
+    /// the same certificate, both prompts show one key, and nothing of the old
+    /// pairing is needed or left over.
+    #[test]
+    fn a_pairing_is_made_again_after_an_unpair_from_either_side() {
+        for desk_unpairs in [true, false] {
+            let net = TestNetwork::new();
+            let (mut desktop, mut phone) = paired_pair(&net);
+            let certificate = desktop.trusted_certificate();
+            assert!(certificate.is_some());
+            if desk_unpairs {
+                desktop.unpair();
+            } else {
+                phone.unpair();
+            }
+            net.advance(0);
+            desktop.pump();
+            phone.pump();
+            assert!(!desktop.is_trusted() && !phone.is_trusted());
+            assert_eq!(desktop.pair_state(), PairState::NotPaired);
+            assert_eq!(phone.pair_state(), PairState::NotPaired);
+
+            desktop.request_pair();
+            net.advance(0);
+            phone.pump();
+            assert_eq!(phone.pair_state(), PairState::RequestedByPeer);
+            assert_eq!(desktop.verification_key(), phone.verification_key());
+            phone.accept();
+            net.advance(0);
+            desktop.pump();
+            assert_eq!(desktop.pair_state(), PairState::Paired);
+            assert!(desktop.is_trusted() && phone.is_trusted());
+            assert_eq!(desktop.trusted_certificate(), certificate);
+            assert!(desktop.errors().is_empty() && phone.errors().is_empty());
+        }
+    }
 }

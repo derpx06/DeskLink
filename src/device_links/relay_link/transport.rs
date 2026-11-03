@@ -13,9 +13,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use crate::device_links::core::{LinkTransport, ReadOutcome};
-use crate::device_links::packet::{
-    NetworkPacket, PACKET_TYPE_HEARTBEAT, PACKET_TYPE_PAIR, PACKET_TYPE_WEBRTC_SIGNAL_V1,
-};
+use crate::device_links::packet::NetworkPacket;
 
 const IDLE_WAIT: Duration = Duration::from_millis(50);
 
@@ -34,13 +32,14 @@ pub struct RelayLinkTransport {
 }
 
 /// Whether `packet` may cross a relay link at all.
+///
+/// The rule is `pairing_transport::packet_may_cross`: only an unpair notice
+/// of the pairing packets, until off-LAN pairing is compiled in and switched on.
 pub fn allowed_on_relay(packet: &NetworkPacket) -> bool {
-    match packet.packet_type.as_str() {
-        PACKET_TYPE_WEBRTC_SIGNAL_V1 | PACKET_TYPE_HEARTBEAT => true,
-        // Only an unpair notice: pairing itself never happens off the LAN.
-        PACKET_TYPE_PAIR => packet.body.get("pair").and_then(|pair| pair.as_bool()) == Some(false),
-        _ => false,
-    }
+    crate::device_links::pairing_transport::admits(
+        crate::device_links::pairing_transport::PairingTransportKind::Relay,
+        packet,
+    )
 }
 
 impl RelayLinkTransport {
@@ -120,13 +119,28 @@ impl LinkTransport for RelayLinkTransport {
         self.arrived.notify_all();
     }
 
+    fn pairing_transport(&self) -> crate::device_links::pairing_transport::PairingTransportKind {
+        crate::device_links::pairing_transport::PairingTransportKind::Relay
+    }
+
     // `local_ip` stays `None`: the relay is not the path media will take.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::device_links::packet::{PACKET_TYPE_HEARTBEAT, PACKET_TYPE_PAIR};
     use std::sync::mpsc::channel;
+
+    #[test]
+    fn a_relay_link_names_itself_to_the_pairing_state_machine() {
+        let (tx, _rx) = channel();
+        let link = RelayLinkTransport::new("fp".into(), tx);
+        assert_eq!(
+            link.pairing_transport(),
+            crate::device_links::pairing_transport::PairingTransportKind::Relay
+        );
+    }
 
     #[test]
     fn only_bootstrap_packets_pass_and_bytes_frame_by_line() {

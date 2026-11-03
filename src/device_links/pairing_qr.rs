@@ -46,6 +46,10 @@ struct Pending {
     failures: std::collections::HashMap<[u8; 32], u8>,
     total_failures: u32,
     uri: String,
+    /// What the address part of the code was built from, to be rebuilt when
+    /// this computer's addresses change while the code is on screen.
+    desktop_id: String,
+    fp: [u8; 32],
 }
 
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
@@ -116,19 +120,7 @@ pub fn start(
     let mut secret = [0u8; 32];
     openssl::rand::rand_bytes(&mut secret).map_err(|e| e.to_string())?;
     let fp = fingerprint(desktop_certificate_der)?;
-    let mut uri = format!(
-        "desklink://pair?v=1&id={desktop_id}&fp={}&s={}",
-        URL_SAFE_NO_PAD.encode(fp),
-        URL_SAFE_NO_PAD.encode(secret),
-    );
-    if let Some(host) = host {
-        uri.push_str("&h=");
-        uri.push_str(&host);
-    }
-    if !addresses.is_empty() {
-        let list: Vec<String> = addresses.iter().map(ToString::to_string).collect();
-        uri.push_str(&format!("&a={}&p={port}", list.join(",")));
-    }
+    let uri = build_uri(desktop_id, &fp, &secret, host, addresses, port);
     let mut pending = PENDING
         .lock()
         .map_err(|_| "QR pairing state poisoned".to_string())?;
@@ -143,8 +135,67 @@ pub fn start(
         failures: std::collections::HashMap::new(),
         total_failures: 0,
         uri: uri.clone(),
+        desktop_id: desktop_id.to_string(),
+        fp,
     });
     Ok(uri)
+}
+
+fn build_uri(
+    desktop_id: &str,
+    fp: &[u8; 32],
+    secret: &[u8; 32],
+    host: Option<String>,
+    addresses: &[std::net::Ipv4Addr],
+    port: u16,
+) -> String {
+    let mut uri = format!(
+        "desklink://pair?v=1&id={desktop_id}&fp={}&s={}",
+        URL_SAFE_NO_PAD.encode(fp),
+        URL_SAFE_NO_PAD.encode(secret),
+    );
+    if let Some(host) = host {
+        uri.push_str("&h=");
+        uri.push_str(&host);
+    }
+    if !addresses.is_empty() {
+        let list: Vec<String> = addresses.iter().map(ToString::to_string).collect();
+        uri.push_str(&format!("&a={}&p={port}", list.join(",")));
+    }
+    uri
+}
+
+/// This computer's addresses changed while a code is on screen: the same code
+/// (same secret, same expiry, so a phone that already scanned it still pairs)
+/// with the new addresses. Without it the phone dials addresses that are gone
+/// for up to the code's five minutes. Returns whether a live code was updated.
+pub fn refresh_addresses(
+    host: Option<String>,
+    addresses: &[std::net::Ipv4Addr],
+    port: u16,
+) -> bool {
+    let Ok(mut pending) = PENDING.lock() else {
+        return false;
+    };
+    let Some(live) = pending
+        .as_mut()
+        .filter(|live| live.expires_at > Instant::now())
+    else {
+        return false;
+    };
+    let uri = build_uri(
+        &live.desktop_id,
+        &live.fp,
+        &live.secret,
+        host,
+        addresses,
+        port,
+    );
+    if uri == live.uri {
+        return false;
+    }
+    live.uri = uri;
+    true
 }
 
 /// Withdraws the live code (the dialog was closed).
@@ -354,6 +405,46 @@ mod tests {
 
         let (width, dark) = modules("desklink://pair?v=1").unwrap();
         assert_eq!(dark.len(), width * width);
+        cancel();
+    }
+
+    /// The computer's addresses change (Wi-Fi roam, VPN up) while a code is
+    /// shown: the code's addresses follow, its secret and expiry do not.
+    #[test]
+    fn a_live_code_follows_the_computers_addresses_without_changing_its_secret() {
+        let _one_code = TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (desktop_fp, phone_fp) = (fingerprint(b"cert").unwrap(), [2u8; 32]);
+        let old = ["192.0.2.1".parse().unwrap()];
+        let new = ["10.9.8.7".parse().unwrap()];
+        cancel();
+        assert!(
+            !refresh_addresses(None, &new, 1716),
+            "no code: nothing to do"
+        );
+        let first = start("desk", b"cert", Some("192.0.2.1:1716".into()), &old, 1716).unwrap();
+        let secret = live_secret().unwrap();
+        assert!(
+            !refresh_addresses(Some("192.0.2.1:1716".into()), &old, 1716),
+            "same: no change"
+        );
+        assert!(refresh_addresses(Some("10.9.8.7:1716".into()), &new, 1716));
+        let second = current_uri().unwrap();
+        assert_ne!(first, second);
+        assert!(
+            second.ends_with("&h=10.9.8.7:1716&a=10.9.8.7&p=1716"),
+            "{second}"
+        );
+        assert_eq!(live_secret(), Some(secret), "the same code");
+        // A phone that scanned the first picture still pairs.
+        let mac = URL_SAFE_NO_PAD
+            .encode(proof(&secret, "desk", "phone", &desktop_fp, &phone_fp).unwrap());
+        assert!(verify("desk", "phone", &desktop_fp, &phone_fp, &mac).is_ok());
+        // An expired code is not revived.
+        start("desk", b"cert", None, &old, 1716).unwrap();
+        expire_live_for_test();
+        assert!(!refresh_addresses(None, &new, 1716));
         cancel();
     }
 
