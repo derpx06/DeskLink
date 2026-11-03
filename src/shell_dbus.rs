@@ -601,8 +601,23 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
                         // Only the Shell itself (the extension runs inside it)
                         // may say it shows the alerts: anyone else claiming so
                         // would mute DeskLink's own call and notification alerts.
-                        if hello_is_from_the_shell(&connection, sender) {
+                        let check = check_hello_sender(&connection, sender);
+                        if check == Check::Shell {
                             client_said_hello(&connection, sender, vetted(capabilities));
+                        } else if check == Check::Throttled {
+                            // Someone else's question spent the window; the
+                            // Shell says Hello once, so it is tried again
+                            // just after it, not refused.
+                            let (connection, sender) = (connection.clone(), sender.to_string());
+                            let capabilities = vetted(capabilities);
+                            gtk::glib::timeout_add_local_once(
+                                OWNER_ASK_EVERY + std::time::Duration::from_millis(100),
+                                move || {
+                                    if hello_is_from_the_shell(&connection, &sender) {
+                                        client_said_hello(&connection, &sender, capabilities);
+                                    }
+                                },
+                            );
                         } else {
                             static TOLD: std::sync::Once = std::sync::Once::new();
                             TOLD.call_once(|| {
@@ -1098,32 +1113,60 @@ struct OwnerCache {
 /// call these verbs in a loop.
 const OWNER_ASK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// What the owner check came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Check {
+    Shell,
+    NotTheShell,
+    /// Not asked: a question was asked within [`OWNER_ASK_EVERY`] (by anyone).
+    /// Not an answer: a one-time `Hello` is tried again after the window.
+    Throttled,
+}
+
+fn check_the_shell(
+    cache: &mut OwnerCache,
+    now: std::time::Instant,
+    sender: &str,
+    ask: impl FnOnce() -> Option<String>,
+) -> Check {
+    if is_the_shell(sender, cache.owner.as_deref()) {
+        return Check::Shell;
+    }
+    if cache
+        .asked
+        .is_some_and(|asked| now.duration_since(asked) < OWNER_ASK_EVERY)
+    {
+        return Check::Throttled;
+    }
+    cache.asked = Some(now);
+    cache.owner = ask();
+    if is_the_shell(sender, cache.owner.as_deref()) {
+        Check::Shell
+    } else {
+        Check::NotTheShell
+    }
+}
+
+#[cfg(test)]
 fn is_the_shell_cached(
     cache: &mut OwnerCache,
     now: std::time::Instant,
     sender: &str,
     ask: impl FnOnce() -> Option<String>,
 ) -> bool {
-    if is_the_shell(sender, cache.owner.as_deref()) {
-        return true;
-    }
-    if cache
-        .asked
-        .is_some_and(|asked| now.duration_since(asked) < OWNER_ASK_EVERY)
-    {
-        return false;
-    }
-    cache.asked = Some(now);
-    cache.owner = ask();
-    is_the_shell(sender, cache.owner.as_deref())
+    check_the_shell(cache, now, sender, ask) == Check::Shell
 }
 
 fn hello_is_from_the_shell(connection: &gio::DBusConnection, sender: &str) -> bool {
+    check_hello_sender(connection, sender) == Check::Shell
+}
+
+fn check_hello_sender(connection: &gio::DBusConnection, sender: &str) -> Check {
     thread_local! {
         static OWNER: std::cell::RefCell<OwnerCache> = std::cell::RefCell::new(OwnerCache::default());
     }
     OWNER.with(|cache| {
-        is_the_shell_cached(
+        check_the_shell(
             &mut cache.borrow_mut(),
             std::time::Instant::now(),
             sender,
@@ -2055,6 +2098,28 @@ mod tests {
             "mute-everything".to_string(),
         ];
         assert_eq!(vetted(said), ["notifications", "calls"]);
+    }
+
+    /// A stranger's question spends the window: the Shell's one Hello inside
+    /// it is "throttled" (and tried again after it), not "not the Shell".
+    #[test]
+    fn a_hello_inside_the_window_is_retried_not_refused() {
+        let mut cache = OwnerCache::default();
+        let start = std::time::Instant::now();
+        assert_eq!(
+            check_the_shell(&mut cache, start, ":1.99", || Some(":1.7".into())),
+            Check::NotTheShell
+        );
+        // The Shell restarted a moment later with a new name.
+        assert_eq!(
+            check_the_shell(&mut cache, start, ":1.8", || Some(":1.8".into())),
+            Check::Throttled
+        );
+        let after = start + OWNER_ASK_EVERY + std::time::Duration::from_millis(100);
+        assert_eq!(
+            check_the_shell(&mut cache, after, ":1.8", || Some(":1.8".into())),
+            Check::Shell
+        );
     }
 
     #[test]
