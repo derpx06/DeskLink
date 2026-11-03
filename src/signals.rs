@@ -4,7 +4,8 @@
 //! The handler only writes the signal's number to a pipe (all that is safe in
 //! a handler). A thread started at startup reads it and asks the application
 //! to quit on the main loop; if the main loop is wedged, or quitting hangs, the
-//! process exits anyway after a grace period, and a second signal ends it at
+//! process exits anyway after a grace period, and a second Ctrl-C (or any signal
+//! after a few seconds) ends it at
 //! once. GLib's own signal sources are not used: they run on the main loop, so
 //! a wedged main thread could never be ended by `kill`.
 
@@ -146,8 +147,21 @@ impl Actions for Real {
     }
 }
 
+/// A second signal within this long of the first is taken for the same
+/// request repeated (a session ending sends SIGHUP and SIGTERM together): the
+/// clean quit is let run.
+const REPEAT_IGNORED: Duration = Duration::from_secs(3);
+
+/// Whether a second signal, `since` the first, ends the process at once. Only
+/// the user's own repeated Ctrl-C does so inside [`REPEAT_IGNORED`]; any
+/// signal after it does.
+fn second_signal_ends_it(first: c_int, second: c_int, since: Duration) -> bool {
+    (first == libc::SIGINT && second == libc::SIGINT) || since >= REPEAT_IGNORED
+}
+
 /// Handles `signals`: the first asks `actions` to quit and starts the grace
-/// period; the end of it, or a second signal, exits.
+/// period; the end of it, a second Ctrl-C, or any signal after
+/// [`REPEAT_IGNORED`], exits.
 pub(crate) fn watch(
     signals: &[c_int],
     grace: Duration,
@@ -188,10 +202,17 @@ pub(crate) fn watch(
                     return;
                 };
                 let signal = c_int::from(byte);
-                if asked.is_some() {
-                    // A second one: no more waiting.
-                    actions.exit(signal);
-                    return;
+                if let Some((first, deadline)) = asked {
+                    let since = grace.saturating_sub(
+                        deadline.saturating_duration_since(std::time::Instant::now()),
+                    );
+                    if second_signal_ends_it(first, signal, since) {
+                        actions.exit(signal);
+                        return;
+                    }
+                    // A repeated hang-up or terminate while the clean quit
+                    // runs: the grace goes on.
+                    continue;
                 }
                 asked = Some((signal, std::time::Instant::now() + grace));
                 actions.quit(signal);
@@ -248,6 +269,23 @@ mod tests {
         // Watching twice is refused (one handler for the process).
         let (other, _) = channel();
         assert!(watch(&[libc::SIGUSR1], GRACE, Record(other)).is_err());
+    }
+
+    #[test]
+    fn a_repeated_hangup_or_terminate_lets_the_clean_quit_run() {
+        let soon = Duration::from_millis(500);
+        assert!(!second_signal_ends_it(libc::SIGHUP, libc::SIGTERM, soon));
+        assert!(!second_signal_ends_it(libc::SIGTERM, libc::SIGHUP, soon));
+        assert!(!second_signal_ends_it(libc::SIGINT, libc::SIGTERM, soon));
+        assert!(
+            second_signal_ends_it(libc::SIGINT, libc::SIGINT, soon),
+            "Ctrl-C twice"
+        );
+        assert!(second_signal_ends_it(
+            libc::SIGHUP,
+            libc::SIGTERM,
+            REPEAT_IGNORED
+        ));
     }
 
     extern "C" fn nothing(_: c_int) {}
