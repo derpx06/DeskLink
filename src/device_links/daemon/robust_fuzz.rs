@@ -406,7 +406,8 @@ fn hostile_contact_and_identity_bodies_never_panic() {
 
 /// The peer's feature types whose handlers keep their state in memory (the
 /// notes, contacts and folder stores are process-wide and installed by other
-/// tests, and clipboard, lock and sound handlers act on the machine).
+/// tests, clipboard, lock and sound handlers act on the machine, and sync.have, notes and contacts queue jobs on the
+/// process-wide desk worker, which other tests then find full).
 const SAFE_TYPES: &[&str] = &[
     PACKET_TYPE_ACTIVITY,
     PACKET_TYPE_BATTERY,
@@ -414,7 +415,6 @@ const SAFE_TYPES: &[&str] = &[
     PACKET_TYPE_NOTIFICATION,
     PACKET_TYPE_NOTIFICATION_REQUEST,
     PACKET_TYPE_TELEPHONY,
-    PACKET_TYPE_SYNC_HAVE,
     PACKET_TYPE_PING,
 ];
 
