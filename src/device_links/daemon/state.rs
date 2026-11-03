@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use super::handle::DaemonEvent;
 use crate::device_links::connection_log;
@@ -15,6 +16,10 @@ use serde_json::Value;
 /// Unpaired devices shown at once; more than any real LAN needs.
 const MAX_UNTRUSTED_VIEWS: usize = 32;
 
+/// When each unpaired card was last heard from (beacon or handshake).
+static UNTRUSTED_SEEN: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
 pub(crate) fn upsert_device(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     info: &DeviceInfo,
@@ -25,11 +30,37 @@ pub(crate) fn upsert_device(
         // Discovery beacons are unauthenticated: without a bound, spoofed ids
         // grew this map (and the UI list cloned from it each second) forever.
         // Known and trusted devices are always kept.
-        if !paired
-            && !devices.contains_key(&info.id)
-            && devices.values().filter(|device| !device.trusted).count() >= MAX_UNTRUSTED_VIEWS
-        {
-            return;
+        if !paired {
+            let mut seen = UNTRUSTED_SEEN
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !devices.contains_key(&info.id)
+                && devices.values().filter(|device| !device.trusted).count() >= MAX_UNTRUSTED_VIEWS
+            {
+                // Full of cards nobody has spoken for: the one heard from longest
+                // ago goes (a real phone beacons every few seconds and so stays).
+                // Spoofed ids could otherwise fill the cap for good and hide every
+                // new phone until restart. A card with a live link or a pair prompt
+                // is never the one.
+                let oldest = devices
+                    .iter()
+                    .filter(|(_, device)| {
+                        !device.trusted && device.status == DeviceStatus::Discovered
+                    })
+                    .min_by_key(|(id, _)| seen.get(*id).copied())
+                    .map(|(id, _)| id.clone());
+                match oldest {
+                    Some(id) => {
+                        devices.remove(&id);
+                        seen.remove(&id);
+                    }
+                    None => return,
+                }
+            }
+            if seen.len() >= 1024 {
+                seen.clear(); // bounded: forgotten cards just read as the oldest
+            }
+            seen.insert(info.id.clone(), Instant::now());
         }
         devices
             .entry(info.id.clone())
@@ -124,6 +155,9 @@ pub(crate) fn reconcile_connection_status(
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
     connections: &[DeviceConnection],
 ) {
+    // File writes and other locks wait until the `devices` lock is let go: the
+    // UI ticker takes it every second, so a slow disk here froze the window.
+    let mut after: Vec<AfterLock> = Vec::new();
     let Ok(mut devices) = devices.lock() else {
         return;
     };
@@ -140,7 +174,7 @@ pub(crate) fn reconcile_connection_status(
         connection_log::remember_name(device_id, &device.name);
         // The log is written where the transition happens; this only
         // catches one those paths missed (and repeats nothing).
-        connection_log::note_ready(device_id, ready);
+        after.push(AfterLock::Ready(device_id.clone(), ready));
         // Phone-owned caches (battery, media, notifications) go stale on
         // the edge: kept, shown as "last seen", acted on only once ready.
         if device.feature_transport_ready && !ready {
@@ -152,12 +186,12 @@ pub(crate) fn reconcile_connection_status(
                 // ...nor kept as "in a call" in the pause/resume bookkeeping:
                 // a phone that never comes back would block the resume for
                 // every other phone (I13).
-                crate::device_links::calls::hold_media(device_id, false);
+                after.push(AfterLock::ReleaseMedia(device_id.clone()));
             }
             // Its ongoing items are as old as the link: gone, and the phone
             // sends them again when it is back (its digest forgets them).
             if device.activity.take().is_some() {
-                crate::device_links::sync::forget_feature(device_id, "activity");
+                after.push(AfterLock::ForgetActivity(device_id.clone()));
             }
         } else if ready {
             device.last_seen = None;
@@ -216,6 +250,23 @@ pub(crate) fn reconcile_connection_status(
             device.verification_key = None;
         }
     }
+    drop(devices);
+    for work in after {
+        match work {
+            AfterLock::Ready(id, ready) => connection_log::note_ready(&id, ready),
+            AfterLock::ReleaseMedia(id) => crate::device_links::calls::hold_media(&id, false),
+            AfterLock::ForgetActivity(id) => {
+                crate::device_links::sync::forget_feature(&id, "activity")
+            }
+        }
+    }
+}
+
+/// What `reconcile_connection_status` does once it no longer holds `devices`.
+enum AfterLock {
+    Ready(String, bool),
+    ReleaseMedia(String),
+    ForgetActivity(String),
 }
 
 pub(super) fn update_pair_state(
@@ -1168,6 +1219,81 @@ mod tests {
         crate::device_links::calls::test_hold(&info.id);
         reconcile_connection_status(&devices, &[connection(false)]);
         assert!(!crate::device_links::calls::test_holds(&info.id));
+    }
+
+    fn stranger(id: &str) -> DeviceInfo {
+        DeviceInfo {
+            id: id.to_string(),
+            name: "Stranger".to_string(),
+            device_type: "phone".to_string(),
+            protocol_version: 9,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+            app_version: None,
+        }
+    }
+
+    #[test]
+    fn spoofed_cards_cannot_fill_the_list_for_good() {
+        let devices = Arc::new(Mutex::new(HashMap::new()));
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        let id = |n: usize| format!("{tag}-{n:03}");
+        // A real phone's card is heard from early; then a flood of invented ids.
+        upsert_device(&devices, &stranger(&id(0)), "10.0.0.2".into(), false);
+        for n in 1..=MAX_UNTRUSTED_VIEWS {
+            upsert_device(&devices, &stranger(&id(n)), "10.0.0.3".into(), false);
+        }
+        {
+            let devices = devices.lock().unwrap();
+            assert_eq!(devices.len(), MAX_UNTRUSTED_VIEWS, "the cap holds");
+            assert!(
+                !devices.contains_key(&id(0)),
+                "the card heard from longest ago made room"
+            );
+            assert!(
+                devices.contains_key(&id(MAX_UNTRUSTED_VIEWS)),
+                "the newest is listed"
+            );
+        }
+        // A real phone that beacons again is the newest, however many came before.
+        upsert_device(&devices, &stranger(&id(1)), "10.0.0.3".into(), false);
+        upsert_device(&devices, &stranger(&id(99)), "10.0.0.4".into(), false);
+        let devices = devices.lock().unwrap();
+        assert!(
+            devices.contains_key(&id(1)),
+            "a card that keeps beaconing stays"
+        );
+        assert!(!devices.contains_key(&id(2)));
+    }
+
+    #[test]
+    fn a_card_with_a_live_link_is_never_the_one_that_makes_room() {
+        let devices = Arc::new(Mutex::new(HashMap::new()));
+        let tag = uuid::Uuid::new_v4().simple().to_string();
+        for n in 0..MAX_UNTRUSTED_VIEWS {
+            upsert_device(
+                &devices,
+                &stranger(&format!("{tag}-{n:03}")),
+                "10.0.0.3".into(),
+                false,
+            );
+        }
+        for device in devices.lock().unwrap().values_mut() {
+            device.status = DeviceStatus::Connected;
+        }
+        upsert_device(
+            &devices,
+            &stranger(&format!("{tag}-new")),
+            "10.0.0.4".into(),
+            false,
+        );
+        let devices = devices.lock().unwrap();
+        assert_eq!(devices.len(), MAX_UNTRUSTED_VIEWS);
+        assert!(
+            !devices.contains_key(&format!("{tag}-new")),
+            "nothing evictable: refused"
+        );
     }
 
     #[test]

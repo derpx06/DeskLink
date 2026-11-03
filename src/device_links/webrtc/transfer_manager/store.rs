@@ -1125,6 +1125,25 @@ mod tests {
     }
 
     #[test]
+    fn collision_names_follow_the_shared_vectors() {
+        let f: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../testdata/filenames.json")).unwrap();
+        for (index, case) in f["unique"].as_array().unwrap().iter().enumerate() {
+            let (store, base) = store(&format!("shared-unique-{index}"));
+            for taken in case["taken"].as_array().unwrap() {
+                fs::write(base.join("downloads").join(taken.as_str().unwrap()), b"x").unwrap();
+            }
+            assert_eq!(
+                store
+                    .available_destination_name(case["name"].as_str().unwrap())
+                    .unwrap(),
+                case["out"].as_str().unwrap()
+            );
+            let _ = fs::remove_dir_all(base);
+        }
+    }
+
+    #[test]
     fn a_collision_suffix_never_pushes_the_name_past_the_filesystem_limit() {
         let (store, base) = store("long-collision");
         let stem = "x".repeat(251);

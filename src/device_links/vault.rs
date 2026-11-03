@@ -340,10 +340,20 @@ pub(crate) fn flush() {
     }
 }
 
+/// The log line for a save that failed: which file (its name, not its place or
+/// content) and why.
+fn save_failure(path: &Path, error: &str) -> String {
+    format!(
+        "Could not save the encrypted file {}: {error}",
+        path.file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+    )
+}
+
 /// Seals `plain` into `path` on the writer thread, so the caller (often the
 /// GTK thread: a note being typed) never waits on encryption or fsync. Only
 /// the latest contents per file are written.
-// A write still queued at shutdown is written by `flush()`.
+/// A write still queued at shutdown is written by `flush()`.
 pub(crate) fn seal_later(dir: &Path, path: &Path, aad: &[u8], plain: Vec<u8>) {
     static WAKE: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>> = std::sync::OnceLock::new();
     let wake = WAKE.get_or_init(|| {
@@ -361,10 +371,10 @@ pub(crate) fn seal_later(dir: &Path, path: &Path, aad: &[u8], plain: Vec<u8>) {
                         .and_then(|mut pending| pending.take())
                         .unwrap_or_default();
                     for (path, (dir, aad, plain)) in batch {
-                        if seal(&dir, &path, &aad, &plain).is_err() {
+                        if let Err(error) = seal(&dir, &path, &aad, &plain) {
                             crate::device_links::limits::log_limited(
                                 "vault-save",
-                                "Could not save an encrypted file",
+                                &save_failure(&path, &error),
                             );
                         }
                     }
@@ -377,10 +387,7 @@ pub(crate) fn seal_later(dir: &Path, path: &Path, aad: &[u8], plain: Vec<u8>) {
         if pending.len() >= MAX_PENDING_WRITES && !pending.contains_key(path) {
             // Never dropped: written here instead.
             if let Err(error) = seal(dir, path, aad, &plain) {
-                crate::device_links::limits::log_limited(
-                    "vault-save",
-                    &format!("Could not save an encrypted file: {error}"),
-                );
+                crate::device_links::limits::log_limited("vault-save", &save_failure(path, &error));
             }
             return;
         }
@@ -669,5 +676,18 @@ mod tests {
             "a file made of two writers' bytes"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_save_names_the_file_and_the_reason() {
+        let line = save_failure(
+            Path::new("/home/someone/.config/desklink/notes/notes.sealed"),
+            "disk full",
+        );
+        assert!(
+            line.contains("notes.sealed") && line.contains("disk full"),
+            "{line}"
+        );
+        assert!(!line.contains("someone"), "not the place: {line}");
     }
 }
