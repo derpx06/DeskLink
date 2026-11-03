@@ -61,11 +61,13 @@ fn subtitle(row: &TransferRow, device: &str) -> String {
     } else {
         format!("Sending to {device}")
     };
+    // The lane comes right after the direction: the line wraps on the card,
+    // and it used to be the tail that an ellipsis cut off.
     let lane = crate::device_links::webrtc::transfer_board::lane_of(&row.id)
         .map(|lane| format!(" · {lane}"))
         .unwrap_or_default();
     format!(
-        "{direction} · {} of {}{lane}",
+        "{direction}{lane} · {} of {}",
         crate::bucket_progress::size_words(row.done),
         crate::bucket_progress::size_words(row.total)
     )
@@ -1045,9 +1047,12 @@ fn new_row(daemon: &DaemonHandle, row: &TransferRow) -> RowWidgets {
     name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
     name.set_max_width_chars(16);
     words.append(&name);
+    // Wraps rather than ellipsizes: direction, lane, progress and rate do not
+    // fit one line of a 176 px card, and the lane was the part cut off.
     let subtitle = gtk::Label::builder()
         .xalign(0.0)
-        .ellipsize(gtk::pango::EllipsizeMode::End)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
         .max_width_chars(16)
         .css_classes(["caption", "text-dim", "numeric"])
         .build();
@@ -1110,6 +1115,31 @@ mod tests {
             subtitle(&paused, "Pixel"),
             "Paused — resumes when Pixel reconnects"
         );
+    }
+
+    /// The lane is what the row is for telling; it sits right after the
+    /// direction and the label wraps instead of cutting the tail with an
+    /// ellipsis (a 176 px card; down to a 360 px window it is the same card).
+    /// (Skipped without a display.)
+    #[test]
+    fn a_rows_lane_is_said_first_and_never_ellipsized() {
+        crate::test_display::run(|| {
+            let (daemon, _commands) = DaemonHandle::detached();
+            let mut moving = row(false, 113 << 20, 300 << 20);
+            moving.id = "lane-row".into();
+            use crate::device_links::webrtc::transfer_board as board;
+            assert!(board::begin(moving.clone()));
+            board::set_lane("lane-row", Some("fast lane"));
+            let text = subtitle(&moving, "emulator");
+            assert!(
+                text.starts_with("Sending to emulator · fast lane · "),
+                "{text}"
+            );
+            let shown = new_row(&daemon, &moving);
+            assert!(shown.subtitle.wraps());
+            assert_eq!(shown.subtitle.ellipsize(), gtk::pango::EllipsizeMode::None);
+            board::discard("lane-row");
+        });
     }
 
     /// A paused row (the link dropped mid-file) still has its Cancel button:
