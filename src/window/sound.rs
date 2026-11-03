@@ -4,7 +4,7 @@
 
 use adw::prelude::*;
 
-use super::{ellipsized, icon_square, text, DeviceView};
+use super::{icon_square, text, wrapped, DeviceView};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 
 fn send(daemon: &DaemonHandle, device: &DeviceView, what: &str, on: bool) {
@@ -45,7 +45,10 @@ pub(super) fn attach_menu(daemon: &DaemonHandle, device: &DeviceView, button: &g
         .margin_start(12)
         .margin_end(12)
         .build();
-    list.append(&text(&format!("Sound with {}", device.name), &["heading"]));
+    list.append(&wrapped(
+        &format!("Sound with {}", device.name),
+        &["heading"],
+    ));
     for (what, words) in [
         ("desk-sound", "Play this computer's sound there"),
         ("phone-mic", "Use it as this computer's microphone"),
@@ -96,8 +99,9 @@ fn bar(
         .hexpand(true)
         .valign(gtk::Align::Center)
         .build();
-    words.append(&ellipsized(&headline, &["heading"]));
-    words.append(&ellipsized(&detail, &["text-dim"]));
+    // What is in use, and by whom, wraps: it is what the bar is for.
+    words.append(&wrapped(&headline, &["heading"]));
+    words.append(&wrapped(&detail, &["text-dim"]));
     bar.append(&words);
     bar.update_property(&[gtk::accessible::Property::Label(&format!(
         "{headline}, {detail}"

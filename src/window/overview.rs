@@ -8,7 +8,7 @@ use adw::subclass::prelude::*;
 use super::{
     can_send_feature, card, clock_time, confirm, device_type_label, ellipsized, icon_button,
     icon_square, named_widgets, page_link, pick_and_send_files, session_summary, text, toast_from,
-    unavailable_reason, DesklinkWindow, QuickAction,
+    unavailable_reason, wrapped, DesklinkWindow, QuickAction,
 };
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::{DesktopSession, DeviceStatus, DeviceView};
@@ -164,7 +164,7 @@ fn activity_card(
         .spacing(10)
         .css_classes(["dl-card"])
         .build();
-    card.append(&text(
+    card.append(&wrapped(
         &format!("Happening on {}", device.name),
         &["heading"],
     ));
@@ -889,8 +889,8 @@ fn live_banner(
     if let Some(since) = since.filter(|since| !since.is_empty()) {
         detail.push_str(&format!(" · since {since}"));
     }
-    words.append(&ellipsized(&headline, &["heading"]));
-    let detail_label = ellipsized(&detail, &["text-dim"]);
+    words.append(&wrapped(&headline, &["heading"]));
+    let detail_label = wrapped(&detail, &["text-dim"]);
     detail_label.set_hexpand(true);
     words.append(&detail_label);
     banner.append(&words);
@@ -978,7 +978,10 @@ fn offline_row(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
     name.set_wrap(true);
     name.set_xalign(0.0);
     words.append(&name);
-    let detail = text("Your terminals keep running here", &["text-dim"]);
+    let detail = text(
+        "Check that DeskLink is open on it and it is on the same Wi-Fi. Your terminals keep running here.",
+        &["text-dim"],
+    );
     detail.set_wrap(true);
     detail.set_xalign(0.0);
     words.append(&detail);
@@ -1002,6 +1005,8 @@ fn reconnecting_row(device: &DeviceView) -> gtk::Box {
         .spacing(14)
         .css_classes(["state-banner", "tall"])
         .build();
+    // Under each other when the page is narrow, the words wrapping.
+    row.set_widget_name("responsive");
     let dots = gtk::Box::builder()
         .spacing(4)
         .valign(gtk::Align::Center)
@@ -1016,11 +1021,14 @@ fn reconnecting_row(device: &DeviceView) -> gtk::Box {
         );
     }
     row.append(&dots);
-    row.append(&text(
+    row.append(&wrapped(
         &format!("Reconnecting to {}", device.name),
         &["heading"],
     ));
-    let detail = ellipsized("Setting up the encrypted connection", &["text-dim"]);
+    let detail = wrapped(
+        "Setting up a secure connection. This takes a few seconds.",
+        &["text-dim"],
+    );
     detail.set_hexpand(true);
     row.append(&detail);
     row
@@ -1089,7 +1097,8 @@ fn feature_card(
         head.append(end);
     }
     card.append(&head);
-    card.append(&gtk::Box::builder().vexpand(true).build());
+    // At least a gap, for a card whose bottom is taller than its height.
+    card.append(&gtk::Box::builder().vexpand(true).height_request(12).build());
     card.append(bottom);
     card
 }
@@ -1276,7 +1285,9 @@ fn transfer_progress(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
+    // The middle goes, so the kind of file at the end stays.
     let name = ellipsized(&row.name, &["mono"]);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
     name.set_hexpand(true);
     line.append(&name);
     let label = text(&progress_words(&row), &["caption", "text-dim"]);
@@ -1367,7 +1378,7 @@ fn glide_bar(device: &DeviceView) -> gtk::Box {
         .build();
     let headline = format!("Controlling {}", device.name);
     let detail = "This mouse and keyboard are on the phone. Esc+Super to return.";
-    words.append(&ellipsized(&headline, &["heading"]));
+    words.append(&wrapped(&headline, &["heading"]));
     let detail_label = text(detail, &["text-dim"]);
     detail_label.set_wrap(true);
     detail_label.set_xalign(0.0);
@@ -1448,6 +1459,38 @@ mod activity_tests {
             .collect();
         found.sort();
         found.into_iter().map(|(_, label)| label).collect()
+    }
+
+    /// The banners that say what is wrong with the connection wrap onto more
+    /// lines, never end in an ellipsis: a long phone name must not hide the
+    /// reason or the way out. (Needs a display.)
+    #[test]
+    fn the_connection_banners_wrap_instead_of_cutting_their_words() {
+        crate::test_display::run(|| {
+            let info = crate::device_links::device_info::DeviceInfo::local(
+                "p".into(),
+                "A phone with a name that goes on and on and on".into(),
+            );
+            let device = DeviceView::from_info(&info, "10.0.0.2".into(), true);
+            let (daemon, _commands) = crate::device_links::daemon::DaemonHandle::detached();
+            for banner in [reconnecting_row(&device), offline_row(&daemon, &device)] {
+                let labels = named_widgets(banner.upcast_ref(), "")
+                    .into_iter()
+                    .filter_map(|w| w.downcast::<gtk::Label>().ok())
+                    .filter(|label| label.label().chars().count() > 12)
+                    .collect::<Vec<_>>();
+                assert!(!labels.is_empty());
+                for label in labels {
+                    assert!(label.wraps(), "{} wraps", label.label());
+                    assert_eq!(
+                        label.ellipsize(),
+                        gtk::pango::EllipsizeMode::None,
+                        "{} is not cut",
+                        label.label()
+                    );
+                }
+            }
+        });
     }
 
     /// The card names the phone, shows each item, and its countdown and bar

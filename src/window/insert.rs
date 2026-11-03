@@ -5,7 +5,7 @@
 
 use adw::prelude::*;
 
-use super::{ellipsized, icon_square, DeviceView};
+use super::{icon_square, wrapped, DeviceView};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 
 /// What each row asks for: kind, target, label, icon.
@@ -113,9 +113,9 @@ pub(super) fn bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Box
             "Continue on the phone".to_string(),
         )
     };
-    words.append(&ellipsized(&headline, &["heading"]));
+    words.append(&wrapped(&headline, &["heading"]));
     if !detail.is_empty() {
-        words.append(&ellipsized(&detail, &["text-dim"]));
+        words.append(&wrapped(&detail, &["text-dim"]));
     }
     bar.append(&words);
     bar.update_property(&[gtk::accessible::Property::Label(&format!(
