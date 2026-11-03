@@ -1958,10 +1958,13 @@ fn friendly_error(raw: &str) -> (String, bool) {
              by scanning the QR code: the old pairing is replaced.",
             true,
         )
-    } else if has(&["clocks of this computer"]) {
+    } else if has(&[
+        "clocks of this computer and the phone",
+        "expired desklink webrtc signaling",
+    ]) {
         (
-            "This computer's clock and the phone's clock are far apart. Set the date and time \
-             on both to automatic, then pair again.",
+            "This computer's clock and the phone's clock are more than 5 minutes apart. Set the \
+             clock of the phone or computer to automatic, then try again.",
             false,
         )
     } else if has(&["too many wrong qr", "malformed qr"]) {
@@ -3556,6 +3559,7 @@ mod tests {
         // The pairing refusals are sentences, not the daemon's wording.
         for raw in [
             crate::device_links::pairing::CLOCKS_DIFFER,
+            "Expired DeskLink WebRTC signaling message: the two devices' clocks differ by more than 5 minutes; enable automatic time on both",
             "Too many wrong QR pairing proofs from this device",
             "Malformed QR pairing proof",
             "Too many links are waiting to pair by QR code",

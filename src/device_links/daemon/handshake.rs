@@ -75,7 +75,7 @@ pub(super) fn finish_secure_link(
         .public_key_to_der()
         .map_err(|err| err.to_string())?;
     let pinned = validate_pinned_certificate(&config, &secure_info.id, &cert);
-    let qr_code = crate::device_links::pairing_qr::current_uri();
+    let qr_code = crate::device_links::pairing_qr::live_generation();
     let new_certificate = certificate_admission(pinned, qr_code.is_some())?;
     if !new_certificate {
         let from = stream
@@ -479,7 +479,7 @@ fn admit_qr_only(
     link: SessionLink,
     transport: Arc<dyn crate::device_links::core::LinkTransport>,
     address: String,
-    code: String,
+    code: u64,
     context: QrContext,
 ) -> Result<(), String> {
     use std::sync::atomic::Ordering;
@@ -501,7 +501,7 @@ fn admit_qr_only(
         }
         let _slot = Slot;
         let deadline = std::time::Instant::now() + QR_ONLY_DEADLINE;
-        serve_qr_only(link, transport, address, &code, deadline, context);
+        serve_qr_only(link, transport, address, code, deadline, context);
     });
     Ok(())
 }
@@ -521,14 +521,14 @@ pub(super) fn serve_qr_only(
     link: SessionLink,
     transport: Arc<dyn crate::device_links::core::LinkTransport>,
     address: String,
-    code: &str,
+    code: u64,
     deadline: std::time::Instant,
     context: QrContext,
 ) {
     use crate::device_links::core::ReadOutcome;
     let mut line = Vec::new();
     while std::time::Instant::now() < deadline
-        && crate::device_links::pairing_qr::current_uri().as_deref() == Some(code)
+        && crate::device_links::pairing_qr::live_generation() == Some(code)
     {
         match link.read_byte_at(0) {
             Ok(ReadOutcome::Byte(byte)) => {

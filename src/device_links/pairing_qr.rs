@@ -50,9 +50,20 @@ struct Pending {
     /// this computer's addresses change while the code is on screen.
     desktop_id: String,
     fp: [u8; 32],
+    generation: u64,
 }
 
 static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
+
+/// Identifies one code. Bumped by [`start`] and [`cancel`] and by nothing
+/// else, so a link admitted for a code can tell that *that* code is still the
+/// live one even after [`refresh_addresses`] gave it a new address list (the
+/// URI text changes then; the generation does not).
+static GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_generation() -> u64 {
+    GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+}
 
 /// The secret of the code that was last replaced, withdrawn or let expire, so
 /// a phone that scans it afterwards is told it *expired* (and the person is
@@ -137,6 +148,7 @@ pub fn start(
         uri: uri.clone(),
         desktop_id: desktop_id.to_string(),
         fp,
+        generation: next_generation(),
     });
     Ok(uri)
 }
@@ -206,6 +218,18 @@ pub fn cancel() {
         }
         *pending = None;
     }
+    next_generation();
+}
+
+/// The generation of the live, unexpired code, or `None` when there is none.
+/// A QR-only link holds the generation it was admitted under and lives while
+/// this still returns it.
+pub fn live_generation() -> Option<u64> {
+    let pending = PENDING.lock().ok()?;
+    pending
+        .as_ref()
+        .filter(|pending| pending.expires_at > Instant::now())
+        .map(|pending| pending.generation)
 }
 
 /// The URI of the live, unexpired code, for the UI to render.
@@ -425,6 +449,7 @@ mod tests {
         );
         let first = start("desk", b"cert", Some("192.0.2.1:1716".into()), &old, 1716).unwrap();
         let secret = live_secret().unwrap();
+        let generation = live_generation().unwrap();
         assert!(
             !refresh_addresses(Some("192.0.2.1:1716".into()), &old, 1716),
             "same: no change"
@@ -437,14 +462,24 @@ mod tests {
             "{second}"
         );
         assert_eq!(live_secret(), Some(secret), "the same code");
+        assert_eq!(live_generation(), Some(generation), "the same generation");
         // A phone that scanned the first picture still pairs.
         let mac = URL_SAFE_NO_PAD
             .encode(proof(&secret, "desk", "phone", &desktop_fp, &phone_fp).unwrap());
         assert!(verify("desk", "phone", &desktop_fp, &phone_fp, &mac).is_ok());
+        // A new code is a new generation, and so is none after a withdrawal.
+        start("desk", b"cert", None, &old, 1716).unwrap();
+        assert_ne!(live_generation(), Some(generation));
+        let second = live_generation().unwrap();
+        cancel();
+        assert_eq!(live_generation(), None);
+        start("desk", b"cert", None, &old, 1716).unwrap();
+        assert_ne!(live_generation(), Some(second));
         // An expired code is not revived.
         start("desk", b"cert", None, &old, 1716).unwrap();
         expire_live_for_test();
         assert!(!refresh_addresses(None, &new, 1716));
+        assert_eq!(live_generation(), None, "an expired code has no generation");
         cancel();
     }
 

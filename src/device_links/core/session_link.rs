@@ -217,9 +217,10 @@ impl SessionLink {
     pub fn pairing_transport(
         &self,
     ) -> crate::device_links::pairing_transport::PairingTransportKind {
-        self.transport()
-            .map(|transport| transport.pairing_transport())
-            .unwrap_or(crate::device_links::pairing_transport::PairingTransportKind::Lan)
+        // The carrier's own answer, closed link or not: failing open to the
+        // LAN here would let a relay link that has just closed pass a pairing
+        // packet that was already queued behind it.
+        self.carrier().pairing_transport()
     }
 
     pub fn verification_key(&self, timestamp: i64) -> String {

@@ -42,14 +42,16 @@ pub fn flag_open(compiled: bool, requested: bool) -> bool {
 
 /// Whether pairing may travel off the LAN in this run.
 pub fn off_lan_pairing_enabled() -> bool {
-    flag_open(
-        OFF_LAN_PAIRING_COMPILED,
-        super::config::app_settings()
-            .extra
-            .get(OFF_LAN_SETTING)
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false),
-    )
+    // Short-circuits: a shipped build never reads (or clones) the settings.
+    OFF_LAN_PAIRING_COMPILED
+        && flag_open(
+            true,
+            super::config::app_settings()
+                .extra
+                .get(OFF_LAN_SETTING)
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+        )
 }
 
 /// Whether `packet` may cross a link of `kind`. Every pairing packet the
