@@ -12,6 +12,13 @@ enum Side {
 }
 
 impl Side {
+    fn id(self) -> &'static str {
+        match self {
+            Side::Desk => "desk",
+            Side::Phone => "phone",
+        }
+    }
+
     fn other(self) -> Side {
         match self {
             Side::Desk => Side::Phone,
@@ -20,10 +27,41 @@ impl Side {
     }
 }
 
+/// Carries `packets` from `x` (called `x_id` by `y`) to `y` and everything
+/// that comes back, until quiet. `drop_acks` loses every acknowledgement.
+fn pump(
+    x: &mut Shelf,
+    x_id: &str,
+    y: &mut Shelf,
+    y_id: &str,
+    packets: Vec<NetworkPacket>,
+    drop_acks: bool,
+) {
+    // true: heading to y.
+    let mut queue: VecDeque<(bool, NetworkPacket)> =
+        packets.into_iter().map(|packet| (true, packet)).collect();
+    while let Some((to_y, packet)) = queue.pop_front() {
+        // What crosses is what the wire carries.
+        let packet = NetworkPacket::deserialize(&packet.serialize().unwrap()).unwrap();
+        let (answers, _) = if to_y {
+            handle_from(y, Kind::Notes, &packet, x_id)
+        } else {
+            handle_from(x, Kind::Notes, &packet, y_id)
+        };
+        queue.extend(
+            answers
+                .into_iter()
+                .filter(|answer| !(drop_acks && answer.get_str("op") == Some("ack")))
+                .map(|answer| (!to_y, answer)),
+        );
+    }
+}
+
 struct World {
     desk: Shelf,
     phone: Shelf,
     linked: bool,
+    drop_acks: bool,
 }
 
 impl World {
@@ -32,6 +70,7 @@ impl World {
             desk: Shelf::default(),
             phone: Shelf::default(),
             linked: false,
+            drop_acks: false,
         }
     }
 
@@ -56,12 +95,11 @@ impl World {
     }
 
     fn deliver(&mut self, from: Side, packets: Vec<NetworkPacket>) {
-        let mut queue: VecDeque<(Side, NetworkPacket)> =
-            packets.into_iter().map(|packet| (from, packet)).collect();
-        while let Some((from, packet)) = queue.pop_front() {
-            let to = from.other();
-            let (answers, _) = handle(self.shelf(to), Kind::Notes, &packet);
-            queue.extend(answers.into_iter().map(|answer| (to, answer)));
+        let drop_acks = self.drop_acks;
+        let World { desk, phone, .. } = self;
+        match from {
+            Side::Desk => pump(desk, "desk", phone, "phone", packets, drop_acks),
+            Side::Phone => pump(phone, "phone", desk, "desk", packets, drop_acks),
         }
     }
 
@@ -83,6 +121,8 @@ impl World {
             return;
         }
         let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        // What a push records (see `push`).
+        sent_to(self.shelf(side), Kind::Notes, &ids, side.other().id());
         let values = item_values(self.shelf(side), Kind::Notes, &ids);
         let packets = items_packets(Kind::Notes, values);
         self.deliver(side, packets);
@@ -395,13 +435,13 @@ fn acks_are_ignored_by_what_does_not_know_them_and_never_move_synced_back() {
     let first = shelf.notes[&id].modified;
     edit_from_in_shelf(&mut shelf, &id, None, |n| n.body = "b".into()).unwrap();
     let second = shelf.notes[&id].modified;
-    assert!(acknowledge(&mut shelf, &id, second));
-    assert!(!acknowledge(&mut shelf, &id, first), "never backwards");
+    assert!(acknowledge(&mut shelf, &id, second, "p"));
+    assert!(!acknowledge(&mut shelf, &id, first, "p"), "never backwards");
     assert!(
-        !acknowledge(&mut shelf, &id, 12345),
+        !acknowledge(&mut shelf, &id, 12345, "p"),
         "not a version of ours"
     );
-    assert!(!acknowledge(&mut shelf, "nope", second));
+    assert!(!acknowledge(&mut shelf, "nope", second, "p"));
     assert_eq!(shelf.synced[&id], second);
     let mut ack = NetworkPacket::new(PACKET_TYPE_SNIPPETS);
     ack.set("op", "ack");
@@ -450,7 +490,7 @@ fn duplicate_copies_go_and_copies_with_their_own_text_stay() {
         let copy = copy_of(&base, title, body, modified);
         shelf.notes.insert(copy.id.clone(), copy);
     }
-    let before_texts: Vec<(String, String)> = live_texts(&shelf);
+    let unique_before = unique_texts(&shelf);
     // Automatic: only those equal to the note or to another copy of it.
     let removed = remove_duplicates_in(&mut shelf, false);
     assert_eq!(removed.len(), 2, "{removed:?}");
@@ -461,16 +501,9 @@ fn duplicate_copies_go_and_copies_with_their_own_text_stay() {
         "differs by a character"
     );
     assert!(!shelf.notes[&format!("{id}~14")].deleted, "another title");
-    // Every distinct text that was there is still there.
-    let after: Vec<(String, String)> = live_texts(&shelf);
-    for text in &before_texts {
-        assert!(
-            after.contains(text)
-                || *text == key
-                || before_texts.iter().filter(|t| *t == text).count() > 1
-        );
-    }
-    assert!(after.contains(&key));
+    // Every distinct text that was there is still there, and nothing new appeared.
+    assert_eq!(unique_texts(&shelf), unique_before);
+    assert!(live_texts(&shelf).contains(&key));
     // Nothing more to do, and a tombstone is a normal one (it syncs).
     assert!(remove_duplicates_in(&mut shelf, true).is_empty());
     let tombstone = &shelf.notes[&format!("{id}~11")];
@@ -581,4 +614,400 @@ fn two_edits_in_the_same_millisecond_are_siblings_not_the_same_version() {
         assert_eq!(world.copies(side), 1, "{side:?}");
     }
     world.assert_same_notes();
+}
+
+/// Every distinct (title, body) the live notes say, copies by what they kept.
+fn unique_texts(shelf: &Shelf) -> std::collections::BTreeSet<(String, String)> {
+    shelf
+        .notes
+        .values()
+        .filter(|note| !note.deleted)
+        .map(|note| {
+            let (title, body) = content_key(note);
+            (title, body.to_string())
+        })
+        .collect()
+}
+
+// ── Two phones, lost and late acknowledgements ─────────────────────────────
+
+fn nap() {
+    // Two saves never share a millisecond; a test would.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+}
+
+/// The desk and one phone exchange their indexes, and what they ask for.
+fn sync_with(desk: &mut Shelf, phone: &mut Shelf, phone_id: &str) {
+    let packets = index_packets(desk, Kind::Notes);
+    pump(desk, "desk", phone, phone_id, packets, false);
+    let packets = index_packets(phone, Kind::Notes);
+    pump(phone, phone_id, desk, "desk", packets, false);
+}
+
+/// The desk pushes note `id` to one phone.
+fn push_to(desk: &mut Shelf, phone: &mut Shelf, phone_id: &str, id: &str) {
+    let ids = vec![id.to_string()];
+    sent_to(desk, Kind::Notes, &ids, phone_id);
+    let packets = items_packets(Kind::Notes, item_values(desk, Kind::Notes, &ids));
+    pump(desk, "desk", phone, phone_id, packets, false);
+}
+
+fn edit_body(shelf: &mut Shelf, id: &str, body: &str) {
+    nap();
+    let body = body.to_string();
+    edit_from_in_shelf(shelf, id, None, |note| note.body = body).unwrap();
+}
+
+fn copies_in(shelf: &Shelf) -> usize {
+    shelf
+        .notes
+        .values()
+        .filter(|note| !note.deleted && is_copy(note))
+        .count()
+}
+
+/// The desk is the side with several phones: one that was away through many edits,
+/// while another kept acknowledging, still finds the next version continues its own.
+#[test]
+fn a_phone_away_through_many_edits_is_not_a_rival_when_another_phone_acknowledged() {
+    let (mut desk, mut a, mut b) = (Shelf::default(), Shelf::default(), Shelf::default());
+    let id = create_in_shelf(&mut desk, "v0").unwrap();
+    sync_with(&mut desk, &mut a, "a");
+    sync_with(&mut desk, &mut b, "b");
+    // B is away; A takes and acknowledges every edit.
+    for n in 1..=12 {
+        edit_body(&mut desk, &id, &format!("v{n}"));
+        push_to(&mut desk, &mut a, "a", &id);
+    }
+    assert_eq!(a.notes[&id].body, "v12");
+    sync_with(&mut desk, &mut b, "b");
+    for (name, shelf) in [("desk", &desk), ("a", &a), ("b", &b)] {
+        assert_eq!(copies_in(shelf), 0, "{name}");
+        assert_eq!(shelf.notes[&id].body, "v12", "{name}");
+    }
+    // And the other way round: A away, B present, then A edits from its old version
+    // while the desk moved on: a real conflict, exactly one copy everywhere.
+    for n in 13..=24 {
+        edit_body(&mut desk, &id, &format!("v{n}"));
+        push_to(&mut desk, &mut b, "b", &id);
+    }
+    edit_body(&mut a, &id, "a says");
+    sync_with(&mut desk, &mut a, "a");
+    sync_with(&mut desk, &mut b, "b");
+    assert_eq!(copies_in(&desk), 1);
+    assert_eq!(copies_in(&a), 1);
+    assert_eq!(copies_in(&b), 1);
+}
+
+#[test]
+fn a_lost_acknowledgement_and_many_edits_are_still_one_sided() {
+    let mut world = World::new();
+    let id = world.create(Side::Desk, "v0");
+    world.connect();
+    // The phone takes v1; its acknowledgement never arrives.
+    world.drop_acks = true;
+    world.edit(Side::Desk, &id, "v1");
+    world.push(Side::Desk, &[&id]);
+    world.drop_acks = false;
+    assert_eq!(world.phone.notes[&id].body, "v1");
+    world.disconnect();
+    for n in 2..=12 {
+        world.edit(Side::Desk, &id, &format!("v{n}"));
+    }
+    world.connect();
+    world.assert_no_copies();
+    world.assert_same_notes();
+    assert_eq!(world.live(Side::Phone)[0].body, "v12");
+}
+
+#[test]
+fn an_acknowledgement_does_not_hide_a_real_concurrent_edit() {
+    // Ack, then both edit from what was acknowledged: still a conflict, one copy.
+    let mut world = World::new();
+    let id = world.create(Side::Desk, "base");
+    world.connect();
+    world.edit(Side::Desk, &id, "d1");
+    world.push(Side::Desk, &[&id]);
+    world.disconnect();
+    world.edit(Side::Desk, &id, "d2");
+    world.edit(Side::Phone, &id, "p1");
+    world.connect();
+    for side in SIDES {
+        assert_eq!(world.copies(side), 1, "{side:?}");
+    }
+    world.assert_same_notes();
+}
+
+#[test]
+fn a_late_acknowledgement_names_an_older_version_of_the_chain_and_conflicts_stay_real() {
+    let (mut desk, mut phone) = (Shelf::default(), Shelf::default());
+    let id = create_in_shelf(&mut desk, "base").unwrap();
+    sync_with(&mut desk, &mut phone, "p");
+    edit_body(&mut desk, &id, "d1");
+    let d1 = desk.notes[&id].modified;
+    let ids = vec![id.clone()];
+    sent_to(&mut desk, Kind::Notes, &ids, "p");
+    let items = items_packets(Kind::Notes, item_values(&desk, Kind::Notes, &ids));
+    // The phone takes d1 and answers; the answer is held back.
+    let (mut answers, _) = handle_from(&mut phone, Kind::Notes, &items[0], "desk");
+    let ack = answers.pop().unwrap();
+    assert_eq!(ack.get_str("op"), Some("ack"));
+    // Meanwhile the desk edits again.
+    edit_body(&mut desk, &id, "d2");
+    // The late acknowledgement arrives: the phone holds d1 (not d2).
+    handle_from(&mut desk, Kind::Notes, &ack, "p");
+    assert_eq!(desk.held[&id]["p"], d1);
+    // The phone edits from d1 while the desk made d2: a real conflict.
+    edit_body(&mut phone, &id, "p1");
+    sync_with(&mut desk, &mut phone, "p");
+    assert_eq!(copies_in(&desk), 1);
+    assert_eq!(copies_in(&phone), 1);
+    // And the ack never goes backwards: an older one after a newer changes nothing.
+    let held = desk.held.clone();
+    let stale = {
+        let mut packet = NetworkPacket::new(PACKET_TYPE_NOTES);
+        packet.set("op", "ack");
+        packet.set("items", json!([{"id": id, "modified": d1 - 1}]));
+        packet
+    };
+    handle_from(&mut desk, Kind::Notes, &stale, "p");
+    assert_eq!(desk.held, held);
+}
+
+/// Real packets, the whole path: items out, serialized, the ack back, serialized.
+#[test]
+fn the_acknowledgement_travels_the_real_handle_path() {
+    let (mut desk, mut phone) = (Shelf::default(), Shelf::default());
+    let id = create_in_shelf(&mut desk, "hello").unwrap();
+    let modified = desk.notes[&id].modified;
+    let items = items_packets(
+        Kind::Notes,
+        item_values(&desk, Kind::Notes, std::slice::from_ref(&id)),
+    );
+    let wire =
+        |packet: &NetworkPacket| NetworkPacket::deserialize(&packet.serialize().unwrap()).unwrap();
+    let (answers, changed) = handle_from(&mut phone, Kind::Notes, &wire(&items[0]), "desk");
+    assert!(changed);
+    let ack = answers
+        .iter()
+        .find(|p| p.get_str("op") == Some("ack"))
+        .expect("an ack");
+    assert_eq!(ack.packet_type, PACKET_TYPE_NOTES);
+    assert_eq!(ack.body["items"], json!([{"id": id, "modified": modified}]));
+    assert!(desk.held.is_empty());
+    let (back, desk_changed) = handle_from(&mut desk, Kind::Notes, &wire(ack), "phone");
+    assert!(back.is_empty() && desk_changed);
+    assert_eq!(desk.held[&id]["phone"], modified);
+    // The same again changes nothing (and asks for nothing).
+    let (back, desk_changed) = handle_from(&mut desk, Kind::Notes, &wire(ack), "phone");
+    assert!(back.is_empty() && !desk_changed);
+    // A snippet shelf never acknowledges.
+    let mut snippet = NetworkPacket::new(PACKET_TYPE_SNIPPETS);
+    snippet.set("op", "items");
+    snippet.set("items", json!([{"id": "s", "text": "t", "modified": 5}]));
+    let (answers, _) = handle_from(&mut phone, Kind::Snippets, &snippet, "desk");
+    assert!(answers.iter().all(|p| p.get_str("op") != Some("ack")));
+}
+
+#[test]
+fn what_a_phone_held_is_forgotten_when_it_is_unpaired() {
+    let (mut desk, mut phone) = (Shelf::default(), Shelf::default());
+    let id = create_in_shelf(&mut desk, "x").unwrap();
+    sync_with(&mut desk, &mut phone, "p");
+    assert!(desk.held.contains_key(&id) || desk.sent.contains_key(&id));
+    desk.forget_phone("p");
+    assert!(desk.held.is_empty() && desk.sent.is_empty());
+}
+
+// ── An editor over a note that changed underneath it ───────────────────────
+
+#[test]
+fn text_typed_over_a_note_deleted_underneath_is_kept_and_brings_it_back() {
+    let mut shelf = Shelf::default();
+    let id = create_in_shelf(&mut shelf, "mine").unwrap();
+    let loaded = shelf.notes[&id].modified;
+    // The phone deletes it while the editor is open.
+    nap();
+    edit_from_in_shelf(&mut shelf, &id, None, |note| note.deleted = true).unwrap();
+    nap();
+    let (changed, copy) = edit_from_in_shelf(&mut shelf, &id, Some(loaded), |note| {
+        note.body = "typed after".into()
+    })
+    .unwrap();
+    assert!(changed);
+    assert!(copy.is_none(), "no copy of a tombstone");
+    let note = &shelf.notes[&id];
+    assert!(!note.deleted && note.body == "typed after");
+    assert_eq!(shelf.notes.len(), 1, "no junk 'New Note (conflicted copy)'");
+    // Deleting again an already deleted note stays a deletion.
+    edit_from_in_shelf(&mut shelf, &id, None, |note| note.deleted = true).unwrap();
+    nap();
+    let (changed, _) =
+        edit_from_in_shelf(&mut shelf, &id, None, |note| note.deleted = true).unwrap();
+    assert!(!changed);
+    assert!(shelf.notes[&id].deleted);
+}
+
+#[test]
+fn saving_an_unchanged_editor_over_a_newer_version_changes_nothing() {
+    let mut shelf = Shelf::default();
+    let id = create_in_shelf(&mut shelf, "same").unwrap();
+    let loaded = shelf.notes[&id].modified;
+    nap();
+    edit_from_in_shelf(&mut shelf, &id, None, |note| note.body = "phone's".into()).unwrap();
+    let before = shelf.notes.clone();
+    let (changed, copy) = edit_from_in_shelf(&mut shelf, &id, Some(loaded), |_| {}).unwrap();
+    assert!(!changed && copy.is_none());
+    assert_eq!(shelf.notes, before);
+}
+
+// ── Empty notes, pins, titles ──────────────────────────────────────────────
+
+#[test]
+fn an_empty_never_edited_note_is_not_in_the_index_until_it_is_written_in() {
+    let mut shelf = Shelf::default();
+    let blank = create_in_shelf(&mut shelf, "").unwrap();
+    let spaces = create_in_shelf(&mut shelf, " \n").unwrap();
+    let written = create_in_shelf(&mut shelf, "text").unwrap();
+    let listed = |shelf: &Shelf| -> Vec<String> {
+        index_entries(shelf, Kind::Notes)
+            .iter()
+            .filter_map(|entry| entry["id"].as_str().map(str::to_string))
+            .collect()
+    };
+    assert_eq!(listed(&shelf), vec![written.clone()]);
+    // Fetching it by id still answers, and its first edit lists it.
+    assert_eq!(
+        item_values(&shelf, Kind::Notes, std::slice::from_ref(&blank)).len(),
+        1
+    );
+    edit_body(&mut shelf, &blank, "now it has words");
+    assert!(listed(&shelf).contains(&blank));
+    assert!(!listed(&shelf).contains(&spaces));
+    // One that was written in and emptied again is a real note and is listed.
+    edit_body(&mut shelf, &blank, "");
+    assert!(listed(&shelf).contains(&blank));
+}
+
+#[test]
+fn a_pinned_duplicate_pins_the_note_that_stays() {
+    let mut shelf = Shelf::default();
+    let id = create_in_shelf(&mut shelf, "Plan\nbody").unwrap();
+    let base = shelf.notes[&id].clone();
+    let mut copy = copy_of(&base, "Plan", "Plan\nbody", 51);
+    copy.pinned = true;
+    shelf.notes.insert(copy.id.clone(), copy.clone());
+    let changed = remove_duplicates_in(&mut shelf, false);
+    assert!(
+        changed.contains(&copy.id) && changed.contains(&id),
+        "{changed:?}"
+    );
+    assert!(shelf.notes[&copy.id].deleted);
+    assert!(shelf.notes[&id].pinned, "the pin moved to the survivor");
+    // Copy of a copy chain: the pin ends on what stays.
+    let mut shelf = Shelf::default();
+    let id = create_in_shelf(&mut shelf, "Plan\nbody").unwrap();
+    let base = shelf.notes[&id].clone();
+    let first = copy_of(&base, "Plan", "Plan\nbody", 61);
+    let mut second = copy_of(&base, "Plan", "Plan\nbody", 62);
+    second.pinned = true;
+    shelf.notes.insert(first.id.clone(), first);
+    shelf.notes.insert(second.id.clone(), second);
+    remove_duplicates_in(&mut shelf, false);
+    assert!(shelf.notes[&id].pinned);
+}
+
+#[test]
+fn titles_are_compared_whole_and_trimmed_alike_on_both_sides() {
+    // A 100-character title and a copy that only kept its first 80: not duplicates.
+    let mut shelf = Shelf::default();
+    let id = create_in_shelf(&mut shelf, "body").unwrap();
+    shelf.notes.get_mut(&id).unwrap().title = "a".repeat(100);
+    let base = shelf.notes[&id].clone();
+    let copy = copy_of(&base, &"a".repeat(80), "body", 71);
+    shelf.notes.insert(copy.id.clone(), copy);
+    assert!(remove_duplicates_in(&mut shelf, true).is_empty());
+    // The trimmed characters are an explicit set (the phone trims the same).
+    let note = |title: &str, body: &str| Note {
+        title: title.into(),
+        body: body.into(),
+        ..create_note_for_test()
+    };
+    assert_eq!(note("\u{a0}Hi\u{3000}", "").label(), "Hi");
+    assert_eq!(note("", "\u{a0}# Head \u{2028}\nrest").label(), "# Head");
+    assert_eq!(note("", "\r\n  \n- item").label(), "item");
+    assert_eq!(
+        note("\u{85}x\u{85}", "").label(),
+        "\u{85}x\u{85}",
+        "U+0085 is not trimmed"
+    );
+}
+
+fn create_note_for_test() -> Note {
+    let mut shelf = Shelf::default();
+    let id = create_in_shelf(&mut shelf, "").unwrap();
+    shelf.notes.remove(&id).unwrap()
+}
+
+#[test]
+fn both_sides_clearing_the_same_duplicates_at_once_agree() {
+    let mut world = World::new();
+    let id = world.create(Side::Desk, "Plan\nbody");
+    world.connect();
+    let base = world.desk.notes[&id].clone();
+    for modified in 81..=86 {
+        let copy = copy_of(&base, "Plan", "Plan\nbody", modified);
+        world.desk.notes.insert(copy.id.clone(), copy.clone());
+        world.phone.notes.insert(copy.id.clone(), copy);
+    }
+    let unique = copy_of(&base, "Plan", "Plan\nbody v2", 87);
+    world.desk.notes.insert(unique.id.clone(), unique.clone());
+    world.phone.notes.insert(unique.id.clone(), unique.clone());
+    world.disconnect();
+    // Each side tidies on its own, a moment apart.
+    assert_eq!(remove_duplicates_in(&mut world.desk, false).len(), 6);
+    nap();
+    assert_eq!(remove_duplicates_in(&mut world.phone, false).len(), 6);
+    world.connect();
+    for side in SIDES {
+        let live = world.live(side);
+        assert_eq!(live.len(), 2, "{side:?}");
+        assert!(live.iter().any(|n| n.id == unique.id));
+    }
+    world.assert_same_notes();
+    // Nothing comes back by syncing again.
+    world.disconnect();
+    world.connect();
+    world.assert_same_notes();
+    assert_eq!(world.live(Side::Desk).len(), 2);
+}
+
+// ── Speed ──────────────────────────────────────────────────────────────────
+
+#[test]
+fn finding_duplicates_in_a_big_shelf_is_quick() {
+    let mut shelf = Shelf::default();
+    let filler = |n: usize, tag: &str| format!("{tag}{n} {}", "word ".repeat(400));
+    for n in 0..200 {
+        let id = create_in_shelf(&mut shelf, &filler(n, "note")).unwrap();
+        if n < 150 {
+            // 300 copies: two per note for 150 notes, each as long as its note.
+            let base = shelf.notes[&id].clone();
+            for modified in [1000 + n as i64, 2000 + n as i64] {
+                let copy = copy_of(&base, &base.label(), &base.body, modified);
+                shelf.notes.insert(copy.id.clone(), copy);
+            }
+        }
+    }
+    assert_eq!(shelf.notes.len(), 500);
+    let start = std::time::Instant::now();
+    let doomed = duplicate_copies(&shelf, true);
+    let tidied = remove_duplicates_in(&mut shelf, false);
+    assert_eq!(doomed.len(), 300);
+    assert_eq!(tidied.len(), 300);
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(900),
+        "took {:?}",
+        start.elapsed()
+    );
 }

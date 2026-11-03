@@ -42,11 +42,16 @@ struct Editor {
     pending: RefCell<Option<glib::SourceId>>,
     /// Setting the text from a note, not the user typing.
     loading: Cell<bool>,
+    /// The person changed something since the note was loaded or last saved. A
+    /// save of an untouched editor must not run: it would adopt the stored version
+    /// (a phone's edit that landed) as the editor's own without showing it.
+    dirty: Cell<bool>,
 }
 
 impl Editor {
     fn load(&self, note: Option<&Note>) {
         self.cancel_save();
+        self.dirty.set(false);
         self.loading.set(true);
         match note {
             Some(note) => {
@@ -74,6 +79,9 @@ impl Editor {
     /// Saves now what is typed.
     fn save(&self) {
         self.cancel_save();
+        if !self.dirty.get() {
+            return;
+        }
         let Some((id, loaded)) = self.open.borrow().clone() else {
             return;
         };
@@ -91,9 +99,11 @@ impl Editor {
             // The version this save left, read in the same step as the save: one
             // read afterwards could be a phone's edit that landed in between.
             Ok(Some(modified)) => {
+                self.dirty.set(false);
                 self.open.replace(Some((id, modified)));
             }
-            Ok(None) => {}
+            // Nothing to save (the text is what is stored): the version stays as loaded.
+            Ok(None) => self.dirty.set(false),
             Err(error) => {
                 // The text stays in the editor; nothing is thrown away.
                 toast_from(&self.body, &error);
@@ -106,6 +116,7 @@ impl Editor {
             return;
         }
         self.cancel_save();
+        self.dirty.set(true);
         let editor = Rc::downgrade(self);
         let source = glib::timeout_add_local_once(SAVE_AFTER, move || {
             if let Some(editor) = editor.upgrade() {
@@ -494,6 +505,7 @@ impl Page {
             open: RefCell::new(None),
             pending: RefCell::new(None),
             loading: Cell::new(false),
+            dirty: Cell::new(false),
         });
         {
             let weak = Rc::downgrade(&editor);
@@ -515,6 +527,7 @@ impl Page {
             editor.pin.connect_toggled(move |_| {
                 if let Some(editor) = weak.upgrade() {
                     if !editor.loading.get() {
+                        editor.dirty.set(true);
                         editor.save();
                     }
                 }
