@@ -3754,6 +3754,40 @@ mod lane {
         assert_eq!(env.proxy.connections.load(Ordering::SeqCst), 1);
     }
 
+    /// A lane throttled to about 10 MB/s (3 ms per 32 KiB through the proxy)
+    /// with the production tunables: the watchdogs (5 s without an
+    /// acknowledged block, the receiver's quiet rule) must not end it.
+    #[test]
+    fn a_throttled_lane_survives_a_slow_link() {
+        let env = Env::new(Duration::from_millis(3));
+        let rig = env.rig("lane-slow", Tunables::default());
+        let bytes = payload(40 * MIB + 77, 21);
+        let source = rig.source("big.bin", &bytes);
+        let id = rig.a().start_send(&source).unwrap();
+        eventually("the lane label", || {
+            (board::lane_of(&id) == Some("fast lane")).then_some(())
+        });
+        let got = rig.received();
+        assert_eq!(fs::read(&got.path).unwrap(), bytes);
+        rig.sent_ok();
+        assert_eq!(
+            rig.ab.frames.load(Ordering::SeqCst),
+            0,
+            "all of it on the lane"
+        );
+        assert_eq!(
+            lane_actions(&rig).len(),
+            1,
+            "one switch, to the lane, no more"
+        );
+        assert!(rig
+            .ba
+            .sent(FileAction::BlockNack)
+            .iter()
+            .all(|nack| nack.reason.as_deref() != Some("lane")));
+        assert_eq!(env.proxy.connections.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn a_lane_that_drops_mid_block_falls_back_and_resumes_at_the_last_verified_block() {
         let env = Env::new(Duration::from_millis(1));
