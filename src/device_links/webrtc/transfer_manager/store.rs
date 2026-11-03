@@ -581,21 +581,12 @@ fn stage_name(id: &str) -> String {
     format!(".desklink-{id}.stage")
 }
 
-/// Removes staging files in the downloads folder that nobody has touched since
-/// `cutoff`: what a process that died mid-copy leaves, up to a whole file's
-/// size. Only regular files named exactly `.desklink-<id>.stage`.
-/// State directories managers have been made for, and the phones whose
-/// transfer state was purged lately: what an unpair deletes (see
-/// [`forget_device`]).
+/// State directories transfer state may be in: those managers were made for,
+/// and the one the daemon installs at start (so an unpair purges the files
+/// even when no manager has existed in this run).
 fn state_roots() -> &'static std::sync::Mutex<Vec<PathBuf>> {
     static ROOTS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> = std::sync::OnceLock::new();
     ROOTS.get_or_init(Default::default)
-}
-
-fn purged() -> &'static std::sync::Mutex<Vec<(String, Instant)>> {
-    static PURGED: std::sync::OnceLock<std::sync::Mutex<Vec<(String, Instant)>>> =
-        std::sync::OnceLock::new();
-    PURGED.get_or_init(Default::default)
 }
 
 fn note_state_root(root: &Path) {
@@ -606,27 +597,47 @@ fn note_state_root(root: &Path) {
     }
 }
 
-/// Whether `device_id`'s transfer state was purged within the last 30 s: the
-/// manager of its closing peer must not write it back (its final checkpoint
-/// would otherwise undo the unpair).
-pub(super) fn was_purged(device_id: &str) -> bool {
-    let now = Instant::now();
-    purged().lock().is_ok_and(|purged| {
-        purged.iter().any(|(known, at)| {
-            known == device_id && now.saturating_duration_since(*at) < PURGE_MEMORY
-        })
-    })
+/// The daemon's transfer state directory, known from the start.
+pub(crate) fn install_state_dir(root: &Path) {
+    note_state_root(root);
 }
 
-const PURGE_MEMORY: Duration = Duration::from_secs(30);
+/// The live engines and the phone each belongs to, with the flag that tells an
+/// engine its phone was unpaired. Weak: an engine that is gone is forgotten.
+type EngineFlags = Vec<(String, std::sync::Weak<std::sync::atomic::AtomicBool>)>;
+
+fn engines() -> &'static std::sync::Mutex<EngineFlags> {
+    static ENGINES: std::sync::OnceLock<std::sync::Mutex<EngineFlags>> = std::sync::OnceLock::new();
+    ENGINES.get_or_init(Default::default)
+}
+
+/// Lets `forget_device` reach the engine of `peer` (once per engine).
+pub(super) fn register_engine(peer: &str, flag: &std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    if let Ok(mut engines) = engines().lock() {
+        engines.retain(|(_, known)| known.strong_count() > 0);
+        let weak = std::sync::Arc::downgrade(flag);
+        if !engines.iter().any(|(_, known)| known.ptr_eq(&weak)) {
+            engines.push((peer.to_string(), weak));
+        }
+    }
+}
 
 /// A phone was unpaired (or replaced by a new identity): its partial downloads
-/// and send records go with it, instead of waiting out the seven-day sweep.
+/// and send records go with it, instead of waiting out the seven-day sweep,
+/// and the engine of its closing peer is told to drop what it still holds and
+/// not write it back. A phone paired again later gets a new engine, which this
+/// never touches.
 pub(crate) fn forget_device(device_id: &str) {
-    if let Ok(mut purged) = purged().lock() {
-        let now = Instant::now();
-        purged.retain(|(_, at)| now.saturating_duration_since(*at) < PURGE_MEMORY);
-        purged.push((device_id.to_string(), now));
+    // The engines first: whatever they write before they notice is removed by
+    // the purge below, or by their own purge once they do.
+    if let Ok(engines) = engines().lock() {
+        for (peer, flag) in engines.iter() {
+            if peer == device_id {
+                if let Some(flag) = flag.upgrade() {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
     }
     let roots = state_roots()
         .lock()
@@ -679,6 +690,9 @@ pub(super) fn purge_device(root: &Path, device_id: &str) -> usize {
     gone
 }
 
+/// Removes staging files in the downloads folder that nobody has touched since
+/// `cutoff`: what a process that died mid-copy leaves, up to a whole file's
+/// size. Only regular files named exactly `.desklink-<id>.stage`.
 fn sweep_stages(root: &Path, cutoff: SystemTime) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -1198,8 +1212,30 @@ mod tests {
         forget_device("tablet");
         assert!(store.load_receive(OTHER).unwrap().is_none());
         assert!(store.stored_sends().is_empty());
-        assert!(was_purged("tablet"));
-        assert!(!was_purged("never-heard-of"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// An unpair from the desk while the phone is away: no manager has been
+    /// made in this run, but the directory the daemon installed is purged.
+    #[test]
+    fn an_unpair_purges_the_installed_state_directory_even_when_no_manager_exists() {
+        let (store, base) = store("offline");
+        let device = format!("offline-{}", uuid::Uuid::new_v4().simple());
+        let mut held = checkpoint(1);
+        held.device_id = device.clone();
+        store.create_part(&held.transfer_id).unwrap();
+        store.save_receive(&held, &[[3u8; 32]]).unwrap();
+        // As if no manager had been made for this directory in this run.
+        state_roots()
+            .lock()
+            .unwrap()
+            .retain(|known| known != store.state_root());
+        forget_device(&device);
+        assert!(store.load_receive(ID).unwrap().is_some(), "not known yet");
+        install_state_dir(store.state_root());
+        forget_device(&device);
+        assert!(store.load_receive(ID).unwrap().is_none());
+        assert!(!store.part_path(ID).unwrap().exists());
         let _ = fs::remove_dir_all(base);
     }
 

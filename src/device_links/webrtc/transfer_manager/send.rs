@@ -278,6 +278,9 @@ pub(super) struct Outgoing {
     /// Lane failures of this transfer, all told (never reset): three and it
     /// stays on the data channel.
     lane_failures_total: u32,
+    /// Times a long pause let the lane go (no failure, but a lane that keeps
+    /// being let go is not asked for again for ever: the same three).
+    lane_releases: u32,
     /// A lane carried this transfer and none failed.
     lane_clean: bool,
     /// The peer, the retry base and how old a token may be before the sender
@@ -418,6 +421,7 @@ impl Outgoing {
             lane_failed: None,
             lane_failures: 0,
             lane_failures_total: 0,
+            lane_releases: 0,
             lane_clean: false,
             peer: String::new(),
             lane_retry: Duration::from_secs(10),
@@ -594,11 +598,22 @@ impl Outgoing {
     /// back-off is over, while the LAN path still holds, and never after the
     /// third failure: that transfer then stays on the data channel.
     fn maybe_promote(&mut self, now: Instant, net: &Net) {
-        if self.lane_failed.is_none() {
+        let Some(failed_at) = self.lane_failed else {
+            self.promote_drain = None;
             return;
-        }
+        };
+        // A lane let go by a pause waits as long as a failed one (and longer
+        // each time): a disk that is nearly full pauses and resumes every few
+        // seconds, and that must not cost a re-offer, a token and a TLS dial
+        // each cycle.
+        let wait = self
+            .lane_retry
+            .checked_mul(1 << self.lane_releases.saturating_sub(1).min(5))
+            .unwrap_or(self.lane_retry);
         if self.state != SendState::Sending
             || self.is_held()
+            || self.lane_releases >= MAX_LANE_FAILURES
+            || (self.lane_releases > 0 && now.saturating_duration_since(failed_at) < wait)
             || !matches!(self.lane, LaneTx::Off)
             || !self.lane_offered
             || self.lane_failures_total >= MAX_LANE_FAILURES
@@ -629,6 +644,41 @@ impl Outgoing {
         net.send(self.offer_message(net));
     }
 
+    /// Tests: the lane being agreed (a token waits), the transfer held.
+    #[cfg(test)]
+    pub(super) fn pretend_lane_pending(&mut self) {
+        self.lane = LaneTx::Pending {
+            port: 1,
+            token: "0".repeat(32),
+            at: Instant::now(),
+        };
+    }
+
+    /// Tests: no lane, how often one was let go, whether a re-offer is wanted,
+    /// whether a promotion is waiting for acknowledgements, whether every
+    /// block is acknowledged and the receiver's `complete` awaited.
+    #[cfg(test)]
+    pub(super) fn lane_facts(&self) -> (bool, u32, bool, bool, bool) {
+        (
+            matches!(self.lane, LaneTx::Off),
+            self.lane_releases,
+            self.lane_failed.is_some(),
+            self.promote_drain.is_some(),
+            self.state == SendState::AwaitComplete,
+        )
+    }
+
+    /// Tests: a promotion that waits for acknowledgements, with no lane failed
+    /// (the condition that started it is gone), and a transfer that is waiting
+    /// for `complete`.
+    #[cfg(test)]
+    pub(super) fn pretend(&mut self, draining: bool, awaiting_complete: bool) {
+        self.promote_drain = draining.then(Instant::now);
+        if awaiting_complete {
+            self.state = SendState::AwaitComplete;
+        }
+    }
+
     /// The lane carries the frames now.
     fn on_lane(&self) -> bool {
         matches!(self.lane, LaneTx::Up(_))
@@ -653,15 +703,24 @@ impl Outgoing {
     /// person): its lane is let go, which is no failure (no count, no back-off)
     /// and is asked for again once the transfer moves (`maybe_promote`).
     fn release_lane(&mut self, net: &Net) {
-        if !self.on_lane() {
-            return;
-        }
+        // Up, or being agreed (a token waiting, a dial under way): all of them
+        // end here. A dial that completes later finds nobody to hand its
+        // connection to and closes it.
+        let was_up = self.on_lane();
         if let LaneTx::Up(writer) = &self.lane {
             writer.close();
         }
+        if matches!(self.lane, LaneTx::Off) {
+            return;
+        }
         self.lane = LaneTx::Off;
         self.lane_failed = Some(Instant::now());
-        self.fall_back(net, "the transfer is paused", None);
+        self.lane_releases = self.lane_releases.saturating_add(1);
+        // Nothing left to send (every block is acknowledged) or nothing was on
+        // the lane yet: there is no stream to move, and `done` is not said again.
+        if was_up && self.state != SendState::AwaitComplete {
+            self.fall_back(net, "the transfer is paused", None);
+        }
     }
 
     fn fall_back(&mut self, net: &Net, why: &str, verified: Option<u64>) {

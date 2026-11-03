@@ -287,8 +287,9 @@ impl TransferBoard {
         }
     }
 
-    /// Ends everything a device had running.
-    pub fn finish_device(&mut self, device_id: &str, reason: &str) {
+    /// Ends everything a device had running. Returns the transfers ended. A
+    /// failed row of a device that is gone offers no "Try Again".
+    pub fn finish_device(&mut self, device_id: &str, reason: &str) -> Vec<String> {
         let ids: Vec<String> = self
             .rows
             .iter()
@@ -296,9 +297,11 @@ impl TransferBoard {
             .filter(|row| row.device_id == device_id)
             .map(|row| row.id.clone())
             .collect();
-        for id in ids {
-            self.finish(&id, Outcome::Failed(reason.to_string()));
+        for id in &ids {
+            self.retry_sources.remove(id);
+            self.finish(id, Outcome::Failed(reason.to_string()));
         }
+        ids
     }
 
     pub fn rows(&self) -> Vec<TransferRow> {
@@ -393,7 +396,11 @@ pub fn record(finished: Finished) {
 }
 
 pub fn finish_device(device_id: &str, reason: &str) {
-    board().finish_device(device_id, reason);
+    let ended = board().finish_device(device_id, reason);
+    // The lane tokens of what ended open nothing (W18), as in `finish`.
+    for id in ended {
+        super::file_lane::void_tokens(&id);
+    }
 }
 
 pub fn pause_device(device_id: &str) {
@@ -896,6 +903,23 @@ mod tests {
             .iter()
             .any(|end| end.name == "s0.bin" && !end.ok && end.incoming));
         assert_eq!(board.synced_failed.front().map(String::as_str), Some("s0"));
+    }
+
+    /// An unpair ends the phone's transfers: their lane tokens are void, and a
+    /// failed row offers no "Try Again" for a phone that is gone.
+    #[test]
+    fn ending_a_devices_transfers_voids_their_tokens_and_their_retry() {
+        let (id, device) = ("unpair-board-1", "unpair-board-dev");
+        let token = super::super::file_lane::issue_token(id, device).unwrap();
+        assert!(begin(row(id, device, false, 9 << 20)));
+        set_retry_source(id, PathBuf::from("/tmp/x"));
+        finish_device(device, "The phone was unpaired");
+        assert!(!super::super::file_lane::spend_token_for_test(
+            &token, id, device
+        ));
+        let ended = peek_finished(id);
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        assert_eq!(ended[0].retry, None);
     }
 
     /// A row taken off the board without an outcome (a changed file begun

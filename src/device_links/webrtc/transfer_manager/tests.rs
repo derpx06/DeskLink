@@ -1239,6 +1239,36 @@ fn an_unpair_deletes_the_phones_partial_download_and_its_closing_peer_does_not_w
     assert!(hand.incoming().is_empty());
 }
 
+#[test]
+fn a_phone_paired_again_right_after_an_unpair_keeps_its_new_transfer_through_a_detach() {
+    let peer = format!("repair-{}", uuid::Uuid::new_v4().simple());
+    let old = Hand::with_peer("repair-old", &peer);
+    super::forget_device(&peer);
+    // Same device id (it is frozen), a new pairing, a new peer and manager.
+    let hand = Hand::with_peer("repair-new", &peer);
+    let total = 2 * BLOCK_BYTES;
+    let file = payload(total as usize, 10);
+    let mut offer = FileControl::new(&wire_of(&peer, "beta"), FileAction::Offer, id(3), "token0");
+    offer.filename = Some("r.bin".to_string());
+    offer.total_size = Some(total);
+    offer.mtime = Some(1_700_000_000_000);
+    offer.block_size = Some(BLOCK_BYTES);
+    offer.max_frame_bytes = Some(FRAME_BYTES_PROVEN);
+    hand.send(offer);
+    eventually("the accept", || hand.reply(FileAction::Accept));
+    for frame in block_frames(id(3), 0, &file, 0, false) {
+        hand.manager.on_frame(frame);
+    }
+    eventually("block 0", || hand.reply(FileAction::BlockAck));
+    hand.manager.detach();
+    hand.settle();
+    assert!(!names(&hand.base.join("state")).is_empty(), "checkpointed");
+    assert_eq!(hand.incoming().len(), 1, "the new transfer is not dropped");
+    // The old peer's engine, closing behind the unpair, drops what it held.
+    old.manager.detach();
+    old.settle();
+}
+
 // ── The Bucket ─────────────────────────────────────────────────────────────
 
 #[test]
@@ -3585,6 +3615,7 @@ mod lane {
             overflow: AtomicBool::new(false),
             queue_max: super::super::FILE_QUEUE_MAX_BYTES,
             attached: AtomicBool::new(true),
+            purged: Arc::new(AtomicBool::new(false)),
             hook: Mutex::new(None),
         };
         super::super::read_lane_frames(&mut std::io::Cursor::new(wire), &commands, &shared, mine);
@@ -3625,7 +3656,10 @@ mod lane {
     #[test]
     fn a_transfer_paused_for_space_lets_its_lane_go_without_a_failure_and_gets_one_again() {
         let env = Env::new(Duration::from_millis(2));
-        let rig = env.rig("lane-release", fast());
+        let mut tun = fast();
+        tun.lane_retry = Duration::from_millis(100);
+        let rig = env.rig("lane-release", tun);
+        slow_pipe(&rig, Duration::from_millis(3));
         let bytes = payload(48 * MIB, 33);
         let source = rig.source("big.bin", &bytes);
         let id = rig.a().start_send(&source).unwrap();
@@ -3653,8 +3687,56 @@ mod lane {
         let got = rig.received();
         assert_eq!(fs::read(&got.path).unwrap(), bytes);
         let kinds: Vec<String> = lane_actions(&rig).into_iter().map(|a| a.0).collect();
-        assert_eq!(kinds.first().map(String::as_str), Some("tcp"), "{kinds:?}");
-        assert!(kinds.contains(&"webrtc".to_string()), "{kinds:?}");
+        assert_eq!(&kinds[..3], ["tcp", "webrtc", "tcp"], "{kinds:?}");
+        assert_eq!(
+            file_lane::peer_wait_for_test(&env.receiver.id, Instant::now()),
+            Duration::ZERO
+        );
+    }
+
+    /// A pause that arrives while the lane is still being agreed ends that
+    /// lane too (no dial goes on to a transfer that is held); one that
+    /// arrives when every block is acknowledged does not make the sender say
+    /// `done` again; a promotion that waits for acknowledgements is dropped
+    /// when its reason goes, instead of freezing the transfer.
+    #[test]
+    fn a_pause_ends_a_lane_being_agreed_and_a_finished_send_is_left_alone() {
+        let env = Env::new(Duration::from_millis(2));
+        let rig = env.rig("lane-pending", fast());
+        let bytes = payload(48 * MIB, 34);
+        let source = rig.source("big.bin", &bytes);
+        let id = rig.a().start_send(&source).unwrap();
+        eventually("some blocks over the lane", || {
+            (board::lane_of(&id) == Some("fast lane") && verified(&rig) >= 2).then_some(())
+        });
+        // The lane under agreement (a token waits): the pause ends it.
+        let (off, releases, wants_again) = rig.a().probe(|engine| {
+            let net = engine.net.clone().unwrap();
+            let outgoing = &mut engine.outgoing[0];
+            outgoing.pretend_lane_pending();
+            outgoing.on_peer_pause("storage-full", Some(&net));
+            let (off, releases, wants_again, _, _) = outgoing.lane_facts();
+            (off, releases, wants_again)
+        });
+        assert!(off && releases == 1 && wants_again);
+        // Every block acknowledged and `complete` awaited: a pause with a lane
+        // up closes it and changes nothing else (no restart, no second `done`).
+        let state_kept = rig.a().probe(|engine| {
+            let net = engine.net.clone().unwrap();
+            let outgoing = &mut engine.outgoing[0];
+            outgoing.pretend(false, true);
+            outgoing.on_peer_pause("user", Some(&net));
+            outgoing.lane_facts().4
+        });
+        assert!(state_kept);
+        // A promotion waiting for acknowledgements, its reason gone: dropped.
+        let still = rig.a().probe(|engine| {
+            engine.outgoing[0].pretend(true, false);
+            engine.pump_sends();
+            engine.outgoing[0].lane_facts().3
+        });
+        assert!(!still, "the wait ends with its reason");
+        rig.a().cancel_transfer(&id, code::USER).unwrap();
     }
 
     /// The acknowledgements of the first five blocks never arrive, then the

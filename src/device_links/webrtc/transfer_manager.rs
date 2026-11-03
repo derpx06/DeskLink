@@ -45,7 +45,7 @@ use recv::Incoming;
 use send::Outgoing;
 use store::Store;
 
-pub(crate) use store::forget_device;
+pub(crate) use store::{forget_device, install_state_dir};
 
 /// The largest clipboard image accepted or sent (contract C3).
 pub const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
@@ -243,6 +243,8 @@ struct Shared {
     overflow: AtomicBool,
     queue_max: usize,
     attached: AtomicBool,
+    /// Set by `forget_device`: this engine's phone was unpaired.
+    purged: Arc<AtomicBool>,
     hook: Mutex<Option<CompletionHook>>,
 }
 
@@ -441,6 +443,7 @@ impl WebRtcTransferManager {
             overflow: AtomicBool::new(false),
             queue_max,
             attached: AtomicBool::new(false),
+            purged: Arc::new(AtomicBool::new(false)),
             hook: Mutex::new(None),
         });
         let (commands, inbox) = mpsc::channel();
@@ -473,6 +476,7 @@ impl WebRtcTransferManager {
     /// Binds the manager to a peer's channels. Until then nothing is sent.
     pub fn attach(&self, wire: WebRtcWireBinding, link: Arc<dyn FileLink>) {
         self.shared.attached.store(true, Ordering::Release);
+        store::register_engine(&wire.peer_device_id, &self.shared.purged);
         // This peer's lanes (W18) come to this manager.
         let instance = super::file_lane::register_receiver(
             &wire.peer_device_id,
@@ -815,6 +819,7 @@ impl Engine {
     /// One round of everything that is not a reaction to a message.
     fn tick(&mut self) {
         let now = Instant::now();
+        self.apply_purge();
         self.restart_after_overflow();
         self.apply_backlog();
         self.retry_after_storage_full(now);
@@ -1093,29 +1098,27 @@ impl Engine {
         self.checkpoint_all();
     }
 
+    /// The phone of this engine was unpaired (`forget_device`): what it holds
+    /// of it is dropped with its files, and nothing more is kept for it.
+    fn apply_purge(&mut self) {
+        if !self.shared.purged.load(Ordering::Acquire) {
+            return;
+        }
+        for (_, incoming) in self.incoming.drain() {
+            incoming.discard(&self.store);
+        }
+        for outgoing in self.outgoing.drain(..) {
+            outgoing.discard(&self.store);
+        }
+    }
+
     fn checkpoint_all(&mut self) {
         if self.faults.crash {
             return;
         }
         // A phone unpaired while its peer was closing: nothing of it is
-        // written back, and what this manager still holds of it goes.
-        let (store, outgoing) = (&self.store, &mut self.outgoing);
-        self.incoming.retain(|_, incoming| {
-            if store::was_purged(&incoming.device_id) {
-                incoming.discard(store);
-                false
-            } else {
-                true
-            }
-        });
-        outgoing.retain(|outgoing| {
-            if store::was_purged(&outgoing.peer) {
-                outgoing.discard(store);
-                false
-            } else {
-                true
-            }
-        });
+        // written back, and what this engine still holds of it goes.
+        self.apply_purge();
         for incoming in self.incoming.values_mut() {
             incoming.checkpoint_now(&self.store);
         }
