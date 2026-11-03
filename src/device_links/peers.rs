@@ -36,6 +36,7 @@ pub(crate) fn forget_peer(device_id: &str) {
     webrtc::screen::forget_parked(device_id);
     crate::device_links::contacts::forget(device_id);
     crate::device_links::unlock::forget(device_id);
+    crate::device_links::notes::forget_peer(device_id);
 }
 
 #[cfg(test)]
