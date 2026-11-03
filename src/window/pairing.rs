@@ -72,7 +72,15 @@ pub(super) fn welcome_page(win: &DesklinkWindow, daemon: &DaemonHandle) -> Rc<Ce
     );
     waiting.append(&text("Waiting for a phone…", &["text-dim", "body-small"]));
     center.append(&waiting);
-    body.append(&center);
+    // Scrolls, rather than clipping, in a short window.
+    body.append(
+        &gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .propagate_natural_height(false)
+            .child(&center)
+            .build(),
+    );
 
     let footer = gtk::Box::builder()
         .spacing(12)
@@ -133,7 +141,7 @@ impl DesklinkWindow {
             } else {
                 "Pair with a Code"
             })
-            .content_width(460)
+            .content_width(520)
             .content_height(if with_qr { 680 } else { 440 })
             .build();
         let toolbar = adw::ToolbarView::new();
@@ -205,7 +213,7 @@ impl DesklinkWindow {
                 .hscrollbar_policy(gtk::PolicyType::Never)
                 .child(
                     &adw::Clamp::builder()
-                        .maximum_size(400)
+                        .maximum_size(460)
                         .child(&content)
                         .build(),
                 )
@@ -334,9 +342,23 @@ fn discovery_row(daemon: &DaemonHandle, device: DeviceView) -> adw::ActionRow {
             );
         }
         DeviceStatus::PairRequestedByPeer => {
+            // The code over its two buttons, so the phone's name keeps its
+            // room in a narrow dialog.
+            let stack = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(6)
+                .valign(gtk::Align::Center)
+                .halign(gtk::Align::End)
+                .build();
             if let Some(key) = &device.verification_key {
-                row.add_suffix(&code(key));
+                let key = code(key);
+                key.set_halign(gtk::Align::End);
+                stack.append(&key);
             }
+            let buttons = gtk::Box::builder()
+                .spacing(6)
+                .halign(gtk::Align::End)
+                .build();
             let reject = gtk::Button::builder()
                 .label("Cancel")
                 .valign(gtk::Align::Center)
@@ -346,7 +368,7 @@ fn discovery_row(daemon: &DaemonHandle, device: DeviceView) -> adw::ActionRow {
                 eprintln!("[UI] Reject clicked for {}", id);
                 sender.send(DaemonCommand::RejectPair(id.clone()));
             });
-            row.add_suffix(&reject);
+            buttons.append(&reject);
             let accept = gtk::Button::builder()
                 .label("Pair")
                 .valign(gtk::Align::Center)
@@ -361,7 +383,9 @@ fn discovery_row(daemon: &DaemonHandle, device: DeviceView) -> adw::ActionRow {
                 debug_log!("[UI] Accept clicked for {}", id);
                 daemon.send(DaemonCommand::AcceptPair(id.clone(), shown_key.clone()));
             });
-            row.add_suffix(&accept);
+            buttons.append(&accept);
+            stack.append(&buttons);
+            row.add_suffix(&stack);
         }
         DeviceStatus::Paired => {}
     }
@@ -556,9 +580,13 @@ pub(super) fn pair_waiting_view(device: &DeviceView) -> gtk::Box {
 /// A live pairing QR code from `pairing_qr`, and the flag that takes it
 /// off the air. A scanned or expired code is replaced by a fresh one.
 fn qr_code(daemon: &DaemonHandle) -> (gtk::Picture, Rc<Cell<bool>>) {
+    // Its size is kept while the code is being made, so the page does not
+    // jump when it arrives (the picture is about 175 px).
     let picture = gtk::Picture::builder()
         .can_shrink(false)
         .halign(gtk::Align::Center)
+        .width_request(175)
+        .height_request(175)
         .build();
     picture.update_property(&[gtk::accessible::Property::Label(
         "Pairing QR code. Scan it with DeskLink on your phone.",

@@ -7,7 +7,7 @@
 use adw::prelude::*;
 
 use super::overview::preview_line;
-use super::{ellipsized, text, toast_from};
+use super::{text, toast_from, wrapped};
 
 /// What the history tab was drawn from: it is redrawn only when this changes.
 pub(super) fn history_key(on: bool) -> String {
@@ -98,10 +98,12 @@ pub(super) fn history_box(on: bool) -> gtk::Box {
             .spacing(2)
             .hexpand(true)
             .build();
-        words.append(&ellipsized(
-            &preview_line(&item.text),
-            &["mono", "body-small"],
-        ));
+        // Two lines when the page is narrow; the whole text is the tooltip.
+        let preview = wrapped(&preview_line(&item.text), &["mono", "body-small"]);
+        preview.set_lines(2);
+        preview.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        super::tooltip_when_cut(&preview);
+        words.append(&preview);
         let when = gtk::glib::DateTime::from_unix_local(item.at as i64)
             .ok()
             .zip(now.as_ref())
@@ -111,7 +113,7 @@ pub(super) fn history_box(on: bool) -> gtk::Box {
             .from
             .clone()
             .unwrap_or_else(|| "this computer".to_string());
-        words.append(&ellipsized(
+        words.append(&wrapped(
             &format!("From {from} · {when}"),
             &["caption", "text-faint"],
         ));
@@ -218,7 +220,10 @@ pub(super) fn snippets_section() -> gtk::Box {
                 .accessible_role(gtk::AccessibleRole::Presentation)
                 .build(),
         );
-        let words = ellipsized(&snippet.label(), &["mono", "body-small"]);
+        let words = wrapped(&snippet.label(), &["mono", "body-small"]);
+        words.set_lines(2);
+        words.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        super::tooltip_when_cut(&words);
         words.set_hexpand(true);
         row.append(&words);
         let remove = gtk::Button::builder()

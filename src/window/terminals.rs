@@ -11,7 +11,9 @@ use std::cell::RefCell;
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 
-use super::{confirm, ellipsized, icon_button, named_widgets, text, toast_from, DesklinkWindow};
+use super::{
+    confirm, ellipsized, icon_button, named_widgets, text, toast_from, wrapped, DesklinkWindow,
+};
 use crate::device_links::device::DeviceView;
 use crate::device_links::pty::registry::SessionInfo;
 use crate::device_links::webrtc::terminal_bridge::{attached_devices, end_device_sessions};
@@ -49,7 +51,7 @@ impl Page {
             .width_request(240)
             .build();
         search.update_property(&[gtk::accessible::Property::Label("Search terminals")]);
-        let count = text("", &["text-dim"]);
+        let count = wrapped("", &["text-dim"]);
         let detach = super::soft_button("Detach");
         detach.set_css_classes(&["coral-outline"]);
         detach.set_visible(false);
@@ -83,8 +85,7 @@ impl Page {
             .spacing(18)
             .margin_top(8)
             .margin_bottom(28)
-            .margin_start(28)
-            .margin_end(28)
+            .css_classes(["page-margins"])
             .build();
         list.append(&header);
         list.append(&grid);
@@ -217,7 +218,12 @@ impl Page {
         let attached: Vec<Vec<String>> =
             all.iter().map(|info| attached_devices(&info.id)).collect();
         let phone_attached = attached.iter().any(|devices| devices.contains(&device.id));
-        self.detach.set_label(&format!("Detach {}", device.name));
+        // The button says "Detach"; whose it is is its tooltip and its name for
+        // a screen reader, so a long phone name cannot widen the page.
+        let whole = format!("Detach {} from its terminals", device.name);
+        self.detach.set_tooltip_text(Some(&whole));
+        self.detach
+            .update_property(&[gtk::accessible::Property::Label(&whole)]);
         self.detach.set_visible(phone_attached);
         self.count.set_label(&format!("{} open", all.len()));
         self.note.set_label(&format!(
@@ -620,7 +626,11 @@ fn detail_view(
             .css_classes(["coral-pill"])
             .build();
         pill.append(&presence_dot(&format!("{} is here", device.name)));
-        pill.append(&gtk::Label::new(Some(&format!("{} is here", device.name))));
+        // A long name gives way (the whole sentence is the tooltip), so the
+        // bar never grows past a narrow window.
+        let here = ellipsized(&format!("{} is here", device.name), &[]);
+        here.set_max_width_chars(28);
+        pill.append(&here);
         bar.append(&pill);
     }
     screen.append(&bar);
@@ -736,7 +746,10 @@ fn detail_view(
         let name = text(label, &["text-dim", "body-small"]);
         name.set_hexpand(true);
         row.append(&name);
-        row.append(&ellipsized(&value, &["mono", "body-small"]));
+        // A folder keeps both its start and the folder it is in.
+        let shown = ellipsized(&value, &["mono", "body-small"]);
+        shown.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        row.append(&shown);
         facts.append(
             &gtk::ListBoxRow::builder()
                 .activatable(false)

@@ -10,7 +10,7 @@ use std::cell::RefCell;
 
 use adw::prelude::*;
 
-use super::{ellipsized, icon_button, icon_square, text, toast_from, DesklinkWindow};
+use super::{icon_button, icon_square, text, toast_from, wrapped, DesklinkWindow};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::{DeviceNotification, DeviceView};
 
@@ -43,8 +43,9 @@ pub(super) struct Page {
 
 impl Page {
     pub(super) fn new(win: &DesklinkWindow) -> Self {
-        let count = text("", &["text-dim"]);
+        let count = wrapped("", &["text-dim"]);
         let clear = super::soft_button("Clear All");
+        clear.set_tooltip_text(Some("Dismiss every notification here and on the phone"));
         let header = gtk::Box::builder().spacing(10).build();
         count.set_hexpand(true);
         header.append(&count);
@@ -74,8 +75,7 @@ impl Page {
             .spacing(14)
             .margin_top(8)
             .margin_bottom(28)
-            .margin_start(28)
-            .margin_end(28)
+            .css_classes(["page-margins"])
             .build();
         page.append(&header);
         page.append(&list);
@@ -159,7 +159,7 @@ impl Page {
         }
     }
 
-    pub(super) fn update(&self, _win: &DesklinkWindow, daemon: &DaemonHandle, device: &DeviceView) {
+    pub(super) fn update(&self, win: &DesklinkWindow, daemon: &DaemonHandle, device: &DeviceView) {
         if *self.device.borrow() != device.id {
             self.device.replace(device.id.clone());
             for card in self.cards.borrow_mut().drain(..) {
@@ -212,6 +212,7 @@ impl Page {
             keep
         });
         let mut previous: Option<gtk::Box> = None;
+        let mut built = false;
         for notification in notifications {
             let key = serde_json::to_string(notification).unwrap_or_default();
             let position = cards.iter().position(|card| card.id == notification.id);
@@ -220,6 +221,7 @@ impl Page {
                 Some(index) if cards[index].key == key || typing(&cards[index]) => {}
                 Some(index) => {
                     let fresh = build_card(daemon, &device.id, notification, key);
+                    built = true;
                     self.list
                         .insert_child_after(&fresh.widget, Some(&cards[index].widget));
                     self.list.remove(&cards[index].widget);
@@ -227,6 +229,7 @@ impl Page {
                 }
                 None => {
                     let fresh = build_card(daemon, &device.id, notification, key);
+                    built = true;
                     self.list.append(&fresh.widget);
                     cards.push(fresh);
                 }
@@ -240,6 +243,10 @@ impl Page {
             previous = Some(cards[index].widget.clone());
         }
         drop(cards);
+        if built {
+            // A new card is laid out for the page's width (buttons under the words when narrow).
+            win.apply_layout();
+        }
         // A reply asked for a notification that has since gone: forget it.
         let gone = self
             .pending_reply
@@ -313,21 +320,27 @@ pub(crate) fn app_icon(app: &str) -> &'static str {
     }
 }
 
-/// "Mara · Signal": the title in bold, then the app.
+/// "Mara · Signal": the title in bold, then the app. It wraps (two lines at
+/// most) rather than being cut to a few letters beside the buttons.
 pub(super) fn heading_line(notification: &DeviceNotification) -> gtk::Box {
     let line = gtk::Box::builder().build();
-    if notification.title.is_empty() {
-        line.append(&ellipsized(&notification.app_name, &["heading"]));
+    let label = if notification.title.is_empty() {
+        wrapped(&notification.app_name, &["heading"])
     } else {
-        let title = ellipsized(&notification.title, &["heading"]);
-        line.append(&title);
-        let app = ellipsized(
-            &format!(" · {}", notification.app_name),
-            &["caption", "text-faint"],
-        );
-        app.set_valign(gtk::Align::Center);
-        line.append(&app);
-    }
+        let label = wrapped("", &["heading"]);
+        label.set_use_markup(true);
+        label.set_markup(&format!(
+            "{}<span weight=\"normal\" size=\"smaller\" alpha=\"60%\"> · {}</span>",
+            gtk::glib::markup_escape_text(&notification.title),
+            gtk::glib::markup_escape_text(&notification.app_name),
+        ));
+        label
+    };
+    label.set_lines(2);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_hexpand(true);
+    super::tooltip_when_cut(&label);
+    line.append(&label);
     line
 }
 
@@ -348,8 +361,21 @@ fn build_card(
 ) -> Card {
     let card = super::card(0);
     card.add_css_class("notification-card");
-    let top = gtk::Box::builder().spacing(14).build();
-    top.append(&icon_square(
+    // The words, then the buttons: with a button of its own (reply or an
+    // action) they go under the words when the page is narrow (the
+    // `responsive` box turns vertical), so the title keeps its room; a card
+    // with only its Dismiss cross keeps it beside the words.
+    let top = gtk::Box::builder().spacing(10).build();
+    if notification.request_reply_id.is_some() || !notification.actions.is_empty() {
+        top.set_widget_name("responsive");
+    }
+    let lead = gtk::Box::builder().spacing(14).hexpand(true).build();
+    let actions = gtk::Box::builder()
+        .spacing(8)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Center)
+        .build();
+    lead.append(&icon_square(
         app_icon(&notification.app_name),
         38,
         "avatar-circle",
@@ -367,7 +393,7 @@ fn build_card(
     said.set_lines(3);
     said.set_ellipsize(gtk::pango::EllipsizeMode::End);
     words.append(&said);
-    top.append(&words);
+    lead.append(&words);
 
     for action in notification.actions.iter().take(2) {
         let button = super::soft_button(action);
@@ -384,7 +410,7 @@ fn build_card(
                 action.clone(),
             ));
         });
-        top.append(&button);
+        actions.append(&button);
     }
 
     let entry = gtk::Entry::builder()
@@ -415,7 +441,7 @@ fn build_card(
                 }
             }
         });
-        top.append(&reply);
+        actions.append(&reply);
 
         let bar = gtk::Box::builder()
             .spacing(8)
@@ -483,8 +509,11 @@ fn build_card(
                 id.clone(),
             ));
         });
-        top.append(&dismiss);
+        actions.append(&dismiss);
     }
+    actions.set_visible(actions.first_child().is_some());
+    top.append(&lead);
+    top.append(&actions);
     card.append(&top);
     card.append(&revealer);
     Card {
@@ -509,6 +538,72 @@ mod tests {
         // The phone said so: it is the answer, connected or not.
         assert!(empty_line("Pixel", true, Some(false)).starts_with("Turn on notification access"));
         assert!(!empty_line("Pixel", true, Some(true)).starts_with("Turn on"));
+    }
+
+    /// Every widget under `root`, depth first.
+    fn descendants(root: &gtk::Widget) -> Vec<gtk::Widget> {
+        let mut found = vec![root.clone()];
+        let mut child = root.first_child();
+        while let Some(next) = child {
+            found.extend(descendants(&next));
+            child = next.next_sibling();
+        }
+        found
+    }
+
+    /// A long title wraps (two lines) instead of being cut to a few letters
+    /// beside the buttons, the buttons sit in a box that stacks under the
+    /// words on a narrow page, and each icon-only button has a name.
+    /// (Needs a display.)
+    #[test]
+    fn a_notification_card_wraps_its_title_and_names_its_buttons() {
+        crate::test_display::run(|| {
+            let (daemon, _commands) = DaemonHandle::detached();
+            let notification = DeviceNotification {
+                id: "1".into(),
+                app_name: "Signal".into(),
+                title: "A rather long title that has to go somewhere on a narrow page".into(),
+                text: "Are you deploying today?".into(),
+                ticker: String::new(),
+                is_clearable: true,
+                request_reply_id: Some("r1".into()),
+                actions: vec!["Snooze".into()],
+                silent: false,
+            };
+            let card = build_card(&daemon, "phone", &notification, "k".into());
+            let widgets = descendants(card.widget.upcast_ref());
+            let title = widgets
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Label>())
+                .find(|label| label.label().contains("A rather long title"))
+                .expect("the title");
+            assert!(title.wraps() && title.lines() == 2, "wraps to two lines");
+            assert!(
+                widgets.iter().any(|w| w.widget_name() == "responsive"),
+                "the buttons stack under the words on a narrow page"
+            );
+            for button in widgets
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Button>())
+            {
+                assert!(
+                    button.label().is_some()
+                        || button.tooltip_text().is_some()
+                        || button.child().is_some_and(|c| !descendants(&c)
+                            .iter()
+                            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+                            .all(|l| l.label().is_empty())),
+                    "a button with a name"
+                );
+            }
+            let names: Vec<_> = widgets
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Button>())
+                .filter_map(|b| b.tooltip_text())
+                .collect();
+            assert!(names.iter().any(|name| name == "Dismiss"));
+            assert!(names.iter().any(|name| name == "Send Reply"));
+        });
     }
 
     #[test]

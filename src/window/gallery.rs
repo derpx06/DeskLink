@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use super::{text, toast_from, DesklinkWindow};
+use super::{toast_from, DesklinkWindow};
 use crate::device_links::device::DeviceView;
 use crate::device_links::gallery::{self, Item, STRIP_ITEMS};
 
@@ -38,7 +38,7 @@ fn build(
         .spacing(10)
         .css_classes(["dl-card"])
         .build();
-    card.append(&text(
+    card.append(&super::wrapped(
         &format!("From your phone · {}", device.name),
         &["heading"],
     ));

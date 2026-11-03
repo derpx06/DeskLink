@@ -171,8 +171,16 @@ impl Page {
 
     pub(super) fn update(&self, device: &DeviceView) {
         let on = crate::device_links::config::app_settings().clipboard_sync;
+        // The name only when it is short: a long one would crowd out the tabs
+        // (the whole sentence is the tooltip either way).
+        let sentence = format!("Share clipboard with {}", device.name);
         self.share_label
-            .set_label(&format!("Share clipboard with {}", device.name));
+            .set_label(if device.name.chars().count() <= 18 {
+                &sentence
+            } else {
+                "Share clipboard"
+            });
+        self.share_label.set_tooltip_text(Some(&sentence));
         if self.switch.is_active() != on {
             self.syncing.set(true);
             self.switch.set_active(on);

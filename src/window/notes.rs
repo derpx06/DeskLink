@@ -244,6 +244,16 @@ fn spans(line: &str) -> Vec<((usize, usize), Span)> {
     found
 }
 
+/// A line of a note as plain words for the list: its list, task and heading
+/// marks and its bold, italic and code marks left out.
+fn plain_words(line: &str) -> String {
+    line.trim_start_matches(['#', '>', ' ', '-', '*'])
+        .trim_start_matches("[ ] ")
+        .trim_start_matches("[x] ")
+        .replace("**", "")
+        .replace(['*', '`'], "")
+}
+
 fn note_row(note: &Note) -> gtk::ListBoxRow {
     let words = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -259,8 +269,8 @@ fn note_row(note: &Note) -> gtk::ListBoxRow {
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .find(|line| line.trim_start_matches(['#', ' ']) != note.label())
-        .unwrap_or_default()
-        .to_string();
+        .map(plain_words)
+        .unwrap_or_default();
     let detail = super::ellipsized(
         &if preview.is_empty() {
             modified_words(note.modified)
@@ -661,6 +671,18 @@ impl Page {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The list shows a note's words, not its marks.
+    #[test]
+    fn a_notes_preview_in_the_list_has_no_markdown_marks() {
+        assert_eq!(
+            plain_words("Ship **F6** after the *real-phone* run."),
+            "Ship F6 after the real-phone run."
+        );
+        assert_eq!(plain_words("- [x] contract"), "contract");
+        assert_eq!(plain_words("- `cargo test` green"), "cargo test green");
+        assert_eq!(plain_words("## Plan"), "Plan");
+    }
 
     #[test]
     fn markdown_lite_marks_headings_lists_and_inline_styles() {

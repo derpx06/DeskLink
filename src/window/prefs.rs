@@ -80,16 +80,105 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         .spacing(22)
         .margin_top(8)
         .margin_bottom(28)
-        .margin_start(28)
-        .margin_end(28)
+        .css_classes(["page-margins"])
         .build();
-    for group in groups(daemon, &settings, device, &glide_status, approving) {
-        page.append(&group);
+    page.append(&super::wrapped(
+        &format!(
+            "Settings for this computer and {}. A change takes effect as soon as you make it.",
+            device.name
+        ),
+        &["text-dim"],
+    ));
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Search settings")
+        .build();
+    search.update_property(&[gtk::accessible::Property::Label("Search settings")]);
+    page.append(&search);
+    let groups = groups(daemon, &settings, device, &glide_status, approving);
+    for group in &groups {
+        page.append(group);
     }
+    let groups = searchable(&groups);
+    let nothing = super::wrapped("No setting matches. Try another word.", &["text-dim"]);
+    nothing.set_visible(false);
+    page.append(&nothing);
+    search.connect_search_changed(move |search| {
+        let any = filter_groups(&groups, &search.text());
+        nothing.set_visible(!any);
+    });
     win.replace_body(
         "settings",
         &adw::Clamp::builder().maximum_size(720).child(&page).build(),
     );
+}
+
+/// Every settings row inside `widget`.
+fn rows_in(widget: &gtk::Widget, found: &mut Vec<adw::PreferencesRow>) {
+    if let Some(row) = widget.downcast_ref::<adw::PreferencesRow>() {
+        found.push(row.clone());
+    }
+    let mut child = widget.first_child();
+    while let Some(next) = child {
+        rows_in(&next, found);
+        child = next.next_sibling();
+    }
+}
+
+/// A group as the search sees it: the group, its rows, and which of them
+/// were shown before any search (a row hidden on purpose stays hidden).
+struct Searchable {
+    group: adw::PreferencesGroup,
+    rows: Vec<(adw::PreferencesRow, bool)>,
+    shown: bool,
+}
+
+fn searchable(groups: &[adw::PreferencesGroup]) -> Vec<Searchable> {
+    groups
+        .iter()
+        .map(|group| {
+            let mut rows = Vec::new();
+            rows_in(group.upcast_ref(), &mut rows);
+            Searchable {
+                group: group.clone(),
+                rows: rows
+                    .into_iter()
+                    .map(|row| {
+                        let shown = row.is_visible();
+                        (row, shown)
+                    })
+                    .collect(),
+                shown: group.is_visible(),
+            }
+        })
+        .collect()
+}
+
+/// Shows only the rows (and groups) whose title or words contain `query`;
+/// a group whose own title matches shows whole. True when anything shows.
+fn filter_groups(groups: &[Searchable], query: &str) -> bool {
+    let query = glib::markup_escape_text(query.trim()).to_lowercase();
+    let mut any = false;
+    for Searchable { group, rows, shown } in groups {
+        let whole = query.is_empty() || group.title().to_lowercase().contains(&query);
+        let mut matching = 0;
+        for (row, was_shown) in rows {
+            let mut words = row.title().to_lowercase();
+            if let Some(subtitle) = row
+                .downcast_ref::<adw::ActionRow>()
+                .and_then(|action| action.subtitle())
+            {
+                words.push(' ');
+                words.push_str(&subtitle.to_lowercase());
+            }
+            let matches = whole || words.contains(&query);
+            row.set_visible(*was_shown && matches);
+            matching += usize::from(*was_shown && matches);
+        }
+        let visible = *shown && (matching > 0 || rows.is_empty());
+        group.set_visible(visible);
+        any |= visible;
+    }
+    any
 }
 
 /// The groups of the Settings page, in the order the phone uses too:
@@ -951,7 +1040,6 @@ fn away_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::ActionRow {
         } else {
             NO_RELAY.to_string()
         })
-        .subtitle_lines(2)
         .use_markup(false)
         .activatable(true)
         .build();
@@ -1024,7 +1112,7 @@ fn away_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::ActionRow {
 }
 
 /// What the relay row says while no relay server is set up.
-const NO_RELAY: &str = "No relay server set up · add one to reach this computer away from home";
+const NO_RELAY: &str = "Not set up · add a relay server to reach this computer away from home";
 
 /// "relay.desklink.app" from "wss://relay.desklink.app/v1".
 fn relay_host(url: &str) -> &str {
@@ -1058,9 +1146,10 @@ fn away_from_home_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::P
         .build();
     let turn = adw::SwitchRow::builder()
         .sensitive(settings.relay_configured())
-        .title("Relay Media When Needed")
+        .title("Use a Relay if Needed")
         .subtitle(
-            "Use a TURN server when no direct path exists. Off means direct connections only.",
+            "When your phone and this computer cannot connect directly, pass the data through a \
+             relay. Off means direct connections only.",
         )
         .active(settings.use_turn)
         .build();
@@ -1348,7 +1437,6 @@ fn remote_control_row(device: &DeviceView, approving: bool) -> adw::ActionRow {
             (false, true) => APPROVED,
             (false, false) => NOT_APPROVED,
         })
-        .subtitle_lines(2)
         .build();
     row.add_prefix(&icon_square("input-mouse-symbolic", 30, "row-icon"));
     let approve = gtk::Button::builder()
@@ -1582,6 +1670,46 @@ fn add_glide_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Searching settings finds a row by its title or its words, hides the
+    /// rest and any group left empty, and gives every row back when the
+    /// search is cleared; a row hidden on purpose never comes back.
+    /// (Needs a display.)
+    #[test]
+    fn searching_settings_filters_rows_and_keeps_hidden_ones_hidden() {
+        crate::test_display::run(|| {
+            let row = |title: &str, subtitle: &str| {
+                adw::ActionRow::builder()
+                    .title(title)
+                    .subtitle(subtitle)
+                    .build()
+            };
+            let (wifi, battery, secret) = (
+                row("Keep awake", "While a phone is connected"),
+                row("Start at Login", "Keeps this computer reachable"),
+                row("Hidden row", "Not for this machine"),
+            );
+            secret.set_visible(false);
+            let first = group("Connection");
+            first.add(&wifi);
+            first.add(&secret);
+            let second = group("Appearance");
+            second.add(&battery);
+            let groups = searchable(&[first.clone(), second.clone()]);
+
+            assert!(filter_groups(&groups, "reachable"));
+            assert!(!wifi.is_visible() && battery.is_visible());
+            assert!(!first.is_visible(), "a group with nothing to show goes");
+            assert!(second.is_visible());
+            assert!(filter_groups(&groups, "connection"), "a group's own title");
+            assert!(wifi.is_visible() && !secret.is_visible());
+            assert!(!filter_groups(&groups, "zzz"), "nothing matches");
+            assert!(filter_groups(&groups, ""));
+            assert!(wifi.is_visible() && battery.is_visible());
+            assert!(!secret.is_visible(), "hidden on purpose stays hidden");
+            assert!(first.is_visible() && second.is_visible());
+        });
+    }
 
     /// Computer-wide switches on a per-phone page say they are (J18).
     #[test]

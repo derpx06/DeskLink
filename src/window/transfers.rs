@@ -226,7 +226,6 @@ impl Page {
             "Choose Files…",
             &["suggested-action"],
         );
-        choose.set_margin_start(16);
         inner.append(&choose);
         zone.append(&inner);
 

@@ -1985,7 +1985,8 @@ fn session_summary(device: &DeviceView) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-const OFFLINE: &str = "Offline. DeskLink will reconnect automatically.";
+const OFFLINE: &str =
+    "This computer is offline. Check its network connection; DeskLink reconnects by itself.";
 
 fn is_offline_message(message: &str) -> bool {
     message == OFFLINE
@@ -2341,10 +2342,35 @@ fn text(label: &str, classes: &[&str]) -> gtk::Label {
         .build()
 }
 
-/// The same, ellipsized at the end.
+/// The same, ellipsized at the end. When it is cut, hovering it (or Orca's
+/// description) gives the whole text.
 fn ellipsized(label: &str, classes: &[&str]) -> gtk::Label {
     let label = text(label, classes);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    tooltip_when_cut(&label);
+    label
+}
+
+/// Hovering `label` gives its whole text when it is drawn cut short (it
+/// shows nothing while it fits).
+fn tooltip_when_cut(label: &gtk::Label) {
+    label.set_has_tooltip(true);
+    label.connect_query_tooltip(|label, _, _, _, tooltip| {
+        if label.layout().is_ellipsized() {
+            tooltip.set_text(Some(&label.text()));
+            true
+        } else {
+            false
+        }
+    });
+}
+
+/// The same, wrapping onto more lines instead of being cut: for what the
+/// person must read in full (a status, a reason, a name that matters).
+fn wrapped(label: &str, classes: &[&str]) -> gtk::Label {
+    let label = text(label, classes);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     label
 }
 
@@ -3554,6 +3580,20 @@ mod tests {
             assert!(!window.assert_sticky_notice());
             assert!(!banner.is_revealed());
             crate::platform::clear_report_for_tests();
+        });
+    }
+
+    /// A label that is cut short gives its whole text on hover; one that
+    /// wraps is never cut. (Needs a display.)
+    #[test]
+    fn cut_labels_give_their_whole_text_and_wrapped_ones_are_never_cut() {
+        crate::test_display::run(|| {
+            let cut = ellipsized("A long name that may not fit", &[]);
+            assert_eq!(cut.ellipsize(), gtk::pango::EllipsizeMode::End);
+            assert!(cut.has_tooltip(), "the whole text is there to hover");
+            let words = wrapped("A reason the person must read in full", &[]);
+            assert!(words.wraps());
+            assert_eq!(words.ellipsize(), gtk::pango::EllipsizeMode::None);
         });
     }
 

@@ -9,7 +9,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gdk, glib};
 
-use super::{can_send_feature, text, toast_from, DesklinkWindow};
+use super::{can_send_feature, text, toast_from, wrapped, DesklinkWindow};
 use crate::device_links::contacts::{self, Contact};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::DeviceView;
@@ -185,7 +185,7 @@ impl Page {
         let header = gtk::Box::builder().spacing(8).build();
         header.append(&search);
         header.append(&refresh);
-        let count = text("", &["text-dim"]);
+        let count = wrapped("", &["text-dim"]);
         count.set_xalign(0.0);
 
         let list = gtk::ListBox::builder()
@@ -212,8 +212,7 @@ impl Page {
             .spacing(12)
             .margin_top(8)
             .margin_bottom(28)
-            .margin_start(28)
-            .margin_end(28)
+            .css_classes(["page-margins"])
             .build();
         let vault = Rc::new(super::vault_banner::VaultBanner::new(
             "contacts",

@@ -11,7 +11,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 
-use super::{can_send_feature, ellipsized, icon_button, icon_square, named_widgets};
+use super::{can_send_feature, icon_button, icon_square, named_widgets, wrapped};
 use super::{DesklinkWindow, DeviceView};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::{CallState, CallStatus, PhoneCall};
@@ -162,11 +162,17 @@ pub(super) fn card(daemon: &DaemonHandle, device: &DeviceView, compact: bool) ->
         .valign(gtk::Align::Center)
         .build();
     let caller = call.caller();
-    words.append(&ellipsized(
-        &caller,
-        &[if compact { "heading" } else { "title-3" }],
-    ));
-    let detail = ellipsized(&detail_words(&device.name, status, now_ms()), &["text-dim"]);
+    // Who is calling and what it is are what the person came for: two lines
+    // each before anything is cut (the whole text is then a tooltip).
+    let who = wrapped(&caller, &[if compact { "heading" } else { "title-3" }]);
+    who.set_lines(2);
+    who.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    super::tooltip_when_cut(&who);
+    words.append(&who);
+    let detail = wrapped(&detail_words(&device.name, status, now_ms()), &["text-dim"]);
+    detail.set_lines(3);
+    detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    super::tooltip_when_cut(&detail);
     if let (CallState::Talking, Some(started)) = (call.state, call.started_at) {
         detail.set_widget_name(&format!("call-timer:{started}"));
     }
