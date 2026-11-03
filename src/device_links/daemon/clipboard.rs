@@ -854,6 +854,7 @@ impl DaemonWorker {
                     // Sent only over a ready link, never queued: the copy is
                     // latest-wins, and one queued then dropped was marked sent
                     // and never retried.
+                    let mut too_large = false;
                     let result =
                         FeatureTransport::for_binding(&sessions, &binding).and_then(|transport| {
                             if !transport.is_ready() {
@@ -869,6 +870,7 @@ impl DaemonWorker {
                                     "clipboard-size",
                                     "A copied text too large to share was not sent",
                                 );
+                                too_large = true;
                                 return Ok(true);
                             }
                             transport.send(&packet).map(|()| true)
@@ -878,6 +880,11 @@ impl DaemonWorker {
                         .lock()
                     {
                         remember_if_sent(&mut sent, &binding.device_id, &current_text, &result);
+                    }
+                    if too_large {
+                        // Said once per copy (marked handled above): the
+                        // phone would otherwise never get it, and nobody would know why.
+                        push_error(&errors, too_large_words());
                     }
                     match result {
                             Ok(_) => {}
@@ -897,6 +904,12 @@ impl DaemonWorker {
             }
         });
     }
+}
+
+/// What the person is told when a copy is too big for one message.
+fn too_large_words() -> String {
+    "The text you copied is too large to share with your phone, so it stays on this computer."
+        .to_string()
 }
 
 /// Sends a copied image to every phone with a ready link (the transfer
@@ -943,6 +956,14 @@ fn remember_if_sent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_copy_past_one_message_is_refused_with_words_the_person_sees() {
+        let mut packet = NetworkPacket::new(PACKET_TYPE_CLIPBOARD);
+        packet.set("content", "x".repeat(100_000));
+        assert!(!crate::device_links::webrtc::fits_on_wire(&packet));
+        assert!(too_large_words().contains("too large"));
+    }
 
     #[test]
     fn a_dead_owner_watch_sends_the_poll_back_to_reading() {

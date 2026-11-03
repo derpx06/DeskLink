@@ -89,7 +89,13 @@ pub(crate) fn issue(device_id: &str) -> String {
     let nonce = uuid::Uuid::new_v4().simple().to_string();
     if let Ok(mut issued) = ISSUED.lock() {
         let now = Instant::now();
-        issued.retain(|old| now.duration_since(old.at) < NONCE_LIFETIME * 2);
+        // One live offer per phone: a newer one replaces it, so a phone asking
+        // in a loop cannot grow the list. Spent entries stay (they answer
+        // "replayed"); they are bounded by the lock-operation damper.
+        issued.retain(|old| {
+            now.duration_since(old.at) < NONCE_LIFETIME * 2
+                && (old.used || old.device_id != device_id)
+        });
         issued.push(Issued {
             nonce: nonce.clone(),
             device_id: device_id.to_string(),
@@ -98,6 +104,13 @@ pub(crate) fn issue(device_id: &str) -> String {
         });
     }
     nonce
+}
+
+/// Forgets every offer made to `device_id` (it was unpaired or replaced).
+pub(crate) fn forget(device_id: &str) {
+    if let Ok(mut issued) = ISSUED.lock() {
+        issued.retain(|entry| entry.device_id != device_id);
+    }
 }
 
 /// Checks an approval from `device_id` carrying `nonce`, consuming the nonce.
@@ -161,6 +174,35 @@ mod tests {
             at,
             used: false,
         }]
+    }
+
+    #[test]
+    fn a_phone_asking_in_a_loop_holds_one_live_nonce() {
+        let id = format!("loop-{}", uuid::Uuid::new_v4().simple());
+        let first = issue(&id);
+        for _ in 0..500 {
+            issue(&id);
+        }
+        let live = ISSUED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.device_id == id)
+            .count();
+        assert_eq!(live, 1, "only the newest offer is kept");
+        assert_eq!(
+            approve(&id, Some(&first), ALL_GOOD),
+            Err(Refusal::NoNonce),
+            "an older offer is replaced"
+        );
+    }
+
+    #[test]
+    fn an_unpaired_phone_keeps_no_offer() {
+        let id = format!("gone-{}", uuid::Uuid::new_v4().simple());
+        let nonce = issue(&id);
+        forget(&id);
+        assert_eq!(approve(&id, Some(&nonce), ALL_GOOD), Err(Refusal::NoNonce));
     }
 
     #[test]
