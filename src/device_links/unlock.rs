@@ -26,6 +26,8 @@ pub(crate) enum Refusal {
     NotLocked,
     NotLan,
     NotReady,
+    /// Every check passed but the session would not unlock (logind refused).
+    Failed,
 }
 
 impl Refusal {
@@ -39,6 +41,7 @@ impl Refusal {
             Self::NotLocked => "not-locked",
             Self::NotLan => "not-lan",
             Self::NotReady => "not-ready",
+            Self::Failed => "failed",
         }
     }
 }
@@ -195,6 +198,12 @@ mod tests {
             Err(Refusal::NoNonce),
             "an older offer is replaced"
         );
+    }
+
+    #[test]
+    fn a_session_that_would_not_unlock_is_not_called_not_locked() {
+        assert_eq!(Refusal::Failed.code(), "failed");
+        assert_ne!(Refusal::Failed.code(), Refusal::NotLocked.code());
     }
 
     #[test]

@@ -701,7 +701,7 @@ pub(crate) fn handle_unlock_approval(device_id: &str, nonce: Option<&str>) {
             Ok(()) => record_detail(device_id, ConnectionEvent::UnlockedByPhone, "nearby"),
             Err(error) => {
                 eprintln!("[DeskLink] Could not unlock the session: {error}");
-                refuse(device_id, Refusal::NotLocked);
+                refuse(device_id, Refusal::Failed);
             }
         },
         Err(refusal) => refuse(device_id, refusal),
