@@ -84,12 +84,27 @@ pub(crate) fn may_offer(conditions: Conditions) -> Result<(), Refusal> {
     Ok(())
 }
 
+const MAX_NONCES_PER_DEVICE: usize = 4;
+
 /// A fresh 128-bit nonce for `device_id`, valid once for a minute.
 pub(crate) fn issue(device_id: &str) -> String {
     let nonce = uuid::Uuid::new_v4().simple().to_string();
     if let Ok(mut issued) = ISSUED.lock() {
         let now = Instant::now();
         issued.retain(|old| now.duration_since(old.at) < NONCE_LIFETIME * 2);
+        // A paired phone may ask as often as it likes: it holds a few live
+        // nonces at most, the oldest give way.
+        while issued
+            .iter()
+            .filter(|old| old.device_id == device_id)
+            .count()
+            >= MAX_NONCES_PER_DEVICE
+        {
+            match issued.iter().position(|old| old.device_id == device_id) {
+                Some(oldest) => issued.remove(oldest),
+                None => break,
+            };
+        }
         issued.push(Issued {
             nonce: nonce.clone(),
             device_id: device_id.to_string(),
@@ -249,5 +264,22 @@ mod tests {
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
         assert_eq!(Refusal::NotLan.code(), "not-lan");
+    }
+
+    #[test]
+    fn a_phone_that_keeps_asking_holds_a_few_nonces_not_a_growing_list() {
+        let device = "nonce-flood-phone";
+        let first = issue(device);
+        for _ in 0..200 {
+            issue(device);
+        }
+        let held = ISSUED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|old| old.device_id == device)
+            .count();
+        assert_eq!(held, MAX_NONCES_PER_DEVICE);
+        assert!(ISSUED.lock().unwrap().iter().all(|old| old.nonce != first));
     }
 }

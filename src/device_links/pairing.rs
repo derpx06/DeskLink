@@ -188,7 +188,8 @@ impl PairingHandler {
     /// Whether a peer's request timestamp is close enough to this clock to be
     /// part of a live negotiation rather than a replay.
     fn timestamp_is_plausible(&self, timestamp: i64) -> bool {
-        (timestamp - unix_secs()).abs() <= ALLOWED_TIMESTAMP_DIFFERENCE_SECONDS
+        // abs_diff: `timestamp - now` overflows for a peer-chosen i64.
+        timestamp.abs_diff(unix_secs()) <= ALLOWED_TIMESTAMP_DIFFERENCE_SECONDS.unsigned_abs()
     }
 
     /// Abandons a negotiation the peer never answered.
@@ -507,5 +508,14 @@ mod tests {
         handler.receive(&packet, false);
 
         assert_eq!(handler.state, PairState::Paired);
+    }
+
+    #[test]
+    fn a_hostile_timestamp_is_implausible_instead_of_overflowing() {
+        let handler = PairingHandler::new(false);
+        for timestamp in [i64::MIN, i64::MIN + unix_secs(), i64::MAX, 0, -1] {
+            assert!(!handler.timestamp_is_plausible(timestamp), "{timestamp}");
+        }
+        assert!(handler.timestamp_is_plausible(unix_secs()));
     }
 }

@@ -74,7 +74,10 @@ fn matches(password: &str, stored: &PasswordHash) -> bool {
         return false;
     };
     derive(password, &salt, stored.iterations)
-        .is_ok_and(|actual| openssl::memcmp::eq(&actual, &expected))
+        // `memcmp::eq` asserts equal lengths: a hand-edited hash must not panic.
+        .is_ok_and(|actual| {
+            actual.len() == expected.len() && openssl::memcmp::eq(&actual, &expected)
+        })
 }
 
 #[derive(Default)]
@@ -528,5 +531,16 @@ mod tests {
         assert_ne!(a.salt, b.salt);
         assert!(matches("pw", &a));
         assert!(!matches("pW", &a));
+    }
+
+    #[test]
+    fn a_stored_hash_of_the_wrong_length_is_a_wrong_password_not_a_panic() {
+        let mut stored = cheap("secret");
+        assert!(matches("secret", &stored));
+        let b64 = base64::engine::general_purpose::STANDARD;
+        stored.hash = base64::Engine::encode(&b64, [1u8; 7]);
+        assert!(!matches("secret", &stored));
+        stored.hash = String::new();
+        assert!(!matches("secret", &stored));
     }
 }

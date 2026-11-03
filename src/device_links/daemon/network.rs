@@ -429,6 +429,11 @@ pub(crate) fn ssl_connector(config: &Arc<Mutex<Config>>) -> Result<SslConnector,
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())?;
     let mut builder = SslConnector::builder(SslMethod::tls()).expect("TLS method is available");
+    // The acceptor is mozilla_intermediate (TLS 1.2+); the connector must not
+    // be the weaker end of the same link on an OpenSSL whose default floor is older.
+    builder
+        .set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
+        .map_err(|err| err.to_string())?;
     builder
         .set_certificate(config.certificate())
         .map_err(|err| err.to_string())?;

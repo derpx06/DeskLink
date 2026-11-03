@@ -205,6 +205,8 @@ pub mod network;
 pub mod packet_handler;
 pub mod pairing_commands;
 mod power;
+#[cfg(test)]
+mod robust_fuzz;
 pub mod state;
 #[cfg(test)]
 pub mod test_peer;

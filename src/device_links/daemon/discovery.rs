@@ -671,7 +671,11 @@ impl DaemonWorker {
                             || err.kind() == std::io::ErrorKind::TimedOut
                             // A signal (suspend/resume) interrupted the wait: just read again.
                             || err.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(err) => push_error(&errors, format!("UDP discovery failed: {err}")),
+                    Err(err) => {
+                        push_error(&errors, format!("UDP discovery failed: {err}"));
+                        // A socket that keeps failing must not spin this thread.
+                        thread::sleep(Duration::from_millis(250));
+                    }
                 }
             }
         });

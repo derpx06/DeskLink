@@ -12,6 +12,12 @@ const TAG_BYTES: usize = 16;
 
 /// `dir`'s key, made on first use.
 fn key(dir: &Path) -> Result<[u8; 32], String> {
+    // Two threads finding no key must not each make one (the second overwrote the first, orphaning what was
+    // sealed with it).
+    static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _making = MAKING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = dir.join("key");
     match std::fs::read(&path) {
         Ok(bytes) => match <[u8; 32]>::try_from(bytes) {
@@ -621,5 +627,47 @@ mod tests {
             .is_some_and(|pending| pending.contains_key(&path));
         assert!(!queued, "the write was dropped");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn threads_that_find_no_key_agree_on_one_and_saves_to_one_file_never_interleave() {
+        let dir =
+            std::env::temp_dir().join(format!("desklink-vault-race-{}", uuid::Uuid::new_v4()));
+        let keys: Vec<[u8; 32]> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || key(&dir).unwrap())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(
+            keys.iter().all(|key| *key == keys[0]),
+            "one key, however many ask first"
+        );
+
+        let path = dir.join("shared.bin");
+        let writers: Vec<_> = (0..8u8)
+            .map(|byte| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        crate::device_links::config::write_private(&path, &vec![byte; 256 * 1024])
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 256 * 1024);
+        assert!(
+            bytes.iter().all(|byte| *byte == bytes[0]),
+            "a file made of two writers' bytes"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
