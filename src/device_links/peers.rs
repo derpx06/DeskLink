@@ -14,6 +14,8 @@ pub(crate) fn forget_peer(device_id: &str) {
     use crate::device_links::{daemon, features, glide, mpris, session_lock, sync, webrtc};
     webrtc::transfer_board::finish_device(device_id, "The phone was unpaired");
     webrtc::transfer_manager::forget_device(device_id);
+    webrtc::file_lane::forget_peer(device_id);
+    crate::device_links::folders::forget_device(device_id);
     webrtc::terminal_bridge::revoke_device(device_id);
     crate::device_links::calls::hold_media(device_id, false);
     webrtc::coordinator::forget_liveness(device_id);
@@ -69,6 +71,18 @@ mod tests {
             "device_links/webrtc/audio_session.rs:SESSIONS",
             "device_links/webrtc/capture.rs:SESSIONS",
             "device_links/webrtc/terminal_bridge.rs:BRIDGES",
+            "device_links/calls.rs:HOLD",
+            "device_links/contacts.rs:STORE",
+            "device_links/daemon/discovery.rs:BOOK",
+            "device_links/dnd.rs:ENGINE",
+            "device_links/folders.rs:REFUSED",
+            "device_links/folders.rs:WANTED",
+            "device_links/gallery.rs:LEDGER",
+            "device_links/session_lock.rs:LOCK",
+            "device_links/walk_away.rs:WATCH",
+            "device_links/webrtc/file_lane.rs:GRANTS",
+            "device_links/webrtc/file_lane.rs:PENALTIES",
+            "device_links/webrtc/transfer_board.rs:BOARD",
         ];
         const KEPT: &[&str] = &[
             // Windows and widgets (they close with their device's page).
@@ -98,16 +112,77 @@ mod tests {
             // A marker that a deleted book must not come back from a late
             // reply; cleared by the phone's next snapshot.
             "device_links/contacts.rs:FORGOTTEN",
+            // Rebuilt from the transfer board's rows at every sample, which
+            // `finish_device` has emptied.
+            "bucket_progress.rs:TRACKER",
+            // The daemon's own device table, not a record of a phone.
+            "device_links/desk_features.rs:DAEMON",
+            // Keyed by D-Bus sender/serial and by app, not by phone.
+            "device_links/desk_notifications.rs:STATE",
+            // Keyed by media player.
+            "device_links/mpris.rs:SHOWN",
+            // Terminal sessions outlive their phone while DeskLink runs, by
+            // design.
+            "device_links/pty/registry.rs:REGISTRY",
+            // Registered receivers leave with their transfer manager; the
+            // open-lane counts are balanced by `lane_closed`.
+            "device_links/webrtc/file_lane.rs:REGISTRY",
+            // Keyed by verb, and the page's own browsing state (the thread's
+            // UI).
+            "send_to.rs:LIMITER",
+            "window/bucket.rs:BROWSE",
         ];
+        /// A map or set keyed by a device id, or by a tuple starting with one.
+        fn keyed(text: &str) -> bool {
+            ["HashMap", "HashSet", "BTreeMap", "BTreeSet"]
+                .iter()
+                .any(|kind| {
+                    text.contains(&format!("{kind}<String"))
+                        || text.contains(&format!("{kind}<(String"))
+                })
+        }
+        /// The source without its `#[cfg(test)]` items: a test module (it
+        /// ends at the first `}` in column 0, as rustfmt writes it) or a
+        /// test-only static. Code after a test module is still scanned.
+        fn production(text: &str) -> String {
+            let mut kept = String::new();
+            let mut lines = text.lines();
+            while let Some(line) = lines.next() {
+                if line.trim() == "#[cfg(test)]" {
+                    let Some(item) = lines.next() else { break };
+                    if item.starts_with("mod ") && !item.trim_end().ends_with(';') {
+                        for inner in lines.by_ref() {
+                            if inner == "}" {
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                kept.push_str(line);
+                kept.push('\n');
+            }
+            kept
+        }
+        /// Whether `struct <name>` in `text` holds a device-keyed map or set.
+        fn struct_holds_keyed(text: &str, name: &str) -> bool {
+            let Some(start) = text
+                .find(&format!("struct {name} "))
+                .or_else(|| text.find(&format!("struct {name}\n")))
+            else {
+                return false;
+            };
+            let body = text[start..].split("\n}").next().unwrap_or_default();
+            keyed(body)
+        }
         fn scan(dir: &std::path::Path, root: &std::path::Path, found: &mut Vec<String>) {
             for entry in std::fs::read_dir(dir).unwrap().flatten() {
                 let path = entry.path();
                 if path.is_dir() {
                     scan(&path, root, found);
                 } else if path.extension().is_some_and(|ext| ext == "rs") {
-                    let text = std::fs::read_to_string(&path).unwrap();
-                    let production = text.split("#[cfg(test)]\nmod ").next().unwrap_or_default();
-                    let mut lines = production.lines().peekable();
+                    let text = production(&std::fs::read_to_string(&path).unwrap());
+                    let mut lines = text.lines().peekable();
                     while let Some(line) = lines.next() {
                         let trimmed = line.trim_start();
                         let Some(rest) = trimmed
@@ -118,7 +193,7 @@ mod tests {
                         };
                         // The type may continue on the next line.
                         let mut declaration = rest.to_string();
-                        if !declaration.contains("<") {
+                        if !declaration.contains('<') {
                             continue;
                         }
                         if !declaration.contains('=') {
@@ -126,10 +201,13 @@ mod tests {
                                 declaration.push_str(next);
                             }
                         }
-                        let keyed = declaration.contains("HashMap<String")
-                            || declaration.contains("HashSet<String")
-                            || declaration.contains("BTreeMap<String");
-                        if keyed {
+                        // `Mutex<Penalties>`: a struct of this file that holds the map.
+                        let wrapped = declaration.split(['<', '>', ' ', ',', '=']).any(|word| {
+                            word.starts_with(|c: char| c.is_ascii_uppercase())
+                                && !word.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+                                && struct_holds_keyed(&text, word)
+                        });
+                        if keyed(&declaration) || wrapped {
                             let name = rest.split(':').next().unwrap_or_default().trim();
                             let relative = path.strip_prefix(root).unwrap();
                             found.push(format!("{}:{name}", relative.display()));

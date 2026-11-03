@@ -178,6 +178,12 @@ impl Grants {
         Ok(())
     }
 
+    /// Tokens handed out for `dialler_id` are void.
+    pub(crate) fn void_dialler(&mut self, dialler_id: &str) {
+        self.by_token
+            .retain(|_, grant| grant.dialler_id != dialler_id);
+    }
+
     /// Tokens for `transfer_id` are void (it ended or was cancelled).
     pub(crate) fn void(&mut self, transfer_id: &str) {
         self.by_token
@@ -347,6 +353,15 @@ pub(crate) fn peer_blocked(peer: &str, now: Instant) -> bool {
 pub(crate) fn forgive_peer(peer: &str) {
     if let Ok(mut penalties) = penalties().lock() {
         penalties.by_peer.remove(peer);
+    }
+}
+
+/// `peer` was unpaired: a phone paired again under the same id starts with
+/// no back-off and none of the old tokens.
+pub(crate) fn forget_peer(peer: &str) {
+    forgive_peer(peer);
+    if let Ok(mut grants) = grants().lock() {
+        grants.void_dialler(peer);
     }
 }
 
@@ -702,6 +717,27 @@ mod tests {
     fn same_json(ours: &str, theirs: &str) -> bool {
         serde_json::from_str::<Value>(ours).unwrap()
             == serde_json::from_str::<Value>(theirs).unwrap()
+    }
+
+    #[test]
+    fn an_unpaired_peer_keeps_no_lane_back_off_and_no_tokens() {
+        let now = Instant::now();
+        let peer = "phone-unpaired-lane";
+        penalize_peer(peer, Duration::from_secs(10), now);
+        assert!(peer_blocked(peer, now));
+        let token = grants().lock().unwrap().issue("t-forget", peer, now);
+        forget_peer(peer);
+        assert!(
+            !peer_blocked(peer, now),
+            "a phone paired again starts clean"
+        );
+        assert_eq!(
+            grants()
+                .lock()
+                .unwrap()
+                .redeem(&token, "t-forget", peer, now),
+            Err(Refusal::Token)
+        );
     }
 
     fn fixture() -> Value {

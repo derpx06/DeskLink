@@ -809,6 +809,9 @@ pub(crate) enum Resolve {
 enum Message {
     Packet(String, NetworkPacket),
     Link(String, bool),
+    /// The phone was unpaired: its pairs, manifests and offers go; the
+    /// files in its Bucket stay on disk.
+    Forget(String),
     Arrived {
         device: String,
         folder: FolderRef,
@@ -903,6 +906,19 @@ pub(crate) fn on_packet(device_id: &str, packet: &NetworkPacket) {
         return;
     }
     send_message(Message::Packet(device_id.to_string(), packet.clone()));
+}
+
+/// `device_id` was unpaired: syncing stops and its pairs, manifests, offers
+/// and requested-file records are forgotten. The files in its Bucket folder
+/// are kept (a phone paired again starts a fresh Bucket over the same folder).
+pub(crate) fn forget_device(device_id: &str) {
+    if let Ok(mut wanted) = WANTED.lock() {
+        wanted.retain(|(owner, _, _), _| owner != device_id);
+    }
+    if let Ok(mut refused) = refused_trash().lock() {
+        refused.retain(|(owner, _)| owner != device_id);
+    }
+    send_message(Message::Forget(device_id.to_string()));
 }
 
 /// The link to `device_id` came up or went down: sync runs only while up.
@@ -2700,6 +2716,24 @@ impl Worker {
                         wanted.retain(|(owner, _, _), _| *owner != device);
                     }
                 }
+                self.publish();
+            }
+            Message::Forget(device) => {
+                // Syncing stops and what was requested is dropped.
+                self.handle(Message::Link(device.clone(), false));
+                let books: Vec<String> = self
+                    .pairs
+                    .iter()
+                    .filter(|live| live.pair.device == device)
+                    .map(|live| book_file(&device, &live.pair.id))
+                    .collect();
+                self.pairs.retain(|live| live.pair.device != device);
+                for book in books {
+                    let _ = fs::remove_file(self.dir.join(book));
+                }
+                self.offered.retain(|(offer, _)| offer.device != device);
+                self.asked.retain(|(owner, _), _| *owner != device);
+                self.save_pairs();
                 self.publish();
             }
             Message::Packet(device, packet) => self.on_packet(&device, &packet),
@@ -5423,6 +5457,37 @@ mod tests {
             live.dirty.is_some(),
             "scanned again, so the new version is asked for"
         );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn an_unpaired_phone_loses_its_pairs_and_records_but_not_its_bucket_files() {
+        let (base, root, mut worker) = scratch_bucket("bucket-forget");
+        fs::write(root.join("keep.txt"), "x").unwrap();
+        mark_trash_refused("phone-b", "a.txt");
+        mark_trash_refused("phone-other", "a.txt");
+        WANTED.lock().unwrap().insert(
+            ("phone-b".into(), BUCKET_ID.into(), "k".into()),
+            entry("h", (0, 0)),
+        );
+        assert!(!worker.pairs.is_empty());
+        forget_device("phone-b");
+        worker.handle(Message::Forget("phone-b".into()));
+        assert!(worker
+            .pairs
+            .iter()
+            .all(|live| live.pair.device != "phone-b"));
+        assert!(root.join("keep.txt").exists(), "files stay");
+        assert!(!replace_anyway_offered("phone-b", "a.txt"));
+        assert!(
+            replace_anyway_offered("phone-other", "a.txt"),
+            "only this phone's"
+        );
+        assert!(WANTED
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|(owner, _, _)| owner != "phone-b"));
         let _ = fs::remove_dir_all(&base);
     }
 
