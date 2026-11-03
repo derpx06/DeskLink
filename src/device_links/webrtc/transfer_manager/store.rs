@@ -122,6 +122,7 @@ impl Store {
         let destination_root = fs::canonicalize(&destination_root)
             .map_err(|error| format!("Could not resolve DeskLink download directory: {error}"))?;
         ensure_directory_not_symlink(&destination_root)?;
+        note_state_root(&state_root);
         let store = Self {
             state_root,
             destination_root,
@@ -583,6 +584,101 @@ fn stage_name(id: &str) -> String {
 /// Removes staging files in the downloads folder that nobody has touched since
 /// `cutoff`: what a process that died mid-copy leaves, up to a whole file's
 /// size. Only regular files named exactly `.desklink-<id>.stage`.
+/// State directories managers have been made for, and the phones whose
+/// transfer state was purged lately: what an unpair deletes (see
+/// [`forget_device`]).
+fn state_roots() -> &'static std::sync::Mutex<Vec<PathBuf>> {
+    static ROOTS: std::sync::OnceLock<std::sync::Mutex<Vec<PathBuf>>> = std::sync::OnceLock::new();
+    ROOTS.get_or_init(Default::default)
+}
+
+fn purged() -> &'static std::sync::Mutex<Vec<(String, Instant)>> {
+    static PURGED: std::sync::OnceLock<std::sync::Mutex<Vec<(String, Instant)>>> =
+        std::sync::OnceLock::new();
+    PURGED.get_or_init(Default::default)
+}
+
+fn note_state_root(root: &Path) {
+    if let Ok(mut roots) = state_roots().lock() {
+        if !roots.iter().any(|known| known == root) {
+            roots.push(root.to_path_buf());
+        }
+    }
+}
+
+/// Whether `device_id`'s transfer state was purged within the last 30 s: the
+/// manager of its closing peer must not write it back (its final checkpoint
+/// would otherwise undo the unpair).
+pub(super) fn was_purged(device_id: &str) -> bool {
+    let now = Instant::now();
+    purged().lock().is_ok_and(|purged| {
+        purged.iter().any(|(known, at)| {
+            known == device_id && now.saturating_duration_since(*at) < PURGE_MEMORY
+        })
+    })
+}
+
+const PURGE_MEMORY: Duration = Duration::from_secs(30);
+
+/// A phone was unpaired (or replaced by a new identity): its partial downloads
+/// and send records go with it, instead of waiting out the seven-day sweep.
+pub(crate) fn forget_device(device_id: &str) {
+    if let Ok(mut purged) = purged().lock() {
+        let now = Instant::now();
+        purged.retain(|(_, at)| now.saturating_duration_since(*at) < PURGE_MEMORY);
+        purged.push((device_id.to_string(), now));
+    }
+    let roots = state_roots()
+        .lock()
+        .map(|roots| roots.clone())
+        .unwrap_or_default();
+    for root in roots {
+        purge_device(&root, device_id);
+    }
+}
+
+/// Removes every record in `root` that names `device_id`, with its partial
+/// file and sidecar. Returns how many transfers went.
+pub(super) fn purge_device(root: &Path, device_id: &str) -> usize {
+    let store = Store {
+        state_root: root.to_path_buf(),
+        destination_root: root.to_path_buf(),
+    };
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    let mut gone = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(inner) = name.strip_prefix(".desklink-") else {
+            continue;
+        };
+        if let Some(id) = inner.strip_suffix(".send.json") {
+            let owned = store
+                .read_regular(name)
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<SendCheckpoint>(&bytes).ok())
+                .is_some_and(|record| record.device_id == device_id);
+            if owned && store.remove_send(id).is_ok() {
+                gone += 1;
+            }
+        } else if let Some(id) = inner.strip_suffix(".json") {
+            let owned = store
+                .read_regular(name)
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<ReceiveCheckpoint>(&bytes).ok())
+                .is_some_and(|record| record.device_id == device_id);
+            if owned && store.remove_receive(id).is_ok() {
+                gone += 1;
+            }
+        }
+    }
+    gone
+}
+
 fn sweep_stages(root: &Path, cutoff: SystemTime) {
     let Ok(entries) = fs::read_dir(root) else {
         return;
@@ -1057,6 +1153,53 @@ mod tests {
         // A symlink where the checkpoint belongs is not a checkpoint.
         std::os::unix::fs::symlink("/etc/hostname", &path).unwrap();
         assert!(store.load_receive(ID).unwrap().is_none());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// An unpair deletes that phone's partial downloads and send records, and
+    /// only that phone's; and its closing peer may not write them back.
+    #[test]
+    fn an_unpaired_phones_partials_and_send_records_go_and_another_phones_stay() {
+        const OTHER: &str = "1f8fad5b-d9cb-469f-a165-70867728950f";
+        let (store, base) = store("purge");
+        let mine = checkpoint(2);
+        let mut theirs = checkpoint(1);
+        theirs.transfer_id = OTHER.to_string();
+        theirs.device_id = "tablet".to_string();
+        for held in [&mine, &theirs] {
+            store.create_part(&held.transfer_id).unwrap();
+            store
+                .save_receive(held, &vec![[7u8; 32]; held.blocks_done as usize])
+                .unwrap();
+        }
+        let send = |id: &str, device: &str| SendCheckpoint {
+            transfer_id: id.to_string(),
+            device_id: device.to_string(),
+            token: "token".to_string(),
+            filename: "a.txt".to_string(),
+            total_size: 3,
+            mtime: 5,
+            source: PathBuf::from("/home/me/a.txt"),
+            history: true,
+            clipboard_mime: None,
+            folder: None,
+            content_sha256: None,
+            restarts: 0,
+        };
+        store.save_send(&send(ID, "phone")).unwrap();
+        store.save_send(&send(OTHER, "tablet")).unwrap();
+        assert_eq!(purge_device(store.state_root(), "phone"), 2);
+        assert!(store.load_receive(ID).unwrap().is_none());
+        assert!(!store.part_path(ID).unwrap().exists());
+        assert!(store.load_receive(OTHER).unwrap().is_some());
+        assert_eq!(store.stored_sends().len(), 1);
+        assert_eq!(store.stored_sends()[0].transfer_id, OTHER);
+        // The public entry point finds the directory by itself and remembers.
+        forget_device("tablet");
+        assert!(store.load_receive(OTHER).unwrap().is_none());
+        assert!(store.stored_sends().is_empty());
+        assert!(was_purged("tablet"));
+        assert!(!was_purged("never-heard-of"));
         let _ = fs::remove_dir_all(base);
     }
 

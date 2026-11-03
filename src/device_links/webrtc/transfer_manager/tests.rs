@@ -805,6 +805,10 @@ struct Hand {
 
 impl Hand {
     fn new(label: &str) -> Self {
+        Self::with_peer(label, "alpha")
+    }
+
+    fn with_peer(label: &str, peer: &str) -> Self {
         let base = std::env::temp_dir().join(format!(
             "desklink-v2-hand-{label}-{}",
             uuid::Uuid::new_v4().simple()
@@ -819,7 +823,7 @@ impl Hand {
             .unwrap(),
         );
         let link = Pipe::new();
-        manager.attach(wire_of("beta", "alpha"), link.clone());
+        manager.attach(wire_of("beta", peer), link.clone());
         Self {
             manager,
             link,
@@ -1178,6 +1182,61 @@ fn an_offer_for_a_transfer_already_open_is_answered_from_where_it_is() {
     forged.transfer_token = "another".to_string();
     hand.send(forged);
     eventually("the refusal", || hand.reply(FileAction::Error));
+}
+
+#[test]
+fn a_re_offer_without_a_lane_stops_wanting_one() {
+    let hand = Hand::new("reoffer-lane");
+    let total = 9 << 20;
+    hand.send(hand.offer(id(4), "big.bin", total));
+    eventually("the accept", || hand.reply(FileAction::Accept));
+    // The first offer asked for a lane and this side could take it...
+    hand.manager.probe(|engine| {
+        for incoming in engine.incoming.values_mut() {
+            incoming.lane_wanted = true;
+        }
+    });
+    // ...the same transfer is offered again without one (the sender gave up on
+    // lanes): this offer decides, so no token is issued for it.
+    hand.send(hand.offer(id(4), "big.bin", total));
+    eventually("a second accept", || {
+        (hand.link.sent(FileAction::Accept).len() == 2).then_some(())
+    });
+    let wanted = hand.manager.probe(|engine| {
+        engine
+            .incoming
+            .values()
+            .any(|incoming| incoming.lane_wanted)
+    });
+    assert!(!wanted);
+}
+
+#[test]
+fn an_unpair_deletes_the_phones_partial_download_and_its_closing_peer_does_not_write_it_back() {
+    let peer = format!("unpair-{}", uuid::Uuid::new_v4().simple());
+    let hand = Hand::with_peer("unpair", &peer);
+    let total = 2 * BLOCK_BYTES;
+    let file = payload(total as usize, 9);
+    let mut offer = FileControl::new(&wire_of(&peer, "beta"), FileAction::Offer, id(2), "token0");
+    offer.filename = Some("u.bin".to_string());
+    offer.total_size = Some(total);
+    offer.mtime = Some(1_700_000_000_000);
+    offer.block_size = Some(BLOCK_BYTES);
+    offer.max_frame_bytes = Some(FRAME_BYTES_PROVEN);
+    hand.send(offer);
+    eventually("the accept", || hand.reply(FileAction::Accept));
+    for frame in block_frames(id(2), 0, &file, 0, false) {
+        hand.manager.on_frame(frame);
+    }
+    eventually("block 0", || hand.reply(FileAction::BlockAck));
+    let state = hand.base.join("state");
+    assert!(!names(&state).is_empty(), "a partial is kept while paired");
+    // Unpaired: its files go, and the peer closing behind it checkpoints nothing.
+    super::forget_device(&peer);
+    hand.manager.detach();
+    hand.settle();
+    assert_eq!(names(&state), Vec::<String>::new());
+    assert!(hand.incoming().is_empty());
 }
 
 // ── The Bucket ─────────────────────────────────────────────────────────────
@@ -3559,6 +3618,45 @@ mod lane {
         assert!(sending);
     }
 
+    /// A receiver that pauses for want of space holds the transfer for a long
+    /// while: the sender lets the lane go (no failure counted, no back-off for
+    /// the peer) instead of leaving an idle connection for the receiver to
+    /// find silent, and a lane is asked for again once the transfer moves.
+    #[test]
+    fn a_transfer_paused_for_space_lets_its_lane_go_without_a_failure_and_gets_one_again() {
+        let env = Env::new(Duration::from_millis(2));
+        let rig = env.rig("lane-release", fast());
+        let bytes = payload(48 * MIB, 33);
+        let source = rig.source("big.bin", &bytes);
+        let id = rig.a().start_send(&source).unwrap();
+        eventually("some blocks over the lane", || {
+            (board::lane_of(&id) == Some("fast lane") && verified(&rig) >= 2).then_some(())
+        });
+        rig.b().probe(|engine| engine.faults.disk_full = true);
+        eventually("the lane is let go", || {
+            (board::lane_of(&id) == Some("over WebRTC")).then_some(())
+        });
+        assert_eq!(
+            file_lane::peer_wait_for_test(&env.receiver.id, Instant::now()),
+            Duration::ZERO,
+            "a pause is not a failed lane"
+        );
+        steady(
+            "no new lane while it is held",
+            Duration::from_millis(300),
+            || board::lane_of(&id) == Some("over WebRTC"),
+        );
+        rig.b().probe(|engine| {
+            engine.faults.disk_full = false;
+            engine.faults.free_bytes = Some(1 << 40);
+        });
+        let got = rig.received();
+        assert_eq!(fs::read(&got.path).unwrap(), bytes);
+        let kinds: Vec<String> = lane_actions(&rig).into_iter().map(|a| a.0).collect();
+        assert_eq!(kinds.first().map(String::as_str), Some("tcp"), "{kinds:?}");
+        assert!(kinds.contains(&"webrtc".to_string()), "{kinds:?}");
+    }
+
     /// The acknowledgements of the first five blocks never arrive, then the
     /// lane drops: the receiver verified five, the sender saw none. The
     /// data channel takes over from the receiver's five, not the sender's none.
@@ -3870,6 +3968,37 @@ mod lane {
         let kinds: Vec<String> = lane_actions(&rig).into_iter().map(|a| a.0).collect();
         assert_eq!(&kinds[..3], ["tcp", "webrtc", "tcp"], "{kinds:?}");
         assert!(env.proxy.connections.load(Ordering::SeqCst) >= 2);
+    }
+
+    /// A promotion re-offers only once the block in progress is finished and
+    /// every block sent is acknowledged: what the receiver restarts at is
+    /// exactly what was sent, so nothing in flight on the data channel is
+    /// thrown away.
+    #[test]
+    fn a_promotion_waits_for_the_blocks_in_flight_so_nothing_is_thrown_away() {
+        let env = Env::new(Duration::from_millis(1));
+        env.proxy.plan(&[Plan::Cut(6 * MIB as u64), Plan::Pass]);
+        let mut tun = fast();
+        tun.lane_retry = Duration::from_millis(150);
+        let rig = env.rig("lane-drain", tun);
+        slow_pipe(&rig, Duration::from_millis(2));
+        let bytes = payload(64 * MIB + 5, 17);
+        let source = rig.source("big.bin", &bytes);
+        rig.a().start_send(&source).unwrap();
+        eventually("the promotion's re-offer", || {
+            (rig.ab.sent(FileAction::Offer).len() == 2).then_some(())
+        });
+        let in_flight = rig.a().probe(|engine| {
+            engine
+                .outgoing
+                .first()
+                .and_then(|outgoing| outgoing.promoted_with_in_flight)
+        });
+        assert_eq!(in_flight, Some(0), "the re-offer went with data in flight");
+        let got = rig.received();
+        assert_eq!(fs::read(&got.path).unwrap(), bytes);
+        let kinds: Vec<String> = lane_actions(&rig).into_iter().map(|a| a.0).collect();
+        assert_eq!(&kinds[..3], ["tcp", "webrtc", "tcp"], "{kinds:?}");
     }
 
     #[test]

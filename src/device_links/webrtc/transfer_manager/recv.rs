@@ -39,7 +39,7 @@ pub(super) struct Ctx<'a> {
 pub(super) struct Incoming {
     pub id: String,
     pub token: String,
-    device_id: String,
+    pub(super) device_id: String,
     filename: String,
     destination_name: String,
     total: u64,
@@ -481,6 +481,11 @@ impl Engine {
             existing.adopt_any = true;
             existing.old_stream_possible = true;
             existing.paused = None;
+            // This offer decides, not the first one: an offer without a lane
+            // (the sender gave up on them) gets no token.
+            existing.lane_wanted = message.lane.is_some()
+                && total >= super::super::file_lane::MIN_FILE_BYTES
+                && net.link.lane_target().is_some();
             net.send(existing.accept_message(net));
             return;
         }

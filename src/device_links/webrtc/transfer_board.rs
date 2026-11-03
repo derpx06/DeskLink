@@ -164,7 +164,23 @@ impl TransferBoard {
             return;
         }
         if self.synced.len() >= MAX_ROWS {
-            self.synced.remove(0);
+            // Pushed off the list, not forgotten: the Bucket's slot for it is
+            // freed and the file counts as not synced (it is asked for again).
+            let evicted = self.synced.remove(0);
+            self.notes.remove(&evicted.id);
+            if self.synced_ended.len() >= MAX_FINISHED {
+                self.synced_ended.pop_front();
+            }
+            self.synced_ended.push_back(SyncedEnd {
+                device: evicted.device_id,
+                name: evicted.name,
+                incoming: evicted.incoming,
+                ok: false,
+            });
+            if self.synced_failed.len() >= MAX_FINISHED {
+                self.synced_failed.pop_front();
+            }
+            self.synced_failed.push_back(evicted.id);
         }
         self.synced.push(row);
         self.prune_lanes();
@@ -294,6 +310,7 @@ impl TransferBoard {
     pub fn discard(&mut self, id: &str) {
         self.notes.remove(id);
         self.lanes.remove(id);
+        self.retry_sources.remove(id);
         self.rows.retain(|row| row.id != id);
         self.synced.retain(|row| row.id != id);
     }
@@ -863,5 +880,32 @@ mod tests {
         drop(guard);
         assert!(!rows().iter().any(|row| row.name == name));
         assert!(!board().finished.iter().any(|item| item.name == name));
+    }
+
+    /// A Bucket row pushed off a full list is reported ended (its slot is
+    /// freed) and failed (the file is asked for again), never just forgotten.
+    #[test]
+    fn a_synced_row_pushed_off_a_full_list_is_reported_ended_and_failed() {
+        let mut board = TransferBoard::default();
+        for n in 0..=MAX_ROWS {
+            board.begin_synced(row(&format!("s{n}"), "phone", true, 9 << 20));
+        }
+        assert_eq!(board.synced.len(), MAX_ROWS);
+        assert!(board
+            .synced_ended
+            .iter()
+            .any(|end| end.name == "s0.bin" && !end.ok && end.incoming));
+        assert_eq!(board.synced_failed.front().map(String::as_str), Some("s0"));
+    }
+
+    /// A row taken off the board without an outcome (a changed file begun
+    /// again under a new id) takes its retry source with it.
+    #[test]
+    fn a_discarded_row_forgets_its_retry_source() {
+        let mut board = TransferBoard::default();
+        board.begin(row("r1", "phone", false, 5));
+        board.set_retry_source("r1", PathBuf::from("/tmp/x"));
+        board.discard("r1");
+        assert!(board.retry_sources.is_empty());
     }
 }

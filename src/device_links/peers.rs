@@ -13,6 +13,7 @@
 pub(crate) fn forget_peer(device_id: &str) {
     use crate::device_links::{daemon, features, glide, mpris, session_lock, sync, webrtc};
     webrtc::transfer_board::finish_device(device_id, "The phone was unpaired");
+    webrtc::transfer_manager::forget_device(device_id);
     webrtc::terminal_bridge::revoke_device(device_id);
     crate::device_links::calls::hold_media(device_id, false);
     webrtc::coordinator::forget_liveness(device_id);

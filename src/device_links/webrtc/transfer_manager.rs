@@ -45,6 +45,8 @@ use recv::Incoming;
 use send::Outgoing;
 use store::Store;
 
+pub(crate) use store::forget_device;
+
 /// The largest clipboard image accepted or sent (contract C3).
 pub const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
 
@@ -907,12 +909,13 @@ impl Engine {
             return;
         }
         let why = message.reason.clone().unwrap_or_default();
+        let net = self.net.clone();
         match self
             .outgoing
             .iter_mut()
             .find(|outgoing| outgoing.id == message.transfer_id)
         {
-            Some(outgoing) => outgoing.on_peer_pause(&why),
+            Some(outgoing) => outgoing.on_peer_pause(&why, net.as_deref()),
             None => board::set_note(&message.transfer_id, note_for_peer_pause(&why).as_deref()),
         }
     }
@@ -1094,6 +1097,25 @@ impl Engine {
         if self.faults.crash {
             return;
         }
+        // A phone unpaired while its peer was closing: nothing of it is
+        // written back, and what this manager still holds of it goes.
+        let (store, outgoing) = (&self.store, &mut self.outgoing);
+        self.incoming.retain(|_, incoming| {
+            if store::was_purged(&incoming.device_id) {
+                incoming.discard(store);
+                false
+            } else {
+                true
+            }
+        });
+        outgoing.retain(|outgoing| {
+            if store::was_purged(&outgoing.peer) {
+                outgoing.discard(store);
+                false
+            } else {
+                true
+            }
+        });
         for incoming in self.incoming.values_mut() {
             incoming.checkpoint_now(&self.store);
         }
