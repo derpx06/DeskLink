@@ -407,6 +407,9 @@ impl TransferStatePaths {
     }
 }
 
+/// Starts the error of a settings save that failed on the disk.
+pub(crate) const SAVE_FAILED: &str = "Could not save the settings: ";
+
 fn migrate_transfer_state(old: &Path, new: &Path) {
     if !old.is_dir() {
         return;
@@ -757,6 +760,13 @@ impl Config {
             // reports it (a pairing made now would be lost on restart).
             return Err(NEWER_UNREADABLE.to_string());
         }
+        // So the window can tell a failed save of the settings (a full or
+        // read-only disk) from any other file error.
+        self.write_files()
+            .map_err(|error| format!("{SAVE_FAILED}{error}"))
+    }
+
+    fn write_files(&self) -> Result<(), String> {
         super::private_fs::create_dir_all(&self.base_dir).map_err(|err| err.to_string())?;
         // The pairing record and the session-password hash: this user only.
         write_atomic_if_changed(

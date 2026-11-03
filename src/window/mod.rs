@@ -1998,6 +1998,9 @@ fn is_offline_message(message: &str) -> bool {
 fn friendly_error(raw: &str) -> (String, bool) {
     let lower = raw.to_lowercase();
     let has = |needles: &[&str]| needles.iter().any(|needle| lower.contains(needle));
+    // The settings save names itself (see `Config::save`); any other file
+    // error is not about the settings.
+    let saving = lower.contains(&crate::device_links::config::SAVE_FAILED.to_lowercase());
     let (message, lasting) = if has(&[
         "(os error 101)",
         "network is unreachable",
@@ -2053,18 +2056,25 @@ fn friendly_error(raw: &str) -> (String, bool) {
     } else if has(&["gstreamer webrtc plugins"]) {
         // The start-up check's own words: what to install, kept whole.
         return (raw.to_string(), true);
-    } else if has(&["(os error 30)", "read-only file system"]) {
+    } else if saving && has(&["(os error 30)", "read-only file system"]) {
         (
             "DeskLink cannot save anything: its settings folder is on a read-only file \
              system. Make your home folder writable, or point XDG_CONFIG_HOME at a folder \
              that is, then restart DeskLink.",
             true,
         )
-    } else if has(&["(os error 28)", "no space left"]) {
+    } else if saving && has(&["(os error 28)", "no space left on device"]) {
         (
             "The disk is full, so DeskLink cannot save its settings. Free some space.",
             true,
         )
+    } else if has(&["(os error 30)", "read-only file system"]) {
+        (
+            "A folder DeskLink needs is on a read-only file system.",
+            false,
+        )
+    } else if has(&["(os error 28)", "no space left on device"]) {
+        ("The disk is full. Free some space.", false)
     } else if has(&["(os error 98)", "address already in use"]) {
         (
             "Another app is using DeskLink's network ports. Close other phone-link apps, \
@@ -2092,10 +2102,16 @@ fn friendly_error(raw: &str) -> (String, bool) {
             false,
         )
     } else if has(&[
-        "certificate",
-        "unknown ca",
+        "certificate verify failed",
+        "peer certificate",
+        "bad certificate",
         "bad_certificate",
-        "verify failed",
+        "certificate unknown",
+        "certificate required",
+        "certificate has expired",
+        "self-signed certificate",
+        "unknown ca",
+        "unknown_ca",
         "unable to get local issuer",
     ]) {
         (
@@ -2107,11 +2123,13 @@ fn friendly_error(raw: &str) -> (String, bool) {
         "handshake",
         "tls error",
         "tls alert",
-        "ssl",
+        "ssl error",
+        "ssl routines",
+        "ssl handshake",
+        "sslv3 alert",
         "unexpected eof",
         "unexpected end of file",
-        "end of file",
-        "eof",
+        "failed to fill whole buffer",
         "connection aborted",
         "connection closed",
         "early eof",
@@ -2124,7 +2142,9 @@ fn friendly_error(raw: &str) -> (String, bool) {
         "failed to lookup",
         "name or service not known",
         "no such host",
-        "resolve",
+        "temporary failure in name resolution",
+        "could not resolve",
+        "failed to resolve",
     ]) {
         (
             "DeskLink could not find the device on the network. It will keep looking.",
@@ -3744,6 +3764,45 @@ mod tests {
             ("Pairing failed".to_string(), false)
         );
         assert_eq!(friendly_error("Pairing failed").0, "Pairing failed");
+    }
+
+    /// Words that merely appear in an unrelated error are not rewritten into
+    /// advice about the network, a certificate or the settings.
+    #[test]
+    fn unrelated_errors_keep_their_own_words() {
+        for raw in [
+            "EOF while parsing a value at line 1 column 0",
+            "Could not read the file: end of file reached in the notes",
+            "The certificate chooser is not available",
+            "Cannot resolve the symlink for that folder",
+            "Dissolved 3 sessions",
+            "No space left on the screen for another tile",
+            "Verify failed: the checksum of the copy differs",
+        ] {
+            assert_eq!(friendly_error(raw), (raw.to_string(), false), "{raw}");
+        }
+        // The disk errors say "settings" only for a failed settings save.
+        let full = "No space left on device (os error 28)";
+        assert!(!friendly_error(full).0.contains("settings"));
+        let saved = format!("{}{full}", crate::device_links::config::SAVE_FAILED);
+        assert!(friendly_error(&saved).0.contains("settings"));
+        let read_only = format!(
+            "{}Read-only file system (os error 30)",
+            crate::device_links::config::SAVE_FAILED
+        );
+        assert!(friendly_error(&read_only).0.contains("read-only"));
+        // The real ones still map.
+        assert!(
+            friendly_error("error:0A000086:SSL routines::certificate verify failed")
+                .0
+                .contains("identity could not be checked")
+        );
+        assert!(friendly_error("failed to fill whole buffer")
+            .0
+            .contains("dropped"));
+        assert!(friendly_error("Temporary failure in name resolution")
+            .0
+            .contains("could not find"));
     }
 
     #[test]
