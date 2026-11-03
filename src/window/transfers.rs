@@ -73,6 +73,13 @@ fn subtitle(row: &TransferRow, device: &str) -> String {
     )
 }
 
+/// A rate and a time left are shown only while bytes are meant to be moving: a
+/// row that waits (its note says why, or its device is away) keeps no stale
+/// "3 MB/s · 5 s left" from before it stopped.
+fn shows_rate(row: &TransferRow, held: bool) -> bool {
+    !row.preparing && !row.paused && !held
+}
+
 /// How far along, 0..=1; `None` while there is nothing to measure against.
 pub(super) fn fraction(row: &TransferRow) -> Option<f64> {
     if row.preparing || row.total == 0 {
@@ -901,7 +908,8 @@ fn refresh(
             },
         );
         let rate = rate_text(shown.rate.get(), row.total.saturating_sub(row.done));
-        if !row.preparing && !rate.is_empty() {
+        let held = crate::device_links::webrtc::transfer_board::note(&row.id).is_some();
+        if shows_rate(row, held) && !rate.is_empty() {
             text = format!("{text} · {rate}");
         }
         // Labels here are plain text, so peer-supplied names need no escaping.
@@ -1105,6 +1113,19 @@ mod tests {
             receiving.starts_with("Receiving from Pixel · "),
             "{receiving}"
         );
+    }
+
+    #[test]
+    fn no_rate_is_shown_for_a_row_that_is_waiting() {
+        let moving = row(true, 1_000, 4_000);
+        assert!(shows_rate(&moving, false));
+        assert!(!shows_rate(&moving, true), "a note says why it waits");
+        let mut paused = row(true, 1_000, 4_000);
+        paused.paused = true;
+        assert!(!shows_rate(&paused, false));
+        let mut preparing = row(false, 0, 0);
+        preparing.preparing = true;
+        assert!(!shows_rate(&preparing, false));
     }
 
     #[test]

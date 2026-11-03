@@ -292,6 +292,17 @@ fn wait_for_phone(
         return Err("Only files can be sent".to_string());
     }
     let mut waiting = WAITING.lock().map_err(|_| "Busy, try again".to_string())?;
+    // The same file chosen again while the phone is away (same path, size and
+    // time) is the same request: it waits once and is sent once.
+    let (size, mtime) = (meta.len(), mtime_ns(&meta));
+    if waiting.iter().any(|file| {
+        file.device_id == device_id
+            && file.path == path
+            && file.size == size
+            && file.mtime_ns == mtime
+    }) {
+        return Ok(());
+    }
     if waiting.len() >= MAX_WAITING_FILES {
         return Err(format!(
             "{MAX_WAITING_FILES} files are already waiting for a phone to connect"
@@ -301,8 +312,8 @@ fn wait_for_phone(
         device_id: device_id.to_string(),
         phone: phone.to_string(),
         path,
-        size: meta.len(),
-        mtime_ns: mtime_ns(&meta),
+        size,
+        mtime_ns: mtime,
         queued_at: unix_now(),
         identity: identity.to_string(),
     });
@@ -572,6 +583,31 @@ impl DaemonWorker {
 mod waiting_tests {
     use super::*;
     use crate::device_links::webrtc::transfer_board as board;
+
+    /// Choosing the same file twice for a phone that is away queues it once;
+    /// a changed file (another time) is a new request.
+    #[test]
+    fn the_same_file_chosen_twice_for_an_absent_phone_waits_once() {
+        let dir = std::env::temp_dir().join(format!("desklink-dedupe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "x").unwrap();
+        let phone = format!("dedupe-{}", uuid::Uuid::new_v4().simple());
+        wait_for_phone(&phone, "Pixel", "", file.clone()).unwrap();
+        wait_for_phone(&phone, "Pixel", "", file.clone()).unwrap();
+        assert_eq!(waiting_files(&phone), vec![file.clone()]);
+        // Another phone keeps its own copy of the request.
+        let other = format!("{phone}-2");
+        wait_for_phone(&other, "Tab", "", file.clone()).unwrap();
+        assert_eq!(waiting_files(&other).len(), 1);
+        // The file changed: that is a new request.
+        std::fs::write(&file, "changed longer").unwrap();
+        wait_for_phone(&phone, "Pixel", "", file).unwrap();
+        assert_eq!(waiting_files(&phone).len(), 2);
+        clear_waiting(&phone);
+        clear_waiting(&other);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// I9 + S3: files for an absent phone wait as ONE row; they are released
     /// only when taken, can be put back when refused, expire after a day even
