@@ -83,13 +83,13 @@ pub(crate) fn forget_addresses(device_id: &str) {
     let _ = thread::Builder::new()
         .name("desklink-endpoints".into())
         .spawn(move || {
-            let _writing = WRITING.lock();
             unpersist_endpoint(&device_id);
         });
 }
 
 /// Rewrites `endpoints.json` without `device_id`.
 fn unpersist_endpoint(device_id: &str) {
+    let _writing = WRITING.lock().unwrap_or_else(|p| p.into_inner());
     let mut all = persisted_endpoints();
     if all.remove(device_id).is_none() {
         return;
@@ -159,12 +159,12 @@ pub(super) fn persist_paired_endpoint(
         .spawn(move || {
             // One writer at a time: two links authenticating together must
             // not interleave read-modify-write.
-            let _writing = WRITING.lock();
             persist_endpoint(&device_id, SocketAddr::new(ip, port), &trusted);
         });
 }
 
-/// Serialises the read-modify-write of `endpoints.json`.
+/// Serialises the read-modify-write of `endpoints.json` and its cache. Taken
+/// by [`persist_endpoint`] and [`unpersist_endpoint`] themselves.
 static WRITING: Mutex<()> = Mutex::new(());
 
 /// Where each paired phone was last reachable, kept across restarts so the
@@ -216,6 +216,9 @@ fn persist_endpoint(
     address: SocketAddr,
     trusted: &std::collections::HashSet<String>,
 ) {
+    // One read-modify-write of file and cache at a time: a concurrent change
+    // of another phone's address must not be overwritten by a stale snapshot.
+    let _writing = WRITING.lock().unwrap_or_else(|p| p.into_inner());
     let before = persisted_endpoints();
     let all = updated_endpoints(before.clone(), device_id, address, trusted);
     if let Ok(mut cached) = PERSISTED.lock() {
@@ -1190,7 +1193,7 @@ mod tests {
     #[test]
     fn remembered_addresses_are_private() {
         use std::os::unix::fs::PermissionsExt;
-        let trusted: std::collections::HashSet<String> = ["private-phone".to_string()].into();
+        let trusted = test_phones();
         persist_endpoint("private-phone", "10.1.2.3:1716".parse().unwrap(), &trusted);
         let path = endpoints_path().unwrap();
         let mode =
@@ -1202,8 +1205,7 @@ mod tests {
     /// An unpaired phone's last address must not return after a restart.
     #[test]
     fn an_unpaired_phones_endpoint_leaves_the_file() {
-        let trusted: std::collections::HashSet<String> =
-            ["gone-phone".to_string(), "kept-phone".to_string()].into();
+        let trusted = test_phones();
         persist_endpoint("gone-phone", "10.1.2.4:1716".parse().unwrap(), &trusted);
         persist_endpoint("kept-phone", "10.1.2.5:1716".parse().unwrap(), &trusted);
         unpersist_endpoint("gone-phone");
@@ -1211,6 +1213,56 @@ mod tests {
         assert!(!after.contains_key("gone-phone"));
         assert!(after.contains_key("kept-phone"), "only that phone's");
         assert!(!persisted_snapshot().contains_key("gone-phone"));
+    }
+
+    /// Every phone the tests persist: `persist_endpoint` prunes the file to
+    /// the paired set it is given, so tests running side by side must all
+    /// give the same one or they erase each other's entries.
+    fn test_phones() -> std::collections::HashSet<String> {
+        ["private-phone", "late-phone", "gone-phone", "kept-phone"]
+            .iter()
+            .map(|id| id.to_string())
+            .chain((0..10).flat_map(|n| [format!("race-keep-{n}"), format!("race-gone-{n}")]))
+            .collect()
+    }
+
+    /// Interleaved persists and unpersists of different phones lose neither.
+    #[test]
+    fn concurrent_persist_and_unpersist_of_different_phones_lose_neither() {
+        let trusted = test_phones();
+        for n in 0..10 {
+            persist_endpoint(
+                &format!("race-gone-{n}"),
+                "10.3.0.1:1716".parse().unwrap(),
+                &trusted,
+            );
+        }
+        let writer = {
+            let trusted = trusted.clone();
+            std::thread::spawn(move || {
+                for n in 0..10 {
+                    persist_endpoint(
+                        &format!("race-keep-{n}"),
+                        "10.3.0.2:1716".parse().unwrap(),
+                        &trusted,
+                    );
+                }
+            })
+        };
+        for n in 0..10 {
+            unpersist_endpoint(&format!("race-gone-{n}"));
+        }
+        writer.join().unwrap();
+        let (file, cache) = (persisted_endpoints(), persisted_snapshot());
+        for n in 0..10 {
+            for map in [&file, &cache] {
+                assert!(map.contains_key(&format!("race-keep-{n}")), "kept {n} lost");
+                assert!(
+                    !map.contains_key(&format!("race-gone-{n}")),
+                    "gone {n} back"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1335,7 +1387,7 @@ mod tests {
     /// Review finding A: the remembered addresses were read once at start.
     #[test]
     fn an_address_remembered_later_is_seen_by_the_redialer() {
-        let trusted: std::collections::HashSet<String> = ["late-phone".to_string()].into();
+        let trusted = test_phones();
         let before = persisted_snapshot();
         assert!(!before.contains_key("late-phone"));
         persist_endpoint("late-phone", "10.2.0.5:1716".parse().unwrap(), &trusted);
