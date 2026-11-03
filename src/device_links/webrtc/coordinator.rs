@@ -3721,10 +3721,12 @@ pub(crate) fn classify_peer_state(state: &str) -> PeerStateAction {
 }
 
 fn new_transfer_manager(config: &Arc<Mutex<Config>>) -> Result<Arc<WebRtcTransferManager>, String> {
-    let config = config
+    let paths = config
         .lock()
-        .map_err(|_| "DeskLink configuration lock poisoned".to_string())?;
-    let transfer_state = config.transfer_state_dir();
+        .map_err(|_| "DeskLink configuration lock poisoned".to_string())?
+        .transfer_state_paths();
+    // Moving old state is file IO: not under the configuration lock.
+    let transfer_state = paths.prepare();
     let downloads = dirs::download_dir().unwrap_or_else(|| transfer_state.join("downloads"));
     let manager = Arc::new(WebRtcTransferManager::new(transfer_state, downloads)?);
     // A photo or scan a desk asked for (F3) has arrived.

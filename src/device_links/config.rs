@@ -390,6 +390,23 @@ fn remove_stored_removed_features(base_dir: &Path) -> bool {
 /// directory. Quiet. A move that failed half way (another filesystem, a full
 /// disk) is finished at the next start: the old folder is only removed once
 /// everything in it is in the new one, and files already there are kept.
+/// Where transfer state was and where it lives now.
+pub struct TransferStatePaths {
+    old: PathBuf,
+    new: PathBuf,
+}
+
+impl TransferStatePaths {
+    /// Moves state from the old place to the new if need be (file IO), and
+    /// gives the directory to use.
+    pub fn prepare(self) -> PathBuf {
+        if self.old != self.new {
+            migrate_transfer_state(&self.old, &self.new);
+        }
+        self.new
+    }
+}
+
 fn migrate_transfer_state(old: &Path, new: &Path) {
     if !old.is_dir() {
         return;
@@ -795,22 +812,23 @@ impl Config {
 
     /// Private state for resumable WebRTC file transfers.  This remains below
     /// the existing protocol directory so rebranding and transport migration
-    /// never move identities or pairing records.
-    pub fn transfer_state_dir(&self) -> PathBuf {
+    /// never move identities or pairing records. Only computes the paths:
+    /// [`TransferStatePaths::prepare`] moves old state, and does file IO, so
+    /// call it after the configuration lock is released.
+    pub fn transfer_state_paths(&self) -> TransferStatePaths {
         let old = self.base_dir.join("webrtc-transfers");
         if self.base_dir != config_dir() {
-            return old; // a test or another install root: where it always was
+            // a test or another install root: where it always was
+            return TransferStatePaths {
+                new: old.clone(),
+                old,
+            };
         }
         let new = dirs::state_dir()
             .or_else(dirs::data_local_dir)
-            .map(|state| state.join("desklink").join("transfers"));
-        match new {
-            Some(new) => {
-                migrate_transfer_state(&old, &new);
-                new
-            }
-            None => old,
-        }
+            .map(|state| state.join("desklink").join("transfers"))
+            .unwrap_or_else(|| old.clone());
+        TransferStatePaths { old, new }
     }
 
     /// Snippets and notes (F6), encrypted; never removed on unpair.
@@ -946,6 +964,12 @@ impl Config {
             crate::device_links::daemon::file_transfer::forget_waiting(&info.id);
             // Nor are the photos and the count of the old one.
             crate::device_links::gallery::forget(&info.id);
+            // And what is held in memory for it: unlock nonces, the clipboard
+            // sent, glide, Do Not Disturb, art, lane back-off, transfer
+            // records. (Only what is safe under this lock: stopping live
+            // shares waits on the main loop; the cleanup of an unpair does
+            // that outside it.)
+            crate::device_links::peers::forget_identity_state(&info.id);
             // What the old identity said it already held is not what a new
             // one has: its snapshots are sent again.
             crate::device_links::sync::forget_device(&info.id);
@@ -2170,6 +2194,56 @@ mod tests {
         assert!(config.stored.settings.shows_notifications(&id));
         assert!(config.stored.settings.alerts_commands_to(&id));
         assert!(!config.stored.settings.contact_caller_names.contains(&id));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Computing where transfer state lives is pure; only `prepare` moves it.
+    #[test]
+    fn transfer_state_moves_only_when_prepared() {
+        let base = std::env::temp_dir().join(format!("desklink-statepaths-{}", Uuid::new_v4()));
+        let old = base.join("old");
+        let new = base.join("new");
+        fs::create_dir_all(&old).unwrap();
+        fs::write(old.join("a.part"), "x").unwrap();
+        let config = Config::load_from_dir(base.join("cfg")).unwrap();
+        let same = config.transfer_state_paths();
+        assert_eq!(same.old, same.new, "a test root keeps its place");
+        let paths = TransferStatePaths {
+            old: old.clone(),
+            new: new.clone(),
+        };
+        assert!(old.join("a.part").exists() && !new.exists(), "nothing yet");
+        assert_eq!(paths.prepare(), new);
+        assert!(new.join("a.part").exists() && !old.exists());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A new identity behind the same id does not inherit what the old one
+    /// left in memory (here the glide report and lane back-off).
+    #[test]
+    fn a_new_certificate_forgets_the_old_ones_session_state() {
+        let dir = std::env::temp_dir().join(format!("desklink-idstate-{}", Uuid::new_v4()));
+        let mut config = Config::load_from_dir(dir.clone()).unwrap();
+        let id = format!("phone-{}", Uuid::new_v4().simple());
+        let info = DeviceInfo::local(id.clone(), "Pixel".into());
+        config.trust_device(&info, "cert-1".into()).unwrap();
+        let mut allowed =
+            crate::device_links::packet::NetworkPacket::new("desklink.shareinputdevices");
+        allowed.set("allowed", true);
+        crate::device_links::glide::on_phone_packet(&id, &allowed);
+        crate::device_links::webrtc::file_lane::penalize_peer(
+            &id,
+            std::time::Duration::from_secs(10),
+            std::time::Instant::now(),
+        );
+        config.trust_device(&info, "cert-1".into()).unwrap();
+        assert_eq!(crate::device_links::glide::phone_allows(&id), Some(true));
+        config.trust_device(&info, "cert-2".into()).unwrap();
+        assert_eq!(crate::device_links::glide::phone_allows(&id), None);
+        assert!(!crate::device_links::webrtc::file_lane::peer_blocked(
+            &id,
+            std::time::Instant::now()
+        ));
         let _ = fs::remove_dir_all(dir);
     }
 

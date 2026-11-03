@@ -11,11 +11,33 @@
 /// itself, and its files, are the trust store's own business
 /// (`Config::untrust_device`).
 pub(crate) fn forget_peer(device_id: &str) {
-    use crate::device_links::{daemon, features, glide, mpris, session_lock, sync, webrtc};
-    webrtc::transfer_board::finish_device(device_id, "The phone was unpaired");
+    crate::device_links::webrtc::transfer_board::finish_device(device_id, "The phone was unpaired");
+    forget_identity_state(device_id);
+    forget_live_and_connection_state(device_id);
+}
+
+/// What must not survive a new identity behind the same id (a changed
+/// certificate): consents, nonces, back-off and records held in memory or in
+/// the transfer store. Plain memory and files only: it never waits on another
+/// thread, so it may run under the configuration lock.
+pub(crate) fn forget_identity_state(device_id: &str) {
+    use crate::device_links::{daemon, glide, mpris, webrtc};
     webrtc::transfer_manager::forget_device(device_id);
     webrtc::file_lane::forget_peer(device_id);
     crate::device_links::folders::forget_device(device_id);
+    crate::device_links::unlock::forget(device_id);
+    glide::forget_phone(device_id);
+    crate::device_links::walk_away::forget(device_id);
+    crate::device_links::dnd::forget(device_id);
+    mpris::forget_art_sent(device_id);
+    daemon::clipboard::forget_sent_to(device_id);
+}
+
+/// The rest of [`forget_peer`]: ends live shares (which waits on the main
+/// loop: never under the configuration lock), and drops what was learned of
+/// the connection.
+fn forget_live_and_connection_state(device_id: &str) {
+    use crate::device_links::{daemon, features, session_lock, sync, webrtc};
     webrtc::terminal_bridge::revoke_device(device_id);
     crate::device_links::calls::hold_media(device_id, false);
     webrtc::coordinator::forget_liveness(device_id);
@@ -24,14 +46,8 @@ pub(crate) fn forget_peer(device_id: &str) {
     daemon::pairing_commands::forget_proven(device_id);
     sync::forget_device(device_id);
     session_lock::forget_unlock(device_id);
-    crate::device_links::unlock::forget(device_id);
-    glide::forget_phone(device_id);
-    crate::device_links::walk_away::forget(device_id);
-    crate::device_links::dnd::forget(device_id);
     crate::device_links::gallery::forget(device_id);
-    mpris::forget_art_sent(device_id);
     features::forget_peer_profile(device_id);
-    daemon::clipboard::forget_sent_to(device_id);
     webrtc::audio_session::end_all(device_id);
     webrtc::capture::end(device_id);
     webrtc::remote_session::forget(device_id);
