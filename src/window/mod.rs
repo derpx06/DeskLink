@@ -154,6 +154,10 @@ mod imp {
         pub last_raw_error: RefCell<String>,
         /// When a lasting error (offline) was last reported.
         pub banner_since: Cell<Option<std::time::Instant>>,
+        /// The standing problem (`platform::sticky_notice`) the banner shows
+        /// now, if any, and the ones the person dismissed this run.
+        pub sticky_id: RefCell<Option<&'static str>>,
+        pub sticky_dismissed: RefCell<std::collections::HashSet<&'static str>>,
         /// The last error toast and when, so a repeating error toasts once.
         pub last_error_toast: RefCell<Option<(String, std::time::Instant)>>,
         pub notified_pair_requests: RefCell<HashSet<String>>,
@@ -427,6 +431,11 @@ mod imp {
             let window = obj.downgrade();
             self.error_banner.connect_button_clicked(move |_| {
                 if let Some(window) = window.upgrade() {
+                    // A standing problem's button dismisses it; an error's
+                    // opens the details.
+                    if window.dismiss_sticky_notice() {
+                        return;
+                    }
                     let raw = window.imp().last_raw_error.borrow().clone();
                     window.show_error_details(&raw);
                 }
@@ -1271,7 +1280,11 @@ impl DesklinkWindow {
             .banner_since
             .get()
             .is_none_or(|since| since.elapsed() >= std::time::Duration::from_secs(10));
-        if errors_empty
+        // A standing problem (no WebRTC plugins, nothing can be saved) is
+        // asserted again at every poll, so it outlives the banner timer.
+        let sticky = self.assert_sticky_notice();
+        if !sticky
+            && errors_empty
             && banner_settled
             && devices.iter().all(|device| device.last_error.is_none())
         {
@@ -1483,6 +1496,46 @@ impl DesklinkWindow {
         }
     }
 
+    /// Shows the standing problem, if any, in the banner and keeps it there
+    /// (called at every poll). Returns whether the banner shows it. It waits
+    /// for another banner to go rather than replace it, and stays hidden once
+    /// the person dismissed it.
+    fn assert_sticky_notice(&self) -> bool {
+        let imp = self.imp();
+        let notice = crate::platform::sticky_notice()
+            .filter(|(id, _)| !imp.sticky_dismissed.borrow().contains(id));
+        let showing = imp.sticky_id.borrow().is_some();
+        match notice {
+            Some((id, words)) if showing || !imp.error_banner.is_revealed() => {
+                imp.error_banner.set_title(&words);
+                imp.error_banner.set_button_label(Some("Dismiss"));
+                imp.error_banner.set_revealed(true);
+                imp.sticky_id.replace(Some(id));
+                true
+            }
+            Some(_) => false,
+            None => {
+                if showing {
+                    imp.sticky_id.replace(None);
+                    imp.error_banner.set_revealed(false);
+                }
+                false
+            }
+        }
+    }
+
+    /// The banner button on a standing problem: dismisses it for this run.
+    /// `false` when the banner shows an error instead.
+    fn dismiss_sticky_notice(&self) -> bool {
+        let imp = self.imp();
+        let Some(id) = imp.sticky_id.replace(None) else {
+            return false;
+        };
+        imp.sticky_dismissed.borrow_mut().insert(id);
+        imp.error_banner.set_revealed(false);
+        true
+    }
+
     /// Puts a daemon error in words a person can act on: a banner for a
     /// lasting state, a toast (once per half minute) for a passing one. The
     /// raw text stays one click away for bug reports.
@@ -1495,6 +1548,9 @@ impl DesklinkWindow {
             return;
         }
         if lasting {
+            // An error takes the banner over; a standing problem returns to
+            // it once the error's time is up.
+            imp.sticky_id.replace(None);
             imp.banner_since.set(Some(std::time::Instant::now()));
             imp.error_banner.set_title(&message);
             imp.error_banner.set_button_label(Some("Details"));
@@ -3422,6 +3478,63 @@ mod tests {
             assert_eq!(dialog.heading().as_deref(), Some("Error Details"));
             assert!(dialog.body().contains("identity changed"));
             dialog.close();
+        });
+    }
+
+    /// A standing problem stays in the banner, comes back at every poll after
+    /// an error has had the banner, and goes only when dismissed or fixed.
+    #[test]
+    fn a_standing_problem_stays_in_the_banner_until_it_is_dismissed_or_fixed() {
+        use crate::platform::{evaluate, Probe};
+        let _held = crate::platform::TEST_REPORT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_display::run(|| {
+            let resources = crate::load_resources().expect("the bundled resources");
+            gio::resources_register(&resources);
+            let app = adw::Application::builder()
+                .application_id("derx06.desklink.com.test")
+                .build();
+            let window = DesklinkWindow::new(&app);
+            let banner = window.imp().error_banner.clone();
+            let broken = |writable: bool, plugins: bool| {
+                let mut probe = Probe {
+                    config_writable: writable,
+                    ..Probe::default()
+                };
+                if plugins {
+                    probe.elements = ["webrtcbin", "dtlsdec", "dtlssrtpenc", "nicesrc"]
+                        .map(String::from)
+                        .into();
+                }
+                crate::platform::set_report_for_tests(evaluate(&probe));
+            };
+            // A read-only home: shown, and still shown at the next poll.
+            broken(false, true);
+            assert!(window.assert_sticky_notice());
+            assert!(banner.is_revealed() && banner.title().contains("configuration folder"));
+            assert_eq!(banner.button_label().as_deref(), Some("Dismiss"));
+            assert!(window.assert_sticky_notice(), "asserted again");
+            // An error takes the banner; the problem waits, then returns.
+            window.report_error("Trusted device certificate changed", false);
+            assert!(banner.title().contains("identity changed"));
+            assert!(!window.assert_sticky_notice(), "does not replace an error");
+            assert!(banner.title().contains("identity changed"));
+            banner.set_revealed(false);
+            assert!(window.assert_sticky_notice(), "back once the error is gone");
+            // Dismissed by the person: gone for this run.
+            banner.emit_by_name::<()>("button-clicked", &[]);
+            assert!(!banner.is_revealed());
+            assert!(!window.assert_sticky_notice());
+            assert!(!banner.is_revealed());
+            // Another problem still shows, and a fix hides its banner.
+            broken(true, false);
+            assert!(window.assert_sticky_notice());
+            assert!(banner.title().contains("WebRTC plugins"));
+            broken(true, true);
+            assert!(!window.assert_sticky_notice());
+            assert!(!banner.is_revealed());
+            crate::platform::clear_report_for_tests();
         });
     }
 

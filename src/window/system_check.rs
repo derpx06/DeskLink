@@ -7,6 +7,9 @@ use gtk::glib;
 
 use crate::platform::{Check, Level};
 
+/// How long the dialog waits for a probe before it says it could not check.
+const POLL_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
+
 fn icon(level: Level) -> &'static str {
     match level {
         Level::Ok => "emblem-ok-symbolic",
@@ -76,39 +79,54 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>) {
     holder.append(&body);
     holder.append(&copy);
 
+    // The probe runs again every time the dialog opens (a portal or PipeWire
+    // may have started since); what is known already shows at once and is
+    // replaced when the new answer arrives.
+    let before = crate::platform::generation();
+    crate::platform::refresh();
     let fill = {
         let (body, copy) = (body.clone(), copy.clone());
-        move || -> bool {
+        move |gave_up: bool| {
             while let Some(child) = body.first_child() {
                 body.remove(&child);
             }
             let Some(rows) = crate::platform::report() else {
-                let waiting = gtk::Label::new(Some("Checking this computer…"));
-                body.append(&waiting);
+                let words = if gave_up {
+                    "DeskLink could not check this computer in time. Close this and open it again."
+                } else {
+                    "Checking this computer…"
+                };
+                body.append(&gtk::Label::new(Some(words)));
                 copy.set_sensitive(false);
-                return false;
+                return;
             };
-            body.append(&list(rows));
+            body.append(&list(&rows));
             copy.set_sensitive(true);
-            true
         }
     };
-    if !fill() {
+    fill(false);
+    let started = std::time::Instant::now();
+    glib::timeout_add_local(std::time::Duration::from_millis(300), {
         let fill = fill.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
-            if fill() {
+        move || {
+            if crate::platform::generation() > before {
+                fill(false);
+                glib::ControlFlow::Break
+            } else if started.elapsed() > POLL_LIMIT {
+                // Never poll for good: say what is known, or that nothing is.
+                fill(true);
                 glib::ControlFlow::Break
             } else {
                 glib::ControlFlow::Continue
             }
-        });
-    }
+        }
+    });
     copy.connect_clicked(|button| {
         if let Some(rows) = crate::platform::report() {
             button
                 .display()
                 .clipboard()
-                .set_text(&crate::platform::as_text(rows, crate::platform::distro()));
+                .set_text(&crate::platform::as_text(&rows, crate::platform::distro()));
             super::toast_from(button, "Report copied");
         }
     });

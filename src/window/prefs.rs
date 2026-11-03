@@ -1722,6 +1722,11 @@ mod tests {
                             .collect()
                     };
                     let mut rows = names("rows");
+                    // Rows the phone has no counterpart for are marked in the
+                    // table, so the phone's copy of it can leave them out.
+                    for only in names("deskOnlyRows") {
+                        assert!(rows.contains(&only), "{only} is not a row");
+                    }
                     if crate::shell_dbus::extension_possible() {
                         rows.extend(names("gnomeRows"));
                     }

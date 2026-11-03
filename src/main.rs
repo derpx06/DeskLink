@@ -158,13 +158,17 @@ fn main() -> glib::ExitCode {
     startup("main");
     install_crash_reporter();
 
-    // No display to draw on: say so, rather than GTK's one warning line.
+    // No display to draw on: say so, rather than GTK's one warning line. Not
+    // when DeskLink already runs (a launch then only forwards to it), and
+    // never before the plain command-line modes above have had their turn.
     if let Some(problem) = no_display(
         env_set("DISPLAY"),
         env_set("WAYLAND_DISPLAY"),
         std::env::var_os("XDG_RUNTIME_DIR")
             .is_some_and(|dir| std::path::Path::new(&dir).join("wayland-0").exists()),
-    ) {
+    )
+    .filter(|_| !instance_running())
+    {
         eprintln!("DeskLink: {problem}");
         return glib::ExitCode::FAILURE;
     }
@@ -199,6 +203,34 @@ fn main() -> glib::ExitCode {
 
 fn env_set(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| !value.is_empty())
+}
+
+/// Whether another DeskLink owns the application name on the session bus.
+/// Asked only when a bus is already reachable, so it starts nothing.
+fn instance_running() -> bool {
+    let runtime_bus = std::env::var_os("XDG_RUNTIME_DIR")
+        .is_some_and(|dir| std::path::Path::new(&dir).join("bus").exists());
+    if !env_set("DBUS_SESSION_BUS_ADDRESS") && !runtime_bus {
+        return false;
+    }
+    gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
+        .ok()
+        .and_then(|bus| {
+            bus.call_sync(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                Some(&("derx06.desklink.com",).to_variant()),
+                None,
+                gio::DBusCallFlags::NONE,
+                500,
+                gio::Cancellable::NONE,
+            )
+            .ok()
+        })
+        .and_then(|reply| reply.child_value(0).get::<bool>())
+        .unwrap_or(false)
 }
 
 /// Why DeskLink cannot start without a display (`None` when it can try):

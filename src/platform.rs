@@ -10,7 +10,8 @@
 //! facts from this system and is the only part that touches it.
 
 use std::collections::BTreeSet;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use gtk::gio;
 use gtk::glib::{self, prelude::*};
@@ -482,7 +483,8 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
     );
 
     // Sharing and controlling this computer.
-    let encoder = any(&["vp8enc", "x264enc", "openh264enc", "vah264enc"]);
+    // Desktop to phone video is VP8 (an H.264 encoder is only an experiment).
+    let encoder = has("vp8enc");
     let portal_complete = has_portal("ScreenCast") && has_portal("RemoteDesktop");
     let x11_direct = !wayland && probe.x11_display && !portal_complete;
     rows.push(if !probe.session_bus && !x11_direct {
@@ -519,7 +521,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
                 "share",
                 "Share this screen and let the phone control it",
                 Level::Missing,
-                "Needs GStreamer's X11 screen capture and a video encoder (VP8 or H.264).",
+                "Needs GStreamer's X11 screen capture and its VP8 encoder (gst-plugins-good).",
                 Some(GST_GOOD),
             )
         }
@@ -561,8 +563,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             "share",
             "Share this screen and let the phone control it",
             Level::Missing,
-            "No video encoder found (VP8 is in gst-plugins-good; H.264 in gst-plugins-ugly \
-             or gst-libav).",
+            "The VP8 video encoder (vp8enc, in gst-plugins-good) is not installed.",
             Some(GST_GOOD),
         )
     } else {
@@ -848,7 +849,9 @@ pub fn as_text(rows: &[Check], distro: Option<Distro>) -> String {
 /// returns the exit status (1 when the phone link itself cannot work).
 pub fn run_check_cli() -> i32 {
     let rows = evaluate(&Probe::real());
-    print!("{}", as_text(&rows, distro()));
+    use std::io::Write;
+    // A closed pipe (`desklink --check | head`) is not a crash.
+    let _ = std::io::stdout().write_all(as_text(&rows, distro()).as_bytes());
     i32::from(
         rows.iter()
             .any(|row| row.id == "link" && row.level == Level::Missing),
@@ -882,29 +885,143 @@ pub fn note(id: &str) -> Option<String> {
 
 // ---- the real system --------------------------------------------------------
 
-static REPORT: OnceLock<Vec<Check>> = OnceLock::new();
+static REPORT: RwLock<Option<Arc<Vec<Check>>>> = RwLock::new(None);
+/// Counts finished probes, so a dialog can tell its own refresh is done.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+static PROBING: AtomicBool = AtomicBool::new(false);
 
-/// The result of the start-up probe; `None` until it has finished.
-pub fn report() -> Option<&'static [Check]> {
-    REPORT.get().map(Vec::as_slice)
+/// The latest probe; `None` until the first has finished.
+pub fn report() -> Option<Arc<Vec<Check>>> {
+    REPORT.read().ok()?.clone()
 }
 
-/// Probes the system on a background thread (the probe talks to D-Bus and
-/// GStreamer's plugin registry, which can take seconds on a first run).
+/// How many probes have finished.
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
+
+fn store(rows: Vec<Check>) {
+    if let Ok(mut report) = REPORT.write() {
+        *report = Some(Arc::new(rows));
+    }
+    GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Replaces the report (tests fake a machine this way). Hold
+/// [`TEST_REPORT`] while it is set, and call [`clear_report_for_tests`] after.
+#[cfg(test)]
+pub fn set_report_for_tests(rows: Vec<Check>) {
+    store(rows);
+}
+
+#[cfg(test)]
+pub fn clear_report_for_tests() {
+    if let Ok(mut report) = REPORT.write() {
+        *report = None;
+    }
+}
+
+/// Serialises the tests that fake the report.
+#[cfg(test)]
+pub static TEST_REPORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Probes again on a background thread; one at a time (a second request while
+/// one runs is answered by that one). The probe talks to D-Bus and GStreamer's
+/// plugin registry, which can take seconds on a first run.
+pub fn refresh() {
+    spawn_probe(false, std::time::Duration::ZERO);
+}
+
+/// The first probe at start-up, and another about five seconds later: on
+/// sessions without systemd, PipeWire, the tray host and the portal may
+/// still be starting when DeskLink is.
 pub fn start() {
+    spawn_probe(true, std::time::Duration::ZERO);
+    spawn_probe(false, std::time::Duration::from_secs(5));
+}
+
+fn spawn_probe(log: bool, after: std::time::Duration) {
     let _ = std::thread::Builder::new()
         .name("desklink-platform".into())
-        .spawn(|| {
-            let probe = Probe::real();
-            let rows = evaluate(&probe);
-            for row in rows.iter().filter(|row| row.level == Level::Missing) {
-                eprintln!("[DeskLink] {}: {}", row.title, row.detail);
+        .spawn(move || {
+            std::thread::sleep(after);
+            if PROBING.swap(true, Ordering::AcqRel) {
+                return;
             }
-            let _ = REPORT.set(rows);
+            let rows = evaluate(&Probe::real());
+            if log {
+                for row in rows.iter().filter(|row| row.level == Level::Missing) {
+                    eprintln!("[DeskLink] {}: {}", row.title, row.detail);
+                }
+            }
+            store(rows);
+            PROBING.store(false, Ordering::Release);
         });
 }
 
-fn names(bus: &gio::DBusConnection, method: &str) -> BTreeSet<String> {
+/// The row ids whose loss is shown as a banner that stays until the person
+/// dismisses it (everything else is a Settings note): nothing connects, or
+/// nothing can be saved.
+const STICKY: [&str; 2] = ["link", "storage"];
+
+/// The standing problem to keep in front of the person, if any: its row id
+/// and the words (with the install command for this distribution).
+pub fn sticky_notice() -> Option<(&'static str, String)> {
+    sticky_from(&report()?, distro())
+}
+
+fn sticky_from(rows: &[Check], distro: Option<Distro>) -> Option<(&'static str, String)> {
+    STICKY.iter().find_map(|id| {
+        let row = rows
+            .iter()
+            .find(|row| row.id == *id && row.level == Level::Missing)?;
+        let mut words = row.detail.clone();
+        if let Some(packages) = row.install {
+            words.push_str(&format!(" Install: {}", packages.command(distro)));
+        }
+        Some((*id, words))
+    })
+}
+
+/// Whether a D-Bus error name is a definite "no such thing" (the object
+/// answered and does not have it), as opposed to a timeout or a service that
+/// is still starting.
+fn definite_negative(remote_error: &str) -> bool {
+    matches!(
+        remote_error,
+        "org.freedesktop.DBus.Error.UnknownMethod"
+            | "org.freedesktop.DBus.Error.UnknownInterface"
+            | "org.freedesktop.DBus.Error.UnknownProperty"
+            | "org.freedesktop.DBus.Error.UnknownObject"
+            | "org.freedesktop.DBus.Error.InvalidArgs"
+    )
+}
+
+/// Whether a failed call is a definite "not there" (false: a timeout, no
+/// reply, or a service that is still starting).
+fn definite(error: &glib::Error) -> bool {
+    gio::DBusError::remote_error(error).is_some_and(|name| definite_negative(&name))
+}
+
+/// The names to believe present on a bus. `listed` and `activatable` are the
+/// answers to ListNames and ListActivatableNames (`None` when the call
+/// failed). A name missing from both complete lists is absent; if either list
+/// is missing, a watched name not seen is assumed present (fail open: a slow
+/// bus must not switch features off).
+fn settle_names(
+    listed: Option<BTreeSet<String>>,
+    activatable: Option<BTreeSet<String>>,
+    watched: &[&str],
+) -> BTreeSet<String> {
+    let complete = listed.is_some() && activatable.is_some();
+    let mut all: BTreeSet<String> = listed.into_iter().chain(activatable).flatten().collect();
+    if !complete {
+        all.extend(watched.iter().map(|name| name.to_string()));
+    }
+    all
+}
+
+fn names(bus: &gio::DBusConnection, method: &str) -> Option<BTreeSet<String>> {
     bus.call_sync(
         Some("org.freedesktop.DBus"),
         "/org/freedesktop/DBus",
@@ -918,22 +1035,24 @@ fn names(bus: &gio::DBusConnection, method: &str) -> BTreeSet<String> {
     )
     .ok()
     .and_then(|reply| reply.child_value(0).get::<Vec<String>>())
-    .unwrap_or_default()
-    .into_iter()
-    .collect()
+    .map(|names| names.into_iter().collect())
 }
 
-fn bus_names(bus: &gio::DBusConnection) -> BTreeSet<String> {
-    let mut all = names(bus, "ListNames");
-    all.extend(names(bus, "ListActivatableNames"));
-    all
+fn bus_names(bus: &gio::DBusConnection, watched: &[&str]) -> BTreeSet<String> {
+    settle_names(
+        names(bus, "ListNames"),
+        names(bus, "ListActivatableNames"),
+        watched,
+    )
 }
 
+/// A portal property: `Ok(value)`, `Err(true)` when the portal definitely has
+/// no such interface, `Err(false)` when it could not say in time.
 fn portal_property(
     bus: &gio::DBusConnection,
     interface: &str,
     name: &str,
-) -> Option<glib::Variant> {
+) -> Result<glib::Variant, bool> {
     bus.call_sync(
         Some(PORTAL),
         "/org/freedesktop/portal/desktop",
@@ -945,8 +1064,8 @@ fn portal_property(
         2_000,
         gio::Cancellable::NONE,
     )
-    .ok()
-    .and_then(|reply| reply.child_value(0).as_variant())
+    .map_err(|error| definite(&error))
+    .and_then(|reply| reply.child_value(0).as_variant().ok_or(false))
 }
 
 fn env_set(name: &str) -> bool {
@@ -959,9 +1078,17 @@ fn socket(path: std::path::PathBuf) -> bool {
         .is_ok_and(|meta| meta.file_type().is_socket())
 }
 
+/// Whether asking for the session bus can work without starting anything:
+/// an address in the environment, or the socket systemd and elogind make.
+/// Without either, GDBus would run `dbus-launch`, which a check must not do.
+fn session_bus_reachable(address_set: bool, runtime_bus_socket: bool) -> bool {
+    address_set || runtime_bus_socket
+}
+
 impl Probe {
-    /// Reads the facts from this system. Never fails: what cannot be read is
-    /// reported absent.
+    /// Reads the facts from this system. Never fails. A question that cannot
+    /// be answered in time (a busy bus, a portal still starting) is answered
+    /// in favour of the feature; only a definite "no" switches one off.
     pub fn real() -> Self {
         let mut probe = Probe {
             desktop: std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
@@ -985,9 +1112,18 @@ impl Probe {
             },
             ..Probe::default()
         };
-        if let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+        let reachable = session_bus_reachable(
+            env_set("DBUS_SESSION_BUS_ADDRESS"),
+            runtime.as_ref().is_some_and(|dir| socket(dir.join("bus"))),
+        );
+        let session = reachable
+            .then(|| gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE).ok())
+            .flatten();
+        if let Some(bus) = session {
             probe.session_bus = true;
-            probe.session_names = bus_names(&bus);
+            probe.session_names = bus_names(&bus, &[PORTAL, NOTIFICATIONS, WATCHER]);
+            // A watcher that cannot answer in time counts as hosted.
             probe.tray_host = probe.session_names.contains(WATCHER)
                 && bus
                     .call_sync(
@@ -1001,29 +1137,36 @@ impl Probe {
                         2_000,
                         gio::Cancellable::NONE,
                     )
-                    .ok()
-                    .and_then(|reply| reply.child_value(0).as_variant())
-                    .and_then(|value| value.get::<bool>())
-                    .unwrap_or(false);
+                    .map_or_else(
+                        |error| !definite(&error),
+                        |reply| {
+                            reply
+                                .child_value(0)
+                                .as_variant()
+                                .and_then(|value| value.get::<bool>())
+                                .unwrap_or(true)
+                        },
+                    );
             if probe.session_names.contains(PORTAL) {
                 for interface in PORTAL_INTERFACES {
-                    if portal_property(&bus, interface, "version").is_some() {
+                    // Present, or unable to say in time: only a definite
+                    // "no such interface" leaves it out.
+                    if !matches!(portal_property(&bus, interface, "version"), Err(true)) {
                         probe.portals.insert(interface.to_string());
                     }
                 }
                 probe.screencast_sources =
-                    portal_property(&bus, "ScreenCast", "AvailableSourceTypes")
-                        .and_then(|value| value.get::<u32>());
-                probe.input_capture =
-                    portal_property(&bus, "InputCapture", "SupportedCapabilities")
-                        .and_then(|value| value.get::<u32>());
+                    probe_mask(&bus, "ScreenCast", "AvailableSourceTypes", 7)
+                        .filter(|_| probe.portals.contains("ScreenCast"));
+                probe.input_capture = probe_mask(&bus, "InputCapture", "SupportedCapabilities", 3)
+                    .filter(|_| probe.portals.contains("InputCapture"));
             }
         }
         if let Ok(bus) = gio::bus_get_sync(gio::BusType::System, gio::Cancellable::NONE) {
             probe.system_bus = true;
-            probe.system_names = bus_names(&bus);
+            probe.system_names = bus_names(&bus, &[LOGIND]);
         }
-        if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from) {
+        if let Some(runtime) = runtime {
             probe.pipewire_socket = socket(runtime.join("pipewire-0"));
             probe.pulse_socket = socket(runtime.join("pulse/native"));
         }
@@ -1037,6 +1180,21 @@ impl Probe {
         probe.terminals = crate::device_links::pty::desk::installed_terminals();
         probe.config_writable = config_writable();
         probe
+    }
+}
+
+/// A portal bit mask: its value, or `fallback` (everything on) when the portal
+/// could not answer in time, or `None` on a definite "no such property".
+fn probe_mask(
+    bus: &gio::DBusConnection,
+    interface: &str,
+    property: &str,
+    fallback: u32,
+) -> Option<u32> {
+    match portal_property(bus, interface, property) {
+        Ok(value) => value.get::<u32>(),
+        Err(true) => None,
+        Err(false) => Some(fallback),
     }
 }
 
@@ -1492,21 +1650,124 @@ mod tests {
 
     #[test]
     fn writability_is_asked_of_the_nearest_existing_folder_and_writes_nothing() {
+        // As root everything is writable: the body runs as `nobody` there.
+        if !crate::test_privileges::unprivileged(
+            "platform::tests::writability_is_asked_of_the_nearest_existing_folder_and_writes_nothing",
+        ) {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("desklink-writable-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let below = dir.join("not").join("made").join("yet");
         assert!(writable_below(&below));
         assert!(!below.exists(), "nothing was created");
-        // /proc is never writable for a normal user, and a missing root is not.
+        // A folder the user may not write to, and one that is not there at all.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(!writable_below(&below));
         assert!(!writable_below(std::path::Path::new("/proc/self/nothing")));
         assert!(!writable_below(std::path::Path::new("")));
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn reasons_only_exist_for_missing_features_once_probed() {
-        // Nothing probed in a unit test: no reason, so nothing is hidden.
+    fn only_a_definite_no_from_d_bus_switches_a_portal_feature_off() {
+        for no in [
+            "org.freedesktop.DBus.Error.UnknownMethod",
+            "org.freedesktop.DBus.Error.UnknownInterface",
+            "org.freedesktop.DBus.Error.UnknownProperty",
+            "org.freedesktop.DBus.Error.UnknownObject",
+            "org.freedesktop.DBus.Error.InvalidArgs",
+        ] {
+            assert!(definite_negative(no), "{no}");
+        }
+        for maybe in [
+            "org.freedesktop.DBus.Error.NoReply",
+            "org.freedesktop.DBus.Error.Timeout",
+            "org.freedesktop.DBus.Error.TimedOut",
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "org.freedesktop.DBus.Error.Failed",
+            "",
+        ] {
+            assert!(!definite_negative(maybe), "{maybe}");
+        }
+    }
+
+    #[test]
+    fn a_name_is_absent_only_when_both_bus_lists_were_read_and_lack_it() {
+        let watched = [PORTAL, NOTIFICATIONS];
+        // Both lists read: what is not there is not there.
+        let complete = settle_names(Some(names(&[PORTAL])), Some(names(&["x"])), &watched);
+        assert!(complete.contains(PORTAL) && !complete.contains(NOTIFICATIONS));
+        // Activatable but not running counts as present.
+        let activatable = settle_names(Some(names(&[])), Some(names(&[NOTIFICATIONS])), &watched);
+        assert!(activatable.contains(NOTIFICATIONS));
+        // One list missing (a timeout): every watched name is believed present.
+        for (listed, activatable) in [
+            (None, Some(names(&[]))),
+            (Some(names(&[])), None),
+            (None, None),
+        ] {
+            let all = settle_names(listed, activatable, &watched);
+            assert!(all.contains(PORTAL) && all.contains(NOTIFICATIONS));
+        }
+    }
+
+    #[test]
+    fn the_session_bus_is_asked_for_only_where_that_starts_nothing() {
+        assert!(session_bus_reachable(true, false));
+        assert!(session_bus_reachable(false, true));
+        assert!(!session_bus_reachable(false, false));
+    }
+
+    #[test]
+    fn the_banner_is_for_the_two_losses_that_stop_everything() {
+        let mut probe = full();
+        assert_eq!(sticky_from(&evaluate(&probe), None), None);
+        probe.config_writable = false;
+        let (id, words) = sticky_from(&evaluate(&probe), None).unwrap();
+        assert_eq!(id, "storage");
+        assert!(words.contains("configuration folder"));
+        probe.elements.remove("webrtcbin");
+        let (id, words) = sticky_from(&evaluate(&probe), Some(Distro::Arch)).unwrap();
+        assert_eq!(id, "link", "the phone link comes first");
+        assert!(
+            words.contains("sudo pacman -S gst-plugins-bad libnice"),
+            "{words}"
+        );
+        // A limit (no tray, no notifier) is never a banner.
+        let probe = Probe {
+            tray_host: false,
+            session_names: BTreeSet::new(),
+            ..full()
+        };
+        assert_eq!(sticky_from(&evaluate(&probe), None), None);
+    }
+
+    #[test]
+    fn a_later_probe_replaces_the_report_and_counts() {
+        let _held = TEST_REPORT.lock().unwrap_or_else(|e| e.into_inner());
+        let before = generation();
+        set_report_for_tests(evaluate(&Probe::default()));
+        assert!(generation() > before);
+        assert!(report().is_some());
+        assert!(!works("link"));
+        set_report_for_tests(evaluate(&full()));
+        assert!(works("link"));
         assert_eq!(reason("sound"), None);
-        assert_eq!(note("tray"), None);
+        clear_report_for_tests();
+        assert!(works("link"), "nothing is hidden before a probe");
+    }
+
+    #[test]
+    fn the_share_row_needs_the_vp8_encoder_not_any_encoder() {
+        let mut probe = full();
+        probe.elements.remove("vp8enc");
+        assert_eq!(level(&evaluate(&probe), "share"), Level::Missing);
+        assert!(row(&evaluate(&probe), "share").detail.contains("vp8enc"));
+        probe.elements.insert("x264enc".into());
+        probe.elements.insert("vah264enc".into());
+        assert_eq!(level(&evaluate(&probe), "share"), Level::Missing);
     }
 }

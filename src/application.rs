@@ -41,6 +41,8 @@ mod imp {
         /// Whether this run already said that closing the window leaves
         /// DeskLink running without a tray.
         pub told_hidden: RefCell<bool>,
+        /// When a close request last only minimised the window.
+        pub last_minimized: std::cell::Cell<Option<std::time::Instant>>,
     }
 
     #[glib::object_subclass]
@@ -509,10 +511,24 @@ impl DesklinkApplication {
                 return glib::Propagation::Proceed;
             };
             let way_back = app.tray_hosted() || crate::shell_dbus::extension_active();
-            match close_action(way_back, crate::platform::works("notifications")) {
+            let repeated = app
+                .imp()
+                .last_minimized
+                .get()
+                .is_some_and(|at| at.elapsed() < QUIT_ON_SECOND_CLOSE);
+            match close_action(way_back, crate::platform::works("notifications"), repeated) {
                 CloseAction::Minimize => {
+                    app.imp()
+                        .last_minimized
+                        .set(Some(std::time::Instant::now()));
                     window.minimize();
                     return glib::Propagation::Stop;
+                }
+                // Closing twice in a row where the window can neither hide
+                // nor minimise (a tiling WM) is a request to quit.
+                CloseAction::Quit => {
+                    app.quit();
+                    return glib::Propagation::Proceed;
                 }
                 CloseAction::HideAndTell => {
                     // No tray to show where it went: said each session.
@@ -1589,15 +1605,22 @@ pub(crate) enum CloseAction {
     HideAndTell,
     /// Nothing could bring a hidden window back: keep it, minimised.
     Minimize,
+    /// The same, closed again right after: really quit (a window manager that
+    /// cannot minimise would otherwise make closing impossible).
+    Quit,
 }
+
+/// How soon a second close request after a minimise quits.
+const QUIT_ON_SECOND_CLOSE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Closing the window, given whether a tray (or the extension) is showing
 /// DeskLink and whether a notification can be shown.
-pub(crate) fn close_action(way_back: bool, can_notify: bool) -> CloseAction {
-    match (way_back, can_notify) {
-        (true, _) => CloseAction::Hide,
-        (false, true) => CloseAction::HideAndTell,
-        (false, false) => CloseAction::Minimize,
+pub(crate) fn close_action(way_back: bool, can_notify: bool, repeated: bool) -> CloseAction {
+    match (way_back, can_notify, repeated) {
+        (true, _, _) => CloseAction::Hide,
+        (false, true, _) => CloseAction::HideAndTell,
+        (false, false, false) => CloseAction::Minimize,
+        (false, false, true) => CloseAction::Quit,
     }
 }
 
@@ -1623,10 +1646,19 @@ mod close_tests {
 
     #[test]
     fn a_window_is_never_hidden_with_no_way_to_get_it_back() {
-        assert_eq!(close_action(true, true), CloseAction::Hide);
-        assert_eq!(close_action(true, false), CloseAction::Hide);
-        assert_eq!(close_action(false, true), CloseAction::HideAndTell);
-        assert_eq!(close_action(false, false), CloseAction::Minimize);
+        assert_eq!(close_action(true, true, false), CloseAction::Hide);
+        assert_eq!(close_action(true, false, false), CloseAction::Hide);
+        assert_eq!(close_action(false, true, false), CloseAction::HideAndTell);
+        assert_eq!(close_action(false, false, false), CloseAction::Minimize);
+    }
+
+    #[test]
+    fn closing_twice_where_a_window_cannot_minimise_quits() {
+        assert_eq!(close_action(false, false, true), CloseAction::Quit);
+        // A tray or a notification service means the first close is enough.
+        assert_eq!(close_action(false, true, true), CloseAction::HideAndTell);
+        assert_eq!(close_action(true, false, true), CloseAction::Hide);
+        assert_eq!(QUIT_ON_SECOND_CLOSE, std::time::Duration::from_secs(2));
     }
 
     #[test]

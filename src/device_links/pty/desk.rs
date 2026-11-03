@@ -266,8 +266,17 @@ pub(crate) fn new_desk_session_in(folder: &str) -> Result<String, String> {
 /// The registry owner of sessions started at this computer.
 const DESK_OWNER: &str = "desk";
 
-/// Opens a window on this desktop showing session `id`.
+/// Opens a window on this desktop showing session `id`. Trying terminals
+/// waits on each (a failed one exits at once), so it runs off the caller's
+/// thread, which is often the UI's.
 pub(crate) fn open_on_desktop(id: &str) {
+    let id = id.to_string();
+    let _ = thread::Builder::new()
+        .name("desklink-terminal-open".into())
+        .spawn(move || open_blocking(&id));
+}
+
+fn open_blocking(id: &str) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -295,13 +304,12 @@ pub(crate) fn open_on_desktop(id: &str) {
             .stderr(std::process::Stdio::null())
             .spawn()
         {
-            if in_flatpak {
-                std::thread::sleep(Duration::from_millis(800));
-                if let Ok(Some(status)) = child.try_wait() {
-                    if !status.success() {
-                        continue;
-                    }
-                }
+            // A program that starts and at once exits with an error did not
+            // open a window (a broken `$TERMINAL`, a missing host program in
+            // a Flatpak, a terminal that cannot reach its server): try the
+            // next one. Exiting cleanly is a launcher that handed over.
+            if exits_with_error_soon(&mut child, STARTED_WITHIN) {
+                continue;
             }
             let _ = std::thread::Builder::new()
                 .name("desklink-terminal-window".into())
@@ -315,32 +323,38 @@ pub(crate) fn open_on_desktop(id: &str) {
 }
 
 /// Terminal programs and how each is told to run a command: the arguments
-/// that come before it (`{title}` is the window title). The desktop's own
-/// first, then the ones people install on other desktops. `x-terminal-emulator`
+/// that come before it (`{title}` is the window title). `x-terminal-emulator`
 /// is Debian's alternatives link, the user's choice on Debian and Ubuntu.
-const TERMINALS: [(&str, &[&str]); 21] = [
+const TERMINALS: [(&str, &[&str]); 20] = [
+    // The first seven are the original order, unchanged: a GNOME or KDE
+    // machine picks exactly what it always did.
     ("kgx", &["--title", "{title}", "--"]),
     ("ptyxis", &["--new-window", "--"]),
     ("gnome-terminal", &["--title", "{title}", "--"]),
     ("konsole", &["-e"]),
+    ("xdg-terminal-exec", &[]),
+    // Other desktops' own terminals, before the general-purpose ones.
     ("xfce4-terminal", &["--title", "{title}", "-x"]),
     ("mate-terminal", &["--title", "{title}", "-x"]),
     ("lxterminal", &["--title={title}", "-e"]),
     ("qterminal", &["-e"]),
-    ("xdg-terminal-exec", &[]),
     ("x-terminal-emulator", &["-e"]),
     ("kitty", &["--title", "{title}"]),
     ("alacritty", &["--title", "{title}", "-e"]),
     ("foot", &["--title", "{title}"]),
     ("wezterm", &["start", "--"]),
     ("terminator", &["--title", "{title}", "-x"]),
-    ("tilix", &["--title", "{title}", "-e"]),
     ("urxvt", &["-title", "{title}", "-e"]),
     ("st", &["-t", "{title}", "-e"]),
     ("sakura", &["--title", "{title}", "-x"]),
     ("cool-retro-term", &["-e"]),
     ("xterm", &["-T", "{title}", "-e"]),
 ];
+// Not listed: tilix, termite and deepin-terminal. Their `-e` takes one string
+// to hand to a shell, not an argument list, so the attach command would need
+// shell quoting that has not been checked against their documentation. Only
+// the first five and xterm have been used on a live desktop; the rest follow
+// each program's documented "run this command" flag and are unverified.
 
 /// The commands to try, in order, to show the session in a window: the
 /// user's `$TERMINAL` first (as `terminal -e command`, the common convention),
@@ -380,6 +394,24 @@ fn terminal_attempts(
         }
     }
     attempts
+}
+
+/// How long a terminal has to stay up (or exit cleanly) to count as opened.
+const STARTED_WITHIN: Duration = Duration::from_millis(800);
+
+/// Waits up to `within` for `child`; `true` when it exited with a failure in
+/// that time. Still running, or exited successfully, is `false`.
+fn exits_with_error_soon(child: &mut std::process::Child, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return !status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            _ => return false,
+        }
+    }
 }
 
 /// The terminal programs found on `PATH` (for the system check).
@@ -549,6 +581,53 @@ mod tests {
             .find(|(name, _)| name == "xfce4-terminal")
             .unwrap();
         assert_eq!(xfce.1[..3], ["--title", "DeskLink terminal", "-x"]);
+    }
+
+    #[test]
+    fn the_original_terminals_keep_their_order_and_gnome_still_starts_with_kgx() {
+        let client = vec!["desklink".to_string()];
+        let order: Vec<String> = super::terminal_attempts(&client, "t", None)
+            .into_iter()
+            .map(|(program, _)| program)
+            .collect();
+        let at = |name: &str| order.iter().position(|p| p == name).unwrap();
+        let original = [
+            "kgx",
+            "ptyxis",
+            "gnome-terminal",
+            "konsole",
+            "xdg-terminal-exec",
+            "kitty",
+            "xterm",
+        ];
+        for pair in original.windows(2) {
+            assert!(at(pair[0]) < at(pair[1]), "{pair:?}");
+        }
+        assert_eq!(&order[..5], &original[..5]);
+        // Shells' one-string `-e` terminals are not in the list.
+        for left_out in ["tilix", "termite", "deepin-terminal"] {
+            assert!(!order.iter().any(|p| p == left_out), "{left_out}");
+        }
+    }
+
+    #[test]
+    fn a_terminal_that_exits_with_an_error_at_once_counts_as_failed() {
+        let start = |script: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", script])
+                .spawn()
+                .unwrap()
+        };
+        let within = std::time::Duration::from_millis(800);
+        assert!(super::exits_with_error_soon(&mut start("exit 3"), within));
+        assert!(!super::exits_with_error_soon(&mut start("exit 0"), within));
+        let mut running = start("sleep 5");
+        assert!(!super::exits_with_error_soon(
+            &mut running,
+            std::time::Duration::from_millis(100)
+        ));
+        let _ = running.kill();
+        let _ = running.wait();
     }
 
     #[test]

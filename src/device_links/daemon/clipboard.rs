@@ -372,12 +372,17 @@ fn just_placed(content: &str, now: u64) -> bool {
 /// XWayland) to every Wayland application.
 static X11_CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
 
+/// What `wl-copy` is told: the text is plain UTF-8 (it would otherwise guess
+/// the type from the bytes, and a short string can come out as anything).
+const WL_COPY_ARGS: &[&str] = &["--type", "text/plain;charset=utf-8"];
+
 /// Hands `text` to a clipboard program on its standard input (`wl-copy`
 /// forks into the background to keep serving the selection and exits at
 /// once). `false` when the program is missing or fails.
-fn pipe_to_copier(program: &str, text: &str) -> bool {
+fn pipe_to_copier(program: &str, args: &[&str], text: &str) -> bool {
     use std::io::Write;
     let Ok(mut child) = std::process::Command::new(program)
+        .args(args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -490,7 +495,7 @@ pub(crate) fn set_clipboard_text_from_remote(content: &str) {
         // real clipboard).
         if !cfg!(test)
             && std::env::var_os("WAYLAND_DISPLAY").is_some()
-            && pipe_to_copier("wl-copy", &content)
+            && pipe_to_copier("wl-copy", WL_COPY_ARGS, &content)
         {
             return;
         }
@@ -1333,9 +1338,14 @@ mod tests {
 
     #[test]
     fn a_missing_wl_copy_is_a_quiet_false_and_a_working_one_is_true() {
-        assert!(!pipe_to_copier("desklink-no-such-clipboard-program", "x"));
-        assert!(pipe_to_copier("cat", "x"));
-        assert!(!pipe_to_copier("false", "x"));
+        assert!(!pipe_to_copier(
+            "desklink-no-such-clipboard-program",
+            &[],
+            "x"
+        ));
+        assert!(pipe_to_copier("cat", &[], "x"));
+        assert!(!pipe_to_copier("false", &[], "x"));
+        assert_eq!(WL_COPY_ARGS, ["--type", "text/plain;charset=utf-8"]);
     }
 
     /// Two copies arriving close together: the newest is what stays (the
