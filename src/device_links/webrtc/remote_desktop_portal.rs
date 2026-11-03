@@ -264,7 +264,7 @@ pub(crate) fn plain_portal_error(error: &str) -> String {
 
 /// The ScreenCast portal's `(AvailableSourceTypes, AvailableCursorModes)`;
 /// `None` when the portal does not answer.
-fn screencast_offers(connection: &gio::DBusConnection) -> Option<(u32, u32)> {
+fn screencast_offers(connection: &gio::DBusConnection, timeout_ms: i32) -> Option<(u32, u32)> {
     let get = |name: &str| {
         connection
             .call_sync(
@@ -275,7 +275,7 @@ fn screencast_offers(connection: &gio::DBusConnection) -> Option<(u32, u32)> {
                 Some(&(SCREEN_INTERFACE, name).to_variant()),
                 None,
                 gio::DBusCallFlags::NONE,
-                3_000,
+                timeout_ms,
                 None::<&gio::Cancellable>,
             )
             .ok()
@@ -325,20 +325,53 @@ fn restart_portal_frontend(connection: &gio::DBusConnection) -> bool {
     }
 }
 
+/// What one answer of the portal means for a share of `source_type`.
+#[derive(Debug, PartialEq)]
+enum PortalVerdict {
+    Ready(Option<u32>),
+    /// It answers, just without this kind of source (no VIRTUAL, say): a
+    /// restart would not add it.
+    Missing(u32),
+    /// It answers with no source types at all: its backend died.
+    Restart,
+    /// No answer (timeout, D-Bus error): busy or slow, not proof of a dead
+    /// backend. Restarting would drop every app's portal sessions.
+    Silent,
+}
+
+fn portal_verdict(answer: Option<(u32, u32)>, source_type: u32) -> PortalVerdict {
+    match answer {
+        Some((types, modes)) if types & source_type != 0 => {
+            PortalVerdict::Ready(pick_cursor_mode(modes))
+        }
+        Some((0, _)) => PortalVerdict::Restart,
+        Some((types, _)) => PortalVerdict::Missing(types),
+        None => PortalVerdict::Silent,
+    }
+}
+
 /// The cursor mode to ask for, once the portal offers `source_type`
 /// screens; restarts a portal that offers none (see
-/// [`restart_portal_frontend`]) and waits for it to come back.
+/// [`restart_portal_frontend`]) and waits for it to come back. A portal
+/// that does not answer is asked three times with growing patience and is
+/// never restarted.
 fn ready_portal(connection: &gio::DBusConnection, source_type: u32) -> Result<Option<u32>, String> {
-    match screencast_offers(connection) {
-        Some((types, modes)) if types & source_type != 0 => return Ok(pick_cursor_mode(modes)),
-        // It answers, just without this kind of source (no VIRTUAL, say):
-        // a restart would not add it.
-        Some((types, _)) if types != 0 => {
+    let mut verdict = PortalVerdict::Silent;
+    for timeout_ms in [3_000, 5_000, 10_000] {
+        verdict = portal_verdict(screencast_offers(connection, timeout_ms), source_type);
+        if verdict != PortalVerdict::Silent {
+            break;
+        }
+    }
+    match verdict {
+        PortalVerdict::Ready(mode) => return Ok(mode),
+        PortalVerdict::Missing(types) => {
             return Err(format!(
                 "Desktop portal offers source types {types}, not {source_type}"
             ))
         }
-        _ => {}
+        PortalVerdict::Silent => return Err(PORTAL_NOT_RESPONDING.to_string()),
+        PortalVerdict::Restart => {}
     }
     if !restart_portal_frontend(connection) {
         return Err(PORTAL_NOT_RESPONDING.to_string());
@@ -346,11 +379,11 @@ fn ready_portal(connection: &gio::DBusConnection, source_type: u32) -> Result<Op
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         thread::sleep(Duration::from_millis(500));
-        if let Some((types, modes)) = screencast_offers(connection) {
-            if types & source_type != 0 {
-                eprintln!("[DeskLink] Screen-sharing portal is back after its restart");
-                return Ok(pick_cursor_mode(modes));
-            }
+        if let PortalVerdict::Ready(mode) =
+            portal_verdict(screencast_offers(connection, 3_000), source_type)
+        {
+            eprintln!("[DeskLink] Screen-sharing portal is back after its restart");
+            return Ok(mode);
         }
     }
     Err(PORTAL_RESTARTING.to_string())
@@ -1224,6 +1257,21 @@ mod tests {
         assert_eq!(pick_cursor_mode(1 | 4), Some(1));
         assert_eq!(pick_cursor_mode(4), Some(4));
         assert_eq!(pick_cursor_mode(0), None, "left out, never asked for");
+    }
+
+    #[test]
+    fn only_a_zero_source_answer_restarts_the_portal() {
+        assert_eq!(
+            portal_verdict(None, 1),
+            PortalVerdict::Silent,
+            "timeout/D-Bus error: no restart"
+        );
+        assert_eq!(portal_verdict(Some((0, 0)), 1), PortalVerdict::Restart);
+        assert_eq!(
+            portal_verdict(Some((1, 2)), 1),
+            PortalVerdict::Ready(Some(2))
+        );
+        assert_eq!(portal_verdict(Some((1, 2)), 4), PortalVerdict::Missing(1));
     }
 
     #[test]
