@@ -1428,7 +1428,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let net = TestNetwork::new();
         let (desktop, _phone, _desk_id, _desk_der) = paired_desk_showing_a_code(&net);
-        let code = pairing_qr::current_uri().expect("live code");
+        let code = pairing_qr::live_generation().expect("live code");
         let forged = foreign_certificate_pem();
         let (link, transport) = claimed_link(&desktop, &forged);
         let context = context(&desktop);
@@ -1437,7 +1437,7 @@ mod tests {
                 link,
                 transport,
                 "test".into(),
-                &code,
+                code,
                 std::time::Instant::now() + std::time::Duration::from_secs(60),
                 context,
             )
@@ -1637,5 +1637,385 @@ mod tests {
         assert!(!crate::device_links::transport::should_surface_send_error(
             &error
         ));
+    }
+
+    fn pair_request(timestamp: i64) -> NetworkPacket {
+        let mut request = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_PAIR);
+        request.set("pair", true);
+        request.set("timestamp", timestamp);
+        request
+    }
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+    }
+
+    /// Clock skew: a request stamped more than 5 minutes off used to be
+    /// dropped without a word, so the asking phone waited out its 30 s and said
+    /// "timed out". Now it is refused at once and the card says why. A replayed
+    /// request from hours ago is the same case.
+    #[test]
+    fn a_request_from_a_skewed_clock_is_refused_in_words_and_never_prompts() {
+        for skew in [-7_200, 7_200, -86_400] {
+            let net = TestNetwork::new();
+            let (mut desktop, mut phone) = peer_pair(&net, "desktop-1", "phone-1");
+            phone
+                .binding
+                .link
+                .send_packet(&pair_request(now_secs() + skew))
+                .unwrap();
+            net.advance(0);
+            desktop.pump();
+            assert_eq!(desktop.pair_state(), PairState::NotPaired, "no prompt");
+            assert!(desktop.displayed_verification_key().is_none());
+            let error = desktop.devices.lock().unwrap()[&desktop.peer_id()]
+                .last_error
+                .clone()
+                .unwrap_or_default();
+            assert_eq!(error, crate::device_links::pairing::CLOCKS_DIFFER);
+            // The asking side hears it at once, not after its timeout.
+            net.advance(0);
+            phone.pump();
+            assert_eq!(phone.pair_state(), PairState::NotPaired);
+            assert!(!desktop.is_trusted() && !phone.is_trusted());
+        }
+        // Inside the window it prompts as ever.
+        let net = TestNetwork::new();
+        let (mut desktop, phone) = peer_pair(&net, "desktop-1", "phone-1");
+        phone
+            .binding
+            .link
+            .send_packet(&pair_request(now_secs() - 120))
+            .unwrap();
+        net.advance(0);
+        desktop.pump();
+        assert_eq!(desktop.pair_state(), PairState::RequestedByPeer);
+    }
+
+    /// Defence at the pairing state machine's entrance: whatever carrier a
+    /// pairing packet arrives on, a relay link cannot start, answer or QR-prove
+    /// a pairing while off-LAN pairing is compiled out; its `pair:false` still
+    /// unpairs.
+    #[test]
+    fn a_relay_link_cannot_start_or_answer_a_pairing_and_can_still_unpair() {
+        use crate::device_links::packet::PACKET_TYPE_PAIR;
+        use crate::device_links::relay_link::transport::RelayLinkTransport;
+        let dir = temp_dir("relay-gate");
+        let config = Arc::new(Mutex::new(Config::load_from_dir(dir.clone()).unwrap()));
+        let sessions = Arc::new(DeviceManager::new());
+        let devices: Arc<Mutex<HashMap<String, DeviceView>>> = Arc::default();
+        let events: Arc<Mutex<Vec<DaemonEvent>>> = Arc::default();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let info = DeviceInfo {
+            id: "relay-phone".into(),
+            name: "relay-phone".into(),
+            device_type: "phone".into(),
+            protocol_version: PROTOCOL_VERSION,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+            app_version: None,
+        };
+        let link = SessionLink::new(
+            Arc::new(RelayLinkTransport::new("fp".into(), tx)),
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            info,
+        );
+        let binding = sessions
+            .register_link("relay-phone".into(), link, false)
+            .unwrap()
+            .binding;
+        let state = || {
+            sessions
+                .with_session(&binding, |session| session.pairing.state)
+                .unwrap()
+        };
+        let apply = |packet: NetworkPacket| {
+            apply_lan_packet(&binding, packet, &devices, &sessions, &config, &events)
+        };
+        apply(pair_request(now_secs()));
+        assert_eq!(
+            state(),
+            PairState::NotPaired,
+            "a request over a relay is dropped"
+        );
+        let mut accept = NetworkPacket::new(PACKET_TYPE_PAIR);
+        accept.set("pair", true);
+        let _ = sessions.with_session(&binding, |session| {
+            session.pairing.request_packet().unwrap();
+        });
+        apply(accept);
+        assert_eq!(
+            state(),
+            PairState::Requested,
+            "an acceptance over a relay is dropped"
+        );
+        let mut unpair = NetworkPacket::new(PACKET_TYPE_PAIR);
+        unpair.set("pair", false);
+        apply(unpair);
+        assert_eq!(
+            state(),
+            PairState::NotPaired,
+            "pair:false is the one pairing packet it carries"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Re-pair after an unpair, from either side: the record is made again with
+    /// the same certificate, both prompts show one key, and nothing of the old
+    /// pairing is needed or left over.
+    #[test]
+    fn a_pairing_is_made_again_after_an_unpair_from_either_side() {
+        for desk_unpairs in [true, false] {
+            let net = TestNetwork::new();
+            let (mut desktop, mut phone) = paired_pair(&net);
+            let certificate = desktop.trusted_certificate();
+            assert!(certificate.is_some());
+            if desk_unpairs {
+                desktop.unpair();
+            } else {
+                phone.unpair();
+            }
+            net.advance(0);
+            desktop.pump();
+            phone.pump();
+            assert!(!desktop.is_trusted() && !phone.is_trusted());
+            assert_eq!(desktop.pair_state(), PairState::NotPaired);
+            assert_eq!(phone.pair_state(), PairState::NotPaired);
+
+            desktop.request_pair();
+            net.advance(0);
+            phone.pump();
+            assert_eq!(phone.pair_state(), PairState::RequestedByPeer);
+            assert_eq!(desktop.verification_key(), phone.verification_key());
+            phone.accept();
+            net.advance(0);
+            desktop.pump();
+            assert_eq!(desktop.pair_state(), PairState::Paired);
+            assert!(desktop.is_trusted() && phone.is_trusted());
+            assert_eq!(desktop.trusted_certificate(), certificate);
+            assert!(desktop.errors().is_empty() && phone.errors().is_empty());
+        }
+    }
+
+    fn relay_session(
+        config: &Arc<Mutex<Config>>,
+        sessions: &Arc<DeviceManager>,
+        pem: &str,
+        paired: bool,
+    ) -> (SessionBinding, DeviceInfo) {
+        let _ = config;
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let info = DeviceInfo {
+            id: "relay-phone".into(),
+            name: "relay-phone".into(),
+            device_type: "phone".into(),
+            protocol_version: PROTOCOL_VERSION,
+            incoming_capabilities: Vec::new(),
+            outgoing_capabilities: Vec::new(),
+            instance_id: None,
+            app_version: None,
+        };
+        let link = SessionLink::new(
+            Arc::new(
+                crate::device_links::relay_link::transport::RelayLinkTransport::new(
+                    "fp".into(),
+                    tx,
+                ),
+            ),
+            pem.to_string(),
+            Vec::new(),
+            Vec::new(),
+            info.clone(),
+        );
+        let binding = sessions
+            .register_link("relay-phone".into(), link, paired)
+            .unwrap()
+            .binding;
+        (binding, info)
+    }
+
+    /// The QR leg of the relay gate, with a proof that would pair on the LAN:
+    /// over a relay link it pairs nothing and does not consume the code; the
+    /// same proof on a LAN-kind link pairs (so it is the gate that stopped it).
+    #[test]
+    fn a_valid_qr_proof_over_a_relay_link_pairs_nothing_and_is_not_consumed() {
+        use super::super::handshake::{qr_only_packet, QrOnly};
+        use crate::device_links::pairing_qr;
+        let _one_code = pairing_qr::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = temp_dir("relay-qr");
+        let config = Arc::new(Mutex::new(Config::load_from_dir(dir.clone()).unwrap()));
+        let sessions = Arc::new(DeviceManager::new());
+        let devices: Arc<Mutex<HashMap<String, DeviceView>>> = Arc::default();
+        let events: Arc<Mutex<Vec<DaemonEvent>>> = Arc::default();
+        let (desk_id, desk_der) = {
+            let config = config.lock().unwrap();
+            (
+                config.local_device_info().id,
+                config.certificate().to_der().unwrap(),
+            )
+        };
+        pairing_qr::start(&desk_id, &desk_der, None, &[], 1716).unwrap();
+        let pem = foreign_certificate_pem();
+        let (binding, info) = relay_session(&config, &sessions, &pem, false);
+        let proof = qr_proof(&desk_id, &desk_der, "relay-phone", &pem);
+
+        apply_lan_packet(
+            &binding,
+            proof.clone(),
+            &devices,
+            &sessions,
+            &config,
+            &events,
+        );
+        assert!(!config.lock().unwrap().is_trusted("relay-phone"));
+        assert!(
+            pairing_qr::live_secret().is_some(),
+            "the code is not consumed"
+        );
+        assert!(events.lock().unwrap().is_empty());
+
+        // The same proof on a LAN-kind link with that certificate pairs.
+        let wire = TestNetwork::new();
+        let lan = SessionLink::new(Arc::new(wire.end(0)), pem, Vec::new(), Vec::new(), info);
+        assert_eq!(qr_only_packet(&lan, &proof, &config), QrOnly::Proven);
+        assert!(config.lock().unwrap().is_trusted("relay-phone"));
+        pairing_qr::cancel();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `pair:false` is the one pairing packet a relay carries: it unpairs a
+    /// paired phone, drops the trust record and forgets what the desk held
+    /// for it (here: the unlock nonce it was offered).
+    #[test]
+    fn a_pair_false_over_a_relay_link_unpairs_and_forgets_the_phone() {
+        use crate::device_links::unlock::{approve, issue, Conditions, Refusal};
+        let dir = temp_dir("relay-unpair");
+        let config = Arc::new(Mutex::new(Config::load_from_dir(dir.clone()).unwrap()));
+        let sessions = Arc::new(DeviceManager::new());
+        let devices: Arc<Mutex<HashMap<String, DeviceView>>> = Arc::default();
+        let events: Arc<Mutex<Vec<DaemonEvent>>> = Arc::default();
+        let pem = foreign_certificate_pem();
+        let (binding, info) = relay_session(&config, &sessions, &pem, true);
+        config.lock().unwrap().trust_device(&info, pem).unwrap();
+        let nonce = issue("relay-phone");
+        let mut unpair = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_PAIR);
+        unpair.set("pair", false);
+
+        apply_lan_packet(&binding, unpair, &devices, &sessions, &config, &events);
+
+        assert!(!config.lock().unwrap().is_trusted("relay-phone"));
+        assert_eq!(
+            sessions
+                .with_session(&binding, |session| session.pairing.state)
+                .unwrap(),
+            PairState::NotPaired
+        );
+        let all_good = Conditions {
+            allowed: true,
+            locked: true,
+            local: true,
+            ready: true,
+        };
+        assert_eq!(
+            approve("relay-phone", Some(&nonce), all_good),
+            Err(Refusal::NoNonce),
+            "forget_peer ran"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A relay link that has closed still says it is a relay link: a queued
+    /// pairing packet cannot slip through as "LAN".
+    #[test]
+    fn a_closed_relay_link_still_reports_the_relay_carrier() {
+        use crate::device_links::pairing_transport::PairingTransportKind;
+        let dir = temp_dir("relay-closed");
+        let config = Arc::new(Mutex::new(Config::load_from_dir(dir.clone()).unwrap()));
+        let sessions = Arc::new(DeviceManager::new());
+        let (binding, _) = relay_session(&config, &sessions, "", false);
+        assert_eq!(
+            binding.link.pairing_transport(),
+            PairingTransportKind::Relay
+        );
+        binding.link.close();
+        assert_eq!(
+            binding.link.pairing_transport(),
+            PairingTransportKind::Relay
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The computer's addresses change while a link is already admitted for
+    /// the code: the refresh must not close it, and its proof still pairs.
+    #[test]
+    fn a_qr_only_link_survives_an_address_refresh_and_still_pairs() {
+        use crate::device_links::core::LinkTransport;
+        use crate::device_links::pairing_qr;
+        let _one_code = pairing_qr::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let net = TestNetwork::new();
+        let (desktop, _phone, desk_id, desk_der) = paired_desk_showing_a_code(&net);
+        let new_pem = foreign_certificate_pem();
+        let wire = TestNetwork::new();
+        let transport: Arc<dyn LinkTransport> = Arc::new(wire.end(0));
+        let phone_end = wire.end(1);
+        let link = SessionLink::new(
+            Arc::clone(&transport),
+            new_pem.clone(),
+            desktop.local_public_der.clone(),
+            desktop.remote_public_der.clone(),
+            desktop.info.clone(),
+        );
+        let generation = pairing_qr::live_generation().expect("live code");
+        let context = context(&desktop);
+        let server = std::thread::spawn(move || {
+            super::super::handshake::serve_qr_only(
+                link,
+                transport,
+                "test".into(),
+                generation,
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+                context,
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // The network changed: same code, new addresses.
+        let addresses = ["10.9.8.7".parse().unwrap()];
+        assert!(pairing_qr::refresh_addresses(
+            Some("10.9.8.7:1716".into()),
+            &addresses,
+            1716
+        ));
+        assert_eq!(pairing_qr::live_generation(), Some(generation));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!server.is_finished(), "the refresh did not close the link");
+
+        let proof = qr_proof(&desk_id, &desk_der, &desktop.peer_id(), &new_pem);
+        phone_end.send_packet(&proof).unwrap();
+        wire.advance(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !server.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(server.is_finished());
+        assert_eq!(
+            desktop.trusted_certificate().as_deref(),
+            Some(new_pem.as_str()),
+            "the proof was read after the refresh and paired"
+        );
+        if let Some(binding) = desktop.sessions.current_binding(&desktop.peer_id()) {
+            binding.link.close();
+        }
+        pairing_qr::cancel();
     }
 }

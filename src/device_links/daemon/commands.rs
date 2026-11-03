@@ -655,6 +655,12 @@ impl DaemonWorker {
         crate::device_links::walk_away::reset();
         crate::device_links::relay_link::client::reset();
         super::discovery::beacon_again();
+        // A code on screen carries the old addresses.
+        crate::device_links::pairing_qr::refresh_addresses(
+            lan_address().map(|ip| format!("{ip}:{}", self.tcp_port)),
+            &super::network::lan_ipv4s(&super::network::local_interfaces()),
+            self.tcp_port,
+        );
         let present: Vec<std::net::IpAddr> = super::network::local_interfaces()
             .into_iter()
             .map(|(_, ip)| ip)

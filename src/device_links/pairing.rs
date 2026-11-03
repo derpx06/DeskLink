@@ -2,7 +2,11 @@ use openssl::hash::{hash, MessageDigest};
 
 use super::packet::{NetworkPacket, PACKET_TYPE_PAIR};
 
-const ALLOWED_TIMESTAMP_DIFFERENCE_SECONDS: i64 = 30 * 60;
+/// The same five minutes the signed WebRTC signaling allows
+/// (`webrtc/signaling.rs` `MAX_AGE_MILLIS`): a pairing that passed a looser
+/// check would only fail a moment later at the handover, with a different
+/// message. Mirrored on Android.
+const ALLOWED_TIMESTAMP_DIFFERENCE_SECONDS: i64 = 5 * 60;
 
 /// How long a pairing negotiation waits, in either direction.
 ///
@@ -273,6 +277,25 @@ pub fn needs_pair_reconfirmation(
         && packet.get_bool("pair") == Some(true)
         && packet.get_i64("timestamp").is_some()
 }
+
+/// A pairing request that was dropped only because its timestamp is too far
+/// from this clock: nothing else leaves a `NotPaired` handler `NotPaired` when
+/// a request carrying a timestamp arrives. The caller says so (a refusal to the
+/// peer and words on the card) instead of letting the peer wait out its timeout.
+pub fn request_refused_for_clock(
+    previous_state: PairState,
+    current_state: PairState,
+    packet: &NetworkPacket,
+) -> bool {
+    previous_state == PairState::NotPaired
+        && current_state == PairState::NotPaired
+        && packet.get_bool("pair") == Some(true)
+        && packet.get_i64("timestamp").is_some()
+}
+
+/// What the card says when [`request_refused_for_clock`] holds. The wording is
+/// matched by `friendly_error`.
+pub const CLOCKS_DIFFER: &str = "Pairing refused: the clocks of this computer and the phone differ by more than 5 minutes. Set the clock of the phone or computer to automatic";
 
 fn unix_secs() -> i64 {
     std::time::SystemTime::now()

@@ -1958,6 +1958,25 @@ fn friendly_error(raw: &str) -> (String, bool) {
              by scanning the QR code: the old pairing is replaced.",
             true,
         )
+    } else if has(&[
+        "clocks of this computer and the phone",
+        "expired desklink webrtc signaling",
+    ]) {
+        (
+            "This computer's clock and the phone's clock are more than 5 minutes apart. Set the \
+             clock of the phone or computer to automatic, then try again.",
+            false,
+        )
+    } else if has(&["too many wrong qr", "malformed qr"]) {
+        (
+            "That QR code can't be used any more. Scan the new one shown on this computer.",
+            false,
+        )
+    } else if has(&["too many links are waiting to pair"]) {
+        (
+            "Several devices are trying to pair at once. Wait a moment, then scan again.",
+            false,
+        )
     } else if has(&["qr pairing code expired"]) {
         (
             "That QR code expired. Scan the new one shown on this computer.",
@@ -3536,6 +3555,19 @@ mod tests {
         assert!(friendly_error("Operation not permitted (os error 1)")
             .0
             .contains("not allowed"));
+
+        // The pairing refusals are sentences, not the daemon's wording.
+        for raw in [
+            crate::device_links::pairing::CLOCKS_DIFFER,
+            "Expired DeskLink WebRTC signaling message: the two devices' clocks differ by more than 5 minutes; enable automatic time on both",
+            "Too many wrong QR pairing proofs from this device",
+            "Malformed QR pairing proof",
+            "Too many links are waiting to pair by QR code",
+        ] {
+            let (words, _) = friendly_error(raw);
+            assert_ne!(words, raw, "{raw}");
+            assert!(words.ends_with('.'), "{words}");
+        }
 
         // Anything else keeps its words but loses the errno tail.
         assert_eq!(

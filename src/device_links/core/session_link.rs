@@ -213,6 +213,16 @@ impl SessionLink {
         self.transport().ok()?.local_ip()
     }
 
+    /// Which carrier this link travels over (see `pairing_transport.rs`).
+    pub fn pairing_transport(
+        &self,
+    ) -> crate::device_links::pairing_transport::PairingTransportKind {
+        // The carrier's own answer, closed link or not: failing open to the
+        // LAN here would let a relay link that has just closed pass a pairing
+        // packet that was already queued behind it.
+        self.carrier().pairing_transport()
+    }
+
     pub fn verification_key(&self, timestamp: i64) -> String {
         PairingHandler::verification_key(&self.local_public_der, &self.remote_public_der, timestamp)
     }

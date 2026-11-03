@@ -59,6 +59,12 @@ pub trait LinkTransport: Send + Sync {
     fn local_ip(&self) -> Option<IpAddr> {
         None
     }
+
+    /// The carrier, as far as pairing is concerned (`pairing_transport.rs`).
+    /// A new carrier names itself here; the default is the LAN.
+    fn pairing_transport(&self) -> crate::device_links::pairing_transport::PairingTransportKind {
+        crate::device_links::pairing_transport::PairingTransportKind::Lan
+    }
 }
 
 /// A link with no carrier at all, for tests that only exercise session state.
