@@ -20,6 +20,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -233,12 +234,16 @@ fn serve(stream: UnixStream) -> Result<(), String> {
     }
     let _closed = Closed(&session);
 
+    // The pump only notices a closed socket when it writes, which an idle
+    // shell never makes it do: it is told to stop instead.
+    let stop = Arc::new(AtomicBool::new(false));
     let output = {
         let session = Arc::clone(&session);
         let stream = stream.try_clone().map_err(|e| e.to_string())?;
+        let stop = Arc::clone(&stop);
         std::thread::Builder::new()
             .name("desklink-desk-terminal-out".into())
-            .spawn(move || pump_output(&session, stream))
+            .spawn(move || pump_output(&session, stream, &stop))
             .map_err(|e| e.to_string())?
     };
     // Input from the desk's keyboard. The desk is this computer's own user,
@@ -264,14 +269,18 @@ fn serve(stream: UnixStream) -> Result<(), String> {
             Err(_) => break,
         }
     }
+    stop.store(true, Ordering::Release);
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = output.join();
     Ok(())
 }
 
-fn pump_output(session: &PtySession, mut stream: UnixStream) {
+fn pump_output(session: &PtySession, mut stream: UnixStream, stop: &AtomicBool) {
     let mut offset = None;
-    while let Ok(resync) = session.resync(offset, 64 * 1024) {
+    while !stop.load(Ordering::Acquire) {
+        let Ok(resync) = session.resync(offset, 64 * 1024) else {
+            return;
+        };
         let (next, data) = match resync {
             Resync::Snapshot { at, data } => (at, data),
             Resync::Bytes { from, data } => (from + data.len() as u64, data),
@@ -748,6 +757,41 @@ mod tests {
         );
         drop(held);
         assert!(ClientSlot::claim().is_some(), "free again once they end");
+    }
+
+    /// A quiet shell never makes the pump write, so only a stop flag ends it:
+    /// the window count must fall when the desk window closes.
+    #[test]
+    fn closing_the_window_of_a_quiet_session_ends_the_attachment() {
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let info = super::super::registry::registry()
+            .lock()
+            .unwrap()
+            .create(Some(command), 24, 80, "desk-test")
+            .expect("quiet session");
+        let session = super::super::registry::registry()
+            .lock()
+            .unwrap()
+            .get(&info.id)
+            .unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn(move || serve(server));
+        client
+            .write_all(format!("ATTACH {} 30 100\n", info.id).as_bytes())
+            .unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !session.desk_sets_size() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(session.desk_sets_size(), "the window attached");
+        drop(client);
+        let until = std::time::Instant::now() + Duration::from_secs(3);
+        while !served.is_finished() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(served.is_finished(), "serve must return on a quiet session");
+        assert!(!session.desk_sets_size(), "the desk window count falls");
     }
 
     #[test]
