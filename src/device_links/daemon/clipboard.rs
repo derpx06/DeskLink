@@ -278,6 +278,13 @@ pub(super) fn apply_phone_packet(
     ))
 }
 
+/// How long the clipboard poll rests: a second while sharing, and five with
+/// the switch off, when a look only finds the switch still off (an idle
+/// computer should not wake every second for that).
+fn poll_pause(sharing: bool) -> Duration {
+    Duration::from_millis(if sharing { 1000 } else { 5000 })
+}
+
 /// What a phone's clipboard packet did here, for the debug log.
 #[cfg(any(test, debug_assertions))]
 pub(super) fn clipboard_from_phone(
@@ -726,9 +733,12 @@ impl DaemonWorker {
             // last read for text.
             let mut handle: Option<arboard::Clipboard> = None;
             let mut text_gen = u64::MAX;
+            let mut pause = poll_pause(true);
             while !shutdown.load(Ordering::Acquire) {
-                thread::sleep(Duration::from_millis(1000));
-                if !crate::device_links::config::app_settings().clipboard_sync {
+                thread::sleep(pause);
+                let sharing = crate::device_links::config::app_settings().clipboard_sync;
+                pause = poll_pause(sharing);
+                if !sharing {
                     handle = None;
                     continue;
                 }
@@ -870,7 +880,7 @@ impl DaemonWorker {
                                     "clipboard-size",
                                     "A copied text too large to share was not sent",
                                 );
-                                too_large = true;
+                                too_large = tell_too_large(&binding.device_id);
                                 return Ok(true);
                             }
                             transport.send(&packet).map(|()| true)
@@ -904,6 +914,13 @@ impl DaemonWorker {
             }
         });
     }
+}
+
+/// Whether a copy too big for one message is worth telling the person about
+/// for this phone: only one that takes the clipboard (a phone with clipboard
+/// sharing off is not meant to get anything, so nothing is lost for it).
+fn tell_too_large(device_id: &str) -> bool {
+    crate::device_links::features::peer_accepts(device_id, PACKET_TYPE_CLIPBOARD)
 }
 
 /// What the person is told when a copy is too big for one message.
@@ -956,6 +973,28 @@ fn remember_if_sent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_phone_with_clipboard_sharing_off_is_not_told_about_a_copy_too_large() {
+        use crate::device_links::features::{forget_peer_profile, record_peer_profile};
+        let on = vec![
+            PACKET_TYPE_CLIPBOARD.to_string(),
+            "desklink.ping".to_string(),
+        ];
+        let without = vec!["desklink.ping".to_string()];
+        record_peer_profile("clip-on-phone", &on, &on);
+        record_peer_profile("clip-off-phone", &without, &without);
+        assert!(tell_too_large("clip-on-phone"));
+        assert!(!tell_too_large("clip-off-phone"));
+        forget_peer_profile("clip-on-phone");
+        forget_peer_profile("clip-off-phone");
+    }
+
+    #[test]
+    fn the_poll_rests_longer_with_sharing_off() {
+        assert_eq!(poll_pause(true), Duration::from_secs(1));
+        assert!(poll_pause(false) > poll_pause(true));
+    }
 
     #[test]
     fn a_copy_past_one_message_is_refused_with_words_the_person_sees() {
