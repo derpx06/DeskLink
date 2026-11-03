@@ -38,6 +38,11 @@ mod imp {
         /// connected and reachable until the user picks Quit.
         pub hold: RefCell<Option<gio::ApplicationHoldGuard>>,
         pub tray: RefCell<Option<crate::tray::Tray>>,
+        /// Whether this run already said that closing the window leaves
+        /// DeskLink running without a tray.
+        pub told_hidden: RefCell<bool>,
+        /// When a close request last only minimised the window.
+        pub last_minimized: std::cell::Cell<Option<std::time::Instant>>,
     }
 
     #[glib::object_subclass]
@@ -65,6 +70,8 @@ mod imp {
             crate::startup("application constructed");
             self.daemon.replace(Some(DaemonHandle::start()));
             crate::startup("daemon started");
+            // What this system can do, found out off the main thread.
+            crate::platform::start();
             // The desk side of shared terminals (it leaves a running
             // instance's socket alone if this launch is a second one).
             crate::device_links::pty::desk::start_server();
@@ -365,6 +372,11 @@ impl DesklinkApplication {
                 }
             })
             .build();
+        // The "closed to the background" notification's click: with no tray
+        // to reopen from, the notification is the way back.
+        let show_window_action = gio::ActionEntry::builder("show-window")
+            .activate(move |app: &Self, _, _| app.main_window().present())
+            .build();
         let history_action = gio::ActionEntry::builder("history")
             .activate(move |app: &Self, _, _| app.show_history())
             .build();
@@ -415,6 +427,7 @@ impl DesklinkApplication {
             end_sessions_action,
             lock_hand_off_action,
             history_action,
+            show_window_action,
             open_bucket_action,
             turn_on_bucket_action,
             walk_away_cancel_action,
@@ -488,19 +501,58 @@ impl DesklinkApplication {
             window.set_daemon(daemon);
         }
         // Closing hides: the window's poll keeps delivering pings,
-        // find-my-phone and errors, and reopening is instant.
+        // find-my-phone and errors, and reopening is instant. Where nothing
+        // could bring the window back (no tray, no notification service) it
+        // minimises instead, so it is never hidden for good.
         window.set_hide_on_close(true);
-        // Once, ever: closing did not quit, and nothing said so (J16).
         let app = self.downgrade();
-        window.connect_close_request(move |_| {
-            if let Some(app) = app.upgrade() {
-                if take_first_hide(&crate::device_links::config::desklink_config_root()) {
-                    let note = gio::Notification::new("DeskLink is still running");
-                    note.set_body(Some(
-                        "Closing the window keeps DeskLink connected in the background. \
-                         Quit it from the tray or the app menu.",
-                    ));
-                    app.send_notification(Some("desklink-background"), &note);
+        window.connect_close_request(move |window| {
+            let Some(app) = app.upgrade() else {
+                return glib::Propagation::Proceed;
+            };
+            let way_back = app.tray_hosted() || crate::shell_dbus::extension_active();
+            let repeated = app
+                .imp()
+                .last_minimized
+                .get()
+                .is_some_and(|at| at.elapsed() < QUIT_ON_SECOND_CLOSE);
+            match close_action(way_back, crate::platform::works("notifications"), repeated) {
+                CloseAction::Minimize => {
+                    app.imp()
+                        .last_minimized
+                        .set(Some(std::time::Instant::now()));
+                    window.minimize();
+                    return glib::Propagation::Stop;
+                }
+                // Closing twice in a row where the window can neither hide
+                // nor minimise (a tiling WM) is a request to quit.
+                CloseAction::Quit => {
+                    app.quit();
+                    return glib::Propagation::Proceed;
+                }
+                CloseAction::HideAndTell => {
+                    // No tray to show where it went: said each session.
+                    if take_hide_notice(&mut app.imp().told_hidden.borrow_mut()) {
+                        let note = gio::Notification::new("DeskLink is still running");
+                        note.set_body(Some(
+                            "There is no tray on this desktop, so DeskLink stays connected in \
+                             the background. Click here, or start DeskLink from your launcher, \
+                             to open it again.",
+                        ));
+                        note.set_default_action("app.show-window");
+                        app.send_notification(Some("desklink-background"), &note);
+                    }
+                }
+                CloseAction::Hide => {
+                    // Once, ever: closing did not quit, and nothing said so (J16).
+                    if take_first_hide(&crate::device_links::config::desklink_config_root()) {
+                        let note = gio::Notification::new("DeskLink is still running");
+                        note.set_body(Some(
+                            "Closing the window keeps DeskLink connected in the background. \
+                             Quit it from the tray or the app menu.",
+                        ));
+                        app.send_notification(Some("desklink-background"), &note);
+                    }
                 }
             }
             glib::Propagation::Proceed
@@ -1544,6 +1596,39 @@ mod tests {
     }
 }
 
+/// What closing the main window does.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CloseAction {
+    /// Hide it; a tray (or the top-bar extension) shows DeskLink is running.
+    Hide,
+    /// Hide it and say, once per run, how to get it back.
+    HideAndTell,
+    /// Nothing could bring a hidden window back: keep it, minimised.
+    Minimize,
+    /// The same, closed again right after: really quit (a window manager that
+    /// cannot minimise would otherwise make closing impossible).
+    Quit,
+}
+
+/// How soon a second close request after a minimise quits.
+const QUIT_ON_SECOND_CLOSE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Closing the window, given whether a tray (or the extension) is showing
+/// DeskLink and whether a notification can be shown.
+pub(crate) fn close_action(way_back: bool, can_notify: bool, repeated: bool) -> CloseAction {
+    match (way_back, can_notify, repeated) {
+        (true, _, _) => CloseAction::Hide,
+        (false, true, _) => CloseAction::HideAndTell,
+        (false, false, false) => CloseAction::Minimize,
+        (false, false, true) => CloseAction::Quit,
+    }
+}
+
+/// True the first time it is called for `told` (and remembers it).
+fn take_hide_notice(told: &mut bool) -> bool {
+    !std::mem::replace(told, true)
+}
+
 /// Whether this is the first time the window was closed (and remembers it):
 /// the note about DeskLink staying in the background is shown once.
 pub(crate) fn take_first_hide(dir: &std::path::Path) -> bool {
@@ -1553,6 +1638,35 @@ pub(crate) fn take_first_hide(dir: &std::path::Path) -> bool {
     }
     let _ = std::fs::create_dir_all(dir);
     std::fs::write(&marker, b"").is_ok()
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    #[test]
+    fn a_window_is_never_hidden_with_no_way_to_get_it_back() {
+        assert_eq!(close_action(true, true, false), CloseAction::Hide);
+        assert_eq!(close_action(true, false, false), CloseAction::Hide);
+        assert_eq!(close_action(false, true, false), CloseAction::HideAndTell);
+        assert_eq!(close_action(false, false, false), CloseAction::Minimize);
+    }
+
+    #[test]
+    fn closing_twice_where_a_window_cannot_minimise_quits() {
+        assert_eq!(close_action(false, false, true), CloseAction::Quit);
+        // A tray or a notification service means the first close is enough.
+        assert_eq!(close_action(false, true, true), CloseAction::HideAndTell);
+        assert_eq!(close_action(true, false, true), CloseAction::Hide);
+        assert_eq!(QUIT_ON_SECOND_CLOSE, std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_no_tray_notice_comes_once_per_run() {
+        let mut told = false;
+        assert!(take_hide_notice(&mut told));
+        assert!(!take_hide_notice(&mut told));
+    }
 }
 
 #[cfg(test)]

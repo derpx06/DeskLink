@@ -83,6 +83,7 @@ mod kde;
 mod link_glyph;
 mod pdf;
 mod phone_mpris;
+mod platform;
 mod protocol;
 mod remote_control;
 mod search_provider;
@@ -117,6 +118,10 @@ fn main() -> glib::ExitCode {
     if args.len() == 3 && args[1] == "--attach-terminal" {
         let status = device_links::pty::desk::run_client(&args[2]);
         return glib::ExitCode::from(status.clamp(0, 255));
+    }
+    // `desklink --check`: what works on this computer, without a window.
+    if args.len() == 2 && args[1] == "--check" {
+        return glib::ExitCode::from(platform::run_check_cli());
     }
     // `desklink --send-files [--to <phone>] <files…>`: Files' "Send to"
     // scripts and Open With entry. Hands the files to the running app.
@@ -153,11 +158,29 @@ fn main() -> glib::ExitCode {
     startup("main");
     install_crash_reporter();
 
-    // Set up gettext translations
-    bindtextdomain(GETTEXT_PACKAGE, LOCALEDIR).expect("Unable to bind the text domain");
-    bind_textdomain_codeset(GETTEXT_PACKAGE, "UTF-8")
-        .expect("Unable to set the text domain encoding");
-    textdomain(GETTEXT_PACKAGE).expect("Unable to switch to the text domain");
+    // No display to draw on: say so, rather than GTK's one warning line. Not
+    // when DeskLink already runs (a launch then only forwards to it), and
+    // never before the plain command-line modes above have had their turn.
+    if let Some(problem) = no_display(
+        env_set("DISPLAY"),
+        env_set("WAYLAND_DISPLAY"),
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .is_some_and(|dir| std::path::Path::new(&dir).join("wayland-0").exists()),
+    )
+    .filter(|_| !instance_running())
+    {
+        eprintln!("DeskLink: {problem}");
+        return glib::ExitCode::FAILURE;
+    }
+
+    // Set up gettext translations. A missing translation is not a reason not
+    // to start: the text stays in English.
+    if let Err(error) = bindtextdomain(GETTEXT_PACKAGE, LOCALEDIR)
+        .and_then(|_| bind_textdomain_codeset(GETTEXT_PACKAGE, "UTF-8"))
+        .and_then(|_| textdomain(GETTEXT_PACKAGE))
+    {
+        eprintln!("[DeskLink] Translations are off: {error}");
+    }
 
     // Load resources
     let resources = load_resources().expect("Could not load resources");
@@ -176,6 +199,63 @@ fn main() -> glib::ExitCode {
     // terminal.
     startup("application created; running");
     app.run()
+}
+
+fn env_set(name: &str) -> bool {
+    std::env::var_os(name).is_some_and(|value| !value.is_empty())
+}
+
+/// Whether another DeskLink owns the application name on the session bus.
+/// Asked only when a bus is already reachable, so it starts nothing.
+fn instance_running() -> bool {
+    let runtime_bus = std::env::var_os("XDG_RUNTIME_DIR")
+        .is_some_and(|dir| std::path::Path::new(&dir).join("bus").exists());
+    if !env_set("DBUS_SESSION_BUS_ADDRESS") && !runtime_bus {
+        return false;
+    }
+    gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
+        .ok()
+        .and_then(|bus| {
+            bus.call_sync(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                "org.freedesktop.DBus",
+                "NameHasOwner",
+                Some(&("derx06.desklink.com",).to_variant()),
+                None,
+                gio::DBusCallFlags::NONE,
+                500,
+                gio::Cancellable::NONE,
+            )
+            .ok()
+        })
+        .and_then(|reply| reply.child_value(0).get::<bool>())
+        .unwrap_or(false)
+}
+
+/// Why DeskLink cannot start without a display (`None` when it can try):
+/// neither `DISPLAY` nor `WAYLAND_DISPLAY` is set and there is no default
+/// Wayland socket (`wayland-0`, which libwayland uses when the variable is
+/// unset).
+fn no_display(x11: bool, wayland: bool, default_wayland_socket: bool) -> Option<&'static str> {
+    (!x11 && !wayland && !default_wayland_socket).then_some(
+        "there is no graphical session to show a window in (DISPLAY and WAYLAND_DISPLAY \
+         are not set). Start it from your desktop, or under a virtual display \
+         (xvfb-run desklink).",
+    )
+}
+
+#[cfg(test)]
+mod display_tests {
+    #[test]
+    fn a_missing_display_is_explained_and_any_display_is_tried() {
+        assert!(
+            super::no_display(false, false, false).is_some_and(|words| words.contains("xvfb-run"))
+        );
+        assert!(super::no_display(true, false, false).is_none());
+        assert!(super::no_display(false, true, false).is_none());
+        assert!(super::no_display(false, false, true).is_none());
+    }
 }
 
 fn load_resources() -> Result<gio::Resource, glib::Error> {

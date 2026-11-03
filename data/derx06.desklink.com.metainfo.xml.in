@@ -8,7 +8,7 @@
   <summary>Use your phone and computer together</summary>
   <description>
     <p>
-      DeskLink connects your Android phone to your GNOME desktop. Pair once by
+      DeskLink connects your Android phone to your Linux desktop (GNOME, KDE Plasma, Xfce, Cinnamon, MATE, COSMIC, sway and others, on Wayland or X11). Pair once by
       scanning a code, and the two work as one: see your phone on your screen,
       control your computer from your phone, and move text, files and
       notifications between them.
@@ -19,8 +19,7 @@
       <li>Shared terminals, including one tap to start Claude Code or Codex on your computer</li>
       <li>Phone notifications on the desktop, with replies</li>
       <li>Clipboard sync in both directions</li>
-      <li>File transfer, and browsing the phone’s files from the desktop</li>
-      <li>A presentation remote for your slides</li>
+      <li>File transfer in both directions</li>
       <li>Works away from home through the DeskLink relay, with end-to-end encrypted signaling</li>
     </ul>
     <p>
@@ -66,7 +65,7 @@
       <image>https://raw.githubusercontent.com/derpx06/DeskLink/master/data/screenshots/screen.png</image>
     </screenshot>
     <screenshot>
-      <caption>Browsing the phone’s files</caption>
+      <caption>Files moving between the phone and the computer</caption>
       <image>https://raw.githubusercontent.com/derpx06/DeskLink/master/data/screenshots/files.png</image>
     </screenshot>
   </screenshots>

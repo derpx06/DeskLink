@@ -266,38 +266,35 @@ pub(crate) fn new_desk_session_in(folder: &str) -> Result<String, String> {
 /// The registry owner of sessions started at this computer.
 const DESK_OWNER: &str = "desk";
 
-/// Opens a window on this desktop showing session `id`.
+/// Opens a window on this desktop showing session `id`. Trying terminals
+/// waits on each (a failed one exits at once), so it runs off the caller's
+/// thread, which is often the UI's.
 pub(crate) fn open_on_desktop(id: &str) {
+    let id = id.to_string();
+    let _ = thread::Builder::new()
+        .name("desklink-terminal-open".into())
+        .spawn(move || open_blocking(&id));
+}
+
+fn open_blocking(id: &str) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
     let exe = exe.to_string_lossy().into_owned();
     let title = "DeskLink terminal";
     let client = super::host::attach_client(&exe, id);
-    let client: Vec<&str> = client.iter().map(String::as_str).collect();
     let in_flatpak = super::host::in_flatpak();
-    let attempts: [(&str, Vec<&str>); 7] = [
-        ("kgx", [&["--title", title, "--"][..], &client].concat()),
-        ("ptyxis", [&["--new-window", "--"][..], &client].concat()),
-        (
-            "gnome-terminal",
-            [&["--title", title, "--"][..], &client].concat(),
-        ),
-        ("konsole", [&["-e"][..], &client].concat()),
-        ("xdg-terminal-exec", client.to_vec()),
-        ("kitty", client.to_vec()),
-        ("xterm", [&["-e"][..], &client].concat()),
-    ];
+    let attempts = terminal_attempts(&client, title, std::env::var("TERMINAL").ok().as_deref());
     for (program, args) in attempts {
         // Inside a Flatpak the terminal app is the host's. `flatpak-spawn`
         // itself always starts, so a missing host program shows up as a quick
         // failing exit instead of a spawn error.
         let mut command = if in_flatpak {
             let mut command = std::process::Command::new("flatpak-spawn");
-            command.args(["--host", program]).args(&args);
+            command.args(["--host", &program]).args(&args);
             command
         } else {
-            let mut command = std::process::Command::new(program);
+            let mut command = std::process::Command::new(&program);
             command.args(&args);
             command
         };
@@ -307,13 +304,12 @@ pub(crate) fn open_on_desktop(id: &str) {
             .stderr(std::process::Stdio::null())
             .spawn()
         {
-            if in_flatpak {
-                std::thread::sleep(Duration::from_millis(800));
-                if let Ok(Some(status)) = child.try_wait() {
-                    if !status.success() {
-                        continue;
-                    }
-                }
+            // A program that starts and at once exits with an error did not
+            // open a window (a broken `$TERMINAL`, a missing host program in
+            // a Flatpak, a terminal that cannot reach its server): try the
+            // next one. Exiting cleanly is a launcher that handed over.
+            if exits_with_error_soon(&mut child, STARTED_WITHIN) {
+                continue;
             }
             let _ = std::thread::Builder::new()
                 .name("desklink-terminal-window".into())
@@ -324,6 +320,115 @@ pub(crate) fn open_on_desktop(id: &str) {
         }
     }
     eprintln!("[DeskLink] No terminal app found to show the shared session on the desktop");
+}
+
+/// Terminal programs and how each is told to run a command: the arguments
+/// that come before it (`{title}` is the window title). `x-terminal-emulator`
+/// is Debian's alternatives link, the user's choice on Debian and Ubuntu.
+const TERMINALS: [(&str, &[&str]); 20] = [
+    // The first seven are the original order, unchanged: a GNOME or KDE
+    // machine picks exactly what it always did.
+    ("kgx", &["--title", "{title}", "--"]),
+    ("ptyxis", &["--new-window", "--"]),
+    ("gnome-terminal", &["--title", "{title}", "--"]),
+    ("konsole", &["-e"]),
+    ("xdg-terminal-exec", &[]),
+    // Other desktops' own terminals, before the general-purpose ones.
+    ("xfce4-terminal", &["--title", "{title}", "-x"]),
+    ("mate-terminal", &["--title", "{title}", "-x"]),
+    ("lxterminal", &["--title={title}", "-e"]),
+    ("qterminal", &["-e"]),
+    ("x-terminal-emulator", &["-e"]),
+    ("kitty", &["--title", "{title}"]),
+    ("alacritty", &["--title", "{title}", "-e"]),
+    ("foot", &["--title", "{title}"]),
+    ("wezterm", &["start", "--"]),
+    ("terminator", &["--title", "{title}", "-x"]),
+    ("urxvt", &["-title", "{title}", "-e"]),
+    ("st", &["-t", "{title}", "-e"]),
+    ("sakura", &["--title", "{title}", "-x"]),
+    ("cool-retro-term", &["-e"]),
+    ("xterm", &["-T", "{title}", "-e"]),
+];
+// Not listed: tilix, termite and deepin-terminal. Their `-e` takes one string
+// to hand to a shell, not an argument list, so the attach command would need
+// shell quoting that has not been checked against their documentation. Only
+// the first five and xterm have been used on a live desktop; the rest follow
+// each program's documented "run this command" flag and are unverified.
+
+/// The commands to try, in order, to show the session in a window: the
+/// user's `$TERMINAL` first (as `terminal -e command`, the common convention),
+/// then [`TERMINALS`]. Each is `(program, arguments)` with `client` last.
+fn terminal_attempts(
+    client: &[String],
+    title: &str,
+    preferred: Option<&str>,
+) -> Vec<(String, Vec<String>)> {
+    let mut attempts = Vec::new();
+    if let Some(program) = preferred.filter(|name| {
+        // A bare program name only: `$TERMINAL` is never run through a shell.
+        !name.is_empty() && !name.contains(char::is_whitespace) && !name.contains('/')
+    }) {
+        if !TERMINALS.iter().any(|(known, _)| *known == program) {
+            attempts.push((
+                program.to_string(),
+                ["-e".to_string()]
+                    .into_iter()
+                    .chain(client.iter().cloned())
+                    .collect(),
+            ));
+        }
+    }
+    for (program, before) in TERMINALS {
+        let mut args: Vec<String> = before
+            .iter()
+            .map(|arg| arg.replace("{title}", title))
+            .collect();
+        args.extend(client.iter().cloned());
+        let entry = (program.to_string(), args);
+        // The user's own choice, when it is one we know, goes first.
+        if preferred == Some(program) {
+            attempts.insert(0, entry);
+        } else {
+            attempts.push(entry);
+        }
+    }
+    attempts
+}
+
+/// How long a terminal has to stay up (or exit cleanly) to count as opened.
+const STARTED_WITHIN: Duration = Duration::from_millis(800);
+
+/// Waits up to `within` for `child`; `true` when it exited with a failure in
+/// that time. Still running, or exited successfully, is `false`.
+fn exits_with_error_soon(child: &mut std::process::Child, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return !status.success(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// The terminal programs found on `PATH` (for the system check).
+pub(crate) fn installed_terminals() -> std::collections::BTreeSet<String> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    TERMINALS
+        .iter()
+        .map(|(program, _)| *program)
+        .filter(|program| {
+            std::env::split_paths(&path).any(|dir| {
+                dir.join(program)
+                    .metadata()
+                    .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            })
+        })
+        .map(str::to_string)
+        .collect()
 }
 
 // ---- client (`desklink --attach-terminal <id>`, inside the desk window) -----
@@ -443,6 +548,108 @@ pub(crate) fn run_client(id: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_terminal_gets_the_attach_command_last_and_a_titled_window() {
+        let client: Vec<String> = ["/usr/bin/desklink", "--attach-terminal", "7"]
+            .map(String::from)
+            .to_vec();
+        let attempts = super::terminal_attempts(&client, "DeskLink terminal", None);
+        assert_eq!(attempts.len(), super::TERMINALS.len());
+        for (program, args) in &attempts {
+            assert!(args.ends_with(&client), "{program}: {args:?}");
+            assert!(!args.iter().any(|arg| arg.contains("{title}")), "{program}");
+        }
+        // The terminals the common desktops ship are all there.
+        for program in [
+            "kgx",
+            "konsole",
+            "xfce4-terminal",
+            "mate-terminal",
+            "x-terminal-emulator",
+            "foot",
+            "alacritty",
+            "kitty",
+            "xterm",
+        ] {
+            assert!(
+                attempts.iter().any(|(name, _)| name == program),
+                "{program}"
+            );
+        }
+        let xfce = attempts
+            .iter()
+            .find(|(name, _)| name == "xfce4-terminal")
+            .unwrap();
+        assert_eq!(xfce.1[..3], ["--title", "DeskLink terminal", "-x"]);
+    }
+
+    #[test]
+    fn the_original_terminals_keep_their_order_and_gnome_still_starts_with_kgx() {
+        let client = vec!["desklink".to_string()];
+        let order: Vec<String> = super::terminal_attempts(&client, "t", None)
+            .into_iter()
+            .map(|(program, _)| program)
+            .collect();
+        let at = |name: &str| order.iter().position(|p| p == name).unwrap();
+        let original = [
+            "kgx",
+            "ptyxis",
+            "gnome-terminal",
+            "konsole",
+            "xdg-terminal-exec",
+            "kitty",
+            "xterm",
+        ];
+        for pair in original.windows(2) {
+            assert!(at(pair[0]) < at(pair[1]), "{pair:?}");
+        }
+        assert_eq!(&order[..5], &original[..5]);
+        // Shells' one-string `-e` terminals are not in the list.
+        for left_out in ["tilix", "termite", "deepin-terminal"] {
+            assert!(!order.iter().any(|p| p == left_out), "{left_out}");
+        }
+    }
+
+    #[test]
+    fn a_terminal_that_exits_with_an_error_at_once_counts_as_failed() {
+        let start = |script: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", script])
+                .spawn()
+                .unwrap()
+        };
+        let within = std::time::Duration::from_millis(800);
+        assert!(super::exits_with_error_soon(&mut start("exit 3"), within));
+        assert!(!super::exits_with_error_soon(&mut start("exit 0"), within));
+        let mut running = start("sleep 5");
+        assert!(!super::exits_with_error_soon(
+            &mut running,
+            std::time::Duration::from_millis(100)
+        ));
+        let _ = running.kill();
+        let _ = running.wait();
+    }
+
+    #[test]
+    fn the_users_terminal_is_tried_first_and_never_through_a_shell() {
+        let client = vec!["desklink".to_string(), "--attach-terminal".to_string()];
+        let first = |preferred| {
+            super::terminal_attempts(&client, "t", preferred)
+                .into_iter()
+                .next()
+                .map(|(program, _)| program)
+        };
+        assert_eq!(first(Some("foot")).as_deref(), Some("foot"));
+        assert_eq!(first(Some("wezterm")).as_deref(), Some("wezterm"));
+        assert_eq!(first(Some("someterm")).as_deref(), Some("someterm"));
+        assert_eq!(first(None).as_deref(), Some("kgx"));
+        for hostile in ["", "rm -rf ~", "/tmp/x", "a b"] {
+            assert_eq!(first(Some(hostile)).as_deref(), Some("kgx"), "{hostile:?}");
+        }
+        let unknown = super::terminal_attempts(&client, "t", Some("someterm"));
+        assert_eq!(unknown[0].1[0], "-e");
+    }
+
     use super::*;
 
     #[test]

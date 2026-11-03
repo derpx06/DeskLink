@@ -192,6 +192,7 @@ fn groups(
     let advanced = group(GROUPS[9]);
     advanced.add(&away_row(daemon, settings));
     advanced.add(&history_row());
+    advanced.add(&system_check_row());
     advanced.add(&logs_row());
 
     // The group titles are fixed (see GROUPS); calls and sound build theirs.
@@ -233,6 +234,7 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>, daemon: &DaemonHandle)
     let advanced = group(GROUPS[9]);
     advanced.add(&away_row(daemon, &settings));
     advanced.add(&history_row());
+    advanced.add(&system_check_row());
     advanced.add(&logs_row());
     page.add(&advanced);
     dialog.add(&page);
@@ -252,6 +254,12 @@ fn sound_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Preference
     mic.connect_active_notify(move |row| {
         sender.send(DaemonCommand::SetDeskMicToPhone(row.is_active()))
     });
+    // No PipeWire (or its GStreamer plugin): off, with the reason.
+    if let Some(reason) = crate::platform::reason("sound") {
+        mic.set_sensitive(false);
+        mic.set_subtitle(&esc(reason));
+        mic.set_subtitle_lines(0);
+    }
     group.add(&mic);
     group
 }
@@ -466,6 +474,23 @@ fn history_row() -> adw::ActionRow {
 }
 
 /// "Logs": where crash reports are kept.
+fn system_check_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("System check")
+        .subtitle("What works on this computer, and what to install for the rest")
+        .activatable(true)
+        .build();
+    with_icon(&row, "preferences-system-symbolic");
+    row.add_suffix(
+        &gtk::Image::builder()
+            .icon_name("go-next-symbolic")
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build(),
+    );
+    row.connect_activated(super::system_check::show_dialog);
+    row
+}
+
 fn logs_row() -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title("Crash reports")
@@ -484,12 +509,18 @@ fn logs_row() -> adw::ActionRow {
             return;
         };
         let _ = std::fs::create_dir_all(&dir);
+        let (shown, widget) = (dir.display().to_string(), row.clone());
         gtk::FileLauncher::new(Some(&gio::File::for_path(dir))).launch(
             row.root().and_downcast_ref::<gtk::Window>(),
             gio::Cancellable::NONE,
-            |result| {
+            move |result| {
                 if let Err(error) = result {
                     eprintln!("[UI] Could not open the crash folder: {error}");
+                    // No file manager (a bare window manager) is not a silent no-op.
+                    super::toast_from(
+                        &widget,
+                        &format!("No file manager opened it. The reports are in {shown}"),
+                    );
                 }
             },
         );
@@ -684,7 +715,11 @@ fn phone_keep_awake_row(
 fn start_at_login_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
         .title("Start at Login")
-        .subtitle("Keeps this computer reachable after a restart")
+        .subtitle(crate::platform::note("autostart").map_or_else(
+            || glib::GString::from("Keeps this computer reachable after a restart"),
+            esc,
+        ))
+        .subtitle_lines(0)
         .active(settings.start_at_login.unwrap_or(true))
         .build();
     with_icon(&row, "system-shutdown-symbolic");
@@ -1336,6 +1371,13 @@ fn remote_control_row(device: &DeviceView, approving: bool) -> adw::ActionRow {
     )]);
     row.add_suffix(&forget);
     row.add_suffix(&approve);
+    // A desktop that cannot share its screen says why, instead of a button
+    // that opens nothing.
+    if let Some(reason) = crate::platform::reason("share") {
+        approve.set_sensitive(false);
+        row.set_subtitle(&esc(reason));
+        row.set_subtitle_lines(0);
+    }
     let id = device.id.clone();
     approve.connect_clicked(move |button| {
         if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {
@@ -1680,6 +1722,11 @@ mod tests {
                             .collect()
                     };
                     let mut rows = names("rows");
+                    // Rows the phone has no counterpart for are marked in the
+                    // table, so the phone's copy of it can leave them out.
+                    for only in names("deskOnlyRows") {
+                        assert!(rows.contains(&only), "{only} is not a row");
+                    }
                     if crate::shell_dbus::extension_possible() {
                         rows.extend(names("gnomeRows"));
                     }

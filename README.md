@@ -29,7 +29,7 @@ KDE product and does not interoperate with KDE Connect peers.
 | Debian 13 (trixie) | native `.deb` ([`packaging/debian`](packaging/debian)) | Built with Debian's own Rust 1.85 |
 | Ubuntu 24.04 LTS and newer | native `.deb` | 24.04 needs the `rustc-1.85` toolchain package; it ships no `gstreamer1.0-gtk4`, which DeskLink bundles |
 | Fedora 43 and newer | native RPM ([`packaging/obs`](packaging/obs)) | H.264 needs `gstreamer1-plugin-openh264` or `gstreamer1-plugin-libav` |
-| openSUSE Tumbleweed, Leap 16 | native RPM (OBS) | H.264 needs `gstreamer-plugins-libav` (Packman) |
+| openSUSE Tumbleweed (Leap 16 untested) | native RPM (OBS) | H.264 needs `gstreamer-plugins-libav` (Packman) |
 | Arch Linux, Manjaro | AUR | |
 | NixOS and Nix | `nix run github:derpx06/DeskLink` ([`flake.nix`](flake.nix)) | |
 
@@ -40,9 +40,12 @@ Controlling this computer from the phone depends on the desktop:
 
 | Desktop | Phone sees the screen | Phone controls it |
 |---|---|---|
-| GNOME, KDE Plasma, COSMIC 1.10+ | yes (portal) | yes (portal) |
-| Cinnamon, MATE, XFCE and other X11 desktops | yes (X11 fallback) | yes (XTest), after approving the phone at the desk under Remote Control |
-| wlroots compositors (Sway, Hyprland, ...) | yes (portal) | no: their portals have no RemoteDesktop |
+| GNOME, KDE Plasma | yes (portal) | yes (portal) |
+| Cinnamon, MATE, XFCE and other X11 desktops | yes (X11 fallback, native packages only: the Flatpak runtime has no X11 capture) | yes (XTest), after approving the phone at the desk under Remote Control |
+| COSMIC, wlroots compositors (Sway, Hyprland, ...) | not yet: their portals offer ScreenCast but not RemoteDesktop, and DeskLink needs both for any desktop share | not yet |
+
+Settings, Advanced, System check (or `desklink --check`) lists what works on
+your computer and the packages to install for the rest.
 
 The X11 fallback is used only when the session is X11 and the portal offers no
 screen sharing. It captures every monitor as one picture.

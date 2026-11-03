@@ -17,7 +17,7 @@
         system: pkgs: {
           default = pkgs.stdenv.mkDerivation {
             pname = "desklink";
-            version = "1.0.0";
+            version = "1.3.0";
             src = ./.;
 
             # Meson wraps `cargo build --locked`; the hook points cargo at

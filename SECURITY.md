@@ -52,6 +52,7 @@ share DeskLink's address space either way.
 | `--talk-name=org.freedesktop.Flatpak` | Shared terminals start the shell on the host (see above). The one permission that removes the sandbox. |
 | `--system-talk-name=org.freedesktop.login1` | Unlock with the phone and keep awake while a phone is connected. |
 | `--talk-name=org.freedesktop.ScreenSaver`, `--talk-name=org.gnome.ScreenSaver` | Lock the screen from the phone and see its lock state. |
+| `--talk-name=org.mpris.MediaPlayer2.*`, `--own-name=org.mpris.MediaPlayer2.DeskLink.*` | Media players on this computer show on the phone (talk), and the phone's media appears in the desktop's media controls (own). Without them a sandbox sees no players and the desktop sees no phone. |
 | `--talk-name=org.kde.StatusNotifierWatcher`, `--own-name=org.kde.StatusNotifierItem-2-1` | The tray icon. |
 | `--talk-name=org.gnome.Shell.Extensions` | The optional top-bar extension (turn on, turn off, state). |
 | `--talk-name=org.a11y.Bus` | Accessibility (screen readers). |

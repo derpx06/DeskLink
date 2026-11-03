@@ -17,6 +17,8 @@
         "--system-talk-name=org.freedesktop.login1",
         "--talk-name=org.freedesktop.ScreenSaver",
         "--talk-name=org.gnome.ScreenSaver",
+        "--talk-name=org.mpris.MediaPlayer2.*",
+        "--own-name=org.mpris.MediaPlayer2.DeskLink.*",
         "--talk-name=org.kde.StatusNotifierWatcher",
         "--own-name=org.kde.StatusNotifierItem-2-1",
         "--talk-name=org.gnome.Shell.Extensions",

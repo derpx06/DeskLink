@@ -379,6 +379,31 @@ fn just_placed(content: &str, now: u64) -> bool {
 /// XWayland) to every Wayland application.
 static X11_CLIPBOARD: Mutex<Option<arboard::Clipboard>> = Mutex::new(None);
 
+/// What `wl-copy` is told: the text is plain UTF-8 (it would otherwise guess
+/// the type from the bytes, and a short string can come out as anything).
+const WL_COPY_ARGS: &[&str] = &["--type", "text/plain;charset=utf-8"];
+
+/// Hands `text` to a clipboard program on its standard input (`wl-copy`
+/// forks into the background to keep serving the selection and exits at
+/// once). `false` when the program is missing or fails.
+fn pipe_to_copier(program: &str, args: &[&str], text: &str) -> bool {
+    use std::io::Write;
+    let Ok(mut child) = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let written = child
+        .stdin
+        .take()
+        .is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+    child.wait().is_ok_and(|status| status.success()) && written
+}
+
 fn set_x11(text: &str, still_latest: &dyn Fn() -> bool) -> bool {
     let Ok(mut held) = X11_CLIPBOARD.lock() else {
         return false;
@@ -467,6 +492,18 @@ pub(crate) fn set_clipboard_text_from_remote(content: &str) {
                 .is_ok_and(|last| *last == content)
         };
         if !latest() || set_x11(&content, &latest) {
+            return;
+        }
+        // A Wayland-only compositor (no XWayland): wl-clipboard's `wl-copy`
+        // owns the selection through the data-control protocol, which works
+        // while no DeskLink window has focus. Not installed everywhere.
+        // Only in a Wayland session the environment names (never a default
+        // socket guessed at, and never from a test: it would take over the
+        // real clipboard).
+        if !cfg!(test)
+            && std::env::var_os("WAYLAND_DISPLAY").is_some()
+            && pipe_to_copier("wl-copy", WL_COPY_ARGS, &content)
+        {
             return;
         }
         debug_log!("[Clipboard] No X11 clipboard here; placing it through GTK instead");
@@ -1357,6 +1394,18 @@ mod tests {
             assert!(history().iter().any(|item| item.text == content), "{name}");
         }
         LOCAL_COPY_AT.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn a_missing_wl_copy_is_a_quiet_false_and_a_working_one_is_true() {
+        assert!(!pipe_to_copier(
+            "desklink-no-such-clipboard-program",
+            &[],
+            "x"
+        ));
+        assert!(pipe_to_copier("cat", &[], "x"));
+        assert!(!pipe_to_copier("false", &[], "x"));
+        assert_eq!(WL_COPY_ARGS, ["--type", "text/plain;charset=utf-8"]);
     }
 
     /// Two copies arriving close together: the newest is what stays (the

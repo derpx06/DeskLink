@@ -2,7 +2,7 @@
 
 pkgname=desklink-bin
 _pkgname=desklink
-pkgver=1.0.0
+pkgver=1.3.0
 pkgrel=1
 pkgdesc='Use your Android phone and GNOME desktop together (prebuilt)'
 arch=('x86_64')
