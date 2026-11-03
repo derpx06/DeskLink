@@ -81,6 +81,9 @@ mod tests {
             "device_links/webrtc/coordinator.rs:LAST",
             // Throttles that expire by themselves.
             "device_links/daemon/discovery.rs:LAST",
+            // When each unpaired card was last heard from: bounded (cleared at 1024), and only
+            // decides which card makes room.
+            "device_links/daemon/state.rs:UNTRUSTED_SEEN",
             // History keeps names of phones that are gone, on purpose.
             "device_links/connection_log.rs:NAMES",
             "device_links/connection_log.rs:READY",
