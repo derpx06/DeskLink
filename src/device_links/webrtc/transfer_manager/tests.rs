@@ -3643,7 +3643,7 @@ mod lane {
         let source = rig.source("big.bin", &bytes);
         let id = rig.a().start_send(&source).unwrap();
         eventually("some blocks over the lane", || {
-            (board::lane_of(&id) == Some("fast lane") && verified(&rig) >= 2).then_some(())
+            (board::lane_of(&id) == Some("fast, over Wi-Fi") && verified(&rig) >= 2).then_some(())
         });
         let step = |held: bool| {
             rig.a().probe(move |engine| {
@@ -3673,11 +3673,11 @@ mod lane {
         let source = rig.source("big.bin", &bytes);
         let id = rig.a().start_send(&source).unwrap();
         eventually("some blocks over the lane", || {
-            (board::lane_of(&id) == Some("fast lane") && verified(&rig) >= 2).then_some(())
+            (board::lane_of(&id) == Some("fast, over Wi-Fi") && verified(&rig) >= 2).then_some(())
         });
         rig.b().probe(|engine| engine.faults.disk_full = true);
         eventually("the lane is let go", || {
-            (board::lane_of(&id) == Some("over WebRTC")).then_some(())
+            (board::lane_of(&id) == Some("over the secure link")).then_some(())
         });
         assert_eq!(
             file_lane::peer_wait_for_test(&env.receiver.id, Instant::now()),
@@ -3687,7 +3687,7 @@ mod lane {
         steady(
             "no new lane while it is held",
             Duration::from_millis(300),
-            || board::lane_of(&id) == Some("over WebRTC"),
+            || board::lane_of(&id) == Some("over the secure link"),
         );
         rig.b().probe(|engine| {
             engine.faults.disk_full = false;
@@ -3716,7 +3716,7 @@ mod lane {
         let source = rig.source("big.bin", &bytes);
         let id = rig.a().start_send(&source).unwrap();
         eventually("some blocks over the lane", || {
-            (board::lane_of(&id) == Some("fast lane") && verified(&rig) >= 2).then_some(())
+            (board::lane_of(&id) == Some("fast, over Wi-Fi") && verified(&rig) >= 2).then_some(())
         });
         // The lane under agreement (a token waits): the pause ends it.
         let (off, releases, wants_again) = rig.a().probe(|engine| {
@@ -3932,7 +3932,7 @@ mod lane {
         let source = rig.source("big.bin", &bytes);
         let id = rig.a().start_send(&source).unwrap();
         eventually("the lane label", || {
-            (board::lane_of(&id) == Some("fast lane")).then_some(())
+            (board::lane_of(&id) == Some("fast, over Wi-Fi")).then_some(())
         });
         let got = rig.received();
         assert_eq!(fs::read(&got.path).unwrap(), bytes);
@@ -3968,7 +3968,7 @@ mod lane {
         let source = rig.source("big.bin", &bytes);
         let id = rig.a().start_send(&source).unwrap();
         eventually("the lane label", || {
-            (board::lane_of(&id) == Some("fast lane")).then_some(())
+            (board::lane_of(&id) == Some("fast, over Wi-Fi")).then_some(())
         });
         let got = rig.received();
         assert_eq!(fs::read(&got.path).unwrap(), bytes);
@@ -4174,7 +4174,7 @@ mod lane {
         let source = rig.source("big.bin", &bytes);
         let id = rig.a().start_send(&source).unwrap();
         eventually("some blocks over the lane", || {
-            (board::lane_of(&id) == Some("fast lane") && verified(&rig) >= 2).then_some(())
+            (board::lane_of(&id) == Some("fast, over Wi-Fi") && verified(&rig) >= 2).then_some(())
         });
         rig.a().cancel_transfer(&id, code::USER).unwrap();
         eventually("cancelled", || was_cancelled(&id).then_some(()));

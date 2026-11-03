@@ -82,7 +82,7 @@ pub struct TransferBoard {
     ended: VecDeque<(u64, Finished)>,
     ended_seq: u64,
     /// Which lane a listed transfer is on, in the person's words ("fast
-    /// lane", "over WebRTC"), by transfer id.
+    /// lane", "over the secure link"), by transfer id.
     lanes: std::collections::HashMap<String, &'static str>,
 }
 
@@ -578,9 +578,9 @@ mod tests {
         let id = "lane-board-1";
         let token = super::super::file_lane::issue_token(id, "phone").unwrap();
         assert!(begin(row(id, "lane-dev-1", false, 9 << 20)));
-        set_lane(id, Some("fast lane"));
-        assert_eq!(lane_of(id), Some("fast lane"));
-        assert_eq!(lanes().get(id).copied(), Some("fast lane"));
+        set_lane(id, Some("fast, over Wi-Fi"));
+        assert_eq!(lane_of(id), Some("fast, over Wi-Fi"));
+        assert_eq!(lanes().get(id).copied(), Some("fast, over Wi-Fi"));
         finish(id, Outcome::Sent);
         assert_eq!(lane_of(id), None);
         assert!(!super::super::file_lane::spend_token_for_test(
@@ -602,7 +602,7 @@ mod tests {
     fn the_lane_map_returns_to_empty_however_a_thousand_transfers_end() {
         let mut board = TransferBoard::default();
         // Not listed: nothing is kept.
-        board.set_lane("ghost", Some("fast lane"));
+        board.set_lane("ghost", Some("fast, over Wi-Fi"));
         assert!(board.lanes.is_empty());
         for n in 0..1000 {
             let id = format!("t-{n}");
@@ -614,7 +614,7 @@ mod tests {
                 // A full board refuses a new row; then there is no lane either.
                 let _ = board.begin(row(&id, &device, false, 9 << 20));
             }
-            board.set_lane(&id, Some("fast lane"));
+            board.set_lane(&id, Some("fast, over Wi-Fi"));
             match n % 6 {
                 0 => board.finish(&id, Outcome::Sent),
                 1 => board.finish(&id, Outcome::Cancelled),

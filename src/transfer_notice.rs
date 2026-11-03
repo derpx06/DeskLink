@@ -54,7 +54,7 @@ struct Tracked {
     rate: Rate,
     row: TransferRow,
     note: Option<String>,
-    /// "fast lane" or "over WebRTC", when the board says which.
+    /// "fast, over Wi-Fi" or "over the secure link", when the board says which.
     lane: Option<&'static str>,
 }
 
@@ -468,13 +468,13 @@ mod tests {
     fn the_progress_says_which_lane_the_file_is_on() {
         let (mut notices, t0) = (Notices::default(), Instant::now());
         let big = |done| [row("t", "p", "big.bin", false, done, 300 * MB)];
-        notices.set_lanes(HashMap::from([("t".to_string(), "fast lane")]));
+        notices.set_lanes(HashMap::from([("t".to_string(), "fast, over Wi-Fi")]));
         notices.look(at(t0, 0.0), &big(0), &[], &name, &none);
         let shown = notices.look(at(t0, 2.5), &big(16 * MB), &[], &name, &none);
         let Action::Progress { body, .. } = &shown[0] else {
             panic!("{shown:?}")
         };
-        assert!(body.ends_with(" · fast lane"), "{body}");
+        assert!(body.ends_with(" · fast, over Wi-Fi"), "{body}");
         // Two files on different lanes: nothing is claimed.
         let two = |done| {
             [
@@ -483,24 +483,27 @@ mod tests {
             ]
         };
         notices.set_lanes(HashMap::from([
-            ("t".to_string(), "fast lane"),
-            ("u".to_string(), "over WebRTC"),
+            ("t".to_string(), "fast, over Wi-Fi"),
+            ("u".to_string(), "over the secure link"),
         ]));
         let shown = notices.look(at(t0, 8.0), &two(40 * MB), &[], &name, &none);
         let Action::Progress { body, .. } = &shown[0] else {
             panic!("{shown:?}")
         };
-        assert!(!body.contains("lane") && !body.contains("WebRTC"), "{body}");
-        // Both over WebRTC: that is said.
+        assert!(
+            !body.contains("Wi-Fi") && !body.contains("secure link"),
+            "{body}"
+        );
+        // Both over the secure link: that is said.
         notices.set_lanes(HashMap::from([
-            ("t".to_string(), "over WebRTC"),
-            ("u".to_string(), "over WebRTC"),
+            ("t".to_string(), "over the secure link"),
+            ("u".to_string(), "over the secure link"),
         ]));
         let shown = notices.look(at(t0, 14.0), &two(60 * MB), &[], &name, &none);
         let Action::Progress { body, .. } = &shown[0] else {
             panic!("{shown:?}")
         };
-        assert!(body.ends_with(" · over WebRTC"), "{body}");
+        assert!(body.ends_with(" · over the secure link"), "{body}");
     }
 
     /// The send ends: the progress is replaced by what happened, in words.

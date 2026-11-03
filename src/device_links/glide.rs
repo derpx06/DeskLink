@@ -2277,10 +2277,16 @@ mod tests {
         );
         // The compositor ending it tells the phone, and releases nothing.
         glide.activated(6, (0.0, 10.0), &keys, Instant::now());
+        // Packet ids are millisecond clocks: compare what is sent, not the packets.
+        let outs = glide.deactivated();
         assert_eq!(
-            glide.deactivated(),
-            vec![Out::Send(Glide::taken_back()), Out::Gliding(false)]
+            sent(&outs),
+            vec![serde_json::Value::Object(Glide::taken_back().body)]
         );
+        assert!(matches!(
+            outs.as_slice(),
+            [Out::Send(_), Out::Gliding(false)]
+        ));
     }
 
     #[test]

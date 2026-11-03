@@ -1178,15 +1178,15 @@ pub(super) mod words {
 
     /// What the board says a transfer is riding on.
     pub fn fast_lane() -> &'static str {
-        "fast lane"
+        "fast, over Wi-Fi"
     }
 
     pub fn over_webrtc() -> &'static str {
-        "over WebRTC"
+        "over the secure link"
     }
 
     pub fn through_a_relay() -> &'static str {
-        "through a relay"
+        "through the internet (slower)"
     }
 
     /// What a transfer riding the data channel says: only a transfer a lane

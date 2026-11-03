@@ -1149,10 +1149,10 @@ mod tests {
             moving.id = "lane-row".into();
             use crate::device_links::webrtc::transfer_board as board;
             assert!(board::begin(moving.clone()));
-            board::set_lane("lane-row", Some("fast lane"));
+            board::set_lane("lane-row", Some("fast, over Wi-Fi"));
             let text = subtitle(&moving, "emulator");
             assert!(
-                text.starts_with("Sending to emulator · fast lane · "),
+                text.starts_with("Sending to emulator · fast, over Wi-Fi · "),
                 "{text}"
             );
             let shown = new_row(&daemon, &moving);
