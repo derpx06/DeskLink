@@ -16,6 +16,8 @@
     {"name": "siblings, both edited",     "local": {"id": "n", "body": "L", "modified": 200, "parent": 100},
      "incoming": {"id": "n", "body": "I", "modified": 210, "parent": 100},                              "outcome": "conflict"},
     {"name": "their edit beats our deletion", "local": {"id": "n", "body": "", "modified": 200, "parent": 100, "deleted": true},
-     "incoming": {"id": "n", "body": "I", "modified": 210, "parent": 100},                              "outcome": "taken"}
+     "incoming": {"id": "n", "body": "I", "modified": 210, "parent": 100},                              "outcome": "taken"},
+    {"name": "same modified, other text (a millisecond tie)", "local": {"id": "n", "body": "L", "modified": 200, "parent": 100},
+     "incoming": {"id": "n", "body": "I", "modified": 200, "parent": 100},                              "outcome": "conflict"}
   ]
 }

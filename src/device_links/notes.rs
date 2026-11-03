@@ -97,6 +97,9 @@ pub(crate) struct Note {
     pub(crate) deleted: bool,
 }
 
+/// What a conflicted copy's title ends with.
+const COPY_SUFFIX: &str = "(conflicted copy)";
+
 /// How many earlier versions a note names as ancestors.
 pub(crate) const MAX_ANCESTORS: usize = 8;
 
@@ -203,7 +206,9 @@ fn merge_note(shelf: &mut Shelf, incoming: Note) -> Merged {
         shelf.notes.insert(incoming.id.clone(), incoming);
         return Merged::Taken;
     };
-    if local.modified == incoming.modified {
+    // Equal `modified` is the same version only if it says the same (two sides
+    // can edit in the same millisecond); otherwise they are siblings.
+    if local.modified == incoming.modified && local.same_content(&incoming) {
         shelf.synced.insert(local.id.clone(), local.modified);
         return Merged::Same;
     }
@@ -236,28 +241,126 @@ fn merge_note(shelf: &mut Shelf, incoming: Note) -> Merged {
     let conflict = !winner.same_content(&loser) && !winner.deleted && !loser.deleted;
     let copy = conflict.then(|| Note {
         id: format!("{}~{}", loser.id, loser.modified),
-        title: format!("{} (conflicted copy)", loser.label()),
+        title: format!("{} {COPY_SUFFIX}", loser.label()),
         parent: loser.modified,
         ..loser
     });
-    // Ours stays and the copy is already here: resolved before.
-    let known = copy
-        .as_ref()
-        .is_none_or(|copy| shelf.notes.get(&copy.id) == Some(copy));
-    if !incoming_wins && known {
+    // A copy that is already here, as it was, edited or deleted, was resolved
+    // before: it is never written over (that reverted the person's edits to it
+    // and brought deleted copies back).
+    let copy = copy.filter(|copy| !shelf.notes.contains_key(&copy.id));
+    if !incoming_wins && (!conflict || copy.is_none()) {
         return Merged::KeptOurs;
     }
+    let fresh_copy = copy.is_some();
     if let Some(copy) = copy {
         shelf.synced.insert(copy.id.clone(), copy.modified);
         shelf.notes.insert(copy.id.clone(), copy);
     }
     shelf.synced.insert(winner.id.clone(), winner.modified);
     shelf.notes.insert(winner.id.clone(), winner);
-    if conflict {
+    if fresh_copy {
         Merged::Conflict
     } else {
         Merged::Taken
     }
+}
+
+/// The peer holds `modified` of note `id` (it took it, or listed it): the
+/// version our next edit names as its `parent`, if it is one of ours and newer
+/// than what we had. Whether `synced` moved.
+fn acknowledge(shelf: &mut Shelf, id: &str, modified: i64) -> bool {
+    let Some(note) = shelf.notes.get(id) else {
+        return false;
+    };
+    let chain: Vec<i64> = std::iter::once(note.modified)
+        .chain(note.ancestors.iter().copied())
+        .collect();
+    let Some(at) = chain.iter().position(|m| *m == modified) else {
+        return false;
+    };
+    let held = shelf
+        .synced
+        .get(id)
+        .and_then(|synced| chain.iter().position(|m| m == synced))
+        .unwrap_or(usize::MAX);
+    if at < held {
+        shelf.synced.insert(id.to_string(), modified);
+        return true;
+    }
+    false
+}
+
+// ── Duplicate conflicted copies ───────────────────────────────────────────
+
+/// The note a conflicted copy was made from: copies are `<id>~<modified>`.
+fn copy_base(id: &str) -> Option<&str> {
+    let (base, modified) = id.rsplit_once('~')?;
+    (!base.is_empty() && !modified.is_empty() && modified.bytes().all(|b| b.is_ascii_digit()))
+        .then_some(base)
+}
+
+fn is_copy(note: &Note) -> bool {
+    copy_base(&note.id).is_some() && note.title.ends_with(COPY_SUFFIX)
+}
+
+/// What a note says, for telling duplicates: a copy's title without the
+/// suffix (it is the label of the version it kept), or a note's label, and
+/// the body.
+fn content_key(note: &Note) -> (String, &str) {
+    let mut title = note.title.as_str();
+    if is_copy(note) {
+        while let Some(rest) = title.strip_suffix(COPY_SUFFIX) {
+            title = rest.trim_end();
+        }
+        return (title.to_string(), note.body.as_str());
+    }
+    (note.label(), note.body.as_str())
+}
+
+/// Which live copies to delete. A copy goes only when something that stays says
+/// the same: `everywhere` is the person's "Remove duplicate copies" (any other
+/// live note, or the lowest-id one of identical copies); without it, only a
+/// note it was made from, or an identical copy of the same note. A copy whose
+/// text is anywhere else unique is never listed.
+fn duplicate_copies(shelf: &Shelf, everywhere: bool) -> Vec<String> {
+    let live: Vec<&Note> = shelf.notes.values().filter(|note| !note.deleted).collect();
+    let mut doomed = Vec::new();
+    for copy in live.iter().filter(|note| is_copy(note)) {
+        let key = content_key(copy);
+        let base = copy_base(&copy.id).unwrap_or_default();
+        // Something that is not itself a copy, or the made-from note, says it too.
+        let by_original = live.iter().any(|other| {
+            !is_copy(other)
+                && other.id != copy.id
+                && (everywhere || other.id == base)
+                && content_key(other) == key
+        });
+        // An identical copy with a lower id stays (ids are the same on both sides).
+        let by_sibling = live.iter().any(|other| {
+            is_copy(other)
+                && other.id < copy.id
+                && (everywhere || copy_base(&other.id) == Some(base))
+                && content_key(other) == key
+        });
+        if by_original || by_sibling {
+            doomed.push(copy.id.clone());
+        }
+    }
+    doomed
+}
+
+/// Deletes (as the person would: a tombstone that syncs) the copies
+/// [`duplicate_copies`] lists. The ids deleted.
+fn remove_duplicates_in(shelf: &mut Shelf, everywhere: bool) -> Vec<String> {
+    let doomed = duplicate_copies(shelf, everywhere);
+    doomed
+        .into_iter()
+        .filter(|id| {
+            edit_from_in_shelf(shelf, id, None, |note| note.deleted = true)
+                .is_ok_and(|(changed, _)| changed)
+        })
+        .collect()
 }
 
 /// The ids in a peer's index we should fetch.
@@ -431,6 +534,18 @@ fn handle(shelf: &mut Shelf, kind: Kind, packet: &NetworkPacket) -> (Vec<Network
                 .take(MAX_INDEX_ENTRIES)
                 .cloned()
                 .collect();
+            // What the peer lists exactly as we hold it, it holds: the base of our next edit.
+            let mut changed = false;
+            if kind == Kind::Notes {
+                for entry in &index {
+                    if let (Some(id), Some(modified)) = (
+                        entry.get("id").and_then(Value::as_str),
+                        entry.get("modified").and_then(Value::as_i64),
+                    ) {
+                        changed |= acknowledge(shelf, id, modified);
+                    }
+                }
+            }
             let ids = wanted(shelf, kind, &index);
             let fetches = ids
                 .chunks(FETCH_IDS)
@@ -441,7 +556,27 @@ fn handle(shelf: &mut Shelf, kind: Kind, packet: &NetworkPacket) -> (Vec<Network
                     fetch
                 })
                 .collect();
-            (fetches, false)
+            (fetches, changed)
+        }
+        Some("ack") if kind == Kind::Notes => {
+            // The peer took these versions of ours (older builds never send this).
+            let mut changed = false;
+            for entry in packet
+                .body
+                .get("items")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .take(MAX_ITEMS_PER_PACKET)
+            {
+                if let (Some(id), Some(modified)) = (
+                    entry.get("id").and_then(Value::as_str),
+                    entry.get("modified").and_then(Value::as_i64),
+                ) {
+                    changed |= acknowledge(shelf, id, modified);
+                }
+            }
+            (Vec::new(), changed)
         }
         Some("fetch") => {
             let ids: Vec<String> = packet
@@ -468,6 +603,7 @@ fn handle(shelf: &mut Shelf, kind: Kind, packet: &NetworkPacket) -> (Vec<Network
                 .collect();
             let mut changed = false;
             let mut send_back = Vec::new();
+            let mut held = Vec::new();
             for item in items {
                 match kind {
                     Kind::Snippets => {
@@ -505,6 +641,7 @@ fn handle(shelf: &mut Shelf, kind: Kind, packet: &NetworkPacket) -> (Vec<Network
                             continue;
                         }
                         let id = note.id.clone();
+                        let modified = note.modified;
                         // A new id, or a conflict copy, needs room.
                         if shelf.notes.len() >= MAX_NOTE_ENTRIES {
                             super::limits::log_limited(
@@ -515,8 +652,11 @@ fn handle(shelf: &mut Shelf, kind: Kind, packet: &NetworkPacket) -> (Vec<Network
                         }
                         match merge_note(shelf, note) {
                             Merged::KeptOurs => send_back.push(id),
-                            Merged::Same => {}
-                            Merged::Taken => changed = true,
+                            Merged::Same => held.push((id, modified)),
+                            Merged::Taken => {
+                                changed = true;
+                                held.push((id, modified));
+                            }
                             // The peer resolves it alike once it has ours.
                             Merged::Conflict => {
                                 changed = true;
@@ -526,10 +666,22 @@ fn handle(shelf: &mut Shelf, kind: Kind, packet: &NetworkPacket) -> (Vec<Network
                     }
                 }
             }
-            (
-                items_packets(kind, item_values(shelf, kind, &send_back)),
-                changed,
-            )
+            let mut answers = items_packets(kind, item_values(shelf, kind, &send_back));
+            // Tell the sender it now has these versions here (its next edit then
+            // names one as its base instead of an older one).
+            for chunk in held.chunks(FETCH_IDS) {
+                let mut ack = NetworkPacket::new(kind.packet_type());
+                ack.set("op", "ack");
+                ack.set(
+                    "items",
+                    chunk
+                        .iter()
+                        .map(|(id, modified)| json!({"id": id, "modified": modified}))
+                        .collect::<Vec<_>>(),
+                );
+                answers.push(ack);
+            }
+            (answers, changed)
         }
         _ => (Vec::new(), false),
     }
@@ -561,6 +713,7 @@ const AAD: &[u8] = b"desklink-snippets-and-notes";
 pub(crate) fn install(dir: PathBuf) {
     let mut shelf: Shelf = super::vault::open_or_quarantine(&dir, &dir.join(FILE), AAD);
     prune(&mut shelf, now_ms());
+    remove_duplicates_in(&mut shelf, false);
     if let Ok(mut store) = store().lock() {
         *store = Some(Store { dir, shelf });
     }
@@ -663,6 +816,9 @@ pub(crate) fn on_packet(device_id: &str, packet: &NetworkPacket) -> Vec<NetworkP
                 }
             });
         }
+    }
+    if kind == Kind::Notes && GENERATION.load(Ordering::Relaxed) != before {
+        clean_up_after_sync();
     }
     debug_log!(
         "[Notes] {} {} from {device_id}: {} answers",
@@ -865,29 +1021,39 @@ pub(crate) fn note(id: &str) -> Option<Note> {
 /// A new empty note (N1: `parent` 0); its id.
 pub(crate) fn new_note(body: &str) -> Option<String> {
     let id = with_shelf(|shelf| {
-        if shelf.notes.values().filter(|note| !note.deleted).count() >= MAX_NOTES {
-            return (None, false);
-        }
-        let now = now_ms();
-        let id = uuid::Uuid::new_v4().to_string();
-        shelf.notes.insert(
-            id.clone(),
-            Note {
-                id: id.clone(),
-                title: String::new(),
-                body: body.to_string(),
-                pinned: false,
-                created: now,
-                modified: now,
-                parent: 0,
-                ancestors: Vec::new(),
-                deleted: false,
-            },
-        );
-        (Some(id), true)
+        let id = create_in_shelf(shelf, body);
+        let saved = id.is_some();
+        (id, saved)
     })
     .flatten()?;
-    push(Kind::Notes, vec![id.clone()]);
+    // An empty note stays here until it has something in it (its first edit
+    // pushes it): the "+" button used to fill the phone's list with blanks.
+    if !body.trim().is_empty() {
+        push(Kind::Notes, vec![id.clone()]);
+    }
+    Some(id)
+}
+
+fn create_in_shelf(shelf: &mut Shelf, body: &str) -> Option<String> {
+    if shelf.notes.values().filter(|note| !note.deleted).count() >= MAX_NOTES {
+        return None;
+    }
+    let now = now_ms();
+    let id = uuid::Uuid::new_v4().to_string();
+    shelf.notes.insert(
+        id.clone(),
+        Note {
+            id: id.clone(),
+            title: String::new(),
+            body: body.to_string(),
+            pinned: false,
+            created: now,
+            modified: now,
+            parent: 0,
+            ancestors: Vec::new(),
+            deleted: false,
+        },
+    );
     Some(id)
 }
 
@@ -921,7 +1087,7 @@ fn edit_from_in_shelf(
         .filter(|loaded| *loaded != before.modified)
         .map(|_| Note {
             id: format!("{}~{}", before.id, before.modified),
-            title: format!("{} (conflicted copy)", before.label()),
+            title: format!("{} {COPY_SUFFIX}", before.label()),
             parent: before.modified,
             ..before.clone()
         });
@@ -943,6 +1109,8 @@ fn edit_from_in_shelf(
     note.ancestors = ancestors_after(&before);
     // Strictly later, even within one millisecond.
     note.modified = now_ms().max(before.modified.saturating_add(1));
+    // Never over a copy that is already here (edited, or deleted on purpose).
+    let overtaken = overtaken.filter(|copy| !shelf.notes.contains_key(&copy.id));
     let copy_id = overtaken.map(|copy| {
         let copy_id = copy.id.clone();
         shelf.synced.insert(copy_id.clone(), copy.modified);
@@ -956,36 +1124,89 @@ fn edit_from_in_shelf(
 /// Saves an edit to note `id`. Refused, in words the editor shows, when
 /// the note would pass 64 KB — never dropped silently.
 pub(crate) fn edit_note(id: &str, change: impl FnOnce(&mut Note)) -> Result<(), String> {
-    edit_note_from(id, None, change)
+    edit_note_from(id, None, change).map(|_| ())
 }
 
 /// [`edit_note`] for an editor that loaded the version with this `modified`
 /// (see [`edit_from_in_shelf`]).
+///
+/// Returns the `modified` the note has after the call, read in the same step as
+/// the edit: reading it afterwards could pick up a version that landed from the
+/// phone in between, which the editor would then type over without a word.
 pub(crate) fn edit_note_from(
     id: &str,
     loaded: Option<i64>,
     change: impl FnOnce(&mut Note),
-) -> Result<(), String> {
+) -> Result<Option<i64>, String> {
     let changed = with_shelf(|shelf| {
         let result = edit_from_in_shelf(shelf, id, loaded, change);
         let saved = matches!(result, Ok((true, _)));
-        (result, saved)
+        let modified = shelf.notes.get(id).map(|note| note.modified);
+        ((result, modified), saved)
     });
     match changed {
-        Some(Ok((true, copy))) => {
+        Some((Ok((true, copy)), modified)) => {
             let mut ids = vec![id.to_string()];
             ids.extend(copy);
             push(Kind::Notes, ids);
-            Ok(())
+            Ok(modified)
         }
-        Some(Ok((false, _))) | None => Ok(()),
-        Some(Err(error)) => Err(error),
+        Some((Ok((false, _)), modified)) => Ok(modified),
+        None => Ok(None),
+        Some((Err(error), _)) => Err(error),
+    }
+}
+
+/// "Remove duplicate copies": (copies that would go, copies that stay because
+/// their text exists nowhere else).
+pub(crate) fn duplicate_copies_preview() -> (usize, usize) {
+    with_shelf(|shelf| {
+        let doomed = duplicate_copies(shelf, true).len();
+        let copies = shelf
+            .notes
+            .values()
+            .filter(|note| !note.deleted && is_copy(note))
+            .count();
+        ((doomed, copies - doomed), false)
+    })
+    .unwrap_or_default()
+}
+
+/// Deletes the duplicate copies; how many went.
+pub(crate) fn remove_duplicate_copies() -> usize {
+    let removed = with_shelf(|shelf| {
+        let removed = remove_duplicates_in(shelf, true);
+        let saved = !removed.is_empty();
+        (removed, saved)
+    })
+    .unwrap_or_default();
+    let count = removed.len();
+    if count > 0 {
+        push(Kind::Notes, removed);
+    }
+    count
+}
+
+/// Clears what merging left behind (identical copies of a note or of each
+/// other) and tells the phones.
+fn clean_up_after_sync() {
+    let removed = with_shelf(|shelf| {
+        let removed = remove_duplicates_in(shelf, false);
+        let saved = !removed.is_empty();
+        (removed, saved)
+    })
+    .unwrap_or_default();
+    if !removed.is_empty() {
+        push(Kind::Notes, removed);
     }
 }
 
 /// What the editor says when a note passes its size bound.
 pub(crate) const TOO_LONG: &str =
     "This note is too long to save (20 KiB at most). Shorten it: the last changes are not saved yet.";
+
+#[cfg(test)]
+mod sync_scenarios;
 
 #[cfg(test)]
 mod relay_tests {
@@ -1297,7 +1518,9 @@ mod tests {
         assert_eq!(fetches.len(), 1);
         let (items, _) = handle(&mut desk, Kind::Notes, &fetches[0]);
         let (back, changed) = handle(&mut phone, Kind::Notes, &items[0]);
-        assert!(changed && back.is_empty());
+        // Nothing to send back but the acknowledgement that it took the note.
+        assert!(changed && back.iter().all(|p| p.get_str("op") == Some("ack")));
+        assert_eq!(back.len(), 1);
         assert_eq!(phone.notes["n"].body, "hello");
         // Junk and over-bound items are dropped.
         let mut junk = NetworkPacket::new(PACKET_TYPE_NOTES);

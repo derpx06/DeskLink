@@ -23,6 +23,8 @@ pub(super) struct Page {
     list: gtk::ListBox,
     search: gtk::SearchEntry,
     editor: Rc<Editor>,
+    /// "Remove duplicate copies", shown while conflicted copies exist.
+    tidy: gtk::Button,
     /// The notes generation the list shows.
     shown: Cell<u64>,
 }
@@ -81,17 +83,21 @@ impl Editor {
             .to_string();
         let title = self.title.text().to_string();
         let pinned = self.pin.is_active();
-        if let Err(error) = notes::edit_note_from(&id, Some(loaded), |note| {
+        match notes::edit_note_from(&id, Some(loaded), |note| {
             note.title = title;
             note.body = body;
             note.pinned = pinned;
         }) {
-            // The text stays in the editor; nothing is thrown away.
-            toast_from(&self.body, &error);
-            return;
-        }
-        if let Some(note) = notes::note(&id) {
-            self.open.replace(Some((id, note.modified)));
+            // The version this save left, read in the same step as the save: one
+            // read afterwards could be a phone's edit that landed in between.
+            Ok(Some(modified)) => {
+                self.open.replace(Some((id, modified)));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                // The text stays in the editor; nothing is thrown away.
+                toast_from(&self.body, &error);
+            }
         }
     }
 
@@ -274,6 +280,46 @@ fn note_row(note: &Note) -> gtk::ListBoxRow {
     row
 }
 
+/// Asks, with the counts, before deleting duplicate conflicted copies. A copy
+/// with text found nowhere else is never deleted; it is only counted.
+fn confirm_remove_duplicates(button: &gtk::Button) {
+    let (removable, kept) = notes::duplicate_copies_preview();
+    let Some(window) = button.root().and_downcast::<DesklinkWindow>() else {
+        return;
+    };
+    if removable == 0 {
+        window.show_feature_toast(&format!(
+            "No duplicate copies. {kept} {} different text, kept.",
+            if kept == 1 { "copy has" } else { "copies have" }
+        ));
+        return;
+    }
+    let dialog = adw::AlertDialog::new(
+        Some("Remove duplicate copies?"),
+        Some(&format!(
+            "{removable} conflicted {} the same text as another note and will be deleted, here and on your phone.{}",
+            if removable == 1 { "copy has" } else { "copies have" },
+            if kept == 0 {
+                String::new()
+            } else {
+                format!(" {kept} with different text will be kept.")
+            }
+        )),
+    );
+    dialog.add_responses(&[("cancel", "_Cancel"), ("remove", "_Remove")]);
+    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    let weak = window.downgrade();
+    dialog.connect_response(Some("remove"), move |_, _| {
+        let removed = notes::remove_duplicate_copies();
+        if let Some(window) = weak.upgrade() {
+            window.show_feature_toast(&format!("Removed {removed} duplicate copies"));
+        }
+    });
+    dialog.present(Some(&window));
+}
+
 fn modified_words(modified: i64) -> String {
     let now = glib::DateTime::now_local().ok();
     glib::DateTime::from_unix_local(modified / 1000)
@@ -324,6 +370,17 @@ impl Page {
             .orientation(gtk::Orientation::Vertical)
             .build();
         sidebar_box.append(&top);
+        let tidy = gtk::Button::builder()
+            .label("Remove duplicate copies")
+            .tooltip_text("Deletes conflicted copies that say exactly what another note says")
+            .css_classes(["flat"])
+            .margin_start(12)
+            .margin_end(12)
+            .margin_bottom(6)
+            .visible(false)
+            .build();
+        tidy.connect_clicked(confirm_remove_duplicates);
+        sidebar_box.append(&tidy);
         sidebar_box.append(
             &gtk::ScrolledWindow::builder()
                 .hscrollbar_policy(gtk::PolicyType::Never)
@@ -511,6 +568,7 @@ impl Page {
             list,
             search,
             editor,
+            tidy,
             shown: Cell::new(u64::MAX),
         };
         {
@@ -538,6 +596,8 @@ impl Page {
         if self.shown.replace(generation) == generation {
             return;
         }
+        let (removable, kept) = notes::duplicate_copies_preview();
+        self.tidy.set_visible(removable + kept > 0);
         let open = self.editor.open.borrow().clone();
         // Rows only: `first_child` can be the list's placeholder, and removing
         // that is how the empty pane lost its "No Notes Yet" prompt.
