@@ -1524,25 +1524,31 @@ impl Engine {
                 board::finish(&id, Outcome::Failed(text));
             }
             Trouble::Changed => {
-                tell(code::SOURCE_CHANGED, &words::source_changed_once());
                 let again = outgoing.folder.is_none()
                     && outgoing.clipboard_mime.is_none()
                     && outgoing.restarts < MAX_RESTARTS;
-                let restarted = again
-                    .then(|| self.restart_changed(&outgoing))
-                    .and_then(Result::ok);
-                outgoing.discard(&self.store);
-                match restarted {
-                    // The same row carries on under the new id.
-                    Some(()) => board::discard(&id),
-                    None => {
-                        let words = if outgoing.restarts >= MAX_RESTARTS {
-                            words::source_changed_for_good()
-                        } else {
-                            words::source_changed_once()
-                        };
-                        board::finish(&id, Outcome::Failed(words));
+                if again {
+                    tell(code::SOURCE_CHANGED, &words::source_changed_once());
+                    let restarted = self.restart_changed(&outgoing).is_ok();
+                    outgoing.discard(&self.store);
+                    if restarted {
+                        // The same row carries on under the new id.
+                        board::discard(&id);
+                    } else {
+                        board::finish(&id, Outcome::Failed(words::source_changed_once()));
                     }
+                } else {
+                    // The end of it: the person's row says why before the receiver is told. (Where
+                    // both ends share one board, as in the tests, the receiver's own note for the
+                    // same id would otherwise be the one kept, and the sender's "for good" lost.)
+                    let words = if outgoing.restarts >= MAX_RESTARTS {
+                        words::source_changed_for_good()
+                    } else {
+                        words::source_changed_once()
+                    };
+                    board::finish(&id, Outcome::Failed(words));
+                    tell(code::SOURCE_CHANGED, &words::source_changed_once());
+                    outgoing.discard(&self.store);
                 }
             }
         }
