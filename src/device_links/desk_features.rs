@@ -550,6 +550,12 @@ fn apply_change(settings: &mut AppSettings, device_id: &str, key: &str, value: b
     }
 }
 
+/// What the person is told when a setting a phone changed could not be kept
+/// (the phone sees its switch go back and has no way to say why).
+fn setting_not_saved_words(error: &str) -> String {
+    format!("A setting changed from your phone could not be saved, so it stays as it was: {error}")
+}
+
 /// A phone changed some of the desk's settings: apply, log, and tell every
 /// phone (the asker included) the result.
 pub(crate) fn handle_settings_request(device_id: &str, packet: &NetworkPacket) {
@@ -591,7 +597,10 @@ pub(crate) fn handle_settings_request(device_id: &str, packet: &NetworkPacket) {
                     super::relay_link::client::reset();
                 }
             }
-            Err(error) => eprintln!("[DeskLink] Could not save a setting from the phone: {error}"),
+            Err(error) => {
+                eprintln!("[DeskLink] Could not save a setting from the phone: {error}");
+                super::daemon::push_user_error(&daemon.errors, setting_not_saved_words(&error));
+            }
         }
     }
     push_settings();
@@ -701,7 +710,7 @@ pub(crate) fn handle_unlock_approval(device_id: &str, nonce: Option<&str>) {
             Ok(()) => record_detail(device_id, ConnectionEvent::UnlockedByPhone, "nearby"),
             Err(error) => {
                 eprintln!("[DeskLink] Could not unlock the session: {error}");
-                refuse(device_id, Refusal::NotLocked);
+                refuse(device_id, Refusal::Failed);
             }
         },
         Err(refusal) => refuse(device_id, refusal),
@@ -813,6 +822,12 @@ fn hand_off(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_setting_that_could_not_be_saved_is_told_in_plain_words() {
+        let words = setting_not_saved_words("disk full");
+        assert!(words.contains("could not be saved") && words.contains("disk full"));
+    }
+
     use super::*;
     use serde_json::json;
 
