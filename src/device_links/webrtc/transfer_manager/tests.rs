@@ -1450,11 +1450,18 @@ fn a_file_that_keeps_changing_fails_after_two_restarts() {
         if header.block_index == 1 && id != last {
             last = id;
             round += 1;
-            fs::write(
-                &path,
-                payload(24 * BLOCK_BYTES as usize + round as usize, 40 + round),
-            )
-            .unwrap();
+            // One append, one write(2): the file grows between two reads and is never seen
+            // half-written. `fs::write` truncates first, and a sender that looked at the file
+            // in that moment (slow machine) offered a torn, shorter file that sent cleanly, so
+            // no later block 1 came, no further change, and the test waited for a failure
+            // that could not come.
+            use std::io::Write;
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&vec![0xAB; round as usize])
+                .unwrap();
         }
         Fate::Deliver
     }));
@@ -2503,8 +2510,8 @@ fn say_done(hand: &Hand, id: &str, total: u64, hashes: &[[u8; 32]]) {
 }
 
 /// A real receive through the manager, the store, the board and the
-/// history: three blocks, the bytes checked where they landed, the history
-/// row there, and "complete" only once all of it is true.
+/// history: three blocks, the bytes checked where they landed (before the
+/// sender is told "complete"), then the board and the history row.
 #[test]
 fn a_received_file_is_complete_only_once_it_is_placed_recorded_and_listed() {
     let hand = Hand::new("glue-ok");
@@ -2518,16 +2525,18 @@ fn a_received_file_is_complete_only_once_it_is_placed_recorded_and_listed() {
         complete.file_hash.as_deref(),
         Some(hex(&hash_of_hashes(&hashes)).as_str())
     );
-    // Listed on the board as received at that path, and in the history.
-    assert!(outcomes(id(1))
-        .iter()
-        .any(|outcome| matches!(outcome, board::Outcome::Received(path) if *path == placed)));
-    assert!(
-        crate::device_links::transfer_log::recent()
+    // Listed on the board as received at that path, and in the history. The board and the
+    // history are written by the engine just after it tells the sender (the file itself is
+    // placed before), so they are waited for, not read in the same instant.
+    eventually("the board and the history row", || {
+        let listed = outcomes(id(1))
             .iter()
-            .any(|entry| entry.path == placed && entry.incoming && entry.device_id == "alpha"),
-        "the history row"
-    );
+            .any(|outcome| matches!(outcome, board::Outcome::Received(path) if *path == placed));
+        let recorded = crate::device_links::transfer_log::recent()
+            .iter()
+            .any(|entry| entry.path == placed && entry.incoming && entry.device_id == "alpha");
+        (listed && recorded).then_some(())
+    });
     assert!(
         names(&hand.base.join("state")).is_empty(),
         "no partial left"
@@ -3776,15 +3785,29 @@ mod lane {
             .copied()
             .max()
             .expect("the receiver said where it was");
-        assert!(verified >= 4, "the receiver had verified {verified}");
-        // Nothing the receiver verified went again over the data channel.
-        let carried = rig.ab.frame_bytes.load(Ordering::SeqCst);
-        let overhead = rig.ab.frames.load(Ordering::SeqCst) as u64 * 40 + 25 * 32;
-        assert!(
-            carried
-                <= bytes.len() as u64 - (verified * BLOCK_BYTES).min(bytes.len() as u64) + overhead,
-            "{carried} bytes over WebRTC with {verified} blocks verified"
-        );
+        // The sender saw no acknowledgement at all (the first five are dropped); the receiver had
+        // verified some blocks, and said so.
+        assert!(verified >= 1, "the receiver had verified {verified}");
+        // Which end notices the dead lane first is a matter of thread timing. When the receiver's
+        // word arrives first the sender carries on from it, and nothing verified goes again over
+        // the data channel. When the sender's own switch (from the block it saw acknowledged: 0)
+        // comes first, frames from there are already on their way when the receiver's position
+        // follows (the receiver then holds only what it still needs); the byte count says
+        // nothing about the receiver's number in that order, so it is checked in the first only.
+        let switch = lane_actions(&rig)
+            .into_iter()
+            .find(|(kind, _, _)| kind == "webrtc")
+            .expect("the sender went over the data channel");
+        if switch.1 >= verified {
+            let carried = rig.ab.frame_bytes.load(Ordering::SeqCst);
+            let overhead = rig.ab.frames.load(Ordering::SeqCst) as u64 * 40 + 25 * 32;
+            assert!(
+                carried
+                    <= bytes.len() as u64 - (verified * BLOCK_BYTES).min(bytes.len() as u64)
+                        + overhead,
+                "{carried} bytes over WebRTC with {verified} blocks verified"
+            );
+        }
         assert!(rig.ab.frames.load(Ordering::SeqCst) > 0);
     }
 
@@ -4121,7 +4144,26 @@ mod lane {
         assert_eq!(kinds.first().map(String::as_str), Some("tcp"));
         assert!(kinds.contains(&"webrtc".to_string()), "{kinds:?}");
         assert!(rig.ab.frames.load(Ordering::SeqCst) > 0);
-        assert_eq!(rig.ba.sent(FileAction::BlockNack).len(), 2);
+        let reasons: Vec<_> = rig
+            .ba
+            .sent(FileAction::BlockNack)
+            .into_iter()
+            .map(|nack| nack.reason)
+            .collect();
+        // The lane is given up at the second refusal of a block. The receiver may also say where
+        // it was when it sees the lane close (`lane`: not a refusal); whether that word is sent
+        // before the sender's own switch is processed depends on thread timing, so it is allowed.
+        let refusals = reasons
+            .iter()
+            .filter(|reason| reason.as_deref() == Some("hash-mismatch"))
+            .count();
+        assert_eq!(refusals, 2, "{reasons:?}");
+        assert!(
+            reasons
+                .iter()
+                .all(|reason| matches!(reason.as_deref(), Some("hash-mismatch" | "lane"))),
+            "{reasons:?}"
+        );
     }
 
     #[test]
