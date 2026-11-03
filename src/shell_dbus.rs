@@ -1084,23 +1084,68 @@ fn is_the_shell_caller(connection: &gio::DBusConnection, sender: Option<&str>) -
     sender.is_some_and(|sender| hello_is_from_the_shell(connection, sender))
 }
 
+/// The Shell's bus name as last asked for, and when. A bus name is never reused,
+/// so a cached owner that matches the caller is still right after any restart;
+/// only a caller that does not match needs a fresh question.
+#[derive(Default)]
+struct OwnerCache {
+    asked: Option<std::time::Instant>,
+    owner: Option<String>,
+}
+
+/// A fresh question about the owner is asked at most this often: the call blocks
+/// the main loop (up to its 500 ms timeout), and any process of the same user may
+/// call these verbs in a loop.
+const OWNER_ASK_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn is_the_shell_cached(
+    cache: &mut OwnerCache,
+    now: std::time::Instant,
+    sender: &str,
+    ask: impl FnOnce() -> Option<String>,
+) -> bool {
+    if is_the_shell(sender, cache.owner.as_deref()) {
+        return true;
+    }
+    if cache
+        .asked
+        .is_some_and(|asked| now.duration_since(asked) < OWNER_ASK_EVERY)
+    {
+        return false;
+    }
+    cache.asked = Some(now);
+    cache.owner = ask();
+    is_the_shell(sender, cache.owner.as_deref())
+}
+
 fn hello_is_from_the_shell(connection: &gio::DBusConnection, sender: &str) -> bool {
-    let owner = connection
-        .call_sync(
-            Some("org.freedesktop.DBus"),
-            "/org/freedesktop/DBus",
-            "org.freedesktop.DBus",
-            "GetNameOwner",
-            Some(&("org.gnome.Shell",).to_variant()),
-            None,
-            gio::DBusCallFlags::NONE,
-            500,
-            gio::Cancellable::NONE,
+    thread_local! {
+        static OWNER: std::cell::RefCell<OwnerCache> = std::cell::RefCell::new(OwnerCache::default());
+    }
+    OWNER.with(|cache| {
+        is_the_shell_cached(
+            &mut cache.borrow_mut(),
+            std::time::Instant::now(),
+            sender,
+            || {
+                connection
+                    .call_sync(
+                        Some("org.freedesktop.DBus"),
+                        "/org/freedesktop/DBus",
+                        "org.freedesktop.DBus",
+                        "GetNameOwner",
+                        Some(&("org.gnome.Shell",).to_variant()),
+                        None,
+                        gio::DBusCallFlags::NONE,
+                        500,
+                        gio::Cancellable::NONE,
+                    )
+                    .ok()
+                    .and_then(|reply| reply.get::<(String,)>())
+                    .map(|(owner,)| owner)
+            },
         )
-        .ok()
-        .and_then(|reply| reply.get::<(String,)>())
-        .map(|(owner,)| owner);
-    is_the_shell(sender, owner.as_deref())
+    })
 }
 
 /// A top-bar client (the extension, on enable) says what it handles. Kept
@@ -2010,5 +2055,41 @@ mod tests {
             "mute-everything".to_string(),
         ];
         assert_eq!(vetted(said), ["notifications", "calls"]);
+    }
+
+    #[test]
+    fn a_flood_of_callers_costs_one_bus_question_per_window() {
+        let mut cache = OwnerCache::default();
+        let start = std::time::Instant::now();
+        let asked = std::cell::Cell::new(0);
+        let ask = |owner: &'static str| {
+            let asked = &asked;
+            move || {
+                asked.set(asked.get() + 1);
+                Some(owner.to_string())
+            }
+        };
+        // The Shell is asked once, then answered from memory.
+        assert!(is_the_shell_cached(&mut cache, start, ":1.7", ask(":1.7")));
+        assert!(is_the_shell_cached(&mut cache, start, ":1.7", ask(":1.7")));
+        assert_eq!(asked.get(), 1);
+        // A stranger repeating itself asks nothing more inside the window.
+        for _ in 0..1000 {
+            assert!(!is_the_shell_cached(
+                &mut cache,
+                start,
+                ":1.99",
+                ask(":1.7")
+            ));
+        }
+        assert_eq!(asked.get(), 1);
+        // After it, one fresh question: a restarted Shell has a new name.
+        let later = start + OWNER_ASK_EVERY;
+        assert!(is_the_shell_cached(&mut cache, later, ":1.8", ask(":1.8")));
+        assert_eq!(asked.get(), 2);
+        assert!(
+            !is_the_shell_cached(&mut cache, later, ":1.7", ask(":1.8")),
+            "the old name is gone"
+        );
     }
 }

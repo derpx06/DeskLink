@@ -74,7 +74,10 @@ fn matches(password: &str, stored: &PasswordHash) -> bool {
         return false;
     };
     derive(password, &salt, stored.iterations)
-        .is_ok_and(|actual| openssl::memcmp::eq(&actual, &expected))
+        // `memcmp::eq` asserts equal lengths: a hand-edited hash must not panic.
+        .is_ok_and(|actual| {
+            actual.len() == expected.len() && openssl::memcmp::eq(&actual, &expected)
+        })
 }
 
 #[derive(Default)]
@@ -87,6 +90,11 @@ struct DeviceState {
     /// offered again (a reconnect resending a stale one on several requests
     /// at once) is refused but not counted twice.
     last_wrong: Option<[u8; 32]>,
+    /// Guesses being hashed right now. Hashing runs outside the lock, so
+    /// without this several handlers (control channel, terminal channel) each
+    /// passed the check before any failure was recorded, and one burst got more
+    /// than [`FREE_ATTEMPTS`] tries.
+    in_flight: u32,
 }
 
 /// What [`SessionLock::begin`] decided without hashing.
@@ -150,6 +158,13 @@ impl SessionLock {
         if state.last_wrong == Some(digest(offered)) {
             return Precheck::Denied(PASSWORD_WRONG.to_string());
         }
+        // A guess in flight counts as spent: the guesses allowed before a lockout
+        // are shared out, not repeated by every handler that asks at once. (After
+        // a lockout, one at a time.)
+        if state.in_flight >= FREE_ATTEMPTS.saturating_sub(state.failures).max(1) {
+            return Precheck::Denied(PASSWORD_WRONG.to_string());
+        }
+        state.in_flight += 1;
         Precheck::Verify(self.epoch)
     }
 
@@ -165,6 +180,7 @@ impl SessionLock {
     ) -> Result<(), String> {
         let changed = epoch != self.epoch;
         let state = self.devices.entry(device_id.to_string()).or_default();
+        state.in_flight = state.in_flight.saturating_sub(1);
         // A right answer to a question asked before the password changed or
         // the phone was unpaired unlocks nothing; nor does one that arrives
         // while a lockout (started by a concurrent wrong guess) runs.
@@ -528,5 +544,54 @@ mod tests {
         assert_ne!(a.salt, b.salt);
         assert!(matches("pw", &a));
         assert!(!matches("pW", &a));
+    }
+
+    #[test]
+    fn a_stored_hash_of_the_wrong_length_is_a_wrong_password_not_a_panic() {
+        let mut stored = cheap("secret");
+        assert!(matches("secret", &stored));
+        let b64 = base64::engine::general_purpose::STANDARD;
+        stored.hash = base64::Engine::encode(&b64, [1u8; 7]);
+        assert!(!matches("secret", &stored));
+        stored.hash = String::new();
+        assert!(!matches("secret", &stored));
+    }
+
+    #[test]
+    fn guesses_in_flight_together_never_exceed_the_free_attempts() {
+        let stored = cheap("secret");
+        let now = Instant::now();
+        let mut lock = SessionLock::default();
+        // Ten handlers ask before any has finished hashing.
+        let verifying: Vec<_> = (0..10)
+            .map(|n| lock.begin(Some(&stored), "phone", 1, Some(&format!("wrong{n}")), now))
+            .filter(|precheck| matches!(precheck, Precheck::Verify(_)))
+            .collect();
+        assert_eq!(
+            verifying.len(),
+            FREE_ATTEMPTS as usize,
+            "no more than the free attempts"
+        );
+        // As they finish, the lockout comes at the fifth failure, as it would one by one.
+        let mut last = Ok(());
+        for (n, precheck) in verifying.into_iter().enumerate() {
+            let Precheck::Verify(epoch) = precheck else {
+                unreachable!()
+            };
+            last = lock.finish("phone", 1, &format!("wrong{n}"), false, epoch, now);
+        }
+        assert!(last.unwrap_err().starts_with(PASSWORD_LOCKED));
+        assert!(matches!(
+            lock.begin(Some(&stored), "phone", 1, Some("secret"), now),
+            Precheck::Denied(_)
+        ));
+        // After the lockout, one at a time.
+        let later = now + MAX_LOCKOUT;
+        let first = lock.begin(Some(&stored), "phone", 1, Some("again1"), later);
+        assert!(matches!(first, Precheck::Verify(_)));
+        assert!(matches!(
+            lock.begin(Some(&stored), "phone", 1, Some("again2"), later),
+            Precheck::Denied(_)
+        ));
     }
 }

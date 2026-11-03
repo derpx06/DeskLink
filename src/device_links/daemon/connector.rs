@@ -9,7 +9,7 @@ use std::time::Duration;
 use super::handle::DaemonEvent;
 use super::handshake::finish_secure_link;
 use super::network::ssl_connector;
-use super::state::{push_error, upsert_device};
+use super::state::{push_error, upsert_from_beacon};
 use crate::device_links::config::Config;
 use crate::device_links::core::DeviceManager;
 use crate::device_links::device::DeviceView;
@@ -190,7 +190,9 @@ fn accept_incoming_device(
         .map(|config| config.is_trusted(&info.id))
         .unwrap_or(false);
     super::discovery::remember_endpoint(&info, &packet, trusted);
-    upsert_device(
+    // Pre-TLS and unauthenticated: it may create a card, never rewrite a
+    // known one (the pinned handshake does that, in `finish_secure_link`).
+    upsert_from_beacon(
         &devices,
         &info,
         stream

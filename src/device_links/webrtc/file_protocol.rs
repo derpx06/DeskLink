@@ -376,8 +376,20 @@ impl FileControl {
     }
 
     pub fn from_json(input: &[u8]) -> Result<Self, String> {
-        serde_json::from_slice(input)
-            .map_err(|error| format!("Malformed DeskLink file control: {error}"))
+        let mut control: Self = serde_json::from_slice(input)
+            .map_err(|error| format!("Malformed DeskLink file control: {error}"))?;
+        // A peer's name is cleaned once, here, so the matching of a re-offer, the
+        // checkpoint, the board and the destination all see the same name. (A
+        // Bucket file keeps its name: it must equal the last segment of its path,
+        // and names with such characters are not synced.)
+        if control.folder.is_none() && control.relpath.is_none() {
+            if let Some(name) = control.filename.as_mut() {
+                if name.chars().any(char::is_control) || name.chars().any(is_bidi) {
+                    *name = sanitize_filename(name);
+                }
+            }
+        }
+        Ok(control)
     }
 
     pub fn to_json(&self) -> Result<Vec<u8>, String> {
@@ -695,6 +707,38 @@ fn validate_token(value: &str) -> Result<(), String> {
         return Err("Invalid DeskLink transfer token".to_string());
     }
     Ok(())
+}
+
+/// A received name as it is kept and shown: control characters and the bidi
+/// marks and overrides (`photo<U+202E>gpj.exe` reads as `photoexe.jpg`) are
+/// dropped, an empty result, `.` or `..` becomes `file`, and at most 255 UTF-8
+/// bytes stay. Mirrored by `sanitizeFilename` on Android; both pass
+/// `testdata/filenames.json`.
+fn is_bidi(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{2028}' | '\u{2029}'
+    ) || ('\u{202A}'..='\u{202E}').contains(&c)
+        || ('\u{2066}'..='\u{2069}').contains(&c)
+}
+
+pub(crate) fn sanitize_filename(raw: &str) -> String {
+    let mut name: String = raw
+        .chars()
+        .filter(|c| !c.is_control() && !is_bidi(*c))
+        .collect();
+    if name.len() > 255 {
+        let mut end = 255;
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
+        name.truncate(end);
+    }
+    if matches!(name.as_str(), "" | "." | "..") {
+        "file".to_string()
+    } else {
+        name
+    }
 }
 
 pub(crate) fn validate_filename(value: &str) -> Result<(), String> {
@@ -1082,6 +1126,30 @@ mod tests {
         ] {
             assert!(validate_filename(name).is_ok(), "{name:?} is harmless");
         }
+    }
+
+    #[test]
+    fn received_names_are_cleaned_like_the_shared_vectors() {
+        let f: serde_json::Value =
+            serde_json::from_str(include_str!("../../../testdata/filenames.json")).unwrap();
+        for case in f["sanitize"].as_array().unwrap() {
+            let (raw, out) = (case["in"].as_str().unwrap(), case["out"].as_str().unwrap());
+            assert_eq!(sanitize_filename(raw), out, "{raw:?}");
+            assert!(
+                validate_filename(out).is_ok(),
+                "{out:?} must pass the wire check"
+            );
+        }
+        // Through the parser, as an offer arrives: cleaned once, and valid.
+        let mut json = serde_json::to_value(offer()).unwrap();
+        json["filename"] = "photo\u{202e}gpj.exe\u{0}".into();
+        let parsed = FileControl::from_json(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert_eq!(parsed.filename.as_deref(), Some("photogpj.exe"));
+        // A Bucket file keeps its name: it must equal its path's last segment.
+        json["folder"] = "f".into();
+        json["relpath"] = "dir/a\u{202e}b".into();
+        let kept = FileControl::from_json(&serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(kept.filename.unwrap().contains('\u{202e}'));
     }
 
     #[test]

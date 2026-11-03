@@ -425,10 +425,21 @@ pub(crate) fn ssl_acceptor(config: &Arc<Mutex<Config>>) -> Result<SslAcceptor, S
 }
 
 pub(crate) fn ssl_connector(config: &Arc<Mutex<Config>>) -> Result<SslConnector, String> {
+    Ok(ssl_connector_builder(config)?.build())
+}
+
+fn ssl_connector_builder(
+    config: &Arc<Mutex<Config>>,
+) -> Result<openssl::ssl::SslConnectorBuilder, String> {
     let config = config
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())?;
     let mut builder = SslConnector::builder(SslMethod::tls()).expect("TLS method is available");
+    // The acceptor is mozilla_intermediate (TLS 1.2+); the connector must not
+    // be the weaker end of the same link on an OpenSSL whose default floor is older.
+    builder
+        .set_min_proto_version(Some(openssl::ssl::SslVersion::TLS1_2))
+        .map_err(|err| err.to_string())?;
     builder
         .set_certificate(config.certificate())
         .map_err(|err| err.to_string())?;
@@ -436,7 +447,7 @@ pub(crate) fn ssl_connector(config: &Arc<Mutex<Config>>) -> Result<SslConnector,
         .set_private_key(config.key())
         .map_err(|err| err.to_string())?;
     builder.set_verify_callback(SslVerifyMode::PEER, |_preverify_ok, _ctx| true);
-    Ok(builder.build())
+    Ok(builder)
 }
 
 #[cfg(test)]
@@ -469,6 +480,19 @@ mod tests {
             !local_interfaces().is_empty(),
             "this machine has at least loopback"
         );
+    }
+
+    #[test]
+    fn the_connector_is_no_weaker_than_the_acceptor() {
+        let dir =
+            std::env::temp_dir().join(format!("desklink-tls-{}", uuid::Uuid::new_v4().simple()));
+        let config = Arc::new(Mutex::new(Config::load_from_dir(dir.clone()).unwrap()));
+        let mut builder = ssl_connector_builder(&config).unwrap();
+        assert_eq!(
+            builder.min_proto_version(),
+            Some(openssl::ssl::SslVersion::TLS1_2)
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

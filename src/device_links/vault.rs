@@ -12,6 +12,12 @@ const TAG_BYTES: usize = 16;
 
 /// `dir`'s key, made on first use.
 fn key(dir: &Path) -> Result<[u8; 32], String> {
+    // Two threads finding no key must not each make one (the second overwrote the first, orphaning what was
+    // sealed with it).
+    static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _making = MAKING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let path = dir.join("key");
     match std::fs::read(&path) {
         Ok(bytes) => match <[u8; 32]>::try_from(bytes) {
@@ -334,10 +340,20 @@ pub(crate) fn flush() {
     }
 }
 
+/// The log line for a save that failed: which file (its name, not its place or
+/// content) and why.
+fn save_failure(path: &Path, error: &str) -> String {
+    format!(
+        "Could not save the encrypted file {}: {error}",
+        path.file_name()
+            .map_or_else(String::new, |name| name.to_string_lossy().into_owned())
+    )
+}
+
 /// Seals `plain` into `path` on the writer thread, so the caller (often the
 /// GTK thread: a note being typed) never waits on encryption or fsync. Only
 /// the latest contents per file are written.
-// A write still queued at shutdown is written by `flush()`.
+/// A write still queued at shutdown is written by `flush()`.
 pub(crate) fn seal_later(dir: &Path, path: &Path, aad: &[u8], plain: Vec<u8>) {
     static WAKE: std::sync::OnceLock<std::sync::mpsc::SyncSender<()>> = std::sync::OnceLock::new();
     let wake = WAKE.get_or_init(|| {
@@ -355,10 +371,10 @@ pub(crate) fn seal_later(dir: &Path, path: &Path, aad: &[u8], plain: Vec<u8>) {
                         .and_then(|mut pending| pending.take())
                         .unwrap_or_default();
                     for (path, (dir, aad, plain)) in batch {
-                        if seal(&dir, &path, &aad, &plain).is_err() {
+                        if let Err(error) = seal(&dir, &path, &aad, &plain) {
                             crate::device_links::limits::log_limited(
                                 "vault-save",
-                                "Could not save an encrypted file",
+                                &save_failure(&path, &error),
                             );
                         }
                     }
@@ -371,10 +387,7 @@ pub(crate) fn seal_later(dir: &Path, path: &Path, aad: &[u8], plain: Vec<u8>) {
         if pending.len() >= MAX_PENDING_WRITES && !pending.contains_key(path) {
             // Never dropped: written here instead.
             if let Err(error) = seal(dir, path, aad, &plain) {
-                crate::device_links::limits::log_limited(
-                    "vault-save",
-                    &format!("Could not save an encrypted file: {error}"),
-                );
+                crate::device_links::limits::log_limited("vault-save", &save_failure(path, &error));
             }
             return;
         }
@@ -621,5 +634,60 @@ mod tests {
             .is_some_and(|pending| pending.contains_key(&path));
         assert!(!queued, "the write was dropped");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn threads_that_find_no_key_agree_on_one_and_saves_to_one_file_never_interleave() {
+        let dir =
+            std::env::temp_dir().join(format!("desklink-vault-race-{}", uuid::Uuid::new_v4()));
+        let keys: Vec<[u8; 32]> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || key(&dir).unwrap())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(
+            keys.iter().all(|key| *key == keys[0]),
+            "one key, however many ask first"
+        );
+
+        let path = dir.join("shared.bin");
+        let writers: Vec<_> = (0..8u8)
+            .map(|byte| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20 {
+                        crate::device_links::config::write_private(&path, &vec![byte; 256 * 1024])
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len(), 256 * 1024);
+        assert!(
+            bytes.iter().all(|byte| *byte == bytes[0]),
+            "a file made of two writers' bytes"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_failed_save_names_the_file_and_the_reason() {
+        let line = save_failure(
+            Path::new("/home/someone/.config/desklink/notes/notes.sealed"),
+            "disk full",
+        );
+        assert!(
+            line.contains("notes.sealed") && line.contains("disk full"),
+            "{line}"
+        );
+        assert!(!line.contains("someone"), "not the place: {line}");
     }
 }

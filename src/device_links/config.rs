@@ -280,7 +280,9 @@ pub fn app_settings() -> AppSettings {
     settings_mirror()
         .lock()
         .map(|settings| settings.clone())
-        .unwrap_or_default()
+        // A poisoned mirror still holds the last settings. Defaults here would
+        // read as "no session password" and open the gate it guards.
+        .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
 }
 
 /// Tests: turns photos from `device_id` on or off in the process-wide view.
@@ -1124,6 +1126,15 @@ pub(crate) fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), 
 fn write_atomic(path: &std::path::Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     use std::io::Write;
 
+    // One writer at a time: the temp name is fixed per path, so two threads saving the same file (the vault's
+    // writer and an inline overflow save) interleaved their bytes into a file that was then renamed into place.
+    // A leaf lock: nothing else is acquired while it is held (only the open, write, fsync and rename of one
+    // small file), so a caller that holds the Config mutex or the vault's cannot deadlock on it; the wait is
+    // another writer's fsync.
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _one_at_a_time = WRITING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let tmp = path.with_extension("tmp");
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
@@ -2160,5 +2171,19 @@ mod tests {
         assert!(config.stored.settings.alerts_commands_to(&id));
         assert!(!config.stored.settings.contact_caller_names.contains(&id));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_poisoned_settings_mirror_still_answers_with_what_it_held() {
+        let before = app_settings();
+        let poisoner = std::thread::spawn(|| {
+            let _held = settings_mirror().lock().unwrap();
+            panic!("poisoning the settings mirror on purpose");
+        });
+        assert!(poisoner.join().is_err());
+        assert!(settings_mirror().lock().is_err(), "the mirror is poisoned");
+        // Defaults here would read as "no session password" and open the gate it guards.
+        assert_eq!(app_settings(), before);
+        settings_mirror().clear_poison(); // other tests share the mirror
     }
 }

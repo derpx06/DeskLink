@@ -87,6 +87,8 @@ pub(crate) fn may_offer(conditions: Conditions) -> Result<(), Refusal> {
     Ok(())
 }
 
+const MAX_NONCES_PER_DEVICE: usize = 4;
+
 /// A fresh 128-bit nonce for `device_id`, valid once for a minute.
 pub(crate) fn issue(device_id: &str) -> String {
     let nonce = uuid::Uuid::new_v4().simple().to_string();
@@ -94,11 +96,22 @@ pub(crate) fn issue(device_id: &str) -> String {
         let now = Instant::now();
         // One live offer per phone: a newer one replaces it, so a phone asking
         // in a loop cannot grow the list. Spent entries stay (they answer
-        // "replayed"); they are bounded by the lock-operation damper.
+        // "replayed"), but only the newest few per phone: the oldest give way.
         issued.retain(|old| {
             now.duration_since(old.at) < NONCE_LIFETIME * 2
                 && (old.used || old.device_id != device_id)
         });
+        while issued
+            .iter()
+            .filter(|old| old.device_id == device_id)
+            .count()
+            >= MAX_NONCES_PER_DEVICE
+        {
+            match issued.iter().position(|old| old.device_id == device_id) {
+                Some(oldest) => issued.remove(oldest),
+                None => break,
+            };
+        }
         issued.push(Issued {
             nonce: nonce.clone(),
             device_id: device_id.to_string(),
@@ -313,5 +326,24 @@ mod tests {
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(a, b);
         assert_eq!(Refusal::NotLan.code(), "not-lan");
+    }
+
+    #[test]
+    fn a_phone_that_keeps_unlocking_holds_a_few_spent_nonces_not_a_growing_list() {
+        let device = "nonce-flood-phone";
+        let first = issue(device);
+        assert_eq!(approve(device, Some(&first), ALL_GOOD), Ok(()));
+        for _ in 0..200 {
+            let nonce = issue(device);
+            let _ = approve(device, Some(&nonce), ALL_GOOD);
+        }
+        let held = ISSUED
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|old| old.device_id == device)
+            .count();
+        assert_eq!(held, MAX_NONCES_PER_DEVICE);
+        assert!(ISSUED.lock().unwrap().iter().all(|old| old.nonce != first));
     }
 }

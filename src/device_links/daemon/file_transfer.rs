@@ -716,12 +716,18 @@ mod waiting_tests {
     #[test]
     fn the_queue_survives_a_restart() {
         let dir = scratch("round");
+        // Entries queued a moment ago, not in 1970: the tests beside this one
+        // call expire_waiting(unix_now()) on the shared queue, which drops
+        // anything a day old and so dropped these between the restore and the
+        // assertion.
+        let queued = unix_now().saturating_sub(10);
+        let now = queued + 10;
         let file = dir.join("a.txt");
         std::fs::write(&file, "x").unwrap();
         let state = dir.join("state").join("send-queue.json");
         let files = vec![
-            entry("restart-phone", &file, 1_000),
-            entry("gone", &file, 1_000),
+            entry("restart-phone", &file, queued),
+            entry("gone", &file, queued),
         ];
         save_queue(&state, &files);
         {
@@ -729,10 +735,10 @@ mod waiting_tests {
             let mode = std::fs::metadata(&state).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0, "owner only, was {mode:o}");
         }
-        assert_eq!(load_queue(&state, 2_000), files, "round trip");
+        assert_eq!(load_queue(&state, now), files, "round trip");
 
         // A restart: only the phone still paired gets its files back.
-        restore_from(&state, 2_000, |id| {
+        restore_from(&state, now, |id| {
             (id == "restart-phone").then(|| "cert-a".to_string())
         });
         assert_eq!(waiting_files("restart-phone"), vec![file.clone()]);
@@ -850,15 +856,18 @@ mod waiting_tests {
         let file = dir.join("a.txt");
         std::fs::write(&file, "x").unwrap();
         let state = dir.join("send-queue.json");
-        save_queue(&state, &[entry("reinstalled-phone", &file, 1_000)]);
+        // Queued a moment ago (not in 1970): a neighbouring test's expire_waiting(unix_now()) drops the old.
+        let queued = unix_now().saturating_sub(10);
+        let now = queued + 10;
+        save_queue(&state, &[entry("reinstalled-phone", &file, queued)]);
         // Same id, a different certificate: nothing comes back.
-        restore_from(&state, 2_000, |_| Some("cert-b".to_string()));
+        restore_from(&state, now, |_| Some("cert-b".to_string()));
         assert!(waiting_files("reinstalled-phone").is_empty());
         // Unpaired since: nothing either.
-        restore_from(&state, 2_000, |_| None);
+        restore_from(&state, now, |_| None);
         assert!(waiting_files("reinstalled-phone").is_empty());
         // The same certificate: back.
-        restore_from(&state, 2_000, |_| Some("cert-a".to_string()));
+        restore_from(&state, now, |_| Some("cert-a".to_string()));
         assert_eq!(waiting_files("reinstalled-phone"), vec![file]);
         clear_waiting("reinstalled-phone");
         let _ = std::fs::remove_dir_all(&dir);

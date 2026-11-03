@@ -102,12 +102,17 @@ impl IceServerConfig {
         }
         for uri in &self.stun_servers {
             if !(uri.starts_with("stun://") || uri.starts_with("stuns://")) {
-                return Err(format!("Unsupported STUN server URI: {uri}"));
+                // The URI is not echoed: a TURN entry carries its credential.
+                return Err(
+                    "Unsupported STUN server URI (expected stun:// or stuns://)".to_string()
+                );
             }
         }
         for uri in &self.turn_servers {
             if !(uri.starts_with("turn://") || uri.starts_with("turns://")) {
-                return Err(format!("Unsupported TURN server URI: {uri}"));
+                return Err(
+                    "Unsupported TURN server URI (expected turn:// or turns://)".to_string()
+                );
             }
         }
         Ok(())

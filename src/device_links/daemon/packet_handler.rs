@@ -268,7 +268,14 @@ pub(super) fn apply_lan_packet(
         &local_info,
         &packet,
     ) {
-        eprintln!("[Daemon] Rejected {} packet: {error}", packet.packet_type);
+        // Rate-limited and cut: the type is the sender's word, up to a whole line.
+        crate::device_links::limits::log_limited(
+            "rejected-packet",
+            &format!(
+                "[Daemon] Rejected {} packet: {error}",
+                packet.packet_type.chars().take(48).collect::<String>()
+            ),
+        );
         if error == crate::device_links::daemon::dispatcher::DispatchError::UnpairedFeature {
             notify_peer_not_paired(&binding, &sessions);
         }
@@ -298,7 +305,10 @@ pub(super) fn apply_lan_packet(
             Arc::clone(&devices),
             Arc::clone(&events),
         ) {
-            eprintln!("[Daemon] Rejected DeskLink WebRTC signaling: {error}");
+            crate::device_links::limits::log_limited(
+                "rejected-signaling",
+                &format!("[Daemon] Rejected DeskLink WebRTC signaling: {error}"),
+            );
             if error.contains("clocks differ") {
                 crate::device_links::daemon::state::mark_error(&devices, &device_id, error);
             }

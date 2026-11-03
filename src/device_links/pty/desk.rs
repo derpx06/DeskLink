@@ -33,11 +33,46 @@ const EXIT: u8 = 3;
 /// Largest frame either side accepts.
 const MAX_FRAME: usize = 256 * 1024;
 
-fn socket_path() -> PathBuf {
-    let base = super::host::runtime_dir().unwrap_or_else(|| {
-        std::env::temp_dir().join(format!("desklink-{}", unsafe { libc::getuid() }))
-    });
-    base.join("desklink").join("terminal.sock")
+/// Where the sessions are served: under the user's runtime directory, else the
+/// user's own cache directory. Never a shared place such as `/tmp`, where
+/// another user could have made the directory first.
+fn socket_path() -> Option<PathBuf> {
+    let base = super::host::runtime_dir().or_else(dirs::cache_dir)?;
+    Some(base.join("desklink").join("terminal.sock"))
+}
+
+/// Whether `path` is a real (not linked) entry owned by this user.
+fn owned_by_us(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|meta| !meta.file_type().is_symlink() && meta.uid() == unsafe { libc::getuid() })
+}
+
+/// Desk clients served at once; a window per session is a handful, never this many.
+const MAX_CLIENTS: usize = 32;
+/// The attach line is short; the peer has this long to send it.
+const ATTACH_LINE_MAX: u64 = 256;
+const ATTACH_LINE_WITHIN: Duration = Duration::from_secs(5);
+static CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct ClientSlot;
+
+impl ClientSlot {
+    fn claim() -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        if CLIENTS.fetch_add(1, Ordering::AcqRel) < MAX_CLIENTS {
+            Some(Self)
+        } else {
+            CLIENTS.fetch_sub(1, Ordering::AcqRel);
+            None
+        }
+    }
+}
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        CLIENTS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 pub(crate) fn encode(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -93,9 +128,13 @@ pub(crate) fn start_server() {
             super::launchers::login_path();
             super::launchers::installed();
         });
-    let path = socket_path();
+    let Some(path) = socket_path() else {
+        eprintln!("[DeskLink] Shared terminals at the desk are unavailable: no private directory");
+        return;
+    };
     let Some(dir) = path.parent() else { return };
     if std::fs::create_dir_all(dir).is_err()
+        || !owned_by_us(dir)
         || std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).is_err()
     {
         eprintln!(
@@ -124,9 +163,13 @@ pub(crate) fn start_server() {
                 if !same_user(&stream) {
                     continue;
                 }
+                let Some(slot) = ClientSlot::claim() else {
+                    continue; // dropped: closes the connection
+                };
                 let _ = std::thread::Builder::new()
                     .name("desklink-desk-terminal".into())
                     .spawn(move || {
+                        let _slot = slot;
                         if let Err(error) = serve(stream) {
                             eprintln!("[DeskLink] Desk terminal ended: {error}");
                         }
@@ -159,7 +202,17 @@ fn same_user(stream: &UnixStream) -> bool {
 fn serve(stream: UnixStream) -> Result<(), String> {
     let mut reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
     let mut line = String::new();
-    reader.read_line(&mut line).map_err(|e| e.to_string())?;
+    // The request is one short line, sent at once: a client that does not send
+    // it (or never ends it) is not kept waiting. The timeout is lifted for the
+    // session itself, which is idle for as long as nobody types.
+    stream
+        .set_read_timeout(Some(ATTACH_LINE_WITHIN))
+        .map_err(|e| e.to_string())?;
+    std::io::Read::by_ref(&mut reader)
+        .take(ATTACH_LINE_MAX)
+        .read_line(&mut line)
+        .map_err(|e| e.to_string())?;
+    stream.set_read_timeout(None).map_err(|e| e.to_string())?;
     let (id, rows, cols) = parse_attach(&line).ok_or("malformed attach request")?;
     let session = super::registry::registry()
         .lock()
@@ -468,7 +521,12 @@ fn window_size() -> (u16, u16) {
 
 /// Runs the desk client until the session ends or the window closes.
 pub(crate) fn run_client(id: &str) -> i32 {
-    let mut stream = match UnixStream::connect(socket_path()) {
+    // A socket that is not ours (or a link to one) is not a DeskLink to type into.
+    let Some(path) = socket_path().filter(|path| owned_by_us(path)) else {
+        eprintln!("DeskLink is not running.");
+        return 1;
+    };
+    let mut stream = match UnixStream::connect(path) {
         Ok(stream) => stream,
         Err(error) => {
             eprintln!("DeskLink is not running ({error}).");
@@ -651,6 +709,63 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_socket_is_never_under_a_shared_directory() {
+        assert!(socket_path().is_some(), "a runtime or cache directory");
+        let source = include_str!("desk.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            !source.contains("temp_dir()"),
+            "no fallback to a world-writable directory"
+        );
+    }
+
+    #[test]
+    fn only_a_real_entry_of_ours_is_trusted() {
+        let dir =
+            std::env::temp_dir().join(format!("desklink-own-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(owned_by_us(&dir));
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        assert!(!owned_by_us(&link), "a link is not the entry itself");
+        assert!(!owned_by_us(&dir.join("missing")));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clients_are_capped_and_the_slot_comes_back() {
+        let held: Vec<_> = (0..MAX_CLIENTS)
+            .map(|_| ClientSlot::claim().expect("free"))
+            .collect();
+        assert!(ClientSlot::claim().is_none(), "the cap is firm");
+        assert!(
+            ClientSlot::claim().is_none(),
+            "and a refusal does not leak a count"
+        );
+        drop(held);
+        assert!(ClientSlot::claim().is_some(), "free again once they end");
+    }
+
+    #[test]
+    fn an_attach_line_that_never_ends_is_cut_not_buffered() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut client = client;
+            // Far more than the line bound, and no newline.
+            let _ = client.write_all(&[b'A'; 64 * 1024]);
+            client
+        });
+        let result = serve(server);
+        assert!(
+            result.is_err(),
+            "a line past its bound is a malformed request"
+        );
+        let _ = writer.join();
+    }
 
     #[test]
     fn attach_requests_are_strictly_parsed() {
