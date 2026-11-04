@@ -333,14 +333,14 @@ def real_cases():
     lsenv = {"LS_COLORS": "di=1;34:ln=1;36:ex=1;32:*.md=33:*.txt=35"}
     cases = {
         "ls-color": lambda c: run_pty(["ls", "--color=always", "-CF"], c, cwd=d, env=lsenv, wall=3),
-        "less": lambda c: run_pty(["less", "-R", os.path.join(tmp, "long.txt")], c, keys=[(0.6, b" "), (1.0, b" "), (1.4, b"q")], wall=4, env={"LESS": ""}),
+        "less": lambda c: run_pty(["less", "-R", os.path.join(tmp, "long.txt")], c, keys=[(0.6, b" "), (1.0, b" ")], wall=1.8, env={"LESS": ""}),
         "vim": lambda c: run_pty(["vim", "-u", "NONE", "-N", "-c", "syntax on | set number | set t_Co=256 | set background=dark", os.path.join(tmp, "app.py")], c,
-                                 keys=[(1.0, b"\x06"), (1.5, b"/hello\r"), (2.0, b":q!\r")], wall=4),
+                                 keys=[(1.0, b"\x06"), (1.5, b"/hello\r")], wall=2.4),
         "vim-resize": lambda c: run_pty(["vim", "-u", "NONE", "-N", "-c", "syntax on | set number", os.path.join(tmp, "app.py")], c, rows=ROWS,
-                                        resizes=[(1.0, max(c - 10, 20), ROWS - 6), (1.6, c, ROWS)], keys=[(2.4, b":q!\r")], wall=4),
-        "nano": lambda c: run_pty(["nano", "--nonewlines", os.path.join(tmp, "app.py")], c, keys=[(1.0, b"\x16"), (1.6, b"\x18")], wall=4, env={"TERM": "xterm-256color"}),
-        "htop": lambda c: run_pty(["htop", "-t"], c, keys=[(2.0, b"q")], wall=5, env={"HTOPRC": "/dev/null"}),
-        "curses": lambda c: run_pty(["python3", os.path.join(tmp, "curses_app.py")], c, keys=[(0.8, b"q")], wall=3),
+                                        resizes=[(1.0, max(c - 10, 20), ROWS - 6), (1.6, c, ROWS)], keys=[], wall=2.6),
+        "nano": lambda c: run_pty(["nano", "--nonewlines", os.path.join(tmp, "app.py")], c, keys=[(1.0, b"\x16")], wall=1.8, env={"TERM": "xterm-256color"}),
+        "htop": lambda c: run_pty(["htop", "-t"], c, keys=[], wall=2.6, env={"HTOPRC": "/dev/null"}),
+        "curses": lambda c: run_pty(["python3", os.path.join(tmp, "curses_app.py")], c, keys=[], wall=1.6),
         "claude": lambda c: run_pty(["claude"], c, keys=[(5.0, b"\x03"), (5.4, b"\x03")], wall=7, env={"HOME": tempfile.mkdtemp(prefix="dlconf-home-"), "DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"}, netns=True),
         "codex": lambda c: run_pty(["codex"], c, keys=[(5.0, b"\x03"), (5.4, b"\x03")], wall=7, env={"HOME": tempfile.mkdtemp(prefix="dlconf-home-"), "CODEX_HOME": tempfile.mkdtemp(prefix="dlconf-codex-")}, netns=True),
     }

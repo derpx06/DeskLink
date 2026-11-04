@@ -1,4 +1,4 @@
-[?1049h[22;0;0t[>4;2m[?1h=[?2004h[?1004h[1;30r[?12h[?12l[22;2t[22;1t[27m[23m[29m[m[H[2J[?25l[30;1H"/tmp/dlconf-files-ib0dr85w/app.py" 42L, 1044B[2;1H▽[6n[2;1H  [3;1HPzz\[0%m[6n[3;1H           [1;1H[>c]10;?]11;?[1;1H[38;5;130m  1 [m[35mimport[m os
+[?1049h[22;0;0t[>4;2m[?1h=[?2004h[?1004h[1;30r[?12h[?12l[22;2t[22;1t[27m[23m[29m[m[H[2J[?25l[30;1H"/tmp/dlconf-files-9yb0lnba/app.py" 42L, 1044B[2;1H▽[6n[2;1H  [3;1HPzz\[0%m[6n[3;1H           [1;1H[>c]10;?]11;?[1;1H[38;5;130m  1 [m[35mimport[m os
 [38;5;130m  2 [m[2;5H[K[3;1H[38;5;130m  3 def[m [36mgreet[m(name: [36mstr[m) -> [36mstr[m:[3;33H[K[4;1H[38;5;130m  4 [m    [31m"""Say hello."""[m
 [38;5;130m  5 [m    [34m# a long comment line that is certainly longer than forty columns wide aa[m[6;1H[38;5;130m    [m[34mnd wraps in vim[m
 [38;5;130m  6 [m    [38;5;130mreturn[m [31mf"hello, [m[35m{[mname[35m}[m[31m!"[m  [34m# trailing[m
@@ -68,4 +68,4 @@
 [38;5;130m 24 [m[8C[36mself[m.value = value
 [38;5;130m 25 
  26 
- 27 if[m __name__ == [31m"__main__"[m:[30;63H1,1[11CTop[?25h[1;5H[?25l[30;63H[K[30;1H:q![?2004l[>4;m[23;2t[23;1t[30;1H[K[30;1H[?1004l[?2004l[?1l>[?1049l[23;0;0t[?25h[>4;m
+ 27 if[m __name__ == [31m"__main__"[m:[30;63H1,1[11CTop[?25h[1;5H

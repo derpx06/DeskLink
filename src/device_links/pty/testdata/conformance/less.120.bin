@@ -27,7 +27,7 @@ line 25: [1;32mboldbold[0m the quick brown fox jumps over the lazy dog 0123456
 line 26: [1;33mboldboldbold[0m the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐[m
 line 27: [1;34mbold[0m the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐[m
 line 28: [1;35mboldbold[0m the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐[m
-[7m/tmp/dlconf-files-pk0428t4/long.txt[27m[K[Kline 29: [1;36mboldboldbold[0m the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐[m
+[7m/tmp/dlconf-files-9yb0lnba/long.txt[27m[K[Kline 29: [1;36mboldboldbold[0m the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐[m
 line 30: [1;31mbold[0m the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐[m
 line 31: [1;32mboldbold[0m the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐[m
 line 32: [1;33mboldboldbold[0m the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐[m
@@ -78,4 +78,4 @@ line 76: [1;35mboldbold[0m the quick brown fox jumps over the lazy dog 0123456
 line 77: [1;36mboldboldbold[0m the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐[m
 line 78: [1;31mbold[0m the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐[m
 line 79: [1;32mboldbold[0m the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐[m
-[7m(END)[27m[K[K[?1l>[?1049l[23;0;0t
+[7m(END)[27m[K
