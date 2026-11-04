@@ -774,7 +774,11 @@ fn restricted(mut command: CommandBuilder) -> CommandBuilder {
     }
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
-    let var = |name: &str| command.get_env(name).map(|v| v.to_string_lossy().into_owned());
+    let var = |name: &str| {
+        command
+            .get_env(name)
+            .map(|v| v.to_string_lossy().into_owned())
+    };
     let fix = utf8_fix(var("LC_ALL"), var("LC_CTYPE"), var("LANG"));
     if let Some((name, value)) = fix {
         command.env(name, value);
@@ -1071,16 +1075,28 @@ mod tests {
         assert_eq!(utf8_fix(None, None, None), Some(("LANG", "C.UTF-8")));
         assert_eq!(utf8_fix(None, None, some("")), Some(("LANG", "C.UTF-8")));
         assert_eq!(utf8_fix(None, None, some("C")), Some(("LANG", "C.UTF-8")));
-        assert_eq!(utf8_fix(None, None, some("POSIX")), Some(("LANG", "C.UTF-8")));
-        assert_eq!(utf8_fix(None, None, some("en_GB.ISO-8859-1")), Some(("LANG", "C.UTF-8")));
+        assert_eq!(
+            utf8_fix(None, None, some("POSIX")),
+            Some(("LANG", "C.UTF-8"))
+        );
+        assert_eq!(
+            utf8_fix(None, None, some("en_GB.ISO-8859-1")),
+            Some(("LANG", "C.UTF-8"))
+        );
         // Already UTF-8: leave the person's locale alone.
         assert_eq!(utf8_fix(None, None, some("en_GB.UTF-8")), None);
         assert_eq!(utf8_fix(None, None, some("de_DE.utf8")), None);
         assert_eq!(utf8_fix(None, some("en_US.UTF-8"), some("C")), None);
         // LC_ALL beats everything, so that is what must be replaced.
-        assert_eq!(utf8_fix(some("C"), None, some("en_GB.UTF-8")), Some(("LC_ALL", "C.UTF-8")));
+        assert_eq!(
+            utf8_fix(some("C"), None, some("en_GB.UTF-8")),
+            Some(("LC_ALL", "C.UTF-8"))
+        );
         assert_eq!(utf8_fix(some("en_GB.UTF-8"), some("C"), some("C")), None);
-        assert_eq!(utf8_fix(None, some("C"), some("en_GB.UTF-8")), Some(("LC_CTYPE", "C.UTF-8")));
+        assert_eq!(
+            utf8_fix(None, some("C"), some("en_GB.UTF-8")),
+            Some(("LC_CTYPE", "C.UTF-8"))
+        );
     }
 
     #[test]

@@ -472,7 +472,12 @@ mod tests {
         resize.claim_size = Some(true);
         let json = String::from_utf8(resize.to_json().unwrap()).unwrap();
         assert!(json.contains("\"cols\":50,\"claimSize\":true"), "{json}");
-        assert_eq!(TerminalControl::from_json(json.as_bytes()).unwrap().claim_size, Some(true));
+        assert_eq!(
+            TerminalControl::from_json(json.as_bytes())
+                .unwrap()
+                .claim_size,
+            Some(true)
+        );
     }
 
     #[test]

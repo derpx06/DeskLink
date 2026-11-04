@@ -197,12 +197,17 @@ mod tests {
             }
             let want = std::fs::read_to_string(&grid_path).unwrap_or_default();
             if want != got {
-                failures.push(format!("{name}.{cols}: grid differs from {}", grid_path.display()));
+                failures.push(format!(
+                    "{name}.{cols}: grid differs from {}",
+                    grid_path.display()
+                ));
             }
             // The snapshot must reproduce the screen it was taken from.
             let again = feed(&snapshot(&parser), parser.screen().size().1, &[]);
             if grid(&again) != got {
-                failures.push(format!("{name}.{cols}: vt100 does not reproduce its own snapshot"));
+                failures.push(format!(
+                    "{name}.{cols}: vt100 does not reproduce its own snapshot"
+                ));
             }
             if std::fs::read(&snap_path).unwrap_or_default() != snapshot(&parser) {
                 failures.push(format!("{name}.{cols}: stale .snap"));
