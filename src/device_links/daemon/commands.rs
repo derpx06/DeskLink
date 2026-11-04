@@ -196,6 +196,16 @@ impl DaemonWorker {
             DaemonCommand::Telephony(id, action, number) => {
                 self.send_telephony(&id, &action, number.as_deref())
             }
+            DaemonCommand::Capture(id, kind, _)
+                if kind == "text" && !crate::device_links::webrtc::capture::text_available(&id) =>
+            {
+                crate::device_links::webrtc::capture::notify(
+                    super::handle::DaemonEvent::CaptureNotice {
+                        device_id: id,
+                        message: "This phone cannot read text from a picture".to_string(),
+                    },
+                );
+            }
             DaemonCommand::Capture(id, kind, target) => {
                 let sent =
                     self.with_feature_transport(&id, |transport| transport.capture(&kind, &target));

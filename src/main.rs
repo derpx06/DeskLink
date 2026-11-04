@@ -132,7 +132,7 @@ fn main() -> glib::ExitCode {
     if args.get(1).is_some_and(|arg| arg == "--bucket") {
         return send_to::run_bucket_cli(&args[2..]);
     }
-    // `desklink --insert <photo|photo-file|scan|text|qr>` and `desklink --sound
+    // `desklink --insert <photo|photo-file|scan|text|qr>` (`text` only for a phone that can read it) and `desklink --sound
     // <verb>`: what the Insert and Sound buttons do, for a script or a
     // terminal. Handed to the running app like `--send-files`.
     if args.get(1).is_some_and(|arg| arg == "--insert") {

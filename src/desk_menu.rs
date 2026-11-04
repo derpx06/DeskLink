@@ -173,9 +173,7 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
     if phone.feature_transport_ready {
         menu.push(TrayEntry::Submenu {
             label: "Insert from Phone".into(),
-            children: crate::window::insert::CAPTURES
-                .iter()
-                .enumerate()
+            children: crate::window::insert::offered(&phone.id)
                 .map(|(index, (_, _, label, icon))| {
                     TrayEntry::action(*label, format!("insert-{index}:{}", phone.id)).icon(icon)
                 })
@@ -561,6 +559,23 @@ mod tests {
         assert!(!tray(phone("tray-insert", false))
             .iter()
             .any(|action| action.starts_with("insert-")));
+    }
+
+    /// A phone whose build has no recogniser answered `unsupported` once: the
+    /// tray stops offering Copy Text for it, and only for it.
+    #[test]
+    fn the_tray_drops_copy_text_for_a_phone_that_cannot_read_it() {
+        let tray =
+            |device: DeviceView| actions(&entries(&[device], &AppSettings::default(), &[], false));
+        crate::device_links::webrtc::capture::text_unsupported("tray-notext");
+        let text = crate::window::insert::CAPTURES
+            .iter()
+            .position(|(kind, ..)| *kind == "text")
+            .unwrap();
+        let without = tray(phone("tray-notext", true));
+        assert!(!without.contains(&format!("insert-{text}:tray-notext")));
+        assert!(without.contains(&"insert-0:tray-notext".to_string()));
+        assert!(tray(phone("tray-hastext", true)).contains(&format!("insert-{text}:tray-hastext")));
     }
 
     /// Review finding D: once the ladder gives up, the tray has a button.

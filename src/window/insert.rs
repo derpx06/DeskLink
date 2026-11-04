@@ -32,6 +32,36 @@ pub(crate) const CAPTURES: [(&str, &str, &str, &str); 5] = [
     ("qr", "clipboard", "Scan a QR Code", "view-grid-symbolic"),
 ];
 
+/// The rows to offer for a phone: its index in [`CAPTURES`] (the tray's verb)
+/// and the row. "Copy Text" goes once the phone has said it cannot (its build
+/// has the recogniser switched off, `-Pdesklink.ocr`).
+pub(crate) fn offered(
+    device_id: &str,
+) -> impl Iterator<
+    Item = (
+        usize,
+        &'static (&'static str, &'static str, &'static str, &'static str),
+    ),
+> {
+    offered_for(crate::device_links::webrtc::capture::text_available(
+        device_id,
+    ))
+}
+
+fn offered_for(
+    text: bool,
+) -> impl Iterator<
+    Item = (
+        usize,
+        &'static (&'static str, &'static str, &'static str, &'static str),
+    ),
+> {
+    CAPTURES
+        .iter()
+        .enumerate()
+        .filter(move |(_, (kind, ..))| text || *kind != "text")
+}
+
 fn row(icon: &str, label: &str) -> gtk::Button {
     let content = gtk::Box::builder().spacing(12).build();
     content.append(&gtk::Image::from_icon_name(icon));
@@ -53,7 +83,7 @@ pub(super) fn attach_menu(daemon: &DaemonHandle, device: &DeviceView, button: &g
         .margin_end(6)
         .build();
     let popover = gtk::Popover::builder().child(&list).build();
-    for (kind, target, label, icon) in CAPTURES {
+    for (_, (kind, target, label, icon)) in offered(&device.id) {
         let item = row(icon, label);
         // Weakly: the popover owns this button, which owns this closure; a
         // strong reference back kept every rebuilt page's menu alive.
@@ -132,4 +162,22 @@ pub(super) fn bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Box
     });
     bar.append(&cancel);
     Some(bar)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_text_is_offered_only_while_the_phone_can_read_it() {
+        let kinds = |text| {
+            offered_for(text)
+                .map(|(_, (kind, ..))| *kind)
+                .collect::<Vec<_>>()
+        };
+        assert!(kinds(true).contains(&"text"));
+        assert_eq!(kinds(false), ["photo", "photo", "scan", "qr"]);
+        // The tray's verbs keep their place in CAPTURES.
+        assert_eq!(offered_for(false).last().unwrap().0, 4);
+    }
 }

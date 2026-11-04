@@ -16,6 +16,27 @@ use crate::device_links::daemon::handle::DaemonEvent;
 
 /// What the phone can capture.
 pub(crate) const KINDS: [&str; 4] = ["photo", "scan", "text", "qr"];
+/// Phones that answered a `text` request with `unsupported` (a build without
+/// the on-phone recogniser): "Copy Text" is not offered for them. In memory
+/// only, so a restart of DeskLink asks again.
+static NO_TEXT: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// False once this phone has said it cannot read text from a picture.
+pub(crate) fn text_available(device_id: &str) -> bool {
+    NO_TEXT
+        .lock()
+        .map(|phones| !phones.iter().any(|id| id == device_id))
+        .unwrap_or(true)
+}
+
+pub(crate) fn text_unsupported(device_id: &str) {
+    if let Ok(mut phones) = NO_TEXT.lock() {
+        if !phones.iter().any(|id| id == device_id) {
+            phones.push(device_id.to_string());
+        }
+    }
+}
+
 /// The phone gives up after 120 s; the desk forgets a capture a little
 /// after that, in case its cancellation never arrived.
 const FORGET_AFTER: Duration = Duration::from_secs(150);
@@ -155,6 +176,10 @@ pub(crate) fn handle(device_id: &str, phone: &str, message: &ControlMessage) -> 
         }
         ControlKind::CaptureCancelled => {
             end(device_id);
+            if capture.kind == "text" && message.reason.as_deref() == Some("unsupported") {
+                text_unsupported(device_id);
+                return Outcome::Ended(Some(format!("{phone} cannot read text from a picture")));
+            }
             Outcome::Ended(reason_words(phone, message.reason.as_deref()))
         }
         // The desk is never asked for a capture.
@@ -470,6 +495,27 @@ mod tests {
             }
         );
         assert!(status("cap-a").is_none());
+    }
+
+    #[test]
+    fn a_phone_without_the_recogniser_hides_copy_text_but_not_the_rest() {
+        assert!(text_available("cap-t"));
+        // A camera that cannot open is `unsupported` too, and says nothing about text.
+        let photo = begin("cap-t", "photo", "clipboard", &build);
+        let mut no_camera = build(ControlKind::CaptureCancelled, &photo.remote_session_id, 2);
+        no_camera.reason = Some("unsupported".into());
+        handle("cap-t", "Pixel", &no_camera);
+        assert!(text_available("cap-t"));
+
+        let text = begin("cap-t", "text", "clipboard", &build);
+        let mut refused = build(ControlKind::CaptureCancelled, &text.remote_session_id, 2);
+        refused.reason = Some("unsupported".into());
+        assert_eq!(
+            handle("cap-t", "Pixel", &refused),
+            Outcome::Ended(Some("Pixel cannot read text from a picture".into()))
+        );
+        assert!(!text_available("cap-t"));
+        assert!(text_available("cap-other"));
     }
 
     #[test]
