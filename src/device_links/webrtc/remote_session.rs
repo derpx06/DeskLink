@@ -968,6 +968,11 @@ impl RemoteSession {
             ControlKind::ViewDenied | ControlKind::ScreenError => self.stop(),
             // Failing to grant *control* must not take a working view with it.
             ControlKind::ControlDenied => {
+                // A grant wins over the denial of an earlier, repeated request that
+                // arrives late: control already held stays held.
+                if self.state == SessionState::Controlling && self.lease.is_some() {
+                    return Ok(());
+                }
                 self.lease = None;
                 self.peer_input_lease = None;
                 self.control_denial = Some(
@@ -1898,6 +1903,44 @@ mod tests {
         session.accept(&turned, 1_003).unwrap();
         assert_eq!(session.phone_screen(), Some((2400, 1080)));
         assert_eq!(session.state(), SessionState::Controlling, "control stays");
+    }
+
+    /// The phone asks for control again every couple of seconds; the answer to an
+    /// earlier request (a denial) can arrive after the grant. It must not take
+    /// control away, and a denial with nothing granted still does its job.
+    #[test]
+    fn a_late_denial_does_not_undo_a_grant() {
+        let mut session = RemoteSession::new();
+        let id = Uuid::new_v4().to_string();
+        let mut request = message(ControlKind::RequestView, &id);
+        request.direction = Some(ScreenDirection::PhoneToDesktop);
+        session.accept(&request, 1_000).unwrap();
+        let mut ready = message(ControlKind::ScreenReady, &id);
+        ready.direction = Some(ScreenDirection::PhoneToDesktop);
+        session.accept(&ready, 1_001).unwrap();
+        session.begin_control().unwrap();
+        let mut denied = message(ControlKind::ControlDenied, &id);
+        denied.reason = Some("first answer".into());
+        session.accept(&denied, 1_002).unwrap();
+        assert_eq!(session.state(), SessionState::Viewing);
+        assert_eq!(session.control_denial(), Some("first answer"));
+
+        session.begin_control().unwrap();
+        let mut granted = message(ControlKind::ControlGranted, &id);
+        granted.lease_id = Some("lease".into());
+        granted.lease_expires_at = Some(31_000);
+        session.accept(&granted, 1_003).unwrap();
+        assert_eq!(session.control_denial(), None, "a grant clears the reason");
+
+        let mut late = message(ControlKind::ControlDenied, &id);
+        late.reason = Some("late answer".into());
+        session.accept(&late, 1_004).unwrap();
+        assert_eq!(session.state(), SessionState::Controlling);
+        assert_eq!(session.control_denial(), None);
+        assert!(
+            session.heartbeat_lease(1_005).is_some(),
+            "the lease survives"
+        );
     }
 
     /// Captured text counted in characters by the phone can be more bytes than
