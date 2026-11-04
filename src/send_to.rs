@@ -1,11 +1,14 @@
 //! "Send to <phone>" from Files: `desklink --send-files [--to <device>]
-//! <paths…>`, a Nautilus script per paired phone, and an Open With entry.
+//! <paths…>`, a Nautilus script per paired phone and a Dolphin service menu.
 //!
 //! The command runs before GTK starts: it asks the running DeskLink (over
 //! its own D-Bus name, the `app.send-files` action) to send the files,
-//! starting it first if it is not running. The scripts and the `.desktop`
-//! entry are written by the app itself, under the user's data dir: nothing
-//! to install. A script is removed when its phone is unpaired.
+//! starting it first if it is not running. The scripts and the service menu
+//! are written by the app itself, under the user's data dir: nothing to
+//! install. A script is removed when its phone is unpaired. DeskLink is never
+//! the default application for any file type: its "Open With" entries list
+//! only types that something else already opens, and the hijacking entries
+//! older builds wrote are removed (`refresh_open_with`).
 
 use std::path::{Path, PathBuf};
 
@@ -19,17 +22,39 @@ const APP_ID: &str = "derx06.desklink.com";
 const APP_PATH: &str = "/derx06/desklink/com";
 /// Marks a script DeskLink wrote, with the phone it is for.
 const SCRIPT_MARK: &str = "# desklink-device: ";
-const OPEN_WITH: &str = "derx06.desklink.com.SendTo.desktop";
-/// F8b: "Add to DeskLink Bucket" in Open With.
-const BUCKET_OPEN_WITH: &str = "derx06.desklink.com.Bucket.desktop";
+/// The two helper entries in `applications/`: "Send to Phone" and "Add to
+/// DeskLink Bucket" in a file's "Open With" list. Older builds wrote them with
+/// `MimeType=application/octet-stream;...`, which made DeskLink the default
+/// application for generic binary files.
+const OPEN_WITH_FILES: [&str; 2] = [
+    "derx06.desklink.com.SendTo.desktop",
+    "derx06.desklink.com.Bucket.desktop",
+];
+/// Set in every entry the current build writes; an entry of ours without it
+/// is an old, default-hijacking one.
+const OPEN_WITH_MARK: &str = "X-DeskLink-OpenWith=2";
+/// File types the entries may be offered for. Never `application/octet-stream`
+/// or a wildcard: a type is added only when something else already opens it.
+const OPEN_WITH_CANDIDATES: [&str; 15] = [
+    "image/jpeg",
+    "image/png",
+    "image/gif",
+    "image/webp",
+    "image/heic",
+    "video/mp4",
+    "video/quicktime",
+    "video/webm",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/flac",
+    "audio/x-wav",
+    "application/pdf",
+    "text/plain",
+    "application/zip",
+];
 /// The Files script that puts the chosen files in the Bucket.
 const BUCKET_SCRIPT: &str = "Add to DeskLink Bucket";
 const BUCKET_SCRIPT_MARK: &str = "# desklink-bucket";
-/// File types the Open With entry is offered for; `application/octet-stream`
-/// puts it under "Open With…" for every file.
-const MIME_TYPES: &str = "application/octet-stream;image/jpeg;image/png;image/gif;image/webp;\
-image/heic;video/mp4;video/quicktime;video/webm;audio/mpeg;audio/ogg;audio/flac;audio/x-wav;\
-application/pdf;text/plain;application/zip;";
 
 /// `--send-files` arguments: the phone (if named) and the files.
 #[derive(Debug, PartialEq, Eq)]
@@ -682,7 +707,6 @@ pub(crate) fn script(exe: &Path, device_id: &str) -> String {
     )
 }
 
-/// The Open With entry: `Exec` quoted per the Desktop Entry spec.
 /// `path` as one quoted `Exec` argument, per the Desktop Entry spec: `"`,
 /// `` ` ``, `$` and `\\` are escaped with a backslash inside the quotes, and
 /// then every backslash is doubled (string-value escaping applies first), so
@@ -709,21 +733,6 @@ pub(crate) fn bucket_script(exe: &Path) -> String {
     format!(
         "#!/bin/sh\n# Written by DeskLink.\n{BUCKET_SCRIPT_MARK}\nexec {} --bucket -- \"$@\"\n",
         shell_quote(&exe.to_string_lossy()),
-    )
-}
-
-/// "Add to DeskLink Bucket" in Open With.
-pub(crate) fn bucket_open_with_entry(exe: &Path) -> String {
-    let exe = desktop_exec_quoted(exe);
-    format!(
-        "[Desktop Entry]\nType=Application\nName=Add to DeskLink Bucket\nComment=Put files in the Bucket you share with your phone\nIcon=derx06.desklink.com\nExec={exe} --bucket %F\nTerminal=false\nNoDisplay=true\nMimeType={MIME_TYPES}\n"
-    )
-}
-
-pub(crate) fn open_with_entry(exe: &Path) -> String {
-    let exe = desktop_exec_quoted(exe);
-    format!(
-        "[Desktop Entry]\nType=Application\nName=Send to Phone\nComment=Send files to your phone with DeskLink\nIcon=derx06.desklink.com\nExec={exe} --send-files %F\nTerminal=false\nNoDisplay=true\nMimeType={MIME_TYPES}\n"
     )
 }
 
@@ -764,6 +773,174 @@ pub(crate) fn dolphin_menu(exe: &Path, phones: &[(String, String)]) -> String {
         ));
     }
     menu
+}
+
+/// Whether `text` is a helper entry DeskLink itself wrote (see
+/// `OPEN_WITH_FILES`), old or new: the header, our icon and one of our two
+/// commands.
+fn is_open_with_entry(text: &str) -> bool {
+    text.starts_with("[Desktop Entry]\n")
+        && text.lines().any(|line| line == "Icon=derx06.desklink.com")
+        && text.lines().any(|line| {
+            line.starts_with("Exec=")
+                && (line.ends_with(" --send-files %F") || line.ends_with(" --bucket %F"))
+        })
+}
+
+/// `mimeapps.list` text without DeskLink's helper entries: a line that only
+/// named them goes, a line that also names other applications keeps those.
+/// Everything else is returned byte for byte. `None` when nothing changed.
+fn strip_legacy_associations(text: &str) -> Option<String> {
+    let mut changed = false;
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        let comment = line.trim_start().starts_with('#');
+        if comment || !OPEN_WITH_FILES.iter().any(|name| line.contains(name)) {
+            out.push_str(line);
+            continue;
+        }
+        changed = true;
+        let end = &line[line.trim_end_matches(['\n', '\r']).len()..];
+        let body = &line[..line.len() - end.len()];
+        let Some((key, value)) = body.split_once('=') else {
+            continue;
+        };
+        let kept: Vec<&str> = value
+            .split(';')
+            .filter(|app| !app.is_empty() && !OPEN_WITH_FILES.contains(app))
+            .collect();
+        if !kept.is_empty() {
+            out.push_str(&format!("{key}={};{end}", kept.join(";")));
+        }
+    }
+    changed.then_some(out)
+}
+
+/// Replaces `path` (through a symlink, as dotfile managers make them) with
+/// `text`: a temporary file beside it, then a rename.
+fn rewrite_atomically(path: &Path, text: &str) -> std::io::Result<()> {
+    let target = std::fs::canonicalize(path)?;
+    let mut temp = target.clone().into_os_string();
+    temp.push(format!(".desklink-{}", std::process::id()));
+    let temp = PathBuf::from(temp);
+    std::fs::write(&temp, text)?;
+    let renamed = std::fs::metadata(&target)
+        .and_then(|meta| std::fs::set_permissions(&temp, meta.permissions()))
+        .and_then(|()| std::fs::rename(&temp, &target));
+    if renamed.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    renamed
+}
+
+/// The types of `candidates` that already have a default application other
+/// than DeskLink (`default_for_type`: the id of the default, if any).
+pub(crate) fn open_with_types(
+    candidates: &[&str],
+    default_for_type: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    candidates
+        .iter()
+        .filter(|mime| default_for_type(mime).is_some_and(|id| !id.starts_with(APP_ID)))
+        .map(|mime| mime.to_string())
+        .collect()
+}
+
+/// An "Open With" helper entry offered for `types`.
+fn open_with_helper(name: &str, comment: &str, exe: &Path, flag: &str, types: &[String]) -> String {
+    let exe = desktop_exec_quoted(exe);
+    format!(
+        "[Desktop Entry]\nType=Application\nName={name}\nComment={comment}\nIcon=derx06.desklink.com\nExec={exe} {flag} %F\nTerminal=false\nNoDisplay=true\nMimeType={};\n{OPEN_WITH_MARK}\n",
+        types.join(";")
+    )
+}
+
+/// Brings the "Open With" helper entries in step with this system, at every
+/// start: our own entries (and, once, the lines naming them in the two
+/// `mimeapps.list` files) are removed first, so they cannot answer the
+/// question of what the default is; then both entries are written for the
+/// candidate types that already have a default that is not DeskLink, and not
+/// at all when there are none. `mimeapps.list` is never written otherwise.
+/// Whether any file changed.
+pub(crate) fn refresh_open_with(
+    data_dir: &Path,
+    config_dir: &Path,
+    exe: &Path,
+    default_for_type: impl Fn(&str) -> Option<String>,
+) -> bool {
+    let applications = data_dir.join("applications");
+    let read = || -> Vec<Option<String>> {
+        OPEN_WITH_FILES
+            .iter()
+            .map(|name| {
+                std::fs::read_to_string(applications.join(name))
+                    .ok()
+                    .filter(|text| is_open_with_entry(text))
+            })
+            .collect()
+    };
+    let before = read();
+    let mut changed = false;
+    // An old entry (no mark), or none of ours at all (a user who deleted them
+    // may still have the association lines): the lines go. Entries of this
+    // build are left to the user's own choices.
+    let current = before
+        .iter()
+        .flatten()
+        .all(|text| text.contains(OPEN_WITH_MARK));
+    if !current || before.iter().all(Option::is_none) {
+        for list in [
+            config_dir.join("mimeapps.list"),
+            applications.join("mimeapps.list"),
+        ] {
+            if let Some(clean) = std::fs::read_to_string(&list)
+                .ok()
+                .and_then(|text| strip_legacy_associations(&text))
+            {
+                changed |= rewrite_atomically(&list, &clean).is_ok();
+            }
+        }
+    }
+    for (name, text) in OPEN_WITH_FILES.iter().zip(&before) {
+        if text.is_some() {
+            let _ = std::fs::remove_file(applications.join(name));
+        }
+    }
+    let types = open_with_types(&OPEN_WITH_CANDIDATES, default_for_type);
+    if !types.is_empty() {
+        let entries = [
+            open_with_helper(
+                "Send to Phone",
+                "Send files to your phone with DeskLink",
+                exe,
+                "--send-files",
+                &types,
+            ),
+            open_with_helper(
+                "Add to DeskLink Bucket",
+                "Put files in the Bucket you share with your phone",
+                exe,
+                "--bucket",
+                &types,
+            ),
+        ];
+        for (name, text) in OPEN_WITH_FILES.iter().zip(&entries) {
+            if let Err(error) = write_if_changed(&applications.join(name), text, false) {
+                eprintln!("[DeskLink] Could not add {name} to Open With: {error}");
+            }
+        }
+    }
+    changed || read() != before
+}
+
+/// Rebuilds the desktop's MIME cache for `<data>/applications`; best effort.
+fn update_desktop_database(applications: &Path) {
+    let _ = std::process::Command::new("update-desktop-database")
+        .arg(applications)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Writes `content` to `path` when it differs; `executable` sets mode 0755.
@@ -819,14 +996,13 @@ fn sync_scripts(dir: &Path, exe: &Path, phones: &[(String, String)]) -> std::io:
     Ok(())
 }
 
-/// Keeps the scripts and the Open With entry in step with the paired phones
-/// while the app runs.
-/// Whether the file-manager integration (Open With, Nautilus scripts, the
-/// Dolphin menu) is written: not from a sandbox the host cannot see into.
+/// Whether the file-manager integration (Nautilus scripts, the Dolphin menu)
+/// is written: not from a sandbox the host cannot see into.
 fn writes_host_integration(in_flatpak: bool) -> bool {
     !in_flatpak
 }
 
+/// Keeps the scripts in step with the paired phones while the app runs.
 pub fn start(app: &DesklinkApplication) {
     // Inside a Flatpak these files would land in the app's private data
     // directory, which the host's file managers never read, with an `Exec=`
@@ -838,18 +1014,18 @@ pub fn start(app: &DesklinkApplication) {
         return;
     };
     let data = glib::user_data_dir();
-    if let Err(error) = write_if_changed(
-        &data.join("applications").join(OPEN_WITH),
-        &open_with_entry(&exe),
-        false,
-    ) {
-        eprintln!("[DeskLink] Could not add \"Send to Phone\" to Open With: {error}");
-    }
-    let _ = write_if_changed(
-        &data.join("applications").join(BUCKET_OPEN_WITH),
-        &bucket_open_with_entry(&exe),
-        false,
-    );
+    // Off the UI thread: file IO, the MIME database and a child process.
+    let (open_data, open_config, open_exe) = (data.clone(), glib::user_config_dir(), exe.clone());
+    std::thread::spawn(move || {
+        let default_for_type = |mime: &str| {
+            gio::AppInfo::default_for_type(mime, false)
+                .and_then(|app| app.id())
+                .map(|id| id.to_string())
+        };
+        if refresh_open_with(&open_data, &open_config, &open_exe, default_for_type) {
+            update_desktop_database(&open_data.join("applications"));
+        }
+    });
     let scripts = data.join("nautilus").join("scripts");
     let service_menu = data.join("kio").join("servicemenus").join(SERVICE_MENU);
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
@@ -1146,19 +1322,12 @@ mod tests {
     }
 
     #[test]
-    fn the_open_with_entry_quotes_its_command() {
-        let entry = open_with_entry(Path::new("/home/me/my \"bin\"/desklink"));
-        assert!(
-            entry.contains("Exec=\"/home/me/my \\\\\"bin\\\\\"/desklink\" --send-files %F\n"),
-            "{entry}"
-        );
+    fn desktop_exec_quoting() {
         assert_eq!(
             desktop_exec_quoted(Path::new("/a\\b/$c/100%/d`e")),
             "\"/a\\\\\\\\b/\\\\$c/100%%/d\\\\`e\"",
             "a backslash is four, a dollar two plus itself, a percent doubled"
         );
-        assert!(entry.contains("MimeType=application/octet-stream;"));
-        assert!(entry.contains("NoDisplay=true"));
     }
 
     #[test]
@@ -1243,6 +1412,294 @@ mod tests {
         sync_scripts(&dir, exe, &renamed).unwrap();
         assert!(dir.join("Send to Pixel 9").exists() && !dir.join("Send to Pixel").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const OLD_BUCKET: &str = "[Desktop Entry]\nType=Application\nName=Add to DeskLink Bucket\nComment=Put files in the Bucket you share with your phone\nIcon=derx06.desklink.com\nExec=\"/home/me/.local/bin/desklink\" --bucket %F\nTerminal=false\nNoDisplay=true\nMimeType=application/octet-stream;image/jpeg;\n";
+    const OLD_SEND: &str = "[Desktop Entry]\nType=Application\nName=Send to Phone\nComment=Send files to your phone with DeskLink\nIcon=derx06.desklink.com\nExec=/usr/bin/desklink --send-files %F\nTerminal=false\nNoDisplay=true\nMimeType=application/octet-stream;image/jpeg;\n";
+    const EXE: &str = "/usr/bin/desklink";
+
+    fn fixture() -> (PathBuf, PathBuf, PathBuf) {
+        let home = std::env::temp_dir().join(format!("desklink-openwith-{}", uuid::Uuid::new_v4()));
+        let (data, config) = (home.join("share"), home.join("config"));
+        std::fs::create_dir_all(data.join("applications")).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        (home, data, config)
+    }
+
+    /// A system where only these types have a default application.
+    fn defaults(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |mime| {
+            pairs
+                .iter()
+                .find(|(m, _)| *m == mime)
+                .map(|(_, id)| id.to_string())
+        }
+    }
+
+    fn mime_line(text: &str) -> String {
+        text.lines()
+            .find(|line| line.starts_with("MimeType="))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn only_types_someone_else_already_opens_are_offered() {
+        let lookup = defaults(&[
+            ("image/png", "org.gnome.Loupe.desktop"),
+            ("application/pdf", "evince.desktop"),
+            ("text/plain", "derx06.desklink.com.SendTo.desktop"),
+            ("video/mp4", "derx06.desklink.com.desktop"),
+            ("application/octet-stream", "gedit.desktop"),
+        ]);
+        let candidates = [
+            "image/png",
+            "image/gif",
+            "text/plain",
+            "video/mp4",
+            "application/pdf",
+        ];
+        assert_eq!(
+            open_with_types(&candidates, &lookup),
+            ["image/png", "application/pdf"],
+            "no default: out; our own id: out"
+        );
+        assert!(open_with_types(&candidates, |_| None).is_empty());
+        assert!(
+            !OPEN_WITH_CANDIDATES
+                .iter()
+                .any(|mime| mime.contains('*') || *mime == "application/octet-stream"),
+            "a generic type is never a candidate, whatever its default is"
+        );
+        assert!(open_with_types(
+            &OPEN_WITH_CANDIDATES,
+            defaults(&[("application/octet-stream", "gedit.desktop")])
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn the_entries_list_only_those_types_and_say_they_are_current() {
+        let (home, data, config) = fixture();
+        let lookup = defaults(&[
+            ("image/png", "loupe.desktop"),
+            ("application/pdf", "evince.desktop"),
+        ]);
+        assert!(refresh_open_with(&data, &config, Path::new(EXE), &lookup));
+        let apps = data.join("applications");
+        let send = std::fs::read_to_string(apps.join(OPEN_WITH_FILES[0])).unwrap();
+        let bucket = std::fs::read_to_string(apps.join(OPEN_WITH_FILES[1])).unwrap();
+        for entry in [&send, &bucket] {
+            assert_eq!(mime_line(entry), "MimeType=image/png;application/pdf;");
+            assert!(entry.contains(OPEN_WITH_MARK) && entry.contains("NoDisplay=true"));
+            assert!(is_open_with_entry(entry));
+        }
+        assert!(send.contains("Exec=\"/usr/bin/desklink\" --send-files %F\n"));
+        assert!(bucket.contains("Exec=\"/usr/bin/desklink\" --bucket %F\n"));
+        // Idempotent.
+        assert!(!refresh_open_with(&data, &config, Path::new(EXE), &lookup));
+        // A type loses its default: it drops out at the next start.
+        let fewer = defaults(&[("image/png", "loupe.desktop")]);
+        assert!(refresh_open_with(&data, &config, Path::new(EXE), &fewer));
+        let send = std::fs::read_to_string(apps.join(OPEN_WITH_FILES[0])).unwrap();
+        assert_eq!(mime_line(&send), "MimeType=image/png;");
+        // Nothing has a default: no handler file at all.
+        assert!(refresh_open_with(&data, &config, Path::new(EXE), |_| None));
+        assert!(!apps.join(OPEN_WITH_FILES[0]).exists() && !apps.join(OPEN_WITH_FILES[1]).exists());
+        assert!(!refresh_open_with(&data, &config, Path::new(EXE), |_| None));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Our own entries must not decide what the default is: the lookup runs
+    /// after they are removed.
+    #[test]
+    fn the_lookup_does_not_see_our_own_entries() {
+        let (home, data, config) = fixture();
+        let apps = data.join("applications");
+        std::fs::write(apps.join(OPEN_WITH_FILES[0]), OLD_SEND).unwrap();
+        let seen = std::cell::Cell::new(false);
+        refresh_open_with(&data, &config, Path::new(EXE), |_| {
+            seen.set(seen.get() || apps.join(OPEN_WITH_FILES[0]).exists());
+            None
+        });
+        assert!(!seen.get());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The owner's machine: the old files go, the mimeapps lines naming them
+    /// go, and nothing else moves; the new entries do not include the type
+    /// that had no other default.
+    #[test]
+    fn the_old_entries_and_their_associations_are_replaced_and_nothing_else_moves() {
+        let (home, data, config) = fixture();
+        let apps = data.join("applications");
+        std::fs::write(apps.join(OPEN_WITH_FILES[1]), OLD_BUCKET).unwrap();
+        std::fs::write(apps.join(OPEN_WITH_FILES[0]), OLD_SEND).unwrap();
+        let user_entry = "[Desktop Entry]\nType=Application\nName=Mine\nExec=mine %F\n";
+        std::fs::write(apps.join("derx06.desklink.com.desktop"), user_entry).unwrap();
+        std::fs::write(apps.join("other.desktop"), user_entry).unwrap();
+        let before = "# keep me\r\n[Default Applications]\napplication/octet-stream=derx06.desklink.com.Bucket.desktop;\ntext/plain=gedit.desktop;derx06.desklink.com.SendTo.desktop;\n\n[Added Associations]\nimage/png=derx06.desklink.com.SendTo.desktop\nimage/jpeg=eog.desktop\n# derx06.desklink.com.Bucket.desktop=stays\naudio/ogg=vlc.desktop";
+        let after = "# keep me\r\n[Default Applications]\ntext/plain=gedit.desktop;\n\n[Added Associations]\nimage/jpeg=eog.desktop\n# derx06.desklink.com.Bucket.desktop=stays\naudio/ogg=vlc.desktop";
+        std::fs::write(config.join("mimeapps.list"), before).unwrap();
+        std::fs::write(apps.join("mimeapps.list"), before).unwrap();
+
+        let lookup = defaults(&[
+            ("image/jpeg", "eog.desktop"),
+            ("text/plain", "gedit.desktop"),
+        ]);
+        assert!(refresh_open_with(&data, &config, Path::new(EXE), &lookup));
+        for list in [config.join("mimeapps.list"), apps.join("mimeapps.list")] {
+            assert_eq!(std::fs::read_to_string(list).unwrap(), after);
+        }
+        for name in OPEN_WITH_FILES {
+            let text = std::fs::read_to_string(apps.join(name)).unwrap();
+            assert_eq!(mime_line(&text), "MimeType=image/jpeg;text/plain;");
+            assert!(!text.contains("octet-stream"));
+        }
+        for kept in ["derx06.desklink.com.desktop", "other.desktop"] {
+            assert_eq!(
+                std::fs::read_to_string(apps.join(kept)).unwrap(),
+                user_entry
+            );
+        }
+        // Idempotent, and now that the entries are this build's the user's
+        // own choices in mimeapps.list are not touched.
+        let chosen = format!(
+            "{after}\n[Default Applications]\nimage/png=derx06.desklink.com.SendTo.desktop\n"
+        );
+        std::fs::write(config.join("mimeapps.list"), &chosen).unwrap();
+        assert!(!refresh_open_with(&data, &config, Path::new(EXE), &lookup));
+        assert_eq!(
+            std::fs::read_to_string(config.join("mimeapps.list")).unwrap(),
+            chosen
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// With no entry of ours on disk the lines naming them go too, so a
+    /// re-created file cannot inherit an old default.
+    #[test]
+    fn stale_associations_go_even_when_the_files_are_gone() {
+        let (home, data, config) = fixture();
+        std::fs::write(
+            config.join("mimeapps.list"),
+            "[Default Applications]\napplication/octet-stream=derx06.desklink.com.Bucket.desktop\nx/y=z.desktop\n",
+        )
+        .unwrap();
+        assert!(refresh_open_with(&data, &config, Path::new(EXE), |_| None));
+        assert_eq!(
+            std::fs::read_to_string(config.join("mimeapps.list")).unwrap(),
+            "[Default Applications]\nx/y=z.desktop\n"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A file with our name that is not what we wrote is the user's.
+    #[test]
+    fn a_modified_file_with_our_name_is_left_alone() {
+        let (home, data, config) = fixture();
+        let path = data.join("applications").join(OPEN_WITH_FILES[1]);
+        let theirs = "[Desktop Entry]\nType=Application\nName=Bucket\nExec=my-script %F\n";
+        std::fs::write(&path, theirs).unwrap();
+        let _ = refresh_open_with(&data, &config, Path::new(EXE), |_| None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), theirs);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A `mimeapps.list` kept in a dotfiles repo is a symlink: the target is
+    /// rewritten, the link stays.
+    #[test]
+    fn a_mimeapps_symlink_stays_a_symlink() {
+        let (home, data, config) = fixture();
+        let target = home.join("dotfiles-mimeapps.list");
+        std::fs::write(
+            &target,
+            "[Default Applications]\na/b=derx06.desklink.com.SendTo.desktop;\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target, config.join("mimeapps.list")).unwrap();
+        assert!(refresh_open_with(&data, &config, Path::new(EXE), |_| None));
+        assert!(std::fs::symlink_metadata(config.join("mimeapps.list"))
+            .unwrap()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "[Default Applications]\n"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// DeskLink must never be the default application for a file type. The
+    /// only `MimeType=` it may carry: its own launcher takes `tel:` links; the
+    /// "Open With" helpers list candidate types that already have another
+    /// default (never a generic one); the Dolphin service menu (in
+    /// `kio/servicemenus`: it has no `Exec`, is no application, is never put
+    /// in the MIME cache and is no handler).
+    #[test]
+    fn nothing_desklink_writes_or_ships_makes_it_the_default_for_a_file_type() {
+        fn mime_lines(text: &str) -> Vec<String> {
+            text.lines()
+                .filter(|line| line.trim_start().starts_with("MimeType"))
+                .map(str::to_string)
+                .collect()
+        }
+        let exe = Path::new(EXE);
+        let menu = dolphin_menu(exe, &[("p1".into(), "Pixel".into())]);
+        assert_eq!(mime_lines(&menu), ["MimeType=application/octet-stream;"]);
+        assert!(
+            menu.starts_with("[Desktop Entry]\nType=Service\n"),
+            "not an Application"
+        );
+        let main_group = menu.split("\n[Desktop Action").next().unwrap();
+        assert!(
+            !main_group.contains("\nExec=") && !main_group.contains("\nTryExec="),
+            "no handler command of its own"
+        );
+        for written in [
+            crate::autostart::entry(EXE),
+            crate::kde::RUNNER.to_string(),
+            script(exe, "p1"),
+            bucket_script(exe),
+        ] {
+            assert!(mime_lines(&written).is_empty(), "{written}");
+        }
+        // The helpers, for every candidate: nothing generic, ever.
+        let all: Vec<String> = OPEN_WITH_CANDIDATES.iter().map(|m| m.to_string()).collect();
+        let helper = open_with_helper("n", "c", exe, "--bucket", &all);
+        let line = mime_line(&helper);
+        assert!(!line.contains("octet-stream") && !line.contains('*') && !line.contains("inode/"));
+        // Every shipped file: only the launcher's `tel:` scheme.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut found = Vec::new();
+        let mut folders = vec![
+            root.join("data"),
+            root.join("packaging"),
+            root.join("flatpak"),
+        ];
+        while let Some(dir) = folders.pop() {
+            for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    folders.push(path);
+                } else if let Ok(text) = std::fs::read_to_string(&path) {
+                    for line in mime_lines(&text) {
+                        found.push((
+                            path.file_name().unwrap().to_string_lossy().to_string(),
+                            line,
+                        ));
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            found,
+            [(
+                "derx06.desklink.com.desktop.in".to_string(),
+                "MimeType=x-scheme-handler/tel;".to_string()
+            )]
+        );
+        assert!(is_open_with_entry(OLD_BUCKET) && is_open_with_entry(OLD_SEND));
+        assert!(!OLD_SEND.contains(OPEN_WITH_MARK));
     }
 
     /// A sandbox writes no host file-manager integration.

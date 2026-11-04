@@ -29,7 +29,7 @@ fn entry_path() -> Option<PathBuf> {
 /// path: a bare name would be searched on the login manager's `PATH`, which
 /// often lacks `~/.local/bin`, and systemd's autostart generator drops an
 /// entry whose `TryExec` it cannot find.
-fn entry(executable: &str) -> String {
+pub(crate) fn entry(executable: &str) -> String {
     // The `Exec` path is quoted (an AppImage's mount point or a home folder
     // can hold spaces). `TryExec` makes every desktop skip the entry once the
     // program is gone, so an uninstall leaves no broken autostart behind; it
