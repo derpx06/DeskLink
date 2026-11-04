@@ -162,9 +162,9 @@ def g_ink(cols, rows):
         lines = body + text + wrapped + box(["> " + "type here " * 3, "? for shortcuts"])
         if prev:
             o.append(CSI + "2K" + (CSI + "1A" + CSI + "2K") * (prev - 1) + "\r")
-        o.append("\n".join(lines))
+        o.append("\r\n".join(lines))
         prev = len(lines)
-    o.append("\n")
+    o.append("\r\n")
     return "".join(o).encode()
 
 
