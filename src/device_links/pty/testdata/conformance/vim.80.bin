@@ -1,0 +1,27 @@
+[?1049h[22;0;0t[>4;2m[?1h=[?2004h[?1004h[1;30r[?12h[?12l[22;2t[22;1t[27m[23m[29m[m[H[2J[?25l[30;1H"/tmp/dlconf-files-pk0428t4/app.py" 42L, 1044B[2;1H▽[6n[2;1H  [3;1HPzz\[0%m[6n[3;1H           [1;1H[>c]10;?]11;?[27m[23m[29m[m[H[2J[1;1H[93m  1 [m[38;5;81mimport[m os
+[93m  2 
+  3 [m[93mdef[m [1m[96mgreet[m(name: [1m[96mstr[m) -> [1m[96mstr[m:
+[93m  4 [m    [95m"""Say hello."""[m
+[93m  5 [m    [96m# a long comment line that is certainly longer than forty columns wide aa[m[6;1H[93m    [m[96mnd wraps in vim[m
+[93m  6 [m    [93mreturn[m [95mf"hello, [m[38;5;224m{[mname[38;5;224m}[m[95m!"[m  [96m# trailing[m
+[93m  7 
+  8 [m[93mclass[m [38;5;121mThing[m:
+[93m  9 [m    [93mdef[m [1m[96m__init__[m([1m[96mself[m, value=[95m42[m):
+[93m 10 [m[8C[1m[96mself[m.value = value
+[93m 11 
+ 12 
+ 13 [m[93mif[m __name__ == [95m"__main__"[m:
+[93m 14 [m    [1m[96mprint[m(greet(os.environ.get([95m"USER"[m, [95m"world"[m)))
+[93m 15 [m[38;5;81mimport[m os
+[93m 16 
+ 17 [m[93mdef[m [1m[96mgreet[m(name: [1m[96mstr[m) -> [1m[96mstr[m:
+[93m 18 [m    [95m"""Say hello."""[m
+[93m 19 [m    [96m# a long comment line that is certainly longer than forty columns wide aa[m[21;1H[93m    [m[96mnd wraps in vim[m
+[93m 20 [m    [93mreturn[m [95mf"hello, [m[38;5;224m{[mname[38;5;224m}[m[95m!"[m  [96m# trailing[m
+[93m 21 
+ 22 [m[93mclass[m [38;5;121mThing[m:
+[93m 23 [m    [93mdef[m [1m[96m__init__[m([1m[96mself[m, value=[95m42[m):
+[93m 24 [m[8C[1m[96mself[m.value = value
+[93m 25 
+ 26 
+ 27 [m[93mif[m __name__ == [95m"__main__"[m:[30;63H1,1[11CTop[?25h[1;5H[?4m[?25l[30;53H~@k[1;5H[30;53H   [1;5H[?25h[?25l[30;53H^F[1;5H[30;53H  [1;5H[27m[23m[29m[m[1;1H[93m 26 [m[1;5H[K[2;1H[93m 27 [m[93mif[m __name__ == [95m"__main__"[m:[2;31H[K[3;1H[93m 28 [m    [1m[96mprint[m(greet(os.environ.get([95m"USER"[m, [95m"world"[m)))[3;54H[K[4;1H[93m 29 [m[38;5;81mimport[m os[4;14H[K[5;1H[93m 30 [m[5;5H[K[6;1H[93m 31 [m[93mdef[m [1m[96mgreet[m(name: [1m[96mstr[m) -> [1m[96mstr[m:[6;33H[K[7;1H[93m 32 [m    [95m"""Say hello."""[m[7;25H[K[8;1H[93m 33 [m    [96m# a long comment line that is certainly longer than forty columns wide aa[m[9;1H[93m    [m[96mnd wraps in vim[m[9;20H[K[10;1H[93m 34 [m    [93mreturn[m [95mf"hello, [m[38;5;224m{[mname[38;5;224m}[m[95m!"[m  [96m# trailing[m[10;45H[K[11;1H[93m 35 [m[11;5H[K[12;1H[93m 36 [m[93mclass[m [38;5;121mThing[m:[12;17H[K[13;1H[93m 37 [m    [93mdef[m [1m[96m__init__[m([1m[96mself[m, value=[95m42[m):[13;38H[K[14;1H[93m 38 [m        [1m[96mself[m.value = value[14;31H[K[15;1H[93m 39 [m[15;5H[K[16;1H[93m 40 [m[16;5H[K[17;1H[93m 41 [m[93mif[m __name__ == [95m"__main__"[m:[17;31H[K[18;1H[93m 42 [m    [1m[96mprint[m(greet(os.environ.get([95m"USER"[m, [95m"world"[m)))[18;54H[K[19;1H[94m~                                                                               [20;1H~                                                                               [21;1H~                                                                               [22;1H~                                                                               [23;1H~                                                                               [24;1H~                                                                               [25;1H~                                                                               [26;1H~                                                                               [27;1H~                                                                               [28;1H~                                                                               [29;1H~                                                                               [m[30;1H[K[30;63H26,0-1[8CBot[?25h[1;5H[?25l[30;63H[K[30;1H/hello[62C32,12[9CBot[?25h[7;16H[?25l[30;1H[K[30;1H:q![?2004l[>4;m[23;2t[23;1t[30;1H[K[30;1H[?1004l[?2004l[?1l>[?1049l[23;0;0t[?25h[>4;m

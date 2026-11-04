@@ -4,6 +4,8 @@
 //! the reader thread drains the PTY whether or not a client is attached, so a
 //! build keeps building while the phone is in a pocket.
 
+#[cfg(test)]
+mod conformance;
 pub(crate) mod desk;
 pub(crate) mod host;
 pub(crate) mod jobs;

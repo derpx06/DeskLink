@@ -159,6 +159,13 @@ pub(crate) struct PtySession {
     /// sets the size: a phone's keyboard or layout changing kept squeezing the
     /// desk window to the phone's shape.
     desk_windows: AtomicU64,
+    /// The phone that holds an explicit claim on the size (it created the
+    /// session, or the person tapped "Phone size"). While it does, a desk
+    /// window shows the program top-left instead of setting the size, until
+    /// the desk takes it back by being resized or typed in.
+    phone_claim: Mutex<Option<String>>,
+    /// The last size a desk window reported, to go back to when the claim ends.
+    desk_size: Mutex<Option<(u16, u16)>>,
     /// When it was started, for the desk's terminal details.
     started: std::time::SystemTime,
 }
@@ -289,6 +296,8 @@ impl PtySession {
             exited_seen: OnceLock::new(),
             size: Mutex::new((rows, cols)),
             desk_windows: AtomicU64::new(0),
+            phone_claim: Mutex::new(None),
+            desk_size: Mutex::new(None),
             started: std::time::SystemTime::now(),
         };
         spawn_reader(reader, output, head, eof);
@@ -337,12 +346,68 @@ impl PtySession {
     }
 
     pub(crate) fn desk_window_closed(&self) {
-        self.desk_windows.fetch_sub(1, Ordering::AcqRel);
+        // The last window going away ends any claim: nothing is left to squeeze.
+        if self.desk_windows.fetch_sub(1, Ordering::AcqRel) == 1 {
+            *self.phone_claim.lock().expect("phone claim lock") = None;
+            *self.desk_size.lock().expect("desk size lock") = None;
+        }
     }
 
-    /// Whether a desk window owns the size; a phone then views it scaled.
-    pub(crate) fn desk_sets_size(&self) -> bool {
+    /// Whether a terminal window at the desk shows this session. That window's
+    /// terminal answers the program's queries, so the phone must not.
+    pub(crate) fn has_desk_window(&self) -> bool {
         self.desk_windows.load(Ordering::Acquire) > 0
+    }
+
+    /// Whether a desk window owns the size; a phone then views it as it is.
+    pub(crate) fn desk_sets_size(&self) -> bool {
+        self.has_desk_window() && !self.phone_sets_size()
+    }
+
+    /// Whether a phone holds the size claim.
+    pub(crate) fn phone_sets_size(&self) -> bool {
+        self.phone_claim.lock().expect("phone claim lock").is_some()
+    }
+
+    /// `device_id` takes the size and sets it to `rows` x `cols`.
+    pub(crate) fn claim_for_phone(
+        &self,
+        device_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(), String> {
+        *self.phone_claim.lock().expect("phone claim lock") = Some(device_id.to_string());
+        self.resize(rows, cols)
+    }
+
+    /// Ends `device_id`'s claim (it let go, detached or went away) and puts a
+    /// desk window back to the size it last reported.
+    pub(crate) fn release_phone_claim(&self, device_id: &str) {
+        {
+            let mut claim = self.phone_claim.lock().expect("phone claim lock");
+            if claim.as_deref() != Some(device_id) {
+                return;
+            }
+            *claim = None;
+        }
+        let desk = *self.desk_size.lock().expect("desk size lock");
+        if let Some((rows, cols)) = desk.filter(|_| self.has_desk_window()) {
+            let _ = self.resize(rows, cols);
+        }
+    }
+
+    /// A desk window attached or was resized. It sets the size unless a phone
+    /// holds the claim; `typed` is the person acting at the desk, which takes
+    /// the claim back.
+    pub(crate) fn desk_window_size(&self, rows: u16, cols: u16, acted: bool) {
+        let (rows, cols) = clamp_size(rows, cols);
+        *self.desk_size.lock().expect("desk size lock") = Some((rows, cols));
+        if acted {
+            *self.phone_claim.lock().expect("phone claim lock") = None;
+        }
+        if !self.phone_sets_size() && self.size() != (rows, cols) {
+            let _ = self.resize(rows, cols);
+        }
     }
 
     pub(crate) fn size(&self) -> (u16, u16) {
@@ -411,17 +476,16 @@ impl PtySession {
     /// Nudges full-screen programs into repainting after a snapshot.
     ///
     /// The snapshot carries only what `vt100` models; images, hyperlinks and
-    /// exotic underlines are not in it. One round-trip through a different
-    /// geometry makes `vim`/`htop`/`tmux` redraw from their own state, which
-    /// covers the gap for nothing more than two ioctls.
+    /// exotic underlines are not in it. `SIGWINCH` to the foreground process
+    /// group makes `vim`/`htop`/`tmux`/Ink/Ratatui redraw from their own state
+    /// - and, unlike the width round trip this replaced, never lets a program
+    /// draw a frame one column wider than the client's screen (every line of
+    /// which wrapped, and Ink's relative erase then hit the wrong rows).
     pub(crate) fn nudge_redraw(&self) {
-        let (rows, cols) = self.size();
-        let widened = cols.saturating_add(1).min(MAX_DIMENSION);
-        if widened == cols {
-            return;
+        if let Some(pgrp) = self.foreground_pgrp().filter(|pgrp| *pgrp > 1) {
+            // SAFETY: killpg only sends a signal.
+            unsafe { libc::killpg(pgrp, libc::SIGWINCH) };
         }
-        let _ = self.resize(rows, widened);
-        let _ = self.resize(rows, cols);
     }
 
     /// One past the last output byte, without taking the output lock.
@@ -710,7 +774,66 @@ fn restricted(mut command: CommandBuilder) -> CommandBuilder {
     }
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
+    let var = |name: &str| command.get_env(name).map(|v| v.to_string_lossy().into_owned());
+    let fix = utf8_fix(var("LC_ALL"), var("LC_CTYPE"), var("LANG"));
+    if let Some((name, value)) = fix {
+        command.env(name, value);
+    }
     command
+}
+
+/// The UTF-8 locale a session needs. Box drawing, wide characters and every
+/// program that honours the locale (readline, less, vim, tmux) are wrong in a
+/// `C`/POSIX or Latin-1 one, and a DeskLink started by D-Bus or systemd may have
+/// no `LANG` at all. `None` when the inherited locale already is UTF-8.
+fn utf8_fix(
+    lc_all: Option<String>,
+    lc_ctype: Option<String>,
+    lang: Option<String>,
+) -> Option<(&'static str, &'static str)> {
+    const FIX: &str = "C.UTF-8";
+    let utf8 = |v: &str| {
+        let v = v.to_ascii_lowercase();
+        v.contains("utf-8") || v.contains("utf8")
+    };
+    let set = |v: &Option<String>| v.as_deref().filter(|v| !v.is_empty()).map(str::to_owned);
+    if let Some(all) = set(&lc_all) {
+        return (!utf8(&all)).then_some(("LC_ALL", FIX));
+    }
+    if let Some(ctype) = set(&lc_ctype) {
+        return (!utf8(&ctype)).then_some(("LC_CTYPE", FIX));
+    }
+    match set(&lang) {
+        Some(lang) if utf8(&lang) => None,
+        // `en_IN` and friends are UTF-8 in glibc without saying so, but only
+        // the name tells: ask the C library what the locale really is.
+        Some(lang) if locale_is_utf8(&lang) => None,
+        _ => Some(("LANG", FIX)),
+    }
+}
+
+/// Whether glibc's locale `name` uses UTF-8 (it can be installed without
+/// `.UTF-8` in its name).
+fn locale_is_utf8(name: &str) -> bool {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return false;
+    };
+    // `newlocale` does not touch the process locale, so this is thread safe.
+    unsafe {
+        let loc = libc::newlocale(libc::LC_CTYPE_MASK, name.as_ptr(), std::ptr::null_mut());
+        if loc.is_null() {
+            return false;
+        }
+        let old = libc::uselocale(loc);
+        let codeset = libc::nl_langinfo(libc::CODESET);
+        let utf8 = !codeset.is_null()
+            && std::ffi::CStr::from_ptr(codeset)
+                .to_bytes()
+                .eq_ignore_ascii_case(b"UTF-8");
+        libc::uselocale(old);
+        libc::freelocale(loc);
+        utf8
+    }
 }
 
 fn clamp_size(rows: u16, cols: u16) -> (u16, u16) {
@@ -938,6 +1061,55 @@ mod tests {
         assert!(screen.contains("color=[truecolor]"), "{screen}");
         let home = std::env::var("HOME").unwrap();
         assert!(screen.contains(&format!("pwd=[{home}]")), "{screen}");
+        session.close();
+    }
+
+    #[test]
+    fn a_session_always_gets_a_utf8_locale() {
+        let some = |v: &str| Some(v.to_string());
+        // Nothing set (D-Bus or systemd activation): fix it.
+        assert_eq!(utf8_fix(None, None, None), Some(("LANG", "C.UTF-8")));
+        assert_eq!(utf8_fix(None, None, some("")), Some(("LANG", "C.UTF-8")));
+        assert_eq!(utf8_fix(None, None, some("C")), Some(("LANG", "C.UTF-8")));
+        assert_eq!(utf8_fix(None, None, some("POSIX")), Some(("LANG", "C.UTF-8")));
+        assert_eq!(utf8_fix(None, None, some("en_GB.ISO-8859-1")), Some(("LANG", "C.UTF-8")));
+        // Already UTF-8: leave the person's locale alone.
+        assert_eq!(utf8_fix(None, None, some("en_GB.UTF-8")), None);
+        assert_eq!(utf8_fix(None, None, some("de_DE.utf8")), None);
+        assert_eq!(utf8_fix(None, some("en_US.UTF-8"), some("C")), None);
+        // LC_ALL beats everything, so that is what must be replaced.
+        assert_eq!(utf8_fix(some("C"), None, some("en_GB.UTF-8")), Some(("LC_ALL", "C.UTF-8")));
+        assert_eq!(utf8_fix(some("en_GB.UTF-8"), some("C"), some("C")), None);
+        assert_eq!(utf8_fix(None, some("C"), some("en_GB.UTF-8")), Some(("LC_CTYPE", "C.UTF-8")));
+    }
+
+    #[test]
+    fn the_shell_environment_is_utf8_even_when_the_parent_is_not() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "printf 'cs=[%s]' \"$(locale charmap)\"; sleep 5"]);
+        std::env::set_var("LC_ALL", "C");
+        let session = PtySession::spawn(Some(command), 24, 80).expect("spawn locale probe");
+        std::env::remove_var("LC_ALL");
+        assert!(wait_for_contents(&session, "cs=["), "no output");
+        let screen = session.output.lock().unwrap().parser.screen().contents();
+        assert!(screen.contains("cs=[UTF-8]"), "{screen}");
+        session.close();
+    }
+
+    /// The redraw nudge must not change the size: a program that drew one
+    /// column too wide for the phone's screen wrapped every line of the frame.
+    #[test]
+    fn nudging_a_redraw_keeps_the_size_and_wakes_the_program() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args([
+            "-c",
+            "trap 'echo winch=$(stty size)' WINCH; echo ready; while :; do sleep 0.1; done",
+        ]);
+        let session = PtySession::spawn(Some(command), 24, 80).expect("spawn winch probe");
+        assert!(wait_for_contents(&session, "ready"), "shell never started");
+        session.nudge_redraw();
+        assert!(wait_for_contents(&session, "winch=24 80"), "no SIGWINCH");
+        assert_eq!(session.size(), (24, 80));
         session.close();
     }
 

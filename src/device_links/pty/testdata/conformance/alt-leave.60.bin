@@ -1,0 +1,3 @@
+before
+[?1049h[2J[Halt screen
+[5;5Hmoved[?1049lafter

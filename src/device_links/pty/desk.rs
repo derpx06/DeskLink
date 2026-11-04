@@ -220,12 +220,14 @@ fn serve(stream: UnixStream) -> Result<(), String> {
         .map_err(|_| "terminal registry lock poisoned")?
         .get(&id)
         .ok_or("no such DeskLink terminal")?;
-    // A desk window sets the size while it is open; the phone shows it
-    // scaled. With several, the last one to attach, resize or type wins.
-    let mut desk_size = (rows, cols);
-    let _ = session.resize(rows, cols);
+    // A desk window sets the size while it is open, unless the phone that made
+    // the session (or the person, on the phone) claimed it: then the window
+    // shows the program top-left until the desk is resized or typed in. With
+    // several windows, the last one to resize or type wins.
+    let mut desk_size = Some((rows, cols));
     session.touch();
     session.desk_window_opened();
+    session.desk_window_size(rows, cols, false);
     struct Closed<'a>(&'a PtySession);
     impl Drop for Closed<'_> {
         fn drop(&mut self) {
@@ -252,8 +254,9 @@ fn serve(stream: UnixStream) -> Result<(), String> {
         match read_frame(&mut reader) {
             Ok((INPUT, bytes)) => {
                 session.touch();
-                if session.size() != desk_size {
-                    let _ = session.resize(desk_size.0, desk_size.1);
+                // Typing at the desk takes the size back from the phone.
+                if let Some((rows, cols)) = desk_size {
+                    session.desk_window_size(rows, cols, true);
                 }
                 if session.write_input(&bytes).is_err() {
                     break;
@@ -262,8 +265,8 @@ fn serve(stream: UnixStream) -> Result<(), String> {
             Ok((RESIZE, payload)) if payload.len() == 4 => {
                 let rows = u16::from_be_bytes([payload[0], payload[1]]);
                 let cols = u16::from_be_bytes([payload[2], payload[3]]);
-                desk_size = (rows.clamp(1, 1000), cols.clamp(1, 1000));
-                let _ = session.resize(desk_size.0, desk_size.1);
+                desk_size = Some((rows.clamp(1, 1000), cols.clamp(1, 1000)));
+                session.desk_window_size(rows, cols, true);
             }
             Ok(_) => {}
             Err(_) => break,

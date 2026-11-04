@@ -1,0 +1,14 @@
+ascii abc
+日本語のテキスト
+한국어 텍스트
+emoji 😀 👍 🎉 end
+zwj 👨‍👩‍👧 end
+combining é é ä end
+ambig ±×÷ ○● end
+box ┌─┬─┐ ├─┼─┤ └─┴─┘ ╔═╗ ║ ╚═╝ ╭─╮ ╰─╯
+block ▀▄█▌▐ ░▒▓ ▁▂▃▄▅▆▇█
+braille ⠀⠁⠂⠃⡇⣿
+spin ✻ ✽ ✳ ⏺ ⎿ ❯ ● ○ ✓ ✗
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx日本
+yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy日本
+zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzw
