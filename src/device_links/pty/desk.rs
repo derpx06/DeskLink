@@ -797,6 +797,48 @@ mod tests {
         assert!(!session.desk_sets_size(), "the desk window count falls");
     }
 
+    /// The phone that made a session keeps its size when the desk window opens
+    /// for it; the first thing typed at the desk takes the size back.
+    #[test]
+    fn a_window_opening_over_a_phones_claim_leaves_its_size_until_typed_in() {
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let info = super::super::registry::registry()
+            .lock()
+            .unwrap()
+            .create(Some(command), 24, 80, "desk-test")
+            .expect("quiet session");
+        let session = super::super::registry::registry()
+            .lock()
+            .unwrap()
+            .get(&info.id)
+            .unwrap();
+        session.claim_for_phone("phone-1", 30, 50).unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn(move || serve(server));
+        client
+            .write_all(format!("ATTACH {} 40 120\n", info.id).as_bytes())
+            .unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !session.has_desk_window() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(session.has_desk_window());
+        assert_eq!(session.size(), (30, 50), "the window did not squeeze it");
+        assert!(!session.desk_sets_size() && session.phone_sets_size());
+
+        client.write_all(&encode(INPUT, b"x")).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while session.phone_sets_size() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(session.size(), (40, 120), "typing at the desk took it back");
+        assert!(session.desk_sets_size());
+        drop(client);
+        let _ = served.join();
+        assert!(!session.has_desk_window());
+    }
+
     #[test]
     fn an_attach_line_that_never_ends_is_cut_not_buffered() {
         let (client, server) = UnixStream::pair().unwrap();
