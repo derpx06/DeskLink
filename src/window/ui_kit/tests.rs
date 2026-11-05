@@ -407,3 +407,53 @@ fn progress_goes_green_at_the_end_and_the_sheet_builds() {
         assert!(sheet.child().is_some());
     });
 }
+
+#[test]
+fn a_banner_has_a_kind_a_role_and_words_for_screen_readers() {
+    use banner::{banner, empty_state, live_banner, spoken, BannerKind};
+    let mut seen = std::collections::HashSet::new();
+    for kind in BannerKind::ALL {
+        assert!(seen.insert(kind.class()), "one class per kind");
+    }
+    assert_eq!(BannerKind::Error.role(), gtk::AccessibleRole::Alert);
+    assert_eq!(BannerKind::Info.role(), gtk::AccessibleRole::Status);
+    assert_eq!(spoken("Can't reach Pixel 9", None), "Can't reach Pixel 9");
+    assert_eq!(spoken("A", Some("b")), "A. b");
+    assert_eq!(spoken("A", Some("")), "A");
+    with_kit(|| {
+        let one = banner(
+            BannerKind::Warn,
+            "desklink-warning-symbolic",
+            "Pixel 9 wants to pair",
+            Some("Check the code."),
+        );
+        assert!(one.root.has_css_class("dl-banner") && one.root.has_css_class("warn"));
+        assert_eq!(one.root.widget_name(), "responsive", "stacks when narrow");
+        one.set_text("Done", None);
+        assert_eq!(one.title.label(), "Done");
+        assert!(!one.detail.is_visible());
+
+        // A live banner always has its End.
+        let ended = std::rc::Rc::new(std::cell::Cell::new(false));
+        let sink = ended.clone();
+        let live = live_banner(
+            "desklink-mobile-screen-share-symbolic",
+            "Pixel 9 is using this computer",
+            None,
+            "End",
+            move |_| sink.set(true),
+        );
+        let end = live
+            .actions
+            .first_child()
+            .and_downcast::<gtk::Button>()
+            .expect("an End button");
+        assert_eq!(end.label().as_deref(), Some("End"));
+        end.emit_clicked();
+        assert!(ended.get());
+
+        let empty = empty_state("desklink-folder-symbolic", "No files yet", "Send some.");
+        assert!(empty.has_css_class("dl-empty"));
+        assert_eq!(empty.observe_children().n_items(), 3);
+    });
+}

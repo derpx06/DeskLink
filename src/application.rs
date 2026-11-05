@@ -117,6 +117,10 @@ mod imp {
             obj.set_accels_for_action("app.preferences", &["<control>comma"]);
             obj.set_accels_for_action("app.history", &["<control>h"]);
             obj.set_accels_for_action("win.pair-new", &["<control>n"]);
+            obj.set_accels_for_action("win.send-files", &["<control>o"]);
+            for (page, accel) in crate::window::PAGE_ACCELS {
+                obj.set_accels_for_action(&format!("win.show-page('{page}')"), &[accel]);
+            }
             obj.set_accels_for_action("win.toggle-search", &["<control>f"]);
             obj.set_accels_for_action("window.close", &["<control>w"]);
         }
@@ -972,12 +976,15 @@ impl DesklinkApplication {
             .css_classes(["boxed-list"])
             .build();
         for (title, shortcut) in [
-            ("Pair New Device", "Ctrl+N"),
-            ("Search Terminals", "Ctrl+F"),
-            ("Connection History", "Ctrl+H"),
+            ("Home, Files, Notes & clipboard", "Ctrl+1 to 3"),
+            ("Notifications, Terminals, Contacts", "Ctrl+4 to 6"),
+            ("Pair another phone", "Ctrl+N"),
+            ("Send files", "Ctrl+O"),
+            ("Search terminals", "Ctrl+F"),
+            ("Connection history", "Ctrl+H"),
             ("Settings", "Ctrl+,"),
-            ("Show Shortcuts", "Ctrl+?"),
-            ("Close Window", "Ctrl+W"),
+            ("Keyboard shortcuts", "Ctrl+?"),
+            ("Close window", "Ctrl+W"),
             ("Quit", "Ctrl+Q"),
         ] {
             let row = adw::ActionRow::builder().title(title).build();
@@ -998,7 +1005,7 @@ impl DesklinkApplication {
             .margin_end(12)
             .build();
         adw::Dialog::builder()
-            .title("Keyboard Shortcuts")
+            .title("Keyboard shortcuts")
             .content_width(420)
             .child(&with_header(&content))
             .build()
@@ -1008,23 +1015,26 @@ impl DesklinkApplication {
 
 /// The palette, light and dark: (name, light, dark), from the DeskLink design
 /// (`dl` / `dd`). libadwaita's own colours come first, then DeskLink's tokens
-/// used by `style.css`.
+/// used by `style.css`. The neutrals (window, header bar, sidebar, cards,
+/// popovers, dialogs) are the UI kit's `dl_bg`, `dl_sidebar` and `dl_surface`
+/// (`UI-REDESIGN.md` 2.1), so a window not redesigned yet sits on the same
+/// greys as one that is.
 const PALETTE: &[(&str, &str, &str)] = &[
-    ("window_bg_color", "#f7f7f5", "#1c1c1f"),
+    ("window_bg_color", "#f7f7f4", "#131315"),
     ("window_fg_color", "#18181b", "#f2f2f3"),
-    ("view_bg_color", "#ffffff", "#26262a"),
+    ("view_bg_color", "#ffffff", "#1b1b1e"),
     ("view_fg_color", "#18181b", "#f2f2f3"),
-    ("card_bg_color", "#ffffff", "#26262a"),
+    ("card_bg_color", "#ffffff", "#1b1b1e"),
     ("card_fg_color", "#18181b", "#f2f2f3"),
-    ("headerbar_bg_color", "#f7f7f5", "#1c1c1f"),
+    ("headerbar_bg_color", "#f7f7f4", "#131315"),
     ("headerbar_fg_color", "#18181b", "#f2f2f3"),
-    ("headerbar_backdrop_color", "#f7f7f5", "#1c1c1f"),
-    ("sidebar_bg_color", "#f0f0ed", "#232326"),
+    ("headerbar_backdrop_color", "#f7f7f4", "#131315"),
+    ("sidebar_bg_color", "#efefeb", "#17171a"),
     ("sidebar_fg_color", "#18181b", "#f2f2f3"),
-    ("sidebar_backdrop_color", "#f0f0ed", "#232326"),
-    ("popover_bg_color", "#ffffff", "#26262a"),
+    ("sidebar_backdrop_color", "#efefeb", "#17171a"),
+    ("popover_bg_color", "#ffffff", "#1b1b1e"),
     ("popover_fg_color", "#18181b", "#f2f2f3"),
-    ("dialog_bg_color", "#ffffff", "#26262a"),
+    ("dialog_bg_color", "#ffffff", "#1b1b1e"),
     ("dialog_fg_color", "#18181b", "#f2f2f3"),
     ("accent_bg_color", "#3b63e6", "#7c95ff"),
     ("accent_fg_color", "#ffffff", "#0d0e10"),

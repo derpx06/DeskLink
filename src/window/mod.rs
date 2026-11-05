@@ -58,20 +58,32 @@ use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::device_links::features::FeatureRegistry;
 use crate::device_links::webrtc::transfer_board::{Finished, Outcome};
 
-/// The pages, in sidebar order: (name, title, icon). The last two are the
-/// sidebar's footer.
+/// The pages, in sidebar order: (name, title, icon). The last is the
+/// sidebar's footer. Frequent pages cluster at the top; Contacts, which is
+/// read-only and rare, comes after Terminals (`UI-REDESIGN.md` 3.9).
 const PAGES: &[(&str, &str, &str)] = &[
-    ("home", "Home", "user-home-symbolic"),
-    ("files", "Files", "folder-symbolic"),
-    ("notes", "Notes & Clipboard", "document-edit-symbolic"),
+    ("home", "Home", "desklink-home-symbolic"),
+    ("files", "Files", "desklink-folder-symbolic"),
+    ("notes", "Notes & clipboard", "desklink-edit-note-symbolic"),
     (
         "notifications",
         "Notifications",
-        "preferences-system-notifications-symbolic",
+        "desklink-notifications-symbolic",
     ),
-    ("contacts", "Contacts", "x-office-address-book-symbolic"),
-    ("terminals", "Terminals", "utilities-terminal-symbolic"),
-    ("settings", "Settings", "emblem-system-symbolic"),
+    ("terminals", "Terminals", "desklink-terminal-symbolic"),
+    ("contacts", "Contacts", "desklink-person-symbolic"),
+    ("settings", "Settings", "desklink-settings-symbolic"),
+];
+
+/// Ctrl+1 to Ctrl+6 open the main pages in sidebar order (`win.show-page`);
+/// Settings is Ctrl+, (`app.preferences`). Shown in the shortcuts dialog.
+pub(crate) const PAGE_ACCELS: [(&str, &str); 6] = [
+    ("home", "<control>1"),
+    ("files", "<control>2"),
+    ("notes", "<control>3"),
+    ("notifications", "<control>4"),
+    ("terminals", "<control>5"),
+    ("contacts", "<control>6"),
 ];
 
 /// How many of [`PAGES`] are in the sidebar's main list; Settings is the
@@ -106,6 +118,8 @@ mod imp {
         pub split_view: TemplateChild<adw::NavigationSplitView>,
         #[template_child]
         pub content_page: TemplateChild<adw::NavigationPage>,
+        #[template_child]
+        pub drop_hint: TemplateChild<gtk::Label>,
         #[template_child]
         pub device_card: TemplateChild<gtk::MenuButton>,
         #[template_child]
@@ -234,6 +248,7 @@ mod imp {
             }
 
             self.sidebar.replace(Some(sidebar::Sidebar::new(&obj)));
+            sidebar::install_window_drop(&obj);
             for (name, _, _) in PAGES {
                 let child: gtk::Widget = match *name {
                     "terminals" => {
@@ -393,6 +408,34 @@ mod imp {
                                 eprintln!("[UI] Could not start a terminal in {folder}: {error}");
                                 window.show_feature_toast("Could not start a terminal there");
                             }
+                        }
+                    })
+                    .build(),
+                // Ctrl+O: choose files and send them to the selected phone.
+                gio::ActionEntry::builder("send-files")
+                    .activate(|window: &super::DesklinkWindow, _, _| {
+                        let (Some(daemon), Some(id)) = (window.daemon(), window.selected_id())
+                        else {
+                            return;
+                        };
+                        let device = window
+                            .known_devices(&daemon)
+                            .into_iter()
+                            .find(|device| device.id == id);
+                        match device {
+                            Some(device)
+                                if device.trusted
+                                    && can_send_feature(
+                                        &device,
+                                        crate::device_links::packet::PACKET_TYPE_SHARE_REQUEST,
+                                    ) =>
+                            {
+                                match unavailable_reason(&device) {
+                                    Some(reason) => window.show_feature_toast(&reason),
+                                    None => pick_and_send_files(&daemon, &id, window),
+                                }
+                            }
+                            _ => window.show_feature_toast("Pair a phone to send files"),
                         }
                     })
                     .build(),
@@ -863,13 +906,13 @@ impl DesklinkWindow {
                     device_id,
                     device_name,
                 } => {
-                    // The scan is done: leave "Pair New Device" for the phone
+                    // The scan is done: leave "Pair another phone" for the phone
                     // it just paired. The page renders later in this refresh.
                     let mut was_pairing = false;
                     if let Some(dialog) = self.visible_dialog() {
                         if matches!(
                             dialog.title().as_str(),
-                            "Pair New Device" | "Pair with a Code"
+                            pairing::PAIR_TITLE | pairing::PAIR_CODE_TITLE
                         ) {
                             dialog.close();
                             was_pairing = true;
@@ -2225,23 +2268,6 @@ pub(crate) fn device_type_label(device_type: &str) -> String {
     device_kind(device_type).1.to_string()
 }
 
-/// How a device's reachability reads, and the CSS class that goes with it.
-///
-/// The sidebar, the switcher and every page derive it from here, so they
-/// cannot disagree about whether a device is connected.
-fn device_status_presentation(device: &DeviceView) -> (&'static str, &'static str) {
-    match &device.status {
-        // Reachable over the bootstrap link but still negotiating the encrypted
-        // feature transport. Calling it plain "Connected" hid a stuck handover.
-        DeviceStatus::Paired if !device.feature_transport_ready => ("Connecting…", "connecting"),
-        DeviceStatus::Paired => ("Connected", "connected"),
-        DeviceStatus::Unreachable => ("Offline", "offline"),
-        DeviceStatus::PairRequestedByPeer => ("Wants to pair", "attention"),
-        DeviceStatus::PairRequested => ("Waiting…", "connecting"),
-        other => (other.label(), "neutral"),
-    }
-}
-
 /// "482913" → "482 913": two groups read aloud and compare more easily.
 fn spaced_code(code: &str) -> String {
     let digits: Vec<char> = code.chars().collect();
@@ -2518,12 +2544,36 @@ fn accept_dropped_files(
     target: &impl IsA<gtk::Widget>,
     resolve: impl Fn() -> Option<(DaemonHandle, String)> + 'static,
 ) {
+    accept_dropped_files_hover(target, resolve, |_| {});
+}
+
+/// [`accept_dropped_files`], and `hover(true)` while files are dragged over
+/// `target` and a phone can take them, `hover(false)` when they leave or drop.
+fn accept_dropped_files_hover(
+    target: &impl IsA<gtk::Widget>,
+    resolve: impl Fn() -> Option<(DaemonHandle, String)> + 'static,
+    hover: impl Fn(bool) + 'static,
+) {
     let drop = gtk::DropTarget::new(
         gtk::gdk::FileList::static_type(),
         gtk::gdk::DragAction::COPY,
     );
+    let resolve = std::rc::Rc::new(resolve);
+    let hover = std::rc::Rc::new(hover);
+    {
+        let (resolve, hover) = (resolve.clone(), hover.clone());
+        drop.connect_enter(move |_, _, _| {
+            hover(resolve().is_some());
+            gtk::gdk::DragAction::COPY
+        });
+    }
+    {
+        let hover = hover.clone();
+        drop.connect_leave(move |_| hover(false));
+    }
     let widget = target.as_ref().downgrade();
     drop.connect_drop(move |_, value, _, _| {
+        hover(false);
         let Ok(files) = value.get::<gtk::gdk::FileList>() else {
             return false;
         };
@@ -2567,7 +2617,7 @@ fn accept_dropped_files(
 ///   beside it as `<stem>-<title>.png`.
 /// - `fake-device KIND[:TYPE] NAME`: shows a made-up device (`paired`,
 ///   `paired-turn`, `connecting`, `unreachable`, `pair-request`, `requested`,
-///   `discovered`; TYPE `phone`, `tablet`, `tv`, `laptop`, `desktop`);
+///   `discovered`, `refused`; TYPE `phone`, `tablet`, `tv`, `laptop`, `desktop`);
 ///   `fake-clear` removes them.
 /// - `ui-kit [W H]`: the UI kit's component sheet in its own window.
 /// - `page NAME`, `select N` (the Nth fake device), `open-terminal N`,
@@ -3154,6 +3204,8 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             _ => adw::ColorScheme::Default,
         }),
         "open-pair" => win.show_discovery_dialog(true),
+        // "fake-error TEXT": a daemon error, as the banner shows it.
+        "fake-error" => win.report_error(&format!("{id} {arg}").trim().replace('_', " "), false),
         "open-codes" => win.show_discovery_dialog(false),
         // "fake-transfer NAME DONE/TOTAL": a transfer row.
         "fake-transfer" => {
@@ -3437,6 +3489,12 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
             device.trusted = false;
             device.status = DeviceStatus::Discovered;
         }
+        // A request that was refused: nearby again, with the reason.
+        "refused" => {
+            device.trusted = false;
+            device.status = DeviceStatus::Discovered;
+            device.last_error = Some("Pairing request was rejected".to_string());
+        }
         "connecting" => device.status = DeviceStatus::Paired,
         _ => {
             device.status = DeviceStatus::Paired;
@@ -3661,26 +3719,21 @@ mod tests {
 
     /// The page used to render a hardcoded green "● Connected" for every
     /// paired device, so an unreachable phone read as connected right next to
-    /// a sidebar row that said otherwise. Both now derive from this function.
+    /// a sidebar row that said otherwise. Both now derive from `Presentation`.
     #[test]
     fn status_presentation_never_reports_an_unreachable_device_as_connected() {
+        use crate::link_glyph::Presentation;
         let mut device = phone();
         device.status = DeviceStatus::Unreachable;
-        assert_eq!(device_status_presentation(&device), ("Offline", "offline"));
+        assert_eq!(Presentation::of(&device).word, "Can't reach");
 
         // Paired but the WebRTC handover has not finished.
         device.status = DeviceStatus::Paired;
         device.feature_transport_ready = false;
-        assert_eq!(
-            device_status_presentation(&device),
-            ("Connecting…", "connecting")
-        );
+        assert_eq!(Presentation::of(&device).word, "Connecting…");
 
         device.feature_transport_ready = true;
-        assert_eq!(
-            device_status_presentation(&device),
-            ("Connected", "connected")
-        );
+        assert_eq!(Presentation::of(&device).word, "Connected");
     }
 
     /// Every action on an offline or connecting phone says why it is
@@ -3834,9 +3887,8 @@ mod tests {
         }
     }
 
-    /// The sidebar, top to bottom: Home, Files, Notes & Clipboard,
-    /// Notifications, Contacts, Terminals, then the Settings footer. The
-    /// phone's navigation uses the same names in the same order.
+    /// The sidebar, top to bottom: Home, Files, Notes & clipboard,
+    /// Notifications, Terminals, Contacts, then the Settings footer.
     #[test]
     fn the_sidebar_lists_the_six_pages_then_settings() {
         let titles: Vec<_> = PAGES.iter().map(|(_, title, _)| *title).collect();
@@ -3845,16 +3897,47 @@ mod tests {
             [
                 "Home",
                 "Files",
-                "Notes & Clipboard",
+                "Notes & clipboard",
                 "Notifications",
-                "Contacts",
                 "Terminals",
+                "Contacts",
                 "Settings"
             ]
         );
         let names: Vec<_> = PAGES.iter().map(|(name, _, _)| *name).collect();
         assert_eq!(&names[MAIN_PAGES..], ["settings"]);
         assert_eq!(MAIN_PAGES, 6);
+    }
+
+    /// Ctrl+1 to Ctrl+6 open the six pages in sidebar order, Settings keeps
+    /// Ctrl+, and the dialog that lists them says the same keys.
+    #[test]
+    fn the_page_shortcuts_follow_the_sidebar_and_the_dialog_lists_them() {
+        let names: Vec<_> = PAGES.iter().take(MAIN_PAGES).map(|(name, _, _)| *name).collect();
+        let bound: Vec<_> = PAGE_ACCELS.iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, bound);
+        let mut seen = std::collections::HashSet::new();
+        let dialog = include_str!("../shortcuts-dialog.ui");
+        for (index, (_, accel)) in PAGE_ACCELS.iter().enumerate() {
+            assert_eq!(*accel, format!("<control>{}", index + 1));
+            assert!(seen.insert(*accel), "{accel} twice");
+            assert!(
+                dialog.contains(&format!("&lt;Control&gt;{}<", index + 1)),
+                "the dialog lists Ctrl+{}",
+                index + 1
+            );
+        }
+        for words in ["Send files", "&lt;Control&gt;o", "&lt;Control&gt;comma", "Pair another phone"] {
+            assert!(dialog.contains(words), "{words}");
+        }
+        // Sentence case in the dialog, as everywhere.
+        assert!(!dialog.contains("Pair New Device") && !dialog.contains("Close Window"));
+    }
+
+    #[test]
+    fn the_drop_words_name_the_phone() {
+        assert_eq!(sidebar::drop_words("Pixel 9"), "Drop to send to Pixel 9");
+        assert_eq!(sidebar::drop_words(""), "Drop to send");
     }
 
     /// The tabs of Notes & Clipboard are addressed by name, every other name

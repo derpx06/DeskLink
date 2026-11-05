@@ -5,10 +5,15 @@
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 
+use super::ui_kit::banner::{banner, BannerKind};
+use super::ui_kit::{
+    button, card as kit_card, icon_square as kit_icon_square, icon_button as kit_icon_button,
+    status_pill, tile, ButtonKind, TileKind, Tone,
+};
 use super::{
-    can_send_feature, card, clock_time, confirm, device_type_label, ellipsized, icon_button,
-    icon_square, named_widgets, page_link, pick_and_send_files, session_summary, text, toast_from,
-    unavailable_reason, wrapped, DesklinkWindow, QuickAction,
+    can_send_feature, clock_time, confirm, device_type_label, ellipsized, named_widgets,
+    pick_and_send_files, session_summary, text, toast_from, unavailable_reason, wrapped,
+    DesklinkWindow, QuickAction,
 };
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::{DesktopSession, DeviceStatus, DeviceView};
@@ -18,7 +23,7 @@ use crate::device_links::packet::{
 };
 use crate::device_links::webrtc::terminal_bridge::attached_devices;
 use crate::device_links::webrtc::transfer_board::TransferRow;
-use crate::link_glyph::{battery_ring, link_glyph, presence_dot, LinkState};
+use crate::link_glyph::{battery_ring, presence_dot, LinkState, Presentation};
 
 pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &DeviceView) {
     let imp = win.imp();
@@ -69,9 +74,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     }
     let page = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(20)
-        .margin_top(10)
-        .margin_bottom(28)
+        .spacing(16)
+        .margin_top(8)
+        .margin_bottom(32)
         .css_classes(["overview-page"])
         .build();
     if device.trusted {
@@ -87,15 +92,15 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         if let Some(capture) = super::insert::bar(daemon, device) {
             page.append(&capture);
         }
+        if let Some(summary) = session_summary(device) {
+            page.append(&live_strip(daemon, device, &summary, since.as_deref()));
+        }
         page.append(&hero(daemon, device, &minute));
         if let Some(card) = activity_card(device, &settings) {
             page.append(&card);
         }
         if let Some(bar) = now_playing_bar(daemon, device) {
             page.append(&bar);
-        }
-        if let Some(summary) = session_summary(device) {
-            page.append(&live_banner(daemon, device, &summary, since.as_deref()));
         }
         match device.status {
             DeviceStatus::Unreachable => page.append(&offline_row(daemon, device)),
@@ -104,15 +109,19 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
             }
             _ => {}
         }
-        page.append(&columns(win, daemon, device));
+        page.append(&tiles(daemon, device));
+        page.append(&columns(daemon, device));
+        page.append(&terminals_card(win, device));
     } else if device.status == DeviceStatus::PairRequestedByPeer {
         page.append(&super::pairing::pair_request_view(daemon, device));
+    } else if device.status == DeviceStatus::PairRequested {
+        page.append(&super::pairing::pair_waiting_view(daemon, device));
     } else {
-        page.append(&super::pairing::pair_waiting_view(device));
+        page.append(&super::pairing::pair_idle_view(daemon, device));
     }
     let clamp = adw::Clamp::builder()
-        .maximum_size(1120)
-        .tightening_threshold(960)
+        .maximum_size(944)
+        .tightening_threshold(800)
         .child(&page)
         .build();
     win.replace_body("home", &clamp);
@@ -159,15 +168,7 @@ fn activity_card(
     if items.is_empty() {
         return None;
     }
-    let card = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(10)
-        .css_classes(["dl-card"])
-        .build();
-    card.append(&wrapped(
-        &format!("Happening on {}", device.name),
-        &["heading"],
-    ));
+    let card = kit_card(Some(&format!("Happening on {}", device.name)));
     for (index, item) in items.into_iter().enumerate() {
         let row = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -195,7 +196,7 @@ fn activity_card(
             row.append(&ellipsized(&detail, &["caption", "text-dim"]));
         }
         if item.progress >= 0 {
-            let bar = gtk::ProgressBar::builder().css_classes(["thin"]).build();
+            let bar = super::ui_kit::progress(0.0);
             bar.set_widget_name(&format!("activity-bar:{index}"));
             row.append(&bar);
         }
@@ -296,18 +297,18 @@ fn charging_words(remaining_ms: Option<i64>) -> String {
 }
 
 /// The hero: the phone, its name, how it is connected, its battery, and
-/// what can be done to it.
+/// the two things most people came to do: send files, send the clipboard.
 fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
     let band = gtk::Box::builder()
-        .spacing(26)
+        .spacing(24)
         .css_classes(["hero-band"])
         .build();
     band.set_widget_name("responsive");
 
     let phone = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .width_request(62)
-        .height_request(118)
+        .width_request(56)
+        .height_request(96)
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
         .css_classes(["phone-art"])
@@ -323,7 +324,7 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
     phone.append(
         &gtk::Label::builder()
             .label(time)
-            .margin_top(22)
+            .margin_top(18)
             .css_classes(["phone-time"])
             .name("hero-clock")
             .build(),
@@ -332,21 +333,28 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
 
     let info = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
+        .spacing(8)
         .hexpand(true)
         .valign(gtk::Align::Center)
         .build();
-    let name = text(&device.name, &["hero-name"]);
-    name.set_wrap(true);
-    name.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    info.append(&name);
-    let state = LinkState::of(device);
+    info.append(&hero_name(&device.name));
+    // The pill and its detail. The round trip changes every reading and is
+    // set in place (`show_round_trip`), so it is not part of the detail.
+    let steady = DeviceView {
+        rtt_ms: None,
+        ..device.clone()
+    };
+    let words = Presentation::of(&steady);
     let link = gtk::Box::builder().spacing(10).build();
-    link.append(&link_glyph(state, state.label(device)));
-    link.append(&text(state.label(device), &["text-dim", "hero-meta"]));
-    let rtt = text("", &["mono", "text-faint", "hero-meta"]);
+    link.append(&status_pill(words.status, words.word));
+    let detail = text(&words.detail, &["dl-secondary"]);
+    detail.set_wrap(true);
+    detail.set_valign(gtk::Align::Center);
+    link.append(&detail);
+    let rtt = text("", &["dl-mono", "dl-caption"]);
     rtt.set_widget_name("hero-rtt");
     rtt.set_tooltip_text(Some("Round trip to the phone"));
+    rtt.set_valign(gtk::Align::Center);
     rtt.set_visible(false);
     link.append(&rtt);
     info.append(&link);
@@ -378,7 +386,7 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
     }
     if let Some(error) = &device.last_error {
         let (words, details) = super::hero_error_words(error);
-        let label = text(&words, &["caption", "error"]);
+        let label = text(&words, &["dl-secondary", "error"]);
         label.set_wrap(true);
         info.append(&label);
         // The system's own words, one click away (selectable, for a bug report).
@@ -393,7 +401,7 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         }
         // The ladder gave up: this is what acts on "Try again".
         if crate::device_links::webrtc::coordinator::is_unavailable(error) {
-            let retry = icon_button("view-refresh-symbolic", "Try Again", &["soft-button"]);
+            let retry = button(ButtonKind::Tonal, "Try again", Some("desklink-refresh-symbolic"));
             retry.set_widget_name("hero-reconnect");
             retry.set_halign(gtk::Align::Start);
             let (daemon, id) = (daemon.clone(), device.id.clone());
@@ -403,113 +411,334 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
     }
     band.append(&info);
 
+    // One primary and one tonal button, stacked; under the name when narrow.
     let actions = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(14)
+        .spacing(8)
         .halign(gtk::Align::End)
         .valign(gtk::Align::Center)
         .build();
     actions.set_widget_name("hero-actions");
     let reason = unavailable_reason(device);
-    // ONE row of primary actions, wrapping when the page is narrow: Show
-    // Phone Screen, Send Files, Ring, Lock, Type, Insert, Sound, and the
-    // overflow menu (Ping, Send link, Send clipboard).
-    let kind = device_type_label(&device.device_type);
-    let row = wrap_row(4, 8);
-    row.set_widget_name("hero-wrap");
-    row.set_homogeneous(true);
-    if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
-        let name = format!("Show {kind} Screen");
-        let show = round_action("video-display-symbolic", "Screen", &name);
+    if can_send_feature(device, PACKET_TYPE_SHARE_REQUEST) {
+        let send = button(
+            ButtonKind::Primary,
+            "Send files…",
+            Some("desklink-upload-file-symbolic"),
+        );
+        send.set_tooltip_text(Some(&format!("Send files to {} (Ctrl+O)", device.name)));
         let (daemon, id) = (daemon.clone(), device.id.clone());
-        show.connect_clicked(move |button| {
+        send.connect_clicked(move |button| pick_and_send_files(&daemon, &id, button));
+        disable_with(&send, reason.as_deref());
+        actions.append(&send);
+    }
+    if can_send_feature(device, crate::device_links::packet::PACKET_TYPE_CLIPBOARD) {
+        let clipboard = button(
+            ButtonKind::Tonal,
+            "Send clipboard",
+            Some("desklink-content-paste-symbolic"),
+        );
+        clipboard.connect_clicked(move |button| {
+            if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {
+                window.quick_action(QuickAction::Clipboard);
+            }
+        });
+        disable_with(&clipboard, reason.as_deref());
+        actions.append(&clipboard);
+    }
+    band.append(&actions);
+    band
+}
+
+/// The phone's name, at most two lines, then an ellipsis with the whole name
+/// as its tooltip and its accessible label.
+fn hero_name(name: &str) -> gtk::Label {
+    let label = text(name, &["dl-hero"]);
+    label.set_wrap(true);
+    label.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    label.set_lines(2);
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_accessible_role(gtk::AccessibleRole::Heading);
+    label.update_property(&[
+        gtk::accessible::Property::Label(name),
+        gtk::accessible::Property::Level(1),
+    ]);
+    super::tooltip_when_cut(&label);
+    label
+}
+
+/// Why a tile cannot be used now, in one or two words: its hint line says
+/// it (the whole reason is its tooltip).
+fn tile_reason(device: &DeviceView) -> Option<&'static str> {
+    match device.status {
+        DeviceStatus::Paired if device.feature_transport_ready => None,
+        DeviceStatus::Paired => Some("Connecting…"),
+        _ => Some("Can't reach"),
+    }
+}
+
+/// Where the tile row gets fewer columns: below 840 px it has three, below
+/// 560 two, so there is never an orphan tile on a line of its own.
+const TILE_STEPS: [(i32, u32); 2] = [(840, 3), (560, 2)];
+
+/// How many tiles a row of `width` px holds.
+fn tile_columns(width: i32) -> u32 {
+    let mut columns = 6;
+    for (below, fewer) in TILE_STEPS {
+        if width < below {
+            columns = fewer;
+        }
+    }
+    columns
+}
+
+/// A tile that cannot be used: greyed, its hint the reason, its tooltip the
+/// whole reason.
+fn disable_tile(tile: &gtk::Button, device: &DeviceView) {
+    if let (Some(short), Some(whole)) = (tile_reason(device), unavailable_reason(device)) {
+        tile.set_sensitive(false);
+        tile.set_tooltip_text(Some(&whole));
+        if let Some(hint) = named_widgets(tile.upcast_ref(), "")
+            .into_iter()
+            .find(|w| w.has_css_class("dl-tile-hint"))
+            .and_downcast::<gtk::Label>()
+        {
+            hint.set_label(short);
+        }
+        tile.update_property(&[gtk::accessible::Property::Description(&whole)]);
+    }
+}
+
+/// The six quick actions: Phone screen, Insert, Sound, Ring phone, Hand off
+/// and More. A row of six, three by two, or two by three, by the page's width.
+fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> adw::BreakpointBin {
+    let kind = device_type_label(&device.device_type);
+    let flow = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .homogeneous(true)
+        .min_children_per_line(2)
+        .max_children_per_line(tile_columns(1000))
+        .column_spacing(12)
+        .row_spacing(12)
+        .build();
+    flow.set_widget_name("tile-row");
+    let add = |tile: &gtk::Button| {
+        tile.set_hexpand(true);
+        flow.append(tile);
+        if let Some(cell) = tile.parent() {
+            cell.set_focusable(false);
+        }
+    };
+    if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
+        let screen = tile(
+            "desklink-mobile-screen-share-symbolic",
+            &format!("{kind} screen"),
+            Some("See and control it"),
+            TileKind::Normal,
+        );
+        screen.set_tooltip_text(Some(&format!("Show {kind} Screen")));
+        let (screen_daemon, id) = (daemon.clone(), device.id.clone());
+        screen.connect_clicked(move |button| {
             if let Some(root) = button.root().and_downcast::<gtk::Window>() {
                 crate::remote_control::show_remote_control_dialog(
-                    daemon.clone(),
+                    screen_daemon.clone(),
                     id.clone(),
                     &root,
                 );
             }
         });
-        disable_with(&show, reason.as_deref());
-        add_wrapped(&row, &show);
+        disable_tile(&screen, device);
+        add(&screen);
+
+        let insert = tile(
+            "desklink-photo-camera-symbolic",
+            "Insert",
+            Some("Photo, scan, text"),
+            TileKind::Normal,
+        );
+        insert.set_tooltip_text(Some(&format!(
+            "Insert from {}: a photo, a scan, text or a QR code",
+            device.name
+        )));
+        super::insert::attach_menu(daemon, device, &insert);
+        disable_tile(&insert, device);
+        add(&insert);
+
+        // Sound both ways (F1): its two switches in a popover.
+        let on = device.sound.is_some();
+        let sound = tile(
+            "desklink-volume-up-symbolic",
+            "Sound",
+            Some(if on { "On" } else { "Phone to here" }),
+            if on { TileKind::On } else { TileKind::Normal },
+        );
+        sound.set_tooltip_text(Some(&format!("Sound with {}", device.name)));
+        super::sound::attach_menu(daemon, device, &sound);
+        disable_tile(&sound, device);
+        add(&sound);
     }
-    if can_send_feature(device, PACKET_TYPE_SHARE_REQUEST) {
-        let send = round_action("document-send-symbolic", "Files", "Send Files…");
-        send.add_css_class("primary");
-        let (daemon, id) = (daemon.clone(), device.id.clone());
-        send.connect_clicked(move |button| pick_and_send_files(&daemon, &id, button));
-        disable_with(&send, reason.as_deref());
-        add_wrapped(&row, &send);
-    }
-    for (packet, icon, label, accessible, action) in [
-        (
-            PACKET_TYPE_FINDMYPHONE_REQUEST,
-            "desklink-ring-symbolic",
-            "Ring",
-            format!("Ring {kind}"),
-            QuickAction::Ring,
-        ),
-        (
-            PACKET_TYPE_LOCK_REQUEST,
-            "system-lock-screen-symbolic",
-            "Lock",
-            format!("Lock {kind}"),
-            QuickAction::Lock,
-        ),
-    ] {
-        if !can_send_feature(device, packet) {
-            continue;
-        }
-        let button = round_action(icon, label, &accessible);
-        button.connect_clicked(move |button| {
+    if can_send_feature(device, PACKET_TYPE_FINDMYPHONE_REQUEST) {
+        let ring = tile(
+            "desklink-ring-volume-symbolic",
+            &format!("Ring {}", kind.to_lowercase()),
+            Some("Find it"),
+            TileKind::Normal,
+        );
+        ring.set_tooltip_text(Some(&format!("Ring {kind}")));
+        ring.connect_clicked(|button| {
             if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {
-                window.quick_action(action);
+                window.quick_action(QuickAction::Ring);
             }
         });
-        disable_with(&button, reason.as_deref());
-        add_wrapped(&row, &button);
+        disable_tile(&ring, device);
+        add(&ring);
     }
-    // Insert from the phone (F3): a photo, scan, text or QR code, here.
-    if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
-        let insert = round_action(
-            "camera-photo-symbolic",
-            "Insert",
-            &format!(
-                "Insert from {}: a photo, a scan, text or a QR code",
-                device.name
-            ),
-        );
-        super::insert::attach_menu(daemon, device, &insert);
-        disable_with(&insert, reason.as_deref());
-        add_wrapped(&row, &insert);
-        // Sound both ways (F1): its two switches in a popover.
-        let sound = round_action(
-            "audio-speakers-symbolic",
-            "Sound",
-            &format!("Sound with {}", device.name),
-        );
-        if device.sound.is_some() {
-            sound.add_css_class("on");
+    // Walk away: lock here, carry on from the phone, in the newest terminal.
+    let open_terminal = crate::terminal_previews::sessions()
+        .iter()
+        .any(|info| info.exit_status.is_none());
+    let hand_off = tile(
+        "desklink-lock-symbolic",
+        "Hand off",
+        Some(if open_terminal {
+            "Continue on phone"
+        } else {
+            "Needs a terminal"
+        }),
+        TileKind::Normal,
+    );
+    hand_off.set_tooltip_text(Some(&format!(
+        "Lock this computer and open the newest terminal on {}",
+        device.name
+    )));
+    hand_off.set_action_name(Some("app.lock-hand-off"));
+    if device.feature_transport_ready && open_terminal {
+        // Enabled.
+    } else if device.feature_transport_ready {
+        hand_off.set_sensitive(false);
+    } else {
+        disable_tile(&hand_off, device);
+    }
+    add(&hand_off);
+    if let Some(more) = more_tile(daemon, device) {
+        add(&more);
+    }
+
+    let bin = adw::BreakpointBin::builder()
+        .width_request(280)
+        .height_request(1)
+        .child(&flow)
+        .build();
+    for (below, columns) in TILE_STEPS {
+        if let Ok(condition) = adw::BreakpointCondition::parse(&format!("max-width: {}sp", below - 1)) {
+            let breakpoint = adw::Breakpoint::new(condition);
+            breakpoint.add_setter(&flow, "max-children-per-line", Some(&columns.to_value()));
+            bin.add_breakpoint(breakpoint);
         }
-        super::sound::attach_menu(daemon, device, &sound);
-        disable_with(&sound, reason.as_deref());
-        add_wrapped(&row, &sound);
     }
-    if let Some(more) = overflow_menu(daemon, device, reason.as_deref()) {
-        add_wrapped(&row, &more);
+    bin
+}
+
+/// "More": Lock phone, Send a nudge, Send a link. A popover of rows, each an
+/// icon square, a title and a hint. `None` when the phone takes none.
+fn more_tile(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Button> {
+    type Run = Box<dyn Fn(&gtk::Widget)>;
+    let kind = device_type_label(&device.device_type);
+    let mut items: Vec<(&str, String, &str, Run)> = Vec::new();
+    if can_send_feature(device, PACKET_TYPE_LOCK_REQUEST) {
+        items.push((
+            "desklink-lock-symbolic",
+            format!("Lock {}", kind.to_lowercase()),
+            "Lock its screen",
+            Box::new(|anchor: &gtk::Widget| {
+                if let Some(window) = anchor.root().and_downcast::<DesklinkWindow>() {
+                    window.quick_action(QuickAction::Lock);
+                }
+            }),
+        ));
     }
-    // One row when the page has room for them all.
-    let mut count = 0;
-    let mut cell = row.first_child();
-    while let Some(next) = cell {
-        count += 1;
-        cell = next.next_sibling();
+    if can_send_feature(device, PACKET_TYPE_PING) {
+        items.push((
+            "desklink-vibration-symbolic",
+            "Send a nudge".to_string(),
+            "A quiet notification",
+            Box::new(|anchor: &gtk::Widget| {
+                if let Some(window) = anchor.root().and_downcast::<DesklinkWindow>() {
+                    window.quick_action(QuickAction::Ping);
+                }
+            }),
+        ));
     }
-    row.set_max_children_per_line(count.max(4));
-    actions.append(&row);
-    band.append(&actions);
-    band
+    if can_send_feature(device, PACKET_TYPE_SHARE_REQUEST) {
+        let (daemon, id, name) = (daemon.clone(), device.id.clone(), device.name.clone());
+        items.push((
+            "desklink-link-symbolic",
+            "Send a link…".to_string(),
+            "Opens on the phone",
+            Box::new(move |anchor: &gtk::Widget| {
+                show_send_link_dialog(daemon.clone(), id.clone(), &name, anchor)
+            }),
+        ));
+    }
+    if items.is_empty() {
+        return None;
+    }
+    let more = tile(
+        "desklink-more-vert-symbolic",
+        "More",
+        Some("Lock, nudge, link"),
+        TileKind::Normal,
+    );
+    more.update_property(&[gtk::accessible::Property::Label(&format!(
+        "More actions for {}: lock, nudge, send a link",
+        device.name
+    ))]);
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["dl-row-group"])
+        .build();
+    let runs: Vec<Run> = items
+        .into_iter()
+        .map(|(icon, title, hint, run)| {
+            let row = super::ui_kit::list_row(icon, Tone::Neutral, &title, Some(hint));
+            row.set_activatable(true);
+            row.set_sensitive(device.feature_transport_ready);
+            list.append(&row);
+            run
+        })
+        .collect();
+    let popover = gtk::Popover::builder()
+        .child(&list)
+        .css_classes(["more-popover"])
+        .build();
+    popover.set_parent(&more);
+    more.connect_destroy({
+        let popover = popover.clone();
+        move |_| popover.unparent()
+    });
+    let weak = popover.downgrade();
+    // Weakly: the tile owns the popover, which owns this closure.
+    let anchor = more.downgrade();
+    list.connect_row_activated(move |_, row| {
+        if let Some(popover) = weak.upgrade() {
+            popover.popdown();
+        }
+        let (Some(anchor), Some(run)) = (
+            anchor.upgrade(),
+            usize::try_from(row.index()).ok().and_then(|i| runs.get(i)),
+        ) else {
+            return;
+        };
+        run(anchor.upcast_ref());
+    });
+    let shown = popover.downgrade();
+    more.connect_clicked(move |_| {
+        if let Some(popover) = shown.upgrade() {
+            popover.popup();
+        }
+    });
+    disable_tile(&more, device);
+    Some(more)
 }
 
 /// Greys `button` out with the reason as its tooltip, when there is one.
@@ -540,105 +769,7 @@ pub(super) fn add_wrapped(row: &gtk::FlowBox, widget: &impl IsA<gtk::Widget>) {
     }
 }
 
-/// The "More" menu after the primary actions: Ping, Send link, Send
-/// clipboard. `None` when the phone takes none of them.
-fn overflow_menu(
-    daemon: &DaemonHandle,
-    device: &DeviceView,
-    reason: Option<&str>,
-) -> Option<gtk::MenuButton> {
-    let list = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
-        .build();
-    let popover = gtk::Popover::builder().child(&list).build();
-    let mut any = false;
-    for (packet, icon, label, action) in [
-        (
-            PACKET_TYPE_PING,
-            "network-transmit-receive-symbolic",
-            "Ping",
-            Some(QuickAction::Ping),
-        ),
-        (
-            PACKET_TYPE_SHARE_REQUEST,
-            "insert-link-symbolic",
-            "Send Link…",
-            None,
-        ),
-        (
-            crate::device_links::packet::PACKET_TYPE_CLIPBOARD,
-            "edit-paste-symbolic",
-            "Send Clipboard",
-            Some(QuickAction::Clipboard),
-        ),
-    ] {
-        if !can_send_feature(device, packet) {
-            continue;
-        }
-        any = true;
-        let button = icon_button(icon, label, &["flat"]);
-        button.set_halign(gtk::Align::Fill);
-        button.set_sensitive(reason.is_none());
-        let (daemon, id, name) = (daemon.clone(), device.id.clone(), device.name.clone());
-        let popover = popover.downgrade();
-        button.connect_clicked(move |button| {
-            if let Some(popover) = popover.upgrade() {
-                popover.popdown();
-            }
-            match action {
-                Some(action) => {
-                    if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {
-                        window.quick_action(action);
-                    }
-                }
-                None => show_send_link_dialog(daemon.clone(), id.clone(), &name, button),
-            }
-        });
-        list.append(&button);
-    }
-    if !any {
-        return None;
-    }
-    let more = gtk::MenuButton::builder()
-        .popover(&popover)
-        .icon_name("view-more-symbolic")
-        .tooltip_text("More actions")
-        .valign(gtk::Align::Start)
-        .halign(gtk::Align::Center)
-        .css_classes(["circular", "flat", "round-more"])
-        .build();
-    more.update_property(&[gtk::accessible::Property::Label(&format!(
-        "More actions for {}: ping, send a link, send the clipboard",
-        device.name
-    ))]);
-    Some(more)
-}
-
-/// A round icon with a caption under it: Ring, Lock, Type, Insert, Sound.
-fn round_action(icon: &str, label: &str, accessible: &str) -> gtk::Button {
-    let content = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(6)
-        .build();
-    content.append(&super::icon_square(icon, 40, "round-icon"));
-    content.append(
-        &gtk::Label::builder()
-            .label(label)
-            .css_classes(["round-caption"])
-            .build(),
-    );
-    let button = gtk::Button::builder()
-        .child(&content)
-        .width_request(50)
-        .tooltip_text(accessible)
-        .css_classes(["round-action"])
-        .build();
-    button.update_property(&[gtk::accessible::Property::Label(accessible)]);
-    button
-}
-
-/// "Send a Link": a URL to open on the phone.
+/// "Send a link": a URL to open on the phone.
 fn show_send_link_dialog(
     daemon: DaemonHandle,
     device_id: String,
@@ -778,7 +909,7 @@ fn now_playing_bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Bo
         .filter(|media| media.is_playing || !media.title.is_empty())?;
     let bar = gtk::Box::builder()
         .spacing(16)
-        .css_classes(["dl-card", "now-playing"])
+        .css_classes(["dl-card", "dl-card-new", "now-playing"])
         .build();
     bar.append(&art(52, media.album_art.as_ref()));
     let words = gtk::Box::builder()
@@ -927,198 +1058,129 @@ fn art(size: i32, cover: Option<&crate::device_links::media_art::PhoneArt>) -> g
     art
 }
 
-/// "Pixel 9 is using this computer · in a terminal, viewing your screen",
-/// with End All, which asks first.
-fn live_banner(
+/// "Pixel 9 is using this computer · viewing your screen · since 14:02",
+/// with End all, which asks first.
+fn live_strip(
     daemon: &DaemonHandle,
     device: &DeviceView,
     summary: &str,
     since: Option<&str>,
 ) -> gtk::Box {
-    let banner = gtk::Box::builder()
-        .spacing(14)
-        .css_classes(["live-banner"])
-        .build();
-    banner.append(&icon_square("screen-shared-symbolic", 28, "live-icon"));
-    let words = gtk::Box::builder()
-        .hexpand(true)
-        .valign(gtk::Align::Center)
-        .build();
     let headline = if device.desktop_extended {
         format!("{} is a second display", device.name)
     } else {
         format!("{} is using this computer", device.name)
     };
-    let mut detail = format!(" · {summary}");
-    if let Some(since) = since.filter(|since| !since.is_empty()) {
-        detail.push_str(&format!(" · since {since}"));
-    }
-    words.append(&wrapped(&headline, &["heading"]));
-    let detail_label = wrapped(&detail, &["text-dim"]);
-    detail_label.set_hexpand(true);
-    words.append(&detail_label);
-    banner.append(&words);
-    banner.update_property(&[gtk::accessible::Property::Label(&format!(
-        "{headline}{detail}"
-    ))]);
-    // Its buttons stack at the right edge when the page is narrow.
-    let controls = wrap_row(1, 3);
-    controls.set_row_spacing(6);
-    controls.set_column_spacing(6);
-    banner.append(&controls);
+    let strip = banner(
+        BannerKind::Live,
+        "desklink-mobile-screen-share-symbolic",
+        &headline,
+        Some(&live_detail(summary, since)),
+    );
     // A second display (F2) is placed with the desktop's display settings.
     if device.desktop_extended {
         if let Some(settings) = gtk::glib::find_program_in_path("gnome-control-center") {
-            let arrange = super::soft_button("Arrange…");
+            let arrange = button(ButtonKind::Outline, "Arrange…", None);
             arrange.set_tooltip_text(Some("Place the phone's display beside this screen"));
             arrange.connect_clicked(move |_| {
                 let _ = std::process::Command::new(&settings).arg("display").spawn();
             });
-            add_wrapped(&controls, &arrange);
+            strip.add_action(&arrange);
         }
     }
     // Its speaker toggle (F1): this computer's sound to the phone too.
     if device.desktop_session != DesktopSession::None {
         let on = super::sound::is_on(device, "desk-sound");
-        let sound = gtk::Button::builder()
-            .icon_name(if on {
-                "audio-volume-high-symbolic"
+        let label = if on {
+            "Stop sending this computer's sound"
+        } else {
+            "Play this computer's sound on the phone"
+        };
+        let sound = kit_icon_button(
+            if on {
+                "desklink-volume-up-symbolic"
             } else {
-                "audio-volume-muted-symbolic"
-            })
-            .tooltip_text(if on {
-                "Stop Sending This Computer's Sound"
-            } else {
-                "Play This Computer's Sound on the Phone"
-            })
-            .valign(gtk::Align::Center)
-            .css_classes(["circular", "flat"])
-            .build();
-        sound.update_property(&[gtk::accessible::Property::Label(
-            &sound.tooltip_text().unwrap_or_default(),
-        )]);
+                "desklink-volume-mute-symbolic"
+            },
+            label,
+        );
         super::sound::toggle(daemon, device, "desk-sound", &sound);
-        add_wrapped(&controls, &sound);
+        strip.add_action(&sound);
     }
-    let end = super::soft_button("End All");
-    end.set_css_classes(&["coral-outline"]);
+    let end = button(ButtonKind::Danger, "End all", None);
     end.set_tooltip_text(Some("End the phone's sessions on this computer"));
     let (daemon, id, name) = (daemon.clone(), device.id.clone(), device.name.clone());
     end.connect_clicked(move |button| {
         let (daemon, id, target) = (daemon.clone(), id.clone(), button.clone());
         confirm(
             button,
-            &format!("End Sessions with {name}?"),
+            &format!("End sessions with {name}?"),
             "The phone stops using the screen and its terminals here. The terminals keep running.",
-            "_End Sessions",
+            "_End sessions",
             move || {
                 daemon.send(DaemonCommand::EndPhoneSessions(Some(id.clone())));
                 toast_from(&target, "Sessions ended");
             },
         );
     });
-    add_wrapped(&controls, &end);
-    banner
+    strip.add_action(&end);
+    strip.root
 }
 
-/// "Pixel 9 is offline · your terminals keep running here", Try Again.
+/// "Viewing your screen · since 14:02": the summary with a capital.
+fn live_detail(summary: &str, since: Option<&str>) -> String {
+    let mut detail = summary.to_string();
+    if let Some(first) = detail.get(..1) {
+        detail = first.to_uppercase() + &detail[1..];
+    }
+    if let Some(since) = since.filter(|since| !since.is_empty()) {
+        detail.push_str(&format!(" · since {since}"));
+    }
+    detail
+}
+
+/// "Pixel 9 is offline · your terminals keep running here", Try again.
 fn offline_row(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
-    // The words and the action side by side; under each other when narrow
-    // (the `responsive` box turns vertical), the text wrapping rather than
-    // cut off with an ellipsis.
-    let row = gtk::Box::builder()
-        .spacing(10)
-        .css_classes(["state-banner"])
-        .build();
-    row.set_widget_name("responsive");
-    let lead = gtk::Box::builder().spacing(14).hexpand(true).build();
-    lead.append(&icon_square("network-offline-symbolic", 28, "state-icon"));
-    let words = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .hexpand(true)
-        .valign(gtk::Align::Center)
-        .build();
-    let name = text(&format!("{} is offline", device.name), &["heading"]);
-    name.set_wrap(true);
-    name.set_xalign(0.0);
-    words.append(&name);
-    let detail = text(
-        "Check that DeskLink is open on it and it is on the same Wi-Fi. Your terminals keep running here.",
-        &["text-dim"],
+    let words = banner(
+        BannerKind::Error,
+        "desklink-warning-symbolic",
+        &format!("Can't reach {}", device.name),
+        Some(
+            "Check that DeskLink is open on it and it is on the same Wi-Fi. \
+             Your terminals keep running here.",
+        ),
     );
-    detail.set_wrap(true);
-    detail.set_xalign(0.0);
-    words.append(&detail);
-    lead.append(&words);
-    row.append(&lead);
-    let retry = super::soft_button("Try Again");
-    retry.set_halign(gtk::Align::End);
-    retry.set_css_classes(&["raised-button"]);
+    let retry = button(ButtonKind::Text, "Try again", None);
     let daemon = daemon.clone();
     retry.connect_clicked(move |button| {
         daemon.send(DaemonCommand::Discover);
         toast_from(button, "Searching the network…");
     });
-    row.append(&retry);
-    row
+    words.add_action(&retry);
+    words.root
 }
 
 /// Reachable, the encrypted connection still being set up.
 fn reconnecting_row(device: &DeviceView) -> gtk::Box {
-    let row = gtk::Box::builder()
-        .spacing(14)
-        .css_classes(["state-banner", "tall"])
-        .build();
-    // Under each other when the page is narrow, the words wrapping.
-    row.set_widget_name("responsive");
-    let dots = gtk::Box::builder()
-        .spacing(4)
-        .valign(gtk::Align::Center)
-        .accessible_role(gtk::AccessibleRole::Presentation)
-        .build();
-    for delay in ["one", "two", "three"] {
-        dots.append(
-            &gtk::Box::builder()
-                .valign(gtk::Align::Center)
-                .css_classes(["dot", "pulse", delay])
-                .build(),
-        );
-    }
-    row.append(&dots);
-    row.append(&wrapped(
-        &format!("Reconnecting to {}", device.name),
-        &["heading"],
-    ));
-    let detail = wrapped(
-        "Setting up a secure connection. This takes a few seconds.",
-        &["text-dim"],
-    );
-    detail.set_hexpand(true);
-    row.append(&detail);
-    row
+    banner(
+        BannerKind::Info,
+        "desklink-refresh-symbolic",
+        &format!("Connecting to {}", device.name),
+        Some("Setting up a secure connection. This takes a few seconds."),
+    )
+    .root
 }
 
-/// "On this computer" and "On Pixel 9", side by side, or stacked when narrow.
-fn columns(win: &DesklinkWindow, daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
+/// Notifications and Files side by side, or stacked when narrow.
+fn columns(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
     let columns = gtk::Box::builder()
-        .spacing(18)
+        .spacing(16)
         .homogeneous(true)
         .valign(gtk::Align::Start)
         .build();
     columns.set_widget_name("responsive");
-    let left = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(14)
-        .build();
-    left.append(&notifications_card(device));
-    left.append(&terminals_card(win, device));
-    let right = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(14)
-        .build();
-    right.append(&files_card(daemon, device));
-    columns.append(&left);
-    columns.append(&right);
+    columns.append(&notifications_card(device));
+    columns.append(&files_card(daemon, device));
     columns
 }
 
@@ -1132,125 +1194,116 @@ fn files_card(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
     card
 }
 
-/// A 150 px card: icon, title, subtitle and an optional end widget on top,
-/// `bottom` at the bottom.
+/// A card: its title and a line under it on the left, an optional widget at
+/// the end of the header, and `body` below. Dimmed while what it shows is
+/// the last known (`stale`).
 fn feature_card(
-    icon: &str,
     title: &str,
-    subtitle: &impl IsA<gtk::Widget>,
+    subtitle: &str,
     end: Option<&gtk::Widget>,
-    bottom: &impl IsA<gtk::Widget>,
+    body: &impl IsA<gtk::Widget>,
+    stale: bool,
 ) -> gtk::Box {
-    let card = card(0);
+    let card = kit_card(None);
     card.add_css_class("feature-card");
-    card.set_height_request(150);
-    // Not the spacer's expansion: cards keep their height side by side.
     card.set_vexpand(false);
-    let head = gtk::Box::builder().spacing(14).build();
-    head.append(&icon_square(icon, 36, "feature-icon"));
+    if stale {
+        card.add_css_class("stale");
+    }
+    let head = gtk::Box::builder().spacing(12).build();
     let words = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(2)
         .hexpand(true)
         .valign(gtk::Align::Center)
         .build();
-    words.append(&ellipsized(title, &["card-title"]));
-    words.append(subtitle);
+    let heading = ellipsized(title, &["dl-card-title"]);
+    heading.set_accessible_role(gtk::AccessibleRole::Heading);
+    words.append(&heading);
+    words.append(&ellipsized(subtitle, &["dl-secondary"]));
     head.append(&words);
     if let Some(end) = end {
         head.append(end);
     }
     card.append(&head);
-    // At least a gap, for a card whose bottom is taller than its height.
-    card.append(&gtk::Box::builder().vexpand(true).height_request(12).build());
-    card.append(bottom);
+    card.append(body);
     card
 }
 
-fn subtitle(label: &str) -> gtk::Label {
-    ellipsized(label, &["card-subtitle"])
+/// A text button that opens page `name`: "View all", "Open".
+fn page_button(label: &str, name: &str) -> gtk::Button {
+    let button = button(ButtonKind::Text, label, None);
+    button.set_valign(gtk::Align::Center);
+    button.set_action_name(Some("win.show-page"));
+    button.set_action_target_value(Some(&name.to_variant()));
+    button
 }
 
+/// The Terminals card: how many are open, New terminal, and the newest one
+/// as a strip to open it.
 fn terminals_card(win: &DesklinkWindow, device: &DeviceView) -> gtk::Box {
     let sessions = crate::terminal_previews::sessions();
     let shared = sessions
         .iter()
         .filter(|info| attached_devices(&info.id).contains(&device.id))
         .count();
-    let mut words = format!("{} open", sessions.len());
-    if shared > 0 {
-        words.push_str(&format!(" · {shared} shared with {}", device.name));
-    }
-    let bottom: gtk::Widget = match sessions.first() {
-        Some(info) => {
-            let strip = gtk::Box::builder().spacing(12).build();
-            strip.append(&text(
-                &crate::terminal_previews::display_title(&info.title),
-                &["mono", "strip-title"],
-            ));
-            let last = ellipsized(" ", &["mono", "strip-line"]);
-            last.set_hexpand(true);
-            last.set_widget_name(&format!("strip-line:{}", info.id));
-            strip.append(&last);
-            if attached_devices(&info.id).contains(&device.id) {
-                strip.append(&presence_dot(&format!("{} is attached", device.name)));
-                strip.append(&text(&device.name, &["strip-phone"]));
-            }
-            let button = gtk::Button::builder()
-                .child(&strip)
-                .css_classes(["term-strip"])
-                .build();
-            button.update_property(&[gtk::accessible::Property::Label(&format!(
-                "Open the {} terminal",
-                crate::terminal_previews::display_title(&info.title)
-            ))]);
-            let (window, id) = (win.downgrade(), info.id.clone());
-            button.connect_clicked(move |_| {
-                if let Some(window) = window.upgrade() {
-                    window.show_page("terminals");
-                    if let Some(page) = window.imp().terminals.borrow().as_ref() {
-                        page.open_detail(&window, &id);
-                    }
+    let words = terminals_words(sessions.len(), shared, &device.name);
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+    if let Some(info) = sessions.first() {
+        let strip = gtk::Box::builder().spacing(12).build();
+        strip.append(&text(
+            &crate::terminal_previews::display_title(&info.title),
+            &["mono", "strip-title"],
+        ));
+        let last = ellipsized(" ", &["mono", "strip-line"]);
+        last.set_hexpand(true);
+        last.set_widget_name(&format!("strip-line:{}", info.id));
+        strip.append(&last);
+        if attached_devices(&info.id).contains(&device.id) {
+            strip.append(&presence_dot(&format!("{} is attached", device.name)));
+            strip.append(&text(&device.name, &["strip-phone"]));
+        }
+        let open = gtk::Button::builder()
+            .child(&strip)
+            .css_classes(["term-strip"])
+            .build();
+        open.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Open the {} terminal",
+            crate::terminal_previews::display_title(&info.title)
+        ))]);
+        let (window, id) = (win.downgrade(), info.id.clone());
+        open.connect_clicked(move |_| {
+            if let Some(window) = window.upgrade() {
+                window.show_page("terminals");
+                if let Some(page) = window.imp().terminals.borrow().as_ref() {
+                    page.open_detail(&window, &id);
                 }
-            });
-            if device.feature_transport_ready && info.exit_status.is_none() {
-                // Walk away: lock here, carry on from the phone.
-                let both = gtk::Box::builder()
-                    .orientation(gtk::Orientation::Vertical)
-                    .spacing(10)
-                    .build();
-                both.append(&button);
-                let hand_off = icon_button(
-                    "system-lock-screen-symbolic",
-                    "Lock & Hand Off",
-                    &["soft-button"],
-                );
-                hand_off.set_halign(gtk::Align::Start);
-                hand_off.set_tooltip_text(Some(&format!(
-                    "Lock this computer and open the newest terminal on {}",
-                    device.name
-                )));
-                hand_off.set_action_name(Some("app.lock-hand-off"));
-                both.append(&hand_off);
-                both.upcast()
-            } else {
-                button.upcast()
             }
-        }
-        None => {
-            let new = icon_button("list-add-symbolic", "New Terminal", &["dashed-button"]);
-            new.set_action_name(Some("win.new-terminal"));
-            new.set_action_target_value(Some(&"shell".to_variant()));
-            new.upcast()
-        }
-    };
-    feature_card(
-        "utilities-terminal-symbolic",
-        "Terminals",
-        &subtitle(&words),
-        Some(page_link("View All", "terminals").upcast_ref()),
-        &bottom,
-    )
+        });
+        body.append(&open);
+    }
+    let new = button(ButtonKind::Tonal, "New terminal", Some("desklink-add-symbolic"));
+    new.set_valign(gtk::Align::Center);
+    new.set_action_name(Some("win.new-terminal"));
+    new.set_action_target_value(Some(&"shell".to_variant()));
+    let card = feature_card("Terminals", &words, Some(new.upcast_ref()), &body, false);
+    if sessions.is_empty() {
+        // Only the header and its button: nothing to show below.
+        card.remove(&body);
+    }
+    card
+}
+
+/// "1 open", "2 open · 1 shared with Pixel 9".
+fn terminals_words(open: usize, shared: usize, phone: &str) -> String {
+    let mut words = format!("{open} open");
+    if shared > 0 {
+        words.push_str(&format!(" · {shared} shared with {phone}"));
+    }
+    words
 }
 
 /// At most 200 characters of one line, so a huge copy cannot stretch a row.
@@ -1262,6 +1315,8 @@ pub(super) fn preview_line(text: &str) -> String {
     }
 }
 
+/// The Notifications card: the newest two, each with Reply when the phone
+/// takes one; or why there is nothing.
 fn notifications_card(device: &DeviceView) -> gtk::Box {
     let shown = crate::device_links::config::app_settings().shows_notifications(&device.id);
     let mut words = match (shown, device.notifications.len()) {
@@ -1272,13 +1327,16 @@ fn notifications_card(device: &DeviceView) -> gtk::Box {
     if let Some(seen) = super::last_seen_words(device).filter(|_| shown) {
         words.push_str(&format!(" · {seen}"));
     }
-    let bottom: gtk::Widget = match device.notifications.first().filter(|_| shown) {
-        Some(newest) => {
+    let body = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .build();
+    if shown && !device.notifications.is_empty() {
+        for newest in device.notifications.iter().take(2) {
             let row = gtk::Box::builder().spacing(12).build();
-            row.append(&icon_square(
+            row.append(&kit_icon_square(
                 super::notifications::app_icon(&newest.app_name),
-                36,
-                "avatar-circle",
+                Tone::Accent,
             ));
             let words = gtk::Box::builder()
                 .orientation(gtk::Orientation::Vertical)
@@ -1289,11 +1347,12 @@ fn notifications_card(device: &DeviceView) -> gtk::Box {
             words.append(&super::notifications::heading_line(newest));
             words.append(&ellipsized(
                 super::notifications::body(newest),
-                &["text-dim", "body-small"],
+                &["dl-secondary"],
             ));
             row.append(&words);
             if newest.request_reply_id.is_some() {
-                let reply = icon_button("mail-reply-sender-symbolic", "Reply", &["soft-button"]);
+                let reply = button(ButtonKind::Tonal, "Reply", Some("desklink-reply-symbolic"));
+                reply.set_valign(gtk::Align::Center);
                 // Replies go to the phone: only while it is connected.
                 reply.set_sensitive(device.feature_transport_ready);
                 let id = newest.id.clone();
@@ -1307,24 +1366,30 @@ fn notifications_card(device: &DeviceView) -> gtk::Box {
                 });
                 row.append(&reply);
             }
-            row.upcast()
+            body.append(&row);
         }
-        None => text(
-            if shown {
-                "You're all caught up."
-            } else {
-                "Turn them on in Settings."
-            },
-            &["card-note"],
-        )
-        .upcast(),
-    };
+    } else if shown {
+        body.append(&text(
+            &format!("{}'s notifications show up here.", device.name),
+            &["dl-secondary"],
+        ));
+    } else {
+        body.append(&wrapped(
+            &format!("Notifications from {} are turned off.", device.name),
+            &["dl-secondary"],
+        ));
+        let turn_on = button(ButtonKind::Tonal, "Turn on", None);
+        turn_on.set_halign(gtk::Align::Start);
+        turn_on.set_action_name(Some("win.show-page"));
+        turn_on.set_action_target_value(Some(&"settings".to_variant()));
+        body.append(&turn_on);
+    }
     feature_card(
-        "preferences-system-notifications-symbolic",
         "Notifications",
-        &subtitle(&words),
-        Some(page_link("View All", "notifications").upcast_ref()),
-        &bottom,
+        &words,
+        Some(page_button("View all", "notifications").upcast_ref()),
+        &body,
+        shown && !device.feature_transport_ready,
     )
 }
 
@@ -1341,9 +1406,9 @@ fn transfer_progress(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::
     line.append(
         &gtk::Image::builder()
             .icon_name(if row.incoming {
-                "go-down-symbolic"
+                "desklink-arrow-downward-symbolic"
             } else {
-                "go-up-symbolic"
+                "desklink-arrow-upward-symbolic"
             })
             .css_classes(["text-dim"])
             .accessible_role(gtk::AccessibleRole::Presentation)
@@ -1358,7 +1423,7 @@ fn transfer_progress(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::
     label.set_widget_name("overview-transfer-label");
     line.append(&label);
     progress.append(&line);
-    let bar = gtk::ProgressBar::builder().css_classes(["thin"]).build();
+    let bar = super::ui_kit::progress(0.0);
     bar.set_widget_name("overview-transfer-bar");
     bar.update_property(&[gtk::accessible::Property::Label(&row.name)]);
     if let Some(fraction) = super::transfers::fraction(&row) {
@@ -1427,31 +1492,16 @@ fn gliding_onto(device_id: &str) -> bool {
     crate::device_links::glide::status().gliding.as_deref() == Some(device_id)
 }
 
-/// The coral in-use bar while gliding. No Stop button: every click goes to
+/// The coral in-use bar while gliding. No End button: every click goes to
 /// the phone then; Esc+Super is the way back.
 fn glide_bar(device: &DeviceView) -> gtk::Box {
-    let bar = gtk::Box::builder()
-        .spacing(14)
-        .css_classes(["live-banner"])
-        .build();
-    bar.append(&icon_square("input-mouse-symbolic", 28, "live-icon"));
-    let words = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .hexpand(true)
-        .valign(gtk::Align::Center)
-        .build();
-    let headline = format!("Controlling {}", device.name);
-    let detail = "This mouse and keyboard are on the phone. Esc+Super to return.";
-    words.append(&wrapped(&headline, &["heading"]));
-    let detail_label = text(detail, &["text-dim"]);
-    detail_label.set_wrap(true);
-    detail_label.set_xalign(0.0);
-    words.append(&detail_label);
-    bar.append(&words);
-    bar.update_property(&[gtk::accessible::Property::Label(&format!(
-        "{headline}. {detail}"
-    ))]);
-    bar
+    banner(
+        BannerKind::Live,
+        "desklink-mouse-symbolic",
+        &format!("Controlling {}", device.name),
+        Some("This mouse and keyboard are on the phone. Esc+Super to return."),
+    )
+    .root
 }
 
 #[cfg(test)]
@@ -1533,6 +1583,67 @@ mod tests {
         ] {
             assert_eq!(link_to_send(typed), None, "{typed}");
         }
+    }
+
+    /// Six tiles in a row, then three by two, then two by three: never one
+    /// alone on a line.
+    #[test]
+    fn the_tile_row_never_leaves_an_orphan() {
+        assert_eq!(tile_columns(1000), 6);
+        assert_eq!(tile_columns(840), 6);
+        assert_eq!(tile_columns(839), 3);
+        assert_eq!(tile_columns(560), 3);
+        assert_eq!(tile_columns(559), 2);
+        assert_eq!(tile_columns(280), 2);
+        // 6 tiles divide into rows of 6, 3 and 2.
+        for width in [1000, 700, 300] {
+            assert_eq!(6 % tile_columns(width), 0, "{width}");
+        }
+    }
+
+    #[test]
+    fn the_live_strip_and_the_card_words_are_sentences() {
+        assert_eq!(live_detail("viewing your screen", None), "Viewing your screen");
+        assert_eq!(
+            live_detail("in a terminal, viewing your screen", Some("14:02")),
+            "In a terminal, viewing your screen · since 14:02"
+        );
+        assert_eq!(live_detail("a second display", Some("")), "A second display");
+        assert_eq!(terminals_words(0, 0, "Pixel"), "0 open");
+        assert_eq!(terminals_words(2, 1, "Pixel"), "2 open · 1 shared with Pixel");
+    }
+
+    /// A tile that cannot be used says why in a word, with the same words as
+    /// the status pill.
+    #[test]
+    fn a_tile_that_cannot_be_used_says_why() {
+        let info = crate::device_links::device_info::DeviceInfo::local("p".into(), "Pixel".into());
+        let mut device = DeviceView::from_info(&info, "10.0.0.2".into(), true);
+        device.status = DeviceStatus::Paired;
+        device.feature_transport_ready = true;
+        assert_eq!(tile_reason(&device), None);
+        device.feature_transport_ready = false;
+        assert_eq!(tile_reason(&device), Some("Connecting…"));
+        device.status = DeviceStatus::Unreachable;
+        assert_eq!(tile_reason(&device), Some("Can't reach"));
+        assert_eq!(
+            Presentation::of(&device).word,
+            tile_reason(&device).unwrap(),
+            "the pill and the tile agree"
+        );
+    }
+
+    /// The hero's name is two lines at most, then an ellipsis, and a heading
+    /// for screen readers. (Needs a display.)
+    #[test]
+    fn a_long_name_is_two_lines_then_cut() {
+        crate::test_display::run(|| {
+            let name = hero_name(&"Aman's Pixel 9 Pro XL Fold ".repeat(6));
+            assert_eq!(name.lines(), 2);
+            assert_eq!(name.ellipsize(), gtk::pango::EllipsizeMode::End);
+            assert!(name.wraps() && name.has_css_class("dl-hero"));
+            assert_eq!(name.accessible_role(), gtk::AccessibleRole::Heading);
+        });
     }
 
     #[test]

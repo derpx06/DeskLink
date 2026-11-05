@@ -1,26 +1,28 @@
 //! "Your notes can't be saved yet": shown on a page whose sealed file could
 //! not be read just now (the key, or the disk). What is typed meanwhile is
-//! kept in memory; Try Again reads the file again and merges it in, Start
-//! Fresh gives the old file up (a copy stays beside it).
+//! kept in memory; Try again reads the file again and merges it in, Start
+//! fresh gives the old file up (a copy stays beside it).
 
 use adw::prelude::*;
 
+use super::ui_kit::banner::{banner, BannerKind};
+use super::ui_kit::{button, ButtonKind};
 use crate::device_links::vault;
 
 #[derive(Debug)]
 pub(super) struct VaultBanner {
     pub(super) root: gtk::Box,
-    label: gtk::Label,
     folder: &'static str,
 }
 
-/// The words of the banner for a page about `what` ("notes", "contacts").
-pub(super) fn words(what: &str) -> String {
-    format!(
-        "Your {what} can't be saved yet: their file couldn't be read just now (the key or the disk). \
-         Nothing was lost. What you type meanwhile is kept until DeskLink quits."
-    )
+/// The banner's headline for a page about `what` ("notes", "contacts").
+pub(super) fn title(what: &str) -> String {
+    format!("Your {what} can't be saved yet")
 }
+
+/// What happened, and what happens meanwhile.
+const DETAIL: &str = "Their file couldn't be read just now (the key or the disk). \
+     Nothing was lost. What you type meanwhile is kept until DeskLink quits.";
 
 impl VaultBanner {
     /// `folder` is the vault folder ("notes", "contacts"); `retry` returns
@@ -31,47 +33,37 @@ impl VaultBanner {
         retry: fn() -> bool,
         fresh: fn(),
     ) -> Self {
-        let label = gtk::Label::builder()
-            .label(words(what))
-            .wrap(true)
-            .xalign(0.0)
-            .hexpand(true)
-            .build();
-        let again = gtk::Button::with_label("Try Again");
+        let warning = banner(
+            BannerKind::Warn,
+            "desklink-warning-symbolic",
+            &title(what),
+            Some(DETAIL),
+        );
+        let again = button(ButtonKind::Tonal, "Try again", None);
         again.connect_clicked(move |button| {
             if !retry() {
                 super::toast_from(button, "Still can't read it");
             }
         });
-        let start = gtk::Button::with_label("Start Fresh…");
-        start.add_css_class("destructive-action");
+        let start = button(ButtonKind::Danger, "Start fresh…", None);
         start.connect_clicked(move |button| {
             super::confirm(
                 button,
                 "Start fresh?",
                 "The old file is kept as a backup beside it. What you type from now on is saved.",
-                "Start Fresh",
+                "Start fresh",
                 fresh,
             );
         });
-        let root = gtk::Box::builder()
-            .spacing(12)
-            .margin_start(12)
-            .margin_end(12)
-            .margin_top(6)
-            .margin_bottom(6)
-            .css_classes(["state-banner"])
-            .visible(false)
-            .build();
-        root.append(&label);
-        root.append(&again);
-        root.append(&start);
-        root.update_property(&[gtk::accessible::Property::Label(&words(what))]);
-        Self {
-            root,
-            label,
-            folder,
-        }
+        warning.add_action(&again);
+        warning.add_action(&start);
+        let root = warning.root;
+        root.set_margin_start(12);
+        root.set_margin_end(12);
+        root.set_margin_top(6);
+        root.set_margin_bottom(6);
+        root.set_visible(false);
+        Self { root, folder }
     }
 
     /// Shown while a file under the folder cannot be saved.
@@ -80,7 +72,6 @@ impl VaultBanner {
         if self.root.is_visible() != blocked {
             self.root.set_visible(blocked);
         }
-        let _ = &self.label;
     }
 }
 
@@ -133,11 +124,11 @@ mod tests {
                     .clone()
             };
             assert!(!banner.root.is_visible(), "hidden while nothing is blocked");
-            labelled("Try Again").emit_clicked();
+            labelled("Try again").emit_clicked();
             assert_eq!(RETRIES.load(Ordering::SeqCst), 1);
             assert_eq!(FRESH.load(Ordering::SeqCst), 0);
 
-            labelled("Start Fresh…").emit_clicked();
+            labelled("Start fresh…").emit_clicked();
             assert_eq!(FRESH.load(Ordering::SeqCst), 0, "asked first");
             let dialog = window
                 .visible_dialog()
@@ -151,7 +142,7 @@ mod tests {
             assert_eq!(FRESH.load(Ordering::SeqCst), 0);
 
             // Asked again and confirmed, it does.
-            labelled("Start Fresh…").emit_clicked();
+            labelled("Start fresh…").emit_clicked();
             let dialog = window
                 .visible_dialog()
                 .and_downcast::<adw::AlertDialog>()
@@ -160,7 +151,7 @@ mod tests {
             buttons(dialog.upcast_ref(), &mut found);
             let go = found
                 .iter()
-                .find(|button| button.label().as_deref() == Some("Start Fresh"))
+                .find(|button| button.label().as_deref() == Some("Start fresh"))
                 .expect("the dialog's Start Fresh button");
             go.emit_clicked();
             while context.iteration(false) {}

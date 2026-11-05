@@ -5,16 +5,28 @@
 use adw::prelude::*;
 use gtk::glib;
 
+use super::ui_kit::banner::{banner, BannerKind};
+use super::ui_kit::{button, list_row, ButtonKind, Tone};
 use crate::platform::{Check, Level};
 
 /// How long the dialog waits for a probe before it says it could not check.
 const POLL_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 
-fn icon(level: Level) -> &'static str {
+/// The glyph and tone of a row: a check, a warning, an error, each a
+/// different shape as well as a colour.
+fn look(level: Level) -> (&'static str, Tone) {
     match level {
-        Level::Ok => "emblem-ok-symbolic",
-        Level::Limited => "dialog-warning-symbolic",
-        Level::Missing => "dialog-error-symbolic",
+        Level::Ok => ("desklink-check-circle-symbolic", Tone::Success),
+        Level::Limited => ("desklink-warning-symbolic", Tone::Warn),
+        Level::Missing => ("desklink-error-symbolic", Tone::Error),
+    }
+}
+
+fn level_words(level: Level) -> &'static str {
+    match level {
+        Level::Ok => "Works",
+        Level::Limited => "Works with a limit",
+        Level::Missing => "Not available",
     }
 }
 
@@ -22,7 +34,7 @@ fn list(rows: &[Check]) -> gtk::ListBox {
     let distro = crate::platform::distro();
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["boxed-list"])
+        .css_classes(["dl-row-group"])
         .build();
     for row in rows {
         let subtitle = match row.install {
@@ -31,19 +43,15 @@ fn list(rows: &[Check]) -> gtk::ListBox {
             }
             _ => row.detail.clone(),
         };
-        let widget = adw::ActionRow::builder()
-            .title(glib::markup_escape_text(row.title))
-            .subtitle(glib::markup_escape_text(&subtitle))
-            .subtitle_selectable(true)
-            .subtitle_lines(0)
-            .build();
-        let status = gtk::Image::from_icon_name(icon(row.level));
-        status.set_tooltip_text(Some(match row.level {
-            Level::Ok => "Works",
-            Level::Limited => "Works with a limit",
-            Level::Missing => "Not available",
-        }));
-        widget.add_prefix(&status);
+        let (icon, tone) = look(row.level);
+        let widget = list_row(icon, tone, row.title, Some(&subtitle));
+        // The whole text, to read and to copy.
+        widget.set_subtitle_selectable(true);
+        widget.set_subtitle_lines(0);
+        widget.set_tooltip_text(Some(level_words(row.level)));
+        widget.update_property(&[gtk::accessible::Property::Description(level_words(
+            row.level,
+        ))]);
         list.append(&widget);
     }
     list
@@ -60,21 +68,18 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>) {
         .margin_start(12)
         .margin_end(12)
         .build();
-    let copy = gtk::Button::builder()
-        .label("Copy Report")
-        .halign(gtk::Align::End)
-        .build();
-    copy.add_css_class("pill");
-    let intro = gtk::Label::builder()
-        .label(
-            "What DeskLink found on this computer. Anything marked as missing is hidden or \
-             switched off where it is used, with the reason.",
-        )
-        .wrap(true)
-        .xalign(0.0)
-        .build();
-    intro.add_css_class("dim-label");
-    holder.append(&intro);
+    let copy = button(ButtonKind::Tonal, "Copy report", Some("desklink-content-copy-symbolic"));
+    copy.set_halign(gtk::Align::End);
+    let intro = banner(
+        BannerKind::Info,
+        "desklink-info-symbolic",
+        "What DeskLink found on this computer",
+        Some(
+            "Anything marked as missing is hidden or switched off where it is used, \
+             with the reason.",
+        ),
+    );
+    holder.append(&intro.root);
     let body = gtk::Box::new(gtk::Orientation::Vertical, 0);
     holder.append(&body);
     holder.append(&copy);
@@ -131,7 +136,7 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>) {
         }
     });
     let dialog = adw::Dialog::builder()
-        .title("System Check")
+        .title("System check")
         .content_width(560)
         .content_height(640)
         .child(&crate::application::with_header(

@@ -12,6 +12,7 @@ use gtk::cairo;
 
 use crate::application::token_color;
 use crate::device_links::device::{DeviceStatus, DeviceView};
+use crate::window::ui_kit::Status;
 
 /// How a device is linked to this computer, as the glyph's connector shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,17 +40,6 @@ impl LinkState {
         }
     }
 
-    /// "Connected over Wi-Fi": the hero's words.
-    pub(crate) fn label(self, device: &DeviceView) -> &'static str {
-        match (self, device.connection_path.as_deref()) {
-            (Self::Direct, Some("direct")) => "Connected over the internet",
-            (Self::Direct, _) => "Connected over Wi-Fi",
-            (Self::Relay, _) => "Connected through the relay",
-            (Self::Connecting, _) => "Connecting…",
-            (Self::Offline, _) => "Offline",
-        }
-    }
-
     /// The link's round-trip time ("12 ms") while connected and measured.
     pub(crate) fn round_trip(self, device: &DeviceView) -> Option<String> {
         matches!(self, Self::Direct | Self::Relay)
@@ -57,15 +47,91 @@ impl LinkState {
             .flatten()
             .map(|ms| format!("{ms} ms"))
     }
+}
 
-    /// "Connected · Wi-Fi": the sidebar's words.
-    pub(crate) fn short_label(self, device: &DeviceView) -> &'static str {
-        match (self, device.connection_path.as_deref()) {
-            (Self::Direct, Some("direct")) => "Connected · Internet",
-            (Self::Direct, _) => "Connected · Wi-Fi",
-            (Self::Relay, _) => "Connected · Relay",
-            (Self::Connecting, _) => "Connecting…",
-            (Self::Offline, _) => "Offline",
+/// What a device's state is called, in the words every surface shares (phone,
+/// desk, top bar; `UI-REDESIGN.md` 3.0): a pill word, a longer detail line,
+/// and a short detail for narrow places.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Presentation {
+    pub(crate) status: Status,
+    /// The pill: "Connected", "Connecting…", "Can't reach", "Needs your OK".
+    pub(crate) word: &'static str,
+    /// "over Wi-Fi · 9 ms", "Check that Pixel 9 is on and on your network".
+    pub(crate) detail: String,
+    /// "Wi-Fi · 9 ms": the same for a place that is 200 px wide.
+    pub(crate) short: String,
+}
+
+impl Presentation {
+    pub(crate) fn of(device: &DeviceView) -> Self {
+        let make = |status, word, detail: &str, short: &str| Self {
+            status,
+            word,
+            detail: detail.to_string(),
+            short: short.to_string(),
+        };
+        if !device.trusted {
+            return match device.status {
+                DeviceStatus::PairRequestedByPeer => {
+                    make(Status::Warn, "Needs your OK", "Wants to pair", "Wants to pair")
+                }
+                DeviceStatus::PairRequested => make(
+                    Status::Idle,
+                    "Waiting…",
+                    "Accept the request on the phone",
+                    "Accept on the phone",
+                ),
+                DeviceStatus::Discovered | DeviceStatus::Connected => {
+                    make(Status::Idle, "Nearby", "Not paired yet", "Not paired yet")
+                }
+                _ => make(Status::Idle, "Connecting…", "", ""),
+            };
+        }
+        let state = LinkState::of(device);
+        match state {
+            LinkState::Direct | LinkState::Relay => {
+                // The internet, direct or through the relay, reads the same:
+                // end to end encrypted either way.
+                let (route, short_route) = match (state, device.connection_path.as_deref()) {
+                    (LinkState::Relay, _) | (_, Some("direct")) => {
+                        ("over the internet · encrypted", "Internet")
+                    }
+                    _ => ("over Wi-Fi", "Wi-Fi"),
+                };
+                let rtt = state.round_trip(device);
+                let with_rtt = |text: &str| match &rtt {
+                    Some(rtt) => format!("{text} · {rtt}"),
+                    None => text.to_string(),
+                };
+                Self {
+                    status: Status::Ok,
+                    word: "Connected",
+                    detail: with_rtt(route),
+                    short: with_rtt(short_route),
+                }
+            }
+            LinkState::Connecting => make(
+                Status::Idle,
+                "Connecting…",
+                "Setting up a secure connection",
+                "Setting up",
+            ),
+            LinkState::Offline => Self {
+                status: Status::Err,
+                word: "Can't reach",
+                detail: format!("Check that {} is on and on your network", device.name),
+                short: "Not on your network".to_string(),
+            },
+        }
+    }
+
+    /// "Connected over Wi-Fi · 9 ms": a screen reader's and a tooltip's words.
+    pub(crate) fn spoken(&self) -> String {
+        if self.detail.is_empty() {
+            self.word.to_string()
+        } else {
+            format!("{} {}", self.word, self.detail)
         }
     }
 }
@@ -279,20 +345,48 @@ mod tests {
         phone.feature_transport_ready = true;
         phone.connection_path = Some("lan".into());
         assert_eq!(LinkState::of(&phone), LinkState::Direct);
-        assert_eq!(LinkState::of(&phone).label(&phone), "Connected over Wi-Fi");
+        let words = Presentation::of(&phone);
+        assert_eq!((words.status, words.word), (Status::Ok, "Connected"));
+        assert_eq!(words.detail, "over Wi-Fi");
+        phone.rtt_ms = Some(9);
+        assert_eq!(Presentation::of(&phone).detail, "over Wi-Fi · 9 ms");
+        assert_eq!(Presentation::of(&phone).short, "Wi-Fi · 9 ms");
+        assert_eq!(Presentation::of(&phone).spoken(), "Connected over Wi-Fi · 9 ms");
 
-        phone.connection_path = Some("direct".into());
-        assert_eq!(LinkState::of(&phone), LinkState::Direct);
-        assert_eq!(
-            LinkState::of(&phone).short_label(&phone),
-            "Connected · Internet"
-        );
-
+        // The internet reads the same direct or through the relay, and the
+        // words never say "relay".
+        for path in ["direct", "turn"] {
+            phone.connection_path = Some(path.into());
+            let words = Presentation::of(&phone);
+            assert_eq!(words.detail, "over the internet · encrypted · 9 ms");
+            assert!(!words.detail.to_lowercase().contains("relay"));
+        }
         phone.connection_path = Some("turn".into());
         assert_eq!(LinkState::of(&phone), LinkState::Relay);
-        assert_eq!(
-            LinkState::of(&phone).short_label(&phone),
-            "Connected · Relay"
-        );
+    }
+
+    /// The same words as the phone's and the shell menu's (3.0): one word per
+    /// state, a shape per word, and never "Connected" for a link that is not
+    /// feature-ready.
+    #[test]
+    fn every_state_has_its_shared_word_and_unreachable_is_never_connected() {
+        let mut phone = device();
+        phone.status = DeviceStatus::Paired;
+        let connecting = Presentation::of(&phone);
+        assert_eq!((connecting.status, connecting.word), (Status::Idle, "Connecting…"));
+
+        phone.status = DeviceStatus::Unreachable;
+        let away = Presentation::of(&phone);
+        assert_eq!((away.status, away.word), (Status::Err, "Can't reach"));
+        assert_eq!(away.detail, "Check that Pixel is on and on your network");
+
+        phone.trusted = false;
+        phone.status = DeviceStatus::PairRequestedByPeer;
+        let asks = Presentation::of(&phone);
+        assert_eq!((asks.status, asks.word), (Status::Warn, "Needs your OK"));
+        phone.status = DeviceStatus::Discovered;
+        assert_eq!(Presentation::of(&phone).word, "Nearby");
+        phone.status = DeviceStatus::PairRequested;
+        assert_eq!(Presentation::of(&phone).status, Status::Idle);
     }
 }

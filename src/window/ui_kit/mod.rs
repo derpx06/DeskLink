@@ -18,6 +18,7 @@
 // The waves that use the kit land after it.
 #![allow(dead_code)]
 
+pub(crate) mod banner;
 pub(crate) mod icons;
 mod sheet;
 pub(crate) mod tokens;

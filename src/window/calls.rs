@@ -11,7 +11,8 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 
-use super::{can_send_feature, icon_button, icon_square, named_widgets, wrapped};
+use super::ui_kit::{icon_button, icon_square, ButtonKind, Tone};
+use super::{can_send_feature, named_widgets, wrapped};
 use super::{DesklinkWindow, DeviceView};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::{CallState, CallStatus, PhoneCall};
@@ -57,37 +58,42 @@ pub(super) fn detail_words(phone: &str, status: &CallStatus, now_ms: i64) -> Str
     words
 }
 
-/// The buttons a call offers now: (action, label, icon, classes).
+/// What a call button looks like: the kit's button kind, or the answer
+/// button's own green (`#0B7A59`, white on it 5.33:1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallButton {
+    Answer,
+    Kind(ButtonKind),
+}
+
+/// The buttons a call offers now: (action, label, icon, look). The words are
+/// exactly Silence, Decline, Answer, Mute, Unmute and End (`UI-REDESIGN.md`
+/// 3.18).
 pub(crate) fn buttons(
     status: &CallStatus,
-) -> Vec<(
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static [&'static str],
-)> {
+) -> Vec<(&'static str, &'static str, &'static str, CallButton)> {
     let call = status.primary();
     if call.incoming && call.state == CallState::Ringing {
         let mut buttons = vec![
             (
                 "answer",
                 "Answer",
-                "call-start-symbolic",
-                &["call-answer"][..],
+                "desklink-call-symbolic",
+                CallButton::Answer,
             ),
             (
                 "decline",
                 "Decline",
-                "call-stop-symbolic",
-                &["destructive-action"][..],
+                "desklink-close-symbolic",
+                CallButton::Kind(ButtonKind::Danger),
             ),
         ];
         if !status.silenced {
             buttons.push((
                 "silence",
                 "Silence",
-                "audio-volume-muted-symbolic",
-                &["soft-button"][..],
+                "desklink-volume-mute-symbolic",
+                CallButton::Kind(ButtonKind::Tonal),
             ));
         }
         return buttons;
@@ -97,22 +103,22 @@ pub(crate) fn buttons(
             (
                 "unmute",
                 "Unmute",
-                "microphone-sensitivity-muted-symbolic",
-                &["soft-button", "toggled"][..],
+                "desklink-mic-symbolic",
+                CallButton::Kind(ButtonKind::Tonal),
             )
         } else {
             (
                 "mute",
                 "Mute",
-                "audio-input-microphone-symbolic",
-                &["soft-button"][..],
+                "desklink-mic-symbolic",
+                CallButton::Kind(ButtonKind::Tonal),
             )
         },
         (
             "end",
             "End",
-            "call-stop-symbolic",
-            &["destructive-action"][..],
+            "desklink-close-symbolic",
+            CallButton::Kind(ButtonKind::Danger),
         ),
     ]
 }
@@ -130,7 +136,7 @@ pub(super) fn card(daemon: &DaemonHandle, device: &DeviceView, compact: bool) ->
     let call = status.primary();
     let ringing = ringing_here(call);
     let card = gtk::Box::builder()
-        .spacing(14)
+        .spacing(12)
         .css_classes(["call-card"])
         .build();
     if compact {
@@ -142,11 +148,8 @@ pub(super) fn card(daemon: &DaemonHandle, device: &DeviceView, compact: bool) ->
     if ringing {
         card.add_css_class("ringing");
     }
-    let icon = icon_square(
-        "call-start-symbolic",
-        if compact { 28 } else { 40 },
-        "call-icon",
-    );
+    let icon = icon_square("desklink-call-symbolic", Tone::Success);
+    icon.add_css_class("call-icon");
     // The ring pulses, unless the user turned animations off (GNOME's
     // "Reduce animation" sets this).
     if ringing
@@ -164,12 +167,15 @@ pub(super) fn card(daemon: &DaemonHandle, device: &DeviceView, compact: bool) ->
     let caller = call.caller();
     // Who is calling and what it is are what the person came for: two lines
     // each before anything is cut (the whole text is then a tooltip).
-    let who = wrapped(&caller, &[if compact { "heading" } else { "title-3" }]);
+    let who = wrapped(&caller, &[if compact { "heading" } else { "dl-card-title" }]);
     who.set_lines(2);
     who.set_ellipsize(gtk::pango::EllipsizeMode::End);
     super::tooltip_when_cut(&who);
     words.append(&who);
-    let detail = wrapped(&detail_words(&device.name, status, now_ms()), &["text-dim"]);
+    let detail = wrapped(
+        &detail_words(&device.name, status, now_ms()),
+        &["dl-secondary"],
+    );
     detail.set_lines(3);
     detail.set_ellipsize(gtk::pango::EllipsizeMode::End);
     super::tooltip_when_cut(&detail);
@@ -190,25 +196,27 @@ pub(super) fn card(daemon: &DaemonHandle, device: &DeviceView, compact: bool) ->
     if !compact {
         actions.set_widget_name("hero-wrap");
     }
-    for (action, label, icon, classes) in buttons(status) {
+    for (action, label, icon, look) in buttons(status) {
         // The bar over other pages stays one line at any width: icons only,
         // their words in the tooltip and for screen readers.
         let button = if compact {
-            let button = gtk::Button::builder()
-                .icon_name(icon)
-                .tooltip_text(label)
-                .css_classes(
-                    classes
-                        .iter()
-                        .copied()
-                        .chain(["circular"])
-                        .collect::<Vec<_>>(),
-                )
-                .build();
-            button.update_property(&[gtk::accessible::Property::Label(label)]);
+            let button = icon_button(icon, label);
+            match look {
+                CallButton::Answer => button.add_css_class("call-answer"),
+                CallButton::Kind(ButtonKind::Danger) => button.add_css_class("call-danger"),
+                CallButton::Kind(_) => {}
+            }
             button
         } else {
-            icon_button(icon, label, classes)
+            match look {
+                CallButton::Kind(kind) => super::ui_kit::button(kind, label, Some(icon)),
+                CallButton::Answer => {
+                    let made = super::ui_kit::button(ButtonKind::Primary, label, Some(icon));
+                    made.remove_css_class("dl-btn-primary");
+                    made.add_css_class("call-answer");
+                    made
+                }
+            }
         };
         button.set_sensitive(can);
         if !can {

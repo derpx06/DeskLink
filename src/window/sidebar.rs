@@ -5,10 +5,12 @@ use std::cell::RefCell;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
+use gtk::glib;
 
-use super::{device_status_presentation, device_type_icon, DesklinkWindow, MAIN_PAGES, PAGES};
-use crate::device_links::device::{DeviceStatus, DeviceView};
-use crate::link_glyph::{link_glyph, presence_dot, LinkState};
+use super::ui_kit::{button, icon_square, status_dot, status_pill, ButtonKind, Tone};
+use super::{device_type_icon, DesklinkWindow, MAIN_PAGES, PAGES};
+use crate::device_links::device::DeviceView;
+use crate::link_glyph::{link_glyph, presence_dot, LinkState, Presentation};
 
 /// Where the last selected device is kept: `~/.config/desklink/last-device`,
 /// beside the `appearance` file. Its own file, so the pairing records are
@@ -55,6 +57,8 @@ impl Sidebar {
             content.append(
                 &gtk::Image::builder()
                     .icon_name(*icon)
+                    .pixel_size(24)
+                    .css_classes(["nav-icon"])
                     .accessible_role(gtk::AccessibleRole::Presentation)
                     .build(),
             );
@@ -95,12 +99,14 @@ impl Sidebar {
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["switcher-list"])
             .build();
-        switcher.update_property(&[gtk::accessible::Property::Label("Paired devices")]);
-        let pair = super::icon_button("list-add-symbolic", "Pair New Device…", &["flat"]);
+        switcher.update_property(&[gtk::accessible::Property::Label("Paired phones")]);
+        let pair = button(
+            ButtonKind::Text,
+            "Pair another phone",
+            Some("desklink-add-symbolic"),
+        );
         pair.set_action_name(Some("win.pair-new"));
-        if let Some(content) = pair.child() {
-            content.set_halign(gtk::Align::Start);
-        }
+        pair.set_halign(gtk::Align::Start);
         let content = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(4)
@@ -169,48 +175,51 @@ impl Sidebar {
         self.update_switcher(devices, device);
     }
 
-    /// The device card: link glyph, name, "Connected · Wi-Fi".
+    /// The device card: link glyph, the phone's name, and under it a status
+    /// dot, the word ("Connected") and the short detail ("Wi-Fi · 9 ms").
     fn update_card(&self, win: &DesklinkWindow, device: &DeviceView) {
         let state = LinkState::of(device);
-        let short = if device.trusted {
-            match state.round_trip(device) {
-                // The glyph already says connected: room for the time.
-                Some(rtt) => format!(
-                    "{} · {rtt}",
-                    state.short_label(device).trim_start_matches("Connected · ")
-                ),
-                None => state.short_label(device).to_string(),
-            }
-        } else {
-            device_status_presentation(device).0.to_string()
-        };
-        let key = format!("{}\n{short}\n{state:?}", device.name);
+        let words = Presentation::of(device);
+        let key = format!("{}\n{words:?}\n{state:?}", device.name);
         if *self.card_key.borrow() == key {
             return;
         }
         self.card_key.replace(key);
         let content = gtk::Box::builder().spacing(12).build();
-        content.append(&link_glyph(state, state.label(device)));
-        let words = gtk::Box::builder()
+        content.append(&link_glyph(state, &words.spoken()));
+        let lines = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(2)
             .hexpand(true)
             .valign(gtk::Align::Center)
             .build();
-        words.append(&super::ellipsized(&device.name, &["device-name"]));
-        words.append(&super::ellipsized(&short, &["caption", "text-dim"]));
-        content.append(&words);
+        lines.append(&super::ellipsized(&device.name, &["device-name"]));
+        let status = gtk::Box::builder()
+            .spacing(6)
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build();
+        status.append(&status_dot(words.status));
+        status.append(&gtk::Label::builder().label(words.word).css_classes(["dl-label"]).build());
+        if !words.short.is_empty() {
+            status.append(&super::ellipsized(
+                &words.short,
+                &["dl-caption", "dl-mono"],
+            ));
+        }
+        lines.append(&status);
+        content.append(&lines);
         content.append(
             &gtk::Image::builder()
-                .icon_name("pan-down-symbolic")
+                .icon_name("desklink-expand-more-symbolic")
+                .pixel_size(20)
                 .css_classes(["text-dim"])
                 .accessible_role(gtk::AccessibleRole::Presentation)
                 .build(),
         );
         let card = &win.imp().device_card;
         card.set_child(Some(&content));
-        let label = format!("{}, {short}. Switch device", device.name);
-        card.set_tooltip_text(Some("Switch device"));
+        let label = format!("{}, {}. Switch phone", device.name, words.spoken());
+        card.set_tooltip_text(Some("Switch phone"));
         card.update_property(&[gtk::accessible::Property::Label(&label)]);
     }
 
@@ -255,10 +264,7 @@ impl Sidebar {
                         end.append(&presence_dot("A phone is attached"));
                         label.push_str(", a phone is attached");
                     }
-                    end.append(&super::text(
-                        &sessions.len().to_string(),
-                        &["mono", "nav-count"],
-                    ));
+                    end.append(&super::text(&sessions.len().to_string(), &["count-badge"]));
                     label.push_str(&format!(", {} open", sessions.len()));
                 }
                 "files" if bucket_asked => {
@@ -275,23 +281,21 @@ impl Sidebar {
         }
     }
 
-    /// The switcher's rows: each paired device and its state.
+    /// The switcher's rows: each paired phone, its status pill and detail.
     fn update_switcher(&self, devices: &[DeviceView], selected: &DeviceView) {
-        let key = serde_json::to_string(
-            &devices
-                .iter()
-                .map(|device| {
-                    (
-                        &device.id,
-                        &device.name,
-                        &device.device_type,
-                        LinkState::of(device).short_label(device),
-                        device_status_presentation(device).0,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
-        .unwrap_or_default()
+        let key = devices
+            .iter()
+            .map(|device| {
+                format!(
+                    "{}|{}|{}|{:?}",
+                    device.id,
+                    device.name,
+                    device.device_type,
+                    Presentation::of(device)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
             + &selected.id;
         if *self.switcher_key.borrow() == key {
             return;
@@ -299,39 +303,39 @@ impl Sidebar {
         self.switcher_key.replace(key);
         self.switcher.remove_all();
         for device in devices {
-            let state = if device.trusted {
-                LinkState::of(device).short_label(device)
-            } else {
-                device_status_presentation(device).0
-            };
+            let words = Presentation::of(device);
             let content = gtk::Box::builder()
                 .spacing(12)
-                .margin_top(8)
-                .margin_bottom(8)
+                .margin_top(6)
+                .margin_bottom(6)
                 .margin_start(6)
                 .margin_end(6)
                 .build();
-            let offline = matches!(device.status, DeviceStatus::Unreachable);
-            content.append(
-                &gtk::Image::builder()
-                    .icon_name(device_type_icon(&device.device_type))
-                    .css_classes(if offline { vec!["text-dim"] } else { vec![] })
-                    .accessible_role(gtk::AccessibleRole::Presentation)
-                    .build(),
-            );
-            let words = gtk::Box::builder()
-                .orientation(gtk::Orientation::Vertical)
-                .spacing(1)
-                .hexpand(true)
-                .build();
-            words.append(&super::ellipsized(&device.name, &["heading"]));
-            words.append(&super::ellipsized(state, &["caption", "text-dim"]));
-            content.append(&words);
             let current = device.id == selected.id;
+            let tone = if current { Tone::Accent } else { Tone::Neutral };
+            content.append(&icon_square(device_type_icon(&device.device_type), tone));
+            let lines = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(4)
+                .hexpand(true)
+                .valign(gtk::Align::Center)
+                .build();
+            lines.append(&super::ellipsized(&device.name, &["heading"]));
+            let status = gtk::Box::builder().spacing(8).build();
+            status.append(&status_pill(words.status, words.word));
+            if !words.short.is_empty() {
+                status.append(&super::ellipsized(
+                    &words.short,
+                    &["dl-caption", "dl-mono"],
+                ));
+            }
+            lines.append(&status);
+            content.append(&lines);
             if current {
                 content.append(
                     &gtk::Image::builder()
-                        .icon_name("object-select-symbolic")
+                        .icon_name("desklink-check-symbolic")
+                        .pixel_size(20)
                         .css_classes(["accent"])
                         .accessible_role(gtk::AccessibleRole::Presentation)
                         .build(),
@@ -343,11 +347,68 @@ impl Sidebar {
                 row.add_css_class("current");
             }
             row.update_property(&[gtk::accessible::Property::Label(&format!(
-                "{}, {state}{}",
+                "{}, {}{}",
                 device.name,
+                words.spoken(),
                 if current { ", selected" } else { "" }
             ))]);
             self.switcher.append(&row);
         }
+    }
+}
+
+/// "Drop to send to Pixel 9": files dragged anywhere over the window are
+/// sent to the selected phone once it is connected. A target below (the Files
+/// page, the Bucket card) takes its own drops first.
+pub(super) fn install_window_drop(win: &DesklinkWindow) {
+    let imp = win.imp();
+    let target = |window: &glib::WeakRef<DesklinkWindow>| {
+        let window = window.upgrade()?;
+        let daemon = window.daemon()?;
+        let id = window.selected_id()?;
+        let device = window
+            .known_devices(&daemon)
+            .into_iter()
+            .find(|known| known.id == id && known.trusted && known.feature_transport_ready)?;
+        Some((window, daemon, device))
+    };
+    let weak = win.downgrade();
+    let hover_weak = win.downgrade();
+    super::accept_dropped_files_hover(
+        &imp.split_view.get(),
+        move || target(&weak).map(|(_, daemon, device)| (daemon, device.id)),
+        move |over| {
+            let Some(window) = hover_weak.upgrade() else {
+                return;
+            };
+            let imp = window.imp();
+            if over {
+                let name = window
+                    .selected_id()
+                    .and_then(|id| {
+                        let daemon = window.daemon()?;
+                        window
+                            .known_devices(&daemon)
+                            .into_iter()
+                            .find(|device| device.id == id)
+                            .map(|device| device.name)
+                    })
+                    .unwrap_or_default();
+                imp.drop_hint.set_label(&drop_words(&name));
+                imp.split_view.add_css_class("drop-over");
+            } else {
+                imp.split_view.remove_css_class("drop-over");
+            }
+            imp.drop_hint.set_visible(over);
+        },
+    );
+}
+
+/// The words over a window files are dragged across.
+pub(super) fn drop_words(name: &str) -> String {
+    if name.is_empty() {
+        "Drop to send".to_string()
+    } else {
+        format!("Drop to send to {name}")
     }
 }

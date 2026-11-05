@@ -91,46 +91,53 @@ window.unfocused .skeleton { animation: none; }
 }
 
 /* ── Sidebar ───────────────────────────────────────────────────────────── */
+/* The device card: a surface with the kit's edge; the switcher opens from it. */
 menubutton.device-card > button {
   padding: 12px;
-  border-radius: 12px;
-  background-color: @card_bg_color;
-  box-shadow: 0 0 0 1px @card_edge, 0 1px 3px @card_shadow_near;
+  border-radius: 16px;
+  background-color: @dl_surface;
+  box-shadow: inset 0 0 0 1px @dl_edge;
 }
-menubutton.device-card > button:hover { background-color: mix(@card_bg_color, @surface_2, 0.6); }
-.device-name { font-size: 14px; font-weight: 700; }
-.navigation-sidebar { padding: 0 10px; background: none; }
+menubutton.device-card > button:hover { background-image: linear-gradient(alpha(currentColor, 0.06), alpha(currentColor, 0.06)); }
+menubutton.device-card > button:focus-visible { outline: 2px solid @dl_accent_text; outline-offset: 2px; }
+.device-name { font-size: 0.93em; font-weight: 700; }
+.navigation-sidebar { padding: 0 12px; background: none; }
+/* Rows 40 high, radius 10; the selected one is the tonal fill and heavier. */
 .navigation-sidebar > row {
-  min-height: 38px;
-  padding: 0 10px;
-  margin: 1px 0;
-  border-radius: 8px;
+  min-height: 40px;
+  padding: 0 12px;
+  margin: 2px 0;
+  border-radius: 10px;
+  color: @dl_text_dim;
 }
+.navigation-sidebar > row:hover { background-color: alpha(@dl_text, 0.06); }
 .navigation-sidebar > row:selected {
-  background-color: @surface_2;
-  color: @window_fg_color;
+  background-color: @dl_surface_2;
+  color: @dl_text;
 }
 .navigation-sidebar > row:selected .nav-label { font-weight: 600; }
-.sidebar-footer { padding-top: 10px; padding-bottom: 10px; }
-.sidebar-footer > row:not(:selected) { color: @text_dim; }
-.nav-count { font-size: 12px; color: @text_faint; }
+.navigation-sidebar > row:focus-visible { outline: 2px solid @dl_accent_text; outline-offset: -2px; }
+.navigation-sidebar > row:disabled { opacity: 0.38; }
+.sidebar-footer { padding-top: 8px; padding-bottom: 12px; }
+/* A count that goes to zero: accent fill, 18 high, in the row's name too. */
 .count-badge {
   min-width: 18px;
   min-height: 18px;
-  padding: 0 5px;
+  padding: 0 6px;
   border-radius: 9px;
-  background-color: @accent_bg_color;
-  color: @accent_fg_color;
-  font-size: 12px;
+  background-color: @dl_accent;
+  color: @dl_on_accent;
+  font-size: 0.8em;
   font-weight: 700;
 }
 popover.device-switcher > contents {
-  padding: 6px;
-  border-radius: 14px;
+  padding: 8px;
+  border-radius: 16px;
 }
 .switcher-list { background: none; }
-.switcher-list > row { border-radius: 9px; }
-.switcher-list > row.current { background-color: @surface_2; }
+.switcher-list > row { border-radius: 12px; }
+.switcher-list > row.current { background-color: @dl_surface_2; }
+.switcher-list > row:focus-visible { outline: 2px solid @dl_accent_text; outline-offset: -2px; }
 
 /* ── Surfaces ──────────────────────────────────────────────────────────── */
 .dl-card,
@@ -231,32 +238,19 @@ button.suggested-action { font-weight: 600; }
 
 /* ── Hero ──────────────────────────────────────────────────────────────── */
 .hero-band {
-  padding: 22px 24px;
-  border-radius: 20px;
-  background-color: @card_bg_color;
-  background-image: linear-gradient(135deg, @card_bg_color 40%, @surface_2);
-  box-shadow: 0 0 0 1px @card_edge, 0 1px 3px @card_shadow_near;
+  padding: 24px;
+  border-radius: 16px;
+  background-color: @dl_surface;
+  box-shadow: inset 0 0 0 1px @dl_edge;
 }
-.hero-band .soft-button,
-.hero-band button.suggested-action {
-  min-height: 36px;
-  padding: 0 14px;
-  border-radius: 9px;
-}
-.hero-name {
-  font-size: 32px;
-  font-weight: 700;
-  letter-spacing: -0.9px;
-}
-.hero-meta { font-size: 14px; }
-.battery-percent { font-size: 13px; font-weight: 600; }
+.hero-band .dl-hero { letter-spacing: -0.3px; }
+.battery-percent { font-size: 0.87em; font-weight: 600; }
 /* The phone, drawn like the design's: a dark slab with its clock. */
 .phone-art {
-  border-radius: 16px;
-  border: 3px solid @window_fg_color;
+  border-radius: 12px;
+  border: 3px solid @dl_text;
   background-image: linear-gradient(170deg, #3a4466, #12141c);
   padding-top: 8px;
-  box-shadow: 0 10px 24px -8px rgba(0, 0, 0, 0.35);
 }
 .phone-camera {
   min-width: 5px;
@@ -266,7 +260,7 @@ button.suggested-action { font-weight: 600; }
 }
 .phone-time {
   color: white;
-  font-size: 13px;
+  font-size: 0.87em;
   font-weight: 300;
 }
 .round-action {
@@ -282,9 +276,11 @@ button.suggested-action { font-weight: 600; }
 .round-caption { font-size: 12px; font-weight: 600; color: @text_dim; }
 .round-action:disabled { opacity: 0.45; }
 .round-action.on .round-icon { background-color: @coral; color: white; }
-/* Send Files, the one primary action of the row. */
 .round-action.primary .round-icon { background-color: @accent_bg_color; color: @accent_fg_color; }
 .round-more { margin-top: 4px; min-width: 40px; min-height: 40px; }
+/* A card showing what the phone last said, while it is away. */
+.dl-card.stale { opacity: 0.75; }
+.install-address { font-size: 0.87em; }
 
 /* ── Now playing ───────────────────────────────────────────────────────── */
 .now-playing { padding: 12px 16px 12px 12px; }
@@ -303,25 +299,48 @@ levelbar.track > trough > block.filled { background-color: @window_fg_color; bor
 levelbar.track > trough > block.empty { background-color: @surface_2; }
 
 /* ── Banners ───────────────────────────────────────────────────────────── */
+/* The older banners (`.live-banner`, `.state-banner`), which the Bucket, Insert
+   and Sound bars still use, look like the kit's (`.dl-banner`) until they move. */
 .live-banner,
 .state-banner {
-  padding: 9px 10px 9px 14px;
-  border-radius: 14px;
+  padding: 12px 16px;
+  border-radius: 16px;
 }
-.live-banner { background-color: @coral_bg; }
-.state-banner { background-color: @surface_2; }
-.state-banner.tall { padding: 13px 14px; }
+.live-banner { background-color: @dl_live_container; }
+.state-banner { background-color: @dl_surface_2; }
+.state-banner.tall { padding: 12px 16px; }
 .live-icon {
   border-radius: 8px;
-  background-color: @coral;
-  /* Opaque in every style: libadwaita's own card colour is translucent. */
-  color: @window_bg_color;
+  background-color: @dl_surface;
+  color: @dl_live_text;
 }
 .state-icon {
   border-radius: 8px;
-  background-color: @card_bg_color;
-  color: @text_dim;
+  background-color: @dl_surface;
+  color: @dl_text_dim;
 }
+
+/* The window's own banner (`AdwBanner`: a daemon error, a standing problem)
+   in the kit's look: an error container with a text button. */
+banner.dl-banner-host > revealer > widget {
+  margin: 8px 12px 0 12px;
+  padding: 4px 8px 4px 16px;
+  border-radius: 16px;
+  background-color: @dl_error_container;
+  color: @dl_on_error_container;
+  box-shadow: none;
+}
+banner.dl-banner-host > revealer > widget label { font-weight: 600; }
+banner.dl-banner-host > revealer > widget button {
+  min-height: 40px;
+  border-radius: 12px;
+  background: none;
+  box-shadow: none;
+  color: @dl_on_error_container;
+  font-weight: 600;
+}
+banner.dl-banner-host > revealer > widget button:hover { background-color: alpha(currentColor, 0.1); }
+banner.dl-banner-host > revealer > widget button:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
 
 /* ── Overview cards ────────────────────────────────────────────────────── */
 .term-strip {
@@ -533,20 +552,33 @@ button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.0
   box-shadow: 0 0 0 1px @hairline, 0 16px 40px -12px rgba(0, 0, 0, 0.18);
 }
 .pair-title {
-  font-size: 26px;
+  font-size: 1.73em;
   font-weight: 700;
-  letter-spacing: -0.5px;
+  letter-spacing: -0.3px;
 }
-.pair-subtitle { font-size: 15px; color: @text_dim; }
+.pair-subtitle { font-size: 1em; color: @dl_text_dim; }
 .pair-footer {
-  padding: 14px 22px;
-  border-top: 1px solid @hairline;
+  padding: 12px 24px;
+  border-top: 1px solid @dl_hairline;
 }
 .pairing-code {
-  margin: 10px 0 2px 0;
-  font-size: 42px;
+  margin: 8px 0 0 0;
+  font-size: 2.8em;
   font-weight: 600;
   letter-spacing: 0.12em;
+}
+/* A file dragged over the window: a dashed edge and the words for it. */
+.drop-over {
+  outline: 2px dashed @dl_accent;
+  outline-offset: -8px;
+  background-color: alpha(@dl_accent_container, 0.4);
+}
+.drop-hint {
+  padding: 12px 20px;
+  border-radius: 999px;
+  background-color: @dl_accent;
+  color: @dl_on_accent;
+  font-weight: 600;
 }
 
 /* ── Phone screen viewer ───────────────────────────────────────────────── */
@@ -567,17 +599,18 @@ button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.0
  * other pages. Answer is a darker mint, so white text keeps 4.5:1. */
 @define-color call_green #0b7a59;
 .call-card {
-  padding: 14px 16px;
+  padding: 12px 16px;
   border-radius: 16px;
-  background-color: @card_bg_color;
-  box-shadow: 0 0 0 1px @card_edge;
+  background-color: @dl_surface;
+  box-shadow: inset 0 0 0 1px @dl_edge;
 }
-.call-card.compact { padding: 8px 10px 8px 12px; border-radius: 14px; }
+.call-card.compact { padding: 8px 12px; }
 .call-card.ringing {
-  background-color: alpha(@mint, 0.1);
-  box-shadow: 0 0 0 1px alpha(@mint, 0.3);
+  background-color: @dl_success_container;
+  box-shadow: none;
 }
-.call-icon { border-radius: 999px; background-color: @call_green; color: white; }
+.call-icon.dl-icon-square { border-radius: 999px; background-color: @call_green; color: white; }
+.call-card.compact .call-icon.dl-icon-square { min-width: 32px; min-height: 32px; }
 /* Ringing: a ripple. GTK drops it when the user turned animations off. */
 .call-icon.pulse { animation: ring-pulse 1.4s ease-out infinite; }
 @keyframes ring-pulse {
@@ -585,8 +618,9 @@ button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.0
   70% { box-shadow: 0 0 0 10px alpha(@mint, 0); }
   100% { box-shadow: 0 0 0 0 alpha(@mint, 0); }
 }
-.call-answer { background-color: @call_green; color: white; }
-.call-answer:hover { background-color: shade(@call_green, 1.1); }
+.dl-btn.call-answer, .dl-icon-btn.call-answer { background-color: @call_green; color: white; }
+.dl-btn.call-answer:hover { background-color: shade(@call_green, 1.1); }
+.dl-icon-btn.call-danger { background-color: @dl_error_container; color: @dl_on_error_container; }
 
 /* A PDF page in the viewer: paper on the stage. */
 .pdf-page {

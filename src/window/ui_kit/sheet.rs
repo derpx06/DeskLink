@@ -4,6 +4,7 @@
 
 use adw::prelude::*;
 
+use super::banner::{banner, empty_state, live_banner, BannerKind};
 use super::{
     button, card, chip, icon_button, icon_square, list_row, progress_row, row_group,
     section_header, segmented, status_dot, status_pill, tile, toast_preview, ButtonKind, Status,
@@ -245,6 +246,70 @@ fn cards() -> gtk::Box {
     all
 }
 
+fn banners() -> gtk::Box {
+    let all = column(12);
+    for (kind, icon, title, detail, action) in [
+        (
+            BannerKind::Info,
+            "desklink-info-symbolic",
+            "Pixel 9 is on the latest DeskLink",
+            Some("Nothing to do."),
+            None,
+        ),
+        (
+            BannerKind::Success,
+            "desklink-check-circle-symbolic",
+            "Paired with Pixel 9",
+            None,
+            None,
+        ),
+        (
+            BannerKind::Warn,
+            "desklink-warning-symbolic",
+            "Pixel 9 wants to pair",
+            Some("Check that its code matches before you accept."),
+            Some("Review"),
+        ),
+        (
+            BannerKind::Error,
+            "desklink-error-symbolic",
+            "Can't reach Pixel 9",
+            Some("Check that it is on and on your network."),
+            Some("Try again"),
+        ),
+    ] {
+        let one = banner(kind, icon, title, detail);
+        if let Some(label) = action {
+            one.add_action(&button(ButtonKind::Text, label, None));
+        }
+        all.append(&one.root);
+    }
+    all.append(
+        &live_banner(
+            "desklink-mobile-screen-share-symbolic",
+            "Pixel 9 is using this computer",
+            Some("Viewing your screen · since 14:02"),
+            "End",
+            |_| {},
+        )
+        .root,
+    );
+    let empty = empty_state(
+        "desklink-folder-symbolic",
+        "No files yet",
+        "Files you send or receive show up here.",
+    );
+    empty.append(&button(
+        ButtonKind::Primary,
+        "Send files",
+        Some("desklink-upload-file-symbolic"),
+    ));
+    let out = column(16);
+    out.append(&captioned("Banners", &all));
+    out.append(&captioned("Empty state", &empty));
+    out
+}
+
 /// The whole sheet, in a scrolled window with the window colour behind it.
 pub(crate) fn sheet() -> gtk::ScrolledWindow {
     let page = column(32);
@@ -266,6 +331,7 @@ pub(crate) fn sheet() -> gtk::ScrolledWindow {
         tiles(),
         lists(),
         cards(),
+        banners(),
     ] {
         page.append(&part);
     }

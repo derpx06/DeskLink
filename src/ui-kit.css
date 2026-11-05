@@ -217,6 +217,45 @@
   box-shadow: inset 0 0 0 1px @dl_edge;
 }
 
+/* ── Banner and empty state (UI-REDESIGN 2.8.11, 2.8.15) ───────────────── */
+.dl-banner {
+  padding: 12px 16px;
+  border-radius: 16px;
+  background-color: @dl_surface_2;
+  color: @dl_text;
+}
+.dl-banner.success { background-color: @dl_success_container; }
+.dl-banner.warn { background-color: @dl_warn_container; }
+.dl-banner.error { background-color: @dl_error_container; }
+.dl-banner.live { background-color: @dl_live_container; }
+.dl-banner-title { font-size: 0.93em; font-weight: 600; }
+.dl-banner-detail { font-size: 0.87em; color: @dl_text_dim; }
+/* A 32 px square on the banner's ground, in the role's own text colour. */
+.dl-banner .dl-banner-icon {
+  min-width: 32px;
+  min-height: 32px;
+  border-radius: 8px;
+  background-color: @dl_surface;
+  color: @dl_text_dim;
+}
+.dl-banner .dl-banner-icon image { -gtk-icon-size: 20px; }
+.dl-banner.success .dl-banner-icon { color: @dl_success_text; }
+.dl-banner.warn .dl-banner-icon { color: @dl_warn_text; }
+.dl-banner.error .dl-banner-icon { color: @dl_error_text; }
+.dl-banner.live .dl-banner-icon { color: @dl_live_text; }
+
+.dl-empty { padding: 24px; }
+.dl-empty-circle {
+  min-width: 72px;
+  min-height: 72px;
+  border-radius: 999px;
+  background-color: @dl_surface_2;
+  color: @dl_text_dim;
+}
+.dl-empty-circle image { -gtk-icon-size: 28px; }
+.dl-empty-title { font-size: 1.13em; font-weight: 600; }
+.dl-empty-body { font-size: 0.93em; color: @dl_text_dim; }
+
 /* ── Toast (the inverse snackbar; AdwToast inside `.dl-toasts` too) ─────── */
 .dl-toast, .dl-toasts toast {
   padding: 12px 16px;

@@ -1,4 +1,4 @@
-//! Pairing: the welcome page's QR code, "Pair New Device" with the phones
+//! Pairing: the welcome page's QR code, "Pair another phone" with the phones
 //! nearby, and confirming a phone's request by comparing codes.
 
 use std::cell::{Cell, RefCell};
@@ -8,12 +8,24 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gdk, glib};
 
+use super::ui_kit::banner::{banner, empty_state, BannerKind};
+use super::ui_kit::{button, icon_button, icon_square, ButtonKind, Tone};
 use super::{
-    device_status_presentation, device_type_icon, device_type_label, friendly_error, spaced_code,
-    text, DesklinkWindow,
+    device_type_icon, device_type_label, friendly_error, hero_error_words, spaced_code, text,
+    DesklinkWindow,
 };
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::{DeviceStatus, DeviceView};
+use crate::link_glyph::Presentation;
+
+/// The titles of the pairing dialog (the window closes it when a scan pairs).
+pub(super) const PAIR_TITLE: &str = "Pair another phone";
+pub(super) const PAIR_CODE_TITLE: &str = "Pair with a code";
+
+/// What the welcome page says to do.
+pub(super) const WELCOME_HELP: &str = "Open DeskLink on your phone and scan this code.";
+/// Where to get the phone app (J16).
+pub(super) const INSTALL_ADDRESS: &str = "github.com/derpx06/DeskLink/releases";
 
 /// The welcome page: a pairing QR code, what to do with it, and pairing by
 /// code instead. Returns the flag that stops its code ([`stop_welcome`]).
@@ -24,13 +36,13 @@ pub(super) fn welcome_page(win: &DesklinkWindow, daemon: &DaemonHandle) -> Rc<Ce
     }
     let center = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(28)
+        .spacing(24)
         .vexpand(true)
         .valign(gtk::Align::Center)
         .halign(gtk::Align::Center)
         .margin_start(24)
         .margin_end(24)
-        .margin_bottom(40)
+        .margin_bottom(32)
         .build();
     let (code, stopped) = qr_code(daemon);
     let frame = gtk::Box::builder()
@@ -41,17 +53,20 @@ pub(super) fn welcome_page(win: &DesklinkWindow, daemon: &DaemonHandle) -> Rc<Ce
     center.append(&frame);
     let words = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(10)
+        .spacing(8)
         .build();
     words.append(
         &gtk::Label::builder()
             .label("Pair a phone")
+            .wrap(true)
+            .justify(gtk::Justification::Center)
             .css_classes(["pair-title"])
+            .accessible_role(gtk::AccessibleRole::Heading)
             .build(),
     );
     words.append(
         &gtk::Label::builder()
-            .label(PHONE_WELCOME)
+            .label(WELCOME_HELP)
             .wrap(true)
             .max_width_chars(40)
             .justify(gtk::Justification::Center)
@@ -59,17 +74,26 @@ pub(super) fn welcome_page(win: &DesklinkWindow, daemon: &DaemonHandle) -> Rc<Ce
             .build(),
     );
     center.append(&words);
+    center.append(&install_line());
     let waiting = gtk::Box::builder()
         .spacing(8)
         .halign(gtk::Align::Center)
         .build();
-    waiting.append(
-        &gtk::Box::builder()
-            .valign(gtk::Align::Center)
-            .css_classes(["dot", "accent-dot", "pulse"])
-            .accessible_role(gtk::AccessibleRole::Presentation)
-            .build(),
-    );
+    let dots = gtk::Box::builder()
+        .spacing(4)
+        .valign(gtk::Align::Center)
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
+    for delay in ["one", "two", "three"] {
+        dots.append(
+            &gtk::Box::builder()
+                .valign(gtk::Align::Center)
+                .css_classes(["dot", "pulse", delay])
+                .accessible_role(gtk::AccessibleRole::Presentation)
+                .build(),
+        );
+    }
+    waiting.append(&dots);
     waiting.append(&text("Waiting for a phone…", &["text-dim", "body-small"]));
     center.append(&waiting);
     // Scrolls, rather than clipping, in a short window.
@@ -86,14 +110,14 @@ pub(super) fn welcome_page(win: &DesklinkWindow, daemon: &DaemonHandle) -> Rc<Ce
         .spacing(12)
         .css_classes(["pair-footer"])
         .build();
-    let visible = gtk::Box::builder().hexpand(true).build();
+    let visible = gtk::Box::builder()
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
     visible.append(&text("Visible as ", &["text-dim", "body-small"]));
     visible.append(&text(&host_name(), &["mono", "body-small"]));
     footer.append(&visible);
-    let codes = gtk::Button::builder()
-        .label("Pair with a Code Instead")
-        .css_classes(["link-button"])
-        .build();
+    let codes = button(ButtonKind::Text, "Pair with a code instead", None);
     let window = win.downgrade();
     codes.connect_clicked(move |_| {
         if let Some(window) = window.upgrade() {
@@ -105,9 +129,44 @@ pub(super) fn welcome_page(win: &DesklinkWindow, daemon: &DaemonHandle) -> Rc<Ce
     stopped
 }
 
-/// What the welcome page says, with where to get the phone app (J16).
-pub(super) const PHONE_WELCOME: &str = "Open DeskLink on your Android phone and scan this code. \
-     No app yet? Get DeskLink for Android from github.com/derpx06/DeskLink/releases.";
+/// "No app yet?" and the release address, selectable, with a copy button.
+fn install_line() -> gtk::Box {
+    let line = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .halign(gtk::Align::Center)
+        .build();
+    line.append(
+        &gtk::Label::builder()
+            .label("No app yet? Get DeskLink for Android at")
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .css_classes(["text-dim", "body-small"])
+            .build(),
+    );
+    let address = gtk::Box::builder()
+        .spacing(4)
+        .halign(gtk::Align::Center)
+        .build();
+    address.append(
+        &gtk::Label::builder()
+            .label(INSTALL_ADDRESS)
+            .selectable(true)
+            .wrap(true)
+            .wrap_mode(gtk::pango::WrapMode::Char)
+            .valign(gtk::Align::Center)
+            .css_classes(["dl-mono", "install-address"])
+            .build(),
+    );
+    let copy = icon_button("desklink-content-copy-symbolic", "Copy the address");
+    copy.connect_clicked(|copy| {
+        copy.display().clipboard().set_text(INSTALL_ADDRESS);
+        super::toast_from(copy, "Address copied");
+    });
+    address.append(&copy);
+    line.append(&address);
+    line
+}
 
 /// Takes the welcome page's code off the air.
 pub(super) fn stop_welcome(daemon: &DaemonHandle, stopped: &Cell<bool>) {
@@ -123,7 +182,7 @@ fn host_name() -> String {
 }
 
 impl DesklinkWindow {
-    /// "Pair New Device": the phones found nearby, to pair with by code,
+    /// "Pair another phone": the phones found nearby, to pair with by code,
     /// and with `with_qr` a QR code to scan first.
     pub(super) fn show_discovery_dialog(&self, with_qr: bool) {
         let Some(daemon) = self.daemon() else {
@@ -136,21 +195,13 @@ impl DesklinkWindow {
         daemon.send(DaemonCommand::Discover);
 
         let dialog = adw::Dialog::builder()
-            .title(if with_qr {
-                "Pair New Device"
-            } else {
-                "Pair with a Code"
-            })
+            .title(if with_qr { PAIR_TITLE } else { PAIR_CODE_TITLE })
             .content_width(520)
             .content_height(if with_qr { 680 } else { 440 })
             .build();
         let toolbar = adw::ToolbarView::new();
         let header = adw::HeaderBar::new();
-        let refresh = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text("Search Again")
-            .build();
-        refresh.update_property(&[gtk::accessible::Property::Label("Search Again")]);
+        let refresh = icon_button("desklink-refresh-symbolic", "Search again");
         header.pack_start(&refresh);
         toolbar.add_top_bar(&header);
 
@@ -180,7 +231,7 @@ impl DesklinkWindow {
                     .label("Scan with DeskLink on your phone.")
                     .wrap(true)
                     .justify(gtk::Justification::Center)
-                    .css_classes(["dim-label"])
+                    .css_classes(["text-dim"])
                     .build(),
             );
             content.append(&section);
@@ -191,21 +242,35 @@ impl DesklinkWindow {
 
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
+            .css_classes(["dl-row-group"])
             .build();
-        let nearby = adw::PreferencesGroup::builder()
-            .title("Nearby Devices")
-            .description(
-                "Phones on this network with DeskLink open. Pair, then check both show the same code.",
-            )
-            .header_suffix(
-                &gtk::Spinner::builder()
-                    .spinning(true)
-                    .valign(gtk::Align::Center)
-                    .build(),
-            )
+        list.set_placeholder(Some(&empty_state(
+            "desklink-search-symbolic",
+            "Looking for phones…",
+            "Keep both devices on the same Wi-Fi network.",
+        )));
+        let nearby = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
             .build();
-        nearby.add(&list);
+        let heading = gtk::Box::builder().spacing(8).build();
+        heading.append(&super::ui_kit::section_header("Phones on this network"));
+        heading.append(
+            &gtk::Spinner::builder()
+                .spinning(true)
+                .valign(gtk::Align::Center)
+                .build(),
+        );
+        nearby.append(&heading);
+        nearby.append(
+            &gtk::Label::builder()
+                .label("Pair, then check that both devices show the same code.")
+                .xalign(0.0)
+                .wrap(true)
+                .css_classes(["dl-secondary"])
+                .build(),
+        );
+        nearby.append(&list);
         content.append(&nearby);
 
         toolbar.set_content(Some(
@@ -277,55 +342,49 @@ fn populate_discovery_list(
     }
     last_snapshot.replace(Some(snapshot));
     list.remove_all();
-    if devices.is_empty() {
-        list.append(
-            &adw::ActionRow::builder()
-                .title("Looking for phones…")
-                .subtitle("Keep both devices on the same Wi-Fi network.")
-                .build(),
-        );
-        return;
-    }
     for device in devices {
         list.append(&discovery_row(daemon, device));
     }
 }
 
-/// A device in the nearby list: discovered, or mid-pairing with its code.
-fn discovery_row(daemon: &DaemonHandle, device: DeviceView) -> adw::ActionRow {
-    let mut subtitle_parts: Vec<String> = vec![device_type_label(&device.device_type)];
+/// The line under a nearby phone's name: "Phone · Wants to pair · why not".
+pub(super) fn discovery_subtitle(device: &DeviceView) -> String {
+    let mut parts: Vec<String> = vec![device_type_label(&device.device_type)];
     if !matches!(device.status, DeviceStatus::Discovered) {
-        subtitle_parts.push(device_status_presentation(&device).0.to_string());
+        parts.push(Presentation::of(device).detail);
     }
     if let Some(error) = &device.last_error {
-        subtitle_parts.push(friendly_error(error).0);
+        parts.push(friendly_error(error).0);
     }
-    // A phone's name is text, not markup: the row reads it as typed before
-    // anything is set on it.
-    let row = adw::ActionRow::builder()
-        .title(&device.name)
-        .use_markup(false)
-        .build();
-    row.set_subtitle(&subtitle_parts.join(" · "));
-    row.set_activatable(false);
-    row.add_prefix(&super::icon_square(
+    parts.retain(|part| !part.is_empty());
+    parts.join(" · ")
+}
+
+/// A device in the nearby list: discovered, or mid-pairing with its code.
+fn discovery_row(daemon: &DaemonHandle, device: DeviceView) -> adw::ActionRow {
+    // `list_row` escapes the name: a phone's name is text, not markup.
+    let row = super::ui_kit::list_row(
         device_type_icon(&device.device_type),
-        32,
-        "row-icon",
-    ));
+        Tone::Neutral,
+        &device.name,
+        Some(&discovery_subtitle(&device)),
+    );
+    row.set_activatable(false);
     let code = |key: &str| {
         gtk::Label::builder()
             .label(spaced_code(key))
             .valign(gtk::Align::Center)
-            .css_classes(["mono", "heading", "accent"])
+            .css_classes(["dl-mono", "heading", "accent"])
             .build()
     };
     match &device.status {
         DeviceStatus::Discovered | DeviceStatus::Connected | DeviceStatus::Unreachable => {
-            let pair = gtk::Button::builder()
-                .label("Pair")
-                .valign(gtk::Align::Center)
-                .build();
+            let pair = button(ButtonKind::Tonal, "Pair", None);
+            pair.set_valign(gtk::Align::Center);
+            pair.update_property(&[gtk::accessible::Property::Label(&format!(
+                "Pair with {}",
+                device.name
+            ))]);
             let (daemon, id) = (daemon.clone(), device.id.clone());
             pair.connect_clicked(move |_| daemon.send(DaemonCommand::RequestPair(id.clone())));
             row.add_suffix(&pair);
@@ -359,21 +418,14 @@ fn discovery_row(daemon: &DaemonHandle, device: DeviceView) -> adw::ActionRow {
                 .spacing(6)
                 .halign(gtk::Align::End)
                 .build();
-            let reject = gtk::Button::builder()
-                .label("Cancel")
-                .valign(gtk::Align::Center)
-                .build();
+            let reject = button(ButtonKind::Text, "Cancel", None);
             let (sender, id) = (daemon.clone(), device.id.clone());
             reject.connect_clicked(move |_| {
                 eprintln!("[UI] Reject clicked for {}", id);
                 sender.send(DaemonCommand::RejectPair(id.clone()));
             });
             buttons.append(&reject);
-            let accept = gtk::Button::builder()
-                .label("Pair")
-                .valign(gtk::Align::Center)
-                .css_classes(["suggested-action"])
-                .build();
+            let accept = button(ButtonKind::Tonal, "Pair", None);
             let (daemon, id, shown_key) = (
                 daemon.clone(),
                 device.id.clone(),
@@ -408,6 +460,33 @@ fn pairing_code_label(code: &str) -> gtk::Label {
     label
 }
 
+/// The phone asking, as a glyph, its name, and its kind and address.
+fn phone_line(device: &DeviceView) -> gtk::Box {
+    let line = gtk::Box::builder()
+        .spacing(12)
+        .halign(gtk::Align::Center)
+        .build();
+    line.append(&icon_square(
+        device_type_icon(&device.device_type),
+        Tone::Accent,
+    ));
+    let words = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .valign(gtk::Align::Center)
+        .build();
+    words.append(&super::ellipsized(&device.name, &["heading"]));
+    let mut about = device_type_label(&device.device_type);
+    if !device.address.is_empty() {
+        about.push_str(&format!(" · {}", device.address));
+    }
+    words.append(&super::ellipsized(&about, &["dl-mono", "dl-caption"]));
+    line.append(&words);
+    line
+}
+
+/// The reminder under every pairing question.
+const OWN_PHONES_ONLY: &str = "Only pair phones you own.";
+
 /// "Pair with Pixel 9?" with the code to compare. Cancel refuses; Escape
 /// only puts the dialog away, and the request stays answerable on the
 /// device's overview.
@@ -418,7 +497,7 @@ pub(super) fn present_pair_dialog(
 ) {
     let dialog = adw::AlertDialog::new(
         Some(&format!("Pair with {}?", device.name)),
-        Some("Check that your phone shows the same code."),
+        Some("Check that this code is also on the phone."),
     );
     dialog.add_responses(&[("reject", "_Cancel"), ("accept", "_Pair")]);
     dialog.set_response_appearance("accept", adw::ResponseAppearance::Suggested);
@@ -429,15 +508,12 @@ pub(super) fn present_pair_dialog(
             .orientation(gtk::Orientation::Vertical)
             .spacing(4)
             .build();
+        extra.append(&phone_line(device));
         extra.append(&pairing_code_label(key));
-        let mut about = device.name.to_lowercase().replace(' ', "-");
-        if !device.address.is_empty() {
-            about.push_str(&format!(" · {}", device.address));
-        }
         extra.append(
             &gtk::Label::builder()
-                .label(about)
-                .css_classes(["mono", "caption", "text-faint"])
+                .label(OWN_PHONES_ONLY)
+                .css_classes(["dl-caption"])
                 .build(),
         );
         dialog.set_extra_child(Some(&extra));
@@ -476,29 +552,42 @@ pub(super) fn present_pair_dialog(
     dialog.present(Some(win));
 }
 
-/// The phone asked to pair: the code to compare, and Cancel / Pair.
-pub(super) fn pair_request_view(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
+/// A centred column with the phone, a title and a line of help: the shape
+/// of every pairing page of a phone that is not paired yet.
+fn pair_page(device: &DeviceView, title: &str, help: &str) -> gtk::Box {
     let view = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
         .margin_top(48)
         .halign(gtk::Align::Center)
         .build();
+    view.append(&phone_line(device));
     view.append(
         &gtk::Label::builder()
-            .label(format!("Pair with {}?", device.name))
+            .label(title)
             .wrap(true)
             .justify(gtk::Justification::Center)
             .css_classes(["pair-title"])
+            .accessible_role(gtk::AccessibleRole::Heading)
             .build(),
     );
     view.append(
         &gtk::Label::builder()
-            .label("Check that your phone shows the same code.")
+            .label(help)
             .wrap(true)
             .justify(gtk::Justification::Center)
             .css_classes(["text-dim"])
             .build(),
+    );
+    view
+}
+
+/// The phone asked to pair: the code to compare, and Cancel / Pair.
+pub(super) fn pair_request_view(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
+    let view = pair_page(
+        device,
+        &format!("Pair with {}?", device.name),
+        "Check that this code is also on the phone.",
     );
     if let Some(key) = &device.verification_key {
         view.append(&pairing_code_label(key));
@@ -507,17 +596,10 @@ pub(super) fn pair_request_view(daemon: &DaemonHandle, device: &DeviceView) -> g
         .spacing(12)
         .halign(gtk::Align::Center)
         .homogeneous(true)
-        .margin_top(18)
+        .margin_top(12)
         .build();
-    let reject = gtk::Button::builder()
-        .label("Cancel")
-        .width_request(150)
-        .css_classes(["soft-button"])
-        .build();
-    let accept = gtk::Button::builder()
-        .label("Pair")
-        .css_classes(["suggested-action"])
-        .build();
+    let reject = button(ButtonKind::Tonal, "Cancel", None);
+    let accept = button(ButtonKind::Primary, "Pair", None);
     let (sender, id) = (daemon.clone(), device.id.clone());
     reject.connect_clicked(move |_| {
         eprintln!("[UI] Reject clicked for {}", id);
@@ -535,45 +617,68 @@ pub(super) fn pair_request_view(daemon: &DaemonHandle, device: &DeviceView) -> g
     buttons.append(&reject);
     buttons.append(&accept);
     view.append(&buttons);
+    view.append(
+        &gtk::Label::builder()
+            .label(OWN_PHONES_ONLY)
+            .css_classes(["dl-caption"])
+            .build(),
+    );
     view
 }
 
-/// This computer asked to pair: waiting for the phone to accept.
-pub(super) fn pair_waiting_view(device: &DeviceView) -> gtk::Box {
-    let view = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(12)
-        .margin_top(48)
-        .halign(gtk::Align::Center)
-        .build();
-    let heading = gtk::Box::builder()
-        .spacing(12)
-        .halign(gtk::Align::Center)
-        .build();
-    heading.append(&gtk::Spinner::builder().spinning(true).build());
-    heading.append(
-        &gtk::Label::builder()
-            .label(format!("Waiting for {}", device.name))
-            .wrap(true)
-            .css_classes(["pair-title"])
-            .build(),
+/// This computer asked to pair: waiting for the phone to accept. Cancel
+/// withdraws the request.
+pub(super) fn pair_waiting_view(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
+    let view = pair_page(
+        device,
+        &format!("Waiting for {}", device.name),
+        if device.verification_key.is_some() {
+            "Accept on the phone if it shows this code."
+        } else {
+            "Accept the request on the phone."
+        },
     );
-    view.append(&heading);
-    view.append(
-        &gtk::Label::builder()
-            .label(if device.verification_key.is_some() {
-                "Accept on the phone if it shows this code."
-            } else {
-                "Accept the request on the phone."
-            })
-            .wrap(true)
-            .justify(gtk::Justification::Center)
-            .css_classes(["text-dim"])
-            .build(),
-    );
+    view.append(&gtk::Spinner::builder().spinning(true).build());
     if let Some(key) = &device.verification_key {
         view.append(&pairing_code_label(key));
     }
+    let cancel = button(ButtonKind::Text, "Cancel", None);
+    cancel.set_halign(gtk::Align::Center);
+    let (daemon, id) = (daemon.clone(), device.id.clone());
+    cancel.connect_clicked(move |_| daemon.send(DaemonCommand::RejectPair(id.clone())));
+    view.append(&cancel);
+    view
+}
+
+/// A phone that is nearby (or refused, or let the request expire): Pair, and
+/// when the last try did not go through, why and Try again.
+pub(super) fn pair_idle_view(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
+    let view = pair_page(
+        device,
+        &format!("Pair with {}", device.name),
+        "Both devices show the same code. Check it before you accept.",
+    );
+    if let Some(error) = &device.last_error {
+        let (words, _) = hero_error_words(error);
+        let failed = banner(
+            BannerKind::Error,
+            "desklink-warning-symbolic",
+            &format!("Couldn't pair with {}", device.name),
+            Some(&words),
+        );
+        failed.root.set_halign(gtk::Align::Center);
+        let again = button(ButtonKind::Text, "Try again", None);
+        let (daemon, id) = (daemon.clone(), device.id.clone());
+        again.connect_clicked(move |_| daemon.send(DaemonCommand::RequestPair(id.clone())));
+        failed.add_action(&again);
+        view.append(&failed.root);
+        return view;
+    }
+    let pair = button(ButtonKind::Primary, "Pair", None);
+    pair.set_halign(gtk::Align::Center);
+    let (daemon, id) = (daemon.clone(), device.id.clone());
+    pair.connect_clicked(move |_| daemon.send(DaemonCommand::RequestPair(id.clone())));
+    view.append(&pair);
     view
 }
 
@@ -698,8 +803,39 @@ fn qr_texture(uri: &str) -> Option<gdk::MemoryTexture> {
 
 #[cfg(test)]
 mod welcome_tests {
+    use super::*;
+    use crate::device_links::device_info::DeviceInfo;
+
+    fn nearby() -> DeviceView {
+        let info = DeviceInfo::local("p".into(), "Pixel 9".into());
+        let mut device = DeviceView::from_info(&info, "10.0.0.2".into(), false);
+        device.status = DeviceStatus::Discovered;
+        device
+    }
+
     #[test]
     fn the_welcome_says_where_to_get_the_phone_app() {
-        assert!(super::PHONE_WELCOME.contains("github.com/derpx06/DeskLink/releases"));
+        assert_eq!(INSTALL_ADDRESS, "github.com/derpx06/DeskLink/releases");
+        assert!(WELCOME_HELP.contains("scan this code"));
+    }
+
+    /// A nearby phone's line says what it is and, once a request went
+    /// wrong, why, in plain sentence-case words.
+    #[test]
+    fn a_nearby_phone_reads_as_its_kind_its_state_and_why_it_failed() {
+        let mut device = nearby();
+        assert_eq!(discovery_subtitle(&device), "Phone");
+        device.status = DeviceStatus::PairRequestedByPeer;
+        assert_eq!(discovery_subtitle(&device), "Phone · Wants to pair");
+        device.status = DeviceStatus::PairRequested;
+        assert_eq!(
+            discovery_subtitle(&device),
+            "Phone · Accept the request on the phone"
+        );
+        device.status = DeviceStatus::Discovered;
+        device.last_error = Some("Pairing failed".into());
+        assert_eq!(discovery_subtitle(&device), "Phone · Pairing failed");
+        assert_eq!(PAIR_TITLE, "Pair another phone");
+        assert_eq!(PAIR_CODE_TITLE, "Pair with a code");
     }
 }
