@@ -97,9 +97,47 @@ pub(super) fn history_key(on: bool) -> String {
             .iter()
             .map(|item| (item.text.clone(), item.from.clone(), item.at))
             .collect::<Vec<_>>(),
-        super::clock_time(gtk::glib::DateTime::now_local().ok()),
     ))
     .unwrap_or_default()
+}
+
+/// "From Pixel 9 · 2 min ago": a history row's second line.
+fn history_subtitle(from: &str, at: u64, now: &gtk::glib::DateTime) -> String {
+    let when = gtk::glib::DateTime::from_unix_local(at as i64)
+        .map(|when| super::history::time_label(now, &when))
+        .unwrap_or_default();
+    format!("From {from} · {when}")
+}
+
+const AT_PREFIX: &str = "clip-at:";
+
+/// Brings the "2 min ago" of the history rows under `root` up to date, in
+/// place: the list is rebuilt only when what was copied changes, not each
+/// minute.
+pub(super) fn refresh_times(root: &gtk::Widget) {
+    let Ok(now) = gtk::glib::DateTime::now_local() else {
+        return;
+    };
+    let mut stack = vec![root.clone()];
+    while let Some(widget) = stack.pop() {
+        if let (Some(row), Some(rest)) = (
+            widget.downcast_ref::<adw::ActionRow>(),
+            widget.widget_name().strip_prefix(AT_PREFIX),
+        ) {
+            if let Some((at, from)) = rest.split_once(':') {
+                let words = history_subtitle(from, at.parse().unwrap_or(0), &now);
+                let words = gtk::glib::markup_escape_text(&words);
+                if row.subtitle().as_deref() != Some(words.as_str()) {
+                    row.set_subtitle(&words);
+                }
+            }
+        }
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            child = next.next_sibling();
+            stack.push(next);
+        }
+    }
 }
 
 /// The line under the sharing switch: what is shared and what is not.
@@ -170,11 +208,6 @@ pub(super) fn history_box(on: bool) -> gtk::Box {
     let now = gtk::glib::DateTime::now_local().ok();
     let mut list_rows = Vec::new();
     for item in items {
-        let when = gtk::glib::DateTime::from_unix_local(item.at as i64)
-            .ok()
-            .zip(now.as_ref())
-            .map(|(when, now)| super::history::time_label(now, &when))
-            .unwrap_or_default();
         let from = item
             .from
             .clone()
@@ -188,8 +221,11 @@ pub(super) fn history_box(on: bool) -> gtk::Box {
             },
             Tone::Neutral,
             &preview,
-            Some(&format!("From {from} · {when}")),
+            now.as_ref()
+                .map(|now| history_subtitle(&from, item.at, now))
+                .as_deref(),
         );
+        row.set_widget_name(&format!("{AT_PREFIX}{}:{from}", item.at));
         row.set_title_lines(2);
         row.add_css_class("dl-mono-row");
         full_text_tip(&row, &item.text);
@@ -338,5 +374,33 @@ pub(super) fn tab_chips(
 pub(super) fn pick_chip(chips: &[(String, gtk::ToggleButton)], name: &str) {
     if let Some((_, chip)) = chips.iter().find(|(chip, _)| chip == name) {
         chip.set_active(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// "2 h ago" moves on without the list being rebuilt. (Needs a display.)
+    #[test]
+    fn the_times_of_the_history_rows_are_refreshed_in_place() {
+        crate::test_display::run(|| {
+            let now = gtk::glib::DateTime::now_local().unwrap();
+            let at = now.to_unix() as u64;
+            let row = ui_kit::list_row(
+                "desklink-device-phone-symbolic",
+                Tone::Neutral,
+                "git push",
+                Some(&history_subtitle("Pixel 9", at - 3 * 3600, &now)),
+            );
+            row.set_widget_name(&format!("{AT_PREFIX}{}:Pixel 9", at - 3 * 3600));
+            let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            holder.append(&row);
+            assert_eq!(row.subtitle().unwrap(), "From Pixel 9 · 3 h ago");
+            // Later: the row's own time says so, nothing else changed.
+            row.set_widget_name(&format!("{AT_PREFIX}{}:Pixel 9", at - 20));
+            refresh_times(holder.upcast_ref());
+            assert_eq!(row.subtitle().unwrap(), "From Pixel 9 · Just now");
+        });
     }
 }

@@ -222,5 +222,6 @@ impl Page {
             }
             self.history.append(&clipboard::history_box(on));
         }
+        clipboard::refresh_times(self.history.upcast_ref());
     }
 }
