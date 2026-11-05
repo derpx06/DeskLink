@@ -167,7 +167,10 @@ pub(super) fn card(daemon: &DaemonHandle, device: &DeviceView, compact: bool) ->
     let caller = call.caller();
     // Who is calling and what it is are what the person came for: two lines
     // each before anything is cut (the whole text is then a tooltip).
-    let who = wrapped(&caller, &[if compact { "heading" } else { "dl-card-title" }]);
+    let who = wrapped(
+        &caller,
+        &[if compact { "heading" } else { "dl-card-title" }],
+    );
     who.set_lines(2);
     who.set_ellipsize(gtk::pango::EllipsizeMode::End);
     super::tooltip_when_cut(&who);

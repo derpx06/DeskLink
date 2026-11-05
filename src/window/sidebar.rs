@@ -10,7 +10,7 @@ use gtk::glib;
 use super::ui_kit::{button, icon_square, status_dot, status_pill, ButtonKind, Tone};
 use super::{device_type_icon, DesklinkWindow, MAIN_PAGES, PAGES};
 use crate::device_links::device::DeviceView;
-use crate::link_glyph::{link_glyph, presence_dot, LinkState, Presentation};
+use crate::link_glyph::{presence_dot, Presentation};
 
 /// Where the last selected device is kept: `~/.config/desklink/last-device`,
 /// beside the `appearance` file. Its own file, so the pairing records are
@@ -175,18 +175,16 @@ impl Sidebar {
         self.update_switcher(devices, device);
     }
 
-    /// The device card: link glyph, the phone's name, and under it a status
+    /// The device card: the phone's name, and under it a status
     /// dot, the word ("Connected") and the short detail ("Wi-Fi · 9 ms").
     fn update_card(&self, win: &DesklinkWindow, device: &DeviceView) {
-        let state = LinkState::of(device);
         let words = Presentation::of(device);
-        let key = format!("{}\n{words:?}\n{state:?}", device.name);
+        let key = format!("{}\n{words:?}", device.name);
         if *self.card_key.borrow() == key {
             return;
         }
         self.card_key.replace(key);
         let content = gtk::Box::builder().spacing(12).build();
-        content.append(&link_glyph(state, &words.spoken()));
         let lines = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(2)
@@ -199,12 +197,14 @@ impl Sidebar {
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build();
         status.append(&status_dot(words.status));
-        status.append(&gtk::Label::builder().label(words.word).css_classes(["dl-label"]).build());
+        status.append(
+            &gtk::Label::builder()
+                .label(words.word)
+                .css_classes(["dl-label"])
+                .build(),
+        );
         if !words.short.is_empty() {
-            status.append(&super::ellipsized(
-                &words.short,
-                &["dl-caption", "dl-mono"],
-            ));
+            status.append(&super::ellipsized(&words.short, &["dl-caption", "dl-mono"]));
         }
         lines.append(&status);
         content.append(&lines);
@@ -324,10 +324,7 @@ impl Sidebar {
             let status = gtk::Box::builder().spacing(8).build();
             status.append(&status_pill(words.status, words.word));
             if !words.short.is_empty() {
-                status.append(&super::ellipsized(
-                    &words.short,
-                    &["dl-caption", "dl-mono"],
-                ));
+                status.append(&super::ellipsized(&words.short, &["dl-caption", "dl-mono"]));
             }
             lines.append(&status);
             content.append(&lines);

@@ -81,10 +81,10 @@ impl Banner {
     pub(crate) fn set_text(&self, title: &str, detail: Option<&str>) {
         self.title.set_label(title);
         self.detail.set_label(detail.unwrap_or_default());
-        self.detail.set_visible(detail.is_some_and(|d| !d.is_empty()));
-        self.root.update_property(&[gtk::accessible::Property::Label(
-            &spoken(title, detail),
-        )]);
+        self.detail
+            .set_visible(detail.is_some_and(|d| !d.is_empty()));
+        self.root
+            .update_property(&[gtk::accessible::Property::Label(&spoken(title, detail))]);
     }
 }
 

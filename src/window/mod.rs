@@ -249,6 +249,15 @@ mod imp {
 
             self.sidebar.replace(Some(sidebar::Sidebar::new(&obj)));
             sidebar::install_window_drop(&obj);
+            // The tile row follows the window as it is resized.
+            obj.connect_default_width_notify(|window| {
+                let window = window.downgrade();
+                glib::idle_add_local_once(move || {
+                    if let Some(window) = window.upgrade() {
+                        window.apply_tile_columns();
+                    }
+                });
+            });
             for (name, _, _) in PAGES {
                 let child: gtk::Widget = match *name {
                     "terminals" => {
@@ -1149,6 +1158,25 @@ impl DesklinkWindow {
         });
     }
 
+    /// Sets how many tiles the Home row holds from the page's width (the
+    /// page's margins off), now and once the layout has settled.
+    fn apply_tile_columns(&self) {
+        let imp = self.imp();
+        let width = imp.page_stack.width();
+        if width <= 0 {
+            return;
+        }
+        let margins = if imp.narrow.get() { 24 } else { 64 };
+        let columns = overview::tile_columns((width - margins).min(880));
+        for widget in named_widgets(imp.page_stack.upcast_ref(), "tile-row") {
+            if let Some(flow) = widget.downcast_ref::<gtk::FlowBox>() {
+                if flow.max_children_per_line() != columns {
+                    flow.set_max_children_per_line(columns);
+                }
+            }
+        }
+    }
+
     /// Lays named boxes and grids out for the window's width: the overview's
     /// two columns and the hero stack when phone-narrow, the terminal grid
     /// goes one to a line.
@@ -1211,6 +1239,13 @@ impl DesklinkWindow {
                 stack.push(next);
             }
         }
+        self.apply_tile_columns();
+        let window = self.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(window) = window.upgrade() {
+                window.apply_tile_columns();
+            }
+        });
     }
 
     /// Runs `refresh_devices` once the current handler has returned, e.g.
@@ -3913,7 +3948,11 @@ mod tests {
     /// Ctrl+, and the dialog that lists them says the same keys.
     #[test]
     fn the_page_shortcuts_follow_the_sidebar_and_the_dialog_lists_them() {
-        let names: Vec<_> = PAGES.iter().take(MAIN_PAGES).map(|(name, _, _)| *name).collect();
+        let names: Vec<_> = PAGES
+            .iter()
+            .take(MAIN_PAGES)
+            .map(|(name, _, _)| *name)
+            .collect();
         let bound: Vec<_> = PAGE_ACCELS.iter().map(|(name, _)| *name).collect();
         assert_eq!(names, bound);
         let mut seen = std::collections::HashSet::new();
@@ -3927,7 +3966,12 @@ mod tests {
                 index + 1
             );
         }
-        for words in ["Send files", "&lt;Control&gt;o", "&lt;Control&gt;comma", "Pair another phone"] {
+        for words in [
+            "Send files",
+            "&lt;Control&gt;o",
+            "&lt;Control&gt;comma",
+            "Pair another phone",
+        ] {
             assert!(dialog.contains(words), "{words}");
         }
         // Sentence case in the dialog, as everywhere.

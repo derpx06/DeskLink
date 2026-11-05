@@ -7,7 +7,7 @@ use adw::subclass::prelude::*;
 
 use super::ui_kit::banner::{banner, BannerKind};
 use super::ui_kit::{
-    button, card as kit_card, icon_square as kit_icon_square, icon_button as kit_icon_button,
+    button, card as kit_card, icon_button as kit_icon_button, icon_square as kit_icon_square,
     status_pill, tile, ButtonKind, TileKind, Tone,
 };
 use super::{
@@ -401,7 +401,11 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         }
         // The ladder gave up: this is what acts on "Try again".
         if crate::device_links::webrtc::coordinator::is_unavailable(error) {
-            let retry = button(ButtonKind::Tonal, "Try again", Some("desklink-refresh-symbolic"));
+            let retry = button(
+                ButtonKind::Tonal,
+                "Try again",
+                Some("desklink-refresh-symbolic"),
+            );
             retry.set_widget_name("hero-reconnect");
             retry.set_halign(gtk::Align::Start);
             let (daemon, id) = (daemon.clone(), device.id.clone());
@@ -477,12 +481,13 @@ fn tile_reason(device: &DeviceView) -> Option<&'static str> {
     }
 }
 
-/// Where the tile row gets fewer columns: below 840 px it has three, below
+/// Where the tile row gets fewer columns (its width in px, the window sets
+/// them as it is resized, `apply_tile_columns`): below 840 it has three, below
 /// 560 two, so there is never an orphan tile on a line of its own.
 const TILE_STEPS: [(i32, u32); 2] = [(840, 3), (560, 2)];
 
 /// How many tiles a row of `width` px holds.
-fn tile_columns(width: i32) -> u32 {
+pub(super) fn tile_columns(width: i32) -> u32 {
     let mut columns = 6;
     for (below, fewer) in TILE_STEPS {
         if width < below {
@@ -511,7 +516,7 @@ fn disable_tile(tile: &gtk::Button, device: &DeviceView) {
 
 /// The six quick actions: Phone screen, Insert, Sound, Ring phone, Hand off
 /// and More. A row of six, three by two, or two by three, by the page's width.
-fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> adw::BreakpointBin {
+fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> gtk::FlowBox {
     let kind = device_type_label(&device.device_type);
     let flow = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
@@ -624,19 +629,7 @@ fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> adw::BreakpointBin {
         add(&more);
     }
 
-    let bin = adw::BreakpointBin::builder()
-        .width_request(280)
-        .height_request(1)
-        .child(&flow)
-        .build();
-    for (below, columns) in TILE_STEPS {
-        if let Ok(condition) = adw::BreakpointCondition::parse(&format!("max-width: {}sp", below - 1)) {
-            let breakpoint = adw::Breakpoint::new(condition);
-            breakpoint.add_setter(&flow, "max-children-per-line", Some(&columns.to_value()));
-            bin.add_breakpoint(breakpoint);
-        }
-    }
-    bin
+    flow
 }
 
 /// "More": Lock phone, Send a nudge, Send a link. A popover of rows, each an
@@ -1285,7 +1278,11 @@ fn terminals_card(win: &DesklinkWindow, device: &DeviceView) -> gtk::Box {
         });
         body.append(&open);
     }
-    let new = button(ButtonKind::Tonal, "New terminal", Some("desklink-add-symbolic"));
+    let new = button(
+        ButtonKind::Tonal,
+        "New terminal",
+        Some("desklink-add-symbolic"),
+    );
     new.set_valign(gtk::Align::Center);
     new.set_action_name(Some("win.new-terminal"));
     new.set_action_target_value(Some(&"shell".to_variant()));
@@ -1603,14 +1600,23 @@ mod tests {
 
     #[test]
     fn the_live_strip_and_the_card_words_are_sentences() {
-        assert_eq!(live_detail("viewing your screen", None), "Viewing your screen");
+        assert_eq!(
+            live_detail("viewing your screen", None),
+            "Viewing your screen"
+        );
         assert_eq!(
             live_detail("in a terminal, viewing your screen", Some("14:02")),
             "In a terminal, viewing your screen · since 14:02"
         );
-        assert_eq!(live_detail("a second display", Some("")), "A second display");
+        assert_eq!(
+            live_detail("a second display", Some("")),
+            "A second display"
+        );
         assert_eq!(terminals_words(0, 0, "Pixel"), "0 open");
-        assert_eq!(terminals_words(2, 1, "Pixel"), "2 open · 1 shared with Pixel");
+        assert_eq!(
+            terminals_words(2, 1, "Pixel"),
+            "2 open · 1 shared with Pixel"
+        );
     }
 
     /// A tile that cannot be used says why in a word, with the same words as

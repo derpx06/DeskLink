@@ -68,7 +68,11 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>) {
         .margin_start(12)
         .margin_end(12)
         .build();
-    let copy = button(ButtonKind::Tonal, "Copy report", Some("desklink-content-copy-symbolic"));
+    let copy = button(
+        ButtonKind::Tonal,
+        "Copy report",
+        Some("desklink-content-copy-symbolic"),
+    );
     copy.set_halign(gtk::Align::End);
     let intro = banner(
         BannerKind::Info,
