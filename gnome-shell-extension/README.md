@@ -45,6 +45,11 @@ While the phone has something ongoing (a timer, a download, navigation) the pill
 otherwise off and shows the first item with its live countdown or progress (`Activities` property; the
 text is worked out by the helpers in `extension.js`, tested with `node --test gnome-shell-extension/tests/activity.test.mjs`).
 
+While a phone is viewing or controlling this screen, the "Compiz windows effect" extension's wobble is taken
+off a window as it is grabbed (`WobbleGuard` in `extension.js`, tested by `tests/wobble.test.mjs`): with the
+wobble on, GNOME's screen cast shows the dragged window as missing for the whole drag (gnome-shell #7116), so
+it vanished from the phone's picture. The wobble returns when the phone stops looking.
+
 The extension only talks to the app over D-Bus
 (`derx06.desklink.com.Shell1` at `/derx06/desklink/com/Shell`, see
 `src/shell_dbus.rs`). Files to send are picked in DeskLink's own dialog.

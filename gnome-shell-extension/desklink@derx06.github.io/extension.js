@@ -168,6 +168,64 @@ class DeskLinkButton extends PanelMenu.Button {
     }
 });
 
+// BEGIN wobble guard
+// Keeps a window-wobble extension from hiding windows from the phone.
+//
+// "Compiz windows effect" (compiz-windows-effect@hermes83.github.com) wraps a
+// window in a Clutter.DeformEffect while it is dragged, resized or
+// maximised. Mutter's screen cast (the PipeWire stream DeskLink sends to the
+// phone) draws such a window as *nothing* until the effect ends: the phone
+// sees the window vanish for the whole drag (gnome-shell issue #7116; OBS and
+// Discord lose it too). Measured on GNOME Shell 50.4: the dragged window is
+// missing from every captured frame, in all three cursor modes, and from a
+// Shell screenshot; any other window and a plain DeformEffect are fine.
+//
+// While a phone is looking at this screen, the effect is taken off the
+// grabbed window as soon as the other extension adds it. The wobble is back
+// the moment the phone stops looking. Only that one effect, by its name.
+export const WOBBLE_EFFECT = 'wobbly-compiz-effect';
+
+/// Takes the wobble effect off `window`'s actor, cleaning up through the
+/// effect's own `destroy()` (it has timers and signal handlers of its own).
+/// Returns whether there was one.
+export function stripWobble(window) {
+    const actor = window?.get_compositor_private?.();
+    const effect = actor?.get_effect?.(WOBBLE_EFFECT);
+    if (!effect)
+        return false;
+    try {
+        effect.destroy();
+    } catch (error) {
+        // Not the shape this code knows: just detach it.
+        actor.remove_effect(effect);
+    }
+    return true;
+}
+
+export class WobbleGuard {
+    constructor(display = global.display) {
+        this._display = display;
+        this._id = 0;
+    }
+
+    /// True while a phone is viewing or controlling this screen.
+    set sharing(on) {
+        if (on && !this._id) {
+            // After the other extension's own handler, which adds the effect.
+            this._id = this._display.connect_after('grab-op-begin',
+                (_display, window) => stripWobble(window));
+        } else if (!on && this._id) {
+            this._display.disconnect(this._id);
+            this._id = 0;
+        }
+    }
+
+    destroy() {
+        this.sharing = false;
+    }
+}
+// END wobble guard
+
 // BEGIN activity helpers (pure; tested by tests/activity.test.mjs)
 /// "4:32", or "1:05:09" from an hour; a countdown rounds up.
 export function clockText(ms) {
@@ -207,6 +265,7 @@ export default class DeskLinkExtension extends Extension {
     // are withdrawn while locked.
     enable() {
         this._selected = null;
+        this._wobble = new WobbleGuard();
         this._notifications = new PhoneNotifications((method, args) => this._call(method, args));
         this._calls = new PhoneCalls((method, args) => this._call(method, args));
         this._quietNotifications = true;
@@ -247,6 +306,8 @@ export default class DeskLinkExtension extends Extension {
         Main.sessionMode.disconnect(this._modeId);
         this._modeId = 0;
         this._disconnect();
+        this._wobble.destroy();
+        this._wobble = null;
         this._notifications.destroy();
         this._notifications = null;
         this._calls.destroy();
@@ -308,6 +369,9 @@ export default class DeskLinkExtension extends Extension {
         const devices = this._read('Devices', []).filter(device => device.paired);
         const desk = this._read('Desk', {});
         const live = devices.filter(device => device.screen || device.terminals > 0);
+        // A phone looking at this screen: no wobbling windows, they vanish from the picture (see the wobble guard above).
+        if (this._wobble)
+            this._wobble.sharing = running && devices.some(device => device.screen === 'view' || device.screen === 'control');
         const selected = devices.find(device => device.id === this._selected) ??
             devices.find(device => device.ready) ??
             devices.find(device => device.reachable) ?? devices[0];
