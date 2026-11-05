@@ -700,7 +700,7 @@ impl ShellDevice {
         dict.insert("liveSince", self.live_since);
         let switches = glib::VariantDict::new(None);
         for (key, on) in &self.settings {
-            switches.insert(*key, *on);
+            switches.insert(key, *on);
         }
         dict.insert_value("settings", &switches.end());
         let sound = glib::VariantDict::new(None);
@@ -1685,8 +1685,10 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 15] = [
-    // The current build (wave 2: the ongoing-items chip in the pill).
+const KNOWN_BUILDS: [&str; 16] = [
+    // The current build (the complete remote: model.js, sections, switches).
+    "b1c3aeb335ad359842ef42bbc1951fe68acc047c5be6116aea83185e2ae1f737",
+    // Wave 2: the ongoing-items chip in the pill.
     "c27272d96fac1f6029a7494eacbe93b716a44b05959acb0ded9b697e8f42a5d2",
     // w8: the Photo tile, `insert-photo`.
     "4d5b8192ae0a8fdcbceef31bcf955ff08d555b8cae633d758d77521e376687e4",
