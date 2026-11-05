@@ -707,9 +707,13 @@ impl DesktopScreenCapture {
             .map_err(|error| format!("DeskLink screen capture needs capsfilter: {error}"))?;
         // Scale before converting: colour conversion then runs on the small
         // frame, not the full-resolution one.
-        let elements = vec![
-            source,
-            system_memory,
+        let mut elements = vec![source, system_memory];
+        // The capture says how its picture must be turned (PipeWire's video
+        // transform, which `pipewiresrc` turns into an `image-orientation`
+        // tag); nothing downstream read it, so a rotated or flipped output was
+        // encoded as it came and the phone showed it upside down.
+        elements.extend(orientation_filter());
+        elements.extend([
             scale,
             convert,
             rate.clone(),
@@ -717,7 +721,7 @@ impl DesktopScreenCapture {
             queue,
             encoder.clone(),
             payloader.clone(),
-        ];
+        ]);
         pipeline
             .add_many(elements.iter())
             .map_err(|error| format!("Could not add DeskLink screen encoder chain: {error}"))?;
@@ -1384,6 +1388,16 @@ fn encoder_chain(
     Ok((scale, convert, rate, filter, queue, encoder, payloader))
 }
 
+/// Turns the picture the way the capture's `image-orientation` tag says, and
+/// is a pass-through when there is no tag. `None` if `videoflip` is missing
+/// (the picture is then sent as captured, as before).
+fn orientation_filter() -> Option<gst::Element> {
+    gst::ElementFactory::make("videoflip")
+        .property_from_str("video-direction", "auto")
+        .build()
+        .ok()
+}
+
 /// Debug builds: the real desktop-share path without a phone — GNOME portal
 /// (resuming `device_id`'s remembered grant, or asking at the desktop),
 /// PipeWire capture of this screen, the exact encoder chain the phone gets,
@@ -1679,6 +1693,97 @@ const MAX_FPS: i64 = 60;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A capture that tags its picture as rotated or flipped (PipeWire's video
+    /// transform) comes out turned the right way; an untagged one is untouched.
+    #[test]
+    fn the_capture_orientation_tag_turns_the_picture_the_right_way() {
+        if gst::init().is_err() || gst::ElementFactory::find("taginject").is_none() {
+            return;
+        }
+        let Some(_) = orientation_filter() else {
+            return;
+        };
+        const W: usize = 64;
+        const H: usize = 32;
+        fn run(tag: Option<&str>) -> (usize, usize, Vec<u8>) {
+            let description = format!(
+                "videotestsrc num-buffers=1 pattern=smpte ! video/x-raw,format=GRAY8,width={W},height={H} ! {} \
+                 videoflip video-direction=auto ! fakesink name=out sync=false",
+                tag.map_or(String::new(), |tag| format!(
+                    "taginject tags=image-orientation={tag} !"
+                ))
+            );
+            let pipeline = gst::parse::launch(&description)
+                .unwrap()
+                .downcast::<gst::Pipeline>()
+                .unwrap();
+            let taken = Arc::new(Mutex::new(None));
+            let probe = Arc::clone(&taken);
+            pipeline
+                .by_name("out")
+                .unwrap()
+                .static_pad("sink")
+                .unwrap()
+                .add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+                    if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data {
+                        let caps = pad.current_caps().unwrap();
+                        let shape = caps.structure(0).unwrap();
+                        let (w, h) = (
+                            shape.get::<i32>("width").unwrap() as usize,
+                            shape.get::<i32>("height").unwrap() as usize,
+                        );
+                        let pixels = buffer.map_readable().unwrap().to_vec();
+                        *probe.lock().unwrap() = Some((w, h, pixels));
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+            pipeline.set_state(gst::State::Playing).unwrap();
+            let bus = pipeline.bus().unwrap();
+            bus.timed_pop_filtered(
+                gst::ClockTime::from_seconds(10),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            );
+            pipeline.set_state(gst::State::Null).unwrap();
+            let frame = taken.lock().unwrap().take();
+            frame.expect("a frame")
+        }
+        let (_, _, reference) = run(None);
+        let at = |pixels: &[u8], w: usize, x: usize, y: usize| pixels[y * w + x];
+        // Not all one grey, or the checks below prove nothing.
+        assert!(reference.windows(2).any(|pair| pair[0] != pair[1]));
+
+        let (w, h, upside_down) = run(Some("rotate-180"));
+        assert_eq!((w, h), (W, H));
+        for (x, y) in [(0, 0), (W - 1, 0), (5, H - 1), (40, 7), (W - 1, H - 1)] {
+            assert_eq!(
+                at(&upside_down, w, x, y),
+                at(&reference, W, W - 1 - x, H - 1 - y)
+            );
+        }
+        let (_, _, mirrored) = run(Some("flip-rotate-0"));
+        let (_, _, vertical) = run(Some("flip-rotate-180"));
+        for (x, y) in [(0, 0), (W - 1, 0), (5, H - 1), (40, 7)] {
+            assert_eq!(
+                at(&mirrored, W, x, y),
+                at(&reference, W, W - 1 - x, y),
+                "horizontal"
+            );
+            assert_eq!(
+                at(&vertical, W, x, y),
+                at(&reference, W, x, H - 1 - y),
+                "vertical"
+            );
+        }
+        // Quarter turns swap the sides, either way round.
+        for tag in ["rotate-90", "rotate-270"] {
+            let (w, h, _) = run(Some(tag));
+            assert_eq!((w, h), (H, W), "{tag}");
+        }
+        // Untouched when untagged, and an explicit "upright" tag changes nothing.
+        let (_, _, upright) = run(Some("rotate-0"));
+        assert_eq!(upright, reference);
+    }
 
     #[test]
     fn the_rate_follows_loss_and_queueing_in_small_steps() {

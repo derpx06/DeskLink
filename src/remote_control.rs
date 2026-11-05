@@ -83,11 +83,68 @@ thread_local! {
         RefCell::new(std::collections::HashMap::new());
 }
 
-/// How to turn on the phone's control, shown when it refuses for that. A
-/// sideloaded app's accessibility switch is greyed out until Android's
-/// "restricted settings" are allowed for it.
-const ACCESSIBILITY_STEPS: &str = "On the phone: Settings → Accessibility → DeskLink → On \
-     (if it's greyed out: App info → ⋮ → Allow restricted settings first)";
+/// How to turn on the phone's control: the phone's own per-computer switch.
+fn control_off_text(computer: &str) -> String {
+    format!(
+        "Control is off on the phone. On your phone: Settings, Control, turn on \u{201c}Let {computer} control this phone\u{201d}."
+    )
+}
+
+/// A sideloaded app's accessibility switch is greyed out until Android's
+/// "restricted settings" are allowed for it: kept in the tooltip.
+const ACCESSIBILITY_STEPS: &str = "If the switch is greyed out: Settings → Apps → DeskLink → ⋮ → \
+     Allow restricted settings, then turn on Accessibility → DeskLink.";
+
+/// One line about the phone screen's state, shown in a strip *above* the picture
+/// (never over it). `ask` offers the one action: ask the phone for control.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Notice {
+    pub(crate) text: String,
+    pub(crate) ask: bool,
+}
+
+/// What the strip says. Control granted (`lease_active`) says nothing at all, so
+/// the strip goes the moment the phone allows it, with no click.
+pub(crate) fn status_notice(
+    state: Option<SessionState>,
+    gave_up: bool,
+    has_picture: bool,
+    denial: Option<&str>,
+    lease_active: bool,
+    computer: &str,
+) -> Option<Notice> {
+    let say = |text: &str| {
+        Some(Notice {
+            text: text.to_string(),
+            ask: false,
+        })
+    };
+    match state {
+        Some(SessionState::RequestingView) => say("Approve screen sharing on the phone…"),
+        Some(
+            SessionState::Viewing | SessionState::RequestingControl | SessionState::Controlling,
+        ) if lease_active => None,
+        Some(SessionState::Viewing | SessionState::RequestingControl) if denial.is_some() => {
+            Some(Notice {
+                text: control_off_text(computer),
+                ask: true,
+            })
+        }
+        Some(SessionState::Viewing | SessionState::RequestingControl) => {
+            say("Asking the phone for control…")
+        }
+        Some(SessionState::Controlling) if !has_picture => {
+            say("Allow screen sharing on the phone (check its notifications)…")
+        }
+        Some(SessionState::Controlling) => say("Asking the phone for control…"),
+        Some(SessionState::PausedLocked) => say("Phone is locked · unlock it to continue"),
+        Some(SessionState::Stopped) if gave_up => {
+            say("The phone declined or stopped sharing its screen")
+        }
+        Some(SessionState::Stopped) => say("Screen stopped · reconnecting…"),
+        _ => None,
+    }
+}
 
 pub fn show_remote_control_dialog(
     daemon: DaemonHandle,
@@ -159,26 +216,52 @@ pub fn show_remote_control_dialog(
         .halign(gtk::Align::Center)
         .css_classes(["toolbar", "osd", "floating-toolbar"])
         .build();
+    keys.update_property(&[gtk::accessible::Property::Label(
+        "Phone buttons: Back, Home, Recent apps",
+    )]);
+    // What this bar is: the phone's own navigation keys, not the computer's.
+    keys.append(
+        &gtk::Label::builder()
+            .label("Phone buttons")
+            .css_classes(["caption", "dim-label"])
+            .margin_start(6)
+            .build(),
+    );
+    let mut nav_buttons = Vec::new();
     for (icon, tooltip, name) in [
-        ("go-previous-symbolic", "Back (right click)", "backclick"),
-        ("go-home-symbolic", "Home (middle click)", "middleclick"),
-        ("view-app-grid-symbolic", "Recent Apps", "forwardclick"),
+        (
+            "go-previous-symbolic",
+            "Phone Back (or right click)",
+            "backclick",
+        ),
+        (
+            "go-home-symbolic",
+            "Phone Home (or middle click)",
+            "middleclick",
+        ),
+        (
+            "view-app-grid-symbolic",
+            "Phone Recent Apps",
+            "forwardclick",
+        ),
     ] {
         let button = gtk::Button::builder()
             .icon_name(icon)
             .tooltip_text(tooltip)
             .css_classes(["circular"])
+            .sensitive(false)
             .build();
         button.update_property(&[gtk::accessible::Property::Label(tooltip)]);
         let send = Rc::clone(&send);
         button.connect_clicked(move |_| send(action(name)));
         keys.append(&button);
+        nav_buttons.push((button, tooltip));
     }
     keys.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     // The phone's sound here while its screen shows (F1).
     let speaker = gtk::ToggleButton::builder()
         .icon_name("audio-volume-muted-symbolic")
-        .tooltip_text("Play the Phone's Sound Here")
+        .tooltip_text("Play the phone's sound on this computer")
         .css_classes(["circular"])
         .build();
     speaker.update_property(&[gtk::accessible::Property::Label(
@@ -257,16 +340,15 @@ pub fn show_remote_control_dialog(
         &picture,
         &[gtk::accessible::Property::Label("Phone screen")],
     );
-    // A note over the picture once there is one ("Asking the phone for
-    // control…"); before that, a centred spinner with the same words.
-    let status = gtk::Label::builder()
-        .css_classes(["osd", "toolbar"])
-        .wrap(true)
-        .justify(gtk::Justification::Center)
-        .halign(gtk::Align::Center)
-        .valign(gtk::Align::Start)
-        .margin_top(12)
+    // One strip above the picture, never over it ("Asking the phone for
+    // control…", "Control is off on the phone…"); before there is a picture,
+    // a centred spinner with the same words. It goes by itself when control
+    // is granted.
+    let status = adw::Banner::builder()
+        .use_markup(false)
+        .button_label("Ask the phone")
         .build();
+    toolbar.add_top_bar(&status);
     let loading = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(12)
@@ -298,7 +380,6 @@ pub fn show_remote_control_dialog(
     loading.append(&ask_again);
     let overlay = gtk::Overlay::builder().child(&picture).build();
     overlay.add_overlay(&loading);
-    overlay.add_overlay(&status);
     toolbar.set_content(Some(&overlay));
 
     // A screen the phone offered is already being started under its id.
@@ -321,6 +402,23 @@ pub fn show_remote_control_dialog(
     }
     let link_ready = Rc::new(Cell::new(true));
     let last_control_request = Rc::new(Cell::new(std::time::Instant::now()));
+    {
+        // The one action: ask the phone now (it shows its own prompt for what is missing).
+        let (daemon, device, last) = (
+            daemon.clone(),
+            Rc::clone(&device),
+            Rc::clone(&last_control_request),
+        );
+        status.connect_button_clicked(move |_| {
+            daemon.send(DaemonCommand::RequestPhoneControl(device.to_string()));
+            last.set(std::time::Instant::now());
+        });
+    }
+    let computer = glib::host_name().to_string();
+    let nav_buttons: Vec<(glib::WeakRef<gtk::Button>, &'static str)> = nav_buttons
+        .into_iter()
+        .map(|(button, tooltip)| (button.downgrade(), tooltip))
+        .collect();
 
     // State, picture and status, refreshed ~30 times a second.
     {
@@ -338,6 +436,7 @@ pub fn show_remote_control_dialog(
         let route = route.downgrade();
         let kind = kind.downgrade();
         let tick = Cell::new(0u32);
+        let lease_was = Cell::new(false);
         glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
             let (Some(picture), Some(status)) = (picture.upgrade(), status.upgrade()) else {
                 return glib::ControlFlow::Break;
@@ -397,8 +496,7 @@ pub fn show_remote_control_dialog(
                 daemon.send(DaemonCommand::RequestPhoneControl(device.to_string()));
                 last_control_request.set(std::time::Instant::now());
             }
-            let denial = session_control_denial(device.as_str())
-                .map(|reason| format!("{reason} — {ACCESSIBILITY_STEPS}"));
+            let denial = session_control_denial(device.as_str());
             let paintable = crate::device_links::webrtc::screen::stream_for(device.as_str())
                 .and_then(|stream| stream.paintable());
             if picture.paintable() != paintable {
@@ -406,27 +504,29 @@ pub fn show_remote_control_dialog(
             }
             #[cfg(debug_assertions)]
             save_frame_on_request(&picture);
-            let text = match state {
-                Some(SessionState::RequestingView) => Some("Approve screen sharing on the phone…"),
-                Some(SessionState::Viewing) | Some(SessionState::RequestingControl)
-                    if denial.is_some() =>
-                {
-                    denial.as_deref()
+            let lease_active = remote_control_lease_active(device.as_str());
+            // The phone's buttons work exactly when control is granted; when it is
+            // not they say so instead of looking usable and doing nothing.
+            if lease_was.replace(lease_active) != lease_active || tick.get() == 1 {
+                for (button, tooltip) in &nav_buttons {
+                    if let Some(button) = button.upgrade() {
+                        button.set_sensitive(lease_active);
+                        button.set_tooltip_text(Some(if lease_active {
+                            *tooltip
+                        } else {
+                            "Needs control: it is off on the phone"
+                        }));
+                    }
                 }
-                Some(SessionState::Viewing) | Some(SessionState::RequestingControl) => {
-                    Some("Asking the phone for control…")
-                }
-                Some(SessionState::Controlling) if paintable.is_none() => {
-                    Some("Allow screen sharing on the phone (check its notifications)…")
-                }
-                Some(SessionState::Controlling) => None,
-                Some(SessionState::PausedLocked) => Some("Phone is locked · unlock it to continue"),
-                Some(SessionState::Stopped) if gave_up => {
-                    Some("The phone declined or stopped sharing its screen")
-                }
-                Some(SessionState::Stopped) => Some("Screen stopped · reconnecting…"),
-                _ => None,
-            };
+            }
+            let notice = status_notice(
+                state,
+                gave_up,
+                paintable.is_some(),
+                denial.as_deref(),
+                lease_active,
+                &computer,
+            );
             let connecting = format!(
                 "Connecting to {}…",
                 title
@@ -438,11 +538,24 @@ pub fn show_remote_control_dialog(
             let waiting = paintable.is_none();
             if let (Some(loading), Some(label)) = (loading.upgrade(), loading_label.upgrade()) {
                 loading.set_visible(waiting);
-                label.set_label(text.unwrap_or(&connecting));
+                label.set_label(notice.as_ref().map_or(&connecting, |n| &n.text));
             }
-            status.set_visible(!waiting && text.is_some());
-            if let Some(text) = text {
-                status.set_label(text);
+            let strip = !waiting && notice.is_some();
+            if strip != status.is_revealed() {
+                status.set_revealed(strip);
+            }
+            if let Some(notice) = &notice {
+                if status.title().as_str() != notice.text {
+                    status.set_title(&notice.text);
+                }
+                let label = if notice.ask { "Ask the phone" } else { "" };
+                if status.button_label().as_deref().unwrap_or("") != label {
+                    status.set_button_label(Some(label));
+                }
+                let hint = notice
+                    .ask
+                    .then(|| format!("{} {ACCESSIBILITY_STEPS}", denial.as_deref().unwrap_or("")));
+                status.set_tooltip_text(hint.as_deref());
             }
             glib::ControlFlow::Continue
         });
@@ -884,6 +997,48 @@ mod tests {
             map_to_phone((500.0, 500.0), widget, (0.0, 0.0), phone),
             None
         );
+    }
+
+    /// Not granted: a strip with the instruction and the one action. Granted: no
+    /// strip and the buttons enabled, with no click. Revoked: back.
+    #[test]
+    fn the_control_strip_follows_the_grant_and_goes_by_itself() {
+        let notice =
+            |state, denial, lease| status_notice(state, false, true, denial, lease, "desk");
+        let asking = notice(Some(SessionState::Viewing), None, false).unwrap();
+        assert_eq!(asking.text, "Asking the phone for control…");
+        assert!(!asking.ask);
+
+        let refused = notice(
+            Some(SessionState::Viewing),
+            Some("accessibility is off"),
+            false,
+        )
+        .unwrap();
+        assert!(refused.ask, "the one action is offered");
+        assert_eq!(
+            refused.text,
+            "Control is off on the phone. On your phone: Settings, Control, turn on \u{201c}Let desk control this phone\u{201d}."
+        );
+
+        // Granted: nothing is said, whatever the state or a stale reason says.
+        for state in [
+            SessionState::Viewing,
+            SessionState::RequestingControl,
+            SessionState::Controlling,
+        ] {
+            assert_eq!(notice(Some(state), Some("stale"), true), None);
+        }
+        // Revoked: it comes back.
+        assert!(
+            notice(Some(SessionState::Viewing), Some("x"), false)
+                .unwrap()
+                .ask
+        );
+        // Other states keep their own words and never offer to ask.
+        let locked = notice(Some(SessionState::PausedLocked), None, false).unwrap();
+        assert!(!locked.ask);
+        assert_eq!(notice(Some(SessionState::Idle), None, false), None);
     }
 
     #[test]
