@@ -1102,7 +1102,11 @@ fn breadcrumb(win: &DesklinkWindow) -> gtk::Box {
 
 /// "Add files…".
 fn add_button(device: &str) -> gtk::Button {
-    let button = ui_kit::button(ButtonKind::Tonal, "Add files…", Some("desklink-add-symbolic"));
+    let button = ui_kit::button(
+        ButtonKind::Tonal,
+        "Add files…",
+        Some("desklink-add-symbolic"),
+    );
     button.set_valign(gtk::Align::Center);
     let device = device.to_string();
     button.connect_clicked(move |button| choose(button, &device));
@@ -1658,11 +1662,15 @@ fn badge(item: &Item, device: &DeviceView) -> Option<gtk::Widget> {
         }
         ItemState::Sending => {
             holder.add_css_class("moving");
-            holder.append(&gtk::Image::from_icon_name("desklink-arrow-upward-symbolic"));
+            holder.append(&gtk::Image::from_icon_name(
+                "desklink-arrow-upward-symbolic",
+            ));
         }
         ItemState::Receiving => {
             holder.add_css_class("moving");
-            holder.append(&gtk::Image::from_icon_name("desklink-arrow-downward-symbolic"));
+            holder.append(&gtk::Image::from_icon_name(
+                "desklink-arrow-downward-symbolic",
+            ));
         }
         ItemState::Waiting => {
             holder.add_css_class("waiting");

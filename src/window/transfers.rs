@@ -620,7 +620,11 @@ pub(super) fn add_card(grid: &gtk::FlowBox, card: &impl IsA<gtk::Widget>) {
 
 /// An empty state of the kit's shape: a 28 glyph in a 72 circle, a title,
 /// up to three lines of words, centred, at most 320 wide.
-pub(super) fn empty_state(icon: &str, title: &str, body: &str) -> (gtk::Box, gtk::Label, gtk::Label) {
+pub(super) fn empty_state(
+    icon: &str,
+    title: &str,
+    body: &str,
+) -> (gtk::Box, gtk::Label, gtk::Label) {
     let column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -863,9 +867,8 @@ impl Page {
             .take(50)
             .collect();
         let minute = super::clock_time(glib::DateTime::now_local().ok());
-        let key =
-            serde_json::to_string(&(&entries, &device.name, minute, filter.label(), any))
-                .unwrap_or_default();
+        let key = serde_json::to_string(&(&entries, &device.name, minute, filter.label(), any))
+            .unwrap_or_default();
         if *self.history_key.borrow() == key {
             return;
         }
@@ -1046,7 +1049,10 @@ fn card_words(entry: &LoggedFile, device: &str) -> gtk::Box {
     name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
     name.set_max_width_chars(16);
     words.append(&name);
-    words.append(&ellipsized(&size_and_time(entry), &["dl-secondary", "numeric"]));
+    words.append(&ellipsized(
+        &size_and_time(entry),
+        &["dl-secondary", "numeric"],
+    ));
     words.append(&direction(entry, device));
     // Where it went, so nobody has to look for it.
     if entry.incoming {
@@ -1919,7 +1925,11 @@ mod tests {
     fn a_row_says_what_it_is_waiting_for_in_a_word() {
         let moving = row(false, 100, 400);
         assert_eq!(row_state(&moving, false), RowState::Moving);
-        assert_eq!(RowState::Moving.pill(), None, "a moving row has its percent");
+        assert_eq!(
+            RowState::Moving.pill(),
+            None,
+            "a moving row has its percent"
+        );
         assert_eq!(row_state(&moving, true), RowState::Waiting);
         assert_eq!(RowState::Waiting.pill(), Some((Status::Warn, "Waiting")));
         let mut paused = row(true, 100, 400);
@@ -1933,7 +1943,10 @@ mod tests {
 
     #[test]
     fn a_failure_reads_as_a_sentence_and_an_empty_page_says_why() {
-        assert_eq!(reason_words("pixel 9 ran out of space"), "Pixel 9 ran out of space.");
+        assert_eq!(
+            reason_words("pixel 9 ran out of space"),
+            "Pixel 9 ran out of space."
+        );
         assert_eq!(reason_words("The file changed. "), "The file changed.");
         assert_eq!(reason_words(""), "Something went wrong.");
         let (title, body) = empty_words(Filter::All, false, "Pixel 9");

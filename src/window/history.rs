@@ -185,7 +185,11 @@ pub(crate) fn history_content(
     }
     close(&page, group.take());
     if older > 0 {
-        let more = ui_kit::button(ButtonKind::Tonal, &format!("Show older ({older} more)"), None);
+        let more = ui_kit::button(
+            ButtonKind::Tonal,
+            &format!("Show older ({older} more)"),
+            None,
+        );
         more.set_halign(gtk::Align::Center);
         if let Some(on_more) = on_more {
             more.connect_clicked(move |_| on_more());
