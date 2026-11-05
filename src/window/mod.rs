@@ -2660,6 +2660,8 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 scroll.vadjustment().set_value(arg.parse().unwrap_or(0.0));
             }
         }
+        // "settings-page list|N|search [words]": walks Settings' subpages.
+        "settings-page" => prefs::debug_open(id, arg),
         "scroll-end" => {
             if let Some((scroll, _)) = win.imp().bodies.borrow().get(id).cloned() {
                 let adjustment = scroll.vadjustment();

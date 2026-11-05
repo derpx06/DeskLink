@@ -6,7 +6,8 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 
-use super::{icon_square, DesklinkWindow};
+use super::ui_kit::{self, ButtonKind, Tone};
+use super::{clipboard, DesklinkWindow};
 use crate::device_links::config::AppSettings;
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::DeviceView;
@@ -75,41 +76,369 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         return;
     }
     LIVE.with(|live| live.borrow_mut().clear());
-    let page = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(22)
-        .margin_top(8)
-        .margin_bottom(28)
-        .css_classes(["page-margins"])
+    clipboard::ensure_css();
+    let view = build_view(daemon, &settings, device, &glide_status, approving);
+    win.replace_body(
+        "settings",
+        &adw::Clamp::builder()
+            .maximum_size(720)
+            .child(&view.root)
+            .build(),
+    );
+}
+
+/// Where the ten groups sit in the list (`UI-REDESIGN.md` 3.17): the section,
+/// the group (an index into [`GROUPS`]), its glyph and its one line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    Computer,
+    Phone,
+    Privacy,
+}
+
+const PAGES: [(Section, usize, &str, &str); 10] = [
+    (
+        Section::Computer,
+        0,
+        "desklink-wifi-symbolic",
+        "Stay awake, start at login",
+    ),
+    (
+        Section::Phone,
+        1,
+        "desklink-notifications-symbolic",
+        "Show, forward and silence",
+    ),
+    (
+        Section::Phone,
+        2,
+        "desklink-content-paste-symbolic",
+        "Share what you copy",
+    ),
+    (
+        Section::Phone,
+        3,
+        "desklink-call-symbolic",
+        "Names and music",
+    ),
+    (
+        Section::Phone,
+        4,
+        "desklink-volume-up-symbolic",
+        "Microphone",
+    ),
+    (
+        Section::Phone,
+        5,
+        "desklink-mouse-symbolic",
+        "Glide and remote control",
+    ),
+    (
+        Section::Phone,
+        6,
+        "desklink-folder-symbolic",
+        "Bucket, downloads, photos",
+    ),
+    (
+        Section::Privacy,
+        7,
+        "desklink-lock-symbolic",
+        "Password, terminals, unlock, unpair",
+    ),
+    (
+        Section::Privacy,
+        8,
+        "desklink-palette-symbolic",
+        "Style and tray icon",
+    ),
+    (
+        Section::Privacy,
+        9,
+        "desklink-tune-symbolic",
+        "Away from home, history, checks",
+    ),
+];
+
+fn section_label(section: Section, phone: &str) -> String {
+    match section {
+        Section::Computer => "This computer".to_string(),
+        Section::Phone => format!("Share with {phone}"),
+        Section::Privacy => "Privacy and safety".to_string(),
+    }
+}
+
+thread_local! {
+    /// The subpage open (an index into [`GROUPS`]) and the view it is in:
+    /// a rebuild (a setting changed) puts the person back on the same page.
+    static OPEN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static NAV: std::cell::RefCell<glib::WeakRef<adw::NavigationView>> =
+        std::cell::RefCell::new(glib::WeakRef::new());
+    static SEARCH: std::cell::RefCell<glib::WeakRef<gtk::SearchEntry>> =
+        std::cell::RefCell::new(glib::WeakRef::new());
+}
+
+fn tag(index: usize) -> String {
+    format!("page-{index}")
+}
+
+/// The Settings page: a list of destinations that push a subpage each.
+struct View {
+    root: adw::NavigationView,
+    /// The subpages, by group index (the tests read their rows).
+    pages: Vec<adw::NavigationPage>,
+}
+
+fn build_view(
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    device: &DeviceView,
+    glide_status: &crate::device_links::glide::Status,
+    approving: bool,
+) -> View {
+    let groups = groups(daemon, settings, device, glide_status, approving);
+    let titles: Vec<String> = groups
+        .iter()
+        .map(|group| group.title().to_string())
+        .collect();
+    let nav = adw::NavigationView::builder()
+        .animate_transitions(true)
         .build();
-    page.append(&super::wrapped(
-        &format!(
-            "Settings for this computer and {}. A change takes effect as soon as you make it.",
-            device.name
-        ),
-        &["text-dim"],
-    ));
+    let searchables = searchable(&groups);
+
+    // Subpages: a way back, the title, the phone it is for, then the group.
+    let mut pages = Vec::new();
+    let mut homes = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
+        let section = PAGES[index].0;
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .margin_top(8)
+            .margin_bottom(28)
+            .css_classes(["page-margins"])
+            .build();
+        let back = ui_kit::button(
+            ButtonKind::Text,
+            "Settings",
+            Some("desklink-arrow-back-symbolic"),
+        );
+        back.set_halign(gtk::Align::Start);
+        back.set_tooltip_text(Some("Back to Settings (Esc)"));
+        {
+            let nav = nav.downgrade();
+            back.connect_clicked(move |_| {
+                if let Some(nav) = nav.upgrade() {
+                    nav.pop();
+                }
+            });
+        }
+        content.append(&back);
+        let title = gtk::Label::builder()
+            .label(GROUPS[index])
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["dl-title"])
+            .accessible_role(gtk::AccessibleRole::Heading)
+            .build();
+        title.update_property(&[gtk::accessible::Property::Level(1)]);
+        content.append(&title);
+        let whose = match section {
+            Section::Phone => format!("For {}", device.name),
+            Section::Privacy if index == 7 => format!("For {}", device.name),
+            _ => "For this computer".to_string(),
+        };
+        content.append(&super::wrapped(&whose, &["dl-page-sub"]));
+        let home = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        group.set_title("");
+        group.add_css_class("dl-settings-group");
+        home.append(group);
+        content.append(&home);
+        let keys = gtk::EventControllerKey::new();
+        {
+            let nav = nav.downgrade();
+            keys.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk::gdk::Key::Escape {
+                    if let Some(nav) = nav.upgrade() {
+                        return if nav.pop() {
+                            glib::Propagation::Stop
+                        } else {
+                            glib::Propagation::Proceed
+                        };
+                    }
+                }
+                glib::Propagation::Proceed
+            });
+        }
+        content.add_controller(keys);
+        let page = adw::NavigationPage::builder()
+            .title(GROUPS[index])
+            .tag(tag(index))
+            .child(&content)
+            .build();
+        nav.add(&page);
+        pages.push(page);
+        homes.push(home);
+    }
+
+    // The list.
+    let list = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .build();
+    let quick = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+    quick.append(&ui_kit::section_header("Quick switches"));
+    let switches: Vec<adw::ActionRow> = vec![
+        show_notifications_row(daemon, settings, device).upcast(),
+        clipboard_row(daemon, settings).upcast(),
+        keep_awake_row(daemon, settings).upcast(),
+    ];
+    quick.append(&ui_kit::row_group(&switches));
+    list.append(&quick);
+    for section in [Section::Computer, Section::Phone, Section::Privacy] {
+        let label = section_label(section, &device.name);
+        let header = ui_kit::section_header(&label);
+        header.set_wrap(false);
+        header.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        header.set_tooltip_text(Some(&label));
+        let mut rows = Vec::new();
+        for (page_section, index, icon, summary) in PAGES {
+            if page_section != section {
+                continue;
+            }
+            let row = ui_kit::list_row(icon, Tone::Neutral, GROUPS[index], Some(summary));
+            row.set_activatable(true);
+            row.add_suffix(
+                &gtk::Image::builder()
+                    .icon_name("desklink-chevron-right-symbolic")
+                    .accessible_role(gtk::AccessibleRole::Presentation)
+                    .build(),
+            );
+            let nav = nav.downgrade();
+            row.connect_activated(move |_| {
+                if let Some(nav) = nav.upgrade() {
+                    nav.push_by_tag(&tag(index));
+                }
+            });
+            rows.push(row);
+        }
+        let block = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .build();
+        block.append(&header);
+        block.append(&ui_kit::row_group(&rows));
+        list.append(&block);
+    }
+
+    // Search: the matching rows themselves, under their group's name.
+    let results = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .build();
+    let nothing = super::wrapped("No setting matches. Try another word.", &["dl-secondary"]);
+    nothing.set_visible(false);
+    results.append(&nothing);
+    let stack = gtk::Stack::builder().vhomogeneous(false).build();
+    stack.add_named(&list, Some("list"));
+    stack.add_named(&results, Some("results"));
     let search = gtk::SearchEntry::builder()
         .placeholder_text("Search settings")
         .build();
     search.update_property(&[gtk::accessible::Property::Label("Search settings")]);
-    page.append(&search);
-    let groups = groups(daemon, &settings, device, &glide_status, approving);
-    for group in &groups {
-        page.append(group);
+    {
+        let (groups, results, stack, nothing) = (
+            groups.clone(),
+            results.clone(),
+            stack.clone(),
+            nothing.clone(),
+        );
+        search.connect_search_changed(move |search| {
+            let query = search.text();
+            let searching = !query.trim().is_empty();
+            for (index, group) in groups.iter().enumerate() {
+                let target = if searching { &results } else { &homes[index] };
+                if group.parent().as_ref() != Some(target.upcast_ref()) {
+                    if let Some(old) = group.parent().and_downcast::<gtk::Box>() {
+                        old.remove(group);
+                    }
+                    target.append(group);
+                    group.set_title(if searching { &titles[index] } else { "" });
+                }
+            }
+            let any = filter_groups(&searchables, &query);
+            nothing.set_visible(searching && !any);
+            stack.set_visible_child_name(if searching { "results" } else { "list" });
+        });
     }
-    let groups = searchable(&groups);
-    let nothing = super::wrapped("No setting matches. Try another word.", &["text-dim"]);
-    nothing.set_visible(false);
-    page.append(&nothing);
-    search.connect_search_changed(move |search| {
-        let any = filter_groups(&groups, &search.text());
-        nothing.set_visible(!any);
+    let root_content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .margin_top(8)
+        .margin_bottom(28)
+        .css_classes(["page-margins"])
+        .build();
+    root_content.append(&super::wrapped(
+        "Changes apply right away.",
+        &["dl-page-sub"],
+    ));
+    root_content.append(&search);
+    root_content.append(&stack);
+    let root_page = adw::NavigationPage::builder()
+        .title("Settings")
+        .tag("list")
+        .child(&root_content)
+        .build();
+    nav.add(&root_page);
+    nav.push(&root_page);
+
+    // Remember the subpage open, and go back to it after a rebuild.
+    nav.connect_visible_page_notify(|nav| {
+        let open: Option<usize> = nav.visible_page().and_then(|page| {
+            page.tag()
+                .and_then(|tag| tag.strip_prefix("page-").and_then(|n| n.parse().ok()))
+        });
+        OPEN.with(|slot| slot.set(open));
     });
-    win.replace_body(
-        "settings",
-        &adw::Clamp::builder().maximum_size(720).child(&page).build(),
-    );
+    if let Some(index) = OPEN
+        .with(|slot| slot.get())
+        .filter(|index| *index < pages.len())
+    {
+        nav.set_animate_transitions(false);
+        nav.push_by_tag(&tag(index));
+        nav.set_animate_transitions(true);
+    }
+    NAV.with(|slot| slot.replace(nav.downgrade()));
+    SEARCH.with(|slot| slot.replace(search.downgrade()));
+    View { root: nav, pages }
+}
+
+/// Debug e2e: `settings-page list|N|search`, to walk the pages in a screenshot.
+#[cfg(debug_assertions)]
+pub(super) fn debug_open(id: &str, arg: &str) {
+    let Some(nav) = NAV.with(|slot| slot.borrow().upgrade()) else {
+        return;
+    };
+    match id {
+        "list" => {
+            nav.pop_to_tag("list");
+        }
+        "search" => {
+            nav.pop_to_tag("list");
+            if let Some(search) = SEARCH.with(|slot| slot.borrow().upgrade()) {
+                search.set_text(&arg.replace('_', " "));
+            }
+        }
+        number => {
+            if let Ok(index) = number.parse::<usize>() {
+                nav.push_by_tag(&tag(index));
+            }
+        }
+    }
 }
 
 /// Every settings row inside `widget`.
@@ -228,24 +557,7 @@ fn groups(
     notifications.set_description(Some(
         "Where phone notifications show, and which of this computer's go to the phone",
     ));
-    let shown = adw::SwitchRow::builder()
-        .title(esc(format!("Show {}'s notifications here", device.name)))
-        .subtitle("On this desktop, with replies")
-        .active(settings.shows_notifications(&device.id))
-        .build();
-    shown.add_prefix(&icon_square(
-        "preferences-system-notifications-symbolic",
-        30,
-        "row-icon",
-    ));
-    let (sender, id) = (daemon.clone(), device.id.clone());
-    shown.connect_active_notify(move |row| {
-        sender.send(DaemonCommand::SetShowNotifications(
-            id.clone(),
-            row.is_active(),
-        ));
-    });
-    follow(&shown, |settings, id| settings.shows_notifications(id));
+    let shown = show_notifications_row(daemon, settings, device);
     notifications.add(&shown);
     notifications.add(&command_alerts_row(daemon, settings, device));
     add_forward_rows(&notifications, daemon, settings);
@@ -299,6 +611,29 @@ fn groups(
         appearance,
         advanced,
     ]
+}
+
+/// "Show <phone>'s notifications here": in its group and among the quick switches.
+fn show_notifications_row(
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    device: &DeviceView,
+) -> adw::SwitchRow {
+    let shown = adw::SwitchRow::builder()
+        .title(esc(format!("Show {}'s notifications here", device.name)))
+        .subtitle("On this desktop, with replies")
+        .active(settings.shows_notifications(&device.id))
+        .build();
+    with_icon(&shown, "preferences-system-notifications-symbolic");
+    let (sender, id) = (daemon.clone(), device.id.clone());
+    shown.connect_active_notify(move |row| {
+        sender.send(DaemonCommand::SetShowNotifications(
+            id.clone(),
+            row.is_active(),
+        ));
+    });
+    follow(&shown, |settings, id| settings.shows_notifications(id));
+    shown
 }
 
 /// The computer-wide settings as a dialog, for when no phone is paired.
@@ -509,7 +844,7 @@ fn downloads_row() -> adw::ActionRow {
     with_icon(&row, "folder-download-symbolic");
     row.add_suffix(
         &gtk::Image::builder()
-            .icon_name("go-next-symbolic")
+            .icon_name("desklink-chevron-right-symbolic")
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
@@ -540,7 +875,7 @@ fn history_row() -> adw::ActionRow {
     with_icon(&row, "document-open-recent-symbolic");
     row.add_suffix(
         &gtk::Image::builder()
-            .icon_name("go-next-symbolic")
+            .icon_name("desklink-chevron-right-symbolic")
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
@@ -572,7 +907,7 @@ fn system_check_row() -> adw::ActionRow {
     with_icon(&row, "preferences-system-symbolic");
     row.add_suffix(
         &gtk::Image::builder()
-            .icon_name("go-next-symbolic")
+            .icon_name("desklink-chevron-right-symbolic")
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
@@ -589,7 +924,7 @@ fn logs_row() -> adw::ActionRow {
     with_icon(&row, "text-x-generic-symbolic");
     row.add_suffix(
         &gtk::Image::builder()
-            .icon_name("go-next-symbolic")
+            .icon_name("desklink-chevron-right-symbolic")
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
@@ -615,6 +950,45 @@ fn logs_row() -> adw::ActionRow {
         );
     });
     row
+}
+
+/// The kit's glyph (and tone) for the GNOME icon name a row asks for.
+fn material(icon: &str) -> (&str, Tone) {
+    match icon {
+        "preferences-system-notifications-symbolic" => {
+            ("desklink-notifications-symbolic", Tone::Neutral)
+        }
+        "audio-input-microphone-symbolic" => ("desklink-mic-symbolic", Tone::Neutral),
+        "avatar-default-symbolic" => ("desklink-person-symbolic", Tone::Neutral),
+        "media-playback-pause-symbolic" => ("desklink-pause-symbolic", Tone::Neutral),
+        "edit-paste-symbolic" => ("desklink-content-paste-symbolic", Tone::Neutral),
+        "folder-symbolic" => ("desklink-folder-symbolic", Tone::Neutral),
+        "folder-download-symbolic" => ("desklink-download-symbolic", Tone::Neutral),
+        "document-open-recent-symbolic" => ("desklink-history-symbolic", Tone::Neutral),
+        "preferences-system-symbolic" => ("desklink-settings-symbolic", Tone::Neutral),
+        "text-x-generic-symbolic" => ("desklink-description-symbolic", Tone::Neutral),
+        "weather-clear-night-symbolic" => ("desklink-coffee-symbolic", Tone::Neutral),
+        "changes-allow-symbolic" => ("desklink-lock-open-symbolic", Tone::Neutral),
+        "image-x-generic-symbolic" => ("desklink-image-symbolic", Tone::Neutral),
+        "notifications-disabled-symbolic" => ("desklink-volume-mute-symbolic", Tone::Neutral),
+        "system-lock-screen-symbolic" => ("desklink-lock-symbolic", Tone::Neutral),
+        "alarm-symbolic" => ("desklink-notifications-active-symbolic", Tone::Neutral),
+        "system-shutdown-symbolic" => ("desklink-restart-alt-symbolic", Tone::Neutral),
+        "phone-symbolic" => ("desklink-device-phone-symbolic", Tone::Neutral),
+        "view-app-grid-symbolic" => ("desklink-tune-symbolic", Tone::Neutral),
+        "preferences-desktop-appearance-symbolic" => ("desklink-palette-symbolic", Tone::Neutral),
+        "utilities-terminal-symbolic" => ("desklink-terminal-symbolic", Tone::Neutral),
+        "auth-fingerprint-symbolic" => ("desklink-fingerprint-symbolic", Tone::Neutral),
+        "input-mouse-symbolic" => ("desklink-mouse-symbolic", Tone::Neutral),
+        "dialog-warning-symbolic" => ("desklink-warning-symbolic", Tone::Warn),
+        other => (other, Tone::Neutral),
+    }
+}
+
+/// A row's 40 px icon square (the old `row-icon` badge, in the kit's look).
+fn icon_square(icon: &str, _size: i32, _class: &str) -> gtk::CenterBox {
+    let (name, tone) = material(icon);
+    ui_kit::icon_square(name, tone)
 }
 
 fn with_icon(row: &impl IsA<adw::ActionRow>, icon: &str) {
@@ -1069,7 +1443,7 @@ fn away_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::ActionRow {
     row.add_suffix(&switch);
     row.add_suffix(
         &gtk::Image::builder()
-            .icon_name("go-next-symbolic")
+            .icon_name("desklink-chevron-right-symbolic")
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
@@ -1890,4 +2264,125 @@ mod tests {
         assert!(glide_explained("Pixel", Some(true), "Desk").starts_with("Move the pointer past"));
     }
 
+    /// Each of the ten groups has one place in the list, in the groups' order.
+    #[test]
+    fn every_group_has_one_place_in_the_list() {
+        let indexes: Vec<usize> = PAGES.iter().map(|page| page.1).collect();
+        assert_eq!(indexes, (0..GROUPS.len()).collect::<Vec<_>>());
+        assert_eq!(section_label(Section::Computer, "Pixel"), "This computer");
+        assert_eq!(section_label(Section::Phone, "Pixel"), "Share with Pixel");
+        assert_eq!(
+            section_label(Section::Privacy, "Pixel"),
+            "Privacy and safety"
+        );
+    }
+
+    fn view_for_tests() -> (View, DaemonHandle) {
+        let info = crate::device_links::device_info::DeviceInfo::local(
+            "parity-phone".into(),
+            "Pixel 9".into(),
+        );
+        let device = DeviceView::from_info(&info, "192.168.1.9".into(), true);
+        let status = crate::device_links::glide::Status {
+            availability: crate::device_links::glide::Availability::Unavailable("test"),
+            gliding: None,
+            problem: None,
+        };
+        let (daemon, _commands) = DaemonHandle::detached();
+        let view = build_view(&daemon, &AppSettings::default(), &device, &status, false);
+        (view, daemon)
+    }
+
+    fn all_titles(widget: &gtk::Widget, out: &mut Vec<String>) {
+        if let Some(row) = widget.downcast_ref::<adw::PreferencesRow>() {
+            let title = row.title();
+            out.push(
+                gtk::pango::parse_markup(&title, '\0')
+                    .map_or_else(|_| title.to_string(), |(_, plain, _)| plain.to_string()),
+            );
+        }
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            all_titles(&next, out);
+            child = next.next_sibling();
+        }
+    }
+
+    /// The redesign moves rows into subpages and removes none: every row title
+    /// of the desk-ui1 page (`testdata/settings_row_titles_desk_ui1.json`,
+    /// written from that page, the Away from home dialog included) is in a
+    /// subpage now, and each subpage is linked from the list. (Needs a display.)
+    #[test]
+    fn every_original_settings_row_is_still_reachable() {
+        crate::test_display::run(|| {
+            let before: Vec<String> = serde_json::from_str(include_str!(
+                "../../testdata/settings_row_titles_desk_ui1.json"
+            ))
+            .unwrap();
+            let (view, daemon) = view_for_tests();
+            let mut after = Vec::new();
+            for page in &view.pages {
+                all_titles(page.child().unwrap().upcast_ref(), &mut after);
+            }
+            // The dialog behind "Reach this computer from anywhere" is built
+            // by the same function as before.
+            all_titles(
+                away_from_home_group(&daemon, &AppSettings::default()).upcast_ref(),
+                &mut after,
+            );
+            let missing: Vec<_> = before
+                .iter()
+                .filter(|title| !after.contains(title))
+                .collect();
+            assert!(missing.is_empty(), "rows lost: {missing:?}");
+            // And the list links to every subpage.
+            let mut listed = Vec::new();
+            let root = view.root.find_page("list").unwrap();
+            all_titles(root.child().unwrap().upcast_ref(), &mut listed);
+            for title in GROUPS {
+                assert!(
+                    listed.iter().any(|row| row == title),
+                    "{title} is not in the list"
+                );
+            }
+        });
+    }
+
+    /// Searching shows the matching rows under their group's name, from every
+    /// page, and clearing the search puts each group back on its page.
+    #[test]
+    fn searching_settings_reaches_every_page_and_clearing_restores_them() {
+        crate::test_display::run(|| {
+            fn find(widget: &gtk::Widget) -> Option<adw::PreferencesGroup> {
+                if let Some(group) = widget.downcast_ref::<adw::PreferencesGroup>() {
+                    return Some(group.clone());
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    if let Some(found) = find(&next) {
+                        return Some(found);
+                    }
+                    child = next.next_sibling();
+                }
+                None
+            }
+            let (view, _daemon) = view_for_tests();
+            let groups: Vec<adw::PreferencesGroup> = view
+                .pages
+                .iter()
+                .map(|page| find(page.child().unwrap().upcast_ref()).unwrap())
+                .collect();
+            let homes: Vec<_> = groups.iter().map(|group| group.parent()).collect();
+            let search = SEARCH.with(|slot| slot.borrow().upgrade()).unwrap();
+            search.set_text("glide");
+            assert_ne!(groups[5].parent(), homes[5], "Control moved to the results");
+            assert!(groups[5].is_visible(), "and shows its matching rows");
+            assert!(!groups[7].is_visible(), "Privacy has no glide row");
+            search.set_text("");
+            for (group, home) in groups.iter().zip(&homes) {
+                assert_eq!(&group.parent(), home);
+                assert!(group.is_visible());
+            }
+        });
+    }
 }
