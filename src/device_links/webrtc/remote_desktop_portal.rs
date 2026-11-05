@@ -1181,17 +1181,35 @@ pub(crate) fn request(
                         "Desktop portal {method} returned an invalid request handle"
                     ));
                 }
-                *response_path.borrow_mut() = Some(path);
+                *response_path.borrow_mut() = Some(path.clone());
 
                 let deadline = Instant::now() + REQUEST_TIMEOUT;
                 loop {
                     if let Some(result) = response.borrow_mut().take() {
                         return result;
                     }
+                    // Nobody is waiting any more: close the request too, or its dialog
+                    // stays on screen and a late Allow starts a share no phone asked for
+                    // (and a retry stacks a second dialog on the first).
+                    let close_request = || {
+                        let _ = connection.call_sync(
+                            Some(PORTAL_BUS),
+                            &path,
+                            "org.freedesktop.portal.Request",
+                            "Close",
+                            None,
+                            None,
+                            gio::DBusCallFlags::NONE,
+                            2_000,
+                            None::<&gio::Cancellable>,
+                        );
+                    };
                     if cancel.load(Ordering::Acquire) {
+                        close_request();
                         return Err(format!("Desktop permission request {method} was cancelled"));
                     }
                     if Instant::now() >= deadline {
+                        close_request();
                         return Err(format!("Timed out waiting for desktop portal {method}"));
                     }
                     while context.pending() {
@@ -1281,6 +1299,10 @@ mod tests {
         assert_eq!(plain_portal_error(PORTAL_RESTARTING), PORTAL_RESTARTING);
         assert_eq!(
             plain_portal_error("Desktop permission request Start was cancelled"),
+            "Screen sharing was declined on this computer"
+        );
+        assert_eq!(
+            plain_portal_error("Desktop permission request Start was denied"),
             "Screen sharing was declined on this computer"
         );
         assert_eq!(
