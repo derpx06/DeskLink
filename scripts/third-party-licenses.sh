@@ -62,5 +62,8 @@ for text, crates in sorted(texts.values(), key=lambda t: t[1][0]):
     print("Used by: " + ", ".join(crates))
     print("-" * 72)
     print(text)
+# Not crates: assets the app bundles.
+print("\n== Bundled assets ==\n")
+print(open("src/icons/MATERIAL-SYMBOLS-LICENSE.txt").read().rstrip())
 ' > "$out"
 echo "wrote $out ($(wc -l < "$out") lines)"
