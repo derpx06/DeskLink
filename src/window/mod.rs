@@ -39,6 +39,7 @@ mod notes;
 mod notes_clipboard;
 pub(crate) mod notifications;
 mod overview;
+pub(crate) use overview::link_to_send;
 mod pairing;
 mod pdf_view;
 pub(crate) mod prefs;
@@ -2469,7 +2470,7 @@ fn card(spacing: i32) -> gtk::Box {
 }
 
 /// Asks before `confirm`ing something that cuts the phone off.
-fn confirm(
+pub(crate) fn confirm(
     parent: &impl IsA<gtk::Widget>,
     heading: &str,
     body: &str,

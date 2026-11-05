@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- The GNOME top-bar menu is the complete remote for a paired phone: status chips, six quick
+  actions, what is going on now and a section per area (send, insert, sound, notes,
+  notifications, calls, terminals, screen, files, privacy) with the phone's switches.
+  Security-sensitive switches can only be turned off there. Top-bar interface 9.
+
 ## 1.3.0 — 2026-10-25
 
 - Keep awake is off for new installs and holds the computer awake only while a

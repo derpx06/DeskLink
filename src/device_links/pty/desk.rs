@@ -839,6 +839,54 @@ mod tests {
         assert!(!session.has_desk_window());
     }
 
+    /// The desk taking the size back is one step: whoever sees the phone's
+    /// claim gone sees the desk's size already in place. (The claim used to be
+    /// cleared first and the PTY resized after, so a reader that waited for
+    /// the release and then read the size could catch the old one.)
+    #[test]
+    fn the_claim_is_never_seen_released_before_the_size_is_back() {
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let info = super::super::registry::registry()
+            .lock()
+            .unwrap()
+            .create(Some(command), 24, 80, "desk-test")
+            .expect("quiet session");
+        let session = super::super::registry::registry()
+            .lock()
+            .unwrap()
+            .get(&info.id)
+            .unwrap();
+        for round in 0..300 {
+            session.claim_for_phone("phone-1", 30, 50).unwrap();
+            assert_eq!(session.size(), (30, 50));
+            // The watcher spins on the claim before the desk acts, so it is
+            // always watching when the claim goes.
+            let spinning = Arc::new(AtomicBool::new(false));
+            let watcher = {
+                let session = Arc::clone(&session);
+                let spinning = Arc::clone(&spinning);
+                std::thread::spawn(move || {
+                    assert!(session.phone_sets_size(), "the claim is held");
+                    spinning.store(true, Ordering::Release);
+                    while session.phone_sets_size() {
+                        std::thread::yield_now();
+                    }
+                    session.size()
+                })
+            };
+            while !spinning.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            session.desk_window_size(40, 120, true);
+            assert_eq!(
+                watcher.join().unwrap(),
+                (40, 120),
+                "round {round}: the claim was seen released with the phone's size"
+            );
+        }
+    }
+
     #[test]
     fn an_attach_line_that_never_ends_is_cut_not_buffered() {
         let (client, server) = UnixStream::pair().unwrap();

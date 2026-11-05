@@ -176,6 +176,7 @@
 .button.desklink-tile {
   border-radius: 18px;
   min-height: 64px;
+  min-width: 88px;
   padding: 8px 4px;
 }
 .desklink-tile-content { spacing: 6px; }
@@ -209,3 +210,39 @@
   background-color: #3584e4;
   background-color: -st-accent-color;
 }
+
+/* ── Status chips under the header ───────────────────────────────────── */
+.desklink-chip-lines { spacing: 6px; }
+.desklink-chip-line { spacing: 6px; }
+.desklink-status-chip {
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 0.86em;
+  font-weight: bold;
+}
+.desklink-dark.desklink-status-chip.info { background-color: rgba(255, 255, 255, 0.10); }
+.desklink-light.desklink-status-chip.info { background-color: rgba(0, 0, 0, 0.08); }
+.desklink-dark.desklink-status-chip.off { background-color: rgba(255, 255, 255, 0.05); color: rgba(255, 255, 255, 0.6); }
+.desklink-light.desklink-status-chip.off { background-color: rgba(0, 0, 0, 0.04); color: rgba(0, 0, 0, 0.55); }
+/* Mint and coral keep their own contrast on both styles. */
+.desklink-status-chip.ok { background-color: rgba(47, 191, 143, 0.22); color: #2fbf8f; }
+.desklink-light.desklink-status-chip.ok { color: #0b7a59; }
+.desklink-status-chip.warn { background-color: rgba(229, 83, 61, 0.22); color: #e5533d; }
+.desklink-light.desklink-status-chip.warn { color: #b02f1b; }
+
+/* ── Sections and their rows ─────────────────────────────────────────── */
+.desklink-section-state { font-size: 0.86em; opacity: 0.7; margin-right: 6px; }
+.desklink-head { spacing: 2px; padding: 2px 0; }
+.desklink-danger { color: #e5533d; }
+.desklink-light.desklink-danger { color: #b02f1b; }
+
+/* ── Footer: Open DeskLink · Settings · Pause ────────────────────────── */
+.desklink-footer { spacing: 8px; }
+.button.desklink-footer-button { padding: 6px 8px; }
+.desklink-footer-content { spacing: 6px; }
+.desklink-footer-icon { icon-size: 14px; }
+.desklink-footer-label { font-size: 0.9em; }
+.desklink-dark.desklink-footer-button { background-color: rgba(255, 255, 255, 0.07); }
+.desklink-light.desklink-footer-button { background-color: rgba(0, 0, 0, 0.05); }
+.desklink-dark.desklink-footer-button:hover { background-color: rgba(255, 255, 255, 0.12); }
+.desklink-light.desklink-footer-button:hover { background-color: rgba(0, 0, 0, 0.09); }

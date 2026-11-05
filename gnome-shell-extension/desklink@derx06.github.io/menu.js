@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// The Quick Settings menu's content: a header with the phone and a battery
-// ring, the phone switcher, a call or offline card, a grid of actions, the
-// phone's music, what is live on this computer, and recent files. Stock
-// St/PopupMenu widgets and the shell's own button and quick-toggle styles,
-// so it follows light/dark, the accent colour and high contrast; only the
-// mint and coral status marks are DeskLink's own.
+// The top-bar menu's content, drawn from model.js: a header with the phone and
+// a battery ring, status chips, the phone switcher, a call or offline card, six
+// quick actions, the phone's music, what is going on now, one collapsed
+// section per area (every action and setting of a paired phone), and a
+// footer. Stock St/PopupMenu widgets and the shell's own button and
+// quick-toggle styles, so it follows light/dark, the accent colour and high
+// contrast; only the mint and coral status marks are DeskLink's own.
 
 import Cairo from 'cairo';
 import Clutter from 'gi://Clutter';
@@ -17,95 +18,16 @@ import St from 'gi://St';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
+import {deviceChips, footer, liveWords, quickTiles, sections, statusLine, timer, duration, lastSeen} from './model.js';
+
+export {lastSeen, sessionLine, shortStatus, statusLine} from './model.js';
+
 const MINT = [0x2f / 255, 0xbf / 255, 0x8f / 255];
 const CORAL = [0xe5 / 255, 0x53 / 255, 0x3d / 255];
-const ROUTE = {lan: 'Wi-Fi', direct: 'Internet', turn: 'Relay', relay: 'Relay'};
-
-export function lastSeen(device) {
-    if (!device.lastSeen)
-        return '';
-    const seen = GLib.DateTime.new_from_unix_local(device.lastSeen);
-    const now = GLib.DateTime.new_now_local();
-    const today = seen.get_ymd().join() === now.get_ymd().join();
-    return `last seen ${seen.format(today ? '%H:%M' : '%-d %b %H:%M')}`;
-}
-
-/// "Connected · Wi-Fi · 82% ⚡", "last seen 14:02", "Connecting…".
-export function statusLine(device) {
-    if (!device)
-        return 'No phone connected';
-    if (device.ready) {
-        const parts = ['Connected'];
-        if (ROUTE[device.path])
-            parts.push(ROUTE[device.path]);
-        if (device.battery >= 0)
-            parts.push(`${device.battery}%${device.charging ? ' ⚡' : ''}`);
-        return parts.join(' · ');
-    }
-    if (device.reachable)
-        return 'Connecting…';
-    return lastSeen(device) || 'Not connected';
-}
-
-/// "Wi-Fi · 82%": the toggle's short subtitle (its title is the phone).
-export function shortStatus(device) {
-    if (!device?.ready)
-        return statusLine(device);
-    const parts = [];
-    if (ROUTE[device.path])
-        parts.push(ROUTE[device.path]);
-    if (device.battery >= 0)
-        parts.push(`${device.battery}%`);
-    return parts.join(' · ') || 'Connected';
-}
 
 /// The shell's light or dark style, for the card surfaces.
 export function styleVariant() {
     return Main.getStyleVariant?.() === 'light' ? 'light' : 'dark';
-}
-
-/// "Viewing · 2 terminals": a live card's short line.
-function liveWords(device) {
-    const parts = [];
-    if (device.screen === 'control')
-        parts.push('Controlling');
-    else if (device.screen === 'view')
-        parts.push('Viewing');
-    if (device.terminals > 0)
-        parts.push(device.terminals === 1 ? '1 terminal' : `${device.terminals} terminals`);
-    return parts.join(' · ');
-}
-
-/// "viewing the screen · 2 terminals".
-export function sessionLine(device) {
-    const parts = [];
-    if (device.screen === 'control')
-        parts.push('controlling the screen');
-    else if (device.screen === 'view')
-        parts.push('viewing the screen');
-    else if (device.screen === 'glide')
-        parts.push('this mouse and keyboard are on it · Esc+Super to return');
-    if (device.terminals > 0)
-        parts.push(device.terminals === 1 ? '1 terminal' : `${device.terminals} terminals`);
-    return parts.join(' · ');
-}
-
-/// "just now", "12 min", "1 h 05 min" since `unixSeconds`.
-function duration(unixSeconds) {
-    const minutes = Math.max(0, Math.floor((Date.now() / 1000 - unixSeconds) / 60));
-    if (minutes < 1)
-        return 'just now';
-    if (minutes < 60)
-        return `${minutes} min`;
-    return `${Math.floor(minutes / 60)} h ${String(minutes % 60).padStart(2, '0')} min`;
-}
-
-/// "1:05", "1:02:03" since `unixMillis`.
-function timer(unixMillis) {
-    const seconds = Math.max(0, Math.floor((Date.now() - unixMillis) / 1000));
-    const [h, m, s] = [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60];
-    const pad = n => String(n).padStart(2, '0');
-    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
 function label(text, styleClass, params = {}) {
@@ -246,22 +168,304 @@ function fileIcon(file) {
     }
 }
 
-/// Builds the menu. `ctx`: devices, selected, desk, transfers,
-/// invoke(id, action), call(method, args), select(id), appear(actor, key),
-/// tick(fn) (run every second while open).
+
+/// A status chip: a small rounded label, mint / coral / neutral / dimmed.
+function chip(entry, variant) {
+    return new St.Label({
+        text: entry.text,
+        style_class: `desklink-status-chip ${entry.tone} ${variant}`,
+        y_align: Clutter.ActorAlign.CENTER,
+        accessible_name: entry.text,
+    });
+}
+
+/// Chips in lines of about 36 characters: a St box does not wrap.
+function chipLines(chips, variant) {
+    const lines = [[]];
+    let width = 0;
+    for (const entry of chips) {
+        const need = entry.text.length + 4;
+        if (width + need > 46 && lines.at(-1).length > 0) {
+            lines.push([]);
+            width = 0;
+        }
+        lines.at(-1).push(entry);
+        width += need;
+    }
+    const column_ = column({style_class: 'desklink-chip-lines'});
+    for (const line of lines) {
+        const box_ = box({style_class: 'desklink-chip-line'});
+        line.forEach(entry => box_.add_child(chip(entry, variant)));
+        column_.add_child(box_);
+    }
+    return column_;
+}
+
+/// A progress row: icon and title, a detail line and a bar. `update(line,
+/// detail, fraction)` moves it in place.
+function progressItem(icon, activatable) {
+    const item = new PopupMenu.PopupBaseMenuItem({
+        style_class: 'desklink-row desklink-bucket', activate: activatable, hover: activatable, can_focus: activatable,
+    });
+    const words = column({style_class: 'desklink-bucket-words'});
+    const head = box();
+    head.add_child(new St.Icon({icon_name: icon, style_class: 'desklink-bucket-icon', y_align: Clutter.ActorAlign.CENTER}));
+    const line = label('', 'desklink-card-title');
+    head.add_child(line);
+    words.add_child(head);
+    const detail = dim(label('', 'desklink-card-subtitle'));
+    words.add_child(detail);
+    const track = new St.Widget({style_class: 'desklink-progress', x_expand: true, layout_manager: new Clutter.BinLayout()});
+    const fill = new St.Widget({style_class: 'desklink-progress-fill', x_align: Clutter.ActorAlign.START, y_expand: true});
+    track.add_child(fill);
+    words.add_child(track);
+    item.add_child(words);
+    let fraction = 0;
+    const draw = () => {
+        if (track.get_stage())
+            fill.width = Math.round(track.width * fraction);
+    };
+    track.connect('notify::width', draw);
+    track.connect('notify::mapped', draw);
+    const update = (title, text, value) => {
+        line.text = title;
+        detail.text = text;
+        fraction = Math.min(1, Math.max(0, value ?? 0));
+        item.accessible_name = `${title}, ${text}, ${Math.round(fraction * 100)}%`;
+        draw();
+    };
+    return {item, update};
+}
+
+/// A switch row that keeps the menu open (the stock one closes it on a click).
+function switchItem(text, on, onToggle) {
+    const item = new PopupMenu.PopupSwitchMenuItem(text, !!on);
+    item.activate = () => item.toggle();
+    item.accessible_name = text;
+    item.connect('toggled', (_item, state) => onToggle(state));
+    return item;
+}
+
+/// One row of a section.
+function sectionRow(entry, selected, ctx) {
+    const id = selected.id;
+    const send = entry.device === false ? '' : id;
+    switch (entry.kind) {
+    case 'action': {
+        const item = new PopupMenu.PopupImageMenuItem(entry.label, entry.icon);
+        item.accessible_name = entry.note ? `${entry.label}, ${entry.note}` : entry.label;
+        if (entry.note)
+            item.add_child(dim(label(entry.note, 'desklink-card-subtitle', {x_expand: true, x_align: Clutter.ActorAlign.END})));
+        if (entry.danger)
+            item.add_style_class_name('desklink-danger');
+        if (!entry.enabled)
+            item.setSensitive(false);
+        item.connect('activate', () => entry.action === 'send-link' ? ctx.sendLink(id) : ctx.invoke(send, entry.action));
+        return item;
+    }
+    case 'switch': {
+        if (entry.sensitive && !entry.on) {
+            // Off for a security reason: turned on only in DeskLink itself.
+            const item = new PopupMenu.PopupImageMenuItem(entry.label, 'changes-prevent-symbolic');
+            item.add_child(dim(label('Off · in DeskLink', 'desklink-card-subtitle', {x_expand: true, x_align: Clutter.ActorAlign.END})));
+            item.accessible_name = `${entry.label}, off. Opens DeskLink to turn it on.`;
+            item.connect('activate', () => ctx.invoke(id, 'open-settings'));
+            return item;
+        }
+        const item = switchItem(entry.label, entry.on, state =>
+            ctx.setSwitch(entry.scope === 'desk' ? '' : id, entry.key, state));
+        if (entry.sensitive)
+            item.add_style_class_name('desklink-sensitive');
+        if (entry.note) {
+            item.accessible_name = `${entry.label}, ${entry.note}`;
+            item.add_child(dim(label(entry.note, 'desklink-card-subtitle')));
+        }
+        if (!entry.enabled)
+            item.setSensitive(false);
+        return item;
+    }
+    case 'snippet': {
+        const item = new PopupMenu.PopupImageMenuItem(entry.label, 'edit-copy-symbolic');
+        item.accessible_name = `Copy ${entry.label}`;
+        item.connect('activate', () =>
+            St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, entry.text));
+        return item;
+    }
+    default: { // 'file'
+        const file = entry.file;
+        const item = new PopupMenu.PopupBaseMenuItem({style_class: 'desklink-row desklink-file'});
+        item.add_child(new St.Icon({gicon: fileIcon(file), style_class: 'desklink-thumb'}));
+        const words = column();
+        words.add_child(label(file.name, 'desklink-file-name'));
+        const when = file.time ? GLib.DateTime.new_from_unix_local(file.time).format('%H:%M') : '';
+        words.add_child(dim(label(`${entry.detail}${when ? ` · ${when}` : ''}`, 'desklink-card-subtitle')));
+        item.add_child(words);
+        item.accessible_name = `${file.name}, ${entry.detail}`;
+        item.connect('activate', () => ctx.call('OpenTransfer', [file.id]));
+        return item;
+    }
+    }
+}
+
+/// Scrolls `scroll` so `actor` (and the rows under it) is in view.
+function reveal(scroll, actor, extra = 0) {
+    const adjustment = scroll.vadjustment ?? scroll.get_vadjustment?.() ?? scroll.vscroll?.adjustment;
+    if (!adjustment)
+        return;
+    const [, top] = actor.get_transformed_position();
+    const [, viewTop] = scroll.get_transformed_position();
+    const [, height] = actor.get_preferred_height(-1);
+    const from = adjustment.value + (top - viewTop);
+    const to = from + height + extra; // the section's header and its rows
+    if (to > adjustment.value + scroll.height)
+        adjustment.value = Math.min(from, to - scroll.height);
+    else if (from < adjustment.value)
+        adjustment.value = from;
+}
+
+/// Runs `fn` after `ms` unless `actor` is gone by then (its source is removed
+/// with it, so nothing outlives the menu).
+function defer(actor, ms, fn) {
+    let id = 0;
+    id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+        id = 0;
+        try {
+            fn();
+        } catch (error) {
+            // Best effort: the menu still works without it.
+        }
+        return GLib.SOURCE_REMOVE;
+    });
+    actor.connect('destroy', () => {
+        if (id)
+            GLib.source_remove(id);
+        id = 0;
+    });
+}
+
+/// Scrolls the menu so an opened section's rows are on screen (a tall menu
+/// scrolls inside its own scroller). The rows are laid out once the section
+/// has opened, so it looks twice.
+function keepInView(item) {
+    const show = () => {
+        let parent = item.get_parent();
+        while (parent && !(parent instanceof St.ScrollView))
+            parent = parent.get_parent();
+        if (parent && item.mapped)
+            reveal(parent, item, item.menu.actor.get_preferred_height(-1)[1]);
+    };
+    defer(item, 0, show);
+    defer(item, 320, show);
+}
+
+/// The sections' own scroller: a tall menu is clipped by the screen, so the
+/// list scrolls inside a height that leaves the footer on screen. Returns the
+/// section that rows go into. Parented like any section (activating a row
+/// closes the menu, keys move between rows).
+function scrolledSection(menu) {
+    const wrapper = new PopupMenu.PopupMenuSection();
+    menu.addMenuItem(wrapper);
+    const holder = new PopupMenu.PopupMenuSection();
+    wrapper.addMenuItem(holder);
+    wrapper.box.remove_child(holder.actor);
+    const scroller = new St.ScrollView({
+        style_class: 'desklink-scroller',
+        hscrollbar_policy: St.PolicyType.NEVER,
+        vscrollbar_policy: St.PolicyType.AUTOMATIC,
+        overlay_scrollbars: true,
+        x_expand: true,
+        child: holder.actor,
+    });
+    wrapper.box.add_child(scroller);
+    let alive = true;
+    scroller.connect('destroy', () => (alive = false));
+    const fit = () => {
+        if (!alive || !scroller.mapped)
+            return;
+        try {
+            const monitor = Main.layoutManager.findMonitorForActor?.(scroller) ?? Main.layoutManager.primaryMonitor;
+            scroller.style = '';
+            const [, natural] = scroller.get_preferred_height(-1);
+            const [, boxHeight] = menu.box.get_preferred_height(-1);
+            const [, boxTop] = menu.box.get_transformed_position();
+            const excess = boxTop + boxHeight - (monitor.y + monitor.height - 24);
+            scroller.style = excess > 0 ? `max-height: ${Math.floor(Math.max(160, natural - excess))}px;` : '';
+        } catch (error) {
+            // Best effort: without it the menu is only as tall as it is.
+        }
+    };
+    const later = () => defer(scroller, 0, fit);
+    scroller.connect('notify::mapped', later);
+    holder.fit = later;
+    return holder;
+}
+
+/// A collapsed section: icon, title and a short state; one open at a time
+/// (the shell's accordion), and the open one survives a rebuild.
+function addSection(menu, section, selected, ctx) {
+    const sub = new PopupMenu.PopupSubMenuMenuItem(section.title, true);
+    sub.add_style_class_name('desklink-section');
+    sub.icon.icon_name = section.icon;
+    sub.accessible_name = section.subtitle ? `${section.title}, ${section.subtitle}` : section.title;
+    if (section.subtitle) {
+        // Before the arrow: "3 new", "On", "2 allowed".
+        const state = label(section.subtitle, 'desklink-section-state');
+        sub.insert_child_at_index(state, Math.max(0, sub.get_n_children() - 1));
+    }
+    for (const entry of section.rows) {
+        const item = sectionRow(entry, selected, ctx);
+        ctx.track?.(item, `${section.id}:${entry.id}`);
+        sub.menu.addMenuItem(item);
+    }
+    sub.menu.connect('open-state-changed', (_menu, open) => {
+        ctx.sectionOpened(section.id, open);
+        if (open) {
+            // The shell gives a section its own scrollbar when the menu is
+            // as tall as the screen; this menu scrolls as a whole instead.
+            defer(sub, 0, () => {
+                sub.menu.actor.vscrollbar_policy = St.PolicyType.NEVER;
+                sub.menu.actor.remove_style_pseudo_class('scrolled');
+                menu.fit?.();
+            });
+            keepInView(sub);
+        } else {
+            menu.fit?.();
+        }
+    });
+    ctx.track?.(sub, `section:${section.id}`);
+    menu.addMenuItem(sub);
+    if (ctx.openSection === section.id)
+        sub.menu.open(0);
+}
+
+/// Builds the menu. `ctx`: devices, selected, desk, transfers, snippets,
+/// activities (this phone's ongoing items), activityText(item),
+/// linkInClipboard, openSection, sectionOpened(id, open),
+/// invoke(id, action), call(method, args), setSwitch(id, key, on),
+/// sendLink(id), select(id), appear(actor, key), tick(fn) (run every second
+/// while open), track(item, key).
 export function fillMenu(menu, ctx) {
     const {devices, selected, desk, transfers, invoke} = ctx;
     const variant = `desklink-${styleVariant()}`;
     const can = (device, action) => device?.actions.includes(action);
-    menu.setHeader('phone-symbolic', selected?.name ?? 'DeskLink', statusLine(selected));
-    ctx.ring.set(selected?.ready ? selected.battery : -1, !!selected?.charging);
+    if (menu.setHeader) {
+        menu.setHeader('phone-symbolic', selected?.name ?? 'DeskLink', statusLine(selected));
+        ctx.ring?.set(selected?.ready ? selected.battery : -1, !!selected?.charging);
+    }
     menu.removeAll();
+    if (!menu.setHeader && selected) {
+        // A plain popup menu has no header: a title row in its place.
+        const title = column({style_class: 'desklink-head'});
+        title.add_child(label(selected.name, 'desklink-card-title'));
+        title.add_child(dim(label(statusLine(selected), 'desklink-card-subtitle')));
+        menu.addMenuItem(row(title));
+    }
 
     // Phones: one chip each, the shown one checked.
     if (devices.length > 1) {
         const chips = box({style_class: 'desklink-chips'});
         for (const device of devices) {
-            const chip = new St.Button({
+            const phoneChip = new St.Button({
                 style_class: `button desklink-chip ${variant}`,
                 toggle_mode: true,
                 checked: device.id === selected?.id,
@@ -272,9 +476,9 @@ export function fillMenu(menu, ctx) {
             const dot = new St.Widget({style_class: `desklink-dot ${device.ready ? 'mint' : ''}`, y_align: Clutter.ActorAlign.CENTER});
             content.add_child(dot);
             content.add_child(label(device.name, 'desklink-chip-label'));
-            chip.child = content;
-            chip.connect('clicked', () => ctx.select(device.id));
-            chips.add_child(chip);
+            phoneChip.child = content;
+            phoneChip.connect('clicked', () => ctx.select(device.id));
+            chips.add_child(phoneChip);
         }
         menu.addMenuItem(row(chips));
     }
@@ -285,7 +489,13 @@ export function fillMenu(menu, ctx) {
         return;
     }
 
-    // Not connected: when it was last here, and Reconnect.
+    // Everything between the phone's name and the footer scrolls when the
+    // screen is too short for it.
+    const body = scrolledSection(menu);
+    // How it is: connection, route, battery, lane, sound, Do Not Disturb.
+    body.addMenuItem(row(chipLines(deviceChips(selected), variant)));
+
+    // Not connected: when it was last here, and a way to try again.
     if (!selected.ready) {
         const card = box({style_class: `desklink-card ${variant}`});
         card.add_child(new St.Icon({icon_name: 'network-offline-symbolic', style_class: 'desklink-card-icon'}));
@@ -293,9 +503,12 @@ export function fillMenu(menu, ctx) {
         words.add_child(label(selected.reachable ? 'Connecting…' : 'Not connected', 'desklink-card-title'));
         words.add_child(dim(label(lastSeen(selected) || 'Waiting for the phone', 'desklink-card-subtitle')));
         card.add_child(words);
-        card.add_child(textButton('Reconnect', () => invoke('', 'reconnect')));
+        if (can(selected, 'try-again'))
+            card.add_child(textButton('Try again', () => invoke(selected.id, 'try-again')));
+        else
+            card.add_child(textButton('Reconnect', () => invoke('', 'reconnect')));
         ctx.appear(card, `offline:${selected.id}`);
-        menu.addMenuItem(row(card));
+        body.addMenuItem(row(card));
     }
 
     // A call: Answer/Decline while ringing, the time and End while on it.
@@ -332,42 +545,24 @@ export function fillMenu(menu, ctx) {
                 card.add_child(iconButton('call-stop-symbolic', 'End call', () => invoke(selected.id, 'call-end'), 'desklink-decline'));
         }
         ctx.appear(card, `call:${call.id}:${call.state}`);
-        menu.addMenuItem(row(card));
+        body.addMenuItem(row(card));
     }
 
-    // The actions, three to a row.
-    const ready = !!selected.ready;
-    const tiles = [
-        tile('audio-volume-high-symbolic', 'Ring', {variant, name: `Ring ${selected.name}`, enabled: ready && can(selected, 'ring'), onClick: () => invoke(selected.id, 'ring')}),
-        tile('system-lock-screen-symbolic', 'Lock', {variant, name: `Lock ${selected.name}`, enabled: ready && can(selected, 'lock'), onClick: () => invoke(selected.id, 'lock')}),
-        tile('document-send-symbolic', 'Files', {variant, name: `Send files to ${selected.name}`, enabled: ready && can(selected, 'send-files'), onClick: () => invoke(selected.id, 'send-files')}),
-        tile('camera-photo-symbolic', 'Photo', {variant, name: `Take a photo with ${selected.name} and put it on the clipboard`, enabled: ready && can(selected, 'insert-photo'), onClick: () => invoke(selected.id, 'insert-photo')}),
-        tile('edit-paste-symbolic', 'Clipboard', {variant, name: `Send the clipboard to ${selected.name}`, enabled: ready && can(selected, 'send-clipboard'), onClick: () => invoke(selected.id, 'send-clipboard')}),
-    ];
-    if (desk.keepAwake !== undefined) {
-        tiles.push(tile('weather-clear-night-symbolic', 'Awake', {
-            variant,
-            name: 'Keep this computer awake',
-            checked: desk.keepAwake,
-            onClick: () => invoke('', desk.keepAwake ? 'keep-awake-off' : 'keep-awake-on'),
-        }));
-    }
-    tiles.push(tile('send-to-symbolic', 'Hand Off', {
-        variant,
-        name: 'Lock this computer and continue on the phone',
-        enabled: !!desk.handOff,
-        onClick: () => invoke('', 'lock-hand-off'),
-    }));
+    // Six quick actions, three to a row.
     const grid = column({style_class: 'desklink-grid'});
+    const tiles = quickTiles(selected).map(entry => tile(entry.icon, entry.label, {
+        variant, name: entry.name, enabled: entry.enabled,
+        onClick: () => invoke(selected.id, entry.action),
+    }));
     for (let i = 0; i < tiles.length; i += 3) {
         const line = box({style_class: 'desklink-grid-row'});
         tiles.slice(i, i + 3).forEach(t => line.add_child(t));
         grid.add_child(line);
     }
-    menu.addMenuItem(row(grid));
+    body.addMenuItem(row(grid));
 
     // The phone's music.
-    const media = ready ? selected.media : null;
+    const media = selected.ready ? selected.media : null;
     if (media) {
         const line = box({style_class: 'desklink-media'});
         line.add_child(new St.Icon({icon_name: 'audio-x-generic-symbolic', style_class: `desklink-art ${variant}`, y_align: Clutter.ActorAlign.CENTER}));
@@ -376,52 +571,56 @@ export function fillMenu(menu, ctx) {
         if (media.artist)
             words.add_child(dim(label(media.artist, 'desklink-card-subtitle')));
         line.add_child(words);
+        if (can(selected, 'media-prev'))
+            line.add_child(iconButton('media-skip-backward-symbolic', 'Previous track', () => invoke(selected.id, 'media-prev'), variant));
         line.add_child(iconButton(media.playing ? 'media-playback-pause-symbolic' : 'media-playback-start-symbolic',
             media.playing ? 'Pause' : 'Play', () => invoke(selected.id, 'media-play-pause'), variant));
         line.add_child(iconButton('media-skip-forward-symbolic', 'Next track', () => invoke(selected.id, 'media-next'), variant));
-        menu.addMenuItem(row(line));
+        body.addMenuItem(row(line));
     }
 
-    // The Files sync (the Bucket): what, how fast, how long; opens Files.
+    // Going on now: files moving, the Files sync, the phone's timers.
+    const moving = selected.transfers ?? [];
+    const activities = (ctx.activities ?? []).filter(item => item.device === selected.id).slice(0, 2);
     const bucket = selected.bucket;
+    if (moving.length > 0 || bucket || activities.length > 0)
+        body.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Now'));
+    const bars = moving.slice(0, 3).map((transfer, index) => {
+        const bar = progressItem(transfer.incoming ? 'folder-download-symbolic' : 'folder-upload-symbolic', false);
+        bar.show = now => bar.update(`${now.incoming ? 'Receiving' : 'Sending'} ${now.name}`,
+            [now.paused ? 'Paused' : (now.fraction > 0 ? `${Math.round(now.fraction * 100)}%` : 'Preparing'), now.lane]
+                .filter(Boolean).join(' · '), now.fraction);
+        bar.show(transfer);
+        ctx.appear(bar.item, `transfer:${selected.id}:${index}:${transfer.name}`);
+        body.addMenuItem(bar.item);
+        return bar;
+    });
+    // Their progress moves every second: updated in place, not rebuilt.
+    ctx.onTransfers?.(list => bars.forEach((bar, index) => list[index] && bar.show(list[index])));
     if (bucket) {
-        const item = new PopupMenu.PopupBaseMenuItem({style_class: 'desklink-row desklink-bucket'});
-        const words = column({style_class: 'desklink-bucket-words'});
-        const head = box();
-        head.add_child(new St.Icon({icon_name: 'folder-symbolic', style_class: 'desklink-bucket-icon', y_align: Clutter.ActorAlign.CENTER}));
-        const line = label('', 'desklink-card-title');
-        head.add_child(line);
-        words.add_child(head);
-        const detail = dim(label('', 'desklink-card-subtitle'));
+        const bar = progressItem('folder-symbolic', true);
+        bar.update(bucket.line, bucket.detail, bucket.fraction);
+        ctx.onBucket?.(now => now && bar.update(now.line, now.detail, now.fraction));
+        bar.item.connect('activate', () => invoke(selected.id, 'open-bucket'));
+        ctx.appear(bar.item, `bucket:${selected.id}`);
+        body.addMenuItem(bar.item);
+    }
+    for (const activity of activities) {
+        const item = new PopupMenu.PopupBaseMenuItem({activate: false, hover: false, can_focus: false, style_class: 'desklink-row'});
+        item.add_child(new St.Icon({icon_name: 'alarm-symbolic', style_class: 'desklink-bucket-icon', y_align: Clutter.ActorAlign.CENTER}));
+        const words = column();
+        words.add_child(label(activity.title || activity.app, 'desklink-card-title'));
+        const detail = dim(label(ctx.activityText(activity), 'desklink-card-subtitle'));
+        ctx.tick(() => (detail.text = ctx.activityText(activity)));
         words.add_child(detail);
-        const track = new St.Widget({style_class: 'desklink-progress', x_expand: true, layout_manager: new Clutter.BinLayout()});
-        const fill = new St.Widget({style_class: 'desklink-progress-fill', x_align: Clutter.ActorAlign.START, y_expand: true});
-        track.add_child(fill);
-        words.add_child(track);
         item.add_child(words);
-        let fraction = 0;
-        const draw = () => (fill.width = Math.round(track.width * fraction));
-        track.connect('notify::width', draw);
-        const show = now => {
-            if (!now)
-                return;
-            line.text = now.line;
-            detail.text = now.detail;
-            fraction = Math.min(1, Math.max(0, now.fraction ?? 0));
-            item.accessible_name = `Files: ${now.line}, ${now.detail}, ${Math.round(fraction * 100)}%`;
-            draw();
-        };
-        show(bucket);
-        ctx.onBucket?.(show);
-        item.connect('activate', () => invoke(selected.id, 'open-bucket'));
-        ctx.appear(item, `bucket:${selected.id}`);
-        menu.addMenuItem(item);
+        body.addMenuItem(item);
     }
 
     // What is live on this computer.
     const live = devices.filter(device => device.screen || device.terminals > 0);
     if (live.length > 0) {
-        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('On this computer'));
+        body.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('On this computer'));
         for (const device of live) {
             const card = box({style_class: `desklink-card ${variant} desklink-live`});
             card.add_child(new St.Widget({style_class: 'desklink-dot coral', y_align: Clutter.ActorAlign.CENTER}));
@@ -442,43 +641,38 @@ export function fillMenu(menu, ctx) {
             end.accessible_name = `End what ${device.name} is doing here`;
             card.add_child(end);
             ctx.appear(card, `live:${device.id}`);
-            menu.addMenuItem(row(card));
+            body.addMenuItem(row(card));
         }
         if (live.length > 1)
-            menu.addAction('End Everything', () => invoke('', 'end-sessions'));
+            body.addAction('End Everything', () => invoke('', 'end-sessions'));
     }
 
-    // Recent files, opened on click.
-    if (transfers.length > 0) {
-        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Recent files'));
-        for (const file of transfers.slice(0, 3)) {
-            const item = new PopupMenu.PopupBaseMenuItem({style_class: 'desklink-row desklink-file'});
-            item.add_child(new St.Icon({gicon: fileIcon(file), style_class: 'desklink-thumb'}));
-            const words = column();
-            words.add_child(label(file.name, 'desklink-file-name'));
-            const when = file.time ? GLib.DateTime.new_from_unix_local(file.time).format('%H:%M') : '';
-            words.add_child(dim(label(`${file.incoming ? 'from' : 'to'} ${file.deviceName}${when ? ` · ${when}` : ''}`, 'desklink-card-subtitle')));
-            item.add_child(words);
-            item.accessible_name = `${file.name}, ${file.incoming ? 'from' : 'to'} ${file.deviceName}`;
-            item.connect('activate', () => ctx.call('OpenTransfer', [file.id]));
-            menu.addMenuItem(item);
-        }
-    }
+    // Every area, collapsed.
+    body.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+    for (const section of sections(selected, desk, {
+        transfers: transfers.filter(file => file.deviceName === selected.name),
+        snippets: ctx.snippets ?? [],
+        linkInClipboard: !!ctx.linkInClipboard,
+    }))
+        addSection(body, section, selected, ctx);
 
-    // Snippets: copied on click (the shell owns the clipboard).
-    const snippets = ctx.snippets ?? [];
-    if (snippets.length > 0) {
-        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Snippets'));
-        for (const snippet of snippets.slice(0, 5)) {
-            const item = new PopupMenu.PopupImageMenuItem(snippet.label, 'edit-copy-symbolic');
-            item.accessible_name = `Copy ${snippet.label}`;
-            item.connect('activate', () =>
-                St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, snippet.text));
-            menu.addMenuItem(item);
-        }
-    }
-
+    // The footer: the app, its settings, and a pause for notifications.
     menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
-    menu.addAction('New Note', () => invoke('', 'new-note'), 'document-edit-symbolic');
-    menu.addAction('Open DeskLink', () => invoke(selected.id, 'open'));
+    const bar = box({style_class: 'desklink-footer'});
+    for (const button of footer(selected, desk)) {
+        const view = new St.Button({
+            style_class: `button desklink-pill-button desklink-footer-button ${variant}`,
+            child: box({style_class: 'desklink-footer-content', x_align: Clutter.ActorAlign.CENTER}),
+            can_focus: true,
+            x_expand: true,
+            accessible_name: button.label,
+        });
+        view.child.add_child(new St.Icon({icon_name: button.icon, style_class: 'desklink-footer-icon', y_align: Clutter.ActorAlign.CENTER}));
+        view.child.add_child(label(button.short, 'desklink-footer-label'));
+        view.connect('clicked', () => button.key
+            ? ctx.setSwitch(selected.id, button.key, button.on)
+            : invoke(selected.id, button.action));
+        bar.add_child(view);
+    }
+    menu.addMenuItem(row(bar));
 }

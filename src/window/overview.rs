@@ -685,20 +685,84 @@ fn show_send_link_dialog(
     });
 }
 
-/// What the user typed as a link to open: `https://` is added when no
-/// scheme was given; anything with spaces is not a link.
-fn link_to_send(typed: &str) -> Option<String> {
+/// Endings that name a file, not a site (`README.md`, `photo.jpg`), though many
+/// are also country domains: a bare word with one of them is not a link.
+const FILE_ENDINGS: [&str; 44] = [
+    "md", "txt", "pdf", "doc", "docx", "odt", "xls", "xlsx", "ods", "csv", "ppt", "pptx", "rtf",
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "heic", "mp3", "mp4", "mkv", "wav", "flac",
+    "zip", "tar", "gz", "xz", "7z", "rs", "py", "js", "ts", "kt", "java", "sh", "json", "toml",
+    "yml", "yaml", "log", "apk",
+];
+
+/// A host name: dot-separated labels of letters, digits and hyphens. A bare
+/// word must look like a site (two labels, an alphabetic ending of two or
+/// more letters, not a file ending); after `http(s)://` any such host does.
+fn is_host(host: &str, bare: bool) -> bool {
+    let labels: Vec<&str> = host.split('.').collect();
+    let label_ok = |label: &&str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if !labels.iter().all(label_ok) {
+        return false;
+    }
+    if !bare {
+        return true;
+    }
+    let ending = labels
+        .last()
+        .copied()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    labels.len() >= 2
+        && ending.len() >= 2
+        && ending.bytes().all(|b| b.is_ascii_alphabetic())
+        && !FILE_ENDINGS.contains(&ending.as_str())
+}
+
+/// What the user typed as a link to open: an `http://` or `https://` address,
+/// or a bare `host.tld` (with an optional port and path) that gets `https://`.
+/// A file name (`README.md`), another scheme (`file:///…`, `javascript:`,
+/// `mailto:`), a name with spaces, or a host with `user@` is not a link.
+pub(crate) fn link_to_send(typed: &str) -> Option<String> {
     let typed = typed.trim();
-    if typed.is_empty() || typed.contains(char::is_whitespace) || !typed.contains('.') {
+    if typed.is_empty()
+        || typed.len() > 2000
+        || typed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
         return None;
     }
-    Some(
-        if typed.starts_with("http://") || typed.starts_with("https://") {
-            typed.to_string()
-        } else {
-            format!("https://{typed}")
-        },
-    )
+    let lower = typed.to_ascii_lowercase();
+    let (rest, bare) = if lower.starts_with("https://") {
+        (&typed[8..], false)
+    } else if lower.starts_with("http://") {
+        (&typed[7..], false)
+    } else if typed.contains("://") {
+        return None;
+    } else {
+        (typed, true)
+    };
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (authority, None),
+    };
+    if port.is_some_and(|port| {
+        port.is_empty() || port.len() > 5 || !port.bytes().all(|b| b.is_ascii_digit())
+    }) || !is_host(host, bare)
+    {
+        return None;
+    }
+    Some(if bare {
+        format!("https://{typed}")
+    } else {
+        typed.to_string()
+    })
 }
 
 /// The phone's music while it plays: track, progress and controls.
@@ -1423,6 +1487,52 @@ mod tests {
         assert_eq!(link_to_send("not a link"), None);
         assert_eq!(link_to_send("localhost"), None);
         assert_eq!(link_to_send(""), None);
+    }
+
+    /// The same vectors as `tests/model.test.mjs` (`looksLikeLink`).
+    #[test]
+    fn only_web_addresses_and_site_names_become_links() {
+        for (typed, sent) in [
+            ("https://example.org/a?b=c", "https://example.org/a?b=c"),
+            ("http://example.org", "http://example.org"),
+            ("example.org", "https://example.org"),
+            (
+                "www.example.com/path?x=1",
+                "https://www.example.com/path?x=1",
+            ),
+            ("sub.example.co.uk", "https://sub.example.co.uk"),
+            ("example.org:8080/x", "https://example.org:8080/x"),
+            ("HTTPS://Example.org", "HTTPS://Example.org"),
+            ("http://localhost:3000", "http://localhost:3000"),
+        ] {
+            assert_eq!(link_to_send(typed).as_deref(), Some(sent), "{typed}");
+        }
+        for typed in [
+            "README.md",
+            "notes.txt",
+            "photo.jpg",
+            "foo.md/bar",
+            "archive.tar.gz",
+            "file:///etc/passwd",
+            "ftp://example.org",
+            "javascript:alert.x",
+            "mailto:a@b.org",
+            "data:text/plain,hi",
+            "https://",
+            "http:///x",
+            "https://exa mple.org",
+            "hello",
+            "1.2.3",
+            "192.168.1.1",
+            "a..b.org",
+            "-a.org",
+            "example.org:abc",
+            "example.org:",
+            "https://good.com@evil.org",
+            "[::1]:80",
+        ] {
+            assert_eq!(link_to_send(typed), None, "{typed}");
+        }
     }
 
     #[test]
