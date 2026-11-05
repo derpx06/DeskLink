@@ -24,9 +24,14 @@ EXTRA = [
 ]
 
 def path_data(xml):
+    """(path, viewBox). Some drawables draw in the font's own space, y from
+    -960 to 0, and move it down with <group android:translateY="960">: the
+    same shift is the viewBox's origin."""
     m = re.search(r'android:pathData="([^"]+)"', xml)
-    vw = re.search(r'android:viewportWidth="([\d.]+)"', xml)
-    return m.group(1), vw.group(1)
+    vw = re.search(r'android:viewportWidth="([\d.]+)"', xml).group(1)
+    shift = re.search(r'android:translateY="([\d.]+)"', xml)
+    top = f"-{shift.group(1)}" if shift else "0"
+    return m.group(1), f"0 {top} {vw} {vw}"
 
 found = {}
 for f in sorted(os.listdir(phone)):
@@ -37,10 +42,10 @@ for name in EXTRA:
         found[name] = path_data(open(os.path.join(sdk, name, f"rounded_{name}_24.xml")).read())
 
 entries = []
-for name, (d, size) in sorted(found.items()):
+for name, (d, view_box) in sorted(found.items()):
     stem = "desklink-" + name.replace("_", "-") + "-symbolic"
     svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" '
-           f'viewBox="0 0 {size} {size}"><path fill="#222" d="{d}"/></svg>\n')
+           f'viewBox="{view_box}"><path fill="#222" d="{d}"/></svg>\n')
     open(os.path.join(icons, stem + ".svg"), "w").write(svg)
     entries.append(f'    <file alias="icons/scalable/actions/{stem}.svg">icons/{stem}.svg</file>')
 

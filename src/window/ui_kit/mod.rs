@@ -366,18 +366,13 @@ pub(crate) fn tile(
 }
 
 /// A 40 px rounded square with a 24 px glyph, for list rows and banners.
-pub(crate) fn icon_square(icon_name: &str, tone: Tone) -> gtk::Box {
-    let square = gtk::Box::builder()
+pub(crate) fn icon_square(icon_name: &str, tone: Tone) -> gtk::CenterBox {
+    gtk::CenterBox::builder()
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
         .css_classes(tone.classes())
-        .build();
-    let glyph = icon(icon_name, 24);
-    glyph.set_halign(gtk::Align::Center);
-    glyph.set_valign(gtk::Align::Center);
-    glyph.set_hexpand(true);
-    square.append(&glyph);
-    square
+        .center_widget(&icon(icon_name, 24))
+        .build()
 }
 
 /// A list row: icon square, title (wraps), up to three lines of secondary

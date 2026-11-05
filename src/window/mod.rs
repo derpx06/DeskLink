@@ -3139,7 +3139,7 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         // "ui-kit [W H]": the component sheet in its own window.
         "ui-kit" => {
             let size = |text: &str, default| text.parse().unwrap_or(default);
-            ui_kit::present_sheet(win, size(&id, 1100), size(&arg, 1500));
+            ui_kit::present_sheet(win, size(id, 1100), size(arg, 1500));
         }
         "window-size" => {
             if let (Ok(width), Ok(height)) = (id.parse(), arg.parse()) {

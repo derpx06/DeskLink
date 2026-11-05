@@ -63,6 +63,44 @@ fn buttons() -> gtk::Box {
     all
 }
 
+/// The keyboard focus ring, forced on: a window with no window manager
+/// (the screenshot harness) never has the focus, so Tab alone shows nothing.
+fn focus_ring() -> gtk::Box {
+    let focused = |widget: &gtk::Widget| {
+        widget.set_state_flags(
+            gtk::StateFlags::FOCUSED | gtk::StateFlags::FOCUS_VISIBLE,
+            false,
+        );
+    };
+    let line = row(20);
+    line.set_valign(gtk::Align::Center);
+    let primary = button(ButtonKind::Primary, "Send files", None);
+    let outline = button(ButtonKind::Outline, "Pair another", None);
+    let text = button(ButtonKind::Text, "Learn more", None);
+    let more = icon_button("desklink-more-vert-symbolic", "More");
+    let tile = tile(
+        "desklink-folder-symbolic",
+        "Files",
+        Some("Open"),
+        TileKind::Normal,
+    );
+    let chip = chip("Notes", None, false);
+    for widget in [
+        primary.upcast_ref::<gtk::Widget>(),
+        outline.upcast_ref(),
+        text.upcast_ref(),
+        more.upcast_ref(),
+        tile.upcast_ref(),
+        chip.upcast_ref(),
+    ] {
+        focused(widget);
+        widget.set_valign(gtk::Align::Center);
+        widget.set_halign(gtk::Align::Start);
+        line.append(widget);
+    }
+    captioned("Keyboard focus (forced)", &line)
+}
+
 fn chips() -> gtk::Box {
     let all = column(16);
     let line = row(8);
@@ -220,7 +258,15 @@ pub(crate) fn sheet() -> gtk::ScrolledWindow {
         .css_classes(["dl-hero"])
         .build();
     page.append(&title);
-    for part in [buttons(), chips(), statuses(), tiles(), lists(), cards()] {
+    for part in [
+        buttons(),
+        focus_ring(),
+        chips(),
+        statuses(),
+        tiles(),
+        lists(),
+        cards(),
+    ] {
         page.append(&part);
     }
     gtk::ScrolledWindow::builder()
@@ -230,9 +276,7 @@ pub(crate) fn sheet() -> gtk::ScrolledWindow {
         .build()
 }
 
-/// Shows the sheet in its own window, with the keyboard focus ring on the
-/// first button (a screenshot shows the ring only if the window believes the
-/// last input was the keyboard).
+/// Shows the sheet in its own window.
 pub(crate) fn present_sheet(parent: &impl IsA<gtk::Window>, width: i32, height: i32) {
     let window = adw::Window::builder()
         .title("UI kit")
@@ -241,6 +285,5 @@ pub(crate) fn present_sheet(parent: &impl IsA<gtk::Window>, width: i32, height: 
         .transient_for(parent)
         .content(&sheet())
         .build();
-    window.set_focus_visible(true);
     window.present();
 }
