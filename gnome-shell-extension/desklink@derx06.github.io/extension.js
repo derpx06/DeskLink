@@ -361,6 +361,8 @@ export default class DeskLinkExtension extends Extension {
             }) : 0;
             if (open)
                 this._lookAtClipboard(state);
+            else
+                state.focus = null; // a closed menu keeps no focus to restore
         });
     }
 
@@ -408,10 +410,15 @@ export default class DeskLinkExtension extends Extension {
             linkInClipboard: state.link,
             openSection: state.openSection,
             sectionOpened: (id, open) => {
-                if (open)
+                if (open) {
                     state.openSection = id;
-                else if (state.openSection === id)
-                    state.openSection = null;
+                } else {
+                    if (state.openSection === id)
+                        state.openSection = null;
+                    // Rows of a section that closed are not where focus belongs.
+                    if (state.focus?.startsWith(`${id}:`))
+                        state.focus = null;
+                }
             },
             activityText: item => this._activityText(item),
             invoke: (id, action) => this._invoke(id, action),
@@ -441,8 +448,9 @@ export default class DeskLinkExtension extends Extension {
             },
         });
         state.seen = shown;
-        if (menu.isOpen && state.focus)
-            state.items.get(state.focus)?.grabKeyFocus?.();
+        const focused = menu.isOpen && state.focus ? state.items.get(state.focus) : null;
+        if (focused?.mapped)
+            focused.grabKeyFocus?.();
     }
 
     /// A switch in the menu: the app decides (a security one only goes off).
