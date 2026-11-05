@@ -39,7 +39,13 @@ pub const INTERFACE: &str = "derx06.desklink.com.Shell1";
 /// 7: `Devices[].bucket` (`line`, `detail`, `fraction`) while the Bucket
 /// syncs, and the `open-bucket` action.
 /// 8: the `insert-photo` action (a photo from the phone onto the clipboard).
-const VERSION: u32 = 8;
+/// 9: the complete remote. `Devices[].settings` (per-phone switches),
+/// `.sound`, `.rttMs`, `.unread`, `.textCapture`, `.transfers`; more `Desk`
+/// switches; the `SetSwitch` and `SendLink` methods; the `ping`, `send-link`,
+/// `show-screen`, `media-prev`, `insert-*`, `open-*` and `unpair` actions.
+/// The security-sensitive switches can only be turned OFF here
+/// ([`SWITCHES`]); turning them on is the application's own page.
+const VERSION: u32 = 9;
 const INVALID_ARGS: &str = "org.freedesktop.DBus.Error.InvalidArgs";
 
 const XML: &str = r#"<node>
@@ -71,6 +77,15 @@ const XML: &str = r#"<node>
     </method>
     <method name="OpenTransfer">
       <arg name="transfer_id" type="s" direction="in"/>
+    </method>
+    <method name="SetSwitch">
+      <arg name="device_id" type="s" direction="in"/>
+      <arg name="key" type="s" direction="in"/>
+      <arg name="on" type="b" direction="in"/>
+    </method>
+    <method name="SendLink">
+      <arg name="device_id" type="s" direction="in"/>
+      <arg name="link" type="s" direction="in"/>
     </method>
     <method name="Hello">
       <arg name="version" type="u" direction="in"/>
@@ -104,6 +119,18 @@ struct Desk {
     /// Settings → Appearance → "Phone in the top bar": the extension's own pill, on
     /// top of the Quick Settings menu.
     pill: bool,
+    /// This computer's notifications go to the phones.
+    forward_notifications: bool,
+    /// This computer's players pause during a call.
+    pause_media_on_call: bool,
+    /// Phones may hear this computer's microphone.
+    desk_mic: bool,
+    /// Sound can work here (PipeWire and its GStreamer plugin).
+    sound_available: bool,
+    /// Do Not Disturb can be shared (GNOME's notification settings).
+    dnd_supported: bool,
+    /// A session password is set.
+    has_password: bool,
 }
 
 impl Desk {
@@ -113,6 +140,12 @@ impl Desk {
         dict.insert("clipboard", self.clipboard);
         dict.insert("handOff", self.hand_off);
         dict.insert("pill", self.pill);
+        dict.insert("forwardNotifications", self.forward_notifications);
+        dict.insert("pauseMediaOnCall", self.pause_media_on_call);
+        dict.insert("deskMic", self.desk_mic);
+        dict.insert("soundAvailable", self.sound_available);
+        dict.insert("dndSupported", self.dnd_supported);
+        dict.insert("hasPassword", self.has_password);
         dict.end()
     }
 }
@@ -127,6 +160,12 @@ fn desk(devices: &[ShellDevice]) -> Desk {
                 .iter()
                 .any(|info| info.exit_status.is_none()),
         pill: settings.top_bar_pill,
+        forward_notifications: settings.forward_notifications,
+        pause_media_on_call: settings.pause_media_on_call,
+        desk_mic: settings.desk_mic_to_phone,
+        sound_available: crate::platform::reason("sound").is_none(),
+        dnd_supported: crate::device_links::dnd::desk_state().is_some(),
+        has_password: settings.session_password.is_some(),
     }
 }
 
@@ -154,7 +193,54 @@ struct ShellDevice {
     bucket: Option<ShellBucket>,
     /// Since when it has been using this computer (Unix seconds); 0 not.
     live_since: u64,
+    /// Its per-phone switches, by [`SWITCHES`] key.
+    settings: Vec<(&'static str, bool)>,
+    /// Sound with this phone: this computer's to it, its microphone here, its
+    /// sound here.
+    sound: [bool; 3],
+    /// Round trip in milliseconds; -1 unknown.
+    rtt_ms: i32,
+    /// Its notifications shown here and not yet dismissed.
+    unread: u32,
+    /// The phone can read text from a picture.
+    text_capture: bool,
+    /// Files going to or from it now (the Bucket's are in `bucket`).
+    transfers: Vec<ShellTransfer>,
     actions: Vec<&'static str>,
+}
+
+/// One file moving now: `Devices[].transfers`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShellTransfer {
+    name: String,
+    incoming: bool,
+    /// 0..=1000; 0 while still preparing.
+    permille: u32,
+    paused: bool,
+    /// "fast lane" or "over the secure link"; "" not said yet.
+    lane: String,
+}
+
+fn shell_transfers(device_id: &str) -> Vec<ShellTransfer> {
+    use crate::device_links::webrtc::transfer_board;
+    transfer_board::rows()
+        .into_iter()
+        .filter(|row| row.device_id == device_id)
+        .map(|row| ShellTransfer {
+            permille: if row.total == 0 || row.preparing {
+                0
+            } else {
+                (row.done.min(row.total) * 1000 / row.total) as u32
+            },
+            lane: transfer_board::lane_of(&row.id)
+                .unwrap_or_default()
+                .to_string(),
+            name: row.name,
+            incoming: row.incoming,
+            paused: row.paused,
+        })
+        .take(RECENT_TRANSFERS)
+        .collect()
 }
 
 /// The phone's Bucket sync now: `Devices[].bucket`.
@@ -302,23 +388,96 @@ fn shell_device(device: &DeviceView, settings: &AppSettings) -> ShellDevice {
         media: shell_media(device),
         bucket: crate::bucket_progress::summary(&device.id).map(|summary| shell_bucket(&summary)),
         live_since: 0,
+        settings: SWITCHES
+            .iter()
+            .filter(|spec| spec.scope == Scope::Phone)
+            .filter_map(|spec| Some((spec.key, phone_switch(spec.key, device, settings)?)))
+            .collect(),
+        sound: {
+            let sound = device.sound.clone().unwrap_or_default();
+            [
+                sound.sending.is_some(),
+                sound.hearing.as_deref() == Some("mic"),
+                sound.hearing.as_deref() == Some("system"),
+            ]
+        },
+        rtt_ms: device.rtt_ms.map_or(-1, |ms| ms as i32),
+        unread: if settings.shows_notifications(&device.id) {
+            device.notifications.len() as u32
+        } else {
+            0
+        },
+        text_capture: crate::device_links::webrtc::capture::text_available(&device.id),
+        transfers: if device.feature_transport_ready {
+            shell_transfers(&device.id)
+        } else {
+            Vec::new()
+        },
         actions: actions(device, settings),
     }
 }
 
+/// What the phone takes from this computer: the window's own test, so a tile
+/// is offered exactly when the window would offer its button.
+fn takes(device: &DeviceView, packet_type: &str) -> bool {
+    crate::window::can_send_feature(device, packet_type)
+}
+
+/// The Insert-from-phone actions and their rows in `window::insert::CAPTURES`.
+const INSERTS: [(&str, usize); 5] = [
+    ("insert-photo", 0),
+    ("insert-photo-file", 1),
+    ("insert-scan", 2),
+    ("insert-text", 3),
+    ("insert-qr", 4),
+];
+
+/// The pages of the window a client may open for a phone, by action.
+const PAGES: [(&str, &str); 8] = [
+    ("open-files", "files"),
+    ("open-notes", "notes"),
+    ("open-clipboard", "clipboard"),
+    ("open-snippets", "snippets"),
+    ("open-notifications", "notifications"),
+    ("open-contacts", "contacts"),
+    ("open-terminals", "terminals"),
+    ("open-settings", "settings"),
+];
+
 /// What a client may offer for `device` right now.
 fn actions(device: &DeviceView, settings: &AppSettings) -> Vec<&'static str> {
+    use crate::device_links::packet::{
+        PACKET_TYPE_CLIPBOARD, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_LOCK_REQUEST,
+        PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_PING, PACKET_TYPE_SHARE_REQUEST,
+    };
     let mut actions = vec!["open"];
     if device.feature_transport_ready {
-        actions.extend([
-            "ring",
-            "lock",
-            "send-files",
-            "send-clipboard",
-            "new-terminal",
-            // A photo from the phone into whatever is open (F3, C2).
-            "insert-photo",
-        ]);
+        for (action, packet) in [
+            ("ring", PACKET_TYPE_FINDMYPHONE_REQUEST),
+            ("lock", PACKET_TYPE_LOCK_REQUEST),
+            ("send-files", PACKET_TYPE_SHARE_REQUEST),
+            ("send-link", PACKET_TYPE_SHARE_REQUEST),
+            ("send-clipboard", PACKET_TYPE_CLIPBOARD),
+            ("ping", PACKET_TYPE_PING),
+            ("show-screen", PACKET_TYPE_MOUSEPAD_REQUEST),
+        ] {
+            if takes(device, packet) {
+                actions.push(action);
+            }
+        }
+        // A shared terminal starts at this computer; it needs nothing of the phone.
+        actions.push("new-terminal");
+        // A photo, a scan, text or a QR code from the phone (F3, C2): the
+        // window offers them on the same test; "text" also needs its OCR.
+        if takes(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
+            for (action, _) in INSERTS {
+                if action != "insert-text"
+                    || crate::device_links::webrtc::capture::text_available(&device.id)
+                {
+                    actions.push(action);
+                }
+            }
+        }
     }
     // The lock-screen button: only with "Unlock with … nearby" on and the
     // phone connected on this network.
@@ -344,7 +503,12 @@ fn actions(device: &DeviceView, settings: &AppSettings) -> Vec<&'static str> {
         }
     }
     if shell_media(device).is_some() {
-        actions.extend(["media-play-pause", "media-next"]);
+        actions.extend(["media-prev", "media-play-pause", "media-next"]);
+    }
+    // The window's own pages and its Unpair question, for a paired phone.
+    if device.trusted {
+        actions.extend(PAGES.iter().map(|(action, _)| *action));
+        actions.push("unpair");
     }
     if device.trusted && crate::device_links::folders::bucket_on(&device.id) {
         actions.push("open-bucket");
@@ -363,6 +527,133 @@ fn actions(device: &DeviceView, settings: &AppSettings) -> Vec<&'static str> {
         actions.push("end-sessions");
     }
     actions
+}
+
+/// Whose switch it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Phone,
+    Desk,
+}
+
+/// A switch a client may set with `SetSwitch`. `sensitive` ones are off by
+/// default for a security reason (they let a phone run commands, unlock or
+/// fill the disk, or let a phone hear this room); they can only be turned
+/// OFF from the top bar. Turning one on is DeskLink's own page.
+struct SwitchSpec {
+    key: &'static str,
+    scope: Scope,
+    sensitive: bool,
+}
+
+const fn switch(key: &'static str, scope: Scope, sensitive: bool) -> SwitchSpec {
+    SwitchSpec {
+        key,
+        scope,
+        sensitive,
+    }
+}
+
+const SWITCHES: [SwitchSpec; 18] = [
+    switch("showNotifications", Scope::Phone, false),
+    switch("dndShare", Scope::Phone, false),
+    switch("commandAlerts", Scope::Phone, false),
+    switch("namesCallers", Scope::Phone, false),
+    switch("walkAway", Scope::Phone, false),
+    switch("terminalAccess", Scope::Phone, true),
+    switch("unlockNearby", Scope::Phone, true),
+    switch("galleryAccept", Scope::Phone, true),
+    switch("phoneKeepAwake", Scope::Phone, true),
+    switch("glide", Scope::Phone, true),
+    switch("deskSound", Scope::Phone, false),
+    switch("phoneMic", Scope::Phone, false),
+    switch("phoneSound", Scope::Phone, false),
+    switch("keepAwake", Scope::Desk, false),
+    switch("clipboard", Scope::Desk, false),
+    switch("forwardNotifications", Scope::Desk, false),
+    switch("pauseMediaOnCall", Scope::Desk, false),
+    switch("deskMic", Scope::Desk, true),
+];
+
+/// A phone's switch as published (`None`: not a state switch; sound is in
+/// `Devices[].sound`).
+fn phone_switch(key: &str, device: &DeviceView, settings: &AppSettings) -> Option<bool> {
+    let id = device.id.as_str();
+    Some(match key {
+        "showNotifications" => settings.shows_notifications(id),
+        "dndShare" => settings.shares_dnd_with(id),
+        "commandAlerts" => settings.alerts_commands_to(id),
+        "namesCallers" => settings.names_callers_from(id),
+        "walkAway" => settings.locks_when_away(id),
+        "terminalAccess" => device.terminal_access,
+        "unlockNearby" => settings.unlocks_from(id),
+        "galleryAccept" => settings.accepts_gallery_from(id),
+        "phoneKeepAwake" => settings.lets_keep_awake(id),
+        "glide" => settings
+            .glide
+            .as_ref()
+            .is_some_and(|glide| glide.device == id),
+        _ => return None,
+    })
+}
+
+/// The command a switch comes to, or why not. Pure: the one table behind
+/// `SetSwitch`. A sensitive switch only goes off here.
+fn resolve_switch(key: &str, device_id: &str, on: bool) -> Result<DaemonCommand, String> {
+    let spec = SWITCHES
+        .iter()
+        .find(|spec| spec.key == key)
+        .ok_or_else(|| format!("\"{key}\" is not a switch"))?;
+    match (spec.scope, device_id.is_empty()) {
+        (Scope::Phone, true) => return Err(format!("\"{key}\" needs a device")),
+        (Scope::Desk, false) => return Err(format!("\"{key}\" belongs to this computer")),
+        _ => {}
+    }
+    if spec.sensitive && on {
+        return Err(format!(
+            "\"{key}\" is turned on in DeskLink's own settings, not from the top bar"
+        ));
+    }
+    let id = device_id.to_string();
+    Ok(match key {
+        "showNotifications" => DaemonCommand::SetShowNotifications(id, on),
+        "dndShare" => DaemonCommand::SetDndShare(id, on),
+        "commandAlerts" => DaemonCommand::SetCommandAlerts(id, on),
+        "namesCallers" => DaemonCommand::SetContactCallerNames(id, on),
+        "walkAway" => DaemonCommand::SetWalkAwayLock(id, on),
+        "terminalAccess" => DaemonCommand::SetTerminalAccess(id, on),
+        "unlockNearby" => DaemonCommand::SetUnlockNearby(id, on),
+        "galleryAccept" => DaemonCommand::SetGalleryAccept(id, on),
+        "phoneKeepAwake" => DaemonCommand::SetKeepAwakeFrom(id, on),
+        "glide" => DaemonCommand::SetGlide(id, None),
+        "deskSound" => DaemonCommand::Sound(id, "desk-sound".into(), on),
+        "phoneMic" => DaemonCommand::Sound(id, "phone-mic".into(), on),
+        "phoneSound" => DaemonCommand::Sound(id, "phone-sound".into(), on),
+        "keepAwake" => DaemonCommand::SetStayAwake(on),
+        "clipboard" => DaemonCommand::SetClipboardSync(on),
+        "forwardNotifications" => DaemonCommand::SetForwardNotifications(on),
+        "pauseMediaOnCall" => DaemonCommand::SetPauseMediaOnCall(on),
+        "deskMic" => DaemonCommand::SetDeskMicToPhone(on),
+        _ => return Err(format!("\"{key}\" is not a switch")),
+    })
+}
+
+/// Whether `SetSwitch` may run `key` for `device` now: the phone is paired,
+/// sound needs a live link, sharing Do Not Disturb needs GNOME's settings.
+fn switch_allowed(device: Option<&ShellDevice>, key: &str, on: bool) -> Result<(), String> {
+    let Some(device) = device else {
+        return Ok(());
+    };
+    if !device.paired {
+        return Err("that phone is not paired".to_string());
+    }
+    if matches!(key, "deskSound" | "phoneMic" | "phoneSound") && on && !device.ready {
+        return Err(format!("{} is not connected", device.name));
+    }
+    if key == "dndShare" && on && crate::device_links::dnd::desk_state().is_none() {
+        return Err("Do Not Disturb cannot be shared on this desktop".to_string());
+    }
+    Ok(())
 }
 
 impl ShellDevice {
@@ -407,6 +698,32 @@ impl ShellDevice {
             dict.insert_value("bucket", &entry.end());
         }
         dict.insert("liveSince", self.live_since);
+        let switches = glib::VariantDict::new(None);
+        for (key, on) in &self.settings {
+            switches.insert(*key, *on);
+        }
+        dict.insert_value("settings", &switches.end());
+        let sound = glib::VariantDict::new(None);
+        sound.insert("deskSound", self.sound[0]);
+        sound.insert("phoneMic", self.sound[1]);
+        sound.insert("phoneSound", self.sound[2]);
+        dict.insert_value("sound", &sound.end());
+        dict.insert("rttMs", self.rtt_ms);
+        dict.insert("unread", self.unread);
+        dict.insert("textCapture", self.text_capture);
+        let transfers = self.transfers.iter().map(|transfer| {
+            let entry = glib::VariantDict::new(None);
+            entry.insert("name", &transfer.name);
+            entry.insert("incoming", transfer.incoming);
+            entry.insert("fraction", f64::from(transfer.permille) / 1000.0);
+            entry.insert("paused", transfer.paused);
+            entry.insert("lane", &transfer.lane);
+            entry.end()
+        });
+        dict.insert_value(
+            "transfers",
+            &Variant::array_from_iter_with_type(glib::VariantTy::VARDICT, transfers),
+        );
         dict.insert("actions", &self.actions);
         dict.end()
     }
@@ -772,6 +1089,26 @@ fn call(app: &DesklinkApplication, method: &str, params: &Variant) -> Result<(),
             }
             Ok(())
         }
+        "SetSwitch" => {
+            let (device_id, key, on) = params.get::<(String, String, bool)>().unwrap_or_default();
+            let command = resolve_switch(&key, &device_id, on)?;
+            let devices = current(app);
+            let device = devices.iter().find(|device| device.id == device_id);
+            if !device_id.is_empty() && device.is_none() {
+                return Err(format!("no device \"{device_id}\""));
+            }
+            switch_allowed(device, &key, on)?;
+            daemon.send(command);
+            Ok(())
+        }
+        "SendLink" => {
+            let (device_id, link) = params.get::<(String, String)>().unwrap_or_default();
+            let devices = current(app);
+            check(&devices, &device_id, "send-link")?;
+            let link = crate::window::link_to_send(&link).ok_or("not a link")?;
+            daemon.send(DaemonCommand::SendShareText(device_id, link));
+            Ok(())
+        }
         "OpenTransfer" => {
             let id = params.get::<(String,)>().unwrap_or_default().0;
             // Only a file on the recent list, never an arbitrary path.
@@ -794,7 +1131,8 @@ fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str
     match (action, id, daemon) {
         ("ring", Some(id), Some(daemon)) => daemon.send(DaemonCommand::SendFindPhone(id)),
         ("lock", Some(id), Some(daemon)) => daemon.send(DaemonCommand::SendLockRequest(id, true)),
-        ("media-play-pause" | "media-next", Some(id), Some(daemon)) => {
+        ("ping", Some(id), Some(daemon)) => daemon.send(DaemonCommand::SendPing(id)),
+        ("media-prev" | "media-play-pause" | "media-next", Some(id), Some(daemon)) => {
             let player = daemon
                 .devices()
                 .into_iter()
@@ -802,10 +1140,10 @@ fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str
                 .and_then(|known| known.media_status)
                 .map(|media| media.player);
             if let Some(player) = player {
-                let verb = if action == "media-next" {
-                    "Next"
-                } else {
-                    "PlayPause"
+                let verb = match action {
+                    "media-next" => "Next",
+                    "media-prev" => "Previous",
+                    _ => "PlayPause",
                 };
                 daemon.send(DaemonCommand::SendMprisAction(id, player, verb.into()));
             }
@@ -852,11 +1190,44 @@ fn perform(app: &DesklinkApplication, device: Option<&ShellDevice>, action: &str
                 .unwrap_or_default();
             pick_and_send_files(app, &id, name);
         }
-        ("insert-photo", Some(id), Some(daemon)) => daemon.send(DaemonCommand::Capture(
-            id,
-            "photo".into(),
-            "clipboard".into(),
-        )),
+        (insert, Some(id), Some(daemon)) if insert.starts_with("insert-") => {
+            let capture = INSERTS
+                .iter()
+                .find(|(action, _)| *action == insert)
+                .and_then(|(_, index)| crate::window::insert::CAPTURES.get(*index));
+            if let Some((kind, target, ..)) = capture {
+                daemon.send(DaemonCommand::Capture(id, (*kind).into(), (*target).into()));
+            }
+        }
+        ("show-screen", Some(id), Some(daemon)) => {
+            // The phone still has to agree to share; the dialog says so.
+            if let Some(window) = main_window(app) {
+                crate::remote_control::show_remote_control_dialog(daemon, id, &window);
+            }
+        }
+        ("unpair", Some(id), Some(daemon)) => {
+            // The window's own question, never a silent unpairing.
+            if let Some(window) = main_window(app).and_downcast::<crate::DesklinkWindow>() {
+                let name = device.map(|device| device.name.clone()).unwrap_or_default();
+                window.show_device(&id);
+                crate::window::confirm(
+                    &window,
+                    &format!("Unpair {name}?"),
+                    "It can connect again only after pairing again.",
+                    "_Unpair",
+                    move || daemon.send(DaemonCommand::Unpair(id.clone())),
+                );
+            }
+        }
+        (page, Some(id), _) if PAGES.iter().any(|(action, _)| *action == page) => {
+            if let (Some(window), Some((_, name))) = (
+                main_window(app).and_downcast::<crate::DesklinkWindow>(),
+                PAGES.iter().find(|(action, _)| *action == page),
+            ) {
+                window.show_device(&id);
+                window.show_page(name);
+            }
+        }
         ("open-bucket", Some(id), _) => {
             app.activate_action("open-bucket", Some(&id.to_variant()));
         }
@@ -1837,16 +2208,21 @@ mod tests {
         );
         assert_eq!(dict.lookup::<i32>("battery").unwrap(), Some(81));
         assert_eq!(dict.lookup::<u32>("terminals").unwrap(), Some(2));
+        // The phone takes nothing yet (no capabilities): only what is local.
         assert_eq!(
             dict.lookup::<Vec<String>>("actions").unwrap().unwrap(),
             [
                 "open",
-                "ring",
-                "lock",
-                "send-files",
-                "send-clipboard",
                 "new-terminal",
-                "insert-photo",
+                "open-files",
+                "open-notes",
+                "open-clipboard",
+                "open-snippets",
+                "open-notifications",
+                "open-contacts",
+                "open-terminals",
+                "open-settings",
+                "unpair",
                 "end-sessions"
             ]
         );
@@ -1910,6 +2286,7 @@ mod tests {
     #[test]
     fn actions_follow_readiness_and_sessions_and_invoke_checks_them() {
         let mut device = phone();
+        device.trusted = false;
         assert_eq!(actions(&device, &on()), ["open"]);
         device.terminal_sessions_attached = 1;
         assert_eq!(actions(&device, &on()), ["open", "end-sessions"]);
@@ -2156,5 +2533,280 @@ mod tests {
             !is_the_shell_cached(&mut cache, later, ":1.7", ask(":1.8")),
             "the old name is gone"
         );
+    }
+
+    /// A phone that takes everything the window offers.
+    fn capable() -> DeviceView {
+        use crate::device_links::packet::*;
+        let mut device = phone();
+        device.status = DeviceStatus::Paired;
+        device.trusted = true;
+        device.feature_transport_ready = true;
+        device.incoming_capabilities = [
+            PACKET_TYPE_FINDMYPHONE_REQUEST,
+            PACKET_TYPE_LOCK_REQUEST,
+            PACKET_TYPE_SHARE_REQUEST,
+            PACKET_TYPE_CLIPBOARD,
+            PACKET_TYPE_PING,
+            PACKET_TYPE_MOUSEPAD_REQUEST,
+        ]
+        .map(String::from)
+        .to_vec();
+        device
+    }
+
+    #[test]
+    fn the_remote_offers_each_action_only_when_the_phone_takes_it() {
+        let device = capable();
+        let all = actions(&device, &AppSettings::default());
+        for action in [
+            "ring",
+            "lock",
+            "send-files",
+            "send-link",
+            "send-clipboard",
+            "ping",
+            "show-screen",
+            "new-terminal",
+            "insert-photo",
+            "insert-photo-file",
+            "insert-scan",
+            "insert-qr",
+            "open-files",
+            "open-notes",
+            "open-clipboard",
+            "open-snippets",
+            "open-notifications",
+            "open-contacts",
+            "open-terminals",
+            "open-settings",
+            "unpair",
+        ] {
+            assert!(all.contains(&action), "{action}");
+        }
+        assert!(!all.contains(&"media-prev"), "no music");
+        // A phone that takes no ping, no screen and no pictures is not offered them.
+        let mut bare = capable();
+        bare.incoming_capabilities = vec![crate::device_links::packet::PACKET_TYPE_PING.into()];
+        let few = actions(&bare, &AppSettings::default());
+        assert!(few.contains(&"ping"));
+        for action in ["ring", "lock", "send-files", "show-screen", "insert-scan"] {
+            assert!(!few.contains(&action), "{action}");
+        }
+        // Not paired: no pages, no unpair.
+        let mut stranger = capable();
+        stranger.trusted = false;
+        let list = actions(&stranger, &AppSettings::default());
+        assert!(!list.contains(&"unpair") && !list.contains(&"open-notes"));
+        // Not ready: nothing that needs the phone.
+        let mut offline = capable();
+        offline.feature_transport_ready = false;
+        let list = actions(&offline, &AppSettings::default());
+        assert!(!list.contains(&"ring") && !list.contains(&"insert-qr"));
+        // Every action is allowed through `check`, and only for its device.
+        let devices = [shell_device(&device, &AppSettings::default())];
+        assert!(check(&devices, "phone1", "ping").is_ok());
+        assert!(check(&devices, "", "ping").is_err());
+        assert!(check(&devices, "phone1", "send-link").is_ok());
+    }
+
+    #[test]
+    fn music_gets_a_previous_track_too() {
+        let mut device = capable();
+        device.media_status = Some(crate::device_links::device::MediaStatus {
+            player: "Spotify".into(),
+            player_list: vec!["Spotify".into()],
+            title: "Song".into(),
+            artist: "Band".into(),
+            album: String::new(),
+            is_playing: true,
+            volume: None,
+            position: None,
+            length: None,
+            can_seek: false,
+            album_art_url: None,
+            album_art: None,
+        });
+        let list = actions(&device, &AppSettings::default());
+        for action in ["media-prev", "media-play-pause", "media-next"] {
+            assert!(list.contains(&action), "{action}");
+        }
+    }
+
+    /// The one table behind `SetSwitch`: every key resolves, a switch that is
+    /// off for security never turns on from the top bar, and the scope is kept.
+    #[test]
+    fn a_switch_resolves_to_its_command_and_security_ones_only_go_off() {
+        for spec in &SWITCHES {
+            let id = if spec.scope == Scope::Phone { "p" } else { "" };
+            let off = resolve_switch(spec.key, id, false);
+            assert!(off.is_ok(), "{} off", spec.key);
+            let on = resolve_switch(spec.key, id, true);
+            assert_eq!(on.is_err(), spec.sensitive, "{} on", spec.key);
+            // The wrong scope never resolves.
+            let wrong = if spec.scope == Scope::Phone { "" } else { "p" };
+            assert!(
+                resolve_switch(spec.key, wrong, false).is_err(),
+                "{}",
+                spec.key
+            );
+        }
+        assert!(matches!(
+            resolve_switch("showNotifications", "p", false),
+            Ok(DaemonCommand::SetShowNotifications(id, false)) if id == "p"
+        ));
+        assert!(matches!(
+            resolve_switch("terminalAccess", "p", false),
+            Ok(DaemonCommand::SetTerminalAccess(id, false)) if id == "p"
+        ));
+        assert!(matches!(
+            resolve_switch("phoneMic", "p", true),
+            Ok(DaemonCommand::Sound(id, what, true)) if id == "p" && what == "phone-mic"
+        ));
+        assert!(matches!(
+            resolve_switch("keepAwake", "", true),
+            Ok(DaemonCommand::SetStayAwake(true))
+        ));
+        assert!(matches!(
+            resolve_switch("glide", "p", false),
+            Ok(DaemonCommand::SetGlide(id, None)) if id == "p"
+        ));
+        for key in [
+            "terminalAccess",
+            "unlockNearby",
+            "galleryAccept",
+            "phoneKeepAwake",
+            "glide",
+        ] {
+            assert!(resolve_switch(key, "p", true).is_err(), "{key}");
+        }
+        assert!(resolve_switch("deskMic", "", true).is_err());
+        assert!(resolve_switch("explode", "p", true).is_err());
+        assert!(
+            resolve_switch("walkAway", "", true).is_err(),
+            "needs a phone"
+        );
+    }
+
+    #[test]
+    fn a_switch_needs_a_paired_phone_and_sound_a_live_link() {
+        let mut device = capable();
+        let mapped = shell_device(&device, &AppSettings::default());
+        assert!(switch_allowed(Some(&mapped), "deskSound", true).is_ok());
+        assert!(switch_allowed(None, "keepAwake", true).is_ok());
+        device.feature_transport_ready = false;
+        let offline = shell_device(&device, &AppSettings::default());
+        assert!(switch_allowed(Some(&offline), "deskSound", true).is_err());
+        assert!(
+            switch_allowed(Some(&offline), "deskSound", false).is_ok(),
+            "off is always possible"
+        );
+        device.trusted = false;
+        let stranger = shell_device(&device, &AppSettings::default());
+        assert!(switch_allowed(Some(&stranger), "commandAlerts", false).is_err());
+    }
+
+    #[test]
+    fn the_settings_sound_and_counts_are_published() {
+        let mut settings = AppSettings::default();
+        settings.hidden_notifications.insert("phone1".into());
+        settings.dnd_devices.insert("phone1".into());
+        settings.unlock_devices.insert("phone1".into());
+        let mut device = capable();
+        device.terminal_access = true;
+        device.rtt_ms = Some(12);
+        device.sound = Some(crate::device_links::device::SoundUse {
+            sending: Some("system".into()),
+            hearing: Some("mic".into()),
+            hearing_live: true,
+        });
+        let mapped = shell_device(&device, &settings);
+        let list = devices_variant(&[mapped]);
+        let dict = glib::VariantDict::new(Some(&list.child_value(0)));
+        let switches = glib::VariantDict::new(dict.lookup_value("settings", None).as_ref());
+        let flag = |key: &str| switches.lookup::<bool>(key).unwrap();
+        assert_eq!(flag("showNotifications"), Some(false), "hidden here");
+        assert_eq!(flag("dndShare"), Some(true));
+        assert_eq!(flag("unlockNearby"), Some(true));
+        assert_eq!(flag("terminalAccess"), Some(true));
+        assert_eq!(flag("walkAway"), Some(false));
+        assert_eq!(flag("glide"), Some(false));
+        let sound = glib::VariantDict::new(dict.lookup_value("sound", None).as_ref());
+        assert_eq!(sound.lookup::<bool>("deskSound").unwrap(), Some(true));
+        assert_eq!(sound.lookup::<bool>("phoneMic").unwrap(), Some(true));
+        assert_eq!(sound.lookup::<bool>("phoneSound").unwrap(), Some(false));
+        assert_eq!(dict.lookup::<i32>("rttMs").unwrap(), Some(12));
+        assert_eq!(dict.lookup::<u32>("unread").unwrap(), Some(0));
+        assert_eq!(
+            dict.lookup_value("transfers", None)
+                .unwrap()
+                .type_()
+                .as_str(),
+            "aa{sv}"
+        );
+        let desk = Desk {
+            keep_awake: false,
+            clipboard: true,
+            hand_off: false,
+            pill: false,
+            forward_notifications: true,
+            pause_media_on_call: false,
+            desk_mic: false,
+            sound_available: true,
+            dnd_supported: false,
+            has_password: true,
+        }
+        .to_variant();
+        let desk = glib::VariantDict::new(Some(&desk));
+        assert_eq!(
+            desk.lookup::<bool>("forwardNotifications").unwrap(),
+            Some(true)
+        );
+        assert_eq!(desk.lookup::<bool>("hasPassword").unwrap(), Some(true));
+    }
+
+    #[test]
+    fn a_transfer_in_flight_is_published_with_its_lane() {
+        use crate::device_links::webrtc::transfer_board;
+        let row = transfer_board::TransferRow {
+            id: "shell-t1".into(),
+            device_id: "shell-lane".into(),
+            name: "film.mkv".into(),
+            incoming: false,
+            done: 250,
+            total: 1000,
+            preparing: false,
+            paused: false,
+        };
+        assert!(transfer_board::begin(row));
+        transfer_board::set_lane("shell-t1", Some("fast lane"));
+        let shown = shell_transfers("shell-lane");
+        transfer_board::discard("shell-t1");
+        assert_eq!(shown.len(), 1);
+        assert_eq!(
+            (shown[0].permille, shown[0].lane.as_str(), shown[0].incoming),
+            (250, "fast lane", false)
+        );
+        assert!(shell_transfers("shell-lane").is_empty());
+    }
+
+    #[test]
+    fn every_page_action_names_a_page_the_window_has() {
+        for (action, page) in PAGES {
+            let (resolved, _) = crate::window::resolve_page(page);
+            assert!(
+                [
+                    "home",
+                    "files",
+                    "notes",
+                    "notifications",
+                    "contacts",
+                    "terminals",
+                    "settings"
+                ]
+                .contains(&resolved),
+                "{action} -> {page}"
+            );
+        }
     }
 }

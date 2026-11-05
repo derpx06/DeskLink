@@ -687,7 +687,7 @@ fn show_send_link_dialog(
 
 /// What the user typed as a link to open: `https://` is added when no
 /// scheme was given; anything with spaces is not a link.
-fn link_to_send(typed: &str) -> Option<String> {
+pub(crate) fn link_to_send(typed: &str) -> Option<String> {
     let typed = typed.trim();
     if typed.is_empty() || typed.contains(char::is_whitespace) || !typed.contains('.') {
         return None;
