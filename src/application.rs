@@ -224,9 +224,6 @@ mod imp {
     impl AdwApplicationImpl for DesklinkApplication {}
 }
 
-/// The Bucket questions (a phone asked, the desk has not turned it on) not
-/// yet told about: each is returned once. `told` forgets a question once it is
-/// gone, so a phone that asks again later is told again.
 /// Which phones' "approve it at this computer" notices to post and which to
 /// take down, given the phones waiting now and those already announced.
 fn approval_changes(
@@ -249,6 +246,9 @@ fn approval_changes(
     (fresh, gone)
 }
 
+/// The Bucket questions (a phone asked, the desk has not turned it on) not
+/// yet told about: each is returned once. `told` forgets a question once it is
+/// gone, so a phone that asks again later is told again.
 fn new_bucket_questions(
     offers: &[crate::device_links::folders::Offer],
     told: &mut std::collections::HashSet<String>,

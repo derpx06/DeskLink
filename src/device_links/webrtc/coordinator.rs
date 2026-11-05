@@ -139,16 +139,36 @@ fn desktop_portal_services() -> &'static Mutex<HashMap<String, DesktopPortalServ
 /// dialog at this computer, with the share (`id`) that is waiting. The desk
 /// window posts a notification for each, so the person at the laptop knows
 /// where to look (the dialog is GNOME's, not DeskLink's).
-fn portal_approvals() -> &'static Mutex<HashMap<String, u64>> {
-    static WAITING: std::sync::OnceLock<Mutex<HashMap<String, u64>>> = std::sync::OnceLock::new();
+fn portal_approvals() -> &'static Mutex<HashMap<String, (u64, std::time::Instant)>> {
+    static WAITING: std::sync::OnceLock<Mutex<HashMap<String, (u64, std::time::Instant)>>> =
+        std::sync::OnceLock::new();
     WAITING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The phones (by id) waiting for approval at this computer right now.
+/// A portal wait shorter than this says nothing: a remembered grant answers at once and
+/// shows no dialog, so no notice (and no log line) is made for it.
+const APPROVAL_NOTICE_AFTER: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The phones in `waiting` that have waited at least `after` at `now`.
+fn waited_long_enough(
+    waiting: &HashMap<String, (u64, std::time::Instant)>,
+    now: std::time::Instant,
+    after: std::time::Duration,
+) -> Vec<String> {
+    waiting
+        .iter()
+        .filter(|(_, (_, since))| now.saturating_duration_since(*since) >= after)
+        .map(|(device, _)| device.clone())
+        .collect()
+}
+
+/// The phones (by id) that have waited for approval at this computer long enough to be worth a notice.
 pub(crate) fn phones_awaiting_approval() -> Vec<String> {
     portal_approvals()
         .lock()
-        .map(|waiting| waiting.keys().cloned().collect())
+        .map(|waiting| {
+            waited_long_enough(&waiting, std::time::Instant::now(), APPROVAL_NOTICE_AFTER)
+        })
         .unwrap_or_default()
 }
 
@@ -163,13 +183,27 @@ struct AwaitingApproval {
 
 impl AwaitingApproval {
     fn begin(device_id: &str, id: u64) -> Self {
-        // Not debug_log!: this is the one line that says a phone's request got here.
-        eprintln!(
-            "[DeskLink] {device_id} asked to see this screen; waiting for it to be allowed here"
-        );
         if let Ok(mut waiting) = portal_approvals().lock() {
-            waiting.insert(device_id.to_string(), id);
+            waiting.insert(device_id.to_string(), (id, std::time::Instant::now()));
         }
+        // Once the wait has lasted long enough to be a dialog somebody must answer: the one
+        // line (not debug_log!) that says a phone's request got here, and the notice, now
+        // rather than at the next tick. A grant answered sooner leaves neither.
+        let (device, share) = (device_id.to_string(), id);
+        let _ = thread::Builder::new()
+            .name("desklink-approval-notice".into())
+            .spawn(move || {
+                thread::sleep(APPROVAL_NOTICE_AFTER);
+                let still_waiting = portal_approvals()
+                    .lock()
+                    .is_ok_and(|waiting| waiting.get(&device).is_some_and(|(id, _)| *id == share));
+                if still_waiting {
+                    eprintln!(
+                        "[DeskLink] {device} asked to see this screen; waiting for it to be allowed here"
+                    );
+                    crate::device_links::daemon::state::nudge_tickers();
+                }
+            });
         Self {
             device_id: device_id.to_string(),
             id,
@@ -180,12 +214,14 @@ impl AwaitingApproval {
 impl Drop for AwaitingApproval {
     fn drop(&mut self) {
         if let Ok(mut waiting) = portal_approvals().lock() {
-            if waiting.get(&self.device_id) == Some(&self.id) {
+            if waiting
+                .get(&self.device_id)
+                .is_some_and(|(id, _)| *id == self.id)
+            {
                 waiting.remove(&self.device_id);
             }
         }
-        // The notice is withdrawn now, not at the next tick. (Posting it waits for a
-        // tick on purpose: a remembered grant answers at once and shows nothing.)
+        // The notice is withdrawn now, not at the next tick.
         crate::device_links::daemon::state::nudge_tickers();
     }
 }
@@ -4921,17 +4957,44 @@ fn now_millis() -> i64 {
 mod tests {
     #[test]
     fn a_phone_awaits_approval_until_its_own_share_answers() {
-        use super::{phones_awaiting_approval, AwaitingApproval};
+        use super::{
+            portal_approvals, waited_long_enough, AwaitingApproval, APPROVAL_NOTICE_AFTER,
+        };
         let phone = "approval-test-phone";
-        assert!(!phones_awaiting_approval().iter().any(|id| id == phone));
+        let listed_after = |wait: std::time::Duration| {
+            let waiting = portal_approvals().lock().unwrap();
+            waited_long_enough(
+                &waiting,
+                std::time::Instant::now() + wait,
+                APPROVAL_NOTICE_AFTER,
+            )
+            .iter()
+            .any(|id| id == phone)
+        };
+        assert!(!listed_after(std::time::Duration::from_secs(60)));
         let first = AwaitingApproval::begin(phone, 1);
-        assert!(phones_awaiting_approval().iter().any(|id| id == phone));
+        assert!(listed_after(std::time::Duration::from_secs(60)));
         // A retry replaces the share; the old one ending must not clear the new one's notice.
         let second = AwaitingApproval::begin(phone, 2);
         drop(first);
-        assert!(phones_awaiting_approval().iter().any(|id| id == phone));
+        assert!(listed_after(std::time::Duration::from_secs(60)));
         drop(second);
-        assert!(!phones_awaiting_approval().iter().any(|id| id == phone));
+        assert!(!listed_after(std::time::Duration::from_secs(60)));
+    }
+
+    /// A remembered grant answers at once: nothing is posted for a wait shorter than the threshold.
+    #[test]
+    fn the_notice_waits_for_the_portal_to_take_a_moment() {
+        use super::{waited_long_enough, APPROVAL_NOTICE_AFTER};
+        use std::time::{Duration, Instant};
+        let since = Instant::now();
+        let waiting = std::collections::HashMap::from([("phone".to_string(), (1u64, since))]);
+        let at =
+            |extra: Duration| waited_long_enough(&waiting, since + extra, APPROVAL_NOTICE_AFTER);
+        assert!(at(Duration::ZERO).is_empty());
+        assert!(at(APPROVAL_NOTICE_AFTER - Duration::from_millis(1)).is_empty());
+        assert_eq!(at(APPROVAL_NOTICE_AFTER), vec!["phone".to_string()]);
+        assert_eq!(APPROVAL_NOTICE_AFTER, Duration::from_millis(1500));
     }
 
     /// An unpaired phone leaves no liveness behind (the maps would only grow).
