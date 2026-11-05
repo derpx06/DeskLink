@@ -1750,8 +1750,10 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 16] = [
-    // The current build (the complete remote: model.js, sections, switches).
+const KNOWN_BUILDS: [&str; 17] = [
+    // The current build (links checked, focus kept only while open).
+    "32a1f784c930664df85dfce8b6572ea1a8608150585320cfb6c7fb090ac854a7",
+    // The complete remote, first cut (model.js, sections, switches).
     "b1c3aeb335ad359842ef42bbc1951fe68acc047c5be6116aea83185e2ae1f737",
     // Wave 2: the ongoing-items chip in the pill.
     "c27272d96fac1f6029a7494eacbe93b716a44b05959acb0ded9b697e8f42a5d2",
