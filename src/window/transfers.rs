@@ -68,9 +68,18 @@ fn debug_rows() -> Vec<TransferRow> {
             row.paused = true;
         }
         let lane = [
-            ("fast:", "fast, over Wi-Fi"),
-            ("secure:", "over the secure link"),
-            ("internet:", "through the internet (slower)"),
+            (
+                "fast:",
+                crate::device_links::webrtc::transfer_manager::words::fast_lane(),
+            ),
+            (
+                "secure:",
+                crate::device_links::webrtc::transfer_manager::words::over_webrtc(),
+            ),
+            (
+                "internet:",
+                crate::device_links::webrtc::transfer_manager::words::through_a_relay(),
+            ),
         ]
         .into_iter()
         .find(|(prefix, _)| row.name.starts_with(prefix));
@@ -385,7 +394,8 @@ struct Failures {
     kept: RefCell<Vec<Failure>>,
     seen: Cell<u64>,
     /// What is drawn now, so the list is rebuilt only when it changes.
-    drawn: RefCell<Vec<Failure>>,
+    /// `None`: nothing drawn that can be trusted (the next sync redraws).
+    drawn: RefCell<Option<Vec<Failure>>>,
 }
 
 /// "Pixel 9 ran out of space." as a sentence: the first letter up, a full
@@ -450,7 +460,7 @@ impl Failures {
             .collect();
         #[cfg(debug_assertions)]
         shown.extend(debug_failures(device));
-        if *self.drawn.borrow() == shown {
+        if self.drawn.borrow().as_ref() == Some(&shown) {
             return;
         }
         while let Some(child) = self.list.first_child() {
@@ -460,12 +470,12 @@ impl Failures {
             self.list.append(&failed_row(self, daemon, failure));
         }
         self.list.set_visible(!shown.is_empty());
-        self.drawn.replace(shown);
+        self.drawn.replace(Some(shown));
     }
 
     fn forget(&self, id: &str) {
         self.kept.borrow_mut().retain(|failure| failure.id != id);
-        self.drawn.borrow_mut().clear();
+        self.drawn.replace(None);
     }
 }
 
@@ -501,15 +511,23 @@ fn failed_row(failures: &Rc<Failures>, daemon: &DaemonHandle, failure: &Failure)
             failure.name
         ))]);
         let (failures, daemon, device, path, id) = (
-            Rc::clone(failures),
+            Rc::downgrade(failures),
             daemon.clone(),
             failure.device_id.clone(),
             path.clone(),
             failure.id.clone(),
         );
-        again.connect_clicked(move |_| {
+        again.connect_clicked(move |button| {
+            // Once is enough: the row goes at the next sync, and a second
+            // activation before then asks for nothing.
+            if !button.is_sensitive() {
+                return;
+            }
+            button.set_sensitive(false);
             daemon.send(DaemonCommand::SendFile(device.clone(), path.clone()));
-            failures.forget(&id);
+            if let Some(failures) = failures.upgrade() {
+                failures.forget(&id);
+            }
         });
         words.append(&again);
     }
@@ -520,8 +538,12 @@ fn failed_row(failures: &Rc<Failures>, daemon: &DaemonHandle, failure: &Failure)
         failure.name
     ))]);
     {
-        let (failures, id) = (Rc::clone(failures), failure.id.clone());
-        dismiss.connect_clicked(move |_| failures.forget(&id));
+        let (failures, id) = (Rc::downgrade(failures), failure.id.clone());
+        dismiss.connect_clicked(move |_| {
+            if let Some(failures) = failures.upgrade() {
+                failures.forget(&id);
+            }
+        });
     }
     row.append(&dismiss);
     row.update_property(&[gtk::accessible::Property::Label(&format!(
@@ -1970,23 +1992,115 @@ mod tests {
         assert_eq!(title, "No files yet");
     }
 
-    /// The lane words of CLAUDE.md stay verbatim on the row, whichever the
-    /// lane: nothing here rewrites them.
+    /// The lane words of CLAUDE.md stay verbatim: the producer says exactly
+    /// these (rewording it breaks this test), and the row carries them.
     #[test]
     fn the_lane_words_are_kept_as_the_board_says_them() {
         use crate::device_links::webrtc::transfer_board as board;
-        for (id, lane) in [
-            ("lane-a", "fast, over Wi-Fi"),
-            ("lane-b", "over the secure link"),
-            ("lane-c", "through the internet (slower)"),
-        ] {
+        use crate::device_links::webrtc::transfer_manager::words;
+        let lanes = [
+            ("lane-a", words::fast_lane(), "fast, over Wi-Fi"),
+            ("lane-b", words::over_webrtc(), "over the secure link"),
+            (
+                "lane-c",
+                words::through_a_relay(),
+                "through the internet (slower)",
+            ),
+        ];
+        for (id, produced, pinned) in lanes {
+            assert_eq!(produced, pinned, "CLAUDE.md pins these words");
             let mut moving = row(false, 1 << 20, 8 << 20);
             moving.id = id.into();
             assert!(board::begin(moving.clone()));
-            board::set_lane(id, Some(lane));
+            board::set_lane(id, Some(produced));
             let text = subtitle(&moving, "Pixel");
-            assert!(text.contains(&format!(" · {lane} · ")), "{text}");
+            assert!(text.contains(&format!(" · {pinned} · ")), "{text}");
             board::discard(id);
         }
+    }
+
+    fn failure(id: &str) -> Failure {
+        Failure {
+            id: id.into(),
+            device_id: "phone".into(),
+            name: "report.pdf".into(),
+            incoming: false,
+            reason: "Out of space.".into(),
+            retry: Some(std::path::PathBuf::from("/tmp/report.pdf")),
+        }
+    }
+
+    fn buttons(widget: &gtk::Widget, found: &mut Vec<gtk::Button>) {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            found.push(button.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            buttons(&next, found);
+            child = next.next_sibling();
+        }
+    }
+
+    /// Dismiss removes the one failure that is drawn, and Try again sends
+    /// the file once and takes its row away. (Skipped without a display.)
+    #[test]
+    fn dismissing_or_retrying_the_only_failure_removes_its_row() {
+        crate::test_display::run(|| {
+            let (daemon, commands) = DaemonHandle::detached();
+            let failures = Failures::new();
+            let rows = |failures: &Failures| {
+                let mut count = 0;
+                let mut child = failures.list.first_child();
+                while let Some(next) = child {
+                    count += 1;
+                    child = next.next_sibling();
+                }
+                count
+            };
+            failures.kept.borrow_mut().push(failure("a"));
+            failures.sync(&daemon, "phone");
+            assert_eq!(rows(&failures), 1);
+            assert!(failures.list.is_visible());
+            failures.forget("a");
+            failures.sync(&daemon, "phone");
+            assert_eq!(rows(&failures), 0, "dismissed");
+            assert!(!failures.list.is_visible());
+
+            failures.kept.borrow_mut().push(failure("b"));
+            failures.sync(&daemon, "phone");
+            let mut found = Vec::new();
+            buttons(failures.list.upcast_ref(), &mut found);
+            let again = found
+                .iter()
+                .find(|button| button.tooltip_text().as_deref() == Some("Send this file again"))
+                .expect("a failed send offers Try again")
+                .clone();
+            again.emit_clicked();
+            again.emit_clicked();
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(DaemonCommand::SendFile(device, _)) if device == "phone"
+            ));
+            assert!(
+                commands.try_recv().is_err(),
+                "once, however often it is clicked"
+            );
+            failures.sync(&daemon, "phone");
+            assert_eq!(rows(&failures), 0, "the retried row is gone");
+        });
+    }
+
+    /// The row's buttons hold the list weakly: nothing keeps it alive.
+    #[test]
+    fn the_failure_rows_do_not_keep_their_list_alive() {
+        crate::test_display::run(|| {
+            let (daemon, _commands) = DaemonHandle::detached();
+            let failures = Failures::new();
+            failures.kept.borrow_mut().push(failure("c"));
+            failures.sync(&daemon, "phone");
+            let weak = Rc::downgrade(&failures);
+            drop(failures);
+            assert!(weak.upgrade().is_none());
+        });
     }
 }

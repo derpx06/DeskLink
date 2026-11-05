@@ -1148,7 +1148,7 @@ pub(super) fn stall_note(change: &StallChange, finishing: bool) -> Option<Option
 }
 
 /// What a person reads for a reason a transfer ended or waits.
-pub(super) mod words {
+pub(crate) mod words {
     use super::{code, FileControl};
 
     /// Between the sender's `done` and the receiver's `complete`.
