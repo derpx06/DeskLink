@@ -20,9 +20,7 @@ use crate::device_links::device::DeviceView;
 use crate::device_links::pty::registry::SessionInfo;
 use crate::device_links::webrtc::terminal_bridge::{attached_devices, end_device_sessions};
 use crate::link_glyph::presence_dot;
-use crate::terminal_previews::{
-    display_title, screen_lines, sessions, started, waiting_for_input, ATTENTION_LINES,
-};
+use crate::terminal_previews::{display_title, screen_lines, sessions, started, waiting_for_input};
 
 /// How many lines the detail's preview shows.
 const DETAIL_LINES: usize = 60;
@@ -100,6 +98,7 @@ impl Page {
         let open_settings = ui_kit::button(ButtonKind::Tonal, "Open settings", None);
         open_settings.set_valign(gtk::Align::Center);
         open_settings.connect_clicked(|button| {
+            super::prefs::show_privacy();
             let _ = button.activate_action("win.show-page", Some(&"settings".to_variant()));
         });
         access.append(&open_settings);
@@ -297,6 +296,17 @@ impl Page {
         .unwrap_or_default();
         if *self.key.borrow() != key {
             self.key.replace(key);
+            // Keyboard focus on a tile goes to the same terminal's new tile.
+            let focused = gtk::prelude::RootExt::focus(win).and_then(|focus| {
+                let mut widget = Some(focus);
+                while let Some(candidate) = widget {
+                    if candidate.widget_name().starts_with("terminal-tile:") {
+                        return Some(candidate.widget_name().to_string());
+                    }
+                    widget = candidate.parent();
+                }
+                None
+            });
             while let Some(child) = self.grid.first_child() {
                 self.grid.remove(&child);
             }
@@ -324,6 +334,14 @@ impl Page {
                 }
                 self.grid.append(&flow);
             }
+            if let Some(name) = focused {
+                if let Some(tile) = named_widgets(self.grid.upcast_ref(), &name)
+                    .into_iter()
+                    .find(|widget| widget.widget_name() == name)
+                {
+                    tile.grab_focus();
+                }
+            }
         }
         self.refresh_lines();
     }
@@ -339,7 +357,7 @@ impl Page {
             let Some(info) = all.iter().find(|info| info.id == id) else {
                 continue;
             };
-            let (lines, _) = screen_lines(info, ATTENTION_LINES);
+            let (lines, _) = screen_lines(info, usize::MAX);
             set_text(&widget, &tile_text(&lines, info.exit_status));
             let waiting = info.exit_status.is_none() && waiting_for_input(&lines);
             let exact = |prefix: &str| {
@@ -514,7 +532,7 @@ fn tile(
         content.append(&place);
     }
 
-    let (lines, _) = screen_lines(info, ATTENTION_LINES);
+    let (lines, _) = screen_lines(info, usize::MAX);
     let waiting = info.exit_status.is_none() && waiting_for_input(&lines);
     let body = gtk::Label::builder()
         .label(tile_text(&lines, info.exit_status))
