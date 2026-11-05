@@ -1,0 +1,144 @@
+size 80x30
+cursor 0 4 visible 1 alt 1
+|  1 import os
+|  2
+|  3 def greet(name: str) -> str:
+|  4     """Say hello."""
+|  5     # a long comment line that is certainly longer than forty columns wide a
+|    nd wraps in vim
+|  6     return f"hello, {name}!"  # trailing
+|  7
+|  8 class Thing:
+|  9     def __init__(self, value=42):
+| 10         self.value = value
+| 11
+| 12
+| 13 if __name__ == "__main__":
+| 14     print(greet(os.environ.get("USER", "world")))
+| 15 import os
+| 16
+| 17 def greet(name: str) -> str:
+| 18     """Say hello."""
+| 19     # a long comment line that is certainly longer than forty columns wide a
+|    nd wraps in vim
+| 20     return f"hello, {name}!"  # trailing
+| 21
+| 22 class Thing:
+| 23     def __init__(self, value=42):
+| 24         self.value = value
+| 25
+| 26
+| 27 if __name__ == "__main__":
+|                                                              1,1           Top
+0,2-2: fg=130 bg=-
+0,4-9: fg=5 bg=-
+1,2-2: fg=130 bg=-
+2,2-2: fg=130 bg=-
+2,4-6: fg=130 bg=-
+2,8-12: fg=6 bg=-
+2,20-22: fg=6 bg=-
+2,28-30: fg=6 bg=-
+3,2-2: fg=130 bg=-
+3,8-13: fg=1 bg=-
+3,15-23: fg=1 bg=-
+4,2-2: fg=130 bg=-
+4,8-8: fg=4 bg=-
+4,10-10: fg=4 bg=-
+4,12-15: fg=4 bg=-
+4,17-23: fg=4 bg=-
+4,25-28: fg=4 bg=-
+4,30-33: fg=4 bg=-
+4,35-36: fg=4 bg=-
+4,38-46: fg=4 bg=-
+4,48-53: fg=4 bg=-
+4,55-58: fg=4 bg=-
+4,60-64: fg=4 bg=-
+4,66-72: fg=4 bg=-
+4,74-77: fg=4 bg=-
+4,79-79: fg=4 bg=-
+5,4-5: fg=4 bg=-
+5,7-11: fg=4 bg=-
+5,13-14: fg=4 bg=-
+5,16-18: fg=4 bg=-
+6,2-2: fg=130 bg=-
+6,8-13: fg=130 bg=-
+6,15-22: fg=1 bg=-
+6,24-24: fg=5 bg=-
+6,29-29: fg=5 bg=-
+6,30-31: fg=1 bg=-
+6,34-34: fg=4 bg=-
+6,36-43: fg=4 bg=-
+7,2-2: fg=130 bg=-
+8,2-2: fg=130 bg=-
+8,4-8: fg=130 bg=-
+8,10-14: fg=2 bg=-
+9,2-2: fg=130 bg=-
+9,8-10: fg=130 bg=-
+9,12-19: fg=6 bg=-
+9,21-24: fg=6 bg=-
+9,33-34: fg=1 bg=-
+10,1-2: fg=130 bg=-
+10,12-15: fg=6 bg=-
+11,1-2: fg=130 bg=-
+12,1-2: fg=130 bg=-
+13,1-2: fg=130 bg=-
+13,4-5: fg=130 bg=-
+13,19-28: fg=1 bg=-
+14,1-2: fg=130 bg=-
+14,8-12: fg=6 bg=-
+14,35-40: fg=1 bg=-
+14,43-49: fg=1 bg=-
+15,1-2: fg=130 bg=-
+15,4-9: fg=5 bg=-
+16,1-2: fg=130 bg=-
+17,1-2: fg=130 bg=-
+17,4-6: fg=130 bg=-
+17,8-12: fg=6 bg=-
+17,20-22: fg=6 bg=-
+17,28-30: fg=6 bg=-
+18,1-2: fg=130 bg=-
+18,8-13: fg=1 bg=-
+18,15-23: fg=1 bg=-
+19,1-2: fg=130 bg=-
+19,8-8: fg=4 bg=-
+19,10-10: fg=4 bg=-
+19,12-15: fg=4 bg=-
+19,17-23: fg=4 bg=-
+19,25-28: fg=4 bg=-
+19,30-33: fg=4 bg=-
+19,35-36: fg=4 bg=-
+19,38-46: fg=4 bg=-
+19,48-53: fg=4 bg=-
+19,55-58: fg=4 bg=-
+19,60-64: fg=4 bg=-
+19,66-72: fg=4 bg=-
+19,74-77: fg=4 bg=-
+19,79-79: fg=4 bg=-
+20,4-5: fg=4 bg=-
+20,7-11: fg=4 bg=-
+20,13-14: fg=4 bg=-
+20,16-18: fg=4 bg=-
+21,1-2: fg=130 bg=-
+21,8-13: fg=130 bg=-
+21,15-22: fg=1 bg=-
+21,24-24: fg=5 bg=-
+21,29-29: fg=5 bg=-
+21,30-31: fg=1 bg=-
+21,34-34: fg=4 bg=-
+21,36-43: fg=4 bg=-
+22,1-2: fg=130 bg=-
+23,1-2: fg=130 bg=-
+23,4-8: fg=130 bg=-
+23,10-14: fg=2 bg=-
+24,1-2: fg=130 bg=-
+24,8-10: fg=130 bg=-
+24,12-19: fg=6 bg=-
+24,21-24: fg=6 bg=-
+24,33-34: fg=1 bg=-
+25,1-2: fg=130 bg=-
+25,12-15: fg=6 bg=-
+26,1-2: fg=130 bg=-
+27,1-2: fg=130 bg=-
+28,1-2: fg=130 bg=-
+28,4-5: fg=130 bg=-
+28,19-28: fg=1 bg=-

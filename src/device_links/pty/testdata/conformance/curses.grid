@@ -1,0 +1,80 @@
+size 80x30
+cursor 28 21 visible 0 alt 1
+|lq curses demo qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqk
+|x row 1 ░▒▓█░▒▓█░▒▓█ 日本語                                                    x
+|x row 2 ░▒▓█░▒▓█░▒▓█ 日本語                                                    x
+|x row 3 ░▒▓█░▒▓█░▒▓█ 日本語                                                    x
+|x row 4 ░▒▓█░▒▓█░▒▓█ 日本語                                                    x
+|x row 5 ░▒▓█░▒▓█░▒▓█ 日本語                                                    x
+|x row 6 ░▒▓█░▒▓█░▒▓█ 日本語                                                    x
+|x row 7 ░▒▓█░▒▓█░▒▓█ 日本語                                                    x
+|x row 8 ░▒▓█░▒▓█░▒▓█ 日本語                                                    x
+|x row 9 ░▒▓█░▒▓█░▒▓█ 日本語                                                    x
+|x row 10 ░▒▓█░▒▓█░▒▓█ 日本語                                                   x
+|x row 11 ░▒▓█░▒▓█░▒▓█ 日本語                                                   x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x                                                                              x
+|x reverse   underline                                                          x
+|mqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqj
+0,3-8: fg=- bg=- bold
+0,10-13: fg=- bg=- bold
+1,2-4: fg=2 bg=-
+1,6-6: fg=2 bg=-
+1,8-19: fg=2 bg=-
+1,21-26: fg=2 bg=-
+2,2-4: fg=3 bg=-
+2,6-6: fg=3 bg=-
+2,8-19: fg=3 bg=-
+2,21-26: fg=3 bg=-
+3,2-4: fg=4 bg=-
+3,6-6: fg=4 bg=-
+3,8-19: fg=4 bg=-
+3,21-26: fg=4 bg=-
+4,2-4: fg=5 bg=-
+4,6-6: fg=5 bg=-
+4,8-19: fg=5 bg=-
+4,21-26: fg=5 bg=-
+5,2-4: fg=6 bg=-
+5,6-6: fg=6 bg=-
+5,8-19: fg=6 bg=-
+5,21-26: fg=6 bg=-
+6,2-4: fg=7 bg=-
+6,6-6: fg=7 bg=-
+6,8-19: fg=7 bg=-
+6,21-26: fg=7 bg=-
+7,2-4: fg=1 bg=-
+7,6-6: fg=1 bg=-
+7,8-19: fg=1 bg=-
+7,21-26: fg=1 bg=-
+8,2-4: fg=2 bg=-
+8,6-6: fg=2 bg=-
+8,8-19: fg=2 bg=-
+8,21-26: fg=2 bg=-
+9,2-4: fg=3 bg=-
+9,6-6: fg=3 bg=-
+9,8-19: fg=3 bg=-
+9,21-26: fg=3 bg=-
+10,2-4: fg=4 bg=-
+10,6-7: fg=4 bg=-
+10,9-20: fg=4 bg=-
+10,22-27: fg=4 bg=-
+11,2-4: fg=5 bg=-
+11,6-7: fg=5 bg=-
+11,9-20: fg=5 bg=-
+11,22-27: fg=5 bg=-
+28,2-8: fg=- bg=- inverse
+28,12-20: fg=- bg=- underline

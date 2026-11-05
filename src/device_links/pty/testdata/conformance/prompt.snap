@@ -1,0 +1,4 @@
+c[?25h[m[H[J[32;1muser@host[m:[34;1m~/project[m$ echo word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word 
+word word word word word word word word word word word word word word word word word word word word word word word word word word word word word word 
+[32;1muser@host[m:[34;1m~/project[m$ ^C
+[32;1muser@host[m:[34;1m~/project[m$ >[?1l[?2004h

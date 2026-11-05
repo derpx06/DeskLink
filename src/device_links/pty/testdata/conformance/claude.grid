@@ -1,0 +1,64 @@
+size 80x30
+cursor 25 0 visible 1 alt 0
+|Welcome to Claude Code v2.1.318
+|..........................................................
+|
+|     *                                       █████▓▓░
+|                                 *         ███▓░     ░░
+|            ░░░░░░                        ███▓░
+|    ░░░   ░░░░░░░░░░                      ███▓░
+|   ░░░░░░░░░░░░░░░░░░░    *                ██▓░░      ▓
+|                                             ░▓▓███▓▓░
+| *                                 ░░░░
+|                                 ░░░░░░░░
+|                               ░░░░░░░░░░░░░░░░
+|       █████████                                        *
+|      ██▄█████▄██                        *
+|       █████████      *
+|.......█ █   █ █..........................................
+|
+| Unable to connect to Anthropic services
+|
+| Failed to connect to api.anthropic.com: EAI_AGAIN
+|
+| Please check your internet connection and network settings.
+|
+| Note: Claude Code might not be available in your country. Check supported
+| countries at https://anthropic.com/supported-countries
+|
+|
+|
+|
+|
+0,0-6: fg=#d77757 bg=-
+0,8-9: fg=#d77757 bg=-
+0,11-16: fg=#d77757 bg=-
+0,18-21: fg=#d77757 bg=-
+0,23-30: fg=#999999 bg=-
+7,26-26: fg=- bg=- bold
+9,1-1: fg=#999999 bg=-
+9,35-38: fg=#999999 bg=-
+10,33-40: fg=#999999 bg=-
+11,31-46: fg=#999999 bg=-
+12,7-15: fg=#d77757 bg=-
+12,56-56: fg=#999999 bg=-
+13,6-16: fg=#d77757 bg=-
+13,41-41: fg=- bg=- bold
+14,7-15: fg=#d77757 bg=-
+15,7-7: fg=#d77757 bg=-
+15,9-9: fg=#d77757 bg=-
+15,13-13: fg=#d77757 bg=-
+15,15-15: fg=#d77757 bg=-
+17,1-6: fg=#ff6b80 bg=-
+17,8-9: fg=#ff6b80 bg=-
+17,11-17: fg=#ff6b80 bg=-
+17,19-20: fg=#ff6b80 bg=-
+17,22-30: fg=#ff6b80 bg=-
+17,32-39: fg=#ff6b80 bg=-
+19,1-6: fg=#ff6b80 bg=-
+19,8-9: fg=#ff6b80 bg=-
+19,11-17: fg=#ff6b80 bg=-
+19,19-20: fg=#ff6b80 bg=-
+19,22-39: fg=#ff6b80 bg=-
+19,41-49: fg=#ff6b80 bg=-
+24,14-54: fg=#b1b9f9 bg=-

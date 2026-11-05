@@ -1,0 +1,326 @@
+size 80x30
+cursor 29 79 visible 0 alt 1
+|
+|    0[||       3.8%]   4[||       5.1%]   8[||        5.1%] 12[||        3.2%]
+|    1[||       3.2%]   5[||       5.1%]   9[||        3.2%] 13[|         1.3%]
+|    2[||       4.5%]   6[||       5.1%]  10[||        3.1%] 14[||        1.3%]
+|    3[|        0.6%]   7[         0.0%]  11[||        2.5%] 15[||        2.5%]
+|  Mem[|||||||||||||||||||||9.26G/15.3G] Tasks: 337, 2139 thr, 256 kthr; 2 runn
+|  Swp[|||||||||||||||||||||7.48G/7.67G] Load average: 1.98 3.18 3.78
+|                                        Uptime: 15:01:21
+|
+|  [Main] [I/O]
+|   PID△USER       PRI  NI  VIRT   RES  PRIV S  CPU% MEM%   TIME+  Command
+|     1 root        20   0 21356  9820  3740 S   0.0  0.1  0:07.70 /sbin/init spl
+|   424 root        20   0 94048 24136   892 S   0.0  0.2  0:06.78 ├─ /usr/lib/sy
+|   441 root        20   0  9176  2376   136 S   0.0  0.0  0:00.18 ├─ /usr/lib/sy
+|432360 root        20   0  9832  5576   632 S   0.0  0.0  0:00.00 │  ├─ systemd-
+|432724 root        20   0  9832  5576   636 S   0.0  0.0  0:00.00 │  ├─ systemd-
+|432725 root        20   0  9832  5572   632 S   0.0  0.0  0:00.00 │  └─ systemd-
+|   479 systemd-ti  20   0 85492  2772   160 S   0.0  0.0  0:00.13 ├─ /usr/lib/sy
+|   483 systemd-ti  20   0 85492  2772     0 S   0.0  0.0  0:00.02 │  └─ /usr/lib
+|   485 root        20   0 44728  5080  1404 S   0.0  0.0  0:00.83 ├─ /usr/lib/sy
+|   964 dbus        20   0  8340  2804   248 S   0.0  0.0  0:00.15 ├─ /usr/bin/db
+|   965 dbus        20   0  8760  4272  2148 S   0.0  0.0  0:02.77 │  └─ dbus-bro
+|   966 earlyoom     0 -20  3072  2304   188 S   0.0  0.0  0:03.07 ├─ /usr/bin/ea
+|   967 root        20   0  412M 12188  2344 S   0.0  0.1  0:02.33 ├─ /usr/bin/Ne
+|   984 root        20   0  412M 12188     0 S   0.0  0.1  0:00.19 │  ├─ /usr/bin
+|   986 root        20   0  412M 12188     0 S   0.0  0.1  0:00.00 │  ├─ /usr/bin
+|   987 root        20   0  412M 12188     0 S   0.0  0.1  0:00.69 │  └─ /usr/bin
+|   970 root        20   0 82100  2648   192 S   0.0  0.0  0:02.21 ├─ /usr/sbin/i
+|   989 root        20   0 82100  2648     0 S   0.0  0.0  0:00.00 │  └─ /usr/sbi
+|F1Help  F2Setup F3SearchF4FilterF5List  F6SortByF7Nice -F8Nice +F9Kill  F10Quit
+1,4-4: fg=6 bg=-
+1,5-5: fg=- bg=- bold
+1,6-6: fg=2 bg=-
+1,7-7: fg=1 bg=-
+1,15-18: fg=8 bg=- bold
+1,19-19: fg=- bg=- bold
+1,23-23: fg=6 bg=-
+1,24-24: fg=- bg=- bold
+1,25-25: fg=2 bg=-
+1,26-26: fg=1 bg=-
+1,34-37: fg=8 bg=- bold
+1,38-38: fg=- bg=- bold
+1,42-42: fg=6 bg=-
+1,43-43: fg=- bg=- bold
+1,44-44: fg=2 bg=-
+1,45-45: fg=1 bg=-
+1,54-57: fg=8 bg=- bold
+1,58-58: fg=- bg=- bold
+1,60-61: fg=6 bg=-
+1,62-62: fg=- bg=- bold
+1,63-63: fg=2 bg=-
+1,64-64: fg=1 bg=-
+1,73-76: fg=8 bg=- bold
+1,77-77: fg=- bg=- bold
+2,4-4: fg=6 bg=-
+2,5-5: fg=- bg=- bold
+2,6-6: fg=2 bg=-
+2,7-7: fg=1 bg=-
+2,15-18: fg=8 bg=- bold
+2,19-19: fg=- bg=- bold
+2,23-23: fg=6 bg=-
+2,24-24: fg=- bg=- bold
+2,25-25: fg=2 bg=-
+2,26-26: fg=1 bg=-
+2,34-37: fg=8 bg=- bold
+2,38-38: fg=- bg=- bold
+2,42-42: fg=6 bg=-
+2,43-43: fg=- bg=- bold
+2,44-44: fg=2 bg=-
+2,45-45: fg=1 bg=-
+2,54-57: fg=8 bg=- bold
+2,58-58: fg=- bg=- bold
+2,60-61: fg=6 bg=-
+2,62-62: fg=- bg=- bold
+2,63-63: fg=2 bg=-
+2,73-76: fg=8 bg=- bold
+2,77-77: fg=- bg=- bold
+3,4-4: fg=6 bg=-
+3,5-5: fg=- bg=- bold
+3,6-6: fg=2 bg=-
+3,7-7: fg=1 bg=-
+3,15-18: fg=8 bg=- bold
+3,19-19: fg=- bg=- bold
+3,23-23: fg=6 bg=-
+3,24-24: fg=- bg=- bold
+3,25-25: fg=2 bg=-
+3,26-26: fg=1 bg=-
+3,34-37: fg=8 bg=- bold
+3,38-38: fg=- bg=- bold
+3,41-42: fg=6 bg=-
+3,43-43: fg=- bg=- bold
+3,44-44: fg=2 bg=-
+3,45-45: fg=1 bg=-
+3,54-57: fg=8 bg=- bold
+3,58-58: fg=- bg=- bold
+3,60-61: fg=6 bg=-
+3,62-62: fg=- bg=- bold
+3,63-63: fg=2 bg=-
+3,64-64: fg=1 bg=-
+3,73-76: fg=8 bg=- bold
+3,77-77: fg=- bg=- bold
+4,4-4: fg=6 bg=-
+4,5-5: fg=- bg=- bold
+4,6-6: fg=1 bg=-
+4,15-18: fg=8 bg=- bold
+4,19-19: fg=- bg=- bold
+4,23-23: fg=6 bg=-
+4,24-24: fg=- bg=- bold
+4,34-37: fg=8 bg=- bold
+4,38-38: fg=- bg=- bold
+4,41-42: fg=6 bg=-
+4,43-43: fg=- bg=- bold
+4,44-44: fg=2 bg=-
+4,45-45: fg=1 bg=-
+4,54-57: fg=8 bg=- bold
+4,58-58: fg=- bg=- bold
+4,60-61: fg=6 bg=-
+4,62-62: fg=- bg=- bold
+4,63-63: fg=2 bg=-
+4,64-64: fg=1 bg=-
+4,73-76: fg=8 bg=- bold
+4,77-77: fg=- bg=- bold
+5,2-4: fg=6 bg=-
+5,5-5: fg=- bg=- bold
+5,6-22: fg=2 bg=-
+5,23-25: fg=5 bg=-
+5,26-26: fg=4 bg=- bold
+5,27-34: fg=3 bg=-
+5,35-37: fg=8 bg=- bold
+5,38-38: fg=- bg=- bold
+5,40-45: fg=6 bg=-
+5,47-49: fg=6 bg=- bold
+5,50-50: fg=6 bg=-
+5,52-55: fg=2 bg=- bold
+5,57-59: fg=6 bg=-
+5,60-60: fg=8 bg=- bold
+5,62-64: fg=8 bg=- bold
+5,66-69: fg=8 bg=- bold
+5,70-70: fg=6 bg=-
+5,72-72: fg=2 bg=- bold
+5,74-77: fg=6 bg=-
+6,2-4: fg=6 bg=-
+6,5-5: fg=- bg=- bold
+6,6-37: fg=1 bg=-
+6,38-38: fg=- bg=- bold
+6,40-43: fg=6 bg=-
+6,45-52: fg=6 bg=-
+6,54-57: fg=- bg=- bold
+6,59-62: fg=6 bg=- bold
+6,64-67: fg=6 bg=-
+7,40-46: fg=6 bg=-
+7,48-55: fg=6 bg=- bold
+9,2-2: fg=2 bg=2
+9,3-6: fg=0 bg=2
+9,7-7: fg=2 bg=2
+9,9-9: fg=4 bg=4
+9,10-12: fg=0 bg=4
+9,13-13: fg=4 bg=4
+10,0-6: fg=0 bg=6
+10,7-79: fg=0 bg=2
+11,0-79: fg=0 bg=6
+12,7-10: fg=8 bg=- bold
+12,24-24: fg=8 bg=- bold
+12,26-27: fg=6 bg=-
+12,32-33: fg=6 bg=-
+12,44-44: fg=8 bg=- bold
+12,48-50: fg=8 bg=- bold
+12,66-67: fg=6 bg=-
+13,7-10: fg=8 bg=- bold
+13,24-24: fg=8 bg=- bold
+13,27-27: fg=6 bg=-
+13,33-33: fg=6 bg=-
+13,44-44: fg=8 bg=- bold
+13,48-50: fg=8 bg=- bold
+13,53-55: fg=8 bg=- bold
+13,66-67: fg=6 bg=-
+14,7-10: fg=8 bg=- bold
+14,24-24: fg=8 bg=- bold
+14,27-27: fg=6 bg=-
+14,33-33: fg=6 bg=-
+14,44-44: fg=8 bg=- bold
+14,48-50: fg=8 bg=- bold
+14,53-55: fg=8 bg=- bold
+14,58-64: fg=8 bg=- bold
+14,66-66: fg=6 bg=-
+14,69-70: fg=6 bg=-
+15,7-10: fg=8 bg=- bold
+15,24-24: fg=8 bg=- bold
+15,27-27: fg=6 bg=-
+15,33-33: fg=6 bg=-
+15,44-44: fg=8 bg=- bold
+15,48-50: fg=8 bg=- bold
+15,53-55: fg=8 bg=- bold
+15,58-64: fg=8 bg=- bold
+15,66-66: fg=6 bg=-
+15,69-70: fg=6 bg=-
+16,7-10: fg=8 bg=- bold
+16,24-24: fg=8 bg=- bold
+16,27-27: fg=6 bg=-
+16,33-33: fg=6 bg=-
+16,44-44: fg=8 bg=- bold
+16,48-50: fg=8 bg=- bold
+16,53-55: fg=8 bg=- bold
+16,58-64: fg=8 bg=- bold
+16,66-66: fg=6 bg=-
+16,69-70: fg=6 bg=-
+17,7-16: fg=5 bg=-
+17,24-24: fg=8 bg=- bold
+17,26-27: fg=6 bg=-
+17,33-33: fg=6 bg=-
+17,44-44: fg=8 bg=- bold
+17,48-50: fg=8 bg=- bold
+17,53-55: fg=8 bg=- bold
+17,66-67: fg=6 bg=-
+18,7-16: fg=5 bg=-
+18,24-24: fg=8 bg=- bold
+18,26-27: fg=6 bg=-
+18,33-33: fg=6 bg=-
+18,44-44: fg=8 bg=- bold
+18,48-50: fg=8 bg=- bold
+18,53-55: fg=8 bg=- bold
+18,66-66: fg=6 bg=-
+18,69-70: fg=6 bg=-
+18,72-79: fg=2 bg=-
+19,7-10: fg=8 bg=- bold
+19,24-24: fg=8 bg=- bold
+19,26-27: fg=6 bg=-
+19,33-33: fg=6 bg=-
+19,39-39: fg=6 bg=-
+19,44-44: fg=8 bg=- bold
+19,48-50: fg=8 bg=- bold
+19,53-55: fg=8 bg=- bold
+19,66-67: fg=6 bg=-
+20,7-10: fg=8 bg=- bold
+20,24-24: fg=8 bg=- bold
+20,27-27: fg=6 bg=-
+20,33-33: fg=6 bg=-
+20,44-44: fg=8 bg=- bold
+20,48-50: fg=8 bg=- bold
+20,53-55: fg=8 bg=- bold
+20,66-67: fg=6 bg=-
+21,7-10: fg=5 bg=-
+21,24-24: fg=8 bg=- bold
+21,27-27: fg=6 bg=-
+21,33-33: fg=6 bg=-
+21,39-39: fg=6 bg=-
+21,44-44: fg=8 bg=- bold
+21,48-50: fg=8 bg=- bold
+21,53-55: fg=8 bg=- bold
+21,66-66: fg=6 bg=-
+21,69-70: fg=6 bg=-
+22,7-14: fg=5 bg=-
+22,22-24: fg=1 bg=-
+22,27-27: fg=6 bg=-
+22,33-33: fg=6 bg=-
+22,44-44: fg=8 bg=- bold
+22,48-50: fg=8 bg=- bold
+22,53-55: fg=8 bg=- bold
+22,66-67: fg=6 bg=-
+23,7-10: fg=8 bg=- bold
+23,24-24: fg=8 bg=- bold
+23,27-30: fg=6 bg=-
+23,32-33: fg=6 bg=-
+23,39-39: fg=6 bg=-
+23,44-44: fg=8 bg=- bold
+23,48-50: fg=8 bg=- bold
+23,66-67: fg=6 bg=-
+24,7-10: fg=5 bg=-
+24,24-24: fg=8 bg=- bold
+24,27-30: fg=6 bg=-
+24,32-33: fg=6 bg=-
+24,44-44: fg=8 bg=- bold
+24,48-50: fg=8 bg=- bold
+24,66-66: fg=6 bg=-
+24,69-70: fg=6 bg=-
+24,72-79: fg=2 bg=-
+25,7-10: fg=5 bg=-
+25,24-24: fg=8 bg=- bold
+25,27-30: fg=6 bg=-
+25,32-33: fg=6 bg=-
+25,44-44: fg=8 bg=- bold
+25,48-50: fg=8 bg=- bold
+25,58-64: fg=8 bg=- bold
+25,66-66: fg=6 bg=-
+25,69-70: fg=6 bg=-
+25,72-79: fg=2 bg=-
+26,7-10: fg=5 bg=-
+26,24-24: fg=8 bg=- bold
+26,27-30: fg=6 bg=-
+26,32-33: fg=6 bg=-
+26,44-44: fg=8 bg=- bold
+26,48-50: fg=8 bg=- bold
+26,66-66: fg=6 bg=-
+26,69-70: fg=6 bg=-
+26,72-79: fg=2 bg=-
+27,7-10: fg=8 bg=- bold
+27,24-24: fg=8 bg=- bold
+27,26-27: fg=6 bg=-
+27,33-33: fg=6 bg=-
+27,44-44: fg=8 bg=- bold
+27,48-50: fg=8 bg=- bold
+27,53-55: fg=8 bg=- bold
+27,66-67: fg=6 bg=-
+28,7-10: fg=5 bg=-
+28,24-24: fg=8 bg=- bold
+28,26-27: fg=6 bg=-
+28,33-33: fg=6 bg=-
+28,44-44: fg=8 bg=- bold
+28,48-50: fg=8 bg=- bold
+28,53-55: fg=8 bg=- bold
+28,58-64: fg=8 bg=- bold
+28,66-66: fg=6 bg=-
+28,69-70: fg=6 bg=-
+28,72-79: fg=2 bg=-
+29,2-7: fg=0 bg=6
+29,10-15: fg=0 bg=6
+29,18-23: fg=0 bg=6
+29,26-31: fg=0 bg=6
+29,34-39: fg=0 bg=6
+29,42-47: fg=0 bg=6
+29,50-55: fg=0 bg=6
+29,58-63: fg=0 bg=6
+29,66-71: fg=0 bg=6
+29,75-79: fg=0 bg=6

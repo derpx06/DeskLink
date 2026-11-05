@@ -1,0 +1,50 @@
+size 80x30
+cursor 29 1 visible 1 alt 1
+|line 35: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓
+|█ │┌─┐
+|line 36: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 37: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌
+|─┐
+|line 38: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓
+|█ │┌─┐
+|line 39: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 40: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌
+|─┐
+|line 41: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓
+|█ │┌─┐
+|line 42: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 43: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌
+|─┐
+|line 44: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓
+|█ │┌─┐
+|line 45: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 46: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌
+|─┐
+|line 47: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓
+|█ │┌─┐
+|line 48: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 49: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌
+|─┐
+|line 50: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓
+|█ │┌─┐
+|line 51: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 52: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌
+|:
+0,9-20: fg=6 bg=- bold
+2,9-12: fg=1 bg=- bold
+3,9-16: fg=2 bg=- bold
+5,9-20: fg=3 bg=- bold
+7,9-12: fg=4 bg=- bold
+8,9-16: fg=5 bg=- bold
+10,9-20: fg=6 bg=- bold
+12,9-12: fg=1 bg=- bold
+13,9-16: fg=2 bg=- bold
+15,9-20: fg=3 bg=- bold
+17,9-12: fg=4 bg=- bold
+18,9-16: fg=5 bg=- bold
+20,9-20: fg=6 bg=- bold
+22,9-12: fg=1 bg=- bold
+23,9-16: fg=2 bg=- bold
+25,9-20: fg=3 bg=- bold
+27,9-12: fg=4 bg=- bold
+28,9-16: fg=5 bg=- bold

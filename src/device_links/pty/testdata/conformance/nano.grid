@@ -1,0 +1,47 @@
+size 80x30
+cursor 1 0 visible 1 alt 1
+|  GNU nano 9.2           /tmp/dlconf-files-9yb0lnba/app.py
+|
+|
+|if __name__ == "__main__":
+|    print(greet(os.environ.get("USER", "world")))
+|import os
+|
+|def greet(name: str) -> str:
+|    """Say hello."""
+|    # a long comment line that is certainly longer than forty columns wide and >
+|    return f"hello, {name}!"  # trailing
+|
+|class Thing:
+|    def __init__(self, value=42):
+|        self.value = value
+|
+|
+|if __name__ == "__main__":
+|    print(greet(os.environ.get("USER", "world")))
+|
+|
+|
+|
+|
+|
+|
+|
+|                               [ Read 42 lines ]
+|^G Help      ^O Write Out ^F Where Is  ^K Cut       ^T Execute   ^C Location
+|^X Exit      ^R Read File ^\ Replace   ^U Paste     ^J Justify   ^/ Go To Line
+0,0-79: fg=- bg=- inverse
+9,79-79: fg=- bg=- inverse
+27,31-47: fg=- bg=- inverse
+28,0-1: fg=- bg=- inverse
+28,13-14: fg=- bg=- inverse
+28,26-27: fg=- bg=- inverse
+28,39-40: fg=- bg=- inverse
+28,52-53: fg=- bg=- inverse
+28,65-66: fg=- bg=- inverse
+29,0-1: fg=- bg=- inverse
+29,13-14: fg=- bg=- inverse
+29,26-27: fg=- bg=- inverse
+29,39-40: fg=- bg=- inverse
+29,52-53: fg=- bg=- inverse
+29,65-66: fg=- bg=- inverse
