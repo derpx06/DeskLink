@@ -105,6 +105,10 @@ pub struct TerminalSessionInfo {
     /// as typed keys. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub desk_window: bool,
+    /// The phone holds the size claim: the program is drawn for the phone's
+    /// screen even though a desk window is open. Omitted when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub phone_size: bool,
     /// A phone other than the receiver is attached. Omitted when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub attached: bool,
@@ -139,6 +143,11 @@ pub struct TerminalControl {
     pub rows: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cols: Option<u16>,
+    /// `Resize`: `true` claims the size for the phone even over an open desk
+    /// window, `false` gives it back; absent is a plain resize (honoured only
+    /// when no desk window owns the size).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_size: Option<bool>,
     /// Where the client's byte stream resumes, or where the host says it does.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
@@ -186,6 +195,7 @@ impl TerminalControl {
             terminal_id: None,
             rows: None,
             cols: None,
+            claim_size: None,
             offset: None,
             command: None,
             sessions: None,
@@ -424,6 +434,51 @@ fn validate_command(command: &[String]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn phone_size_and_claim_size_are_optional_and_ordered_like_the_phone_writes_them() {
+        let wire = wire();
+        let mut info = TerminalSessionInfo {
+            terminal_id: "t1".into(),
+            title: "x".into(),
+            rows: 24,
+            cols: 80,
+            exit_status: None,
+            desk_window: true,
+            phone_size: false,
+            attached: true,
+            cwd: None,
+            started_at: None,
+            shell: None,
+        };
+        assert!(!serde_json::to_string(&info).unwrap().contains("phoneSize"));
+        info.phone_size = true;
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(
+            json.contains("\"deskWindow\":true,\"phoneSize\":true,\"attached\":true"),
+            "{json}"
+        );
+        let older: TerminalSessionInfo =
+            serde_json::from_str(r#"{"terminalId":"t1","title":"x","rows":24,"cols":80}"#).unwrap();
+        assert!(!older.phone_size);
+
+        let mut resize = TerminalControl::new(TerminalAction::Resize, &wire);
+        resize.terminal_id = Some("t1".into());
+        resize.rows = Some(30);
+        resize.cols = Some(50);
+        assert!(!String::from_utf8(resize.to_json().unwrap())
+            .unwrap()
+            .contains("claimSize"));
+        resize.claim_size = Some(true);
+        let json = String::from_utf8(resize.to_json().unwrap()).unwrap();
+        assert!(json.contains("\"cols\":50,\"claimSize\":true"), "{json}");
+        assert_eq!(
+            TerminalControl::from_json(json.as_bytes())
+                .unwrap()
+                .claim_size,
+            Some(true)
+        );
+    }
 
     #[test]
     fn desk_window_is_sent_only_when_true() {

@@ -49,6 +49,7 @@ pub(crate) struct SessionInfo {
     pub(crate) exit_status: Option<u32>,
     /// A terminal window at the desk is showing this session.
     pub(crate) desk_window: bool,
+    pub(crate) phone_size: bool,
     /// The foreground process's directory, `$HOME` written `~`.
     pub(crate) cwd: Option<String>,
     /// When it started, in Unix seconds.
@@ -257,7 +258,8 @@ fn describe(session: &PtySession) -> SessionInfo {
         rows,
         cols,
         exit_status: session.exit_status(),
-        desk_window: session.desk_sets_size(),
+        desk_window: session.has_desk_window(),
+        phone_size: session.phone_sets_size(),
         cwd: session
             .cwd()
             .map(|cwd| tilde(&cwd))
@@ -398,6 +400,7 @@ mod tests {
             cols: 80,
             exit_status: None,
             desk_window: false,
+            phone_size: false,
             cwd: Some(cwd.into()),
             started_at: 0,
             shell: None,

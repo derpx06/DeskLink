@@ -108,8 +108,9 @@ struct Attachment {
     next: u64,
     /// The size this peer was last told the session has.
     told_size: (u16, u16),
-    /// Whether the phone was last told a desk window shows this session.
-    told_desk_window: bool,
+    /// Whether the phone was last told a desk window shows this session, and
+    /// whether it holds the size.
+    told_desk_window: (bool, bool),
     /// The size this peer's screen wants, from its last `Resize`.
     viewport: Option<(u16, u16)>,
 }
@@ -239,6 +240,11 @@ impl TerminalBridge {
                 match made {
                     Ok(info) => {
                         audit("create", self.device(), Some(&info.id));
+                        // The phone that made it sets its size: the window that
+                        // opens at the desk attaches without resizing it.
+                        if let Some(session) = registry.get(&info.id) {
+                            let _ = session.claim_for_phone(&self.wire.peer_device_id, rows, cols);
+                        }
                         // The same session opens at the desk, so it can be
                         // carried on there (not from tests: no windows).
                         if !cfg!(test) {
@@ -302,7 +308,10 @@ impl TerminalBridge {
                 // The screen, then the reply that says where the live stream
                 // resumes — in that order, released by the pump against the
                 // channel's budget rather than dumped on it here.
-                let mut events = split_chunk_events(chunk);
+                // The list first: it carries the size the screen below was drawn
+                // for, which the phone may not have heard since it last looked.
+                let mut events = vec![sessions_event(&self.wire, registry, &self.elsewhere)];
+                events.extend(split_chunk_events(chunk));
                 events.push(TerminalEvent::SendControl(reply));
                 if let Err(error) = self.queue(events) {
                     self.refuse(Some(id.to_string()), &error);
@@ -314,7 +323,7 @@ impl TerminalBridge {
                 registry.claim_writer(id, &self.wire.peer_device_id);
                 session.touch();
                 audit("attach", self.device(), Some(id));
-                let desk_window = session.desk_sets_size();
+                let desk_window = (session.has_desk_window(), session.phone_sets_size());
                 self.attached.insert(
                     id.to_string(),
                     Attachment {
@@ -332,6 +341,9 @@ impl TerminalBridge {
                 let id = require_id(control)?;
                 if let Some(attachment) = self.attached.remove(id) {
                     attachment.session.touch();
+                    attachment
+                        .session
+                        .release_phone_claim(&self.wire.peer_device_id);
                     audit("detach", self.device(), Some(id));
                 }
                 // Leaving must hand the keyboard back, or nobody else can type
@@ -360,18 +372,29 @@ impl TerminalBridge {
                     return Ok(());
                 };
                 attachment.viewport = Some((rows, cols));
-                // Only the writer resizes, and never over an open desk window:
-                // a viewer's phone rotating must not reflow the screen out from
-                // under whoever is typing.
-                if !registry.is_writer(id, &self.wire.peer_device_id)
-                    || attachment.session.desk_sets_size()
-                {
-                    // It has already redrawn at its own size; telling it the
-                    // real one again puts it back.
-                    attachment.told_size = (0, 0);
-                    return Ok(());
+                let device = self.wire.peer_device_id.as_str();
+                let writer = registry.is_writer(id, device);
+                match control.claim_size {
+                    // The person asked for the phone's size, or to give it back.
+                    // Only the device that types may.
+                    Some(true) if writer => attachment.session.claim_for_phone(device, rows, cols),
+                    Some(false) if writer => {
+                        attachment.session.release_phone_claim(device);
+                        attachment.told_size = (0, 0);
+                        Ok(())
+                    }
+                    // Only the writer resizes, and never over an open desk window
+                    // that owns the size: a viewer's phone rotating must not
+                    // reflow the screen out from under whoever is typing.
+                    _ if !writer || attachment.session.desk_sets_size() => {
+                        // It has not changed its own screen (the phone follows
+                        // the host's size); telling it the real one again keeps
+                        // that true.
+                        attachment.told_size = (0, 0);
+                        Ok(())
+                    }
+                    _ => attachment.session.resize(rows, cols),
                 }
-                attachment.session.resize(rows, cols)
             }
 
             // Host-authored actions. A peer sending one is not making a request;
@@ -490,7 +513,7 @@ impl TerminalBridge {
         // So does a desk window opening or closing: the phone answers the
         // program's terminal queries only while no desk window does.
         let size = session.size();
-        let desk_window = session.desk_sets_size();
+        let desk_window = (session.has_desk_window(), session.phone_sets_size());
         if size != attachment.told_size || desk_window != attachment.told_desk_window {
             if let Some(attachment) = self.attached.get_mut(id) {
                 attachment.told_size = size;
@@ -583,6 +606,9 @@ impl TerminalBridge {
         self.outbox_bytes = 0;
         for (id, attachment) in std::mem::take(&mut self.attached) {
             attachment.session.touch();
+            attachment
+                .session
+                .release_phone_claim(&self.wire.peer_device_id);
             audit("revoke-detach", self.device(), Some(&id));
             let mut closed = TerminalControl::new(TerminalAction::Closed, &self.wire);
             closed.terminal_id = Some(id);
@@ -599,6 +625,9 @@ impl TerminalBridge {
     pub(crate) fn detach_all(&mut self, registry: &mut TerminalRegistry) {
         for (id, attachment) in std::mem::take(&mut self.attached) {
             attachment.session.touch();
+            attachment
+                .session
+                .release_phone_claim(&self.wire.peer_device_id);
             audit("detach", self.device(), Some(&id));
         }
         self.outbox.clear();
@@ -1102,6 +1131,7 @@ fn sessions_event(
                     cols: info.cols,
                     exit_status: info.exit_status,
                     desk_window: info.desk_window,
+                    phone_size: info.phone_size,
                     attached,
                     cwd: info.cwd,
                     started_at: Some(info.started_at),
@@ -1369,7 +1399,7 @@ mod tests {
         // A desk window opens at its own size.
         let session = registry.get(&id).unwrap();
         session.desk_window_opened();
-        session.resize(40, 120).unwrap();
+        session.desk_window_size(40, 120, true);
         assert_eq!(
             told(bridge.pump(usize::MAX / 2, &mut registry)),
             Some((40, 120))
@@ -1402,6 +1432,91 @@ mod tests {
             told(bridge.pump(usize::MAX / 2, &mut registry)),
             Some((30, 50))
         );
+        registry.close(&id);
+    }
+
+    /// The phone that made a session sets its size even though a desk window
+    /// opens; the desk takes it back by being resized or typed in, the person
+    /// can hand it over either way, and the claim ends with the phone's attachment.
+    #[test]
+    fn the_phone_that_made_the_session_keeps_the_size_until_the_desk_acts() {
+        let mut registry = TerminalRegistry::new();
+        let mut bridge = new_bridge("phone-1");
+        let id = create(&mut bridge, &mut registry, Some(sleeping_command()));
+        let session = registry.get(&id).unwrap();
+        assert!(session.phone_sets_size(), "the creator holds the size");
+        attach(&mut bridge, &mut registry, &id);
+        let resize = |bridge: &mut TerminalBridge,
+                      registry: &mut TerminalRegistry,
+                      rows,
+                      cols,
+                      claim: Option<bool>| {
+            let mut resize = request(TerminalAction::Resize, &bridge.wire);
+            resize.terminal_id = Some(id.clone());
+            resize.rows = Some(rows);
+            resize.cols = Some(cols);
+            resize.claim_size = claim;
+            bridge.handle_control(&resize, registry).unwrap();
+        };
+
+        // The window the desk opens for it attaches at its own size, which changes nothing.
+        session.desk_window_opened();
+        session.desk_window_size(40, 120, false);
+        assert!(session.has_desk_window() && !session.desk_sets_size());
+        resize(&mut bridge, &mut registry, 30, 50, None);
+        assert_eq!(session.size(), (30, 50));
+
+        // Typing or resizing at the desk takes the size back; the phone's plain resizes are then ignored.
+        session.desk_window_size(40, 120, true);
+        assert_eq!(session.size(), (40, 120));
+        assert!(!session.phone_sets_size() && session.desk_sets_size());
+        resize(&mut bridge, &mut registry, 30, 50, None);
+        assert_eq!(session.size(), (40, 120));
+
+        // The person taps "Phone size", then "Desk size".
+        resize(&mut bridge, &mut registry, 30, 50, Some(true));
+        assert_eq!(session.size(), (30, 50));
+        assert!(session.phone_sets_size());
+        resize(&mut bridge, &mut registry, 30, 50, Some(false));
+        assert_eq!(session.size(), (40, 120));
+        assert!(!session.phone_sets_size());
+
+        // Detaching lets go of a claim too.
+        resize(&mut bridge, &mut registry, 30, 50, Some(true));
+        let mut detach = request(TerminalAction::Detach, &bridge.wire);
+        detach.terminal_id = Some(id.clone());
+        bridge.handle_control(&detach, &mut registry).unwrap();
+        assert!(!session.phone_sets_size());
+        assert_eq!(session.size(), (40, 120));
+
+        // The last window closing ends the claim and the size question with it.
+        session.desk_window_closed();
+        assert!(!session.has_desk_window());
+        registry.close(&id);
+    }
+
+    /// A viewer (not the keyboard's holder) cannot claim the size.
+    #[test]
+    fn only_the_writer_can_claim_the_size() {
+        let mut registry = TerminalRegistry::new();
+        let mut owner = new_bridge("phone-1");
+        let id = create(&mut owner, &mut registry, Some(sleeping_command()));
+        let session = registry.get(&id).unwrap();
+        session.release_phone_claim("phone-1");
+        session.desk_window_opened();
+        session.desk_window_size(40, 120, true);
+        attach(&mut owner, &mut registry, &id);
+        let mut viewer = new_bridge("phone-2");
+        attach(&mut viewer, &mut registry, &id);
+        let mut claim = request(TerminalAction::Resize, &viewer.wire);
+        claim.terminal_id = Some(id.clone());
+        claim.rows = Some(30);
+        claim.cols = Some(50);
+        claim.claim_size = Some(true);
+        viewer.handle_control(&claim, &mut registry).unwrap();
+        assert!(!session.phone_sets_size());
+        assert_eq!(session.size(), (40, 120));
+        session.desk_window_closed();
         registry.close(&id);
     }
 
@@ -1962,6 +2077,7 @@ mod tests {
                     cols: 1000,
                     exit_status: Some(u32::MAX),
                     desk_window: true,
+                    phone_size: true,
                     attached: true,
                     cwd: Some(
                         "\u{10348}"

@@ -1,0 +1,42 @@
+[?1049h[2J[H[1;29r$ echo line 1 abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc
+$ echo line 2 abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc
+$ echo line 3 abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc
+$ echo line 4 abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc
+$ echo line 5 abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc
+$ echo line 6 abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc
+$ echo line 7 abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc
+$ echo line 8 abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc
+$ echo line 9 abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc
+$ echo line 10 abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc
+$ echo line 11 abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc
+[30;1H[30;42m [0] 0:bash* 1:vim-                              12:30 05-No[0m[29;1H
+scrolled 0
+scrolled 1
+scrolled 2
+scrolled 3
+scrolled 4
+scrolled 5
+scrolled 6
+scrolled 7
+scrolled 8
+scrolled 9
+scrolled 10
+scrolled 11
+scrolled 12
+scrolled 13
+scrolled 14
+scrolled 15
+scrolled 16
+scrolled 17
+scrolled 18
+scrolled 19
+scrolled 20
+scrolled 21
+scrolled 22
+scrolled 23
+scrolled 24
+scrolled 25
+scrolled 26
+scrolled 27
+scrolled 28
+scrolled 29[r

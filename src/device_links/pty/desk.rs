@@ -220,12 +220,14 @@ fn serve(stream: UnixStream) -> Result<(), String> {
         .map_err(|_| "terminal registry lock poisoned")?
         .get(&id)
         .ok_or("no such DeskLink terminal")?;
-    // A desk window sets the size while it is open; the phone shows it
-    // scaled. With several, the last one to attach, resize or type wins.
-    let mut desk_size = (rows, cols);
-    let _ = session.resize(rows, cols);
+    // A desk window sets the size while it is open, unless the phone that made
+    // the session (or the person, on the phone) claimed it: then the window
+    // shows the program top-left until the desk is resized or typed in. With
+    // several windows, the last one to resize or type wins.
+    let mut desk_size = Some((rows, cols));
     session.touch();
     session.desk_window_opened();
+    session.desk_window_size(rows, cols, false);
     struct Closed<'a>(&'a PtySession);
     impl Drop for Closed<'_> {
         fn drop(&mut self) {
@@ -252,8 +254,9 @@ fn serve(stream: UnixStream) -> Result<(), String> {
         match read_frame(&mut reader) {
             Ok((INPUT, bytes)) => {
                 session.touch();
-                if session.size() != desk_size {
-                    let _ = session.resize(desk_size.0, desk_size.1);
+                // Typing at the desk takes the size back from the phone.
+                if let Some((rows, cols)) = desk_size {
+                    session.desk_window_size(rows, cols, true);
                 }
                 if session.write_input(&bytes).is_err() {
                     break;
@@ -262,8 +265,8 @@ fn serve(stream: UnixStream) -> Result<(), String> {
             Ok((RESIZE, payload)) if payload.len() == 4 => {
                 let rows = u16::from_be_bytes([payload[0], payload[1]]);
                 let cols = u16::from_be_bytes([payload[2], payload[3]]);
-                desk_size = (rows.clamp(1, 1000), cols.clamp(1, 1000));
-                let _ = session.resize(desk_size.0, desk_size.1);
+                desk_size = Some((rows.clamp(1, 1000), cols.clamp(1, 1000)));
+                session.desk_window_size(rows, cols, true);
             }
             Ok(_) => {}
             Err(_) => break,
@@ -792,6 +795,48 @@ mod tests {
         }
         assert!(served.is_finished(), "serve must return on a quiet session");
         assert!(!session.desk_sets_size(), "the desk window count falls");
+    }
+
+    /// The phone that made a session keeps its size when the desk window opens
+    /// for it; the first thing typed at the desk takes the size back.
+    #[test]
+    fn a_window_opening_over_a_phones_claim_leaves_its_size_until_typed_in() {
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let info = super::super::registry::registry()
+            .lock()
+            .unwrap()
+            .create(Some(command), 24, 80, "desk-test")
+            .expect("quiet session");
+        let session = super::super::registry::registry()
+            .lock()
+            .unwrap()
+            .get(&info.id)
+            .unwrap();
+        session.claim_for_phone("phone-1", 30, 50).unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn(move || serve(server));
+        client
+            .write_all(format!("ATTACH {} 40 120\n", info.id).as_bytes())
+            .unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !session.has_desk_window() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(session.has_desk_window());
+        assert_eq!(session.size(), (30, 50), "the window did not squeeze it");
+        assert!(!session.desk_sets_size() && session.phone_sets_size());
+
+        client.write_all(&encode(INPUT, b"x")).unwrap();
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while session.phone_sets_size() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(session.size(), (40, 120), "typing at the desk took it back");
+        assert!(session.desk_sets_size());
+        drop(client);
+        let _ = served.join();
+        assert!(!session.has_desk_window());
     }
 
     #[test]
