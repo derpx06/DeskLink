@@ -114,6 +114,8 @@ mod tests {
             "device_links/webrtc/coordinator.rs:RETIRING",
             "device_links/webrtc/coordinator.rs:SERVICES",
             "device_links/webrtc/coordinator.rs:STARTING",
+            // A share waiting for the portal's answer; its guard ends the entry when the worker does.
+            "device_links/webrtc/coordinator.rs:WAITING",
             "device_links/webrtc/coordinator.rs:LAST",
             // Throttles that expire by themselves.
             "device_links/daemon/discovery.rs:LAST",

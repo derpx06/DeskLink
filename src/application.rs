@@ -228,6 +228,28 @@ mod imp {
     impl AdwApplicationImpl for DesklinkApplication {}
 }
 
+/// Which phones' "approve it at this computer" notices to post and which to
+/// take down, given the phones waiting now and those already announced.
+fn approval_changes(
+    waiting: &[String],
+    shown: &mut std::collections::HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let gone: Vec<String> = shown
+        .iter()
+        .filter(|device| !waiting.contains(device))
+        .cloned()
+        .collect();
+    for device in &gone {
+        shown.remove(device);
+    }
+    let fresh = waiting
+        .iter()
+        .filter(|device| shown.insert((*device).clone()))
+        .cloned()
+        .collect();
+    (fresh, gone)
+}
+
 /// The Bucket questions (a phone asked, the desk has not turned it on) not
 /// yet told about: each is returned once. `told` forgets a question once it is
 /// gone, so a phone that asks again later is told again.
@@ -604,6 +626,7 @@ impl DesklinkApplication {
 
         let mut notified = std::collections::HashSet::<String>::new();
         let mut asked = std::collections::HashSet::<String>::new();
+        let mut approving = std::collections::HashSet::<String>::new();
         let mut notices = crate::transfer_notice::Notices::default();
         crate::ticker::every_tick(move || {
             crate::guard("app tick", glib::ControlFlow::Continue, || {
@@ -672,6 +695,27 @@ impl DesklinkApplication {
                         Some(&format!("bucket-ask-{}", offer.device)),
                         &notification,
                     );
+                }
+                // A phone's screen request waits for an answer in GNOME's own dialog,
+                // which says nothing about DeskLink: say where to look, and take
+                // the notice down the moment it is answered.
+                let waiting = crate::device_links::webrtc::coordinator::phones_awaiting_approval();
+                let (to_post, to_withdraw) = approval_changes(&waiting, &mut approving);
+                for device in to_post {
+                    let phone = daemon
+                        .devices()
+                        .into_iter()
+                        .find(|known| known.id == device)
+                        .map_or_else(|| "A phone".to_string(), |known| known.name);
+                    let notification =
+                        gio::Notification::new(&format!("{phone} wants to show this screen"));
+                    notification.set_body(Some("Approve it in the window that just opened."));
+                    notification.set_priority(gio::NotificationPriority::High);
+                    notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+                    app.send_notification(Some(&format!("screen-approve-{device}")), &notification);
+                }
+                for device in to_withdraw {
+                    app.withdraw_notification(&format!("screen-approve-{device}"));
                 }
                 {
                     let devices = daemon.devices();
@@ -1794,6 +1838,32 @@ pub(crate) fn bucket_ask_pending(
     offers
         .iter()
         .any(|offer| offer.bucket && offer.device == device)
+}
+
+#[cfg(test)]
+mod approval_notice_tests {
+    use super::approval_changes;
+    use std::collections::HashSet;
+
+    #[test]
+    fn the_approval_notice_is_posted_once_and_withdrawn_when_answered() {
+        let mut shown = HashSet::new();
+        let waiting = vec!["phone-a".to_string()];
+        assert_eq!(
+            approval_changes(&waiting, &mut shown),
+            (vec!["phone-a".to_string()], vec![])
+        );
+        assert_eq!(
+            approval_changes(&waiting, &mut shown),
+            (vec![], vec![]),
+            "not again"
+        );
+        assert_eq!(
+            approval_changes(&[], &mut shown),
+            (vec![], vec!["phone-a".to_string()])
+        );
+        assert_eq!(approval_changes(&[], &mut shown), (vec![], vec![]));
+    }
 }
 
 #[cfg(test)]
