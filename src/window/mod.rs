@@ -2561,15 +2561,6 @@ fn page_link(label: &str, page: &str) -> gtk::Button {
     button
 }
 
-/// A card: the design's white rounded surface with a soft edge.
-fn card(spacing: i32) -> gtk::Box {
-    gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(spacing)
-        .css_classes(["dl-card"])
-        .build()
-}
-
 /// Asks before `confirm`ing something that cuts the phone off.
 pub(crate) fn confirm(
     parent: &impl IsA<gtk::Widget>,
