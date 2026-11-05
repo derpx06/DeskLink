@@ -1752,7 +1752,7 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// stamp, is still ours and safe to update.
 const KNOWN_BUILDS: [&str; 18] = [
     // The current build (no wobbling window while a phone looks at this screen).
-    "78e0e3c3b28c4ba92a6ff8b0f6880c98ebb4145ae84ee4921bbe96cef7e0fa7d",
+    "f7b1d5832081bd42eb8aaa027e115a3963208f9490d73840539df50f829bd347",
     // Links checked, focus kept only while open.
     "32a1f784c930664df85dfce8b6572ea1a8608150585320cfb6c7fb090ac854a7",
     // The complete remote, first cut (model.js, sections, switches).

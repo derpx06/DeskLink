@@ -46,9 +46,11 @@ otherwise off and shows the first item with its live countdown or progress (`Act
 text is worked out by the helpers in `extension.js`, tested with `node --test gnome-shell-extension/tests/activity.test.mjs`).
 
 While a phone is viewing or controlling this screen, the "Compiz windows effect" extension's wobble is taken
-off a window as it is grabbed (`WobbleGuard` in `extension.js`, tested by `tests/wobble.test.mjs`): with the
-wobble on, GNOME's screen cast shows the dragged window as missing for the whole drag (gnome-shell #7116), so
-it vanished from the phone's picture. The wobble returns when the phone stops looking.
+off a window the moment it appears (`WobbleGuard` in `extension.js`, tested by `tests/wobble.test.mjs`): when a
+window is grabbed (drag, resize), when a maximised or tiled window is dragged out or unmaximised
+(`size-change`) and when one is maximised (`size-changed`). With the wobble on, GNOME's screen cast shows
+such a window as missing for the whole effect (gnome-shell #7116), so it vanished from the phone's picture. The
+wobble returns when the phone stops looking. Other window effects (magic lamp, burn my windows) are not touched.
 
 The extension only talks to the app over D-Bus
 (`derx06.desklink.com.Shell1` at `/derx06/desklink/com/Shell`, see

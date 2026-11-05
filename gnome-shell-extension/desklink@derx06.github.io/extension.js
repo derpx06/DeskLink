@@ -181,15 +181,16 @@ class DeskLinkButton extends PanelMenu.Button {
 // Shell screenshot; any other window and a plain DeformEffect are fine.
 //
 // While a phone is looking at this screen, the effect is taken off the
-// grabbed window as soon as the other extension adds it. The wobble is back
-// the moment the phone stops looking. Only that one effect, by its name.
+// window as soon as the other extension adds it: on a grab (drag, resize), on
+// `size-change` (a maximised or tiled window dragged out) and on `size-changed`
+// (maximising). The wobble is back the moment the phone stops looking. Only
+// that one effect, by its name; an unmaximise by button is covered too.
 export const WOBBLE_EFFECT = 'wobbly-compiz-effect';
 
-/// Takes the wobble effect off `window`'s actor, cleaning up through the
+/// Takes the wobble effect off a window actor, cleaning up through the
 /// effect's own `destroy()` (it has timers and signal handlers of its own).
 /// Returns whether there was one.
-export function stripWobble(window) {
-    const actor = window?.get_compositor_private?.();
+export function stripActor(actor) {
     const effect = actor?.get_effect?.(WOBBLE_EFFECT);
     if (!effect)
         return false;
@@ -197,26 +198,49 @@ export function stripWobble(window) {
         effect.destroy();
     } catch (error) {
         // Not the shape this code knows: just detach it.
-        actor.remove_effect(effect);
+        try {
+            actor.remove_effect(effect);
+        } catch (ignored) {
+            // Already gone.
+        }
     }
     return true;
 }
 
+/// [`stripActor`] for a Meta.Window (what `grab-op-begin` hands over).
+export function stripWobble(window) {
+    return stripActor(window?.get_compositor_private?.());
+}
+
+/// Whether a phone is viewing or controlling this screen (glide is the
+/// pointer on the phone, not the picture).
+export function lookingAtScreen(devices) {
+    return Array.isArray(devices) &&
+        devices.some(device => device?.screen === 'view' || device?.screen === 'control');
+}
+
 export class WobbleGuard {
-    constructor(display = global.display) {
+    constructor(display = global.display, windowManager = global.window_manager) {
         this._display = display;
-        this._id = 0;
+        this._wm = windowManager;
+        this._ids = [];
     }
 
     /// True while a phone is viewing or controlling this screen.
     set sharing(on) {
-        if (on && !this._id) {
-            // After the other extension's own handler, which adds the effect.
-            this._id = this._display.connect_after('grab-op-begin',
-                (_display, window) => stripWobble(window));
-        } else if (!on && this._id) {
-            this._display.disconnect(this._id);
-            this._id = 0;
+        if (on && !this._ids.length) {
+            // Each after the other extension's own handler, which adds the
+            // effect: a grab (drag, resize), and the size changes it adds
+            // one on too (a maximised or tiled window dragged out, maximising).
+            this._ids = [
+                [this._display, this._display.connect_after('grab-op-begin',
+                    (_display, window) => stripWobble(window))],
+                [this._wm, this._wm.connect_after('size-change', (_wm, actor) => stripActor(actor))],
+                [this._wm, this._wm.connect_after('size-changed', (_wm, actor) => stripActor(actor))],
+            ];
+        } else if (!on && this._ids.length) {
+            this._ids.forEach(([object, id]) => object.disconnect(id));
+            this._ids = [];
         }
     }
 
@@ -371,7 +395,7 @@ export default class DeskLinkExtension extends Extension {
         const live = devices.filter(device => device.screen || device.terminals > 0);
         // A phone looking at this screen: no wobbling windows, they vanish from the picture (see the wobble guard above).
         if (this._wobble)
-            this._wobble.sharing = running && devices.some(device => device.screen === 'view' || device.screen === 'control');
+            this._wobble.sharing = running && lookingAtScreen(devices);
         const selected = devices.find(device => device.id === this._selected) ??
             devices.find(device => device.ready) ??
             devices.find(device => device.reachable) ?? devices[0];
