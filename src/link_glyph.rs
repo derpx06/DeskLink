@@ -61,6 +61,15 @@ pub(crate) struct Presentation {
 }
 
 impl Presentation {
+    /// The words without the round-trip time, which changes with every
+    /// reading: what a widget is drawn from, so it is not rebuilt for it.
+    pub(crate) fn steady(device: &DeviceView) -> Self {
+        Self::of(&DeviceView {
+            rtt_ms: None,
+            ..device.clone()
+        })
+    }
+
     pub(crate) fn of(device: &DeviceView) -> Self {
         let make = |status, word, detail: &str, short: &str| Self {
             status,

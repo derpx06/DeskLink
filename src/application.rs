@@ -119,7 +119,7 @@ mod imp {
             obj.set_accels_for_action("win.pair-new", &["<control>n"]);
             obj.set_accels_for_action("win.send-files", &["<control>o"]);
             for (page, accel) in crate::window::PAGE_ACCELS {
-                obj.set_accels_for_action(&format!("win.show-page('{page}')"), &[accel]);
+                obj.set_accels_for_action(&format!("win.page-shortcut('{page}')"), &[accel]);
             }
             obj.set_accels_for_action("win.toggle-search", &["<control>f"]);
             obj.set_accels_for_action("window.close", &["<control>w"]);

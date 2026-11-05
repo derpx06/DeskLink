@@ -105,7 +105,15 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>) {
                 } else {
                     "Checking this computer…"
                 };
-                body.append(&gtk::Label::new(Some(words)));
+                // A status, so a screen reader says it when the dialog opens.
+                body.append(
+                    &gtk::Label::builder()
+                        .label(words)
+                        .wrap(true)
+                        .xalign(0.0)
+                        .accessible_role(gtk::AccessibleRole::Status)
+                        .build(),
+                );
                 copy.set_sensitive(false);
                 return;
             };
@@ -115,10 +123,15 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>) {
     };
     fill(false);
     let started = std::time::Instant::now();
+    // Set when the dialog closes: the poll stops with it.
+    let closed = std::rc::Rc::new(std::cell::Cell::new(false));
     glib::timeout_add_local(std::time::Duration::from_millis(300), {
         let fill = fill.clone();
+        let closed = closed.clone();
         move || {
-            if crate::platform::generation() > before {
+            if closed.get() {
+                glib::ControlFlow::Break
+            } else if crate::platform::generation() > before {
                 fill(false);
                 glib::ControlFlow::Break
             } else if started.elapsed() > POLL_LIMIT {
@@ -150,5 +163,6 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>) {
                 .build(),
         ))
         .build();
+    dialog.connect_closed(move |_| closed.set(true));
     dialog.present(Some(parent));
 }

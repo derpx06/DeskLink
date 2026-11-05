@@ -58,6 +58,35 @@ use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::device_links::features::FeatureRegistry;
 use crate::device_links::webrtc::transfer_board::{Finished, Outcome};
 
+/// Whether a Ctrl+digit page shortcut does anything now. Not over a dialog
+/// (as Ctrl+N is not), and the pages of a phone only for a paired one: a
+/// phone still pairing has just its overview, and showing the page would
+/// flicker. Notes & clipboard is the user's own and opens with no phone too
+/// (as the solo view); the other pages do nothing there.
+fn page_shortcut_applies(page: &str, dialog_open: bool, paired: bool) -> bool {
+    !dialog_open && (paired || page == "notes")
+}
+
+/// Whether the window lists `device`: a paired one, one mid-pairing, or a
+/// `refused` one (it did not accept our request; its page says so).
+fn is_listed(device: &DeviceView, refused: bool) -> bool {
+    if refused && !device.trusted {
+        return true;
+    }
+    (device.trusted
+        || matches!(
+            device.status,
+            DeviceStatus::PairRequested | DeviceStatus::PairRequestedByPeer
+        ))
+        && matches!(
+            device.status,
+            DeviceStatus::Paired
+                | DeviceStatus::Unreachable
+                | DeviceStatus::PairRequested
+                | DeviceStatus::PairRequestedByPeer
+        )
+}
+
 /// The pages, in sidebar order: (name, title, icon). The last is the
 /// sidebar's footer. Frequent pages cluster at the top; Contacts, which is
 /// read-only and rare, comes after Terminals (`UI-REDESIGN.md` 3.9).
@@ -420,11 +449,29 @@ mod imp {
                         }
                     })
                     .build(),
+                // Ctrl+1 to Ctrl+6: a page by name, from the keyboard only.
+                gio::ActionEntry::builder("page-shortcut")
+                    .parameter_type(Some(glib::VariantTy::STRING))
+                    .activate(|window: &super::DesklinkWindow, _, parameter| {
+                        let Some(page) = parameter.and_then(|value| value.get::<String>()) else {
+                            return;
+                        };
+                        let paired = window.selected_is_paired();
+                        if page_shortcut_applies(&page, window.visible_dialog().is_some(), paired) {
+                            window.show_page(&page);
+                        }
+                    })
+                    .build(),
                 // Ctrl+O: choose files and send them to the selected phone.
                 gio::ActionEntry::builder("send-files")
                     .activate(|window: &super::DesklinkWindow, _, _| {
+                        // Not over a dialog, as Ctrl+N is not.
+                        if window.visible_dialog().is_some() {
+                            return;
+                        }
                         let (Some(daemon), Some(id)) = (window.daemon(), window.selected_id())
                         else {
+                            window.show_feature_toast("Pair a phone to send files");
                             return;
                         };
                         let device = window
@@ -843,24 +890,17 @@ impl DesklinkWindow {
         let mut devices = daemon.devices();
         #[cfg(debug_assertions)]
         devices.extend(self.imp().fake_devices.borrow().iter().cloned());
+        // A phone that did not accept our request stays, with why.
+        let (refused, newly) = pairing::watch(&devices);
+        for name in newly {
+            self.show_feature_toast(&format!("{name} didn't accept the request"));
+        }
+        let refused_ids: Vec<String> = refused.iter().map(|gone| gone.id.clone()).collect();
+        devices.retain(|device| !refused_ids.contains(&device.id));
+        devices.extend(refused);
         devices
             .into_iter()
-            .filter(|device| {
-                device.trusted
-                    || matches!(
-                        device.status,
-                        DeviceStatus::PairRequested | DeviceStatus::PairRequestedByPeer
-                    )
-            })
-            .filter(|device| {
-                matches!(
-                    device.status,
-                    DeviceStatus::Paired
-                        | DeviceStatus::Unreachable
-                        | DeviceStatus::PairRequested
-                        | DeviceStatus::PairRequestedByPeer
-                )
-            })
+            .filter(|device| is_listed(device, refused_ids.contains(&device.id)))
             .collect()
     }
 
@@ -3979,13 +4019,27 @@ mod tests {
     }
 
     #[test]
+    fn page_shortcuts_wait_for_a_paired_phone_and_for_dialogs() {
+        assert!(page_shortcut_applies("files", false, true));
+        assert!(!page_shortcut_applies("files", true, true), "over a dialog");
+        assert!(
+            !page_shortcut_applies("files", false, false),
+            "still pairing"
+        );
+        assert!(!page_shortcut_applies("home", false, false));
+        assert!(
+            page_shortcut_applies("notes", false, false),
+            "the user's own"
+        );
+        assert!(!page_shortcut_applies("notes", true, false));
+    }
+
+    #[test]
     fn the_drop_words_name_the_phone() {
         assert_eq!(sidebar::drop_words("Pixel 9"), "Drop to send to Pixel 9");
         assert_eq!(sidebar::drop_words(""), "Drop to send");
     }
 
-    /// The tabs of Notes & Clipboard are addressed by name, every other name
-    /// is a page of the sidebar.
     /// `win.send-again` acts only on a retry that was offered.
     #[test]
     fn send_again_ignores_a_path_nobody_offered() {
@@ -4022,7 +4076,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// A worker that panicked ends the wait; a slow one is waited for.
     /// Every error on the Home hero reads as a sentence; the library's words
     /// are only in the details.
     #[test]
@@ -4078,6 +4131,7 @@ mod tests {
         );
     }
 
+    /// A worker that panicked ends the wait; a slow one is waited for.
     #[test]
     fn a_dead_worker_ends_the_wait_for_its_result() {
         let (sender, receiver) = std::sync::mpsc::channel::<u32>();

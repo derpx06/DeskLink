@@ -632,6 +632,11 @@ fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> gtk::FlowBox {
     flow
 }
 
+/// "More actions for Pixel 9: Lock phone, Send a nudge": what is in it.
+fn more_label(name: &str, titles: &[&str]) -> String {
+    format!("More actions for {name}: {}", titles.join(", "))
+}
+
 /// "More": Lock phone, Send a nudge, Send a link. A popover of rows, each an
 /// icon square, a title and a hint. `None` when the phone takes none.
 fn more_tile(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Button> {
@@ -682,9 +687,13 @@ fn more_tile(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Button> 
         Some("Lock, nudge, link"),
         TileKind::Normal,
     );
-    more.update_property(&[gtk::accessible::Property::Label(&format!(
-        "More actions for {}: lock, nudge, send a link",
-        device.name
+    let titles: Vec<&str> = items
+        .iter()
+        .map(|(_, title, _, _)| title.as_str())
+        .collect();
+    more.update_property(&[gtk::accessible::Property::Label(&more_label(
+        &device.name,
+        &titles,
     ))]);
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
@@ -1580,6 +1589,14 @@ mod tests {
         ] {
             assert_eq!(link_to_send(typed), None, "{typed}");
         }
+    }
+
+    #[test]
+    fn the_more_tile_names_what_is_in_it() {
+        assert_eq!(
+            more_label("Pixel 9", &["Lock phone", "Send a link…"]),
+            "More actions for Pixel 9: Lock phone, Send a link…"
+        );
     }
 
     /// Six tiles in a row, then three by two, then two by three: never one

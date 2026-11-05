@@ -488,6 +488,81 @@ fn phone_line(device: &DeviceView) -> gtk::Box {
     line
 }
 
+/// How long a phone that did not accept our request stays in the list, with
+/// "Couldn't pair" and Try again.
+const REFUSED_STAYS: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Remembers the requests this computer made, so one that ends without a
+/// pairing (the phone said no, or let it run out) can be shown: the daemon
+/// takes such a phone back to "nearby", where the window lists nothing.
+#[derive(Debug, Default)]
+pub(super) struct PairWatch {
+    /// Phones asked now, as last seen.
+    asked: std::collections::HashMap<String, DeviceView>,
+    /// Phones that did not accept, and when we noticed.
+    refused: std::collections::HashMap<String, (DeviceView, std::time::Instant)>,
+}
+
+impl PairWatch {
+    /// Looks at the devices the daemon knows. Returns the phones to keep
+    /// showing as refused, and the names of those newly refused. Calling it
+    /// again with the same devices changes nothing.
+    pub(super) fn observe(
+        &mut self,
+        devices: &[DeviceView],
+        now: std::time::Instant,
+    ) -> (Vec<DeviceView>, Vec<String>) {
+        let mut newly = Vec::new();
+        for id in std::mem::take(&mut self.asked).into_keys() {
+            let now_device = devices.iter().find(|device| device.id == id);
+            match now_device {
+                // Paired, or still being asked: nothing to report.
+                Some(device) if device.trusted || device.status == DeviceStatus::PairRequested => {}
+                // Asked, and now a stranger again (or gone): it did not accept.
+                Some(device) if device.status != DeviceStatus::PairRequestedByPeer => {
+                    let mut gone = device.clone();
+                    gone.last_error
+                        .get_or_insert_with(|| "Pairing request was rejected".into());
+                    newly.push(gone.name.clone());
+                    self.refused.insert(id, (gone, now));
+                }
+                _ => {}
+            }
+        }
+        for device in devices {
+            if device.trusted {
+                self.refused.remove(&device.id);
+            } else if device.status == DeviceStatus::PairRequested {
+                self.refused.remove(&device.id);
+                self.asked.insert(device.id.clone(), device.clone());
+            } else if device.status == DeviceStatus::PairRequestedByPeer {
+                self.refused.remove(&device.id);
+            }
+        }
+        self.refused
+            .retain(|_, (_, at)| now.duration_since(*at) < REFUSED_STAYS);
+        let kept = self
+            .refused
+            .values()
+            .map(|(device, _)| device.clone())
+            .collect();
+        (kept, newly)
+    }
+}
+
+thread_local! {
+    static WATCH: RefCell<PairWatch> = RefCell::default();
+}
+
+/// [`PairWatch::observe`] for the window (one thread, one watch).
+pub(super) fn watch(devices: &[DeviceView]) -> (Vec<DeviceView>, Vec<String>) {
+    WATCH.with(|watch| {
+        watch
+            .borrow_mut()
+            .observe(devices, std::time::Instant::now())
+    })
+}
+
 /// The reminder under every pairing question.
 const OWN_PHONES_ONLY: &str = "Only pair phones you own.";
 
@@ -816,6 +891,101 @@ mod welcome_tests {
         device.status = DeviceStatus::Discovered;
         device.device_type = "phone".into();
         device
+    }
+
+    fn asked() -> DeviceView {
+        let mut device = nearby();
+        device.status = DeviceStatus::PairRequested;
+        device
+    }
+
+    /// A phone we asked and that went back to "nearby" is shown as refused
+    /// (so the page can say so and offer Try again), for a while, and not
+    /// when it paired, or asked us, or was never asked.
+    #[test]
+    fn a_refused_request_stays_in_the_list_with_the_reason() {
+        let t0 = std::time::Instant::now();
+        let mut watch = PairWatch::default();
+        let (kept, newly) = watch.observe(&[nearby()], t0);
+        assert!(kept.is_empty() && newly.is_empty(), "never asked");
+
+        assert!(watch.observe(&[asked()], t0).0.is_empty());
+        let (kept, newly) = watch.observe(&[nearby()], t0);
+        assert_eq!(newly, ["Pixel 9"]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].status, DeviceStatus::Discovered);
+        assert_eq!(
+            kept[0].last_error.as_deref(),
+            Some("Pairing request was rejected")
+        );
+        // The same look again says nothing new and keeps it.
+        let (kept, newly) = watch.observe(&[nearby()], t0);
+        assert!(newly.is_empty() && kept.len() == 1);
+        // It also stays when the daemon has dropped it from its list.
+        assert_eq!(watch.observe(&[], t0).0.len(), 1);
+        // After two minutes it goes.
+        let later = t0 + REFUSED_STAYS;
+        assert!(watch.observe(&[], later).0.is_empty());
+    }
+
+    #[test]
+    fn a_request_that_pairs_or_is_asked_again_is_not_refused() {
+        let t0 = std::time::Instant::now();
+        let mut watch = PairWatch::default();
+        watch.observe(&[asked()], t0);
+        let mut paired = asked();
+        paired.trusted = true;
+        paired.status = DeviceStatus::Paired;
+        let (kept, newly) = watch.observe(&[paired], t0);
+        assert!(kept.is_empty() && newly.is_empty());
+
+        watch.observe(&[asked()], t0);
+        watch.observe(&[nearby()], t0);
+        // Asked again: the old refusal is gone.
+        assert!(watch.observe(&[asked()], t0).0.is_empty());
+        // The phone asking us is its own page, not a refusal.
+        let mut theirs = nearby();
+        theirs.status = DeviceStatus::PairRequestedByPeer;
+        watch.observe(&[asked()], t0);
+        assert!(watch.observe(&[theirs], t0).1.is_empty());
+    }
+
+    /// What the window lists, and what the page of a listed phone says: a
+    /// refused phone is listed (a plain nearby one is not), and its page
+    /// shows the "Couldn't pair" banner with Try again. (Needs a display.)
+    #[test]
+    fn a_refused_phone_is_listed_and_its_page_says_why() {
+        assert!(!super::super::is_listed(&nearby(), false), "plain nearby");
+        assert!(super::super::is_listed(&nearby(), true), "refused");
+        assert!(super::super::is_listed(&asked(), false));
+        crate::test_display::run(|| {
+            let mut watch = PairWatch::default();
+            let t0 = std::time::Instant::now();
+            watch.observe(&[asked()], t0);
+            let (kept, _) = watch.observe(&[nearby()], t0);
+            let (daemon, _commands) = DaemonHandle::detached();
+            let page = pair_idle_view(&daemon, &kept[0]);
+            let mut texts = Vec::new();
+            let mut stack = vec![page.upcast::<gtk::Widget>()];
+            while let Some(widget) = stack.pop() {
+                if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+                    texts.push(label.label().to_string());
+                }
+                if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                    texts.extend(button.label().map(|text| text.to_string()));
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    child = next.next_sibling();
+                    stack.push(next);
+                }
+            }
+            assert!(
+                texts.iter().any(|t| t == "Couldn't pair with Pixel 9"),
+                "{texts:?}"
+            );
+            assert!(texts.iter().any(|t| t == "Try again"), "{texts:?}");
+        });
     }
 
     #[test]
