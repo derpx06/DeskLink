@@ -493,7 +493,8 @@ fn failed_row(failures: &Rc<Failures>, daemon: &DaemonHandle, failure: &Failure)
     row.append(&words);
     if let (Some(path), false) = (&failure.retry, failure.device_id.is_empty()) {
         let again = ui_kit::button(ButtonKind::Tonal, "Try again", None);
-        again.set_valign(gtk::Align::Center);
+        again.set_halign(gtk::Align::Start);
+        again.set_margin_top(6);
         again.set_tooltip_text(Some("Send this file again"));
         again.update_property(&[gtk::accessible::Property::Label(&format!(
             "Try sending {} again",
@@ -510,10 +511,10 @@ fn failed_row(failures: &Rc<Failures>, daemon: &DaemonHandle, failure: &Failure)
             daemon.send(DaemonCommand::SendFile(device.clone(), path.clone()));
             failures.forget(&id);
         });
-        row.append(&again);
+        words.append(&again);
     }
     let dismiss = ui_kit::icon_button("desklink-close-symbolic", "Dismiss");
-    dismiss.set_valign(gtk::Align::Center);
+    dismiss.set_valign(gtk::Align::Start);
     dismiss.update_property(&[gtk::accessible::Property::Label(&format!(
         "Dismiss the failed {verb} of {}",
         failure.name
@@ -670,7 +671,6 @@ impl Page {
 
         // Title, Send files and the page's one overflow.
         let head = gtk::Box::builder().spacing(8).build();
-        head.set_widget_name("responsive");
         let title = ui_kit::section_header("Sent and received");
         title.set_hexpand(true);
         title.set_valign(gtk::Align::Center);
