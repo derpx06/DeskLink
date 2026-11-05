@@ -139,6 +139,21 @@ button.file-card:focus-visible {
   background-color: @dl_surface_2;
 }
 .bucket-sync-state { color: @dl_text_dim; }
+/* A MenuButton wears the class on its wrapper; its inner button is the flat one. */
+menubutton.dl-icon-btn > button {
+  min-width: 40px;
+  min-height: 40px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: none;
+  box-shadow: none;
+  color: inherit;
+}
+menubutton.dl-icon-btn > button:hover {
+  background-image: linear-gradient(alpha(currentColor, 0.08), alpha(currentColor, 0.08));
+}
+menubutton.dl-icon-btn > button:focus-visible { outline: 2px solid @dl_accent_text; outline-offset: 2px; }
 /* The Select toggle: on is the accent container. */
 .dl-icon-btn:checked { background-color: @dl_accent_container; color: @dl_on_accent_container; }
 .dl-icon-btn.bucket-menu:hover { background-color: alpha(currentColor, 0.08); }

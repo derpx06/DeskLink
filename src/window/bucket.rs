@@ -1527,6 +1527,7 @@ fn tile(
     if item.dir {
         // Everything moving inside it, added up.
         let line = ellipsized(&meta, &["dl-secondary", "numeric"]);
+        line.set_max_width_chars(18);
         words.append(&line);
         let bar = thin_bar(&format!("Progress of {}", leaf(&item.path)));
         bar.set_margin_top(4);
@@ -1542,6 +1543,7 @@ fn tile(
     } else if matches!(item.state, ItemState::Sending | ItemState::Receiving) {
         // "340 MB of 1.2 GiB · 2 min left" and a bar, kept current.
         let line = ellipsized("Waiting…", &["dl-secondary", "numeric"]);
+        line.set_max_width_chars(18);
         words.append(&line);
         let bar = thin_bar(&format!("Progress of {}", leaf(&item.path)));
         bar.set_margin_top(4);
@@ -1554,7 +1556,9 @@ fn tile(
             bar: bar.downgrade(),
         });
     } else {
-        words.append(&ellipsized(&meta, &["dl-secondary"]));
+        let line = ellipsized(&meta, &["dl-secondary"]);
+        line.set_max_width_chars(18);
+        words.append(&line);
     }
     card.append(&words);
     let button = gtk::Button::builder()
