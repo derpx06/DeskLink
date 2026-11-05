@@ -134,8 +134,11 @@ pub(crate) fn dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/device_links/pty/testdata/conformance")
 }
 
-/// Every case: `(name, cols, bytes, resizes)`.
-pub(crate) fn cases() -> Vec<(String, u16, Vec<u8>, Vec<(usize, u16, u16)>)> {
+/// One corpus entry: `(name, cols, bytes, resizes)`.
+pub(crate) type Case = (String, u16, Vec<u8>, Vec<(usize, u16, u16)>);
+
+/// Every case.
+pub(crate) fn cases() -> Vec<Case> {
     let mut found = Vec::new();
     let mut entries: Vec<_> = std::fs::read_dir(dir())
         .expect("conformance directory")

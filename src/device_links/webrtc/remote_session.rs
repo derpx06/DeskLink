@@ -979,7 +979,10 @@ impl RemoteSession {
                 // A grant wins over the denial of an earlier, repeated request that
                 // arrives late: control already held (and not yet expired) stays held.
                 if self.state == SessionState::Controlling
-                    && self.lease.as_ref().is_some_and(|lease| lease.expires_at > now)
+                    && self
+                        .lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.expires_at > now)
                 {
                     return Ok(());
                 }

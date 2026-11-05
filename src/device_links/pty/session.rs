@@ -488,8 +488,8 @@ impl PtySession {
     ///
     /// The snapshot carries only what `vt100` models; images, hyperlinks and
     /// exotic underlines are not in it. `SIGWINCH` to the foreground process
-    /// group makes `vim`/`htop`/`tmux`/Ink/Ratatui redraw from their own state
-    /// - and, unlike the width round trip this replaced, never lets a program
+    /// group makes `vim`/`htop`/`tmux`/Ink/Ratatui redraw from their own state,
+    /// and, unlike the width round trip this replaced, never lets a program
     /// draw a frame one column wider than the client's screen (every line of
     /// which wrapped, and Ink's relative erase then hit the wrong rows).
     pub(crate) fn nudge_redraw(&self) {
