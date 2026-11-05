@@ -11,7 +11,8 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gdk, gio, glib};
 
-use super::{ellipsized, icon_button, icon_square, text, toast_from, DesklinkWindow};
+use super::ui_kit::{self, ButtonKind, Status, Tone};
+use super::{ellipsized, icon_square, text, toast_from, DesklinkWindow};
 use crate::device_links::device::DeviceView;
 use crate::device_links::folders::{self, Item, ItemState, PairView, Phase, Side, BUCKET_ID};
 use crate::device_links::transfer_log::LoggedFile;
@@ -400,11 +401,7 @@ fn update_live(live: &Live) -> bool {
 
 /// A thin bar for screen readers too.
 fn thin_bar(name: &str) -> gtk::ProgressBar {
-    let bar = gtk::ProgressBar::builder()
-        .css_classes(["thin"])
-        .valign(gtk::Align::Center)
-        .hexpand(true)
-        .build();
+    let bar = ui_kit::progress(0.0);
     bar.update_property(&[gtk::accessible::Property::Label(name)]);
     bar
 }
@@ -482,27 +479,38 @@ pub(super) fn asked(device_id: &str) -> bool {
             .any(|offer| offer.device == device_id && offer.bucket)
 }
 
+/// "A folder that is the same on this computer and Pixel 9": the Bucket's
+/// one line (`UI-REDESIGN.md` 5.2).
+fn one_liner(device: &str) -> String {
+    format!("A folder that is the same on this computer and {device}.")
+}
+
 /// Before the Bucket is on: what it is, one button.
 fn off_card(device: &DeviceView, asked: bool) -> gtk::Box {
-    let card = gtk::Box::builder()
+    let card = ui_kit::card(None);
+    card.add_css_class("files-bucket-card");
+    let head = gtk::Box::builder().spacing(12).build();
+    head.append(&ui_kit::icon_square(
+        "desklink-inventory-symbolic",
+        Tone::Accent,
+    ));
+    let words = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .spacing(14)
-        .css_classes(["dl-card", "bucket-hero"])
+        .spacing(2)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
         .build();
-    let art = icon_square("folder-symbolic", 64, "bucket-art");
-    art.set_halign(gtk::Align::Center);
-    card.append(&art);
-    let title = text(
+    let title = super::wrapped(
         if asked {
             "Turn on the Bucket?"
         } else {
-            "Your Bucket"
+            "Bucket"
         },
-        &["bucket-title"],
+        &["files-bucket-title"],
     );
-    title.set_halign(gtk::Align::Center);
-    card.append(&title);
-    let body = text(
+    title.set_accessible_role(gtk::AccessibleRole::Heading);
+    words.append(&title);
+    words.append(&super::wrapped(
         &if asked {
             format!(
                 "{} asked for a Bucket with this computer: put anything in it, here or there, \
@@ -510,50 +518,42 @@ fn off_card(device: &DeviceView, asked: bool) -> gtk::Box {
                 device.name
             )
         } else {
-            format!(
-                "One place for anything you want on both this computer and {}: files, \
-                 pictures, text and links. Put it in on either and it shows up on the other.",
-                device.name
-            )
+            one_liner(&device.name)
         },
-        &["text-dim"],
-    );
-    body.set_wrap(true);
-    body.set_justify(gtk::Justification::Center);
-    body.set_halign(gtk::Align::Center);
-    body.set_max_width_chars(60);
-    card.append(&body);
-    let buttons = gtk::Box::builder()
-        .spacing(10)
-        .halign(gtk::Align::Center)
-        .margin_top(4)
+        &["dl-secondary"],
+    ));
+    head.append(&words);
+    card.append(&head);
+    let buttons = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .homogeneous(false)
+        .max_children_per_line(2)
+        .column_spacing(8)
+        .row_spacing(8)
+        .halign(gtk::Align::End)
         .build();
     if asked {
-        let later = super::soft_button("Not Now");
+        let later = ui_kit::button(ButtonKind::Text, "Not now", None);
         let id = device.id.clone();
         later.connect_clicked(move |_| folders::decline(&id, BUCKET_ID));
-        buttons.append(&later);
+        super::transfers::add_card(&buttons, &later);
     }
-    let on = icon_button(
-        "folder-new-symbolic",
-        "Turn On the Bucket",
-        &["suggested-action", "pill"],
+    let on = ui_kit::button(
+        ButtonKind::Primary,
+        "Turn on the Bucket",
+        Some("desklink-directory-sync-symbolic"),
     );
     let id = device.id.clone();
     on.connect_clicked(move |_| folders::turn_on_bucket(&id));
-    buttons.append(&on);
+    super::transfers::add_card(&buttons, &on);
     card.append(&buttons);
-    let place = text(
+    card.append(&super::wrapped(
         "It is the folder DeskLink Bucket in your Home folder, also in the Files sidebar.",
-        &["caption", "text-faint"],
-    );
-    place.set_wrap(true);
-    place.set_justify(gtk::Justification::Center);
-    place.set_halign(gtk::Align::Center);
-    card.append(&place);
+        &["dl-caption"],
+    ));
     let dropped = folders::dropped_pairs();
     if dropped > 0 {
-        let note = text(
+        card.append(&super::wrapped(
             &format!(
                 "The Bucket replaces folder pairs. {} you set up before stopped syncing; \
                  their files are still where they were.",
@@ -563,12 +563,8 @@ fn off_card(device: &DeviceView, asked: bool) -> gtk::Box {
                     format!("The {dropped} folder pairs")
                 }
             ),
-            &["caption", "text-dim"],
-        );
-        note.set_wrap(true);
-        note.set_justify(gtk::Justification::Center);
-        note.set_halign(gtk::Align::Center);
-        card.append(&note);
+            &["dl-secondary"],
+        ));
     }
     card
 }
@@ -577,7 +573,7 @@ fn off_card(device: &DeviceView, asked: bool) -> gtk::Box {
 fn waiting_card(view: &PairView, device: &DeviceView) -> gtk::Box {
     let bar = gtk::Box::builder()
         .spacing(14)
-        .css_classes(["state-banner", "tall"])
+        .css_classes(["state-banner", "files-banner", "tall"])
         .build();
     let spinner = gtk::Spinner::builder()
         .spinning(true)
@@ -591,17 +587,18 @@ fn waiting_card(view: &PairView, device: &DeviceView) -> gtk::Box {
         .build();
     words.append(&ellipsized(
         &format!("Waiting for {}", device.name),
-        &["heading"],
+        &["files-banner-title"],
     ));
     let detail = text(
         "Open DeskLink on the phone and choose where its Bucket goes. You can add things here \
          already.",
-        &["text-dim"],
+        &["dl-secondary"],
     );
     detail.set_wrap(true);
     words.append(&detail);
     bar.append(&words);
-    let cancel = super::soft_button("Cancel");
+    let cancel = ui_kit::button(ButtonKind::Text, "Cancel", None);
+    cancel.set_valign(gtk::Align::Center);
     let (id, pair) = (view.pair.device.clone(), view.pair.id.clone());
     cancel.connect_clicked(move |_| folders::remove(&id, &pair));
     bar.append(&cancel);
@@ -653,7 +650,7 @@ fn fill(win: &DesklinkWindow, page: &gtk::Box, view: &PairView, device: &DeviceV
     } else if level.is_empty() {
         let hint = text(
             "This folder is empty. Drop files here to add them.",
-            &["bucket-title"],
+            &["files-bucket-title"],
         );
         hint.set_margin_top(40);
         hint.set_margin_bottom(40);
@@ -664,14 +661,14 @@ fn fill(win: &DesklinkWindow, page: &gtk::Box, view: &PairView, device: &DeviceV
     } else {
         page.append(&grid(win, &level, view, device));
         if let Some(note) = more_note(level.len()) {
-            let note = text(&note, &["caption", "text-dim"]);
+            let note = text(&note, &["dl-secondary"]);
             note.set_wrap(true);
             note.set_halign(gtk::Align::Center);
             page.append(&note);
         }
         let hint = text(
             "Drop files or folders anywhere here, or press Ctrl+V to paste.",
-            &["caption", "text-faint"],
+            &["dl-caption"],
         );
         hint.set_halign(gtk::Align::Center);
         hint.set_wrap(true);
@@ -761,12 +758,12 @@ fn selection_bar(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> 
     let bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
-        .css_classes(["state-banner", "selection-bar"])
+        .css_classes(["state-banner", "files-banner", "selection-bar"])
         .visible(false)
         .build();
     bar.update_property(&[gtk::accessible::Property::Label("Selection actions")]);
     let top = gtk::Box::builder().spacing(8).build();
-    let count = text("Select items", &["heading"]);
+    let count = text("Select items", &["files-banner-title"]);
     count.set_hexpand(true);
     count.set_xalign(0.0);
     top.append(&count);
@@ -788,13 +785,13 @@ fn selection_bar(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> 
     // With more items than are drawn it says so, and reaches only those drawn.
     let hidden = BROWSE.with(|browse| browse.borrow().hidden);
     let all = menu_item(&if hidden > 0 {
-        format!("Select All {MAX_TILES} Shown")
+        format!("Select all {MAX_TILES} shown")
     } else {
-        "Select All".to_string()
+        "Select all".to_string()
     });
     all.connect_clicked(|_| select_all());
     add(&all);
-    let move_to = menu_item("Move to Folder…");
+    let move_to = menu_item("Move to folder…");
     {
         let (id, view) = (device.id.clone(), view.clone());
         move_to.connect_clicked(move |button| {
@@ -825,8 +822,8 @@ fn selection_bar(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> 
         });
     }
     add(&copy);
-    let remove = menu_item("Remove from Both…");
-    remove.add_css_class("error");
+    let remove = menu_item("Remove from both…");
+    mark_danger(&remove);
     {
         let (id, phone) = (device.id.clone(), device.name.clone());
         remove.connect_clicked(move |button| {
@@ -928,16 +925,16 @@ fn not_synced(folders: &[String]) -> gtk::Box {
         .build();
     line.append(
         &gtk::Image::builder()
-            .icon_name("folder-symbolic")
-            .pixel_size(14)
-            .css_classes(["text-faint"])
+            .icon_name("desklink-folder-symbolic")
+            .pixel_size(16)
+            .css_classes(["bucket-folder-icon"])
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
     let names = folders.join(", ");
     let label = text(
         &format!("Not synced ({}): {names}", folders.len()),
-        &["caption", "text-faint"],
+        &["dl-caption"],
     );
     label.set_wrap(true);
     line.append(&label);
@@ -957,13 +954,11 @@ fn header(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> gtk::Bo
     words.append(&breadcrumb(win));
     let state = gtk::Box::builder().spacing(8).build();
     let connected = device.feature_transport_ready;
-    state.append(
-        &gtk::Box::builder()
-            .valign(gtk::Align::Center)
-            .css_classes(["dot", if connected { "mint" } else { "faint" }])
-            .accessible_role(gtk::AccessibleRole::Presentation)
-            .build(),
-    );
+    state.append(&ui_kit::status_dot(if connected {
+        Status::Ok
+    } else {
+        Status::Idle
+    }));
     let mut parts = Vec::new();
     let mut ages = false;
     if connected {
@@ -1000,7 +995,7 @@ fn header(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> gtk::Bo
         })
     };
     let idle = idle_now();
-    let line = text(&idle, &["caption", "text-dim", "numeric"]);
+    let line = text(&idle, &["dl-secondary", "numeric"]);
     line.set_wrap(true);
     state.append(&line);
     words.append(&state);
@@ -1009,7 +1004,7 @@ fn header(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> gtk::Bo
     let bar = thin_bar("Bucket sync progress");
     bar.set_visible(false);
     progress.append(&bar);
-    let speed = text("", &["caption", "text-dim", "numeric"]);
+    let speed = text("", &["dl-secondary", "numeric"]);
     speed.set_visible(false);
     progress.append(&speed);
     words.append(&progress);
@@ -1031,13 +1026,8 @@ fn header(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> gtk::Bo
     actions.append(&add_button(&device.id));
     // F8c: a new folder (not inside a level-2 folder) and selection.
     if current_depth() < folders::MAX_BUCKET_DEPTH {
-        let new = gtk::Button::builder()
-            .icon_name("folder-new-symbolic")
-            .tooltip_text("New Folder")
-            .valign(gtk::Align::Center)
-            .css_classes(["circular"])
-            .build();
-        new.update_property(&[gtk::accessible::Property::Label("New Folder")]);
+        let new = ui_kit::icon_button("folder-new-symbolic", "New folder");
+        new.set_valign(gtk::Align::Center);
         let id = device.id.clone();
         new.connect_clicked(move |_| {
             folders::new_folder(&id, &current());
@@ -1045,10 +1035,10 @@ fn header(win: &DesklinkWindow, view: &PairView, device: &DeviceView) -> gtk::Bo
         actions.append(&new);
     }
     let select = gtk::ToggleButton::builder()
-        .icon_name("selection-mode-symbolic")
+        .icon_name("desklink-check-circle-symbolic")
         .tooltip_text("Select")
         .valign(gtk::Align::Center)
-        .css_classes(["circular"])
+        .css_classes(["dl-icon-btn"])
         .active(selecting())
         .build();
     select.update_property(&[gtk::accessible::Property::Label("Select items")]);
@@ -1068,7 +1058,9 @@ fn breadcrumb(win: &DesklinkWindow) -> gtk::Box {
         "Where you are in the Bucket",
     )]);
     if here.is_empty() {
-        crumbs.append(&text("Bucket", &["bucket-heading"]));
+        let root = text("Bucket", &["bucket-heading"]);
+        root.set_accessible_role(gtk::AccessibleRole::Heading);
+        crumbs.append(&root);
         return crumbs;
     }
     let mut parts = vec![(String::new(), "Bucket".to_string())];
@@ -1083,17 +1075,17 @@ fn breadcrumb(win: &DesklinkWindow) -> gtk::Box {
     let last = parts.len() - 1;
     for (index, (target, name)) in parts.into_iter().enumerate() {
         if index > 0 {
-            crumbs.append(&text("›", &["bucket-heading", "text-faint"]));
+            crumbs.append(&text("›", &["dl-section"]));
         }
         if index == last {
-            let label = text(&name, &["bucket-heading"]);
+            let label = text(&name, &["dl-mono", "bucket-last-crumb"]);
             label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
             label.set_max_width_chars(20);
             crumbs.append(&label);
         } else {
             let button = gtk::Button::builder()
                 .label(&name)
-                .css_classes(["flat", "bucket-crumb"])
+                .css_classes(["flat", "bucket-crumb", "dl-mono"])
                 .build();
             button.update_property(&[gtk::accessible::Property::Label(&format!("Back to {name}"))]);
             let win = win.downgrade();
@@ -1108,9 +1100,10 @@ fn breadcrumb(win: &DesklinkWindow) -> gtk::Box {
     crumbs
 }
 
-/// "Add Files…".
+/// "Add files…".
 fn add_button(device: &str) -> gtk::Button {
-    let button = icon_button("list-add-symbolic", "Add Files…", &["suggested-action"]);
+    let button = ui_kit::button(ButtonKind::Tonal, "Add files…", Some("desklink-add-symbolic"));
+    button.set_valign(gtk::Align::Center);
     let device = device.to_string();
     button.connect_clicked(move |button| choose(button, &device));
     button
@@ -1138,7 +1131,7 @@ fn more_menu(view: &PairView, device: &DeviceView) -> gtk::MenuButton {
         });
     }
     menu.append(&open_files);
-    let add_folder = menu_item("Add Folder…");
+    let add_folder = menu_item("Add folder…");
     {
         let (id, pop) = (device.id.clone(), popover.downgrade());
         add_folder.connect_clicked(move |button| {
@@ -1149,8 +1142,8 @@ fn more_menu(view: &PairView, device: &DeviceView) -> gtk::MenuButton {
         });
     }
     menu.append(&add_folder);
-    let off = menu_item("Turn Off the Bucket…");
-    off.add_css_class("error");
+    let off = menu_item("Turn off the Bucket…");
+    mark_danger(&off);
     let (id, name, root) = (
         device.id.clone(),
         device.name.clone(),
@@ -1170,16 +1163,16 @@ fn more_menu(view: &PairView, device: &DeviceView) -> gtk::MenuButton {
                  and on the phone.",
                 shown_path(&root)
             ),
-            "Turn Off",
+            "Turn off",
             move || folders::remove(&id, BUCKET_ID),
         );
     });
     menu.append(&off);
     let button = gtk::MenuButton::builder()
-        .icon_name("view-more-symbolic")
+        .icon_name("desklink-more-vert-symbolic")
         .popover(&popover)
         .valign(gtk::Align::Center)
-        .css_classes(["circular", "flat"])
+        .css_classes(["dl-icon-btn"])
         .tooltip_text("More")
         .build();
     button.update_property(&[gtk::accessible::Property::Label("More Bucket options")]);
@@ -1187,14 +1180,17 @@ fn more_menu(view: &PairView, device: &DeviceView) -> gtk::MenuButton {
 }
 
 fn menu_item(label: &str) -> gtk::Button {
-    let button = gtk::Button::builder()
-        .label(label)
-        .css_classes(["flat"])
-        .build();
+    let button = ui_kit::button(ButtonKind::Text, label, None);
     if let Some(label) = button.child().and_downcast::<gtk::Label>() {
         label.set_xalign(0.0);
     }
     button
+}
+
+/// A menu item that removes or turns something off: the error colours.
+fn mark_danger(button: &gtk::Button) {
+    button.remove_css_class("dl-btn-text");
+    button.add_css_class("dl-btn-danger");
 }
 
 /// What needs the user: a size warning, a held empty folder, a problem.
@@ -1222,52 +1218,53 @@ fn size_notice(bytes: u64) -> Option<(String, String)> {
 fn problem_banner(view: &PairView) -> Option<gtk::Box> {
     let (icon, headline, detail, confirm) = match &view.phase {
         Phase::EmptyHeld => (
-            "dialog-warning-symbolic",
+            "desklink-warning-symbolic",
             "The Bucket folder is empty here".to_string(),
             "Is its drive connected? Nothing is deleted on the phone until you say so.".to_string(),
             true,
         ),
         Phase::Problem(problem) => (
-            "dialog-warning-symbolic",
+            "desklink-warning-symbolic",
             "Something needs a look".to_string(),
             problem.clone(),
             false,
         ),
         Phase::TooMany => (
-            "dialog-warning-symbolic",
+            "desklink-warning-symbolic",
             "The Bucket is full".to_string(),
             "Only the first 10,000 items sync.".to_string(),
             false,
         ),
         Phase::NotOnPhone => (
-            "dialog-warning-symbolic",
+            "desklink-warning-symbolic",
             "Not set up on the phone".to_string(),
             "Turn on the Bucket in DeskLink on the phone.".to_string(),
             false,
         ),
         _ if size_notice(view.bytes).is_some() => {
             let (headline, detail) = size_notice(view.bytes).unwrap_or_default();
-            ("drive-harddisk-symbolic", headline, detail, false)
+            ("desklink-inventory-symbolic", headline, detail, false)
         }
         _ => return None,
     };
     let bar = gtk::Box::builder()
         .spacing(14)
-        .css_classes(["state-banner", "tall"])
+        .css_classes(["state-banner", "files-banner", "warn", "tall"])
         .build();
-    bar.append(&icon_square(icon, 28, "state-icon"));
+    bar.append(&ui_kit::icon_square(icon, Tone::Warn));
     let words = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .hexpand(true)
         .valign(gtk::Align::Center)
         .build();
-    words.append(&ellipsized(&headline, &["heading"]));
-    let detail_label = text(&detail, &["text-dim"]);
+    words.append(&ellipsized(&headline, &["files-banner-title"]));
+    let detail_label = text(&detail, &["dl-secondary"]);
     detail_label.set_wrap(true);
     words.append(&detail_label);
     bar.append(&words);
     if matches!(&view.phase, Phase::Problem(problem) if problem == folders::FOLDER_MISSING) {
-        let create = super::soft_button("Create Folder");
+        let create = ui_kit::button(ButtonKind::Outline, "Create folder", None);
+        create.set_valign(gtk::Align::Center);
         let root = view.pair.root.clone();
         create.connect_clicked(move |button| {
             if let Err(error) = folders::recreate_root(&root) {
@@ -1275,7 +1272,8 @@ fn problem_banner(view: &PairView) -> Option<gtk::Box> {
             }
         });
         bar.append(&create);
-        let off = super::soft_button("Turn Off");
+        let off = ui_kit::button(ButtonKind::Text, "Turn off", None);
+        off.set_valign(gtk::Align::Center);
         let id = view.pair.device.clone();
         off.connect_clicked(move |button| {
             let id = id.clone();
@@ -1290,7 +1288,8 @@ fn problem_banner(view: &PairView) -> Option<gtk::Box> {
         bar.append(&off);
     }
     if confirm {
-        let button = super::soft_button("It's Empty on Purpose");
+        let button = ui_kit::button(ButtonKind::Outline, "It's empty on purpose", None);
+        button.set_valign(gtk::Align::Center);
         let id = view.pair.device.clone();
         button.connect_clicked(move |button| {
             let id = id.clone();
@@ -1310,46 +1309,34 @@ fn problem_banner(view: &PairView) -> Option<gtk::Box> {
     Some(bar)
 }
 
-/// Nothing here yet: a big drop zone.
+/// Nothing here yet: the empty state, as the drop zone.
 fn empty_zone(device: &DeviceView) -> gtk::Box {
     let zone = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(10)
-        .height_request(300)
+        .height_request(240)
         .css_classes(["drop-zone", "bucket-drop"])
         .build();
-    let inner = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(10)
-        .vexpand(true)
-        .valign(gtk::Align::Center)
-        .halign(gtk::Align::Center)
-        .margin_start(16)
-        .margin_end(16)
-        .build();
-    let art = icon_square("folder-download-symbolic", 64, "bucket-art");
-    art.set_halign(gtk::Align::Center);
-    inner.append(&art);
-    let title = text(
-        &format!("Drop anything here. It shows up on {} too.", device.name),
-        &["bucket-title"],
+    let (inner, _, _) = super::transfers::empty_state(
+        "desklink-inventory-symbolic",
+        "Nothing here yet",
+        &format!(
+            "Drop files here from either device. They show up on {} too.",
+            device.name
+        ),
     );
-    title.set_wrap(true);
-    title.set_justify(gtk::Justification::Center);
-    title.set_halign(gtk::Align::Center);
-    inner.append(&title);
-    {
-        let ways = text(
-            "Or paste with Ctrl+V, choose Add Files, use Files › Scripts › Add to DeskLink \
-             Bucket, or save files straight into the DeskLink Bucket folder.",
-            &["caption", "text-dim"],
-        );
-        ways.set_wrap(true);
-        ways.set_justify(gtk::Justification::Center);
-        ways.set_max_width_chars(56);
-        ways.set_halign(gtk::Align::Center);
-        inner.append(&ways);
-    }
+    inner.set_vexpand(true);
+    inner.set_valign(gtk::Align::Center);
+    let ways = text(
+        "Or paste with Ctrl+V, choose Add files, use Files › Scripts › Add to DeskLink \
+         Bucket, or save files straight into the DeskLink Bucket folder.",
+        &["dl-caption"],
+    );
+    ways.set_wrap(true);
+    ways.set_justify(gtk::Justification::Center);
+    ways.set_max_width_chars(56);
+    ways.set_halign(gtk::Align::Center);
+    inner.append(&ways);
     zone.append(&inner);
     zone
 }
@@ -1470,11 +1457,11 @@ fn tile(
     if item.dir {
         preview.add_overlay(
             &gtk::Image::builder()
-                .icon_name("folder-symbolic")
+                .icon_name("desklink-folder-symbolic")
                 .pixel_size(56)
                 .halign(gtk::Align::Center)
                 .valign(gtk::Align::Center)
-                .css_classes(["text-dim", "bucket-folder-icon"])
+                .css_classes(["bucket-folder-icon"])
                 .accessible_role(gtk::AccessibleRole::Presentation)
                 .build(),
         );
@@ -1504,7 +1491,7 @@ fn tile(
         .visible(false)
         .accessible_role(gtk::AccessibleRole::Presentation)
         .build();
-    check.append(&gtk::Image::from_icon_name("object-select-symbolic"));
+    check.append(&gtk::Image::from_icon_name("desklink-check-symbolic"));
     preview.add_overlay(&check);
     card.append(&preview);
     let words = gtk::Box::builder()
@@ -1535,7 +1522,7 @@ fn tile(
     };
     if item.dir {
         // Everything moving inside it, added up.
-        let line = ellipsized(&meta, &["caption", "text-dim", "numeric"]);
+        let line = ellipsized(&meta, &["dl-secondary", "numeric"]);
         words.append(&line);
         let bar = thin_bar(&format!("Progress of {}", leaf(&item.path)));
         bar.set_margin_top(4);
@@ -1550,7 +1537,7 @@ fn tile(
         });
     } else if matches!(item.state, ItemState::Sending | ItemState::Receiving) {
         // "340 MB of 1.2 GiB · 2 min left" and a bar, kept current.
-        let line = ellipsized("Waiting…", &["caption", "text-dim", "numeric"]);
+        let line = ellipsized("Waiting…", &["dl-secondary", "numeric"]);
         words.append(&line);
         let bar = thin_bar(&format!("Progress of {}", leaf(&item.path)));
         bar.set_margin_top(4);
@@ -1563,7 +1550,7 @@ fn tile(
             bar: bar.downgrade(),
         });
     } else {
-        words.append(&ellipsized(&meta, &["caption", "text-dim"]));
+        words.append(&ellipsized(&meta, &["dl-secondary"]));
     }
     card.append(&words);
     let button = gtk::Button::builder()
@@ -1667,23 +1654,23 @@ fn badge(item: &Item, device: &DeviceView) -> Option<gtk::Widget> {
     match item.state {
         ItemState::Synced => {
             holder.add_css_class("synced");
-            holder.append(&gtk::Image::from_icon_name("object-select-symbolic"));
+            holder.append(&gtk::Image::from_icon_name("desklink-check-symbolic"));
         }
         ItemState::Sending => {
             holder.add_css_class("moving");
-            holder.append(&gtk::Image::from_icon_name("go-up-symbolic"));
+            holder.append(&gtk::Image::from_icon_name("desklink-arrow-upward-symbolic"));
         }
         ItemState::Receiving => {
             holder.add_css_class("moving");
-            holder.append(&gtk::Image::from_icon_name("go-down-symbolic"));
+            holder.append(&gtk::Image::from_icon_name("desklink-arrow-downward-symbolic"));
         }
         ItemState::Waiting => {
             holder.add_css_class("waiting");
-            holder.append(&gtk::Image::from_icon_name("alarm-symbolic"));
+            holder.append(&gtk::Image::from_icon_name("desklink-schedule-symbolic"));
         }
         ItemState::Conflict => {
             holder.add_css_class("conflict");
-            holder.append(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
+            holder.append(&gtk::Image::from_icon_name("desklink-warning-symbolic"));
         }
     }
     Some(holder.upcast())
@@ -1721,7 +1708,7 @@ fn item_menu(item: &Item, path: &Path, device: &DeviceView, view: &PairView) -> 
     {
         let path = path.clone();
         add(
-            "Show in Folder",
+            "Show in folder",
             Box::new(move |button| {
                 gtk::FileLauncher::new(Some(&gio::File::for_path(&path))).open_containing_folder(
                     button.root().and_downcast_ref::<gtk::Window>(),
@@ -1757,8 +1744,8 @@ fn item_menu(item: &Item, path: &Path, device: &DeviceView, view: &PairView) -> 
             .cloned();
         if let Some(conflict) = conflict {
             for (label, how) in [
-                ("Keep Both".to_string(), folders::Resolve::Both),
-                ("Keep This Computer's".to_string(), folders::Resolve::Desk),
+                ("Keep both".to_string(), folders::Resolve::Both),
+                ("Keep this computer's".to_string(), folders::Resolve::Desk),
                 (format!("Keep {}'s", device.name), folders::Resolve::Phone),
             ]
             .into_iter()
@@ -1788,7 +1775,7 @@ fn item_menu(item: &Item, path: &Path, device: &DeviceView, view: &PairView) -> 
     );
     let folder = item.dir;
     let remove = add(
-        "Remove from Both…",
+        "Remove from both…",
         Box::new(move |button| {
             let (rel, id) = (rel.clone(), id.clone());
             super::confirm(
@@ -1808,15 +1795,15 @@ fn item_menu(item: &Item, path: &Path, device: &DeviceView, view: &PairView) -> 
             );
         }),
     );
-    remove.add_css_class("error");
+    mark_danger(&remove);
     let button = gtk::MenuButton::builder()
-        .icon_name("view-more-symbolic")
+        .icon_name("desklink-more-vert-symbolic")
         .popover(&popover)
         .halign(gtk::Align::End)
         .valign(gtk::Align::End)
-        .margin_end(6)
-        .margin_bottom(8)
-        .css_classes(["circular", "flat", "bucket-menu"])
+        .margin_end(4)
+        .margin_bottom(4)
+        .css_classes(["dl-icon-btn", "bucket-menu"])
         .tooltip_text("More")
         .build();
     button.update_property(&[gtk::accessible::Property::Label(&format!(
@@ -2222,6 +2209,14 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_buckets_one_line_names_the_phone() {
+        assert_eq!(
+            super::one_liner("Pixel 9"),
+            "A folder that is the same on this computer and Pixel 9."
+        );
+    }
+
     /// Select All, Shift-click and Remove from Both only reach tiles that
     /// are drawn: items past the cap are never selected.
     /// Selecting: a click never opens a card or enters a folder (checked with

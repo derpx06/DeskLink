@@ -1,0 +1,221 @@
+/* The Files area in the DeskLink kit's look (docs/UI-REDESIGN.md 3.12): the
+ * Bucket, the transfer rows, the file cards, the gallery strip, the viewers
+ * and the connection history. Loaded after ui-kit.css, so it restyles the
+ * older classes these pages still use (`.file-card`, `.bucket-*`, ...)
+ * without touching style.css, which other pages share. Colours are `@dl_*`
+ * tokens; the viewer's stage is the one exception (dark in both themes, as
+ * the terminal is), and is named once below. Sizes are `em` of the window
+ * font or the kit's scales (shape 8/12/16/999, spacing 4/8/12/16/24).
+ */
+
+@define-color dl_stage #111214;
+@define-color dl_on_stage #f2f2f3;
+@define-color dl_on_stage_dim #b4b4bd;
+@define-color dl_stage_raised #1d1e22;
+@define-color dl_stage_ring #a9b8ff;
+
+/* ── Transfer rows (moving now, failed) ────────────────────────────────── */
+.files-row {
+  padding: 12px 16px;
+  border-radius: 16px;
+  background-color: @dl_surface;
+  box-shadow: inset 0 0 0 1px @dl_edge;
+}
+.files-row .files-name { font-weight: 600; }
+.files-row.failed { background-color: @dl_error_container; box-shadow: none; }
+.files-row.failed .files-name,
+.files-row.failed .dl-secondary { color: @dl_on_error_container; }
+
+/* ── Empty state: a 28 glyph in a 72 circle, title, words ──────────────── */
+.files-empty { padding: 0 16px; }
+.files-empty-art {
+  min-width: 72px;
+  min-height: 72px;
+  border-radius: 999px;
+  background-color: @dl_surface_2;
+  color: @dl_text_dim;
+}
+.files-empty-title { font-size: 1.13em; font-weight: 600; }
+
+/* ── File cards: preview on top, then name, size and time, direction ───── */
+.file-card {
+  padding: 0;
+  border-radius: 16px;
+  background-color: @dl_surface;
+  background-image: none;
+  box-shadow: inset 0 0 0 1px @dl_edge;
+}
+button.file-card:hover {
+  background-color: @dl_surface;
+  background-image: linear-gradient(alpha(currentColor, 0.06), alpha(currentColor, 0.06));
+}
+button.file-card:hover .file-preview { background-color: @dl_surface_2; }
+button.file-card:focus-visible {
+  outline: 2px solid @dl_accent_text;
+  outline-offset: 2px;
+}
+.file-preview-clip { border-radius: 16px 16px 0 0; }
+.file-preview { background-color: @dl_surface_2; }
+.file-card-words { padding: 12px 16px 16px 16px; }
+.file-name { font-size: 0.93em; font-weight: 600; }
+.type-label { font-size: 0.8em; font-weight: 600; letter-spacing: 0.06em; color: @dl_text_dim; }
+.files-glyph { color: @dl_text_dim; }
+.files-direction { color: @dl_hint; }
+.file-card.missing .file-name { color: @dl_text_dim; }
+.dl-skeleton { background-color: @dl_surface_2; background-image: none; }
+.duration-chip { font-size: 0.8em; }
+.file-card.selected {
+  outline: 2px solid @dl_accent_text;
+  outline-offset: -2px;
+  background-color: @dl_accent_container;
+  color: @dl_on_accent_container;
+}
+
+/* ── Banners on this page (problems, waiting, selection actions) ───────── */
+.state-banner.files-banner {
+  padding: 12px 16px;
+  border-radius: 16px;
+  background-color: @dl_surface_2;
+  color: @dl_text;
+}
+.state-banner.files-banner.warn { background-color: @dl_warn_container; color: @dl_on_warn_container; }
+.state-banner.files-banner.error { background-color: @dl_error_container; color: @dl_on_error_container; }
+.state-banner.files-banner.selection-bar {
+  background-color: @dl_accent_container;
+  color: @dl_on_accent_container;
+}
+.files-banner .dl-secondary { color: inherit; }
+.files-banner-title { font-weight: 600; }
+
+/* ── The Bucket: card (off, asked), header, tiles, drop zone ───────────── */
+.files-bucket-card { padding: 16px; }
+.files-bucket-title { font-size: 1.07em; font-weight: 600; }
+.bucket-heading { font-size: 1.47em; font-weight: 600; letter-spacing: normal; }
+.bucket-crumb {
+  min-height: 40px;
+  padding: 0 8px;
+  border-radius: 8px;
+  font-size: 0.93em;
+  font-weight: 600;
+  color: @dl_accent_text;
+}
+.bucket-crumb:focus-visible { outline: 2px solid @dl_accent_text; outline-offset: 2px; }
+.bucket-last-crumb { font-size: 1.07em; font-weight: 700; }
+.bucket-drop {
+  border-radius: 16px;
+  border: none;
+  background-color: @dl_surface;
+  box-shadow: inset 0 0 0 1px @dl_edge;
+}
+.bucket-drop-hover .bucket-drop,
+.bucket-drop.bucket-drop-hover,
+.bucket-drop-hover.file-card {
+  background-color: alpha(@dl_accent_container, 0.5);
+}
+.bucket-drop-hover { box-shadow: inset 0 0 0 2px @dl_accent_text; border-radius: 16px; }
+.bucket-badge {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0;
+  border-radius: 999px;
+  background-color: @dl_surface;
+  box-shadow: inset 0 0 0 1px @dl_edge;
+  -gtk-icon-size: 16px;
+}
+.bucket-badge > image, .bucket-badge > spinner { margin: 6px; }
+.bucket-badge.synced { color: @dl_success_text; }
+.bucket-badge.moving { color: @dl_accent_text; }
+.bucket-badge.waiting { color: @dl_text_dim; }
+.bucket-badge.conflict { background-color: @dl_warn_container; color: @dl_on_warn_container; }
+.bucket-check { color: @dl_text_dim; }
+.bucket-check.on { background-color: @dl_accent; color: @dl_on_accent; }
+.bucket-words { padding-right: 44px; }
+.bucket-words:dir(rtl) { padding-right: 16px; padding-left: 44px; }
+.bucket-menu { min-width: 40px; min-height: 40px; border-radius: 999px; color: @dl_text_dim; }
+.bucket-folder-icon { color: @dl_text_dim; }
+.bucket-recent {
+  padding: 12px 16px;
+  border-radius: 12px;
+  background-color: @dl_surface_2;
+}
+.bucket-sync-state { color: @dl_text_dim; }
+/* The Select toggle: on is the accent container. */
+.dl-icon-btn:checked { background-color: @dl_accent_container; color: @dl_on_accent_container; }
+.dl-icon-btn.bucket-menu:hover { background-color: alpha(currentColor, 0.08); }
+
+/* ── Gallery strip ("From your phone") ─────────────────────────────────── */
+.files-gallery-tile .file-preview { border-radius: 8px; }
+
+/* ── Viewers: a dark stage, light chrome ───────────────────────────────── */
+.viewer-shell { background-color: @dl_stage; color: @dl_on_stage; }
+.viewer-area { background-color: @dl_stage; color: @dl_on_stage; }
+.viewer-area .title-4 { color: @dl_on_stage; }
+.viewer-area .text-dim,
+.viewer-area .dl-secondary { color: @dl_on_stage_dim; }
+.viewer-shell headerbar {
+  background-color: @dl_stage;
+  color: @dl_on_stage;
+  box-shadow: inset 0 -1px 0 alpha(@dl_on_stage, 0.12);
+}
+.viewer-shell headerbar windowtitle .title { font-weight: 600; }
+.viewer-shell headerbar windowtitle .subtitle { color: @dl_on_stage_dim; }
+.viewer-shell headerbar button {
+  min-width: 40px;
+  min-height: 40px;
+  padding: 0;
+  border-radius: 999px;
+  background: none;
+  box-shadow: none;
+  color: @dl_on_stage;
+}
+.viewer-shell headerbar button:hover { background-color: alpha(@dl_on_stage, 0.12); }
+.viewer-shell headerbar button:focus-visible,
+.viewer-bar button:focus-visible,
+.viewer-step:focus-visible {
+  outline: 2px solid @dl_stage_ring;
+  outline-offset: 2px;
+}
+.viewer-step {
+  min-width: 40px;
+  min-height: 40px;
+  border-radius: 999px;
+  background-color: alpha(@dl_stage_raised, 0.85);
+  color: @dl_on_stage;
+  box-shadow: inset 0 0 0 1px alpha(@dl_on_stage, 0.16);
+}
+.viewer-step:hover { background-color: @dl_stage_raised; }
+/* The PDF's floating bar: page, zoom, open. */
+.viewer-bar {
+  margin: 16px;
+  padding: 4px 8px;
+  border-radius: 16px;
+  background-color: alpha(@dl_stage_raised, 0.92);
+  color: @dl_on_stage;
+  box-shadow: inset 0 0 0 1px alpha(@dl_on_stage, 0.16);
+}
+.viewer-bar button {
+  min-width: 40px;
+  min-height: 40px;
+  padding: 0 8px;
+  border-radius: 12px;
+  background: none;
+  box-shadow: none;
+  color: @dl_on_stage;
+}
+.viewer-bar button:hover { background-color: alpha(@dl_on_stage, 0.12); }
+.viewer-bar separator { background-color: alpha(@dl_on_stage, 0.16); min-width: 1px; margin: 8px 4px; }
+.viewer-other-title { font-size: 1.33em; font-weight: 600; color: @dl_on_stage; }
+.viewer-other-glyph {
+  min-width: 96px;
+  min-height: 96px;
+  border-radius: 999px;
+  background-color: @dl_stage_raised;
+  color: @dl_on_stage_dim;
+}
+.viewer-shell .dl-btn-outline { color: @dl_stage_ring; box-shadow: inset 0 0 0 1.5px alpha(@dl_on_stage, 0.4); }
+.viewer-shell .dl-btn-primary { background-color: @dl_stage_ring; color: @dl_stage; }
+.viewer-area .files-empty-art { background-color: @dl_stage_raised; color: @dl_on_stage_dim; }
+.viewer-area .files-empty-title { color: @dl_on_stage; }
+
+/* ── Connection history (dialog, and the same list inside Settings) ────── */
+.history-row-time { color: @dl_hint; font-size: 0.8em; }

@@ -4,6 +4,8 @@
 use adw::prelude::*;
 use gtk::glib;
 
+use super::ui_kit::{self, ButtonKind, Tone};
+
 /// Connection History as a dialog: Settings -> Advanced, and the
 /// `app.history` action. `only` names one device; everything in the log (30
 /// days) is listed.
@@ -16,7 +18,7 @@ pub(crate) fn show_dialog(
     let shown = std::rc::Rc::new(std::cell::Cell::new(PAGE));
     fill(&clamp, types, only, &shown);
     let dialog = adw::Dialog::builder()
-        .title("Connection History")
+        .title("Connection history")
         .content_width(520)
         .content_height(620)
         .child(&crate::application::with_header(
@@ -78,13 +80,14 @@ pub(crate) fn history_content(
         .filter(|entry| only.is_none_or(|id| entry.device_id == id))
         .collect();
     if entries.is_empty() {
-        return adw::StatusPage::builder()
-            .icon_name("document-open-recent-symbolic")
-            .title("No Activity Yet")
-            .description("Connections from your phones are listed here for 30 days.")
-            .vexpand(true)
-            .build()
-            .upcast();
+        let (empty, _, _) = super::transfers::empty_state(
+            "desklink-history-symbolic",
+            "No activity yet",
+            "Connections from your phones are listed here for 30 days.",
+        );
+        empty.set_vexpand(true);
+        empty.set_valign(gtk::Align::Center);
+        return empty.upcast();
     }
     let now = glib::DateTime::now_local().ok();
     let page = gtk::Box::builder()
@@ -95,7 +98,19 @@ pub(crate) fn history_content(
         .margin_start(12)
         .margin_end(12)
         .build();
-    let mut group: Option<(String, adw::PreferencesGroup)> = None;
+    // The day being listed, and its rows so far; a day closes into a card.
+    let mut group: Option<(String, Vec<adw::ActionRow>)> = None;
+    let close = |page: &gtk::Box, group: Option<(String, Vec<adw::ActionRow>)>| {
+        if let Some((day, rows)) = group {
+            let section = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(8)
+                .build();
+            section.append(&ui_kit::section_header(&day));
+            section.append(&ui_kit::row_group(&rows));
+            page.append(&section);
+        }
+    };
     let older = entries.len().saturating_sub(limit);
     for entry in entries.into_iter().take(limit) {
         let Some(when) = glib::DateTime::from_unix_local(entry.ts as i64).ok() else {
@@ -106,9 +121,8 @@ pub(crate) fn history_content(
             .map(|now| day_label(now, &when))
             .unwrap_or_default();
         if group.as_ref().is_none_or(|(shown, _)| *shown != day) {
-            let next = adw::PreferencesGroup::builder().title(&day).build();
-            page.append(&next);
-            group = Some((day, next));
+            close(&page, group.take());
+            group = Some((day, Vec::new()));
         }
         let device = if entry.device_name.is_empty() {
             entry.device_id.clone()
@@ -127,24 +141,20 @@ pub(crate) fn history_content(
         if let Some(detail) = &entry.detail {
             subtitle = format!("{subtitle} · {detail}");
         }
-        let row = adw::ActionRow::builder()
-            .title(entry.event.label())
-            .use_markup(false)
-            .build();
-        // After `use_markup(false)`: a path or a name with `&` is not markup.
-        row.set_subtitle(&subtitle);
         // Colour is for failures only.
         let failed = matches!(
             entry.event,
             crate::device_links::connection_log::ConnectionEvent::PasswordRejected
                 | crate::device_links::connection_log::ConnectionEvent::UnlockRefused
         );
-
-        let icon = super::icon_square(event_icon(entry.event), 32, "row-icon");
-        if failed {
-            icon.add_css_class("error");
-        }
-        row.add_prefix(&icon);
+        // The kit escapes the title and the subtitle: a path or a name with
+        // `&` is not markup.
+        let row = ui_kit::list_row(
+            event_icon(entry.event),
+            if failed { Tone::Error } else { Tone::Neutral },
+            entry.event.label(),
+            Some(&subtitle),
+        );
         if let Some(kind) = types.get(&entry.device_id).filter(|_| only.is_none()) {
             row.add_suffix(
                 &gtk::Image::builder()
@@ -166,19 +176,17 @@ pub(crate) fn history_content(
                         .map(|text| text.trim().to_string())
                         .unwrap_or_default(),
                 )
-                .css_classes(["text-faint", "caption", "numeric"])
+                .css_classes(["history-row-time", "numeric"])
                 .build(),
         );
-        if let Some((_, group)) = &group {
-            group.add(&row);
+        if let Some((_, rows)) = group.as_mut() {
+            rows.push(row);
         }
     }
+    close(&page, group.take());
     if older > 0 {
-        let more = gtk::Button::builder()
-            .label(format!("Show Older ({older} more)"))
-            .halign(gtk::Align::Center)
-            .css_classes(["soft-button"])
-            .build();
+        let more = ui_kit::button(ButtonKind::Tonal, &format!("Show older ({older} more)"), None);
+        more.set_halign(gtk::Align::Center);
         if let Some(on_more) = on_more {
             more.connect_clicked(move |_| on_more());
         }
@@ -191,22 +199,22 @@ pub(crate) fn history_content(
 fn event_icon(event: crate::device_links::connection_log::ConnectionEvent) -> &'static str {
     use crate::device_links::connection_log::ConnectionEvent::*;
     match event {
-        Connected => "network-transmit-receive-symbolic",
-        Disconnected => "network-offline-symbolic",
-        ScreenViewStarted | ScreenControlStarted => "screen-shared-symbolic",
-        ScreenSessionEnded => "video-display-symbolic",
-        TerminalAttached | TerminalDetached => "utilities-terminal-symbolic",
-        PasswordRejected => "dialog-warning-symbolic",
-        SessionsEnded => "process-stop-symbolic",
-        Route => "network-workgroup-symbolic",
-        SettingsChanged => "emblem-system-symbolic",
-        UnlockRefused => "dialog-warning-symbolic",
-        UnlockedByPhone => "changes-allow-symbolic",
+        Connected => "desklink-link-symbolic",
+        Disconnected => "desklink-link-off-symbolic",
+        ScreenViewStarted | ScreenControlStarted | ScreenSessionEnded => {
+            "desklink-desktop-windows-symbolic"
+        }
+        TerminalAttached | TerminalDetached => "desklink-terminal-symbolic",
+        PasswordRejected | UnlockRefused => "desklink-warning-symbolic",
+        SessionsEnded => "desklink-stop-circle-symbolic",
+        Route => "desklink-public-symbolic",
+        SettingsChanged => "desklink-settings-symbolic",
+        UnlockedByPhone => "desklink-lock-open-symbolic",
     }
 }
 
 /// "Today", "Yesterday", a weekday within the week, else the date.
-fn day_label(now: &glib::DateTime, when: &glib::DateTime) -> String {
+pub(super) fn day_label(now: &glib::DateTime, when: &glib::DateTime) -> String {
     let midnight = |time: &glib::DateTime| {
         let (year, month, day) = time.ymd();
         glib::DateTime::from_local(year, month, day, 0, 0, 0.0).ok()

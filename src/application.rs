@@ -1190,6 +1190,14 @@ fn install_brand_styles() {
         &kit,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
+    // The Files area's look, after the kit's.
+    let files = gtk::CssProvider::new();
+    files.load_from_resource("/derx06/desklink/com/files-ui.css");
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &files,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
     let accent = gtk::CssProvider::new();
     gtk::style_context_add_provider_for_display(
         &display,

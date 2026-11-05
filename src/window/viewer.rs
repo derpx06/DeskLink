@@ -11,6 +11,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gdk, gio, glib};
 
+use super::ui_kit::{self, ButtonKind};
 use super::DesklinkWindow;
 use crate::device_links::transfer_log::LoggedFile;
 use crate::thumbnails::{kind_of, FileKind};
@@ -64,11 +65,11 @@ pub(super) fn show(win: &DesklinkWindow, items: &[LoggedFile], index: usize, dev
     let header = adw::HeaderBar::builder().title_widget(&title).build();
 
     // An icon: the header must fit a phone-width window.
-    let open_with = header_button("document-open-symbolic", "Open With…");
-    let zoom = header_button("zoom-original-symbolic", "Actual Size");
-    let copy = header_button("edit-copy-symbolic", "Copy");
-    let folder = header_button("folder-open-symbolic", "Show in Folder");
-    let remove = header_button("list-remove-symbolic", "Remove from List");
+    let open_with = header_button("desklink-open-in-new-symbolic", "Open with…");
+    let zoom = header_button("zoom-original-symbolic", "Actual size");
+    let copy = header_button("desklink-content-copy-symbolic", "Copy");
+    let folder = header_button("desklink-folder-symbolic", "Show in folder");
+    let remove = header_button("list-remove-symbolic", "Remove from list");
     header.pack_start(&open_with);
     header.pack_end(&remove);
     header.pack_end(&folder);
@@ -80,14 +81,15 @@ pub(super) fn show(win: &DesklinkWindow, items: &[LoggedFile], index: usize, dev
         .vexpand(true)
         .css_classes(["viewer-area"])
         .build();
-    let previous = side_button("go-previous-symbolic", "Previous File", gtk::Align::Start);
-    let next = side_button("go-next-symbolic", "Next File", gtk::Align::End);
+    let previous = side_button("go-previous-symbolic", "Previous file", gtk::Align::Start);
+    let next = side_button("go-next-symbolic", "Next file", gtk::Align::End);
     let stage = gtk::Overlay::builder().child(&area).build();
     stage.add_overlay(&previous);
     stage.add_overlay(&next);
     let toasts = adw::ToastOverlay::new();
     toasts.set_child(Some(&stage));
     let toolbar = adw::ToolbarView::new();
+    toolbar.add_css_class("viewer-shell");
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&toasts));
     dialog.set_child(Some(&toolbar));
@@ -246,10 +248,21 @@ fn side_button(icon: &str, label: &str, side: gtk::Align) -> gtk::Button {
         .valign(gtk::Align::Center)
         .margin_start(12)
         .margin_end(12)
-        .css_classes(["circular", "osd", "viewer-step"])
+        .css_classes(["circular", "viewer-step"])
         .build();
     button.update_property(&[gtk::accessible::Property::Label(label)]);
     button
+}
+
+/// "2.4 MB · 12 min ago · from Pixel 9", and "· 2 of 7" while there are
+/// others to page to.
+fn subtitle_words(file: &LoggedFile, way: &str, index: usize, count: usize) -> String {
+    let base = format!("{} · {way}", super::transfers::size_and_time(file));
+    if count > 1 {
+        format!("{base} · {} of {count}", index + 1)
+    } else {
+        base
+    }
 }
 
 impl Viewer {
@@ -297,10 +310,8 @@ impl Viewer {
             format!("sent to {device}")
         };
         self.title.set_title(&file.name);
-        self.title.set_subtitle(&format!(
-            "{} · {way}",
-            super::transfers::size_and_time(&file)
-        ));
+        self.title
+            .set_subtitle(&subtitle_words(&file, &way, index, count));
         self.dialog.set_title(&file.name);
         self.previous.set_visible(index > 0);
         self.next.set_visible(index + 1 < count);
@@ -374,14 +385,14 @@ impl Viewer {
                         while let Some(child) = area.first_child() {
                             area.remove(&child);
                         }
-                        area.append(
-                            &adw::StatusPage::builder()
-                                .icon_name("image-missing-symbolic")
-                                .title("Can't open this image")
-                                .description("It may be damaged, or in a format this computer can't show. Try Open With….")
-                                .hexpand(true)
-                                .build(),
+                        let (page, _, _) = super::transfers::empty_state(
+                            "desklink-broken-image-symbolic",
+                            "Can't open this image",
+                            "It may be damaged, or in a format this computer can't show. Try Open with….",
                         );
+                        page.set_hexpand(true);
+                        page.set_valign(gtk::Align::Center);
+                        area.append(&page);
                     }
                 }
                 _ => {}
@@ -416,46 +427,49 @@ impl Viewer {
             .valign(gtk::Align::Center)
             .build();
         let (content_type, _) = gio::content_type_guess(Some(&file.name), &[]);
-        page.append(
-            &gtk::Image::builder()
-                .gicon(&gio::content_type_get_icon(&content_type))
-                .pixel_size(96)
-                .accessible_role(gtk::AccessibleRole::Presentation)
-                .build(),
-        );
+        let glyph = gtk::CenterBox::builder()
+            .halign(gtk::Align::Center)
+            .css_classes(["viewer-other-glyph"])
+            .center_widget(
+                &gtk::Image::builder()
+                    .icon_name(super::transfers::glyph_for(&file.name))
+                    .pixel_size(48)
+                    .accessible_role(gtk::AccessibleRole::Presentation)
+                    .build(),
+            )
+            .build();
+        page.append(&glyph);
         page.append(
             &gtk::Label::builder()
                 .label(&file.name)
                 .wrap(true)
                 .justify(gtk::Justification::Center)
-                .css_classes(["title-4"])
+                .css_classes(["viewer-other-title"])
                 .build(),
         );
         page.append(
             &gtk::Label::builder()
                 .label(gio::content_type_get_description(&content_type))
-                .css_classes(["text-dim"])
+                .css_classes(["dl-secondary"])
                 .build(),
         );
-        let buttons = gtk::Box::builder()
-            .spacing(10)
+        let buttons = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .homogeneous(false)
+            .max_children_per_line(2)
+            .column_spacing(8)
+            .row_spacing(8)
             .halign(gtk::Align::Center)
             .margin_top(8)
             .build();
-        let open = gtk::Button::builder()
-            .label("Open With…")
-            .css_classes(["suggested-action", "pill"])
-            .build();
-        let folder = gtk::Button::builder()
-            .label("Show in Folder")
-            .css_classes(["pill"])
-            .build();
+        let open = ui_kit::button(ButtonKind::Primary, "Open with…", None);
+        let folder = ui_kit::button(ButtonKind::Outline, "Show in folder", None);
         let path = file.path.clone();
         open.connect_clicked(move |button| launch(button, &path, false));
         let path = file.path.clone();
         folder.connect_clicked(move |button| launch(button, &path, true));
-        buttons.append(&open);
-        buttons.append(&folder);
+        super::transfers::add_card(&buttons, &open);
+        super::transfers::add_card(&buttons, &folder);
         page.append(&buttons);
         self.area.append(&page);
     }
@@ -507,9 +521,9 @@ impl Viewer {
     fn update_zoom_button(&self) {
         let fitted = self.state.borrow().zoom.is_none();
         let (icon, label) = if fitted {
-            ("zoom-original-symbolic", "Actual Size")
+            ("zoom-original-symbolic", "Actual size")
         } else {
-            ("zoom-fit-best-symbolic", "Fit to Window")
+            ("zoom-fit-best-symbolic", "Fit to window")
         };
         self.zoom.set_icon_name(icon);
         self.zoom.set_tooltip_text(Some(label));
@@ -610,4 +624,29 @@ fn load_bounded(path: &std::path::Path) -> Result<gdk::Texture, glib::Error> {
         return Ok(gdk::Texture::for_pixbuf(&pixbuf));
     }
     gdk::Texture::from_filename(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn file() -> LoggedFile {
+        LoggedFile {
+            ts: 0,
+            device_id: "phone".into(),
+            device_name: "Pixel".into(),
+            name: "a.png".into(),
+            path: std::path::PathBuf::from("/tmp/a.png"),
+            size: 2048,
+            incoming: true,
+        }
+    }
+
+    #[test]
+    fn the_title_says_where_you_are_among_the_files() {
+        let alone = subtitle_words(&file(), "from Pixel", 0, 1);
+        assert!(alone.ends_with("from Pixel"), "{alone}");
+        let third = subtitle_words(&file(), "from Pixel", 2, 7);
+        assert!(third.ends_with("· 3 of 7"), "{third}");
+    }
 }
