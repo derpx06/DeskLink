@@ -307,11 +307,40 @@ export function footer(device, desk) {
     return buttons;
 }
 
-/// Whether `text` looks like something to open on the phone: one word with a
-/// dot, or an http(s) address (the app checks it again).
+// Endings that name a file, not a site (`README.md`): the same list as the app's
+// `link_to_send` (src/window/overview.rs), which has the last word.
+const FILE_ENDINGS = new Set(['md', 'txt', 'pdf', 'doc', 'docx', 'odt', 'xls', 'xlsx', 'ods', 'csv', 'ppt', 'pptx',
+    'rtf', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'bmp', 'heic', 'mp3', 'mp4', 'mkv', 'wav', 'flac', 'zip',
+    'tar', 'gz', 'xz', '7z', 'rs', 'py', 'js', 'ts', 'kt', 'java', 'sh', 'json', 'toml', 'yml', 'yaml', 'log', 'apk']);
+
+function isHost(host, bare) {
+    const labels = host.split('.');
+    if (!labels.every(label => /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/.test(label)))
+        return false;
+    if (!bare)
+        return true;
+    const ending = labels.at(-1).toLowerCase();
+    return labels.length >= 2 && /^[a-z]{2,}$/.test(ending) && !FILE_ENDINGS.has(ending);
+}
+
+/// Whether `text` is something to open on the phone: an http(s) address or a
+/// bare `host.tld` (optional port and path). A file name (`README.md`), another
+/// scheme (`file:///`, `javascript:`), a name with spaces or `user@host` is
+/// not. The app checks it again.
 export function looksLikeLink(text) {
     const typed = (text ?? '').trim();
-    return typed.length > 0 && typed.length < 2000 && !/\s/.test(typed) && typed.includes('.');
+    if (typed.length === 0 || typed.length > 2000 || /[\s\p{Cc}]/u.test(typed))
+        return false;
+    const scheme = /^(https?):\/\//i.exec(typed);
+    if (!scheme && typed.includes('://'))
+        return false;
+    const rest = scheme ? typed.slice(scheme[0].length) : typed;
+    const authority = rest.split(/[/?#]/, 1)[0];
+    const colon = authority.lastIndexOf(':');
+    const host = colon >= 0 ? authority.slice(0, colon) : authority;
+    if (colon >= 0 && !/^[0-9]{1,5}$/.test(authority.slice(colon + 1)))
+        return false;
+    return isHost(host, !scheme);
 }
 
 /// Every action and switch key the menu can send, for the contract test.

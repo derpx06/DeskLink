@@ -143,13 +143,21 @@ test('Send copied link waits for a link on the clipboard', () => {
         .rows.find(row => row.id === 'send-link');
     assert.equal(find(true).enabled, true);
     assert.equal(find(false).enabled, false);
-    assert.ok(looksLikeLink('https://example.org/a?b=c'));
-    assert.ok(looksLikeLink(' example.org '));
-    assert.ok(!looksLikeLink('two words.org'));
-    assert.ok(!looksLikeLink('hello'));
-    assert.ok(!looksLikeLink(''));
 });
 
+// The same vectors as `only_web_addresses_and_site_names_become_links` in
+// src/window/overview.rs.
+test('only web addresses and site names are links', () => {
+    for (const typed of ['https://example.org/a?b=c', 'http://example.org', 'example.org', ' example.org ',
+        'www.example.com/path?x=1', 'sub.example.co.uk', 'example.org:8080/x', 'HTTPS://Example.org',
+        'http://localhost:3000'])
+        assert.ok(looksLikeLink(typed), typed);
+    for (const typed of ['README.md', 'notes.txt', 'photo.jpg', 'foo.md/bar', 'archive.tar.gz',
+        'file:///etc/passwd', 'ftp://example.org', 'javascript:alert.x', 'mailto:a@b.org', 'data:text/plain,hi',
+        'https://', 'http:///x', 'https://exa mple.org', 'hello', '1.2.3', '192.168.1.1', 'a..b.org', '-a.org',
+        'example.org:abc', 'example.org:', 'https://good.com@evil.org', '[::1]:80', 'two words.org', '', null])
+        assert.ok(!looksLikeLink(typed), String(typed));
+});
 
 test('recent files and snippets are rows of their sections, capped', () => {
     const files = Array.from({length: 5}, (_, i) => ({id: `/f${i}`, name: `f${i}.txt`, incoming: i % 2 === 0, deviceName: 'Pixel'}));
