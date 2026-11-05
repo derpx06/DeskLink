@@ -860,15 +860,24 @@ mod tests {
         for round in 0..300 {
             session.claim_for_phone("phone-1", 30, 50).unwrap();
             assert_eq!(session.size(), (30, 50));
+            // The watcher spins on the claim before the desk acts, so it is
+            // always watching when the claim goes.
+            let spinning = Arc::new(AtomicBool::new(false));
             let watcher = {
                 let session = Arc::clone(&session);
+                let spinning = Arc::clone(&spinning);
                 std::thread::spawn(move || {
+                    assert!(session.phone_sets_size(), "the claim is held");
+                    spinning.store(true, Ordering::Release);
                     while session.phone_sets_size() {
                         std::thread::yield_now();
                     }
                     session.size()
                 })
             };
+            while !spinning.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
             session.desk_window_size(40, 120, true);
             assert_eq!(
                 watcher.join().unwrap(),
