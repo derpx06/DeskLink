@@ -2375,11 +2375,14 @@ mod tests {
                 .collect();
             let homes: Vec<_> = groups.iter().map(|group| group.parent()).collect();
             let search = SEARCH.with(|slot| slot.borrow().upgrade()).unwrap();
+            // `search-changed` is sent after a pause; without a main loop, send it.
             search.set_text("glide");
+            search.emit_by_name::<()>("search-changed", &[]);
             assert_ne!(groups[5].parent(), homes[5], "Control moved to the results");
             assert!(groups[5].is_visible(), "and shows its matching rows");
             assert!(!groups[7].is_visible(), "Privacy has no glide row");
             search.set_text("");
+            search.emit_by_name::<()>("search-changed", &[]);
             for (group, home) in groups.iter().zip(&homes) {
                 assert_eq!(&group.parent(), home);
                 assert!(group.is_visible());
