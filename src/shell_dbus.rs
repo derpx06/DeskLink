@@ -1619,7 +1619,7 @@ pub fn extension_active() -> bool {
 }
 
 /// The extension, built into the app so any install can turn it on.
-const EXTENSION_FILES: [(&str, &str); 6] = [
+const EXTENSION_FILES: [(&str, &str); 7] = [
     (
         "metadata.json",
         include_str!("../gnome-shell-extension/desklink@derx06.github.io/metadata.json"),
@@ -1643,6 +1643,10 @@ const EXTENSION_FILES: [(&str, &str); 6] = [
     (
         "desklink-symbolic.svg",
         include_str!("../gnome-shell-extension/desklink@derx06.github.io/desklink-symbolic.svg"),
+    ),
+    (
+        "model.js",
+        include_str!("../gnome-shell-extension/desklink@derx06.github.io/model.js"),
     ),
 ];
 
@@ -1683,36 +1687,36 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// stamp, is still ours and safe to update.
 const KNOWN_BUILDS: [&str; 15] = [
     // The current build (wave 2: the ongoing-items chip in the pill).
-    "ccf6bd3b8d82eecd58fbc29c45fa3f0ffad598c593a8b5bb47cea8a0f00f48c7",
+    "c27272d96fac1f6029a7494eacbe93b716a44b05959acb0ded9b697e8f42a5d2",
     // w8: the Photo tile, `insert-photo`.
-    "72517e77af7844b6b0e0acc6bce2694a7f3653cd38ef5131b437abf01f8e9d9a",
+    "4d5b8192ae0a8fdcbceef31bcf955ff08d555b8cae633d758d77521e376687e4",
     // w7c: no images decoded in the shell, follow-up messages announced,
     // the reply dialog destroyed, accent fallback.
-    "73de6db35cf56eba8b413c3cca78d2a7389efdb1f3653f5178a02b67d8864607",
+    "23025d05bb0300675bc3d5f1c046be8b267deb7f6692767003822244d1341725",
     // W4: the Files row, Settings in its comments.
-    "6a907b946c22e452a0853b683a98bef425482d0fe38181d4dce255e4cb7fc8da",
+    "b07fccfbb89268d72553923fe74ed53089e2042fac1fe006ede1f89ff7fd2e4e",
     // The Bucket's sync progress row.
-    "01fee36c261108ac481f15db17de0b7c860e79ba8e77d8a932540e07952a7f8a",
+    "9bdbd7405e48738c94bd65dfae6baa2f412c78c9f892fad0bfe5c2656858138f",
     // 35a2ff3, F4: glide in the live row.
-    "1ce14fd319e5ac1654c16dfa8a79910c95da9bdcca33f880f5f3f62654de440d",
+    "1744f9ec921dbf1f1e3fb9c4215b87190518f4dbe40cd8ce21a5336150987d3f",
     // F6: Snippets and New Note in the menu.
-    "d15f25a0eaca4d3f37d6423d5eefafeadacd0dc3fb8e6c07389ce7861d701f50",
+    "d20b1b57eea99e3c781feb69b6ab5bed3393e22e0eb81d88e5b7d30af5cb88e4",
     // Top-bar redesign: menu.js, the glyph icon.
-    "299c2cbb85734c4379c74cf5afd4e6d3a73f3d9ab9fb4cc1738de0b165297da5",
+    "3413a34defbe375ac5347683de5a53f89d0df1c11e586b9b454cc43348154e77",
     // be1b760, 2026-10-21.
-    "fe350711d70ada59bc0428004409555265854e5c91d5cda444439823ac7707b2",
+    "07555cf126179911873994980fc0a360b4fea38819bee64277a44ad752ab2649",
     // 9784a7d, 2026-10-21.
-    "14c40f57d58fe269429b3969aa555fbfc85b0afe9787fbfb30feb621a4d1f0cb",
+    "2aa899e5394ac50cb6fbbb536d135797d93bf5d8adcfa50ba130c743d956154b",
     // f798285, 2026-10-21.
-    "befac3aedecccb11f26d2a19b4eeb9f6b59638b6d09387ad3a4a01cbbb548d78",
+    "cc953aaa3a1db690eff0f36053be389f6527da1921f1285829a0e6ced2f7e06f",
     // 1b78f08, 2026-10-21.
-    "09c6a14190617bb0c7c32ef7ef5f048d1a4e1abaed8b2b8146f658648d48d6cf",
+    "aa5bffbecce7a7ccc59b6a0e611dbd44ece3377a1ed547305266d941079d476e",
     // ba03b84, 2026-10-21.
-    "9e3afd7a15663156d6377aed4acfbc9ac5f9ec9af11aee725831d8e380d5c2f4",
+    "d68895988634a5a62377c63ca97bd643f901f232419b4b8c84f341b20c49f4f4",
     // 635fc5d, 2026-10-20.
-    "8598af7cdd26d69961816c7d215146566a4a975e83d3d6fbbd5e0de414225402",
+    "cff05ba7d6f7e20074ae6fa7406177e58ac4bf8901d07faace5f131f07da8878",
     // 1f8c0a4, 2026-10-20.
-    "85e45fc9fdd19dc3b711ca70df8ae7d1600bf2e252eccfd0e9a2550f99cc42af",
+    "1fedcbddc921c5b1a5ebe46fd73127d6a732c0f67d74e78f24fa06402abbafe9",
 ];
 
 /// Whether an installed copy (by digest) is DeskLink's own and may be
@@ -2369,7 +2373,7 @@ mod tests {
         );
         assert!(
             KNOWN_BUILDS
-                .contains(&"8598af7cdd26d69961816c7d215146566a4a975e83d3d6fbbd5e0de414225402"),
+                .contains(&"cff05ba7d6f7e20074ae6fa7406177e58ac4bf8901d07faace5f131f07da8878"),
             "the 2026-10-20 build (extension.js 6911 bytes)"
         );
     }

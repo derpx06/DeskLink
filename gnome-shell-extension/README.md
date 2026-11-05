@@ -1,11 +1,40 @@
 # DeskLink GNOME Shell extension
 
-Shows DeskLink in the GNOME top bar (GNOME 45–51): a pill with the link glyph
-(computer, wire, phone; green while a phone is connected) and a coral dot while
-a phone is using this computer. Its menu lists what is live now, each with
-End, then End Everything, the desk's tiles (Keep Awake, Clipboard, Send Files,
-Ring Phone), Lock & Hand Off and Open DeskLink. It needs the DeskLink app
-running; while it is not, nothing is shown.
+Shows DeskLink in the GNOME top bar (GNOME 45–51) as the complete remote for a
+paired phone: a Quick Settings toggle named after the phone, whose menu (and the
+optional pill's, the same menu) holds everything the phone can do. It needs the
+DeskLink app running; while it is not, nothing is shown.
+
+```
+Header            name · "Connected · Wi-Fi · 82% ⚡" · battery ring
+Chips             Connected · Wi-Fi 12 ms · 82% charging · Fast lane · Sound on · DND shared
+Cards             Not connected (Try again / Reconnect) · a call (Answer, Decline, Mute, End)
+Quick actions     Files · Clipboard · Ring · Lock · Screen · Photo
+Now playing       previous · play/pause · next
+Now               files moving (with their lane) · Files sync · the phone's timers · what is live here, with End
+Sections          one collapsed section each; the body scrolls when the screen is short
+  Send & share        Send files · Send clipboard · Send copied link · Ping · recent files
+  Insert from phone   Photo · Photo as a file · Scan a document · Text from a picture · QR code
+  Sound               play this computer's sound there · phone as microphone · phone's sound here
+  Notes & clipboard   New note · snippets · Open notes · Clipboard history · share the clipboard
+  Notifications       show here · share Do Not Disturb · command alerts · pause music in calls ·
+                      send this computer's notifications · Open notifications
+  Calls & contacts    name callers from contacts · Contacts…
+  Terminals           New shared terminal · Open terminals · Terminal access
+  Screen & control    Show the phone's screen… · End sessions · Glide
+  Files               Open synced files · Files page · accept photos and screenshots
+  Privacy & security  unlock with the phone · lock when I walk away · keep-awake from the phone ·
+                      phones may hear this mic · All settings… · Unpair…
+  This computer       Keep awake · Lock & hand off · Look for the phone again
+Footer            Open DeskLink · Settings · Pause / Resume notifications
+```
+
+Switches change the app's own settings and keep the menu open. Security-sensitive
+ones (terminal access, unlock with the phone, accepting photos, keep-awake from
+the phone, glide, the microphone) can only be turned **off** here; the app itself
+refuses to turn them on over D-Bus, and an off one shows a lock and opens DeskLink.
+Unpair asks in DeskLink's window, never silently. The menu never carries file
+paths, contacts or call numbers.
 
 On the lock screen (`session-modes: ["user", "unlock-dialog"]`) it shows only
 "Unlock with <phone>", and only while the app offers it: "Unlock with <phone>
@@ -19,6 +48,29 @@ text is worked out by the helpers in `extension.js`, tested with `node --test gn
 The extension only talks to the app over D-Bus
 (`derx06.desklink.com.Shell1` at `/derx06/desklink/com/Shell`, see
 `src/shell_dbus.rs`). Files to send are picked in DeskLink's own dialog.
+
+Interface version 9 adds to `Devices[]` the per-phone `settings` (the switches),
+`sound`, `rttMs`, `unread`, `textCapture` and `transfers`; to `Desk` the
+computer-wide switches; the methods `SetSwitch(device, key, on)` (an allow-list;
+the security keys refuse `on`) and `SendLink(device, link)`; and the actions
+`ping`, `send-link`, `show-screen`, `media-prev`, `insert-photo-file|scan|text|qr`,
+`open-files|notes|clipboard|snippets|notifications|contacts|terminals|settings` and
+`unpair`. An action is listed only when the phone takes it. An older app (interface
+below 9) simply shows fewer rows. `model.js` has no GNOME imports and says what the
+menu holds; `tests/model.test.mjs` also checks that every action and key it names is
+in `shell_dbus.rs`. Run the tests with `node --test gnome-shell-extension/tests/*.test.mjs`.
+
+## Checking it on the real top bar
+
+The tests and a headless GNOME Shell 50 render the menu, but only the real session
+shows what it looks like on your screen. After `make install` and logging in again:
+
+1. Open the toggle's menu with one phone connected, then with the phone off: chips,
+   tiles and the Reconnect card.
+2. Open each section; turn a switch on and off and see that the menu stays open and
+   the app's Settings page agrees. Try a locked row: it should open DeskLink.
+3. Light and dark style; a small screen (the body should scroll, the footer stay).
+4. Start a file transfer and look for "Fast lane" and the progress bar.
 
 ## Install locally
 
