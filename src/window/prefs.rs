@@ -6,7 +6,8 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 
-use super::{icon_square, DesklinkWindow};
+use super::ui_kit::{self, ButtonKind, Tone};
+use super::{clipboard, DesklinkWindow};
 use crate::device_links::config::AppSettings;
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::DeviceView;
@@ -20,6 +21,21 @@ type LiveSwitch = (
 
 thread_local! {
     static LIVE: std::cell::RefCell<Vec<LiveSwitch>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+thread_local! {
+    /// Set while [`sync_live`] moves a switch to what a phone set: the move
+    /// is not the person's click and must not be sent back.
+    static SYNCING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A followed switch's handler: runs for a click, not for [`sync_live`].
+fn toggled(row: &adw::SwitchRow, handler: impl Fn(&adw::SwitchRow) + 'static) {
+    row.connect_active_notify(move |row| {
+        if !SYNCING.with(|syncing| syncing.get()) {
+            handler(row);
+        }
+    });
 }
 
 fn follow(row: &adw::SwitchRow, read: fn(&AppSettings, &str) -> bool) {
@@ -36,7 +52,9 @@ fn sync_live(device_id: &str) {
             };
             let value = read(&settings, device_id);
             if row.is_active() != value {
+                SYNCING.with(|syncing| syncing.set(true));
                 row.set_active(value);
+                SYNCING.with(|syncing| syncing.set(false));
             }
             true
         })
@@ -75,41 +93,429 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         return;
     }
     LIVE.with(|live| live.borrow_mut().clear());
-    let page = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(22)
-        .margin_top(8)
-        .margin_bottom(28)
-        .css_classes(["page-margins"])
+    clipboard::ensure_css();
+    let scroll = imp
+        .bodies
+        .borrow()
+        .get("settings")
+        .map(|(scroll, _)| scroll.vadjustment());
+    let view = build_view(scroll, daemon, &settings, device, &glide_status, approving);
+    win.replace_body(
+        "settings",
+        &adw::Clamp::builder()
+            .maximum_size(720)
+            .child(&view.root)
+            .build(),
+    );
+}
+
+/// Where the ten groups sit in the list (`UI-REDESIGN.md` 3.17): the section,
+/// the group (an index into [`GROUPS`]), its glyph and its one line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Section {
+    Computer,
+    Phone,
+    Privacy,
+}
+
+const PAGES: [(Section, usize, &str, &str); 10] = [
+    (
+        Section::Computer,
+        0,
+        "desklink-wifi-symbolic",
+        "Stay awake, start at login",
+    ),
+    (
+        Section::Phone,
+        1,
+        "desklink-notifications-symbolic",
+        "Show, forward and silence",
+    ),
+    (
+        Section::Phone,
+        2,
+        "desklink-content-paste-symbolic",
+        "Share what you copy",
+    ),
+    (
+        Section::Phone,
+        3,
+        "desklink-call-symbolic",
+        "Names and music",
+    ),
+    (
+        Section::Phone,
+        4,
+        "desklink-volume-up-symbolic",
+        "Microphone",
+    ),
+    (
+        Section::Phone,
+        5,
+        "desklink-mouse-symbolic",
+        "Glide and remote control",
+    ),
+    (
+        Section::Phone,
+        6,
+        "desklink-folder-symbolic",
+        "Bucket, downloads, photos",
+    ),
+    (
+        Section::Privacy,
+        7,
+        "desklink-lock-symbolic",
+        "Password, terminals, unlock, unpair",
+    ),
+    (
+        Section::Privacy,
+        8,
+        "desklink-palette-symbolic",
+        "Style and tray icon",
+    ),
+    (
+        Section::Privacy,
+        9,
+        "desklink-tune-symbolic",
+        "Away from home, history, checks",
+    ),
+];
+
+fn section_label(section: Section, phone: &str) -> String {
+    match section {
+        Section::Computer => "This computer".to_string(),
+        Section::Phone => format!("Share with {phone}"),
+        Section::Privacy => "Privacy and safety".to_string(),
+    }
+}
+
+thread_local! {
+    /// The subpage open (an index into [`GROUPS`]) and the view it is in:
+    /// a rebuild (a setting changed) puts the person back on the same page.
+    static OPEN: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// What was typed in the search box, kept across rebuilds.
+    static QUERY: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// Where each page (`None` is the list) was scrolled to.
+    static SCROLLS: std::cell::RefCell<std::collections::HashMap<Option<usize>, f64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    static NAV: std::cell::RefCell<glib::WeakRef<adw::NavigationView>> =
+        std::cell::RefCell::new(glib::WeakRef::new());
+    static SEARCH: std::cell::RefCell<glib::WeakRef<gtk::SearchEntry>> =
+        std::cell::RefCell::new(glib::WeakRef::new());
+}
+
+fn tag(index: usize) -> String {
+    format!("page-{index}")
+}
+
+/// The Settings page: a list of destinations that push a subpage each.
+struct View {
+    root: adw::NavigationView,
+    /// The subpages, by group index (the tests read their rows).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pages: Vec<adw::NavigationPage>,
+}
+
+fn build_view(
+    scroll: Option<gtk::Adjustment>,
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    device: &DeviceView,
+    glide_status: &crate::device_links::glide::Status,
+    approving: bool,
+) -> View {
+    let groups = groups(daemon, settings, device, glide_status, approving);
+    let titles: Vec<String> = groups
+        .iter()
+        .map(|group| group.title().to_string())
+        .collect();
+    let nav = adw::NavigationView::builder()
+        .animate_transitions(true)
         .build();
-    page.append(&super::wrapped(
-        &format!(
-            "Settings for this computer and {}. A change takes effect as soon as you make it.",
-            device.name
-        ),
-        &["text-dim"],
-    ));
+    let searchables = searchable(&groups);
+
+    // Subpages: a way back, the title, the phone it is for, then the group.
+    let mut pages = Vec::new();
+    let mut homes = Vec::new();
+    for (index, group) in groups.iter().enumerate() {
+        let section = PAGES[index].0;
+        let content = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(12)
+            .margin_top(8)
+            .margin_bottom(28)
+            .css_classes(["page-margins"])
+            .build();
+        let back = ui_kit::button(
+            ButtonKind::Text,
+            "Settings",
+            Some("desklink-arrow-back-symbolic"),
+        );
+        back.set_halign(gtk::Align::Start);
+        back.set_tooltip_text(Some("Back to Settings (Esc)"));
+        {
+            let nav = nav.downgrade();
+            back.connect_clicked(move |_| {
+                if let Some(nav) = nav.upgrade() {
+                    nav.pop();
+                }
+            });
+        }
+        content.append(&back);
+        let title = gtk::Label::builder()
+            .label(GROUPS[index])
+            .xalign(0.0)
+            .wrap(true)
+            .css_classes(["dl-title"])
+            .accessible_role(gtk::AccessibleRole::Heading)
+            .build();
+        title.update_property(&[gtk::accessible::Property::Level(1)]);
+        content.append(&title);
+        let whose = match section {
+            Section::Phone => format!("For {}", device.name),
+            Section::Privacy if index == 7 => format!("For {}", device.name),
+            _ => "For this computer".to_string(),
+        };
+        content.append(&super::wrapped(&whose, &["dl-page-sub"]));
+        let home = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .build();
+        group.set_title("");
+        group.add_css_class("dl-settings-group");
+        home.append(group);
+        content.append(&home);
+        let keys = gtk::EventControllerKey::new();
+        {
+            let nav = nav.downgrade();
+            keys.connect_key_pressed(move |_, key, _, _| {
+                if key == gtk::gdk::Key::Escape {
+                    if let Some(nav) = nav.upgrade() {
+                        return if nav.pop() {
+                            glib::Propagation::Stop
+                        } else {
+                            glib::Propagation::Proceed
+                        };
+                    }
+                }
+                glib::Propagation::Proceed
+            });
+        }
+        content.add_controller(keys);
+        let page = adw::NavigationPage::builder()
+            .title(GROUPS[index])
+            .tag(tag(index))
+            .child(&content)
+            .build();
+        nav.add(&page);
+        pages.push(page);
+        homes.push(home);
+    }
+
+    // The list.
+    let list = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .build();
+    let quick = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+    quick.append(&ui_kit::section_header("Quick switches"));
+    let switches: Vec<adw::ActionRow> = vec![
+        show_notifications_row(daemon, settings, device).upcast(),
+        clipboard_row(daemon, settings).upcast(),
+        keep_awake_row(daemon, settings).upcast(),
+    ];
+    quick.append(&ui_kit::row_group(&switches));
+    list.append(&quick);
+    for section in [Section::Computer, Section::Phone, Section::Privacy] {
+        let label = section_label(section, &device.name);
+        let header = ui_kit::section_header(&label);
+        header.set_wrap(false);
+        header.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        header.set_tooltip_text(Some(&label));
+        let mut rows = Vec::new();
+        for (page_section, index, icon, summary) in PAGES {
+            if page_section != section {
+                continue;
+            }
+            let row = ui_kit::list_row(icon, Tone::Neutral, GROUPS[index], Some(summary));
+            row.set_activatable(true);
+            row.add_suffix(
+                &gtk::Image::builder()
+                    .icon_name("desklink-chevron-right-symbolic")
+                    .accessible_role(gtk::AccessibleRole::Presentation)
+                    .build(),
+            );
+            let nav = nav.downgrade();
+            row.connect_activated(move |_| {
+                if let Some(nav) = nav.upgrade() {
+                    nav.push_by_tag(&tag(index));
+                }
+            });
+            rows.push(row);
+        }
+        let block = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .build();
+        block.append(&header);
+        block.append(&ui_kit::row_group(&rows));
+        list.append(&block);
+    }
+
+    // Search: the matching rows themselves, under their group's name.
+    let results = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .build();
+    let nothing = super::wrapped("No setting matches. Try another word.", &["dl-secondary"]);
+    nothing.set_visible(false);
+    results.append(&nothing);
+    let stack = gtk::Stack::builder().vhomogeneous(false).build();
+    stack.add_named(&list, Some("list"));
+    stack.add_named(&results, Some("results"));
     let search = gtk::SearchEntry::builder()
         .placeholder_text("Search settings")
         .build();
     search.update_property(&[gtk::accessible::Property::Label("Search settings")]);
-    page.append(&search);
-    let groups = groups(daemon, &settings, device, &glide_status, approving);
-    for group in &groups {
-        page.append(group);
+    {
+        let (groups, results, stack, nothing) = (
+            groups.clone(),
+            results.clone(),
+            stack.clone(),
+            nothing.clone(),
+        );
+        let apply = std::rc::Rc::new(move |search: &gtk::SearchEntry| {
+            let query = search.text();
+            QUERY.with(|slot| slot.replace(query.to_string()));
+            let searching = !query.trim().is_empty();
+            for (index, group) in groups.iter().enumerate() {
+                let target = if searching { &results } else { &homes[index] };
+                if group.parent().as_ref() != Some(target.upcast_ref()) {
+                    if let Some(old) = group.parent().and_downcast::<gtk::Box>() {
+                        old.remove(group);
+                    }
+                    target.append(group);
+                    group.set_title(if searching { &titles[index] } else { "" });
+                }
+            }
+            let any = filter_groups(&searchables, &query);
+            nothing.set_visible(searching && !any);
+            stack.set_visible_child_name(if searching { "results" } else { "list" });
+        });
+        search.connect_search_changed({
+            let apply = apply.clone();
+            move |search| (*apply)(search)
+        });
+        // A rebuild (a setting changed) keeps what was typed.
+        let kept = QUERY.with(|slot| slot.borrow().clone());
+        if !kept.is_empty() {
+            search.set_text(&kept);
+            (*apply)(&search);
+        }
     }
-    let groups = searchable(&groups);
-    let nothing = super::wrapped("No setting matches. Try another word.", &["text-dim"]);
-    nothing.set_visible(false);
-    page.append(&nothing);
-    search.connect_search_changed(move |search| {
-        let any = filter_groups(&groups, &search.text());
-        nothing.set_visible(!any);
+    let root_content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .margin_top(8)
+        .margin_bottom(28)
+        .css_classes(["page-margins"])
+        .build();
+    root_content.append(&super::wrapped(
+        "Changes apply right away.",
+        &["dl-page-sub"],
+    ));
+    root_content.append(&search);
+    root_content.append(&stack);
+    let root_page = adw::NavigationPage::builder()
+        .title("Settings")
+        .tag("list")
+        .child(&root_content)
+        .build();
+    nav.add(&root_page);
+    nav.push(&root_page);
+
+    // Go back to the subpage that was open before a rebuild, then remember
+    // the one open from now on, and where each page was scrolled to: the
+    // window's one scroller must not carry the list's offset into a subpage.
+    let open = OPEN
+        .with(|slot| slot.get())
+        .filter(|index| *index < pages.len());
+    OPEN.with(|slot| slot.set(open));
+    if let Some(index) = open {
+        nav.set_animate_transitions(false);
+        nav.push_by_tag(&tag(index));
+        nav.set_animate_transitions(true);
+    }
+    nav.connect_visible_page_notify(move |nav| {
+        let now: Option<usize> = nav.visible_page().and_then(|page| {
+            page.tag()
+                .and_then(|tag| tag.strip_prefix("page-").and_then(|n| n.parse().ok()))
+        });
+        let before = OPEN.with(|slot| slot.replace(now));
+        if before == now {
+            return;
+        }
+        let Some(scroll) = scroll.clone() else {
+            return;
+        };
+        SCROLLS.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            slot.insert(before, scroll.value());
+            let offset = slot.get(&now).copied().unwrap_or(0.0);
+            // After the page is laid out, or the offset would be clamped.
+            glib::timeout_add_local_once(std::time::Duration::from_millis(60), move || {
+                scroll.set_value(offset)
+            });
+        });
     });
-    win.replace_body(
-        "settings",
-        &adw::Clamp::builder().maximum_size(720).child(&page).build(),
-    );
+    NAV.with(|slot| slot.replace(nav.downgrade()));
+    SEARCH.with(|slot| slot.replace(search.downgrade()));
+    View { root: nav, pages }
+}
+
+/// Opens Privacy & security (from "Terminal access is off for <phone>"): the
+/// next time Settings shows, or now when it is built.
+pub(super) fn show_privacy() {
+    QUERY.with(|slot| slot.borrow_mut().clear());
+    OPEN.with(|slot| slot.set(Some(7)));
+    if let Some(search) = SEARCH.with(|slot| slot.borrow().upgrade()) {
+        if !search.text().is_empty() {
+            search.set_text("");
+            search.emit_by_name::<()>("search-changed", &[]);
+        }
+    }
+    if let Some(nav) = NAV.with(|slot| slot.borrow().upgrade()) {
+        nav.set_animate_transitions(false);
+        nav.pop_to_tag("list");
+        nav.push_by_tag(&tag(7));
+        nav.set_animate_transitions(true);
+    }
+}
+
+/// Debug e2e: `settings-page list|N|search`, to walk the pages in a screenshot.
+#[cfg(debug_assertions)]
+pub(super) fn debug_open(id: &str, arg: &str) {
+    let Some(nav) = NAV.with(|slot| slot.borrow().upgrade()) else {
+        return;
+    };
+    match id {
+        "list" => {
+            nav.pop_to_tag("list");
+        }
+        "search" => {
+            nav.pop_to_tag("list");
+            if let Some(search) = SEARCH.with(|slot| slot.borrow().upgrade()) {
+                search.set_text(&arg.replace('_', " "));
+            }
+        }
+        number => {
+            if let Ok(index) = number.parse::<usize>() {
+                nav.push_by_tag(&tag(index));
+            }
+        }
+    }
 }
 
 /// Every settings row inside `widget`.
@@ -122,6 +528,17 @@ fn rows_in(widget: &gtk::Widget, found: &mut Vec<adw::PreferencesRow>) {
         rows_in(&next, found);
         child = next.next_sibling();
     }
+}
+
+/// The widget name of a row whose visibility is its own state (the glide
+/// arrangement follows the glide switch): the search leaves it alone.
+const OWN_VISIBILITY: &str = "own-visibility";
+
+/// A markup string as the plain text it shows ("Privacy &amp; security" is
+/// "Privacy & security"); text that is not markup is itself.
+fn plain(markup: &str) -> String {
+    gtk::pango::parse_markup(markup, '\0')
+        .map_or_else(|_| markup.to_string(), |(_, text, _)| text.to_string())
 }
 
 /// A group as the search sees it: the group, its rows, and which of them
@@ -142,6 +559,7 @@ fn searchable(groups: &[adw::PreferencesGroup]) -> Vec<Searchable> {
                 group: group.clone(),
                 rows: rows
                     .into_iter()
+                    .filter(|row| row.widget_name() != OWN_VISIBILITY)
                     .map(|row| {
                         let shown = row.is_visible();
                         (row, shown)
@@ -156,19 +574,20 @@ fn searchable(groups: &[adw::PreferencesGroup]) -> Vec<Searchable> {
 /// Shows only the rows (and groups) whose title or words contain `query`;
 /// a group whose own title matches shows whole. True when anything shows.
 fn filter_groups(groups: &[Searchable], query: &str) -> bool {
-    let query = glib::markup_escape_text(query.trim()).to_lowercase();
+    // Typed text against the plain words of the rows, not their markup.
+    let query = query.trim().to_lowercase();
     let mut any = false;
     for Searchable { group, rows, shown } in groups {
-        let whole = query.is_empty() || group.title().to_lowercase().contains(&query);
+        let whole = query.is_empty() || plain(&group.title()).to_lowercase().contains(&query);
         let mut matching = 0;
         for (row, was_shown) in rows {
-            let mut words = row.title().to_lowercase();
+            let mut words = plain(&row.title()).to_lowercase();
             if let Some(subtitle) = row
                 .downcast_ref::<adw::ActionRow>()
                 .and_then(|action| action.subtitle())
             {
                 words.push(' ');
-                words.push_str(&subtitle.to_lowercase());
+                words.push_str(&plain(&subtitle).to_lowercase());
             }
             let matches = whole || words.contains(&query);
             row.set_visible(*was_shown && matches);
@@ -228,24 +647,7 @@ fn groups(
     notifications.set_description(Some(
         "Where phone notifications show, and which of this computer's go to the phone",
     ));
-    let shown = adw::SwitchRow::builder()
-        .title(esc(format!("Show {}'s notifications here", device.name)))
-        .subtitle("On this desktop, with replies")
-        .active(settings.shows_notifications(&device.id))
-        .build();
-    shown.add_prefix(&icon_square(
-        "preferences-system-notifications-symbolic",
-        30,
-        "row-icon",
-    ));
-    let (sender, id) = (daemon.clone(), device.id.clone());
-    shown.connect_active_notify(move |row| {
-        sender.send(DaemonCommand::SetShowNotifications(
-            id.clone(),
-            row.is_active(),
-        ));
-    });
-    follow(&shown, |settings, id| settings.shows_notifications(id));
+    let shown = show_notifications_row(daemon, settings, device);
     notifications.add(&shown);
     notifications.add(&command_alerts_row(daemon, settings, device));
     add_forward_rows(&notifications, daemon, settings);
@@ -299,6 +701,29 @@ fn groups(
         appearance,
         advanced,
     ]
+}
+
+/// "Show <phone>'s notifications here": in its group and among the quick switches.
+fn show_notifications_row(
+    daemon: &DaemonHandle,
+    settings: &AppSettings,
+    device: &DeviceView,
+) -> adw::SwitchRow {
+    let shown = adw::SwitchRow::builder()
+        .title(esc(format!("Show {}'s notifications here", device.name)))
+        .subtitle("On this desktop, with replies")
+        .active(settings.shows_notifications(&device.id))
+        .build();
+    with_icon(&shown, "preferences-system-notifications-symbolic");
+    let (sender, id) = (daemon.clone(), device.id.clone());
+    toggled(&shown, move |row| {
+        sender.send(DaemonCommand::SetShowNotifications(
+            id.clone(),
+            row.is_active(),
+        ));
+    });
+    follow(&shown, |settings, id| settings.shows_notifications(id));
+    shown
 }
 
 /// The computer-wide settings as a dialog, for when no phone is paired.
@@ -448,7 +873,7 @@ fn pause_music_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Switch
         .build();
     with_icon(&row, "media-playback-pause-symbolic");
     let daemon = daemon.clone();
-    row.connect_active_notify(move |row| {
+    toggled(&row, move |row| {
         daemon.send(DaemonCommand::SetPauseMediaOnCall(row.is_active()))
     });
     follow(&row, |settings, _| settings.pause_media_on_call);
@@ -472,7 +897,7 @@ fn clipboard_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::SwitchRo
         .build();
     with_icon(&row, "edit-paste-symbolic");
     let daemon = daemon.clone();
-    row.connect_active_notify(move |row| {
+    toggled(&row, move |row| {
         daemon.send(DaemonCommand::SetClipboardSync(row.is_active()))
     });
     follow(&row, |settings, _| settings.clipboard_sync);
@@ -509,7 +934,7 @@ fn downloads_row() -> adw::ActionRow {
     with_icon(&row, "folder-download-symbolic");
     row.add_suffix(
         &gtk::Image::builder()
-            .icon_name("go-next-symbolic")
+            .icon_name("desklink-chevron-right-symbolic")
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
@@ -540,7 +965,7 @@ fn history_row() -> adw::ActionRow {
     with_icon(&row, "document-open-recent-symbolic");
     row.add_suffix(
         &gtk::Image::builder()
-            .icon_name("go-next-symbolic")
+            .icon_name("desklink-chevron-right-symbolic")
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
@@ -572,7 +997,7 @@ fn system_check_row() -> adw::ActionRow {
     with_icon(&row, "preferences-system-symbolic");
     row.add_suffix(
         &gtk::Image::builder()
-            .icon_name("go-next-symbolic")
+            .icon_name("desklink-chevron-right-symbolic")
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
@@ -589,7 +1014,7 @@ fn logs_row() -> adw::ActionRow {
     with_icon(&row, "text-x-generic-symbolic");
     row.add_suffix(
         &gtk::Image::builder()
-            .icon_name("go-next-symbolic")
+            .icon_name("desklink-chevron-right-symbolic")
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
@@ -617,6 +1042,45 @@ fn logs_row() -> adw::ActionRow {
     row
 }
 
+/// The kit's glyph (and tone) for the GNOME icon name a row asks for.
+fn material(icon: &str) -> (&str, Tone) {
+    match icon {
+        "preferences-system-notifications-symbolic" => {
+            ("desklink-notifications-symbolic", Tone::Neutral)
+        }
+        "audio-input-microphone-symbolic" => ("desklink-mic-symbolic", Tone::Neutral),
+        "avatar-default-symbolic" => ("desklink-person-symbolic", Tone::Neutral),
+        "media-playback-pause-symbolic" => ("desklink-pause-symbolic", Tone::Neutral),
+        "edit-paste-symbolic" => ("desklink-content-paste-symbolic", Tone::Neutral),
+        "folder-symbolic" => ("desklink-folder-symbolic", Tone::Neutral),
+        "folder-download-symbolic" => ("desklink-download-symbolic", Tone::Neutral),
+        "document-open-recent-symbolic" => ("desklink-history-symbolic", Tone::Neutral),
+        "preferences-system-symbolic" => ("desklink-settings-symbolic", Tone::Neutral),
+        "text-x-generic-symbolic" => ("desklink-description-symbolic", Tone::Neutral),
+        "weather-clear-night-symbolic" => ("desklink-coffee-symbolic", Tone::Neutral),
+        "changes-allow-symbolic" => ("desklink-lock-open-symbolic", Tone::Neutral),
+        "image-x-generic-symbolic" => ("desklink-image-symbolic", Tone::Neutral),
+        "notifications-disabled-symbolic" => ("desklink-volume-mute-symbolic", Tone::Neutral),
+        "system-lock-screen-symbolic" => ("desklink-lock-symbolic", Tone::Neutral),
+        "alarm-symbolic" => ("desklink-notifications-active-symbolic", Tone::Neutral),
+        "system-shutdown-symbolic" => ("desklink-restart-alt-symbolic", Tone::Neutral),
+        "phone-symbolic" => ("desklink-device-phone-symbolic", Tone::Neutral),
+        "view-app-grid-symbolic" => ("desklink-tune-symbolic", Tone::Neutral),
+        "preferences-desktop-appearance-symbolic" => ("desklink-palette-symbolic", Tone::Neutral),
+        "utilities-terminal-symbolic" => ("desklink-terminal-symbolic", Tone::Neutral),
+        "auth-fingerprint-symbolic" => ("desklink-fingerprint-symbolic", Tone::Neutral),
+        "input-mouse-symbolic" => ("desklink-mouse-symbolic", Tone::Neutral),
+        "dialog-warning-symbolic" => ("desklink-warning-symbolic", Tone::Warn),
+        other => (other, Tone::Neutral),
+    }
+}
+
+/// A row's 40 px icon square (the old `row-icon` badge, in the kit's look).
+fn icon_square(icon: &str, _size: i32, _class: &str) -> gtk::CenterBox {
+    let (name, tone) = material(icon);
+    ui_kit::icon_square(name, tone)
+}
+
 fn with_icon(row: &impl IsA<adw::ActionRow>, icon: &str) {
     row.add_prefix(&icon_square(icon, 30, "row-icon"));
 }
@@ -629,7 +1093,9 @@ fn keep_awake_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::SwitchR
         .build();
     with_icon(&row, "weather-clear-night-symbolic");
     let daemon = daemon.clone();
-    row.connect_active_notify(move |row| daemon.send(DaemonCommand::SetStayAwake(row.is_active())));
+    toggled(&row, move |row| {
+        daemon.send(DaemonCommand::SetStayAwake(row.is_active()))
+    });
     follow(&row, |settings, _| settings.stay_awake);
     row
 }
@@ -656,7 +1122,7 @@ fn unlock_nearby_row(
     with_icon(&row, "changes-allow-symbolic");
     row.update_property(&[gtk::accessible::Property::Description(&explained)]);
     let (daemon, id) = (daemon.clone(), device.id.clone());
-    row.connect_active_notify(move |row| {
+    toggled(&row, move |row| {
         daemon.send(DaemonCommand::SetUnlockNearby(id.clone(), row.is_active()))
     });
     follow(&row, |settings, id| settings.unlocks_from(id));
@@ -684,7 +1150,7 @@ fn gallery_row(
     with_icon(&row, "image-x-generic-symbolic");
     row.update_property(&[gtk::accessible::Property::Description(&explained)]);
     let (daemon, id) = (daemon.clone(), device.id.clone());
-    row.connect_active_notify(move |row| {
+    toggled(&row, move |row| {
         daemon.send(DaemonCommand::SetGalleryAccept(id.clone(), row.is_active()))
     });
     follow(&row, |settings, id| settings.accepts_gallery_from(id));
@@ -718,7 +1184,7 @@ fn dnd_row(daemon: &DaemonHandle, settings: &AppSettings, device: &DeviceView) -
     with_icon(&row, "notifications-disabled-symbolic");
     row.update_property(&[gtk::accessible::Property::Description(&explained)]);
     let (daemon, id) = (daemon.clone(), device.id.clone());
-    row.connect_active_notify(move |row| {
+    toggled(&row, move |row| {
         daemon.send(DaemonCommand::SetDndShare(id.clone(), row.is_active()))
     });
     follow(&row, |settings, id| settings.shares_dnd_with(id));
@@ -746,7 +1212,7 @@ fn walk_away_row(
     with_icon(&row, "system-lock-screen-symbolic");
     row.update_property(&[gtk::accessible::Property::Description(&explained)]);
     let (daemon, id) = (daemon.clone(), device.id.clone());
-    row.connect_active_notify(move |row| {
+    toggled(&row, move |row| {
         daemon.send(DaemonCommand::SetWalkAwayLock(id.clone(), row.is_active()))
     });
     follow(&row, |settings, id| settings.locks_when_away(id));
@@ -769,7 +1235,7 @@ fn command_alerts_row(
     ));
     with_icon(&row, "alarm-symbolic");
     let (daemon, id) = (daemon.clone(), device.id.clone());
-    row.connect_active_notify(move |row| {
+    toggled(&row, move |row| {
         daemon.send(DaemonCommand::SetCommandAlerts(id.clone(), row.is_active()))
     });
     follow(&row, |settings, id| settings.alerts_commands_to(id));
@@ -794,7 +1260,7 @@ fn phone_keep_awake_row(
     ));
     with_icon(&row, "weather-clear-night-symbolic");
     let (daemon, id) = (daemon.clone(), device.id.clone());
-    row.connect_active_notify(move |row| {
+    toggled(&row, move |row| {
         daemon.send(DaemonCommand::SetKeepAwakeFrom(id.clone(), row.is_active()))
     });
     follow(&row, |settings, id| settings.lets_keep_awake(id));
@@ -828,7 +1294,7 @@ fn top_bar_pill_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Switc
         .build();
     with_icon(&row, "phone-symbolic");
     let daemon = daemon.clone();
-    row.connect_active_notify(move |row| {
+    toggled(&row, move |row| {
         daemon.send(DaemonCommand::SetTopBarPill(row.is_active()))
     });
     follow(&row, |settings, _| settings.top_bar_pill);
@@ -1069,7 +1535,7 @@ fn away_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::ActionRow {
     row.add_suffix(&switch);
     row.add_suffix(
         &gtk::Image::builder()
-            .icon_name("go-next-symbolic")
+            .icon_name("desklink-chevron-right-symbolic")
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
@@ -1644,10 +2110,15 @@ fn add_glide_rows(
     arrangement.update_property(&[gtk::accessible::Property::Label(&format!(
         "Where {phone} sits"
     ))]);
+    // Its visibility follows the glide switch, never the search's.
+    arrangement.set_widget_name(OWN_VISIBILITY);
     group.add(&arrangement);
     let (daemon, id) = (daemon.clone(), device.id.clone());
     switch.connect_active_notify(move |switch| {
         arrangement.set_visible(switch.is_active());
+        if SYNCING.with(|syncing| syncing.get()) {
+            return;
+        }
         // The slot shown as chosen (right by default).
         let edge = switch.is_active().then(|| {
             slots
@@ -1888,5 +2359,256 @@ mod tests {
         assert_eq!(glide_explained("Pixel", None, "Desk"), says);
         assert_eq!(glide_explained("Pixel", Some(false), "Desk"), says);
         assert!(glide_explained("Pixel", Some(true), "Desk").starts_with("Move the pointer past"));
+    }
+
+    /// Each of the ten groups has one place in the list, in the groups' order.
+    #[test]
+    fn every_group_has_one_place_in_the_list() {
+        let indexes: Vec<usize> = PAGES.iter().map(|page| page.1).collect();
+        assert_eq!(indexes, (0..GROUPS.len()).collect::<Vec<_>>());
+        assert_eq!(section_label(Section::Computer, "Pixel"), "This computer");
+        assert_eq!(section_label(Section::Phone, "Pixel"), "Share with Pixel");
+        assert_eq!(
+            section_label(Section::Privacy, "Pixel"),
+            "Privacy and safety"
+        );
+    }
+
+    fn view_for_tests() -> (View, DaemonHandle) {
+        let info = crate::device_links::device_info::DeviceInfo::local(
+            "parity-phone".into(),
+            "Pixel 9".into(),
+        );
+        let device = DeviceView::from_info(&info, "192.168.1.9".into(), true);
+        let status = crate::device_links::glide::Status {
+            availability: crate::device_links::glide::Availability::Unavailable("test"),
+            gliding: None,
+            problem: None,
+        };
+        let (daemon, _commands) = DaemonHandle::detached();
+        let view = build_view(
+            None,
+            &daemon,
+            &AppSettings::default(),
+            &device,
+            &status,
+            false,
+        );
+        (view, daemon)
+    }
+
+    fn all_titles(widget: &gtk::Widget, out: &mut Vec<String>) {
+        if let Some(row) = widget.downcast_ref::<adw::PreferencesRow>() {
+            let title = row.title();
+            out.push(
+                gtk::pango::parse_markup(&title, '\0')
+                    .map_or_else(|_| title.to_string(), |(_, plain, _)| plain.to_string()),
+            );
+        }
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            all_titles(&next, out);
+            child = next.next_sibling();
+        }
+    }
+
+    /// The redesign moves rows into subpages and removes none: every row title
+    /// of the desk-ui1 page (`testdata/settings_row_titles_desk_ui1.json`,
+    /// written from that page, the Away from home dialog included) is in a
+    /// subpage now, and each subpage is linked from the list. (Needs a display.)
+    #[test]
+    fn every_original_settings_row_is_still_reachable() {
+        crate::test_display::run(|| {
+            // The rows of the old page. Some depend on the machine: the two
+            // GNOME rows (an extension is possible) and the relay address
+            // row's title (a built-in relay server).
+            let table: serde_json::Value = serde_json::from_str(include_str!(
+                "../../testdata/settings_row_titles_desk_ui1.json"
+            ))
+            .unwrap();
+            let names = |key: &str| -> Vec<String> {
+                table[key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|title| title.as_str().unwrap().to_string())
+                    .collect()
+            };
+            let mut before = names("always");
+            if crate::shell_dbus::extension_possible() {
+                before.extend(names("gnome"));
+            }
+            before.extend(names(
+                if crate::device_links::config::DEFAULT_RELAY_URL.is_empty() {
+                    "relayCustom"
+                } else {
+                    "relayBuiltIn"
+                },
+            ));
+            let (view, daemon) = view_for_tests();
+            let mut after = Vec::new();
+            for page in &view.pages {
+                all_titles(page.child().unwrap().upcast_ref(), &mut after);
+            }
+            // The dialog behind "Reach this computer from anywhere" is built
+            // by the same function as before.
+            all_titles(
+                away_from_home_group(&daemon, &AppSettings::default()).upcast_ref(),
+                &mut after,
+            );
+            let missing: Vec<_> = before
+                .iter()
+                .filter(|title| !after.contains(title))
+                .collect();
+            assert!(missing.is_empty(), "rows lost: {missing:?}");
+            // And the list links to every subpage.
+            let mut listed = Vec::new();
+            let root = view.root.find_page("list").unwrap();
+            all_titles(root.child().unwrap().upcast_ref(), &mut listed);
+            for title in GROUPS {
+                assert!(
+                    listed.iter().any(|row| row == title),
+                    "{title} is not in the list"
+                );
+            }
+        });
+    }
+
+    /// Searching shows the matching rows under their group's name, from every
+    /// page, and clearing the search puts each group back on its page.
+    #[test]
+    fn searching_settings_reaches_every_page_and_clearing_restores_them() {
+        crate::test_display::run(|| {
+            fn find(widget: &gtk::Widget) -> Option<adw::PreferencesGroup> {
+                if let Some(group) = widget.downcast_ref::<adw::PreferencesGroup>() {
+                    return Some(group.clone());
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    if let Some(found) = find(&next) {
+                        return Some(found);
+                    }
+                    child = next.next_sibling();
+                }
+                None
+            }
+            let (view, _daemon) = view_for_tests();
+            let groups: Vec<adw::PreferencesGroup> = view
+                .pages
+                .iter()
+                .map(|page| find(page.child().unwrap().upcast_ref()).unwrap())
+                .collect();
+            let homes: Vec<_> = groups.iter().map(|group| group.parent()).collect();
+            let search = SEARCH.with(|slot| slot.borrow().upgrade()).unwrap();
+            // `search-changed` is sent after a pause; without a main loop, send it.
+            search.set_text("glide");
+            search.emit_by_name::<()>("search-changed", &[]);
+            assert_ne!(groups[5].parent(), homes[5], "Control moved to the results");
+            assert!(groups[5].is_visible(), "and shows its matching rows");
+            assert!(!groups[7].is_visible(), "Privacy has no glide row");
+            search.set_text("");
+            search.emit_by_name::<()>("search-changed", &[]);
+            for (group, home) in groups.iter().zip(&homes) {
+                assert_eq!(&group.parent(), home);
+                assert!(group.is_visible());
+            }
+        });
+    }
+
+    /// The search reads what the rows say, not their markup: an apostrophe or
+    /// an ampersand typed is found, and "amp" is not in "Privacy & security".
+    /// (Needs a display.)
+    #[test]
+    fn search_matches_the_plain_words_of_the_rows() {
+        crate::test_display::run(|| {
+            let privacy = group("Privacy & security");
+            let send = adw::SwitchRow::builder()
+                .title(esc("Send this computer's notifications"))
+                .subtitle(esc("Only from the apps you choose & never back"))
+                .build();
+            privacy.add(&send);
+            let other = group("Sound");
+            let mic = adw::SwitchRow::builder().title("Microphone").build();
+            other.add(&mic);
+            let groups = searchable(&[privacy.clone(), other.clone()]);
+            assert!(filter_groups(&groups, "computer's"));
+            assert!(send.is_visible() && !mic.is_visible());
+            assert!(filter_groups(&groups, "choose & never"));
+            assert!(send.is_visible());
+            assert!(
+                filter_groups(&groups, "privacy & security"),
+                "the group's title"
+            );
+            assert!(!filter_groups(&groups, "amp"), "markup is not text");
+            assert!(!filter_groups(&groups, "&amp;"));
+            assert!(filter_groups(&groups, ""));
+        });
+    }
+
+    /// A row whose visibility is its own (the glide arrangement, shown while
+    /// glide is on) is not touched by a search and its clearing.
+    #[test]
+    fn the_search_leaves_a_rows_own_visibility_alone() {
+        crate::test_display::run(|| {
+            let controls = group("Control");
+            let glide = adw::SwitchRow::builder().title("Glide onto Pixel").build();
+            let arrangement = adw::PreferencesRow::builder().visible(false).build();
+            arrangement.set_widget_name(OWN_VISIBILITY);
+            controls.add(&glide);
+            controls.add(&arrangement);
+            let groups = searchable(std::slice::from_ref(&controls));
+            // Glide is turned on after the page was built; then a search and a clear.
+            arrangement.set_visible(true);
+            assert!(filter_groups(&groups, "glide"));
+            assert!(filter_groups(&groups, ""));
+            assert!(arrangement.is_visible());
+            arrangement.set_visible(false);
+            assert!(filter_groups(&groups, "glide"));
+            assert!(filter_groups(&groups, ""));
+            assert!(!arrangement.is_visible());
+        });
+    }
+
+    /// A rebuild keeps what was typed and the subpage that was open, and a
+    /// phone's change moved onto a switch is not sent back as a click.
+    /// (Needs a display.)
+    #[test]
+    fn a_rebuild_keeps_the_query_and_the_open_page_and_a_sync_sends_nothing() {
+        crate::test_display::run(|| {
+            let (first, _daemon) = view_for_tests();
+            let search = SEARCH.with(|slot| slot.borrow().upgrade()).unwrap();
+            search.set_text("clipboard");
+            search.emit_by_name::<()>("search-changed", &[]);
+            OPEN.with(|slot| slot.set(Some(7)));
+            drop(first);
+            let (second, _daemon) = view_for_tests();
+            let search = SEARCH.with(|slot| slot.borrow().upgrade()).unwrap();
+            assert_eq!(search.text(), "clipboard");
+            assert_eq!(
+                second
+                    .root
+                    .visible_page()
+                    .and_then(|page| page.tag())
+                    .as_deref(),
+                Some("page-7")
+            );
+            search.set_text("");
+            search.emit_by_name::<()>("search-changed", &[]);
+            OPEN.with(|slot| slot.set(None));
+
+            // A switch moved by `sync_live` does not run a click's handler.
+            let (daemon, commands) = DaemonHandle::detached();
+            let row = adw::SwitchRow::builder().build();
+            let sent = std::rc::Rc::new(std::cell::Cell::new(0));
+            let counter = sent.clone();
+            toggled(&row, move |_| counter.set(counter.get() + 1));
+            SYNCING.with(|syncing| syncing.set(true));
+            row.set_active(true);
+            SYNCING.with(|syncing| syncing.set(false));
+            assert_eq!(sent.get(), 0);
+            row.set_active(false);
+            assert_eq!(sent.get(), 1);
+            drop((daemon, commands));
+        });
     }
 }

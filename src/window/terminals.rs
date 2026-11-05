@@ -11,14 +11,16 @@ use std::cell::RefCell;
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 
+use super::ui_kit::{self, ButtonKind, Tone};
 use super::{
-    confirm, ellipsized, icon_button, named_widgets, text, toast_from, wrapped, DesklinkWindow,
+    clipboard, confirm, ellipsized, icon_button, named_widgets, text, toast_from, wrapped,
+    DesklinkWindow,
 };
 use crate::device_links::device::DeviceView;
 use crate::device_links::pty::registry::SessionInfo;
 use crate::device_links::webrtc::terminal_bridge::{attached_devices, end_device_sessions};
 use crate::link_glyph::presence_dot;
-use crate::terminal_previews::{display_title, preview, screen_lines, sessions, started};
+use crate::terminal_previews::{display_title, screen_lines, sessions, started, waiting_for_input};
 
 /// How many lines the detail's preview shows.
 const DETAIL_LINES: usize = 60;
@@ -32,6 +34,9 @@ pub(super) struct Page {
     detach: gtk::Button,
     grid: gtk::Box,
     note: gtk::Label,
+    /// "Terminal access is off for <phone>", with a way to Settings.
+    access: gtk::Box,
+    access_line: gtk::Label,
     detail: gtk::Box,
     /// The terminal the detail shows.
     detail_id: RefCell<Option<String>>,
@@ -51,9 +56,9 @@ impl Page {
             .width_request(240)
             .build();
         search.update_property(&[gtk::accessible::Property::Label("Search terminals")]);
-        let count = wrapped("", &["text-dim"]);
-        let detach = super::soft_button("Detach");
-        detach.set_css_classes(&["coral-outline"]);
+        clipboard::ensure_css();
+        let count = text("", &["dl-secondary"]);
+        let detach = ui_kit::button(ButtonKind::Danger, "Detach", None);
         detach.set_visible(false);
         let header = gtk::Box::builder().spacing(12).build();
         header.set_widget_name("responsive");
@@ -67,18 +72,36 @@ impl Page {
         let grid = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
-        let note = text("", &["text-faint", "body-small"]);
+        let note = text("", &["dl-hint-line"]);
         note.set_wrap(true);
-        let info = gtk::Box::builder().spacing(8).build();
-        info.append(
-            &gtk::Image::builder()
-                .icon_name("dialog-information-symbolic")
-                .valign(gtk::Align::Start)
-                .css_classes(["text-faint"])
-                .accessible_role(gtk::AccessibleRole::Presentation)
-                .build(),
-        );
-        info.append(&note);
+
+        // Terminal access off for the phone: said once, with the way to turn it on.
+        let access = gtk::Box::builder()
+            .spacing(12)
+            .css_classes(["dl-card", "dl-card-new"])
+            .visible(false)
+            .build();
+        access.set_widget_name("responsive");
+        access.append(&ui_kit::icon_square("desklink-lock-symbolic", Tone::Warn));
+        let access_words = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .hexpand(true)
+            .valign(gtk::Align::Center)
+            .build();
+        let access_line = wrapped("", &["dl-label"]);
+        access_words.append(&access_line);
+        access_words.append(&wrapped(
+            "Turn it on under Privacy & security.",
+            &["dl-secondary"],
+        ));
+        access.append(&access_words);
+        let open_settings = ui_kit::button(ButtonKind::Tonal, "Open settings", None);
+        open_settings.set_valign(gtk::Align::Center);
+        open_settings.connect_clicked(|button| {
+            super::prefs::show_privacy();
+            let _ = button.activate_action("win.show-page", Some(&"settings".to_variant()));
+        });
+        access.append(&open_settings);
 
         let list = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -88,8 +111,9 @@ impl Page {
             .css_classes(["page-margins"])
             .build();
         list.append(&header);
+        list.append(&access);
         list.append(&grid);
-        list.append(&info);
+        list.append(&note);
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
@@ -137,6 +161,8 @@ impl Page {
             detach,
             grid,
             note,
+            access,
+            access_line,
             detail,
             detail_id: RefCell::default(),
             device: RefCell::default(),
@@ -220,6 +246,9 @@ impl Page {
         let phone_attached = attached.iter().any(|devices| devices.contains(&device.id));
         // The button says "Detach"; whose it is is its tooltip and its name for
         // a screen reader, so a long phone name cannot widen the page.
+        self.access.set_visible(!device.terminal_access);
+        self.access_line
+            .set_label(&format!("Terminal access is off for {}", device.name));
         let whole = format!("Detach {} from its terminals", device.name);
         self.detach.set_tooltip_text(Some(&whole));
         self.detach
@@ -267,6 +296,17 @@ impl Page {
         .unwrap_or_default();
         if *self.key.borrow() != key {
             self.key.replace(key);
+            // Keyboard focus on a tile goes to the same terminal's new tile.
+            let focused = gtk::prelude::RootExt::focus(win).and_then(|focus| {
+                let mut widget = Some(focus);
+                while let Some(candidate) = widget {
+                    if candidate.widget_name().starts_with("terminal-tile:") {
+                        return Some(candidate.widget_name().to_string());
+                    }
+                    widget = candidate.parent();
+                }
+                None
+            });
             while let Some(child) = self.grid.first_child() {
                 self.grid.remove(&child);
             }
@@ -294,6 +334,14 @@ impl Page {
                 }
                 self.grid.append(&flow);
             }
+            if let Some(name) = focused {
+                if let Some(tile) = named_widgets(self.grid.upcast_ref(), &name)
+                    .into_iter()
+                    .find(|widget| widget.widget_name() == name)
+                {
+                    tile.grab_focus();
+                }
+            }
         }
         self.refresh_lines();
     }
@@ -309,8 +357,26 @@ impl Page {
             let Some(info) = all.iter().find(|info| info.id == id) else {
                 continue;
             };
-            let (lines, _) = preview(info);
+            let (lines, _) = screen_lines(info, usize::MAX);
             set_text(&widget, &tile_text(&lines, info.exit_status));
+            let waiting = info.exit_status.is_none() && waiting_for_input(&lines);
+            let exact = |prefix: &str| {
+                let name = format!("{prefix}{id}");
+                named_widgets(self.root.upcast_ref(), &name)
+                    .into_iter()
+                    .filter(move |widget| widget.widget_name() == name)
+                    .collect::<Vec<_>>()
+            };
+            for band in exact("terminal-ask:") {
+                band.set_visible(waiting);
+            }
+            for tile in exact("terminal-tile:") {
+                tile.update_property(&[gtk::accessible::Property::Description(if waiting {
+                    "Waiting for your input"
+                } else {
+                    ""
+                })]);
+            }
         }
         for widget in named_widgets(self.root.upcast_ref(), "terminal-detail:") {
             let id = widget
@@ -395,8 +461,8 @@ fn new_terminal_button(folders: &gtk::gio::Menu) -> adw::SplitButton {
         sections
     };
     let content = adw::ButtonContent::builder()
-        .icon_name("list-add-symbolic")
-        .label("New Terminal")
+        .icon_name("desklink-add-symbolic")
+        .label("New terminal")
         .build();
     let button = adw::SplitButton::builder()
         .child(&content)
@@ -408,7 +474,7 @@ fn new_terminal_button(folders: &gtk::gio::Menu) -> adw::SplitButton {
         .valign(gtk::Align::Center)
         .css_classes(["suggested-action"])
         .build();
-    button.update_property(&[gtk::accessible::Property::Label("New Terminal")]);
+    button.update_property(&[gtk::accessible::Property::Label("New terminal")]);
     button.set_widget_name("new-terminal");
     button
 }
@@ -466,7 +532,8 @@ fn tile(
         content.append(&place);
     }
 
-    let (lines, _) = preview(info);
+    let (lines, _) = screen_lines(info, usize::MAX);
+    let waiting = info.exit_status.is_none() && waiting_for_input(&lines);
     let body = gtk::Label::builder()
         .label(tile_text(&lines, info.exit_status))
         .xalign(0.0)
@@ -486,26 +553,31 @@ fn tile(
     let here = attached.contains(&device.id);
     let others = attached.iter().filter(|id| **id != device.id).count();
     if here {
-        foot.append(&presence_dot(&format!("{} is attached", device.name)));
+        foot.append(&presence_dot(&format!("Open on {}", device.name)));
         foot.append(&ellipsized(
-            &format!("{} attached", device.name),
+            &format!("Open on {}", device.name),
             &["tile-phone"],
         ));
     } else if others > 0 {
-        foot.append(&presence_dot("Another device is attached"));
-        foot.append(&ellipsized("Another device attached", &["tile-phone"]));
+        foot.append(&presence_dot("Open on another device"));
+        foot.append(&ellipsized("Open on another device", &["tile-phone"]));
     } else {
         foot.append(&ellipsized("Only on this computer", &["tile-meta"]));
     }
     foot.append(&gtk::Box::builder().hexpand(true).build());
     foot.append(
         &gtk::Image::builder()
-            .icon_name("go-next-symbolic")
+            .icon_name("desklink-chevron-right-symbolic")
             .css_classes(["tile-meta"])
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
     content.append(&foot);
+    // The phone's "Waiting for your input", for a prompt the person must answer.
+    let ask = text("Waiting for your input", &["dl-ask"]);
+    ask.set_widget_name(&format!("terminal-ask:{}", info.id));
+    ask.set_visible(waiting);
+    content.append(&ask);
 
     let mut classes = vec!["terminal-tile"];
     if !attached.is_empty() {
@@ -513,20 +585,26 @@ fn tile(
     }
     let button = gtk::Button::builder()
         .child(&content)
-        .height_request(176)
+        .height_request(168)
         .vexpand(false)
         .valign(gtk::Align::Start)
         .css_classes(classes)
         .build();
+    button.set_widget_name(&format!("terminal-tile:{}", info.id));
     button.update_property(&[gtk::accessible::Property::Label(&format!(
         "{} terminal{}",
         display_title(&info.title),
         if here {
-            format!(", {} attached", device.name)
+            format!(", open on {}", device.name)
         } else {
             String::new()
         }
     ))]);
+    if waiting {
+        button.update_property(&[gtk::accessible::Property::Description(
+            "Waiting for your input",
+        )]);
+    }
     let (window, id) = (win.downgrade(), info.id.clone());
     button.connect_clicked(move |_| {
         if let Some(window) = window.upgrade() {
@@ -556,9 +634,11 @@ fn empty_tile() -> gtk::Box {
             .build(),
     );
     tile.append(&prompt);
+    let title = text("No terminals yet", &["terminal-title"]);
+    tile.append(&title);
     let words = text(
-        "Start Claude Code, Codex or a shell. The phone sees it too.",
-        &["terminal-title"],
+        "Start Claude Code, Codex or a shell here, or on your phone. The phone sees it too.",
+        &["tile-meta"],
     );
     words.set_wrap(true);
     tile.append(&words);
@@ -606,7 +686,7 @@ fn detail_view(
         .spacing(10)
         .css_classes(["term-detail-bar"])
         .build();
-    let back = icon_button("go-previous-symbolic", "Terminals", &["term-back"]);
+    let back = icon_button("desklink-arrow-back-symbolic", "Terminals", &["term-back"]);
     let window = win.downgrade();
     back.connect_clicked(move |_| {
         if let Some(window) = window.upgrade() {
@@ -625,10 +705,10 @@ fn detail_view(
             .spacing(8)
             .css_classes(["coral-pill"])
             .build();
-        pill.append(&presence_dot(&format!("{} is here", device.name)));
+        pill.append(&presence_dot(&format!("{} is viewing", device.name)));
         // A long name gives way (the whole sentence is the tooltip), so the
         // bar never grows past a narrow window.
-        let here = ellipsized(&format!("{} is here", device.name), &[]);
+        let here = ellipsized(&format!("{} is viewing", device.name), &[]);
         here.set_max_width_chars(28);
         pill.append(&here);
         bar.append(&pill);
@@ -660,13 +740,13 @@ fn detail_view(
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
         .build();
-    who.append(&text("Attached", &["side-heading"]));
+    who.append(&text("Open on", &["side-heading"]));
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list", "compact-list"])
         .build();
     list.append(&attached_row(
-        "computer-symbolic",
+        "desklink-device-desktop-symbolic",
         "This computer",
         if info.desk_window {
             "In a terminal window"
@@ -691,16 +771,13 @@ fn detail_view(
             .get(id)
             .cloned()
             .unwrap_or_else(|| "A phone".to_string());
-        let detach = gtk::Button::builder()
-            .label("Detach")
-            .valign(gtk::Align::Center)
-            .tooltip_text(format!("Detach {name} from its terminals"))
-            .css_classes(["flat", "coral-link"])
-            .build();
+        let detach = ui_kit::button(ButtonKind::Text, "Detach", None);
+        detach.set_valign(gtk::Align::Center);
+        detach.set_tooltip_text(Some(&format!("Detach {name} from its terminals")));
         let (device_id, device_name) = (id.clone(), name.clone());
         detach.connect_clicked(move |button| detach_device(button, &device_id, &device_name));
         list.append(&attached_row(
-            "phone-symbolic",
+            "desklink-device-phone-symbolic",
             &name,
             "Viewing",
             Some(&detach),
@@ -714,7 +791,7 @@ fn detail_view(
                 "Not open on {}. It can join from its Terminals tab.",
                 device.name
             ),
-            &["text-faint", "body-small"],
+            &["dl-hint-line"],
         );
         note.set_wrap(true);
         who.append(&note);
@@ -760,18 +837,15 @@ fn detail_view(
     side.append(&facts);
     side.append(&gtk::Box::builder().vexpand(true).build());
 
-    let open = icon_button(
-        "window-new-symbolic",
-        "Open in Terminal Window",
-        &["soft-button"],
+    let open = ui_kit::button(
+        ButtonKind::Tonal,
+        "Open in terminal window",
+        Some("desklink-open-in-new-symbolic"),
     );
     let id = info.id.clone();
     open.connect_clicked(move |_| crate::device_links::pty::desk::open_on_desktop(&id));
     side.append(&open);
-    let end = gtk::Button::builder()
-        .label("End Session")
-        .css_classes(["danger-soft"])
-        .build();
+    let end = ui_kit::button(ButtonKind::Danger, "End session", None);
     let (id, name) = (info.id.clone(), display_title(&info.title));
     end.connect_clicked(move |button| {
         let (id, target) = (id.clone(), button.clone());
@@ -779,7 +853,7 @@ fn detail_view(
             button,
             &format!("End {name}?"),
             "Whatever runs in it stops, here and on every phone.",
-            "_End Session",
+            "_End session",
             move || {
                 crate::terminal_previews::close(&id);
                 toast_from(&target, "Session ended");
@@ -812,7 +886,7 @@ fn attached_row(
     row.append(
         &gtk::Image::builder()
             .icon_name(icon)
-            .css_classes(["text-dim"])
+            .css_classes(["dl-glyph"])
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );

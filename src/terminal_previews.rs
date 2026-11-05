@@ -86,6 +86,155 @@ pub(crate) fn last_lines(contents: &str, count: usize) -> Vec<String> {
         .collect()
 }
 
+/// How many of the last lines say whether a terminal is waiting for the
+/// person (the phone's `TerminalAttention` looks at the last 14 too).
+pub(crate) const ATTENTION_LINES: usize = 14;
+
+/// Whether the last lines of a terminal ask the person something: a y/n
+/// question, an approval menu, "press enter", a password prompt. The same
+/// prompts as the phone's `classifyAttention` (`TerminalAttention.kt`); only
+/// the last [`ATTENTION_LINES`] non-blank lines count, a prompt that scrolled
+/// away is history.
+pub(crate) fn waiting_for_input(lines: &[String]) -> bool {
+    let tail: Vec<&String> = lines
+        .iter()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    tail[tail.len().saturating_sub(ATTENTION_LINES)..]
+        .iter()
+        .any(|line| asks_the_person(line))
+}
+
+/// Starts with one of `words` as a whole word; returns what follows.
+fn after_word<'a>(text: &'a str, words: &[&str]) -> Option<&'a str> {
+    words.iter().find_map(|word| {
+        let rest = text.strip_prefix(word)?;
+        (rest.is_empty() || !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+            .then_some(rest)
+    })
+}
+
+/// The text after each place `phrase` occurs as whole words (`\bphrase\b`).
+fn after_phrase<'a>(haystack: &'a str, phrase: &'a str) -> impl Iterator<Item = &'a str> {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    haystack.match_indices(phrase).filter_map(move |(at, _)| {
+        let rest = &haystack[at + phrase.len()..];
+        let starts = !haystack[..at].chars().next_back().is_some_and(word);
+        let ends = !rest.chars().next().is_some_and(word);
+        (starts && ends).then_some(rest)
+    })
+}
+
+/// The text of every place `needle` occurs in `haystack`, from just after it.
+fn after_each<'a>(haystack: &'a str, needle: &'a str) -> impl Iterator<Item = &'a str> {
+    haystack
+        .match_indices(needle)
+        .map(move |(at, _)| &haystack[at + needle.len()..])
+}
+
+fn asks_the_person(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    let squeezed: String = lower.chars().filter(|c| !c.is_whitespace()).collect();
+    // (y/n) [Y/n] [y/N] (yes/no)
+    if [
+        "(y/n)", "[y/n]", "(yes/no)", "[yes/no]", "(y/no)", "[y/no]", "(yes/n)", "[yes/n]",
+    ]
+    .iter()
+    .any(|mark| squeezed.contains(mark))
+    {
+        return true;
+    }
+    // Claude Code, Codex.
+    let starts = |phrase: &str, words: &[&str]| {
+        after_each(&lower, phrase).any(|rest| after_word(rest, words).is_some())
+    };
+    if starts(
+        "do you want to ",
+        &[
+            "proceed",
+            "continue",
+            "make this edit",
+            "create",
+            "run",
+            "allow",
+            "overwrite",
+            "apply",
+            "delete",
+        ],
+    ) || starts(
+        "would you like to ",
+        &["proceed", "continue", "run", "apply", "allow", "make"],
+    ) {
+        return true;
+    }
+    // allow (this )?(command|codex|claude|tool) ... ?
+    for rest in after_each(&lower, "allow ") {
+        let rest = rest.strip_prefix("this ").unwrap_or(rest);
+        if after_word(rest, &["command", "codex", "claude", "tool"])
+            .is_some_and(|after| after.contains('?'))
+        {
+            return true;
+        }
+    }
+    if ["press enter", "press return", "press any key", "hit enter"]
+        .iter()
+        .any(|phrase| after_phrase(&lower, phrase).next().is_some())
+    {
+        return true;
+    }
+    let trimmed = lower.trim_end();
+    if trimmed.ends_with("continue?") || trimmed.ends_with("proceed?") {
+        return true;
+    }
+    if after_phrase(&lower, "are you sure").any(|rest| rest.contains('?')) {
+        return true;
+    }
+    // An approval menu with its cursor on "1. Yes".
+    let menu = lower
+        .trim_start()
+        .trim_start_matches(['❯', '>', '›'])
+        .trim_start();
+    if menu.strip_prefix("1.").is_some_and(|rest| {
+        after_word(rest.trim_start(), &["yes"]).is_some() && rest.starts_with(char::is_whitespace)
+    }) {
+        return true;
+    }
+    // "3. No, and tell Claude what to do differently".
+    let word_before = |at: usize| {
+        lower[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    };
+    if lower.match_indices("no, and tell ").any(|(at, phrase)| {
+        let rest = &lower[at + phrase.len()..];
+        let word_end = rest
+            .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        !word_before(at) && word_end > 0 && rest[word_end..].starts_with(" what to do")
+    }) {
+        return true;
+    }
+    // [sudo] password for sam:   Passphrase:
+    if let Some(before) = trimmed.strip_suffix(':') {
+        for word in ["password", "passphrase"] {
+            for (at, _) in before.match_indices(word) {
+                let starts_a_word = before[..at]
+                    .chars()
+                    .next_back()
+                    .is_none_or(char::is_whitespace);
+                let rest = &before[at + word.len()..];
+                if starts_a_word
+                    && (rest.is_empty() || (rest.starts_with(" for ") && !rest.contains(':')))
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// The small label on a tile: "CC" for Claude Code, "CX" for Codex, ">_" for
 /// a shell.
 pub(crate) fn agent_chip(title: &str) -> &'static str {
@@ -156,5 +305,81 @@ mod tests {
         assert_eq!(agent_chip("-zsh"), ">_");
         assert_eq!(display_title("claude"), "Claude Code");
         assert_eq!(display_title("-bash"), "bash");
+    }
+
+    fn lines(text: &str) -> Vec<String> {
+        text.lines().map(str::to_string).collect()
+    }
+
+    /// The vectors of the phone's `TerminalAttentionTest`: the same prompts
+    /// wait, the same ordinary output does not.
+    #[test]
+    fn a_terminal_asking_something_is_waiting_for_input() {
+        for prompt in [
+            "Overwrite file? (y/n)",
+            "Proceed [Y/n]",
+            "Continue ( yes / no )",
+            "Do you want to proceed?",
+            "Do you want to make this edit to src/main.rs?",
+            "Would you like to run the following command?",
+            "Allow this command to run? ",
+            "Press ENTER to continue",
+            "Are you sure you want to delete it?",
+            "❯ 1. Yes",
+            "  3. No, and tell Claude what to do differently",
+            "[sudo] password for sam:",
+            "Password:",
+            "Enter passphrase:",
+            "Apply these changes, continue?",
+        ] {
+            assert!(waiting_for_input(&lines(prompt)), "{prompt}");
+        }
+        for output in [
+            "",
+            "   ",
+            "$ cargo build",
+            "Compiling desklink v1.4.0",
+            "the password file was not changed",
+            "compress enterprise logs",
+            "we compress entering data and hit entertainment",
+            "unpress enter",
+            "they are you surely done",
+            "Password rules: 12 characters",
+            "You can continue later.",
+            "yes/no questions are handled elsewhere",
+        ] {
+            assert!(!waiting_for_input(&lines(output)), "{output}");
+        }
+    }
+
+    /// Only the last 14 lines count: an answered question scrolled away.
+    #[test]
+    fn a_prompt_that_scrolled_away_is_history() {
+        let mut screen = vec!["Overwrite file? (y/n)".to_string()];
+        screen.extend((0..14).map(|n| format!("line {n}")));
+        assert!(!waiting_for_input(&screen));
+        screen.remove(1);
+        assert!(waiting_for_input(&screen));
+        // Blank lines do not push it out.
+        let mut blanks = vec!["Overwrite file? (y/n)".to_string()];
+        blanks.extend(std::iter::repeat_n(String::new(), 30));
+        assert!(waiting_for_input(&blanks));
+    }
+
+    /// The phone looks at the last 14 non-blank lines of the whole screen:
+    /// blank lines between do not shorten the window.
+    #[test]
+    fn blank_lines_between_do_not_hide_a_prompt() {
+        let mut screen = vec!["Overwrite file? (y/n)".to_string()];
+        for n in 0..12 {
+            screen.push(format!("line {n}"));
+            screen.push(String::new());
+        }
+        // 13 non-blank lines in 25: the prompt is within the last 14.
+        assert!(waiting_for_input(&screen));
+        screen.push("one more".into());
+        assert!(waiting_for_input(&screen), "the 14th from the end");
+        screen.push("and another".into());
+        assert!(!waiting_for_input(&screen));
     }
 }
