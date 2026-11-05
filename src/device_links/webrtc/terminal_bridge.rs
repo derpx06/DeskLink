@@ -386,7 +386,13 @@ impl TerminalBridge {
                     // Only the writer resizes, and never over an open desk window
                     // that owns the size: a viewer's phone rotating must not
                     // reflow the screen out from under whoever is typing.
-                    _ if !writer || attachment.session.desk_sets_size() => {
+                    _ if !writer
+                        || attachment.session.desk_sets_size()
+                        || attachment
+                            .session
+                            .claim_holder()
+                            .is_some_and(|holder| holder != device) =>
+                    {
                         // It has not changed its own screen (the phone follows
                         // the host's size); telling it the real one again keeps
                         // that true.
@@ -433,7 +439,15 @@ impl TerminalBridge {
         // The last desk window closed since this phone last resized: its
         // size again.
         if let Some(viewport) = attachment.viewport {
-            if !attachment.session.desk_sets_size() && attachment.session.size() != viewport {
+            // Never over a desk window's size, nor over another phone's claim.
+            let others_claim = attachment
+                .session
+                .claim_holder()
+                .is_some_and(|holder| holder != self.wire.peer_device_id);
+            if !attachment.session.desk_sets_size()
+                && !others_claim
+                && attachment.session.size() != viewport
+            {
                 let _ = attachment.session.resize(viewport.0, viewport.1);
             }
         }
@@ -1492,6 +1506,33 @@ mod tests {
         // The last window closing ends the claim and the size question with it.
         session.desk_window_closed();
         assert!(!session.has_desk_window());
+        registry.close(&id);
+    }
+
+    /// A second phone that takes the keyboard lease must not undo the first
+    /// phone's size claim by typing.
+    #[test]
+    fn typing_does_not_override_another_phones_claim() {
+        let mut registry = TerminalRegistry::new();
+        let mut first = new_bridge("phone-1");
+        let id = create(&mut first, &mut registry, Some(sleeping_command()));
+        let session = registry.get(&id).unwrap();
+        session.release_phone_claim("phone-1");
+        attach(&mut first, &mut registry, &id);
+        session.claim_for_phone("phone-1", 30, 50).unwrap();
+        // The first phone lets go of the keyboard; the second takes it with a viewport of its own.
+        registry.release_terminal_writer(&id, "phone-1");
+        let mut second = new_bridge("phone-2");
+        attach(&mut second, &mut registry, &id);
+        let mut resize = request(TerminalAction::Resize, &second.wire);
+        resize.terminal_id = Some(id.clone());
+        resize.rows = Some(20);
+        resize.cols = Some(40);
+        second.handle_control(&resize, &mut registry).unwrap();
+        second
+            .handle_chunk(&input(&id, b"x"), &mut registry)
+            .unwrap();
+        assert_eq!(session.size(), (30, 50), "the first phone's claim stands");
         registry.close(&id);
     }
 

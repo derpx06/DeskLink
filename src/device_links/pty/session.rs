@@ -120,14 +120,20 @@ impl Output {
     /// client's normal buffer, and quitting vim then emits `?1049l` and drops
     /// the client into a buffer that never had the shell in it.
     fn snapshot(&self) -> Vec<u8> {
-        let screen = self.parser.screen();
-        let mut out = Vec::from(&b"\x1bc"[..]);
-        if screen.alternate_screen() {
-            out.extend_from_slice(b"\x1b[?1049h");
-        }
-        out.extend_from_slice(&screen.state_formatted());
-        out
+        snapshot_bytes(&self.parser)
     }
+}
+
+/// What a client attaching now is sent (see [`Output::snapshot`]); also what the
+/// conformance corpus pins, so the test cannot drift from the product.
+pub(crate) fn snapshot_bytes(parser: &vt100::Parser) -> Vec<u8> {
+    let screen = parser.screen();
+    let mut out = Vec::from(&b"\x1bc"[..]);
+    if screen.alternate_screen() {
+        out.extend_from_slice(b"\x1b[?1049h");
+    }
+    out.extend_from_slice(&screen.state_formatted());
+    out
 }
 
 pub(crate) struct PtySession {
@@ -367,6 +373,11 @@ impl PtySession {
     /// Whether a phone holds the size claim.
     pub(crate) fn phone_sets_size(&self) -> bool {
         self.phone_claim.lock().expect("phone claim lock").is_some()
+    }
+
+    /// The device holding the size claim, if any.
+    pub(crate) fn claim_holder(&self) -> Option<String> {
+        self.phone_claim.lock().expect("phone claim lock").clone()
     }
 
     /// `device_id` takes the size and sets it to `rows` x `cols`.

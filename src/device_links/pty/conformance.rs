@@ -6,7 +6,6 @@
 //! and compare cell by cell, so a divergence between the two shows up on one side.
 //!
 //! `DESKLINK_BLESS=1 cargo test conformance` rewrites the `.grid`/`.snap` files.
-//! Keep this module free of crate imports: it is also built on its own.
 
 use std::path::{Path, PathBuf};
 
@@ -123,15 +122,9 @@ pub(crate) fn grid(parser: &vt100::Parser) -> String {
     out
 }
 
-/// What `session::Output::snapshot` sends a phone that attaches now.
+/// What `session::Output::snapshot` sends a phone that attaches now: the real function.
 pub(crate) fn snapshot(parser: &vt100::Parser) -> Vec<u8> {
-    let screen = parser.screen();
-    let mut out = Vec::from(&b"\x1bc"[..]);
-    if screen.alternate_screen() {
-        out.extend_from_slice(b"\x1b[?1049h");
-    }
-    out.extend_from_slice(&screen.state_formatted());
-    out
+    super::session::snapshot_bytes(parser)
 }
 
 pub(crate) fn dir() -> PathBuf {
@@ -195,7 +188,13 @@ mod tests {
                 std::fs::write(&snap_path, snapshot(&parser)).unwrap();
                 continue;
             }
-            let want = std::fs::read_to_string(&grid_path).unwrap_or_default();
+            let Ok(want) = std::fs::read_to_string(&grid_path) else {
+                failures.push(format!(
+                    "{name}.{cols}: no reference grid at {} - run `DESKLINK_BLESS=1 cargo test conformance` and commit the .grid/.snap files",
+                    grid_path.display()
+                ));
+                continue;
+            };
             if want != got {
                 failures.push(format!(
                     "{name}.{cols}: grid differs from {}",
@@ -209,7 +208,7 @@ mod tests {
                     "{name}.{cols}: vt100 does not reproduce its own snapshot"
                 ));
             }
-            if std::fs::read(&snap_path).unwrap_or_default() != snapshot(&parser) {
+            if std::fs::read(&snap_path).ok().as_deref() != Some(&snapshot(&parser)[..]) {
                 failures.push(format!("{name}.{cols}: stale .snap"));
             }
         }

@@ -788,6 +788,7 @@ impl RemoteSession {
     pub fn begin_view(&mut self, direction: ScreenDirection) -> String {
         let id = Uuid::new_v4().to_string();
         self.remote_session_id = Some(id.clone());
+        self.control_denial = None;
         self.direction = Some(direction);
         self.lease = None;
         self.peer_input_lease = None;
@@ -807,6 +808,7 @@ impl RemoteSession {
             return Err("busy".to_string());
         }
         self.remote_session_id = Some(id.to_string());
+        self.control_denial = None;
         self.direction = Some(ScreenDirection::PhoneToDesktop);
         self.lease = None;
         self.peer_input_lease = None;
@@ -898,6 +900,7 @@ impl RemoteSession {
             }
             ControlKind::RequestView => {
                 self.remote_session_id = Some(message.remote_session_id.clone());
+                self.control_denial = None;
                 self.direction = message.direction;
                 self.lease = None;
                 self.peer_input_lease = None;
@@ -968,9 +971,16 @@ impl RemoteSession {
             ControlKind::ViewDenied | ControlKind::ScreenError => self.stop(),
             // Failing to grant *control* must not take a working view with it.
             ControlKind::ControlDenied => {
+                // With no session there is nothing to deny control of: ignored, not
+                // a reason to start "viewing" one.
+                if self.remote_session_id.is_none() {
+                    return Ok(());
+                }
                 // A grant wins over the denial of an earlier, repeated request that
-                // arrives late: control already held stays held.
-                if self.state == SessionState::Controlling && self.lease.is_some() {
+                // arrives late: control already held (and not yet expired) stays held.
+                if self.state == SessionState::Controlling
+                    && self.lease.as_ref().is_some_and(|lease| lease.expires_at > now)
+                {
                     return Ok(());
                 }
                 self.lease = None;
@@ -1058,6 +1068,7 @@ impl RemoteSession {
         self.direction = None;
         self.lease = None;
         self.peer_input_lease = None;
+        self.control_denial = None;
     }
 
     /// Converts a pending host authorization into a revocable peer-owned lease.
@@ -1903,6 +1914,74 @@ mod tests {
         session.accept(&turned, 1_003).unwrap();
         assert_eq!(session.phone_screen(), Some((2400, 1080)));
         assert_eq!(session.state(), SessionState::Controlling, "control stays");
+    }
+
+    /// A denial with no session under way is nothing to act on: it must not start "viewing".
+    #[test]
+    fn a_control_denial_with_no_session_is_ignored() {
+        let mut session = RemoteSession::new();
+        let denied = message(ControlKind::ControlDenied, &Uuid::new_v4().to_string());
+        session.accept(&denied, 1_000).unwrap();
+        assert_eq!(session.state(), SessionState::Idle);
+        assert_eq!(session.control_denial(), None);
+    }
+
+    /// A grant shields the session from a late denial only while the lease is still good.
+    #[test]
+    fn a_denial_after_the_lease_expired_is_not_shielded() {
+        let mut session = RemoteSession::new();
+        let id = Uuid::new_v4().to_string();
+        let mut request = message(ControlKind::RequestView, &id);
+        request.direction = Some(ScreenDirection::PhoneToDesktop);
+        session.accept(&request, 1_000).unwrap();
+        let mut ready = message(ControlKind::ScreenReady, &id);
+        ready.direction = Some(ScreenDirection::PhoneToDesktop);
+        session.accept(&ready, 1_001).unwrap();
+        session.begin_control().unwrap();
+        let mut granted = message(ControlKind::ControlGranted, &id);
+        granted.lease_id = Some("lease".into());
+        granted.lease_expires_at = Some(2_000);
+        session.accept(&granted, 1_002).unwrap();
+        let mut denied = message(ControlKind::ControlDenied, &id);
+        denied.reason = Some("too late".into());
+        session.accept(&denied, 2_500).unwrap();
+        assert_eq!(session.state(), SessionState::Viewing);
+        assert_eq!(session.control_denial(), Some("too late"));
+    }
+
+    /// The reason a phone refused control belongs to the session it was said in.
+    #[test]
+    fn the_control_denial_does_not_outlive_its_session() {
+        let denied_session = || {
+            let mut session = RemoteSession::new();
+            let id = Uuid::new_v4().to_string();
+            let mut request = message(ControlKind::RequestView, &id);
+            request.direction = Some(ScreenDirection::PhoneToDesktop);
+            session.accept(&request, 1_000).unwrap();
+            let mut denied = message(ControlKind::ControlDenied, &id);
+            denied.reason = Some("accessibility is off".into());
+            session.accept(&denied, 1_001).unwrap();
+            assert_eq!(session.control_denial(), Some("accessibility is off"));
+            (session, id)
+        };
+        let (mut session, _) = denied_session();
+        session.begin_view(ScreenDirection::DesktopToPhone);
+        assert_eq!(session.control_denial(), None, "begin_view");
+
+        let (mut session, _) = denied_session();
+        session.stop();
+        assert_eq!(session.control_denial(), None, "stop");
+
+        let (mut session, _) = denied_session();
+        session.stop();
+        session.adopt_offer("another-session").unwrap();
+        assert_eq!(session.control_denial(), None, "adopt_offer");
+
+        let (mut session, _) = denied_session();
+        let mut request = message(ControlKind::RequestView, "a-new-session");
+        request.direction = Some(ScreenDirection::PhoneToDesktop);
+        session.accept(&request, 1_002).unwrap();
+        assert_eq!(session.control_denial(), None, "request-view");
     }
 
     /// The phone asks for control again every couple of seconds; the answer to an
