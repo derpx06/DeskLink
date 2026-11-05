@@ -347,6 +347,20 @@ impl PtySession {
         process_name(self.shell_pid()?)
     }
 
+    /// The phone's size claim. A panic while it was held does not make every
+    /// later caller panic too: the claim is a plain value, still usable.
+    fn claim(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.phone_claim
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn desk_size_lock(&self) -> std::sync::MutexGuard<'_, Option<(u16, u16)>> {
+        self.desk_size
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub(crate) fn desk_window_opened(&self) {
         self.desk_windows.fetch_add(1, Ordering::AcqRel);
     }
@@ -354,8 +368,8 @@ impl PtySession {
     pub(crate) fn desk_window_closed(&self) {
         // The last window going away ends any claim: nothing is left to squeeze.
         if self.desk_windows.fetch_sub(1, Ordering::AcqRel) == 1 {
-            *self.phone_claim.lock().expect("phone claim lock") = None;
-            *self.desk_size.lock().expect("desk size lock") = None;
+            *self.claim() = None;
+            *self.desk_size_lock() = None;
         }
     }
 
@@ -366,18 +380,20 @@ impl PtySession {
     }
 
     /// Whether a desk window owns the size; a phone then views it as it is.
+    #[cfg(test)]
     pub(crate) fn desk_sets_size(&self) -> bool {
         self.has_desk_window() && !self.phone_sets_size()
     }
 
     /// Whether a phone holds the size claim.
     pub(crate) fn phone_sets_size(&self) -> bool {
-        self.phone_claim.lock().expect("phone claim lock").is_some()
+        self.claim().is_some()
     }
 
     /// The device holding the size claim, if any.
+    #[cfg(test)]
     pub(crate) fn claim_holder(&self) -> Option<String> {
-        self.phone_claim.lock().expect("phone claim lock").clone()
+        self.claim().clone()
     }
 
     /// `device_id` takes the size and sets it to `rows` x `cols`.
@@ -387,8 +403,36 @@ impl PtySession {
         rows: u16,
         cols: u16,
     ) -> Result<(), String> {
-        *self.phone_claim.lock().expect("phone claim lock") = Some(device_id.to_string());
+        // The claim stays locked through the resize, so nobody sees it taken
+        // while the size is still the old one.
+        let mut claim = self.claim();
+        *claim = Some(device_id.to_string());
         self.resize(rows, cols)
+    }
+
+    /// Resizes for `device_id` unless a desk window owns the size or another
+    /// phone holds the claim: the check and the resize are one step under the
+    /// claim lock, so a window opening or a claim landing in between cannot be
+    /// resized over. With `only_if_changed` an unchanged size is left alone.
+    /// `Ok(false)`: held back.
+    pub(crate) fn resize_unless_held(
+        &self,
+        device_id: &str,
+        rows: u16,
+        cols: u16,
+        only_if_changed: bool,
+    ) -> Result<bool, String> {
+        let claim = self.claim();
+        let desk_owns = self.has_desk_window() && claim.is_none();
+        let other_phone = claim.as_deref().is_some_and(|holder| holder != device_id);
+        if desk_owns || other_phone {
+            return Ok(false);
+        }
+        let (rows, cols) = clamp_size(rows, cols);
+        if only_if_changed && self.size() == (rows, cols) {
+            return Ok(true);
+        }
+        self.resize(rows, cols).map(|()| true)
     }
 
     /// Ends `device_id`'s claim (it let go, detached or went away) and puts a
@@ -396,12 +440,12 @@ impl PtySession {
     pub(crate) fn release_phone_claim(&self, device_id: &str) {
         // The claim stays locked until the desk's size is back: anyone who sees
         // it gone sees the size already changed (see `desk_window_size`).
-        let mut claim = self.phone_claim.lock().expect("phone claim lock");
+        let mut claim = self.claim();
         if claim.as_deref() != Some(device_id) {
             return;
         }
         *claim = None;
-        let desk = *self.desk_size.lock().expect("desk size lock");
+        let desk = *self.desk_size_lock();
         if let Some((rows, cols)) = desk.filter(|_| self.has_desk_window()) {
             let _ = self.resize(rows, cols);
         }
@@ -417,8 +461,8 @@ impl PtySession {
     /// gap between the two).
     pub(crate) fn desk_window_size(&self, rows: u16, cols: u16, acted: bool) {
         let (rows, cols) = clamp_size(rows, cols);
-        *self.desk_size.lock().expect("desk size lock") = Some((rows, cols));
-        let mut claim = self.phone_claim.lock().expect("phone claim lock");
+        *self.desk_size_lock() = Some((rows, cols));
+        let mut claim = self.claim();
         if acted {
             *claim = None;
         }
@@ -980,6 +1024,52 @@ mod tests {
             session.resync(None, usize::MAX).unwrap(),
             Resync::Snapshot { .. }
         ));
+    }
+
+    #[test]
+    fn a_resize_is_held_back_by_a_desk_window_or_another_phones_claim_in_one_step() {
+        let session = PtySession::spawn(None, 24, 80).expect("spawn shell");
+        // Nobody owns it: the phone sizes it (and an unchanged size is left).
+        assert_eq!(session.resize_unless_held("a", 30, 100, true), Ok(true));
+        assert_eq!(session.size(), (30, 100));
+        assert_eq!(session.resize_unless_held("a", 30, 100, true), Ok(true));
+        // A desk window owns the size: held back.
+        session.desk_window_opened();
+        assert_eq!(session.resize_unless_held("a", 50, 90, false), Ok(false));
+        assert_eq!(session.size(), (30, 100));
+        // Phone `a` claims it: `a` resizes, `b` is held back, the desk window
+        // no longer owns it.
+        session.claim_for_phone("a", 33, 77).unwrap();
+        assert_eq!(session.resize_unless_held("a", 34, 78, false), Ok(true));
+        assert_eq!(session.size(), (34, 78));
+        assert_eq!(session.resize_unless_held("b", 60, 60, false), Ok(false));
+        assert_eq!(session.size(), (34, 78));
+        // The claim goes: the desk window owns it again.
+        session.release_phone_claim("a");
+        assert_eq!(session.resize_unless_held("a", 40, 40, false), Ok(false));
+        session.desk_window_closed();
+        assert_eq!(session.resize_unless_held("b", 40, 41, false), Ok(true));
+        assert_eq!(session.size(), (40, 41));
+    }
+
+    /// A panic while the claim was held must not make every later caller panic.
+    #[test]
+    fn a_poisoned_claim_lock_does_not_panic_later_callers() {
+        let session = Arc::new(PtySession::spawn(None, 24, 80).expect("spawn shell"));
+        let poisoner = Arc::clone(&session);
+        let _ = std::thread::spawn(move || {
+            let _held = poisoner.phone_claim.lock().unwrap();
+            panic!("a caller died holding the claim");
+        })
+        .join();
+        assert!(session.phone_claim.is_poisoned());
+        assert!(!session.phone_sets_size());
+        session.claim_for_phone("a", 30, 50).unwrap();
+        assert_eq!(session.claim_holder().as_deref(), Some("a"));
+        session.desk_window_size(40, 120, true);
+        assert!(!session.phone_sets_size());
+        assert_eq!(session.size(), (40, 120));
+        session.release_phone_claim("a");
     }
 
     #[test]

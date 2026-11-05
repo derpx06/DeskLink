@@ -384,22 +384,22 @@ impl TerminalBridge {
                         Ok(())
                     }
                     // Only the writer resizes, and never over an open desk window
-                    // that owns the size: a viewer's phone rotating must not
+                    // that owns the size, nor another phone's claim (checked and
+                    // resized in one step): a viewer's phone rotating must not
                     // reflow the screen out from under whoever is typing.
-                    _ if !writer
-                        || attachment.session.desk_sets_size()
-                        || attachment
-                            .session
-                            .claim_holder()
-                            .is_some_and(|holder| holder != device) =>
-                    {
-                        // It has not changed its own screen (the phone follows
-                        // the host's size); telling it the real one again keeps
-                        // that true.
-                        attachment.told_size = (0, 0);
+                    _ => {
+                        let sized = writer
+                            && attachment
+                                .session
+                                .resize_unless_held(device, rows, cols, false)?;
+                        if !sized {
+                            // It has not changed its own screen (the phone
+                            // follows the host's size); telling it the real one
+                            // again keeps that true.
+                            attachment.told_size = (0, 0);
+                        }
                         Ok(())
                     }
-                    _ => attachment.session.resize(rows, cols),
                 }
             }
 
@@ -440,16 +440,12 @@ impl TerminalBridge {
         // size again.
         if let Some(viewport) = attachment.viewport {
             // Never over a desk window's size, nor over another phone's claim.
-            let others_claim = attachment
-                .session
-                .claim_holder()
-                .is_some_and(|holder| holder != self.wire.peer_device_id);
-            if !attachment.session.desk_sets_size()
-                && !others_claim
-                && attachment.session.size() != viewport
-            {
-                let _ = attachment.session.resize(viewport.0, viewport.1);
-            }
+            let _ = attachment.session.resize_unless_held(
+                &self.wire.peer_device_id,
+                viewport.0,
+                viewport.1,
+                true,
+            );
         }
         match attachment.session.write_input(&chunk.data) {
             Ok(()) => self.input_refusal_reported = false,
