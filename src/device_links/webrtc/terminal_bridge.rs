@@ -1361,9 +1361,14 @@ mod tests {
             Some(printing_command("bridge-hello")),
         );
 
-        // The screen first, then the reply naming where the stream resumes.
+        // The list first (the size the screen is drawn for), then the screen, then the
+        // reply naming where the stream resumes.
         let events = attach(&mut bridge, &mut registry, &id);
-        assert!(matches!(&events[0], TerminalEvent::SendChunk(c) if c.kind == ChunkKind::Snapshot));
+        assert!(matches!(
+            &events[0],
+            TerminalEvent::SendControl(c) if c.action == TerminalAction::Sessions
+        ));
+        assert!(matches!(&events[1], TerminalEvent::SendChunk(c) if c.kind == ChunkKind::Snapshot));
         assert!(matches!(
             events.last(),
             Some(TerminalEvent::SendControl(c)) if c.action == TerminalAction::Attached
