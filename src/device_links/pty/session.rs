@@ -394,13 +394,13 @@ impl PtySession {
     /// Ends `device_id`'s claim (it let go, detached or went away) and puts a
     /// desk window back to the size it last reported.
     pub(crate) fn release_phone_claim(&self, device_id: &str) {
-        {
-            let mut claim = self.phone_claim.lock().expect("phone claim lock");
-            if claim.as_deref() != Some(device_id) {
-                return;
-            }
-            *claim = None;
+        // The claim stays locked until the desk's size is back: anyone who sees
+        // it gone sees the size already changed (see `desk_window_size`).
+        let mut claim = self.phone_claim.lock().expect("phone claim lock");
+        if claim.as_deref() != Some(device_id) {
+            return;
         }
+        *claim = None;
         let desk = *self.desk_size.lock().expect("desk size lock");
         if let Some((rows, cols)) = desk.filter(|_| self.has_desk_window()) {
             let _ = self.resize(rows, cols);
@@ -410,13 +410,19 @@ impl PtySession {
     /// A desk window attached or was resized. It sets the size unless a phone
     /// holds the claim; `typed` is the person acting at the desk, which takes
     /// the claim back.
+    ///
+    /// The claim lock is held across the resize: `phone_sets_size` therefore
+    /// never reads "released" while the size is still the phone's (a reader
+    /// that waits for the release and then reads the size used to catch the
+    /// gap between the two).
     pub(crate) fn desk_window_size(&self, rows: u16, cols: u16, acted: bool) {
         let (rows, cols) = clamp_size(rows, cols);
         *self.desk_size.lock().expect("desk size lock") = Some((rows, cols));
+        let mut claim = self.phone_claim.lock().expect("phone claim lock");
         if acted {
-            *self.phone_claim.lock().expect("phone claim lock") = None;
+            *claim = None;
         }
-        if !self.phone_sets_size() && self.size() != (rows, cols) {
+        if claim.is_none() && self.size() != (rows, cols) {
             let _ = self.resize(rows, cols);
         }
     }
