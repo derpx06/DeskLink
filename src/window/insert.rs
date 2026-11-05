@@ -94,8 +94,8 @@ pub(super) fn attach_menu(daemon: &DaemonHandle, device: &DeviceView, button: &g
             }
             daemon.send(DaemonCommand::Capture(
                 id.clone(),
-                kind.into(),
-                target.into(),
+                (*kind).into(),
+                (*target).into(),
             ));
         });
         list.append(&item);

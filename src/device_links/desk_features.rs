@@ -1134,6 +1134,7 @@ mod tests {
             cols: 80,
             exit_status: None,
             desk_window: false,
+            phone_size: false,
             cwd: Some("~/api".into()),
             started_at: 0,
             shell: None,
