@@ -502,6 +502,16 @@ fn look_for_phone(
             let (Pick::Phone(phone), Some(daemon)) = (found, app.daemon_handle()) else {
                 return;
             };
+            if matches!(&request, Direct::Insert { kind, .. } if kind == "text")
+                && !crate::device_links::webrtc::capture::text_available(&phone.id)
+            {
+                say(
+                    &app,
+                    "Text recognition is not available",
+                    &format!("{} cannot read text from a picture.", phone.name),
+                );
+                return;
+            }
             say(
                 &app,
                 &request.asking(&phone.name),
