@@ -903,6 +903,7 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
 
     let weak = app.downgrade();
     let shown = Rc::clone(&properties);
+    let announced = Rc::clone(&properties);
     let registered = connection
         .register_object(PATH, &interface)
         .method_call(
@@ -921,17 +922,20 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
                         let check = check_hello_sender(&connection, sender);
                         if check == Check::Shell {
                             client_said_hello(&connection, sender, vetted(capabilities));
+                            announce_to(&connection, sender, &announced.borrow());
                         } else if check == Check::Throttled {
                             // Someone else's question spent the window; the
                             // Shell says Hello once, so it is tried again
                             // just after it, not refused.
                             let (connection, sender) = (connection.clone(), sender.to_string());
                             let capabilities = vetted(capabilities);
+                            let announced = Rc::clone(&announced);
                             gtk::glib::timeout_add_local_once(
                                 OWNER_ASK_EVERY + std::time::Duration::from_millis(100),
                                 move || {
                                     if hello_is_from_the_shell(&connection, &sender) {
                                         client_said_hello(&connection, &sender, capabilities);
+                                        announce_to(&connection, &sender, &announced.borrow());
                                     }
                                 },
                             );
@@ -961,12 +965,12 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
                 })
             },
         )
-        .property(move |_, _, _, _, name| {
-            shown
-                .borrow()
-                .get(name)
-                .cloned()
-                .unwrap_or_else(|| VERSION.to_variant())
+        .property(move |connection, sender, _, _, name| {
+            // Phone names, call numbers, notifications, snippets and what is
+            // allowed per phone are for the Shell only: anyone else on the
+            // session bus reads empty values (the version is not private).
+            let from_shell = name == "Version" || is_the_shell_caller(&connection, sender);
+            visible_property(name, &shown.borrow(), from_shell)
         })
         .build();
     if let Err(error) = registered {
@@ -990,21 +994,76 @@ pub fn export(app: &DesklinkApplication, connection: &gio::DBusConnection) {
                 .map(|(name, value)| (name.to_string(), value.clone()))
                 .collect();
             properties.replace(now);
+            // Sent to the Shell alone: a broadcast would hand the same values
+            // to any process that listens on the session bus.
             if !changed.is_empty() {
-                let changed = (INTERFACE, changed, Vec::<String>::new()).to_variant();
-                let _ = connection.emit_signal(
-                    None,
-                    PATH,
-                    "org.freedesktop.DBus.Properties",
-                    "PropertiesChanged",
-                    Some(&changed),
-                );
+                if let Some(owner) = known_shell_owner() {
+                    emit_changed(&connection, &owner, changed);
+                }
             }
             glib::ControlFlow::Continue
         })
     });
 
     offer_extension(app);
+}
+
+/// The empty value of a property, of its declared type.
+fn empty_property(name: &str) -> Variant {
+    match name {
+        "Desk" => glib::VariantDict::new(None).end(),
+        _ => Variant::array_from_iter_with_type(
+            glib::VariantTy::VARDICT,
+            std::iter::empty::<Variant>(),
+        ),
+    }
+}
+
+/// What a reader of property `name` gets: the real value for the Shell, an
+/// empty one of the same type for anyone else.
+fn visible_property(
+    name: &str,
+    values: &std::collections::HashMap<&'static str, Variant>,
+    from_shell: bool,
+) -> Variant {
+    match values.get(name) {
+        Some(value) if from_shell || name == "Version" => value.clone(),
+        Some(_) => empty_property(name),
+        None => VERSION.to_variant(),
+    }
+}
+
+/// `PropertiesChanged` to one bus name (the Shell's), never a broadcast.
+fn emit_changed(
+    connection: &gio::DBusConnection,
+    destination: &str,
+    changed: std::collections::HashMap<String, Variant>,
+) {
+    let changed = (INTERFACE, changed, Vec::<String>::new()).to_variant();
+    let _ = connection.emit_signal(
+        Some(destination),
+        PATH,
+        "org.freedesktop.DBus.Properties",
+        "PropertiesChanged",
+        Some(&changed),
+    );
+}
+
+/// Every current value, to a client that just proved it is the Shell (its
+/// first read may have come before the owner was known).
+fn announce_to(
+    connection: &gio::DBusConnection,
+    shell: &str,
+    values: &std::collections::HashMap<&'static str, Variant>,
+) {
+    emit_changed(
+        connection,
+        shell,
+        values
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect(),
+    );
 }
 
 /// Every property's current value, by name.
@@ -1532,10 +1591,16 @@ fn hello_is_from_the_shell(connection: &gio::DBusConnection, sender: &str) -> bo
     check_hello_sender(connection, sender) == Check::Shell
 }
 
+thread_local! {
+    static OWNER: std::cell::RefCell<OwnerCache> = std::cell::RefCell::new(OwnerCache::default());
+}
+
+/// The Shell's bus name, once it has been asked for and answered.
+fn known_shell_owner() -> Option<String> {
+    OWNER.with(|cache| cache.borrow().owner.clone())
+}
+
 fn check_hello_sender(connection: &gio::DBusConnection, sender: &str) -> Check {
-    thread_local! {
-        static OWNER: std::cell::RefCell<OwnerCache> = std::cell::RefCell::new(OwnerCache::default());
-    }
     OWNER.with(|cache| {
         check_the_shell(
             &mut cache.borrow_mut(),
@@ -2814,5 +2879,50 @@ mod tests {
                 "{action} -> {page}"
             );
         }
+    }
+
+    /// Phone names, notifications, snippets and permissions are for the Shell:
+    /// another process on the bus reads empty values of the same type, and
+    /// nothing is broadcast.
+    #[test]
+    fn only_the_shell_reads_the_private_properties() {
+        let mut device = capable();
+        device.name = "Secret phone".into();
+        let settings = AppSettings::default();
+        let devices = [shell_device(&device, &settings)];
+        let values = std::collections::HashMap::from([
+            ("Version", VERSION.to_variant()),
+            ("Desk", desk(&devices).to_variant()),
+            ("Devices", devices_variant(&devices)),
+            ("Notifications", notifications_variant(&[device], &settings)),
+            ("Transfers", transfers_variant(&[])),
+            ("Snippets", snippets_variant()),
+            ("Activities", activities_variant(&[], &settings, 0)),
+        ]);
+        for (name, real) in &values {
+            let seen = visible_property(name, &values, true);
+            assert_eq!(&seen, real, "{name} for the Shell");
+            let other = visible_property(name, &values, false);
+            assert_eq!(other.type_(), real.type_(), "{name}: the same type");
+            if *name == "Version" {
+                assert_eq!(other, *real);
+            } else {
+                assert_eq!(other.n_children(), 0, "{name} is empty for anyone else");
+                assert!(!other.print(true).contains("Secret"), "{name}");
+            }
+        }
+        assert!(
+            visible_property("Devices", &values, true)
+                .print(true)
+                .contains("Secret phone"),
+            "the Shell sees the name"
+        );
+        // No broadcast: every PropertiesChanged names its destination.
+        let source = include_str!("shell_dbus.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert_eq!(source.matches(".emit_signal(").count(), 1);
+        assert!(source.contains("emit_signal(\n        Some(destination),"));
     }
 }
