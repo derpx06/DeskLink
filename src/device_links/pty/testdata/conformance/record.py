@@ -278,9 +278,14 @@ def g_sgr(cols, rows):
     o.append("\r\n")
     for i in (30, 31, 32, 33, 34, 35, 36, 37, 90, 97):
         o.append("\x1b[%dm%d\x1b[0m " % (i, i))
-    o.append("\r\n\x1b[38;5;208mc256\x1b[48;5;21m bg\x1b[0m \x1b[38;2;12;34;56mtrue\x1b[0m \x1b[38:2::200:100:50mcolon\x1b[0m \x1b[48:5:99mc\x1b[0m\r\n")
+    o.append("\r\n\x1b[38;5;208mc256\x1b[48;5;21m bg\x1b[0m \x1b[38;2;12;34;56mtrue\x1b[0m\r\n")
     o.append("\x1b[1;31;47mbold red on white\x1b[22;39;49m plain\x1b[0m\r\n\x1b[7mrev\x1b[27m not\x1b[0m\r\n")
     return "".join(o).encode()
+
+
+def g_sgr_colon(cols, rows):
+    """ISO 8613-6 colon forms: the vt100 reference ignores the 38:2 colour, so only the text is compared."""
+    return ("\x1b[38:2::200:100:50mtrue\x1b[0m \x1b[48:5:99mindexed\x1b[0m \x1b[4:3mcurly\x1b[4:0m plain\r\n").encode()
 
 
 def g_edit(cols, rows):
@@ -320,7 +325,7 @@ def g_prompt(cols, rows):
 SYNTH = {
     "ink": g_ink, "ink-naive": g_ink_naive, "ratatui": g_ratatui, "alt-leave": g_alt_leave, "tmux-like": g_tmux,
     "fzf-like": g_fzf, "lazygit-like": g_lazygit, "btop-like": g_btop, "wide": g_wide, "sgr": g_sgr,
-    "edit": g_edit, "sync": g_sync, "prompt": g_prompt,
+    "edit": g_edit, "sgr-colon": g_sgr_colon, "sync": g_sync, "prompt": g_prompt,
 }
 
 
