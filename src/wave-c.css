@@ -88,3 +88,4 @@ row.dl-mono-row label.title { font-family: "JetBrains Mono", monospace; font-siz
 .dl-send { background-color: @dl_accent; color: @dl_on_accent; min-width: 36px; min-height: 36px; }
 .dl-send:hover { background-image: linear-gradient(alpha(currentColor, 0.1), alpha(currentColor, 0.1)); }
 row.dl-contact label.subtitle { font-family: "JetBrains Mono", monospace; font-size: 0.8em; font-feature-settings: "tnum"; }
+.dl-settings-group > box > label.description, .dl-settings-group .description { color: @dl_text_dim; opacity: 1; }

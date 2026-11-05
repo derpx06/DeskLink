@@ -59,7 +59,7 @@ impl Page {
             .build();
         search.update_property(&[gtk::accessible::Property::Label("Search terminals")]);
         clipboard::ensure_css();
-        let count = wrapped("", &["dl-secondary"]);
+        let count = text("", &["dl-secondary"]);
         let detach = ui_kit::button(ButtonKind::Danger, "Detach", None);
         detach.set_visible(false);
         let header = gtk::Box::builder().spacing(12).build();
