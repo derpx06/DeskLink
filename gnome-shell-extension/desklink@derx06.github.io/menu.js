@@ -309,7 +309,7 @@ function sectionRow(entry, selected, ctx) {
 
 /// Scrolls `scroll` so `actor` (and the rows under it) is in view.
 function reveal(scroll, actor, extra = 0) {
-    const adjustment = scroll.vadjustment ?? scroll.get_vadjustment?.();
+    const adjustment = scroll.vadjustment ?? scroll.get_vadjustment?.() ?? scroll.vscroll?.adjustment;
     if (!adjustment)
         return;
     const [, top] = actor.get_transformed_position();

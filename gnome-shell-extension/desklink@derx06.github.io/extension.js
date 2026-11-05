@@ -511,8 +511,11 @@ export default class DeskLinkExtension extends Extension {
             this._startChipTimer();
         else
             this._stopChipTimer();
-        // The same complete menu as Quick Settings.
-        this._fillMenu(menu, this._pill, devices, selected, desk);
+        // The same complete menu as Quick Settings (built only while shown).
+        if (this._button.visible)
+            this._fillMenu(menu, this._pill, devices, selected, desk);
+        else
+            this._pill.key = null;
     }
 
     /// The pill's text: the first ongoing item and its live part.
