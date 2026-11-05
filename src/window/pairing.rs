@@ -814,6 +814,7 @@ mod welcome_tests {
         let info = DeviceInfo::local("p".into(), "Pixel 9".into());
         let mut device = DeviceView::from_info(&info, "10.0.0.2".into(), false);
         device.status = DeviceStatus::Discovered;
+        device.device_type = "phone".into();
         device
     }
 

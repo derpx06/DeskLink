@@ -1073,7 +1073,7 @@ const TOKENS: &[(&str, &str, &str)] = &[
     // m, o, ot, ob, obr: connected, and the other device in use.
     ("mint", "#0f9b72", "#3fd1a2"),
     ("coral", "#e5533d", "#ff7c66"),
-    ("coral_text", "#c2412b", "#ff9a88"),
+    ("coral_text", "#b03a25", "#ff9a88"),
     ("coral_bg", "#fcefec", "#33221f"),
     (
         "coral_border",
