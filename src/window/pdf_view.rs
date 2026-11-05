@@ -94,18 +94,18 @@ pub(super) fn open(path: &Path) -> Rc<PdfView> {
         .halign(gtk::Align::Center)
         .valign(gtk::Align::End)
         .margin_bottom(14)
-        .css_classes(["toolbar", "osd", "floating-toolbar"])
+        .css_classes(["viewer-bar"])
         .build();
-    let zoom_out = tool("zoom-out-symbolic", "Zoom Out");
-    let fit = tool("zoom-fit-best-symbolic", "Fit Width");
-    let zoom_in = tool("zoom-in-symbolic", "Zoom In");
+    let zoom_out = tool("zoom-out-symbolic", "Zoom out");
+    let fit = tool("zoom-fit-best-symbolic", "Fit width");
+    let zoom_in = tool("zoom-in-symbolic", "Zoom in");
     // Short, so the bar fits a phone-width window.
     let open_default = gtk::Button::builder()
         .label("Open")
-        .tooltip_text("Open in Default App")
+        .tooltip_text("Open in default app")
         .css_classes(["flat"])
         .build();
-    open_default.update_property(&[gtk::accessible::Property::Label("Open in Default App")]);
+    open_default.update_property(&[gtk::accessible::Property::Label("Open in default app")]);
     bar.append(&page_label);
     bar.append(&gtk::Separator::new(gtk::Orientation::Vertical));
     bar.append(&zoom_out);
@@ -339,20 +339,24 @@ impl PdfView {
                 self.lay_out();
             }
             Reply::Failed(error) => {
-                let page = adw::StatusPage::builder()
-                    .icon_name("x-office-document-symbolic")
-                    .title("Can't preview this PDF here")
-                    .description(glib::markup_escape_text(&error))
-                    .hexpand(true)
-                    .build();
-                let open = gtk::Button::builder()
-                    .label("Open in Default App")
-                    .halign(gtk::Align::Center)
-                    .css_classes(["suggested-action", "pill"])
-                    .build();
+                let (page, _, body) = super::transfers::empty_state(
+                    "desklink-picture-as-pdf-symbolic",
+                    "Can't preview this PDF here",
+                    &error,
+                );
+                body.set_selectable(true);
+                page.set_hexpand(true);
+                page.set_valign(gtk::Align::Center);
+                let open = super::ui_kit::button(
+                    super::ui_kit::ButtonKind::Primary,
+                    "Open in default app",
+                    None,
+                );
+                open.set_halign(gtk::Align::Center);
+                open.set_margin_top(8);
                 let file = self.path.clone();
                 open.connect_clicked(move |button| open_in_default_app(button, &file));
-                page.set_child(Some(&open));
+                page.append(&open);
                 self.stack.add_named(&page, Some("failed"));
                 self.stack.set_visible_child_name("failed");
             }

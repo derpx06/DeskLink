@@ -34,6 +34,11 @@ fn main() {
 
     println!(
         "cargo:rerun-if-changed={}",
+        manifest_dir.join("src").join("files-ui.css").display()
+    );
+
+    println!(
+        "cargo:rerun-if-changed={}",
         manifest_dir.join("src").join("icons").display()
     );
     println!(

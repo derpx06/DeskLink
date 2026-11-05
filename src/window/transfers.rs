@@ -20,7 +20,8 @@ use gtk::{gio, glib};
 
 use adw::subclass::prelude::*;
 
-use super::{ellipsized, icon_button, icon_square, text, DesklinkWindow};
+use super::ui_kit::{self, ButtonKind, Status, Tone};
+use super::{ellipsized, text, DesklinkWindow};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::DeviceView;
 use crate::device_links::transfer_log::LoggedFile;
@@ -38,11 +39,83 @@ thread_local! {
 
 /// The transfers moving now, injected ones included in debug builds.
 pub(super) fn rows(daemon: &DaemonHandle) -> Vec<TransferRow> {
+    // Fakes first: one that names a lane is put on the real board.
+    #[cfg(debug_assertions)]
+    let fakes = debug_rows();
     #[allow(unused_mut)]
     let mut rows = daemon.transfer_rows();
     #[cfg(debug_assertions)]
-    rows.extend(FAKE_ROWS.with(|fake| fake.borrow().clone()));
+    rows.extend(fakes);
     rows
+}
+
+/// Debug builds, for screenshots: what a `fake-transfer` name can say.
+/// `paused:NAME` is a transfer whose link dropped; `fast:NAME`, `secure:NAME`
+/// and `internet:NAME` are on that lane (they join the real board, so the row
+/// says the lane's words); `failed:NAME|reason` is not moving at all (see
+/// [`debug_failures`]).
+#[cfg(debug_assertions)]
+fn debug_rows() -> Vec<TransferRow> {
+    use crate::device_links::webrtc::transfer_board as board;
+    let fakes = FAKE_ROWS.with(|fake| fake.borrow().clone());
+    let mut shown = Vec::new();
+    for mut row in fakes {
+        if row.name.starts_with("failed:") {
+            continue;
+        }
+        if let Some(name) = row.name.strip_prefix("paused:") {
+            row.name = name.to_string();
+            row.paused = true;
+        }
+        let lane = [
+            (
+                "fast:",
+                crate::device_links::webrtc::transfer_manager::words::fast_lane(),
+            ),
+            (
+                "secure:",
+                crate::device_links::webrtc::transfer_manager::words::over_webrtc(),
+            ),
+            (
+                "internet:",
+                crate::device_links::webrtc::transfer_manager::words::through_a_relay(),
+            ),
+        ]
+        .into_iter()
+        .find(|(prefix, _)| row.name.starts_with(prefix));
+        if let Some((prefix, words)) = lane {
+            row.name = row.name[prefix.len()..].to_string();
+            if board::lane_of(&row.id).is_none() {
+                board::begin(row.clone());
+                board::set_lane(&row.id, Some(words));
+            }
+            // The board lists it now.
+            continue;
+        }
+        shown.push(row);
+    }
+    shown
+}
+
+/// Debug builds: the `failed:NAME|reason` fakes, as failures of `device`.
+#[cfg(debug_assertions)]
+fn debug_failures(device: &str) -> Vec<Failure> {
+    FAKE_ROWS.with(|fake| {
+        fake.borrow()
+            .iter()
+            .filter_map(|row| {
+                let (name, reason) = row.name.strip_prefix("failed:")?.split_once('|')?;
+                Some(Failure {
+                    id: row.id.clone(),
+                    device_id: device.to_string(),
+                    name: name.to_string(),
+                    incoming: row.incoming,
+                    reason: reason_words(reason),
+                    retry: Some(std::path::PathBuf::from("/tmp").join(name)),
+                })
+            })
+            .collect()
+    })
 }
 
 /// "Sending to Pixel · 4.2 MB of 40 MB".
@@ -88,6 +161,185 @@ pub(super) fn fraction(row: &TransferRow) -> Option<f64> {
     Some((row.done as f64 / row.total as f64).clamp(0.0, 1.0))
 }
 
+/// What a moving row is doing, for its pill. `held` is a note saying why it
+/// waits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowState {
+    /// A file being copied and hashed.
+    Preparing,
+    /// Bytes are meant to be moving.
+    Moving,
+    /// The connection dropped; it resumes by itself.
+    Paused,
+    /// Waiting for something else (a slot, space): the note says what.
+    Waiting,
+}
+
+fn row_state(row: &TransferRow, held: bool) -> RowState {
+    if row.preparing {
+        RowState::Preparing
+    } else if row.paused {
+        RowState::Paused
+    } else if held {
+        RowState::Waiting
+    } else {
+        RowState::Moving
+    }
+}
+
+impl RowState {
+    /// The pill's state and word; a moving row has none (its percent says it).
+    fn pill(self) -> Option<(Status, &'static str)> {
+        match self {
+            Self::Moving => None,
+            Self::Preparing => Some((Status::Idle, "Preparing")),
+            Self::Paused => Some((Status::Idle, "Paused")),
+            Self::Waiting => Some((Status::Warn, "Waiting")),
+        }
+    }
+}
+
+/// The kinds of file the chips tell apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Class {
+    Image,
+    Video,
+    Audio,
+    Pdf,
+    Document,
+    Archive,
+    Other,
+}
+
+/// What a file is, from its name.
+fn class_of(name: &str) -> Class {
+    use crate::thumbnails::{kind_of, FileKind};
+    match kind_of(std::path::Path::new(name)) {
+        FileKind::Image => return Class::Image,
+        FileKind::Video => return Class::Video,
+        FileKind::Pdf => return Class::Pdf,
+        FileKind::Other => {}
+    }
+    let extension = std::path::Path::new(name)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_lowercase)
+        .unwrap_or_default();
+    match extension.as_str() {
+        "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "7z" | "rar" => Class::Archive,
+        "doc" | "docx" | "odt" | "rtf" | "txt" | "md" | "xls" | "xlsx" | "ods" | "csv" | "ppt"
+        | "pptx" | "odp" | "epub" => Class::Document,
+        "mp3" | "flac" | "ogg" | "opus" | "wav" | "m4a" | "aac" => Class::Audio,
+        _ => Class::Other,
+    }
+}
+
+/// The kit glyph for a file of this name.
+pub(super) fn glyph_for(name: &str) -> &'static str {
+    match class_of(name) {
+        Class::Image => "desklink-image-symbolic",
+        Class::Video => "desklink-movie-symbolic",
+        Class::Audio => "desklink-music-note-symbolic",
+        Class::Pdf => "desklink-picture-as-pdf-symbolic",
+        Class::Archive => "desklink-folder-zip-symbolic",
+        Class::Document | Class::Other => "desklink-description-symbolic",
+    }
+}
+
+/// Which files the history shows: one choice, as the chips.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum Filter {
+    #[default]
+    All,
+    Received,
+    Sent,
+    Images,
+    Documents,
+    Archives,
+}
+
+impl Filter {
+    const CHIPS: [Filter; 6] = [
+        Self::All,
+        Self::Received,
+        Self::Sent,
+        Self::Images,
+        Self::Documents,
+        Self::Archives,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Received => "Received",
+            Self::Sent => "Sent",
+            Self::Images => "Images",
+            Self::Documents => "Documents",
+            Self::Archives => "Archives",
+        }
+    }
+
+    fn matches(self, entry: &LoggedFile) -> bool {
+        match self {
+            Self::All => true,
+            Self::Received => entry.incoming,
+            Self::Sent => !entry.incoming,
+            Self::Images => class_of(&entry.name) == Class::Image,
+            // A PDF is a document.
+            Self::Documents => matches!(class_of(&entry.name), Class::Document | Class::Pdf),
+            Self::Archives => class_of(&entry.name) == Class::Archive,
+        }
+    }
+}
+
+/// The empty state's title and words: nothing at all yet, or nothing under
+/// this chip.
+fn empty_words(filter: Filter, any: bool, device: &str) -> (String, String) {
+    if filter == Filter::All || !any {
+        (
+            "No files yet".to_string(),
+            format!(
+                "Files you send to or receive from {device} show up here for 30 days. Drop files \
+                 on this page, or press Send files."
+            ),
+        )
+    } else {
+        let none = match filter {
+            Filter::Received => "No received files",
+            Filter::Sent => "No sent files",
+            Filter::Images => "No images",
+            Filter::Documents => "No documents",
+            Filter::Archives => "No archives",
+            Filter::All => "No files yet",
+        };
+        (
+            none.to_string(),
+            "Nothing matches this filter in the last 30 days. Choose All to see everything."
+                .to_string(),
+        )
+    }
+}
+
+/// Files in the order given, grouped under "Today", "Yesterday", a weekday
+/// or a date; a day that comes again later in the list starts a new group.
+fn day_groups<T>(
+    items: impl IntoIterator<Item = (u64, T)>,
+    now: &glib::DateTime,
+) -> Vec<(String, Vec<T>)> {
+    let mut groups: Vec<(String, Vec<T>)> = Vec::new();
+    for (ts, item) in items {
+        let day = glib::DateTime::from_unix_local(ts as i64)
+            .ok()
+            .map(|when| super::history::day_label(now, &when))
+            .unwrap_or_default();
+        match groups.last_mut() {
+            Some((last, members)) if *last == day => members.push(item),
+            _ => groups.push((day, vec![item])),
+        }
+    }
+    groups
+}
+
 /// "3.1 MB/s · 12 s left"; empty until there is a rate to speak of.
 fn rate_text(bytes_per_second: f64, remaining: u64) -> String {
     if bytes_per_second < 1.0 {
@@ -107,41 +359,239 @@ fn rate_text(bytes_per_second: f64, remaining: u64) -> String {
     format!("{speed} · {left}")
 }
 
-/// A symbolic icon for the file's type, guessed from its name.
-fn file_icon(name: &str) -> gio::Icon {
-    let (content_type, _) = gio::content_type_guess(Some(name), &[]);
-    gio::content_type_get_symbolic_icon(&content_type)
-}
-
 struct RowWidgets {
     row: gtk::Box,
     subtitle: gtk::Label,
+    percent: gtk::Label,
     bar: gtk::ProgressBar,
+    /// Paused, waiting or preparing, in a word (hidden while it moves).
+    pill: gtk::Box,
+    pill_state: Cell<Option<RowState>>,
     /// When `done` was last sampled, and the smoothed rate since.
     sample: Cell<(std::time::Instant, u64)>,
     rate: Cell<f64>,
 }
 
+/// A send or receive that ended badly: kept on the page until it is tried
+/// again or dismissed, so the reason is not lost with a toast.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Failure {
+    id: String,
+    device_id: String,
+    name: String,
+    incoming: bool,
+    reason: String,
+    retry: Option<std::path::PathBuf>,
+}
+
+/// How many failures the page keeps.
+const MAX_FAILURES: usize = 5;
+
+/// The failures part of the page, and how far along the board's outcomes it
+/// has read.
+struct Failures {
+    list: gtk::Box,
+    kept: RefCell<Vec<Failure>>,
+    seen: Cell<u64>,
+    /// What is drawn now, so the list is rebuilt only when it changes.
+    /// `None`: nothing drawn that can be trusted (the next sync redraws).
+    drawn: RefCell<Option<Vec<Failure>>>,
+}
+
+/// "Pixel 9 ran out of space." as a sentence: the first letter up, a full
+/// stop; "Something went wrong." when nothing was said.
+fn reason_words(reason: &str) -> String {
+    let reason = reason.trim().trim_end_matches('.');
+    let mut chars = reason.chars();
+    match chars.next() {
+        None => "Something went wrong.".to_string(),
+        Some(first) => format!("{}{}.", first.to_uppercase(), chars.as_str()),
+    }
+}
+
+impl Failures {
+    fn new() -> Rc<Self> {
+        let list = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .visible(false)
+            .build();
+        list.update_property(&[gtk::accessible::Property::Label("Failed transfers")]);
+        Rc::new(Self {
+            list,
+            kept: RefCell::default(),
+            // Only what fails from now on; earlier outcomes were toasts.
+            seen: Cell::new(crate::device_links::webrtc::transfer_board::ended_since(u64::MAX).1),
+            drawn: RefCell::default(),
+        })
+    }
+
+    /// Reads the outcomes since last time and redraws when the list changed.
+    fn sync(self: &Rc<Self>, daemon: &DaemonHandle, device: &str) {
+        use crate::device_links::webrtc::transfer_board::{ended_since, Outcome};
+        let (news, seq) = ended_since(self.seen.get());
+        self.seen.set(seq);
+        {
+            let mut kept = self.kept.borrow_mut();
+            for done in news {
+                if let Outcome::Failed(reason) = done.outcome {
+                    kept.retain(|failure| failure.id != done.id);
+                    kept.push(Failure {
+                        id: done.id,
+                        device_id: done.device_id,
+                        name: done.name,
+                        incoming: done.incoming,
+                        reason: reason_words(&reason),
+                        retry: done.retry,
+                    });
+                    if kept.len() > MAX_FAILURES {
+                        kept.remove(0);
+                    }
+                }
+            }
+        }
+        #[allow(unused_mut)]
+        let mut shown: Vec<Failure> = self
+            .kept
+            .borrow()
+            .iter()
+            .filter(|failure| failure.device_id == device)
+            .cloned()
+            .collect();
+        #[cfg(debug_assertions)]
+        shown.extend(debug_failures(device));
+        if self.drawn.borrow().as_ref() == Some(&shown) {
+            return;
+        }
+        while let Some(child) = self.list.first_child() {
+            self.list.remove(&child);
+        }
+        for failure in shown.iter().rev() {
+            self.list.append(&failed_row(self, daemon, failure));
+        }
+        self.list.set_visible(!shown.is_empty());
+        self.drawn.replace(Some(shown));
+    }
+
+    fn forget(&self, id: &str) {
+        self.kept.borrow_mut().retain(|failure| failure.id != id);
+        self.drawn.replace(None);
+    }
+}
+
+/// A failed transfer: what, why, and Try again when the file is still known.
+fn failed_row(failures: &Rc<Failures>, daemon: &DaemonHandle, failure: &Failure) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .spacing(12)
+        .css_classes(["files-row", "failed"])
+        .build();
+    row.append(&ui_kit::icon_square("desklink-error-symbolic", Tone::Error));
+    let words = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(2)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
+    let verb = if failure.incoming { "receive" } else { "send" };
+    let name = ellipsized(&failure.name, &["dl-mono", "files-name"]);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    words.append(&name);
+    words.append(&super::wrapped(
+        &format!("Could not {verb} it. {}", failure.reason),
+        &["dl-secondary"],
+    ));
+    row.append(&words);
+    if let (Some(path), false) = (&failure.retry, failure.device_id.is_empty()) {
+        let again = ui_kit::button(ButtonKind::Tonal, "Try again", None);
+        again.set_halign(gtk::Align::Start);
+        again.set_margin_top(6);
+        again.set_tooltip_text(Some("Send this file again"));
+        again.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Try sending {} again",
+            failure.name
+        ))]);
+        let (failures, daemon, device, path, id) = (
+            Rc::downgrade(failures),
+            daemon.clone(),
+            failure.device_id.clone(),
+            path.clone(),
+            failure.id.clone(),
+        );
+        again.connect_clicked(move |button| {
+            // Once is enough: the row goes at the next sync, and a second
+            // activation before then asks for nothing.
+            if !button.is_sensitive() {
+                return;
+            }
+            button.set_sensitive(false);
+            daemon.send(DaemonCommand::SendFile(device.clone(), path.clone()));
+            if let Some(failures) = failures.upgrade() {
+                failures.forget(&id);
+            }
+        });
+        words.append(&again);
+    }
+    let dismiss = ui_kit::icon_button("desklink-close-symbolic", "Dismiss");
+    dismiss.set_valign(gtk::Align::Start);
+    dismiss.update_property(&[gtk::accessible::Property::Label(&format!(
+        "Dismiss the failed {verb} of {}",
+        failure.name
+    ))]);
+    {
+        let (failures, id) = (Rc::downgrade(failures), failure.id.clone());
+        dismiss.connect_clicked(move |_| {
+            if let Some(failures) = failures.upgrade() {
+                failures.forget(&id);
+            }
+        });
+    }
+    row.append(&dismiss);
+    row.update_property(&[gtk::accessible::Property::Label(&format!(
+        "{}: could not {verb}. {}",
+        failure.name, failure.reason
+    ))]);
+    row
+}
+
+/// What the page asked the presence worker for, and what it asked it with.
+struct Pending {
+    entries: Vec<LoggedFile>,
+    device: String,
+    filter: Filter,
+    /// Whether the device has any entry at all (before the filter).
+    any: bool,
+}
+
 #[derive(Debug)]
 pub(super) struct Page {
-    /// The transfers part of the Files page: the send zone, the transfers
-    /// moving now and the history. Not scrolled: Files scrolls it with the
-    /// Bucket above it.
+    /// The transfers part of the Files page: Send files, what moves now, what
+    /// failed and the history. Not scrolled: Files scrolls it with the Bucket
+    /// above it.
     pub(super) content: gtk::Box,
-    zone_title: gtk::Label,
+    hint: gtk::Label,
     choose: gtk::Button,
-    history: gtk::FlowBox,
-    empty: gtk::Label,
+    /// The day groups, each a heading and a grid of cards.
+    history: gtk::Box,
+    empty: gtk::Box,
+    empty_title: gtk::Label,
+    empty_body: gtk::Label,
+    filter: Rc<Cell<Filter>>,
     history_key: RefCell<String>,
     /// The presence check asked for last; a reply to an older one is
     /// dropped. With it, the entries and device name it was asked for.
     generation: Cell<u64>,
-    pending: RefCell<(Vec<LoggedFile>, String)>,
+    pending: RefCell<Pending>,
     window: glib::WeakRef<DesklinkWindow>,
     /// The selected device: id and name.
     device: Rc<RefCell<(String, String)>>,
     /// Arms the progress timer (see [`follow`]).
     kick: Kick,
+}
+
+impl std::fmt::Debug for Pending {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Pending")
+    }
 }
 
 /// The function that starts the progress timer.
@@ -191,86 +641,139 @@ pub(super) fn add_card(grid: &gtk::FlowBox, card: &impl IsA<gtk::Widget>) {
     }
 }
 
+/// An empty state of the kit's shape: a 28 glyph in a 72 circle, a title,
+/// up to three lines of words, centred, at most 320 wide.
+pub(super) fn empty_state(
+    icon: &str,
+    title: &str,
+    body: &str,
+) -> (gtk::Box, gtk::Label, gtk::Label) {
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .halign(gtk::Align::Center)
+        .css_classes(["files-empty"])
+        .build();
+    let circle = gtk::CenterBox::builder()
+        .halign(gtk::Align::Center)
+        .css_classes(["files-empty-art"])
+        .center_widget(
+            &gtk::Image::builder()
+                .icon_name(icon)
+                .pixel_size(28)
+                .accessible_role(gtk::AccessibleRole::Presentation)
+                .build(),
+        )
+        .build();
+    column.append(&circle);
+    let title = gtk::Label::builder()
+        .label(title)
+        .wrap(true)
+        .justify(gtk::Justification::Center)
+        .css_classes(["files-empty-title"])
+        .accessible_role(gtk::AccessibleRole::Heading)
+        .build();
+    let body = gtk::Label::builder()
+        .label(body)
+        .wrap(true)
+        .max_width_chars(36)
+        .justify(gtk::Justification::Center)
+        .css_classes(["dl-secondary"])
+        .build();
+    // At most 320 wide, whatever the words.
+    let clamp = adw::Clamp::builder()
+        .maximum_size(320)
+        .tightening_threshold(320)
+        .build();
+    let words = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+    words.append(&title);
+    words.append(&body);
+    clamp.set_child(Some(&words));
+    column.append(&clamp);
+    (column, title, body)
+}
+
 impl Page {
     pub(super) fn new(win: &DesklinkWindow) -> Self {
         crate::thumbnails::set_delivery(deliver);
         WINDOW.with(|window| window.replace(win.downgrade()));
-        let zone = gtk::Box::builder()
-            .spacing(16)
-            .height_request(120)
-            .halign(gtk::Align::Fill)
-            .css_classes(["drop-zone"])
-            .build();
-        let inner = gtk::Box::builder()
-            .spacing(16)
-            .hexpand(true)
-            .halign(gtk::Align::Center)
-            .valign(gtk::Align::Center)
-            .build();
-        inner.set_widget_name("responsive");
-        inner.append(&icon_square("document-send-symbolic", 44, "feature-icon"));
-        let words = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(2)
-            .valign(gtk::Align::Center)
-            .build();
-        let zone_title = text("", &["card-title"]);
-        zone_title.set_wrap(true);
-        words.append(&zone_title);
-        let landing = text("They land in Downloads on the phone", &["card-subtitle"]);
-        landing.set_wrap(true);
-        words.append(&landing);
-        inner.append(&words);
-        let choose = icon_button(
-            "document-send-symbolic",
-            "Choose Files…",
-            &["suggested-action"],
-        );
-        inner.append(&choose);
-        zone.append(&inner);
+        let filter = Rc::new(Cell::new(Filter::All));
 
+        // Title, Send files and the page's one overflow.
+        let head = gtk::Box::builder().spacing(8).build();
+        let title = ui_kit::section_header("Sent and received");
+        title.set_hexpand(true);
+        title.set_valign(gtk::Align::Center);
+        head.append(&title);
+        let choose = ui_kit::button(
+            ButtonKind::Primary,
+            "Send files…",
+            Some("desklink-upload-file-symbolic"),
+        );
+        choose.set_valign(gtk::Align::Center);
+        head.append(&choose);
+        head.append(&more_menu());
+        let hint = super::wrapped("", &["dl-secondary"]);
+
+        let failures = Failures::new();
         let moving = grid();
         moving.set_visible(false);
+        moving.set_max_children_per_line(1);
+        moving.set_homogeneous(false);
+        moving.set_row_spacing(8);
         moving.update_property(&[gtk::accessible::Property::Label("Moving now")]);
 
-        let head = gtk::Box::builder().spacing(12).margin_top(6).build();
-        let title = text("Recent transfers", &["card-title"]);
-        title.set_hexpand(true);
-        head.append(&title);
-        let open = gtk::Button::builder()
-            .label("Open Downloads")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat"])
-            .build();
-        open.connect_clicked(|button| {
-            let Some(dir) = glib::user_special_dir(glib::UserDirectory::Downloads) else {
-                return;
-            };
-            gtk::FileLauncher::new(Some(&gio::File::for_path(dir))).launch(
-                button.root().and_downcast_ref::<gtk::Window>(),
-                gio::Cancellable::NONE,
-                |result| {
-                    if let Err(error) = result {
-                        eprintln!("[UI] Could not open Downloads: {error}");
+        // Filter chips: one choice, scrolling sideways when they do not fit.
+        let chips = gtk::Box::builder().spacing(8).build();
+        chips.update_property(&[gtk::accessible::Property::Label("Show")]);
+        let mut first: Option<gtk::ToggleButton> = None;
+        for choice in Filter::CHIPS {
+            let chip = ui_kit::chip(choice.label(), None, choice == Filter::All);
+            match &first {
+                Some(first) => chip.set_group(Some(first)),
+                None => first = Some(chip.clone()),
+            }
+            let (filter, window) = (Rc::clone(&filter), win.downgrade());
+            chip.connect_toggled(move |chip| {
+                if chip.is_active() && filter.replace(choice) != choice {
+                    if let Some(window) = window.upgrade() {
+                        window.refresh_soon();
                     }
-                },
-            );
-        });
-        head.append(&open);
-        let history = grid();
+                }
+            });
+            chips.append(&chip);
+        }
+        let chips = gtk::ScrolledWindow::builder()
+            .child(&chips)
+            .hscrollbar_policy(gtk::PolicyType::Automatic)
+            .vscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .build();
+
+        let history = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(16)
+            .build();
         history.update_property(&[gtk::accessible::Property::Label("Recent transfers")]);
-        let empty = text("", &["text-faint", "body-small"]);
-        empty.set_wrap(true);
+        let (empty, empty_title, empty_body) =
+            empty_state("desklink-folder-symbolic", "No files yet", "");
+        empty.set_margin_top(24);
+        empty.set_margin_bottom(24);
 
         let page = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(16)
+            .spacing(12)
             .margin_start(16)
             .margin_end(16)
             .build();
-        page.append(&zone);
         page.append(&head);
+        page.append(&hint);
+        page.append(&failures.list);
         page.append(&moving);
+        page.append(&chips);
         page.append(&history);
         page.append(&empty);
 
@@ -285,7 +788,12 @@ impl Page {
         }
         let kick = Kick::default();
         if let Some(daemon) = win.daemon() {
-            kick.set(follow(&moving, daemon, Rc::clone(&device)));
+            kick.set(follow(
+                &moving,
+                daemon,
+                Rc::clone(&device),
+                Rc::clone(&failures),
+            ));
         } else {
             // The daemon is handed over after construction.
             let (window, moving, device, kick) = (
@@ -296,19 +804,27 @@ impl Page {
             );
             glib::idle_add_local_once(move || {
                 if let Some(daemon) = window.upgrade().and_then(|window| window.daemon()) {
-                    kick.set(follow(&moving, daemon, device));
+                    kick.set(follow(&moving, daemon, device, failures));
                 }
             });
         }
         Self {
             content: page,
-            zone_title,
+            hint,
             choose,
             history,
             empty,
+            empty_title,
+            empty_body,
+            filter,
             history_key: RefCell::default(),
             generation: Cell::new(0),
-            pending: RefCell::default(),
+            pending: RefCell::new(Pending {
+                entries: Vec::new(),
+                device: String::new(),
+                filter: Filter::All,
+                any: false,
+            }),
             window: win.downgrade(),
             device,
             kick,
@@ -341,7 +857,9 @@ impl Page {
     /// Empties the history cards (and their pictures); the next update
     /// draws them again.
     pub(super) fn release_cards(&self) {
-        self.history.remove_all();
+        while let Some(child) = self.history.first_child() {
+            self.history.remove(&child);
+        }
         self.invalidate();
     }
 
@@ -359,8 +877,10 @@ impl Page {
         self.device
             .replace((device.id.clone(), device.name.clone()));
         self.kick();
-        self.zone_title
-            .set_label(&format!("Drop files to send to {}", device.name));
+        self.hint.set_label(&format!(
+            "Or drop files here to send them to {}. They land in Downloads on the phone.",
+            device.name
+        ));
         self.choose.set_sensitive(device.feature_transport_ready);
         self.choose
             .set_tooltip_text(super::unavailable_reason(device).as_deref());
@@ -368,13 +888,20 @@ impl Page {
         // The 50 newest are listed, and only they decide a redraw. Whether
         // each is still there is asked of the worker (a stat on a network
         // mount can hang), and the grid is drawn when it answers.
-        let entries: Vec<_> = crate::device_links::transfer_log::recent()
+        let filter = self.filter.get();
+        let all: Vec<_> = crate::device_links::transfer_log::recent()
             .into_iter()
             .filter(|entry| entry.device_id == device.id)
+            .collect();
+        let any = !all.is_empty();
+        let entries: Vec<_> = all
+            .into_iter()
+            .filter(|entry| filter.matches(entry))
             .take(50)
             .collect();
         let minute = super::clock_time(glib::DateTime::now_local().ok());
-        let key = serde_json::to_string(&(&entries, &device.name, minute)).unwrap_or_default();
+        let key = serde_json::to_string(&(&entries, &device.name, minute, filter.label(), any))
+            .unwrap_or_default();
         if *self.history_key.borrow() == key {
             return;
         }
@@ -382,7 +909,12 @@ impl Page {
         let generation = self.generation.get() + 1;
         self.generation.set(generation);
         let paths = entries.iter().map(|entry| entry.path.clone()).collect();
-        self.pending.replace((entries, device.name.clone()));
+        self.pending.replace(Pending {
+            entries,
+            device: device.name.clone(),
+            filter,
+            any,
+        });
         crate::thumbnails::check_presence(generation, paths);
     }
 
@@ -394,18 +926,28 @@ impl Page {
         if generation != self.generation.get() {
             return;
         }
-        let (entries, device) = self.pending.borrow().clone();
+        let (entries, device, filter, any) = {
+            let pending = self.pending.borrow();
+            (
+                pending.entries.clone(),
+                pending.device.clone(),
+                pending.filter,
+                pending.any,
+            )
+        };
         if files.len() != entries.len() {
             return;
         }
         // Thumbnails kept in memory: only those still listed.
         let keys: HashSet<&String> = files.iter().filter_map(|file| file.key.as_ref()).collect();
         SHOWN.with(|shown| shown.borrow_mut().retain(|key, _| keys.contains(key)));
-        self.history.remove_all();
+        while let Some(child) = self.history.first_child() {
+            self.history.remove(&child);
+        }
         self.empty.set_visible(entries.is_empty());
-        self.empty.set_label(&format!(
-            "Nothing sent to or received from {device} in the last 30 days."
-        ));
+        let (title, body) = empty_words(filter, any, &device);
+        self.empty_title.set_label(&title);
+        self.empty_body.set_label(&body);
         // What the viewer pages through: the files still there.
         let viewable: Rc<Vec<LoggedFile>> = Rc::new(
             entries
@@ -415,15 +957,75 @@ impl Page {
                 .map(|(entry, _)| entry.clone())
                 .collect(),
         );
-        for (entry, file) in entries.iter().zip(files) {
-            let card: gtk::Widget = if file.exists {
-                file_card(&win, entry, file.key.as_deref(), &device, &viewable).upcast()
-            } else {
-                missing_card(&win, entry, &device).upcast()
-            };
-            add_card(&self.history, &card);
+        let Ok(now) = glib::DateTime::now_local() else {
+            return;
+        };
+        let cards = entries.iter().zip(files);
+        for (day, members) in day_groups(cards.map(|(entry, file)| (entry.ts, (entry, file))), &now)
+        {
+            let group = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(8)
+                .build();
+            group.append(&ui_kit::section_header(&day));
+            let cards = grid();
+            cards.update_property(&[gtk::accessible::Property::Label(&day)]);
+            for (entry, file) in members {
+                let card: gtk::Widget = if file.exists {
+                    file_card(&win, entry, file.key.as_deref(), &device, &viewable).upcast()
+                } else {
+                    missing_card(&win, entry, &device).upcast()
+                };
+                add_card(&cards, &card);
+            }
+            group.append(&cards);
+            self.history.append(&group);
         }
     }
+}
+
+/// The page's overflow: Open Downloads.
+fn more_menu() -> gtk::MenuButton {
+    let menu = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .margin_top(6)
+        .margin_bottom(6)
+        .margin_start(6)
+        .margin_end(6)
+        .build();
+    let popover = gtk::Popover::builder().child(&menu).build();
+    let open = ui_kit::button(ButtonKind::Text, "Open Downloads", None);
+    open.set_halign(gtk::Align::Start);
+    {
+        let popover = popover.downgrade();
+        open.connect_clicked(move |button| {
+            if let Some(popover) = popover.upgrade() {
+                popover.popdown();
+            }
+            let Some(dir) = glib::user_special_dir(glib::UserDirectory::Downloads) else {
+                return;
+            };
+            gtk::FileLauncher::new(Some(&gio::File::for_path(dir))).launch(
+                button.root().and_downcast_ref::<gtk::Window>(),
+                gio::Cancellable::NONE,
+                |result| {
+                    if let Err(error) = result {
+                        eprintln!("[UI] Could not open Downloads: {error}");
+                    }
+                },
+            );
+        });
+    }
+    menu.append(&open);
+    let button = gtk::MenuButton::builder()
+        .icon_name("desklink-more-vert-symbolic")
+        .popover(&popover)
+        .valign(gtk::Align::Center)
+        .css_classes(["dl-icon-btn"])
+        .tooltip_text("More")
+        .build();
+    button.update_property(&[gtk::accessible::Property::Label("More about files")]);
+    button
 }
 
 /// "2.4 MB · 12 min ago".
@@ -449,12 +1051,12 @@ fn direction(entry: &LoggedFile, device: &str) -> gtk::Box {
     line.append(
         &gtk::Image::builder()
             .icon_name(if entry.incoming {
-                "go-down-symbolic"
+                "desklink-arrow-downward-symbolic"
             } else {
-                "go-up-symbolic"
+                "desklink-arrow-upward-symbolic"
             })
             .pixel_size(12)
-            .css_classes(["text-faint"])
+            .css_classes(["files-direction"])
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
@@ -464,7 +1066,7 @@ fn direction(entry: &LoggedFile, device: &str) -> gtk::Box {
         } else {
             format!("Sent to {device}")
         },
-        &["caption", "text-faint"],
+        &["dl-caption"],
     ));
     line
 }
@@ -480,13 +1082,16 @@ fn card_words(entry: &LoggedFile, device: &str) -> gtk::Box {
     name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
     name.set_max_width_chars(16);
     words.append(&name);
-    words.append(&ellipsized(&size_and_time(entry), &["caption", "text-dim"]));
+    words.append(&ellipsized(
+        &size_and_time(entry),
+        &["dl-secondary", "numeric"],
+    ));
     words.append(&direction(entry, device));
     // Where it went, so nobody has to look for it.
     if entry.incoming {
         words.append(&ellipsized(
             &format!("Saved in {}", super::saved_in(&entry.path)),
-            &["caption", "text-dim"],
+            &["dl-secondary"],
         ));
     }
     words
@@ -508,7 +1113,7 @@ fn preview_area() -> (gtk::Overlay, gtk::Box) {
     (overlay, base)
 }
 
-/// A typed icon for a file with no picture: a PDF, a document.
+/// A typed glyph for a file with no picture: a PDF, a document.
 pub(super) fn type_icon(name: &str) -> gtk::Box {
     let icon = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -518,9 +1123,9 @@ pub(super) fn type_icon(name: &str) -> gtk::Box {
         .build();
     icon.append(
         &gtk::Image::builder()
-            .gicon(&file_icon(name))
+            .icon_name(glyph_for(name))
             .pixel_size(40)
-            .css_classes(["text-dim"])
+            .css_classes(["files-glyph"])
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
@@ -529,7 +1134,7 @@ pub(super) fn type_icon(name: &str) -> gtk::Box {
         .and_then(|extension| extension.to_str())
         .unwrap_or("file")
         .to_uppercase();
-    icon.append(&text(&extension, &["caption", "type-label"]));
+    icon.append(&text(&extension, &["dl-caption", "type-label"]));
     icon
 }
 
@@ -639,7 +1244,7 @@ pub(super) fn fill_preview(
     let shimmer = gtk::Box::builder()
         .hexpand(true)
         .vexpand(true)
-        .css_classes(["skeleton"])
+        .css_classes(["skeleton", "dl-skeleton"])
         .accessible_role(gtk::AccessibleRole::Presentation)
         .build();
     overlay.add_overlay(&shimmer);
@@ -684,7 +1289,7 @@ fn show_thumbnail(
         .css_classes(["play-badge"])
         .accessible_role(gtk::AccessibleRole::Presentation)
         .build();
-    badge.append(&gtk::Image::from_icon_name("media-playback-start-symbolic"));
+    badge.append(&gtk::Image::from_icon_name("desklink-play-arrow-symbolic"));
     overlay.add_overlay(&badge);
     if let Some(duration) = duration {
         let length = text(&clock(duration), &["duration-chip", "numeric"]);
@@ -766,18 +1371,15 @@ fn missing_card(win: &DesklinkWindow, entry: &LoggedFile, device: &str) -> gtk::
         .build();
     gone.append(
         &gtk::Image::builder()
-            .icon_name("edit-find-symbolic")
+            .icon_name("desklink-broken-image-symbolic")
             .pixel_size(28)
-            .css_classes(["text-faint"])
+            .css_classes(["files-glyph"])
             .accessible_role(gtk::AccessibleRole::Presentation)
             .build(),
     );
-    gone.append(&text("File moved or deleted", &["caption", "text-dim"]));
-    let remove = gtk::Button::builder()
-        .label("Remove from List")
-        .halign(gtk::Align::Center)
-        .css_classes(["flat", "remove-button"])
-        .build();
+    gone.append(&text("File moved or deleted", &["dl-secondary"]));
+    let remove = ui_kit::button(ButtonKind::Text, "Remove from list", None);
+    remove.set_halign(gtk::Align::Center);
     gone.append(&remove);
     preview.add_overlay(&gone);
     card.append(&preview);
@@ -810,6 +1412,7 @@ fn follow(
     grid: &gtk::FlowBox,
     daemon: DaemonHandle,
     device: Rc<RefCell<(String, String)>>,
+    failures: Rc<Failures>,
 ) -> Rc<dyn Fn()> {
     let rows: Rc<RefCell<HashMap<String, RowWidgets>>> = Rc::default();
     let weak = grid.downgrade();
@@ -825,12 +1428,13 @@ fn follow(
             return;
         }
         running.set(true);
-        let (weak, daemon, rows, device, running) = (
+        let (weak, daemon, rows, device, running, failures) = (
             weak.clone(),
             daemon.clone(),
             Rc::clone(&rows),
             Rc::clone(&device),
             Rc::clone(&running),
+            Rc::clone(&failures),
         );
         glib::timeout_add_local(POLL_INTERVAL, move || {
             let Some(grid) = weak.upgrade() else {
@@ -839,11 +1443,11 @@ fn follow(
             };
             if !needs_timer(&grid, &daemon, &rows) {
                 // One last pass clears cards whose transfer has ended.
-                refresh(&grid, &daemon, &rows, &device.borrow().1);
+                refresh(&grid, &daemon, &rows, &device.borrow(), &failures);
                 running.set(false);
                 return glib::ControlFlow::Break;
             }
-            refresh(&grid, &daemon, &rows, &device.borrow().1);
+            refresh(&grid, &daemon, &rows, &device.borrow(), &failures);
             glib::ControlFlow::Continue
         });
     })
@@ -865,8 +1469,11 @@ fn refresh(
     grid: &gtk::FlowBox,
     daemon: &DaemonHandle,
     widgets: &RefCell<HashMap<String, RowWidgets>>,
-    device: &str,
+    selected: &(String, String),
+    failures: &Rc<Failures>,
 ) {
+    let device = selected.1.as_str();
+    failures.sync(daemon, &selected.0);
     let rows = rows(daemon);
     let mut widgets = widgets.borrow_mut();
     // Cards whose transfer has ended.
@@ -915,8 +1522,24 @@ fn refresh(
         shown.subtitle.set_label(&text);
         shown.subtitle.set_tooltip_text(Some(&text));
         match fraction(row) {
-            Some(fraction) => shown.bar.set_fraction(fraction),
-            None => shown.bar.pulse(),
+            Some(fraction) => {
+                ui_kit::set_progress(&shown.bar, fraction);
+                shown.percent.set_label(&ui_kit::percent_text(fraction));
+            }
+            None => {
+                shown.bar.pulse();
+                shown.percent.set_label("");
+            }
+        }
+        let state = row_state(row, held);
+        if shown.pill_state.replace(Some(state)) != Some(state) {
+            match state.pill() {
+                Some((status, word)) => {
+                    ui_kit::update_pill(&shown.pill, status, word);
+                    shown.pill.set_visible(true);
+                }
+                None => shown.pill.set_visible(false),
+            }
         }
     }
     grid.set_visible(!rows.is_empty());
@@ -952,9 +1575,9 @@ fn waiting_menu(device_id: &str, name: &str) -> gtk::MenuButton {
                 name.set_hexpand(true);
                 line.append(&name);
                 let remove = gtk::Button::builder()
-                    .icon_name("edit-delete-symbolic")
+                    .icon_name("desklink-delete-symbolic")
                     .tooltip_text("Don't send this file")
-                    .css_classes(["flat", "circular"])
+                    .css_classes(["dl-icon-btn"])
                     .build();
                 remove.update_property(&[gtk::accessible::Property::Label(&format!(
                     "Don't send {label}"
@@ -969,8 +1592,7 @@ fn waiting_menu(device_id: &str, name: &str) -> gtk::MenuButton {
                 line.append(&remove);
                 list.append(&line);
             }
-            let cancel = gtk::Button::with_label("Cancel All");
-            cancel.add_css_class("destructive-action");
+            let cancel = ui_kit::button(ButtonKind::Danger, "Cancel all", None);
             let (id, popover) = (id.clone(), popover.clone());
             cancel.connect_clicked(move |_| {
                 queue::clear_waiting(&id);
@@ -989,11 +1611,8 @@ fn waiting_menu(device_id: &str, name: &str) -> gtk::MenuButton {
     let button = gtk::MenuButton::builder()
         .icon_name("view-list-symbolic")
         .tooltip_text("Waiting files")
-        .halign(gtk::Align::End)
-        .valign(gtk::Align::Start)
-        .margin_top(6)
-        .margin_end(6)
-        .css_classes(["circular", "osd"])
+        .valign(gtk::Align::Center)
+        .css_classes(["dl-icon-btn"])
         .popover(&popover)
         .build();
     button.update_property(&[gtk::accessible::Property::Label(&format!(
@@ -1002,36 +1621,64 @@ fn waiting_menu(device_id: &str, name: &str) -> gtk::MenuButton {
     button
 }
 
-/// A transfer moving now, as a card: its type, name, progress and Cancel.
+/// A transfer moving now, as a row: its type, name and percent, a progress
+/// bar, what it is doing in words, and Cancel.
 fn new_row(daemon: &DaemonHandle, row: &TransferRow) -> RowWidgets {
     let card = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .css_classes(["file-card", "moving"])
+        .spacing(12)
+        .css_classes(["files-row", "moving"])
         .build();
-    let (preview, _) = preview_area();
-    preview.add_overlay(&type_icon(&row.name));
+    card.append(&ui_kit::icon_square(glyph_for(&row.name), Tone::Accent));
+    let words = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(6)
+        .hexpand(true)
+        .valign(gtk::Align::Center)
+        .build();
+    let top = gtk::Box::builder().spacing(12).build();
+    let name = ellipsized(&row.name, &["dl-mono", "files-name"]);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    name.set_hexpand(true);
+    top.append(&name);
+    let percent = gtk::Label::builder()
+        .xalign(1.0)
+        .css_classes(["dl-progress-text"])
+        .accessible_role(gtk::AccessibleRole::Presentation)
+        .build();
+    top.append(&percent);
+    words.append(&top);
+    let bar = ui_kit::progress(0.0);
+    bar.update_property(&[gtk::accessible::Property::Label(&row.name)]);
+    words.append(&bar);
+    // Wraps rather than ellipsizes: direction, lane, progress and rate do not
+    // fit one line, and the lane ("fast, over Wi-Fi") was the part cut off.
+    let subtitle = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .css_classes(["dl-secondary", "numeric"])
+        .build();
+    words.append(&subtitle);
+    let pill = ui_kit::status_pill(Status::Idle, "Paused");
+    pill.set_visible(false);
+    words.append(&pill);
+    card.append(&words);
     if crate::device_links::daemon::file_transfer::is_waiting_row(&row.id) {
-        preview.add_overlay(&waiting_menu(&row.device_id, &row.name));
+        card.append(&waiting_menu(&row.device_id, &row.name));
     }
     // A file still being copied has no transfer to cancel yet.
     if !row.preparing {
-        let cancel = gtk::Button::builder()
-            .icon_name("process-stop-symbolic")
-            .tooltip_text("Cancel this transfer")
-            .halign(gtk::Align::End)
-            .valign(gtk::Align::Start)
-            .margin_top(6)
-            .margin_end(6)
-            .css_classes(["circular", "osd"])
-            .build();
+        let cancel = ui_kit::icon_button("desklink-close-symbolic", "Cancel this transfer");
+        cancel.set_valign(gtk::Align::Center);
         cancel.update_property(&[gtk::accessible::Property::Label(&format!(
-            "Cancel sending {}",
+            "Cancel {} {}",
+            if row.incoming { "receiving" } else { "sending" },
             row.name
         ))]);
         let (daemon, device_id, transfer_id) =
             (daemon.clone(), row.device_id.clone(), row.id.clone());
         cancel.connect_clicked(move |button| {
-            // Once is enough; the card goes when the daemon has done it. (A
+            // Once is enough; the row goes when the daemon has done it. (A
             // second activation, however it arrives, asks for nothing.)
             if !button.is_sensitive() {
                 return;
@@ -1042,35 +1689,8 @@ fn new_row(daemon: &DaemonHandle, row: &TransferRow) -> RowWidgets {
                 transfer_id.clone(),
             ));
         });
-        preview.add_overlay(&cancel);
+        card.append(&cancel);
     }
-    card.append(&preview);
-    let words = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(4)
-        .css_classes(["file-card-words"])
-        .build();
-    let name = ellipsized(&row.name, &["file-name"]);
-    name.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
-    name.set_max_width_chars(16);
-    words.append(&name);
-    // Wraps rather than ellipsizes: direction, lane, progress and rate do not
-    // fit one line of a 176 px card, and the lane was the part cut off.
-    let subtitle = gtk::Label::builder()
-        .xalign(0.0)
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::WordChar)
-        .max_width_chars(16)
-        .css_classes(["caption", "text-dim", "numeric"])
-        .build();
-    words.append(&subtitle);
-    let bar = gtk::ProgressBar::builder()
-        .margin_top(4)
-        .css_classes(["thin"])
-        .build();
-    bar.update_property(&[gtk::accessible::Property::Label(&row.name)]);
-    words.append(&bar);
-    card.append(&words);
     card.update_property(&[gtk::accessible::Property::Label(&format!(
         "{}, {}",
         row.name,
@@ -1079,7 +1699,10 @@ fn new_row(daemon: &DaemonHandle, row: &TransferRow) -> RowWidgets {
     RowWidgets {
         row: card,
         subtitle,
+        percent,
         bar,
+        pill,
+        pill_state: Cell::new(None),
         sample: Cell::new((std::time::Instant::now(), row.done)),
         rate: Cell::new(0.0),
     }
@@ -1239,5 +1862,245 @@ mod tests {
         assert!(rate_text(1_000_000.0, 600_000_000).ends_with("10 min left"));
         assert!(rate_text(1_000.0, 10_000_000).ends_with("3 h left"));
         assert!(rate_text(1_000_000.0, 0).ends_with("/s"));
+    }
+
+    fn logged(name: &str, incoming: bool, ts: u64) -> LoggedFile {
+        LoggedFile {
+            ts,
+            device_id: "phone".into(),
+            device_name: "Pixel".into(),
+            name: name.into(),
+            path: std::path::PathBuf::from("/tmp").join(name),
+            size: 10,
+            incoming,
+        }
+    }
+
+    #[test]
+    fn the_chips_filter_by_direction_and_by_kind() {
+        let photo = logged("IMG_1.JPG", true, 1);
+        let report = logged("report.pdf", false, 2);
+        let backup = logged("backup.tar.gz", true, 3);
+        let clip = logged("clip.mp4", true, 4);
+        let notes = logged("notes.txt", false, 5);
+        let all = [&photo, &report, &backup, &clip, &notes];
+        let shown = |filter: Filter| -> Vec<&str> {
+            all.iter()
+                .filter(|entry| filter.matches(entry))
+                .map(|entry| entry.name.as_str())
+                .collect()
+        };
+        assert_eq!(shown(Filter::All).len(), 5);
+        assert_eq!(
+            shown(Filter::Received),
+            ["IMG_1.JPG", "backup.tar.gz", "clip.mp4"]
+        );
+        assert_eq!(shown(Filter::Sent), ["report.pdf", "notes.txt"]);
+        assert_eq!(shown(Filter::Images), ["IMG_1.JPG"]);
+        assert_eq!(shown(Filter::Documents), ["report.pdf", "notes.txt"]);
+        assert_eq!(shown(Filter::Archives), ["backup.tar.gz"]);
+        // The chips are the six, in this order, All first.
+        let labels: Vec<_> = Filter::CHIPS.iter().map(|filter| filter.label()).collect();
+        assert_eq!(
+            labels,
+            ["All", "Received", "Sent", "Images", "Documents", "Archives"]
+        );
+    }
+
+    #[test]
+    fn a_file_has_a_glyph_by_its_kind() {
+        assert_eq!(glyph_for("a.JPG"), "desklink-image-symbolic");
+        assert_eq!(glyph_for("a.mkv"), "desklink-movie-symbolic");
+        assert_eq!(glyph_for("a.pdf"), "desklink-picture-as-pdf-symbolic");
+        assert_eq!(glyph_for("a.zip"), "desklink-folder-zip-symbolic");
+        assert_eq!(glyph_for("a.mp3"), "desklink-music-note-symbolic");
+        assert_eq!(glyph_for("a.docx"), "desklink-description-symbolic");
+        assert_eq!(glyph_for("noextension"), "desklink-description-symbolic");
+    }
+
+    #[test]
+    fn files_are_grouped_by_the_day_they_came() {
+        let at = |day: i32, hour: i32| {
+            glib::DateTime::from_local(2026, 10, day, hour, 0, 0.0)
+                .unwrap()
+                .to_unix() as u64
+        };
+        let now = glib::DateTime::from_local(2026, 10, 20, 15, 0, 0.0).unwrap();
+        // Newest first, as the log gives them.
+        let groups = day_groups(
+            [
+                (at(20, 14), "a"),
+                (at(20, 9), "b"),
+                (at(19, 22), "c"),
+                (at(16, 12), "d"),
+                (at(1, 12), "e"),
+                (at(1, 8), "f"),
+            ],
+            &now,
+        );
+        let shown: Vec<(&str, &[&str])> = groups
+            .iter()
+            .map(|(day, members)| (day.as_str(), members.as_slice()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("Today", &["a", "b"][..]),
+                ("Yesterday", &["c"][..]),
+                ("Friday", &["d"][..]),
+                ("1 October", &["e", "f"][..]),
+            ]
+        );
+        assert!(day_groups(Vec::<(u64, ())>::new(), &now).is_empty());
+    }
+
+    #[test]
+    fn a_row_says_what_it_is_waiting_for_in_a_word() {
+        let moving = row(false, 100, 400);
+        assert_eq!(row_state(&moving, false), RowState::Moving);
+        assert_eq!(
+            RowState::Moving.pill(),
+            None,
+            "a moving row has its percent"
+        );
+        assert_eq!(row_state(&moving, true), RowState::Waiting);
+        assert_eq!(RowState::Waiting.pill(), Some((Status::Warn, "Waiting")));
+        let mut paused = row(true, 100, 400);
+        paused.paused = true;
+        assert_eq!(row_state(&paused, true), RowState::Paused);
+        assert_eq!(RowState::Paused.pill(), Some((Status::Idle, "Paused")));
+        let mut copying = row(false, 0, 0);
+        copying.preparing = true;
+        assert_eq!(row_state(&copying, false), RowState::Preparing);
+    }
+
+    #[test]
+    fn a_failure_reads_as_a_sentence_and_an_empty_page_says_why() {
+        assert_eq!(
+            reason_words("pixel 9 ran out of space"),
+            "Pixel 9 ran out of space."
+        );
+        assert_eq!(reason_words("The file changed. "), "The file changed.");
+        assert_eq!(reason_words(""), "Something went wrong.");
+        let (title, body) = empty_words(Filter::All, false, "Pixel 9");
+        assert_eq!(title, "No files yet");
+        assert!(body.contains("Pixel 9"), "{body}");
+        // A chip with nothing under it is not "no files yet".
+        let (title, _) = empty_words(Filter::Archives, true, "Pixel 9");
+        assert_eq!(title, "No archives");
+        let (title, _) = empty_words(Filter::Archives, false, "Pixel 9");
+        assert_eq!(title, "No files yet");
+    }
+
+    /// The lane words of CLAUDE.md stay verbatim: the producer says exactly
+    /// these (rewording it breaks this test), and the row carries them.
+    #[test]
+    fn the_lane_words_are_kept_as_the_board_says_them() {
+        use crate::device_links::webrtc::transfer_board as board;
+        use crate::device_links::webrtc::transfer_manager::words;
+        let lanes = [
+            ("lane-a", words::fast_lane(), "fast, over Wi-Fi"),
+            ("lane-b", words::over_webrtc(), "over the secure link"),
+            (
+                "lane-c",
+                words::through_a_relay(),
+                "through the internet (slower)",
+            ),
+        ];
+        for (id, produced, pinned) in lanes {
+            assert_eq!(produced, pinned, "CLAUDE.md pins these words");
+            let mut moving = row(false, 1 << 20, 8 << 20);
+            moving.id = id.into();
+            assert!(board::begin(moving.clone()));
+            board::set_lane(id, Some(produced));
+            let text = subtitle(&moving, "Pixel");
+            assert!(text.contains(&format!(" · {pinned} · ")), "{text}");
+            board::discard(id);
+        }
+    }
+
+    fn failure(id: &str) -> Failure {
+        Failure {
+            id: id.into(),
+            device_id: "phone".into(),
+            name: "report.pdf".into(),
+            incoming: false,
+            reason: "Out of space.".into(),
+            retry: Some(std::path::PathBuf::from("/tmp/report.pdf")),
+        }
+    }
+
+    fn buttons(widget: &gtk::Widget, found: &mut Vec<gtk::Button>) {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            found.push(button.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(next) = child {
+            buttons(&next, found);
+            child = next.next_sibling();
+        }
+    }
+
+    /// Dismiss removes the one failure that is drawn, and Try again sends
+    /// the file once and takes its row away. (Skipped without a display.)
+    #[test]
+    fn dismissing_or_retrying_the_only_failure_removes_its_row() {
+        crate::test_display::run(|| {
+            let (daemon, commands) = DaemonHandle::detached();
+            let failures = Failures::new();
+            let rows = |failures: &Failures| {
+                let mut count = 0;
+                let mut child = failures.list.first_child();
+                while let Some(next) = child {
+                    count += 1;
+                    child = next.next_sibling();
+                }
+                count
+            };
+            failures.kept.borrow_mut().push(failure("a"));
+            failures.sync(&daemon, "phone");
+            assert_eq!(rows(&failures), 1);
+            assert!(failures.list.is_visible());
+            failures.forget("a");
+            failures.sync(&daemon, "phone");
+            assert_eq!(rows(&failures), 0, "dismissed");
+            assert!(!failures.list.is_visible());
+
+            failures.kept.borrow_mut().push(failure("b"));
+            failures.sync(&daemon, "phone");
+            let mut found = Vec::new();
+            buttons(failures.list.upcast_ref(), &mut found);
+            let again = found
+                .iter()
+                .find(|button| button.tooltip_text().as_deref() == Some("Send this file again"))
+                .expect("a failed send offers Try again")
+                .clone();
+            again.emit_clicked();
+            again.emit_clicked();
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(DaemonCommand::SendFile(device, _)) if device == "phone"
+            ));
+            assert!(
+                commands.try_recv().is_err(),
+                "once, however often it is clicked"
+            );
+            failures.sync(&daemon, "phone");
+            assert_eq!(rows(&failures), 0, "the retried row is gone");
+        });
+    }
+
+    /// The row's buttons hold the list weakly: nothing keeps it alive.
+    #[test]
+    fn the_failure_rows_do_not_keep_their_list_alive() {
+        crate::test_display::run(|| {
+            let (daemon, _commands) = DaemonHandle::detached();
+            let failures = Failures::new();
+            failures.kept.borrow_mut().push(failure("c"));
+            failures.sync(&daemon, "phone");
+            let weak = Rc::downgrade(&failures);
+            drop(failures);
+            assert!(weak.upgrade().is_none());
+        });
     }
 }

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use adw::prelude::*;
 use gtk::{gdk, gio, glib};
 
+use super::ui_kit;
 use super::{toast_from, DesklinkWindow};
 use crate::device_links::device::DeviceView;
 use crate::device_links::gallery::{self, Item, STRIP_ITEMS};
@@ -16,6 +17,16 @@ const THUMB_H: i32 = 120;
 /// The strip for `device`, or `None` while photos are off for it or nothing is
 /// kept.
 pub(super) fn strip(device: &DeviceView) -> Option<gtk::Box> {
+    // Debug builds, for screenshots: the pictures in this folder, whatever
+    // the device and the setting.
+    #[cfg(debug_assertions)]
+    if let Some(dir) = std::env::var_os("DESKLINK_FAKE_GALLERY") {
+        let items: Vec<Item> = gallery::list_in(Path::new(&dir), "")
+            .into_iter()
+            .take(STRIP_ITEMS)
+            .collect();
+        return build(device, true, &items, dirs::download_dir());
+    }
     let on = crate::device_links::config::app_settings().accepts_gallery_from(&device.id);
     let items: Vec<Item> = gallery::list(&device.id)
         .into_iter()
@@ -33,15 +44,8 @@ fn build(
     if !on || items.is_empty() {
         return None;
     }
-    let card = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(10)
-        .css_classes(["dl-card"])
-        .build();
-    card.append(&super::wrapped(
-        &format!("From your phone · {}", device.name),
-        &["heading"],
-    ));
+    let card = ui_kit::card(Some(&format!("From your phone · {}", device.name)));
+    card.set_spacing(12);
     let row = gtk::Box::builder().spacing(12).build();
     for item in items {
         row.append(&tile(item, downloads.clone()));
@@ -62,6 +66,7 @@ fn tile(item: &Item, downloads: Option<PathBuf>) -> gtk::Box {
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
         .width_request(THUMB_W)
+        .css_classes(["files-gallery-tile"])
         .build();
     let picture = gtk::Picture::builder()
         .width_request(THUMB_W)
@@ -73,16 +78,12 @@ fn tile(item: &Item, downloads: Option<PathBuf>) -> gtk::Box {
     picture.update_property(&[gtk::accessible::Property::Label(&item.name)]);
     load_thumbnail(&picture, item.path.clone());
     tile.append(&picture);
-    let name = super::ellipsized(&item.name, &["caption", "text-dim"]);
+    let name = super::ellipsized(&item.name, &["dl-secondary"]);
     name.set_max_width_chars(20);
     tile.append(&name);
     let buttons = gtk::Box::builder().spacing(2).build();
     let make = |icon: &str, label: &str, run: Box<dyn Fn(&gtk::Button)>| {
-        let button = gtk::Button::builder()
-            .icon_name(icon)
-            .tooltip_text(label)
-            .css_classes(["flat", "circular"])
-            .build();
+        let button = ui_kit::icon_button(icon, label);
         button.update_property(&[gtk::accessible::Property::Label(&format!(
             "{label} {}",
             item.name
@@ -92,7 +93,7 @@ fn tile(item: &Item, downloads: Option<PathBuf>) -> gtk::Box {
     };
     let path = item.path.clone();
     make(
-        "edit-copy-symbolic",
+        "desklink-content-copy-symbolic",
         "Copy",
         Box::new({
             let path = path.clone();
@@ -100,7 +101,7 @@ fn tile(item: &Item, downloads: Option<PathBuf>) -> gtk::Box {
         }),
     );
     make(
-        "document-open-symbolic",
+        "desklink-open-in-new-symbolic",
         "Open",
         Box::new({
             let path = path.clone();
@@ -108,7 +109,7 @@ fn tile(item: &Item, downloads: Option<PathBuf>) -> gtk::Box {
         }),
     );
     make(
-        "document-save-symbolic",
+        "desklink-download-symbolic",
         "Save",
         Box::new({
             let (path, name) = (path.clone(), item.name.clone());
@@ -126,7 +127,7 @@ fn tile(item: &Item, downloads: Option<PathBuf>) -> gtk::Box {
         }),
     );
     make(
-        "edit-delete-symbolic",
+        "desklink-delete-symbolic",
         "Remove",
         Box::new(move |button| {
             if gallery::remove(&path) {
