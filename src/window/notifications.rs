@@ -1,6 +1,7 @@
 //! The Notifications page: the phone's notifications, each with Reply (an
 //! inline entry, sent to the phone), its own actions and Dismiss, and Clear
-//! All.
+//! all. Cards are the kit's; Delete or Backspace on a focused card dismisses
+//! it and Enter opens its reply.
 //!
 //! Cards are kept by notification id and only added, removed or reordered
 //! as notifications come and go, so a reply being typed survives the
@@ -9,8 +10,10 @@
 use std::cell::RefCell;
 
 use adw::prelude::*;
+use gtk::glib;
 
-use super::{icon_button, icon_square, text, toast_from, wrapped, DesklinkWindow};
+use super::ui_kit::{self, ButtonKind, Tone};
+use super::{clipboard, text, toast_from, wrapped, DesklinkWindow};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::{DeviceNotification, DeviceView};
 
@@ -30,10 +33,8 @@ pub(super) struct Page {
     list: gtk::Box,
     count: gtk::Label,
     clear: gtk::Button,
-    empty: gtk::Box,
-    empty_line: gtk::Label,
-    hidden: gtk::Box,
-    hidden_title: gtk::Label,
+    empty: clipboard::EmptyState,
+    hidden: clipboard::EmptyState,
     cards: RefCell<Vec<Card>>,
     /// The device the cards belong to.
     device: RefCell<String>,
@@ -43,44 +44,48 @@ pub(super) struct Page {
 
 impl Page {
     pub(super) fn new(win: &DesklinkWindow) -> Self {
-        let count = wrapped("", &["text-dim"]);
-        let clear = super::soft_button("Clear All");
+        clipboard::ensure_css();
+        let count = wrapped("", &["dl-secondary"]);
+        let clear = ui_kit::button(ButtonKind::Tonal, "Clear all", None);
         clear.set_tooltip_text(Some("Dismiss every notification here and on the phone"));
-        let header = gtk::Box::builder().spacing(10).build();
+        let header = gtk::Box::builder()
+            .spacing(10)
+            .valign(gtk::Align::Center)
+            .build();
         count.set_hexpand(true);
+        count.set_valign(gtk::Align::Center);
         header.append(&count);
         header.append(&clear);
 
         let list = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(14)
+            .spacing(12)
             .build();
-        let (empty, _, empty_line) = status(
-            "preferences-system-notifications-symbolic",
-            "You're all caught up",
-            "New phone notifications appear here.",
+        let empty = clipboard::empty_state(
+            "desklink-notifications-symbolic",
+            "No notifications",
+            "Your phone's notifications show up here.",
         );
-        let (hidden, hidden_title, _) = status(
-            "preferences-system-notifications-symbolic",
-            "",
+        let hidden = clipboard::empty_state(
+            "desklink-notifications-symbolic",
+            "Notifications are turned off",
             "Turn them on to see them here and on your desktop.",
         );
-        let show = super::soft_button("Show Notifications");
-        show.set_css_classes(&["suggested-action", "pill"]);
+        let show = ui_kit::button(ButtonKind::Primary, "Turn on", None);
         show.set_halign(gtk::Align::Center);
-        hidden.append(&show);
+        hidden.root.append(&show);
 
         let page = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .spacing(14)
+            .spacing(12)
             .margin_top(8)
             .margin_bottom(28)
             .css_classes(["page-margins"])
             .build();
         page.append(&header);
         page.append(&list);
-        page.append(&empty);
-        page.append(&hidden);
+        page.append(&empty.root);
+        page.append(&hidden.root);
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
@@ -133,9 +138,7 @@ impl Page {
             count,
             clear,
             empty,
-            empty_line,
             hidden,
-            hidden_title,
             cards: RefCell::default(),
             device: RefCell::default(),
             pending_reply: RefCell::default(),
@@ -167,12 +170,14 @@ impl Page {
             }
         }
         let shown = crate::device_links::config::app_settings().shows_notifications(&device.id);
-        self.hidden.set_visible(!shown);
+        self.hidden.root.set_visible(!shown);
         self.list.set_visible(shown);
-        self.hidden_title
-            .set_label(&format!("Notifications from {} are hidden", device.name));
+        self.hidden.title.set_label(&format!(
+            "Notifications from {} are turned off",
+            device.name
+        ));
         if !shown {
-            self.empty.set_visible(false);
+            self.empty.root.set_visible(false);
             self.count.set_label("Hidden on this computer");
             self.clear.set_sensitive(false);
             return;
@@ -186,8 +191,8 @@ impl Page {
             count.push_str(&format!(" · {seen}"));
         }
         self.count.set_label(&count);
-        self.empty.set_visible(notifications.is_empty());
-        self.empty_line.set_label(&empty_line(
+        self.empty.root.set_visible(notifications.is_empty());
+        self.empty.body.set_label(&empty_line(
             &device.name,
             device.feature_transport_ready,
             device.notification_access,
@@ -268,37 +273,11 @@ fn empty_line(phone: &str, connected: bool, access: Option<bool>) -> String {
         format!("Turn on notification access in DeskLink on {phone}.")
     } else if connected {
         format!(
-            "New phone notifications appear here. Nothing arriving? Allow notification access in DeskLink on {phone}."
+            "{phone}'s notifications show up here. Nothing arriving? Allow notification access in DeskLink on {phone}."
         )
     } else {
-        "New phone notifications appear here.".to_string()
+        format!("{phone}'s notifications show up here.")
     }
-}
-
-/// An icon, a title and a line, centred: an empty or hidden list.
-fn status(icon: &str, title: &str, description: &str) -> (gtk::Box, gtk::Label, gtk::Label) {
-    let status = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(10)
-        .margin_top(80)
-        .halign(gtk::Align::Center)
-        .build();
-    status.append(&icon_square(icon, 64, "status-icon"));
-    let title = gtk::Label::builder()
-        .label(title)
-        .justify(gtk::Justification::Center)
-        .wrap(true)
-        .css_classes(["title-4"])
-        .build();
-    status.append(&title);
-    let line = gtk::Label::builder()
-        .label(description)
-        .justify(gtk::Justification::Center)
-        .wrap(true)
-        .css_classes(["text-dim"])
-        .build();
-    status.append(&line);
-    (status, title, line)
 }
 
 /// A glyph for the notifying app, from its name.
@@ -317,6 +296,18 @@ pub(crate) fn app_icon(app: &str) -> &'static str {
         "user-available-symbolic"
     } else {
         "preferences-system-notifications-symbolic"
+    }
+}
+
+/// The kit's glyph for the notifying app (`app_icon` names theme icons, for
+/// the desktop's own notifications).
+fn glyph(app: &str) -> &'static str {
+    match app_icon(app) {
+        "mail-unread-symbolic" => "desklink-description-symbolic",
+        "x-office-calendar-symbolic" => "desklink-schedule-symbolic",
+        "call-start-symbolic" => "desklink-call-symbolic",
+        "user-available-symbolic" => "desklink-person-symbolic",
+        _ => "desklink-notifications-symbolic",
     }
 }
 
@@ -359,8 +350,10 @@ fn build_card(
     notification: &DeviceNotification,
     key: String,
 ) -> Card {
-    let card = super::card(0);
-    card.add_css_class("notification-card");
+    let card = ui_kit::card(None);
+    card.set_spacing(0);
+    card.add_css_class("dl-note-card");
+    card.set_focusable(true);
     // The words, then the buttons: with a button of its own (reply or an
     // action) they go under the words when the page is narrow (the
     // `responsive` box turns vertical), so the title keeps its room; a card
@@ -369,16 +362,20 @@ fn build_card(
     if notification.request_reply_id.is_some() || !notification.actions.is_empty() {
         top.set_widget_name("responsive");
     }
-    let lead = gtk::Box::builder().spacing(14).hexpand(true).build();
+    let lead = gtk::Box::builder().spacing(12).hexpand(true).build();
     let actions = gtk::Box::builder()
         .spacing(8)
         .halign(gtk::Align::End)
         .valign(gtk::Align::Center)
         .build();
-    lead.append(&icon_square(
-        app_icon(&notification.app_name),
-        38,
-        "avatar-circle",
+    let who = if notification.title.is_empty() {
+        &notification.app_name
+    } else {
+        &notification.title
+    };
+    lead.append(&ui_kit::icon_square(
+        glyph(&notification.app_name),
+        Tone::Accent,
     ));
     let words = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -387,16 +384,22 @@ fn build_card(
         .valign(gtk::Align::Center)
         .build();
     words.append(&heading_line(notification));
-    let said = text(body(notification), &["text-dim", "body-small"]);
+    let said = text(body(notification), &["dl-secondary"]);
     said.set_wrap(true);
     said.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     said.set_lines(3);
     said.set_ellipsize(gtk::pango::EllipsizeMode::End);
     words.append(&said);
     lead.append(&words);
+    // The card reads as one thing: who, what the notification says.
+    card.update_property(&[gtk::accessible::Property::Label(&format!(
+        "{who}, {}: {}",
+        notification.app_name,
+        body(notification)
+    ))]);
 
     for action in notification.actions.iter().take(2) {
-        let button = super::soft_button(action);
+        let button = ui_kit::button(ButtonKind::Text, action, None);
         let (daemon, device_id, key, action) = (
             daemon.clone(),
             device_id.to_string(),
@@ -418,19 +421,13 @@ fn build_card(
         .hexpand(true)
         .css_classes(["flat"])
         .build();
-    entry.update_property(&[gtk::accessible::Property::Label(&format!(
-        "Reply to {}",
-        if notification.title.is_empty() {
-            &notification.app_name
-        } else {
-            &notification.title
-        }
-    ))]);
+    entry.update_property(&[gtk::accessible::Property::Label(&format!("Reply to {who}"))]);
     let revealer = gtk::Revealer::builder()
         .transition_type(gtk::RevealerTransitionType::SlideDown)
         .build();
+    let mut reply_button = None;
     if let Some(reply_id) = &notification.request_reply_id {
-        let reply = icon_button("mail-reply-sender-symbolic", "Reply", &["soft-button"]);
+        let reply = ui_kit::button(ButtonKind::Tonal, "Reply", Some("desklink-reply-symbolic"));
         let (shown, field) = (revealer.downgrade(), entry.downgrade());
         reply.connect_clicked(move |_| {
             if let (Some(revealer), Some(entry)) = (shown.upgrade(), field.upgrade()) {
@@ -442,21 +439,22 @@ fn build_card(
             }
         });
         actions.append(&reply);
+        reply_button = Some(reply);
 
         let bar = gtk::Box::builder()
             .spacing(8)
             .margin_start(52)
             .margin_top(12)
-            .css_classes(["reply-bar"])
+            .css_classes(["dl-reply-bar"])
             .build();
         bar.append(&entry);
         let send = gtk::Button::builder()
-            .icon_name("go-up-symbolic")
-            .tooltip_text("Send Reply")
+            .icon_name("desklink-arrow-upward-symbolic")
+            .tooltip_text("Send reply")
             .valign(gtk::Align::Center)
-            .css_classes(["circular", "suggested-action", "send-button"])
+            .css_classes(["dl-icon-btn", "dl-send"])
             .build();
-        send.update_property(&[gtk::accessible::Property::Label("Send Reply")]);
+        send.update_property(&[gtk::accessible::Property::Label("Send reply")]);
         let send_reply = {
             let (daemon, device_id, reply_id) =
                 (daemon.clone(), device_id.to_string(), reply_id.clone());
@@ -489,14 +487,10 @@ fn build_card(
         bar.append(&send);
         revealer.set_child(Some(&bar));
     }
+    let mut dismiss_button = None;
     if notification.is_clearable {
-        let dismiss = gtk::Button::builder()
-            .icon_name("window-close-symbolic")
-            .tooltip_text("Dismiss")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat", "circular"])
-            .build();
-        dismiss.update_property(&[gtk::accessible::Property::Label("Dismiss")]);
+        let dismiss = ui_kit::icon_button("desklink-close-symbolic", "Dismiss");
+        dismiss.set_valign(gtk::Align::Center);
         let (daemon, device_id, id) = (
             daemon.clone(),
             device_id.to_string(),
@@ -510,7 +504,43 @@ fn build_card(
             ));
         });
         actions.append(&dismiss);
+        dismiss_button = Some(dismiss);
     }
+    // Keyboard: on the card itself (not while typing a reply), Delete or
+    // Backspace dismisses it and Enter opens the reply.
+    let keys = gtk::EventControllerKey::new();
+    {
+        let (card_weak, dismiss, reply) = (
+            card.downgrade(),
+            dismiss_button.as_ref().map(|button| button.downgrade()),
+            reply_button.as_ref().map(|button| button.downgrade()),
+        );
+        keys.connect_key_pressed(move |_, key, _, _| {
+            use gtk::gdk::Key;
+            if !card_weak.upgrade().is_some_and(|card| card.is_focus()) {
+                return glib::Propagation::Proceed;
+            }
+            match key {
+                Key::Delete | Key::BackSpace => {
+                    if let Some(button) = dismiss.as_ref().and_then(|button| button.upgrade()) {
+                        if button.is_sensitive() {
+                            button.emit_clicked();
+                        }
+                        return glib::Propagation::Stop;
+                    }
+                }
+                Key::Return | Key::KP_Enter => {
+                    if let Some(button) = reply.as_ref().and_then(|button| button.upgrade()) {
+                        button.emit_clicked();
+                        return glib::Propagation::Stop;
+                    }
+                }
+                _ => {}
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    card.add_controller(keys);
     actions.set_visible(actions.first_child().is_some());
     top.append(&lead);
     top.append(&actions);
@@ -602,7 +632,7 @@ mod tests {
                 .filter_map(|b| b.tooltip_text())
                 .collect();
             assert!(names.iter().any(|name| name == "Dismiss"));
-            assert!(names.iter().any(|name| name == "Send Reply"));
+            assert!(names.iter().any(|name| name == "Send reply"));
         });
     }
 

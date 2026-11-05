@@ -10,7 +10,8 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::glib;
 
-use super::{text, toast_from, DesklinkWindow};
+use super::ui_kit::{self, ButtonKind};
+use super::{clipboard, text, toast_from, DesklinkWindow};
 use crate::device_links::notes::{self, Note};
 
 /// Saved this long after the last keystroke.
@@ -35,6 +36,8 @@ struct Editor {
     body: gtk::TextView,
     pin: gtk::ToggleButton,
     delete: gtk::Button,
+    /// "Saving…", "Saved": where the autosave stands.
+    saved: gtk::Label,
     stack: gtk::Stack,
     /// The note open, and the `modified` it had when loaded or saved.
     open: RefCell<Option<(String, i64)>>,
@@ -52,6 +55,7 @@ impl Editor {
     fn load(&self, note: Option<&Note>) {
         self.cancel_save();
         self.dirty.set(false);
+        self.saved.set_label("");
         self.loading.set(true);
         match note {
             Some(note) => {
@@ -101,11 +105,16 @@ impl Editor {
             Ok(Some(modified)) => {
                 self.dirty.set(false);
                 self.open.replace(Some((id, modified)));
+                self.saved.set_label("Saved");
             }
             // Nothing to save (the text is what is stored): the version stays as loaded.
-            Ok(None) => self.dirty.set(false),
+            Ok(None) => {
+                self.dirty.set(false);
+                self.saved.set_label("Saved");
+            }
             Err(error) => {
                 // The text stays in the editor; nothing is thrown away.
+                self.saved.set_label("Not saved");
                 toast_from(&self.body, &error);
             }
         }
@@ -117,6 +126,7 @@ impl Editor {
         }
         self.cancel_save();
         self.dirty.set(true);
+        self.saved.set_label("Saving…");
         let editor = Rc::downgrade(self);
         let source = glib::timeout_add_local_once(SAVE_AFTER, move || {
             if let Some(editor) = editor.upgrade() {
@@ -277,20 +287,23 @@ fn note_row(note: &Note) -> gtk::ListBoxRow {
         } else {
             format!("{} · {preview}", modified_words(note.modified))
         },
-        &["caption", "text-dim"],
+        &["dl-secondary"],
     );
     detail.set_xalign(0.0);
     words.append(&detail);
     let line = gtk::Box::builder()
         .spacing(10)
-        .css_classes(["padded-row"])
+        .margin_top(8)
+        .margin_bottom(8)
+        .margin_start(8)
+        .margin_end(8)
         .build();
     line.append(&words);
     if note.pinned {
         line.append(
             &gtk::Image::builder()
-                .icon_name("view-pin-symbolic")
-                .css_classes(["text-dim"])
+                .icon_name("desklink-keep-filled-symbolic")
+                .valign(gtk::Align::Center)
                 .tooltip_text("Pinned")
                 .build(),
         );
@@ -352,20 +365,18 @@ fn modified_words(modified: i64) -> String {
 
 impl Page {
     pub(super) fn new(win: &DesklinkWindow) -> Self {
+        clipboard::ensure_css();
         let search = gtk::SearchEntry::builder()
             .placeholder_text("Search notes")
             .hexpand(true)
             .build();
-        let add = gtk::Button::builder()
-            .icon_name("list-add-symbolic")
-            .tooltip_text("New Note")
-            .css_classes(["flat", "circular"])
-            .build();
-        add.update_property(&[gtk::accessible::Property::Label("New Note")]);
+        search.update_property(&[gtk::accessible::Property::Label("Search notes")]);
+        let add = ui_kit::icon_button("desklink-add-symbolic", "New note (Ctrl+N)");
+        add.update_property(&[gtk::accessible::Property::Label("New note")]);
         let top = gtk::Box::builder()
             .spacing(6)
             .margin_start(12)
-            .margin_end(12)
+            .margin_end(8)
             .margin_top(8)
             .margin_bottom(8)
             .build();
@@ -373,33 +384,37 @@ impl Page {
         top.append(&add);
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::Single)
-            .css_classes(["navigation-sidebar"])
+            .css_classes(["dl-note-list"])
             .build();
         list.update_property(&[gtk::accessible::Property::Label("Notes")]);
         // Collapsed (a narrow window) this list is all that shows: with no notes
         // it says so and how to start one, instead of an empty pane.
-        let none = adw::StatusPage::builder()
-            .icon_name("document-edit-symbolic")
-            .title("No Notes Yet")
-            .description("Write one with the + above. Notes sync with your phone, encrypted.")
-            .vexpand(true)
-            .build();
-        none.add_css_class("compact");
-        list.set_placeholder(Some(&none));
+        let none = clipboard::empty_state(
+            "desklink-edit-note-symbolic",
+            "No notes yet",
+            "Notes you write here also appear on your phone.",
+        );
+        let first = ui_kit::button(
+            ButtonKind::Primary,
+            "New note",
+            Some("desklink-add-symbolic"),
+        );
+        first.set_halign(gtk::Align::Center);
+        none.root.append(&first);
+        list.set_placeholder(Some(&none.root));
         list.set_vexpand(true);
         let sidebar_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .build();
         sidebar_box.append(&top);
-        let tidy = gtk::Button::builder()
-            .label("Remove duplicate copies")
-            .tooltip_text("Deletes conflicted copies that say exactly what another note says")
-            .css_classes(["flat"])
-            .margin_start(12)
-            .margin_end(12)
-            .margin_bottom(6)
-            .visible(false)
-            .build();
+        let tidy = ui_kit::button(ButtonKind::Text, "Remove duplicate copies", None);
+        tidy.set_tooltip_text(Some(
+            "Deletes conflicted copies that say exactly what another note says",
+        ));
+        tidy.set_margin_start(12);
+        tidy.set_margin_end(12);
+        tidy.set_margin_bottom(6);
+        tidy.set_visible(false);
         tidy.connect_clicked(confirm_remove_duplicates);
         sidebar_box.append(&tidy);
         sidebar_box.append(
@@ -417,30 +432,25 @@ impl Page {
             .build();
         title.update_property(&[gtk::accessible::Property::Label("Note title")]);
         let pin = gtk::ToggleButton::builder()
-            .icon_name("view-pin-symbolic")
-            .tooltip_text("Pin to the Top")
+            .icon_name("desklink-keep-symbolic")
+            .tooltip_text("Pin to the top")
             .valign(gtk::Align::Center)
-            .css_classes(["flat", "circular"])
+            .css_classes(["dl-icon-btn"])
             .build();
         pin.update_property(&[gtk::accessible::Property::Label("Pin to the top")]);
-        let delete = gtk::Button::builder()
-            .icon_name("user-trash-symbolic")
-            .tooltip_text("Delete Note")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat", "circular"])
-            .build();
-        delete.update_property(&[gtk::accessible::Property::Label("Delete note")]);
+        let delete = ui_kit::icon_button("desklink-delete-symbolic", "Delete note");
+        delete.set_valign(gtk::Align::Center);
         // Back to the list, when only one of them fits.
-        let back = gtk::Button::builder()
-            .icon_name("go-previous-symbolic")
-            .tooltip_text("All Notes")
+        let back = ui_kit::icon_button("desklink-arrow-back-symbolic", "All notes");
+        back.set_valign(gtk::Align::Center);
+        let saved = gtk::Label::builder()
+            .css_classes(["dl-saved"])
             .valign(gtk::Align::Center)
-            .css_classes(["flat", "circular"])
             .build();
-        back.update_property(&[gtk::accessible::Property::Label("All notes")]);
         let head = gtk::Box::builder().spacing(6).build();
         head.append(&back);
         head.append(&title);
+        head.append(&saved);
         head.append(&pin);
         head.append(&delete);
         let body = gtk::TextView::builder()
@@ -470,20 +480,19 @@ impl Page {
         );
         let hint = text(
             "Synced with your phone and kept here, encrypted, even if you unpair it.",
-            &["caption", "text-faint"],
+            &["dl-caption"],
         );
         hint.set_wrap(true);
         hint.set_margin_bottom(8);
         editing.append(&hint);
-        let empty = adw::StatusPage::builder()
-            .icon_name("document-edit-symbolic")
-            .title("No Note Selected")
-            .description("Pick a note, or start a new one with +")
-            .build();
-        empty.add_css_class("compact");
+        let empty = clipboard::empty_state(
+            "desklink-edit-note-symbolic",
+            "No note selected",
+            "Pick a note, or start a new one with +",
+        );
         let stack = gtk::Stack::new();
         stack.add_named(&editing, Some("editor"));
-        stack.add_named(&empty, Some("none"));
+        stack.add_named(&empty.root, Some("none"));
         stack.set_visible_child_name("none");
 
         let split = adw::NavigationSplitView::builder()
@@ -511,6 +520,7 @@ impl Page {
             body,
             pin,
             delete,
+            saved,
             stack,
             open: RefCell::new(None),
             pending: RefCell::new(None),
@@ -594,9 +604,9 @@ impl Page {
             tidy,
             shown: Cell::new(u64::MAX),
         };
-        {
+        for button in [add, first] {
             let win = win.downgrade();
-            add.connect_clicked(move |_| {
+            button.connect_clicked(move |_| {
                 if let Some(win) = win.upgrade() {
                     win.new_note();
                 }
@@ -735,7 +745,7 @@ impl Solo {
             &notes.root,
             Some("notes"),
             "Notes",
-            "document-edit-symbolic",
+            "desklink-edit-note-symbolic",
         );
         stack.add_titled_with_icon(
             &gtk::ScrolledWindow::builder()
@@ -749,7 +759,7 @@ impl Solo {
                 .build(),
             Some("snippets"),
             "Snippets",
-            "view-pin-symbolic",
+            "desklink-keep-symbolic",
         );
         let back = gtk::Button::builder()
             .icon_name("go-previous-symbolic")

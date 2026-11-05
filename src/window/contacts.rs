@@ -9,7 +9,8 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk::{gdk, glib};
 
-use super::{can_send_feature, text, toast_from, wrapped, DesklinkWindow};
+use super::ui_kit;
+use super::{can_send_feature, clipboard, text, toast_from, wrapped, DesklinkWindow};
 use crate::device_links::contacts::{self, Contact};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::DeviceView;
@@ -25,9 +26,9 @@ pub(super) struct Page {
     count: gtk::Label,
     list: gtk::ListBox,
     stack: gtk::Stack,
-    empty: adw::StatusPage,
+    empty: clipboard::EmptyState,
     /// What is shown: the device, its name and the cache generation.
-    shown: RefCell<(String, String, u64)>,
+    shown: RefCell<(String, String, u64, bool)>,
     /// Every contact by uid, for the details (the list draws only some).
     contacts: Rc<RefCell<HashMap<String, Contact>>>,
     /// Every contact in order, the phone's name, and the search terms: what
@@ -126,6 +127,10 @@ struct Source {
     all: Vec<Contact>,
     phone: String,
     terms: String,
+    /// The device a Call acts for, and whether it can place one now.
+    device_id: String,
+    can_call: bool,
+    win: glib::WeakRef<DesklinkWindow>,
 }
 
 /// Rebuilds the rows for the terms: at most [`MAX_ROWS`], in order.
@@ -140,18 +145,43 @@ fn draw(list: &gtk::ListBox, count: &gtk::Label, source: &Source) {
             .title(&contact.name)
             .use_markup(false)
             .activatable(true)
+            .css_classes(["dl-contact"])
             .build();
-        let subtitle = contact
-            .phones
-            .first()
-            .map(|phone| phone.number.clone())
+        let first_number = contact.phones.first().map(|phone| phone.number.clone());
+        let subtitle = first_number
+            .clone()
             .or_else(|| contact.emails.first().cloned())
             .or_else(|| contact.org.clone());
         if let Some(subtitle) = subtitle {
             row.set_subtitle(&subtitle);
         }
-        row.add_prefix(&avatar(contact, 36));
-        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        row.add_prefix(&avatar(contact, 40));
+        // Call, from the list: the phone places it, after asking.
+        if let Some(number) = first_number {
+            let call = ui_kit::icon_button("desklink-call-symbolic", "Call");
+            call.update_property(&[gtk::accessible::Property::Label(&format!(
+                "Call {} on the phone",
+                contact.name
+            ))]);
+            call.set_valign(gtk::Align::Center);
+            call.set_sensitive(source.can_call);
+            if !source.can_call {
+                call.set_tooltip_text(Some("Connect the phone to call from here"));
+            }
+            let (win, id) = (source.win.clone(), source.device_id.clone());
+            call.connect_clicked(move |_| {
+                if let Some(win) = win.upgrade() {
+                    super::confirm_dial(&win, &number, Some(&id));
+                }
+            });
+            row.add_suffix(&call);
+        }
+        row.add_suffix(
+            &gtk::Image::builder()
+                .icon_name("desklink-chevron-right-symbolic")
+                .accessible_role(gtk::AccessibleRole::Presentation)
+                .build(),
+        );
         row.set_widget_name(&contact.uid);
         list.append(&row);
     }
@@ -175,37 +205,34 @@ impl Page {
             .placeholder_text("Search contacts")
             .hexpand(true)
             .build();
-        let refresh = gtk::Button::builder()
-            .icon_name("view-refresh-symbolic")
-            .tooltip_text("Refresh from the phone")
-            .valign(gtk::Align::Center)
-            .css_classes(["flat", "circular"])
-            .build();
-        refresh.update_property(&[gtk::accessible::Property::Label("Refresh from the phone")]);
+        clipboard::ensure_css();
+        search.update_property(&[gtk::accessible::Property::Label("Search contacts")]);
+        let refresh = ui_kit::icon_button("desklink-refresh-symbolic", "Refresh from the phone");
+        refresh.set_valign(gtk::Align::Center);
         let header = gtk::Box::builder().spacing(8).build();
         header.append(&search);
         header.append(&refresh);
-        let count = wrapped("", &["text-dim"]);
+        let count = wrapped("", &["dl-secondary"]);
         count.set_xalign(0.0);
 
         let list = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)
-            .css_classes(["boxed-list"])
+            .css_classes(["dl-row-group"])
             .valign(gtk::Align::Start)
             .build();
         list.update_property(&[gtk::accessible::Property::Label("Contacts")]);
-        let none = text("No matching contacts", &["text-dim"]);
+        let none = text("No matching contacts", &["dl-secondary"]);
         none.set_margin_top(18);
         none.set_margin_bottom(18);
         list.set_placeholder(Some(&none));
-        let empty = adw::StatusPage::builder()
-            .icon_name("x-office-address-book-symbolic")
-            .vexpand(true)
-            .build();
-        empty.add_css_class("compact");
+        let empty = clipboard::empty_state(
+            "desklink-person-symbolic",
+            "No contacts yet",
+            "Turn on contacts to see them here.",
+        );
         let stack = gtk::Stack::builder().vhomogeneous(false).build();
         stack.add_named(&list, Some("list"));
-        stack.add_named(&empty, Some("empty"));
+        stack.add_named(&empty.root, Some("empty"));
 
         let page = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -237,6 +264,7 @@ impl Page {
 
         let contacts: Rc<RefCell<HashMap<String, Contact>>> = Rc::default();
         let source: Rc<RefCell<Source>> = Rc::default();
+        source.borrow().win.set(Some(win));
         list.set_header_func(|row, before| {
             let title = |row: &gtk::ListBoxRow| {
                 row.downcast_ref::<adw::ActionRow>()
@@ -246,11 +274,7 @@ impl Page {
             if before.and_then(title) == letter {
                 row.set_header(None::<&gtk::Widget>);
             } else if let Some(letter) = letter {
-                let heading = text(&letter, &["list-heading"]);
-                heading.set_xalign(0.0);
-                heading.set_margin_start(12);
-                heading.set_margin_top(8);
-                heading.set_margin_bottom(4);
+                let heading = text(&letter, &["dl-letter"]);
                 row.set_header(Some(&heading));
             }
         });
@@ -316,12 +340,10 @@ impl Page {
         let can_refresh =
             ready && can_send_feature(device, PACKET_TYPE_CONTACTS_REQUEST_ALL_UIDS_TIMESTAMPS);
         self.refresh.set_sensitive(can_refresh);
-        self.device.replace((
-            device.id.clone(),
-            ready && can_send_feature(device, PACKET_TYPE_TELEPHONY_REQUEST),
-        ));
+        let can_call = ready && can_send_feature(device, PACKET_TYPE_TELEPHONY_REQUEST);
+        self.device.replace((device.id.clone(), can_call));
         let generation = contacts::generation();
-        let shown = (device.id.clone(), device.name.clone(), generation);
+        let shown = (device.id.clone(), device.name.clone(), generation, can_call);
         if *self.shown.borrow() == shown {
             return;
         }
@@ -340,20 +362,18 @@ impl Page {
             let mut source = self.source.borrow_mut();
             source.all = list.clone();
             source.phone = device.name.clone();
+            source.device_id = device.id.clone();
+            source.can_call = can_call;
         }
         draw(&self.list, &self.count, &self.source.borrow());
 
         if list.is_empty() {
-            self.empty.set_title(&glib::markup_escape_text(&format!(
-                "No Contacts from {}",
-                device.name
-            )));
-            self.empty
-                .set_description(Some(&glib::markup_escape_text(&format!(
-                    "Turn on “Share contacts” for this computer in DeskLink on {}. \
+            self.empty.title.set_label("No contacts yet");
+            self.empty.body.set_label(&format!(
+                "Turn on “Share contacts” for this computer in DeskLink on {}. \
                  They are kept here encrypted, and removed when you unpair.",
-                    device.name
-                ))));
+                device.name
+            ));
             self.stack.set_visible_child_name("empty");
         } else {
             self.stack.set_visible_child_name("list");
@@ -402,13 +422,8 @@ fn show_details(win: &DesklinkWindow, device_id: &str, can_call: bool, contact: 
         .content_width(420)
         .build();
     let copy_button = |value: String, what: &'static str| {
-        let button = gtk::Button::builder()
-            .icon_name("edit-copy-symbolic")
-            .tooltip_text(format!("Copy {what}"))
-            .valign(gtk::Align::Center)
-            .css_classes(["flat"])
-            .build();
-        button.update_property(&[gtk::accessible::Property::Label(&format!("Copy {what}"))]);
+        let button = ui_kit::icon_button("desklink-content-copy-symbolic", &format!("Copy {what}"));
+        button.set_valign(gtk::Align::Center);
         button.connect_clicked(move |button| {
             button.clipboard().set_text(&value);
             toast_from(button, &format!("Copied {what}"));
@@ -430,13 +445,9 @@ fn show_details(win: &DesklinkWindow, device_id: &str, can_call: bool, contact: 
                 .subtitle_selectable(true)
                 .build();
             row.add_css_class("property");
-            let call = gtk::Button::builder()
-                .icon_name("call-start-symbolic")
-                .tooltip_text("Call")
-                .valign(gtk::Align::Center)
-                .sensitive(can_call)
-                .css_classes(["flat"])
-                .build();
+            let call = ui_kit::icon_button("desklink-call-symbolic", "Call");
+            call.set_valign(gtk::Align::Center);
+            call.set_sensitive(can_call);
             call.update_property(&[gtk::accessible::Property::Label(&format!(
                 "Call {}",
                 phone.number
@@ -457,13 +468,9 @@ fn show_details(win: &DesklinkWindow, device_id: &str, can_call: bool, contact: 
                     }
                 });
             }
-            let message = gtk::Button::builder()
-                .icon_name("chat-message-new-symbolic")
-                .tooltip_text("Message on the phone")
-                .valign(gtk::Align::Center)
-                .sensitive(can_call)
-                .css_classes(["flat"])
-                .build();
+            let message = ui_kit::icon_button("chat-message-new-symbolic", "Message on the phone");
+            message.set_valign(gtk::Align::Center);
+            message.set_sensitive(can_call);
             message.update_property(&[gtk::accessible::Property::Label(&format!(
                 "Message {} on the phone",
                 phone.number
