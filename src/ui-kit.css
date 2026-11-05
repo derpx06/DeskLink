@@ -1,0 +1,245 @@
+/* DeskLink UI kit (docs/UI-REDESIGN.md section 2): the shared look of the
+ * phone and the desk, as classes. Colours are only `@dl_*` names (see
+ * window/ui_kit/tokens.rs; none is written here), sizes are `em` of the
+ * window font (15 px base) or the shape/spacing scale below, so text scaling
+ * works. Loaded by application.rs above style.css; the builders that put
+ * these classes on widgets are in window/ui_kit/mod.rs.
+ *
+ * Shape scale (px):  8 thumbnails, 12 buttons/fields/segmented/toasts/icon
+ *                    squares, 16 cards/tiles/banners/lists, 24 dialogs,
+ *                    28 sheets, 999 chips/pills/dots.   (3 = progress bar)
+ * Spacing scale:     4 8 12 16 24 32 48
+ * Hit targets (desk, UI-REDESIGN 2.4): 40 x 40 minimum for buttons, rows,
+ *                    chips, segments; tiles 64 high.
+ * Type (em of 15 px): hero 1.87/700, title 1.47/600, card title 1.07/600,
+ *                    body 1, secondary .87, label .93/600, section .87/600,
+ *                    caption .8 (never below 12 px), mono .8.
+ * States: hover = text at 6%, pressed = 10% (100 ms linear), focus-visible
+ *         = 2 px ring in dl_accent_text, 2 px off, disabled = 38%.
+ */
+
+/* ── Type ──────────────────────────────────────────────────────────────── */
+.dl-hero { font-size: 1.87em; font-weight: 700; letter-spacing: -0.02em; }
+.dl-title { font-size: 1.47em; font-weight: 600; }
+.dl-card-title { font-size: 1.07em; font-weight: 600; }
+.dl-secondary { font-size: 0.87em; color: @dl_text_dim; }
+.dl-label { font-size: 0.93em; font-weight: 600; }
+.dl-caption { font-size: 0.8em; font-weight: 500; color: @dl_hint; }
+.dl-mono { font-family: "JetBrains Mono", monospace; font-size: 0.8em; font-feature-settings: "tnum"; }
+.dl-section { font-size: 0.87em; font-weight: 600; color: @dl_text_dim; }
+
+/* ── Focus, hover, pressed, disabled (shared) ──────────────────────────── */
+.dl-btn, .dl-icon-btn, .dl-tile, .dl-chip, .dl-segment {
+  transition: background-color 100ms linear, background-image 100ms linear;
+}
+.dl-btn:focus-visible, .dl-icon-btn:focus-visible, .dl-tile:focus-visible,
+.dl-segment:focus-visible, .dl-row:focus-visible {
+  outline: 2px solid @dl_accent_text;
+  outline-offset: 2px;
+}
+.dl-btn:hover, .dl-icon-btn:hover, .dl-tile:hover, .dl-segment:hover {
+  background-image: linear-gradient(alpha(currentColor, 0.06), alpha(currentColor, 0.06));
+}
+.dl-btn:active, .dl-icon-btn:active, .dl-tile:active, .dl-segment:active {
+  background-image: linear-gradient(alpha(currentColor, 0.1), alpha(currentColor, 0.1));
+}
+.dl-btn:disabled, .dl-icon-btn:disabled, .dl-tile:disabled, .dl-chip:disabled, .dl-segment:disabled {
+  opacity: 0.38;
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────────── */
+.dl-btn {
+  min-height: 40px;
+  min-width: 88px;
+  padding: 0 20px;
+  border: none;
+  border-radius: 12px;
+  box-shadow: none;
+  font-size: 0.93em;
+  font-weight: 600;
+}
+.dl-btn-primary { background-color: @dl_accent; color: @dl_on_accent; }
+.dl-btn-tonal { background-color: @dl_accent_container; color: @dl_on_accent_container; }
+.dl-btn-outline {
+  background-color: transparent;
+  color: @dl_accent_text;
+  box-shadow: inset 0 0 0 1.5px @dl_outline;
+}
+.dl-btn-text {
+  min-width: 40px;
+  padding: 0 12px;
+  background-color: transparent;
+  color: @dl_accent_text;
+}
+.dl-btn-danger { background-color: @dl_error_container; color: @dl_on_error_container; }
+/* The confirm button of a destructive dialog. */
+.dl-btn-danger.solid { background-color: @dl_error; color: @dl_on_error; }
+.dl-btn-content { min-height: 40px; }
+.dl-btn-content image { -gtk-icon-size: 20px; }
+
+.dl-icon-btn {
+  min-width: 40px;
+  min-height: 40px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background-color: transparent;
+  box-shadow: none;
+  color: @dl_text_dim;
+}
+.dl-icon-btn image { -gtk-icon-size: 24px; }
+
+/* ── Chips and the segmented control ───────────────────────────────────── */
+/* The chip is a 40 px high hit box around a 32 px face; the ring is the face's. */
+.dl-chip {
+  min-height: 40px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: none;
+  box-shadow: none;
+  outline: none;
+}
+.dl-chip-face {
+  min-height: 32px;
+  padding: 0 12px;
+  border-radius: 999px;
+  background-color: @dl_surface;
+  box-shadow: inset 0 0 0 1px @dl_edge;
+  font-size: 0.87em;
+  font-weight: 600;
+}
+.dl-chip-face image { -gtk-icon-size: 18px; }
+.dl-chip:hover .dl-chip-face { background-image: linear-gradient(alpha(currentColor, 0.06), alpha(currentColor, 0.06)); }
+.dl-chip:checked .dl-chip-face { background-color: @dl_accent_container; color: @dl_on_accent_container; }
+.dl-chip:focus-visible .dl-chip-face { outline: 2px solid @dl_accent_text; outline-offset: 2px; }
+
+.dl-segmented {
+  padding: 4px;
+  border-radius: 12px;
+  background-color: @dl_surface_2;
+}
+.dl-segment {
+  min-height: 40px;
+  padding: 0 16px;
+  border: none;
+  border-radius: 8px;
+  background-color: transparent;
+  box-shadow: none;
+  color: @dl_text_dim;
+  font-size: 0.93em;
+  font-weight: 600;
+}
+.dl-segment:checked { background-color: @dl_surface; color: @dl_text; box-shadow: 0 0 0 1px @dl_edge; }
+
+/* ── Status dot and pill ───────────────────────────────────────────────── */
+/* A shape as well as a colour: disc connected, ring waiting, diamond needs
+   you, triangle failed (an icon), square live. */
+.dl-dot { min-width: 8px; min-height: 8px; border-radius: 999px; }
+.dl-dot.ok { background-color: @dl_success; }
+.dl-dot.idle { box-shadow: inset 0 0 0 1.5px @dl_text_faint; }
+.dl-dot.warn { background-color: @dl_warn; border-radius: 1px; transform: rotate(45deg); }
+.dl-dot.live { background-color: @dl_live; border-radius: 2px; }
+.dl-dot.err { min-width: 12px; min-height: 12px; background: none; color: @dl_error; }
+.dl-dot.err image { -gtk-icon-size: 12px; }
+
+.dl-pill {
+  min-height: 28px;
+  padding: 0 12px;
+  border-radius: 999px;
+  font-size: 0.87em;
+  font-weight: 600;
+  background-color: @dl_surface_2;
+  color: @dl_text_dim;
+}
+.dl-pill.ok { background-color: @dl_success_container; color: @dl_on_success_container; }
+.dl-pill.err { background-color: @dl_error_container; color: @dl_on_error_container; }
+.dl-pill.warn { background-color: @dl_warn_container; color: @dl_on_warn_container; }
+.dl-pill.live { background-color: @dl_live_container; color: @dl_on_live_container; }
+
+/* ── Quick-action tile ─────────────────────────────────────────────────── */
+.dl-tile {
+  min-width: 126px;
+  min-height: 64px;
+  padding: 12px;
+  border: none;
+  border-radius: 16px;
+  background-color: @dl_surface;
+  color: @dl_text;
+  box-shadow: inset 0 0 0 1px @dl_edge;
+}
+.dl-tile .dl-tile-title { font-size: 0.87em; font-weight: 600; }
+.dl-tile .dl-tile-hint { font-size: 0.8em; color: @dl_text_dim; }
+.dl-tile image.dl-tile-icon { -gtk-icon-size: 22px; }
+/* The one primary tile of a screen. */
+.dl-tile.primary { background-color: @dl_accent; color: @dl_on_accent; box-shadow: none; }
+.dl-tile.primary .dl-tile-hint { color: @dl_on_accent; opacity: 0.8; }
+.dl-tile.on { background-color: @dl_accent_container; color: @dl_on_accent_container; box-shadow: none; }
+.dl-tile.on .dl-tile-hint { color: @dl_on_accent_container; opacity: 0.8; }
+
+/* ── Icon squares and list rows ────────────────────────────────────────── */
+.dl-icon-square {
+  min-width: 40px;
+  min-height: 40px;
+  border-radius: 12px;
+  background-color: @dl_surface_2;
+  color: @dl_text_dim;
+}
+.dl-icon-square image { -gtk-icon-size: 24px; }
+.dl-icon-square.accent { background-color: @dl_accent_container; color: @dl_on_accent_container; }
+.dl-icon-square.success { background-color: @dl_success_container; color: @dl_on_success_container; }
+.dl-icon-square.warn { background-color: @dl_warn_container; color: @dl_on_warn_container; }
+.dl-icon-square.error { background-color: @dl_error_container; color: @dl_on_error_container; }
+.dl-icon-square.live { background-color: @dl_live_container; color: @dl_on_live_container; }
+
+.dl-row-group {
+  border-radius: 16px;
+  background-color: @dl_surface;
+  box-shadow: inset 0 0 0 1px @dl_edge;
+}
+.dl-row-group > row { background: none; border-radius: 0; }
+.dl-row-group > row + row { border-top: 1px solid @dl_hairline; }
+.dl-row-group > row:first-child { border-top-left-radius: 16px; border-top-right-radius: 16px; }
+.dl-row-group > row:last-child { border-bottom-left-radius: 16px; border-bottom-right-radius: 16px; }
+.dl-row { min-height: 52px; padding: 8px 12px; }
+.dl-row label.title { font-size: 1em; font-weight: 600; }
+.dl-row label.subtitle { font-size: 0.87em; color: @dl_text_dim; opacity: 1; }
+.dl-row:hover { background-image: linear-gradient(alpha(currentColor, 0.06), alpha(currentColor, 0.06)); }
+
+/* ── Cards ─────────────────────────────────────────────────────────────── */
+/* `.dl-card-new` is the kit's card; `.dl-card` alone is still the older
+   look (style.css) until the last screen wave moves its users over. */
+.dl-card.dl-card-new {
+  padding: 16px;
+  border-radius: 16px;
+  background-color: @dl_surface;
+  background-image: none;
+  box-shadow: inset 0 0 0 1px @dl_edge;
+}
+
+/* ── Toast (the inverse snackbar; AdwToast inside `.dl-toasts` too) ─────── */
+.dl-toast, .dl-toasts toast {
+  padding: 12px 16px;
+  border-radius: 12px;
+  background-color: @dl_inverse;
+  color: @dl_on_inverse;
+  font-size: 0.93em;
+}
+.dl-toasts toast label { color: @dl_on_inverse; }
+
+/* ── Progress ──────────────────────────────────────────────────────────── */
+progressbar.dl-progress > trough {
+  min-height: 6px;
+  border-radius: 3px;
+  background-color: @dl_surface_2;
+}
+progressbar.dl-progress > trough > progress {
+  min-height: 6px;
+  border-radius: 3px;
+  background-color: @dl_accent;
+}
+progressbar.dl-progress.done > trough > progress { background-color: @dl_success; }
+.dl-progress-text { font-family: "JetBrains Mono", monospace; font-size: 0.8em; font-feature-settings: "tnum"; color: @dl_text_dim; }
+
+/* ── The component sheet (developer gallery) ───────────────────────────── */
+.dl-sheet { background-color: @dl_bg; color: @dl_text; }

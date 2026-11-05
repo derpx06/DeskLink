@@ -45,6 +45,7 @@ pub(crate) mod prefs;
 mod sidebar;
 mod terminals;
 mod transfers;
+pub(crate) mod ui_kit;
 mod viewer;
 
 use adw::prelude::*;
@@ -2567,6 +2568,7 @@ fn accept_dropped_files(
 ///   `paired-turn`, `connecting`, `unreachable`, `pair-request`, `requested`,
 ///   `discovered`; TYPE `phone`, `tablet`, `tv`, `laptop`, `desktop`);
 ///   `fake-clear` removes them.
+/// - `ui-kit [W H]`: the UI kit's component sheet in its own window.
 /// - `page NAME`, `select N` (the Nth fake device), `open-terminal N`,
 ///   `open-switcher`, `window-size W H`, `color-scheme dark|light|default`,
 ///   `open-pair`, `open-codes`, `nav content|sidebar`,
@@ -3133,6 +3135,11 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 }
             }
             debug_log!("[E2E] too-wide {limit}: {found:#?}");
+        }
+        // "ui-kit [W H]": the component sheet in its own window.
+        "ui-kit" => {
+            let size = |text: &str, default| text.parse().unwrap_or(default);
+            ui_kit::present_sheet(win, size(&id, 1100), size(&arg, 1500));
         }
         "window-size" => {
             if let (Ok(width), Ok(height)) = (id.parse(), arg.parse()) {

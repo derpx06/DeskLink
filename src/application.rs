@@ -1101,9 +1101,9 @@ pub(crate) fn token_color(name: &str) -> gtk::gdk::RGBA {
         .iter()
         .chain(TOKENS)
         .find(|(token, _, _)| *token == name)
-        .and_then(|(_, light, dark_value)| {
-            gtk::gdk::RGBA::parse(if dark { *dark_value } else { *light }).ok()
-        })
+        .map(|(_, light, dark_value)| if dark { *dark_value } else { *light })
+        .or_else(|| crate::window::ui_kit::tokens::value(name, dark, false))
+        .and_then(|value| gtk::gdk::RGBA::parse(value).ok())
         .unwrap_or(gtk::gdk::RGBA::new(0.5, 0.5, 0.5, 1.0))
 }
 
@@ -1135,6 +1135,8 @@ fn palette_css(dark: bool, modern: bool, contrast: bool) -> String {
     if modern && !root.is_empty() {
         css.push_str(&format!(":root {{ {root}}}\n"));
     }
+    // The UI kit's `dl_*` tokens (docs/UI-REDESIGN.md 2.1).
+    css.push_str(&crate::window::ui_kit::tokens::css(dark, modern, contrast));
     css
 }
 
@@ -1178,6 +1180,15 @@ fn install_brand_styles() {
         &display,
         &palette,
         gtk::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+    );
+    // The UI kit's classes, after `style.css`; their colours are the
+    // palette's `dl_*` names.
+    let kit = gtk::CssProvider::new();
+    kit.load_from_resource("/derx06/desklink/com/ui-kit.css");
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &kit,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
     );
     let accent = gtk::CssProvider::new();
     gtk::style_context_add_provider_for_display(
