@@ -1,0 +1,28 @@
+c[?1049h[?25h[m[H[J[93m 26 
+ 27 if[m __name__ == [95m"__main__"[m:
+[93m 28 [m    [96;1mprint[m(greet(os.environ.get([95m"USER"[m, [95m"world"[m)))
+[93m 29 [38;5;81mimport[m os
+[93m 30 
+ 31 def[m [96;1mgreet[m(name: [96;1mstr[m) -> [96;1mstr[m:
+[93m 32 [m    [95m"""Say hello."""
+[93m 33 [m    [96m# a long comment line that is certainly longer than [93m    [96mforty columns wide and wraps in vim
+[93m 34 [m    [93mreturn[m [95mf"hello, [38;5;224m{[mname[38;5;224m}[95m!"[m  [96m# trailing
+[93m 35 
+ 36 class[m [38;5;121mThing[m:
+[93m 37 [m    [93mdef[m [96;1m__init__[m([96;1mself[m, value=[95m42[m):
+[93m 38 [m        [96;1mself[m.value = value
+[93m 39 
+ 40 
+ 41 if[m __name__ == [95m"__main__"[m:
+[93m 42 [m    [96;1mprint[m(greet(os.environ.get([95m"USER"[m, [95m"world"[m)))
+[94m~                                                           
+~                                                           ~                                                           
+~                                                           
+~                                                           
+~                                                           
+~                                                           
+~                                                           
+~                                                           
+~                                                           
+~                                                           
+[m/hello[36C32,12[9CBot[7;16H=[?1h[?2004h

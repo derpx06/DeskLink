@@ -1,0 +1,37 @@
+size 40x30
+cursor 29 28 visible 1 alt 1
+|╭─Status────╮╭─Log─────────────────────╮
+|│ commit 01 ││ commit 01  fix thing    │
+|│ commit 02 ││ commit 02  fix thing    │
+|│ commit 03 ││ commit 03  fix thing    │
+|│ commit 04 ││ commit 04  fix thing    │
+|│ commit 05 ││ commit 05  fix thing    │
+|│ commit 06 ││ commit 06  fix thing    │
+|│ commit 07 ││ commit 07  fix thing    │
+|│ commit 08 ││ commit 08  fix thing    │
+|│ commit 09 ││ commit 09  fix thing    │
+|│ commit 10 ││ commit 10  fix thing    │
+|│ commit 11 ││ commit 11  fix thing    │
+|│ commit 12 ││ commit 12  fix thing    │
+|│ commit 13 ││ commit 13  fix thing    │
+|╰───────────╯│ commit 14  fix thing    │
+|╭─Files─────╮│ commit 15  fix thing    │
+|│ commit 01 ││ commit 16  fix thing    │
+|│ commit 02 ││ commit 17  fix thing    │
+|│ commit 03 ││ commit 18  fix thing    │
+|│ commit 04 ││ commit 19  fix thing    │
+|│ commit 05 ││ commit 20  fix thing    │
+|│ commit 06 ││ commit 21  fix thing    │
+|│ commit 07 ││ commit 22  fix thing    │
+|│ commit 08 ││ commit 23  fix thing    │
+|│ commit 09 ││ commit 24  fix thing    │
+|│ commit 10 ││ commit 25  fix thing    │
+|│ commit 11 ││ commit 26  fix thing    │
+|│ commit 12 ││ commit 27  fix thing    │
+|╰───────────╯╰─────────────────────────╯
+|Open menu: x  Keybindings: ?
+29,0-3: fg=4 bg=-
+29,5-9: fg=4 bg=-
+29,11-11: fg=4 bg=-
+29,14-25: fg=4 bg=-
+29,27-27: fg=4 bg=-

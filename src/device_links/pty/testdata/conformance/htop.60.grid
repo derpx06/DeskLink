@@ -1,0 +1,288 @@
+size 60x30
+cursor 29 59 visible 0 alt 1
+|
+|    0[||  6.5%]   4[||  5.1%]   8[||   5.7%] 12[||   3.8%]
+|    1[||  3.8%]   5[|   3.8%]   9[||   3.8%] 13[|    1.3%]
+|    2[||  3.2%]   6[||  5.1%]  10[||   3.9%] 14[||   2.5%]
+|    3[    0.0%]   7[    0.0%]  11[||   6.9%] 15[||   2.6%]
+|  Mem[|||||||||||9.25G/15.3G] Tasks: 337, 2139 thr, 256 kt
+|  Swp[|||||||||||7.48G/7.67G] Load average: 2.15 3.23 3.80
+|                              Uptime: 15:01:18
+|
+|  [Main] [I/O]
+|   PID△USER       PRI  NI  VIRT   RES  PRIV S  CPU% MEM%   T
+|     1 root        20   0 21356  9820  3740 S   0.0  0.1  0:
+|   424 root        20   0 94048 24136   892 S   0.0  0.2  0:
+|   441 root        20   0  9176  2376   136 S   0.0  0.0  0:
+|432360 root        20   0  9832  5576   632 S   0.0  0.0  0:
+|432724 root        20   0  9832  5576   636 S   0.0  0.0  0:
+|432725 root        20   0  9832  5572   632 S   0.0  0.0  0:
+|   479 systemd-ti  20   0 85492  2772   160 S   0.0  0.0  0:
+|   483 systemd-ti  20   0 85492  2772     0 S   0.0  0.0  0:
+|   485 root        20   0 44728  5080  1404 S   0.0  0.0  0:
+|   964 dbus        20   0  8340  2804   248 S   0.0  0.0  0:
+|   965 dbus        20   0  8760  4272  2148 S   0.0  0.0  0:
+|   966 earlyoom     0 -20  3072  2304   188 S   0.0  0.0  0:
+|   967 root        20   0  412M 12188  2344 S   0.0  0.1  0:
+|   984 root        20   0  412M 12188     0 S   0.0  0.1  0:
+|   986 root        20   0  412M 12188     0 S   0.0  0.1  0:
+|   987 root        20   0  412M 12188     0 S   0.0  0.1  0:
+|   970 root        20   0 82100  2648   192 S   0.0  0.0  0:
+|   989 root        20   0 82100  2648     0 S   0.0  0.0  0:
+|F1Help  F2Setup F3SearchF4FilterF5List  F6SortByF7Nice -F8Ni
+1,4-4: fg=6 bg=-
+1,5-5: fg=- bg=- bold
+1,6-6: fg=2 bg=-
+1,7-7: fg=1 bg=-
+1,10-13: fg=8 bg=- bold
+1,14-14: fg=- bg=- bold
+1,18-18: fg=6 bg=-
+1,19-19: fg=- bg=- bold
+1,20-20: fg=2 bg=-
+1,21-21: fg=1 bg=-
+1,24-27: fg=8 bg=- bold
+1,28-28: fg=- bg=- bold
+1,32-32: fg=6 bg=-
+1,33-33: fg=- bg=- bold
+1,34-34: fg=2 bg=-
+1,35-35: fg=1 bg=-
+1,39-42: fg=8 bg=- bold
+1,43-43: fg=- bg=- bold
+1,45-46: fg=6 bg=-
+1,47-47: fg=- bg=- bold
+1,48-48: fg=2 bg=-
+1,49-49: fg=1 bg=-
+1,53-56: fg=8 bg=- bold
+1,57-57: fg=- bg=- bold
+2,4-4: fg=6 bg=-
+2,5-5: fg=- bg=- bold
+2,6-6: fg=2 bg=-
+2,7-7: fg=1 bg=-
+2,10-13: fg=8 bg=- bold
+2,14-14: fg=- bg=- bold
+2,18-18: fg=6 bg=-
+2,19-19: fg=- bg=- bold
+2,20-20: fg=1 bg=-
+2,24-27: fg=8 bg=- bold
+2,28-28: fg=- bg=- bold
+2,32-32: fg=6 bg=-
+2,33-33: fg=- bg=- bold
+2,34-34: fg=2 bg=-
+2,35-35: fg=1 bg=-
+2,39-42: fg=8 bg=- bold
+2,43-43: fg=- bg=- bold
+2,45-46: fg=6 bg=-
+2,47-47: fg=- bg=- bold
+2,48-48: fg=1 bg=-
+2,53-56: fg=8 bg=- bold
+2,57-57: fg=- bg=- bold
+3,4-4: fg=6 bg=-
+3,5-5: fg=- bg=- bold
+3,6-6: fg=2 bg=-
+3,7-7: fg=1 bg=-
+3,10-13: fg=8 bg=- bold
+3,14-14: fg=- bg=- bold
+3,18-18: fg=6 bg=-
+3,19-19: fg=- bg=- bold
+3,20-20: fg=2 bg=-
+3,21-21: fg=1 bg=-
+3,24-27: fg=8 bg=- bold
+3,28-28: fg=- bg=- bold
+3,31-32: fg=6 bg=-
+3,33-33: fg=- bg=- bold
+3,34-34: fg=2 bg=-
+3,35-35: fg=1 bg=-
+3,39-42: fg=8 bg=- bold
+3,43-43: fg=- bg=- bold
+3,45-46: fg=6 bg=-
+3,47-47: fg=- bg=- bold
+3,48-48: fg=2 bg=-
+3,49-49: fg=1 bg=-
+3,53-56: fg=8 bg=- bold
+3,57-57: fg=- bg=- bold
+4,4-4: fg=6 bg=-
+4,5-5: fg=- bg=- bold
+4,10-13: fg=8 bg=- bold
+4,14-14: fg=- bg=- bold
+4,18-18: fg=6 bg=-
+4,19-19: fg=- bg=- bold
+4,24-27: fg=8 bg=- bold
+4,28-28: fg=- bg=- bold
+4,31-32: fg=6 bg=-
+4,33-33: fg=- bg=- bold
+4,34-34: fg=2 bg=-
+4,35-35: fg=1 bg=-
+4,39-42: fg=8 bg=- bold
+4,43-43: fg=- bg=- bold
+4,45-46: fg=6 bg=-
+4,47-47: fg=- bg=- bold
+4,48-48: fg=2 bg=-
+4,49-49: fg=1 bg=-
+4,53-56: fg=8 bg=- bold
+4,57-57: fg=- bg=- bold
+5,2-4: fg=6 bg=-
+5,5-5: fg=- bg=- bold
+5,6-17: fg=2 bg=-
+5,18-19: fg=5 bg=-
+5,20-20: fg=4 bg=- bold
+5,21-25: fg=3 bg=-
+5,26-27: fg=8 bg=- bold
+5,28-28: fg=- bg=- bold
+5,30-35: fg=6 bg=-
+5,37-39: fg=6 bg=- bold
+5,40-40: fg=6 bg=-
+5,42-45: fg=2 bg=- bold
+5,47-49: fg=6 bg=-
+5,50-50: fg=8 bg=- bold
+5,52-54: fg=8 bg=- bold
+5,56-57: fg=8 bg=- bold
+6,2-4: fg=6 bg=-
+6,5-5: fg=- bg=- bold
+6,6-27: fg=1 bg=-
+6,28-28: fg=- bg=- bold
+6,30-33: fg=6 bg=-
+6,35-42: fg=6 bg=-
+6,44-47: fg=- bg=- bold
+6,49-52: fg=6 bg=- bold
+6,54-57: fg=6 bg=-
+7,30-36: fg=6 bg=-
+7,38-45: fg=6 bg=- bold
+9,2-2: fg=2 bg=2
+9,3-6: fg=0 bg=2
+9,7-7: fg=2 bg=2
+9,9-9: fg=4 bg=4
+9,10-12: fg=0 bg=4
+9,13-13: fg=4 bg=4
+10,0-6: fg=0 bg=6
+10,7-59: fg=0 bg=2
+11,0-59: fg=0 bg=6
+12,7-10: fg=8 bg=- bold
+12,24-24: fg=8 bg=- bold
+12,26-27: fg=6 bg=-
+12,32-33: fg=6 bg=-
+12,44-44: fg=8 bg=- bold
+12,48-50: fg=8 bg=- bold
+13,7-10: fg=8 bg=- bold
+13,24-24: fg=8 bg=- bold
+13,27-27: fg=6 bg=-
+13,33-33: fg=6 bg=-
+13,44-44: fg=8 bg=- bold
+13,48-50: fg=8 bg=- bold
+13,53-55: fg=8 bg=- bold
+14,7-10: fg=8 bg=- bold
+14,24-24: fg=8 bg=- bold
+14,27-27: fg=6 bg=-
+14,33-33: fg=6 bg=-
+14,44-44: fg=8 bg=- bold
+14,48-50: fg=8 bg=- bold
+14,53-55: fg=8 bg=- bold
+14,58-59: fg=8 bg=- bold
+15,7-10: fg=8 bg=- bold
+15,24-24: fg=8 bg=- bold
+15,27-27: fg=6 bg=-
+15,33-33: fg=6 bg=-
+15,44-44: fg=8 bg=- bold
+15,48-50: fg=8 bg=- bold
+15,53-55: fg=8 bg=- bold
+15,58-59: fg=8 bg=- bold
+16,7-10: fg=8 bg=- bold
+16,24-24: fg=8 bg=- bold
+16,27-27: fg=6 bg=-
+16,33-33: fg=6 bg=-
+16,44-44: fg=8 bg=- bold
+16,48-50: fg=8 bg=- bold
+16,53-55: fg=8 bg=- bold
+16,58-59: fg=8 bg=- bold
+17,7-16: fg=5 bg=-
+17,24-24: fg=8 bg=- bold
+17,26-27: fg=6 bg=-
+17,33-33: fg=6 bg=-
+17,44-44: fg=8 bg=- bold
+17,48-50: fg=8 bg=- bold
+17,53-55: fg=8 bg=- bold
+18,7-16: fg=5 bg=-
+18,24-24: fg=8 bg=- bold
+18,26-27: fg=6 bg=-
+18,33-33: fg=6 bg=-
+18,44-44: fg=8 bg=- bold
+18,48-50: fg=8 bg=- bold
+18,53-55: fg=8 bg=- bold
+19,7-10: fg=8 bg=- bold
+19,24-24: fg=8 bg=- bold
+19,26-27: fg=6 bg=-
+19,33-33: fg=6 bg=-
+19,39-39: fg=6 bg=-
+19,44-44: fg=8 bg=- bold
+19,48-50: fg=8 bg=- bold
+19,53-55: fg=8 bg=- bold
+20,7-10: fg=8 bg=- bold
+20,24-24: fg=8 bg=- bold
+20,27-27: fg=6 bg=-
+20,33-33: fg=6 bg=-
+20,44-44: fg=8 bg=- bold
+20,48-50: fg=8 bg=- bold
+20,53-55: fg=8 bg=- bold
+21,7-10: fg=5 bg=-
+21,24-24: fg=8 bg=- bold
+21,27-27: fg=6 bg=-
+21,33-33: fg=6 bg=-
+21,39-39: fg=6 bg=-
+21,44-44: fg=8 bg=- bold
+21,48-50: fg=8 bg=- bold
+21,53-55: fg=8 bg=- bold
+22,7-14: fg=5 bg=-
+22,22-24: fg=1 bg=-
+22,27-27: fg=6 bg=-
+22,33-33: fg=6 bg=-
+22,44-44: fg=8 bg=- bold
+22,48-50: fg=8 bg=- bold
+22,53-55: fg=8 bg=- bold
+23,7-10: fg=8 bg=- bold
+23,24-24: fg=8 bg=- bold
+23,27-30: fg=6 bg=-
+23,32-33: fg=6 bg=-
+23,39-39: fg=6 bg=-
+23,44-44: fg=8 bg=- bold
+23,48-50: fg=8 bg=- bold
+24,7-10: fg=5 bg=-
+24,24-24: fg=8 bg=- bold
+24,27-30: fg=6 bg=-
+24,32-33: fg=6 bg=-
+24,44-44: fg=8 bg=- bold
+24,48-50: fg=8 bg=- bold
+25,7-10: fg=5 bg=-
+25,24-24: fg=8 bg=- bold
+25,27-30: fg=6 bg=-
+25,32-33: fg=6 bg=-
+25,44-44: fg=8 bg=- bold
+25,48-50: fg=8 bg=- bold
+25,58-59: fg=8 bg=- bold
+26,7-10: fg=5 bg=-
+26,24-24: fg=8 bg=- bold
+26,27-30: fg=6 bg=-
+26,32-33: fg=6 bg=-
+26,44-44: fg=8 bg=- bold
+26,48-50: fg=8 bg=- bold
+27,7-10: fg=8 bg=- bold
+27,24-24: fg=8 bg=- bold
+27,26-27: fg=6 bg=-
+27,33-33: fg=6 bg=-
+27,44-44: fg=8 bg=- bold
+27,48-50: fg=8 bg=- bold
+27,53-55: fg=8 bg=- bold
+28,7-10: fg=5 bg=-
+28,24-24: fg=8 bg=- bold
+28,26-27: fg=6 bg=-
+28,33-33: fg=6 bg=-
+28,44-44: fg=8 bg=- bold
+28,48-50: fg=8 bg=- bold
+28,53-55: fg=8 bg=- bold
+28,58-59: fg=8 bg=- bold
+29,2-7: fg=0 bg=6
+29,10-15: fg=0 bg=6
+29,18-23: fg=0 bg=6
+29,26-31: fg=0 bg=6
+29,34-39: fg=0 bg=6
+29,42-47: fg=0 bg=6
+29,50-55: fg=0 bg=6
+29,58-59: fg=0 bg=6

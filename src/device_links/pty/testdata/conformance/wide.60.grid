@@ -1,0 +1,32 @@
+size 60x30
+cursor 17 0 visible 1 alt 0
+|ascii abc
+|日本語のテキスト
+|한국어 텍스트
+|emoji 😀 👍 🎉 end
+|zwj 👨‍👩‍👧 end
+|combining é é ä end
+|ambig ±×÷ ○● end
+|box ┌─┬─┐ ├─┼─┤ └─┴─┘ ╔═╗ ║ ╚═╝ ╭─╮ ╰─╯
+|block ▀▄█▌▐ ░▒▓ ▁▂▃▄▅▆▇█
+|braille ⠀⠁⠂⠃⡇⣿
+|spin ✻ ✽ ✳ ⏺ ⎿ ❯ ● ○ ✓ ✗
+|xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+|日本
+|yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy日
+|本
+|zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+|w
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|

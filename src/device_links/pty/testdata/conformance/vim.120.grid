@@ -1,0 +1,107 @@
+size 120x30
+cursor 4 15 visible 1 alt 1
+| 28     print(greet(os.environ.get("USER", "world")))
+| 29 import os
+| 30
+| 31 def greet(name: str) -> str:
+| 32     """Say hello."""
+| 33     # a long comment line that is certainly longer than forty columns wide and wraps in vim
+| 34     return f"hello, {name}!"  # trailing
+| 35
+| 36 class Thing:
+| 37     def __init__(self, value=42):
+| 38         self.value = value
+| 39
+| 40
+| 41 if __name__ == "__main__":
+| 42     print(greet(os.environ.get("USER", "world")))
+|~
+|~
+|~
+|~
+|~
+|~
+|~
+|~
+|~
+|~
+|~
+|~
+|~
+|~
+|/hello                                                                                                32,12         Bot
+0,1-2: fg=11 bg=-
+0,8-12: fg=14 bg=- bold
+0,35-40: fg=13 bg=-
+0,43-49: fg=13 bg=-
+1,1-2: fg=11 bg=-
+1,4-9: fg=81 bg=-
+2,1-2: fg=11 bg=-
+3,1-2: fg=11 bg=-
+3,4-6: fg=11 bg=-
+3,8-12: fg=14 bg=- bold
+3,20-22: fg=14 bg=- bold
+3,28-30: fg=14 bg=- bold
+4,1-2: fg=11 bg=-
+4,8-13: fg=13 bg=-
+4,15-23: fg=13 bg=-
+5,1-2: fg=11 bg=-
+5,8-8: fg=14 bg=-
+5,10-10: fg=14 bg=-
+5,12-15: fg=14 bg=-
+5,17-23: fg=14 bg=-
+5,25-28: fg=14 bg=-
+5,30-33: fg=14 bg=-
+5,35-36: fg=14 bg=-
+5,38-46: fg=14 bg=-
+5,48-53: fg=14 bg=-
+5,55-58: fg=14 bg=-
+5,60-64: fg=14 bg=-
+5,66-72: fg=14 bg=-
+5,74-77: fg=14 bg=-
+5,79-81: fg=14 bg=-
+5,83-87: fg=14 bg=-
+5,89-90: fg=14 bg=-
+5,92-94: fg=14 bg=-
+6,1-2: fg=11 bg=-
+6,8-13: fg=11 bg=-
+6,15-22: fg=13 bg=-
+6,24-24: fg=224 bg=-
+6,29-29: fg=224 bg=-
+6,30-31: fg=13 bg=-
+6,34-34: fg=14 bg=-
+6,36-43: fg=14 bg=-
+7,1-2: fg=11 bg=-
+8,1-2: fg=11 bg=-
+8,4-8: fg=11 bg=-
+8,10-14: fg=121 bg=-
+9,1-2: fg=11 bg=-
+9,8-10: fg=11 bg=-
+9,12-19: fg=14 bg=- bold
+9,21-24: fg=14 bg=- bold
+9,33-34: fg=13 bg=-
+10,1-2: fg=11 bg=-
+10,12-15: fg=14 bg=- bold
+11,1-2: fg=11 bg=-
+12,1-2: fg=11 bg=-
+13,1-2: fg=11 bg=-
+13,4-5: fg=11 bg=-
+13,19-28: fg=13 bg=-
+14,1-2: fg=11 bg=-
+14,8-12: fg=14 bg=- bold
+14,35-40: fg=13 bg=-
+14,43-49: fg=13 bg=-
+15,0-0: fg=12 bg=-
+16,0-0: fg=12 bg=-
+17,0-0: fg=12 bg=-
+18,0-0: fg=12 bg=-
+19,0-0: fg=12 bg=-
+20,0-0: fg=12 bg=-
+21,0-0: fg=12 bg=-
+22,0-0: fg=12 bg=-
+23,0-0: fg=12 bg=-
+24,0-0: fg=12 bg=-
+25,0-0: fg=12 bg=-
+26,0-0: fg=12 bg=-
+27,0-0: fg=12 bg=-
+28,0-0: fg=12 bg=-

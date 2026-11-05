@@ -1,0 +1,38 @@
+size 120x30
+cursor 5 21 visible 1 alt 0
+|user@host:~/project$ echo word word word word word word word word word word word word word word word word word word word
+| word word word word word word word word word word word
+|word word word word word word word word word word word word word word word word word word word word word word word word
+|word word word word word word
+|user@host:~/project$ ^C
+|user@host:~/project$
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+0,0-8: fg=2 bg=- bold
+0,10-18: fg=4 bg=- bold
+4,0-8: fg=2 bg=- bold
+4,10-18: fg=4 bg=- bold
+5,0-8: fg=2 bg=- bold
+5,10-18: fg=4 bg=- bold

@@ -181,8 +181,10 @@ mod tests {
         for (name, cols, bytes, resizes) in cases {
             let parser = feed(&bytes, cols, &resizes);
             let got = grid(&parser);
-            let base = dir().join(format!("{name}.{cols}"));
-            let (grid_path, snap_path) = (base.with_extension("grid"), base.with_extension("snap"));
+            let (grid_path, snap_path) = (
+                dir().join(format!("{name}.{cols}.grid")),
+                dir().join(format!("{name}.{cols}.snap")),
+            );
             if bless() {
                 std::fs::write(&grid_path, &got).unwrap();
                 std::fs::write(&snap_path, snapshot(&parser)).unwrap();

@@ -1,0 +1,116 @@
+size 40x30
+cursor 12 15 visible 1 alt 1
+| 21
+| 22 class Thing:
+| 23     def __init__(self, value=42):
+| 24         self.value = value
+| 25
+| 26
+| 27 if __name__ == "__main__":
+| 28     print(greet(os.environ.get("USER
+|    ", "world")))
+| 29 import os
+| 30
+| 31 def greet(name: str) -> str:
+| 32     """Say hello."""
+| 33     # a long comment line that is ce
+|    rtainly longer than forty columns wi
+|    de and wraps in vim
+| 34     return f"hello, {name}!"  # trai
+|    ling
+| 35
+| 36 class Thing:
+| 37     def __init__(self, value=42):
+| 38         self.value = value
+| 39
+| 40
+| 41 if __name__ == "__main__":
+| 42     print(greet(os.environ.get("USER
+|    ", "world")))
+|~
+|~
+|/hello                32,12         Bot
+0,1-2: fg=11 bg=-
+1,1-2: fg=11 bg=-
+1,4-8: fg=11 bg=-
+1,10-14: fg=121 bg=-
+2,1-2: fg=11 bg=-
+2,8-10: fg=11 bg=-
+2,12-19: fg=14 bg=- bold
+2,21-24: fg=14 bg=- bold
+2,33-34: fg=13 bg=-
+3,1-2: fg=11 bg=-
+3,12-15: fg=14 bg=- bold
+4,1-2: fg=11 bg=-
+5,1-2: fg=11 bg=-
+6,1-2: fg=11 bg=-
+6,4-5: fg=11 bg=-
+6,19-28: fg=13 bg=-
+7,1-2: fg=11 bg=-
+7,8-12: fg=14 bg=- bold
+7,35-39: fg=13 bg=-
+8,4-4: fg=13 bg=-
+8,7-13: fg=13 bg=-
+9,1-2: fg=11 bg=-
+9,4-9: fg=81 bg=-
+10,1-2: fg=11 bg=-
+11,1-2: fg=11 bg=-
+11,4-6: fg=11 bg=-
+11,8-12: fg=14 bg=- bold
+11,20-22: fg=14 bg=- bold
+11,28-30: fg=14 bg=- bold
+12,1-2: fg=11 bg=-
+12,8-13: fg=13 bg=-
+12,15-23: fg=13 bg=-
+13,1-2: fg=11 bg=-
+13,8-8: fg=14 bg=-
+13,10-10: fg=14 bg=-
+13,12-15: fg=14 bg=-
+13,17-23: fg=14 bg=-
+13,25-28: fg=14 bg=-
+13,30-33: fg=14 bg=-
+13,35-36: fg=14 bg=-
+13,38-39: fg=14 bg=-
+14,4-10: fg=14 bg=-
+14,12-17: fg=14 bg=-
+14,19-22: fg=14 bg=-
+14,24-28: fg=14 bg=-
+14,30-36: fg=14 bg=-
+14,38-39: fg=14 bg=-
+15,4-5: fg=14 bg=-
+15,7-9: fg=14 bg=-
+15,11-15: fg=14 bg=-
+15,17-18: fg=14 bg=-
+15,20-22: fg=14 bg=-
+16,1-2: fg=11 bg=-
+16,8-13: fg=11 bg=-
+16,15-22: fg=13 bg=-
+16,24-24: fg=224 bg=-
+16,29-29: fg=224 bg=-
+16,30-31: fg=13 bg=-
+16,34-34: fg=14 bg=-
+16,36-39: fg=14 bg=-
+17,4-7: fg=14 bg=-
+18,1-2: fg=11 bg=-
+19,1-2: fg=11 bg=-
+19,4-8: fg=11 bg=-
+19,10-14: fg=121 bg=-
+20,1-2: fg=11 bg=-
+20,8-10: fg=11 bg=-
+20,12-19: fg=14 bg=- bold
+20,21-24: fg=14 bg=- bold
+20,33-34: fg=13 bg=-
+21,1-2: fg=11 bg=-
+21,12-15: fg=14 bg=- bold
+22,1-2: fg=11 bg=-
+23,1-2: fg=11 bg=-
+24,1-2: fg=11 bg=-
+24,4-5: fg=11 bg=-
+24,19-28: fg=13 bg=-
+25,1-2: fg=11 bg=-
+25,8-12: fg=14 bg=- bold
+25,35-39: fg=13 bg=-
+26,4-4: fg=13 bg=-
+26,7-13: fg=13 bg=-
+27,0-0: fg=12 bg=-
+28,0-0: fg=12 bg=-

@@ -1,0 +1,62 @@
+size 120x30
+cursor 29 5 visible 1 alt 1
+|line 51: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 52: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 53: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 54: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 55: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 56: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 57: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 58: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 59: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 60: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 61: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 62: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 63: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 64: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 65: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 66: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 67: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 68: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 69: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 70: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 71: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 72: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 73: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 74: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 75: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 76: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 77: boldboldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 78: bold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|line 79: boldbold the quick brown fox jumps over the lazy dog 0123456789 ░▒▓█ │┌─┐
+|(END)
+0,9-12: fg=4 bg=- bold
+1,9-16: fg=5 bg=- bold
+2,9-20: fg=6 bg=- bold
+3,9-12: fg=1 bg=- bold
+4,9-16: fg=2 bg=- bold
+5,9-20: fg=3 bg=- bold
+6,9-12: fg=4 bg=- bold
+7,9-16: fg=5 bg=- bold
+8,9-20: fg=6 bg=- bold
+9,9-12: fg=1 bg=- bold
+10,9-16: fg=2 bg=- bold
+11,9-20: fg=3 bg=- bold
+12,9-12: fg=4 bg=- bold
+13,9-16: fg=5 bg=- bold
+14,9-20: fg=6 bg=- bold
+15,9-12: fg=1 bg=- bold
+16,9-16: fg=2 bg=- bold
+17,9-20: fg=3 bg=- bold
+18,9-12: fg=4 bg=- bold
+19,9-16: fg=5 bg=- bold
+20,9-20: fg=6 bg=- bold
+21,9-12: fg=1 bg=- bold
+22,9-16: fg=2 bg=- bold
+23,9-20: fg=3 bg=- bold
+24,9-12: fg=4 bg=- bold
+25,9-16: fg=5 bg=- bold
+26,9-20: fg=6 bg=- bold
+27,9-12: fg=1 bg=- bold
+28,9-16: fg=2 bg=- bold
+29,0-4: fg=- bg=- inverse

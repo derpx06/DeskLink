@@ -1,0 +1,41 @@
+size 40x30
+cursor 10 0 visible 1 alt 0
+|Cargo.toml
+|README.md
+|a-very-long-file-name-that-wraps.txt
+|docs/
+|link@
+|main.rs*
+|notes.md
+|src/
+|target/
+|日本語.txt
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+1,0-8: fg=3 bg=-
+2,0-35: fg=5 bg=-
+3,0-3: fg=4 bg=- bold
+4,0-3: fg=6 bg=- bold
+5,0-6: fg=2 bg=- bold
+6,0-7: fg=3 bg=-
+7,0-2: fg=4 bg=- bold
+8,0-5: fg=4 bg=- bold
+9,0-9: fg=5 bg=-

@@ -1,0 +1,33 @@
+size 40x30
+cursor 0 0 visible 1 alt 1
+|scrolled 1
+|scrolled 2
+|scrolled 3
+|scrolled 4
+|scrolled 5
+|scrolled 6
+|scrolled 7
+|scrolled 8
+|scrolled 9
+|scrolled 10
+|scrolled 11
+|scrolled 12
+|scrolled 13
+|scrolled 14
+|scrolled 15
+|scrolled 16
+|scrolled 17
+|scrolled 18
+|scrolled 19
+|scrolled 20
+|scrolled 21
+|scrolled 22
+|scrolled 23
+|scrolled 24
+|scrolled 25
+|scrolled 26
+|scrolled 27
+|scrolled 28
+|scrolled 29
+| [0] 0:bash* 1:vim-          12:30 05-No
+29,0-39: fg=0 bg=2

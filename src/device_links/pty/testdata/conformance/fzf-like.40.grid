@@ -1,0 +1,33 @@
+size 40x30
+cursor 7 0 visible 1 alt 0
+|> ma
+|> src/main.rs
+|  src/lib.rs
+|  docs/README.md
+|  Cargo.toml
+|  日本語/ファイル.txt
+|  a/very/long/path/xxxxxxxxxxxxxxxxxxxxx
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+1,0-1: fg=- bg=- inverse

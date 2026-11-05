@@ -1,0 +1,45 @@
+size 60x30
+cursor 1 0 visible 1 alt 1
+|  GNU nano 9.2 /tmp/dlconf-files-9yb0lnba/app.py
+|
+|
+|if __name__ == "__main__":
+|    print(greet(os.environ.get("USER", "world")))
+|import os
+|
+|def greet(name: str) -> str:
+|    """Say hello."""
+|    # a long comment line that is certainly longer than for>
+|    return f"hello, {name}!"  # trailing
+|
+|class Thing:
+|    def __init__(self, value=42):
+|        self.value = value
+|
+|
+|if __name__ == "__main__":
+|    print(greet(os.environ.get("USER", "world")))
+|
+|
+|
+|
+|
+|
+|
+|
+|                     [ Read 42 lines ]
+|^G Help     ^O Write Out^F Where Is ^K Cut      ^T Execute
+|^X Exit     ^R Read File^\ Replace  ^U Paste    ^J Justify
+0,0-59: fg=- bg=- inverse
+9,59-59: fg=- bg=- inverse
+27,21-37: fg=- bg=- inverse
+28,0-1: fg=- bg=- inverse
+28,12-13: fg=- bg=- inverse
+28,24-25: fg=- bg=- inverse
+28,36-37: fg=- bg=- inverse
+28,48-49: fg=- bg=- inverse
+29,0-1: fg=- bg=- inverse
+29,12-13: fg=- bg=- inverse
+29,24-25: fg=- bg=- inverse
+29,36-37: fg=- bg=- inverse
+29,48-49: fg=- bg=- inverse

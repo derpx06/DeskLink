@@ -1,0 +1,6 @@
+c[?1049h[?25h[m[H[J[7m  GNU nano 9.2                               /tmp/dlconf-files-9yb0lnba/app.py                                          [4;1H[mif __name__ == "__main__":[5;5Hprint(greet(os.environ.get("USER", "world")))
+import os[8;1Hdef greet(name: str) -> str:
+    """Say hello."""[10;5H# a long comment line that is certainly longer than forty columns wide and wraps in vim[11;5Hreturn f"hello, {name}!"  # trailing[13;1Hclass Thing:
+    def __init__(self, value=42):[15;5H    self.value = value[18;1Hif __name__ == "__main__":[19;5Hprint(greet(os.environ.get("USER", "world")))[28;52H[7m[ Read 42 lines ]
+^G[m Help[8C[7m^O[m Write Out   [7m^F[m Where Is    [7m^K[m Cut[9C[7m^T[m Execute     [7m^C[m Location    [7mM-U[m Undo[7C[7mM-A[m Set Mark
+[7m^X[m Exit[8C[7m^R[m Read File   [7m^\[m Replace     [7m^U[m Paste[7C[7m^J[m Justify     [7m^/[m Go To Line  [7mM-E[m Redo[7C[7mM-6[m Copy[2;1H=[?1h[?2004h

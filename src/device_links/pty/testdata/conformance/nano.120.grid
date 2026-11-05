@@ -1,0 +1,50 @@
+size 120x30
+cursor 1 0 visible 1 alt 1
+|  GNU nano 9.2                               /tmp/dlconf-files-9yb0lnba/app.py
+|
+|
+|if __name__ == "__main__":
+|    print(greet(os.environ.get("USER", "world")))
+|import os
+|
+|def greet(name: str) -> str:
+|    """Say hello."""
+|    # a long comment line that is certainly longer than forty columns wide and wraps in vim
+|    return f"hello, {name}!"  # trailing
+|
+|class Thing:
+|    def __init__(self, value=42):
+|        self.value = value
+|
+|
+|if __name__ == "__main__":
+|    print(greet(os.environ.get("USER", "world")))
+|
+|
+|
+|
+|
+|
+|
+|
+|                                                   [ Read 42 lines ]
+|^G Help        ^O Write Out   ^F Where Is    ^K Cut         ^T Execute     ^C Location    M-U Undo       M-A Set Mark
+|^X Exit        ^R Read File   ^\ Replace     ^U Paste       ^J Justify     ^/ Go To Line  M-E Redo       M-6 Copy
+0,0-119: fg=- bg=- inverse
+27,51-67: fg=- bg=- inverse
+28,0-1: fg=- bg=- inverse
+28,15-16: fg=- bg=- inverse
+28,30-31: fg=- bg=- inverse
+28,45-46: fg=- bg=- inverse
+28,60-61: fg=- bg=- inverse
+28,75-76: fg=- bg=- inverse
+28,90-92: fg=- bg=- inverse
+28,105-107: fg=- bg=- inverse
+29,0-1: fg=- bg=- inverse
+29,15-16: fg=- bg=- inverse
+29,30-31: fg=- bg=- inverse
+29,45-46: fg=- bg=- inverse
+29,60-61: fg=- bg=- inverse
+29,75-76: fg=- bg=- inverse
+29,90-92: fg=- bg=- inverse
+29,105-107: fg=- bg=- inverse

@@ -1,0 +1,38 @@
+size 60x30
+cursor 7 0 visible 1 alt 0
+|· Percolating… (11s · esc to interrupt)
+|Thinking about the problem and reading some files from the r
+|epository to find where it is
+|╭──────────────────────────────────────────────────────────╮
+|│> type here type here type here                           │
+|│? for shortcuts                                           │
+|╰──────────────────────────────────────────────────────────╯
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+3,0-59: fg=#d77757 bg=-
+4,0-0: fg=#d77757 bg=-
+4,59-59: fg=#d77757 bg=-
+5,0-0: fg=#d77757 bg=-
+5,59-59: fg=#d77757 bg=-
+6,0-59: fg=#d77757 bg=-

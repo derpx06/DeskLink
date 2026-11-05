@@ -1,0 +1,41 @@
+size 120x30
+cursor 2 0 visible 1 alt 0
+|Cargo.toml  a-very-long-file-name-that-wraps.txt  link@     notes.md  target/
+|README.md   docs/                                 main.rs*  src/      日本語.txt
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+|
+0,12-47: fg=5 bg=-
+0,50-53: fg=6 bg=- bold
+0,60-67: fg=3 bg=-
+0,70-75: fg=4 bg=- bold
+1,0-8: fg=3 bg=-
+1,12-15: fg=4 bg=- bold
+1,50-56: fg=2 bg=- bold
+1,60-62: fg=4 bg=- bold
+1,70-79: fg=5 bg=-

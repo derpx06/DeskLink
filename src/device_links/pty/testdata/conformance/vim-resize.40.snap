@@ -1,0 +1,22 @@
+c[?1049h[?25h[m[H[J[38;5;130m  1 [35mimport[m os
+[38;5;130m  2 
+  3 def[m [36mgreet[m(name: [36mstr[m) -> [36mstr[m:
+[38;5;130m  4 [m    [31m"""Say hello."""
+[38;5;130m  5 [m    [34m# a long comment line that is ce[38;5;130m    [34mrtainly longer than forty columns wi[38;5;130m    [34mde and wraps in vim
+[38;5;130m  6 [m    [38;5;130mreturn[m [31mf"hello, [35m{[mname[35m}[31m!"[m  [34m# trai[38;5;130m    [34mling
+[38;5;130m  7 
+  8 class[m [32mThing[m:
+[38;5;130m  9 [m    [38;5;130mdef[m [36m__init__[m([36mself[m, value=[31m42[m):
+[38;5;130m 10 [8C[36mself[m.value = value
+[38;5;130m 11 
+ 12 
+ 13 if[m __name__ == [31m"__main__"[m:
+[38;5;130m 14 [m    [36mprint[m(greet(os.environ.get([31m"USER[38;5;130m    [31m"[m, [31m"world"[m)))
+[38;5;130m 15 [35mimport[m os
+[38;5;130m 16 
+ 17 def[m [36mgreet[m(name: [36mstr[m) -> [36mstr[m:
+[38;5;130m 18 [m    [31m"""Say hello."""
+[38;5;130m 19 [m    [34m# a long comment line that is ce[38;5;130m    [34mrtainly longer than forty columns wi[38;5;130m    [34mde and wraps in vim
+[38;5;130m 20 [m    [38;5;130mreturn[m [31mf"hello, [35m{[mname[35m}[31m!"[m  [34m# trai[38;5;130m    [34mling
+[38;5;130m 21 
+ 22 class[m [32mThing[m:[30;23H1,1[11CTop[1;5H=[?1h[?2004h

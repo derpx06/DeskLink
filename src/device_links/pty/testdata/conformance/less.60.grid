@@ -1,0 +1,47 @@
+size 60x30
+cursor 29 1 visible 1 alt 1
+|line 29: boldboldbold the quick brown fox jumps over the laz
+|y dog 0123456789 ░▒▓█ │┌─┐
+|line 30: bold the quick brown fox jumps over the lazy dog 01
+|23456789 ░▒▓█ │┌─┐
+|line 31: boldbold the quick brown fox jumps over the lazy do
+|g 0123456789 ░▒▓█ │┌─┐
+|line 32: boldboldbold the quick brown fox jumps over the laz
+|y dog 0123456789 ░▒▓█ │┌─┐
+|line 33: bold the quick brown fox jumps over the lazy dog 01
+|23456789 ░▒▓█ │┌─┐
+|line 34: boldbold the quick brown fox jumps over the lazy do
+|g 0123456789 ░▒▓█ │┌─┐
+|line 35: boldboldbold the quick brown fox jumps over the laz
+|y dog 0123456789 ░▒▓█ │┌─┐
+|line 36: bold the quick brown fox jumps over the lazy dog 01
+|23456789 ░▒▓█ │┌─┐
+|line 37: boldbold the quick brown fox jumps over the lazy do
+|g 0123456789 ░▒▓█ │┌─┐
+|line 38: boldboldbold the quick brown fox jumps over the laz
+|y dog 0123456789 ░▒▓█ │┌─┐
+|line 39: bold the quick brown fox jumps over the lazy dog 01
+|23456789 ░▒▓█ │┌─┐
+|line 40: boldbold the quick brown fox jumps over the lazy do
+|g 0123456789 ░▒▓█ │┌─┐
+|line 41: boldboldbold the quick brown fox jumps over the laz
+|y dog 0123456789 ░▒▓█ │┌─┐
+|line 42: bold the quick brown fox jumps over the lazy dog 01
+|23456789 ░▒▓█ │┌─┐
+|line 43: boldbold the quick brown fox jumps over the lazy do
+|:
+0,9-20: fg=6 bg=- bold
+2,9-12: fg=1 bg=- bold
+4,9-16: fg=2 bg=- bold
+6,9-20: fg=3 bg=- bold
+8,9-12: fg=4 bg=- bold
+10,9-16: fg=5 bg=- bold
+12,9-20: fg=6 bg=- bold
+14,9-12: fg=1 bg=- bold
+16,9-16: fg=2 bg=- bold
+18,9-20: fg=3 bg=- bold
+20,9-12: fg=4 bg=- bold
+22,9-16: fg=5 bg=- bold
+24,9-20: fg=6 bg=- bold
+26,9-12: fg=1 bg=- bold
+28,9-16: fg=2 bg=- bold
