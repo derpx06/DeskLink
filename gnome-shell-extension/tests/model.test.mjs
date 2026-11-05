@@ -150,6 +150,7 @@ test('Send copied link waits for a link on the clipboard', () => {
     assert.ok(!looksLikeLink(''));
 });
 
+
 test('recent files and snippets are rows of their sections, capped', () => {
     const files = Array.from({length: 5}, (_, i) => ({id: `/f${i}`, name: `f${i}.txt`, incoming: i % 2 === 0, deviceName: 'Pixel'}));
     const snippets = Array.from({length: 9}, (_, i) => ({id: `s${i}`, label: `S${i}`, text: `t${i}`}));
@@ -186,14 +187,48 @@ test('live words and clocks', () => {
 const rust = readFileSync(
     fileURLToPath(new URL('../../src/shell_dbus.rs', import.meta.url)), 'utf8').split('#[cfg(test)]')[0];
 
-test('every action the menu sends is one shell_dbus.rs knows', () => {
-    const {actions} = everythingSent(phone(), desk(), {
+/// The text of one item of shell_dbus.rs, from its first line to its `end`.
+function part(start, end) {
+    const from = rust.indexOf(start);
+    assert.ok(from >= 0, `${start} is not in shell_dbus.rs`);
+    return rust.slice(from, rust.indexOf(end, from));
+}
+const quoted = text => [...text.matchAll(/"([a-z][a-z-]*)"/g)].map(m => m[1]);
+
+test('every action the menu sends is in the table that serves it', () => {
+    const deviceless = new Set(quoted(part('const DEVICELESS', '];')));
+    const inserts = new Set(quoted(part('const INSERTS', '];')));
+    const pages = new Set([...part('const PAGES', '];').matchAll(/\("([a-z-]+)", "/g)].map(m => m[1]));
+    // actions(): what a phone is offered; read between its signature and the next item.
+    const offered = new Set(quoted(part('fn actions(device: &DeviceView', '\n}\n')));
+    for (const table of [deviceless, inserts, pages, offered])
+        assert.ok(table.size >= 3, 'a table was read');
+
+    const rows = sections(phone(), desk(), {
         snippets: [{id: 's', label: 'S', text: 't'}],
         transfers: [{id: '/f', name: 'f', incoming: true, deviceName: 'Pixel'}],
-    });
-    assert.ok(actions.length > 25);
+        linkInClipboard: true,
+    }).flatMap(entry => entry.rows).filter(row => row.kind === 'action');
+    const forDevice = [...quickTiles(phone()), ...rows].filter(row => row.device !== false).map(row => row.action);
+    const forDesk = rows.filter(row => row.device === false).map(row => row.action);
+    assert.deepEqual(forDesk.sort(), ['lock-hand-off', 'new-note', 'reconnect']);
+    for (const action of forDesk)
+        assert.ok(deviceless.has(action), `${action} is not in DEVICELESS`);
+    for (const action of forDevice) {
+        assert.ok(offered.has(action) || inserts.has(action) || pages.has(action),
+            `${action} is not offered by actions(), INSERTS or PAGES`);
+        assert.ok(!deviceless.has(action) || action === 'end-sessions', `${action} would be sent with a device but is device-less`);
+    }
+    // What the cards and the footer send, each in the table that serves it.
+    for (const action of ['call-answer', 'call-decline', 'call-mute', 'call-unmute', 'call-end',
+        'media-prev', 'media-play-pause', 'media-next', 'try-again', 'end-sessions', 'open-bucket', 'open', 'open-settings'])
+        assert.ok(offered.has(action) || pages.has(action), `${action} is not offered by actions() or PAGES`);
+    for (const action of ['reconnect', 'end-sessions'])
+        assert.ok(deviceless.has(action), `${action} is not in DEVICELESS`);
+    // Every action the menu can send is one of those.
+    const {actions} = everythingSent(phone(), desk(), {});
     for (const action of actions)
-        assert.ok(rust.includes(`"${action}"`), `${action} is not in shell_dbus.rs`);
+        assert.ok(offered.has(action) || inserts.has(action) || pages.has(action) || deviceless.has(action), action);
 });
 
 test('every switch key the menu sends is in the app\'s allow-list', () => {
