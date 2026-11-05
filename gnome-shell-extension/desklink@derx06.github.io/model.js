@@ -291,14 +291,15 @@ export function sections(device, desk, extras = {}) {
 /// The footer's three buttons.
 export function footer(device, desk) {
     const buttons = [
-        {id: 'open', label: 'Open DeskLink', icon: 'focus-windows-symbolic', action: 'open'},
+        {id: 'open', label: 'Open DeskLink', short: 'Open DeskLink', icon: 'focus-windows-symbolic', action: 'open'},
     ];
     if (has(device, 'open-settings'))
-        buttons.push({id: 'settings', label: 'Settings', icon: 'emblem-system-symbolic', action: 'open-settings'});
+        buttons.push({id: 'settings', label: 'Settings', short: 'Settings', icon: 'emblem-system-symbolic', action: 'open-settings'});
     if (device?.settings && 'showNotifications' in device.settings) {
         const shown = device.settings.showNotifications;
         buttons.push({
             id: 'pause', label: shown ? 'Pause notifications' : 'Resume notifications',
+            short: shown ? 'Pause' : 'Resume',
             icon: shown ? 'notifications-disabled-symbolic' : 'preferences-system-notifications-symbolic',
             key: 'showNotifications', on: !shown,
         });

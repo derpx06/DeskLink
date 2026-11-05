@@ -4,10 +4,11 @@
 //
 // Quick Settings is the primary surface: a toggle named after the phone
 // ("Connected · 82% · charging", or "last seen 14:02" while its link is down)
-// whose menu lists the phones, quick actions (Ring, Lock, Send Files, Send
-// clipboard, Keep Awake), what is live on this computer (each with End, and
-// End Everything), recent transfers, Lock & Hand Off and Open DeskLink. A
-// small status icon shows in the top bar while a phone is connected.
+// whose menu is the complete remote for a paired phone: status chips, six
+// quick actions, what is going on now, one section per area with every action
+// and setting (model.js says what, menu.js draws it), and a footer. Security
+// switches can only be turned off here; the app turns them on. A small status
+// icon shows in the top bar while a phone is connected.
 //
 // The phones' notifications become GNOME notifications, and a call ringing on
 // a phone a critical banner with Answer and Decline (notifications.js).
@@ -31,10 +32,10 @@ import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
-import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
-import {BatteryRing, fillMenu, sessionLine, shortStatus, statusLine, styleVariant} from './menu.js';
+import {BatteryRing, fillMenu, shortStatus, statusLine, styleVariant} from './menu.js';
+import {looksLikeLink} from './model.js';
 import {PhoneCalls, PhoneNotifications} from './notifications.js';
 
 const BUS_NAME = 'derx06.desklink.com';
@@ -71,6 +72,15 @@ const ShellProxy = Gio.DBusProxy.makeProxyWrapper(`<node>
     </method>
     <method name="OpenTransfer">
       <arg name="transfer_id" type="s" direction="in"/>
+    </method>
+    <method name="SetSwitch">
+      <arg name="device_id" type="s" direction="in"/>
+      <arg name="key" type="s" direction="in"/>
+      <arg name="on" type="b" direction="in"/>
+    </method>
+    <method name="SendLink">
+      <arg name="device_id" type="s" direction="in"/>
+      <arg name="link" type="s" direction="in"/>
     </method>
     <method name="Hello">
       <arg name="version" type="u" direction="in"/>
@@ -197,7 +207,6 @@ export default class DeskLinkExtension extends Extension {
     // are withdrawn while locked.
     enable() {
         this._selected = null;
-        this._menuKey = null;
         this._notifications = new PhoneNotifications((method, args) => this._call(method, args));
         this._calls = new PhoneCalls((method, args) => this._call(method, args));
         this._quietNotifications = true;
@@ -206,21 +215,14 @@ export default class DeskLinkExtension extends Extension {
         this._indicator.toggle.connect('clicked', () => this._toggleClicked());
         this._ring = new BatteryRing();
         this._indicator.toggle.menu.addHeaderSuffix(this._ring);
-        // Durations and call timers move while the menu is open.
-        this._tickers = [];
-        this._seen = new Set();
-        this._tickId = 0;
-        this._indicator.toggle.menu.connect('open-state-changed', (_menu, open) => {
-            if (this._tickId)
-                GLib.source_remove(this._tickId);
-            this._tickId = open ? GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
-                this._tickers.forEach(tick => tick());
-                return GLib.SOURCE_CONTINUE;
-            }) : 0;
-        });
+        // Durations and call timers move while a menu is open.
+        this._qs = this._menuState();
+        this._watchMenu(this._indicator.toggle.menu, this._qs);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
 
         this._button = new DeskLinkButton();
+        this._pill = this._menuState();
+        this._watchMenu(this._button.menu, this._pill);
         Main.panel.addToStatusArea(this.uuid, this._button);
 
         this._modeId = Main.sessionMode.connect('updated', () => this._sync());
@@ -233,9 +235,12 @@ export default class DeskLinkExtension extends Extension {
     }
 
     disable() {
-        if (this._tickId)
-            GLib.source_remove(this._tickId);
-        this._tickId = 0;
+        for (const state of [this._qs, this._pill]) {
+            if (state?.tickId)
+                GLib.source_remove(state.tickId);
+            if (state)
+                state.tickId = 0;
+        }
         this._stopChipTimer();
         Gio.bus_unwatch_name(this._watchId);
         this._watchId = 0;
@@ -326,7 +331,7 @@ export default class DeskLinkExtension extends Extension {
         this._indicator.showConnected(running && !locked && devices.some(device => device.ready),
             live.length > 0);
         if (!locked)
-            this._fillMenu(toggle.menu, devices, selected, desk, live);
+            this._fillMenu(toggle.menu, this._qs, devices, selected, desk);
 
         this._syncPill(locked, running, devices, desk, live, selected);
     }
@@ -339,68 +344,150 @@ export default class DeskLinkExtension extends Extension {
             this._invoke('', 'reconnect');
     }
 
-    _fillMenu(menu, devices, selected, desk, live_) {
+    _menuState() {
+        return {key: null, tickers: [], bucketUpdate: null, transfersUpdate: null, seen: new Set(),
+            openSection: null, items: new Map(), focus: null, link: false, tickId: 0};
+    }
+
+    /// Seconds tick while the menu is open, and the clipboard is looked at
+    /// for "Send copied link".
+    _watchMenu(menu, state) {
+        menu.connect('open-state-changed', (_menu, open) => {
+            if (state.tickId)
+                GLib.source_remove(state.tickId);
+            state.tickId = open ? GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+                state.tickers.forEach(tick => tick());
+                return GLib.SOURCE_CONTINUE;
+            }) : 0;
+            if (open)
+                this._lookAtClipboard(state);
+        });
+    }
+
+    _lookAtClipboard(state) {
+        St.Clipboard.get_default().get_text(St.ClipboardType.CLIPBOARD, (_clipboard, text) => {
+            const link = looksLikeLink(text);
+            if (link === state.link || !this._proxy)
+                return;
+            state.link = link;
+            state.key = null;
+            this._sync();
+        });
+    }
+
+    _fillMenu(menu, state, devices, selected, desk) {
         const transfers = this._read('Transfers', []);
         const snippets = this._read('Snippets', []);
+        const activities = this._read('Activities', []);
         // Rebuilt only when what it shows changed, so keyboard focus in an
-        // open menu is not thrown away every second.
-        // The Bucket's progress changes every second: updated in place.
-        const steady = devices.map(device => ({...device, bucket: !!device.bucket}));
-        const menuKey = JSON.stringify([steady, selected?.id, desk, transfers, snippets, styleVariant()]);
-        if (menuKey === this._menuKey) {
-            this._bucketUpdate?.(selected?.bucket);
+        // open menu is not thrown away every second. The Bucket's and the
+        // transfers' progress and the round trip change all the time: the
+        // first two are updated in place, the third is rounded.
+        const steady = devices.map(device => ({
+            ...device,
+            bucket: !!device.bucket,
+            rttMs: Math.round((device.rttMs ?? -1) / 25),
+            transfers: (device.transfers ?? []).map(t => [t.name, t.incoming, t.paused, t.lane, t.fraction > 0]),
+        }));
+        const key = JSON.stringify([steady, selected?.id, desk, transfers, snippets, styleVariant(), state.link,
+            activities.map(item => [item.id, item.title])]);
+        if (key === state.key) {
+            state.bucketUpdate?.(selected?.bucket);
+            state.transfersUpdate?.(selected?.transfers ?? []);
             return;
         }
-        this._menuKey = menuKey;
-        this._tickers = [];
-        this._bucketUpdate = null;
+        state.key = key;
+        state.tickers = [];
+        state.bucketUpdate = null;
+        state.transfersUpdate = null;
+        state.items = new Map();
         const shown = new Set();
         fillMenu(menu, {
-            devices, selected, desk, transfers, snippets,
-            ring: this._ring,
+            devices, selected, desk, transfers, snippets, activities,
+            ring: menu === this._indicator?.toggle.menu ? this._ring : null,
+            linkInClipboard: state.link,
+            openSection: state.openSection,
+            sectionOpened: (id, open) => {
+                if (open)
+                    state.openSection = id;
+                else if (state.openSection === id)
+                    state.openSection = null;
+            },
+            activityText: item => this._activityText(item),
             invoke: (id, action) => this._invoke(id, action),
             call: (method, args) => this._call(method, args),
+            setSwitch: (id, switchKey, on) => this._setSwitch(id, switchKey, on),
+            sendLink: id => this._sendLink(id),
             select: id => {
                 this._selected = id;
-                this._menuKey = null;
+                state.key = null;
                 this._sync();
             },
-            tick: fn => this._tickers.push(fn),
-            onBucket: fn => (this._bucketUpdate = fn),
+            tick: fn => state.tickers.push(fn),
+            onBucket: fn => (state.bucketUpdate = fn),
+            onTransfers: fn => (state.transfersUpdate = fn),
+            // Keyboard focus (or the hovered row) goes back to the same row.
+            track: (item, itemKey) => {
+                state.items.set(itemKey, item);
+                item.connect('key-focus-in', () => (state.focus = itemKey));
+            },
             // New cards fade in (instantly when animations are off).
-            appear: (actor, key) => {
-                shown.add(key);
-                if (this._seen.has(key))
+            appear: (actor, appearKey) => {
+                shown.add(appearKey);
+                if (state.seen.has(appearKey))
                     return;
                 actor.opacity = 0;
                 actor.ease({opacity: 255, duration: 220, mode: Clutter.AnimationMode.EASE_OUT_QUAD});
             },
         });
-        this._seen = shown;
+        state.seen = shown;
+        if (menu.isOpen && state.focus)
+            state.items.get(state.focus)?.grabKeyFocus?.();
     }
 
-    /// "Pixel · viewing the screen · 2 terminals" with an End button.
-    _liveRow(device) {
-        const row = new PopupMenu.PopupBaseMenuItem({activate: false, hover: false, can_focus: false});
-        row.add_child(new St.Label(centered({
-            text: `${device.name} · ${sessionLine(device)}`,
-            x_expand: true,
-        })));
-        const end = new St.Button({
-            label: 'End',
-            style_class: 'button desklink-end-button',
-            can_focus: true,
-            accessible_name: `End what ${device.name} is doing here`,
+    /// A switch in the menu: the app decides (a security one only goes off).
+    /// The menu stays open; a refusal puts the menu back as the app has it.
+    _setSwitch(deviceId, key, on) {
+        const proxy = this._proxy;
+        if (!proxy)
+            return;
+        const done = (_result, error) => {
+            if (!error)
+                return;
+            console.warn(`DeskLink: ${key} failed: ${error.message}`);
+            this._qs.key = null;
+            this._pill.key = null;
+            this._sync();
+        };
+        // An app older than interface 9 only knows two of them, as actions.
+        if (this._read('Version', 0) < 9) {
+            const old = {keepAwake: 'keep-awake', clipboard: 'clipboard'}[key];
+            if (old)
+                proxy.InvokeRemote('', `${old}-${on ? 'on' : 'off'}`, done);
+            return;
+        }
+        proxy.SetSwitchRemote(deviceId, key, on, done);
+    }
+
+    /// "Send copied link": the clipboard's text, which the app checks again.
+    _sendLink(deviceId) {
+        St.Clipboard.get_default().get_text(St.ClipboardType.CLIPBOARD, (_clipboard, text) => {
+            if (!looksLikeLink(text) || !this._proxy)
+                return;
+            this._call('SendLink', [deviceId, text.trim()]);
         });
-        end.connect('clicked', () => this._invoke(device.id, 'end-sessions'));
-        row.add_child(end);
-        return row;
+    }
+
+    _activityText(item) {
+        const text = liveText(item, Date.now());
+        return text || (item.kind ?? '');
     }
 
     _syncPill(locked, running, devices, desk, live, selected) {
         const menu = this._button.menu;
-        menu.removeAll();
         if (locked) {
+            menu.removeAll();
+            this._pill.key = null;
             const unlockers = devices.filter(device => device.actions.includes('unlock-via-phone'));
             this._button.visible = running && unlockers.length > 0;
             this._chipItems = [];
@@ -424,18 +511,8 @@ export default class DeskLinkExtension extends Extension {
             this._startChipTimer();
         else
             this._stopChipTimer();
-        const head = new PopupMenu.PopupMenuItem(
-            selected ? `${selected.name} · ${statusLine(selected)}` : 'No phone connected',
-            {reactive: false});
-        menu.addMenuItem(head);
-        for (const device of live)
-            menu.addMenuItem(this._liveRow(device));
-        for (const item of this._chipItems ?? []) {
-            menu.addMenuItem(new PopupMenu.PopupMenuItem(
-                `${item.title || item.app} · ${liveText(item, Date.now())}`.replace(/ · $/, ''),
-                {reactive: false}));
-        }
-        menu.addAction('Open DeskLink', () => this._invoke(selected?.id ?? '', 'open'));
+        // The same complete menu as Quick Settings.
+        this._fillMenu(menu, this._pill, devices, selected, desk);
     }
 
     /// The pill's text: the first ongoing item and its live part.
