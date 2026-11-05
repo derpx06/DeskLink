@@ -1760,7 +1760,7 @@ fn item_menu(item: &Item, path: &Path, device: &DeviceView, view: &PairView) -> 
             .chain(
                 folders::replace_anyway_offered(&device.id, &conflict.path).then(|| {
                     (
-                        format!("Replace with {}'s Anyway", device.name),
+                        format!("Replace with {}'s anyway", device.name),
                         folders::Resolve::PhoneAnyway,
                     )
                 }),
@@ -2415,18 +2415,18 @@ mod tests {
                 labels
             };
             let before = labels();
-            for choice in ["Keep Both", "Keep This Computer's", "Keep Pixel's"] {
+            for choice in ["Keep both", "Keep this computer's", "Keep Pixel's"] {
                 assert!(before.iter().any(|label| label == choice), "{before:?}");
             }
             assert!(
-                before.iter().all(|label| !label.contains("Anyway")),
+                before.iter().all(|label| !label.contains("anyway")),
                 "not before a refusal: {before:?}"
             );
             folders::mark_trash_refused("gate-phone", "c.txt");
             assert!(
                 labels()
                     .iter()
-                    .any(|label| label == "Replace with Pixel's Anyway"),
+                    .any(|label| label == "Replace with Pixel's anyway"),
                 "offered after the refusal"
             );
         });
