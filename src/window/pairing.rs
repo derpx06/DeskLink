@@ -110,6 +110,8 @@ pub(super) fn welcome_page(win: &DesklinkWindow, daemon: &DaemonHandle) -> Rc<Ce
         .spacing(12)
         .css_classes(["pair-footer"])
         .build();
+    // Under each other when the window is phone-narrow.
+    footer.set_widget_name("responsive");
     let visible = gtk::Box::builder()
         .hexpand(true)
         .valign(gtk::Align::Center)
@@ -118,6 +120,7 @@ pub(super) fn welcome_page(win: &DesklinkWindow, daemon: &DaemonHandle) -> Rc<Ce
     visible.append(&text(&host_name(), &["mono", "body-small"]));
     footer.append(&visible);
     let codes = button(ButtonKind::Text, "Pair with a code instead", None);
+    codes.set_halign(gtk::Align::End);
     let window = win.downgrade();
     codes.connect_clicked(move |_| {
         if let Some(window) = window.upgrade() {

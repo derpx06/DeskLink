@@ -320,7 +320,9 @@ impl Sidebar {
                 .hexpand(true)
                 .valign(gtk::Align::Center)
                 .build();
-            lines.append(&super::ellipsized(&device.name, &["heading"]));
+            let name = super::ellipsized(&device.name, &["heading"]);
+            name.set_max_width_chars(28);
+            lines.append(&name);
             let status = gtk::Box::builder().spacing(8).build();
             status.append(&status_pill(words.status, words.word));
             if !words.short.is_empty() {
