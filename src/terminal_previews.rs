@@ -114,6 +114,17 @@ fn after_word<'a>(text: &'a str, words: &[&str]) -> Option<&'a str> {
     })
 }
 
+/// The text after each place `phrase` occurs as whole words (`\bphrase\b`).
+fn after_phrase<'a>(haystack: &'a str, phrase: &'a str) -> impl Iterator<Item = &'a str> {
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    haystack.match_indices(phrase).filter_map(move |(at, _)| {
+        let rest = &haystack[at + phrase.len()..];
+        let starts = !haystack[..at].chars().next_back().is_some_and(word);
+        let ends = !rest.chars().next().is_some_and(word);
+        (starts && ends).then_some(rest)
+    })
+}
+
 /// The text of every place `needle` occurs in `haystack`, from just after it.
 fn after_each<'a>(haystack: &'a str, needle: &'a str) -> impl Iterator<Item = &'a str> {
     haystack
@@ -167,7 +178,7 @@ fn asks_the_person(line: &str) -> bool {
     }
     if ["press enter", "press return", "press any key", "hit enter"]
         .iter()
-        .any(|phrase| after_each(&lower, phrase).any(|_| true))
+        .any(|phrase| after_phrase(&lower, phrase).next().is_some())
     {
         return true;
     }
@@ -175,7 +186,7 @@ fn asks_the_person(line: &str) -> bool {
     if trimmed.ends_with("continue?") || trimmed.ends_with("proceed?") {
         return true;
     }
-    if after_each(&lower, "are you sure").any(|rest| rest.contains('?')) {
+    if after_phrase(&lower, "are you sure").any(|rest| rest.contains('?')) {
         return true;
     }
     // An approval menu with its cursor on "1. Yes".
@@ -189,11 +200,18 @@ fn asks_the_person(line: &str) -> bool {
         return true;
     }
     // "3. No, and tell Claude what to do differently".
-    if after_each(&lower, "no, and tell ").any(|rest| {
+    let word_before = |at: usize| {
+        lower[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    };
+    if lower.match_indices("no, and tell ").any(|(at, phrase)| {
+        let rest = &lower[at + phrase.len()..];
         let word_end = rest
             .find(|c: char| !(c.is_alphanumeric() || c == '_'))
             .unwrap_or(rest.len());
-        word_end > 0 && rest[word_end..].starts_with(" what to do")
+        !word_before(at) && word_end > 0 && rest[word_end..].starts_with(" what to do")
     }) {
         return true;
     }
@@ -322,6 +340,10 @@ mod tests {
             "$ cargo build",
             "Compiling desklink v1.4.0",
             "the password file was not changed",
+            "compress enterprise logs",
+            "we compress entering data and hit entertainment",
+            "unpress enter",
+            "they are you surely done",
             "Password rules: 12 characters",
             "You can continue later.",
             "yes/no questions are handled elsewhere",
@@ -342,5 +364,22 @@ mod tests {
         let mut blanks = vec!["Overwrite file? (y/n)".to_string()];
         blanks.extend(std::iter::repeat_n(String::new(), 30));
         assert!(waiting_for_input(&blanks));
+    }
+
+    /// The phone looks at the last 14 non-blank lines of the whole screen:
+    /// blank lines between do not shorten the window.
+    #[test]
+    fn blank_lines_between_do_not_hide_a_prompt() {
+        let mut screen = vec!["Overwrite file? (y/n)".to_string()];
+        for n in 0..12 {
+            screen.push(format!("line {n}"));
+            screen.push(String::new());
+        }
+        // 13 non-blank lines in 25: the prompt is within the last 14.
+        assert!(waiting_for_input(&screen));
+        screen.push("one more".into());
+        assert!(waiting_for_input(&screen), "the 14th from the end");
+        screen.push("and another".into());
+        assert!(!waiting_for_input(&screen));
     }
 }
