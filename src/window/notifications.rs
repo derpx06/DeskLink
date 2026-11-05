@@ -8,6 +8,7 @@
 //! once-a-second refresh.
 
 use std::cell::RefCell;
+use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk::glib;
@@ -25,6 +26,10 @@ struct Card {
     widget: gtk::Box,
     entry: gtk::Entry,
     revealer: gtk::Revealer,
+    /// What a reply is sent under now. The phone mints a new id each time it
+    /// posts or updates a notification, so a card kept while a reply is being
+    /// typed must follow it: an old id is "No such notification" there.
+    reply_id: Rc<RefCell<Option<String>>>,
 }
 
 #[derive(Debug)]
@@ -223,13 +228,26 @@ impl Page {
             let position = cards.iter().position(|card| card.id == notification.id);
             let typing = |card: &Card| !card.entry.text().is_empty() || card.entry.has_focus();
             match position {
-                Some(index) if cards[index].key == key || typing(&cards[index]) => {}
+                Some(index) if cards[index].key == key || typing(&cards[index]) => {
+                    // Kept as it is, but a reply goes out under the id the phone has now.
+                    cards[index]
+                        .reply_id
+                        .replace(notification.request_reply_id.clone());
+                }
                 Some(index) => {
                     let fresh = build_card(daemon, &device.id, notification, key);
                     built = true;
+                    // Focus on the old card (or a button in it) moves to the new one.
+                    let had_focus = gtk::prelude::RootExt::focus(win).is_some_and(|focus| {
+                        focus == *cards[index].widget.upcast_ref::<gtk::Widget>()
+                            || focus.is_ancestor(&cards[index].widget)
+                    });
                     self.list
                         .insert_child_after(&fresh.widget, Some(&cards[index].widget));
                     self.list.remove(&cards[index].widget);
+                    if had_focus {
+                        fresh.widget.grab_focus();
+                    }
                     cards[index] = fresh;
                 }
                 None => {
@@ -426,7 +444,8 @@ fn build_card(
         .transition_type(gtk::RevealerTransitionType::SlideDown)
         .build();
     let mut reply_button = None;
-    if let Some(reply_id) = &notification.request_reply_id {
+    let reply_id = Rc::new(RefCell::new(notification.request_reply_id.clone()));
+    if notification.request_reply_id.is_some() {
         let reply = ui_kit::button(ButtonKind::Tonal, "Reply", Some("desklink-reply-symbolic"));
         let (shown, field) = (revealer.downgrade(), entry.downgrade());
         reply.connect_clicked(move |_| {
@@ -457,7 +476,7 @@ fn build_card(
         send.update_property(&[gtk::accessible::Property::Label("Send reply")]);
         let send_reply = {
             let (daemon, device_id, reply_id) =
-                (daemon.clone(), device_id.to_string(), reply_id.clone());
+                (daemon.clone(), device_id.to_string(), Rc::clone(&reply_id));
             let (field, shown) = (entry.downgrade(), revealer.downgrade());
             move || {
                 let Some(entry) = field.upgrade() else {
@@ -467,9 +486,14 @@ fn build_card(
                 if message.is_empty() {
                     return;
                 }
+                // The notification can have lost its reply since: say so, keep the text.
+                let Some(reply_id) = reply_id.borrow().clone() else {
+                    toast_from(&entry, "This notification can't be replied to any more");
+                    return;
+                };
                 daemon.send(DaemonCommand::ReplyNotification(
                     device_id.clone(),
-                    reply_id.clone(),
+                    reply_id,
                     message,
                 ));
                 entry.set_text("");
@@ -552,6 +576,7 @@ fn build_card(
         widget: card,
         entry,
         revealer,
+        reply_id,
     }
 }
 
@@ -645,5 +670,43 @@ mod tests {
             app_icon("Toaster"),
             "preferences-system-notifications-symbolic"
         );
+    }
+
+    /// A card kept while a reply is typed sends it under the id the phone has
+    /// now, not the one it had when the card was built. (Needs a display.)
+    #[test]
+    fn a_reply_is_sent_under_the_newest_reply_id() {
+        crate::test_display::run(|| {
+            let (daemon, commands) = DaemonHandle::detached();
+            let notification = DeviceNotification {
+                id: "1".into(),
+                app_name: "Signal".into(),
+                title: "Mara".into(),
+                text: "Are you deploying today?".into(),
+                ticker: String::new(),
+                is_clearable: true,
+                request_reply_id: Some("r1".into()),
+                actions: vec![],
+                silent: false,
+            };
+            let card = build_card(&daemon, "phone", &notification, "k".into());
+            card.entry.set_text("yes, at five");
+            // The phone updated the notification: a new id.
+            card.reply_id.replace(Some("r2".into()));
+            card.entry.emit_activate();
+            match commands.try_recv() {
+                Ok(DaemonCommand::ReplyNotification(device, id, message)) => {
+                    assert_eq!((device.as_str(), id.as_str()), ("phone", "r2"));
+                    assert_eq!(message, "yes, at five");
+                }
+                other => panic!("expected the reply, got {other:?}"),
+            }
+            // No reply id any more: nothing is sent and the text stays.
+            card.entry.set_text("late");
+            card.reply_id.replace(None);
+            card.entry.emit_activate();
+            assert!(commands.try_recv().is_err());
+            assert_eq!(card.entry.text(), "late");
+        });
     }
 }
