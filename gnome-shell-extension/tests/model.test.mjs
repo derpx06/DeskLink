@@ -54,7 +54,7 @@ test('chips: connection, route with round trip, battery, lane, sound, DND', () =
         settings: {dndShare: true},
     }));
     assert.deepEqual(chips.map(chip => chip.text),
-        ['Connected', 'Wi-Fi · 12 ms', '82% · charging', 'Fast lane', 'Sound on', 'Sharing Do Not Disturb']);
+        ['Connected', 'Wi-Fi · 12 ms', '82% · charging', 'Fast lane', 'Sound on', 'DND shared']);
     assert.equal(deviceChips(phone({battery: 15, charging: false})).find(c => c.id === 'battery').tone, 'warn');
     assert.deepEqual(deviceChips(phone({ready: false, reachable: false, settings: {}})).map(c => c.text), ['Offline']);
     assert.deepEqual(deviceChips(null), []);
@@ -212,4 +212,11 @@ test('the app\'s published switches are all shown somewhere', () => {
         if (row)
             assert.equal(row.sensitive, sensitive === 'true', `${key}: sensitivity differs from the app`);
     }
+});
+
+test('every action row is usable unless it says otherwise', () => {
+    const rows = sections(phone(), desk(), {linkInClipboard: false}).flatMap(s => s.rows).filter(r => r.kind === 'action');
+    assert.ok(rows.length > 20);
+    // The link waits for a link on the clipboard, Hand Off for a running terminal.
+    assert.deepEqual(rows.filter(r => !r.enabled).map(r => r.id), ['send-link', 'lock-hand-off']);
 });

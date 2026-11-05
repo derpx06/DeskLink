@@ -176,6 +176,7 @@
 .button.desklink-tile {
   border-radius: 18px;
   min-height: 64px;
+  min-width: 100px;
   padding: 8px 4px;
 }
 .desklink-tile-content { spacing: 6px; }

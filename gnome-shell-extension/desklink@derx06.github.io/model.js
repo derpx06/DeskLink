@@ -126,7 +126,7 @@ export function deviceChips(device) {
             chips.push({id: 'sound', text: 'Sound on', tone: 'info'});
     }
     if (device.settings?.dndShare)
-        chips.push({id: 'dnd', text: 'Sharing Do Not Disturb', tone: 'info'});
+        chips.push({id: 'dnd', text: 'DND shared', tone: 'info'});
     return chips;
 }
 
@@ -150,7 +150,7 @@ export function quickTiles(device) {
 // Rows -----------------------------------------------------------------
 
 const act = (id, label, icon, extra = {}) =>
-    ({kind: 'action', id, label, icon, action: id, ...extra});
+    ({kind: 'action', id, label, icon, action: id, enabled: true, ...extra});
 
 /// A switch row. `scope` 'phone' reads `device.settings`, 'desk' reads
 /// `desk`. `sensitive` ones are off for a security reason: the app only lets
@@ -221,9 +221,9 @@ export function sections(device, desk, extras = {}) {
         has(device, 'insert-qr') && act('insert-qr', 'Scan a QR code', 'view-grid-symbolic'),
     ]);
     add('sound', 'audio-speakers-symbolic', 'Sound', [
-        soundSwitch(device, desk, 'deskSound', `Play this computer's sound on ${name}`),
-        soundSwitch(device, desk, 'phoneMic', `Use ${name} as microphone`),
-        soundSwitch(device, desk, 'phoneSound', `Play ${name}'s sound here`),
+        soundSwitch(device, desk, 'deskSound', 'Play this computer\'s sound there'),
+        soundSwitch(device, desk, 'phoneMic', 'Use the phone as microphone'),
+        soundSwitch(device, desk, 'phoneSound', 'Play the phone\'s sound here'),
     ], (device.sound && (device.sound.deskSound || device.sound.phoneMic || device.sound.phoneSound)) ? 'On' : '');
     add('notes', 'document-edit-symbolic', 'Notes & clipboard', [
         act('new-note', 'New note', 'document-edit-symbolic', {device: false}),
@@ -236,41 +236,41 @@ export function sections(device, desk, extras = {}) {
     ]);
     const unread = device.unread > 0 ? `${device.unread} new` : '';
     add('notifications', 'preferences-system-notifications-symbolic', 'Notifications', [
-        phoneSwitch(device, 'showNotifications', `Show ${name}'s notifications here`),
+        phoneSwitch(device, 'showNotifications', 'Show its notifications here'),
         phoneSwitch(device, 'dndShare', 'Share Do Not Disturb', {
             enabled: desk?.dndSupported !== false || !!device.settings?.dndShare,
             note: desk?.dndSupported === false ? 'Not available on this desktop' : '',
         }),
-        phoneSwitch(device, 'commandAlerts', `Tell ${name} when a command finishes`),
+        phoneSwitch(device, 'commandAlerts', 'Tell it when a command finishes'),
         deskSwitch(desk, 'pauseMediaOnCall', 'Pause music during calls'),
-        deskSwitch(desk, 'forwardNotifications', `Send this computer's notifications to ${name}`),
+        deskSwitch(desk, 'forwardNotifications', 'Send this computer\'s notifications'),
         has(device, 'open-notifications') &&
             act('open-notifications', unread ? `Open notifications (${unread})` : 'Open notifications', 'mail-unread-symbolic'),
     ], unread);
     add('calls', 'call-start-symbolic', 'Calls & contacts', [
-        phoneSwitch(device, 'namesCallers', `Name callers from ${name}'s contacts`),
+        phoneSwitch(device, 'namesCallers', 'Name callers from its contacts'),
         has(device, 'open-contacts') && act('open-contacts', 'Contacts…', 'x-office-address-book-symbolic'),
     ]);
     add('terminals', 'utilities-terminal-symbolic', 'Terminals', [
         has(device, 'new-terminal') && act('new-terminal', 'New shared terminal', 'list-add-symbolic'),
         has(device, 'open-terminals') && act('open-terminals', 'Open terminals', 'utilities-terminal-symbolic'),
-        phoneSwitch(device, 'terminalAccess', `Let ${name} open terminals`),
+        phoneSwitch(device, 'terminalAccess', 'Terminal access'),
     ], device.terminals > 0 ? `${device.terminals} attached` : '');
     add('screen', 'video-display-symbolic', 'Screen & control', [
-        has(device, 'show-screen') && act('show-screen', `Show ${name}'s screen…`, 'video-display-symbolic'),
-        has(device, 'end-sessions') && act('end-sessions', `End what ${name} is doing here`, 'process-stop-symbolic'),
-        phoneSwitch(device, 'glide', `Glide this mouse onto ${name}`),
+        has(device, 'show-screen') && act('show-screen', 'Show its screen…', 'video-display-symbolic'),
+        has(device, 'end-sessions') && act('end-sessions', 'End what it is doing here', 'process-stop-symbolic'),
+        phoneSwitch(device, 'glide', 'Glide the mouse onto it'),
     ]);
     add('files', 'folder-symbolic', 'Files', [
         has(device, 'open-bucket') && act('open-bucket', 'Open synced files', 'folder-symbolic'),
         has(device, 'open-files') && act('open-files', 'Files page', 'folder-open-symbolic'),
-        phoneSwitch(device, 'galleryAccept', `Accept photos and screenshots from ${name}`),
+        phoneSwitch(device, 'galleryAccept', 'Accept its photos and screenshots'),
     ]);
     const privacy = present([
-        phoneSwitch(device, 'unlockNearby', `Unlock this computer with ${name}`),
-        phoneSwitch(device, 'walkAway', `Lock when I walk away with ${name}`),
-        phoneSwitch(device, 'phoneKeepAwake', `Let ${name} keep this computer awake`),
-        deskSwitch(desk, 'deskMic', `Let phones hear this computer's microphone`),
+        phoneSwitch(device, 'unlockNearby', 'Unlock with the phone'),
+        phoneSwitch(device, 'walkAway', 'Lock when I walk away'),
+        phoneSwitch(device, 'phoneKeepAwake', 'Phone can keep this awake'),
+        deskSwitch(desk, 'deskMic', 'Phones can hear this mic'),
     ]);
     const onCount = [device.settings?.terminalAccess, device.settings?.unlockNearby,
         device.settings?.galleryAccept, device.settings?.phoneKeepAwake, device.settings?.glide,

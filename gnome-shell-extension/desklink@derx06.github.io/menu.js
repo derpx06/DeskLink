@@ -185,7 +185,7 @@ function chipLines(chips, variant) {
     let width = 0;
     for (const entry of chips) {
         const need = entry.text.length + 4;
-        if (width + need > 36 && lines.at(-1).length > 0) {
+        if (width + need > 46 && lines.at(-1).length > 0) {
             lines.push([]);
             width = 0;
         }
@@ -221,8 +221,12 @@ function progressItem(icon, activatable) {
     words.add_child(track);
     item.add_child(words);
     let fraction = 0;
-    const draw = () => (fill.width = Math.round(track.width * fraction));
+    const draw = () => {
+        if (track.get_stage())
+            fill.width = Math.round(track.width * fraction);
+    };
     track.connect('notify::width', draw);
+    track.connect('notify::mapped', draw);
     const update = (title, text, value) => {
         line.text = title;
         detail.text = text;
@@ -263,7 +267,7 @@ function sectionRow(entry, selected, ctx) {
         if (entry.sensitive && !entry.on) {
             // Off for a security reason: turned on only in DeskLink itself.
             const item = new PopupMenu.PopupImageMenuItem(entry.label, 'changes-prevent-symbolic');
-            item.add_child(dim(label('Off · set up in DeskLink', 'desklink-card-subtitle', {x_expand: true, x_align: Clutter.ActorAlign.END})));
+            item.add_child(dim(label('Off · in DeskLink', 'desklink-card-subtitle', {x_expand: true, x_align: Clutter.ActorAlign.END})));
             item.accessible_name = `${entry.label}, off. Opens DeskLink to turn it on.`;
             item.connect('activate', () => ctx.invoke(id, 'open-settings'));
             return item;
@@ -303,6 +307,98 @@ function sectionRow(entry, selected, ctx) {
     }
 }
 
+/// Scrolls `scroll` so `actor` (and the rows under it) is in view.
+function reveal(scroll, actor, extra = 0) {
+    const adjustment = scroll.vadjustment ?? scroll.get_vadjustment?.();
+    if (!adjustment)
+        return;
+    const [, top] = actor.get_transformed_position();
+    const [, viewTop] = scroll.get_transformed_position();
+    const [, height] = actor.get_preferred_height(-1);
+    const from = adjustment.value + (top - viewTop);
+    const to = from + height + extra; // the section's header and its rows
+    if (to > adjustment.value + scroll.height)
+        adjustment.value = Math.min(from, to - scroll.height);
+    else if (from < adjustment.value)
+        adjustment.value = from;
+}
+
+/// Scrolls the menu so an opened section's rows are on screen (a tall menu
+/// scrolls inside the shell's own scroll view).
+function keepInView(item) {
+    const id = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+        try {
+            let parent = item.get_parent();
+            while (parent && !(parent instanceof St.ScrollView))
+                parent = parent.get_parent();
+            if (parent && item.mapped) {
+                reveal(parent, item, item.menu.actor.get_preferred_height(-1)[1]);
+                // The rows are laid out once the section has opened.
+                GLib.timeout_add(GLib.PRIORITY_DEFAULT, 320, () => {
+                    try {
+                        if (item.mapped)
+                            reveal(parent, item, item.menu.actor.get_preferred_height(-1)[1]);
+                    } catch (error) {
+                        // Gone with the menu.
+                    }
+                    return GLib.SOURCE_REMOVE;
+                });
+            }
+        } catch (error) {
+            // Best effort: the menu still works without it.
+        }
+        return GLib.SOURCE_REMOVE;
+    });
+    GLib.Source.set_name_by_id?.(id, '[desklink] keep section in view');
+}
+
+/// The sections' own scroller: a tall menu is clipped by the screen, so the
+/// list scrolls inside a height that leaves the footer on screen. Returns the
+/// section that rows go into. Parented like any section (activating a row
+/// closes the menu, keys move between rows).
+function scrolledSection(menu) {
+    const wrapper = new PopupMenu.PopupMenuSection();
+    menu.addMenuItem(wrapper);
+    const holder = new PopupMenu.PopupMenuSection();
+    wrapper.addMenuItem(holder);
+    wrapper.box.remove_child(holder.actor);
+    const scroller = new St.ScrollView({
+        style_class: 'desklink-scroller',
+        hscrollbar_policy: St.PolicyType.NEVER,
+        vscrollbar_policy: St.PolicyType.AUTOMATIC,
+        overlay_scrollbars: true,
+        x_expand: true,
+        child: holder.actor,
+    });
+    wrapper.box.add_child(scroller);
+    let alive = true;
+    scroller.connect('destroy', () => (alive = false));
+    const fit = () => {
+        if (!alive || !scroller.mapped)
+            return;
+        try {
+            const monitor = Main.layoutManager.findMonitorForActor?.(scroller) ?? Main.layoutManager.primaryMonitor;
+            scroller.style = '';
+            const [, natural] = scroller.get_preferred_height(-1);
+            const [, boxHeight] = menu.box.get_preferred_height(-1);
+            const [, boxTop] = menu.box.get_transformed_position();
+            const excess = boxTop + boxHeight - (monitor.y + monitor.height - 24);
+            scroller.style = excess > 0 ? `max-height: ${Math.floor(Math.max(160, natural - excess))}px;` : '';
+        } catch (error) {
+            // Best effort: without it the menu is only as tall as it is.
+        }
+    };
+    const later = () => {
+        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+            fit();
+            return GLib.SOURCE_REMOVE;
+        });
+    };
+    scroller.connect('notify::mapped', later);
+    holder.fit = later;
+    return holder;
+}
+
 /// A collapsed section: icon, title and a short state; one open at a time
 /// (the shell's accordion), and the open one survives a rebuild.
 function addSection(menu, section, selected, ctx) {
@@ -319,7 +415,12 @@ function addSection(menu, section, selected, ctx) {
         ctx.track?.(item, `${section.id}:${entry.id}`);
         sub.menu.addMenuItem(item);
     }
-    sub.menu.connect('open-state-changed', (_menu, open) => ctx.sectionOpened(section.id, open));
+    sub.menu.connect('open-state-changed', (_menu, open) => {
+        ctx.sectionOpened(section.id, open);
+        menu.fit?.();
+        if (open)
+            keepInView(sub);
+    });
     ctx.track?.(sub, `section:${section.id}`);
     menu.addMenuItem(sub);
     if (ctx.openSection === section.id)
@@ -377,8 +478,11 @@ export function fillMenu(menu, ctx) {
         return;
     }
 
+    // Everything between the phone's name and the footer scrolls when the
+    // screen is too short for it.
+    const body = scrolledSection(menu);
     // How it is: connection, route, battery, lane, sound, Do Not Disturb.
-    menu.addMenuItem(row(chipLines(deviceChips(selected), variant)));
+    body.addMenuItem(row(chipLines(deviceChips(selected), variant)));
 
     // Not connected: when it was last here, and a way to try again.
     if (!selected.ready) {
@@ -393,7 +497,7 @@ export function fillMenu(menu, ctx) {
         else
             card.add_child(textButton('Reconnect', () => invoke('', 'reconnect')));
         ctx.appear(card, `offline:${selected.id}`);
-        menu.addMenuItem(row(card));
+        body.addMenuItem(row(card));
     }
 
     // A call: Answer/Decline while ringing, the time and End while on it.
@@ -430,7 +534,7 @@ export function fillMenu(menu, ctx) {
                 card.add_child(iconButton('call-stop-symbolic', 'End call', () => invoke(selected.id, 'call-end'), 'desklink-decline'));
         }
         ctx.appear(card, `call:${call.id}:${call.state}`);
-        menu.addMenuItem(row(card));
+        body.addMenuItem(row(card));
     }
 
     // Six quick actions, three to a row.
@@ -444,7 +548,7 @@ export function fillMenu(menu, ctx) {
         tiles.slice(i, i + 3).forEach(t => line.add_child(t));
         grid.add_child(line);
     }
-    menu.addMenuItem(row(grid));
+    body.addMenuItem(row(grid));
 
     // The phone's music.
     const media = selected.ready ? selected.media : null;
@@ -461,7 +565,7 @@ export function fillMenu(menu, ctx) {
         line.add_child(iconButton(media.playing ? 'media-playback-pause-symbolic' : 'media-playback-start-symbolic',
             media.playing ? 'Pause' : 'Play', () => invoke(selected.id, 'media-play-pause'), variant));
         line.add_child(iconButton('media-skip-forward-symbolic', 'Next track', () => invoke(selected.id, 'media-next'), variant));
-        menu.addMenuItem(row(line));
+        body.addMenuItem(row(line));
     }
 
     // Going on now: files moving, the Files sync, the phone's timers.
@@ -469,7 +573,7 @@ export function fillMenu(menu, ctx) {
     const activities = (ctx.activities ?? []).filter(item => item.device === selected.id).slice(0, 2);
     const bucket = selected.bucket;
     if (moving.length > 0 || bucket || activities.length > 0)
-        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Now'));
+        body.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('Now'));
     const bars = moving.slice(0, 3).map((transfer, index) => {
         const bar = progressItem(transfer.incoming ? 'folder-download-symbolic' : 'folder-upload-symbolic', false);
         bar.show = now => bar.update(`${now.incoming ? 'Receiving' : 'Sending'} ${now.name}`,
@@ -477,7 +581,7 @@ export function fillMenu(menu, ctx) {
                 .filter(Boolean).join(' · '), now.fraction);
         bar.show(transfer);
         ctx.appear(bar.item, `transfer:${selected.id}:${index}:${transfer.name}`);
-        menu.addMenuItem(bar.item);
+        body.addMenuItem(bar.item);
         return bar;
     });
     // Their progress moves every second: updated in place, not rebuilt.
@@ -488,7 +592,7 @@ export function fillMenu(menu, ctx) {
         ctx.onBucket?.(now => now && bar.update(now.line, now.detail, now.fraction));
         bar.item.connect('activate', () => invoke(selected.id, 'open-bucket'));
         ctx.appear(bar.item, `bucket:${selected.id}`);
-        menu.addMenuItem(bar.item);
+        body.addMenuItem(bar.item);
     }
     for (const activity of activities) {
         const item = new PopupMenu.PopupBaseMenuItem({activate: false, hover: false, can_focus: false, style_class: 'desklink-row'});
@@ -499,13 +603,13 @@ export function fillMenu(menu, ctx) {
         ctx.tick(() => (detail.text = ctx.activityText(activity)));
         words.add_child(detail);
         item.add_child(words);
-        menu.addMenuItem(item);
+        body.addMenuItem(item);
     }
 
     // What is live on this computer.
     const live = devices.filter(device => device.screen || device.terminals > 0);
     if (live.length > 0) {
-        menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('On this computer'));
+        body.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('On this computer'));
         for (const device of live) {
             const card = box({style_class: `desklink-card ${variant} desklink-live`});
             card.add_child(new St.Widget({style_class: 'desklink-dot coral', y_align: Clutter.ActorAlign.CENTER}));
@@ -526,20 +630,20 @@ export function fillMenu(menu, ctx) {
             end.accessible_name = `End what ${device.name} is doing here`;
             card.add_child(end);
             ctx.appear(card, `live:${device.id}`);
-            menu.addMenuItem(row(card));
+            body.addMenuItem(row(card));
         }
         if (live.length > 1)
-            menu.addAction('End Everything', () => invoke('', 'end-sessions'));
+            body.addAction('End Everything', () => invoke('', 'end-sessions'));
     }
 
     // Every area, collapsed.
-    menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+    body.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
     for (const section of sections(selected, desk, {
         transfers: transfers.filter(file => file.deviceName === selected.name),
         snippets: ctx.snippets ?? [],
         linkInClipboard: !!ctx.linkInClipboard,
     }))
-        addSection(menu, section, selected, ctx);
+        addSection(body, section, selected, ctx);
 
     // The footer: the app, its settings, and a pause for notifications.
     menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
