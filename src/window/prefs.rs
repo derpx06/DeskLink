@@ -1889,4 +1889,5 @@ mod tests {
         assert_eq!(glide_explained("Pixel", Some(false), "Desk"), says);
         assert!(glide_explained("Pixel", Some(true), "Desk").starts_with("Move the pointer past"));
     }
+
 }
