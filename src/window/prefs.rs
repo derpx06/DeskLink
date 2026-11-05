@@ -185,6 +185,7 @@ fn tag(index: usize) -> String {
 struct View {
     root: adw::NavigationView,
     /// The subpages, by group index (the tests read their rows).
+    #[cfg_attr(not(test), allow(dead_code))]
     pages: Vec<adw::NavigationPage>,
 }
 
