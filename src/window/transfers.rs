@@ -658,8 +658,19 @@ pub(super) fn empty_state(
         .justify(gtk::Justification::Center)
         .css_classes(["dl-secondary"])
         .build();
-    column.append(&title);
-    column.append(&body);
+    // At most 320 wide, whatever the words.
+    let clamp = adw::Clamp::builder()
+        .maximum_size(320)
+        .tightening_threshold(320)
+        .build();
+    let words = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+    words.append(&title);
+    words.append(&body);
+    clamp.set_child(Some(&words));
+    column.append(&clamp);
     (column, title, body)
 }
 
