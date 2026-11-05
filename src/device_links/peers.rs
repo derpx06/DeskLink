@@ -107,6 +107,9 @@ mod tests {
             "window/transfers.rs:SHOWN",
             "window/transfers.rs:FAILED",
             "window/transfers.rs:WAITING",
+            // Phones we asked to pair, and ones that did not accept: dropped
+            // when they pair, after two minutes, or with the window.
+            "window/pairing.rs:WATCH",
             // Owned by the live share/negotiation, ended by the peer's reset.
             "device_links/webrtc/coordinator.rs:RETIRING",
             "device_links/webrtc/coordinator.rs:SERVICES",
