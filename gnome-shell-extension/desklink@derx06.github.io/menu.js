@@ -323,33 +323,39 @@ function reveal(scroll, actor, extra = 0) {
         adjustment.value = from;
 }
 
-/// Scrolls the menu so an opened section's rows are on screen (a tall menu
-/// scrolls inside the shell's own scroll view).
-function keepInView(item) {
-    const id = GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+/// Runs `fn` after `ms` unless `actor` is gone by then (its source is removed
+/// with it, so nothing outlives the menu).
+function defer(actor, ms, fn) {
+    let id = 0;
+    id = GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+        id = 0;
         try {
-            let parent = item.get_parent();
-            while (parent && !(parent instanceof St.ScrollView))
-                parent = parent.get_parent();
-            if (parent && item.mapped) {
-                reveal(parent, item, item.menu.actor.get_preferred_height(-1)[1]);
-                // The rows are laid out once the section has opened.
-                GLib.timeout_add(GLib.PRIORITY_DEFAULT, 320, () => {
-                    try {
-                        if (item.mapped)
-                            reveal(parent, item, item.menu.actor.get_preferred_height(-1)[1]);
-                    } catch (error) {
-                        // Gone with the menu.
-                    }
-                    return GLib.SOURCE_REMOVE;
-                });
-            }
+            fn();
         } catch (error) {
             // Best effort: the menu still works without it.
         }
         return GLib.SOURCE_REMOVE;
     });
-    GLib.Source.set_name_by_id?.(id, '[desklink] keep section in view');
+    actor.connect('destroy', () => {
+        if (id)
+            GLib.source_remove(id);
+        id = 0;
+    });
+}
+
+/// Scrolls the menu so an opened section's rows are on screen (a tall menu
+/// scrolls inside its own scroller). The rows are laid out once the section
+/// has opened, so it looks twice.
+function keepInView(item) {
+    const show = () => {
+        let parent = item.get_parent();
+        while (parent && !(parent instanceof St.ScrollView))
+            parent = parent.get_parent();
+        if (parent && item.mapped)
+            reveal(parent, item, item.menu.actor.get_preferred_height(-1)[1]);
+    };
+    defer(item, 0, show);
+    defer(item, 320, show);
 }
 
 /// The sections' own scroller: a tall menu is clipped by the screen, so the
@@ -388,12 +394,7 @@ function scrolledSection(menu) {
             // Best effort: without it the menu is only as tall as it is.
         }
     };
-    const later = () => {
-        GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            fit();
-            return GLib.SOURCE_REMOVE;
-        });
-    };
+    const later = () => defer(scroller, 0, fit);
     scroller.connect('notify::mapped', later);
     holder.fit = later;
     return holder;
@@ -406,9 +407,10 @@ function addSection(menu, section, selected, ctx) {
     sub.add_style_class_name('desklink-section');
     sub.icon.icon_name = section.icon;
     sub.accessible_name = section.subtitle ? `${section.title}, ${section.subtitle}` : section.title;
-    if (section.subtitle && sub.status) {
-        sub.status.text = section.subtitle;
-        sub.status.add_style_class_name('desklink-section-state');
+    if (section.subtitle) {
+        // Before the arrow: "3 new", "On", "2 allowed".
+        const state = label(section.subtitle, 'desklink-section-state');
+        sub.insert_child_at_index(state, Math.max(0, sub.get_n_children() - 1));
     }
     for (const entry of section.rows) {
         const item = sectionRow(entry, selected, ctx);
@@ -417,9 +419,18 @@ function addSection(menu, section, selected, ctx) {
     }
     sub.menu.connect('open-state-changed', (_menu, open) => {
         ctx.sectionOpened(section.id, open);
-        menu.fit?.();
-        if (open)
+        if (open) {
+            // The shell gives a section its own scrollbar when the menu is
+            // as tall as the screen; this menu scrolls as a whole instead.
+            defer(sub, 0, () => {
+                sub.menu.actor.vscrollbar_policy = St.PolicyType.NEVER;
+                sub.menu.actor.remove_style_pseudo_class('scrolled');
+                menu.fit?.();
+            });
             keepInView(sub);
+        } else {
+            menu.fit?.();
+        }
     });
     ctx.track?.(sub, `section:${section.id}`);
     menu.addMenuItem(sub);
