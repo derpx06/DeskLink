@@ -80,15 +80,15 @@ impl Group {
     }
 
     /// Rows before anything is typed. Pages and settings are reached by
-    /// name, and the clipboard and contacts are other people's words: none of
-    /// them is put on show just because the palette opened.
+    /// name, and snippets, the clipboard and contacts are text that can be a
+    /// password or a stranger's number: none of them is put on show just
+    /// because the palette opened (a shared screen shows it too). A note shows
+    /// its title only (`Item::private_subtitle`).
     fn idle_cap(self) -> usize {
         match self {
             Self::Actions => IDLE_ACTIONS,
-            Self::Phones | Self::Terminals | Self::Files | Self::Notes | Self::Snippets => {
-                IDLE_PER_GROUP
-            }
-            Self::Pages | Self::Clipboard | Self::Contacts | Self::Settings => 0,
+            Self::Phones | Self::Terminals | Self::Files | Self::Notes => IDLE_PER_GROUP,
+            Self::Pages | Self::Snippets | Self::Clipboard | Self::Contacts | Self::Settings => 0,
         }
     }
 }
@@ -107,7 +107,9 @@ pub(crate) enum Action {
     /// A row of `insert::CAPTURES`.
     Insert(usize),
     /// `desk-sound`, `phone-mic` or `phone-sound`, switched.
-    Sound(&'static str),
+    /// `desk-sound`, `phone-mic` or `phone-sound`, and whether it is turned
+    /// on (not toggled): what the row said when it was drawn is what it does.
+    Sound(&'static str, bool),
     HandOff,
     NewNote,
     NewTerminal,
@@ -120,6 +122,9 @@ pub(crate) enum Action {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
     Action(Action),
+    /// An action on this phone: the one the row was drawn for, so a change
+    /// of selection since then cannot send it to another.
+    PhoneAction(String, Action),
     /// A name of `PAGES`, or the `clipboard` / `snippets` tab of Notes.
     Page(&'static str),
     /// A subpage of Settings (an index into `prefs::GROUPS`).
@@ -149,6 +154,10 @@ pub(crate) struct Item {
     pub(crate) icon: &'static str,
     /// The shortcut that does the same, as a GTK accelerator.
     pub(crate) accel: Option<&'static str>,
+    /// The subtitle is the person's own words (a note's first line): not
+    /// drawn until something is typed, so opening the palette over a screen
+    /// share shows no text of theirs.
+    pub(crate) private_subtitle: bool,
     folded_title: String,
     folded_title_words: Vec<String>,
     folded_rest: String,
@@ -170,10 +179,15 @@ fn words_of(folded: &str) -> Vec<String> {
         .collect()
 }
 
-/// A single line of at most `max` characters, a cut one ending in an ellipsis.
+/// A single line of at most `max` characters, a cut one ending in an
+/// ellipsis. Only the first few times `max` characters are looked at: a
+/// clipboard entry or a note can be megabytes.
 pub(crate) fn one_line(text: &str, max: usize) -> String {
-    let line: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if line.chars().count() <= max {
+    let window = max.saturating_mul(4).max(max + 1);
+    let head: String = text.chars().take(window).collect();
+    let more = text.chars().nth(window).is_some();
+    let line: String = head.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !more && line.chars().count() <= max {
         return line;
     }
     let mut cut: String = line.chars().take(max.saturating_sub(1)).collect();
@@ -203,7 +217,13 @@ impl Item {
             subtitle: one_line(subtitle, 120),
             icon,
             accel: None,
+            private_subtitle: false,
         }
+    }
+
+    fn private(mut self) -> Self {
+        self.private_subtitle = true;
+        self
     }
 
     fn accel(mut self, accel: &'static str) -> Self {
@@ -235,6 +255,33 @@ impl Item {
             };
         }
         Some(total)
+    }
+}
+
+#[cfg(test)]
+impl Item {
+    /// A note row, for tests of what is drawn.
+    pub(crate) fn probe_note(title: &str, preview: &str) -> Item {
+        Item::new(
+            Target::Note("n".into()),
+            Group::Notes,
+            title,
+            preview,
+            "desklink-edit-note-symbolic",
+            "",
+        )
+        .private()
+    }
+
+    pub(crate) fn probe_snippet(label: &str, text: &str) -> Item {
+        Item::new(
+            Target::Snippet(text.into()),
+            Group::Snippets,
+            label,
+            "Copy",
+            "desklink-keep-symbolic",
+            text,
+        )
     }
 }
 
@@ -318,6 +365,7 @@ pub(crate) fn step(current: Option<usize>, len: usize, by: isize) -> Option<usiz
 /// The selected phone, as far as the palette cares.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PhoneState {
+    pub(crate) id: String,
     pub(crate) name: String,
     /// "phone", "tablet", ... for the words of an action.
     pub(crate) kind: String,
@@ -348,6 +396,7 @@ impl PhoneState {
         let reason = super::unavailable_reason(device);
         let screen = can(PACKET_TYPE_MOUSEPAD_REQUEST);
         Self {
+            id: device.id.clone(),
             name: device.name.clone(),
             kind: super::device_type_label(&device.device_type).to_lowercase(),
             usable: reason.is_none(),
@@ -417,22 +466,24 @@ fn phone_action(phone: &PhoneState, action: Action) -> Option<Item> {
                     None,
                 )
             }
-            Action::Sound(what) => {
-                let (title, keywords) = match what {
-                    "desk-sound" if phone.desk_sound_on => (
+            Action::Sound(what, turn_on) => {
+                let (title, keywords) = match (what, turn_on) {
+                    ("desk-sound", false) => (
                         on("Stop playing this computer's sound on {name}"),
                         "audio speakers stop",
                     ),
-                    "desk-sound" => (on("Play this computer's sound on {name}"), "audio speakers"),
-                    "phone-mic" if phone.phone_mic_on => {
+                    ("desk-sound", true) => {
+                        (on("Play this computer's sound on {name}"), "audio speakers")
+                    }
+                    ("phone-mic", false) => {
                         (on("Stop using {name} as microphone"), "mic audio stop")
                     }
-                    "phone-mic" => (on("Use {name} as microphone"), "mic audio"),
-                    _ if phone.phone_sound_on => (
+                    ("phone-mic", true) => (on("Use {name} as microphone"), "mic audio"),
+                    (_, false) => (
                         on("Stop playing {name}'s sound here"),
                         "audio speakers stop",
                     ),
-                    _ => (on("Play {name}'s sound here"), "audio speakers"),
+                    (_, true) => (on("Play {name}'s sound here"), "audio speakers"),
                 };
                 (
                     title,
@@ -551,8 +602,8 @@ pub(crate) fn offered_actions(phone: Option<&PhoneState>, any_terminal_open: boo
         if phone.ping {
             out.push(Action::Nudge);
         }
-        // The Home tile is live with a terminal open; with Terminal access off
-        // it explains and opens Privacy & security instead.
+        // The Home tile is live with a terminal open (the daemon gates it per
+        // phone, whoever asks): the palette asks the same way.
         if any_terminal_open {
             out.push(Action::HandOff);
         }
@@ -561,11 +612,12 @@ pub(crate) fn offered_actions(phone: Option<&PhoneState>, any_terminal_open: boo
     // What is in the Insert and Sound menus: found by a query.
     if let Some(phone) = phone.filter(|phone| phone.screen) {
         out.extend(phone.captures.iter().map(|index| Action::Insert(*index)));
-        out.extend(
-            ["desk-sound", "phone-mic", "phone-sound"]
-                .into_iter()
-                .map(Action::Sound),
-        );
+        // Each says what it does when chosen: on when it is off now.
+        out.extend([
+            Action::Sound("desk-sound", !phone.desk_sound_on),
+            Action::Sound("phone-mic", !phone.phone_mic_on),
+            Action::Sound("phone-sound", !phone.phone_sound_on),
+        ]);
     }
     out.extend([Action::PairAnother, Action::History, Action::Shortcuts]);
     out
@@ -735,7 +787,13 @@ pub(crate) fn build(sources: &Sources) -> Vec<Item> {
             .phone
             .as_ref()
             .and_then(|phone| phone_action(phone, action));
-        items.push(phone_item.unwrap_or_else(|| desk_action(action)));
+        items.push(match (phone_item, &sources.phone) {
+            (Some(mut item), Some(phone)) => {
+                item.target = Target::PhoneAction(phone.id.clone(), action);
+                item
+            }
+            _ => desk_action(action),
+        });
     }
 
     // Pages. The pages of a phone only for a paired one (as Ctrl+1 to 6);
@@ -824,18 +882,21 @@ pub(crate) fn build(sources: &Sources) -> Vec<Item> {
     }
     for note in &sources.notes {
         let body: String = note.body.chars().take(BODY_CHARS).collect();
-        items.push(Item::new(
-            Target::Note(note.id.clone()),
-            Group::Notes,
-            &note.title,
-            &note.preview,
-            if note.pinned {
-                "desklink-keep-filled-symbolic"
-            } else {
-                "desklink-edit-note-symbolic"
-            },
-            &body,
-        ));
+        items.push(
+            Item::new(
+                Target::Note(note.id.clone()),
+                Group::Notes,
+                &note.title,
+                &note.preview,
+                if note.pinned {
+                    "desklink-keep-filled-symbolic"
+                } else {
+                    "desklink-edit-note-symbolic"
+                },
+                &body,
+            )
+            .private(),
+        );
     }
     for (label, text) in &sources.snippets {
         let words: String = text.chars().take(BODY_CHARS).collect();
@@ -1487,5 +1548,72 @@ mod tests {
         assert_eq!(accel_of("Pair another phone"), Some("<control>n"));
         assert_eq!(accel_of("Connection history"), Some("<control>h"));
         assert_eq!(accel_of("Keyboard shortcuts"), Some("<control>question"));
+    }
+
+    #[test]
+    fn phone_rows_name_their_phone_and_sound_rows_say_what_they_will_do() {
+        let mut phone = ready_phone();
+        phone.phone_mic_on = true;
+        let items = build(&sources_with(Some(phone.clone()), 1));
+        let send = items.iter().find(|i| i.title == "Send files").unwrap();
+        assert_eq!(
+            send.target,
+            Target::PhoneAction(phone.id.clone(), Action::SendFiles)
+        );
+        let mic = items
+            .iter()
+            .find(|i| i.title.contains("microphone"))
+            .unwrap();
+        assert_eq!(mic.title, "Stop using Pixel 9 as microphone");
+        assert_eq!(
+            mic.target,
+            Target::PhoneAction(phone.id.clone(), Action::Sound("phone-mic", false))
+        );
+        let play = items
+            .iter()
+            .find(|i| i.title.starts_with("Play Pixel"))
+            .unwrap();
+        assert_eq!(
+            play.target,
+            Target::PhoneAction(phone.id, Action::Sound("phone-sound", true))
+        );
+        // This computer's own rows are not tied to a phone.
+        let new_note = items.iter().find(|i| i.title == "New note").unwrap();
+        assert_eq!(new_note.target, Target::Action(Action::NewNote));
+    }
+
+    #[test]
+    fn idle_hides_snippets_and_what_a_note_says() {
+        let mut sources = sources_with(Some(ready_phone()), 0);
+        sources.snippets = vec![("login".into(), "ssh me@secret".into())];
+        sources.notes = vec![NoteEntry {
+            id: "n".into(),
+            title: "Plan".into(),
+            preview: "the password is hunter2".into(),
+            body: "Plan\nthe password is hunter2".into(),
+            pinned: false,
+        }];
+        let items = build(&sources);
+        let idle = search(&items, "");
+        assert!(idle.iter().all(|s| s.group != Group::Snippets));
+        let note = idle.iter().find(|s| s.group == Group::Notes).unwrap();
+        assert!(items[note.items[0]].private_subtitle);
+        // Typed, both are found.
+        assert_eq!(count(&search(&items, "login")), 1);
+        assert_eq!(count(&search(&items, "hunter2")), 1);
+    }
+
+    #[test]
+    fn a_huge_text_is_cut_without_reading_all_of_it() {
+        let huge = format!("start {}", "word ".repeat(2_000_000));
+        let started = std::time::Instant::now();
+        let line = one_line(&huge, 90);
+        assert!(started.elapsed() < std::time::Duration::from_millis(250));
+        assert_eq!(line.chars().count(), 90);
+        assert!(line.ends_with('…') && line.starts_with("start word"));
+        // Whitespace-heavy input that collapses short is still marked as cut.
+        let spaced = format!("a{}b", " ".repeat(1_000));
+        assert!(one_line(&spaced, 20).ends_with('…'));
+        assert_eq!(one_line("  a   b ", 20), "a b");
     }
 }

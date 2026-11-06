@@ -27,6 +27,20 @@ use crate::config::VERSION;
 use crate::device_links::daemon::DaemonHandle;
 use crate::DesklinkWindow;
 
+/// The key bindings (detailed action, accelerator), besides the page keys of
+/// `window::PAGE_ACCELS`. The shortcuts dialog lists these; a test reads both.
+pub(crate) const ACCELS: [(&str, &str); 9] = [
+    ("app.quit", "<control>q"),
+    ("app.shortcuts", "<control>question"),
+    ("app.preferences", "<control>comma"),
+    ("app.history", "<control>h"),
+    ("win.pair-new", "<control>n"),
+    ("win.send-files", "<control>o"),
+    ("win.toggle-search", "<control>f"),
+    ("win.palette", crate::window::PALETTE_ACCEL),
+    ("window.close", "<control>w"),
+];
+
 mod imp {
     use super::*;
     use std::cell::RefCell;
@@ -112,18 +126,12 @@ mod imp {
             obj.watch_network();
             obj.watch_resume();
             crate::startup("indicators and network watch ready");
-            obj.set_accels_for_action("app.quit", &["<control>q"]);
-            obj.set_accels_for_action("app.shortcuts", &["<control>question"]);
-            obj.set_accels_for_action("app.preferences", &["<control>comma"]);
-            obj.set_accels_for_action("app.history", &["<control>h"]);
-            obj.set_accels_for_action("win.pair-new", &["<control>n"]);
-            obj.set_accels_for_action("win.send-files", &["<control>o"]);
+            for (action, accel) in ACCELS {
+                obj.set_accels_for_action(action, &[accel]);
+            }
             for (page, accel) in crate::window::PAGE_ACCELS {
                 obj.set_accels_for_action(&format!("win.page-shortcut('{page}')"), &[accel]);
             }
-            obj.set_accels_for_action("win.toggle-search", &["<control>f"]);
-            obj.set_accels_for_action("win.palette", &[crate::window::PALETTE_ACCEL]);
-            obj.set_accels_for_action("window.close", &["<control>w"]);
         }
     }
 

@@ -36,6 +36,8 @@ const PAGE_ROWS: isize = 6;
 /// Clipboard entries and files the palette looks through.
 const CLIPS: usize = 50;
 const FILES: usize = 20;
+/// How much of a note's body its row reads: a preview and words to find it by.
+const NOTE_HEAD_CHARS: usize = 400;
 
 /// The dialog on screen, while there is one. Owned here so that a closure
 /// holding a widget never makes a cycle: the handlers hold it weakly.
@@ -75,6 +77,11 @@ pub(super) fn toggle(window: &DesklinkWindow, query: &str) {
     let sources = gather(window);
     let items = model::build(&sources);
     present(window, items, &sources, query);
+}
+
+/// Whether the palette is on screen.
+pub(super) fn is_open() -> bool {
+    OPEN.with(|slot| slot.borrow().is_some())
 }
 
 /// Whether the focus is in something the person types in, where Ctrl+F is
@@ -138,23 +145,22 @@ fn gather(window: &DesklinkWindow) -> Sources {
     let notes = crate::device_links::notes::notes()
         .into_iter()
         .map(|note| {
-            let lines: Vec<String> = note
-                .body
-                .lines()
-                .map(|line| {
-                    line.trim_start_matches(['#', ' ', '-', '*'])
-                        .trim()
-                        .to_string()
-                })
-                .filter(|line| !line.is_empty())
-                .collect();
+            // Only the head of a body is looked at: a note can be long.
+            let body: String = note.body.chars().take(NOTE_HEAD_CHARS).collect();
             // The first line is the title when the note has none of its own.
             let skip = usize::from(note.title.trim().is_empty());
+            let preview = body
+                .lines()
+                .map(|line| line.trim_start_matches(['#', ' ', '-', '*']).trim())
+                .filter(|line| !line.is_empty())
+                .nth(skip)
+                .unwrap_or_default()
+                .to_string();
             NoteEntry {
                 title: note.label(),
-                preview: lines.get(skip).cloned().unwrap_or_default(),
+                preview,
                 id: note.id,
-                body: note.body,
+                body,
                 pinned: note.pinned,
             }
         })
@@ -231,8 +237,9 @@ fn section_title(group: Group) -> gtk::Widget {
     header.upcast()
 }
 
-fn row_for(item: &Item, group: Group, keys: bool) -> adw::ActionRow {
-    let subtitle = (!item.subtitle.is_empty()).then_some(item.subtitle.as_str());
+fn row_for(item: &Item, group: Group, keys: bool, idle: bool) -> adw::ActionRow {
+    let subtitle = (!(item.subtitle.is_empty() || idle && item.private_subtitle))
+        .then_some(item.subtitle.as_str());
     let row = ui_kit::list_row(
         item.icon,
         if group == Group::Actions {
@@ -279,8 +286,10 @@ impl Palette {
             .collect();
         self.order.replace(order.clone());
         let keys = !self.narrow.get();
+        let idle = query.trim().is_empty();
         for (group, index) in order {
-            self.list.append(&row_for(&self.items[index], group, keys));
+            self.list
+                .append(&row_for(&self.items[index], group, keys, idle));
         }
         self.stack
             .set_visible_child_name(if shown == 0 { "empty" } else { "list" });
@@ -332,6 +341,26 @@ impl Palette {
         };
         self.list.select_row(Some(&row));
         row.grab_focus();
+    }
+
+    /// The dialog's capture-phase keys. `GtkSearchEntry` binds next/previous
+    /// match to Ctrl+G, not the arrows, so Up and Down are ours: from the box
+    /// they move to the rows, on a row the list moves itself and only Up from
+    /// the first row (back to the box) is ours.
+    fn key_pressed(&self, key: gtk::gdk::Key) -> glib::Propagation {
+        use gtk::gdk::Key;
+        let in_box = self.in_box();
+        match key {
+            Key::Down | Key::KP_Down if in_box => self.move_by(1),
+            Key::Up | Key::KP_Up if in_box => self.move_by(-1),
+            Key::Page_Down | Key::KP_Page_Down if in_box => self.move_by(PAGE_ROWS),
+            Key::Page_Up | Key::KP_Page_Up if in_box => self.move_by(-PAGE_ROWS),
+            Key::Up | Key::KP_Up if self.selected() == Some(0) => {
+                self.entry.grab_focus();
+            }
+            _ => return glib::Propagation::Proceed,
+        }
+        glib::Propagation::Stop
     }
 
     /// Chooses row `index`: the dialog goes first, then the row is done.
@@ -557,28 +586,9 @@ fn wire(palette: &Rc<Palette>) {
     keys.set_propagation_phase(gtk::PropagationPhase::Capture);
     keys.connect_key_pressed({
         let weak = weak.clone();
-        move |_, key, _, _| {
-            let Some(palette) = weak.upgrade() else {
-                return glib::Propagation::Proceed;
-            };
-            let in_box = palette.in_box();
-            match key {
-                gtk::gdk::Key::Page_Down | gtk::gdk::Key::KP_Page_Down if in_box => {
-                    palette.move_by(PAGE_ROWS);
-                    glib::Propagation::Stop
-                }
-                gtk::gdk::Key::Page_Up | gtk::gdk::Key::KP_Page_Up if in_box => {
-                    palette.move_by(-PAGE_ROWS);
-                    glib::Propagation::Stop
-                }
-                gtk::gdk::Key::Up | gtk::gdk::Key::KP_Up
-                    if !in_box && palette.selected() == Some(0) =>
-                {
-                    palette.entry.grab_focus();
-                    glib::Propagation::Stop
-                }
-                _ => glib::Propagation::Proceed,
-            }
+        move |_, key, _, _| match weak.upgrade() {
+            Some(palette) => palette.key_pressed(key),
+            None => glib::Propagation::Proceed,
         }
     });
     palette.dialog.add_controller(keys);
@@ -621,7 +631,8 @@ fn win_action(window: &DesklinkWindow, name: &str, parameter: Option<&glib::Vari
 /// What choosing `target` does: the same call the equivalent button makes.
 pub(super) fn run(window: &DesklinkWindow, target: &Target) {
     match target {
-        Target::Action(action) => run_action(window, *action),
+        Target::Action(action) => run_desk_action(window, *action),
+        Target::PhoneAction(device, action) => run_phone_action(window, device, *action),
         Target::Page(name) => {
             let paired = window.selected_is_paired();
             if *name == "settings" && !paired {
@@ -657,21 +668,33 @@ pub(super) fn run(window: &DesklinkWindow, target: &Target) {
     }
 }
 
-fn run_action(window: &DesklinkWindow, action: Action) {
-    // What is for this computer.
+fn run_desk_action(window: &DesklinkWindow, action: Action) {
     match action {
-        Action::NewNote => return window.new_note(),
+        Action::NewNote => window.new_note(),
         Action::NewTerminal => {
-            return win_action(window, "new-terminal", Some(&"shell".to_variant()))
+            win_action(window, "new-terminal", Some(&"shell".to_variant()));
+            // The session opens a window at the desk; the page lists it, so
+            // there is something to see here too.
+            if window.selected_is_paired() {
+                window.show_page("terminals");
+            }
         }
-        Action::PairAnother => return win_action(window, "pair-new", None),
-        Action::History => return app_action(window, "history"),
-        Action::Shortcuts => return app_action(window, "shortcuts"),
+        Action::PairAnother => win_action(window, "pair-new", None),
+        Action::History => app_action(window, "history"),
+        Action::Shortcuts => app_action(window, "shortcuts"),
         _ => {}
     }
-    // The rest needs the selected phone, ready now: the Home tiles are
-    // greyed the same way, with the same words.
-    let (Some(daemon), Some(id)) = (window.daemon(), window.selected_id()) else {
+}
+
+/// An action on the phone it was drawn for, if that is still the selected
+/// one and it is ready: the Home tiles are greyed the same way, with the same
+/// words.
+fn run_phone_action(window: &DesklinkWindow, id: &str, action: Action) {
+    if window.selected_id().as_deref() != Some(id) {
+        window.show_feature_toast("The selected phone changed. Open Find anything again");
+        return;
+    }
+    let Some(daemon) = window.daemon() else {
         window.show_feature_toast("Pair a phone first");
         return;
     };
@@ -708,25 +731,11 @@ fn run_action(window: &DesklinkWindow, action: Action) {
                 ));
             }
         }
-        Action::Sound(what) => daemon.send(DaemonCommand::Sound(
-            device.id.clone(),
-            what.into(),
-            !super::sound::is_on(&device, what),
-        )),
-        Action::HandOff => {
-            // The same gate as terminals: with access off, say so and show
-            // where it is turned on.
-            if device.terminal_access {
-                app_action(window, "lock-hand-off");
-            } else {
-                window.show_feature_toast(&format!(
-                    "Terminal access is off for {}. Turn it on under Privacy & security",
-                    device.name
-                ));
-                super::prefs::show_privacy();
-                window.show_page("settings");
-            }
+        Action::Sound(what, on) => {
+            daemon.send(DaemonCommand::Sound(device.id.clone(), what.into(), on))
         }
+        // As the Home tile: the daemon gates it per phone.
+        Action::HandOff => app_action(window, "lock-hand-off"),
         Action::NewNote
         | Action::NewTerminal
         | Action::PairAnother
@@ -854,6 +863,168 @@ mod tests {
                 "the focus is given back"
             );
             drop(before);
+        });
+    }
+
+    /// A window with one ready phone selected and a daemon whose commands
+    /// this test reads. (Needs a display.)
+    fn fixture() -> (
+        DesklinkWindow,
+        std::sync::mpsc::Receiver<DaemonCommand>,
+        String,
+    ) {
+        let resources = crate::load_resources().expect("the bundled resources");
+        gio::resources_register(&resources);
+        let app = adw::Application::builder()
+            .application_id("derx06.desklink.com.test")
+            .build();
+        let window = DesklinkWindow::new(&app);
+        let (daemon, commands) = crate::device_links::daemon::DaemonHandle::detached();
+        window.set_daemon(daemon);
+        let phone = super::super::debug_fake_device("paired", "Pixel 9");
+        let id = phone.id.clone();
+        window.imp().fake_devices.borrow_mut().push(phone);
+        window.select_device(&id);
+        window.present();
+        pump();
+        while commands.try_recv().is_ok() {}
+        (window, commands, id)
+    }
+
+    /// A row is done for the phone it was drawn for: not another one, not a
+    /// phone that is not ready, and a Sound row does what it said.
+    #[test]
+    fn a_phone_row_acts_on_its_own_phone_only_while_it_is_ready() {
+        crate::test_display::run(|| {
+            let (window, commands, id) = fixture();
+            let sent = || commands.try_iter().collect::<Vec<_>>();
+
+            run(&window, &Target::PhoneAction(id.clone(), Action::Ring));
+            let now = sent();
+            assert!(
+                matches!(now.as_slice(), [DaemonCommand::SendFindPhone(to)] if *to == id),
+                "{now:?}"
+            );
+            // Sound rows carry the state they were drawn with.
+            for turn_on in [true, false] {
+                run(
+                    &window,
+                    &Target::PhoneAction(id.clone(), Action::Sound("phone-mic", turn_on)),
+                );
+                let now = sent();
+                assert!(
+                    matches!(now.as_slice(),
+                        [DaemonCommand::Sound(to, what, on)] if *to == id && what == "phone-mic" && *on == turn_on),
+                    "{now:?}"
+                );
+            }
+            run(&window, &Target::PhoneAction(id.clone(), Action::Insert(0)));
+            assert!(matches!(sent().as_slice(), [DaemonCommand::Capture(to, ..)] if *to == id));
+
+            // Drawn for another phone than the selected one: nothing is sent.
+            for action in [
+                Action::Ring,
+                Action::Lock,
+                Action::Nudge,
+                Action::SendClipboard,
+            ] {
+                run(
+                    &window,
+                    &Target::PhoneAction("some-other-phone".into(), action),
+                );
+            }
+            assert!(
+                sent().is_empty(),
+                "the selection changed since the row was drawn"
+            );
+
+            // The selected phone went away: the Home tiles are greyed, so is this.
+            let away = super::super::debug_fake_device("unreachable", "Pixel 9");
+            let away_id = away.id.clone();
+            window.imp().fake_devices.borrow_mut().push(away);
+            window.select_device(&away_id);
+            for action in [
+                Action::Ring,
+                Action::Lock,
+                Action::Sound("desk-sound", true),
+            ] {
+                run(&window, &Target::PhoneAction(away_id.clone(), action));
+            }
+            assert!(sent().is_empty(), "not ready, nothing sent");
+            // And the row of the phone that was selected is not this one's.
+            run(&window, &Target::PhoneAction(id, Action::Ring));
+            assert!(sent().is_empty());
+        });
+    }
+
+    /// Up and Down reach the rows from the search box through the dialog's
+    /// own key controller (the entry binds them to nothing); a row moves
+    /// itself, and Up from the first returns to the box. Ctrl+F does not
+    /// reach the page's search while the palette is open.
+    #[test]
+    fn the_arrows_move_from_the_box_and_back_and_ctrl_f_leaves_the_palette_alone() {
+        use gtk::gdk::{Key, ModifierType};
+        crate::test_display::run(|| {
+            let (window, _commands, _id) = fixture();
+            toggle(&window, "");
+            pump();
+            let palette = open_palette();
+            palette.entry.set_text("e");
+            assert!(palette.rows() > 3);
+            assert!(palette.in_box());
+            let controller = palette
+                .dialog
+                .observe_controllers()
+                .into_iter()
+                .filter_map(|c| c.ok())
+                .filter_map(|c| c.downcast::<gtk::EventControllerKey>().ok())
+                .find(|c| c.propagation_phase() == gtk::PropagationPhase::Capture)
+                .expect("the dialog's capture-phase key controller");
+            let press = |key: Key| {
+                controller
+                    .emit_by_name::<bool>("key-pressed", &[&key, &0u32, &ModifierType::empty()])
+            };
+            assert!(press(Key::Down), "Down from the box is handled");
+            assert_eq!(palette.selected(), Some(1));
+            assert!(!palette.in_box(), "the focus went to the row");
+            assert!(!press(Key::Down), "on a row the list moves itself");
+            assert!(!press(Key::Up), "Up from the second row is the list's");
+            palette.move_by(-1);
+            assert_eq!(palette.selected(), Some(0));
+            assert!(press(Key::Up), "Up from the first row goes back to the box");
+            assert!(palette.in_box());
+            assert!(!press(Key::Up) || palette.selected() == Some(0));
+            assert!(press(Key::Page_Down));
+            assert_eq!(palette.selected(), Some(PAGE_ROWS as usize));
+            assert!(!press(Key::a), "letters are the box's");
+
+            // Ctrl+F (the terminals' search) leaves the open palette alone.
+            win_action(&window, "toggle-search", None);
+            pump();
+            assert!(is_open(), "Ctrl+F is not Ctrl+K");
+            toggle(&window, "");
+            pump();
+            assert!(!is_open());
+        });
+    }
+
+    /// Opening the palette shows no snippet and none of a note's text: those
+    /// can be secrets on a shared screen.
+    #[test]
+    fn idle_rows_show_no_snippets_and_no_note_text() {
+        crate::test_display::run(|| {
+            let items = vec![
+                Item::probe_note("Groceries", "milk, eggs"),
+                Item::probe_snippet("ssh login", "ssh user@secret"),
+            ];
+            let idle = model::search(&items, "");
+            assert_eq!(model::count(&idle), 1, "no snippet idle");
+            let note = &items[idle[0].items[0]];
+            let hidden = row_for(note, Group::Notes, true, true);
+            assert!(hidden.subtitle().is_none_or(|s| s.is_empty()), "title only");
+            let typed = row_for(note, Group::Notes, true, false);
+            assert_eq!(typed.subtitle().as_deref(), Some("milk, eggs"));
+            assert_eq!(model::count(&model::search(&items, "ssh")), 1);
         });
     }
 }

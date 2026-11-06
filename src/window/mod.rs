@@ -537,6 +537,10 @@ mod imp {
                 // "Find anything".
                 gio::ActionEntry::builder("toggle-search")
                     .activate(|window: &super::DesklinkWindow, _, _| {
+                        // Not over a dialog (the palette is one: Ctrl+K closes it).
+                        if palette::is_open() || window.visible_dialog().is_some() {
+                            return;
+                        }
                         if window.imp().page.borrow().as_str() == "terminals"
                             && window.imp().main_stack.visible_child_name().as_deref()
                                 == Some("devices")
@@ -4068,47 +4072,72 @@ mod tests {
         assert!(!dialog.contains("Pair New Device") && !dialog.contains("Close Window"));
     }
 
-    /// Ctrl+K is bound, listed in the shortcuts dialog (both forms of it) and
-    /// named on every search button, and no other action holds the key.
+    /// What the shortcuts dialog lists is what the application binds: every
+    /// action it names has a key in `application::ACCELS`, every accelerator
+    /// it types out is one the window binds, no key is bound twice, and
+    /// Ctrl+K (Find anything) is listed and named on every search button.
     #[test]
-    fn find_anything_has_one_key_and_every_list_of_keys_says_so() {
+    fn the_shortcuts_dialog_lists_the_keys_the_application_binds() {
+        use crate::application::ACCELS;
         let dialog = include_str!("../shortcuts-dialog.ui");
-        let item = dialog
-            .split("<object class=\"AdwShortcutsItem\">")
-            .find(|item| item.contains("win.palette"))
-            .expect("the dialog lists win.palette");
-        assert!(item.contains("Find anything"), "{item}");
-        // Libadwaita's dialog reads the accelerator from the application's
-        // binding; the plain list of older libadwaita is typed out.
-        let application = include_str!("../application.rs");
-        assert!(application
-            .contains("set_accels_for_action(\"win.palette\", &[crate::window::PALETTE_ACCEL])"));
-        assert!(application.contains("(\"Find anything\", \"Ctrl+K\")"));
+        let value = |line: &str, property: &str| -> Option<String> {
+            let open = format!("<property name=\"{property}\"");
+            let at = line.find(&open)?;
+            let rest = &line[at..];
+            let text = &rest[rest.find('>')? + 1..rest.find("</property>")?];
+            Some(
+                text.replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&"),
+            )
+        };
+        let mut actions = Vec::new();
+        let mut typed = Vec::new();
+        for line in dialog.lines() {
+            actions.extend(value(line, "action-name"));
+            typed.extend(value(line, "accelerator"));
+        }
+        assert!(
+            actions.len() >= 6 && typed.len() >= 7,
+            "{actions:?} {typed:?}"
+        );
+        for action in &actions {
+            assert!(
+                ACCELS.iter().any(|(bound, _)| bound == action),
+                "{action} is listed but has no key"
+            );
+        }
+        for accel in &typed {
+            assert!(
+                ACCELS
+                    .iter()
+                    .map(|(_, accel)| *accel)
+                    .chain(PAGE_ACCELS.iter().map(|(_, accel)| *accel))
+                    .any(|bound| bound.eq_ignore_ascii_case(accel)),
+                "{accel} is typed in the dialog but bound to nothing"
+            );
+        }
+        let mut seen = std::collections::HashSet::new();
+        for accel in ACCELS
+            .iter()
+            .map(|(_, accel)| *accel)
+            .chain(PAGE_ACCELS.iter().map(|(_, accel)| *accel))
+        {
+            assert!(seen.insert(accel), "{accel} is bound twice");
+        }
+        // Find anything: bound, listed by its action, named on its buttons.
+        assert!(ACCELS.contains(&("win.palette", PALETTE_ACCEL)));
+        assert!(actions.iter().any(|action| action == "win.palette"));
         assert_eq!(PALETTE_ACCEL, "<control>k");
         let ui = include_str!("../window.ui");
-        assert_eq!(
-            ui.matches("Find anything (Ctrl+K)").count(),
-            3,
-            "welcome, sidebar, page"
-        );
+        assert_eq!(ui.matches("Find anything (Ctrl+K)").count(), 3);
         assert_eq!(
             ui.matches("<property name=\"action-name\">win.palette</property>")
                 .count(),
             3
         );
-        // Ctrl+K is taken by nothing else the window binds.
-        for (_, accel) in PAGE_ACCELS {
-            assert_ne!(accel, PALETTE_ACCEL);
-        }
-        for other in [
-            "<control>f",
-            "<control>n",
-            "<control>o",
-            "<control>h",
-            "<control>w",
-        ] {
-            assert_ne!(other, PALETTE_ACCEL);
-        }
+        // The plain list of older libadwaita says it too.
+        assert!(include_str!("../application.rs").contains("(\"Find anything\", \"Ctrl+K\")"));
     }
 
     #[test]
