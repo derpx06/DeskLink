@@ -113,10 +113,11 @@ pub(super) fn welcome_page(win: &DesklinkWindow, daemon: &DaemonHandle) -> Rc<Ce
     // Under each other when the window is phone-narrow.
     footer.set_widget_name("responsive");
     let visible = gtk::Box::builder()
+        .spacing(6)
         .hexpand(true)
         .valign(gtk::Align::Center)
         .build();
-    visible.append(&text("Visible as ", &["text-dim", "body-small"]));
+    visible.append(&text("Visible as", &["text-dim", "body-small"]));
     visible.append(&text(&host_name(), &["mono", "body-small"]));
     footer.append(&visible);
     let codes = button(ButtonKind::Text, "Pair with a code instead", None);

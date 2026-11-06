@@ -37,16 +37,16 @@
 }
 .text-dim { color: @text_dim; }
 .text-faint { color: @text_faint; }
-.body-small { font-size: 13px; }
-.caption-strong { font-size: 13px; }
-.card-title { font-size: 15px; font-weight: 700; }
-.card-subtitle { font-size: 13px; color: @text_dim; }
-.card-note { font-size: 13px; color: @text_faint; }
-.column-heading { font-size: 13px; font-weight: 600; color: @text_dim; }
-.list-heading { font-size: 13px; font-weight: 600; color: @text_dim; margin-left: 4px; }
+.body-small { font-size: 0.93em; }
+.caption-strong { font-size: 0.93em; }
+.card-title { font-size: 1.07em; font-weight: 700; }
+.card-subtitle { font-size: 0.93em; color: @text_dim; }
+.card-note { font-size: 0.93em; color: @text_faint; }
+.column-heading { font-size: 0.93em; font-weight: 600; color: @text_dim; }
+.list-heading { font-size: 0.93em; font-weight: 600; color: @text_dim; margin-left: 4px; }
 preferencesgroup > box > box > .heading,
 preferencesgroup .heading {
-  font-size: 14px;
+  font-size: 1em;
   font-weight: 700;
   color: @window_fg_color;
 }
@@ -165,7 +165,7 @@ popover.device-switcher > contents {
 }
 .mono-subtitle .subtitle {
   font-family: "JetBrains Mono", monospace;
-  font-size: 12px;
+  font-size: 0.86em;
 }
 
 /* ── Buttons ───────────────────────────────────────────────────────────── */
@@ -177,11 +177,11 @@ popover.device-switcher > contents {
   padding: 0 12px;
   border-radius: 8px;
   font-weight: 600;
-  font-size: 13px;
+  font-size: 0.93em;
 }
 .soft-button { background-color: @surface_2; box-shadow: none; }
 .soft-button:hover { background-color: alpha(currentColor, 0.1); }
-.soft-button.small { min-height: 28px; font-size: 12px; }
+.soft-button.small { min-height: 28px; font-size: 0.86em; }
 .raised-button {
   background-color: @card_bg_color;
   box-shadow: 0 0 0 1px @card_edge, 0 1px 3px @card_shadow_near;
@@ -192,19 +192,19 @@ popover.device-switcher > contents {
   box-shadow: 0 0 0 1px @coral_border;
 }
 .coral-outline:hover { background-color: @coral_bg; }
-.coral-link { color: @coral_text; font-weight: 600; font-size: 12px; }
+.coral-link { color: @coral_text; font-weight: 600; font-size: 0.86em; }
 .switch-chip {
   background-color: @surface_2;
   padding-right: 6px;
 }
-.switch-chip > label { font-weight: 600; font-size: 13px; }
+.switch-chip > label { font-weight: 600; font-size: 0.93em; }
 button.suggested-action { font-weight: 600; }
 .link-button {
   padding: 0 2px;
   background: none;
   color: @accent_color;
   font-weight: 600;
-  font-size: 13px;
+  font-size: 0.93em;
   min-height: 24px;
 }
 .link-button:hover { text-decoration: underline; }
@@ -214,7 +214,7 @@ button.suggested-action { font-weight: 600; }
   border: 1.5px dashed @hairline_strong;
   background: none;
   font-weight: 600;
-  font-size: 13px;
+  font-size: 0.93em;
 }
 .dashed-button.quiet { color: @text_dim; font-weight: normal; }
 .danger-soft {
@@ -223,7 +223,7 @@ button.suggested-action { font-weight: 600; }
   background-color: @danger_bg;
   color: @danger;
   font-weight: 600;
-  font-size: 13px;
+  font-size: 0.93em;
 }
 .danger-soft:hover { background-color: alpha(@danger, 0.16); }
 .danger-soft.unpair { min-height: 34px; padding: 0 16px; }
@@ -273,7 +273,7 @@ button.suggested-action { font-weight: 600; }
   border-radius: 20px;
   background-color: @surface_2;
 }
-.round-caption { font-size: 12px; font-weight: 600; color: @text_dim; }
+.round-caption { font-size: 0.86em; font-weight: 600; color: @text_dim; }
 .round-action:disabled { opacity: 0.45; }
 .round-action.on .round-icon { background-color: @coral; color: white; }
 .round-action.primary .round-icon { background-color: @accent_bg_color; color: @accent_fg_color; }
@@ -352,16 +352,16 @@ banner.dl-banner-host > revealer > widget button:focus-visible { outline: 2px so
   box-shadow: none;
 }
 .term-strip:hover { background-color: mix(@terminal_bg, white, 0.06); }
-.strip-title { font-size: 13px; color: @terminal_fg; }
-.strip-line { font-size: 12px; color: @terminal_dim; }
-.strip-phone, .tile-phone { font-size: 12px; color: @terminal_coral; }
+.strip-title { font-size: 0.93em; color: @terminal_fg; }
+.strip-line { font-size: 0.86em; color: @terminal_dim; }
+.strip-phone, .tile-phone { font-size: 0.86em; color: @terminal_coral; }
 .clip-box {
   min-height: 44px;
   padding: 0 14px;
   border-radius: 10px;
   background-color: @surface_2;
   box-shadow: none;
-  font-size: 12.5px;
+  font-size: 0.89em;
 }
 .clip-box > label { font-weight: normal; }
 .clip-box.off { opacity: 0.6; }
@@ -387,9 +387,9 @@ progressbar.thin > trough { background-color: @surface_2; }
 }
 .terminal-tile:hover { background-color: mix(@terminal_bg, white, 0.04); }
 .terminal-tile.attached { box-shadow: 0 0 0 1.5px alpha(@terminal_coral, 0.7); }
-.tile-title { font-size: 14px; color: @terminal_fg; font-weight: normal; }
-.tile-meta { font-size: 12px; color: @terminal_dim; font-weight: normal; }
-.tile-lines { font-size: 12px; color: @terminal_lines; font-weight: normal; }
+.tile-title { font-size: 1em; color: @terminal_fg; font-weight: normal; }
+.tile-meta { font-size: 0.86em; color: @terminal_dim; font-weight: normal; }
+.tile-lines { font-size: 0.86em; color: @terminal_lines; font-weight: normal; }
 .tile-foot {
   padding-top: 8px;
   border-top: 1px solid alpha(white, 0.07);
@@ -435,20 +435,20 @@ progressbar.thin > trough { background-color: @surface_2; }
   border-radius: 7px;
   background-color: alpha(white, 0.07);
   color: @terminal_fg;
-  font-size: 12px;
+  font-size: 0.86em;
   font-weight: 600;
 }
-.term-detail-title { font-size: 13px; font-weight: 600; color: @terminal_fg; }
+.term-detail-title { font-size: 0.93em; font-weight: 600; color: @terminal_fg; }
 .coral-pill {
   padding: 4px 10px;
   border-radius: 999px;
   background-color: alpha(@terminal_coral, 0.12);
   color: @terminal_coral;
-  font-size: 12px;
+  font-size: 0.86em;
 }
 .term-detail-lines {
   padding: 16px 22px;
-  font-size: 13px;
+  font-size: 0.93em;
   color: @terminal_fg;
 }
 .detail-side {
@@ -456,7 +456,7 @@ progressbar.thin > trough { background-color: @surface_2; }
   background-color: @sidebar_bg_color;
   box-shadow: inset 1px 0 @hairline;
 }
-.side-heading { font-size: 12px; font-weight: 600; color: @text_faint; margin-left: 4px; }
+.side-heading { font-size: 0.86em; font-weight: 600; color: @text_faint; margin-left: 4px; }
 .compact-list { border-radius: 12px; }
 .compact-list > row:first-child { border-top-left-radius: 12px; border-top-right-radius: 12px; }
 .compact-list > row:last-child { border-bottom-left-radius: 12px; border-bottom-right-radius: 12px; }
@@ -503,10 +503,10 @@ button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.0
 .file-preview-clip { border-radius: 14px 14px 0 0; }
 .file-preview { background-color: @surface_2; }
 .file-card-words { padding: 10px 12px 12px 12px; }
-.file-name { font-weight: 600; font-size: 13px; }
+.file-name { font-weight: 600; font-size: 0.93em; }
 .type-label { font-weight: 700; letter-spacing: 0.06em; color: @text_dim; }
 .file-card.missing .file-name { color: @text_dim; }
-.remove-button { min-height: 28px; font-size: 12px; font-weight: 600; }
+.remove-button { min-height: 28px; font-size: 0.86em; font-weight: 600; }
 /* Loading: a soft pulse where the thumbnail will be. */
 .skeleton {
   background-color: alpha(currentColor, 0.08);
@@ -531,7 +531,7 @@ button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.0
   border-radius: 6px;
   background-color: rgba(0, 0, 0, 0.6);
   color: white;
-  font-size: 12px;
+  font-size: 0.86em;
   font-weight: 600;
 }
 
@@ -645,8 +645,8 @@ button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.0
   color: @accent_color;
   -gtk-icon-size: 30px;
 }
-.bucket-title { font-weight: 700; font-size: 18px; }
-.bucket-heading { font-weight: 800; font-size: 22px; letter-spacing: -0.01em; }
+.bucket-title { font-weight: 700; font-size: 1.29em; }
+.bucket-heading { font-weight: 800; font-size: 1.57em; letter-spacing: -0.01em; }
 .bucket-drop {
   border-radius: 20px;
   background-color: alpha(@accent_color, 0.035);
