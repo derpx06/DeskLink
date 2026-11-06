@@ -25,6 +25,7 @@ use gtk::{gdk, gio, glib};
 use serde::{Deserialize, Serialize};
 
 use crate::device_links::eis::{self, Captured};
+use crate::device_links::glide_consent::{Consent, Outcome, Step, Why};
 use crate::device_links::limits::{log_limited, Buckets};
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_MOUSEPAD_REQUEST,
@@ -769,12 +770,18 @@ pub(crate) struct Status {
     pub(crate) gliding: Option<String>,
     /// Why glide is not working, in plain words.
     pub(crate) problem: Option<String>,
+    /// The desktop's "Capture Input" dialog is up and waiting for the person.
+    pub(crate) asking: bool,
+    /// Glide is waiting instead of asking: the window offers "Ask again".
+    pub(crate) can_ask_again: bool,
 }
 
 static STATUS: Mutex<Status> = Mutex::new(Status {
     availability: Availability::Checking,
     gliding: None,
     problem: None,
+    asking: false,
+    can_ask_again: false,
 });
 
 pub(crate) fn status() -> Status {
@@ -785,6 +792,8 @@ pub(crate) fn status() -> Status {
             availability: Availability::Unavailable("Glide stopped working"),
             gliding: None,
             problem: None,
+            asking: false,
+            can_ask_again: false,
         })
 }
 
@@ -820,6 +829,15 @@ enum Command {
 fn queue() -> &'static OnceLock<SyncSender<Command>> {
     static QUEUE_SENDER: OnceLock<SyncSender<Command>> = OnceLock::new();
     &QUEUE_SENDER
+}
+
+/// Set by the window's "Ask again": taken by the next check.
+static ASK_AGAIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The person asks Glide to request the desktop's permission again, ending
+/// any wait after a Cancel, an unanswered dialog or a closed session.
+pub(crate) fn ask_again() {
+    ASK_AGAIN.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Starts the worker (once, at daemon start).
@@ -1329,7 +1347,7 @@ fn check_availability(connection: &gio::DBusConnection) -> Availability {
 /// Plain words for a portal failure.
 fn plain(error: &str) -> String {
     if error.contains("cancelled") || error.contains("denied") {
-        "Glide was not allowed. Turn it off and on again to ask again.".to_string()
+        Why::Declined.words().to_string()
     } else if error.starts_with("Input capture") || error.contains("portal") {
         "This desktop's input capture did not answer".to_string()
     } else {
@@ -1360,6 +1378,18 @@ fn inbound_silence(device: &str) -> Option<Duration> {
         return None;
     }
     crate::device_links::desk_features::inbound_silence(device)
+}
+
+/// Whether the person is at the computer: the session is not locked and has
+/// not gone idle. Unknown counts as here (a desktop without logind still glides).
+fn person_is_here(device: &str) -> bool {
+    #[cfg(debug_assertions)]
+    if test_device(device) {
+        return true;
+    }
+    let _ = device;
+    crate::device_links::logind::locked() != Some(true)
+        && crate::device_links::logind::idle_hint() != Some(true)
 }
 
 /// The barrier is armed only for a phone whose link is ready, that is not
@@ -1497,14 +1527,15 @@ fn react(event: Event, glide: Option<&mut Glide>) -> (Vec<Out>, After) {
             if let Some(glide) = glide {
                 outs = glide.deactivated();
             }
-            After::Close("The desktop stopped glide. Turn it off and on again to restart it.")
+            After::Close(Why::Closed.words())
         }
         Event::ReaderClosed => {
             if let Some(glide) = glide {
                 outs = glide.take_back();
             }
             After::Close(
-                "Glide lost its connection to the desktop. Turn it off and on again to restart it.",
+                "Glide lost its connection to the desktop. DeskLink tries again in a few \
+                 minutes, or ask now.",
             )
         }
     };
@@ -1614,6 +1645,10 @@ struct State {
     /// A refusal's back-off and whether the person was told, kept across
     /// re-armed sessions: (until, told).
     refusal: (Option<Instant>, bool),
+    /// The window shows the wait (`problem`, "Ask again").
+    held_shown: bool,
+    /// When the portal may be asked for a session (once per run).
+    consent: Consent,
 }
 
 /// What a failed arming leads to: the desktop may be busy for a moment (a
@@ -1702,6 +1737,8 @@ fn worker(context: &glib::MainContext, commands: &Receiver<Command>) {
         arm_failures: 0,
         retry_at: None,
         refusal: (None, false),
+        consent: Consent::new(),
+        held_shown: false,
     };
     // A panic must not leave the pointer captured, nor the top bar saying
     // glide is on: release, then say glide stopped.
@@ -1826,10 +1863,12 @@ fn run(
                         closing.disable();
                     }
                     state.glide = None;
-                    state.refused = true;
+                    // Asked for again after a wait, never at once.
+                    state.consent.closed(Instant::now());
                     set_status(|status| {
                         status.gliding = None;
                         status.problem = Some(problem.to_string());
+                        status.can_ask_again = true;
                     });
                 }
             }
@@ -1866,6 +1905,19 @@ fn check(
     outs: &mut Vec<Out>,
 ) {
     let setting = crate::device_links::config::app_settings().glide;
+    let asked_again = ASK_AGAIN.swap(false, std::sync::atomic::Ordering::AcqRel);
+    if asked_again && setting == state.current {
+        // The person ended the wait; nothing else changed.
+        state.consent.person_acts();
+        state.refused = false;
+        state.arm_failures = 0;
+        state.retry_at = None;
+        state.held_shown = false;
+        set_status(|status| {
+            status.problem = None;
+            status.can_ask_again = false;
+        });
+    }
     if setting != state.current {
         // Done now, for the phone it was set for, while the session that
         // captured is still open.
@@ -1881,11 +1933,9 @@ fn check(
             back,
             state.portal.as_mut(),
         );
-        // Another phone or off: a new session (and consent) for it.
-        if setting.as_ref().map(|s| &s.device) != state.current.as_ref().map(|s| &s.device) {
-            state.portal = None;
-            state.glide = None;
-        }
+        // The session (and the consent behind it) belongs to this run, not
+        // to a phone or a setting: switching Glide off and on, or to another
+        // phone, only moves the barrier.
         if let Some(portal) = state.portal.as_mut() {
             // A new edge: barriers are replaced on a disabled session.
             portal.disable();
@@ -1897,9 +1947,13 @@ fn check(
         state.refused = false;
         state.arm_failures = 0;
         state.retry_at = None;
+        // Switching Glide is the person acting: a wait after a Cancel ends.
+        state.consent.person_acts();
+        state.held_shown = false;
         set_status(|status| {
             status.problem = None;
             status.gliding = None;
+            status.can_ask_again = false;
         });
     }
     let gliding = state
@@ -1933,14 +1987,63 @@ fn check(
         .as_ref()
         .is_some_and(|setting| allows_glide(&setting.device));
     let want = wants_barrier(state.refused, silent, is_ready, allowed);
-    if want && state.portal.is_none() {
-        match Portal::open(context, connection) {
-            Ok(opened) => state.portal = Some(opened),
-            Err(error) => {
-                log_limited("open", &error);
-                state.refused = true;
-                set_status(|status| status.problem = Some(plain(&error)));
+    if state.portal.is_none() {
+        // The one place a session is created, and so the one place the
+        // desktop's dialog can come from.
+        let ready = want && state.current.is_some();
+        let device = state.current.as_ref().map(|setting| setting.device.clone());
+        let now = Instant::now();
+        let step = state
+            .consent
+            .step(now, ready, || device.as_deref().is_none_or(person_is_here));
+        if step == Step::Ask {
+            set_status(|status| {
+                status.asking = true;
+                status.problem = None;
+                status.can_ask_again = false;
+            });
+            // The notice is posted by the window's tick; the dialog follows.
+            crate::device_links::daemon::state::nudge_tickers();
+            let opened = Portal::open(context, connection);
+            set_status(|status| status.asking = false);
+            match opened {
+                Ok(opened) => {
+                    state.consent.answered(Instant::now(), Outcome::Allowed);
+                    state.portal = Some(opened);
+                    state.held_shown = false;
+                }
+                Err(error) => {
+                    log_limited("open", &error);
+                    state
+                        .consent
+                        .answered(Instant::now(), Outcome::of_error(&error));
+                    let words = match state.consent.held() {
+                        Some(Why::Declined) => Why::Declined.words().to_string(),
+                        _ => plain(&error),
+                    };
+                    state.held_shown = true;
+                    set_status(|status| {
+                        status.problem = Some(words);
+                        status.can_ask_again = true;
+                    });
+                }
             }
+            crate::device_links::daemon::state::nudge_tickers();
+        } else if let Some(why) = state.consent.held() {
+            if !state.held_shown && state.current.is_some() {
+                state.held_shown = true;
+                set_status(|status| {
+                    status.problem = Some(why.words().to_string());
+                    status.can_ask_again = true;
+                });
+            }
+        } else if state.held_shown {
+            // The wait ran out on its own.
+            state.held_shown = false;
+            set_status(|status| {
+                status.problem = None;
+                status.can_ask_again = false;
+            });
         }
     }
     if let (Some(open), Some(setting)) = (state.portal.as_mut(), state.current.as_ref()) {
@@ -1987,10 +2090,6 @@ fn check(
             perform(Some(setting.device.as_str()), back, Some(&mut *open));
             open.disable();
         }
-    }
-    if state.current.is_none() {
-        state.portal = None;
-        state.glide = None;
     }
 }
 
@@ -2402,6 +2501,8 @@ mod tests {
             arm_failures: 0,
             retry_at: None,
             refusal: (None, false),
+            consent: Consent::new(),
+            held_shown: false,
         };
         set_status(|status| status.gliding = Some("e2e-release-all".into()));
         state.release_all();
@@ -2546,6 +2647,8 @@ mod tests {
             arm_failures: 0,
             retry_at: None,
             refusal: (None, false),
+            consent: Consent::new(),
+            held_shown: false,
         };
         assert_eq!(nap(&state), CHECK_EVERY);
         let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());

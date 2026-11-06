@@ -72,7 +72,13 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     // Glide's availability and problem; its switch and edge update in place.
     let glide_status = crate::device_links::glide::status();
     let key = serde_json::to_string(&(
-        format!("{:?}{:?}", glide_status.availability, glide_status.problem),
+        format!(
+            "{:?}{:?}{}{}",
+            glide_status.availability,
+            glide_status.problem,
+            glide_status.asking,
+            glide_status.can_ask_again
+        ),
         // The phone's "allowed" report changes the glide row's words.
         crate::device_links::glide::phone_allows(&device.id),
         &device.id,
@@ -1979,7 +1985,8 @@ fn glide_explained(phone: &str, allowed: Option<bool>, computer: &str) -> String
     if allowed == Some(true) {
         format!(
             "Move the pointer past the edge of this screen to use {phone} with this mouse and \
-             keyboard. Esc+Super brings it back."
+             keyboard. Esc+Super brings it back. GNOME asks you to allow this once each time \
+             DeskLink starts; it cannot remember the answer."
         )
     } else {
         format!("Turn on “Let {computer} control this phone” on the phone first.")
@@ -2128,12 +2135,31 @@ fn add_glide_rows(
         });
         daemon.send(DaemonCommand::SetGlide(id.clone(), edge));
     });
-    if let Some(problem) = status.problem.as_deref() {
+    if status.asking {
         let row = adw::ActionRow::builder()
-            .title("Glide is not working")
+            .title("Waiting for your OK")
+            .subtitle("Approve “Capture Input” in the window that just opened.")
+            .build();
+        row.add_prefix(&icon_square("dialog-information-symbolic", 30, "row-icon"));
+        group.add(&row);
+    } else if let Some(problem) = status.problem.as_deref() {
+        let row = adw::ActionRow::builder()
+            .title(if status.can_ask_again {
+                "Glide is waiting for your OK"
+            } else {
+                "Glide is not working"
+            })
             .subtitle(esc(problem))
             .build();
         row.add_prefix(&icon_square("dialog-warning-symbolic", 30, "row-icon"));
+        if status.can_ask_again {
+            let ask = gtk::Button::builder()
+                .label("Ask Again")
+                .valign(gtk::Align::Center)
+                .build();
+            ask.connect_clicked(|_| crate::device_links::glide::ask_again());
+            row.add_suffix(&ask);
+        }
         group.add(&row);
     }
 }
@@ -2300,6 +2326,8 @@ mod tests {
                 availability: crate::device_links::glide::Availability::Unavailable("test"),
                 gliding: None,
                 problem: None,
+                asking: false,
+                can_ask_again: false,
             };
             let (daemon, _commands) = DaemonHandle::detached();
             let groups = groups(&daemon, &AppSettings::default(), &device, &status, false);
@@ -2384,6 +2412,8 @@ mod tests {
             availability: crate::device_links::glide::Availability::Unavailable("test"),
             gliding: None,
             problem: None,
+            asking: false,
+            can_ask_again: false,
         };
         let (daemon, _commands) = DaemonHandle::detached();
         let view = build_view(

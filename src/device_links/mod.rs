@@ -15,6 +15,7 @@ pub mod features;
 pub(crate) mod folders;
 pub(crate) mod gallery;
 pub(crate) mod glide;
+pub(crate) mod glide_consent;
 pub(crate) mod lan_scope;
 pub(crate) mod limits;
 pub(crate) mod logind;

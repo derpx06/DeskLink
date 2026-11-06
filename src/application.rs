@@ -250,6 +250,11 @@ fn approval_changes(
     (fresh, gone)
 }
 
+/// The phone Glide's "Capture Input" dialog is up for, if it is.
+fn glide_waiting(asking: bool, phone: Option<String>) -> Vec<String> {
+    phone.filter(|_| asking).into_iter().collect()
+}
+
 /// The Bucket questions (a phone asked, the desk has not turned it on) not
 /// yet told about: each is returned once. `told` forgets a question once it is
 /// gone, so a phone that asks again later is told again.
@@ -627,6 +632,7 @@ impl DesklinkApplication {
         let mut notified = std::collections::HashSet::<String>::new();
         let mut asked = std::collections::HashSet::<String>::new();
         let mut approving = std::collections::HashSet::<String>::new();
+        let mut glide_asking = std::collections::HashSet::<String>::new();
         let mut notices = crate::transfer_notice::Notices::default();
         crate::ticker::every_tick(move || {
             crate::guard("app tick", glib::ControlFlow::Continue, || {
@@ -716,6 +722,35 @@ impl DesklinkApplication {
                 }
                 for device in to_withdraw {
                     app.withdraw_notification(&format!("screen-approve-{device}"));
+                }
+                // Glide is about to put GNOME's "Capture Input" dialog up: say
+                // so, and take the notice down the moment it is answered.
+                let glide = crate::device_links::glide::status();
+                let (to_post, to_withdraw) = approval_changes(
+                    &glide_waiting(
+                        glide.asking,
+                        crate::device_links::config::app_settings()
+                            .glide
+                            .map(|setting| setting.device),
+                    ),
+                    &mut glide_asking,
+                );
+                for device in to_post {
+                    let phone = daemon
+                        .devices()
+                        .into_iter()
+                        .find(|known| known.id == device)
+                        .map_or_else(|| "your phone".to_string(), |known| known.name);
+                    let notification = gio::Notification::new(&format!(
+                        "DeskLink is asking to move your mouse to {phone} (Glide)"
+                    ));
+                    notification.set_body(Some("Approve it in the window that just opened."));
+                    notification.set_priority(gio::NotificationPriority::High);
+                    notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+                    app.send_notification(Some(&format!("glide-ask-{device}")), &notification);
+                }
+                for device in to_withdraw {
+                    app.withdraw_notification(&format!("glide-ask-{device}"));
                 }
                 {
                     let devices = daemon.devices();
@@ -1863,6 +1898,33 @@ mod approval_notice_tests {
             (vec![], vec!["phone-a".to_string()])
         );
         assert_eq!(approval_changes(&[], &mut shown), (vec![], vec![]));
+    }
+
+    #[test]
+    fn the_glide_notice_lives_exactly_as_long_as_the_dialog() {
+        use super::glide_waiting;
+        let mut shown = HashSet::new();
+        let phone = || Some("phone-a".to_string());
+        // Glide on but no dialog (the usual case): nothing is posted.
+        assert_eq!(
+            approval_changes(&glide_waiting(false, phone()), &mut shown),
+            (vec![], vec![])
+        );
+        // The dialog goes up: posted once, however many ticks it takes.
+        assert_eq!(
+            approval_changes(&glide_waiting(true, phone()), &mut shown),
+            (vec!["phone-a".to_string()], vec![])
+        );
+        assert_eq!(
+            approval_changes(&glide_waiting(true, phone()), &mut shown),
+            (vec![], vec![])
+        );
+        // Answered (or Glide switched off while it was up): withdrawn.
+        assert_eq!(
+            approval_changes(&glide_waiting(false, phone()), &mut shown),
+            (vec![], vec!["phone-a".to_string()])
+        );
+        assert!(glide_waiting(true, None).is_empty());
     }
 }
 
