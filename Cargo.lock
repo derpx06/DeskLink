@@ -321,6 +321,7 @@ dependencies = [
  "serde_json",
  "socket2",
  "tungstenite",
+ "unicode-normalization",
  "uuid",
  "vt100",
  "x11rb",

@@ -36,6 +36,8 @@ socket2 = { version = "0.6", features = ["all"] }
 # OpenSSL already linked for pairing.
 tungstenite = { version = "0.30", features = ["native-tls"] }
 uuid = { version = "1", features = ["v4"] }
+# Accent folding for the "Find anything" palette ("cafe" finds "Café"); already in the lock.
+unicode-normalization = "0.1"
 vt100 = "0.16"
 # X11 fallback for sharing the desktop where no ScreenCast portal exists.
 x11rb = { version = "0.13", features = ["xtest", "xfixes"] }

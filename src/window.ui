@@ -47,6 +47,16 @@
                             </accessibility>
                           </object>
                         </child>
+                        <child type="start">
+                          <object class="GtkButton">
+                            <property name="icon-name">desklink-search-symbolic</property>
+                            <property name="tooltip-text" translatable="yes">Find anything (Ctrl+K)</property>
+                            <property name="action-name">win.palette</property>
+                            <accessibility>
+                              <property name="label" translatable="yes">Find anything</property>
+                            </accessibility>
+                          </object>
+                        </child>
                         <child type="end">
                           <object class="GtkMenuButton">
                             <property name="primary">True</property>
@@ -94,6 +104,16 @@
                                         <property name="action-name">win.pair-new</property>
                                         <accessibility>
                                           <property name="label" translatable="yes">Pair another phone</property>
+                                        </accessibility>
+                                      </object>
+                                    </child>
+                                    <child type="start">
+                                      <object class="GtkButton">
+                                        <property name="icon-name">desklink-search-symbolic</property>
+                                        <property name="tooltip-text" translatable="yes">Find anything (Ctrl+K)</property>
+                                        <property name="action-name">win.palette</property>
+                                        <accessibility>
+                                          <property name="label" translatable="yes">Find anything</property>
                                         </accessibility>
                                       </object>
                                     </child>
@@ -172,7 +192,19 @@
                             <property name="child">
                               <object class="AdwToolbarView">
                                 <child type="top">
-                                  <object class="AdwHeaderBar" id="content_header"/>
+                                  <object class="AdwHeaderBar" id="content_header">
+                                    <child type="end">
+                                      <object class="GtkButton" id="content_search">
+                                        <property name="icon-name">desklink-search-symbolic</property>
+                                        <property name="tooltip-text" translatable="yes">Find anything (Ctrl+K)</property>
+                                        <property name="action-name">win.palette</property>
+                                        <property name="visible">False</property>
+                                        <accessibility>
+                                          <property name="label" translatable="yes">Find anything</property>
+                                        </accessibility>
+                                      </object>
+                                    </child>
+                                  </object>
                                 </child>
                                 <child type="top">
                                   <object class="AdwBanner" id="error_banner">

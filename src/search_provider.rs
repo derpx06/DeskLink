@@ -255,6 +255,39 @@ thread_local! {
         const { std::cell::RefCell::new((None, Vec::new(), Vec::new())) };
 }
 
+/// Paired phones' contacts, connected or not: the cache is local. Built
+/// again only when the contacts or the phones changed, and without photos:
+/// a search runs several times per keystroke on the main loop. Also read by
+/// the window's "Find anything".
+pub(crate) fn paired_contacts(
+    app: &DesklinkApplication,
+) -> Vec<(String, String, crate::device_links::contacts::Contact)> {
+    let phones_now: Vec<(String, String)> = app
+        .daemon_handle()
+        .map(|daemon| daemon.devices())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|device| device.trusted)
+        .map(|device| (device.id, device.name))
+        .collect();
+    let generation = crate::device_links::contacts::generation();
+    CONTACTS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.0 != Some(generation) || cache.1 != phones_now {
+            let list: Vec<_> = phones_now
+                .iter()
+                .flat_map(|(id, name)| {
+                    crate::device_links::contacts::list_for_search(id)
+                        .into_iter()
+                        .map(move |contact| (id.clone(), name.clone(), contact))
+                })
+                .collect();
+            *cache = (Some(generation), phones_now.clone(), list);
+        }
+        cache.2.clone()
+    })
+}
+
 pub(crate) fn current(app: &DesklinkApplication) -> Vec<Candidate> {
     let terminals = crate::terminal_previews::sessions();
     let transfers = crate::device_links::transfer_log::recent();
@@ -269,33 +302,7 @@ pub(crate) fn current(app: &DesklinkApplication) -> Vec<Candidate> {
                 .collect()
         })
         .unwrap_or_default();
-    // Paired phones' contacts, connected or not: the cache is local. Built
-    // again only when the contacts or the phones changed, and without photos:
-    // a search runs several times per keystroke on the main loop.
-    let phones_now: Vec<(String, String)> = app
-        .daemon_handle()
-        .map(|daemon| daemon.devices())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|device| device.trusted)
-        .map(|device| (device.id, device.name))
-        .collect();
-    let generation = crate::device_links::contacts::generation();
-    let contacts = CONTACTS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if cache.0 != Some(generation) || cache.1 != phones_now {
-            let list: Vec<_> = phones_now
-                .iter()
-                .flat_map(|(id, name)| {
-                    crate::device_links::contacts::list_for_search(id)
-                        .into_iter()
-                        .map(move |contact| (id.clone(), name.clone(), contact))
-                })
-                .collect();
-            *cache = (Some(generation), phones_now.clone(), list);
-        }
-        cache.2.clone()
-    });
+    let contacts = paired_contacts(app);
     candidates(&Sources {
         terminals: &terminals,
         transfers: &transfers,

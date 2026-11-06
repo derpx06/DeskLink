@@ -773,7 +773,7 @@ pub(super) fn add_wrapped(row: &gtk::FlowBox, widget: &impl IsA<gtk::Widget>) {
 }
 
 /// "Send a link": a URL to open on the phone.
-fn show_send_link_dialog(
+pub(super) fn show_send_link_dialog(
     daemon: DaemonHandle,
     device_id: String,
     device_name: &str,

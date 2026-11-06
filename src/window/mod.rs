@@ -41,6 +41,8 @@ pub(crate) mod notifications;
 mod overview;
 pub(crate) use overview::link_to_send;
 mod pairing;
+mod palette;
+mod palette_model;
 mod pdf_view;
 pub(crate) mod prefs;
 mod sidebar;
@@ -115,6 +117,11 @@ pub(crate) const PAGE_ACCELS: [(&str, &str); 6] = [
     ("contacts", "<control>6"),
 ];
 
+/// Ctrl+K opens "Find anything" (`win.palette`); Ctrl+F does too, off the
+/// Terminals page and outside a text field. Shown in the shortcuts dialog, on
+/// the search buttons and next to nothing else.
+pub(crate) const PALETTE_ACCEL: &str = "<control>k";
+
 /// How many of [`PAGES`] are in the sidebar's main list; Settings is the
 /// footer.
 const MAIN_PAGES: usize = 6;
@@ -149,6 +156,8 @@ mod imp {
         pub content_page: TemplateChild<adw::NavigationPage>,
         #[template_child]
         pub drop_hint: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub content_search: TemplateChild<gtk::Button>,
         #[template_child]
         pub device_card: TemplateChild<gtk::MenuButton>,
         #[template_child]
@@ -276,6 +285,12 @@ mod imp {
                 }
             }
 
+            // The sidebar has the search button; with the sidebar folded away
+            // the page's own header does.
+            self.split_view
+                .bind_property("collapsed", &*self.content_search, "visible")
+                .sync_create()
+                .build();
             self.sidebar.replace(Some(sidebar::Sidebar::new(&obj)));
             sidebar::install_window_drop(&obj);
             // The tile row follows the window as it is resized.
@@ -517,15 +532,26 @@ mod imp {
                         }
                     })
                     .build(),
-                // Ctrl+F: the terminal search.
+                // Ctrl+F: the terminal search on the Terminals page; anywhere
+                // else (and not while typing, where Ctrl+F is the text's)
+                // "Find anything".
                 gio::ActionEntry::builder("toggle-search")
                     .activate(|window: &super::DesklinkWindow, _, _| {
-                        if window.show_page("terminals") {
+                        if window.imp().page.borrow().as_str() == "terminals"
+                            && window.imp().main_stack.visible_child_name().as_deref()
+                                == Some("devices")
+                        {
                             if let Some(page) = window.imp().terminals.borrow().as_ref() {
                                 page.focus_search();
                             }
+                        } else if !palette::typing_in(window) {
+                            palette::toggle(window, "");
                         }
                     })
+                    .build(),
+                // Ctrl+K: "Find anything".
+                gio::ActionEntry::builder("palette")
+                    .activate(|window: &super::DesklinkWindow, _, _| palette::toggle(window, ""))
                     .build(),
             ]);
 
@@ -612,6 +638,33 @@ impl DesklinkWindow {
         self.known_devices(&daemon)
             .iter()
             .any(|device| device.id == id && device.trusted)
+    }
+
+    /// The paired phones, with the made-up ones of a debug build.
+    fn paired_devices(&self) -> Vec<DeviceView> {
+        #[allow(unused_mut)]
+        let mut devices = self
+            .daemon()
+            .map(|daemon| daemon.devices())
+            .unwrap_or_default();
+        #[cfg(debug_assertions)]
+        devices.extend(self.imp().fake_devices.borrow().iter().cloned());
+        devices.retain(|device| device.trusted);
+        devices
+    }
+
+    /// Opens the note `id` in the notes list (from "Find anything").
+    fn open_note(&self, id: &str) {
+        self.show_page("notes");
+        let imp = self.imp();
+        if imp.main_stack.visible_child_name().as_deref() == Some("solo") {
+            if let Some(solo) = imp.solo.borrow().as_ref() {
+                solo.notes.open_id(id);
+            }
+        } else if let Some(page) = imp.notes.borrow().as_ref() {
+            page.show_tab("notes");
+            page.notes.open_id(id);
+        }
     }
 
     /// Shows one of `device_id`'s contacts (from GNOME search).
@@ -3272,6 +3325,9 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             _ => adw::ColorScheme::Default,
         }),
         "open-pair" => win.show_discovery_dialog(true),
+        // "palette [QUERY]": "Find anything", with the words typed
+        // (underscores for spaces); again closes it.
+        "palette" => palette::toggle(win, &format!("{id} {arg}").trim().replace('_', " ")),
         "system-check" => system_check::show_dialog(win),
         // "fake-error TEXT": a daemon error, as the banner shows it.
         "fake-error" => win.report_error(&format!("{id} {arg}").trim().replace('_', " "), false),
@@ -4010,6 +4066,50 @@ mod tests {
         }
         // Sentence case in the dialog, as everywhere.
         assert!(!dialog.contains("Pair New Device") && !dialog.contains("Close Window"));
+    }
+
+    /// Ctrl+K is bound, listed in the shortcuts dialog (both forms of it) and
+    /// named on every search button, and no other action holds the key.
+    #[test]
+    fn find_anything_has_one_key_and_every_list_of_keys_says_so() {
+        let dialog = include_str!("../shortcuts-dialog.ui");
+        let item = dialog
+            .split("<object class=\"AdwShortcutsItem\">")
+            .find(|item| item.contains("win.palette"))
+            .expect("the dialog lists win.palette");
+        assert!(item.contains("Find anything"), "{item}");
+        // Libadwaita's dialog reads the accelerator from the application's
+        // binding; the plain list of older libadwaita is typed out.
+        let application = include_str!("../application.rs");
+        assert!(application.contains(&format!(
+            "set_accels_for_action(\"win.palette\", &[crate::window::PALETTE_ACCEL])"
+        )));
+        assert!(application.contains("(\"Find anything\", \"Ctrl+K\")"));
+        assert_eq!(PALETTE_ACCEL, "<control>k");
+        let ui = include_str!("../window.ui");
+        assert_eq!(
+            ui.matches("Find anything (Ctrl+K)").count(),
+            3,
+            "welcome, sidebar, page"
+        );
+        assert_eq!(
+            ui.matches("<property name=\"action-name\">win.palette</property>")
+                .count(),
+            3
+        );
+        // Ctrl+K is taken by nothing else the window binds.
+        for (_, accel) in PAGE_ACCELS {
+            assert_ne!(accel, PALETTE_ACCEL);
+        }
+        for other in [
+            "<control>f",
+            "<control>n",
+            "<control>o",
+            "<control>h",
+            "<control>w",
+        ] {
+            assert_ne!(other, PALETTE_ACCEL);
+        }
     }
 
     #[test]
