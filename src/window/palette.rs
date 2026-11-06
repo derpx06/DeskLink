@@ -310,7 +310,7 @@ impl Palette {
 
     /// The focus is in the search box (not on a row).
     fn in_box(&self) -> bool {
-        self.dialog.focus().map_or(true, |focus| {
+        self.dialog.focus().is_none_or(|focus| {
             focus == *self.entry.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&self.entry)
         })
     }
@@ -820,8 +820,6 @@ mod tests {
             // done. (Keyboard shortcuts: nothing in this test app answers it.)
             palette.entry.set_text("keyboard sh");
             assert_eq!(palette.rows(), 1);
-            let focus_before = window.imp().nav_list.clone();
-            focus_before.grab_focus();
             palette.entry.emit_by_name::<()>("activate", &[]);
             pump();
             assert!(
@@ -829,15 +827,32 @@ mod tests {
                 "closed after a choice"
             );
 
-            // Ctrl+K again closes it; the slot is empty once it has gone.
+            // The focus goes back to where it was; Ctrl+K again closes it.
+            let focus_before = window.imp().nav_list.clone();
+            focus_before.grab_focus();
+            let focus = || gtk::prelude::GtkWindowExt::focus(&window);
+            assert_eq!(
+                focus().as_ref(),
+                Some(focus_before.upcast_ref::<gtk::Widget>()),
+                "the list can take the focus"
+            );
             toggle(&window, "");
             pump();
             assert!(OPEN.with(|slot| slot.borrow().is_some()));
-            // And again.
+            assert_ne!(
+                focus().as_ref(),
+                Some(focus_before.upcast_ref::<gtk::Widget>()),
+                "the palette has the focus while open"
+            );
             toggle(&window, "");
             pump();
             assert!(OPEN.with(|slot| slot.borrow().is_none()));
             assert!(window.visible_dialog().is_none());
+            assert_eq!(
+                focus().as_ref(),
+                Some(focus_before.upcast_ref::<gtk::Widget>()),
+                "the focus is given back"
+            );
             drop(before);
         });
     }

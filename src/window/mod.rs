@@ -4081,9 +4081,8 @@ mod tests {
         // Libadwaita's dialog reads the accelerator from the application's
         // binding; the plain list of older libadwaita is typed out.
         let application = include_str!("../application.rs");
-        assert!(application.contains(&format!(
-            "set_accels_for_action(\"win.palette\", &[crate::window::PALETTE_ACCEL])"
-        )));
+        assert!(application
+            .contains("set_accels_for_action(\"win.palette\", &[crate::window::PALETTE_ACCEL])"));
         assert!(application.contains("(\"Find anything\", \"Ctrl+K\")"));
         assert_eq!(PALETTE_ACCEL, "<control>k");
         let ui = include_str!("../window.ui");
