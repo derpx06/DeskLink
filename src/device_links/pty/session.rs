@@ -306,7 +306,7 @@ impl PtySession {
             desk_size: Mutex::new(None),
             started: std::time::SystemTime::now(),
         };
-        spawn_reader(reader, output, head, eof);
+        spawn_reader(reader, output, head, eof, session.input.clone());
         Ok(session)
     }
 
@@ -704,6 +704,56 @@ fn spawn_writer(mut writer: Box<dyn Write + Send>) -> SyncSender<Vec<u8>> {
     queue
 }
 
+/// `CSI ? 2026 $ p`: "do you support synchronized output?". Claude Code, neovim, helix and
+/// zellij ask it at start-up and draw each frame between `CSI ? 2026 h` and `l` only if told yes;
+/// asked of nothing that answers, they repaint in the open and a phone shows every half-erased
+/// frame as flicker. DeskLink answers it, once, whatever terminal (a desk window, a phone, none)
+/// is attached: every viewer either holds the frame (the phone does) or ignores the unknown mode.
+const SYNC_QUERY: &[u8] = b"\x1b[?2026$p";
+
+/// `CSI ? 2026 ; 2 $ y`: supported, currently reset.
+const SYNC_SUPPORTED_REPLY: &[u8] = b"\x1b[?2026;2$y";
+
+/// Takes [`SYNC_QUERY`] out of the output, so that exactly one party answers it: a desk window's
+/// terminal would answer too (or answer "unknown" first), and two replies are one stray keystroke
+/// sequence for the program. A query cut by the read boundary is held until the rest arrives.
+// ponytail: a query's head (at most 8 bytes) waits for the next read; a program that stops
+// writing mid-sequence delays those bytes until it writes again.
+#[derive(Default)]
+struct SyncQueryFilter {
+    held: Vec<u8>,
+}
+
+impl SyncQueryFilter {
+    /// The bytes to show, and how many queries were removed.
+    fn filter(&mut self, input: &[u8]) -> (Vec<u8>, usize) {
+        let mut data = std::mem::take(&mut self.held);
+        data.extend_from_slice(input);
+        let mut out = Vec::with_capacity(data.len());
+        let mut found = 0;
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] != 0x1b {
+                out.push(data[i]);
+                i += 1;
+                continue;
+            }
+            let rest = &data[i..];
+            if rest.starts_with(SYNC_QUERY) {
+                found += 1;
+                i += SYNC_QUERY.len();
+            } else if rest.len() < SYNC_QUERY.len() && SYNC_QUERY.starts_with(rest) {
+                self.held = rest.to_vec();
+                break;
+            } else {
+                out.push(0x1b);
+                i += 1;
+            }
+        }
+        (out, found)
+    }
+}
+
 /// Drains the PTY forever, feeding both the ring and the screen model.
 ///
 /// Deliberately a plain OS thread with a blocking read: this codebase has no
@@ -715,20 +765,29 @@ fn spawn_reader(
     output: Arc<Mutex<Output>>,
     head: Arc<AtomicU64>,
     eof: Arc<AtomicBool>,
+    replies: SyncSender<Vec<u8>>,
 ) {
     thread::spawn(move || {
         let mut buffer = [0u8; READ_CHUNK];
+        let mut queries = SyncQueryFilter::default();
         loop {
             match reader.read(&mut buffer) {
                 // `portable-pty` maps the slave-closed `EIO` to a clean EOF, so
                 // this is the normal end of a session, not an error.
                 Ok(0) => break,
                 Ok(count) => {
+                    let (bytes, asked) = queries.filter(&buffer[..count]);
+                    for _ in 0..asked {
+                        let _ = replies.try_send(SYNC_SUPPORTED_REPLY.to_vec());
+                    }
+                    if bytes.is_empty() {
+                        continue;
+                    }
                     let Ok(mut output) = output.lock() else {
                         break;
                     };
-                    output.parser.process(&buffer[..count]);
-                    output.ring.push(&buffer[..count]);
+                    output.parser.process(&bytes);
+                    output.ring.push(&bytes);
                     output.last_activity = Instant::now();
                     head.store(output.ring.head(), Ordering::Release);
                 }
@@ -1093,6 +1152,43 @@ mod tests {
         );
         let session = PtySession::spawn(None, 0, 0).expect("spawn shell");
         assert_eq!(session.size(), (MIN_DIMENSION, MIN_DIMENSION));
+    }
+
+    #[test]
+    fn the_sync_query_is_taken_out_and_counted_however_the_read_is_cut() {
+        let stream = b"ab\x1b[?2026$pcd\x1b[?25l\x1b[?2026$pef";
+        for cut in 0..=stream.len() {
+            let mut filter = SyncQueryFilter::default();
+            let (mut shown, mut asked) = filter.filter(&stream[..cut]);
+            let (rest, more) = filter.filter(&stream[cut..]);
+            shown.extend(rest);
+            asked += more;
+            assert_eq!(asked, 2, "cut at {cut}");
+            assert_eq!(shown, b"abcd\x1b[?25lef", "cut at {cut}");
+        }
+        // Other sequences, and a lone ESC, pass through untouched.
+        let mut filter = SyncQueryFilter::default();
+        let (shown, asked) = filter.filter(b"\x1b[?2026h\x1b[?2026l\x1b\x1b[1m\x1b[?2026$y");
+        assert_eq!(asked, 0);
+        assert_eq!(shown, b"\x1b[?2026h\x1b[?2026l\x1b\x1b[1m\x1b[?2026$y");
+    }
+
+    /// Claude Code asks `CSI ? 2026 $ p` at start-up and only wraps its frames in synchronized output
+    /// if something answers. Nothing did, so a phone showed every half-erased repaint.
+    #[test]
+    fn a_program_asking_for_synchronized_output_is_told_it_is_supported() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args([
+            "-c",
+            "stty raw -echo; printf 'ask:\\033[?2026$p:'; \
+             reply=$(dd bs=1 count=11 2>/dev/null | od -An -c | tr -d ' \\n'); printf 'reply=[%s]' \"$reply\"; sleep 5",
+        ]);
+        let session = PtySession::spawn(Some(command), 24, 80).expect("spawn sync probe");
+        assert!(wait_for_contents(&session, "reply=["), "the program got no answer");
+        let screen = session.output.lock().unwrap().parser.screen().contents();
+        assert!(screen.contains("reply=[033[?2026;2$y]"), "{screen}");
+        assert!(screen.contains("ask::"), "the query reached the screen: {screen}");
+        session.close();
     }
 
     #[test]
