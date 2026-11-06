@@ -1311,29 +1311,23 @@ mod tests {
     }
 
     /// A program that has not read its input for a while (the queue is full) still gets its answer
-    /// once it reads, and the reader is not blocked meanwhile.
+    /// once it reads, behind what was already queued, and the reader is not blocked meanwhile.
     #[test]
     fn the_reply_waits_for_a_full_input_queue_instead_of_being_lost() {
-        let mut command = CommandBuilder::new("/bin/sh");
-        command.args([
-            "-c",
-            "stty raw; sleep 1; printf 'ask:\\033[?2026$p:'; exec cat >/dev/null",
-        ]);
-        let session = PtySession::spawn(Some(command), 24, 80).expect("spawn sync probe");
-        thread::sleep(Duration::from_millis(200));
-        let mut full = false;
-        for _ in 0..20_000 {
-            if session.write_input(&[b'a'; 256]).is_err() {
-                full = true;
-                break;
-            }
-        }
-        assert!(full, "the input queue never filled");
+        let (queue, incoming) = sync_channel::<Vec<u8>>(1);
+        queue.send(b"typed".to_vec()).unwrap();
+        let waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Instant::now();
+        send_sync_reply(&queue, &waiting);
         assert!(
-            wait_for_bytes(&session, ECHOED_REPLY),
-            "the reply was dropped behind the full queue"
+            started.elapsed() < Duration::from_millis(500),
+            "the reader was blocked"
         );
-        session.close();
+        assert_eq!(incoming.recv().unwrap(), b"typed");
+        assert_eq!(
+            incoming.recv_timeout(Duration::from_secs(5)).unwrap(),
+            SYNC_SUPPORTED_REPLY
+        );
     }
 
     /// The head of a query held back at a read boundary is still output: after a moment when the
