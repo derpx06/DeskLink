@@ -655,6 +655,21 @@ impl Page {
         }
     }
 
+    /// Opens the note `id`, as if its row were chosen ("Find anything").
+    pub(super) fn open_id(&self, id: &str) {
+        self.update();
+        self.search.set_text("");
+        let mut index = 0;
+        while let Some(row) = self.list.row_at_index(index) {
+            if row.widget_name() == id {
+                self.list.select_row(Some(&row));
+                row.emit_activate();
+                return;
+            }
+            index += 1;
+        }
+    }
+
     /// Opens the `index`th note listed (debug e2e).
     #[cfg(debug_assertions)]
     pub(super) fn open_nth(&self, index: i32) {

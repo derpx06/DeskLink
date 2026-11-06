@@ -65,7 +65,15 @@
         </child>
         <child>
           <object class="AdwShortcutsItem">
+            <property name="title" translatable="yes" context="shortcut window">Find anything</property>
+            <property name="subtitle" translatable="yes" context="shortcut window">Actions, pages, phones, files, notes, settings</property>
+            <property name="action-name">win.palette</property>
+          </object>
+        </child>
+        <child>
+          <object class="AdwShortcutsItem">
             <property name="title" translatable="yes" context="shortcut window">Search terminals</property>
+            <property name="subtitle" translatable="yes" context="shortcut window">On other pages Ctrl+F finds anything</property>
             <property name="action-name">win.toggle-search</property>
           </object>
         </child>

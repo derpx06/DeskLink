@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- "Find anything" on the desk (Ctrl+K, the search buttons, Ctrl+F off the Terminals page): one search over
+  the actions of the selected phone (only what it takes and only while it is ready), the pages, the other
+  phones, shared terminals, recent files, notes, snippets, the clipboard history, contacts and the settings
+  subpages. Accent-insensitive, every word must match, best match first.
 - The GNOME top-bar menu is the complete remote for a paired phone: status chips, six quick
   actions, what is going on now and a section per area (send, insert, sound, notes,
   notifications, calls, terminals, screen, files, privacy) with the phone's switches.

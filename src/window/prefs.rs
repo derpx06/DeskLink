@@ -484,8 +484,31 @@ fn build_view(
 /// Opens Privacy & security (from "Terminal access is off for <phone>"): the
 /// next time Settings shows, or now when it is built.
 pub(super) fn show_privacy() {
+    show_group(7);
+}
+
+/// The subpages "Find anything" lists: those a phone has, or the computer-wide
+/// ones that exist with none (the settings dialog).
+pub(super) fn subpages(paired: bool) -> Vec<super::palette_model::SettingsPage> {
+    PAGES
+        .iter()
+        .filter(|(_, index, _, _)| paired || [0, 7, 8, 9].contains(index))
+        .map(
+            |(_, index, icon, summary)| super::palette_model::SettingsPage {
+                index: *index,
+                title: GROUPS[*index],
+                summary,
+                icon,
+            },
+        )
+        .collect()
+}
+
+/// Opens subpage `index` (an index into [`GROUPS`]) the next time Settings
+/// shows, or now when it is built.
+pub(super) fn show_group(index: usize) {
     QUERY.with(|slot| slot.borrow_mut().clear());
-    OPEN.with(|slot| slot.set(Some(7)));
+    OPEN.with(|slot| slot.set(Some(index)));
     if let Some(search) = SEARCH.with(|slot| slot.borrow().upgrade()) {
         if !search.text().is_empty() {
             search.set_text("");
@@ -495,7 +518,7 @@ pub(super) fn show_privacy() {
     if let Some(nav) = NAV.with(|slot| slot.borrow().upgrade()) {
         nav.set_animate_transitions(false);
         nav.pop_to_tag("list");
-        nav.push_by_tag(&tag(7));
+        nav.push_by_tag(&tag(index));
         nav.set_animate_transitions(true);
     }
 }

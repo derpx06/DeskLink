@@ -256,6 +256,26 @@
 .dl-empty-title { font-size: 1.13em; font-weight: 600; }
 .dl-empty-body { font-size: 0.93em; color: @dl_text_dim; }
 
+/* ── "Find anything" (window/palette.rs) ───────────────────────────────── */
+.dl-palette-head { padding: 12px 12px 8px; }
+.dl-palette { background: none; padding: 0 0 8px; }
+.dl-palette > row {
+  margin: 0 8px;
+  padding: 4px 12px;
+  border-radius: 12px;
+  background: none;
+}
+.dl-palette > row.dl-row { min-height: 52px; }
+.dl-palette > row:selected {
+  background-color: @dl_accent_container;
+  color: @dl_on_accent_container;
+}
+.dl-palette > row:selected label.subtitle { color: @dl_on_accent_container; opacity: 0.8; }
+.dl-palette > row:selected .dl-icon-square { background-color: @dl_surface; color: @dl_accent_text; }
+.dl-palette > row:selected:hover { background-image: none; }
+.dl-palette-keys { opacity: 0.8; }
+.dl-palette-foot { padding: 8px 16px; border-top: 1px solid @dl_hairline; }
+
 /* ── Toast (the inverse snackbar; AdwToast inside `.dl-toasts` too) ─────── */
 .dl-toast, .dl-toasts toast {
   padding: 12px 16px;

@@ -122,6 +122,7 @@ mod imp {
                 obj.set_accels_for_action(&format!("win.page-shortcut('{page}')"), &[accel]);
             }
             obj.set_accels_for_action("win.toggle-search", &["<control>f"]);
+            obj.set_accels_for_action("win.palette", &[crate::window::PALETTE_ACCEL]);
             obj.set_accels_for_action("window.close", &["<control>w"]);
         }
     }
@@ -1059,6 +1060,7 @@ impl DesklinkApplication {
             ("Notifications, Terminals, Contacts", "Ctrl+4 to 6"),
             ("Pair another phone", "Ctrl+N"),
             ("Send files", "Ctrl+O"),
+            ("Find anything", "Ctrl+K"),
             ("Search terminals", "Ctrl+F"),
             ("Connection history", "Ctrl+H"),
             ("Settings", "Ctrl+,"),
