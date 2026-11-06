@@ -1184,10 +1184,16 @@ mod tests {
              reply=$(dd bs=1 count=11 2>/dev/null | od -An -c | tr -d ' \\n'); printf 'reply=[%s]' \"$reply\"; sleep 5",
         ]);
         let session = PtySession::spawn(Some(command), 24, 80).expect("spawn sync probe");
-        assert!(wait_for_contents(&session, "reply=["), "the program got no answer");
+        assert!(
+            wait_for_contents(&session, "reply=["),
+            "the program got no answer"
+        );
         let screen = session.output.lock().unwrap().parser.screen().contents();
         assert!(screen.contains("reply=[033[?2026;2$y]"), "{screen}");
-        assert!(screen.contains("ask::"), "the query reached the screen: {screen}");
+        assert!(
+            screen.contains("ask::"),
+            "the query reached the screen: {screen}"
+        );
         session.close();
     }
 
