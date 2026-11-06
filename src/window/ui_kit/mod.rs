@@ -340,6 +340,9 @@ pub(crate) fn tile(
             &gtk::Label::builder()
                 .label(hint)
                 .xalign(0.0)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .lines(2)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .css_classes(["dl-tile-hint"])
                 .build(),
