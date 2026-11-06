@@ -48,7 +48,6 @@ pub(super) struct Sidebar {
     switcher: gtk::ListBox,
     /// The words that move with the round trip, set in place: the card's
     /// detail, and each switcher row's (device id, row, detail).
-    card_detail: RefCell<Option<gtk::Label>>,
     switcher_details: RefCell<Vec<(String, gtk::ListBoxRow, gtk::Label)>>,
 }
 
@@ -185,7 +184,6 @@ impl Sidebar {
             rows_key: RefCell::default(),
             switcher_key: RefCell::default(),
             switcher,
-            card_detail: RefCell::default(),
             switcher_details: RefCell::default(),
         }
     }
@@ -231,11 +229,6 @@ impl Sidebar {
     /// rebuilt for it, so an open switcher keeps its focus and its clicks.
     fn update_live_text(&self, win: &DesklinkWindow, devices: &[DeviceView], device: &DeviceView) {
         let words = Presentation::of(device);
-        if let Some(label) = self.card_detail.borrow().as_ref() {
-            if label.text() != words.short {
-                label.set_text(&words.short);
-            }
-        }
         win.imp()
             .device_card
             .update_property(&[gtk::accessible::Property::Label(&format!(
@@ -287,9 +280,6 @@ impl Sidebar {
                 .css_classes(["dl-label"])
                 .build(),
         );
-        let detail = super::ellipsized(&words.short, &["dl-caption", "dl-mono"]);
-        status.append(&detail);
-        self.card_detail.replace(Some(detail));
         lines.append(&status);
         content.append(&lines);
         content.append(

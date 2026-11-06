@@ -616,9 +616,10 @@ fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> gtk::FlowBox {
         "Lock this computer and open the newest terminal on {}",
         device.name
     )));
-    hand_off.set_action_name(Some("app.lock-hand-off"));
     if device.feature_transport_ready && open_terminal {
-        // Enabled.
+        // Enabled. The action is bound only here: a bound action's enabled
+        // state would override `set_sensitive(false)` and leave a dead tile live.
+        hand_off.set_action_name(Some("app.lock-hand-off"));
     } else if device.feature_transport_ready {
         hand_off.set_sensitive(false);
     } else {

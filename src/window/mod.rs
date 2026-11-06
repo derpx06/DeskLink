@@ -3272,6 +3272,7 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             _ => adw::ColorScheme::Default,
         }),
         "open-pair" => win.show_discovery_dialog(true),
+        "system-check" => system_check::show_dialog(win),
         // "fake-error TEXT": a daemon error, as the banner shows it.
         "fake-error" => win.report_error(&format!("{id} {arg}").trim().replace('_', " "), false),
         "open-codes" => win.show_discovery_dialog(false),

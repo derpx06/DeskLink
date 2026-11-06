@@ -154,10 +154,6 @@ fn install_line() -> gtk::Box {
     address.append(
         &gtk::Label::builder()
             .label(INSTALL_ADDRESS)
-            .selectable(true)
-            .wrap(true)
-            .wrap_mode(gtk::pango::WrapMode::Char)
-            .max_width_chars(40)
             .valign(gtk::Align::Center)
             .css_classes(["dl-mono", "install-address"])
             .build(),

@@ -110,7 +110,7 @@ fn debug_failures(device: &str) -> Vec<Failure> {
                     device_id: device.to_string(),
                     name: name.to_string(),
                     incoming: row.incoming,
-                    reason: reason_words(reason),
+                    reason: reason_words(&reason.replace('_', " ")),
                     retry: Some(std::path::PathBuf::from("/tmp").join(name)),
                 })
             })
