@@ -15,7 +15,7 @@
 //! Enter opens the selected row (the first one is selected for you), Esc
 //! closes, Tab moves between the search box and the list, Ctrl+K closes.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -51,6 +51,8 @@ struct Palette {
     order: Rc<RefCell<Vec<(Group, usize)>>>,
     /// The row chosen: done once the dialog has gone.
     chosen: RefCell<Option<Target>>,
+    /// The dialog is narrow: no key caps, they would squeeze the titles.
+    narrow: Cell<bool>,
     /// What had the focus before, to give it back.
     before: glib::WeakRef<gtk::Widget>,
 }
@@ -229,7 +231,7 @@ fn section_title(group: Group) -> gtk::Widget {
     header.upcast()
 }
 
-fn row_for(item: &Item, group: Group) -> adw::ActionRow {
+fn row_for(item: &Item, group: Group, keys: bool) -> adw::ActionRow {
     let subtitle = (!item.subtitle.is_empty()).then_some(item.subtitle.as_str());
     let row = ui_kit::list_row(
         item.icon,
@@ -248,7 +250,7 @@ fn row_for(item: &Item, group: Group) -> adw::ActionRow {
     if item.title.ends_with('…') {
         row.set_tooltip_text(Some(&item.title));
     }
-    if let Some(accel) = item.accel {
+    if let Some(accel) = item.accel.filter(|_| keys) {
         let keys = gtk::ShortcutLabel::new(accel);
         keys.set_valign(gtk::Align::Center);
         keys.add_css_class("dl-palette-keys");
@@ -270,15 +272,16 @@ impl Palette {
         while let Some(row) = self.list.row_at_index(0) {
             self.list.remove(&row);
         }
-        let mut order = Vec::with_capacity(shown);
-        for section in &sections {
-            for index in &section.items {
-                self.list
-                    .append(&row_for(&self.items[*index], section.group));
-                order.push((section.group, *index));
-            }
+        // The order first: the group titles are drawn as rows are added.
+        let order: Vec<(Group, usize)> = sections
+            .iter()
+            .flat_map(|section| section.items.iter().map(|index| (section.group, *index)))
+            .collect();
+        self.order.replace(order.clone());
+        let keys = !self.narrow.get();
+        for (group, index) in order {
+            self.list.append(&row_for(&self.items[index], group, keys));
         }
-        self.order.replace(order);
         self.stack
             .set_visible_child_name(if shown == 0 { "empty" } else { "list" });
         if let Some(first) = self.list.row_at_index(0) {
@@ -343,7 +346,7 @@ impl Palette {
 
 fn present(window: &DesklinkWindow, items: Vec<Item>, sources: &Sources, query: &str) {
     let entry = gtk::SearchEntry::builder()
-        .placeholder_text("Find anything")
+        .placeholder_text("Type to search")
         .hexpand(true)
         .search_delay(0)
         .build();
@@ -405,11 +408,13 @@ fn present(window: &DesklinkWindow, items: Vec<Item>, sources: &Sources, query: 
     let count = gtk::Label::builder()
         .xalign(0.0)
         .hexpand(true)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .css_classes(["dl-secondary"])
         .accessible_role(gtk::AccessibleRole::Status)
         .build();
     let hint = gtk::Label::builder()
         .label("↑↓ move · ↵ open · Esc close")
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .css_classes(["dl-secondary"])
         .accessible_role(gtk::AccessibleRole::Presentation)
         .build();
@@ -442,7 +447,7 @@ fn present(window: &DesklinkWindow, items: Vec<Item>, sources: &Sources, query: 
         adw::LengthUnit::Sp,
     ));
     narrow.add_setter(&hint, "visible", Some(&false.to_value()));
-    bin.add_breakpoint(narrow);
+    bin.add_breakpoint(narrow.clone());
 
     let dialog = adw::Dialog::builder()
         .title("Find anything")
@@ -462,19 +467,34 @@ fn present(window: &DesklinkWindow, items: Vec<Item>, sources: &Sources, query: 
         items,
         order,
         chosen: RefCell::new(None),
+        narrow: Cell::new(false),
         before: gtk::prelude::GtkWindowExt::focus(window)
             .map(|w| w.downgrade())
             .unwrap_or_default(),
     });
     wire(&palette);
-    palette.refill(query);
+    for (apply, is_narrow) in [(true, true), (false, false)] {
+        let weak = Rc::downgrade(&palette);
+        let changed = move |_: &adw::Breakpoint| {
+            if let Some(palette) = weak.upgrade() {
+                palette.narrow.set(is_narrow);
+                palette.refill(&palette.entry.text());
+            }
+        };
+        if apply {
+            narrow.connect_apply(changed);
+        } else {
+            narrow.connect_unapply(changed);
+        }
+    }
+    palette.refill("");
+    OPEN.with(|slot| slot.replace(Some(palette)));
+    dialog.present(Some(window));
+    entry.grab_focus();
     if !query.is_empty() {
         entry.set_text(query);
         entry.set_position(-1);
     }
-    OPEN.with(|slot| slot.replace(Some(palette)));
-    dialog.present(Some(window));
-    entry.grab_focus();
 }
 
 fn wire(palette: &Rc<Palette>) {
@@ -774,9 +794,46 @@ mod tests {
             palette.entry.set_text("qqqzzz");
             assert_eq!(palette.rows(), 0);
             assert_eq!(palette.stack.visible_child_name().as_deref(), Some("empty"));
-            assert_eq!(palette.count.label(), "Nothing matches");
+            assert_eq!(palette.count.label(), "No results");
+
+            // The keys: Down from the box goes to the second row (the first is
+            // already selected), the focus with it; Up from the first row
+            // comes back to the box; the ends stop.
+            palette.entry.set_text("e");
+            assert!(palette.rows() > 8, "{} rows", palette.rows());
+            assert_eq!(palette.selected(), Some(0));
+            palette.entry.emit_by_name::<()>("next-match", &[]);
+            assert_eq!(palette.selected(), Some(1));
+            assert!(!palette.in_box(), "the focus is on the row");
+            palette.move_by(PAGE_ROWS);
+            assert_eq!(palette.selected(), Some(1 + PAGE_ROWS as usize));
+            palette.move_by(1000);
+            assert_eq!(
+                palette.selected(),
+                Some(palette.rows() - 1),
+                "the end stops"
+            );
+            palette.entry.grab_focus();
+            assert!(palette.in_box());
+
+            // Enter opens the selected row: the dialog goes, then the row is
+            // done. (Keyboard shortcuts: nothing in this test app answers it.)
+            palette.entry.set_text("keyboard sh");
+            assert_eq!(palette.rows(), 1);
+            let focus_before = window.imp().nav_list.clone();
+            focus_before.grab_focus();
+            palette.entry.emit_by_name::<()>("activate", &[]);
+            pump();
+            assert!(
+                OPEN.with(|slot| slot.borrow().is_none()),
+                "closed after a choice"
+            );
 
             // Ctrl+K again closes it; the slot is empty once it has gone.
+            toggle(&window, "");
+            pump();
+            assert!(OPEN.with(|slot| slot.borrow().is_some()));
+            // And again.
             toggle(&window, "");
             pump();
             assert!(OPEN.with(|slot| slot.borrow().is_none()));

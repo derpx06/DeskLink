@@ -4,7 +4,9 @@
 //! `PaletteModel.kt` is the reference: the same groups of results, the same
 //! ranking (title prefix, then a word of the title, then anywhere in the
 //! title, then the subtitle and keywords; every word of the query must
-//! match), the same caps (6 a group when searching, 3 when idle).
+//! match), the same caps (6 a group when searching, 3 when idle; the phone
+//! lists all its ~14 actions idle, the desk has twice as many so it lists
+//! the first 6).
 //!
 //! `palette.rs` gathers the [`Sources`] from the live window, draws the
 //! [`Item`]s and maps a chosen [`Target`] onto the window's existing actions
@@ -22,9 +24,11 @@ use crate::device_links::packet::{
 
 /// Rows a group shows for a query.
 pub(crate) const FOUND_PER_GROUP: usize = 6;
-/// Rows a group shows before anything is typed (actions show all of them: they
-/// are the point of the palette).
+/// Rows a group shows before anything is typed.
 pub(crate) const IDLE_PER_GROUP: usize = 3;
+/// Actions shown before anything is typed: the first of the list, which is
+/// the Home tiles' order, so the rest (Insert, Sound, ...) wait for a query.
+pub(crate) const IDLE_ACTIONS: usize = 6;
 /// Longest a row's title is, in characters; a clipboard entry or a note's
 /// first line can be a page.
 const TITLE_CHARS: usize = 90;
@@ -80,7 +84,7 @@ impl Group {
     /// them is put on show just because the palette opened.
     fn idle_cap(self) -> usize {
         match self {
-            Self::Actions => usize::MAX,
+            Self::Actions => IDLE_ACTIONS,
             Self::Phones | Self::Terminals | Self::Files | Self::Notes | Self::Snippets => {
                 IDLE_PER_GROUP
             }
@@ -243,7 +247,7 @@ pub(crate) struct Section {
 
 /// The sections for `query`: groups in [`Group`] order, each ranked (best
 /// first, the given order among equals) and cut to [`FOUND_PER_GROUP`]. A
-/// blank query lists every action and [`IDLE_PER_GROUP`] of the groups that
+/// blank query lists the first [`IDLE_ACTIONS`] actions and [`IDLE_PER_GROUP`] of the groups that
 /// show before anything is typed. Empty groups are left out, so no sections
 /// means "Nothing matches".
 pub(crate) fn search(items: &[Item], query: &str) -> Vec<Section> {
@@ -289,7 +293,7 @@ pub(crate) fn count(sections: &[Section]) -> usize {
 /// What a screen reader is told when the list changes.
 pub(crate) fn count_words(shown: usize, query_blank: bool) -> String {
     match (shown, query_blank) {
-        (0, _) => "Nothing matches".to_string(),
+        (0, _) => "No results".to_string(),
         (1, true) => "1 suggestion".to_string(),
         (n, true) => format!("{n} suggestions"),
         (1, false) => "1 result".to_string(),
@@ -522,8 +526,10 @@ fn icon_for_capture(gnome: &str) -> &'static str {
 /// takes (the Home tiles' own tests); what is on this computer (notes,
 /// terminals, pairing, the history, the shortcuts) is always there.
 pub(crate) fn offered_actions(phone: Option<&PhoneState>, any_terminal_open: bool) -> Vec<Action> {
+    let phone = phone.filter(|phone| phone.usable);
     let mut out = Vec::new();
-    if let Some(phone) = phone.filter(|phone| phone.usable) {
+    // The Home tiles first, in their order: they are what is on show idle.
+    if let Some(phone) = phone {
         if phone.files {
             out.push(Action::SendFiles);
         }
@@ -535,21 +541,15 @@ pub(crate) fn offered_actions(phone: Option<&PhoneState>, any_terminal_open: boo
         }
         if phone.screen {
             out.push(Action::PhoneScreen);
-            out.extend(phone.captures.iter().map(|index| Action::Insert(*index)));
-            out.extend(
-                ["desk-sound", "phone-mic", "phone-sound"]
-                    .into_iter()
-                    .map(Action::Sound),
-            );
         }
         if phone.ring {
             out.push(Action::Ring);
         }
-        if phone.ping {
-            out.push(Action::Nudge);
-        }
         if phone.lock {
             out.push(Action::Lock);
+        }
+        if phone.ping {
+            out.push(Action::Nudge);
         }
         // The Home tile is live with a terminal open; with Terminal access off
         // it explains and opens Privacy & security instead.
@@ -557,13 +557,17 @@ pub(crate) fn offered_actions(phone: Option<&PhoneState>, any_terminal_open: boo
             out.push(Action::HandOff);
         }
     }
-    out.extend([
-        Action::NewNote,
-        Action::NewTerminal,
-        Action::PairAnother,
-        Action::History,
-        Action::Shortcuts,
-    ]);
+    out.extend([Action::NewNote, Action::NewTerminal]);
+    // What is in the Insert and Sound menus: found by a query.
+    if let Some(phone) = phone.filter(|phone| phone.screen) {
+        out.extend(phone.captures.iter().map(|index| Action::Insert(*index)));
+        out.extend(
+            ["desk-sound", "phone-mic", "phone-sound"]
+                .into_iter()
+                .map(Action::Sound),
+        );
+    }
+    out.extend([Action::PairAnother, Action::History, Action::Shortcuts]);
     out
 }
 
@@ -883,7 +887,7 @@ pub(crate) fn build(sources: &Sources) -> Vec<Item> {
             Target::Settings(page.index),
             Group::Settings,
             page.title,
-            page.summary,
+            &format!("Settings · {}", page.summary),
             page.icon,
             &format!("setting preferences {words}"),
         ));
@@ -1044,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_lists_every_action_and_hides_what_people_did_not_ask_for() {
+    fn idle_lists_the_first_actions_and_hides_what_people_did_not_ask_for() {
         let mut items: Vec<Item> = (0..12)
             .map(|n| item(Group::Actions, &format!("Do {n}"), "", ""))
             .collect();
@@ -1059,7 +1063,10 @@ mod tests {
         items.push(item(Group::Terminals, "zsh", "", ""));
         let idle = search(&items, "");
         assert_eq!(idle[0].group, Group::Actions);
-        assert_eq!(idle[0].items.len(), 12, "all the actions");
+        assert_eq!(idle[0].items.len(), IDLE_ACTIONS, "the first actions");
+        assert_eq!(idle[0].items[0], 0);
+        // A query reaches the rest.
+        assert_eq!(search(&items, "do")[0].items.len(), FOUND_PER_GROUP);
         let groups: Vec<_> = idle.iter().map(|s| s.group).collect();
         assert_eq!(groups, [Group::Actions, Group::Terminals]);
         // A query reaches all of them.
@@ -1080,7 +1087,7 @@ mod tests {
 
     #[test]
     fn counts_are_said_in_words() {
-        assert_eq!(count_words(0, false), "Nothing matches");
+        assert_eq!(count_words(0, false), "No results");
         assert_eq!(count_words(1, false), "1 result");
         assert_eq!(count_words(6, false), "6 results");
         assert_eq!(count_words(1, true), "1 suggestion");
