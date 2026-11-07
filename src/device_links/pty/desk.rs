@@ -14,7 +14,12 @@
 //! Wire format, both directions: `[kind: u8][len: u32 BE][payload]`.
 //! Client → host: `INPUT` bytes, `RESIZE` (rows u16, cols u16).
 //! Host → client: `OUTPUT` bytes, `EXIT` (status u32).
-//! The client's first line is `ATTACH <id> <rows> <cols>\n`.
+//! The client's first line is `ATTACH <id> <rows> <cols>[ embedded]\n`.
+//!
+//! `embedded` is the DeskLink window's own terminal (the Terminals page). Its
+//! size follows the page's layout, and VTE answers queries and reports focus
+//! by itself, so neither its resizes nor its input count as the person acting
+//! at the desk: the window calls [`desk_acted`] on a real key press instead.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -96,8 +101,9 @@ fn read_frame(reader: &mut impl Read) -> std::io::Result<(u8, Vec<u8>)> {
     Ok((header[0], payload))
 }
 
-/// `ATTACH <id> <rows> <cols>` → the parts, bounded like the phone protocol.
-pub(crate) fn parse_attach(line: &str) -> Option<(String, u16, u16)> {
+/// `ATTACH <id> <rows> <cols>[ embedded]` → the parts, bounded like the
+/// phone protocol.
+pub(crate) fn parse_attach(line: &str) -> Option<(String, u16, u16, bool)> {
     let mut parts = line.trim_end().split(' ');
     if parts.next()? != "ATTACH" {
         return None;
@@ -113,7 +119,40 @@ pub(crate) fn parse_attach(line: &str) -> Option<(String, u16, u16)> {
     }
     let rows = parts.next()?.parse::<u16>().ok()?.clamp(1, 1000);
     let cols = parts.next()?.parse::<u16>().ok()?.clamp(1, 1000);
-    parts.next().is_none().then(|| (id.to_string(), rows, cols))
+    let embedded = match parts.next() {
+        None => false,
+        Some("embedded") => true,
+        Some(_) => return None,
+    };
+    parts
+        .next()
+        .is_none()
+        .then(|| (id.to_string(), rows, cols, embedded))
+}
+
+/// `desklink --attach-terminal <id> [--embedded]` → the id and whether it is
+/// the DeskLink window's own terminal.
+pub(crate) fn attach_args(args: &[String]) -> Option<(&str, bool)> {
+    match args {
+        [_, flag, id] if flag == "--attach-terminal" => Some((id, false)),
+        [_, flag, id, embedded] if flag == "--attach-terminal" && embedded == "--embedded" => {
+            Some((id, true))
+        }
+        _ => None,
+    }
+}
+
+/// The person typed or pasted into the DeskLink window's own terminal for
+/// session `id`, which shows `rows` x `cols`: that takes the size back, as
+/// typing in any desk window does.
+pub(crate) fn desk_acted(id: &str, rows: u16, cols: u16) {
+    let session = super::registry::registry()
+        .lock()
+        .ok()
+        .and_then(|registry| registry.get(id));
+    if let Some(session) = session.filter(|session| session.has_desk_window()) {
+        session.desk_window_size(rows, cols, true);
+    }
 }
 
 // ---- host (inside DeskLink) ------------------------------------------------
@@ -214,7 +253,7 @@ fn serve(stream: UnixStream) -> Result<(), String> {
         .read_line(&mut line)
         .map_err(|e| e.to_string())?;
     stream.set_read_timeout(None).map_err(|e| e.to_string())?;
-    let (id, rows, cols) = parse_attach(&line).ok_or("malformed attach request")?;
+    let (id, rows, cols, embedded) = parse_attach(&line).ok_or("malformed attach request")?;
     let session = super::registry::registry()
         .lock()
         .map_err(|_| "terminal registry lock poisoned")?
@@ -254,8 +293,10 @@ fn serve(stream: UnixStream) -> Result<(), String> {
         match read_frame(&mut reader) {
             Ok((INPUT, bytes)) => {
                 session.touch();
-                // Typing at the desk takes the size back from the phone.
-                if let Some((rows, cols)) = desk_size {
+                // Typing at the desk takes the size back from the phone. (The
+                // embedded terminal's input may be VTE's own replies: the
+                // window says when the person typed, `desk_acted`.)
+                if let Some((rows, cols)) = desk_size.filter(|_| !embedded) {
                     session.desk_window_size(rows, cols, true);
                 }
                 if session.write_input(&bytes).is_err() {
@@ -266,7 +307,9 @@ fn serve(stream: UnixStream) -> Result<(), String> {
                 let rows = u16::from_be_bytes([payload[0], payload[1]]);
                 let cols = u16::from_be_bytes([payload[2], payload[3]]);
                 desk_size = Some((rows.clamp(1, 1000), cols.clamp(1, 1000)));
-                session.desk_window_size(rows, cols, true);
+                // A terminal window resized is the person acting; the
+                // embedded one resizes with the page's layout.
+                session.desk_window_size(rows, cols, !embedded);
             }
             Ok(_) => {}
             Err(_) => break,
@@ -342,10 +385,9 @@ pub(crate) fn open_on_desktop(id: &str) {
 }
 
 fn open_blocking(id: &str) {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let exe = exe.to_string_lossy().into_owned();
+    let exe = super::host::own_executable(false)
+        .to_string_lossy()
+        .into_owned();
     let title = "DeskLink terminal";
     let client = super::host::attach_client(&exe, id);
     let in_flatpak = super::host::in_flatpak();
@@ -532,7 +574,7 @@ fn window_size() -> (u16, u16) {
 }
 
 /// Runs the desk client until the session ends or the window closes.
-pub(crate) fn run_client(id: &str) -> i32 {
+pub(crate) fn run_client(id: &str, embedded: bool) -> i32 {
     // A socket that is not ours (or a link to one) is not a DeskLink to type into.
     let Some(path) = socket_path().filter(|path| owned_by_us(path)) else {
         eprintln!("DeskLink is not running.");
@@ -547,7 +589,13 @@ pub(crate) fn run_client(id: &str) -> i32 {
     };
     let (rows, cols) = window_size();
     if stream
-        .write_all(format!("ATTACH {id} {rows} {cols}\n").as_bytes())
+        .write_all(
+            format!(
+                "ATTACH {id} {rows} {cols}{}\n",
+                if embedded { " embedded" } else { "" }
+            )
+            .as_bytes(),
+        )
         .is_err()
     {
         return 1;
@@ -891,6 +939,58 @@ mod tests {
             .close(&id);
     }
 
+    /// The DeskLink window's own terminal: its layout resizes and VTE's own
+    /// input (focus reports, answers to queries) leave the phone's claim; the
+    /// person typing there (`desk_acted`) takes it back.
+    #[test]
+    fn the_embedded_terminal_takes_the_size_only_when_the_person_acts() {
+        let (id, session) = quiet_session();
+        session.claim_for_phone("phone-1", 30, 50).unwrap();
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn(move || serve(server));
+        client
+            .write_all(format!("ATTACH {id} 40 120 embedded\n").as_bytes())
+            .unwrap();
+        assert!(eventually(|| session.has_desk_window()));
+        client.write_all(&encode(INPUT, b"\x1b[I")).unwrap();
+        let mut payload = 41u16.to_be_bytes().to_vec();
+        payload.extend_from_slice(&121u16.to_be_bytes());
+        client.write_all(&encode(RESIZE, &payload)).unwrap();
+        client.write_all(&encode(INPUT, b"\x1b[O")).unwrap();
+        // The frames are handled in order; once this one is in, all are.
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(session.phone_sets_size(), "neither layout nor VTE acted");
+        assert_eq!(session.size(), (30, 50));
+        desk_acted(&id, 41, 121);
+        assert!(!session.phone_sets_size());
+        assert_eq!(session.size(), (41, 121), "typing there took it back");
+        drop(client);
+        let _ = served.join();
+        super::super::registry::registry()
+            .lock()
+            .unwrap()
+            .close(&id);
+    }
+
+    #[test]
+    fn the_attach_command_line_is_strict() {
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            attach_args(&args(&["desklink", "--attach-terminal", "7"])),
+            Some(("7", false))
+        );
+        assert_eq!(
+            attach_args(&args(&["desklink", "--attach-terminal", "7", "--embedded"])),
+            Some(("7", true))
+        );
+        assert_eq!(
+            attach_args(&args(&["desklink", "--attach-terminal", "7", "x"])),
+            None
+        );
+        assert_eq!(attach_args(&args(&["desklink", "--attach-terminal"])), None);
+        assert_eq!(attach_args(&args(&["desklink", "--check", "7"])), None);
+    }
+
     /// The desk taking the size back is one step: whoever sees the phone's
     /// claim gone sees the desk's size already in place. (The claim used to be
     /// cleared first and the PTY resized after, so a reader that waited for
@@ -960,12 +1060,17 @@ mod tests {
     fn attach_requests_are_strictly_parsed() {
         assert_eq!(
             parse_attach("ATTACH abc-1 40 120\n"),
-            Some(("abc-1".into(), 40, 120))
+            Some(("abc-1".into(), 40, 120, false))
         );
         assert_eq!(
             parse_attach("ATTACH abc 0 5000"),
-            Some(("abc".into(), 1, 1000))
+            Some(("abc".into(), 1, 1000, false))
         );
+        assert_eq!(
+            parse_attach("ATTACH abc 40 120 embedded\n"),
+            Some(("abc".into(), 40, 120, true))
+        );
+        assert_eq!(parse_attach("ATTACH abc 40 120 embedded extra"), None);
         assert_eq!(parse_attach("ATTACH ../x 40 120"), None);
         assert_eq!(parse_attach("ATTACH abc 40"), None);
         assert_eq!(parse_attach("ATTACH abc 40 120 extra"), None);

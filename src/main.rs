@@ -115,8 +115,8 @@ fn main() -> glib::ExitCode {
     // `desklink --attach-terminal <id>`: the client a desk terminal window
     // runs to show a shared session. No GTK, no second app instance.
     let args: Vec<String> = std::env::args().collect();
-    if args.len() == 3 && args[1] == "--attach-terminal" {
-        let status = device_links::pty::desk::run_client(&args[2]);
+    if let Some((id, embedded)) = device_links::pty::desk::attach_args(&args) {
+        let status = device_links::pty::desk::run_client(id, embedded);
         return glib::ExitCode::from(status.clamp(0, 255));
     }
     // `desklink --check`: what works on this computer, without a window.
