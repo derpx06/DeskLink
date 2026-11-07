@@ -16,7 +16,8 @@ manifest = json.loads((root / "derx06.desklink.com.json").read_text())
 errors, todo = [], []
 
 version = re.search(r'^version = "([^"]+)"', (root / "Cargo.toml").read_text(), re.M).group(1)
-source = next(s for s in manifest["modules"][0]["sources"] if isinstance(s, dict) and s.get("type") == "git")
+desklink = next(m for m in manifest["modules"] if isinstance(m, dict) and m.get("name") == "desklink")
+source = next(s for s in desklink["sources"] if isinstance(s, dict) and s.get("type") == "git")
 if source.get("tag") != f"v{version}":
     errors.append(f"tag {source.get('tag')} is not v{version} (Cargo.toml)")
 if not re.fullmatch(r"[0-9a-f]{40}", source.get("commit", "")):

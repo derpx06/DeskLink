@@ -112,15 +112,17 @@ above.
 
 ## Build from source
 
-Minimum versions: Rust 1.85, GTK 4.12, GStreamer 1.22, and the libadwaita
-release named by the `adw` feature in `Cargo.toml`.
+Minimum versions: Rust 1.85, GTK 4.12, GStreamer 1.22, VTE 0.76 (GTK 4
+build), and the libadwaita release named by the `adw` feature in
+`Cargo.toml`. Without VTE, `cargo build --no-default-features` still builds;
+the Terminals page then shows a read-only preview instead of a terminal.
 `build.rs` runs `glib-compile-resources`, so the GLib tools must be installed
 even for a plain `cargo build`.
 
 Arch Linux:
 
 ```sh
-sudo pacman -S --needed base-devel rust meson gtk4 libadwaita openssl libnice \
+sudo pacman -S --needed base-devel rust meson gtk4 libadwaita vte4 openssl libnice \
   gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
   gst-plugin-pipewire gst-libav desktop-file-utils appstream
 ```
@@ -128,7 +130,7 @@ sudo pacman -S --needed base-devel rust meson gtk4 libadwaita openssl libnice \
 Fedora (43 or newer):
 
 ```sh
-sudo dnf install meson cargo rust gtk4-devel libadwaita-devel openssl-devel \
+sudo dnf install meson cargo rust gtk4-devel libadwaita-devel vte291-gtk4-devel openssl-devel \
   gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-bad-free-devel \
   gstreamer1-plugins-good gstreamer1-plugin-openh264 \
   pipewire-gstreamer libnice-gstreamer1 desktop-file-utils appstream
@@ -139,7 +141,7 @@ or the `rustc-1.85` package, the default Rust is too old):
 
 ```sh
 sudo apt install build-essential meson cargo rustc libgtk-4-dev libadwaita-1-dev \
-  libssl-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  libvte-2.91-gtk4-dev libssl-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
   libgstreamer-plugins-bad1.0-dev gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
   gstreamer1.0-libav gstreamer1.0-pipewire gstreamer1.0-nice \
   desktop-file-utils appstream

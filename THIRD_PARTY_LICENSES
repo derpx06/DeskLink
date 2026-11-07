@@ -137,6 +137,7 @@ if-addrs 0.15.0: MIT OR BSD-3-Clause (https://github.com/messense/if-addrs)
 image 0.25.6: MIT OR Apache-2.0 (https://github.com/image-rs/image)
 indexmap 2.14.0: Apache-2.0 OR MIT (https://github.com/indexmap-rs/indexmap)
 indexmap 2.14.2: Apache-2.0 OR MIT (https://github.com/indexmap-rs/indexmap)
+io-lifetimes 2.0.4: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT (https://github.com/sunfishcode/io-lifetimes)
 itertools 0.14.0: MIT OR Apache-2.0 (https://github.com/rust-itertools/itertools)
 itoa 1.0.18: MIT OR Apache-2.0 (https://github.com/dtolnay/itoa)
 jpeg-decoder 0.3.2: MIT OR Apache-2.0 (https://github.com/image-rs/jpeg-decoder)
@@ -292,6 +293,8 @@ vcpkg 0.2.15: MIT/Apache-2.0 (https://github.com/mcgoo/vcpkg-rs)
 version-compare 0.2.1: MIT (https://gitlab.com/timvisee/version-compare)
 vt100 0.16.2: MIT (https://github.com/doy/vt100-rust)
 vte 0.15.0: Apache-2.0 OR MIT (https://github.com/alacritty/vte)
+vte4 0.8.0: MIT (https://gitlab.gnome.org/World/Rust/vte4-rs)
+vte4-sys 0.8.0: MIT (https://gitlab.gnome.org/World/Rust/vte4-rs)
 wasi 0.11.1+wasi-snapshot-preview1: Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT (https://github.com/bytecodealliance/wasi)
 wasm-bindgen 0.2.126: MIT OR Apache-2.0 (https://github.com/wasm-bindgen/wasm-bindgen)
 wasm-bindgen-macro 0.2.126: MIT OR Apache-2.0 (https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro)
@@ -563,7 +566,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 ------------------------------------------------------------------------
-Used by: adler2 2.0.1, anyhow 1.0.104, async-channel 2.5.0, concurrent-queue 2.5.0, displaydoc 0.2.7, event-listener 5.4.2, event-listener-strategy 0.5.4, fastrand 2.5.0, flume 0.12.0, gst-plugin-version-helper 0.8.4, gstreamer 0.23.7, gstreamer-base 0.23.6, gstreamer-base-sys 0.23.6, gstreamer-gl 0.23.7, gstreamer-gl-sys 0.23.6, gstreamer-sdp 0.23.5, gstreamer-sdp-sys 0.23.5, gstreamer-sys 0.23.6, gstreamer-video 0.23.6, gstreamer-video-sys 0.23.6, gstreamer-webrtc 0.23.5, gstreamer-webrtc-sys 0.23.5, itoa 1.0.18, linux-raw-sys 0.12.1, linux-raw-sys 0.4.15, once_cell 1.21.4, option-operations 0.5.0, parking 2.2.1, paste 1.0.15, pin-project-lite 0.2.17, proc-macro-crate 3.5.0, proc-macro2 1.0.106, proc-macro2 1.0.107, quote 1.0.46, quote 1.0.47, reis 0.5.0, rustix 0.38.44, rustix 1.1.4, rustversion 1.0.22, semver 1.0.28, serde 1.0.228, serde 1.0.229, serde_core 1.0.228, serde_core 1.0.229, serde_derive 1.0.228, serde_derive 1.0.229, serde_json 1.0.150, serde_json 1.0.154, syn 2.0.118, syn 2.0.119, syn 3.0.9, system-deps 7.0.8, thiserror 1.0.69, thiserror 2.0.18, thiserror 2.0.21, thiserror-impl 1.0.69, thiserror-impl 2.0.18, thiserror-impl 2.0.21, unicode-ident 1.0.24, unicode-ident 1.0.27, wasi 0.11.1+wasi-snapshot-preview1, zmij 1.0.21, zmij 1.0.23
+Used by: adler2 2.0.1, anyhow 1.0.104, async-channel 2.5.0, concurrent-queue 2.5.0, displaydoc 0.2.7, event-listener 5.4.2, event-listener-strategy 0.5.4, fastrand 2.5.0, flume 0.12.0, gst-plugin-version-helper 0.8.4, gstreamer 0.23.7, gstreamer-base 0.23.6, gstreamer-base-sys 0.23.6, gstreamer-gl 0.23.7, gstreamer-gl-sys 0.23.6, gstreamer-sdp 0.23.5, gstreamer-sdp-sys 0.23.5, gstreamer-sys 0.23.6, gstreamer-video 0.23.6, gstreamer-video-sys 0.23.6, gstreamer-webrtc 0.23.5, gstreamer-webrtc-sys 0.23.5, io-lifetimes 2.0.4, itoa 1.0.18, linux-raw-sys 0.12.1, linux-raw-sys 0.4.15, once_cell 1.21.4, option-operations 0.5.0, parking 2.2.1, paste 1.0.15, pin-project-lite 0.2.17, proc-macro-crate 3.5.0, proc-macro2 1.0.106, proc-macro2 1.0.107, quote 1.0.46, quote 1.0.47, reis 0.5.0, rustix 0.38.44, rustix 1.1.4, rustversion 1.0.22, semver 1.0.28, serde 1.0.228, serde 1.0.229, serde_core 1.0.228, serde_core 1.0.229, serde_derive 1.0.228, serde_derive 1.0.229, serde_json 1.0.150, serde_json 1.0.154, syn 2.0.118, syn 2.0.119, syn 3.0.9, system-deps 7.0.8, thiserror 1.0.69, thiserror 2.0.18, thiserror 2.0.21, thiserror-impl 1.0.69, thiserror-impl 2.0.18, thiserror-impl 2.0.21, unicode-ident 1.0.24, unicode-ident 1.0.27, wasi 0.11.1+wasi-snapshot-preview1, zmij 1.0.21, zmij 1.0.23
 ------------------------------------------------------------------------
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -1076,7 +1079,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ------------------------------------------------------------------------
-Used by: arrayvec 0.7.8, async-channel 2.5.0, autocfg 1.5.1, base64 0.22.1, bitflags 1.3.2, bitflags 2.13.0, bitflags 2.13.2, bumpalo 3.20.3, cc 1.2.65, cc 1.9.0, cfg-if 1.0.4, cfg-if 1.0.5, concurrent-queue 2.5.0, core-foundation 0.10.1, core-foundation-sys 0.8.7, crossbeam-utils 0.8.23, displaydoc 0.2.7, either 1.17.0, equivalent 1.0.2, equivalent 1.0.3, errno 0.3.14, event-listener 5.4.2, event-listener-strategy 0.5.4, fastrand 2.5.0, find-msvc-tools 0.1.15, find-msvc-tools 0.1.9, flate2 1.1.9, form_urlencoded 1.2.2, gethostname 1.1.0, gstreamer 0.23.7, gstreamer-base 0.23.6, gstreamer-gl 0.23.7, gstreamer-sdp 0.23.5, gstreamer-video 0.23.6, gstreamer-webrtc 0.23.5, hashbrown 0.17.1, heck 0.5.0, httparse 1.10.1, idna 1.1.0, idna_adapter 1.1.0, idna_adapter 1.2.2, idna_mapping 1.1.0, indexmap 2.14.0, indexmap 2.14.2, itertools 0.14.0, jpeg-decoder 0.3.2, js-sys 0.3.103, lazy_static 1.5.0, linux-raw-sys 0.12.1, linux-raw-sys 0.4.15, lock_api 0.4.14, log 0.4.33, log 0.4.34, num-integer 0.1.46, num-rational 0.4.2, num-traits 0.2.19, once_cell 1.21.4, openssl-probe 0.2.1, option-operations 0.5.0, parking 2.2.1, parking_lot 0.12.5, parking_lot_core 0.9.12, percent-encoding 2.3.2, pkg-config 0.3.33, pkg-config 0.3.34, png 0.17.16, regex 1.12.4, regex-automata 0.4.14, regex-syntax 0.8.11, rustc_version 0.4.1, rustix 0.38.44, rustix 1.1.4, rustls 0.23.46, scopeguard 1.2.0, security-framework 3.7.0, security-framework-sys 2.17.0, smallvec 1.15.2, smallvec 1.16.3, socket2 0.6.4, stable_deref_trait 1.2.1, system-deps 7.0.8, tempfile 3.27.0, tungstenite 0.30.0, unicode-bidi 0.3.18, unicode-normalization 0.1.26, unicode-width 0.2.2, url 2.5.8, uuid 1.23.4, vcpkg 0.2.15, wasi 0.11.1+wasi-snapshot-preview1, wasm-bindgen 0.2.126, wasm-bindgen-macro 0.2.126, wasm-bindgen-macro-support 0.2.126, wasm-bindgen-shared 0.2.126, weezl 0.1.12
+Used by: arrayvec 0.7.8, async-channel 2.5.0, autocfg 1.5.1, base64 0.22.1, bitflags 1.3.2, bitflags 2.13.0, bitflags 2.13.2, bumpalo 3.20.3, cc 1.2.65, cc 1.9.0, cfg-if 1.0.4, cfg-if 1.0.5, concurrent-queue 2.5.0, core-foundation 0.10.1, core-foundation-sys 0.8.7, crossbeam-utils 0.8.23, displaydoc 0.2.7, either 1.17.0, equivalent 1.0.2, equivalent 1.0.3, errno 0.3.14, event-listener 5.4.2, event-listener-strategy 0.5.4, fastrand 2.5.0, find-msvc-tools 0.1.15, find-msvc-tools 0.1.9, flate2 1.1.9, form_urlencoded 1.2.2, gethostname 1.1.0, gstreamer 0.23.7, gstreamer-base 0.23.6, gstreamer-gl 0.23.7, gstreamer-sdp 0.23.5, gstreamer-video 0.23.6, gstreamer-webrtc 0.23.5, hashbrown 0.17.1, heck 0.5.0, httparse 1.10.1, idna 1.1.0, idna_adapter 1.1.0, idna_adapter 1.2.2, idna_mapping 1.1.0, indexmap 2.14.0, indexmap 2.14.2, io-lifetimes 2.0.4, itertools 0.14.0, jpeg-decoder 0.3.2, js-sys 0.3.103, lazy_static 1.5.0, linux-raw-sys 0.12.1, linux-raw-sys 0.4.15, lock_api 0.4.14, log 0.4.33, log 0.4.34, num-integer 0.1.46, num-rational 0.4.2, num-traits 0.2.19, once_cell 1.21.4, openssl-probe 0.2.1, option-operations 0.5.0, parking 2.2.1, parking_lot 0.12.5, parking_lot_core 0.9.12, percent-encoding 2.3.2, pkg-config 0.3.33, pkg-config 0.3.34, png 0.17.16, regex 1.12.4, regex-automata 0.4.14, regex-syntax 0.8.11, rustc_version 0.4.1, rustix 0.38.44, rustix 1.1.4, rustls 0.23.46, scopeguard 1.2.0, security-framework 3.7.0, security-framework-sys 2.17.0, smallvec 1.15.2, smallvec 1.16.3, socket2 0.6.4, stable_deref_trait 1.2.1, system-deps 7.0.8, tempfile 3.27.0, tungstenite 0.30.0, unicode-bidi 0.3.18, unicode-normalization 0.1.26, unicode-width 0.2.2, url 2.5.8, uuid 1.23.4, vcpkg 0.2.15, wasi 0.11.1+wasi-snapshot-preview1, wasm-bindgen 0.2.126, wasm-bindgen-macro 0.2.126, wasm-bindgen-macro-support 0.2.126, wasm-bindgen-shared 0.2.126, weezl 0.1.12
 ------------------------------------------------------------------------
 Apache License
                         Version 2.0, January 2004
@@ -2008,7 +2011,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
-Used by: cairo-rs 0.20.12, cairo-sys-rs 0.20.10, gdk-pixbuf 0.20.10, gdk-pixbuf-sys 0.20.10, gdk4 0.9.6, gdk4-sys 0.9.6, gdk4-win32 0.9.5, gdk4-win32-sys 0.9.5, gio 0.20.12, gio-sys 0.20.10, glib 0.20.12, glib-macros 0.20.12, glib-sys 0.20.10, gobject-sys 0.20.10, graphene-rs 0.20.10, graphene-sys 0.20.10, gsk4 0.9.6, gsk4-sys 0.9.6, gtk4 0.9.7, gtk4-macros 0.9.5, gtk4-sys 0.9.6, libadwaita 0.7.2, libadwaita-sys 0.7.2, pango 0.20.12, pango-sys 0.20.10
+Used by: cairo-rs 0.20.12, cairo-sys-rs 0.20.10, gdk-pixbuf 0.20.10, gdk-pixbuf-sys 0.20.10, gdk4 0.9.6, gdk4-sys 0.9.6, gdk4-win32 0.9.5, gdk4-win32-sys 0.9.5, gio 0.20.12, gio-sys 0.20.10, glib 0.20.12, glib-macros 0.20.12, glib-sys 0.20.10, gobject-sys 0.20.10, graphene-rs 0.20.10, graphene-sys 0.20.10, gsk4 0.9.6, gsk4-sys 0.9.6, gtk4 0.9.7, gtk4-macros 0.9.5, gtk4-sys 0.9.6, libadwaita 0.7.2, libadwaita-sys 0.7.2, pango 0.20.12, pango-sys 0.20.10, vte4 0.8.0, vte4-sys 0.8.0
 ------------------------------------------------------------------------
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -5229,115 +5232,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ------------------------------------------------------------------------
-Used by: jpeg-decoder 0.3.2
-------------------------------------------------------------------------
-MIT License
-
-Copyright (c) 2016 The jpeg-decoder Developers
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-------------------------------------------------------------------------
-Used by: lazy_static 1.5.0
-------------------------------------------------------------------------
-Copyright (c) 2010 The Rust Project Developers
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-------------------------------------------------------------------------
-Used by: libc 0.2.190, libc 0.2.191
-------------------------------------------------------------------------
-Copyright (c) The Rust Project Developers
-
-Permission is hereby granted, free of charge, to any
-person obtaining a copy of this software and associated
-documentation files (the "Software"), to deal in the
-Software without restriction, including without
-limitation the rights to use, copy, modify, merge,
-publish, distribute, sublicense, and/or sell copies of
-the Software, and to permit persons to whom the Software
-is furnished to do so, subject to the following
-conditions:
-
-The above copyright notice and this permission notice
-shall be included in all copies or substantial portions
-of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
-ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
-TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
-PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
-SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
-CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
-OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
-IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
-DEALINGS IN THE SOFTWARE.
-
-------------------------------------------------------------------------
-Used by: libredox 0.1.18
-------------------------------------------------------------------------
-MIT License
-
-Copyright (c) 2023 4lDO2
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-------------------------------------------------------------------------
-Used by: linux-raw-sys 0.12.1, linux-raw-sys 0.4.15, rustix 0.38.44, rustix 1.1.4, target-lexicon 0.13.5, wasi 0.11.1+wasi-snapshot-preview1
+Used by: io-lifetimes 2.0.4, linux-raw-sys 0.12.1, linux-raw-sys 0.4.15, rustix 0.38.44, rustix 1.1.4, target-lexicon 0.13.5, wasi 0.11.1+wasi-snapshot-preview1
 ------------------------------------------------------------------------
 Apache License
                            Version 2.0, January 2004
@@ -5557,6 +5452,114 @@ conflicts with the conditions of the GPLv2, you may retroactively and
 prospectively choose to deem waived or otherwise exclude such Section(s) of
 the License, but only in their entirety and only with respect to the Combined
 Software.
+
+------------------------------------------------------------------------
+Used by: jpeg-decoder 0.3.2
+------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2016 The jpeg-decoder Developers
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------
+Used by: lazy_static 1.5.0
+------------------------------------------------------------------------
+Copyright (c) 2010 The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
+Used by: libc 0.2.190, libc 0.2.191
+------------------------------------------------------------------------
+Copyright (c) The Rust Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+------------------------------------------------------------------------
+Used by: libredox 0.1.18
+------------------------------------------------------------------------
+MIT License
+
+Copyright (c) 2023 4lDO2
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
 ------------------------------------------------------------------------
 Used by: locale_config 0.3.0

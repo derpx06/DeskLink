@@ -23,6 +23,7 @@ depends=(
   'libadwaita'
   'libnice'
   'openssl'
+  'vte4'                 # the Terminals page's interactive terminal
 )
 optdepends=(
   'gst-plugin-gtk4: system video sink (a copy is bundled otherwise)'
