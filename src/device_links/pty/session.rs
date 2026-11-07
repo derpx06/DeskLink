@@ -272,6 +272,7 @@ impl PtySession {
         // never see EOF and the session would never be reaped.
         drop(pair.slave);
 
+        let master_fd = pair.master.as_raw_fd();
         let reader = pair
             .master
             .try_clone_reader()
@@ -306,7 +307,11 @@ impl PtySession {
             desk_size: Mutex::new(None),
             started: std::time::SystemTime::now(),
         };
-        spawn_reader(reader, output, head, eof);
+        // SAFETY: dup of the master fd for the reader's own poll; the reader closes it.
+        let poll_fd = master_fd
+            .map(|fd| unsafe { libc::dup(fd) })
+            .filter(|fd| *fd >= 0);
+        spawn_reader(reader, output, head, eof, session.input.clone(), poll_fd);
         Ok(session)
     }
 
@@ -704,36 +709,175 @@ fn spawn_writer(mut writer: Box<dyn Write + Send>) -> SyncSender<Vec<u8>> {
     queue
 }
 
+/// `CSI ? 2026 $ p`: "do you support synchronized output?". Claude Code, neovim, helix and
+/// zellij ask it at start-up and draw each frame between `CSI ? 2026 h` and `l` only if told yes;
+/// asked of nothing that answers, they repaint in the open and a phone shows every half-erased
+/// frame as flicker. DeskLink answers it, once, whatever terminal (a desk window, a phone, none)
+/// is attached: every viewer either holds the frame (the phone does) or ignores the unknown mode.
+///
+/// It is answered wherever it appears in the output while the PTY is open, as a real terminal
+/// does: `cat` of a file that contains it gets the reply typed into the shell, like xterm or
+/// kitty would. Nothing is answered after EOF (the reader has stopped).
+const SYNC_QUERY: &[u8] = b"\x1b[?2026$p";
+
+/// `CSI ? 2026 ; 2 $ y`: supported, currently reset.
+const SYNC_SUPPORTED_REPLY: &[u8] = b"\x1b[?2026;2$y";
+
+/// How long the head of a query cut by a read boundary waits for the rest before it is shown
+/// as it is: a program that goes quiet after `ESC [` still shows its last bytes.
+const HELD_PREFIX_WAIT: Duration = Duration::from_millis(50);
+
+/// Replies waiting for a full input queue (the program is not reading its input) on threads of
+/// their own. Beyond this many, a probe-spamming program that never reads loses the extra ones.
+const MAX_WAITING_REPLIES: usize = 4;
+
+/// Takes [`SYNC_QUERY`] out of the output, so that exactly one party answers it: a desk window's
+/// terminal would answer too (or answer "unknown" first), and two replies are one stray keystroke
+/// sequence for the program. A query cut by the read boundary is held until the rest arrives, or
+/// [`HELD_PREFIX_WAIT`] passes, or the PTY closes.
+#[derive(Default)]
+struct SyncQueryFilter {
+    held: Vec<u8>,
+}
+
+impl SyncQueryFilter {
+    /// The bytes to show, and how many queries were removed.
+    fn filter(&mut self, input: &[u8]) -> (Vec<u8>, usize) {
+        let mut data = std::mem::take(&mut self.held);
+        data.extend_from_slice(input);
+        let mut out = Vec::with_capacity(data.len());
+        let mut found = 0;
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] != 0x1b {
+                out.push(data[i]);
+                i += 1;
+                continue;
+            }
+            let rest = &data[i..];
+            if rest.starts_with(SYNC_QUERY) {
+                found += 1;
+                i += SYNC_QUERY.len();
+            } else if rest.len() < SYNC_QUERY.len() && SYNC_QUERY.starts_with(rest) {
+                self.held = rest.to_vec();
+                break;
+            } else {
+                out.push(0x1b);
+                i += 1;
+            }
+        }
+        (out, found)
+    }
+
+    fn holding(&self) -> bool {
+        !self.held.is_empty()
+    }
+
+    /// The held head of a query, to be shown as output after all.
+    fn release(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.held)
+    }
+}
+
+/// Queues [`SYNC_SUPPORTED_REPLY`] as input. A full queue (the program has not read its input
+/// for a while) must not lose it, and must not stop the reader either - the program may be
+/// blocked writing output - so the reply waits for room on a thread of its own.
+fn send_sync_reply(replies: &SyncSender<Vec<u8>>, waiting: &Arc<std::sync::atomic::AtomicUsize>) {
+    let Err(TrySendError::Full(reply)) = replies.try_send(SYNC_SUPPORTED_REPLY.to_vec()) else {
+        return;
+    };
+    if waiting.fetch_add(1, Ordering::AcqRel) >= MAX_WAITING_REPLIES {
+        waiting.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
+    let replies = replies.clone();
+    let waiting = Arc::clone(waiting);
+    thread::spawn(move || {
+        // Err: the writer is gone with the program; nothing left to answer.
+        let _ = replies.send(reply);
+        waiting.fetch_sub(1, Ordering::AcqRel);
+    });
+}
+
+/// Whether `fd` has something to read within `wait` (or cannot be polled: then the caller's
+/// blocking read decides).
+fn readable_within(fd: Option<i32>, wait: Duration) -> bool {
+    let Some(fd) = fd else {
+        return true;
+    };
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = i32::try_from(wait.as_millis()).unwrap_or(i32::MAX);
+    // SAFETY: one valid pollfd on our own stack; the fd is the reader's own dup.
+    unsafe { libc::poll(&mut poll, 1, millis) != 0 }
+}
+
 /// Drains the PTY forever, feeding both the ring and the screen model.
 ///
 /// Deliberately a plain OS thread with a blocking read: this codebase has no
 /// async runtime, sessions number in the single digits, and a blocking read is
 /// both smaller and the shape `portable-pty` is built for — its master fd is
-/// never set non-blocking.
+/// never set non-blocking. `poll_fd` (a dup of the master the reader owns and
+/// closes) is only used to time out a held query head.
 fn spawn_reader(
     mut reader: Box<dyn Read + Send>,
     output: Arc<Mutex<Output>>,
     head: Arc<AtomicU64>,
     eof: Arc<AtomicBool>,
+    replies: SyncSender<Vec<u8>>,
+    poll_fd: Option<i32>,
 ) {
     thread::spawn(move || {
         let mut buffer = [0u8; READ_CHUNK];
+        let mut queries = SyncQueryFilter::default();
+        let waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let show = |bytes: &[u8]| -> bool {
+            if bytes.is_empty() {
+                return true;
+            }
+            let Ok(mut output) = output.lock() else {
+                return false;
+            };
+            output.parser.process(bytes);
+            output.ring.push(bytes);
+            output.last_activity = Instant::now();
+            head.store(output.ring.head(), Ordering::Release);
+            true
+        };
         loop {
+            // The head of a query is waiting for the rest: not for long.
+            if queries.holding() && !readable_within(poll_fd, HELD_PREFIX_WAIT) {
+                if !show(&queries.release()) {
+                    break;
+                }
+                continue;
+            }
             match reader.read(&mut buffer) {
                 // `portable-pty` maps the slave-closed `EIO` to a clean EOF, so
                 // this is the normal end of a session, not an error.
                 Ok(0) => break,
                 Ok(count) => {
-                    let Ok(mut output) = output.lock() else {
+                    let (bytes, asked) = queries.filter(&buffer[..count]);
+                    for _ in 0..asked {
+                        send_sync_reply(&replies, &waiting);
+                    }
+                    if !show(&bytes) {
                         break;
-                    };
-                    output.parser.process(&buffer[..count]);
-                    output.ring.push(&buffer[..count]);
-                    output.last_activity = Instant::now();
-                    head.store(output.ring.head(), Ordering::Release);
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
+            }
+        }
+        // A held head is output like any other; it is not answered.
+        show(&queries.release());
+        if let Some(fd) = poll_fd {
+            // SAFETY: our own dup, closed once.
+            unsafe {
+                libc::close(fd);
             }
         }
         eof.store(true, Ordering::Release);
@@ -1093,6 +1237,126 @@ mod tests {
         );
         let session = PtySession::spawn(None, 0, 0).expect("spawn shell");
         assert_eq!(session.size(), (MIN_DIMENSION, MIN_DIMENSION));
+    }
+
+    #[test]
+    fn the_sync_query_is_taken_out_and_counted_however_the_read_is_cut() {
+        let stream = b"ab\x1b[?2026$pcd\x1b[?25l\x1b[?2026$pef";
+        for cut in 0..=stream.len() {
+            let mut filter = SyncQueryFilter::default();
+            let (mut shown, mut asked) = filter.filter(&stream[..cut]);
+            let (rest, more) = filter.filter(&stream[cut..]);
+            shown.extend(rest);
+            asked += more;
+            assert_eq!(asked, 2, "cut at {cut}");
+            assert_eq!(shown, b"abcd\x1b[?25lef", "cut at {cut}");
+        }
+        // Other sequences, and a lone ESC, pass through untouched.
+        let mut filter = SyncQueryFilter::default();
+        let (shown, asked) = filter.filter(b"\x1b[?2026h\x1b[?2026l\x1b\x1b[1m\x1b[?2026$y");
+        assert_eq!(asked, 0);
+        assert_eq!(shown, b"\x1b[?2026h\x1b[?2026l\x1b\x1b[1m\x1b[?2026$y");
+        // A head that never gets its rest is released as it was.
+        let mut filter = SyncQueryFilter::default();
+        assert_eq!(filter.filter(b"x\x1b[?20"), (b"x".to_vec(), 0));
+        assert!(filter.holding());
+        assert_eq!(filter.release(), b"\x1b[?20");
+        assert!(!filter.holding());
+    }
+
+    /// Every byte the program wrote so far, from the ring.
+    fn ring_bytes(session: &PtySession) -> Vec<u8> {
+        match session.resync(Some(0), usize::MAX) {
+            Ok(Resync::Bytes { data, .. }) => data,
+            _ => Vec::new(),
+        }
+    }
+
+    fn wait_for_bytes(session: &PtySession, needle: &[u8]) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if ring_bytes(session)
+                .windows(needle.len())
+                .any(|w| w == needle)
+            {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// The line discipline echoes what DeskLink types into the PTY, control characters as `^[`:
+    /// so the reply is read back through the PTY itself.
+    const ECHOED_REPLY: &[u8] = b"^[[?2026;2$y";
+
+    /// Claude Code asks `CSI ? 2026 $ p` at start-up and only wraps its frames in synchronized output
+    /// if something answers. Nothing did, so a phone showed every half-erased repaint.
+    #[test]
+    fn a_program_asking_for_synchronized_output_is_told_it_is_supported() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "printf 'ask:\\033[?2026$p:'; sleep 5"]);
+        let session = PtySession::spawn(Some(command), 24, 80).expect("spawn sync probe");
+        assert!(
+            wait_for_bytes(&session, ECHOED_REPLY),
+            "the program got no answer: {:?}",
+            String::from_utf8_lossy(&ring_bytes(&session))
+        );
+        let output = ring_bytes(&session);
+        assert!(
+            output.windows(5).any(|w| w == b"ask::"),
+            "the query reached the output"
+        );
+        session.close();
+    }
+
+    /// A program that has not read its input for a while (the queue is full) still gets its answer
+    /// once it reads, behind what was already queued, and the reader is not blocked meanwhile.
+    #[test]
+    fn the_reply_waits_for_a_full_input_queue_instead_of_being_lost() {
+        let (queue, incoming) = sync_channel::<Vec<u8>>(1);
+        queue.send(b"typed".to_vec()).unwrap();
+        let waiting = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started = Instant::now();
+        send_sync_reply(&queue, &waiting);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the reader was blocked"
+        );
+        assert_eq!(incoming.recv().unwrap(), b"typed");
+        assert_eq!(
+            incoming.recv_timeout(Duration::from_secs(5)).unwrap(),
+            SYNC_SUPPORTED_REPLY
+        );
+    }
+
+    /// The head of a query held back at a read boundary is still output: after a moment when the
+    /// program goes quiet, and when the PTY closes.
+    #[test]
+    fn a_held_query_head_is_shown_when_the_program_goes_quiet_or_ends() {
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "printf 'quiet\\033['; sleep 5"]);
+        let quiet = PtySession::spawn(Some(command), 24, 80).expect("spawn quiet program");
+        assert!(
+            wait_for_bytes(&quiet, b"quiet\x1b["),
+            "the last bytes never showed"
+        );
+        quiet.close();
+
+        let mut command = CommandBuilder::new("/bin/sh");
+        command.args(["-c", "printf 'ends\\033[?'"]);
+        let ends = PtySession::spawn(Some(command), 24, 80).expect("spawn ending program");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !ends.eof.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(ends.eof.load(Ordering::Acquire), "never saw EOF");
+        let output = ring_bytes(&ends);
+        assert!(
+            output.windows(7).any(|w| w == b"ends\x1b[?"),
+            "lost at EOF: {:?}",
+            String::from_utf8_lossy(&output)
+        );
     }
 
     #[test]
