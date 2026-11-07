@@ -1504,7 +1504,7 @@ mod tests {
         assert!(!session.phone_sets_size());
         assert_eq!(session.size(), (40, 120));
 
-        // The last window closing ends the claim and the size question with it.
+        // The last window closing leaves the size to the phone.
         session.desk_window_closed();
         assert!(!session.has_desk_window());
         registry.close(&id);

@@ -839,6 +839,58 @@ mod tests {
         assert!(!session.has_desk_window());
     }
 
+    /// Waits up to five seconds for `done`.
+    fn eventually(done: impl Fn() -> bool) -> bool {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while !done() && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        done()
+    }
+
+    fn quiet_session() -> (String, Arc<PtySession>) {
+        let mut command = portable_pty::CommandBuilder::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let info = super::super::registry::registry()
+            .lock()
+            .unwrap()
+            .create(Some(command), 24, 80, "desk-test")
+            .expect("quiet session");
+        let session = super::super::registry::registry()
+            .lock()
+            .unwrap()
+            .get(&info.id)
+            .unwrap();
+        (info.id, session)
+    }
+
+    /// Hiding the DeskLink window (another page, the tray) ends its client;
+    /// showing it again attaches anew. Neither is the person acting at the
+    /// desk, so the phone's claim and its size survive both.
+    #[test]
+    fn a_phones_claim_survives_the_desk_window_closing_and_opening_again() {
+        let (id, session) = quiet_session();
+        session.claim_for_phone("phone-1", 30, 50).unwrap();
+        for _ in 0..2 {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn(move || serve(server));
+            client
+                .write_all(format!("ATTACH {id} 40 120\n").as_bytes())
+                .unwrap();
+            assert!(eventually(|| session.has_desk_window()));
+            assert_eq!(session.size(), (30, 50), "showing it took nothing");
+            drop(client);
+            let _ = served.join();
+            assert!(!session.has_desk_window());
+            assert!(session.phone_sets_size(), "hiding it took nothing");
+        }
+        session.release_phone_claim("phone-1");
+        super::super::registry::registry()
+            .lock()
+            .unwrap()
+            .close(&id);
+    }
+
     /// The desk taking the size back is one step: whoever sees the phone's
     /// claim gone sees the desk's size already in place. (The claim used to be
     /// cleared first and the PTY resized after, so a reader that waited for

@@ -371,9 +371,11 @@ impl PtySession {
     }
 
     pub(crate) fn desk_window_closed(&self) {
-        // The last window going away ends any claim: nothing is left to squeeze.
+        // The last window going away forgets its size. A phone's claim stays:
+        // a window closing (or the DeskLink window hiding its terminal) is not
+        // the person acting at the desk, and the next window to open must not
+        // squeeze the phone's view either. The phone lets go by detaching.
         if self.desk_windows.fetch_sub(1, Ordering::AcqRel) == 1 {
-            *self.claim() = None;
             *self.desk_size_lock() = None;
         }
     }
