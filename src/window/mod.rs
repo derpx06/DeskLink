@@ -46,6 +46,8 @@ mod palette_model;
 mod pdf_view;
 pub(crate) mod prefs;
 mod sidebar;
+#[cfg(feature = "vte")]
+mod terminal_view;
 mod terminals;
 mod transfers;
 pub(crate) mod ui_kit;
@@ -2796,6 +2798,19 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 if let Some(page) = win.imp().terminals.borrow().as_ref() {
                     page.open_detail(win, &info.id);
                 }
+            }
+        }
+        // "terminal-type WORDS": typed into the open detail's terminal, then Enter.
+        #[cfg(feature = "vte")]
+        "terminal-type" => {
+            if let Some(terminal) = win
+                .imp()
+                .terminals
+                .borrow()
+                .as_ref()
+                .and_then(|page| page.live_terminal())
+            {
+                terminal.type_text(&format!("{}\r", format!("{id} {arg}").trim()));
             }
         }
         "open-switcher" => win.imp().device_card.popup(),

@@ -446,6 +446,8 @@ progressbar.thin > trough { background-color: @surface_2; }
   color: @terminal_coral;
   font-size: 0.86em;
 }
+/* The live terminal (VTE): its padding is painted terminal black. */
+.term-live { padding: 10px 14px; }
 .term-detail-lines {
   padding: 16px 22px;
   font-size: 0.93em;
