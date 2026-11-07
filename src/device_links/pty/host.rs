@@ -95,6 +95,38 @@ pub(crate) fn runtime_dir() -> Option<PathBuf> {
     )
 }
 
+/// This program, to start again as a desk terminal's client. After an update
+/// replaced the binary while DeskLink ran (`cp` then `mv`), Linux names the
+/// running one ".../desklink (deleted)", and starting that fails: the new file
+/// at the same path is the one to run. `this_process`: the child is this
+/// process's own fork (the Terminals page's terminal), so `/proc/self/exe`,
+/// the running image even when deleted, works too; a terminal app's child
+/// would find the terminal there instead.
+pub(crate) fn own_executable(this_process: bool) -> PathBuf {
+    pick_executable(std::env::current_exe().ok(), this_process, Path::is_file)
+}
+
+fn pick_executable(
+    current: Option<PathBuf>,
+    this_process: bool,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    if let Some(current) = current {
+        let live = current
+            .to_str()
+            .and_then(|text| text.strip_suffix(" (deleted)"))
+            .map_or_else(|| current.clone(), PathBuf::from);
+        if exists(&live) {
+            return live;
+        }
+    }
+    let running = Path::new("/proc/self/exe");
+    if this_process && exists(running) {
+        return running.to_path_buf();
+    }
+    PathBuf::from("desklink")
+}
+
 /// The command a host terminal window runs to show session `id`.
 pub(crate) fn attach_client(exe: &str, id: &str) -> Vec<String> {
     match std::env::var("FLATPAK_ID").ok().filter(|_| in_flatpak()) {
@@ -120,6 +152,41 @@ mod tests {
         argv.iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// After `cp` + `mv` replaced the binary, the running one reads
+    /// "(deleted)": the new file at its path runs, else the running image
+    /// (own children only), else `desklink` on PATH.
+    #[test]
+    fn a_replaced_binary_still_starts_its_clients() {
+        let deleted = Some(PathBuf::from("/home/sam/.local/bin/desklink (deleted)"));
+        let everything = |_: &Path| true;
+        let nothing = |_: &Path| false;
+        let only_proc = |path: &Path| path == Path::new("/proc/self/exe");
+        assert_eq!(
+            pick_executable(deleted.clone(), true, everything),
+            PathBuf::from("/home/sam/.local/bin/desklink")
+        );
+        assert_eq!(
+            pick_executable(deleted.clone(), true, only_proc),
+            PathBuf::from("/proc/self/exe")
+        );
+        assert_eq!(
+            pick_executable(deleted.clone(), false, only_proc),
+            PathBuf::from("desklink"),
+            "a terminal app's child must not run the terminal"
+        );
+        assert_eq!(
+            pick_executable(None, true, nothing),
+            PathBuf::from("desklink")
+        );
+        assert_eq!(
+            pick_executable(Some("/usr/bin/desklink".into()), false, everything),
+            PathBuf::from("/usr/bin/desklink")
+        );
+        // The real thing: this test binary exists under its own name.
+        let me = own_executable(false);
+        assert!(me.is_file() && !me.to_string_lossy().ends_with(" (deleted)"));
     }
 
     #[test]
