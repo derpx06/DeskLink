@@ -145,6 +145,7 @@ pub(crate) fn attach_args(args: &[String]) -> Option<(&str, bool)> {
 /// The person typed or pasted into the DeskLink window's own terminal for
 /// session `id`, which shows `rows` x `cols`: that takes the size back, as
 /// typing in any desk window does.
+#[cfg_attr(not(feature = "vte"), allow(dead_code))]
 pub(crate) fn desk_acted(id: &str, rows: u16, cols: u16) {
     let session = super::registry::registry()
         .lock()

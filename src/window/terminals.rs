@@ -30,6 +30,7 @@ use crate::terminal_previews::{display_title, screen_lines, sessions, started, w
 /// The keys of the Terminals page's terminal while it has focus (every other
 /// Ctrl key is the program's). Listed in the shortcuts dialog;
 /// `terminal_view::key_route` is tested against them.
+#[cfg(test)]
 pub(crate) const TERMINAL_ACCELS: [(&str, &str); 4] = [
     ("Find anything", "<control><shift>k"),
     ("Copy", "<control><shift>c"),
