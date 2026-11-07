@@ -2813,6 +2813,12 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 terminal.type_text(&format!("{}\r", format!("{id} {arg}").trim()));
             }
         }
+        // "xkeys ctrl+k text:echo_hi Return": real X key presses (XTest),
+        // through GTK's whole key path, on the QA display only.
+        "xkeys" => {
+            let spec = format!("{id} {arg}");
+            std::thread::spawn(move || debug_xkeys(&spec));
+        }
         "open-switcher" => win.imp().device_card.popup(),
         // "fake-shell-device KIND NAME": a made-up device for the GNOME
         // integration (extension, media, search), not this window.
@@ -3465,6 +3471,52 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         _ => return false,
     }
     true
+}
+
+/// The QA scripts' keyboard: each token is `mod+...+key` (`ctrl+shift+k`,
+/// `Return`) or `text:words_with_underscores_for_spaces`, pressed through
+/// XTest on this process's X display.
+#[cfg(debug_assertions)]
+fn debug_xkeys(spec: &str) {
+    use crate::device_links::webrtc::remote_desktop_portal::DesktopSession;
+    let Ok(x) = crate::device_links::webrtc::x11_desktop::X11Desktop::connect() else {
+        debug_log!("[E2E] xkeys: no X display");
+        return;
+    };
+    let keysym = |name: &str| -> i32 {
+        match name {
+            "Return" => 0xff0d,
+            "Tab" => 0xff09,
+            "ctrl" => 0xffe3,
+            "shift" => 0xffe1,
+            "alt" => 0xffe9,
+            other => other.chars().next().map_or(0, |c| c as i32),
+        }
+    };
+    let tap = |sym: i32| {
+        let _ = x.keyboard_keysym(sym, true);
+        let _ = x.keyboard_keysym(sym, false);
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    for token in spec.split_whitespace() {
+        if let Some(text) = token.strip_prefix("text:") {
+            for c in text.chars() {
+                tap(if c == '_' { ' ' as i32 } else { c as i32 });
+            }
+            continue;
+        }
+        let parts: Vec<&str> = token.split('+').collect();
+        let (key, mods) = parts.split_last().unwrap_or((&"", &[]));
+        for held in mods {
+            let _ = x.keyboard_keysym(keysym(held), true);
+        }
+        tap(keysym(key));
+        for held in mods.iter().rev() {
+            let _ = x.keyboard_keysym(keysym(held), false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(60));
+    }
+    debug_log!("[E2E] xkeys done: {spec}");
 }
 
 #[cfg(debug_assertions)]
