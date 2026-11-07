@@ -25,6 +25,7 @@ depends=(
   'libadwaita'
   'libnice'              # ICE for webrtcbin
   'openssl'
+  'vte4'                 # the Terminals page's interactive terminal
 )
 makedepends=('cargo' 'meson')
 checkdepends=('appstream' 'desktop-file-utils')

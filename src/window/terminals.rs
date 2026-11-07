@@ -2,9 +2,14 @@
 //! live tile, searchable, and one terminal's detail — a large live
 //! preview, who is attached, and ending it.
 //!
-//! Output is refreshed in place each second; the grid and the detail are
-//! rebuilt only when sessions or attachments change, and the search entry
-//! lives outside both, so typing in it is never interrupted.
+//! Output is refreshed in place each second; the grid and the detail's side
+//! panel are rebuilt only when sessions or attachments change, and the search
+//! entry lives outside both, so typing in it is never interrupted.
+//!
+//! The detail's screen is a real terminal (`terminal_view`, VTE): it is built
+//! once per opened session and never rebuilt, so typing in it is never cut
+//! off. Built without the `vte` feature it is the read-only preview, drawn at
+//! the session's own width (scrolled sideways, never re-wrapped).
 
 use std::cell::RefCell;
 
@@ -23,7 +28,19 @@ use crate::link_glyph::presence_dot;
 use crate::terminal_previews::{display_title, screen_lines, sessions, started, waiting_for_input};
 
 /// How many lines the detail's preview shows.
+#[cfg_attr(feature = "vte", allow(dead_code))]
 const DETAIL_LINES: usize = 60;
+
+/// The open detail's parts: the screen stays, the bar's words and the side
+/// panel are refilled.
+#[derive(Debug)]
+struct Detail {
+    id: String,
+    bar: gtk::Box,
+    side: gtk::Box,
+    #[cfg(feature = "vte")]
+    terminal: super::terminal_view::TerminalView,
+}
 
 #[derive(Debug)]
 pub(super) struct Page {
@@ -44,6 +61,7 @@ pub(super) struct Page {
     device: RefCell<(String, String)>,
     key: RefCell<String>,
     detail_key: RefCell<String>,
+    parts: RefCell<Option<Detail>>,
     /// The New Terminal menu's "Start in" folders, and what they were.
     folders: gtk::gio::Menu,
     shown_folders: RefCell<Vec<String>>,
@@ -129,6 +147,8 @@ impl Page {
             .build();
         stack.add_named(&scroll, Some("grid"));
         stack.add_named(&detail, Some("detail"));
+        #[cfg(feature = "vte")]
+        super::terminal_view::hand_keys_to_terminals(win);
 
         let window = win.downgrade();
         search.connect_search_changed(move |_| {
@@ -168,6 +188,7 @@ impl Page {
             device: RefCell::default(),
             key: RefCell::default(),
             detail_key: RefCell::default(),
+            parts: RefCell::default(),
             folders,
             shown_folders: RefCell::default(),
         }
@@ -205,6 +226,28 @@ impl Page {
         self.detail_id.replace(None);
         self.detail_key.replace(String::new());
         self.stack.set_visible_child_name("grid");
+        self.drop_parts();
+    }
+
+    fn drop_parts(&self) {
+        let old = self.parts.take();
+        #[cfg(feature = "vte")]
+        if let Some(old) = &old {
+            old.terminal.shut();
+        }
+        drop(old);
+        while let Some(child) = self.detail.first_child() {
+            self.detail.remove(&child);
+        }
+    }
+
+    /// The open detail's live terminal, when there is one.
+    #[cfg(feature = "vte")]
+    pub(super) fn live_terminal(&self) -> Option<super::terminal_view::TerminalView> {
+        self.parts
+            .borrow()
+            .as_ref()
+            .map(|parts| parts.terminal.clone())
     }
 
     /// Shows terminal `id`'s detail.
@@ -265,9 +308,20 @@ impl Page {
             match all.iter().position(|info| info.id == id) {
                 Some(index) => self.update_detail(win, device, &all[index], &attached[index]),
                 None => {
-                    // Ended from the phone, or it exited and was reaped.
-                    self.close_detail();
-                    win.update_title();
+                    // Ended from the phone, or it exited and was reaped: the
+                    // live terminal says so (and offers Restart); the
+                    // preview just closes.
+                    #[cfg(feature = "vte")]
+                    let kept = self.live_terminal().is_some_and(|terminal| {
+                        terminal.session_gone();
+                        terminal.has_ended()
+                    });
+                    #[cfg(not(feature = "vte"))]
+                    let kept = false;
+                    if !kept {
+                        self.close_detail();
+                        win.update_title();
+                    }
                 }
             }
         }
@@ -402,6 +456,22 @@ impl Page {
         info: &SessionInfo,
         attached: &[String],
     ) {
+        let fresh = self
+            .parts
+            .borrow()
+            .as_ref()
+            .is_none_or(|parts| parts.id != info.id);
+        if fresh {
+            self.drop_parts();
+            let (split, parts) = detail_skeleton(info);
+            self.detail.append(&split);
+            self.parts.replace(Some(parts));
+            self.detail_key.replace(String::new());
+        }
+        #[cfg(feature = "vte")]
+        if let Some(terminal) = self.live_terminal() {
+            terminal.update(info);
+        }
         let key = serde_json::to_string(&(
             &info.id,
             &info.title,
@@ -417,12 +487,36 @@ impl Page {
             return;
         }
         self.detail_key.replace(key);
-        while let Some(child) = self.detail.first_child() {
-            self.detail.remove(&child);
+        if let Some(parts) = self.parts.borrow().as_ref() {
+            fill_bar(win, &parts.bar, device, info, attached);
+            fill_side(win, &parts.side, device, info, attached);
         }
-        self.detail
-            .append(&detail_view(win, device, info, attached));
-        win.apply_layout();
+        if fresh {
+            win.apply_layout();
+        }
+    }
+}
+
+/// Closes the detail `widget` is in (the ended terminal's Close).
+#[cfg_attr(not(feature = "vte"), allow(dead_code))]
+pub(super) fn close_detail_from(widget: &impl IsA<gtk::Widget>) {
+    if let Some(window) = widget.as_ref().root().and_downcast::<DesklinkWindow>() {
+        if let Some(page) = window.imp().terminals.borrow().as_ref() {
+            page.close_detail();
+        }
+        window.update_title();
+        window.refresh_soon();
+    }
+}
+
+/// Shows terminal `id`'s detail in the window `widget` is in.
+#[cfg_attr(not(feature = "vte"), allow(dead_code))]
+pub(super) fn open_detail_from(widget: &impl IsA<gtk::Widget>, id: &str) {
+    if let Some(window) = widget.as_ref().root().and_downcast::<DesklinkWindow>() {
+        if let Some(page) = window.imp().terminals.borrow().as_ref() {
+            page.open_detail(&window, id);
+        }
+        window.refresh_soon();
     }
 }
 
@@ -665,14 +759,10 @@ fn empty_tile() -> gtk::Box {
     tile
 }
 
-/// One terminal: its live screen on the left, who is attached and what can
-/// be done on the right (below, when narrow).
-fn detail_view(
-    win: &DesklinkWindow,
-    device: &DeviceView,
-    info: &SessionInfo,
-    attached: &[String],
-) -> gtk::Box {
+/// One terminal: its screen on the left, who is attached and what can be
+/// done on the right. Narrow, the panel goes under the screen, folded away
+/// behind "Details".
+fn detail_skeleton(info: &SessionInfo) -> (gtk::Box, Detail) {
     let split = gtk::Box::builder().vexpand(true).build();
     split.set_widget_name("responsive");
 
@@ -682,10 +772,104 @@ fn detail_view(
         .vexpand(true)
         .css_classes(["term-detail"])
         .build();
-    let bar = gtk::Box::builder()
+    let bar = gtk::Box::builder().spacing(10).hexpand(true).build();
+    let details = gtk::ToggleButton::builder()
+        .label("Details")
+        .valign(gtk::Align::Center)
+        .css_classes(["term-back"])
+        .visible(false)
+        .build();
+    details.set_widget_name("terminal-details");
+    let bar_row = gtk::Box::builder()
         .spacing(10)
         .css_classes(["term-detail-bar"])
         .build();
+    bar_row.append(&bar);
+    bar_row.append(&details);
+    screen.append(&bar_row);
+    #[cfg(feature = "vte")]
+    let terminal = {
+        let terminal = super::terminal_view::TerminalView::new(info);
+        screen.append(&terminal.root);
+        terminal
+    };
+    #[cfg(not(feature = "vte"))]
+    screen.append(&preview_screen(info));
+    split.append(&screen);
+
+    let side = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(18)
+        .width_request(250)
+        .css_classes(["detail-side"])
+        .build();
+    split.append(&side);
+
+    // Stacked (narrow), the panel is folded away unless asked for, so the
+    // terminal keeps the height.
+    let fold = {
+        let (side, details) = (side.clone(), details.clone());
+        move |split: &gtk::Box| {
+            let stacked = split.orientation() == gtk::Orientation::Vertical;
+            details.set_visible(stacked);
+            side.set_visible(!stacked || details.is_active());
+        }
+    };
+    fold(&split);
+    split.connect_orientation_notify(fold.clone());
+    let weak = split.downgrade();
+    details.connect_toggled(move |_| {
+        if let Some(split) = weak.upgrade() {
+            fold(&split);
+        }
+    });
+
+    let parts = Detail {
+        id: info.id.clone(),
+        bar,
+        side,
+        #[cfg(feature = "vte")]
+        terminal,
+    };
+    (split, parts)
+}
+
+/// The read-only screen: the session's lines at its own width, top first,
+/// scrolled sideways rather than re-wrapped to the panel.
+#[cfg_attr(feature = "vte", allow(dead_code))]
+fn preview_screen(info: &SessionInfo) -> gtk::ScrolledWindow {
+    let lines = gtk::Label::builder()
+        .label(" ")
+        .xalign(0.0)
+        .yalign(0.0)
+        .valign(gtk::Align::Start)
+        .halign(gtk::Align::Start)
+        .wrap(false)
+        .width_chars(i32::from(info.cols.max(1)))
+        .selectable(true)
+        .css_classes(["mono", "term-detail-lines"])
+        .build();
+    lines.set_widget_name(&format!("terminal-detail:{}", info.id));
+    lines.update_property(&[gtk::accessible::Property::Label("Terminal output")]);
+    gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .vexpand(true)
+        .hexpand(true)
+        .child(&lines)
+        .build()
+}
+
+/// The bar's back button, title and who is viewing.
+fn fill_bar(
+    win: &DesklinkWindow,
+    bar: &gtk::Box,
+    device: &DeviceView,
+    info: &SessionInfo,
+    attached: &[String],
+) {
+    while let Some(child) = bar.first_child() {
+        bar.remove(&child);
+    }
     let back = icon_button("desklink-arrow-back-symbolic", "Terminals", &["term-back"]);
     let window = win.downgrade();
     back.connect_clicked(move |_| {
@@ -713,29 +897,19 @@ fn detail_view(
         pill.append(&here);
         bar.append(&pill);
     }
-    screen.append(&bar);
-    let lines = gtk::Label::builder()
-        .label(" ")
-        .xalign(0.0)
-        .yalign(1.0)
-        .valign(gtk::Align::Fill)
-        .vexpand(true)
-        .wrap(true)
-        .wrap_mode(gtk::pango::WrapMode::Char)
-        .selectable(true)
-        .css_classes(["mono", "term-detail-lines"])
-        .build();
-    lines.set_widget_name(&format!("terminal-detail:{}", info.id));
-    lines.update_property(&[gtk::accessible::Property::Label("Terminal output")]);
-    screen.append(&lines);
-    split.append(&screen);
+}
 
-    let side = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(18)
-        .width_request(250)
-        .css_classes(["detail-side"])
-        .build();
+/// The side panel: who has it open, its facts, and the actions.
+fn fill_side(
+    win: &DesklinkWindow,
+    side: &gtk::Box,
+    device: &DeviceView,
+    info: &SessionInfo,
+    attached: &[String],
+) {
+    while let Some(child) = side.first_child() {
+        side.remove(&child);
+    }
     let who = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -868,8 +1042,6 @@ fn detail_view(
         );
     });
     side.append(&end);
-    split.append(&side);
-    split
 }
 
 fn attached_row(
@@ -922,5 +1094,84 @@ mod tests {
         assert_eq!(tile_text(&lines, None), "b\nc\nd");
         assert_eq!(tile_text(&[], None), "❯");
         assert_eq!(tile_text(&lines, Some(1)), "Exited (1)");
+    }
+
+    fn session(cols: u16) -> SessionInfo {
+        SessionInfo {
+            id: "t1".into(),
+            title: "-bash".into(),
+            rows: 37,
+            cols,
+            exit_status: None,
+            desk_window: false,
+            phone_size: false,
+            cwd: Some("~".into()),
+            started_at: 0,
+            shell: Some("bash".into()),
+        }
+    }
+
+    /// A 99-column session reads as 99 columns: "Terminal: desk" / "link"
+    /// came from wrapping it to the panel.
+    #[test]
+    fn the_preview_keeps_the_sessions_own_width() {
+        crate::test_display::run(|| {
+            let scroll = preview_screen(&session(99));
+            assert_eq!(scroll.hscrollbar_policy(), gtk::PolicyType::Automatic);
+            let label = scroll
+                .child()
+                .and_then(|child| child.downcast::<gtk::Viewport>().ok())
+                .and_then(|viewport| viewport.child())
+                .and_then(|child| child.downcast::<gtk::Label>().ok())
+                .expect("the preview's label");
+            assert!(!label.wraps(), "never re-wrapped");
+            assert_eq!(label.width_chars(), 99);
+            assert_eq!(label.valign(), gtk::Align::Start, "no gap above the text");
+        });
+    }
+
+    /// An open session's detail is a real terminal (or, built without VTE,
+    /// the preview).
+    #[test]
+    fn an_open_session_gets_an_interactive_terminal() {
+        crate::test_display::run(|| {
+            let (split, parts) = detail_skeleton(&session(99));
+            assert_eq!(parts.id, "t1");
+            let live = named_widgets(split.upcast_ref(), "terminal-live:t1");
+            #[cfg(feature = "vte")]
+            {
+                assert_eq!(live.len(), 1);
+                assert!(live[0].is::<vte4::Terminal>());
+                assert!(live[0].is_focusable());
+                assert!(named_widgets(split.upcast_ref(), "terminal-detail:").is_empty());
+            }
+            #[cfg(not(feature = "vte"))]
+            {
+                assert!(live.is_empty());
+                assert_eq!(
+                    named_widgets(split.upcast_ref(), "terminal-detail:t1").len(),
+                    1
+                );
+            }
+        });
+    }
+
+    /// Stacked on a narrow window the panel folds behind "Details".
+    #[test]
+    fn the_side_panel_folds_away_when_narrow() {
+        crate::test_display::run(|| {
+            let (split, parts) = detail_skeleton(&session(80));
+            let details = named_widgets(split.upcast_ref(), "terminal-details")
+                .pop()
+                .and_then(|widget| widget.downcast::<gtk::ToggleButton>().ok())
+                .expect("the Details button");
+            assert!(parts.side.is_visible() && !details.is_visible());
+            split.set_orientation(gtk::Orientation::Vertical);
+            assert!(!parts.side.is_visible() && details.is_visible());
+            details.set_active(true);
+            assert!(parts.side.is_visible());
+            split.set_orientation(gtk::Orientation::Horizontal);
+            assert!(parts.side.is_visible() && !details.is_visible());
+        });
     }
 }

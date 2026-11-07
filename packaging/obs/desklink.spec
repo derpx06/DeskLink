@@ -30,6 +30,7 @@ BuildRequires:  /usr/bin/glib-compile-resources
 BuildRequires:  /usr/bin/glib-compile-schemas
 BuildRequires:  pkgconfig(gtk4) >= 4.12
 BuildRequires:  pkgconfig(libadwaita-1)
+BuildRequires:  pkgconfig(vte-2.91-gtk4) >= 0.76
 BuildRequires:  pkgconfig(gstreamer-1.0) >= 1.22
 BuildRequires:  pkgconfig(gstreamer-base-1.0)
 BuildRequires:  pkgconfig(gstreamer-video-1.0)

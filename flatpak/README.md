@@ -7,6 +7,11 @@ crates come from `cargo-sources.json`, generated from `Cargo.lock`. The
 The runtime is GNOME 51 because DeskLink needs GStreamer 1.28 (`gstreamer`
 feature `v1_28`); GNOME 49 and 50 ship 1.26.
 
+The GNOME runtime has no VTE, so the manifest builds it (GTK 4 only, the
+`vte` module) for the Terminals page's interactive terminal. Its release
+tarball carries its meson subprojects (simdutf, fmt, fast_float), so it
+builds offline. Bump it with the runtime: the archive URL and `sha256`.
+
 ## Generate `cargo-sources.json`
 
 Regenerate it whenever `Cargo.lock` changes. It is not committed here (it is

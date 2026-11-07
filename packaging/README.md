@@ -9,8 +9,9 @@
 | `../flake.nix` | Nix and NixOS |
 
 All of them build with Meson, which runs `cargo build --locked`. The build
-floor is Rust 1.85, GTK 4.12, GStreamer 1.22 and the libadwaita release named
-by the `adw` feature in `Cargo.toml`. `Cargo.lock` is held to Rust 1.85
+floor is Rust 1.85, GTK 4.12, GStreamer 1.22, VTE 0.76 (its GTK 4 build,
+`vte-2.91-gtk4`) and the libadwaita release named by the `adw` feature in
+`Cargo.toml`. `Cargo.lock` is held to Rust 1.85
 (Debian 13's compiler): `idna_adapter` stays at 1.1 and `image` at 0.25.6.
 Check `rust-version` before running `cargo update`.
 

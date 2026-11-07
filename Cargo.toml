@@ -39,8 +39,17 @@ uuid = { version = "1", features = ["v4"] }
 # Accent folding for the "Find anything" palette ("cafe" finds "Café"); already in the lock.
 unicode-normalization = "0.1"
 vt100 = "0.16"
+# The interactive terminal in the Terminals page's detail (VTE 0.76+, GTK 4;
+# Ubuntu 24.04 ships 0.76).
+# Optional: `--no-default-features` builds without it and keeps the
+# read-only preview.
+vte4 = { version = "0.8", features = ["v0_76"], optional = true }
 # X11 fallback for sharing the desktop where no ScreenCast portal exists.
 x11rb = { version = "0.13", features = ["xtest", "xfixes"] }
+
+[features]
+default = ["vte"]
+vte = ["dep:vte4"]
 
 [dependencies.gst]
 package = "gstreamer"

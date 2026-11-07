@@ -41,6 +41,7 @@
               (with pkgs; [
                 gtk4
                 libadwaita
+                vte-gtk4 # the Terminals page's interactive terminal
                 openssl
                 libnice # nicesrc/nicesink for webrtcbin
                 pipewire # pipewiresrc for desktop capture
