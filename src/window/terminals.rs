@@ -27,6 +27,16 @@ use crate::device_links::webrtc::terminal_bridge::{attached_devices, end_device_
 use crate::link_glyph::presence_dot;
 use crate::terminal_previews::{display_title, screen_lines, sessions, started, waiting_for_input};
 
+/// The keys of the Terminals page's terminal while it has focus (every other
+/// Ctrl key is the program's). Listed in the shortcuts dialog;
+/// `terminal_view::key_route` is tested against them.
+pub(crate) const TERMINAL_ACCELS: [(&str, &str); 4] = [
+    ("Find anything", "<control><shift>k"),
+    ("Copy", "<control><shift>c"),
+    ("Paste", "<control><shift>v"),
+    ("Leave the terminal", "<control>Tab"),
+];
+
 /// How many lines the detail's preview shows.
 #[cfg_attr(feature = "vte", allow(dead_code))]
 const DETAIL_LINES: usize = 60;

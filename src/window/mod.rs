@@ -4216,9 +4216,20 @@ mod tests {
                     .iter()
                     .map(|(_, accel)| *accel)
                     .chain(PAGE_ACCELS.iter().map(|(_, accel)| *accel))
+                    .chain(terminals::TERMINAL_ACCELS.iter().map(|(_, accel)| *accel))
                     .any(|bound| bound.eq_ignore_ascii_case(accel)),
                 "{accel} is typed in the dialog but bound to nothing"
             );
+        }
+        // Every key of the page's terminal is listed, by its own name.
+        for (name, accel) in terminals::TERMINAL_ACCELS {
+            assert!(
+                typed
+                    .iter()
+                    .any(|listed| listed.eq_ignore_ascii_case(accel)),
+                "{accel} ({name}) is not in the dialog"
+            );
+            assert!(dialog.contains(&format!(">{name}<")), "{name}");
         }
         let mut seen = std::collections::HashSet::new();
         for accel in ACCELS
