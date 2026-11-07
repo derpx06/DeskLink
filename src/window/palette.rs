@@ -523,6 +523,27 @@ fn present(window: &DesklinkWindow, items: Vec<Item>, sources: &Sources, query: 
     if !query.is_empty() {
         entry.set_text(query);
         entry.set_position(-1);
+        // The dialog focuses the box again once it is up, which selects what
+        // is typed: the next key would replace the letter that opened it.
+        // That first select-all is undone, once.
+        let handler: Rc<RefCell<Option<glib::SignalHandlerId>>> = Rc::default();
+        let id = entry.connect_notify_local(Some("selection-bound"), {
+            let handler = handler.clone();
+            move |entry, _| {
+                if entry.selection_bounds().is_some() {
+                    if let Some(id) = handler.borrow_mut().take() {
+                        entry.disconnect(id);
+                    }
+                    let entry = entry.downgrade();
+                    glib::idle_add_local_once(move || {
+                        if let Some(entry) = entry.upgrade() {
+                            entry.set_position(-1);
+                        }
+                    });
+                }
+            }
+        });
+        handler.replace(Some(id));
     }
 }
 

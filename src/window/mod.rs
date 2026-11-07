@@ -119,7 +119,8 @@ pub(crate) const PAGE_ACCELS: [(&str, &str); 6] = [
 
 /// Ctrl+K opens "Find anything" (`win.palette`); Ctrl+F does too, off the
 /// Terminals page and outside a text field. Shown in the shortcuts dialog, on
-/// the search buttons and next to nothing else.
+/// the search buttons, as key caps in the sidebar's search field and next to
+/// nothing else.
 pub(crate) const PALETTE_ACCEL: &str = "<control>k";
 
 /// How many of [`PAGES`] are in the sidebar's main list; Settings is the
@@ -158,6 +159,8 @@ mod imp {
         pub drop_hint: TemplateChild<gtk::Label>,
         #[template_child]
         pub content_search: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub sidebar_search: TemplateChild<gtk::Button>,
         #[template_child]
         pub device_card: TemplateChild<gtk::MenuButton>,
         #[template_child]
@@ -285,7 +288,7 @@ mod imp {
                 }
             }
 
-            // The sidebar has the search button; with the sidebar folded away
+            // The sidebar has the search field; with the sidebar folded away
             // the page's own header does.
             self.split_view
                 .bind_property("collapsed", &*self.content_search, "visible")
@@ -2835,10 +2838,35 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         }
         // "settings-page list|N|search [words]": walks Settings' subpages.
         "settings-page" => prefs::debug_open(id, arg),
+        // Pages with their own scrollers: every one on screen.
         "scroll-end" => {
-            if let Some((scroll, _)) = win.imp().bodies.borrow().get(id).cloned() {
+            let page = win.imp().page_stack.child_by_name(id);
+            let scrollers: Vec<gtk::Widget> = match win.imp().bodies.borrow().get(id) {
+                Some((scroll, _)) => vec![scroll.clone().upcast()],
+                None => page
+                    .map(|page| named_widgets(&page, ""))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|widget| widget.is::<gtk::ScrolledWindow>() && widget.is_mapped())
+                    .collect(),
+            };
+            for scroll in scrollers
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::ScrolledWindow>())
+            {
                 let adjustment = scroll.vadjustment();
                 adjustment.set_value(adjustment.upper());
+                // A child laid out shorter than it asks for is cut at the bottom.
+                if let Some(child) = scroll.child().and_then(|viewport| viewport.first_child()) {
+                    let (min, nat, _, _) = child.measure(gtk::Orientation::Vertical, child.width());
+                    debug_log!(
+                        "[E2E] scroll-end {id}: upper {} page {} value {}, child {} high, min {min}, natural {nat}",
+                        adjustment.upper(),
+                        adjustment.page_size(),
+                        adjustment.value(),
+                        child.height()
+                    );
+                }
             }
         }
         // New Terminal's menu, with its "Start in" folders.
@@ -3444,6 +3472,14 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 focus.as_ref().map(|widget| widget.type_().name()),
                 focus.as_ref().map(|widget| widget.widget_name())
             );
+            if let Some(text) = focus.and_then(|widget| widget.downcast::<gtk::Text>().ok()) {
+                debug_log!(
+                    "[E2E] focus text {:?}, cursor {}, selection {:?}",
+                    text.text(),
+                    text.position(),
+                    text.selection_bounds()
+                );
+            }
         }
         // "nav content|sidebar": which pane a collapsed window shows.
         "nav" => win.imp().split_view.set_show_content(id == "content"),
@@ -4129,13 +4165,39 @@ mod tests {
         assert!(ACCELS.contains(&("win.palette", PALETTE_ACCEL)));
         assert!(actions.iter().any(|action| action == "win.palette"));
         assert_eq!(PALETTE_ACCEL, "<control>k");
+        // Four ways in: the welcome header, the sidebar's header and its search
+        // field above Settings, and the page header once the sidebar is folded
+        // away. Each says Ctrl+K.
         let ui = include_str!("../window.ui");
-        assert_eq!(ui.matches("Find anything (Ctrl+K)").count(), 3);
-        assert_eq!(
-            ui.matches("<property name=\"action-name\">win.palette</property>")
-                .count(),
-            3
-        );
+        let buttons: Vec<&str> = ui
+            .split("<object class=\"GtkButton\"")
+            .filter(|button| {
+                button
+                    .split("<object ")
+                    .next()
+                    .is_some_and(|own| own.contains("win.palette"))
+            })
+            .collect();
+        assert_eq!(buttons.len(), 4, "{buttons:?}");
+        for button in &buttons {
+            assert!(button.contains("Find anything (Ctrl+K)"), "{button}");
+        }
+        // The field sits at the bottom of the sidebar, just above Settings.
+        let at = |id: &str| ui.find(&format!("id=\"{id}\"")).unwrap_or_default();
+        assert!(at("nav_list") < at("sidebar_search") && at("sidebar_search") < at("footer_list"));
+        // The field shows the key it is opened by, and is read as the same name.
+        let field = ui
+            .split("id=\"sidebar_search\"")
+            .nth(1)
+            .expect("the sidebar has a search field");
+        let field = field.split("footer_list").next().unwrap_or_default();
+        assert!(field.contains(
+            "<property name=\"label\" translatable=\"yes\">Find anything (Ctrl+K)</property>"
+        ));
+        assert!(field.contains(&format!(
+            "<property name=\"accelerator\">{}</property>",
+            PALETTE_ACCEL.replace('<', "&lt;").replace('>', "&gt;")
+        )));
         // The plain list of older libadwaita says it too.
         assert!(include_str!("../application.rs").contains("(\"Find anything\", \"Ctrl+K\")"));
     }

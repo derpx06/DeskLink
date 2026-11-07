@@ -275,6 +275,22 @@
 .dl-palette > row:selected:hover { background-image: none; }
 .dl-palette-keys { opacity: 0.8; }
 .dl-palette-foot { padding: 8px 16px; border-top: 1px solid @dl_hairline; }
+/* The sidebar's way in: a button drawn as a search field. */
+.dl-search-field {
+  min-height: 40px;
+  padding: 0 12px;
+  border: none;
+  border-radius: 12px;
+  background-color: @dl_surface_2;
+  box-shadow: none;
+  color: @dl_text_dim;
+  font-weight: normal;
+  transition: background-color 100ms linear, background-image 100ms linear;
+}
+.dl-search-field:hover { background-image: linear-gradient(alpha(currentColor, 0.06), alpha(currentColor, 0.06)); }
+.dl-search-field:active { background-image: linear-gradient(alpha(currentColor, 0.1), alpha(currentColor, 0.1)); }
+.dl-search-field:focus-visible { outline: 2px solid @dl_accent_text; outline-offset: 2px; }
+.dl-search-field .dl-search-placeholder { color: @dl_text_dim; }
 
 /* ── Toast (the inverse snackbar; AdwToast inside `.dl-toasts` too) ─────── */
 .dl-toast, .dl-toasts toast {

@@ -130,6 +130,32 @@ impl Sidebar {
                 }
             });
         }
+        // A letter typed on the page lists or the search field starts "Find
+        // anything" with it.
+        for widget in [
+            imp.nav_list.upcast_ref::<gtk::Widget>(),
+            imp.footer_list.upcast_ref(),
+            imp.sidebar_search.upcast_ref(),
+        ] {
+            let keys = gtk::EventControllerKey::new();
+            let window = win.downgrade();
+            keys.connect_key_pressed(move |_, key, _, state| {
+                let letter = key.to_unicode().filter(|c| c.is_alphanumeric());
+                let plain = !state.intersects(
+                    gtk::gdk::ModifierType::CONTROL_MASK
+                        | gtk::gdk::ModifierType::ALT_MASK
+                        | gtk::gdk::ModifierType::SUPER_MASK,
+                );
+                match (letter, window.upgrade()) {
+                    (Some(letter), Some(window)) if plain && !super::palette::is_open() => {
+                        super::palette::toggle(&window, &letter.to_string());
+                        glib::Propagation::Stop
+                    }
+                    _ => glib::Propagation::Proceed,
+                }
+            });
+            widget.add_controller(keys);
+        }
 
         let switcher = gtk::ListBox::builder()
             .selection_mode(gtk::SelectionMode::None)

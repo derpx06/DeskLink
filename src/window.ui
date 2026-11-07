@@ -166,6 +166,56 @@
                                     <child>
                                       <object class="GtkSeparator"/>
                                     </child>
+                                    <!-- "Find anything", as a search field everyone sees, just above Settings. -->
+                                    <child>
+                                      <object class="GtkButton" id="sidebar_search">
+                                        <property name="action-name">win.palette</property>
+                                        <property name="tooltip-text" translatable="yes">Find anything (Ctrl+K)</property>
+                                        <property name="margin-start">10</property>
+                                        <property name="margin-end">10</property>
+                                        <property name="margin-top">10</property>
+                                        <property name="margin-bottom">2</property>
+                                        <accessibility>
+                                          <property name="label" translatable="yes">Find anything (Ctrl+K)</property>
+                                        </accessibility>
+                                        <style>
+                                          <class name="dl-search-field"/>
+                                        </style>
+                                        <property name="child">
+                                          <object class="GtkBox">
+                                            <property name="spacing">8</property>
+                                            <child>
+                                              <object class="GtkImage">
+                                                <property name="icon-name">desklink-search-symbolic</property>
+                                                <property name="accessible-role">presentation</property>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkLabel">
+                                                <property name="label" translatable="yes">Search</property>
+                                                <property name="xalign">0</property>
+                                                <property name="hexpand">True</property>
+                                                <property name="ellipsize">end</property>
+                                                <property name="accessible-role">presentation</property>
+                                                <style>
+                                                  <class name="dl-search-placeholder"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkShortcutLabel">
+                                                <property name="accelerator">&lt;control&gt;k</property>
+                                                <property name="valign">center</property>
+                                                <property name="accessible-role">presentation</property>
+                                                <style>
+                                                  <class name="dl-palette-keys"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                          </object>
+                                        </property>
+                                      </object>
+                                    </child>
                                     <child>
                                       <object class="GtkListBox" id="footer_list">
                                         <property name="selection-mode">single</property>
