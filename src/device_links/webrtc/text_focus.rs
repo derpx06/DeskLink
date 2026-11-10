@@ -192,26 +192,48 @@ fn watch(stop: &AtomicBool, on_change: &dyn Fn(bool)) -> Result<(), String> {
             // Focus that was already somewhere when control began sends no
             // event: a terminal focused before the phone took over never
             // raised the keyboard. Report where it is now, then follow events.
-            let mut reported: Option<bool> = None;
-            if let Some((sender, path)) = current_focus(&a11y) {
-                if let Some(editable) =
-                    next_report(reported, element_takes_typing(&a11y, &sender, &path))
-                {
-                    reported = Some(editable);
-                    on_change(editable);
+            let mut reported: Option<Reported> = None;
+            // An element whose query timed out, asked again shortly.
+            let mut retry: Option<(String, String, u32, std::time::Instant)> = None;
+            let look = |sender: &str, path: &str, tries: u32, reported: &mut Option<Reported>| {
+                let element = format!("{sender}{path}");
+                match element_takes_typing(&a11y, sender, path) {
+                    Some(editable) => {
+                        let now = std::time::Instant::now();
+                        if should_report(reported.as_ref(), &element, editable, now) {
+                            on_change(editable);
+                            *reported = Some(Reported {
+                                element,
+                                editable,
+                                at: now,
+                            });
+                        }
+                        None
+                    }
+                    None if tries < FOCUS_RETRIES => Some((
+                        sender.to_string(),
+                        path.to_string(),
+                        tries + 1,
+                        std::time::Instant::now() + FOCUS_RETRY_AFTER,
+                    )),
+                    None => None,
                 }
+            };
+            if let Some((sender, path)) = current_focus(&a11y) {
+                retry = look(&sender, &path, 0, &mut reported);
             }
             while !stop.load(Ordering::Acquire) {
                 while context.pending() {
                     context.iteration(false);
                 }
-                // Only the latest focus matters.
+                // Only the latest focus matters; a newer one replaces a retry.
                 if let Some((sender, path)) = events.try_iter().last() {
-                    if let Some(editable) =
-                        next_report(reported, element_takes_typing(&a11y, &sender, &path))
-                    {
-                        reported = Some(editable);
-                        on_change(editable);
+                    retry = look(&sender, &path, 0, &mut reported);
+                } else if let Some((sender, path, tries, at)) = retry.take() {
+                    if std::time::Instant::now() >= at {
+                        retry = look(&sender, &path, tries, &mut reported);
+                    } else {
+                        retry = Some((sender, path, tries, at));
                     }
                 }
                 thread::sleep(Duration::from_millis(40));
@@ -287,13 +309,42 @@ fn state_word(a11y: &gio::DBusConnection, sender: &str, path: &str) -> u32 {
     state_of(a11y, sender, path, 300).unwrap_or(0)
 }
 
-/// What to tell the phone after looking at a newly focused element: its
-/// answer when that changes what was said, nothing when it is the same or
-/// when the element could not be asked. An application busy drawing (a
-/// terminal printing fast) let `GetRole` time out, which read as "takes no
-/// typing" and dropped the phone's keyboard mid-sentence, then raised it again.
-pub(crate) fn next_report(reported: Option<bool>, observed: Option<bool>) -> Option<bool> {
-    observed.filter(|editable| reported != Some(*editable))
+/// The last report sent to the phone: which element, what, when.
+pub(crate) struct Reported {
+    element: String,
+    editable: bool,
+    at: std::time::Instant,
+}
+
+/// A burst of focus events for one element (a terminal sends three or four)
+/// is told once; after this, the same field focused again is told again.
+const SAME_FOCUS_WINDOW: Duration = Duration::from_secs(1);
+/// Times an element whose query timed out is asked again, and how soon. An
+/// application busy drawing (a terminal printing fast) let `GetRole` time
+/// out, which used to read as "takes no typing".
+const FOCUS_RETRIES: u32 = 2;
+const FOCUS_RETRY_AFTER: Duration = Duration::from_millis(250);
+
+/// Whether a focus on `element` (taking typing or not) is told to the phone.
+/// Every text field that takes focus is told, even when the last report was
+/// also "typing": the phone may have put its keyboard away itself (Back),
+/// and it must come back for the next field. Only a burst of events for the
+/// same element is told once, and "no typing" only when it changes.
+pub(crate) fn should_report(
+    last: Option<&Reported>,
+    element: &str,
+    editable: bool,
+    now: std::time::Instant,
+) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    if !editable {
+        return last.editable;
+    }
+    !last.editable
+        || last.element != element
+        || now.saturating_duration_since(last.at) >= SAME_FOCUS_WINDOW
 }
 
 /// How long the focused element itself may take to answer.
@@ -348,20 +399,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_element_that_does_not_answer_changes_nothing() {
-        assert_eq!(next_report(None, Some(true)), Some(true), "first answer");
-        assert_eq!(next_report(Some(true), Some(true)), None, "unchanged");
-        assert_eq!(
-            next_report(Some(true), Some(false)),
-            Some(false),
-            "left the field"
-        );
-        assert_eq!(
-            next_report(Some(true), None),
-            None,
-            "a busy terminal is not 'no typing'"
-        );
-        assert_eq!(next_report(None, None), None);
+    fn every_text_field_that_takes_focus_raises_the_keyboard_again() {
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let typing = |element: &str, ms: u64| Reported {
+            element: element.to_string(),
+            editable: true,
+            at: at(ms),
+        };
+        assert!(should_report(None, "app/a", true, t0), "first focus");
+        assert!(should_report(None, "app/a", false, t0), "first focus");
+        // The phone may have put its keyboard away (Back): the next field
+        // still raises it.
+        assert!(should_report(
+            Some(&typing("app/a", 0)),
+            "app/b",
+            true,
+            at(100)
+        ));
+        // A terminal's burst of focus events for one element is told once ...
+        assert!(!should_report(
+            Some(&typing("app/a", 0)),
+            "app/a",
+            true,
+            at(100)
+        ));
+        // ... but the same field focused again later is told again.
+        assert!(should_report(
+            Some(&typing("app/a", 0)),
+            "app/a",
+            true,
+            at(1_500)
+        ));
+        // Leaving typing is told once.
+        assert!(should_report(
+            Some(&typing("app/a", 0)),
+            "app/c",
+            false,
+            at(100)
+        ));
+        let away = Reported {
+            element: "app/c".to_string(),
+            editable: false,
+            at: at(100),
+        };
+        assert!(!should_report(Some(&away), "app/d", false, at(200)));
+        assert!(should_report(Some(&away), "app/a", true, at(200)));
     }
 
     #[test]
