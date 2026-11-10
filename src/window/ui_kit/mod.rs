@@ -23,6 +23,7 @@ pub(crate) mod icons;
 mod sheet;
 pub(crate) mod tokens;
 
+#[cfg(debug_assertions)]
 pub(crate) use sheet::present_sheet;
 
 use adw::prelude::*;
