@@ -470,11 +470,45 @@ impl DesktopWebRtcPeer {
         height: i32,
         request: super::screen::ScreenRequest,
     ) -> Result<(), String> {
-        let previous = self
-            .desktop_screen_capture
-            .lock()
-            .map_err(|_| "DeskLink desktop screen track lock poisoned".to_string())?
-            .take();
+        self.start_capture(owner, false, source, width, height, request)
+    }
+
+    /// [`Self::start_desktop_screen_capture`] for a retry by `owner`: it
+    /// never takes, or overwrites, a capture another (newer) share started
+    /// meanwhile; that share keeps its picture and the retry gives up.
+    pub(crate) fn retry_desktop_screen_capture(
+        &self,
+        owner: u64,
+        source: super::screen::DesktopSource,
+        width: i32,
+        height: i32,
+        request: super::screen::ScreenRequest,
+    ) -> Result<(), String> {
+        self.start_capture(owner, true, source, width, height, request)
+    }
+
+    fn start_capture(
+        &self,
+        owner: u64,
+        own_only: bool,
+        source: super::screen::DesktopSource,
+        width: i32,
+        height: i32,
+        request: super::screen::ScreenRequest,
+    ) -> Result<(), String> {
+        let held_by_another = |slot: &Option<(u64, super::screen::DesktopScreenCapture)>| {
+            held_by_another_share(slot.as_ref().map(|(current, _)| *current), owner, own_only)
+        };
+        let previous = {
+            let mut slot = self
+                .desktop_screen_capture
+                .lock()
+                .map_err(|_| "DeskLink desktop screen track lock poisoned".to_string())?;
+            if held_by_another(&slot) {
+                return Err(REPLACED_BY_ANOTHER_SHARE.to_string());
+            }
+            slot.take()
+        };
         if let Some((_, previous)) = previous {
             self.stop_or_retire(previous);
         }
@@ -490,11 +524,16 @@ impl DesktopWebRtcPeer {
                 next_seqnum: self.screen_next_seqnum.lock().ok().and_then(|next| *next),
             }),
         )?;
-        *self
+        let mut slot = self
             .desktop_screen_capture
             .lock()
-            .map_err(|_| "DeskLink desktop screen track lock poisoned".to_string())? =
-            Some((owner, created));
+            .map_err(|_| "DeskLink desktop screen track lock poisoned".to_string())?;
+        if held_by_another(&slot) {
+            drop(slot);
+            self.stop_or_retire(created);
+            return Err(REPLACED_BY_ANOTHER_SHARE.to_string());
+        }
+        *slot = Some((owner, created));
         Ok(())
     }
 
@@ -745,6 +784,16 @@ impl DesktopWebRtcPeer {
                 .get(&kind)
                 .is_some_and(|channel| channel.ready_state() == WebRTCDataChannelState::Open)
         })
+    }
+
+    /// Whether media can flow now: the connection is up and the channels a
+    /// feature-ready link needs are open. Until then `webrtcbin` holds the
+    /// screen capture's thread in its send path.
+    pub fn media_ready(&self) -> bool {
+        self.webrtcbin
+            .property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state")
+            == gst_webrtc::WebRTCPeerConnectionState::Connected
+            && self.required_channels_open()
     }
 
     /// Whether the channels a link needs before it is feature-ready are open.
@@ -1362,6 +1411,15 @@ thread_local! {
     /// Tests: build an offerer without the audio section (an older phone).
     static NO_AUDIO_SECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
+
+/// Whether a capture slot held by `current` is another share's, which a
+/// retry (`own_only`) must leave alone. A first start replaces anything.
+fn held_by_another_share(current: Option<u64>, owner: u64, own_only: bool) -> bool {
+    own_only && current.is_some_and(|current| current != owner)
+}
+
+/// A retried capture found a newer share's capture in its place.
+pub(crate) const REPLACED_BY_ANOTHER_SHARE: &str = "The desktop share was replaced";
 
 /// A max-bundle session has one media section per kind; this is slack, not a
 /// budget.
@@ -2110,6 +2168,7 @@ a=max-message-size:262144\r\n";
             "the encoder chain produced no RTP"
         );
         assert_eq!(capture.payload_type(), 96);
+        assert!(!peer.media_ready(), "no connection: not ready for media");
         // No connection in a unit test, so the chain parks inside `webrtcbin`:
         // `stop` must hand it back instead of hanging, and `close` frees it.
         assert!(capture.stop().is_err());
@@ -2146,6 +2205,19 @@ a=max-message-size:262144\r\n";
         assert!(wait_for_frames(&capture) > 0, "the next share sent nothing");
         let _ = capture.stop();
         peer.close();
+    }
+
+    /// A share's retry never takes or overwrites the capture of a share
+    /// that started meanwhile; a first start replaces whatever is there.
+    #[test]
+    fn a_retry_leaves_a_newer_shares_capture_alone() {
+        assert!(held_by_another_share(Some(2), 1, true));
+        assert!(!held_by_another_share(Some(1), 1, true), "its own");
+        assert!(!held_by_another_share(None, 1, true), "nothing there");
+        assert!(
+            !held_by_another_share(Some(2), 1, false),
+            "a first start replaces"
+        );
     }
 
     /// The section's pad still linked to a chain that never let go of it (a
@@ -2381,6 +2453,14 @@ a=max-message-size:262144\r\n";
     fn a_keyframe_request_from_the_far_side_is_answered_on_a_second_share() {
         let pair = loopback();
         wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !pair.answerer.media_ready() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            pair.answerer.media_ready(),
+            "a connected peer with its channels open is ready for media"
+        );
         let share = |next_seqnum| {
             super::super::screen::DesktopScreenCapture::attach_source(
                 &pair.answerer.pipeline,

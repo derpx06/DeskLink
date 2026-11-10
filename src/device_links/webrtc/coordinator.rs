@@ -303,7 +303,7 @@ impl Drop for PortalWorkerCleanup {
 }
 
 /// A share whose capture produces nothing for this long is rebuilt. The
-/// source re-sends its last frame every 500 ms even on a still desktop, so
+/// source re-sends its last frame every 200 ms even on a still desktop, so
 /// silence means the stream died (PipeWire errors, a failed negotiation) and
 /// the phone would otherwise wait for a picture forever.
 const CAPTURE_STALL: std::time::Duration = std::time::Duration::from_secs(3);
@@ -324,6 +324,10 @@ enum CaptureCheck {
     Flowing { reset: bool },
     /// Quiet, not for long enough to act on.
     Wait,
+    /// Quiet because the link is not ready (connecting, a blip, the phone
+    /// dozing): `webrtcbin` holds the capture's thread until it is, so the
+    /// silence says nothing about the capture. The stall clock stops.
+    Hold,
     /// Rebuild the capture on the same portal stream (no dialog, same SSRC).
     Rebuild,
     /// Rebuilt enough times: tell the phone this share is not working.
@@ -335,6 +339,7 @@ enum CaptureCheck {
 /// `since_rebuild` how long since the last rebuild (if any).
 fn capture_check(
     progressed: bool,
+    link_ready: bool,
     quiet_for: std::time::Duration,
     since_rebuild: Option<std::time::Duration>,
     restarts: u32,
@@ -346,6 +351,8 @@ fn capture_check(
         CaptureCheck::Flowing {
             reset: since_rebuild.is_none_or(|since| since >= CAPTURE_HEALTHY_AFTER),
         }
+    } else if !link_ready {
+        CaptureCheck::Hold
     } else if quiet_for < CAPTURE_STALL {
         CaptureCheck::Wait
     } else if restarts >= CAPTURE_RESTARTS {
@@ -1510,23 +1517,27 @@ const CAPTURE_START_PAUSE: std::time::Duration = std::time::Duration::from_milli
 /// while WirePlumber restarts (about a second) found its PipeWire stream
 /// unlinked: no frames, or "Failed to sync state with parent". Stops early
 /// when the share is cancelled; the last error is returned.
+/// `start(attempt)` is called with 1 first; later attempts must use the
+/// owner-checked start, so a stale retry never takes a newer share's capture.
 fn start_capture_retrying(
     cancel: &std::sync::atomic::AtomicBool,
     pause: impl Fn(std::time::Duration),
-    mut start: impl FnMut() -> Result<(), String>,
+    mut start: impl FnMut(u32) -> Result<(), String>,
 ) -> Result<(), String> {
+    let cancelled = || cancel.load(std::sync::atomic::Ordering::Acquire);
     let mut attempt = 1;
     loop {
-        match start() {
+        match start(attempt) {
             Ok(()) => return Ok(()),
-            Err(error)
-                if attempt < CAPTURE_START_ATTEMPTS
-                    && !cancel.load(std::sync::atomic::Ordering::Acquire) =>
-            {
+            Err(error) if attempt < CAPTURE_START_ATTEMPTS && !cancelled() => {
                 eprintln!(
                     "[DeskLink] Screen capture did not start ({error}); trying again ({attempt} of {CAPTURE_START_ATTEMPTS})"
                 );
                 pause(CAPTURE_START_PAUSE);
+                // Released or replaced during the pause: no more attempts.
+                if cancelled() {
+                    return Err(error);
+                }
                 attempt += 1;
             }
             Err(error) => return Err(error),
@@ -1585,8 +1596,14 @@ fn start_extended_display(
         .try_clone()
         .map_err(|error| format!("Could not keep the PipeWire connection: {error}"))?;
     let before = virtual_display::connectors();
-    start_capture_retrying(cancel, std::thread::sleep, || {
-        peer.start_desktop_screen_capture(
+    start_capture_retrying(cancel, std::thread::sleep, |attempt| {
+        let start = if attempt == 1 {
+            DesktopWebRtcPeer::start_desktop_screen_capture
+        } else {
+            DesktopWebRtcPeer::retry_desktop_screen_capture
+        };
+        start(
+            peer,
             id,
             DesktopSource::PipeWire {
                 fd: dup_pipewire_fd(&source.fd)?,
@@ -1780,8 +1797,14 @@ fn run_desktop_portal_worker(
                 .fd
                 .try_clone()
                 .map_err(|error| format!("Could not keep the PipeWire connection: {error}"))?;
-            start_capture_retrying(&cancel, std::thread::sleep, || {
-                peer.start_desktop_screen_capture(
+            start_capture_retrying(&cancel, std::thread::sleep, |attempt| {
+                let start = if attempt == 1 {
+                    DesktopWebRtcPeer::start_desktop_screen_capture
+                } else {
+                    DesktopWebRtcPeer::retry_desktop_screen_capture
+                };
+                start(
+                    &peer,
                     id,
                     DesktopSource::PipeWire {
                         fd: dup_pipewire_fd(&source.fd)?,
@@ -2026,6 +2049,7 @@ fn run_desktop_portal_worker(
         let frames = peer.desktop_screen_frames_sent();
         match capture_check(
             frames != last_frames,
+            peer.media_ready() && !is_dozing(&device_id),
             last_progress.elapsed(),
             last_rebuild.map(|at| at.elapsed()),
             restarts,
@@ -2038,6 +2062,7 @@ fn run_desktop_portal_worker(
                 }
             }
             CaptureCheck::Wait => {}
+            CaptureCheck::Hold => last_progress = std::time::Instant::now(),
             CaptureCheck::GiveUp => {
                 no_video = true;
                 break;
@@ -5080,9 +5105,12 @@ mod tests {
         use super::{capture_check, CaptureCheck, CAPTURE_RESTARTS, CAPTURE_STALL};
         use std::time::Duration;
         let s = Duration::from_secs;
-        assert_eq!(capture_check(false, s(1), None, 0), CaptureCheck::Wait);
         assert_eq!(
-            capture_check(false, CAPTURE_STALL, None, 0),
+            capture_check(false, true, s(1), None, 0),
+            CaptureCheck::Wait
+        );
+        assert_eq!(
+            capture_check(false, true, CAPTURE_STALL, None, 0),
             CaptureCheck::Rebuild
         );
         // A WirePlumber restart: the stream dies mid-share, every rebuild is
@@ -5090,7 +5118,7 @@ mod tests {
         let mut restarts = 0;
         let mut rebuilds = 0;
         loop {
-            match capture_check(false, CAPTURE_STALL, Some(CAPTURE_STALL), restarts) {
+            match capture_check(false, true, CAPTURE_STALL, Some(CAPTURE_STALL), restarts) {
                 CaptureCheck::Rebuild => {
                     restarts += 1;
                     rebuilds += 1;
@@ -5107,16 +5135,34 @@ mod tests {
         // Picture back after a rebuild: the count is kept until it has
         // flowed a while, then cleared.
         assert_eq!(
-            capture_check(true, s(0), Some(s(2)), 2),
+            capture_check(true, true, s(0), Some(s(2)), 2),
             CaptureCheck::Flowing { reset: false }
         );
         assert_eq!(
-            capture_check(true, s(0), Some(s(11)), 2),
+            capture_check(true, true, s(0), Some(s(11)), 2),
             CaptureCheck::Flowing { reset: true }
         );
         assert_eq!(
-            capture_check(true, s(0), None, 0),
+            capture_check(true, true, s(0), None, 0),
             CaptureCheck::Flowing { reset: true }
+        );
+        // The link not ready (ICE/DTLS slow, a blip, the phone dozing for its
+        // 35 s): a healthy capture held by webrtcbin is neither rebuilt nor
+        // given up, however long, even with every rebuild already spent.
+        for quiet in [CAPTURE_STALL, s(35), s(120)] {
+            assert_eq!(
+                capture_check(false, false, quiet, None, 0),
+                CaptureCheck::Hold
+            );
+            assert_eq!(
+                capture_check(false, false, quiet, Some(quiet), CAPTURE_RESTARTS),
+                CaptureCheck::Hold
+            );
+        }
+        assert_eq!(
+            capture_check(true, false, s(0), None, 0),
+            CaptureCheck::Flowing { reset: true },
+            "video that moves is video"
         );
     }
 
@@ -5130,7 +5176,7 @@ mod tests {
         let result = super::start_capture_retrying(
             &cancel,
             |_| {},
-            || {
+            |_| {
                 calls += 1;
                 if calls < 3 {
                     Err("sync".into())
@@ -5145,7 +5191,7 @@ mod tests {
         let result = super::start_capture_retrying(
             &cancel,
             |_| {},
-            || {
+            |_| {
                 calls += 1;
                 Err(format!("attempt {calls}"))
             },
@@ -5158,13 +5204,43 @@ mod tests {
         let result = super::start_capture_retrying(
             &cancel,
             |_| {},
-            || {
+            |_| {
                 calls += 1;
                 Err("sync".to_string())
             },
         );
         assert!(result.is_err());
         assert_eq!(calls, 1, "a cancelled share is not retried");
+
+        // Released or replaced while it paused: no attempt after the pause,
+        // and every attempt after the first is the owner-checked one.
+        let cancel = AtomicBool::new(false);
+        let mut attempts = Vec::new();
+        let result = super::start_capture_retrying(
+            &cancel,
+            |_| cancel.store(true, std::sync::atomic::Ordering::Release),
+            |attempt| {
+                attempts.push(attempt);
+                Err("sync".to_string())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            attempts,
+            vec![1],
+            "nothing is started after a cancelling pause"
+        );
+        let cancel = AtomicBool::new(false);
+        let mut attempts = Vec::new();
+        let _ = super::start_capture_retrying(
+            &cancel,
+            |_| {},
+            |attempt| {
+                attempts.push(attempt);
+                Err("sync".to_string())
+            },
+        );
+        assert_eq!(attempts, vec![1, 2, 3, 4]);
     }
 
     /// A share that failed is said at the desk too, except a refusal made there.
