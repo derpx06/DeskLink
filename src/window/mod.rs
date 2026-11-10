@@ -3917,6 +3917,8 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
     match kind {
         "unreachable" | "unreachable-eof" => {
             device.status = DeviceStatus::Unreachable;
+            // Away for an hour, as a phone that went out of range is.
+            device.last_seen = Some(crate::device_links::connection_log::now() - 3600);
             if kind == "unreachable-eof" {
                 device.last_error = Some("the handshake failed: unexpected EOF".to_string());
             }

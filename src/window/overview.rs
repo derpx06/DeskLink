@@ -110,12 +110,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         if let Some(bar) = now_playing_bar(daemon, device) {
             page.append(&bar);
         }
-        match device.status {
-            DeviceStatus::Unreachable => page.append(&offline_row(daemon, device)),
-            DeviceStatus::Paired if !device.feature_transport_ready => {
-                page.append(&reconnecting_row(device))
-            }
-            _ => {}
+        // Can't reach is said once, in the hero, with its Try again.
+        if device.status == DeviceStatus::Paired && !device.feature_transport_ready {
+            page.append(&reconnecting_row(device));
         }
         page.append(&tiles(daemon, device));
         page.append(&columns(daemon, device));
@@ -312,17 +309,24 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         .css_classes(["hero-band"])
         .build();
     band.set_widget_name("responsive");
+    let away = device.status == DeviceStatus::Unreachable;
 
+    // A tablet is drawn on its side, wider than tall; anything else as a phone.
+    let tablet = device_type_label(&device.device_type) == "Tablet";
+    let (width, height) = if tablet { (112, 80) } else { (56, 96) };
     let phone = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
-        .width_request(56)
-        .height_request(96)
+        .width_request(width)
+        .height_request(height)
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
         .css_classes(["phone-art"])
         .accessible_role(gtk::AccessibleRole::Presentation)
         .build();
     phone.set_hexpand(false);
+    if tablet {
+        phone.add_css_class("tablet");
+    }
     phone.append(
         &gtk::Box::builder()
             .halign(gtk::Align::Center)
@@ -332,7 +336,7 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
     phone.append(
         &gtk::Label::builder()
             .label(time)
-            .margin_top(18)
+            .margin_top(if tablet { 14 } else { 18 })
             .css_classes(["phone-time"])
             .name("hero-clock")
             .build(),
@@ -372,18 +376,29 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         .filter(|battery| battery.current_charge >= 0)
     {
         let line = gtk::Box::builder().spacing(10).build();
-        line.append(&battery_ring(battery.current_charge, battery.is_charging));
-        let words = gtk::Box::builder().valign(gtk::Align::Center).build();
-        words.append(&text(
+        // Charging is news only while it is live.
+        let live = device.feature_transport_ready;
+        let ring = battery_ring(battery.current_charge, battery.is_charging && live);
+        let percent = text(
             &format!("{}%", battery.current_charge),
             &["mono", "battery-percent"],
-        ));
+        );
+        // Not live: the last reading, dimmed so it does not pass for now.
+        if !live {
+            for stale in [ring.upcast_ref::<gtk::Widget>(), percent.upcast_ref()] {
+                stale.add_css_class("dl-stale");
+                stale.set_tooltip_text(Some("The last battery level DeskLink heard"));
+            }
+        }
+        line.append(&ring);
+        let words = gtk::Box::builder().valign(gtk::Align::Center).build();
+        words.append(&percent);
         if let Some(seen) = super::last_seen_words(device) {
             words.append(&text(
                 &format!(" · {seen}"),
                 &["text-dim", "caption-strong"],
             ));
-        } else if battery.is_charging {
+        } else if battery.is_charging && live {
             words.append(&text(
                 &charging_words(battery.charge_time_remaining),
                 &["text-dim", "caption-strong"],
@@ -392,7 +407,13 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         line.append(&words);
         info.append(&line);
     }
-    if let Some(error) = &device.last_error {
+    let gave_up = device
+        .last_error
+        .as_deref()
+        .is_some_and(crate::device_links::webrtc::coordinator::is_unavailable);
+    // "Can't reach <phone>" from the ladder only repeats the pill when the
+    // phone is away; what failed while connecting is still said.
+    if let Some(error) = device.last_error.as_ref().filter(|_| !(away && gave_up)) {
         let (words, details) = super::hero_error_words(error);
         let label = text(&words, &["dl-secondary", "error"]);
         label.set_wrap(true);
@@ -407,19 +428,24 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
             expander.set_child(Some(&raw));
             info.append(&expander);
         }
-        // The ladder gave up: this is what acts on "Try again".
-        if crate::device_links::webrtc::coordinator::is_unavailable(error) {
-            let retry = button(
-                ButtonKind::Tonal,
-                "Try again",
-                Some("desklink-refresh-symbolic"),
-            );
-            retry.set_widget_name("hero-reconnect");
-            retry.set_halign(gtk::Align::Start);
-            let (daemon, id) = (daemon.clone(), device.id.clone());
-            retry.connect_clicked(move |_| daemon.send(DaemonCommand::Reconnect(id.clone())));
-            info.append(&retry);
-        }
+    }
+    // Away, or the ladder gave up: the one "Try again" on the page. Every
+    // address gets a fresh chance and this computer announces itself.
+    if away || gave_up {
+        let retry = button(
+            ButtonKind::Tonal,
+            "Try again",
+            Some("desklink-refresh-symbolic"),
+        );
+        retry.set_widget_name("hero-reconnect");
+        retry.set_halign(gtk::Align::Start);
+        let (daemon, id, name) = (daemon.clone(), device.id.clone(), device.name.clone());
+        retry.connect_clicked(move |button| {
+            daemon.send(DaemonCommand::Reconnect(id.clone()));
+            daemon.send(DaemonCommand::Discover);
+            toast_from(button, &format!("Looking for {name}…"));
+        });
+        info.append(&retry);
     }
     band.append(&info);
 
@@ -1182,27 +1208,6 @@ fn live_detail(summary: &str, since: Option<&str>) -> String {
     detail
 }
 
-/// "Pixel 9 is offline · your terminals keep running here", Try again.
-fn offline_row(daemon: &DaemonHandle, device: &DeviceView) -> gtk::Box {
-    let words = banner(
-        BannerKind::Error,
-        "desklink-warning-symbolic",
-        &format!("Can't reach {}", device.name),
-        Some(
-            "Check that DeskLink is open on it and it is on the same Wi-Fi. \
-             Your terminals keep running here.",
-        ),
-    );
-    let retry = button(ButtonKind::Text, "Try again", None);
-    let daemon = daemon.clone();
-    retry.connect_clicked(move |button| {
-        daemon.send(DaemonCommand::Discover);
-        toast_from(button, "Searching the network…");
-    });
-    words.add_action(&retry);
-    words.root
-}
-
 /// Reachable, the encrypted connection still being set up.
 fn reconnecting_row(device: &DeviceView) -> gtk::Box {
     banner(
@@ -1719,6 +1724,86 @@ mod tests {
         });
     }
 
+    /// Every label under `root`, and the widgets carrying `class`.
+    fn words_and(root: &gtk::Widget, class: &str) -> (Vec<String>, Vec<gtk::Widget>) {
+        let all = named_widgets(root, "");
+        let words = all
+            .iter()
+            .filter_map(|w| w.downcast_ref::<gtk::Label>())
+            .map(|label| label.label().to_string())
+            .collect();
+        let marked = all.into_iter().filter(|w| w.has_css_class(class)).collect();
+        (words, marked)
+    }
+
+    /// Away for hours: "Can't reach" is said once (the pill and one line), with
+    /// one Try again and no stale "dropped while it was being set up"; the
+    /// hero's two buttons are unavailable like the tiles, the battery reads as
+    /// old, and a tablet is drawn as one. (Needs a display.)
+    #[test]
+    fn an_away_tablet_says_so_once_and_nothing_reads_as_live() {
+        crate::test_display::run(|| {
+            let info =
+                crate::device_links::device_info::DeviceInfo::local("t".into(), "emulator".into());
+            let mut device = DeviceView::from_info(&info, "10.0.0.2".into(), true);
+            device.device_type = "tablet".into();
+            device.status = DeviceStatus::Unreachable;
+            device.last_seen = Some(1_700_000_000);
+            device.battery_status = Some(crate::device_links::device::BatteryStatus {
+                current_charge: 100,
+                is_charging: false,
+                battery_quantity: None,
+                threshold_event: None,
+                charge_time_remaining: None,
+            });
+            let (daemon, _commands) = crate::device_links::daemon::DaemonHandle::detached();
+            let once = |device: &DeviceView| {
+                let band = hero(&daemon, device, "17:07");
+                let root = band.upcast_ref::<gtk::Widget>().clone();
+                let (words, _) = words_and(&root, "");
+                let reach = words.iter().filter(|w| w.contains("Can't reach")).count();
+                let retries = named_widgets(&root, "hero-reconnect").len();
+                (root, words, reach, retries)
+            };
+
+            let (root, words, reach, retries) = once(&device);
+            assert_eq!((reach, retries), (1, 1), "{words:?}");
+            assert!(!words.iter().any(|w| w.contains("being set up")));
+            let actions = named_widgets(&root, "hero-actions");
+            let (_, dimmed) = words_and(&actions[0], "dl-unavailable");
+            assert_eq!(dimmed.len(), 2, "Send files and Send clipboard");
+            let (_, stale) = words_and(&root, "dl-stale");
+            assert_eq!(stale.len(), 2, "the ring and its percent");
+            let (_, art) = words_and(&root, "phone-art");
+            assert!(art[0].has_css_class("tablet"));
+            assert!(art[0].width_request() > art[0].height_request());
+
+            // The ladder's own "Can't reach … · Try again" adds nothing more.
+            device.last_error = Some(crate::device_links::webrtc::coordinator::unavailable_words(
+                "emulator",
+            ));
+            let (_, words, reach, retries) = once(&device);
+            assert_eq!((reach, retries), (1, 1), "{words:?}");
+
+            // Live: no Try again, nothing dimmed, and a phone is a phone.
+            device.last_error = None;
+            device.device_type = "phone".into();
+            device.status = DeviceStatus::Paired;
+            device.feature_transport_ready = true;
+            device.last_seen = None;
+            device.incoming_capabilities = vec![
+                PACKET_TYPE_SHARE_REQUEST.into(),
+                crate::device_links::packet::PACKET_TYPE_CLIPBOARD.into(),
+            ];
+            let (root, _, reach, retries) = once(&device);
+            assert_eq!((reach, retries), (0, 0));
+            assert!(words_and(&root, "dl-unavailable").1.is_empty());
+            assert!(words_and(&root, "dl-stale").1.is_empty());
+            let (_, art) = words_and(&root, "phone-art");
+            assert!(!art[0].has_css_class("tablet"));
+        });
+    }
+
     #[test]
     fn a_long_copied_line_is_cut_short() {
         let long = "x".repeat(500);
@@ -1766,23 +1851,21 @@ mod activity_tests {
                 "A phone with a name that goes on and on and on".into(),
             );
             let device = DeviceView::from_info(&info, "10.0.0.2".into(), true);
-            let (daemon, _commands) = crate::device_links::daemon::DaemonHandle::detached();
-            for banner in [reconnecting_row(&device), offline_row(&daemon, &device)] {
-                let labels = named_widgets(banner.upcast_ref(), "")
-                    .into_iter()
-                    .filter_map(|w| w.downcast::<gtk::Label>().ok())
-                    .filter(|label| label.label().chars().count() > 12)
-                    .collect::<Vec<_>>();
-                assert!(!labels.is_empty());
-                for label in labels {
-                    assert!(label.wraps(), "{} wraps", label.label());
-                    assert_eq!(
-                        label.ellipsize(),
-                        gtk::pango::EllipsizeMode::None,
-                        "{} is not cut",
-                        label.label()
-                    );
-                }
+            let banner = reconnecting_row(&device);
+            let labels = named_widgets(banner.upcast_ref(), "")
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Label>().ok())
+                .filter(|label| label.label().chars().count() > 12)
+                .collect::<Vec<_>>();
+            assert!(!labels.is_empty());
+            for label in labels {
+                assert!(label.wraps(), "{} wraps", label.label());
+                assert_eq!(
+                    label.ellipsize(),
+                    gtk::pango::EllipsizeMode::None,
+                    "{} is not cut",
+                    label.label()
+                );
             }
         });
     }

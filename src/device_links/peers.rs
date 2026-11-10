@@ -44,6 +44,7 @@ fn forget_live_and_connection_state(device_id: &str) {
     daemon::discovery::forget_addresses(device_id);
     daemon::file_transfer::forget_waiting(device_id);
     daemon::pairing_commands::forget_proven(device_id);
+    daemon::state::forget_error_time(device_id);
     sync::forget_device(device_id);
     session_lock::forget_unlock(device_id);
     crate::device_links::gallery::forget(device_id);
@@ -90,6 +91,7 @@ mod tests {
             "device_links/calls.rs:HOLD",
             "device_links/contacts.rs:STORE",
             "device_links/daemon/discovery.rs:BOOK",
+            "device_links/daemon/state.rs:ERROR_AT",
             "device_links/dnd.rs:ENGINE",
             "device_links/folders.rs:REFUSED",
             "device_links/folders.rs:WANTED",

@@ -13,6 +13,23 @@ use crate::device_links::packet::NetworkPacket;
 use crate::device_links::pairing::PairState;
 use serde_json::Value;
 
+/// How long a connection error stays on a device that is not reachable: a
+/// dial that failed a minute ago says nothing about a phone away for hours.
+const ERROR_FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When each device's `last_error` was set ([`mark_error`]). Taken only
+/// while holding `devices`, so the two always agree.
+static ERROR_AT: std::sync::LazyLock<Mutex<HashMap<String, Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Whether `error`, set at `marked`, is too old to show on a device that is
+/// not reachable. The ladder's "Can't reach … · Try again" is kept: it is the
+/// explicit unavailable state, and the way to act on it.
+fn error_is_stale(error: &str, marked: Option<Instant>, now: Instant) -> bool {
+    !crate::device_links::webrtc::coordinator::is_unavailable(error)
+        && marked.is_none_or(|at| now.saturating_duration_since(at) >= ERROR_FRESH_FOR)
+}
+
 /// Unpaired devices shown at once; more than any real LAN needs.
 const MAX_UNTRUSTED_VIEWS: usize = 32;
 
@@ -248,6 +265,19 @@ pub(crate) fn reconcile_connection_status(
         };
         if !reachable {
             device.verification_key = None;
+            // What went wrong while connecting is news for a minute; after
+            // that "Can't reach" says it, and the old words only mislead.
+            let marked = ERROR_AT
+                .lock()
+                .ok()
+                .and_then(|at| at.get(device_id).copied());
+            if device
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error_is_stale(error, marked, Instant::now()))
+            {
+                device.last_error = None;
+            }
         }
     }
     drop(devices);
@@ -303,7 +333,17 @@ pub(crate) fn mark_error(
     if let Ok(mut devices) = devices.lock() {
         if let Some(device) = devices.get_mut(device_id) {
             device.last_error = Some(error);
+            if let Ok(mut at) = ERROR_AT.lock() {
+                at.insert(device_id.to_string(), Instant::now());
+            }
         }
+    }
+}
+
+/// Forgets when `device_id`'s error was set (it was unpaired).
+pub(crate) fn forget_error_time(device_id: &str) {
+    if let Ok(mut at) = ERROR_AT.lock() {
+        at.remove(device_id);
     }
 }
 
@@ -1192,6 +1232,43 @@ mod tests {
             error.as_deref(),
             Some(crate::device_links::webrtc::coordinator::update_words(&info.name).as_str())
         );
+    }
+
+    /// A failed setup is news for a minute; on a phone away for hours it only
+    /// misled ("dropped while it was being set up"). The ladder's unavailable
+    /// words stay: they carry the Try again.
+    #[test]
+    fn an_old_connection_error_is_dropped_from_a_phone_that_is_away() {
+        let now = Instant::now();
+        let eof = "the handshake failed: unexpected EOF";
+        assert!(!error_is_stale(eof, Some(now), now));
+        assert!(!error_is_stale(
+            eof,
+            Some(now),
+            now + std::time::Duration::from_secs(59)
+        ));
+        assert!(error_is_stale(eof, Some(now), now + ERROR_FRESH_FOR));
+        assert!(error_is_stale(eof, None, now), "set without a time: old");
+        let gave_up = crate::device_links::webrtc::coordinator::unavailable_words("Pixel 9");
+        assert!(!error_is_stale(&gave_up, None, now + ERROR_FRESH_FOR));
+
+        let (devices, info) = test_devices();
+        mark_error(&devices, &info.id, eof.to_string());
+        reconcile_connection_status(&devices, &[connection(&info.id, false, false)]);
+        assert_eq!(
+            devices.lock().unwrap()[&info.id].last_error.as_deref(),
+            Some(eof),
+            "just failed: still said"
+        );
+        devices
+            .lock()
+            .unwrap()
+            .get_mut(&info.id)
+            .unwrap()
+            .last_error = Some("set long ago".into());
+        ERROR_AT.lock().unwrap().remove(&info.id);
+        reconcile_connection_status(&devices, &[connection(&info.id, false, false)]);
+        assert_eq!(devices.lock().unwrap()[&info.id].last_error, None);
     }
 
     /// I13: a phone that drops out mid-call no longer counts as in a call, so

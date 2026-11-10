@@ -142,7 +142,9 @@ pub(super) fn persist_paired_endpoint(
     ip: std::net::IpAddr,
     trusted: std::collections::HashSet<String>,
 ) {
-    if ip.is_loopback() || ip.is_unspecified() {
+    // An emulator behind this computer's NAT arrives from this computer's
+    // own address: that is not where it listens.
+    if ip.is_unspecified() || is_own_address(ip, &own_addresses()) {
         return;
     }
     let Some(port) = known_endpoints()
@@ -322,6 +324,23 @@ fn unusable(ip: std::net::IpAddr) -> bool {
     ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
 }
 
+/// `ip` is this computer: loopback, or an address of one of its interfaces
+/// (`own`). A phone in an emulator, behind this computer's NAT, connects
+/// *from* this computer's address; recorded as the phone's, it made DeskLink
+/// dial its own listener every few seconds for ever.
+pub(super) fn is_own_address(ip: std::net::IpAddr, own: &[std::net::IpAddr]) -> bool {
+    let ip = ip.to_canonical();
+    ip.is_loopback() || own.iter().any(|mine| mine.to_canonical() == ip)
+}
+
+/// This computer's interface addresses, now.
+pub(super) fn own_addresses() -> Vec<std::net::IpAddr> {
+    super::network::local_interfaces()
+        .into_iter()
+        .map(|(_, ip)| ip)
+        .collect()
+}
+
 /// Where each paired phone was last seen: its last [`MAX_ADDRESSES`] IPv4s
 /// (from beacons, authenticated links and mDNS) and its newest IPv6. Phones
 /// move between networks and DHCP leases, so dialling only the newest one
@@ -329,13 +348,30 @@ fn unusable(ip: std::net::IpAddr) -> bool {
 #[derive(Debug, Default)]
 pub(super) struct AddressBook {
     phones: HashMap<String, Vec<Address>>,
+    /// This computer's own addresses ([`Self::set_own`]): never a phone's.
+    own: Vec<std::net::IpAddr>,
 }
 
 impl AddressBook {
+    /// Whether `ip` may be recorded (and so dialled) as a phone's address.
+    fn usable(&self, ip: std::net::IpAddr) -> bool {
+        !unusable(ip) && !is_own_address(ip, &self.own)
+    }
+
+    /// This computer's addresses are now `own`: any of them recorded for a
+    /// phone (earlier, or before an interface took it) is dropped.
+    pub(super) fn set_own(&mut self, own: Vec<std::net::IpAddr>) {
+        self.own = own;
+        let own = &self.own;
+        for list in self.phones.values_mut() {
+            list.retain(|known| !is_own_address(known.ip, own));
+        }
+    }
+
     /// `ip` is where `device_id` was just seen: newest first, a repeat moves
     /// up and is tried again at once.
     pub(super) fn seen(&mut self, device_id: &str, ip: std::net::IpAddr) {
-        if unusable(ip) {
+        if !self.usable(ip) {
             return;
         }
         let list = self.phones.entry(device_id.to_string()).or_default();
@@ -363,7 +399,7 @@ impl AddressBook {
     /// pinned handshake over it works ([`Self::worked`]). A known address is
     /// left exactly as it is (its backoff is not reset).
     pub(super) fn candidate(&mut self, device_id: &str, ip: std::net::IpAddr) {
-        if unusable(ip) {
+        if !self.usable(ip) {
             return;
         }
         let list = self.phones.entry(device_id.to_string()).or_default();
@@ -381,7 +417,7 @@ impl AddressBook {
     /// An address remembered from an earlier run's authenticated link: added
     /// if absent (last in line), its backoff untouched if present.
     pub(super) fn remembered(&mut self, device_id: &str, ip: std::net::IpAddr) {
-        if unusable(ip) {
+        if !self.usable(ip) {
             return;
         }
         let list = self.phones.entry(device_id.to_string()).or_default();
@@ -598,6 +634,9 @@ impl DaemonWorker {
         thread::spawn(move || {
             while !shutdown.load(Ordering::Acquire) {
                 thread::sleep(REDIAL_EVERY);
+                // Read before any lock: interfaces come and go (a hotspot,
+                // a VPN), and this computer never dials itself.
+                let own = own_addresses();
                 let targets = {
                     let (Ok(devices), Ok(known)) = (devices.lock(), known_endpoints().lock())
                     else {
@@ -607,6 +646,7 @@ impl DaemonWorker {
                         continue;
                     };
                     let persisted = persisted_snapshot();
+                    book.set_own(own);
                     redial_targets(
                         &devices,
                         &known,
@@ -1001,7 +1041,9 @@ fn handle_identity_packet(
     if !(MIN_TCP_PORT..=MAX_TCP_PORT).contains(&remote_port) {
         return;
     }
-    if remote_port == local_tcp_port && address.ip().is_loopback() {
+    // Dialling this computer's own listener reaches only itself (an emulator
+    // behind its NAT beacons from its address).
+    if remote_port == local_tcp_port && is_own_address(address.ip(), &own_addresses()) {
         return;
     }
 
@@ -1121,6 +1163,33 @@ mod tests {
 
     fn ip(text: &str) -> std::net::IpAddr {
         text.parse().unwrap()
+    }
+
+    /// The emulator behind this computer's NAT connected from 10.180.213.94,
+    /// this computer's own address; recorded as the phone's, DeskLink dialled
+    /// itself every few seconds for ever ("Connection targeted another device").
+    #[test]
+    fn this_computers_own_addresses_are_never_a_phones() {
+        let own = [ip("10.180.213.94"), ip("fe80::5"), ip("172.17.0.1")];
+        assert!(is_own_address(ip("10.180.213.94"), &own));
+        assert!(is_own_address(ip("::ffff:10.180.213.94"), &own), "mapped");
+        assert!(is_own_address(ip("127.0.0.1"), &own));
+        assert!(is_own_address(ip("::1"), &[]));
+        assert!(!is_own_address(ip("10.180.213.40"), &own));
+
+        let mut book = AddressBook::default();
+        let now = Instant::now();
+        // Recorded before this computer took the address (an old record, or a
+        // hotspot that came up later): dropped once it is known to be ours.
+        book.remembered("emulator", ip("10.180.213.94"));
+        book.seen("emulator", ip("10.180.213.40"));
+        book.set_own(own.to_vec());
+        assert_eq!(book.due("emulator", now), [ip("10.180.213.40")]);
+        // From then on it is never recorded, whatever vouches for it.
+        book.seen("emulator", ip("10.180.213.94"));
+        book.candidate("emulator", ip("172.17.0.1"));
+        book.remembered("emulator", ip("fe80::5"));
+        assert_eq!(book.due("emulator", now), [ip("10.180.213.40")]);
     }
 
     #[test]
