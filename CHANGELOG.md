@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- The desk's New terminal starts a shell; its Claude Code and Codex entries are gone. The phone can
+  still start them, and running ones keep their names and badges.
 - "Find anything" on the desk (Ctrl+K, the search buttons, Ctrl+F off the Terminals page): one search over
   the actions of the selected phone (only what it takes and only while it is ready), the pages, the other
   phones, shared terminals, recent files, notes, snippets, the clipboard history, contacts and the settings

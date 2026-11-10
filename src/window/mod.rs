@@ -445,14 +445,12 @@ mod imp {
                         }
                     })
                     .build(),
-                // "shell", "claude" or "codex": a new shared terminal here.
+                // A new shared shell here. The target ("shell") is kept for
+                // the existing call sites; agents start from the phone only.
                 gio::ActionEntry::builder("new-terminal")
                     .parameter_type(Some(glib::VariantTy::STRING))
-                    .activate(|window: &super::DesklinkWindow, _, parameter| {
-                        let program = parameter
-                            .and_then(|value| value.get::<String>())
-                            .filter(|program| program != "shell");
-                        match crate::terminal_previews::start(program.as_deref()) {
+                    .activate(|window: &super::DesklinkWindow, _, _| {
+                        match crate::device_links::pty::desk::new_desk_session() {
                             Ok(_) => window.refresh_soon(),
                             Err(error) => {
                                 eprintln!("[UI] Could not start a terminal: {error}");
