@@ -442,7 +442,7 @@ thread_local! {
 // ---- The widgets -------------------------------------------------------------
 
 /// The onboarding view. `root` goes into the window's main stack.
-pub(crate) struct Onboarding {
+pub(super) struct Onboarding {
     pub root: adw::ToolbarView,
     /// Ends in the pairing page (no phone is paired); else "Done" goes back.
     pub for_pairing: bool,

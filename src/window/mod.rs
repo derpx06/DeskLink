@@ -239,7 +239,7 @@ mod imp {
         #[cfg(debug_assertions)]
         pub fake_devices: RefCell<Vec<DeviceView>>,
         /// The welcome tour on show, if it is.
-        pub onboarding: RefCell<Option<std::rc::Rc<super::onboarding::Onboarding>>>,
+        pub(super) onboarding: RefCell<Option<std::rc::Rc<super::onboarding::Onboarding>>>,
         /// Whether this run has decided to show the first-run tour.
         pub onboarding_decided: Cell<bool>,
         /// The tour ended on the pairing page: it shows the last step's bar.
