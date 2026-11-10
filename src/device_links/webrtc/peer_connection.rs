@@ -2373,6 +2373,59 @@ a=max-message-size:262144\r\n";
         pair.answerer.close();
     }
 
+    /// The phone's keyframe request (PLI) must reach the encoder and be
+    /// answered, on a second share too (same SSRC, continued sequence
+    /// numbers): a decoder that lost its picture shows nothing until a
+    /// keyframe comes.
+    #[test]
+    fn a_keyframe_request_from_the_far_side_is_answered_on_a_second_share() {
+        let pair = loopback();
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let share = |next_seqnum| {
+            super::super::screen::DesktopScreenCapture::attach_source(
+                &pair.answerer.pipeline,
+                &pair.answerer.webrtcbin,
+                test_source(),
+                None,
+                1280,
+                720,
+                super::super::screen::ScreenRequest::FALLBACK,
+                Some(super::super::screen::RtpContinuity {
+                    ssrc: pair.answerer.screen_ssrc,
+                    next_seqnum,
+                }),
+            )
+            .unwrap()
+        };
+        let first = share(None);
+        let stream = assert_far_side_decodes(&pair.offerer_events);
+        let next = first.next_seqnum();
+        assert!(first.stop().is_ok());
+        let second = share(next);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while second.frames_sent() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let (requests, keyframes) = second.key_counts();
+        for _ in 0..3 {
+            assert!(stream.request_keyframe(), "the far side could not ask");
+            std::thread::sleep(std::time::Duration::from_millis(600));
+        }
+        let (requests_after, keyframes_after) = second.key_counts();
+        assert!(
+            requests_after > requests,
+            "no keyframe request reached the encoder ({requests} -> {requests_after})"
+        );
+        assert!(
+            keyframes_after > keyframes,
+            "the encoder made no keyframe for the request ({keyframes} -> {keyframes_after})"
+        );
+        assert!(second.stop().is_ok());
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
     /// A capture that fails to start (as a PipeWire stream that would not
     /// negotiate did) must leave the screen track usable: the next share
     /// reaches the far side's picture.

@@ -332,6 +332,19 @@ impl ScreenStream {
     }
 
     /// Decoded frames delivered to the display so far.
+    /// Asks the sender for a keyframe the way a decoder does (an upstream
+    /// `GstForceKeyUnit`, which the RTP session turns into a PLI).
+    #[cfg(test)]
+    pub(crate) fn request_keyframe(&self) -> bool {
+        self.inner
+            .source_pad
+            .send_event(gst::event::CustomUpstream::new(
+                gst::Structure::builder("GstForceKeyUnit")
+                    .field("all-headers", true)
+                    .build(),
+            ))
+    }
+
     pub fn frames_shown(&self) -> u64 {
         self.inner.shown.load(Ordering::Relaxed)
     }
@@ -576,6 +589,8 @@ pub(crate) struct DesktopScreenCapture {
     _pipewire_fd: Option<OwnedFd>,
     /// Stops the adaptive bitrate controller; see [`spawn_bitrate_controller`].
     rate_control_stop: Arc<AtomicBool>,
+    #[cfg_attr(not(test), allow(dead_code))]
+    chain_stats: ChainStats,
 }
 
 /// Where a desktop share's frames come from.
@@ -836,8 +851,9 @@ impl DesktopScreenCapture {
                     &encoder,
                     &rate,
                     request.fps,
-                    chain_stats,
+                    chain_stats.clone(),
                 ),
+                chain_stats,
                 pipeline: pipeline.clone(),
                 webrtcbin: webrtcbin.clone(),
                 elements,
@@ -882,6 +898,15 @@ impl DesktopScreenCapture {
 
     pub(crate) fn frames_sent(&self) -> u64 {
         self.frames.load(Ordering::Relaxed)
+    }
+
+    /// Key-unit requests that reached the encoder, and keyframes it made.
+    #[cfg(test)]
+    pub(crate) fn key_counts(&self) -> (u64, u64) {
+        (
+            self.chain_stats.key_requests.load(Ordering::Relaxed),
+            self.chain_stats.keyframes.load(Ordering::Relaxed),
+        )
     }
 
     /// The VP8 payload type this capture packetises with.
