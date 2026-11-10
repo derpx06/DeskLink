@@ -548,23 +548,10 @@ fn tile_text(lines: &[String], exit_status: Option<u32>) -> String {
     }
 }
 
-/// "New Terminal" (a shell); its menu also offers the installed agents.
+/// "New terminal" (a shell); its menu offers the folders to start in.
 fn new_terminal_button(folders: &gtk::gio::Menu) -> adw::SplitButton {
     let menu = gtk::gio::Menu::new();
-    menu.append(Some("Shell"), Some("win.new-terminal::shell"));
-    let agents = crate::terminal_previews::installed_agents();
-    if agents.iter().any(|agent| agent == "claude") {
-        menu.append(Some("Claude Code"), Some("win.new-terminal::claude"));
-    }
-    if agents.iter().any(|agent| agent == "codex") {
-        menu.append(Some("Codex"), Some("win.new-terminal::codex"));
-    }
-    let menu = {
-        let sections = gtk::gio::Menu::new();
-        sections.append_section(None, &menu);
-        sections.append_section(Some("Start in"), folders);
-        sections
-    };
+    menu.append_section(Some("Start in"), folders);
     let content = adw::ButtonContent::builder()
         .icon_name("desklink-add-symbolic")
         .label("New terminal")
@@ -575,7 +562,7 @@ fn new_terminal_button(folders: &gtk::gio::Menu) -> adw::SplitButton {
         .action_name("win.new-terminal")
         .action_target(&"shell".to_variant())
         .tooltip_text("Start a shared terminal here")
-        .dropdown_tooltip("More kinds of terminal, and where to start")
+        .dropdown_tooltip("Where to start")
         .valign(gtk::Align::Center)
         .css_classes(["suggested-action"])
         .build();
@@ -742,30 +729,20 @@ fn empty_tile() -> gtk::Box {
     let title = text("No terminals yet", &["terminal-title"]);
     tile.append(&title);
     let words = text(
-        "Start Claude Code, Codex or a shell here, or on your phone. The phone sees it too.",
+        "Start a shell here, or on your phone. The phone sees it too.",
         &["tile-meta"],
     );
     words.set_wrap(true);
     tile.append(&words);
     let buttons = gtk::Box::builder().spacing(8).build();
-    let agents = crate::terminal_previews::installed_agents();
-    for (label, program) in [
-        ("Shell", "shell"),
-        ("Claude Code", "claude"),
-        ("Codex", "codex"),
-    ] {
-        if program != "shell" && !agents.iter().any(|agent| agent == program) {
-            continue;
-        }
-        buttons.append(
-            &gtk::Button::builder()
-                .label(label)
-                .action_name("win.new-terminal")
-                .action_target(&program.to_variant())
-                .css_classes(["dark-chip"])
-                .build(),
-        );
-    }
+    buttons.append(
+        &gtk::Button::builder()
+            .label("New terminal")
+            .action_name("win.new-terminal")
+            .action_target(&"shell".to_variant())
+            .css_classes(["dark-chip"])
+            .build(),
+    );
     tile.append(&buttons);
     tile
 }
@@ -1164,6 +1141,40 @@ mod tests {
                     1
                 );
             }
+        });
+    }
+
+    /// The desk starts shells only: New terminal's menu is the folders to
+    /// start in, and the empty page has one New terminal button (Claude Code
+    /// and Codex start from the phone).
+    #[test]
+    fn the_desk_offers_one_new_terminal_and_no_agents() {
+        crate::test_display::run(|| {
+            let folders = gtk::gio::Menu::new();
+            folders.append(Some("Home folder"), Some("win.new-terminal-in::~"));
+            let button = new_terminal_button(&folders);
+            let target = button.action_target_value().and_then(|v| v.get::<String>());
+            assert_eq!(target.as_deref(), Some("shell"));
+            let menu = button.menu_model().expect("a menu");
+            assert_eq!(menu.n_items(), 1, "only the Start in section");
+            assert_eq!(
+                menu.item_link(0, gtk::gio::MENU_LINK_SECTION),
+                Some(folders.upcast())
+            );
+
+            fn labels(widget: &gtk::Widget, out: &mut Vec<String>) {
+                if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                    out.extend(button.label().map(String::from));
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    labels(&next, out);
+                    child = next.next_sibling();
+                }
+            }
+            let mut found = Vec::new();
+            labels(empty_tile().upcast_ref(), &mut found);
+            assert_eq!(found, ["New terminal"]);
         });
     }
 

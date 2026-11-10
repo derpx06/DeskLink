@@ -1,6 +1,5 @@
 //! The Terminals page: what each shared terminal at this
-//! computer is showing, read from the PTY session's own screen model, and
-//! starting a new shell, Claude Code or Codex session at the desk.
+//! computer is showing, read from the PTY session's own screen model.
 //!
 //! [`agent_chip`] and [`last_lines`] decide what a tile says and have no GTK
 //! in them, so they are unit-tested.
@@ -10,10 +9,6 @@ use crate::device_links::pty::session::Resync;
 
 /// How many lines of output a preview tile shows.
 pub(crate) const PREVIEW_LINES: usize = 5;
-
-/// The registry owner of sessions started at the desk (`desk.rs`'s
-/// `DESK_OWNER`), so agent sessions count against the desk's own cap.
-const DESK_OWNER: &str = "desk";
 
 /// Every live session at this computer, newest first.
 pub(crate) fn sessions() -> Vec<SessionInfo> {
@@ -257,30 +252,6 @@ pub(crate) fn display_title(title: &str) -> String {
         "CX" => "Codex".to_string(),
         _ => title.trim_start_matches('-').to_string(),
     }
-}
-
-/// The agent programs this computer can run ("claude", "codex").
-pub(crate) fn installed_agents() -> Vec<String> {
-    crate::device_links::pty::launchers::installed()
-}
-
-/// Starts a session at the desk — `None` for the login shell, else the named
-/// agent — and opens its window; phones list it too.
-pub(crate) fn start(program: Option<&str>) -> Result<String, String> {
-    let Some(program) = program else {
-        return crate::device_links::pty::desk::new_desk_session();
-    };
-    let info = registry()
-        .lock()
-        .map_err(|_| "terminal registry lock poisoned".to_string())?
-        .create(
-            Some(portable_pty::CommandBuilder::new(program)),
-            24,
-            80,
-            DESK_OWNER,
-        )?;
-    crate::device_links::pty::desk::open_on_desktop(&info.id);
-    Ok(info.id)
 }
 
 #[cfg(test)]
