@@ -69,6 +69,8 @@ pub enum DaemonCommand {
     SetShowNotifications(String, bool),
     /// The user answered "Not now" to the top-bar extension offer.
     SetShellExtensionPromptDismissed(bool),
+    /// The first-run welcome tour was shown.
+    SetOnboardingSeen(bool),
     /// Relay on/off and its address ("" = the built-in one).
     SetRelay {
         enabled: bool,
@@ -339,6 +341,9 @@ impl DaemonWorker {
             }),
             DaemonCommand::SetShellExtensionPromptDismissed(on) => {
                 self.update_settings(|settings| settings.shell_extension_prompt_dismissed = on)
+            }
+            DaemonCommand::SetOnboardingSeen(on) => {
+                self.update_settings(|settings| settings.onboarding_seen = on)
             }
             DaemonCommand::SendFindPhone(id) => self.send_find_phone(&id),
             DaemonCommand::SendMprisAction(id, player, action) => {

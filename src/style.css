@@ -691,3 +691,149 @@ button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.0
   border-radius: 12px;
   background-color: @surface_2;
 }
+
+/* ── Welcome tour (window/onboarding.rs) ───────────────────────────────── */
+.ob-segments { margin: 0 24px; }
+.ob-brand-row { margin: 4px 24px 0 24px; min-height: 40px; }
+.ob-seg {
+  min-height: 40px;
+  padding: 0 2px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  box-shadow: none;
+}
+.ob-seg:focus-visible { outline: 2px solid @dl_accent_text; outline-offset: -2px; }
+.ob-seg-bar { min-height: 4px; border-radius: 2px; background-color: @dl_edge; }
+.ob-seg.on .ob-seg-bar, .ob-seg-bar.on { background-color: @dl_accent; }
+.ob-seg:hover .ob-seg-bar { background-color: @dl_outline; }
+.ob-seg.on:hover .ob-seg-bar { background-color: @dl_accent; }
+.ob-page { margin: 16px 24px 24px 24px; }
+.ob-bottom { padding: 12px 24px 18px 24px; }
+.ob-brand { font-weight: 600; }
+.ob-kicker { font-size: 0.87em; font-weight: 600; color: @dl_accent_text; }
+.ob-title { font-size: 1.87em; font-weight: 700; letter-spacing: -0.02em; }
+.ob-body { font-size: 1.07em; color: @dl_text_dim; }
+.ob-last-step { padding: 8px 24px 0 16px; }
+.ob-scene-card {
+  padding: 24px;
+  border-radius: 28px;
+  background-color: @dl_surface;
+  box-shadow: 0 0 0 1px @dl_hairline;
+}
+/* Setup rows. */
+.ob-setup .ob-row { padding: 14px 16px; }
+.ob-row-title { font-weight: 600; }
+
+/* The scenes: a picture at a fixed size in px, whatever the text size. */
+.ob-scene label { font-size: 12px; font-weight: 600; }
+.ob-accent { color: @dl_accent_text; }
+.ob-dim { color: @dl_text_faint; }
+.ob-laptop {
+  padding: 6px;
+  border-radius: 10px;
+  background-color: @dl_surface;
+  box-shadow: inset 0 0 0 2px @dl_outline;
+}
+.ob-laptop-base { border-radius: 2px 2px 8px 8px; background-color: @dl_outline; }
+.ob-display, .ob-phone-display {
+  border-radius: 5px;
+  background-color: @dl_surface_2;
+}
+.ob-phone {
+  padding: 6px;
+  border-radius: 16px;
+  background-color: @dl_surface;
+  box-shadow: inset 0 0 0 2px @dl_outline;
+}
+.ob-phone-display { padding: 6px; border-radius: 11px; }
+.ob-tile {
+  min-width: 24px;
+  min-height: 24px;
+  border-radius: 7px;
+  background-color: @dl_accent_container;
+  color: @dl_on_accent_container;
+}
+.ob-packet { border-radius: 999px; background-color: @dl_accent; }
+.ob-chip {
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: 999px;
+  background-color: @dl_surface;
+  box-shadow: 0 0 0 1px @dl_edge, 0 6px 16px -8px rgba(0, 0, 0, 0.25);
+}
+.ob-window {
+  border-radius: 4px;
+  background-color: @dl_surface;
+  box-shadow: 0 0 0 1px @dl_hairline;
+}
+.ob-mirror { padding: 6px; border-radius: 4px; background-color: @dl_surface; }
+.ob-touchpad { border-radius: 8px; border: 1.5px dashed @dl_outline; }
+.ob-key { border-radius: 3px; background-color: @dl_surface; box-shadow: 0 0 0 1px @dl_edge; }
+.ob-pointer { color: @dl_text; }
+.ob-drop { margin: 6px; border-radius: 6px; border: 1.5px dashed @dl_accent_text; }
+.ob-note { padding: 8px; border-radius: 6px; background-color: @dl_surface; }
+.ob-line { border-radius: 2px; background-color: @dl_edge; }
+.ob-photo { border-radius: 6px; background-color: @dl_accent_container; }
+.ob-file {
+  border-radius: 5px;
+  background-color: @dl_surface;
+  box-shadow: 0 0 0 1px @dl_edge;
+}
+.ob-shield {
+  border-radius: 999px;
+  background-color: @dl_accent_container;
+  color: @dl_on_accent_container;
+}
+/* A terminal is dark in both themes. */
+.ob-display.dark, .ob-phone-display.dark { background-color: #16161a; }
+.ob-term { padding: 6px; }
+.ob-term label {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  font-weight: 400;
+  color: #e4e4e7;
+}
+.ob-term.small label { font-size: 8px; }
+.ob-term label.prompt { color: #7bd88f; }
+
+/* Motion: finite, played when a page is shown; none at all when animations
+   are off (GTK drops them then; `.still` is the same, said in code). */
+.ob-scene .travel { animation: ob-travel 1.6s ease-in-out 4 both; }
+.ob-scene .send { animation: ob-send 1.8s ease-in-out 3 both; }
+.ob-scene .float { animation: ob-float 3s ease-in-out 3; }
+.ob-scene .drift { animation: ob-drift 2.4s ease-in-out 2; }
+.ob-scene .appear { animation: ob-appear 400ms ease-out both; }
+.ob-scene .d2 { animation-delay: 400ms; }
+.ob-scene .d3 { animation-delay: 800ms; }
+.ob-scene .l2 { animation-delay: 500ms; }
+.ob-scene .l3 { animation-delay: 1100ms; }
+.ob-scene .l4 { animation-delay: 1900ms; }
+.ob-scene.still * { animation: none; }
+window.unfocused .ob-scene * { animation: none; }
+@keyframes ob-travel {
+  0% { opacity: 0; transform: translateX(-6px); }
+  30% { opacity: 1; }
+  70% { opacity: 1; }
+  100% { opacity: 0; transform: translateX(30px); }
+}
+@keyframes ob-send {
+  0% { opacity: 0; transform: translateX(10px); }
+  25% { opacity: 1; }
+  75% { opacity: 1; }
+  100% { opacity: 0; transform: translateX(-26px); }
+}
+@keyframes ob-float {
+  0% { transform: translateY(0); }
+  50% { transform: translateY(-3px); }
+  100% { transform: translateY(0); }
+}
+@keyframes ob-drift {
+  0% { transform: translate(0, 0); }
+  50% { transform: translate(-34px, -30px); }
+  100% { transform: translate(0, 0); }
+}
+@keyframes ob-appear {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}

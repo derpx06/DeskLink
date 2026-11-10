@@ -340,6 +340,10 @@
         <attribute name="action">app.preferences</attribute>
       </item>
       <item>
+        <attribute name="label" translatable="yes">_Welcome tour</attribute>
+        <attribute name="action">win.welcome-tour</attribute>
+      </item>
+      <item>
         <attribute name="label" translatable="yes">_Keyboard shortcuts</attribute>
         <attribute name="action">app.shortcuts</attribute>
       </item>

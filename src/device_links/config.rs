@@ -100,6 +100,9 @@ pub struct AppSettings {
     pub start_at_login: Option<bool>,
     /// The user declined the offer to show DeskLink in the GNOME top bar.
     pub shell_extension_prompt_dismissed: bool,
+    /// The first-run welcome tour has been shown (finished, skipped or left
+    /// for a pairing). A new key: nothing older is read or rewritten.
+    pub onboarding_seen: bool,
     /// Share the clipboard with paired phones, both ways.
     pub clipboard_sync: bool,
     /// Phones whose notifications are not shown here; every phone's are by
@@ -173,6 +176,7 @@ impl Default for AppSettings {
             use_turn: true,
             start_at_login: None,
             shell_extension_prompt_dismissed: false,
+            onboarding_seen: false,
             clipboard_sync: true,
             hidden_notifications: Default::default(),
             muted_command_alerts: Default::default(),

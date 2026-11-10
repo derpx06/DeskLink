@@ -38,6 +38,7 @@ pub(crate) mod history;
 mod notes;
 mod notes_clipboard;
 pub(crate) mod notifications;
+mod onboarding;
 mod overview;
 pub(crate) use overview::link_to_send;
 mod pairing;
@@ -237,6 +238,12 @@ mod imp {
         /// `fake-device` verb, for screenshots without a phone.
         #[cfg(debug_assertions)]
         pub fake_devices: RefCell<Vec<DeviceView>>,
+        /// The welcome tour on show, if it is.
+        pub onboarding: RefCell<Option<std::rc::Rc<super::onboarding::Onboarding>>>,
+        /// Whether this run has decided to show the first-run tour.
+        pub onboarding_decided: Cell<bool>,
+        /// The tour ended on the pairing page: it shows the last step's bar.
+        pub onboarding_to_pairing: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -523,6 +530,12 @@ mod imp {
                         }
                     })
                     .build(),
+                gio::ActionEntry::builder("welcome-tour")
+                    .activate(|window: &super::DesklinkWindow, _, _| {
+                        window.start_onboarding(0);
+                        window.refresh_devices();
+                    })
+                    .build(),
                 gio::ActionEntry::builder("pair-new")
                     .activate(|window: &super::DesklinkWindow, _, _| {
                         window.show_discovery_dialog(true)
@@ -628,6 +641,101 @@ impl DesklinkWindow {
         imp.main_stack.set_visible_child_name("solo");
         self.apply_layout();
         self.refresh_soon();
+    }
+
+    /// Shows the welcome tour at `step` (a replay from the menu too). It ends
+    /// in the pairing page when no phone is paired, else "Done" comes back.
+    pub(super) fn start_onboarding(&self, step: usize) {
+        let imp = self.imp();
+        let Some(daemon) = self.daemon() else { return };
+        if let Some(old) = imp.onboarding.take() {
+            imp.main_stack.remove(&old.root);
+        }
+        let for_pairing = !self
+            .known_devices(&daemon)
+            .iter()
+            .any(|device| device.trusted);
+        let window = self.downgrade();
+        let tour = onboarding::Onboarding::new(&daemon, for_pairing, step, move || {
+            if let Some(window) = window.upgrade() {
+                // After the click that left it, not inside its handler.
+                glib::idle_add_local_once(move || window.end_onboarding(true));
+            }
+        });
+        imp.main_stack.add_named(&tour.root, Some("onboarding"));
+        imp.main_stack.set_visible_child_name("onboarding");
+        imp.onboarding.replace(Some(tour.clone()));
+        tour.next.grab_focus();
+        if let Some(stop) = imp.welcome_qr.take() {
+            pairing::stop_welcome(&daemon, &stop);
+        }
+    }
+
+    /// Takes the tour down and remembers it was seen. `redraw`: show what
+    /// comes next now (the pairing page or the phones).
+    pub(super) fn end_onboarding(&self, redraw: bool) {
+        let imp = self.imp();
+        let Some(tour) = imp.onboarding.take() else {
+            return;
+        };
+        imp.onboarding_to_pairing.set(tour.for_pairing);
+        if !crate::device_links::config::app_settings().onboarding_seen {
+            if let Some(daemon) = self.daemon() {
+                daemon.send(DaemonCommand::SetOnboardingSeen(true));
+            }
+        }
+        imp.main_stack.set_visible_child_name(if tour.for_pairing {
+            "welcome"
+        } else {
+            "devices"
+        });
+        imp.main_stack.remove(&tour.root);
+        imp.snapshots.borrow_mut().clear();
+        if redraw {
+            self.refresh_devices();
+        }
+    }
+
+    /// Over the pairing page after the tour: the last of the step bars, and
+    /// Back to "Set up this computer".
+    fn onboarding_last_step(&self) -> gtk::Widget {
+        let row = gtk::Box::builder()
+            .spacing(12)
+            .css_classes(["ob-last-step"])
+            .build();
+        let back = ui_kit::button(
+            ui_kit::ButtonKind::Text,
+            "Back",
+            Some("desklink-arrow-back-symbolic"),
+        );
+        back.set_tooltip_text(Some("Back to Set up this computer"));
+        let window = self.downgrade();
+        back.connect_clicked(move |_| {
+            if let Some(window) = window.upgrade() {
+                window.imp().onboarding_to_pairing.set(false);
+                window.start_onboarding(onboarding::SETUP);
+            }
+        });
+        row.append(&back);
+        let bars = gtk::Box::builder()
+            .spacing(6)
+            .hexpand(true)
+            .valign(gtk::Align::Center)
+            .build();
+        let count = onboarding::segment_count(true);
+        for _ in 0..count {
+            bars.append(
+                &gtk::Box::builder()
+                    .hexpand(true)
+                    .css_classes(["ob-seg-bar", "on"])
+                    .build(),
+            );
+        }
+        bars.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Step {count} of {count}: Pair a phone"
+        ))]);
+        row.append(&bars);
+        row.upcast()
     }
 
     /// Back from [`Self::show_solo`]: the next refresh picks the welcome
@@ -1125,6 +1233,36 @@ impl DesklinkWindow {
             imp.snapshots.borrow_mut().clear();
         }
 
+        // The first-run tour: decided once, when the paired phones are known.
+        if !imp.onboarding_decided.get() {
+            if !daemon.loaded() {
+                return;
+            }
+            imp.onboarding_decided.set(true);
+            let any_paired = devices.iter().any(|device| device.trusted);
+            if onboarding::show_on_start(
+                crate::device_links::config::app_settings().onboarding_seen,
+                any_paired,
+            ) {
+                self.start_onboarding(0);
+            }
+        }
+        let tour = imp.onboarding.borrow().clone();
+        if let Some(tour) = tour {
+            if tour.for_pairing && !devices.is_empty() {
+                // A phone asked to pair, or paired: the pairing flow as ever.
+                self.end_onboarding(false);
+            } else {
+                if let Some(stop) = imp.welcome_qr.take() {
+                    pairing::stop_welcome(&daemon, &stop);
+                }
+                if imp.main_stack.visible_child_name().as_deref() != Some("onboarding") {
+                    imp.main_stack.set_visible_child_name("onboarding");
+                }
+                return;
+            }
+        }
+
         if imp.main_stack.visible_child_name().as_deref() == Some("solo") {
             // Stays until Back, even if a phone pairs meanwhile.
             if let Some(stop) = imp.welcome_qr.take() {
@@ -1145,6 +1283,9 @@ impl DesklinkWindow {
             if imp.welcome_qr.borrow().is_none() {
                 let shown = pairing::welcome_page(self, &daemon);
                 imp.welcome_qr.replace(Some(shown));
+                if imp.onboarding_to_pairing.get() {
+                    imp.welcome_body.prepend(&self.onboarding_last_step());
+                }
             }
             return;
         }
@@ -2821,6 +2962,42 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         "xkeys" => {
             let spec = format!("{id} {arg}");
             std::thread::spawn(move || debug_xkeys(&spec));
+        }
+        // "onboarding start [STEP]|next|back|skip|key KEYNAME": the welcome tour.
+        "onboarding" => match id {
+            "start" => {
+                win.start_onboarding(arg.parse().unwrap_or(0));
+                win.refresh_devices();
+            }
+            _ => {
+                let tour = win.imp().onboarding.borrow().clone();
+                if let Some(tour) = tour {
+                    let nav = match id {
+                        "next" => Some(onboarding::Nav::Next),
+                        "back" => Some(onboarding::Nav::Back),
+                        "skip" => Some(onboarding::Nav::Skip),
+                        "key" => gtk::gdk::Key::from_name(arg)
+                            .and_then(|key| onboarding::key_nav(key, false)),
+                        _ => None,
+                    };
+                    if let Some(nav) = nav {
+                        tour.apply(nav);
+                    }
+                }
+            }
+        },
+        // "onboarding-gnome off|login|active|none": the top-bar state the
+        // setup step shows; "real" goes back to this desktop's.
+        "onboarding-gnome" => {
+            use crate::shell_dbus::ExtensionStatus;
+            let fake = match id {
+                "off" => Some(Some(ExtensionStatus::Off)),
+                "login" => Some(Some(ExtensionStatus::NeedsLogin)),
+                "active" => Some(Some(ExtensionStatus::Active)),
+                "none" => Some(None),
+                _ => None,
+            };
+            onboarding::DEBUG_EXTENSION.with(|slot| slot.replace(fake));
         }
         "open-switcher" => win.imp().device_card.popup(),
         // "fake-shell-device KIND NAME": a made-up device for the GNOME

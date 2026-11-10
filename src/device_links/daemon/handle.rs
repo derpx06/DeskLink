@@ -87,6 +87,9 @@ pub struct DaemonHandle {
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     errors: Arc<Mutex<Vec<String>>>,
     events: Arc<Mutex<Vec<DaemonEvent>>>,
+    /// Set once the worker has read the config and listed the paired phones
+    /// (or failed to start): until then "no phones" may only mean "not read yet".
+    loaded: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DaemonHandle {
@@ -98,16 +101,18 @@ impl DaemonHandle {
         let worker_devices = Arc::clone(&devices);
         let worker_errors = Arc::clone(&errors);
         let worker_events = Arc::clone(&events);
+        let loaded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_loaded = Arc::clone(&loaded);
 
         thread::spawn(move || {
-            if let Err(error) = DaemonWorker::new(
+            let worker = DaemonWorker::new(
                 worker_devices,
                 worker_errors.clone(),
                 worker_events,
                 command_rx,
-            )
-            .and_then(DaemonWorker::run)
-            {
+            );
+            worker_loaded.store(true, std::sync::atomic::Ordering::Release);
+            if let Err(error) = worker.and_then(DaemonWorker::run) {
                 push_error(&worker_errors, error);
             }
         });
@@ -120,7 +125,13 @@ impl DaemonHandle {
             devices,
             errors,
             events,
+            loaded,
         }
+    }
+
+    /// Whether the paired phones have been read from the config (see `loaded`).
+    pub fn loaded(&self) -> bool {
+        self.loaded.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// A handle with no worker behind it, for tests of the windows: the
@@ -134,6 +145,7 @@ impl DaemonHandle {
             devices: Arc::default(),
             errors: Arc::default(),
             events: Arc::default(),
+            loaded: Arc::new(true.into()),
         };
         (handle, commands)
     }
