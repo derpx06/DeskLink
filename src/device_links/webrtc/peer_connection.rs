@@ -387,6 +387,17 @@ impl DesktopWebRtcPeer {
                 return Err("Only a WebRTC offer or answer can be set as a description".to_string())
             }
         };
+        debug_log!(
+            "[DeskLink] Remote {message_type:?} sections: {}",
+            sdp.lines()
+                .filter(|line| line.starts_with("m=")
+                    || line.starts_with("a=mid")
+                    || ["a=sendrecv", "a=sendonly", "a=recvonly", "a=inactive"]
+                        .contains(&line.trim()))
+                .map(str::trim)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        );
         let sdp = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes())
             .map_err(|error| format!("Invalid DeskLink WebRTC SDP: {error}"))?;
         let description = WebRTCSessionDescription::new(sdp_type, sdp);
@@ -537,15 +548,6 @@ impl DesktopWebRtcPeer {
             .ok()
             .and_then(|capture| capture.as_ref().map(|(_, capture)| capture.frames_sent()))
             .unwrap_or(0)
-    }
-
-    /// Whether the active capture is scaled by `vapostproc`.
-    pub fn desktop_screen_va_scaled(&self) -> bool {
-        self.desktop_screen_capture
-            .lock()
-            .ok()
-            .and_then(|capture| capture.as_ref().map(|(_, capture)| capture.va_scaled()))
-            .unwrap_or(false)
     }
 
     fn stop_or_retire(&self, capture: super::screen::DesktopScreenCapture) {
@@ -1208,10 +1210,6 @@ fn log_pipeline_problems(pipeline: &gst::Pipeline) {
                     error.error(),
                     error.debug().unwrap_or_default()
                 );
-                // The share's scaler: the watchdog's rebuild scales in software.
-                if source.contains("vapostproc") {
-                    super::screen::va_scaler_failed("element error");
-                }
             }
             gst::MessageView::Warning(warning) => eprintln!(
                 "[DeskLink] GStreamer warning from {}: {} ({})",
@@ -2115,6 +2113,71 @@ a=max-message-size:262144\r\n";
         // No connection in a unit test, so the chain parks inside `webrtcbin`:
         // `stop` must hand it back instead of hanging, and `close` frees it.
         assert!(capture.stop().is_err());
+        peer.close();
+    }
+
+    /// A share that fails to start on a phone's connection (a PipeWire
+    /// stream that would not start) must leave the video section to the
+    /// next one: it asked for `sink_0` again, which `webrtcbin` already had,
+    /// and every later share on that connection failed until a restart.
+    #[test]
+    fn a_failed_share_leaves_the_answered_section_to_the_next_share() {
+        let peer = answered_peer(PHONE_OFFER);
+        let share = |source| {
+            super::super::screen::DesktopScreenCapture::attach_source(
+                &peer.pipeline,
+                &peer.webrtcbin,
+                source,
+                None,
+                1280,
+                720,
+                super::super::screen::ScreenRequest::FALLBACK,
+                None,
+            )
+        };
+        for _ in 0..2 {
+            let broken = gst::ElementFactory::make("filesrc")
+                .property("location", "/nonexistent/desklink-screen")
+                .build()
+                .unwrap();
+            assert!(share(broken).is_err());
+        }
+        let capture = share(test_source()).expect("the next share attaches");
+        assert!(wait_for_frames(&capture) > 0, "the next share sent nothing");
+        let _ = capture.stop();
+        peer.close();
+    }
+
+    /// The section's pad still linked to a chain that never let go of it (a
+    /// share that failed or was parked mid-way) must not stop the next share:
+    /// asking `webrtcbin` for that pad by name again ("already has a pad named
+    /// sink_0") failed every later share on the connection.
+    #[test]
+    fn a_share_takes_over_the_section_pad_from_a_stale_chain() {
+        let peer = answered_peer(PHONE_OFFER);
+        let stale = gst::ElementFactory::make("fakesrc").build().unwrap();
+        peer.pipeline.add(&stale).unwrap();
+        let pad = peer
+            .webrtcbin
+            .static_pad("sink_0")
+            .or_else(|| peer.webrtcbin.request_pad_simple("sink_0"))
+            .unwrap();
+        stale.static_pad("src").unwrap().link(&pad).unwrap();
+
+        let capture = super::super::screen::DesktopScreenCapture::attach_source(
+            &peer.pipeline,
+            &peer.webrtcbin,
+            test_source(),
+            None,
+            1280,
+            720,
+            super::super::screen::ScreenRequest::FALLBACK,
+            None,
+        )
+        .expect("the share takes the section over");
+        assert!(wait_for_frames(&capture) > 0, "the share sent nothing");
+        assert!(!stale.static_pad("src").unwrap().is_linked());
+        let _ = capture.stop();
         peer.close();
     }
 

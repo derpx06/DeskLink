@@ -298,22 +298,27 @@ fn state_word(a11y: &gio::DBusConnection, sender: &str, path: &str) -> u32 {
 }
 
 fn element_takes_typing(a11y: &gio::DBusConnection, sender: &str, path: &str) -> bool {
-    let role = a11y
-        .call_sync(
-            Some(sender),
-            path,
-            "org.a11y.atspi.Accessible",
-            "GetRole",
-            None,
-            None,
-            gio::DBusCallFlags::NONE,
-            300,
-            None::<&gio::Cancellable>,
-        )
-        .ok()
-        .and_then(|reply| reply.child_value(0).get::<u32>())
-        .unwrap_or(0);
-    takes_typing(role, state_word(a11y, sender, path))
+    let role = role(a11y, sender, path);
+    let typing = takes_typing(role, state_word(a11y, sender, path));
+    debug_log!("[DeskLink] Text focus: {sender}{path} role {role}, takes typing {typing}");
+    typing
+}
+
+fn role(a11y: &gio::DBusConnection, sender: &str, path: &str) -> u32 {
+    a11y.call_sync(
+        Some(sender),
+        path,
+        "org.a11y.atspi.Accessible",
+        "GetRole",
+        None,
+        None,
+        gio::DBusCallFlags::NONE,
+        300,
+        None::<&gio::Cancellable>,
+    )
+    .ok()
+    .and_then(|reply| reply.child_value(0).get::<u32>())
+    .unwrap_or(0)
 }
 
 #[cfg(test)]

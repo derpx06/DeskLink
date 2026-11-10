@@ -576,8 +576,6 @@ pub(crate) struct DesktopScreenCapture {
     _pipewire_fd: Option<OwnedFd>,
     /// Stops the adaptive bitrate controller; see [`spawn_bitrate_controller`].
     rate_control_stop: Arc<AtomicBool>,
-    /// Scaled by `vapostproc`: if it sends nothing, VA is blamed.
-    va_scaled: bool,
 }
 
 /// Where a desktop share's frames come from.
@@ -681,9 +679,6 @@ impl DesktopScreenCapture {
         let request = request.served(width, height);
         let (scale, convert, rate, filter, queue, encoder, payloader) =
             encoder_chain(width, height, request)?;
-        let va_scaled = scale
-            .factory()
-            .is_some_and(|factory| factory.name() == "vapostproc");
 
         // Frames in system memory. Offered DMA-BUF (vapostproc takes it),
         // PipeWire negotiated buffers with Mutter's tiled modifiers that
@@ -718,7 +713,7 @@ impl DesktopScreenCapture {
             convert,
             rate.clone(),
             filter,
-            queue,
+            queue.clone(),
             encoder.clone(),
             payloader.clone(),
         ]);
@@ -726,6 +721,8 @@ impl DesktopScreenCapture {
             .add_many(elements.iter())
             .map_err(|error| format!("Could not add DeskLink screen encoder chain: {error}"))?;
         let frames = Arc::new(AtomicU64::new(0));
+        let chain_stats = ChainStats::default();
+        let queue_sink = queue.static_pad("sink");
         let build = || -> Result<(gst::Pad, u32), String> {
             // Bind to the pad of the **negotiated** video section. When the
             // phone offered, `webrtcbin` has already created that sink pad, and
@@ -741,12 +738,7 @@ impl DesktopScreenCapture {
                         "The paired device's offer has no video section to send the screen on"
                             .to_string()
                     })?;
-                    webrtcbin
-                        .request_pad_simple(&format!("sink_{mline}"))
-                        .ok_or_else(|| {
-                            "Could not attach video to the negotiated WebRTC screen track"
-                                .to_string()
-                        })?
+                    section_pad(webrtcbin, mline)?
                 }
             };
             // The sink pad is kept on failure, never released: requesting it
@@ -820,6 +812,9 @@ impl DesktopScreenCapture {
                     _ => gst::PadProbeReturn::Ok,
                 }
             });
+            if crate::debug_logging() {
+                chain_stats.watch(&queue_sink, &encoder);
+            }
             if let Err(error) = src_pad.link(&sink_pad) {
                 return fail(format!(
                     "Could not attach the DeskLink screen RTP track: {error}"
@@ -841,6 +836,7 @@ impl DesktopScreenCapture {
                     &encoder,
                     &rate,
                     request.fps,
+                    chain_stats,
                 ),
                 pipeline: pipeline.clone(),
                 webrtcbin: webrtcbin.clone(),
@@ -849,7 +845,6 @@ impl DesktopScreenCapture {
                 frames,
                 payload_type,
                 _pipewire_fd: pipewire_fd,
-                va_scaled,
             }),
             Err(error) => {
                 for element in &elements {
@@ -859,11 +854,6 @@ impl DesktopScreenCapture {
                 Err(error)
             }
         }
-    }
-
-    /// Whether `vapostproc` scales this chain.
-    pub(crate) fn va_scaled(&self) -> bool {
-        self.va_scaled
     }
 
     /// RTP buffers produced so far.
@@ -979,6 +969,66 @@ pub(crate) struct RtpContinuity {
     pub next_seqnum: Option<u16>,
 }
 
+/// Debug logging only: what the encoder is handed, makes and is asked for,
+/// so a choppy or frozen picture on the phone can be traced to its stage.
+#[derive(Clone, Default)]
+struct ChainStats {
+    /// Frames offered to the encoder's queue (more than `encoded`: the
+    /// one-frame leaky queue dropped the rest).
+    offered: Arc<AtomicU64>,
+    encoded: Arc<AtomicU64>,
+    keyframes: Arc<AtomicU64>,
+    /// `GstForceKeyUnit` requests (the phone's PLI/FIR) reaching the encoder.
+    key_requests: Arc<AtomicU64>,
+}
+
+impl ChainStats {
+    fn watch(&self, queue_sink: &Option<gst::Pad>, encoder: &gst::Element) {
+        if let Some(pad) = queue_sink {
+            let offered = Arc::clone(&self.offered);
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                offered.fetch_add(1, Ordering::Relaxed);
+                gst::PadProbeReturn::Ok
+            });
+        }
+        let Some(pad) = encoder.static_pad("src") else {
+            return;
+        };
+        let (encoded, keyframes) = (Arc::clone(&self.encoded), Arc::clone(&self.keyframes));
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data {
+                encoded.fetch_add(1, Ordering::Relaxed);
+                if !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT) {
+                    keyframes.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+        let requests = Arc::clone(&self.key_requests);
+        pad.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |_, info| {
+            if let Some(gst::PadProbeData::Event(event)) = &info.data {
+                if event
+                    .structure()
+                    .is_some_and(|s| s.name() == "GstForceKeyUnit")
+                {
+                    requests.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+
+    fn line(&self) -> String {
+        format!(
+            "offered {} encoded {} keyframes {} key requests {}",
+            self.offered.load(Ordering::Relaxed),
+            self.encoded.load(Ordering::Relaxed),
+            self.keyframes.load(Ordering::Relaxed),
+            self.key_requests.load(Ordering::Relaxed)
+        )
+    }
+}
+
 /// Longest [`DesktopScreenCapture::stop`] waits for the chain to go idle.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -1072,6 +1122,7 @@ fn spawn_bitrate_controller(
     encoder: &gst::Element,
     rate: &gst::Element,
     full_fps: i32,
+    chain_stats: ChainStats,
 ) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
     let (webrtcbin, encoder, rate, flag) = (
@@ -1115,14 +1166,15 @@ fn spawn_bitrate_controller(
                         set_if_present(&rate, "max-rate", &fps.to_string());
                     }
                 }
-                if cfg!(debug_assertions) && tick % 2 == 0 {
+                if crate::debug_logging() && tick % 2 == 0 {
                     let kbps = bytes_sent.saturating_sub(last_bytes) * 8 / 2 / 1000;
                     debug_log!(
-                        "[DeskLink] screen-stats: sent {kbps} kbps, target {} kbps, fps cap {fps}, loss {:.1}%, rtt {} ms, jitter {} ms",
+                        "[DeskLink] screen-stats: sent {kbps} kbps, target {} kbps, fps cap {fps}, loss {:.1}%, rtt {} ms, jitter {} ms, {}",
                         bitrate / 1000,
                         report.loss * 100.0,
                         report.rtt_ms.map_or("?".to_string(), |rtt| format!("{rtt:.0}")),
-                        report.jitter_ms.map_or("?".to_string(), |jitter| format!("{jitter:.0}"))
+                        report.jitter_ms.map_or("?".to_string(), |jitter| format!("{jitter:.0}")),
+                        chain_stats.line()
                     );
                 }
                 if tick % 2 == 0 {
@@ -1181,56 +1233,6 @@ fn set_if_present(element: &gst::Element, name: &str, value: &str) {
     if element.has_property(name, None) {
         element.set_property_from_str(name, value);
     }
-}
-
-/// Set once VA-API scaling failed in a real share: the probe below feeds it
-/// system memory, while a share feeds it what PipeWire hands over (possibly
-/// DMA-BUF), which can still fail. Every later chain this run then scales in
-/// software.
-static VA_SCALER_FAILED: AtomicBool = AtomicBool::new(false);
-
-/// A share's VA-scaled chain errored or produced nothing: scale in software
-/// from now on (the capture watchdog rebuilds the chain).
-pub(crate) fn va_scaler_failed(why: &str) {
-    if !VA_SCALER_FAILED.swap(true, Ordering::AcqRel) {
-        eprintln!("[DeskLink] VA-API scaling failed in a share ({why}); using the software scaler");
-    }
-}
-
-/// Whether VA-API post-processing can scale here: `vapostproc` exists and a
-/// tiny test pipeline through it negotiates to system-memory I420 (it fails
-/// on drivers without a usable video-processing entry point), and no share
-/// has seen it fail. Probed once; `DESKLINK_SCREEN_SOFTWARE=1` forces the
-/// software scaler.
-fn va_scaler_works() -> bool {
-    static WORKS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if VA_SCALER_FAILED.load(Ordering::Acquire) {
-        return false;
-    }
-    *WORKS.get_or_init(|| {
-        if std::env::var("DESKLINK_SCREEN_SOFTWARE").as_deref() == Ok("1")
-            || gst::ElementFactory::find("vapostproc").is_none()
-        {
-            return false;
-        }
-        let Ok(pipeline) = gst::parse::launch(
-            "videotestsrc num-buffers=2 ! video/x-raw,width=320,height=200 ! vapostproc ! \
-             video/x-raw,format=NV12,width=160,height=100 ! videoconvert ! \
-             video/x-raw,format=I420 ! fakesink",
-        ) else {
-            return false;
-        };
-        let worked = pipeline.set_state(gst::State::Playing).is_ok()
-            && pipeline.bus().is_some_and(|bus| {
-                bus.timed_pop_filtered(
-                    gst::ClockTime::from_seconds(3),
-                    &[gst::MessageType::Eos, gst::MessageType::Error],
-                )
-                .is_some_and(|message| matches!(message.view(), gst::MessageView::Eos(_)))
-            });
-        let _ = pipeline.set_state(gst::State::Null);
-        worked
-    })
 }
 
 /// Debug builds, `DESKLINK_SCREEN_H264=1`: send the desk's screen as VA-API
@@ -1292,16 +1294,13 @@ fn encoder_chain(
     };
     let convert = make("videoconvert", "videoconvert")?;
     set_if_present(&convert, "n-threads", "4");
-    let scale = if va_scaler_works() {
-        let scale = make("vapostproc", "vapostproc")?;
-        set_if_present(&scale, "scale-method", "hq");
-        scale
-    } else {
-        let scale = make("videoscale", "videoscale")?;
-        set_if_present(&scale, "method", "lanczos");
-        set_if_present(&scale, "n-threads", "4");
-        scale
-    };
+    // Software, never VA-API `vapostproc`: fed system memory (all PipeWire
+    // gives here), its upload and download capped the whole chain at 26-36
+    // fps against 47-78 in software, measured on this laptop's 2560x1600
+    // panel scaled to 1920x1200 with the same VP8 settings.
+    let scale = make("videoscale", "videoscale")?;
+    set_if_present(&scale, "method", "lanczos");
+    set_if_present(&scale, "n-threads", "4");
     // A cap, never a constant rate: drops frames above `fps`, never repeats
     // or holds one back (a held last frame of a change was up to 500 ms).
     let rate = make("videorate", "videorate")?;
@@ -1556,6 +1555,40 @@ fn negotiated_video_sink_pad(webrtcbin: &gst::Element) -> Option<gst::Pad> {
                 .property::<Option<gst_webrtc::WebRTCRTPTransceiver>>("transceiver")
                 .is_some_and(|transceiver| transceiver.kind() == gst_webrtc::WebRTCKind::Video)
     })
+}
+
+/// The pad for video section `mline`. When `webrtcbin` already has it (a
+/// chain that never let go, or a pad made for the offer that is not marked
+/// as video), it is taken over: asking for it by name a second time is
+/// undefined in GStreamer, and failed every later share on the connection.
+/// Never a pad of the audio section.
+fn section_pad(webrtcbin: &gst::Element, mline: u32) -> Result<gst::Pad, String> {
+    let name = format!("sink_{mline}");
+    let Some(pad) = webrtcbin.static_pad(&name) else {
+        return webrtcbin.request_pad_simple(&name).ok_or_else(|| {
+            "Could not attach video to the negotiated WebRTC screen track".to_string()
+        });
+    };
+    let kind = pad
+        .find_property("transceiver")
+        .and_then(|_| pad.property::<Option<gst_webrtc::WebRTCRTPTransceiver>>("transceiver"))
+        .map(|transceiver| transceiver.kind());
+    let holder = pad
+        .peer()
+        .and_then(|peer| peer.parent_element())
+        .map(|element| element.name().to_string());
+    debug_log!(
+        "[DeskLink] Screen: {name} already exists (transceiver {kind:?}, linked to {holder:?})"
+    );
+    if kind == Some(gst_webrtc::WebRTCKind::Audio) {
+        return Err(format!(
+            "The negotiated video section's pad {name} belongs to the audio track"
+        ));
+    }
+    if let Some(peer) = pad.peer() {
+        let _ = peer.unlink(&pad);
+    }
+    Ok(pad)
 }
 
 /// The m-line index of the video section the remote offer negotiated.
@@ -1862,46 +1895,26 @@ mod tests {
     /// Once a share's VA scaler failed, every later chain scales in
     /// software.
     #[test]
-    fn a_failed_va_scaler_is_not_used_again() {
-        if gst::init().is_err() {
-            return;
-        }
-        va_scaler_failed("test");
-        assert!(!va_scaler_works());
-        let request = ScreenRequest::from_parts(Some(1280), Some(30)).served(1920, 1080);
-        let (scale, ..) = encoder_chain(1920, 1080, request).unwrap();
-        assert_eq!(
-            scale
-                .factory()
-                .map(|factory| factory.name().to_string())
-                .as_deref(),
-            Some("videoscale")
-        );
-    }
-
-    #[test]
     fn the_encoder_chain_is_tuned_for_screens() {
         gst::init().unwrap();
         let request = ScreenRequest::from_parts(Some(2400), Some(60)).served(2560, 1600);
         assert_eq!(request.fps, 30, "software VP8 above 1920 px runs at 30");
         let (scale, convert, rate, filter, _queue, encoder, _payloader) =
             encoder_chain(2560, 1600, request).unwrap();
-        match scale
-            .factory()
-            .map(|factory| factory.name().to_string())
-            .as_deref()
-        {
-            Some("videoscale") => {
-                assert_eq!(scale.property::<u32>("n-threads"), 4);
-                let method = scale.property_value("method");
-                assert_eq!(
-                    gst::glib::EnumValue::from_value(&method).map(|(_, value)| value.nick()),
-                    Some("lanczos")
-                );
-            }
-            Some("vapostproc") => {}
-            other => panic!("unexpected scaler {other:?}"),
-        }
+        assert_eq!(
+            scale
+                .factory()
+                .map(|factory| factory.name().to_string())
+                .as_deref(),
+            Some("videoscale"),
+            "never vapostproc: it capped the chain at 26-36 fps"
+        );
+        assert_eq!(scale.property::<u32>("n-threads"), 4);
+        let method = scale.property_value("method");
+        assert_eq!(
+            gst::glib::EnumValue::from_value(&method).map(|(_, value)| value.nick()),
+            Some("lanczos")
+        );
         assert!(convert.has_property("n-threads", None));
         assert!(rate.property::<bool>("drop-only"));
         assert_eq!(rate.property::<i32>("max-rate"), 30);
