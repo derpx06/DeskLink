@@ -87,9 +87,26 @@ pub struct DaemonHandle {
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     errors: Arc<Mutex<Vec<String>>>,
     events: Arc<Mutex<Vec<DaemonEvent>>>,
-    /// Set once the worker has read the config and listed the paired phones
-    /// (or failed to start): until then "no phones" may only mean "not read yet".
-    loaded: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the paired phones are known: [`LOAD_PENDING`] until the
+    /// worker has read the config and listed them ([`LOAD_KNOWN`]), or could
+    /// not ([`LOAD_FAILED`]). Until known, "no phones" may only mean "not read
+    /// yet", and after a failure it means nothing at all.
+    loaded: Arc<std::sync::atomic::AtomicU8>,
+}
+
+pub(crate) const LOAD_PENDING: u8 = 0;
+pub(crate) const LOAD_KNOWN: u8 = 1;
+pub(crate) const LOAD_FAILED: u8 = 2;
+
+/// What the window knows about the paired phones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairedPhones {
+    /// Not read yet.
+    Pending,
+    /// Read: the device list holds every paired phone.
+    Known,
+    /// The config could not be read (or the worker died first).
+    Unknown,
 }
 
 impl DaemonHandle {
@@ -101,19 +118,25 @@ impl DaemonHandle {
         let worker_devices = Arc::clone(&devices);
         let worker_errors = Arc::clone(&errors);
         let worker_events = Arc::clone(&events);
-        let loaded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loaded = Arc::new(std::sync::atomic::AtomicU8::new(LOAD_PENDING));
         let worker_loaded = Arc::clone(&loaded);
 
         thread::spawn(move || {
-            // Set however this thread ends, a panic included: the window must
-            // not wait for ever.
-            struct MarkLoaded(Arc<std::sync::atomic::AtomicBool>);
-            impl Drop for MarkLoaded {
+            // However this thread ends before the phones are known (a failed
+            // config read, a panic), the window stops waiting and is told the
+            // phones are not known: it must not take that for "none paired".
+            struct MarkFailed(Arc<std::sync::atomic::AtomicU8>);
+            impl Drop for MarkFailed {
                 fn drop(&mut self) {
-                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                    let _ = self.0.compare_exchange(
+                        LOAD_PENDING,
+                        LOAD_FAILED,
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                    );
                 }
             }
-            let _mark = MarkLoaded(Arc::clone(&worker_loaded));
+            let mark = MarkFailed(Arc::clone(&worker_loaded));
             let worker = DaemonWorker::new(
                 worker_devices,
                 worker_errors.clone(),
@@ -121,8 +144,7 @@ impl DaemonHandle {
                 command_rx,
                 &worker_loaded,
             );
-            // Also when it failed to start.
-            worker_loaded.store(true, std::sync::atomic::Ordering::Release);
+            drop(mark);
             if let Err(error) = worker.and_then(DaemonWorker::run) {
                 push_error(&worker_errors, error);
             }
@@ -140,9 +162,20 @@ impl DaemonHandle {
         }
     }
 
-    /// Whether the paired phones have been read from the config (see `loaded`).
-    pub fn loaded(&self) -> bool {
-        self.loaded.load(std::sync::atomic::Ordering::Acquire)
+    /// Whether the paired phones have been read from the config.
+    pub fn paired_phones(&self) -> PairedPhones {
+        match self.loaded.load(std::sync::atomic::Ordering::Acquire) {
+            LOAD_PENDING => PairedPhones::Pending,
+            LOAD_KNOWN => PairedPhones::Known,
+            _ => PairedPhones::Unknown,
+        }
+    }
+
+    /// Tests: what [`Self::paired_phones`] says.
+    #[cfg(test)]
+    pub(crate) fn set_load_state_for_tests(&self, state: u8) {
+        self.loaded
+            .store(state, std::sync::atomic::Ordering::Release);
     }
 
     /// A handle with no worker behind it, for tests of the windows: the
@@ -156,7 +189,7 @@ impl DaemonHandle {
             devices: Arc::default(),
             errors: Arc::default(),
             events: Arc::default(),
-            loaded: Arc::new(true.into()),
+            loaded: Arc::new(LOAD_KNOWN.into()),
         };
         (handle, commands)
     }

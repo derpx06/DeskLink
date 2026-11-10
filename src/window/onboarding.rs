@@ -459,6 +459,8 @@ pub(super) struct Onboarding {
     on_leave: RefCell<Option<Box<dyn FnOnce()>>>,
     /// Set when it is torn down: the setup poll stops.
     closed: Rc<Cell<bool>>,
+    /// The latest setup poll: an older one (an earlier Check again) stops.
+    poll: Cell<u64>,
 }
 
 fn animations_on() -> bool {
@@ -671,6 +673,7 @@ impl Onboarding {
             daemon: daemon.clone(),
             on_leave: RefCell::new(Some(Box::new(on_leave))),
             closed: Rc::new(Cell::new(false)),
+            poll: Cell::new(0),
         });
 
         let weak = Rc::downgrade(&this);
@@ -798,11 +801,16 @@ impl Onboarding {
             crate::platform::refresh();
         }
         self.draw_setup(false);
+        let ticket = self.poll.get() + 1;
+        self.poll.set(ticket);
         let started = std::time::Instant::now();
         let weak = Rc::downgrade(self);
         let closed = self.closed.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(300), move || {
-            let Some(this) = weak.upgrade().filter(|_| !closed.get()) else {
+            let Some(this) = weak
+                .upgrade()
+                .filter(|this| !closed.get() && this.poll.get() == ticket)
+            else {
                 return glib::ControlFlow::Break;
             };
             if crate::platform::generation() > before {
@@ -817,7 +825,48 @@ impl Onboarding {
         });
     }
 
+    /// Which setup control has the keyboard focus: its row's id, or
+    /// "check-again"; `None` when the focus is elsewhere.
+    fn setup_focus(&self) -> Option<String> {
+        let focus = self.root.root().and_then(|root| root.focus())?;
+        if !focus.is_ancestor(&self.setup_body) {
+            return None;
+        }
+        if focus.widget_name() == "check-again" {
+            return Some("check-again".into());
+        }
+        focus
+            .ancestor(gtk::ListBoxRow::static_type())
+            .map(|row| row.widget_name().to_string())
+    }
+
+    /// Puts the focus back on the control `id` had before a redraw.
+    fn restore_setup_focus(&self, id: &str) {
+        let Some(holder) = super::named_widgets(self.setup_body.upcast_ref(), id)
+            .into_iter()
+            .next()
+        else {
+            return;
+        };
+        let control = super::named_widgets(&holder, "")
+            .into_iter()
+            .find(|widget| widget.is::<gtk::Button>() || widget.is::<gtk::Switch>());
+        if let Some(control) = control {
+            control.grab_focus();
+        }
+    }
+
     fn draw_setup(self: &Rc<Self>, gave_up: bool) {
+        // Redrawn in place of the old rows: the focus goes back to the same
+        // row's control, not to the window.
+        let focused = self.setup_focus();
+        self.fill_setup_rows(gave_up);
+        if let Some(id) = focused {
+            self.restore_setup_focus(&id);
+        }
+    }
+
+    fn fill_setup_rows(self: &Rc<Self>, gave_up: bool) {
         let body = &self.setup_body;
         while let Some(child) = body.first_child() {
             body.remove(&child);
@@ -860,6 +909,7 @@ impl Onboarding {
             Some("desklink-refresh-symbolic"),
         );
         again.set_halign(gtk::Align::Start);
+        again.set_widget_name("check-again");
         let weak = Rc::downgrade(self);
         again.connect_clicked(move |_| {
             if let Some(this) = weak.upgrade() {
@@ -1594,6 +1644,16 @@ mod tests {
         DesklinkWindow,
         std::sync::mpsc::Receiver<crate::device_links::daemon::DaemonCommand>,
     ) {
+        window_in(crate::device_links::daemon::handle::LOAD_KNOWN)
+    }
+
+    /// A window whose daemon says `state` about the paired phones from the start.
+    fn window_in(
+        state: u8,
+    ) -> (
+        DesklinkWindow,
+        std::sync::mpsc::Receiver<crate::device_links::daemon::DaemonCommand>,
+    ) {
         let resources = crate::load_resources().expect("the bundled resources");
         gio::resources_register(&resources);
         let app = adw::Application::builder()
@@ -1601,6 +1661,7 @@ mod tests {
             .build();
         let window = DesklinkWindow::new(&app);
         let (daemon, commands) = DaemonHandle::detached();
+        daemon.set_load_state_for_tests(state);
         window.set_daemon(daemon);
         (window, commands)
     }
@@ -1725,6 +1786,118 @@ mod tests {
             while context.iteration(false) {}
             assert!(window.imp().onboarding.borrow().is_none());
             assert_eq!(visible(&window), "devices");
+        });
+    }
+
+    fn seen_sent(
+        commands: &std::sync::mpsc::Receiver<crate::device_links::daemon::DaemonCommand>,
+    ) -> bool {
+        commands
+            .try_iter()
+            .any(|command| matches!(command, DaemonCommand::SetOnboardingSeen(true)))
+    }
+
+    /// Until the phones are read nothing is decided; a config that could not
+    /// be read never shows the tour (it would greet a paired person).
+    #[test]
+    fn the_tour_waits_for_the_phones_and_skips_an_unreadable_config() {
+        use crate::device_links::daemon::handle::{LOAD_FAILED, LOAD_KNOWN, LOAD_PENDING};
+        crate::test_display::run(|| {
+            let (waiting, _commands) = window_in(LOAD_PENDING);
+            let daemon = waiting.daemon().unwrap();
+            waiting.refresh_devices();
+            assert!(waiting.imp().onboarding.borrow().is_none());
+            assert!(!waiting.imp().onboarding_decided.get());
+            daemon.set_load_state_for_tests(LOAD_KNOWN);
+            waiting.refresh_devices();
+            assert_eq!(visible(&waiting), "onboarding", "decided once known");
+
+            let (failed, _commands) = window_in(LOAD_FAILED);
+            failed.refresh_devices();
+            assert!(failed.imp().onboarding_decided.get());
+            assert!(failed.imp().onboarding.borrow().is_none());
+            assert_ne!(visible(&failed), "onboarding");
+        });
+    }
+
+    /// A pairing request interrupts the tour for the pairing flow but leaves
+    /// it unseen; a phone that pairs marks it seen.
+    #[test]
+    fn only_a_paired_phone_marks_the_tour_seen() {
+        crate::test_display::run(|| {
+            let (window, commands) = window();
+            window.refresh_devices();
+            assert_eq!(visible(&window), "onboarding");
+            let request = super::super::debug_fake_device("pair-request", "Pixel 9");
+            assert!(!request.trusted);
+            window.imp().fake_devices.borrow_mut().push(request);
+            window.refresh_devices();
+            assert!(
+                window.imp().onboarding.borrow().is_none(),
+                "the request shows"
+            );
+            assert!(
+                !seen_sent(&commands),
+                "a stray request is not the tour seen"
+            );
+
+            let (window, commands) = window_with_tour();
+            let phone = super::super::debug_fake_device("paired", "Pixel 9");
+            window.imp().fake_devices.borrow_mut().push(phone);
+            window.refresh_devices();
+            assert!(window.imp().onboarding.borrow().is_none());
+            assert!(seen_sent(&commands), "paired: done with the tour");
+        });
+    }
+
+    fn window_with_tour() -> (
+        DesklinkWindow,
+        std::sync::mpsc::Receiver<crate::device_links::daemon::DaemonCommand>,
+    ) {
+        let (window, commands) = window();
+        window.refresh_devices();
+        assert_eq!(visible(&window), "onboarding");
+        (window, commands)
+    }
+
+    /// A setup row's action redraws the list: the keyboard focus comes back
+    /// to the same control instead of falling to the window.
+    #[test]
+    fn check_again_keeps_the_keyboard_focus() {
+        let _held = crate::platform::TEST_REPORT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::test_display::run(|| {
+            crate::platform::set_report_for_tests(evaluate(&gnome_wayland()));
+            let (window, _commands) = window_with_tour();
+            window.present();
+            let tour = window.imp().onboarding.borrow().clone().unwrap();
+            tour.apply(Nav::Skip);
+            let find_again = || {
+                super::super::named_widgets(tour.root.upcast_ref(), "check-again")
+                    .into_iter()
+                    .next()
+                    .and_downcast::<gtk::Button>()
+                    .expect("Check again")
+            };
+            let before = find_again();
+            let focus = || gtk::prelude::RootExt::focus(&window);
+            before.grab_focus();
+            assert_eq!(focus().as_ref(), Some(before.upcast_ref()));
+            let polls = tour.poll.get();
+            before.emit_clicked();
+            before.emit_clicked();
+            let after = find_again();
+            assert_ne!(before, after, "the list was redrawn");
+            assert_eq!(
+                focus().as_ref(),
+                Some(after.upcast_ref()),
+                "the focus followed it"
+            );
+            // One poll per click; only the newest keeps running.
+            assert_eq!(tour.poll.get(), polls + 2);
+            crate::platform::clear_report_for_tests();
+            window.close();
         });
     }
 }

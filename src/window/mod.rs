@@ -660,7 +660,7 @@ impl DesklinkWindow {
         let tour = onboarding::Onboarding::new(&daemon, for_pairing, step, move || {
             if let Some(window) = window.upgrade() {
                 // After the click that left it, not inside its handler.
-                glib::idle_add_local_once(move || window.end_onboarding(true));
+                glib::idle_add_local_once(move || window.end_onboarding(true, true));
             }
         });
         imp.main_stack.add_named(&tour.root, Some("onboarding"));
@@ -672,15 +672,16 @@ impl DesklinkWindow {
         }
     }
 
-    /// Takes the tour down and remembers it was seen. `redraw`: show what
-    /// comes next now (the pairing page or the phones).
-    pub(super) fn end_onboarding(&self, redraw: bool) {
+    /// Takes the tour down; `seen` remembers it was seen (left by the person,
+    /// or a phone paired). `redraw`: show what comes next now (the pairing
+    /// page or the phones).
+    pub(super) fn end_onboarding(&self, redraw: bool, seen: bool) {
         let imp = self.imp();
         let Some(tour) = imp.onboarding.take() else {
             return;
         };
         imp.onboarding_to_pairing.set(tour.for_pairing);
-        if !crate::device_links::config::app_settings().onboarding_seen {
+        if seen && !crate::device_links::config::app_settings().onboarding_seen {
             if let Some(daemon) = self.daemon() {
                 daemon.send(DaemonCommand::SetOnboardingSeen(true));
             }
@@ -1240,23 +1241,37 @@ impl DesklinkWindow {
 
         // The first-run tour: decided once, when the paired phones are known.
         if !imp.onboarding_decided.get() {
-            if !daemon.loaded() {
-                return;
-            }
-            imp.onboarding_decided.set(true);
-            let any_paired = devices.iter().any(|device| device.trusted);
-            if onboarding::show_on_start(
-                crate::device_links::config::app_settings().onboarding_seen,
-                any_paired,
-            ) {
-                self.start_onboarding(0);
+            use crate::device_links::daemon::handle::PairedPhones;
+            match daemon.paired_phones() {
+                PairedPhones::Pending => return,
+                // The config could not be read: "no phone" means nothing.
+                PairedPhones::Unknown => imp.onboarding_decided.set(true),
+                PairedPhones::Known => {
+                    imp.onboarding_decided.set(true);
+                    // Read again now that they are known: `devices` may be a
+                    // snapshot from before the worker listed them.
+                    let any_paired = self
+                        .known_devices(&daemon)
+                        .iter()
+                        .chain(devices.iter())
+                        .any(|device| device.trusted);
+                    if onboarding::show_on_start(
+                        crate::device_links::config::app_settings().onboarding_seen,
+                        any_paired,
+                    ) {
+                        self.start_onboarding(0);
+                    }
+                }
             }
         }
         let tour = imp.onboarding.borrow().clone();
         if let Some(tour) = tour {
+            let paired = devices.iter().any(|device| device.trusted);
             if tour.for_pairing && !devices.is_empty() {
-                // A phone asked to pair, or paired: the pairing flow as ever.
-                self.end_onboarding(false);
+                // A phone paired (the tour is done), or asked to pair: the
+                // pairing flow as ever, and a request that comes to nothing
+                // leaves the tour unseen.
+                self.end_onboarding(false, paired);
             } else {
                 if let Some(stop) = imp.welcome_qr.take() {
                     pairing::stop_welcome(&daemon, &stop);
