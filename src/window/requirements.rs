@@ -15,6 +15,11 @@ use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::platform::{Check, Distro, Level};
 use crate::shell_dbus::ExtensionStatus;
 
+/// What turning on the top bar menu also does (`shell_dbus::turn_on_extension`
+/// sets `disable-user-extensions` to false), said wherever it can be turned on.
+pub(crate) const EXTENSION_NOTE: &str = "Turning it on also allows GNOME user extensions \
+    (a setting for all of them), and GNOME shows it after you log out and back in.";
+
 /// The Settings subpage of passwords, terminals and unlocking.
 const PRIVACY_PAGE: usize = 7;
 
@@ -261,9 +266,10 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
             id: "extension",
             on_phone: false,
             title: "The top bar menu is off".into(),
-            detail: "Your phone's battery, connection and quick actions in GNOME's top bar. \
-                     GNOME shows it after you log out and back in."
-                .into(),
+            detail: format!(
+                "Your phone's battery, connection and quick actions in GNOME's top bar. {}",
+                EXTENSION_NOTE
+            ),
             fix: Fix::TurnOnExtension,
             allow: Some(Allow::Extension),
         }),
@@ -547,7 +553,11 @@ pub(crate) fn allow_all_lines(needs: &[Need]) -> Vec<String> {
                     .title
                     .replace(" is off for ", " for ")
                     .replace(" is off", ""),
-                Allow::Extension => "The top bar menu (it shows after you log in again)".into(),
+                Allow::Extension => {
+                    "The top bar menu, which also allows GNOME user extensions (it shows after \
+                     you log in again)"
+                        .into()
+                }
                 Allow::AskGlide => "Glide asks the desktop for permission".into(),
             })
         })
@@ -873,6 +883,13 @@ mod tests {
             ]
         );
         let by = |id| needs.iter().find(|need| need.id == id).unwrap();
+        assert!(
+            by("extension")
+                .detail
+                .contains("also allows GNOME user extensions"),
+            "{}",
+            by("extension").detail
+        );
         assert_eq!(by("start-at-login").fix, Fix::StartAtLogin);
         assert_eq!(by("terminal-access").fix, Fix::OpenSettings(PRIVACY_PAGE));
         assert_eq!(
@@ -903,7 +920,8 @@ mod tests {
             allow_all_lines(&needs),
             [
                 "Start at login",
-                "The top bar menu (it shows after you log in again)",
+                "The top bar menu, which also allows GNOME user extensions (it shows after you \
+                 log in again)",
                 "Terminal access for Pixel 9",
                 "Unlock with Pixel 9",
                 "Glide asks the desktop for permission"
