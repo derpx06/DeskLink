@@ -1413,13 +1413,20 @@ pub enum ExtensionStatus {
 }
 
 pub fn extension_status() -> ExtensionStatus {
-    let installed = || user_extension_dir().join("metadata.json").is_file();
-    if extension_active() {
-        ExtensionStatus::Active
-    } else if !EXTENSION_KNOWN.with(|known| known.get()) && installed() {
-        ExtensionStatus::NeedsLogin
-    } else {
-        ExtensionStatus::Off
+    status_of(
+        extension_active(),
+        EXTENSION_KNOWN.with(|known| known.get()),
+        user_extension_dir().join("metadata.json").is_file(),
+    )
+}
+
+/// A running menu whose files are gone (DeskLink's data was removed) is Off:
+/// GNOME would drop it at the next log-in, and "Turn on" writes it back.
+fn status_of(active: bool, known: bool, installed: bool) -> ExtensionStatus {
+    match (active, installed) {
+        (true, true) => ExtensionStatus::Active,
+        (false, true) if !known => ExtensionStatus::NeedsLogin,
+        _ => ExtensionStatus::Off,
     }
 }
 
@@ -2144,6 +2151,15 @@ fn offer_extension(app: &DesklinkApplication) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_running_menu_with_its_files_gone_reads_off() {
+        assert_eq!(status_of(true, true, true), ExtensionStatus::Active);
+        assert_eq!(status_of(true, true, false), ExtensionStatus::Off);
+        assert_eq!(status_of(false, false, true), ExtensionStatus::NeedsLogin);
+        assert_eq!(status_of(false, true, true), ExtensionStatus::Off);
+        assert_eq!(status_of(false, false, false), ExtensionStatus::Off);
+    }
 
     /// W13: the top bar gets a phone's shown items with `base` on this
     /// computer's clock; nothing while it is not ready or its notifications
