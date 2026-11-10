@@ -1828,6 +1828,15 @@ mod tests {
             let (window, commands) = window();
             window.refresh_devices();
             assert_eq!(visible(&window), "onboarding");
+            // A phone that is only nearby (a fresh install on the same Wi-Fi)
+            // has asked nothing: the tour stays.
+            for kind in ["discovered", "refused"] {
+                let nearby = super::super::debug_fake_device(kind, "Pixel 9");
+                window.imp().fake_devices.borrow_mut().push(nearby);
+                window.refresh_devices();
+                assert_eq!(visible(&window), "onboarding", "{kind}: the tour stays");
+                window.imp().fake_devices.borrow_mut().clear();
+            }
             let request = super::super::debug_fake_device("pair-request", "Pixel 9");
             assert!(!request.trusted);
             window.imp().fake_devices.borrow_mut().push(request);
