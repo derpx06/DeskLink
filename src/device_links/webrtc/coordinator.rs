@@ -172,6 +172,28 @@ pub(crate) fn phones_awaiting_approval() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Shares that failed to start here, by phone, with the reason the phone
+/// was given: the window says so at this computer too, so neither side is
+/// left wondering why nothing appeared.
+fn share_failures() -> &'static Mutex<Vec<(String, String)>> {
+    static FAILED: std::sync::OnceLock<Mutex<Vec<(String, String)>>> = std::sync::OnceLock::new();
+    FAILED.get_or_init(Default::default)
+}
+
+/// Takes the failures not yet shown (phone id, reason).
+pub(crate) fn take_share_failures() -> Vec<(String, String)> {
+    share_failures()
+        .lock()
+        .map(|mut failed| std::mem::take(&mut *failed))
+        .unwrap_or_default()
+}
+
+/// Whether a failed share is worth telling the person at this computer:
+/// not when they declined it themselves.
+fn tell_desk_about_failure(reason: &str) -> bool {
+    reason != super::remote_desktop_portal::DECLINED_HERE
+}
+
 /// Held while a share waits for the portal's answer; gone when it answers
 /// (allowed, refused, cancelled or timed out), however the worker ends. Only
 /// the share that registered it can clear it, so a replaced share's end does
@@ -1704,6 +1726,13 @@ fn run_desktop_portal_worker(
             eprintln!(
                 "[DeskLink] Desktop screen/control portal setup failed for {device_id}: {error}"
             );
+            let reason = super::remote_desktop_portal::plain_portal_error(&error);
+            if tell_desk_about_failure(&reason) {
+                if let Ok(mut failed) = share_failures().lock() {
+                    failed.push((device_id.clone(), reason.clone()));
+                }
+                crate::device_links::daemon::state::nudge_tickers();
+            }
             let now = now_millis();
             let denied = remote_session::sessions().lock().ok().and_then(|mut open| {
                 open.get_mut(&device_id).map(|session| {
@@ -1715,7 +1744,7 @@ fn run_desktop_portal_worker(
                         session.next_sequence(),
                         now,
                     );
-                    denied.reason = Some(super::remote_desktop_portal::plain_portal_error(&error));
+                    denied.reason = Some(reason);
                     let _ = session.accept(&denied, now);
                     denied
                 })
@@ -4949,6 +4978,21 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// A share that failed is said at the desk too, except a refusal made there.
+    #[test]
+    fn a_failed_share_is_told_at_the_desk_unless_declined_there() {
+        use super::super::remote_desktop_portal::plain_portal_error;
+        assert!(!super::tell_desk_about_failure(&plain_portal_error(
+            "Desktop permission request was denied"
+        )));
+        assert!(super::tell_desk_about_failure(&plain_portal_error(
+            "Could not attach video to the negotiated WebRTC screen track"
+        )));
+        assert!(super::tell_desk_about_failure(&plain_portal_error(
+            "Could not start DeskLink screen capture: Failed to sync state with parent"
+        )));
+    }
+
     #[test]
     fn a_phone_awaits_approval_until_its_own_share_answers() {
         use super::{

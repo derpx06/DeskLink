@@ -229,13 +229,16 @@ pub(crate) fn pick_cursor_mode(available: u32) -> Option<u32> {
 
 /// A portal or D-Bus error as words for the phone. Raw GDBus text never
 /// leaves this computer; it stays in the desk's log.
+/// The phone's reason when the person at this computer said no.
+pub(crate) const DECLINED_HERE: &str = "Screen sharing was declined on this computer";
+
 pub(crate) fn plain_portal_error(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
     if error.starts_with(PORTAL_NOT_RESPONDING) {
         return error.to_string();
     }
     if lower.starts_with("desktop permission request") {
-        return "Screen sharing was declined on this computer".to_string();
+        return DECLINED_HERE.to_string();
     }
     if lower.contains("timed out") {
         return "Nobody answered the screen-sharing prompt on this computer".to_string();
