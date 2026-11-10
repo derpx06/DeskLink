@@ -229,13 +229,16 @@ pub(crate) fn pick_cursor_mode(available: u32) -> Option<u32> {
 
 /// A portal or D-Bus error as words for the phone. Raw GDBus text never
 /// leaves this computer; it stays in the desk's log.
+/// The phone's reason when the person at this computer said no.
+pub(crate) const DECLINED_HERE: &str = "Screen sharing was declined on this computer";
+
 pub(crate) fn plain_portal_error(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
     if error.starts_with(PORTAL_NOT_RESPONDING) {
         return error.to_string();
     }
     if lower.starts_with("desktop permission request") {
-        return "Screen sharing was declined on this computer".to_string();
+        return DECLINED_HERE.to_string();
     }
     if lower.contains("timed out") {
         return "Nobody answered the screen-sharing prompt on this computer".to_string();
@@ -259,8 +262,29 @@ pub(crate) fn plain_portal_error(error: &str) -> String {
     {
         return "This computer couldn't start screen sharing".to_string();
     }
+    // GStreamer's own words ("Failed to sync state with parent", a pad, an
+    // element) mean nothing to the person holding the phone.
+    if [
+        "gstreamer",
+        "screen capture",
+        "screen track",
+        "screen encoder",
+        "sync state",
+        "pad",
+        "element",
+        "webrtc",
+        "negotiat",
+    ]
+    .iter()
+    .any(|word| lower.contains(word))
+    {
+        return CAPTURE_FAILED.to_string();
+    }
     error.to_string()
 }
+
+/// A capture that would not start, in words for the person holding the phone.
+pub(crate) const CAPTURE_FAILED: &str = "The computer couldn't start sharing its screen. Try again; if it keeps happening, restart DeskLink on the computer.";
 
 /// The ScreenCast portal's `(AvailableSourceTypes, AvailableCursorModes)`;
 /// `None` when the portal does not answer.
@@ -1317,6 +1341,16 @@ mod tests {
             plain_portal_error("The desktop share was cancelled"),
             "The desktop share was cancelled",
             "already plain"
+        );
+        assert_eq!(
+            plain_portal_error(
+                "Could not start DeskLink screen capture: Failed to sync state with parent"
+            ),
+            CAPTURE_FAILED
+        );
+        assert_eq!(
+            plain_portal_error("Could not attach video to the negotiated WebRTC screen track"),
+            CAPTURE_FAILED
         );
         for message in [raw, "Could not keep the PipeWire connection: EBADF"] {
             let plain = plain_portal_error(message);

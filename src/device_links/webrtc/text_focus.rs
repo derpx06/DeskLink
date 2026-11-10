@@ -194,9 +194,12 @@ fn watch(stop: &AtomicBool, on_change: &dyn Fn(bool)) -> Result<(), String> {
             // raised the keyboard. Report where it is now, then follow events.
             let mut reported: Option<bool> = None;
             if let Some((sender, path)) = current_focus(&a11y) {
-                let editable = element_takes_typing(&a11y, &sender, &path);
-                reported = Some(editable);
-                on_change(editable);
+                if let Some(editable) =
+                    next_report(reported, element_takes_typing(&a11y, &sender, &path))
+                {
+                    reported = Some(editable);
+                    on_change(editable);
+                }
             }
             while !stop.load(Ordering::Acquire) {
                 while context.pending() {
@@ -204,8 +207,9 @@ fn watch(stop: &AtomicBool, on_change: &dyn Fn(bool)) -> Result<(), String> {
                 }
                 // Only the latest focus matters.
                 if let Some((sender, path)) = events.try_iter().last() {
-                    let editable = element_takes_typing(&a11y, &sender, &path);
-                    if reported != Some(editable) {
+                    if let Some(editable) =
+                        next_report(reported, element_takes_typing(&a11y, &sender, &path))
+                    {
                         reported = Some(editable);
                         on_change(editable);
                     }
@@ -280,6 +284,22 @@ fn children(a11y: &gio::DBusConnection, sender: &str, path: &str) -> Vec<(String
 }
 
 fn state_word(a11y: &gio::DBusConnection, sender: &str, path: &str) -> u32 {
+    state_of(a11y, sender, path, 300).unwrap_or(0)
+}
+
+/// What to tell the phone after looking at a newly focused element: its
+/// answer when that changes what was said, nothing when it is the same or
+/// when the element could not be asked. An application busy drawing (a
+/// terminal printing fast) let `GetRole` time out, which read as "takes no
+/// typing" and dropped the phone's keyboard mid-sentence, then raised it again.
+pub(crate) fn next_report(reported: Option<bool>, observed: Option<bool>) -> Option<bool> {
+    observed.filter(|editable| reported != Some(*editable))
+}
+
+/// How long the focused element itself may take to answer.
+const ELEMENT_TIMEOUT_MS: i32 = 1_000;
+
+fn state_of(a11y: &gio::DBusConnection, sender: &str, path: &str, timeout_ms: i32) -> Option<u32> {
     a11y.call_sync(
         Some(sender),
         path,
@@ -288,37 +308,61 @@ fn state_word(a11y: &gio::DBusConnection, sender: &str, path: &str) -> u32 {
         None,
         None,
         gio::DBusCallFlags::NONE,
-        300,
+        timeout_ms,
         None::<&gio::Cancellable>,
     )
     .ok()
     .and_then(|reply| reply.child_value(0).get::<Vec<u32>>())
     .and_then(|words| words.first().copied())
-    .unwrap_or(0)
 }
 
-fn element_takes_typing(a11y: &gio::DBusConnection, sender: &str, path: &str) -> bool {
-    let role = a11y
-        .call_sync(
-            Some(sender),
-            path,
-            "org.a11y.atspi.Accessible",
-            "GetRole",
-            None,
-            None,
-            gio::DBusCallFlags::NONE,
-            300,
-            None::<&gio::Cancellable>,
-        )
-        .ok()
-        .and_then(|reply| reply.child_value(0).get::<u32>())
-        .unwrap_or(0);
-    takes_typing(role, state_word(a11y, sender, path))
+/// Whether the element takes typing; `None` when it did not answer.
+fn element_takes_typing(a11y: &gio::DBusConnection, sender: &str, path: &str) -> Option<bool> {
+    let role = role(a11y, sender, path);
+    let state = state_of(a11y, sender, path, ELEMENT_TIMEOUT_MS);
+    let typing = role
+        .zip(state)
+        .map(|(role, state)| takes_typing(role, state));
+    debug_log!("[DeskLink] Text focus: {sender}{path} role {role:?}, takes typing {typing:?}");
+    typing
+}
+
+fn role(a11y: &gio::DBusConnection, sender: &str, path: &str) -> Option<u32> {
+    a11y.call_sync(
+        Some(sender),
+        path,
+        "org.a11y.atspi.Accessible",
+        "GetRole",
+        None,
+        None,
+        gio::DBusCallFlags::NONE,
+        ELEMENT_TIMEOUT_MS,
+        None::<&gio::Cancellable>,
+    )
+    .ok()
+    .and_then(|reply| reply.child_value(0).get::<u32>())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_element_that_does_not_answer_changes_nothing() {
+        assert_eq!(next_report(None, Some(true)), Some(true), "first answer");
+        assert_eq!(next_report(Some(true), Some(true)), None, "unchanged");
+        assert_eq!(
+            next_report(Some(true), Some(false)),
+            Some(false),
+            "left the field"
+        );
+        assert_eq!(
+            next_report(Some(true), None),
+            None,
+            "a busy terminal is not 'no typing'"
+        );
+        assert_eq!(next_report(None, None), None);
+    }
 
     #[test]
     fn text_inputs_and_terminals_take_typing_and_controls_do_not() {

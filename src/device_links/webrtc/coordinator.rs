@@ -172,6 +172,28 @@ pub(crate) fn phones_awaiting_approval() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Shares that failed to start here, by phone, with the reason the phone
+/// was given: the window says so at this computer too, so neither side is
+/// left wondering why nothing appeared.
+fn share_failures() -> &'static Mutex<Vec<(String, String)>> {
+    static FAILED: std::sync::OnceLock<Mutex<Vec<(String, String)>>> = std::sync::OnceLock::new();
+    FAILED.get_or_init(Default::default)
+}
+
+/// Takes the failures not yet shown (phone id, reason).
+pub(crate) fn take_share_failures() -> Vec<(String, String)> {
+    share_failures()
+        .lock()
+        .map(|mut failed| std::mem::take(&mut *failed))
+        .unwrap_or_default()
+}
+
+/// Whether a failed share is worth telling the person at this computer:
+/// not when they declined it themselves.
+fn tell_desk_about_failure(reason: &str) -> bool {
+    reason != super::remote_desktop_portal::DECLINED_HERE
+}
+
 /// Held while a share waits for the portal's answer; gone when it answers
 /// (allowed, refused, cancelled or timed out), however the worker ends. Only
 /// the share that registered it can clear it, so a replaced share's end does
@@ -286,8 +308,52 @@ impl Drop for PortalWorkerCleanup {
 /// the phone would otherwise wait for a picture forever.
 const CAPTURE_STALL: std::time::Duration = std::time::Duration::from_secs(3);
 /// Rebuilds in a row without steady video before the share is reported
-/// failed to the phone (`screen-stopped`, "not producing any video").
-const CAPTURE_RESTARTS: u32 = 3;
+/// failed to the phone (`screen-stopped`, "not producing any video"): about
+/// 15 s, which outlasts a WirePlumber restart (measured: back within ~1 s,
+/// and it crashed several times in a minute when bluetoothd did).
+const CAPTURE_RESTARTS: u32 = 5;
+
+/// Why a share ended when its capture never came back.
+const STOPPED_SENDING: &str = "The computer stopped sending its screen. Try again; if it keeps happening, restart DeskLink on the computer.";
+
+/// What the capture watchdog does on one look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureCheck {
+    /// Video moved; `reset` clears the rebuild count (it kept flowing long
+    /// enough after the last rebuild).
+    Flowing { reset: bool },
+    /// Quiet, not for long enough to act on.
+    Wait,
+    /// Rebuild the capture on the same portal stream (no dialog, same SSRC).
+    Rebuild,
+    /// Rebuilt enough times: tell the phone this share is not working.
+    GiveUp,
+}
+
+/// The watchdog's decision. Pure: `progressed` is whether frames were sent
+/// since the last look, `quiet_for` how long since they last were,
+/// `since_rebuild` how long since the last rebuild (if any).
+fn capture_check(
+    progressed: bool,
+    quiet_for: std::time::Duration,
+    since_rebuild: Option<std::time::Duration>,
+    restarts: u32,
+) -> CaptureCheck {
+    if progressed {
+        // Only video that keeps flowing clears the count: a rebuilt chain
+        // that let a few packets out and then died reset it every time,
+        // and the share rebuilt every 4 s for as long as the phone looked.
+        CaptureCheck::Flowing {
+            reset: since_rebuild.is_none_or(|since| since >= CAPTURE_HEALTHY_AFTER),
+        }
+    } else if quiet_for < CAPTURE_STALL {
+        CaptureCheck::Wait
+    } else if restarts >= CAPTURE_RESTARTS {
+        CaptureCheck::GiveUp
+    } else {
+        CaptureCheck::Rebuild
+    }
+}
 /// How long a rebuilt capture must keep sending before the rebuild count
 /// starts over.
 const CAPTURE_HEALTHY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1435,6 +1501,45 @@ fn send_remote_session_message(
     peer.send_text(WebRtcChannel::Control, &text)
 }
 
+/// Attempts at starting a capture, and the pause between them.
+const CAPTURE_START_ATTEMPTS: u32 = 4;
+const CAPTURE_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Starts a capture, trying again a few times. Measured on this laptop: a
+/// crashing bluetoothd takes WirePlumber down with it, and a share started
+/// while WirePlumber restarts (about a second) found its PipeWire stream
+/// unlinked: no frames, or "Failed to sync state with parent". Stops early
+/// when the share is cancelled; the last error is returned.
+fn start_capture_retrying(
+    cancel: &std::sync::atomic::AtomicBool,
+    pause: impl Fn(std::time::Duration),
+    mut start: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    let mut attempt = 1;
+    loop {
+        match start() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt < CAPTURE_START_ATTEMPTS
+                    && !cancel.load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                eprintln!(
+                    "[DeskLink] Screen capture did not start ({error}); trying again ({attempt} of {CAPTURE_START_ATTEMPTS})"
+                );
+                pause(CAPTURE_START_PAUSE);
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// A copy of the portal's PipeWire connection for one capture attempt.
+fn dup_pipewire_fd(fd: &std::os::fd::OwnedFd) -> Result<std::os::fd::OwnedFd, String> {
+    fd.try_clone()
+        .map_err(|error| format!("Could not keep the PipeWire connection: {error}"))
+}
+
 /// The phone as a second display (F2): a virtual monitor of `pixels`, its
 /// scale set so it is readable, input through EIS. Returns what the share
 /// worker needs, with the monitor's logical size (what the phone maps its
@@ -1480,18 +1585,20 @@ fn start_extended_display(
         .try_clone()
         .map_err(|error| format!("Could not keep the PipeWire connection: {error}"))?;
     let before = virtual_display::connectors();
-    peer.start_desktop_screen_capture(
-        id,
-        DesktopSource::PipeWire {
-            fd: source.fd,
-            node_id: source.node_id,
-            serial: source.pipewire_serial,
-            virtual_size: Some(pixels),
-        },
-        pixels.0,
-        pixels.1,
-        request,
-    )?;
+    start_capture_retrying(cancel, std::thread::sleep, || {
+        peer.start_desktop_screen_capture(
+            id,
+            DesktopSource::PipeWire {
+                fd: dup_pipewire_fd(&source.fd)?,
+                node_id: source.node_id,
+                serial: source.pipewire_serial,
+                virtual_size: Some(pixels),
+            },
+            pixels.0,
+            pixels.1,
+            request,
+        )
+    })?;
     // The monitor appears once the capture has negotiated its size.
     let scale = virtual_display::apply_scale(&before, pixels);
     let logical = virtual_display::logical_size(pixels, scale);
@@ -1673,18 +1780,20 @@ fn run_desktop_portal_worker(
                 .fd
                 .try_clone()
                 .map_err(|error| format!("Could not keep the PipeWire connection: {error}"))?;
-            peer.start_desktop_screen_capture(
-                id,
-                DesktopSource::PipeWire {
-                    fd: source.fd,
-                    node_id: source.node_id,
-                    serial: source.pipewire_serial,
-                    virtual_size: None,
-                },
-                source.width,
-                source.height,
-                request,
-            )?;
+            start_capture_retrying(&cancel, std::thread::sleep, || {
+                peer.start_desktop_screen_capture(
+                    id,
+                    DesktopSource::PipeWire {
+                        fd: dup_pipewire_fd(&source.fd)?,
+                        node_id: source.node_id,
+                        serial: source.pipewire_serial,
+                        virtual_size: None,
+                    },
+                    source.width,
+                    source.height,
+                    request,
+                )
+            })?;
             Ok((
                 Box::new(portal),
                 source.width,
@@ -1704,6 +1813,13 @@ fn run_desktop_portal_worker(
             eprintln!(
                 "[DeskLink] Desktop screen/control portal setup failed for {device_id}: {error}"
             );
+            let reason = super::remote_desktop_portal::plain_portal_error(&error);
+            if tell_desk_about_failure(&reason) {
+                if let Ok(mut failed) = share_failures().lock() {
+                    failed.push((device_id.clone(), reason.clone()));
+                }
+                crate::device_links::daemon::state::nudge_tickers();
+            }
             let now = now_millis();
             let denied = remote_session::sessions().lock().ok().and_then(|mut open| {
                 open.get_mut(&device_id).map(|session| {
@@ -1715,7 +1831,7 @@ fn run_desktop_portal_worker(
                         session.next_sequence(),
                         now,
                     );
-                    denied.reason = Some(super::remote_desktop_portal::plain_portal_error(&error));
+                    denied.reason = Some(reason);
                     let _ = session.accept(&denied, now);
                     denied
                 })
@@ -1908,37 +2024,37 @@ fn run_desktop_portal_worker(
         }
         // Capture watchdog; see `CAPTURE_STALL`.
         let frames = peer.desktop_screen_frames_sent();
-        if frames != last_frames {
-            last_frames = frames;
-            last_progress = std::time::Instant::now();
-            // Only video that keeps flowing clears the count: a rebuilt chain
-            // that let a few packets out and then died reset it every time,
-            // and the share rebuilt every 4 s for as long as the phone looked.
-            if last_rebuild.is_none_or(|at| at.elapsed() >= CAPTURE_HEALTHY_AFTER) {
-                restarts = 0;
+        match capture_check(
+            frames != last_frames,
+            last_progress.elapsed(),
+            last_rebuild.map(|at| at.elapsed()),
+            restarts,
+        ) {
+            CaptureCheck::Flowing { reset } => {
+                last_frames = frames;
+                last_progress = std::time::Instant::now();
+                if reset {
+                    restarts = 0;
+                }
             }
-        } else if last_progress.elapsed() >= CAPTURE_STALL {
-            if restarts >= CAPTURE_RESTARTS {
+            CaptureCheck::Wait => {}
+            CaptureCheck::GiveUp => {
                 no_video = true;
                 break;
             }
-            restarts += 1;
-            debug_log!(
+            CaptureCheck::Rebuild => {
+                restarts += 1;
+                debug_log!(
                 "[DeskLink] Desktop share to {device_id} produced no video for {:?}; rebuilding the capture ({restarts} of {CAPTURE_RESTARTS})",
                 CAPTURE_STALL
             );
-            // Nothing ever came out of a VA-scaled chain: the scaler is the
-            // likeliest cause (the share feeds it PipeWire's buffers, which
-            // the startup probe cannot), so the rebuild scales in software.
-            if peer.desktop_screen_frames_sent() == 0 && peer.desktop_screen_va_scaled() {
-                super::screen::va_scaler_failed("no frames");
+                if let Err(error) = capture(portal.active()) {
+                    eprintln!("[DeskLink] Could not rebuild the desktop capture: {error}");
+                }
+                last_frames = peer.desktop_screen_frames_sent();
+                last_progress = std::time::Instant::now();
+                last_rebuild = Some(last_progress);
             }
-            if let Err(error) = capture(portal.active()) {
-                eprintln!("[DeskLink] Could not rebuild the desktop capture: {error}");
-            }
-            last_frames = peer.desktop_screen_frames_sent();
-            last_progress = std::time::Instant::now();
-            last_rebuild = Some(last_progress);
         }
         let wait = if scroll_open.is_some() {
             SCROLL_FINISH_AFTER
@@ -2056,9 +2172,9 @@ fn run_desktop_portal_worker(
     }
     release_held_portal_inputs(&*portal, &mut held_inputs);
     let told = if no_video {
-        Some("The desktop is not producing any video".to_string())
+        Some(STOPPED_SENDING.to_string())
     } else if portal_revoked {
-        Some("Desktop screen/control permission was revoked locally".to_string())
+        Some("Screen sharing was stopped on the computer".to_string())
     } else {
         stopped_here
     };
@@ -4955,6 +5071,117 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// The capture watchdog: a quiet stream is rebuilt every
+    /// `CAPTURE_STALL`, up to `CAPTURE_RESTARTS` times in a row (~15 s,
+    /// longer than a WirePlumber restart), then the share is given up; only
+    /// video that keeps flowing after a rebuild clears the count.
+    #[test]
+    fn a_stalled_capture_is_rebuilt_until_it_flows_or_runs_out_of_tries() {
+        use super::{capture_check, CaptureCheck, CAPTURE_RESTARTS, CAPTURE_STALL};
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        assert_eq!(capture_check(false, s(1), None, 0), CaptureCheck::Wait);
+        assert_eq!(
+            capture_check(false, CAPTURE_STALL, None, 0),
+            CaptureCheck::Rebuild
+        );
+        // A WirePlumber restart: the stream dies mid-share, every rebuild is
+        // tried in turn, and the fifth failure ends it.
+        let mut restarts = 0;
+        let mut rebuilds = 0;
+        loop {
+            match capture_check(false, CAPTURE_STALL, Some(CAPTURE_STALL), restarts) {
+                CaptureCheck::Rebuild => {
+                    restarts += 1;
+                    rebuilds += 1;
+                }
+                CaptureCheck::GiveUp => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(rebuilds, CAPTURE_RESTARTS);
+        assert!(
+            CAPTURE_STALL * CAPTURE_RESTARTS >= s(15),
+            "outlasts a WirePlumber restart"
+        );
+        // Picture back after a rebuild: the count is kept until it has
+        // flowed a while, then cleared.
+        assert_eq!(
+            capture_check(true, s(0), Some(s(2)), 2),
+            CaptureCheck::Flowing { reset: false }
+        );
+        assert_eq!(
+            capture_check(true, s(0), Some(s(11)), 2),
+            CaptureCheck::Flowing { reset: true }
+        );
+        assert_eq!(
+            capture_check(true, s(0), None, 0),
+            CaptureCheck::Flowing { reset: true }
+        );
+    }
+
+    /// A capture that fails to start (WirePlumber restarting under it) is
+    /// tried again, but not for ever and not once the share is cancelled.
+    #[test]
+    fn a_capture_that_fails_to_start_is_tried_again_a_few_times() {
+        use std::sync::atomic::AtomicBool;
+        let cancel = AtomicBool::new(false);
+        let mut calls = 0;
+        let result = super::start_capture_retrying(
+            &cancel,
+            |_| {},
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err("sync".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!((result, calls), (Ok(()), 3));
+
+        let mut calls = 0;
+        let result = super::start_capture_retrying(
+            &cancel,
+            |_| {},
+            || {
+                calls += 1;
+                Err(format!("attempt {calls}"))
+            },
+        );
+        assert_eq!(result, Err("attempt 4".to_string()));
+        assert_eq!(calls, super::CAPTURE_START_ATTEMPTS);
+
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        let mut calls = 0;
+        let result = super::start_capture_retrying(
+            &cancel,
+            |_| {},
+            || {
+                calls += 1;
+                Err("sync".to_string())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "a cancelled share is not retried");
+    }
+
+    /// A share that failed is said at the desk too, except a refusal made there.
+    #[test]
+    fn a_failed_share_is_told_at_the_desk_unless_declined_there() {
+        use super::super::remote_desktop_portal::plain_portal_error;
+        assert!(!super::tell_desk_about_failure(&plain_portal_error(
+            "Desktop permission request was denied"
+        )));
+        assert!(super::tell_desk_about_failure(&plain_portal_error(
+            "Could not attach video to the negotiated WebRTC screen track"
+        )));
+        assert!(super::tell_desk_about_failure(&plain_portal_error(
+            "Could not start DeskLink screen capture: Failed to sync state with parent"
+        )));
+    }
+
     #[test]
     fn a_phone_awaits_approval_until_its_own_share_answers() {
         use super::{

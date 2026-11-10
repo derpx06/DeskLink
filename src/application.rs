@@ -732,6 +732,23 @@ impl DesklinkApplication {
                 for device in to_withdraw {
                     app.withdraw_notification(&format!("screen-approve-{device}"));
                 }
+                // A share that could not start: said here as well as on the phone.
+                for (device, reason) in
+                    crate::device_links::webrtc::coordinator::take_share_failures()
+                {
+                    let phone = daemon
+                        .devices()
+                        .into_iter()
+                        .find(|known| known.id == device)
+                        .map_or_else(|| "the phone".to_string(), |known| known.name);
+                    let notification = gio::Notification::new(&format!(
+                        "This screen couldn't be shown on {phone}"
+                    ));
+                    notification.set_body(Some(&reason));
+                    notification.set_priority(gio::NotificationPriority::High);
+                    notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+                    app.send_notification(Some(&format!("screen-failed-{device}")), &notification);
+                }
                 // Glide is about to put GNOME's "Capture Input" dialog up: say
                 // so, and take the notice down the moment it is answered.
                 let glide = crate::device_links::glide::status();
