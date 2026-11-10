@@ -3719,6 +3719,11 @@ fn debug_xkeys(spec: &str) {
         match name {
             "Return" => 0xff0d,
             "Tab" => 0xff09,
+            "Escape" => 0xff1b,
+            "Left" => 0xff51,
+            "Up" => 0xff52,
+            "Right" => 0xff53,
+            "Down" => 0xff54,
             "ctrl" => 0xffe3,
             "shift" => 0xffe1,
             "alt" => 0xffe9,
