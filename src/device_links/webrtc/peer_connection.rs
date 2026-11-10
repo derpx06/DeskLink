@@ -747,6 +747,16 @@ impl DesktopWebRtcPeer {
         })
     }
 
+    /// Whether media can flow now: the connection is up and the channels a
+    /// feature-ready link needs are open. Until then `webrtcbin` holds the
+    /// screen capture's thread in its send path.
+    pub fn media_ready(&self) -> bool {
+        self.webrtcbin
+            .property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state")
+            == gst_webrtc::WebRTCPeerConnectionState::Connected
+            && self.required_channels_open()
+    }
+
     /// Whether the channels a link needs before it is feature-ready are open.
     pub fn required_channels_open(&self) -> bool {
         let Ok(channels) = self.channels.lock() else {
@@ -2110,6 +2120,7 @@ a=max-message-size:262144\r\n";
             "the encoder chain produced no RTP"
         );
         assert_eq!(capture.payload_type(), 96);
+        assert!(!peer.media_ready(), "no connection: not ready for media");
         // No connection in a unit test, so the chain parks inside `webrtcbin`:
         // `stop` must hand it back instead of hanging, and `close` frees it.
         assert!(capture.stop().is_err());
@@ -2381,6 +2392,14 @@ a=max-message-size:262144\r\n";
     fn a_keyframe_request_from_the_far_side_is_answered_on_a_second_share() {
         let pair = loopback();
         wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !pair.answerer.media_ready() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            pair.answerer.media_ready(),
+            "a connected peer with its channels open is ready for media"
+        );
         let share = |next_seqnum| {
             super::super::screen::DesktopScreenCapture::attach_source(
                 &pair.answerer.pipeline,

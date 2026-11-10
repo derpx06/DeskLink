@@ -303,7 +303,7 @@ impl Drop for PortalWorkerCleanup {
 }
 
 /// A share whose capture produces nothing for this long is rebuilt. The
-/// source re-sends its last frame every 500 ms even on a still desktop, so
+/// source re-sends its last frame every 200 ms even on a still desktop, so
 /// silence means the stream died (PipeWire errors, a failed negotiation) and
 /// the phone would otherwise wait for a picture forever.
 const CAPTURE_STALL: std::time::Duration = std::time::Duration::from_secs(3);
@@ -324,6 +324,10 @@ enum CaptureCheck {
     Flowing { reset: bool },
     /// Quiet, not for long enough to act on.
     Wait,
+    /// Quiet because the link is not ready (connecting, a blip, the phone
+    /// dozing): `webrtcbin` holds the capture's thread until it is, so the
+    /// silence says nothing about the capture. The stall clock stops.
+    Hold,
     /// Rebuild the capture on the same portal stream (no dialog, same SSRC).
     Rebuild,
     /// Rebuilt enough times: tell the phone this share is not working.
@@ -335,6 +339,7 @@ enum CaptureCheck {
 /// `since_rebuild` how long since the last rebuild (if any).
 fn capture_check(
     progressed: bool,
+    link_ready: bool,
     quiet_for: std::time::Duration,
     since_rebuild: Option<std::time::Duration>,
     restarts: u32,
@@ -346,6 +351,8 @@ fn capture_check(
         CaptureCheck::Flowing {
             reset: since_rebuild.is_none_or(|since| since >= CAPTURE_HEALTHY_AFTER),
         }
+    } else if !link_ready {
+        CaptureCheck::Hold
     } else if quiet_for < CAPTURE_STALL {
         CaptureCheck::Wait
     } else if restarts >= CAPTURE_RESTARTS {
@@ -2026,6 +2033,7 @@ fn run_desktop_portal_worker(
         let frames = peer.desktop_screen_frames_sent();
         match capture_check(
             frames != last_frames,
+            peer.media_ready() && !is_dozing(&device_id),
             last_progress.elapsed(),
             last_rebuild.map(|at| at.elapsed()),
             restarts,
@@ -2038,6 +2046,7 @@ fn run_desktop_portal_worker(
                 }
             }
             CaptureCheck::Wait => {}
+            CaptureCheck::Hold => last_progress = std::time::Instant::now(),
             CaptureCheck::GiveUp => {
                 no_video = true;
                 break;
@@ -5080,9 +5089,12 @@ mod tests {
         use super::{capture_check, CaptureCheck, CAPTURE_RESTARTS, CAPTURE_STALL};
         use std::time::Duration;
         let s = Duration::from_secs;
-        assert_eq!(capture_check(false, s(1), None, 0), CaptureCheck::Wait);
         assert_eq!(
-            capture_check(false, CAPTURE_STALL, None, 0),
+            capture_check(false, true, s(1), None, 0),
+            CaptureCheck::Wait
+        );
+        assert_eq!(
+            capture_check(false, true, CAPTURE_STALL, None, 0),
             CaptureCheck::Rebuild
         );
         // A WirePlumber restart: the stream dies mid-share, every rebuild is
@@ -5090,7 +5102,7 @@ mod tests {
         let mut restarts = 0;
         let mut rebuilds = 0;
         loop {
-            match capture_check(false, CAPTURE_STALL, Some(CAPTURE_STALL), restarts) {
+            match capture_check(false, true, CAPTURE_STALL, Some(CAPTURE_STALL), restarts) {
                 CaptureCheck::Rebuild => {
                     restarts += 1;
                     rebuilds += 1;
@@ -5107,16 +5119,34 @@ mod tests {
         // Picture back after a rebuild: the count is kept until it has
         // flowed a while, then cleared.
         assert_eq!(
-            capture_check(true, s(0), Some(s(2)), 2),
+            capture_check(true, true, s(0), Some(s(2)), 2),
             CaptureCheck::Flowing { reset: false }
         );
         assert_eq!(
-            capture_check(true, s(0), Some(s(11)), 2),
+            capture_check(true, true, s(0), Some(s(11)), 2),
             CaptureCheck::Flowing { reset: true }
         );
         assert_eq!(
-            capture_check(true, s(0), None, 0),
+            capture_check(true, true, s(0), None, 0),
             CaptureCheck::Flowing { reset: true }
+        );
+        // The link not ready (ICE/DTLS slow, a blip, the phone dozing for its
+        // 35 s): a healthy capture held by webrtcbin is neither rebuilt nor
+        // given up, however long, even with every rebuild already spent.
+        for quiet in [CAPTURE_STALL, s(35), s(120)] {
+            assert_eq!(
+                capture_check(false, false, quiet, None, 0),
+                CaptureCheck::Hold
+            );
+            assert_eq!(
+                capture_check(false, false, quiet, Some(quiet), CAPTURE_RESTARTS),
+                CaptureCheck::Hold
+            );
+        }
+        assert_eq!(
+            capture_check(true, false, s(0), None, 0),
+            CaptureCheck::Flowing { reset: true },
+            "video that moves is video"
         );
     }
 
