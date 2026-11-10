@@ -90,7 +90,7 @@ button.file-card:focus-visible {
 /* ── The Bucket: card (off, asked), header, tiles, drop zone ───────────── */
 .files-bucket-card { padding: 16px; }
 .files-bucket-title { font-size: 1.07em; font-weight: 600; }
-.bucket-heading { font-size: 1.47em; font-weight: 600; letter-spacing: normal; }
+.bucket-heading { font-size: 1.47em; font-weight: 600; letter-spacing: 0; }
 .bucket-crumb {
   min-height: 40px;
   padding: 0 8px;

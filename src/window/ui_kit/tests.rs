@@ -276,6 +276,26 @@ fn every_token_the_stylesheet_names_exists() {
 }
 
 #[test]
+fn every_app_stylesheet_parses_without_errors() {
+    crate::test_display::run(|| {
+        for (name, css) in [
+            ("style.css", include_str!("../../style.css")),
+            ("files-ui.css", include_str!("../../files-ui.css")),
+            ("wave-c.css", include_str!("../../wave-c.css")),
+        ] {
+            let provider = gtk::CssProvider::new();
+            let errors = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let sink = errors.clone();
+            provider.connect_parsing_error(move |_, section, error| {
+                sink.borrow_mut().push(format!("{section:?}: {error}"));
+            });
+            provider.load_from_string(&format!("{}{css}", tokens::css(false, true, false)));
+            assert!(errors.borrow().is_empty(), "{name}: {:?}", errors.borrow());
+        }
+    });
+}
+
+#[test]
 fn the_stylesheet_and_the_tokens_parse_without_errors_in_every_style() {
     crate::test_display::run(|| {
         for (dark, contrast) in [(false, false), (true, false), (false, true), (true, true)] {
