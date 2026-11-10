@@ -40,6 +40,7 @@ mod notes_clipboard;
 pub(crate) mod notifications;
 mod onboarding;
 mod overview;
+mod requirements;
 pub(crate) use overview::link_to_send;
 mod pairing;
 mod palette;
@@ -2885,7 +2886,8 @@ fn accept_dropped_files_hover(
 /// - `screenshot PATH`: the main window to PATH, every other visible window
 ///   beside it as `<stem>-<title>.png`.
 /// - `fake-device KIND[:TYPE] NAME`: shows a made-up device (`paired`,
-///   `paired-turn`, `connecting`, `unreachable`, `pair-request`, `requested`,
+///   `paired-turn`, `paired-new` (no terminal access, no notification access),
+///   `connecting`, `unreachable`, `pair-request`, `requested`,
 ///   `discovered`, `refused`; TYPE `phone`, `tablet`, `tv`, `laptop`, `desktop`);
 ///   `fake-clear` removes them.
 /// - `ui-kit [W H]`: the UI kit's component sheet in its own window.
@@ -3915,7 +3917,11 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
                 }
                 .into(),
             );
-            device.terminal_access = true;
+            // "paired-new": just paired, nothing allowed yet.
+            device.terminal_access = kind != "paired-new";
+            if kind == "paired-new" {
+                device.notification_access = Some(false);
+            }
             device.rtt_ms = Some(9);
             if kind == "live" || kind == "extended" {
                 device.terminal_sessions_attached = 1;

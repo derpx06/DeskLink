@@ -142,6 +142,8 @@ pub(crate) enum Target {
         device: String,
         uid: String,
     },
+    /// An action that cannot run now: choosing it says why, with the fix.
+    Blocked(super::requirements::Need),
 }
 
 /// One row.
@@ -386,13 +388,20 @@ pub(crate) struct PhoneState {
     pub(crate) desk_sound_on: bool,
     pub(crate) phone_mic_on: bool,
     pub(crate) phone_sound_on: bool,
+    /// What an action's needs are judged by (`requirements::blocker`).
+    pub(crate) facts: super::requirements::PhoneFacts,
 }
 
 impl PhoneState {
-    /// Reads what the Home tiles read: the same capability test
-    /// (`can_send_feature`) and the same reachability reason.
+    /// Reads what the Home tiles read: an action is listed when this build
+    /// has it, and the same needs say when it cannot run.
     pub(crate) fn from_device(device: &DeviceView) -> Self {
-        let can = |packet: &str| super::can_send_feature(device, packet);
+        let can = |packet: &str| {
+            super::FeatureRegistry::desktop()
+                .outgoing_capabilities()
+                .iter()
+                .any(|capability| capability == packet)
+        };
         let reason = super::unavailable_reason(device);
         let screen = can(PACKET_TYPE_MOUSEPAD_REQUEST);
         Self {
@@ -417,8 +426,26 @@ impl PhoneState {
             desk_sound_on: super::sound::is_on(device, "desk-sound"),
             phone_mic_on: super::sound::is_on(device, "phone-mic"),
             phone_sound_on: super::sound::is_on(device, "phone-sound"),
+            facts: super::requirements::PhoneFacts::from_device(device),
         }
     }
+}
+
+/// What `action` needs from the phone, for `requirements::blocker`.
+fn feature_of(action: Action) -> Option<super::requirements::Feature> {
+    use super::requirements::Feature;
+    Some(match action {
+        Action::SendFiles | Action::SendLink => Feature::Send(PACKET_TYPE_SHARE_REQUEST),
+        Action::SendClipboard => Feature::Send(PACKET_TYPE_CLIPBOARD),
+        Action::PhoneScreen | Action::Insert(_) | Action::Sound(..) => {
+            Feature::Send(PACKET_TYPE_MOUSEPAD_REQUEST)
+        }
+        Action::Ring => Feature::Send(PACKET_TYPE_FINDMYPHONE_REQUEST),
+        Action::Lock => Feature::Send(PACKET_TYPE_LOCK_REQUEST),
+        Action::Nudge => Feature::Send(PACKET_TYPE_PING),
+        Action::HandOff => Feature::HandOff,
+        _ => return None,
+    })
 }
 
 /// An action that needs the phone, with the words it is listed by.
@@ -573,11 +600,10 @@ fn icon_for_capture(gnome: &str) -> &'static str {
 }
 
 /// The actions to offer, in the order they are listed. What needs the phone
-/// is there only while it is reachable and ready, and only what its build
-/// takes (the Home tiles' own tests); what is on this computer (notes,
+/// is listed whenever a phone is selected, also when it cannot run now (its
+/// row then says what it needs); what is on this computer (notes,
 /// terminals, pairing, the history, the shortcuts) is always there.
-pub(crate) fn offered_actions(phone: Option<&PhoneState>, any_terminal_open: bool) -> Vec<Action> {
-    let phone = phone.filter(|phone| phone.usable);
+pub(crate) fn offered_actions(phone: Option<&PhoneState>) -> Vec<Action> {
     let mut out = Vec::new();
     // The Home tiles first, in their order: they are what is on show idle.
     if let Some(phone) = phone {
@@ -602,11 +628,7 @@ pub(crate) fn offered_actions(phone: Option<&PhoneState>, any_terminal_open: boo
         if phone.ping {
             out.push(Action::Nudge);
         }
-        // The Home tile is live with a terminal open (the daemon gates it per
-        // phone, whoever asks): the palette asks the same way.
-        if any_terminal_open {
-            out.push(Action::HandOff);
-        }
+        out.push(Action::HandOff);
     }
     out.extend([Action::NewNote, Action::NewTerminal]);
     // What is in the Insert and Sound menus: found by a query.
@@ -782,14 +804,24 @@ pub(crate) fn build(sources: &Sources) -> Vec<Item> {
     let mut items = Vec::new();
 
     // Actions. Open terminals decide Hand off.
-    for action in offered_actions(sources.phone.as_ref(), !sources.terminals.is_empty()) {
+    let any_terminal_open = !sources.terminals.is_empty();
+    for action in offered_actions(sources.phone.as_ref()) {
         let phone_item = sources
             .phone
             .as_ref()
             .and_then(|phone| phone_action(phone, action));
         items.push(match (phone_item, &sources.phone) {
             (Some(mut item), Some(phone)) => {
-                item.target = Target::PhoneAction(phone.id.clone(), action);
+                let need = feature_of(action).and_then(|feature| {
+                    super::requirements::blocker(feature, &phone.facts, any_terminal_open)
+                });
+                match need {
+                    Some(need) => {
+                        item.subtitle = need.title.clone();
+                        item.target = Target::Blocked(need);
+                    }
+                    None => item.target = Target::PhoneAction(phone.id.clone(), action),
+                }
                 item
             }
             _ => desk_action(action),
@@ -972,12 +1004,11 @@ pub(crate) fn scope_line(paired: bool, phone: Option<&PhoneState>) -> String {
     match phone {
         Some(phone) if phone.usable => format!("Actions for {}", phone.name),
         Some(phone) => format!(
-            "{} · {}'s actions are hidden",
+            "{} · each action says what it needs",
             phone
                 .reason
                 .clone()
                 .unwrap_or_else(|| format!("{} is away", phone.name)),
-            phone.name
         ),
         None if paired => "No phone is selected".to_string(),
         None => "Pair a phone to send it files and use its actions".to_string(),
@@ -1182,6 +1213,17 @@ mod tests {
 
     // ── The actions ───────────────────────────────────────────────────────
 
+    /// The actions listed as unavailable, with what each needs.
+    fn blocked_of(items: &[Item]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .filter_map(|item| match &item.target {
+                Target::Blocked(need) => Some((item.title.clone(), need.title.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn titles_of(items: &[Item], group: Group) -> Vec<String> {
         items
             .iter()
@@ -1248,67 +1290,95 @@ mod tests {
             "the Sound rows: {actions:?}"
         );
         assert!(
-            !actions.contains(&"Hand off".to_string()),
-            "needs a terminal"
+            actions.contains(&"Hand off".to_string()),
+            "listed, with its need"
         );
     }
 
+    /// Away or still connecting: every action that needs the phone is still
+    /// listed, each saying why it cannot run now, and choosing one explains.
     #[test]
-    fn actions_that_need_the_phone_go_when_it_is_away_or_still_connecting() {
-        for (ready, status) in [
-            (false, DeviceStatus::Unreachable),
-            (false, DeviceStatus::Paired), // paired, link not ready yet
+    fn actions_that_need_the_phone_say_why_when_it_is_away_or_still_connecting() {
+        for (ready, status, why) in [
+            (false, DeviceStatus::Unreachable, "Can't reach Pixel 9"),
+            (false, DeviceStatus::Paired, "Connecting to Pixel 9…"),
         ] {
             let phone = PhoneState::from_device(&device("Pixel 9", ready, status.clone()));
             assert!(!phone.usable);
             let items = build(&sources_with(Some(phone.clone()), 1));
             let actions = titles_of(&items, Group::Actions);
-            assert_eq!(
-                actions,
-                [
-                    "New note",
-                    "New terminal",
-                    "Pair another phone",
-                    "Connection history",
-                    "Keyboard shortcuts"
-                ],
-                "{status:?}"
-            );
+            assert!(actions.contains(&"Send files".to_string()), "{actions:?}");
+            let blocked = blocked_of(&items);
+            assert!(blocked.len() >= 8, "{blocked:?}");
+            for (title, need) in &blocked {
+                assert_eq!(need, why, "{title} ({status:?})");
+            }
+            let send = items
+                .iter()
+                .find(|item| item.title == "Send files")
+                .unwrap();
+            assert_eq!(send.subtitle, why, "the row says it");
+            for desk in ["New note", "New terminal", "Pair another phone"] {
+                assert!(!blocked.iter().any(|(title, _)| title == desk), "{desk}");
+            }
             let line = scope_line(true, Some(&phone));
             assert!(line.contains("Pixel 9"), "{line}");
-            assert!(line.contains("hidden"), "{line}");
+            assert!(line.contains("says what it needs"), "{line}");
         }
     }
 
+    /// What an older phone's build cannot take is listed and says to update
+    /// it; nothing is sent from such a row.
     #[test]
-    fn an_old_phone_is_not_offered_what_it_cannot_do() {
+    fn an_old_phone_is_offered_what_it_cannot_do_with_the_reason() {
         let mut old = device("Old phone", true, DeviceStatus::Paired);
         old.incoming_capabilities
             .retain(|capability| capability != PACKET_TYPE_LOCK_REQUEST);
         old.incoming_capabilities
             .retain(|capability| capability != PACKET_TYPE_MOUSEPAD_REQUEST);
         let phone = PhoneState::from_device(&old);
-        let actions = titles_of(&build(&sources_with(Some(phone), 0)), Group::Actions);
-        assert!(!actions.contains(&"Lock phone".to_string()), "{actions:?}");
-        assert!(!actions.contains(&"Phone screen".to_string()));
-        assert!(
-            !actions.iter().any(|a| a.contains("microphone")),
-            "sound goes with the screen tile"
+        let items = build(&sources_with(Some(phone), 0));
+        let blocked = blocked_of(&items);
+        let needs = |title: &str| {
+            blocked
+                .iter()
+                .find(|(blocked, _)| blocked == title)
+                .map(|(_, need)| need.clone())
+        };
+        let update = Some("Old phone's DeskLink can't do this yet".to_string());
+        assert_eq!(needs("Lock phone"), update);
+        assert_eq!(needs("Phone screen"), update);
+        assert_eq!(
+            needs("Use Old phone as microphone"),
+            update,
+            "sound goes with the screen"
         );
-        assert!(actions.contains(&"Send files".to_string()));
-        assert!(actions.contains(&"Ring phone".to_string()));
+        assert_eq!(needs("Send files"), None);
+        assert_eq!(needs("Ring phone"), None);
+        assert!(items.iter().any(
+            |item| item.title == "Send files" && matches!(item.target, Target::PhoneAction(..))
+        ));
     }
 
     #[test]
-    fn hand_off_needs_a_terminal_open() {
-        let phone = ready_phone();
-        let with = titles_of(
-            &build(&sources_with(Some(phone.clone()), 1)),
-            Group::Actions,
+    fn hand_off_needs_terminal_access_then_an_open_terminal() {
+        let mut phone = ready_phone();
+        let hand_off = |phone: &PhoneState, terminals| {
+            blocked_of(&build(&sources_with(Some(phone.clone()), terminals)))
+                .into_iter()
+                .find(|(title, _)| title == "Hand off")
+                .map(|(_, need)| need)
+        };
+        assert_eq!(
+            hand_off(&phone, 1).as_deref(),
+            Some("Needs terminal access for Pixel 9")
         );
-        assert!(with.contains(&"Hand off".to_string()));
-        let without = titles_of(&build(&sources_with(Some(phone), 0)), Group::Actions);
-        assert!(!without.contains(&"Hand off".to_string()));
+        phone.facts.terminal_access = true;
+        assert_eq!(hand_off(&phone, 1), None, "live with a terminal open");
+        assert_eq!(
+            hand_off(&phone, 0).as_deref(),
+            Some("Needs an open shared terminal")
+        );
     }
 
     #[test]

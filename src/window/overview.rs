@@ -5,6 +5,7 @@
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 
+use super::requirements::{blocker, Feature, Need, PhoneFacts};
 use super::ui_kit::banner::{banner, BannerKind};
 use super::ui_kit::{
     button, card as kit_card, icon_button as kit_icon_button, icon_square as kit_icon_square,
@@ -12,8 +13,7 @@ use super::ui_kit::{
 };
 use super::{
     can_send_feature, clock_time, confirm, device_type_label, ellipsized, named_widgets,
-    pick_and_send_files, session_summary, text, toast_from, unavailable_reason, wrapped,
-    DesklinkWindow, QuickAction,
+    pick_and_send_files, session_summary, text, toast_from, wrapped, DesklinkWindow, QuickAction,
 };
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::{DesktopSession, DeviceStatus, DeviceView};
@@ -54,7 +54,12 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         .into_iter()
         .map(|item| item.id.clone())
         .collect();
+    let needs = super::requirements::missing(&super::requirements::Facts::now(Some(device)));
     let key = serde_json::to_string(&(
+        super::requirements::key(&needs),
+        crate::terminal_previews::sessions()
+            .iter()
+            .any(|info| info.exit_status.is_none()),
         &steady,
         &since,
         &activity_ids,
@@ -96,6 +101,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
             page.append(&live_strip(daemon, device, &summary, since.as_deref()));
         }
         page.append(&hero(daemon, device, &minute));
+        if let Some(card) = super::requirements::card(daemon, &needs) {
+            page.append(&card);
+        }
         if let Some(card) = activity_card(device, &settings) {
             page.append(&card);
         }
@@ -423,31 +431,40 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
         .valign(gtk::Align::Center)
         .build();
     actions.set_widget_name("hero-actions");
-    let reason = unavailable_reason(device);
-    if can_send_feature(device, PACKET_TYPE_SHARE_REQUEST) {
+    let phone = PhoneFacts::from_device(device);
+    if desktop_sends(PACKET_TYPE_SHARE_REQUEST) {
         let send = button(
             ButtonKind::Primary,
             "Send files…",
             Some("desklink-upload-file-symbolic"),
         );
         send.set_tooltip_text(Some(&format!("Send files to {} (Ctrl+O)", device.name)));
-        let (daemon, id) = (daemon.clone(), device.id.clone());
-        send.connect_clicked(move |button| pick_and_send_files(&daemon, &id, button));
-        disable_with(&send, reason.as_deref());
+        match blocker(Feature::Send(PACKET_TYPE_SHARE_REQUEST), &phone, true) {
+            Some(need) => unavailable(&send, &need),
+            None => {
+                let (daemon, id) = (daemon.clone(), device.id.clone());
+                send.connect_clicked(move |button| pick_and_send_files(&daemon, &id, button));
+            }
+        }
         actions.append(&send);
     }
-    if can_send_feature(device, crate::device_links::packet::PACKET_TYPE_CLIPBOARD) {
+    let clipboard_type = crate::device_links::packet::PACKET_TYPE_CLIPBOARD;
+    if desktop_sends(clipboard_type) {
         let clipboard = button(
             ButtonKind::Tonal,
             "Send clipboard",
             Some("desklink-content-paste-symbolic"),
         );
-        clipboard.connect_clicked(move |button| {
-            if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {
-                window.quick_action(QuickAction::Clipboard);
+        match blocker(Feature::Send(clipboard_type), &phone, true) {
+            Some(need) => unavailable(&clipboard, &need),
+            None => {
+                clipboard.connect_clicked(move |button| {
+                    if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {
+                        window.quick_action(QuickAction::Clipboard);
+                    }
+                });
             }
-        });
-        disable_with(&clipboard, reason.as_deref());
+        }
         actions.append(&clipboard);
     }
     band.append(&actions);
@@ -471,16 +488,6 @@ fn hero_name(name: &str) -> gtk::Label {
     label
 }
 
-/// Why a tile cannot be used now, in one or two words: its hint line says
-/// it (the whole reason is its tooltip).
-fn tile_reason(device: &DeviceView) -> Option<&'static str> {
-    match device.status {
-        DeviceStatus::Paired if device.feature_transport_ready => None,
-        DeviceStatus::Paired => Some("Connecting…"),
-        _ => Some("Can't reach"),
-    }
-}
-
 /// Where the tile row gets fewer columns (its width in px, the window sets
 /// them as it is resized, `apply_tile_columns`): below 840 it has three, below
 /// 560 two, so there is never an orphan tile on a line of its own.
@@ -497,21 +504,25 @@ pub(super) fn tile_columns(width: i32) -> u32 {
     columns
 }
 
-/// A tile that cannot be used: greyed, its hint the reason, its tooltip the
-/// whole reason.
-fn disable_tile(tile: &gtk::Button, device: &DeviceView) {
-    if let (Some(short), Some(whole)) = (tile_reason(device), unavailable_reason(device)) {
-        tile.set_sensitive(false);
-        tile.set_tooltip_text(Some(&whole));
-        if let Some(hint) = named_widgets(tile.upcast_ref(), "")
-            .into_iter()
-            .find(|w| w.has_css_class("dl-tile-hint"))
-            .and_downcast::<gtk::Label>()
-        {
-            hint.set_label(short);
-        }
-        tile.update_property(&[gtk::accessible::Property::Description(&whole)]);
+/// A control that cannot be used now: it looks disabled but stays a focus
+/// stop, its hint (a tile's) is the short reason, its tooltip the need, and a
+/// click says why with the fix. Nothing it would send is wired.
+fn unavailable(control: &gtk::Button, need: &Need) {
+    control.add_css_class("dl-unavailable");
+    control.set_tooltip_text(Some(&need.title));
+    if let Some(hint) = named_widgets(control.upcast_ref(), "")
+        .into_iter()
+        .find(|w| w.has_css_class("dl-tile-hint"))
+        .and_downcast::<gtk::Label>()
+    {
+        hint.set_label(super::requirements::short(need));
     }
+    control.update_property(&[gtk::accessible::Property::Description(&format!(
+        "Unavailable. {}",
+        need.title
+    ))]);
+    let need = need.clone();
+    control.connect_clicked(move |control| super::requirements::explain(control, &need));
 }
 
 /// The six quick actions: Phone screen, Insert, Sound, Ring phone, Hand off
@@ -534,7 +545,13 @@ fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> gtk::FlowBox {
             cell.set_focusable(false);
         }
     };
-    if can_send_feature(device, PACKET_TYPE_MOUSEPAD_REQUEST) {
+    let open_terminal = crate::terminal_previews::sessions()
+        .iter()
+        .any(|info| info.exit_status.is_none());
+    let phone = PhoneFacts::from_device(device);
+    let blocked = |feature| blocker(feature, &phone, open_terminal);
+    if desktop_sends(PACKET_TYPE_MOUSEPAD_REQUEST) {
+        let need = blocked(Feature::Send(PACKET_TYPE_MOUSEPAD_REQUEST));
         let screen = tile(
             "desklink-mobile-screen-share-symbolic",
             &format!("{kind} screen"),
@@ -542,17 +559,21 @@ fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> gtk::FlowBox {
             TileKind::Normal,
         );
         screen.set_tooltip_text(Some(&format!("Show {kind} Screen")));
-        let (screen_daemon, id) = (daemon.clone(), device.id.clone());
-        screen.connect_clicked(move |button| {
-            if let Some(root) = button.root().and_downcast::<gtk::Window>() {
-                crate::remote_control::show_remote_control_dialog(
-                    screen_daemon.clone(),
-                    id.clone(),
-                    &root,
-                );
+        match &need {
+            Some(need) => unavailable(&screen, need),
+            None => {
+                let (screen_daemon, id) = (daemon.clone(), device.id.clone());
+                screen.connect_clicked(move |button| {
+                    if let Some(root) = button.root().and_downcast::<gtk::Window>() {
+                        crate::remote_control::show_remote_control_dialog(
+                            screen_daemon.clone(),
+                            id.clone(),
+                            &root,
+                        );
+                    }
+                });
             }
-        });
-        disable_tile(&screen, device);
+        }
         add(&screen);
 
         let insert = tile(
@@ -565,8 +586,10 @@ fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> gtk::FlowBox {
             "Insert from {}: a photo, a scan, text or a QR code",
             device.name
         )));
-        super::insert::attach_menu(daemon, device, &insert);
-        disable_tile(&insert, device);
+        match &need {
+            Some(need) => unavailable(&insert, need),
+            None => super::insert::attach_menu(daemon, device, &insert),
+        }
         add(&insert);
 
         // Sound both ways (F1): its two switches in a popover.
@@ -578,11 +601,13 @@ fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> gtk::FlowBox {
             if on { TileKind::On } else { TileKind::Normal },
         );
         sound.set_tooltip_text(Some(&format!("Sound with {}", device.name)));
-        super::sound::attach_menu(daemon, device, &sound);
-        disable_tile(&sound, device);
+        match &need {
+            Some(need) => unavailable(&sound, need),
+            None => super::sound::attach_menu(daemon, device, &sound),
+        }
         add(&sound);
     }
-    if can_send_feature(device, PACKET_TYPE_FINDMYPHONE_REQUEST) {
+    if desktop_sends(PACKET_TYPE_FINDMYPHONE_REQUEST) {
         let ring = tile(
             "desklink-ring-volume-symbolic",
             &format!("Ring {}", kind.to_lowercase()),
@@ -590,40 +615,34 @@ fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> gtk::FlowBox {
             TileKind::Normal,
         );
         ring.set_tooltip_text(Some(&format!("Ring {kind}")));
-        ring.connect_clicked(|button| {
-            if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {
-                window.quick_action(QuickAction::Ring);
+        match blocked(Feature::Send(PACKET_TYPE_FINDMYPHONE_REQUEST)) {
+            Some(need) => unavailable(&ring, &need),
+            None => {
+                ring.connect_clicked(|button| {
+                    if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {
+                        window.quick_action(QuickAction::Ring);
+                    }
+                });
             }
-        });
-        disable_tile(&ring, device);
+        }
         add(&ring);
     }
     // Walk away: lock here, carry on from the phone, in the newest terminal.
-    let open_terminal = crate::terminal_previews::sessions()
-        .iter()
-        .any(|info| info.exit_status.is_none());
     let hand_off = tile(
         "desklink-lock-symbolic",
         "Hand off",
-        Some(if open_terminal {
-            "Continue on phone"
-        } else {
-            "Needs a terminal"
-        }),
+        Some("Continue on phone"),
         TileKind::Normal,
     );
     hand_off.set_tooltip_text(Some(&format!(
         "Lock this computer and open the newest terminal on {}",
         device.name
     )));
-    if device.feature_transport_ready && open_terminal {
-        // Enabled. The action is bound only here: a bound action's enabled
-        // state would override `set_sensitive(false)` and leave a dead tile live.
-        hand_off.set_action_name(Some("app.lock-hand-off"));
-    } else if device.feature_transport_ready {
-        hand_off.set_sensitive(false);
-    } else {
-        disable_tile(&hand_off, device);
+    match blocked(Feature::HandOff) {
+        Some(need) => unavailable(&hand_off, &need),
+        // Bound only when it can run: a bound action's state would make the
+        // tile live whatever it says.
+        None => hand_off.set_action_name(Some("app.lock-hand-off")),
     }
     add(&hand_off);
     if let Some(more) = more_tile(daemon, device) {
@@ -643,12 +662,16 @@ fn more_label(name: &str, titles: &[&str]) -> String {
 fn more_tile(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Button> {
     type Run = Box<dyn Fn(&gtk::Widget)>;
     let kind = device_type_label(&device.device_type);
-    let mut items: Vec<(&str, String, &str, Run)> = Vec::new();
-    if can_send_feature(device, PACKET_TYPE_LOCK_REQUEST) {
+    let phone = PhoneFacts::from_device(device);
+    // Each row: icon, title, hint, what it needs, what it does.
+    let mut items: Vec<(&str, String, &str, Option<Need>, Run)> = Vec::new();
+    let need = |packet| blocker(Feature::Send(packet), &phone, true);
+    if desktop_sends(PACKET_TYPE_LOCK_REQUEST) {
         items.push((
             "desklink-lock-symbolic",
             format!("Lock {}", kind.to_lowercase()),
             "Lock its screen",
+            need(PACKET_TYPE_LOCK_REQUEST),
             Box::new(|anchor: &gtk::Widget| {
                 if let Some(window) = anchor.root().and_downcast::<DesklinkWindow>() {
                     window.quick_action(QuickAction::Lock);
@@ -656,11 +679,12 @@ fn more_tile(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Button> 
             }),
         ));
     }
-    if can_send_feature(device, PACKET_TYPE_PING) {
+    if desktop_sends(PACKET_TYPE_PING) {
         items.push((
             "desklink-vibration-symbolic",
             "Send a nudge".to_string(),
             "A quiet notification",
+            need(PACKET_TYPE_PING),
             Box::new(|anchor: &gtk::Widget| {
                 if let Some(window) = anchor.root().and_downcast::<DesklinkWindow>() {
                     window.quick_action(QuickAction::Ping);
@@ -668,12 +692,13 @@ fn more_tile(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Button> 
             }),
         ));
     }
-    if can_send_feature(device, PACKET_TYPE_SHARE_REQUEST) {
+    if desktop_sends(PACKET_TYPE_SHARE_REQUEST) {
         let (daemon, id, name) = (daemon.clone(), device.id.clone(), device.name.clone());
         items.push((
             "desklink-link-symbolic",
             "Send a link…".to_string(),
             "Opens on the phone",
+            need(PACKET_TYPE_SHARE_REQUEST),
             Box::new(move |anchor: &gtk::Widget| {
                 show_send_link_dialog(daemon.clone(), id.clone(), &name, anchor)
             }),
@@ -690,24 +715,37 @@ fn more_tile(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Button> 
     );
     let titles: Vec<&str> = items
         .iter()
-        .map(|(_, title, _, _)| title.as_str())
+        .map(|(_, title, _, _, _)| title.as_str())
         .collect();
     more.update_property(&[gtk::accessible::Property::Label(&more_label(
         &device.name,
         &titles,
     ))]);
+    // Not reachable: every row would say the same, so the tile says it.
+    if let Some(reach) = need(PACKET_TYPE_PING).filter(|need| need.id == "reach") {
+        unavailable(&more, &reach);
+        return Some(more);
+    }
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["dl-row-group"])
         .build();
-    let runs: Vec<Run> = items
+    let runs: Vec<Result<Run, Need>> = items
         .into_iter()
-        .map(|(icon, title, hint, run)| {
-            let row = super::ui_kit::list_row(icon, Tone::Neutral, &title, Some(hint));
+        .map(|(icon, title, hint, need, run)| {
+            let row = super::ui_kit::list_row(
+                icon,
+                Tone::Neutral,
+                &title,
+                Some(need.as_ref().map_or(hint, |need| need.title.as_str())),
+            );
             row.set_activatable(true);
-            row.set_sensitive(device.feature_transport_ready);
+            if need.is_some() {
+                // Listed, looks unavailable; choosing it says why.
+                row.add_css_class("dl-unavailable");
+            }
             list.append(&row);
-            run
+            need.map_or(Ok(run), Err)
         })
         .collect();
     let popover = gtk::Popover::builder()
@@ -732,7 +770,10 @@ fn more_tile(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Button> 
         ) else {
             return;
         };
-        run(anchor.upcast_ref());
+        match run {
+            Ok(run) => run(anchor.upcast_ref()),
+            Err(need) => super::requirements::explain(&anchor, need),
+        }
     });
     let shown = popover.downgrade();
     more.connect_clicked(move |_| {
@@ -740,16 +781,15 @@ fn more_tile(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Button> 
             popover.popup();
         }
     });
-    disable_tile(&more, device);
     Some(more)
 }
 
-/// Greys `button` out with the reason as its tooltip, when there is one.
-fn disable_with(button: &gtk::Button, reason: Option<&str>) {
-    if let Some(reason) = reason {
-        button.set_sensitive(false);
-        button.set_tooltip_text(Some(reason));
-    }
+/// Whether this build of DeskLink sends `packet` at all (a feature it has).
+fn desktop_sends(packet: &str) -> bool {
+    crate::device_links::features::FeatureRegistry::desktop()
+        .outgoing_capabilities()
+        .iter()
+        .any(|capability| capability == packet)
 }
 
 /// A row of controls that wraps when the page is too narrow for it. Its
@@ -1645,14 +1685,23 @@ mod tests {
         let mut device = DeviceView::from_info(&info, "10.0.0.2".into(), true);
         device.status = DeviceStatus::Paired;
         device.feature_transport_ready = true;
-        assert_eq!(tile_reason(&device), None);
+        let reason = |device: &DeviceView| {
+            blocker(
+                Feature::Send(PACKET_TYPE_PING),
+                &PhoneFacts::from_device(device),
+                true,
+            )
+            .map(|need| super::super::requirements::short(&need))
+        };
+        device.incoming_capabilities = vec![PACKET_TYPE_PING.into()];
+        assert_eq!(reason(&device), None);
         device.feature_transport_ready = false;
-        assert_eq!(tile_reason(&device), Some("Connecting…"));
+        assert_eq!(reason(&device), Some("Connecting…"));
         device.status = DeviceStatus::Unreachable;
-        assert_eq!(tile_reason(&device), Some("Can't reach"));
+        assert_eq!(reason(&device), Some("Can't reach"));
         assert_eq!(
             Presentation::of(&device).word,
-            tile_reason(&device).unwrap(),
+            reason(&device).unwrap(),
             "the pill and the tile agree"
         );
     }

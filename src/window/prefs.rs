@@ -71,7 +71,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     let settings = crate::device_links::config::app_settings();
     // Glide's availability and problem; its switch and edge update in place.
     let glide_status = crate::device_links::glide::status();
+    let needs = super::requirements::missing(&super::requirements::Facts::now(Some(device)));
     let key = serde_json::to_string(&(
+        super::requirements::key(&needs),
         format!(
             "{:?}{:?}{}{}",
             glide_status.availability,
@@ -322,6 +324,27 @@ fn build_view(
         .orientation(gtk::Orientation::Vertical)
         .spacing(16)
         .build();
+    // Setup: what is still missing, the same list as Home's card.
+    let needs = super::requirements::missing(&super::requirements::Facts::now(Some(device)));
+    if !needs.is_empty() {
+        let setup = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .build();
+        setup.set_widget_name("settings-setup");
+        setup.append(&ui_kit::section_header("Setup"));
+        setup.append(&super::requirements::rows(&needs));
+        if needs.iter().any(|need| need.allow.is_some()) {
+            let all = ui_kit::button(ButtonKind::Tonal, "Allow all on this computer", None);
+            all.set_halign(gtk::Align::Start);
+            let (daemon, needs) = (daemon.clone(), needs.clone());
+            all.connect_clicked(move |button| {
+                super::requirements::allow_all(button, &daemon, &needs)
+            });
+            setup.append(&all);
+        }
+        list.append(&setup);
+    }
     let quick = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)

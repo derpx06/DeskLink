@@ -251,6 +251,10 @@ fn row_for(item: &Item, group: Group, keys: bool, idle: bool) -> adw::ActionRow 
         subtitle,
     );
     row.add_css_class("dl-palette-row");
+    if matches!(item.target, Target::Blocked(_)) {
+        // Listed, looks unavailable; choosing it says why, with the fix.
+        row.add_css_class("dl-unavailable");
+    }
     row.set_activatable(true);
     row.set_title_lines(1);
     row.set_subtitle_lines(1);
@@ -264,6 +268,9 @@ fn row_for(item: &Item, group: Group, keys: bool, idle: bool) -> adw::ActionRow 
         row.add_suffix(&keys);
     }
     let spoken = match subtitle {
+        Some(subtitle) if matches!(item.target, Target::Blocked(_)) => {
+            format!("{}, unavailable: {}", item.title, subtitle)
+        }
         Some(subtitle) => format!("{}, {}", item.title, subtitle),
         None => item.title.clone(),
     };
@@ -686,6 +693,7 @@ pub(super) fn run(window: &DesklinkWindow, target: &Target) {
             window.show_feature_toast("Copied");
         }
         Target::Contact { device, uid } => window.show_contact(device, uid),
+        Target::Blocked(need) => super::requirements::explain(window, need),
     }
 }
 

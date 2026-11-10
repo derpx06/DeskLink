@@ -837,3 +837,8 @@ window.unfocused .ob-scene * { animation: none; }
   from { opacity: 0; }
   to { opacity: 1; }
 }
+
+/* Unavailable but listed (window/requirements.rs): looks disabled, stays
+   clickable, and a click says why with the fix. */
+.dl-unavailable > *, row.dl-unavailable .title, row.dl-unavailable .dl-icon-square { opacity: 0.45; }
+row.dl-unavailable .subtitle { opacity: 1; color: @dl_text_dim; }
