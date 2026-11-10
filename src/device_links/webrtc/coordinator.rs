@@ -1457,6 +1457,45 @@ fn send_remote_session_message(
     peer.send_text(WebRtcChannel::Control, &text)
 }
 
+/// Attempts at starting a capture, and the pause between them.
+const CAPTURE_START_ATTEMPTS: u32 = 4;
+const CAPTURE_START_PAUSE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Starts a capture, trying again a few times. Measured on this laptop: a
+/// crashing bluetoothd takes WirePlumber down with it, and a share started
+/// while WirePlumber restarts (about a second) found its PipeWire stream
+/// unlinked: no frames, or "Failed to sync state with parent". Stops early
+/// when the share is cancelled; the last error is returned.
+fn start_capture_retrying(
+    cancel: &std::sync::atomic::AtomicBool,
+    pause: impl Fn(std::time::Duration),
+    mut start: impl FnMut() -> Result<(), String>,
+) -> Result<(), String> {
+    let mut attempt = 1;
+    loop {
+        match start() {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if attempt < CAPTURE_START_ATTEMPTS
+                    && !cancel.load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                eprintln!(
+                    "[DeskLink] Screen capture did not start ({error}); trying again ({attempt} of {CAPTURE_START_ATTEMPTS})"
+                );
+                pause(CAPTURE_START_PAUSE);
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// A copy of the portal's PipeWire connection for one capture attempt.
+fn dup_pipewire_fd(fd: &std::os::fd::OwnedFd) -> Result<std::os::fd::OwnedFd, String> {
+    fd.try_clone()
+        .map_err(|error| format!("Could not keep the PipeWire connection: {error}"))
+}
+
 /// The phone as a second display (F2): a virtual monitor of `pixels`, its
 /// scale set so it is readable, input through EIS. Returns what the share
 /// worker needs, with the monitor's logical size (what the phone maps its
@@ -1502,18 +1541,20 @@ fn start_extended_display(
         .try_clone()
         .map_err(|error| format!("Could not keep the PipeWire connection: {error}"))?;
     let before = virtual_display::connectors();
-    peer.start_desktop_screen_capture(
-        id,
-        DesktopSource::PipeWire {
-            fd: source.fd,
-            node_id: source.node_id,
-            serial: source.pipewire_serial,
-            virtual_size: Some(pixels),
-        },
-        pixels.0,
-        pixels.1,
-        request,
-    )?;
+    start_capture_retrying(cancel, std::thread::sleep, || {
+        peer.start_desktop_screen_capture(
+            id,
+            DesktopSource::PipeWire {
+                fd: dup_pipewire_fd(&source.fd)?,
+                node_id: source.node_id,
+                serial: source.pipewire_serial,
+                virtual_size: Some(pixels),
+            },
+            pixels.0,
+            pixels.1,
+            request,
+        )
+    })?;
     // The monitor appears once the capture has negotiated its size.
     let scale = virtual_display::apply_scale(&before, pixels);
     let logical = virtual_display::logical_size(pixels, scale);
@@ -1695,18 +1736,20 @@ fn run_desktop_portal_worker(
                 .fd
                 .try_clone()
                 .map_err(|error| format!("Could not keep the PipeWire connection: {error}"))?;
-            peer.start_desktop_screen_capture(
-                id,
-                DesktopSource::PipeWire {
-                    fd: source.fd,
-                    node_id: source.node_id,
-                    serial: source.pipewire_serial,
-                    virtual_size: None,
-                },
-                source.width,
-                source.height,
-                request,
-            )?;
+            start_capture_retrying(&cancel, std::thread::sleep, || {
+                peer.start_desktop_screen_capture(
+                    id,
+                    DesktopSource::PipeWire {
+                        fd: dup_pipewire_fd(&source.fd)?,
+                        node_id: source.node_id,
+                        serial: source.pipewire_serial,
+                        virtual_size: None,
+                    },
+                    source.width,
+                    source.height,
+                    request,
+                )
+            })?;
             Ok((
                 Box::new(portal),
                 source.width,
@@ -4978,6 +5021,53 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// A capture that fails to start (WirePlumber restarting under it) is
+    /// tried again, but not for ever and not once the share is cancelled.
+    #[test]
+    fn a_capture_that_fails_to_start_is_tried_again_a_few_times() {
+        use std::sync::atomic::AtomicBool;
+        let cancel = AtomicBool::new(false);
+        let mut calls = 0;
+        let result = super::start_capture_retrying(
+            &cancel,
+            |_| {},
+            || {
+                calls += 1;
+                if calls < 3 {
+                    Err("sync".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!((result, calls), (Ok(()), 3));
+
+        let mut calls = 0;
+        let result = super::start_capture_retrying(
+            &cancel,
+            |_| {},
+            || {
+                calls += 1;
+                Err(format!("attempt {calls}"))
+            },
+        );
+        assert_eq!(result, Err("attempt 4".to_string()));
+        assert_eq!(calls, super::CAPTURE_START_ATTEMPTS);
+
+        cancel.store(true, std::sync::atomic::Ordering::Release);
+        let mut calls = 0;
+        let result = super::start_capture_retrying(
+            &cancel,
+            |_| {},
+            || {
+                calls += 1;
+                Err("sync".to_string())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, 1, "a cancelled share is not retried");
+    }
+
     /// A share that failed is said at the desk too, except a refusal made there.
     #[test]
     fn a_failed_share_is_told_at_the_desk_unless_declined_there() {
