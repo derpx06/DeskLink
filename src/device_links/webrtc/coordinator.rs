@@ -308,8 +308,52 @@ impl Drop for PortalWorkerCleanup {
 /// the phone would otherwise wait for a picture forever.
 const CAPTURE_STALL: std::time::Duration = std::time::Duration::from_secs(3);
 /// Rebuilds in a row without steady video before the share is reported
-/// failed to the phone (`screen-stopped`, "not producing any video").
-const CAPTURE_RESTARTS: u32 = 3;
+/// failed to the phone (`screen-stopped`, "not producing any video"): about
+/// 15 s, which outlasts a WirePlumber restart (measured: back within ~1 s,
+/// and it crashed several times in a minute when bluetoothd did).
+const CAPTURE_RESTARTS: u32 = 5;
+
+/// Why a share ended when its capture never came back.
+const STOPPED_SENDING: &str = "The computer stopped sending its screen. Try again; if it keeps happening, restart DeskLink on the computer.";
+
+/// What the capture watchdog does on one look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureCheck {
+    /// Video moved; `reset` clears the rebuild count (it kept flowing long
+    /// enough after the last rebuild).
+    Flowing { reset: bool },
+    /// Quiet, not for long enough to act on.
+    Wait,
+    /// Rebuild the capture on the same portal stream (no dialog, same SSRC).
+    Rebuild,
+    /// Rebuilt enough times: tell the phone this share is not working.
+    GiveUp,
+}
+
+/// The watchdog's decision. Pure: `progressed` is whether frames were sent
+/// since the last look, `quiet_for` how long since they last were,
+/// `since_rebuild` how long since the last rebuild (if any).
+fn capture_check(
+    progressed: bool,
+    quiet_for: std::time::Duration,
+    since_rebuild: Option<std::time::Duration>,
+    restarts: u32,
+) -> CaptureCheck {
+    if progressed {
+        // Only video that keeps flowing clears the count: a rebuilt chain
+        // that let a few packets out and then died reset it every time,
+        // and the share rebuilt every 4 s for as long as the phone looked.
+        CaptureCheck::Flowing {
+            reset: since_rebuild.is_none_or(|since| since >= CAPTURE_HEALTHY_AFTER),
+        }
+    } else if quiet_for < CAPTURE_STALL {
+        CaptureCheck::Wait
+    } else if restarts >= CAPTURE_RESTARTS {
+        CaptureCheck::GiveUp
+    } else {
+        CaptureCheck::Rebuild
+    }
+}
 /// How long a rebuilt capture must keep sending before the rebuild count
 /// starts over.
 const CAPTURE_HEALTHY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
@@ -1980,31 +2024,37 @@ fn run_desktop_portal_worker(
         }
         // Capture watchdog; see `CAPTURE_STALL`.
         let frames = peer.desktop_screen_frames_sent();
-        if frames != last_frames {
-            last_frames = frames;
-            last_progress = std::time::Instant::now();
-            // Only video that keeps flowing clears the count: a rebuilt chain
-            // that let a few packets out and then died reset it every time,
-            // and the share rebuilt every 4 s for as long as the phone looked.
-            if last_rebuild.is_none_or(|at| at.elapsed() >= CAPTURE_HEALTHY_AFTER) {
-                restarts = 0;
+        match capture_check(
+            frames != last_frames,
+            last_progress.elapsed(),
+            last_rebuild.map(|at| at.elapsed()),
+            restarts,
+        ) {
+            CaptureCheck::Flowing { reset } => {
+                last_frames = frames;
+                last_progress = std::time::Instant::now();
+                if reset {
+                    restarts = 0;
+                }
             }
-        } else if last_progress.elapsed() >= CAPTURE_STALL {
-            if restarts >= CAPTURE_RESTARTS {
+            CaptureCheck::Wait => {}
+            CaptureCheck::GiveUp => {
                 no_video = true;
                 break;
             }
-            restarts += 1;
-            debug_log!(
+            CaptureCheck::Rebuild => {
+                restarts += 1;
+                debug_log!(
                 "[DeskLink] Desktop share to {device_id} produced no video for {:?}; rebuilding the capture ({restarts} of {CAPTURE_RESTARTS})",
                 CAPTURE_STALL
             );
-            if let Err(error) = capture(portal.active()) {
-                eprintln!("[DeskLink] Could not rebuild the desktop capture: {error}");
+                if let Err(error) = capture(portal.active()) {
+                    eprintln!("[DeskLink] Could not rebuild the desktop capture: {error}");
+                }
+                last_frames = peer.desktop_screen_frames_sent();
+                last_progress = std::time::Instant::now();
+                last_rebuild = Some(last_progress);
             }
-            last_frames = peer.desktop_screen_frames_sent();
-            last_progress = std::time::Instant::now();
-            last_rebuild = Some(last_progress);
         }
         let wait = if scroll_open.is_some() {
             SCROLL_FINISH_AFTER
@@ -2122,9 +2172,9 @@ fn run_desktop_portal_worker(
     }
     release_held_portal_inputs(&*portal, &mut held_inputs);
     let told = if no_video {
-        Some("The desktop is not producing any video".to_string())
+        Some(STOPPED_SENDING.to_string())
     } else if portal_revoked {
-        Some("Desktop screen/control permission was revoked locally".to_string())
+        Some("Screen sharing was stopped on the computer".to_string())
     } else {
         stopped_here
     };
@@ -5021,6 +5071,55 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// The capture watchdog: a quiet stream is rebuilt every
+    /// `CAPTURE_STALL`, up to `CAPTURE_RESTARTS` times in a row (~15 s,
+    /// longer than a WirePlumber restart), then the share is given up; only
+    /// video that keeps flowing after a rebuild clears the count.
+    #[test]
+    fn a_stalled_capture_is_rebuilt_until_it_flows_or_runs_out_of_tries() {
+        use super::{capture_check, CaptureCheck, CAPTURE_RESTARTS, CAPTURE_STALL};
+        use std::time::Duration;
+        let s = Duration::from_secs;
+        assert_eq!(capture_check(false, s(1), None, 0), CaptureCheck::Wait);
+        assert_eq!(
+            capture_check(false, CAPTURE_STALL, None, 0),
+            CaptureCheck::Rebuild
+        );
+        // A WirePlumber restart: the stream dies mid-share, every rebuild is
+        // tried in turn, and the fifth failure ends it.
+        let mut restarts = 0;
+        let mut rebuilds = 0;
+        loop {
+            match capture_check(false, CAPTURE_STALL, Some(CAPTURE_STALL), restarts) {
+                CaptureCheck::Rebuild => {
+                    restarts += 1;
+                    rebuilds += 1;
+                }
+                CaptureCheck::GiveUp => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(rebuilds, CAPTURE_RESTARTS);
+        assert!(
+            CAPTURE_STALL * CAPTURE_RESTARTS >= s(15),
+            "outlasts a WirePlumber restart"
+        );
+        // Picture back after a rebuild: the count is kept until it has
+        // flowed a while, then cleared.
+        assert_eq!(
+            capture_check(true, s(0), Some(s(2)), 2),
+            CaptureCheck::Flowing { reset: false }
+        );
+        assert_eq!(
+            capture_check(true, s(0), Some(s(11)), 2),
+            CaptureCheck::Flowing { reset: true }
+        );
+        assert_eq!(
+            capture_check(true, s(0), None, 0),
+            CaptureCheck::Flowing { reset: true }
+        );
+    }
+
     /// A capture that fails to start (WirePlumber restarting under it) is
     /// tried again, but not for ever and not once the share is cancelled.
     #[test]
