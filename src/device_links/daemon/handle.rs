@@ -105,12 +105,23 @@ impl DaemonHandle {
         let worker_loaded = Arc::clone(&loaded);
 
         thread::spawn(move || {
+            // Set however this thread ends, a panic included: the window must
+            // not wait for ever.
+            struct MarkLoaded(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for MarkLoaded {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let _mark = MarkLoaded(Arc::clone(&worker_loaded));
             let worker = DaemonWorker::new(
                 worker_devices,
                 worker_errors.clone(),
                 worker_events,
                 command_rx,
+                &worker_loaded,
             );
+            // Also when it failed to start.
             worker_loaded.store(true, std::sync::atomic::Ordering::Release);
             if let Err(error) = worker.and_then(DaemonWorker::run) {
                 push_error(&worker_errors, error);

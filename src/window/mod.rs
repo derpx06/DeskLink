@@ -736,7 +736,11 @@ impl DesklinkWindow {
             "Step {count} of {count}: Pair a phone"
         ))]);
         row.append(&bars);
-        row.upcast()
+        adw::Clamp::builder()
+            .maximum_size(960)
+            .child(&row)
+            .build()
+            .upcast()
     }
 
     /// Back from [`Self::show_solo`]: the next refresh picks the welcome
@@ -2964,6 +2968,19 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         "xkeys" => {
             let spec = format!("{id} {arg}");
             std::thread::spawn(move || debug_xkeys(&spec));
+        }
+        // "click-unavailable N": clicks the Nth unavailable control on show
+        // (it says why, with the fix).
+        "click-unavailable" => {
+            let n: usize = id.parse().unwrap_or(0);
+            let found: Vec<gtk::Button> = named_widgets(win.upcast_ref(), "")
+                .into_iter()
+                .filter(|w| w.has_css_class("dl-unavailable") && w.is_mapped())
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .collect();
+            if let Some(button) = found.into_iter().rev().nth(n) {
+                button.emit_clicked();
+            }
         }
         // "onboarding start [STEP]|next|back|skip|key KEYNAME": the welcome tour.
         "onboarding" => match id {

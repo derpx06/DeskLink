@@ -604,36 +604,65 @@ pub(crate) fn allow_all(anchor: &impl IsA<gtk::Widget>, daemon: &DaemonHandle, n
     dialog.present(Some(anchor));
 }
 
-/// The needs as rows: icon, what is missing, what it unlocks, the fix.
+/// The needs as rows: icon, what is missing, what it unlocks, and the fix
+/// under the words (so a narrow window or large text keeps the words wide).
 pub(crate) fn rows(needs: &[Need]) -> gtk::ListBox {
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::None)
-        .css_classes(["dl-row-group"])
+        .css_classes(["dl-row-group", "dl-needs"])
         .build();
     for need in needs {
-        let row = super::ui_kit::list_row(
-            if need.on_phone {
-                "desklink-device-phone-symbolic"
-            } else {
-                "desklink-warning-symbolic"
-            },
-            if need.on_phone {
-                super::ui_kit::Tone::Accent
-            } else {
-                super::ui_kit::Tone::Warn
-            },
-            &need.title,
-            Some(&need.detail),
-        );
-        row.set_widget_name(need.id);
+        let (icon, tone) = if need.on_phone {
+            (
+                "desklink-device-phone-symbolic",
+                super::ui_kit::Tone::Accent,
+            )
+        } else {
+            ("desklink-warning-symbolic", super::ui_kit::Tone::Warn)
+        };
+        let square = super::ui_kit::icon_square(icon, tone);
+        square.set_valign(gtk::Align::Start);
+        let text = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(4)
+            .hexpand(true)
+            .build();
+        let line = |words: &str, classes: &[&str]| {
+            gtk::Label::builder()
+                .label(words)
+                .wrap(true)
+                .wrap_mode(gtk::pango::WrapMode::WordChar)
+                .xalign(0.0)
+                .css_classes(classes)
+                .build()
+        };
+        text.append(&line(&need.title, &["dl-need-title"]));
+        let detail = line(&need.detail, &["dl-secondary"]);
+        // An install command is read and copied whole.
+        detail.set_selectable(true);
+        text.append(&detail);
         if let Some(label) = need.fix.label() {
             let button = super::ui_kit::button(super::ui_kit::ButtonKind::Tonal, label, None);
-            button.set_valign(gtk::Align::Center);
+            button.set_halign(gtk::Align::Start);
+            button.set_margin_top(4);
             button.update_property(&[gtk::accessible::Property::Description(&need.title)]);
             let need = need.clone();
             button.connect_clicked(move |button| run(button, &need));
-            row.add_suffix(&button);
+            text.append(&button);
         }
+        let content = gtk::Box::builder()
+            .spacing(12)
+            .css_classes(["dl-need"])
+            .build();
+        content.append(&square);
+        content.append(&text);
+        let row = gtk::ListBoxRow::builder()
+            .activatable(false)
+            .focusable(false)
+            .child(&content)
+            .build();
+        row.set_widget_name(need.id);
+        row.update_property(&[gtk::accessible::Property::Label(&need.title)]);
         list.append(&row);
     }
     list

@@ -118,7 +118,11 @@ pub(super) fn welcome_page(win: &DesklinkWindow, daemon: &DaemonHandle) -> Rc<Ce
         .valign(gtk::Align::Center)
         .build();
     visible.append(&text("Visible as", &["text-dim", "body-small"]));
-    visible.append(&text(&host_name(), &["mono", "body-small"]));
+    // Cut in the middle (whole on hover) rather than pushing a narrow
+    // window with large text wider than the screen.
+    let host = super::ellipsized(&host_name(), &["mono", "body-small"]);
+    host.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    visible.append(&host);
     footer.append(&visible);
     let codes = button(ButtonKind::Text, "Pair with a code instead", None);
     codes.set_halign(gtk::Align::End);
@@ -156,6 +160,10 @@ fn install_line() -> gtk::Box {
         &gtk::Label::builder()
             .label(INSTALL_ADDRESS)
             .valign(gtk::Align::Center)
+            // Large text in a narrow window: cut in the middle (Copy has it
+            // whole) rather than pushing the page past the window's edge.
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .tooltip_text(INSTALL_ADDRESS)
             .css_classes(["dl-mono", "install-address"])
             .build(),
     );

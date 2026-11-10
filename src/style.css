@@ -842,3 +842,5 @@ window.unfocused .ob-scene * { animation: none; }
    clickable, and a click says why with the fix. */
 .dl-unavailable > *, row.dl-unavailable .title, row.dl-unavailable .dl-icon-square { opacity: 0.45; }
 row.dl-unavailable .subtitle { opacity: 1; color: @dl_text_dim; }
+.dl-need { padding: 14px 16px; }
+.dl-need-title { font-weight: 600; }

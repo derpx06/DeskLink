@@ -530,8 +530,10 @@ impl Onboarding {
             let words = words_box(page.kicker, page.title, page.body);
             words.set_valign(gtk::Align::Center);
             words.set_hexpand(true);
+            // Two equal columns, so the scene stays put from page to page.
             let layout = gtk::Box::builder()
                 .spacing(40)
+                .homogeneous(true)
                 .valign(gtk::Align::Center)
                 .vexpand(true)
                 .build();
@@ -543,6 +545,7 @@ impl Onboarding {
                 Some(&gtk::Orientation::Vertical.to_value()),
             );
             narrow.add_setter(&layout, "spacing", Some(&24.to_value()));
+            narrow.add_setter(&layout, "homogeneous", Some(&false.to_value()));
             narrow.add_setter(&card, "halign", Some(&gtk::Align::Fill.to_value()));
             stack.add_named(&layout, Some(&index.to_string()));
         }

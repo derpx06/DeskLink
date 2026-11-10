@@ -229,13 +229,8 @@ impl DaemonWorker {
         errors: Arc<Mutex<Vec<String>>>,
         events: Arc<Mutex<Vec<handle::DaemonEvent>>>,
         command_rx: Receiver<DaemonCommand>,
+        paired_known: &std::sync::atomic::AtomicBool,
     ) -> Result<Self, String> {
-        // What this computer must have for a link to work, said once and
-        // plainly (not as "Can't reach the phone", six rungs later).
-        if let Some(problem) = crate::device_links::webrtc::plugin_problem() {
-            eprintln!("[DeskLink] {problem}");
-            state::push_error(&errors, problem);
-        }
         let mut loaded = Config::load()?;
         // A damaged settings file set aside, or a newer one kept read-only:
         // said in words, once.
@@ -255,6 +250,16 @@ impl DaemonWorker {
                     )
                 }),
             );
+        }
+        // The window may now tell "no phone paired" from "not read yet"
+        // (the first-run tour). Before the plugin check: on a first run
+        // GStreamer builds its registry, which takes seconds.
+        paired_known.store(true, std::sync::atomic::Ordering::Release);
+        // What this computer must have for a link to work, said once and
+        // plainly (not as "Can't reach the phone", six rungs later).
+        if let Some(problem) = crate::device_links::webrtc::plugin_problem() {
+            eprintln!("[DeskLink] {problem}");
+            state::push_error(&errors, problem);
         }
         // Files that waited for a phone when DeskLink last ran.
         if !cfg!(test) {
