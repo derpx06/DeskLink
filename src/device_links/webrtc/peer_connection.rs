@@ -470,11 +470,45 @@ impl DesktopWebRtcPeer {
         height: i32,
         request: super::screen::ScreenRequest,
     ) -> Result<(), String> {
-        let previous = self
-            .desktop_screen_capture
-            .lock()
-            .map_err(|_| "DeskLink desktop screen track lock poisoned".to_string())?
-            .take();
+        self.start_capture(owner, false, source, width, height, request)
+    }
+
+    /// [`Self::start_desktop_screen_capture`] for a retry by `owner`: it
+    /// never takes, or overwrites, a capture another (newer) share started
+    /// meanwhile; that share keeps its picture and the retry gives up.
+    pub(crate) fn retry_desktop_screen_capture(
+        &self,
+        owner: u64,
+        source: super::screen::DesktopSource,
+        width: i32,
+        height: i32,
+        request: super::screen::ScreenRequest,
+    ) -> Result<(), String> {
+        self.start_capture(owner, true, source, width, height, request)
+    }
+
+    fn start_capture(
+        &self,
+        owner: u64,
+        own_only: bool,
+        source: super::screen::DesktopSource,
+        width: i32,
+        height: i32,
+        request: super::screen::ScreenRequest,
+    ) -> Result<(), String> {
+        let held_by_another = |slot: &Option<(u64, super::screen::DesktopScreenCapture)>| {
+            held_by_another_share(slot.as_ref().map(|(current, _)| *current), owner, own_only)
+        };
+        let previous = {
+            let mut slot = self
+                .desktop_screen_capture
+                .lock()
+                .map_err(|_| "DeskLink desktop screen track lock poisoned".to_string())?;
+            if held_by_another(&slot) {
+                return Err(REPLACED_BY_ANOTHER_SHARE.to_string());
+            }
+            slot.take()
+        };
         if let Some((_, previous)) = previous {
             self.stop_or_retire(previous);
         }
@@ -490,11 +524,16 @@ impl DesktopWebRtcPeer {
                 next_seqnum: self.screen_next_seqnum.lock().ok().and_then(|next| *next),
             }),
         )?;
-        *self
+        let mut slot = self
             .desktop_screen_capture
             .lock()
-            .map_err(|_| "DeskLink desktop screen track lock poisoned".to_string())? =
-            Some((owner, created));
+            .map_err(|_| "DeskLink desktop screen track lock poisoned".to_string())?;
+        if held_by_another(&slot) {
+            drop(slot);
+            self.stop_or_retire(created);
+            return Err(REPLACED_BY_ANOTHER_SHARE.to_string());
+        }
+        *slot = Some((owner, created));
         Ok(())
     }
 
@@ -1373,6 +1412,15 @@ thread_local! {
     static NO_AUDIO_SECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// Whether a capture slot held by `current` is another share's, which a
+/// retry (`own_only`) must leave alone. A first start replaces anything.
+fn held_by_another_share(current: Option<u64>, owner: u64, own_only: bool) -> bool {
+    own_only && current.is_some_and(|current| current != owner)
+}
+
+/// A retried capture found a newer share's capture in its place.
+pub(crate) const REPLACED_BY_ANOTHER_SHARE: &str = "The desktop share was replaced";
+
 /// A max-bundle session has one media section per kind; this is slack, not a
 /// budget.
 ///
@@ -2157,6 +2205,19 @@ a=max-message-size:262144\r\n";
         assert!(wait_for_frames(&capture) > 0, "the next share sent nothing");
         let _ = capture.stop();
         peer.close();
+    }
+
+    /// A share's retry never takes or overwrites the capture of a share
+    /// that started meanwhile; a first start replaces whatever is there.
+    #[test]
+    fn a_retry_leaves_a_newer_shares_capture_alone() {
+        assert!(held_by_another_share(Some(2), 1, true));
+        assert!(!held_by_another_share(Some(1), 1, true), "its own");
+        assert!(!held_by_another_share(None, 1, true), "nothing there");
+        assert!(
+            !held_by_another_share(Some(2), 1, false),
+            "a first start replaces"
+        );
     }
 
     /// The section's pad still linked to a chain that never let go of it (a

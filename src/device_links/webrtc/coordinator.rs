@@ -1517,23 +1517,27 @@ const CAPTURE_START_PAUSE: std::time::Duration = std::time::Duration::from_milli
 /// while WirePlumber restarts (about a second) found its PipeWire stream
 /// unlinked: no frames, or "Failed to sync state with parent". Stops early
 /// when the share is cancelled; the last error is returned.
+/// `start(attempt)` is called with 1 first; later attempts must use the
+/// owner-checked start, so a stale retry never takes a newer share's capture.
 fn start_capture_retrying(
     cancel: &std::sync::atomic::AtomicBool,
     pause: impl Fn(std::time::Duration),
-    mut start: impl FnMut() -> Result<(), String>,
+    mut start: impl FnMut(u32) -> Result<(), String>,
 ) -> Result<(), String> {
+    let cancelled = || cancel.load(std::sync::atomic::Ordering::Acquire);
     let mut attempt = 1;
     loop {
-        match start() {
+        match start(attempt) {
             Ok(()) => return Ok(()),
-            Err(error)
-                if attempt < CAPTURE_START_ATTEMPTS
-                    && !cancel.load(std::sync::atomic::Ordering::Acquire) =>
-            {
+            Err(error) if attempt < CAPTURE_START_ATTEMPTS && !cancelled() => {
                 eprintln!(
                     "[DeskLink] Screen capture did not start ({error}); trying again ({attempt} of {CAPTURE_START_ATTEMPTS})"
                 );
                 pause(CAPTURE_START_PAUSE);
+                // Released or replaced during the pause: no more attempts.
+                if cancelled() {
+                    return Err(error);
+                }
                 attempt += 1;
             }
             Err(error) => return Err(error),
@@ -1592,8 +1596,14 @@ fn start_extended_display(
         .try_clone()
         .map_err(|error| format!("Could not keep the PipeWire connection: {error}"))?;
     let before = virtual_display::connectors();
-    start_capture_retrying(cancel, std::thread::sleep, || {
-        peer.start_desktop_screen_capture(
+    start_capture_retrying(cancel, std::thread::sleep, |attempt| {
+        let start = if attempt == 1 {
+            DesktopWebRtcPeer::start_desktop_screen_capture
+        } else {
+            DesktopWebRtcPeer::retry_desktop_screen_capture
+        };
+        start(
+            peer,
             id,
             DesktopSource::PipeWire {
                 fd: dup_pipewire_fd(&source.fd)?,
@@ -1787,8 +1797,14 @@ fn run_desktop_portal_worker(
                 .fd
                 .try_clone()
                 .map_err(|error| format!("Could not keep the PipeWire connection: {error}"))?;
-            start_capture_retrying(&cancel, std::thread::sleep, || {
-                peer.start_desktop_screen_capture(
+            start_capture_retrying(&cancel, std::thread::sleep, |attempt| {
+                let start = if attempt == 1 {
+                    DesktopWebRtcPeer::start_desktop_screen_capture
+                } else {
+                    DesktopWebRtcPeer::retry_desktop_screen_capture
+                };
+                start(
+                    &peer,
                     id,
                     DesktopSource::PipeWire {
                         fd: dup_pipewire_fd(&source.fd)?,
@@ -5160,7 +5176,7 @@ mod tests {
         let result = super::start_capture_retrying(
             &cancel,
             |_| {},
-            || {
+            |_| {
                 calls += 1;
                 if calls < 3 {
                     Err("sync".into())
@@ -5175,7 +5191,7 @@ mod tests {
         let result = super::start_capture_retrying(
             &cancel,
             |_| {},
-            || {
+            |_| {
                 calls += 1;
                 Err(format!("attempt {calls}"))
             },
@@ -5188,13 +5204,43 @@ mod tests {
         let result = super::start_capture_retrying(
             &cancel,
             |_| {},
-            || {
+            |_| {
                 calls += 1;
                 Err("sync".to_string())
             },
         );
         assert!(result.is_err());
         assert_eq!(calls, 1, "a cancelled share is not retried");
+
+        // Released or replaced while it paused: no attempt after the pause,
+        // and every attempt after the first is the owner-checked one.
+        let cancel = AtomicBool::new(false);
+        let mut attempts = Vec::new();
+        let result = super::start_capture_retrying(
+            &cancel,
+            |_| cancel.store(true, std::sync::atomic::Ordering::Release),
+            |attempt| {
+                attempts.push(attempt);
+                Err("sync".to_string())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            attempts,
+            vec![1],
+            "nothing is started after a cancelling pause"
+        );
+        let cancel = AtomicBool::new(false);
+        let mut attempts = Vec::new();
+        let _ = super::start_capture_retrying(
+            &cancel,
+            |_| {},
+            |attempt| {
+                attempts.push(attempt);
+                Err("sync".to_string())
+            },
+        );
+        assert_eq!(attempts, vec![1, 2, 3, 4]);
     }
 
     /// A share that failed is said at the desk too, except a refusal made there.
