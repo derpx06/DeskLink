@@ -773,8 +773,14 @@ impl DesktopScreenCapture {
             payloader.set_property("pt", payload_type);
             if let Some(continuity) = continuity {
                 payloader.set_property("ssrc", continuity.ssrc);
-                if let Some(next) = continuity.next_seqnum {
-                    payloader.set_property("seqnum-offset", i32::from(next));
+                payloader.set_property("timestamp-offset", continuity.timestamp_offset);
+                if let Some(resume) = continuity.resume {
+                    payloader.set_property("seqnum-offset", i32::from(resume.seqnum));
+                    if let Some(id) = resume.picture_id {
+                        if payloader.has_property("picture-id-offset", None) {
+                            payloader.set_property("picture-id-offset", i32::from(id));
+                        }
+                    }
                 }
             }
             debug_log!(
@@ -872,17 +878,40 @@ impl DesktopScreenCapture {
         }
     }
 
-    /// RTP buffers produced so far.
-    /// The RTP sequence number the next share must start at, once this one
-    /// has sent anything.
-    pub(crate) fn next_seqnum(&self) -> Option<u16> {
+    /// Where the next share's stream must carry on, once this one has sent
+    /// anything. Read after [`Self::detach`]: a packet numbered later can
+    /// no longer reach the wire, so the next share never repeats one.
+    pub(crate) fn resume(&self) -> Option<RtpResume> {
         if self.frames_sent() == 0 {
             return None;
         }
-        self.elements
+        let payloader = self
+            .elements
             .last()
-            .filter(|payloader| payloader.has_property("seqnum", None))
-            .map(|payloader| (payloader.property::<u32>("seqnum") as u16).wrapping_add(1))
+            .filter(|payloader| payloader.has_property("seqnum", None))?;
+        Some(RtpResume {
+            seqnum: (payloader.property::<u32>("seqnum") as u16).wrapping_add(1),
+            // The id the payloader would give its next frame.
+            picture_id: payloader
+                .has_property("picture-id", None)
+                .then(|| (payloader.property::<i32>("picture-id") & 0x7fff) as u16),
+        })
+    }
+
+    /// Unlinks the chain from `webrtcbin`: nothing more of it reaches the
+    /// wire. The pad is deliberately *kept*, not released: `webrtcbin` builds
+    /// the sender chain (including its FEC/RED encoders) when the pad is
+    /// requested, and asking for the same section's pad again a second time
+    /// logs a CRITICAL and leaves that chain half-built. The next share finds
+    /// this pad again.
+    pub(crate) fn detach(&self) {
+        if let Some(payloader_src) = self
+            .elements
+            .last()
+            .and_then(|element| element.static_pad("src"))
+        {
+            let _ = payloader_src.unlink(&self.sink_pad);
+        }
     }
 
     /// The screen's real pixel size, as the capture negotiated it (a scaled
@@ -909,6 +938,15 @@ impl DesktopScreenCapture {
         )
     }
 
+    /// The encoder's target bitrate (bit/s), as the rate controller last set it.
+    #[cfg(test)]
+    pub(crate) fn encoder_bitrate(&self) -> Option<i32> {
+        self.elements
+            .iter()
+            .find(|element| element.has_property("target-bitrate", None))
+            .map(|encoder| encoder.property::<i32>("target-bitrate"))
+    }
+
     /// The VP8 payload type this capture packetises with.
     pub(crate) fn payload_type(&self) -> u32 {
         self.payload_type
@@ -927,18 +965,8 @@ impl DesktopScreenCapture {
     /// sets the whole pipeline to NULL with `webrtcbin` first, releases it.
     pub(crate) fn stop(self) -> Result<(), Self> {
         self.rate_control_stop.store(true, Ordering::Relaxed);
-        // Unlink from `webrtcbin` first so nothing new can enter it. The pad is
-        // deliberately *kept*, not released: `webrtcbin` builds the sender chain
-        // (including its FEC/RED encoders) when the pad is requested, and asking
-        // for the same section's pad again a second time logs a CRITICAL and
-        // leaves that chain half-built. The next share finds this pad again.
-        if let Some(payloader_src) = self
-            .elements
-            .last()
-            .and_then(|element| element.static_pad("src"))
-        {
-            let _ = payloader_src.unlink(&self.sink_pad);
-        }
+        // Unlink from `webrtcbin` first so nothing new can enter it.
+        self.detach();
         if !self.wait_until_idle(IDLE_TIMEOUT) {
             return Err(self);
         }
@@ -983,15 +1011,32 @@ impl DesktopScreenCapture {
 }
 
 /// How a new share continues the RTP stream of the previous one on the same
-/// connection: same SSRC, sequence numbers carrying on. The phone binds its
-/// picture to the first SSRC it sees, and SRTP refuses to encrypt a sequence
-/// number it has already used for that SSRC ("general supporting library
-/// error" in srtpenc) — so both are needed, or a reopened Remote input waits
-/// for its first picture forever.
+/// connection: same SSRC, and sequence numbers, timestamps and VP8 picture
+/// ids all carrying on. The phone binds its picture to the first SSRC it
+/// sees, and SRTP refuses to encrypt a sequence number it has already used
+/// for that SSRC ("general supporting library error" in srtpenc). And to
+/// the phone it is one stream: libwebrtc numbers VP8 frames by picture id
+/// and drops a frame numbered at or before one it already decoded (a
+/// keyframe is let through only with a newer RTP timestamp). Each new
+/// payloader started at a random picture id and timestamp, so about half of
+/// the reopened views dropped every frame, keyframes and the answers to the
+/// phone's PLIs included: "waiting for the first picture" forever (F8).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RtpContinuity {
     pub ssrc: u32,
-    pub next_seqnum: Option<u16>,
+    /// The connection's RTP clock: a payloader's timestamps are this plus the
+    /// running time, so a later share's are ahead of an earlier one's.
+    pub timestamp_offset: u32,
+    /// Where the previous share stopped; `None` for the first.
+    pub resume: Option<RtpResume>,
+}
+
+/// The next sequence number and VP8 picture id after a share's last packet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RtpResume {
+    pub seqnum: u16,
+    /// `None` for a payloader without picture ids (the H.264 experiment).
+    pub picture_id: Option<u16>,
 }
 
 /// Debug logging only: what the encoder is handed, makes and is asked for,
@@ -1164,7 +1209,8 @@ fn spawn_bitrate_controller(
             let mut streak = 0;
             let mut baseline_ms = f64::MAX;
             let mut tick = 0u64;
-            let mut last_bytes = 0u64;
+            let mut last_bytes = None;
+            let mut silent_logged = false;
             while !flag.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 tick += 1;
@@ -1172,8 +1218,17 @@ fn spawn_bitrate_controller(
                 else {
                     break;
                 };
-                let Some((report, bytes_sent)) = link_report(&webrtcbin) else {
-                    continue;
+                let (report, bytes_sent) = match link_report(&webrtcbin) {
+                    Ok(report) => report,
+                    Err(why) => {
+                        // Once per share: reopened shares on a phone logged
+                        // no stats at all, and nothing said why (F8 follow-up).
+                        if !silent_logged && tick >= 5 {
+                            silent_logged = true;
+                            debug_log!("[DeskLink] screen-stats: none yet, {why}");
+                        }
+                        continue;
+                    }
                 };
                 if let Some(rtt) = report.rtt_ms {
                     // The baseline follows a link that got slower for good.
@@ -1192,7 +1247,9 @@ fn spawn_bitrate_controller(
                     }
                 }
                 if crate::debug_logging() && tick % 2 == 0 {
-                    let kbps = bytes_sent.saturating_sub(last_bytes) * 8 / 2 / 1000;
+                    // The byte count is the stream's, not this share's: the
+                    // first line of a second share counted the first one too.
+                    let kbps = bytes_sent.saturating_sub(last_bytes.unwrap_or(bytes_sent)) * 8 / 2 / 1000;
                     debug_log!(
                         "[DeskLink] screen-stats: sent {kbps} kbps, target {} kbps, fps cap {fps}, loss {:.1}%, rtt {} ms, jitter {} ms, {}",
                         bitrate / 1000,
@@ -1202,8 +1259,8 @@ fn spawn_bitrate_controller(
                         chain_stats.line()
                     );
                 }
-                if tick % 2 == 0 {
-                    last_bytes = bytes_sent;
+                if tick % 2 == 0 || last_bytes.is_none() {
+                    last_bytes = Some(bytes_sent);
                 }
             }
         });
@@ -1214,14 +1271,20 @@ fn spawn_bitrate_controller(
 }
 
 /// The phone's receiver reports (the worst of them) and the bytes sent so
-/// far, from `webrtcbin` stats.
-fn link_report(webrtcbin: &gst::Element) -> Option<(LinkReport, u64)> {
-    let promise = gst::Promise::new();
+/// far, from `webrtcbin` stats; otherwise why there are none. Waits at most
+/// [`STATS_WAIT`], like the peer's own stats read: an unanswered request
+/// used to hold the controller for the rest of the share.
+fn link_report(webrtcbin: &gst::Element) -> Result<(LinkReport, u64), &'static str> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let promise = gst::Promise::with_change_func(move |reply| {
+        let _ = sender.send(reply.ok().flatten().map(|stats| stats.to_owned()));
+    });
     webrtcbin.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
-    if promise.wait() != gst::PromiseResult::Replied {
-        return None;
-    }
-    let reply = promise.get_reply()?;
+    let reply = match receiver.recv_timeout(STATS_WAIT) {
+        Ok(Some(reply)) => reply,
+        Ok(None) => return Err("webrtcbin answered the stats request with nothing"),
+        Err(_) => return Err("webrtcbin did not answer the stats request"),
+    };
     let mut report = LinkReport::default();
     let mut bytes = 0u64;
     let mut any = false;
@@ -1252,7 +1315,11 @@ fn link_report(webrtcbin: &gst::Element) -> Option<(LinkReport, u64)> {
         }
     }
     any.then_some((report, bytes))
+        .ok_or("no receiver report from the phone for the screen stream")
 }
+
+/// Longest the rate controller waits for `webrtcbin`'s stats.
+const STATS_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn set_if_present(element: &gst::Element, name: &str, value: &str) {
     if element.has_property(name, None) {

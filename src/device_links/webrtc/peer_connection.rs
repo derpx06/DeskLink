@@ -156,8 +156,10 @@ pub struct DesktopWebRtcPeer {
     /// a fresh random SSRC never reached the screen — "waiting for the first
     /// picture" whenever Remote input was reopened.
     screen_ssrc: u32,
-    /// Where the next share's sequence numbers continue from.
-    screen_next_seqnum: Mutex<Option<u16>>,
+    /// The screen stream's RTP clock offset, one per peer like its SSRC.
+    screen_timestamp_offset: u32,
+    /// Where the next share's sequence numbers and picture ids continue from.
+    screen_resume: Mutex<Option<super::screen::RtpResume>>,
     pipeline: gst::Pipeline,
     webrtcbin: gst::Element,
     channels: Arc<Mutex<HashMap<WebRtcChannel, WebRTCDataChannel>>>,
@@ -307,7 +309,13 @@ impl DesktopWebRtcPeer {
             events,
             initiator,
             offer_requested,
-            screen_next_seqnum: Mutex::new(None),
+            screen_resume: Mutex::new(None),
+            screen_timestamp_offset: {
+                let mut bytes = [0u8; 4];
+                let _ = openssl::rand::rand_bytes(&mut bytes);
+                // u32::MAX is the payloader's "random".
+                u32::from_ne_bytes(bytes) % u32::MAX
+            },
             screen_ssrc: loop {
                 // Non-zero: 0 is what the unlinked sender advertised.
                 let mut bytes = [0u8; 4];
@@ -519,10 +527,7 @@ impl DesktopWebRtcPeer {
             width,
             height,
             request,
-            Some(super::screen::RtpContinuity {
-                ssrc: self.screen_ssrc,
-                next_seqnum: self.screen_next_seqnum.lock().ok().and_then(|next| *next),
-            }),
+            Some(self.screen_continuity()),
         )?;
         let mut slot = self
             .desktop_screen_capture
@@ -589,10 +594,19 @@ impl DesktopWebRtcPeer {
             .unwrap_or(0)
     }
 
+    /// How the next share carries on this peer's screen stream.
+    fn screen_continuity(&self) -> super::screen::RtpContinuity {
+        super::screen::RtpContinuity {
+            ssrc: self.screen_ssrc,
+            timestamp_offset: self.screen_timestamp_offset,
+            resume: self.screen_resume.lock().ok().and_then(|resume| *resume),
+        }
+    }
+
     fn stop_or_retire(&self, capture: super::screen::DesktopScreenCapture) {
-        if let (Some(next), Ok(mut slot)) = (capture.next_seqnum(), self.screen_next_seqnum.lock())
-        {
-            *slot = Some(next);
+        capture.detach();
+        if let (Some(resume), Ok(mut slot)) = (capture.resume(), self.screen_resume.lock()) {
+            *slot = Some(resume);
         }
         if let Err(parked) = capture.stop() {
             debug_log!(
@@ -2365,10 +2379,7 @@ a=max-message-size:262144\r\n";
                 640,
                 360,
                 super::super::screen::ScreenRequest::FALLBACK,
-                Some(super::super::screen::RtpContinuity {
-                    ssrc: pair.answerer.screen_ssrc,
-                    next_seqnum: None,
-                }),
+                Some(pair.answerer.screen_continuity()),
             )
             .unwrap()
         };
@@ -2403,7 +2414,7 @@ a=max-message-size:262144\r\n";
     fn a_second_share_on_the_same_connection_reaches_the_same_picture() {
         let pair = loopback();
         wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
-        let share = |next_seqnum| {
+        let share = || {
             super::super::screen::DesktopScreenCapture::attach_source(
                 &pair.answerer.pipeline,
                 &pair.answerer.webrtcbin,
@@ -2412,24 +2423,21 @@ a=max-message-size:262144\r\n";
                 1280,
                 720,
                 super::super::screen::ScreenRequest::FALLBACK,
-                Some(super::super::screen::RtpContinuity {
-                    ssrc: pair.answerer.screen_ssrc,
-                    next_seqnum,
-                }),
+                Some(pair.answerer.screen_continuity()),
             )
             .unwrap()
         };
-        let first = share(None);
+        let first = share();
         let stream = assert_far_side_decodes(&pair.offerer_events);
-        let next = first.next_seqnum();
+        pair.answerer.stop_or_retire(first);
         assert!(
-            next.is_some(),
+            pair.answerer.screen_continuity().resume.is_some(),
             "a share that sent packets knows where to continue"
         );
-        assert!(first.stop().is_ok());
+        assert!(pair.answerer.retired_captures.lock().unwrap().is_empty());
 
         let before = stream.frames_shown();
-        let second = share(next);
+        let second = share();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while stream.frames_shown() < before + 10 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2461,7 +2469,7 @@ a=max-message-size:262144\r\n";
             pair.answerer.media_ready(),
             "a connected peer with its channels open is ready for media"
         );
-        let share = |next_seqnum| {
+        let share = || {
             super::super::screen::DesktopScreenCapture::attach_source(
                 &pair.answerer.pipeline,
                 &pair.answerer.webrtcbin,
@@ -2470,18 +2478,14 @@ a=max-message-size:262144\r\n";
                 1280,
                 720,
                 super::super::screen::ScreenRequest::FALLBACK,
-                Some(super::super::screen::RtpContinuity {
-                    ssrc: pair.answerer.screen_ssrc,
-                    next_seqnum,
-                }),
+                Some(pair.answerer.screen_continuity()),
             )
             .unwrap()
         };
-        let first = share(None);
+        let first = share();
         let stream = assert_far_side_decodes(&pair.offerer_events);
-        let next = first.next_seqnum();
-        assert!(first.stop().is_ok());
-        let second = share(next);
+        pair.answerer.stop_or_retire(first);
+        let second = share();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while second.frames_sent() == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2506,6 +2510,195 @@ a=max-message-size:262144\r\n";
         pair.answerer.close();
     }
 
+    /// The bitrate controller runs per share. A reopened share on a phone
+    /// logged no stats at all, so it was not known whether its controller
+    /// steered anything: here a second share on one connection gets the far
+    /// side's receiver reports and raises its bitrate on a clean link.
+    #[test]
+    fn a_second_share_on_one_connection_adapts_its_bitrate() {
+        let pair = loopback();
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let share = || {
+            super::super::screen::DesktopScreenCapture::attach_source(
+                &pair.answerer.pipeline,
+                &pair.answerer.webrtcbin,
+                test_source(),
+                None,
+                1280,
+                720,
+                super::super::screen::ScreenRequest::FALLBACK,
+                Some(pair.answerer.screen_continuity()),
+            )
+            .unwrap()
+        };
+        let first = share();
+        let _stream = assert_far_side_decodes(&pair.offerer_events);
+        pair.answerer.stop_or_retire(first);
+        let second = share();
+        let start = second.encoder_bitrate().expect("a VP8 encoder");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while second.encoder_bitrate() <= Some(start) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(
+            second.encoder_bitrate() > Some(start),
+            "the second share's bitrate never moved from {start}"
+        );
+        let _ = second.stop();
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
+    /// One screen packet as `webrtcbin` is handed it: sequence number, RTP
+    /// timestamp, SSRC, VP8 picture id, and whether it starts a keyframe.
+    fn vp8_packet(data: &[u8]) -> Option<(u16, u32, u32, Option<u16>, bool)> {
+        let word = |at: usize| {
+            data.get(at..at + 4)
+                .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+        };
+        let seq = u16::from_be_bytes([*data.get(2)?, *data.get(3)?]);
+        let (ts, ssrc) = (word(4)?, word(8)?);
+        let mut at = 12 + 4 * usize::from(data[0] & 0x0f);
+        if data[0] & 0x10 != 0 {
+            let words = u16::from_be_bytes([*data.get(at + 2)?, *data.get(at + 3)?]);
+            at += 4 + 4 * usize::from(words);
+        }
+        // RFC 7741 payload descriptor.
+        let first = *data.get(at)?;
+        let start = first & 0x10 != 0 && first & 0x07 == 0;
+        at += 1;
+        let mut picture_id = None;
+        if first & 0x80 != 0 {
+            let flags = *data.get(at)?;
+            at += 1;
+            if flags & 0x80 != 0 {
+                let high = *data.get(at)?;
+                if high & 0x80 != 0 {
+                    picture_id = Some(u16::from(high & 0x7f) << 8 | u16::from(*data.get(at + 1)?));
+                    at += 2;
+                } else {
+                    picture_id = Some(u16::from(high));
+                    at += 1;
+                }
+            }
+            at += usize::from(flags & 0x40 != 0) + usize::from(flags & 0x30 != 0);
+        }
+        // The VP8 payload header's P bit is 0 on a keyframe.
+        let keyframe = start && data.get(at)? & 0x01 == 0;
+        Some((seq, ts, ssrc, picture_id, keyframe))
+    }
+
+    /// Opening the desk's screen again and again on one connection (and
+    /// switching between Mirror and Extend, a new share at a new size) must
+    /// show a picture every time. To the phone it is one stream: libwebrtc
+    /// drops every frame whose VP8 picture id is not after the last one it
+    /// decoded, and lets a keyframe jump back only with a newer timestamp.
+    /// Each share's payloader started at a random picture id and timestamp,
+    /// so about half of the reopened views never showed a picture (F8). So
+    /// every share starts with a keyframe whose sequence number, picture id
+    /// and timestamp carry on just after the previous share's last packet,
+    /// and reaches the far side's picture.
+    #[test]
+    fn every_share_on_one_connection_carries_the_picture_stream_on() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pair = loopback();
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let share = |(width, height)| {
+            super::super::screen::DesktopScreenCapture::attach_source(
+                &pair.answerer.pipeline,
+                &pair.answerer.webrtcbin,
+                test_source(),
+                None,
+                width,
+                height,
+                super::super::screen::ScreenRequest::FALLBACK,
+                Some(pair.answerer.screen_continuity()),
+            )
+            .unwrap()
+        };
+        let current = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut capture = share((1280, 720));
+        let stream = assert_far_side_decodes(&pair.offerer_events);
+        let ssrc = pair.answerer.screen_ssrc;
+        for pad in pair.answerer.webrtcbin.sink_pads() {
+            let (current, seen) = (Arc::clone(&current), Arc::clone(&seen));
+            pad.add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                move |_, info| {
+                    let note = |buffer: &gst::BufferRef| {
+                        let Ok(map) = buffer.map_readable() else {
+                            return;
+                        };
+                        if let Some(packet) = vp8_packet(&map).filter(|p| p.2 == ssrc) {
+                            seen.lock()
+                                .unwrap()
+                                .push((current.load(Ordering::SeqCst), packet));
+                        }
+                    };
+                    match &info.data {
+                        Some(gst::PadProbeData::Buffer(buffer)) => note(buffer),
+                        Some(gst::PadProbeData::BufferList(list)) => list.iter().for_each(note),
+                        _ => {}
+                    }
+                    gst::PadProbeReturn::Ok
+                },
+            );
+        }
+        // Mirror at the laptop's size, Extend at the phone's, and back.
+        let sizes = [(1280, 720), (960, 540)];
+        for index in 1..10 {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            pair.answerer.stop_or_retire(capture);
+            current.store(index, Ordering::SeqCst);
+            let before = stream.frames_shown();
+            let opened = std::time::Instant::now();
+            capture = share(sizes[index % 2]);
+            while stream.frames_shown() < before + 10
+                && opened.elapsed() < std::time::Duration::from_secs(10)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(
+                stream.frames_shown() >= before + 10,
+                "share {index} never reached the far side's picture"
+            );
+            let packets = seen.lock().unwrap();
+            let last = packets.iter().rev().find(|(share, _)| *share == index - 1);
+            let first = packets.iter().find(|(share, _)| *share == index);
+            let (Some((_, last)), Some((_, first))) = (last, first) else {
+                panic!("share {index}: no packets seen around the switch");
+            };
+            assert!(first.4, "share {index} does not start with a keyframe");
+            let seq_step = first.0.wrapping_sub(last.0);
+            assert!(
+                (1..64).contains(&seq_step),
+                "share {index}: sequence {} after {}",
+                first.0,
+                last.0
+            );
+            let (Some(id), Some(last_id)) = (first.3, last.3) else {
+                panic!("share {index}: no VP8 picture ids");
+            };
+            let id_step = id.wrapping_sub(last_id) & 0x7fff;
+            assert!(
+                (1..8).contains(&id_step),
+                "share {index}: picture id {id} after {last_id}"
+            );
+            let ts_step = first.1.wrapping_sub(last.1);
+            assert!(
+                ts_step > 0 && ts_step < 90_000 * 5,
+                "share {index}: timestamp {} after {}",
+                first.1,
+                last.1
+            );
+        }
+        assert!(pair.answerer.retired_captures.lock().unwrap().is_empty());
+        let _ = capture.stop();
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
     /// A capture that fails to start (as a PipeWire stream that would not
     /// negotiate did) must leave the screen track usable: the next share
     /// reaches the far side's picture.
@@ -2522,10 +2715,7 @@ a=max-message-size:262144\r\n";
                 1280,
                 720,
                 super::super::screen::ScreenRequest::FALLBACK,
-                Some(super::super::screen::RtpContinuity {
-                    ssrc: pair.answerer.screen_ssrc,
-                    next_seqnum: None,
-                }),
+                Some(pair.answerer.screen_continuity()),
             )
         };
         // Cannot start: its file does not exist.
