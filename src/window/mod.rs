@@ -93,6 +93,35 @@ fn is_listed(device: &DeviceView, refused: bool) -> bool {
         )
 }
 
+/// The device the window should be about. `chosen` is the person's own
+/// choice (or the one remembered from last time) and always wins while it is
+/// listed. Otherwise the choice is ours and provisional: keep `current` while
+/// it is reachable, else the first reachable phone, else `current` while it is
+/// listed, else the first. So a stale remembered id that put an unreachable
+/// phone up at start gives way when a phone connects.
+fn device_to_show(
+    chosen: Option<&str>,
+    current: Option<&str>,
+    devices: &[DeviceView],
+) -> Option<String> {
+    let listed = |id: &&str| devices.iter().any(|device| device.id == *id);
+    let reachable = |id: &&str| {
+        devices
+            .iter()
+            .any(|device| device.id == *id && matches!(device.status, DeviceStatus::Paired))
+    };
+    chosen
+        .filter(listed)
+        .or(current.filter(reachable))
+        .or(devices
+            .iter()
+            .find(|device| matches!(device.status, DeviceStatus::Paired))
+            .map(|device| device.id.as_str()))
+        .or(current.filter(listed))
+        .or(devices.first().map(|device| device.id.as_str()))
+        .map(str::to_string)
+}
+
 /// The pages, in sidebar order: (name, title, icon). The last is the
 /// sidebar's footer. Frequent pages cluster at the top; Contacts, which is
 /// read-only and rare, comes after Terminals (`UI-REDESIGN.md` 3.9).
@@ -190,6 +219,9 @@ mod imp {
         pub compact: Cell<bool>,
         pub daemon: RefCell<Option<DaemonHandle>>,
         pub selected_device_id: RefCell<Option<String>>,
+        /// The device the person chose (or the remembered one); see
+        /// [`device_to_show`].
+        pub chosen_device_id: RefCell<Option<String>>,
         /// The page shown, one of [`PAGES`]' names.
         pub page: RefCell<String>,
         /// What each page was last drawn from; a page is redrawn only when
@@ -267,7 +299,9 @@ mod imp {
             self.parent_constructed();
             let obj = self.obj();
             self.page.replace("home".to_string());
-            self.selected_device_id.replace(sidebar::load_last_device());
+            let last = sidebar::load_last_device();
+            self.chosen_device_id.replace(last.clone());
+            self.selected_device_id.replace(last);
 
             let window = obj.downgrade();
             self.narrow_breakpoint.connect_apply(move |_| {
@@ -800,11 +834,14 @@ impl DesklinkWindow {
     /// Makes `device_id` the device every page is about, and remembers it.
     fn select_device(&self, device_id: &str) {
         let imp = self.imp();
+        if imp.chosen_device_id.borrow().as_deref() != Some(device_id) {
+            imp.chosen_device_id.replace(Some(device_id.to_string()));
+            sidebar::save_last_device(device_id);
+        }
         if imp.selected_device_id.borrow().as_deref() == Some(device_id) {
             return;
         }
         imp.selected_device_id.replace(Some(device_id.to_string()));
-        sidebar::save_last_device(device_id);
         imp.snapshots.borrow_mut().clear();
         if let Some(page) = imp.terminals.borrow().as_ref() {
             page.close_detail();
@@ -1148,6 +1185,7 @@ impl DesklinkWindow {
                         continue;
                     }
                     imp.selected_device_id.replace(Some(device_id.clone()));
+                    imp.chosen_device_id.replace(Some(device_id.clone()));
                     sidebar::save_last_device(&device_id);
                     imp.page.replace("home".to_string());
                     imp.split_view.set_show_content(true);
@@ -1222,18 +1260,13 @@ impl DesklinkWindow {
         calls::notify(self, &devices);
 
         let selected = imp.selected_device_id.borrow().clone();
-        if selected
-            .as_ref()
-            .is_none_or(|id| devices.iter().all(|device| &device.id != id))
-        {
-            // The remembered device was unpaired, or none was chosen: the
-            // first one, preferring a connected device.
-            let first = devices
-                .iter()
-                .find(|device| matches!(device.status, DeviceStatus::Paired))
-                .or(devices.first())
-                .map(|device| device.id.clone());
-            imp.selected_device_id.replace(first);
+        let show = device_to_show(
+            imp.chosen_device_id.borrow().as_deref(),
+            selected.as_deref(),
+            &devices,
+        );
+        if show != selected {
+            imp.selected_device_id.replace(show);
             imp.snapshots.borrow_mut().clear();
         }
 
@@ -4164,6 +4197,38 @@ mod tests {
             app_version: None,
         };
         DeviceView::from_info(&info, "127.0.0.1".to_string(), true)
+    }
+
+    #[test]
+    fn a_fallback_choice_gives_way_to_a_reachable_phone_but_a_chosen_one_stays() {
+        let with = |id: &str, reachable: bool| {
+            let mut device = phone();
+            device.id = id.to_string();
+            device.status = if reachable {
+                DeviceStatus::Paired
+            } else {
+                DeviceStatus::Unreachable
+            };
+            device
+        };
+        let s = |id: &str| Some(id.to_string());
+        // F1: the remembered id is stale; the emulator is up first, unreachable.
+        let start = [with("emu", false), with("realme", false)];
+        assert_eq!(device_to_show(Some("stale"), None, &start), s("emu"));
+        let up = [with("emu", false), with("realme", true)];
+        assert_eq!(device_to_show(Some("stale"), Some("emu"), &up), s("realme"));
+        // An empty first list does not lose the remembered phone.
+        assert_eq!(device_to_show(Some("realme"), None, &[]), None);
+        assert_eq!(device_to_show(Some("realme"), None, &start), s("realme"));
+        // The person's choice is never overridden, reachable or not.
+        assert_eq!(device_to_show(Some("emu"), Some("emu"), &up), s("emu"));
+        // A reachable fallback is kept; nothing reachable keeps the current one.
+        let both = [with("a", true), with("b", true)];
+        assert_eq!(device_to_show(None, Some("b"), &both), s("b"));
+        let none = [with("a", false), with("b", false)];
+        assert_eq!(device_to_show(None, Some("b"), &none), s("b"));
+        // The chosen phone was unpaired: the fallback again.
+        assert_eq!(device_to_show(Some("gone"), Some("gone"), &up), s("realme"));
     }
 
     #[test]
