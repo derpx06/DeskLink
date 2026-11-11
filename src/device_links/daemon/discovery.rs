@@ -321,7 +321,11 @@ impl Address {
 }
 
 fn unusable(ip: std::net::IpAddr) -> bool {
-    ip.is_loopback() || ip.is_unspecified() || ip.is_multicast()
+    // An IPv6 link-local (fe80::/10) needs its interface's scope id, which an
+    // `IpAddr` cannot carry: every dial of one failed with EINVAL (seen on
+    // the real desk, 17 times in an hour on a phone hotspot).
+    let link_local_v6 = matches!(ip, std::net::IpAddr::V6(v6) if v6.is_unicast_link_local());
+    ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || link_local_v6
 }
 
 /// `ip` is this computer: loopback, or an address of one of its interfaces
@@ -1197,14 +1201,14 @@ mod tests {
         let mut book = AddressBook::default();
         let now = Instant::now();
         for address in [
-            "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "fe80::1", "fe80::2",
+            "10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4", "fd00::1", "fd00::2",
         ] {
             book.seen("phone", ip(address));
         }
         assert_eq!(
             book.due("phone", now),
             [
-                ip("fe80::2"),
+                ip("fd00::2"),
                 ip("10.0.0.4"),
                 ip("10.0.0.3"),
                 ip("10.0.0.2")
@@ -1215,11 +1219,14 @@ mod tests {
         book.seen("phone", ip("10.0.0.2"));
         assert_eq!(book.due("phone", now)[0], ip("10.0.0.2"));
         assert_eq!(book.due("phone", now).len(), 4);
-        // Never loopback, unspecified or multicast.
+        // Never loopback, unspecified, multicast or an IPv6 link-local (no
+        // scope id to dial it with).
+        book.seen("phone", ip("fe80::6cf2:9aff:feca:755c"));
         book.seen("phone", ip("127.0.0.1"));
         book.seen("phone", ip("0.0.0.0"));
         book.seen("phone", ip("224.0.0.1"));
         assert_eq!(book.due("phone", now).len(), 4);
+        assert!(book.due("phone", now).contains(&ip("fd00::2")));
         book.forget("phone");
         assert!(book.due("phone", now).is_empty());
     }
