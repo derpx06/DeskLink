@@ -216,6 +216,18 @@ fn tag(index: usize) -> String {
     format!("page-{index}")
 }
 
+/// Whether subpage `index` is already pushed (showing, or on its way).
+fn shows(nav: &adw::NavigationView, index: usize) -> bool {
+    let stack = nav.navigation_stack();
+    (0..stack.n_items()).any(|i| {
+        stack
+            .item(i)
+            .and_downcast::<adw::NavigationPage>()
+            .and_then(|page| page.tag())
+            .is_some_and(|shown| shown == tag(index))
+    })
+}
+
 /// The Settings page: a list of destinations that push a subpage each.
 struct View {
     root: adw::NavigationView,
@@ -378,7 +390,9 @@ fn build_view(
             );
             let nav = nav.downgrade();
             row.connect_activated(move |_| {
-                if let Some(nav) = nav.upgrade() {
+                // A second activation while the push animates (a double
+                // click) would push it again: Adwaita-CRITICAL, not a page.
+                if let Some(nav) = nav.upgrade().filter(|nav| !shows(nav, index)) {
                     nav.push_by_tag(&tag(index));
                 }
             });
@@ -2642,6 +2656,41 @@ mod tests {
             assert!(filter_groups(&groups, "glide"));
             assert!(filter_groups(&groups, ""));
             assert!(!arrangement.is_visible());
+        });
+    }
+
+    /// A double click on a list row pushes its subpage once: a second push
+    /// of the same tag is an Adwaita-CRITICAL (seen on the real desk).
+    /// (Needs a display.)
+    #[test]
+    fn a_second_activation_does_not_push_the_subpage_again() {
+        crate::test_display::run(|| {
+            let (view, _daemon) = view_for_tests();
+            let list = view.root.find_page("list").unwrap();
+            let mut rows = Vec::new();
+            rows_in(list.upcast_ref(), &mut rows);
+            let row = rows
+                .iter()
+                .find(|row| row.title() == GROUPS[0])
+                .expect("a list row for the first group");
+            let criticals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counter = criticals.clone();
+            let handler = glib::log_set_handler(
+                Some("Adwaita"),
+                glib::LogLevels::LEVEL_CRITICAL,
+                false,
+                false,
+                move |_, _, _| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                },
+            );
+            row.activate();
+            row.activate();
+            glib::log_remove_handler(Some("Adwaita"), handler);
+            assert_eq!(criticals.load(std::sync::atomic::Ordering::Relaxed), 0);
+            assert_eq!(view.root.navigation_stack().n_items(), 2);
+            assert!(shows(&view.root, 0));
+            OPEN.with(|slot| slot.set(None));
         });
     }
 
