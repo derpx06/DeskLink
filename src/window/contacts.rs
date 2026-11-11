@@ -56,6 +56,8 @@ fn haystack(contact: &Contact) -> String {
 /// is a dozen widgets: only this many are drawn, and a search draws the
 /// first of what matches.
 const MAX_ROWS: usize = 300;
+/// The count line while a refresh is out; cleared after 10 s without an answer.
+const ASKING: &str = "Asking the phone…";
 
 /// The contacts to draw for `terms` (lowercased, space-separated: every one
 /// must match), at most [`MAX_ROWS`], and how many matched in all.
@@ -316,14 +318,26 @@ impl Page {
         };
         {
             let device = Rc::clone(&page.device);
-            let count = page.count.clone();
+            let (count, list, source) = (
+                page.count.clone(),
+                page.list.clone(),
+                Rc::clone(&page.source),
+            );
             page.refresh.connect_clicked(move |button| {
                 let id = device.borrow().0.clone();
                 crate::device_links::desk_features::run_later(move || {
                     crate::device_links::desk_features::send(&id, &contacts::refresh_request())
                 });
-                count.set_label("Asking the phone…");
+                count.set_label(ASKING);
                 toast_from(button, "Asked the phone for its contacts");
+                // A phone that does not share contacts never answers: the
+                // words go back to the count instead of asking forever.
+                let (count, list, source) = (count.clone(), list.clone(), Rc::clone(&source));
+                glib::timeout_add_seconds_local_once(10, move || {
+                    if count.label() == ASKING {
+                        draw(&list, &count, &source.borrow());
+                    }
+                });
             });
         }
         page
