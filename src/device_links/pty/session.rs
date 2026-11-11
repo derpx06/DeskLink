@@ -795,6 +795,9 @@ const CSI_HELD_MAX: usize = 256;
 /// terminal previews wait on. No grid is larger than [`MAX_DIMENSION`], so a larger count
 /// does nothing more; private modes (`?2026`) are left alone. An unfinished sequence waits
 /// for its rest, as the parser itself would; one longer than [`CSI_HELD_MAX`] is dropped.
+/// Unlike [`SyncQueryFilter`] nothing held is flushed on a timer: the parser keeps an unfinished
+/// sequence just the same (it shows nothing until the rest), and one released early would let
+/// its rest (`5@` after `ESC[6553`) reach the parser unclamped.
 #[derive(Default)]
 struct CountClamp {
     held: Vec<u8>,
