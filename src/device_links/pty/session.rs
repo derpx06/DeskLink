@@ -40,8 +40,9 @@ const READ_CHUNK: usize = 4 * 1024;
 
 /// Clamp for client-supplied geometry. A terminal cannot be zero-sized, and an
 /// absurd one would make the screen model allocate without bound — dimensions
-/// arrive from the network and are not trusted.
-const MIN_DIMENSION: u16 = 1;
+/// arrive from the network and are not trusted. Two, not one: vt100 panics
+/// drawing a wide character (CJK, emoji) on a one-column screen.
+const MIN_DIMENSION: u16 = 2;
 const MAX_DIMENSION: u16 = 1000;
 
 /// Input chunks that may wait for the writer thread. Each is at most one wire
@@ -103,6 +104,8 @@ pub(crate) enum Resync {
 struct Output {
     ring: OutputRing,
     parser: vt100::Parser,
+    /// What the parser is fed through (the ring keeps the bytes as written).
+    counts: CountClamp,
     /// Last time anything happened to this session — output, or a client
     /// attaching, typing or leaving. The idle reaper reads it.
     last_activity: Instant,
@@ -285,6 +288,7 @@ impl PtySession {
         let output = Arc::new(Mutex::new(Output {
             ring: OutputRing::new(RING_BYTES),
             parser: vt100::Parser::new(rows, cols, 0),
+            counts: CountClamp::default(),
             last_activity: Instant::now(),
         }));
         let head = Arc::new(AtomicU64::new(0));
@@ -781,6 +785,72 @@ impl SyncQueryFilter {
     }
 }
 
+/// Bytes of an unfinished `CSI` held for the next read; longer is not a real sequence.
+const CSI_HELD_MAX: usize = 256;
+
+/// Clamps the counts of plain (non-private) `CSI` sequences to [`MAX_DIMENSION`] before the
+/// screen model sees them. vt100 0.16 runs `CSI n @` (insert characters), `CSI n L` (insert
+/// lines) and `CSI n T` (scroll down) as `n` single steps without a clamp: one `ESC[65535@`
+/// was ~2e9 cell moves under the output lock, which the pump thread and the window's
+/// terminal previews wait on. No grid is larger than [`MAX_DIMENSION`], so a larger count
+/// does nothing more; private modes (`?2026`) are left alone. An unfinished sequence waits
+/// for its rest, as the parser itself would; one longer than [`CSI_HELD_MAX`] is dropped.
+#[derive(Default)]
+struct CountClamp {
+    held: Vec<u8>,
+}
+
+impl CountClamp {
+    fn filter(&mut self, input: &[u8]) -> Vec<u8> {
+        let mut data = std::mem::take(&mut self.held);
+        data.extend_from_slice(input);
+        let mut out = Vec::with_capacity(data.len());
+        let mut i = 0;
+        while i < data.len() {
+            if data[i] != 0x1b || data.get(i + 1).is_some_and(|&next| next != b'[') {
+                out.push(data[i]);
+                i += 1;
+                continue;
+            }
+            let params = i + 2;
+            let end = data[params.min(data.len())..]
+                .iter()
+                .position(|b| !matches!(b, b'0'..=b'9' | b';' | b':'))
+                .map(|at| params + at);
+            match end {
+                None if data.len() - i <= CSI_HELD_MAX => {
+                    self.held = data[i..].to_vec();
+                    break;
+                }
+                // Not a real sequence (the parser keeps 32 parameters): dropped.
+                None => i = data.len(),
+                Some(end) => {
+                    out.extend_from_slice(b"\x1b[");
+                    let mut count: Option<u16> = None;
+                    for &byte in &data[params..end] {
+                        if byte.is_ascii_digit() {
+                            let digit = u16::from(byte - b'0');
+                            count = Some((count.unwrap_or(0) * 10 + digit).min(MAX_DIMENSION));
+                        } else {
+                            push_count(&mut out, count.take());
+                            out.push(byte);
+                        }
+                    }
+                    push_count(&mut out, count);
+                    i = end;
+                }
+            }
+        }
+        out
+    }
+}
+
+fn push_count(out: &mut Vec<u8>, count: Option<u16>) {
+    if let Some(count) = count {
+        out.extend_from_slice(count.to_string().as_bytes());
+    }
+}
+
 /// Queues [`SYNC_SUPPORTED_REPLY`] as input. A full queue (the program has not read its input
 /// for a while) must not lose it, and must not stop the reader either - the program may be
 /// blocked writing output - so the reply waits for room on a thread of its own.
@@ -843,7 +913,8 @@ fn spawn_reader(
             let Ok(mut output) = output.lock() else {
                 return false;
             };
-            output.parser.process(bytes);
+            let output = &mut *output;
+            output.parser.process(&output.counts.filter(bytes));
             output.ring.push(bytes);
             output.last_activity = Instant::now();
             head.store(output.ring.head(), Ordering::Release);
@@ -1239,6 +1310,50 @@ mod tests {
         );
         let session = PtySession::spawn(None, 0, 0).expect("spawn shell");
         assert_eq!(session.size(), (MIN_DIMENSION, MIN_DIMENSION));
+    }
+
+    #[test]
+    fn a_wide_character_on_the_narrowest_screen_does_not_panic() {
+        let (rows, cols) = clamp_size(0, 0);
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process("界😀a界".as_bytes());
+        parser.screen_mut().set_size(rows, cols);
+        parser.process("界".as_bytes());
+    }
+
+    #[test]
+    fn huge_csi_counts_are_clamped_however_the_read_is_cut() {
+        let stream = b"a\x1b[65535@b\x1b[2;99999T\x1b[?2026h\x1b[38;5;200m\x1b[1000L\x1b[0001;x";
+        let want = b"a\x1b[1000@b\x1b[2;1000T\x1b[?2026h\x1b[38;5;200m\x1b[1000L\x1b[1;x";
+        for cut in 0..=stream.len() {
+            let mut counts = CountClamp::default();
+            let mut shown = counts.filter(&stream[..cut]);
+            shown.extend(counts.filter(&stream[cut..]));
+            assert_eq!(shown, want, "cut at {cut}");
+        }
+        // A runaway parameter list is not held without bound.
+        let mut counts = CountClamp::default();
+        let mut runaway = b"\x1b[".to_vec();
+        runaway.extend(std::iter::repeat_n(b'9', 1000));
+        assert!(counts.filter(&runaway).is_empty());
+        assert_eq!(counts.filter(b"@x"), b"@x");
+    }
+
+    /// `ESC[65535@` went to vt100 as 65535 single-cell inserts on a growing
+    /// row: seconds of memmove with the output lock held.
+    #[test]
+    fn a_huge_insert_count_reaches_the_screen_model_quickly() {
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        let mut counts = CountClamp::default();
+        let started = Instant::now();
+        for _ in 0..20 {
+            parser.process(&counts.filter(b"abc\r\x1b[65535@\x1b[65535L\x1b[65535T"));
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
