@@ -938,6 +938,15 @@ impl DesktopScreenCapture {
         )
     }
 
+    /// The encoder's target bitrate (bit/s), as the rate controller last set it.
+    #[cfg(test)]
+    pub(crate) fn encoder_bitrate(&self) -> Option<i32> {
+        self.elements
+            .iter()
+            .find(|element| element.has_property("target-bitrate", None))
+            .map(|encoder| encoder.property::<i32>("target-bitrate"))
+    }
+
     /// The VP8 payload type this capture packetises with.
     pub(crate) fn payload_type(&self) -> u32 {
         self.payload_type
@@ -1200,7 +1209,8 @@ fn spawn_bitrate_controller(
             let mut streak = 0;
             let mut baseline_ms = f64::MAX;
             let mut tick = 0u64;
-            let mut last_bytes = 0u64;
+            let mut last_bytes = None;
+            let mut silent_logged = false;
             while !flag.load(Ordering::Relaxed) {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 tick += 1;
@@ -1208,8 +1218,17 @@ fn spawn_bitrate_controller(
                 else {
                     break;
                 };
-                let Some((report, bytes_sent)) = link_report(&webrtcbin) else {
-                    continue;
+                let (report, bytes_sent) = match link_report(&webrtcbin) {
+                    Ok(report) => report,
+                    Err(why) => {
+                        // Once per share: reopened shares on a phone logged
+                        // no stats at all, and nothing said why (F8 follow-up).
+                        if !silent_logged && tick >= 5 {
+                            silent_logged = true;
+                            debug_log!("[DeskLink] screen-stats: none yet, {why}");
+                        }
+                        continue;
+                    }
                 };
                 if let Some(rtt) = report.rtt_ms {
                     // The baseline follows a link that got slower for good.
@@ -1228,7 +1247,9 @@ fn spawn_bitrate_controller(
                     }
                 }
                 if crate::debug_logging() && tick % 2 == 0 {
-                    let kbps = bytes_sent.saturating_sub(last_bytes) * 8 / 2 / 1000;
+                    // The byte count is the stream's, not this share's: the
+                    // first line of a second share counted the first one too.
+                    let kbps = bytes_sent.saturating_sub(last_bytes.unwrap_or(bytes_sent)) * 8 / 2 / 1000;
                     debug_log!(
                         "[DeskLink] screen-stats: sent {kbps} kbps, target {} kbps, fps cap {fps}, loss {:.1}%, rtt {} ms, jitter {} ms, {}",
                         bitrate / 1000,
@@ -1238,8 +1259,8 @@ fn spawn_bitrate_controller(
                         chain_stats.line()
                     );
                 }
-                if tick % 2 == 0 {
-                    last_bytes = bytes_sent;
+                if tick % 2 == 0 || last_bytes.is_none() {
+                    last_bytes = Some(bytes_sent);
                 }
             }
         });
@@ -1250,14 +1271,20 @@ fn spawn_bitrate_controller(
 }
 
 /// The phone's receiver reports (the worst of them) and the bytes sent so
-/// far, from `webrtcbin` stats.
-fn link_report(webrtcbin: &gst::Element) -> Option<(LinkReport, u64)> {
-    let promise = gst::Promise::new();
+/// far, from `webrtcbin` stats; otherwise why there are none. Waits at most
+/// [`STATS_WAIT`], like the peer's own stats read: an unanswered request
+/// used to hold the controller for the rest of the share.
+fn link_report(webrtcbin: &gst::Element) -> Result<(LinkReport, u64), &'static str> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let promise = gst::Promise::with_change_func(move |reply| {
+        let _ = sender.send(reply.ok().flatten().map(|stats| stats.to_owned()));
+    });
     webrtcbin.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
-    if promise.wait() != gst::PromiseResult::Replied {
-        return None;
-    }
-    let reply = promise.get_reply()?;
+    let reply = match receiver.recv_timeout(STATS_WAIT) {
+        Ok(Some(reply)) => reply,
+        Ok(None) => return Err("webrtcbin answered the stats request with nothing"),
+        Err(_) => return Err("webrtcbin did not answer the stats request"),
+    };
     let mut report = LinkReport::default();
     let mut bytes = 0u64;
     let mut any = false;
@@ -1288,7 +1315,11 @@ fn link_report(webrtcbin: &gst::Element) -> Option<(LinkReport, u64)> {
         }
     }
     any.then_some((report, bytes))
+        .ok_or("no receiver report from the phone for the screen stream")
 }
+
+/// Longest the rate controller waits for `webrtcbin`'s stats.
+const STATS_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn set_if_present(element: &gst::Element, name: &str, value: &str) {
     if element.has_property(name, None) {

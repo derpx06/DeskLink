@@ -2510,6 +2510,45 @@ a=max-message-size:262144\r\n";
         pair.answerer.close();
     }
 
+    /// The bitrate controller runs per share. A reopened share on a phone
+    /// logged no stats at all, so it was not known whether its controller
+    /// steered anything: here a second share on one connection gets the far
+    /// side's receiver reports and raises its bitrate on a clean link.
+    #[test]
+    fn a_second_share_on_one_connection_adapts_its_bitrate() {
+        let pair = loopback();
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let share = || {
+            super::super::screen::DesktopScreenCapture::attach_source(
+                &pair.answerer.pipeline,
+                &pair.answerer.webrtcbin,
+                test_source(),
+                None,
+                1280,
+                720,
+                super::super::screen::ScreenRequest::FALLBACK,
+                Some(pair.answerer.screen_continuity()),
+            )
+            .unwrap()
+        };
+        let first = share();
+        let _stream = assert_far_side_decodes(&pair.offerer_events);
+        pair.answerer.stop_or_retire(first);
+        let second = share();
+        let start = second.encoder_bitrate().expect("a VP8 encoder");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while second.encoder_bitrate() <= Some(start) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        assert!(
+            second.encoder_bitrate() > Some(start),
+            "the second share's bitrate never moved from {start}"
+        );
+        let _ = second.stop();
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
     /// One screen packet as `webrtcbin` is handed it: sequence number, RTP
     /// timestamp, SSRC, VP8 picture id, and whether it starts a keyframe.
     fn vp8_packet(data: &[u8]) -> Option<(u16, u32, u32, Option<u16>, bool)> {
