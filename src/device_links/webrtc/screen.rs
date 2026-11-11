@@ -773,8 +773,14 @@ impl DesktopScreenCapture {
             payloader.set_property("pt", payload_type);
             if let Some(continuity) = continuity {
                 payloader.set_property("ssrc", continuity.ssrc);
-                if let Some(next) = continuity.next_seqnum {
-                    payloader.set_property("seqnum-offset", i32::from(next));
+                payloader.set_property("timestamp-offset", continuity.timestamp_offset);
+                if let Some(resume) = continuity.resume {
+                    payloader.set_property("seqnum-offset", i32::from(resume.seqnum));
+                    if let Some(id) = resume.picture_id {
+                        if payloader.has_property("picture-id-offset", None) {
+                            payloader.set_property("picture-id-offset", i32::from(id));
+                        }
+                    }
                 }
             }
             debug_log!(
@@ -872,17 +878,40 @@ impl DesktopScreenCapture {
         }
     }
 
-    /// RTP buffers produced so far.
-    /// The RTP sequence number the next share must start at, once this one
-    /// has sent anything.
-    pub(crate) fn next_seqnum(&self) -> Option<u16> {
+    /// Where the next share's stream must carry on, once this one has sent
+    /// anything. Read after [`Self::detach`]: a packet numbered later can
+    /// no longer reach the wire, so the next share never repeats one.
+    pub(crate) fn resume(&self) -> Option<RtpResume> {
         if self.frames_sent() == 0 {
             return None;
         }
-        self.elements
+        let payloader = self
+            .elements
             .last()
-            .filter(|payloader| payloader.has_property("seqnum", None))
-            .map(|payloader| (payloader.property::<u32>("seqnum") as u16).wrapping_add(1))
+            .filter(|payloader| payloader.has_property("seqnum", None))?;
+        Some(RtpResume {
+            seqnum: (payloader.property::<u32>("seqnum") as u16).wrapping_add(1),
+            // The id the payloader would give its next frame.
+            picture_id: payloader
+                .has_property("picture-id", None)
+                .then(|| (payloader.property::<i32>("picture-id") & 0x7fff) as u16),
+        })
+    }
+
+    /// Unlinks the chain from `webrtcbin`: nothing more of it reaches the
+    /// wire. The pad is deliberately *kept*, not released: `webrtcbin` builds
+    /// the sender chain (including its FEC/RED encoders) when the pad is
+    /// requested, and asking for the same section's pad again a second time
+    /// logs a CRITICAL and leaves that chain half-built. The next share finds
+    /// this pad again.
+    pub(crate) fn detach(&self) {
+        if let Some(payloader_src) = self
+            .elements
+            .last()
+            .and_then(|element| element.static_pad("src"))
+        {
+            let _ = payloader_src.unlink(&self.sink_pad);
+        }
     }
 
     /// The screen's real pixel size, as the capture negotiated it (a scaled
@@ -927,18 +956,8 @@ impl DesktopScreenCapture {
     /// sets the whole pipeline to NULL with `webrtcbin` first, releases it.
     pub(crate) fn stop(self) -> Result<(), Self> {
         self.rate_control_stop.store(true, Ordering::Relaxed);
-        // Unlink from `webrtcbin` first so nothing new can enter it. The pad is
-        // deliberately *kept*, not released: `webrtcbin` builds the sender chain
-        // (including its FEC/RED encoders) when the pad is requested, and asking
-        // for the same section's pad again a second time logs a CRITICAL and
-        // leaves that chain half-built. The next share finds this pad again.
-        if let Some(payloader_src) = self
-            .elements
-            .last()
-            .and_then(|element| element.static_pad("src"))
-        {
-            let _ = payloader_src.unlink(&self.sink_pad);
-        }
+        // Unlink from `webrtcbin` first so nothing new can enter it.
+        self.detach();
         if !self.wait_until_idle(IDLE_TIMEOUT) {
             return Err(self);
         }
@@ -983,15 +1002,32 @@ impl DesktopScreenCapture {
 }
 
 /// How a new share continues the RTP stream of the previous one on the same
-/// connection: same SSRC, sequence numbers carrying on. The phone binds its
-/// picture to the first SSRC it sees, and SRTP refuses to encrypt a sequence
-/// number it has already used for that SSRC ("general supporting library
-/// error" in srtpenc) — so both are needed, or a reopened Remote input waits
-/// for its first picture forever.
+/// connection: same SSRC, and sequence numbers, timestamps and VP8 picture
+/// ids all carrying on. The phone binds its picture to the first SSRC it
+/// sees, and SRTP refuses to encrypt a sequence number it has already used
+/// for that SSRC ("general supporting library error" in srtpenc). And to
+/// the phone it is one stream: libwebrtc numbers VP8 frames by picture id
+/// and drops a frame numbered at or before one it already decoded (a
+/// keyframe is let through only with a newer RTP timestamp). Each new
+/// payloader started at a random picture id and timestamp, so about half of
+/// the reopened views dropped every frame, keyframes and the answers to the
+/// phone's PLIs included: "waiting for the first picture" forever (F8).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RtpContinuity {
     pub ssrc: u32,
-    pub next_seqnum: Option<u16>,
+    /// The connection's RTP clock: a payloader's timestamps are this plus the
+    /// running time, so a later share's are ahead of an earlier one's.
+    pub timestamp_offset: u32,
+    /// Where the previous share stopped; `None` for the first.
+    pub resume: Option<RtpResume>,
+}
+
+/// The next sequence number and VP8 picture id after a share's last packet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RtpResume {
+    pub seqnum: u16,
+    /// `None` for a payloader without picture ids (the H.264 experiment).
+    pub picture_id: Option<u16>,
 }
 
 /// Debug logging only: what the encoder is handed, makes and is asked for,
