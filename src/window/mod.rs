@@ -1531,10 +1531,14 @@ impl DesklinkWindow {
 
     fn refresh_soon(&self) {
         let window = self.downgrade();
+        // Guarded like the tick: events (`wake_ui`) refresh through here, and a
+        // panic cannot unwind into GLib.
         glib::idle_add_local_once(move || {
-            if let Some(window) = window.upgrade() {
-                window.refresh_devices();
-            }
+            crate::guard("window refresh", (), || {
+                if let Some(window) = window.upgrade() {
+                    window.refresh_devices();
+                }
+            });
         });
     }
 
