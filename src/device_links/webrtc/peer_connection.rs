@@ -2510,10 +2510,12 @@ a=max-message-size:262144\r\n";
         pair.answerer.close();
     }
 
-    /// The bitrate controller runs per share. A reopened share on a phone
-    /// logged no stats at all, so it was not known whether its controller
-    /// steered anything: here a second share on one connection gets the far
-    /// side's receiver reports and raises its bitrate on a clean link.
+    /// The bitrate controller runs per share and steers by the far side's
+    /// receiver reports. A share reopened more than 5 s after the last one got
+    /// none for its whole life (F12): the idle screen SSRC timed out as a
+    /// sender, `webrtcbin` dropped it from its stats, and never took the
+    /// reused SSRC back. So the second share opens after that timeout here,
+    /// and must still get reports and raise its bitrate on a clean link.
     #[test]
     fn a_second_share_on_one_connection_adapts_its_bitrate() {
         let pair = loopback();
@@ -2534,6 +2536,8 @@ a=max-message-size:262144\r\n";
         let first = share();
         let _stream = assert_far_side_decodes(&pair.offerer_events);
         pair.answerer.stop_or_retire(first);
+        // Longer than rtpsession's sender timeout (5 s at the least).
+        std::thread::sleep(std::time::Duration::from_secs(7));
         let second = share();
         let start = second.encoder_bitrate().expect("a VP8 encoder");
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

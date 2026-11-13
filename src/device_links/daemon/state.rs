@@ -1423,6 +1423,16 @@ mod tests {
     }
 
     #[test]
+    fn a_notification_keeps_no_blank_action_titles() {
+        let (devices, info) = test_devices();
+        let mut packet = notification("sensitive");
+        packet.set("actions", serde_json::json!(["", " ", "Archive"]));
+        let settings = crate::device_links::config::AppSettings::default();
+        let kept = upsert_notification_for(&settings, &devices, &info.id, &packet).expect("kept");
+        assert_eq!(kept.actions, vec!["Archive".to_string()]);
+    }
+
+    #[test]
     fn upsert_notification_replaces_existing_notification() {
         let (devices, info) = test_devices();
         let mut first = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_NOTIFICATION);
