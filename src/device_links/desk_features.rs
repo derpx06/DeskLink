@@ -644,6 +644,10 @@ fn conditions(device_id: &str) -> Conditions {
     Conditions {
         allowed: super::config::app_settings().unlocks_from(device_id),
         locked: super::daemon::desktop_locked(),
+        unlockable: !matches!(
+            crate::desktop_env::route(&crate::desktop_env::running_lockers()),
+            crate::desktop_env::Route::Cannot(_)
+        ),
         ..device_conditions(device(device_id).as_ref())
     }
 }
@@ -662,6 +666,7 @@ fn device_conditions(device: Option<&DeviceView>) -> Conditions {
         ready: device.is_some_and(|device| {
             device.status == DeviceStatus::Paired && device.feature_transport_ready
         }),
+        unlockable: true,
     }
 }
 
@@ -697,14 +702,46 @@ pub(crate) fn handle_unlock_approval(device_id: &str, nonce: Option<&str>) {
         return;
     }
     match unlock::approve(device_id, nonce, conditions(device_id)) {
-        Ok(()) => match super::logind::unlock() {
-            Ok(()) => record_detail(device_id, ConnectionEvent::UnlockedByPhone, "nearby"),
-            Err(error) => {
+        Ok(()) => match crate::desktop_env::unlock() {
+            Ok(route) => {
+                record_detail(device_id, ConnectionEvent::UnlockedByPhone, "nearby");
+                confirm_unlocked(device_id, route);
+            }
+            Err(crate::desktop_env::UnlockError::Unsupported(locker)) => {
+                eprintln!("[DeskLink] {locker} cannot be unlocked from the phone");
+                refuse(device_id, Refusal::Unsupported);
+            }
+            Err(crate::desktop_env::UnlockError::Failed(error)) => {
                 eprintln!("[DeskLink] Could not unlock the session: {error}");
                 refuse(device_id, Refusal::Failed);
             }
         },
         Err(refusal) => refuse(device_id, refusal),
+    }
+}
+
+/// How long a lock screen gets to go away before the phone is told it did not.
+const UNLOCK_CHECK_AFTER: Duration = Duration::from_secs(3);
+
+/// A lock screen still up a moment after the unlock is reported to the
+/// phone instead of failing silently: one that ignores logind's Unlock is
+/// "unsupported", a signalled locker that stayed is "failed".
+fn confirm_unlocked(device_id: &str, route: crate::desktop_env::Route) {
+    let device_id = device_id.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(UNLOCK_CHECK_AFTER);
+        if crate::desktop_env::locked() {
+            eprintln!("[DeskLink] The lock screen stayed up after the unlock ({route:?})");
+            refuse(&device_id, unlock_stayed(&route));
+        }
+    });
+}
+
+/// The refusal for a lock screen that stayed up after `route`.
+fn unlock_stayed(route: &crate::desktop_env::Route) -> Refusal {
+    match route {
+        crate::desktop_env::Route::Signal { .. } => Refusal::Failed,
+        _ => Refusal::Unsupported,
     }
 }
 
@@ -1160,6 +1197,21 @@ mod tests {
         )
         .is_err());
         assert_eq!(*order.borrow(), ["lock"], "locked even with no phone");
+    }
+
+    /// A lock screen that ignored logind's Unlock is named as such to the
+    /// phone; a signalled swaylock/hyprlock that stayed up is a failure.
+    #[test]
+    fn a_lock_screen_that_stays_up_is_reported_not_silent() {
+        use crate::desktop_env::Route;
+        assert_eq!(unlock_stayed(&Route::Logind), Refusal::Unsupported);
+        assert_eq!(
+            unlock_stayed(&Route::Signal {
+                pid: 1,
+                name: "swaylock".into()
+            }),
+            Refusal::Failed
+        );
     }
 
     #[test]

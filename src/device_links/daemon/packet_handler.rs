@@ -64,10 +64,11 @@ fn sample_desktop_lock_state() -> bool {
     locked
 }
 
-/// Asks logind for our display session's lock state (bounded; see
-/// [`crate::device_links::logind`]). Unknown reads as unlocked.
+/// Our session's lock state: logind's `LockedHint`, or for lock screens
+/// that do not keep it, a standalone locker or the desktop's screensaver
+/// (bounded; see [`crate::desktop_env::locked`]). Unknown reads as unlocked.
 fn read_desktop_lock_state() -> bool {
-    crate::device_links::logind::locked().unwrap_or(false)
+    crate::desktop_env::locked()
 }
 
 /// How long the screensaver is given to settle before its state is sampled.
@@ -1182,51 +1183,10 @@ pub(crate) fn admit_lock_operation() -> bool {
     true
 }
 
-/// Locks this desktop session, every way a desktop might listen.
+/// Locks this desktop session, every way a desktop might listen (see
+/// [`crate::desktop_env::lock`]).
 pub(crate) fn lock_desktop() {
-    match crate::device_links::logind::lock() {
-        Ok(()) => return,
-        Err(error) => debug_log!("[Daemon] logind could not lock the session: {error}"),
-    }
-    // Without logind (or refused): the freedesktop screensaver interface
-    // every desktop's locker implements (KDE, Xfce, Cinnamon, MATE), then
-    // GNOME's own name. Over D-Bus in-process: no helper program needed.
-    let Ok(bus) = gtk::gio::bus_get_sync(gtk::gio::BusType::Session, gtk::gio::Cancellable::NONE)
-    else {
-        return;
-    };
-    for (name, path, interface) in [
-        (
-            "org.freedesktop.ScreenSaver",
-            "/ScreenSaver",
-            "org.freedesktop.ScreenSaver",
-        ),
-        (
-            "org.freedesktop.ScreenSaver",
-            "/org/freedesktop/ScreenSaver",
-            "org.freedesktop.ScreenSaver",
-        ),
-        (
-            "org.gnome.ScreenSaver",
-            "/org/gnome/ScreenSaver",
-            "org.gnome.ScreenSaver",
-        ),
-    ] {
-        let locked = bus.call_sync(
-            Some(name),
-            path,
-            interface,
-            "Lock",
-            None,
-            None,
-            gtk::gio::DBusCallFlags::NONE,
-            2_000,
-            gtk::gio::Cancellable::NONE,
-        );
-        if locked.is_ok() {
-            return;
-        }
-    }
+    crate::desktop_env::lock();
 }
 
 /// The phone asked this computer to make itself known. The notification is

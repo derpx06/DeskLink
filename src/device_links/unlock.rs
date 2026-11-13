@@ -28,6 +28,9 @@ pub(crate) enum Refusal {
     NotReady,
     /// Every check passed but the session would not unlock (logind refused).
     Failed,
+    /// This computer's lock screen cannot be unlocked from outside (i3lock,
+    /// gtklock…), or it ignored logind's Unlock.
+    Unsupported,
 }
 
 impl Refusal {
@@ -42,6 +45,7 @@ impl Refusal {
             Self::NotLan => "not-lan",
             Self::NotReady => "not-ready",
             Self::Failed => "failed",
+            Self::Unsupported => "unsupported",
         }
     }
 }
@@ -58,6 +62,8 @@ pub(crate) struct Conditions {
     pub(crate) local: bool,
     /// The phone's encrypted connection is up.
     pub(crate) ready: bool,
+    /// The lock screen can be unlocked from outside (logind or a signal).
+    pub(crate) unlockable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +89,9 @@ pub(crate) fn may_offer(conditions: Conditions) -> Result<(), Refusal> {
     }
     if !conditions.locked {
         return Err(Refusal::NotLocked);
+    }
+    if !conditions.unlockable {
+        return Err(Refusal::Unsupported);
     }
     Ok(())
 }
@@ -182,6 +191,7 @@ mod tests {
         locked: true,
         local: true,
         ready: true,
+        unlockable: true,
     };
 
     fn issued(device: &str, at: Instant) -> Vec<Issued> {
@@ -298,6 +308,24 @@ mod tests {
         assert_eq!(
             refused("phone", Some("n1"), now, connecting),
             Refusal::NotReady
+        );
+        let i3lock = Conditions {
+            unlockable: false,
+            ..ALL_GOOD
+        };
+        assert_eq!(
+            refused("phone", Some("n1"), now, i3lock),
+            Refusal::Unsupported
+        );
+        assert_eq!(Refusal::Unsupported.code(), "unsupported");
+        // An open desk is "not locked", whatever its lock screen.
+        let open_i3 = Conditions {
+            locked: false,
+            ..i3lock
+        };
+        assert_eq!(
+            refused("phone", Some("n1"), now, open_i3),
+            Refusal::NotLocked
         );
     }
 
