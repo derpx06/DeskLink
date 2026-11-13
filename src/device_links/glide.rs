@@ -61,6 +61,9 @@ const HELD_MAX: usize = 64;
 const MOTION_EVERY: Duration = Duration::from_millis(4);
 /// How often the worker re-reads the setting and the phone's link.
 const CHECK_EVERY: Duration = Duration::from_millis(250);
+/// The worker's nap with Glide switched off (nearly always): only the
+/// setting can change, and a second is soon enough to notice it switched on.
+const OFF_NAP: Duration = Duration::from_secs(1);
 /// The worker's nap while a session is armed but the pointer is here.
 const ARMED_NAP: Duration = Duration::from_millis(50);
 /// Arming the barrier at most this often in any minute. A burst (monitors
@@ -1890,6 +1893,8 @@ fn nap(state: &State) -> Duration {
         MOTION_EVERY
     } else if state.portal.is_some() {
         ARMED_NAP
+    } else if state.current.is_none() && state.glide.is_none() {
+        OFF_NAP
     } else {
         CHECK_EVERY
     }
@@ -3059,11 +3064,12 @@ mod tests {
         assert_eq!(link_silence(None, None), None);
     }
 
-    /// Nothing wakes the worker 250 times a second while glide is off.
+    /// Nothing wakes the worker more than once a second while glide is off.
     #[test]
     fn the_worker_sleeps_long_when_glide_is_off() {
         let mut state = State::new();
-        assert_eq!(nap(&state), CHECK_EVERY);
+        assert_eq!(nap(&state), OFF_NAP);
+        const { assert!(OFF_NAP.as_millis() >= 1000) };
         let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());
         state.glide = Some(Glide::accepting(
             Barrier::on(Edge::Right, &screen()).unwrap(),
