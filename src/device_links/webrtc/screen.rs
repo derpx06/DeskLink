@@ -349,6 +349,12 @@ impl ScreenStream {
         self.inner.shown.load(Ordering::Relaxed)
     }
 
+    /// Where decoded frames enter the display sink (a fakesink in tests).
+    #[cfg(test)]
+    pub(crate) fn sink_pad(&self) -> Option<gst::Pad> {
+        self.inner.sink.static_pad("sink")
+    }
+
     fn stop(&self) {
         self.inner.stop();
     }
@@ -569,7 +575,151 @@ pub(crate) fn attach_incoming_video(
         }
     });
 
+    if crate::debug_logging() {
+        watch_inbound(pad, &inner);
+    }
     Ok(ScreenStream { inner })
+}
+
+/// `DESKLINK_DEBUG`: a `phone-screen-stats` line every 2 s while a phone's
+/// screen is shown — what arrives (size, frames shown, kbps, loss, NACK/PLI
+/// sent, jitter) and what this desk adds after the jitter buffer: depayload,
+/// decode and conversion per frame, matched by timestamp.
+fn watch_inbound(pad: &gst::Pad, inner: &Arc<ScreenStreamInner>) {
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    let Some(webrtcbin) = pad.parent_element() else {
+        return;
+    };
+    let arrived: Arc<Mutex<HashMap<u64, Instant>>> = Arc::default();
+    // (sum ms, frames, max ms) since the last line.
+    let chain: Arc<Mutex<(f64, u32, f64)>> = Arc::default();
+    let pts_of = |data: &Option<gst::PadProbeData>| match data {
+        Some(gst::PadProbeData::Buffer(buffer)) => buffer.pts(),
+        Some(gst::PadProbeData::BufferList(list)) => list.iter().last().and_then(|b| b.pts()),
+        _ => None,
+    };
+    {
+        let arrived = Arc::clone(&arrived);
+        pad.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+            move |_, info| {
+                if let Some(pts) = pts_of(&info.data) {
+                    let mut arrived = arrived.lock().unwrap_or_else(|e| e.into_inner());
+                    if arrived.len() > 512 {
+                        arrived.clear();
+                    }
+                    // The frame's last packet: decoding can start from here.
+                    arrived.insert(pts.nseconds(), Instant::now());
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+    }
+    if let Some(sink_pad) = inner.sink.static_pad("sink") {
+        let (arrived, chain) = (Arc::clone(&arrived), Arc::clone(&chain));
+        sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            let at = pts_of(&info.data).and_then(|pts| {
+                let mut arrived = arrived.lock().unwrap_or_else(|e| e.into_inner());
+                arrived.remove(&pts.nseconds())
+            });
+            if let Some(at) = at {
+                let ms = at.elapsed().as_secs_f64() * 1e3;
+                let mut chain = chain.lock().unwrap_or_else(|e| e.into_inner());
+                *chain = (chain.0 + ms, chain.1 + 1, chain.2.max(ms));
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+    let weak = Arc::downgrade(inner);
+    std::thread::spawn(move || {
+        let (mut frames, mut bytes, mut since) = (0u64, 0u64, Instant::now());
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            let Some(inner) = weak
+                .upgrade()
+                .filter(|i| !i.stopped.load(Ordering::Acquire))
+            else {
+                return;
+            };
+            let (sum, count, max) =
+                std::mem::take(&mut *chain.lock().unwrap_or_else(|e| e.into_inner()));
+            let shown = inner.shown.load(Ordering::Relaxed);
+            let size = inner
+                .sink
+                .static_pad("sink")
+                .and_then(|pad| pad.current_caps())
+                .and_then(|caps| {
+                    let s = caps.structure(0)?;
+                    Some(format!(
+                        "{}x{}",
+                        s.get::<i32>("width").ok()?,
+                        s.get::<i32>("height").ok()?
+                    ))
+                })
+                .unwrap_or_else(|| "?".into());
+            let decoder = inner
+                .elements
+                .first()
+                .and_then(|decode| decode.downcast_ref::<gst::Bin>().cloned())
+                .and_then(|bin| {
+                    bin.iterate_recurse()
+                        .into_iter()
+                        .flatten()
+                        .find_map(|element| {
+                            let factory = element.factory()?;
+                            factory
+                                .has_type(gst::ElementFactoryType::DECODER)
+                                .then(|| factory.name().to_string())
+                        })
+                })
+                .unwrap_or_else(|| "?".into());
+            // The video stream is the inbound one carrying the most bytes.
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let promise = gst::Promise::with_change_func(move |reply| {
+                let _ = sender.send(reply.ok().flatten().map(|stats| stats.to_owned()));
+            });
+            webrtcbin.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+            let inbound = receiver
+                .recv_timeout(STATS_WAIT)
+                .ok()
+                .flatten()
+                .and_then(|reply| {
+                    reply
+                        .iter()
+                        .filter_map(|(_, value)| value.get::<gst::Structure>().ok())
+                        .filter(|stats| stats.name() == "inbound-rtp")
+                        .max_by_key(|stats| stats.get::<u64>("bytes-received").unwrap_or(0))
+                });
+            let field = |name: &str| {
+                inbound.as_ref().map_or("?".to_string(), |stats| {
+                    stats
+                        .value(name)
+                        .ok()
+                        .and_then(|v| v.serialize().ok())
+                        .map_or("?".to_string(), |v| v.to_string())
+                })
+            };
+            let received = inbound
+                .as_ref()
+                .and_then(|stats| stats.get::<u64>("bytes-received").ok())
+                .unwrap_or(bytes);
+            let seconds = since.elapsed().as_secs_f64();
+            eprintln!(
+                "[DeskLink] phone-screen-stats: {size} via {decoder}, shown {:.1} fps, in {} kbps, \
+                 lost {}, nack {}, pli {}, jitter {} s, after jitter buffer {} ms avg / {:.1} max",
+                (shown - frames) as f64 / seconds,
+                ((received.saturating_sub(bytes)) as f64 * 8.0 / seconds / 1000.0) as u64,
+                field("packets-lost"),
+                field("nack-count"),
+                field("pli-count"),
+                field("jitter"),
+                if count == 0 { "-".to_string() } else { format!("{:.1}", sum / f64::from(count)) },
+                max,
+            );
+            (frames, bytes, since) = (shown, received, Instant::now());
+        }
+    });
 }
 
 /// The lifetime-bound source-to-WebRTC chain for a desktop share.
@@ -1719,7 +1869,7 @@ fn negotiated_video_sink_pad(webrtcbin: &gst::Element) -> Option<gst::Pad> {
 /// as video), it is taken over: asking for it by name a second time is
 /// undefined in GStreamer, and failed every later share on the connection.
 /// Never a pad of the audio section.
-fn section_pad(webrtcbin: &gst::Element, mline: u32) -> Result<gst::Pad, String> {
+pub(crate) fn section_pad(webrtcbin: &gst::Element, mline: u32) -> Result<gst::Pad, String> {
     let name = format!("sink_{mline}");
     let Some(pad) = webrtcbin.static_pad(&name) else {
         return webrtcbin.request_pad_simple(&name).ok_or_else(|| {
@@ -1749,7 +1899,7 @@ fn section_pad(webrtcbin: &gst::Element, mline: u32) -> Result<gst::Pad, String>
 }
 
 /// The m-line index of the video section the remote offer negotiated.
-fn negotiated_video_mline(webrtcbin: &gst::Element) -> Option<u32> {
+pub(crate) fn negotiated_video_mline(webrtcbin: &gst::Element) -> Option<u32> {
     for index in 0i32..16 {
         let transceiver = webrtcbin.emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
             "get-transceiver",
