@@ -37,6 +37,8 @@ pub(crate) enum Fix {
     LogOut,
     /// Approve the phone controlling this screen, now, at the desk.
     ApproveControl(String),
+    /// Ask the phone to turn Glide on there (a prompt on the phone).
+    AskPhoneGlide(String),
     Reconnect(String),
     /// Copies an install command.
     Copy(String),
@@ -54,6 +56,7 @@ impl Fix {
             Self::TurnOnExtension => "Turn on",
             Self::LogOut => "Log out…",
             Self::ApproveControl(_) => "Approve now",
+            Self::AskPhoneGlide(_) => "Ask on phone",
             Self::Reconnect(_) => "Try again",
             Self::Copy(_) => "Copy command",
         })
@@ -109,6 +112,9 @@ pub(crate) struct PhoneFacts {
     pub control_approved: bool,
     /// Glide is set to this phone.
     pub glide_here: bool,
+    /// The phone said Glide is off there (its switch for this computer, or
+    /// the accessibility service it needs).
+    pub glide_off_there: bool,
     /// Android lets it read notifications (`None`: an older phone, unknown).
     pub notification_access: Option<bool>,
 }
@@ -133,6 +139,7 @@ impl PhoneFacts {
                 .glide
                 .as_ref()
                 .is_some_and(|glide| glide.device == device.id),
+            glide_off_there: crate::device_links::glide::phone_allows(&device.id) == Some(false),
             notification_access: device.notification_access,
         }
     }
@@ -330,6 +337,9 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
             allow: None,
         });
     }
+    if phone.glide_here && phone.glide_off_there {
+        needs.push(glide_off_there(phone));
+    }
     if phone.glide_here && facts.glide_asking {
         needs.push(Need {
             id: "glide",
@@ -367,6 +377,35 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
         });
     }
     needs
+}
+
+/// Glide is on here but off on the phone: what to do there, and "Ask on
+/// phone" when its build can show the prompt (an older one: the words only).
+fn glide_off_there(phone: &PhoneFacts) -> Need {
+    let name = &phone.name;
+    let askable = crate::device_links::glide::can_ask_phone(&phone.incoming);
+    Need {
+        id: "glide-phone",
+        on_phone: true,
+        title: format!("Glide is off on {name}. Turn it on there."),
+        detail: if askable {
+            format!(
+                "{name} shows a prompt when you ask; or on {name}, open DeskLink, then Settings, \
+                 Control, and turn on control from this computer."
+            )
+        } else {
+            format!(
+                "On {name}, open DeskLink, then Settings, Control, and turn on control from this \
+                 computer."
+            )
+        },
+        fix: if askable {
+            Fix::AskPhoneGlide(phone.id.clone())
+        } else {
+            Fix::None
+        },
+        allow: None,
+    }
 }
 
 /// What an unavailable action is blocked by.
@@ -481,6 +520,10 @@ pub(crate) fn run(anchor: &impl IsA<gtk::Widget>, need: &Need) {
         },
         Fix::LogOut => crate::shell_dbus::log_out(),
         Fix::ApproveControl(id) => super::prefs::approve_remote_control(&window, id),
+        Fix::AskPhoneGlide(id) => {
+            crate::device_links::glide::ask_phone(id);
+            window.show_feature_toast("Asked on the phone. Turn Glide on there");
+        }
         Fix::Reconnect(id) => {
             if let Some(daemon) = daemon {
                 daemon.send(DaemonCommand::Reconnect(id.clone()));
@@ -770,8 +813,46 @@ mod tests {
             unlock_on: true,
             control_approved: true,
             glide_here: false,
+            glide_off_there: false,
             notification_access: Some(true),
         }
+    }
+
+    /// Glide on here, off on the phone: said on the phone's line with the
+    /// ask when the phone's build takes it, the instruction alone when not;
+    /// nothing when Glide is not set to this phone or is on there.
+    #[test]
+    fn glide_off_on_the_phone_says_so_and_asks_when_it_can() {
+        let facts = |phone: PhoneFacts| Facts {
+            phone: Some(phone),
+            ..complete()
+        };
+        let glide_need = |phone: PhoneFacts| {
+            missing(&facts(phone))
+                .into_iter()
+                .find(|need| need.id == "glide-phone")
+        };
+        let mut off = phone();
+        off.glide_here = true;
+        off.glide_off_there = true;
+        let need = glide_need(off.clone()).expect("listed");
+        assert_eq!(need.title, "Glide is off on Pixel 9. Turn it on there.");
+        assert!(need.on_phone);
+        assert_eq!(need.fix, Fix::None, "an older phone: the words only");
+        assert!(need.detail.contains("Settings, Control"));
+        off.incoming
+            .push(crate::device_links::packet::PACKET_TYPE_SETTINGS_REQUEST.into());
+        let need = glide_need(off.clone()).expect("listed");
+        assert_eq!(need.fix, Fix::AskPhoneGlide("p1".into()));
+        assert_eq!(need.fix.label(), Some("Ask on phone"));
+        assert!(need.allow.is_none(), "never switched from here");
+
+        let mut on_there = off.clone();
+        on_there.glide_off_there = false;
+        assert_eq!(glide_need(on_there), None);
+        let mut not_here = off;
+        not_here.glide_here = false;
+        assert_eq!(glide_need(not_here), None);
     }
 
     fn complete() -> Facts {

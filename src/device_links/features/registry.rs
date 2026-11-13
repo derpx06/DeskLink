@@ -74,7 +74,7 @@ const DESKTOP_INCOMING: [&str; 28] = [
 /// Packets the desktop can construct from a command path, and that a DeskLink
 /// Android plugin can consume. `desklink.systemvolume.request` is absent: the
 /// phone has no receiver for it.
-const DESKTOP_OUTGOING: [&str; 30] = [
+const DESKTOP_OUTGOING: [&str; 31] = [
     // Folder sync (F8): both ways.
     PACKET_TYPE_FILE_LANE,
     PACKET_TYPE_FOLDERS,
@@ -106,6 +106,9 @@ const DESKTOP_OUTGOING: [&str; 30] = [
     PACKET_TYPE_NOTIFICATION_REPLY,
     PACKET_TYPE_NOTIFICATION_REQUEST,
     PACKET_TYPE_PING,
+    // Glide: the person asks the phone to turn Glide on there (a prompt on
+    // the phone, which decides). Sent only to a phone that takes it.
+    PACKET_TYPE_SETTINGS_REQUEST,
     PACKET_TYPE_SCREEN_ERROR,
     PACKET_TYPE_SCREEN_READY,
     PACKET_TYPE_SCREEN_REQUEST,
@@ -411,6 +414,7 @@ mod tests {
                 "desklink.screen.request",
                 "desklink.screen.stop",
                 "desklink.settings",
+                "desklink.settings.request",
                 "desklink.share.request",
                 "desklink.shareinputdevices.request",
                 "desklink.snippets",
@@ -593,6 +597,7 @@ mod tests {
                 "desklink.notification.request",
                 "desklink.ping",
                 "desklink.settings",
+                "desklink.settings.request",
                 "desklink.share.request",
                 "desklink.shareinputdevices.request",
                 "desklink.snippets",
@@ -603,7 +608,7 @@ mod tests {
         );
         // The types in one direction only are directional pairs: what the
         // phone sends the desk accepts, what the desk sends the phone accepts.
-        assert_eq!(one_way.len(), 16, "{one_way:?}");
+        assert_eq!(one_way.len(), 15, "{one_way:?}");
     }
 
     /// Every type each registry lists, except the screen types, rides the
