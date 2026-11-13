@@ -128,9 +128,24 @@ pub struct Check {
     pub id: &'static str,
     pub title: &'static str,
     pub level: Level,
+    /// Plain words for the person.
     pub detail: String,
     pub install: Option<Packages>,
+    /// The technical names behind it (components, services, variables), for
+    /// the copied report, `desklink --check` and the log only; empty if none.
+    pub tech: String,
 }
+
+impl Check {
+    fn tech(mut self, tech: impl Into<String>) -> Self {
+        self.tech = tech.into();
+        self
+    }
+}
+
+/// The start of the share row's words when the desktop's own screen sharing
+/// (the portal) is used; onboarding tells that case apart by it.
+pub const SHARE_THROUGH_DESKTOP: &str = "Through your desktop's own screen sharing.";
 
 /// The facts [`evaluate`] judges. `Default` is an empty machine.
 #[derive(Debug, Clone, Default)]
@@ -323,6 +338,7 @@ fn check(
         level,
         detail: detail.into(),
         install,
+        tech: String::new(),
     }
 }
 
@@ -397,35 +413,34 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
     } else {
         ""
     };
-    rows.push(check(
-        "session",
-        "Desktop session",
-        if wayland || probe.x11_display {
-            Level::Ok
-        } else {
-            Level::Missing
-        },
-        format!(
-            "{} on {session}{packaging}. {}",
-            desktop_name(&probe.desktop),
-            probe.toolkit
-        ),
-        None,
-    ));
+    rows.push(
+        check(
+            "session",
+            "Desktop session",
+            if wayland || probe.x11_display {
+                Level::Ok
+            } else {
+                Level::Missing
+            },
+            format!("{} on {session}{packaging}.", desktop_name(&probe.desktop)),
+            None,
+        )
+        .tech(probe.toolkit.clone()),
+    );
 
     // The bus.
     rows.push(if probe.session_bus {
-        check("bus", "D-Bus session bus", Level::Ok, "Found.", None)
+        check("bus", "Desktop session services", Level::Ok, "Found.", None)
     } else {
         check(
             "bus",
-            "D-Bus session bus",
+            "Desktop session services",
             Level::Missing,
-            "There is no session bus, so the tray, notifications, screen sharing and locking \
-             cannot work. Start DeskLink from your desktop session, or run it as \
-             `dbus-run-session desklink`.",
+            "DeskLink was started outside your desktop session, so the tray, notifications, \
+             screen sharing and locking cannot work. Start it from your desktop's app menu.",
             None,
         )
+        .tech("No D-Bus session bus; outside a session, run `dbus-run-session desklink`.")
     });
 
     // The link itself.
@@ -437,22 +452,23 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
     rows.push(if missing.is_empty() {
         check(
             "link",
-            "Phone link (WebRTC)",
+            "Phone link",
             Level::Ok,
-            "GStreamer's WebRTC plugins are installed.",
+            "Everything DeskLink needs to talk to phones is installed.",
             None,
         )
     } else {
         check(
             "link",
-            "Phone link (WebRTC)",
+            "Phone link",
             Level::Missing,
-            format!(
-                "Phones cannot connect without GStreamer's WebRTC plugins. Missing: {}.",
-                missing.join(", ")
-            ),
+            "Phones cannot connect: parts DeskLink needs to talk to them are not installed.",
             Some(GST_BAD),
         )
+        .tech(format!(
+            "GStreamer WebRTC elements missing: {}.",
+            missing.join(", ")
+        ))
     });
 
     // The tray.
@@ -473,14 +489,14 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
                 Some(APPINDICATOR),
             ),
             _ => (
-                "No tray was found on this desktop (it needs a StatusNotifierItem host, such \
-                 as the tray in Plasma, Xfce, MATE, Cinnamon, Waybar or swaybar). DeskLink \
-                 still works: closing the window keeps it running, and you reopen it from \
-                 the launcher or by running `desklink` again.",
+                "No tray was found on this desktop (Plasma, Xfce, MATE, Cinnamon, Waybar and \
+                 swaybar have one). DeskLink still works: closing the window keeps it \
+                 running, and you reopen it from the launcher or by running `desklink` again.",
                 None,
             ),
         };
         check("tray", "System tray", Level::Limited, detail, install)
+            .tech("No StatusNotifierItem host registered with org.kde.StatusNotifierWatcher.")
     });
 
     // Notifications.
@@ -498,11 +514,12 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
                 "notifications",
                 "Notifications",
                 Level::Limited,
-                "No notification service is running, so DeskLink cannot show phone \
-                 notifications or alerts here. Install one (dunst, mako or swaync, or your \
-                 desktop's own).",
+                "Nothing on this desktop shows notifications, so DeskLink cannot show the \
+                 phone's notifications or alerts here. Install a notification app (dunst, \
+                 mako or swaync, or your desktop's own).",
                 Some(NOTIFIER),
             )
+            .tech("No org.freedesktop.Notifications server and no Notification portal.")
         },
     );
 
@@ -522,7 +539,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             "share",
             "Share this screen and let the phone control it",
             Level::Missing,
-            "Needs the D-Bus session bus.",
+            "Needs DeskLink to run inside your desktop session (see above).",
             None,
         )
     } else if x11_direct {
@@ -532,28 +549,31 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
                 "share",
                 "Share this screen and let the phone control it",
                 Level::Ok,
-                "Through X11 directly (this session has no screen-sharing portal). You \
-                 approve each session at this computer.",
+                "DeskLink shares this screen itself, as this desktop has no screen sharing \
+                 of its own. You approve each phone at this computer.",
                 None,
             )
+            .tech("X11 directly: ximagesrc and XTest (no ScreenCast/RemoteDesktop portal).")
         } else if probe.flatpak {
             check(
                 "share",
                 "Share this screen and let the phone control it",
                 Level::Missing,
-                "This session has no screen-sharing portal, and the Flatpak runtime has no X11 \
-                 screen capture. Install DeskLink from your distribution's package instead, or \
-                 use a desktop whose portal offers screen sharing.",
+                "This desktop has no screen sharing of its own, and the Flatpak version of \
+                 DeskLink cannot share the screen without it. Install DeskLink from your \
+                 distribution's packages instead.",
                 None,
             )
+            .tech("No ScreenCast portal on X11, and the Flatpak runtime has no ximagesrc.")
         } else {
             check(
                 "share",
                 "Share this screen and let the phone control it",
                 Level::Missing,
-                "Needs GStreamer's X11 screen capture and its VP8 encoder (gst-plugins-good).",
+                "Parts DeskLink needs to share this screen are not installed.",
                 Some(GST_GOOD),
             )
+            .tech("Needs GStreamer ximagesrc and vp8enc (gst-plugins-good).")
         }
     } else if !has_portal("ScreenCast") {
         check(
@@ -561,49 +581,53 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             "Share this screen and let the phone control it",
             Level::Missing,
             format!(
-                "Wayland needs a desktop portal for screen sharing, and none answered. \
-                 Install {} and restart your session.",
+                "This desktop's screen sharing service is not installed or not running. \
+                 Install {}, then log out and back in.",
                 portal_backend(family)
             ),
             None,
         )
+        .tech("No xdg-desktop-portal ScreenCast interface answered.")
     } else if !has_portal("RemoteDesktop") {
         check(
             "share",
             "Share this screen and let the phone control it",
             Level::Missing,
             format!(
-                "This desktop's portal can show the screen but has no remote-control \
-                 interface (RemoteDesktop), and DeskLink needs both. {} does not offer it \
-                 on every compositor; GNOME and KDE Plasma do.",
+                "This desktop can show its screen to apps but cannot let them control it, and \
+                 DeskLink needs both. GNOME and KDE Plasma can; {} cannot on every desktop.",
                 portal_backend(family)
             ),
             None,
         )
+        .tech("The portal has ScreenCast but no RemoteDesktop interface.")
     } else if !any(&["pipewiresrc"]) {
         check(
             "share",
             "Share this screen and let the phone control it",
             Level::Missing,
-            "Wayland screen sharing reads PipeWire video through GStreamer's pipewire plugin.",
+            "A part DeskLink needs to share this screen is not installed.",
             Some(GST_PIPEWIRE),
         )
+        .tech("Needs GStreamer pipewiresrc (the PipeWire plugin).")
     } else if !encoder {
         check(
             "share",
             "Share this screen and let the phone control it",
             Level::Missing,
-            "The VP8 video encoder (vp8enc, in gst-plugins-good) is not installed.",
+            "The video encoder DeskLink sends this screen with is not installed.",
             Some(GST_GOOD),
         )
+        .tech("Needs GStreamer vp8enc (gst-plugins-good).")
     } else {
         check(
             "share",
             "Share this screen and let the phone control it",
             Level::Ok,
-            "Through the desktop portal. You approve each session at this computer.",
+            format!("{SHARE_THROUGH_DESKTOP} You approve each session at this computer."),
             None,
         )
+        .tech("xdg-desktop-portal ScreenCast and RemoteDesktop, PipeWire video.")
     });
 
     // The phone's screen shown here.
@@ -613,7 +637,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
                 "view",
                 "Phone screen on this computer",
                 Level::Ok,
-                "A video decoder is installed.",
+                "The phone's screen can be shown here.",
                 None,
             )
         } else {
@@ -621,9 +645,10 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
                 "view",
                 "Phone screen on this computer",
                 Level::Missing,
-                "No VP8 or H.264 decoder found, so the phone's screen cannot be shown.",
+                "The phone's screen cannot be shown: the video decoders are not installed.",
                 Some(GST_VIDEO),
             )
+            .tech("No GStreamer VP8 or H.264 decoder (vp8dec, avdec_h264, openh264dec, vah264dec).")
         },
     );
 
@@ -633,45 +658,50 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             "sound",
             "Sound with the phone",
             Level::Missing,
-            "Needs GStreamer's PipeWire plugin.",
+            "A sound part DeskLink needs is not installed.",
             Some(GST_PIPEWIRE),
         )
+        .tech("Needs GStreamer pipewiresrc and pipewiresink.")
     } else if !has("opusenc") || !has("opusdec") {
         check(
             "sound",
             "Sound with the phone",
             Level::Missing,
-            "Needs the Opus codec.",
+            "The sound codec DeskLink uses is not installed.",
             Some(GST_BASE),
         )
+        .tech("Needs GStreamer opusenc and opusdec (gst-plugins-base).")
     } else if !probe.pipewire_socket && probe.flatpak {
         check(
             "sound",
             "Sound with the phone",
             Level::Missing,
-            "This Flatpak cannot reach PipeWire. Allow it with `flatpak override --user \
-             --filesystem=xdg-run/pipewire-0 derx06.desklink.com` and restart DeskLink.",
+            "This Flatpak is not allowed to use the sound system. Allow it with \
+             `flatpak override --user --filesystem=xdg-run/pipewire-0 derx06.desklink.com` and \
+             restart DeskLink.",
             None,
         )
+        .tech("No $XDG_RUNTIME_DIR/pipewire-0 in the sandbox.")
     } else if !probe.pipewire_socket {
         let pulse = if probe.pulse_socket {
-            "This computer runs PulseAudio alone. "
+            "This computer's sound system is the older PulseAudio. "
         } else {
-            "No sound server answered. "
+            "No sound system answered. "
         };
         check(
             "sound",
             "Sound with the phone",
             Level::Missing,
-            format!("{pulse}Sound with the phone needs PipeWire (with its PulseAudio layer, so other apps keep working)."),
+            format!("{pulse}Sound with the phone needs PipeWire, its successor (other apps keep working)."),
             Some(PIPEWIRE),
         )
+        .tech("No $XDG_RUNTIME_DIR/pipewire-0 socket.")
     } else {
         check(
             "sound",
             "Sound with the phone",
             Level::Ok,
-            "PipeWire is running.",
+            "The sound system is ready.",
             None,
         )
     });
@@ -689,7 +719,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
                 "extend",
                 "Phone as a second display (Extend)",
                 Level::Ok,
-                "The portal can add a virtual monitor.",
+                "This desktop can add a second screen for the phone.",
                 None,
             )
         } else {
@@ -698,14 +728,15 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
                 "Phone as a second display (Extend)",
                 Level::Missing,
                 if wayland {
-                    "This desktop cannot add a virtual monitor for DeskLink (GNOME can; other \
-                     compositors either lack the portal source or only share a workspace)."
+                    "This desktop cannot add a second screen for DeskLink. GNOME and KDE Plasma \
+                     can."
                 } else {
-                    "Needs a Wayland session whose portal can add a virtual monitor (GNOME \
-                     can). X11 sessions cannot."
+                    "Needs a Wayland session of GNOME or KDE Plasma (chosen when you log in). X11 \
+                     sessions cannot add a second screen."
                 },
                 None,
             )
+            .tech("Needs the ScreenCast portal's virtual source (AvailableSourceTypes bit 4) on Mutter or KWin.")
         },
     );
 
@@ -717,7 +748,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
                 "glide",
                 "Move the pointer to the phone (Glide)",
                 Level::Ok,
-                "The portal can capture keyboard and pointer.",
+                "This desktop can hand the mouse and keyboard to the phone.",
                 None,
             )
         } else {
@@ -725,10 +756,11 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
                 "glide",
                 "Move the pointer to the phone (Glide)",
                 Level::Missing,
-                "Needs a Wayland session whose portal offers input capture (GNOME 45 or later, \
-                 or KDE Plasma 6.1 or later).",
+                "This desktop cannot hand the mouse and keyboard to another device. GNOME 45 \
+                 or later and KDE Plasma 6.1 or later can, in a Wayland session.",
                 None,
             )
+            .tech("Needs the InputCapture portal with keyboard and pointer (SupportedCapabilities 3).")
         },
     );
 
@@ -738,7 +770,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             "lock",
             "Lock and unlock from the phone",
             Level::Ok,
-            "logind (or elogind) is running.",
+            "Your system's session service is running.",
             None,
         )
     } else {
@@ -746,11 +778,12 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             "lock",
             "Lock and unlock from the phone",
             Level::Limited,
-            "logind or elogind is not running. Locking falls back to the desktop's own \
-             screensaver service; unlocking with the phone and noticing the computer waking \
-             from sleep need logind or elogind.",
+            "Your system has no session service (logind or elogind). Locking uses the \
+             desktop's own screen saver instead; unlocking with the phone and noticing when the \
+             computer wakes need one.",
             None,
         )
+        .tech("org.freedesktop.login1 is not on the system bus.")
     });
 
     // Unlocking with the phone: only where the lock screen is known to obey
@@ -760,7 +793,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             "unlock",
             "Unlock with the phone",
             Level::Ok,
-            "This desktop's lock screen accepts unlock requests from logind.",
+            "This desktop's lock screen accepts unlocking from the phone.",
             None,
         ),
         _ => check(
@@ -780,7 +813,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             "autostart",
             "Start at login",
             Level::Limited,
-            "This session does not run XDG autostart entries. Add `exec desklink \
+            "This session does not start apps at login by itself. Add `exec desklink \
              --gapplication-service` to your window manager's startup (i3 and sway config, \
              Hyprland `exec-once`, openbox autostart), or use dex.",
             None,
@@ -789,7 +822,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             "autostart",
             "Start at login",
             Level::Limited,
-            "Most compositors of this kind do not run XDG autostart entries. Add \
+            "Desktops of this kind do not start apps at login by themselves. Add \
              `exec desklink --gapplication-service` to the compositor's config (sway `exec`, \
              Hyprland `exec-once`), or run dex.",
             None,
@@ -798,11 +831,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             "autostart",
             "Start at login",
             Level::Ok,
-            if probe.flatpak {
-                "Through the Background portal."
-            } else {
-                "Through an XDG autostart entry."
-            },
+            "DeskLink can start when you log in.",
             None,
         ),
     });
@@ -852,14 +881,17 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
         )
     });
     if !probe.runtime_dir {
-        rows.push(check(
-            "runtime",
-            "Runtime folder",
-            Level::Limited,
-            "XDG_RUNTIME_DIR is not set, so shared terminals and media art are off. A \
-             normal login session sets it.",
-            None,
-        ));
+        rows.push(
+            check(
+                "runtime",
+                "Runtime folder",
+                Level::Limited,
+                "This session has no private folder for running apps, so shared terminals and \
+             media art are off. A normal login sets one up.",
+                None,
+            )
+            .tech("XDG_RUNTIME_DIR is not set."),
+        );
     }
     rows
 }
@@ -875,6 +907,9 @@ pub fn as_text(rows: &[Check], distro: Option<Distro>) -> String {
             Level::Missing => "missing",
         };
         text.push_str(&format!("[{mark}] {}: {}\n", row.title, row.detail));
+        if !row.tech.is_empty() {
+            text.push_str(&format!("           ({})\n", row.tech));
+        }
         if let Some(packages) = row.install.filter(|_| row.level != Level::Ok) {
             for line in packages.command(distro).lines() {
                 text.push_str(&format!("           {line}\n"));
@@ -990,7 +1025,7 @@ fn spawn_probe(log: bool, after: std::time::Duration) {
             let rows = evaluate(&Probe::real());
             if log {
                 for row in rows.iter().filter(|row| row.level == Level::Missing) {
-                    eprintln!("[DeskLink] {}: {}", row.title, row.detail);
+                    eprintln!("[DeskLink] {}: {} {}", row.title, row.detail, row.tech);
                 }
             }
             store(rows);
@@ -1398,7 +1433,7 @@ mod tests {
         };
         let rows = evaluate(&probe);
         assert_eq!(level(&rows, "share"), Level::Ok);
-        assert!(row(&rows, "share").detail.contains("X11 directly"));
+        assert!(row(&rows, "share").tech.contains("X11 directly"));
         // And needs the X11 capture element.
         let mut bare = probe.clone();
         bare.elements.remove("ximagesrc");
@@ -1580,7 +1615,7 @@ mod tests {
         });
         let share = row(&rows, "share");
         assert_eq!(share.level, Level::Missing);
-        assert!(share.detail.contains("RemoteDesktop"));
+        assert!(share.tech.contains("RemoteDesktop"));
     }
 
     #[test]
@@ -1601,7 +1636,11 @@ mod tests {
         let rows = evaluate(&probe);
         let link = row(&rows, "link");
         assert_eq!(link.level, Level::Missing);
-        assert!(link.detail.contains("webrtcbin") && link.detail.contains("nicesrc"));
+        assert!(link.tech.contains("webrtcbin") && link.tech.contains("nicesrc"));
+        assert!(
+            !link.detail.contains("webrtcbin"),
+            "plain words for the person"
+        );
         let packages = link.install.unwrap();
         assert!(packages.debian.contains("gstreamer1.0-plugins-bad"));
         assert!(packages.fedora.contains("gstreamer1-plugins-bad"));
@@ -1618,7 +1657,7 @@ mod tests {
         });
         let sound = row(&rows, "sound");
         assert_eq!(sound.level, Level::Missing);
-        assert!(sound.detail.contains("PulseAudio alone"));
+        assert!(sound.detail.contains("older PulseAudio"));
         // A Flatpak sees the socket only with `xdg-run/pipewire-0`.
         let rows = evaluate(&Probe {
             pipewire_socket: false,
@@ -1698,7 +1737,7 @@ mod tests {
             ..full()
         });
         assert_eq!(level(&rows, "bus"), Level::Missing);
-        assert!(row(&rows, "bus").detail.contains("dbus-run-session"));
+        assert!(row(&rows, "bus").tech.contains("dbus-run-session"));
         assert_eq!(level(&rows, "session"), Level::Missing);
         assert_eq!(level(&rows, "storage"), Level::Missing);
         assert_eq!(level(&rows, "runtime"), Level::Limited);
@@ -1809,7 +1848,7 @@ mod tests {
         for row in &rows {
             assert!(text.contains(row.title), "{}", row.title);
         }
-        assert!(text.contains("[missing] Phone link (WebRTC)"));
+        assert!(text.contains("[missing] Phone link"));
         assert!(text.contains("sudo dnf install gstreamer1-plugins-bad-free"));
         assert!(!text.contains("sudo apt"));
         assert!(as_text(&rows, None).contains("Arch: gst-plugins-bad libnice"));
@@ -1832,6 +1871,63 @@ mod tests {
         assert_eq!(ids.len(), rows.len());
         for row in rows {
             assert!(!row.detail.is_empty() && !row.title.is_empty());
+        }
+    }
+
+    /// The person reads plain words; component and service names stay in the
+    /// technical note (the copied report, `--check` and the log).
+    #[test]
+    fn details_name_no_components_and_the_report_keeps_them() {
+        let jargon = [
+            "GStreamer",
+            "WebRTC",
+            "portal",
+            "D-Bus",
+            "StatusNotifier",
+            "XDG_",
+            "webrtcbin",
+            "vp8",
+            "VP8",
+            "pipewiresrc",
+            "logind's",
+            "virtual monitor",
+        ];
+        let mut machines = vec![Probe::default(), full()];
+        let mut bare = full();
+        bare.elements.clear();
+        bare.portals.clear();
+        bare.tray_host = false;
+        bare.session_names = names(&[PORTAL]);
+        machines.push(bare);
+        machines.push(Probe {
+            desktop: "sway".into(),
+            portals: names(&["ScreenCast"]),
+            ..full()
+        });
+        machines.push(Probe {
+            flatpak: true,
+            pipewire_socket: false,
+            ..full()
+        });
+        for probe in &machines {
+            let rows = evaluate(probe);
+            for row in &rows {
+                // A package to install is named as the distribution names it.
+                let words = row.detail.replace("xdg-desktop-portal", "");
+                for word in jargon {
+                    assert!(
+                        !words.contains(word),
+                        "{}: {:?} in {:?}",
+                        row.id,
+                        word,
+                        row.detail
+                    );
+                }
+            }
+            let text = as_text(&rows, None);
+            for row in rows.iter().filter(|row| !row.tech.is_empty()) {
+                assert!(text.contains(&row.tech), "{}", row.id);
+            }
         }
     }
 
@@ -1952,7 +2048,7 @@ mod tests {
         let mut probe = full();
         probe.elements.remove("vp8enc");
         assert_eq!(level(&evaluate(&probe), "share"), Level::Missing);
-        assert!(row(&evaluate(&probe), "share").detail.contains("vp8enc"));
+        assert!(row(&evaluate(&probe), "share").tech.contains("vp8enc"));
         probe.elements.insert("x264enc".into());
         probe.elements.insert("vah264enc".into());
         assert_eq!(level(&evaluate(&probe), "share"), Level::Missing);
