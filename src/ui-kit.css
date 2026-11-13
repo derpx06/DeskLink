@@ -318,3 +318,14 @@ progressbar.dl-progress.done > trough > progress { background-color: @dl_success
 
 /* ── The component sheet (developer gallery) ───────────────────────────── */
 .dl-sheet { background-color: @dl_bg; color: @dl_text; }
+
+/* Home's "Finish setting up": the steps sit on the card itself, edge to edge
+   between hairlines, not in a second box inside it. */
+#finish-setup .dl-needs {
+  margin: 0 -16px;
+  border-radius: 0;
+  background: none;
+  box-shadow: none;
+}
+#finish-setup .dl-needs > row { border-radius: 0; }
+#finish-setup .dl-needs > row:first-child { border-top: 1px solid @dl_hairline; }
