@@ -1758,7 +1758,9 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 18] = [
+const KNOWN_BUILDS: [&str; 19] = [
+    // Notifications: one plan; a link change never re-banners.
+    "978339f19e09ed6c22f083944bb9a2641c2ef3c481b9d0351ab5b3f7cc305149",
     // The current build (no wobbling window while a phone looks at this screen).
     "f7b1d5832081bd42eb8aaa027e115a3963208f9490d73840539df50f829bd347",
     // Links checked, focus kept only while open.
