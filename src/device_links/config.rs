@@ -168,6 +168,9 @@ pub struct AppSettings {
     /// Keep the caller's name and number on a notification while this
     /// computer is locked. Off by default: a lock screen is public.
     pub caller_on_lock_screen: bool,
+    /// Play a soft sound here while a phone rings (on by default; quiet in
+    /// Do Not Disturb or with "Show calls" off).
+    pub ring_on_computer: bool,
 }
 
 impl Default for AppSettings {
@@ -200,6 +203,7 @@ impl Default for AppSettings {
             pause_media_on_call: true,
             calls_on_computer: true,
             caller_on_lock_screen: false,
+            ring_on_computer: true,
         }
     }
 }

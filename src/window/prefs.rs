@@ -937,6 +937,14 @@ fn calls_group(
             DaemonCommand::SetCallerOnLockScreen,
             |settings: &AppSettings, _: &str| settings.caller_on_lock_screen,
         ),
+        (
+            "Ring on this computer",
+            "A soft sound here while a phone rings. Quiet in Do Not Disturb.",
+            "audio-volume-low-symbolic",
+            settings.ring_on_computer,
+            DaemonCommand::SetRingOnComputer,
+            |settings: &AppSettings, _: &str| settings.ring_on_computer,
+        ),
     ] {
         let row = adw::SwitchRow::builder()
             .title(title)

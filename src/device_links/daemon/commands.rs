@@ -67,6 +67,7 @@ pub enum DaemonCommand {
     SetPauseMediaOnCall(bool),
     SetCallsOnComputer(bool),
     SetCallerOnLockScreen(bool),
+    SetRingOnComputer(bool),
     /// Show a phone's notifications here (device id, shown).
     SetShowNotifications(String, bool),
     /// The user answered "Not now" to the top-bar extension offer.
@@ -316,6 +317,9 @@ impl DaemonWorker {
             }
             DaemonCommand::SetCallsOnComputer(on) => {
                 self.update_settings(|settings| settings.calls_on_computer = on)
+            }
+            DaemonCommand::SetRingOnComputer(on) => {
+                self.update_settings(|settings| settings.ring_on_computer = on)
             }
             DaemonCommand::SetCallerOnLockScreen(on) => {
                 self.update_settings(|settings| settings.caller_on_lock_screen = on)

@@ -4,7 +4,7 @@
     {"title": "Connection", "rows": ["Keep this computer awake while a phone is connected", "Let this phone keep the computer awake", "Start at Login"]},
     {"title": "Notifications", "rows": ["Show {phone}'s notifications here", "Command alerts", "Send this computer's notifications to the phone", "Share Do Not Disturb with {phone}"]},
     {"title": "Clipboard", "rows": ["Share this computer's clipboard with phones"]},
-    {"title": "Calls", "rows": ["Pause music during calls", "Show calls on this computer", "Show caller names on the lock screen", "Name callers from {phone}'s contacts"], "deskOnlyRows": ["Show calls on this computer", "Show caller names on the lock screen"]},
+    {"title": "Calls", "rows": ["Pause music during calls", "Show calls on this computer", "Show caller names on the lock screen", "Ring on this computer", "Name callers from {phone}'s contacts"], "deskOnlyRows": ["Show calls on this computer", "Show caller names on the lock screen", "Ring on this computer"]},
     {"title": "Sound", "rows": ["Phones may hear this computer's microphone"]},
     {"title": "Control", "rows": ["Glide onto {phone}", "Let the phone control mouse and keyboard"]},
     {"title": "Files", "rows": ["Bucket with {phone}", "Downloads folder", "Accept photos and screenshots from {phone}"]},

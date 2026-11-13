@@ -214,6 +214,15 @@ impl Page {
         let header = gtk::Box::builder().spacing(8).build();
         header.append(&search);
         header.append(&refresh);
+        let dial = ui_kit::icon_button("desklink-call-symbolic", "Dial a number");
+        dial.set_valign(gtk::Align::Center);
+        let weak = win.downgrade();
+        dial.connect_clicked(move |_| {
+            if let Some(win) = weak.upgrade() {
+                win.show_dial_pad();
+            }
+        });
+        header.append(&dial);
         let count = wrapped("", &["dl-secondary"]);
         count.set_xalign(0.0);
 

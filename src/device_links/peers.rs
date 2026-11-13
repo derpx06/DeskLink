@@ -106,6 +106,8 @@ mod tests {
             // Windows and widgets (they close with their device's page).
             "remote_control.rs:OPEN_WINDOWS",
             "shell_dbus.rs:LIVE_SINCE",
+            "window/calls.rs:ANSWERED_HERE",
+            "window/calls.rs:LAST_LIVE",
             "window/transfers.rs:SHOWN",
             "window/transfers.rs:FAILED",
             "window/transfers.rs:WAITING",

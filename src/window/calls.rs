@@ -29,6 +29,71 @@ pub(super) fn timer_words(started_at_ms: i64, now_ms: i64) -> String {
     }
 }
 
+/// What a key does on a call (`ringing`: one is ringing, `talking`: one is
+/// up). Enter/A answer, Esc/D decline, S silence, M mute or unmute.
+pub(crate) fn shortcut_action(
+    key: &str,
+    ringing: bool,
+    talking: bool,
+    muted: bool,
+) -> Option<&'static str> {
+    match (key.to_lowercase().as_str(), ringing, talking) {
+        ("return" | "kp_enter" | "a", true, _) => Some("answer"),
+        ("escape" | "d", true, _) => Some("decline"),
+        ("s", true, _) => Some("silence"),
+        ("m", false, true) => Some(if muted { "unmute" } else { "mute" }),
+        _ => None,
+    }
+}
+
+/// The key hint shown on a button's tooltip.
+fn key_hint(action: &str) -> Option<&'static str> {
+    match action {
+        "answer" => Some("A or Enter"),
+        "decline" => Some("D or Esc"),
+        "silence" => Some("S"),
+        "mute" | "unmute" => Some("M"),
+        _ => None,
+    }
+}
+
+/// Where the sound is, said once after Answer from here: the computer does
+/// not carry a call's audio (Android keeps it from apps).
+pub(crate) fn audio_hint(answered_here: bool, state: CallState) -> Option<&'static str> {
+    (answered_here && state == CallState::Talking).then_some(
+        "Talk on your phone. The call's sound stays on the phone. Pick it up, or switch it to speaker.",
+    )
+}
+
+/// "Call ended, 2:31" for a call that was up; `None` when it never was.
+pub(crate) fn ended_summary(
+    call: &PhoneCall,
+    ready: bool,
+    phone: &str,
+    now_ms: i64,
+) -> Option<String> {
+    let started = call
+        .started_at
+        .filter(|_| call.state == CallState::Talking)?;
+    Some(if ready {
+        format!("Call ended, {}", timer_words(started, now_ms))
+    } else {
+        format!("Lost contact with {phone} during the call")
+    })
+}
+
+/// Whether a ringing call plays the soft sound here.
+pub(crate) fn should_ring(ring_setting: bool, shown: bool, banners_shown: Option<bool>) -> bool {
+    ring_setting && shown && banners_shown != Some(false)
+}
+
+thread_local! {
+    /// Calls answered from this computer (shown the audio hint).
+    static ANSWERED_HERE: RefCell<std::collections::HashSet<String>> = RefCell::default();
+    /// Each phone's last live call, for the "Call ended" summary.
+    static LAST_LIVE: RefCell<std::collections::HashMap<String, PhoneCall>> = RefCell::default();
+}
+
 fn now_ms() -> i64 {
     glib::real_time() / 1000
 }
@@ -186,6 +251,10 @@ pub(super) fn card(daemon: &DaemonHandle, device: &DeviceView, compact: bool) ->
         detail.set_widget_name(&format!("call-timer:{started}"));
     }
     words.append(&detail);
+    let answered = ANSWERED_HERE.with(|set| set.borrow().contains(&call.call_id));
+    if let Some(hint) = audio_hint(answered, call.state) {
+        words.append(&wrapped(hint, &["dl-secondary"]));
+    }
     card.append(&words);
     card.update_property(&[gtk::accessible::Property::Label(&format!(
         "{caller}, {}",
@@ -225,8 +294,18 @@ pub(super) fn card(daemon: &DaemonHandle, device: &DeviceView, compact: bool) ->
         if !can {
             button.set_tooltip_text(Some("Update DeskLink on the phone to answer here"));
         }
+        if let Some(keys) = key_hint(action) {
+            if can {
+                button.set_tooltip_text(Some(&format!("{label} ({keys})")));
+            }
+            button.update_property(&[gtk::accessible::Property::KeyShortcuts(keys)]);
+        }
         let (daemon, id) = (daemon.clone(), device.id.clone());
+        let call_id = call.call_id.clone();
         button.connect_clicked(move |_| {
+            if action == "answer" {
+                ANSWERED_HERE.with(|set| set.borrow_mut().insert(call_id.clone()));
+            }
             daemon.send(DaemonCommand::Telephony(
                 id.clone(),
                 action.to_string(),
@@ -269,6 +348,7 @@ fn calling(devices: &[DeviceView]) -> Option<&DeviceView> {
 /// The bar over every page but that phone's own overview (which has the
 /// card), redrawn when the call changes; its timer ticks in place.
 pub(super) fn update_bar(win: &DesklinkWindow, daemon: &DaemonHandle, devices: &[DeviceView]) {
+    announce_ends(win, devices);
     let imp = win.imp();
     let on_overview = |device: &DeviceView| {
         imp.page.borrow().as_str() == "home"
@@ -322,6 +402,97 @@ fn tick(root: &gtk::Widget) {
             }
         }
     }
+}
+
+/// One soft chime from the sound theme, never blocking; silent where no
+/// player exists.
+fn ring_sound() {
+    let _ = std::process::Command::new("canberra-gtk-play")
+        .args(["-i", "phone-incoming-call", "-V", "-6"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|mut child| std::thread::spawn(move || drop(child.wait())));
+}
+
+/// Says how each call ended (its length, or that contact was lost).
+fn announce_ends(win: &DesklinkWindow, devices: &[DeviceView]) {
+    for device in devices.iter().filter(|device| device.trusted) {
+        let live = device
+            .call_status
+            .as_ref()
+            .map(CallStatus::primary)
+            .filter(|call| call.state == CallState::Talking && call.started_at.is_some())
+            .filter(|_| device.feature_transport_ready);
+        if let Some(call) = live {
+            LAST_LIVE.with(|last| last.borrow_mut().insert(device.id.clone(), call.clone()));
+        } else if device.call_status.is_none() || !device.feature_transport_ready {
+            if let Some(call) = LAST_LIVE.with(|last| last.borrow_mut().remove(&device.id)) {
+                ANSWERED_HERE.with(|set| set.borrow_mut().remove(&call.call_id));
+                if let Some(text) = ended_summary(
+                    &call,
+                    device.feature_transport_ready,
+                    &device.name,
+                    now_ms(),
+                ) {
+                    win.show_feature_toast(&text);
+                }
+            }
+        }
+    }
+}
+
+/// Keys on the whole window act on a ringing or live call, unless the
+/// person is typing.
+pub(super) fn install_shortcuts(win: &DesklinkWindow) {
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let weak = win.downgrade();
+    keys.connect_key_pressed(move |_, key, _, state| {
+        let Some(win) = weak.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        if state.intersects(
+            gtk::gdk::ModifierType::CONTROL_MASK
+                | gtk::gdk::ModifierType::ALT_MASK
+                | gtk::gdk::ModifierType::SUPER_MASK,
+        ) || gtk::prelude::GtkWindowExt::focus(&win).is_some_and(|focus| {
+            focus.is::<gtk::Editable>() || focus.ancestor(gtk::Text::static_type()).is_some()
+        }) {
+            return glib::Propagation::Proceed;
+        }
+        let Some(name) = key.name() else {
+            return glib::Propagation::Proceed;
+        };
+        let (Some(daemon), devices) = (win.daemon(), win.paired_devices()) else {
+            return glib::Propagation::Proceed;
+        };
+        let Some(device) = calling(&devices) else {
+            return glib::Propagation::Proceed;
+        };
+        let Some(status) = device.call_status.as_ref() else {
+            return glib::Propagation::Proceed;
+        };
+        let talking = status.primary().state == CallState::Talking;
+        match shortcut_action(&name, status.ringing().is_some(), talking, status.muted) {
+            Some(action) if can_send_feature(device, PACKET_TYPE_TELEPHONY_REQUEST) => {
+                if action == "answer" {
+                    if let Some(call) = status.ringing() {
+                        ANSWERED_HERE.with(|set| set.borrow_mut().insert(call.call_id.clone()));
+                    }
+                }
+                daemon.send(DaemonCommand::Telephony(
+                    device.id.clone(),
+                    action.to_string(),
+                    None,
+                ));
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    });
+    win.add_controller(keys);
 }
 
 /// A notification for each call ringing here — unless the top-bar
@@ -400,6 +571,15 @@ pub(super) fn notify(win: &DesklinkWindow, devices: &[DeviceView]) {
             }
         }
         app.send_notification(Some(&format!("call-{}", device.id)), &notification);
+        let banners = crate::device_links::dnd::GnomeBanners::open()
+            .and_then(|banners| crate::device_links::dnd::Banners::shown(&banners));
+        if should_ring(
+            crate::device_links::config::app_settings().ring_on_computer,
+            shown,
+            banners,
+        ) {
+            ring_sound();
+        }
     }
 }
 
@@ -591,6 +771,9 @@ fn confirm_telephony(
     dialog.set_close_response("cancel");
     DIAL_DIALOG.with(|slot| *slot.borrow_mut() = Some(dialog.downgrade()));
     dialog.connect_response(Some("go"), move |_, _| {
+        if action == "dial" {
+            crate::device_links::dial_recents::add(&number);
+        }
         daemon.send(DaemonCommand::Telephony(
             phone.id.clone(),
             action.to_string(),
@@ -752,5 +935,95 @@ mod tests {
                     || path.ends_with("src/application.rs")),
             "{found:?}"
         );
+    }
+
+    #[test]
+    fn keys_map_to_the_call_actions() {
+        assert_eq!(
+            shortcut_action("Return", true, false, false),
+            Some("answer")
+        );
+        assert_eq!(shortcut_action("a", true, false, false), Some("answer"));
+        assert_eq!(
+            shortcut_action("Escape", true, false, false),
+            Some("decline")
+        );
+        assert_eq!(shortcut_action("D", true, false, false), Some("decline"));
+        assert_eq!(shortcut_action("s", true, false, false), Some("silence"));
+        assert_eq!(shortcut_action("m", false, true, false), Some("mute"));
+        assert_eq!(shortcut_action("m", false, true, true), Some("unmute"));
+        // Nothing ringing: Enter and Esc leave the call alone.
+        assert_eq!(shortcut_action("Return", false, true, false), None);
+        assert_eq!(shortcut_action("Escape", false, true, false), None);
+        assert_eq!(shortcut_action("a", false, false, false), None);
+    }
+
+    #[test]
+    fn the_audio_hint_shows_only_for_a_call_answered_here() {
+        assert!(audio_hint(true, CallState::Talking)
+            .is_some_and(|h| h.starts_with("Talk on your phone")));
+        assert_eq!(audio_hint(false, CallState::Talking), None);
+        assert_eq!(audio_hint(true, CallState::Ringing), None);
+    }
+
+    #[test]
+    fn a_call_that_was_up_ends_with_its_length_or_lost_contact() {
+        let mut call = PhoneCall {
+            call_id: "1".into(),
+            state: CallState::Talking,
+            contact_name: None,
+            number: None,
+            started_at: Some(1_000),
+            incoming: true,
+        };
+        assert_eq!(
+            ended_summary(&call, true, "Pixel", 1_000 + 151_000).as_deref(),
+            Some("Call ended, 2:31")
+        );
+        assert_eq!(
+            ended_summary(&call, false, "Pixel", 5_000).as_deref(),
+            Some("Lost contact with Pixel during the call")
+        );
+        call.state = CallState::Ringing;
+        assert_eq!(ended_summary(&call, true, "Pixel", 5_000), None);
+    }
+
+    #[test]
+    fn the_ring_is_quiet_in_do_not_disturb_and_when_off() {
+        assert!(should_ring(true, true, Some(true)));
+        assert!(should_ring(true, true, None), "no such setting: not DND");
+        assert!(!should_ring(true, true, Some(false)));
+        assert!(!should_ring(false, true, Some(true)));
+        assert!(!should_ring(true, false, Some(true)));
+    }
+
+    #[test]
+    fn the_call_bar_has_labelled_buttons_with_key_hints() {
+        crate::test_display::run(|| {
+            let (daemon, _commands) = DaemonHandle::detached();
+            let info =
+                crate::device_links::device_info::DeviceInfo::local("p".into(), "Pixel".into());
+            let mut device = DeviceView::from_info(&info, "192.168.1.9".into(), true);
+            device.trusted = true;
+            device.feature_transport_ready = true;
+            device.incoming_capabilities = vec![PACKET_TYPE_TELEPHONY_REQUEST.to_string()];
+            device.call_status = Some(status(CallState::Ringing, true, false));
+            let bar = card(&daemon, &device, true).expect("a card for a ringing call");
+            let mut tips = Vec::new();
+            fn walk(widget: &gtk::Widget, tips: &mut Vec<String>) {
+                if let Some(tip) = widget.tooltip_text() {
+                    tips.push(tip.to_string());
+                }
+                let mut child = widget.first_child();
+                while let Some(c) = child {
+                    walk(&c, tips);
+                    child = c.next_sibling();
+                }
+            }
+            walk(bar.upcast_ref(), &mut tips);
+            for want in ["Answer (A or Enter)", "Decline (D or Esc)", "Silence (S)"] {
+                assert!(tips.iter().any(|t| t == want), "{want} in {tips:?}");
+            }
+        });
     }
 }
