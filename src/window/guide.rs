@@ -99,9 +99,9 @@ fn not_now(phone: Option<&PhoneFacts>, needs: &Needs) -> Option<(String, Vec<(St
     };
     let phone = phone?;
     let need = match feature_of(action) {
-        Some(feature) => requirements::blocker(feature, phone, true),
+        Some(feature) => requirements::blocker(feature, phone),
         // Reachability is judged before the feature.
-        None if phone.reach != Reach::Ready => requirements::blocker(Feature::HandOff, phone, true),
+        None if phone.reach != Reach::Ready => requirements::blocker(Feature::HandOff, phone),
         None => None,
     }?;
     let gap = if need.title.ends_with(['…', '.']) {
