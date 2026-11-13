@@ -20,6 +20,8 @@ use crate::link_glyph::Presentation;
 
 /// The titles of the pairing dialog (the window closes it when a scan pairs).
 pub(super) const PAIR_TITLE: &str = "Pair another phone";
+/// The same dialog while no phone is paired yet: there is no "another".
+pub(super) const PAIR_FIRST_TITLE: &str = "Pair a phone";
 pub(super) const PAIR_CODE_TITLE: &str = "Pair with a code";
 /// A phone this computer asked that did not accept (refused, or let it lapse).
 pub(super) const NOT_ACCEPTED: &str = "Not accepted on the phone";
@@ -206,7 +208,11 @@ impl DesklinkWindow {
         daemon.send(DaemonCommand::Discover);
 
         let dialog = adw::Dialog::builder()
-            .title(if with_qr { PAIR_TITLE } else { PAIR_CODE_TITLE })
+            .title(match with_qr {
+                false => PAIR_CODE_TITLE,
+                true if daemon.devices().iter().any(|device| device.trusted) => PAIR_TITLE,
+                true => PAIR_FIRST_TITLE,
+            })
             .content_width(520)
             .content_height(if with_qr { 680 } else { 440 })
             .build();
@@ -255,11 +261,12 @@ impl DesklinkWindow {
             .selection_mode(gtk::SelectionMode::None)
             .css_classes(["dl-row-group"])
             .build();
-        list.set_placeholder(Some(&empty_state(
+        let looking = empty_state(
             "desklink-search-symbolic",
             "Looking for phones…",
-            "Keep both devices on the same Wi-Fi network.",
-        )));
+            "Open DeskLink on your phone, on the same Wi-Fi as this computer.",
+        );
+        list.set_placeholder(Some(&looking));
         let nearby = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(8)
@@ -303,13 +310,13 @@ impl DesklinkWindow {
         });
 
         let snapshot = Rc::new(RefCell::new(None));
-        populate_discovery_list(&list, &daemon, &snapshot);
+        populate_discovery_list(&list, &looking, &daemon, &snapshot);
         let weak_list = list.downgrade();
         glib::timeout_add_seconds_local(1, move || {
             let Some(list) = weak_list.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            populate_discovery_list(&list, &daemon, &snapshot);
+            populate_discovery_list(&list, &looking, &daemon, &snapshot);
             glib::ControlFlow::Continue
         });
 
@@ -325,6 +332,7 @@ impl DesklinkWindow {
 /// something new.
 fn populate_discovery_list(
     list: &gtk::ListBox,
+    placeholder: &gtk::Box,
     daemon: &DaemonHandle,
     last_snapshot: &RefCell<Option<String>>,
 ) {
@@ -352,7 +360,10 @@ fn populate_discovery_list(
         return;
     }
     last_snapshot.replace(Some(snapshot));
+    // `remove_all` takes the placeholder with the rows: without putting it
+    // back the dialog stood empty while nothing was found.
     list.remove_all();
+    list.set_placeholder(Some(placeholder));
     for device in devices {
         list.append(&discovery_row(daemon, device));
     }
@@ -1017,6 +1028,7 @@ mod welcome_tests {
         device.last_error = Some("Pairing failed".into());
         assert_eq!(discovery_subtitle(&device), "Phone · Pairing failed");
         assert_eq!(PAIR_TITLE, "Pair another phone");
+        assert_eq!(PAIR_FIRST_TITLE, "Pair a phone");
         assert_eq!(PAIR_CODE_TITLE, "Pair with a code");
     }
 }

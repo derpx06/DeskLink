@@ -1211,7 +1211,9 @@ impl DesklinkWindow {
                     if let Some(dialog) = self.visible_dialog() {
                         if matches!(
                             dialog.title().as_str(),
-                            pairing::PAIR_TITLE | pairing::PAIR_CODE_TITLE
+                            pairing::PAIR_TITLE
+                                | pairing::PAIR_FIRST_TITLE
+                                | pairing::PAIR_CODE_TITLE
                         ) {
                             dialog.close();
                             was_pairing = true;
