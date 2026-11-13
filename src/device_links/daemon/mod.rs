@@ -25,9 +25,9 @@ pub(super) const HEARTBEAT_IDLE: std::time::Duration = std::time::Duration::from
 
 /// Declare a peer gone after this much silence — three missed probes.
 ///
-/// Sits deliberately below Android's 120s idle reaper, so the two sides agree
-/// a link is dead at roughly the same moment instead of one of them quietly
-/// tearing down a link the other still believes in. That disagreement is the
+/// Sits just below Android's 35 s reader idle limit (`LanLink.IDLE_TIMEOUT_MILLIS`),
+/// so the two sides agree a link is dead at roughly the same moment instead
+/// of one of them quietly tearing down a link the other still believes in. That disagreement is the
 /// livelock: it has been observed in both directions, once with the desktop
 /// discarding 170 of the phone's fresh sockets while holding a dead one, and
 /// once with the phone refusing to dial a desktop that was idle and waiting.
