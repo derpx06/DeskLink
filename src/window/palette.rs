@@ -856,7 +856,7 @@ mod tests {
 
             // Enter opens the selected row: the dialog goes, then the row is
             // done. (Keyboard shortcuts: nothing in this test app answers it.)
-            palette.entry.set_text("keyboard sh");
+            palette.entry.set_text("keyboard shortc");
             assert_eq!(palette.rows(), 1);
             palette.entry.emit_by_name::<()>("activate", &[]);
             pump();

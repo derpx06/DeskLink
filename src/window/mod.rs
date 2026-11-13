@@ -4193,9 +4193,19 @@ mod jargon_tests {
             let line_start = text[..start].rfind('\n').map_or(0, |at| at + 1);
             let line = &text[line_start..start];
             let before = text[..start].trim_end();
-            let matcher = text[..start]
-                .rfind("has(&[")
-                .is_some_and(|at| !text[at..start].contains(']'));
+            // Error matchers, the jargon list itself and the search words
+            // (never shown).
+            let matcher = [
+                ("has(&[", "]"),
+                ("const JARGON", "];"),
+                ("const ROWS", "];"),
+            ]
+            .iter()
+            .any(|(open, close)| {
+                text[..start]
+                    .rfind(open)
+                    .is_some_and(|at| !text[at..start].contains(close))
+            });
             let skipped = [
                 "eprintln!",
                 "println!",
@@ -4212,7 +4222,9 @@ mod jargon_tests {
                 || ["contains(", "starts_with(", "ends_with(", "find("]
                     .iter()
                     .any(|call| before.ends_with(call));
-            if !skipped && literal.contains(' ') {
+            // A raw error the debug build fakes on purpose.
+            let fixture = literal == "the handshake failed: unexpected EOF";
+            if !skipped && !fixture && literal.contains(' ') {
                 out.push((text[..start].matches('\n').count() + 1, literal));
             }
         }
