@@ -145,6 +145,16 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
             );
         }
     }
+    if settings
+        .glide
+        .as_ref()
+        .is_some_and(|glide| glide.device == phone.id)
+        && crate::device_links::glide::phone_locked(&phone.id)
+    {
+        menu.push(TrayEntry::Label(crate::device_links::glide::unlock_words(
+            &phone.name,
+        )));
+    }
     menu.push(
         TrayEntry::action("Ring", format!("ring:{}", phone.id)).icon("audio-volume-high-symbolic"),
     );
@@ -589,6 +599,34 @@ mod tests {
                 _ => Vec::new(),
             })
             .collect()
+    }
+
+    /// A locked phone that Glide is set to: the step, as a line, until it
+    /// reports allowed again.
+    #[test]
+    fn the_tray_says_to_unlock_a_locked_glide_phone() {
+        let id = format!("tray-glide-{}", uuid::Uuid::new_v4().simple());
+        let settings = AppSettings {
+            glide: Some(crate::device_links::glide::GlideSetting {
+                device: id.clone(),
+                edge: crate::device_links::glide::Edge::Right,
+            }),
+            ..AppSettings::default()
+        };
+        let line = TrayEntry::Label(format!("Unlock Phone {id} to use Glide"));
+        let tray = || entries(&[phone(&id, true)], &settings, &[], false);
+        let report = |body: serde_json::Value| {
+            let mut packet = crate::device_links::packet::NetworkPacket::new("x");
+            if let serde_json::Value::Object(map) = body {
+                packet.body.extend(map);
+            }
+            crate::device_links::glide::on_phone_packet(&id, &packet);
+        };
+        report(serde_json::json!({"allowed": false, "reason": "locked"}));
+        assert!(tray().contains(&line));
+        report(serde_json::json!({"allowed": true}));
+        assert!(!tray().contains(&line), "cleared once allowed");
+        crate::device_links::glide::forget_phone(&id);
     }
 
     /// C2: the tray reaches "insert from phone" without the window, for a

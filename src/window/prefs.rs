@@ -85,6 +85,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         ),
         // The phone's "allowed" report changes the glide row's words.
         crate::device_links::glide::phone_allows(&device.id),
+        crate::device_links::glide::phone_locked(&device.id),
         &device.id,
         &device.name,
         approving,
@@ -2115,7 +2116,13 @@ fn unpair_row(daemon: &DaemonHandle, device: &DeviceView) -> adw::ActionRow {
 
 /// The words under the glide switch: what it does, or (until the phone says
 /// it allows glide) what to do on the phone first. Glide stays off until then.
-fn glide_explained(phone: &str, allowed: Option<bool>, computer: &str) -> String {
+fn glide_explained(phone: &str, allowed: Option<bool>, locked: bool, computer: &str) -> String {
+    if locked {
+        return format!(
+            "{}. It works again as soon as {phone} is unlocked.",
+            crate::device_links::glide::unlock_words(phone)
+        );
+    }
     if allowed == Some(true) {
         format!(
             "Move the pointer past the edge of this screen to use {phone} with this mouse and \
@@ -2173,6 +2180,7 @@ fn add_glide_rows(
         None => glide_explained(
             &phone,
             crate::device_links::glide::phone_allows(&device.id),
+            crate::device_links::glide::phone_locked(&device.id),
             &crate::device_links::glide::desk_name(),
         ),
     };
@@ -2282,7 +2290,11 @@ fn add_glide_rows(
         daemon.send(DaemonCommand::SetGlide(id.clone(), edge));
     });
     // On here, off on the phone: said, with the ask where the phone takes it.
-    if current.is_some() && crate::device_links::glide::phone_allows(&device.id) == Some(false) {
+    // (A locked phone is not "off": the row above says to unlock it.)
+    if current.is_some()
+        && crate::device_links::glide::phone_allows(&device.id) == Some(false)
+        && !crate::device_links::glide::phone_locked(&device.id)
+    {
         let row = adw::ActionRow::builder()
             .title(esc(format!("Glide is off on {phone}. Turn it on there.")))
             .subtitle(esc(format!(
@@ -2564,9 +2576,13 @@ mod tests {
     #[test]
     fn the_glide_row_says_what_to_turn_on_until_the_phone_allows_it() {
         let says = "Turn on “Let Desk control this phone” on the phone first.";
-        assert_eq!(glide_explained("Pixel", None, "Desk"), says);
-        assert_eq!(glide_explained("Pixel", Some(false), "Desk"), says);
-        assert!(glide_explained("Pixel", Some(true), "Desk").starts_with("Move the pointer past"));
+        assert_eq!(glide_explained("Pixel", None, false, "Desk"), says);
+        assert_eq!(glide_explained("Pixel", Some(false), false, "Desk"), says);
+        assert!(glide_explained("Pixel", Some(true), false, "Desk")
+            .starts_with("Move the pointer past"));
+        // A locked phone: the step, not a setting to turn on.
+        assert!(glide_explained("Pixel", Some(false), true, "Desk")
+            .starts_with("Unlock Pixel to use Glide"));
     }
 
     /// Each of the ten groups has one place in the list, in the groups' order.

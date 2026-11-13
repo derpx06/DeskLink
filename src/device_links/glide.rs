@@ -909,14 +909,30 @@ pub(crate) fn start() {
     }
 }
 
-/// What each phone last reported about glide (`allowed`). Unknown until it
+/// What each phone last reported about glide: `allowed`, and whether it
+/// said no only because it is locked (`reason: "locked"`). Unknown until it
 /// reports, and forgotten whenever its link is not ready: the phone reports
 /// on every feature-ready.
-static ALLOWED: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+static ALLOWED: Mutex<Option<HashMap<String, (bool, bool)>>> = Mutex::new(None);
 
 /// Whether the phone has said it allows glide: `None` until it reports (an
 /// older phone never does).
 pub(crate) fn phone_allows(device_id: &str) -> Option<bool> {
+    report_of(device_id).map(|(allowed, _)| allowed)
+}
+
+/// Whether the phone said glide waits only for it to be unlocked (cleared by
+/// its next `allowed: true`).
+pub(crate) fn phone_locked(device_id: &str) -> bool {
+    report_of(device_id).is_some_and(|(_, locked)| locked)
+}
+
+/// What the person is told while the phone is locked: no fix, the step.
+pub(crate) fn unlock_words(phone: &str) -> String {
+    format!("Unlock {phone} to use Glide")
+}
+
+fn report_of(device_id: &str) -> Option<(bool, bool)> {
     ALLOWED.lock().ok().and_then(|known| {
         known
             .as_ref()
@@ -924,7 +940,7 @@ pub(crate) fn phone_allows(device_id: &str) -> Option<bool> {
     })
 }
 
-fn set_allowed(device_id: &str, allowed: Option<bool>) {
+fn set_allowed(device_id: &str, allowed: Option<(bool, bool)>) {
     if let Ok(mut known) = ALLOWED.lock() {
         let known = known.get_or_insert_with(HashMap::new);
         match allowed {
@@ -952,8 +968,12 @@ pub(crate) fn forget_phone(device_id: &str) {
 /// point. Each is a report, never an instruction to capture anything.
 pub(crate) fn on_phone_packet(device_id: &str, packet: &NetworkPacket) {
     match classify_phone_packet(packet) {
-        PhoneReport::State { allowed, entered } => {
-            set_allowed(device_id, Some(allowed));
+        PhoneReport::State {
+            allowed,
+            entered,
+            locked,
+        } => {
+            set_allowed(device_id, Some((allowed, locked)));
             send_command(Command::State {
                 device: device_id.to_string(),
                 allowed,
@@ -976,6 +996,8 @@ pub(crate) enum PhoneReport {
     State {
         allowed: bool,
         entered: bool,
+        /// Not allowed only because the phone is locked (`reason: "locked"`).
+        locked: bool,
     },
     HandedBack,
     /// A release point (or a body that is neither: `phone_released` drops it).
@@ -1001,6 +1023,12 @@ pub(crate) fn classify_phone_packet(packet: &NetworkPacket) -> PhoneReport {
                     .get("entered")
                     .and_then(serde_json::Value::as_bool)
                     == Some(true),
+            locked: !allowed
+                && packet
+                    .body
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("locked"),
         }
     } else if packet
         .body

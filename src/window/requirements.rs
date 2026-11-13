@@ -115,6 +115,8 @@ pub(crate) struct PhoneFacts {
     /// The phone said Glide is off there (its switch for this computer, or
     /// the accessibility service it needs).
     pub glide_off_there: bool,
+    /// The phone said Glide waits for it to be unlocked.
+    pub glide_locked: bool,
     /// Android lets it read notifications (`None`: an older phone, unknown).
     pub notification_access: Option<bool>,
 }
@@ -140,6 +142,7 @@ impl PhoneFacts {
                 .as_ref()
                 .is_some_and(|glide| glide.device == device.id),
             glide_off_there: crate::device_links::glide::phone_allows(&device.id) == Some(false),
+            glide_locked: crate::device_links::glide::phone_locked(&device.id),
             notification_access: device.notification_access,
         }
     }
@@ -337,7 +340,19 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
             allow: None,
         });
     }
-    if phone.glide_here && phone.glide_off_there {
+    if phone.glide_here && phone.glide_locked {
+        // An instruction, not a fix: nothing here can unlock the phone.
+        needs.push(Need {
+            id: "glide-phone",
+            on_phone: true,
+            title: crate::device_links::glide::unlock_words(name),
+            detail: format!(
+                "Glide waits while {name} is locked and works again once it is unlocked."
+            ),
+            fix: Fix::None,
+            allow: None,
+        });
+    } else if phone.glide_here && phone.glide_off_there {
         needs.push(glide_off_there(phone));
     }
     if phone.glide_here && facts.glide_asking {
@@ -815,6 +830,7 @@ mod tests {
             control_approved: true,
             glide_here: false,
             glide_off_there: false,
+            glide_locked: false,
             notification_access: Some(true),
         }
     }
@@ -847,6 +863,13 @@ mod tests {
         assert_eq!(need.fix, Fix::AskPhoneGlide("p1".into()));
         assert_eq!(need.fix.label(), Some("Ask on phone"));
         assert!(need.allow.is_none(), "never switched from here");
+
+        // Locked: the step to take there, no button, until allowed again.
+        let mut locked = off.clone();
+        locked.glide_locked = true;
+        let need = glide_need(locked).expect("listed");
+        assert_eq!(need.title, "Unlock Pixel 9 to use Glide");
+        assert_eq!(need.fix, Fix::None);
 
         let mut on_there = off.clone();
         on_there.glide_off_there = false;
