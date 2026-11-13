@@ -85,6 +85,10 @@ CARGOEOF
 
 %build
 %meson
+# Fedora's build flags ask rustc for full debug info, which this package
+# does not ship (see debug_package above); with the release profile's LTO it
+# took the final link past 4 GiB.
+export RUSTFLAGS="${RUSTFLAGS:-} -Cdebuginfo=0"
 %meson_build
 
 %install
