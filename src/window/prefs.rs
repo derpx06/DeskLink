@@ -1703,7 +1703,7 @@ fn add_top_bar_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settin
         }
         ExtensionStatus::Off => {
             menu.set_subtitle(
-                "Off — your phone, live sessions and quick actions in the top bar, and Unlock on the lock screen. Turning it on also allows GNOME user extensions (a setting for all of them); Turn Off disables only this one.",
+                "Off — your phone, live sessions and quick actions in the top bar, and Unlock on the lock screen. Turning it on also allows GNOME user extensions (a setting for all of them); turning it off disables only this one.",
             );
             let button = gtk::Button::builder()
                 .label("Turn on")
@@ -2031,7 +2031,7 @@ pub(super) fn approve_remote_control(window: &DesklinkWindow, id: &str) {
 /// set by hand would be lost.
 fn remote_control_row(device: &DeviceView, approving: bool) -> adw::ActionRow {
     const APPROVED: &str = "Approved until DeskLink restarts";
-    const NOT_APPROVED: &str = "The desktop asks you to approve each time";
+    const NOT_APPROVED: &str = "This computer asks you to approve each time";
     const WAITING: &str =
         "Choose the screen, turn on \u{201c}Allow Remote Interaction\u{201d}, then Share";
 
