@@ -32,7 +32,7 @@ release and `desklink --check` run):
 | Ubuntu 24.04 LTS | 4.14 / 1.5 / 1.24 / 0.76 / 1.85 (`rustc-1.85`) | yes (`dpkg-buildpackage`) | 1516 of 1523 | yes, every element |
 | Debian 13 | 4.18 / 1.7 / 1.26 / 0.80 / 1.85 | yes (`dpkg-buildpackage`) | 1509 of 1523, run before the GStreamer 1.26 fixes that Fedora 43 confirms | yes |
 | Fedora 43 | 4.20 / 1.8 / 1.26 / 0.82 / 1.99 | yes (`rpmbuild`, `%check` 3/3) | 1519 of 1523 | yes; H.264 decoding needs `gstreamer1-plugin-openh264` (Cisco repository, on by default on Workstation) |
-| openSUSE Tumbleweed | 4.24 / 1.10 / 1.28 / 0.84 / 1.99 | TW_BUILD | TW_TESTS | TW_FRESH |
+| openSUSE Tumbleweed | 4.24 / 1.10 / 1.28 / 0.84 / 1.99 | yes (`rpmbuild`, `%check` 2/2) | 1519 of 1523 | yes |
 | Flatpak (GNOME 51) | 4.24 / 1.10 / 1.28 / 0.84 (built) / stable | yes (`flatpak-builder`, local source) | — | `--check`: link and video ok |
 | Ubuntu 25.10, 26.04 | 4.20 / 1.8 / 1.26 / 0.80; 4.22 / 1.9 / 1.28 / 0.84 | meets the floor (versions checked, not built) | | |
 | Fedora 42, 44 | 4.18 / 1.7 / 1.26 / 0.80; 4.22 / 1.9 / 1.28 / 0.84 | meets the floor (versions checked, not built) | | |
@@ -42,7 +42,7 @@ release and `desklink --check` run):
 The failures left in the chroots are environmental or known: three tests that
 re-run themselves as `nobody` cannot do so as root in a rootless user
 namespace (they pass when run on their own), one shared-state test that passes
-alone, and on libadwaita 1.5 two Settings widget tests that read row titles
+alone (a transfer test on a full disk, likewise), and on libadwaita 1.5 two Settings widget tests that read row titles
 back as markup. On GStreamer 1.24 a share reopened on the same connection keeps
 its starting bitrate (`a_second_share_on_one_connection_adapts_its_bitrate`).
 
