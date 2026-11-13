@@ -174,6 +174,8 @@ mod imp {
             // The pointer is never left on a phone: bounded, so a compositor
             // that does not answer cannot hold the app open.
             crate::device_links::glide::shutdown();
+            // Accessibility DeskLink turned on goes back as it was.
+            crate::device_links::webrtc::text_focus::release_accessibility();
             // What was being typed, and whatever the vault writer still
             // holds, is saved on the way out.
             for window in self.obj().windows() {
@@ -748,6 +750,19 @@ impl DesklinkApplication {
                     notification.set_priority(gio::NotificationPriority::High);
                     notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
                     app.send_notification(Some(&format!("screen-failed-{device}")), &notification);
+                }
+                // Chrome (or an Electron app) was open when accessibility came
+                // on: it cannot report text fields until restarted. Said once.
+                if crate::device_links::webrtc::text_focus::take_restart_hint() {
+                    let notification =
+                        gio::Notification::new("Restart Chrome once for the phone keyboard");
+                    notification.set_body(Some(
+                        "Chrome and apps like VS Code that were already open can't tell DeskLink \
+                         when you click a text field. Restart them once and the phone keyboard \
+                         comes up for their text fields too.",
+                    ));
+                    notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+                    app.send_notification(Some("text-focus-restart"), &notification);
                 }
                 // Glide is about to put GNOME's "Capture Input" dialog up: say
                 // so, and take the notice down the moment it is answered.

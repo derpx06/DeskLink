@@ -119,6 +119,9 @@ mod tests {
             // A share waiting for the portal's answer; its guard ends the entry when the worker does.
             "device_links/webrtc/coordinator.rs:WAITING",
             "device_links/webrtc/coordinator.rs:LAST",
+            // Accessibility holders: a phone's entry goes with its control grant,
+            // which unpairing forgets (`set_remote_desktop_token(None)`).
+            "device_links/webrtc/text_focus.rs:STATE",
             // Throttles that expire by themselves.
             "device_links/daemon/discovery.rs:LAST",
             // When each unpaired card was last heard from: bounded (cleared at 1024), and only

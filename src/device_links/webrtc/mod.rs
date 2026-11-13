@@ -20,7 +20,7 @@ pub(crate) mod screen;
 mod signaling;
 pub(crate) mod terminal_bridge;
 pub(crate) mod terminal_protocol;
-mod text_focus;
+pub(crate) mod text_focus;
 pub(crate) mod transfer_board;
 pub(crate) mod transfer_manager;
 pub(crate) mod x11_desktop;

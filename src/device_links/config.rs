@@ -359,12 +359,27 @@ pub(crate) fn remote_desktop_token(device_id: &str) -> Option<String> {
 }
 
 /// Remembers (or with `None`, forgets) the grant for `device_id`.
+///
+/// While a phone holds a grant it can take control again at any time, so
+/// accessibility stays on: apps opened meanwhile (Chrome) report their text
+/// fields and the phone keyboard can follow them.
 pub(crate) fn set_remote_desktop_token(device_id: &str, token: Option<&str>) {
     if let Ok(mut tokens) = remote_desktop_tokens().lock() {
         match token {
             Some(token) => tokens.insert(device_id.to_string(), token.to_string()),
             None => tokens.remove(device_id),
         };
+    }
+    // Off the caller's thread (the GTK one, from the device page): blocking
+    // D-Bus calls. Not in tests, which must not change the desktop's setting.
+    #[cfg(not(test))]
+    {
+        let (holder, wanted) = (format!("grant-{device_id}"), token.is_some());
+        let _ = std::thread::Builder::new()
+            .name("desklink-a11y".into())
+            .spawn(move || {
+                crate::device_links::webrtc::text_focus::hold_accessibility(&holder, wanted)
+            });
     }
 }
 

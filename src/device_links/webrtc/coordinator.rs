@@ -2001,7 +2001,7 @@ fn run_desktop_portal_worker(
 
     // While the phone can type here, tell it when a text input takes focus,
     // so its keyboard comes up on its own. Lives as long as this share.
-    let _text_focus = can_control.then(|| {
+    let text_focus = can_control.then(|| {
         let (peer, wire, attempt_id, session_id, device_id) = (
             Arc::clone(&peer),
             wire.clone(),
@@ -2023,8 +2023,19 @@ fn run_desktop_portal_worker(
                 message.editable = Some(editable);
                 Some(message)
             });
-            if let Some(message) = message {
-                let _ = send_remote_session_message(&peer, &wire, &message);
+            let Some(message) = message else {
+                debug_log!(
+                    "[DeskLink] Text focus (editable {editable}) not sent to {device_id}: no remote session"
+                );
+                return;
+            };
+            match send_remote_session_message(&peer, &wire, &message) {
+                Ok(()) => debug_log!(
+                    "[DeskLink] Text focus sent to {device_id}: editable {editable}"
+                ),
+                Err(error) => debug_log!(
+                    "[DeskLink] Text focus (editable {editable}) not sent to {device_id}: {error}"
+                ),
             }
         })
     });
@@ -2150,6 +2161,11 @@ fn run_desktop_portal_worker(
                         break;
                     }
                     if let (Some(held), Some(pressed)) = (held, pressed) {
+                        if pressed && !held.0 {
+                            if let Some(watcher) = &text_focus {
+                                watcher.clicked();
+                            }
+                        }
                         if pressed {
                             held_inputs.insert(held);
                         } else {

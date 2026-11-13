@@ -4,10 +4,13 @@
 //! focus.
 //!
 //! GNOME keeps accessibility events off until a client asks
-//! (`org.a11y.Status.IsEnabled`); this turns it on while it watches and puts
-//! the previous setting back when it stops. Applications already running when
-//! it turns on may only start reporting after a restart (Chromium-based ones
-//! read the setting at launch); GTK apps and terminals report at once.
+//! (`org.a11y.Status.IsEnabled`, stored as the `toolkit-accessibility`
+//! setting). DeskLink turns it on while it watches and while a phone holds a
+//! remembered control grant ([`hold_accessibility`]), and puts the previous
+//! setting back when neither does (or DeskLink quits). GTK apps and terminals
+//! report at once; Chromium and Electron apps read the setting once at launch
+//! and never join later (Chromium's `ShouldEnableAccessibility` is latched),
+//! so one already open when it turned on is told about in a one-time hint.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -40,6 +43,7 @@ pub(crate) fn takes_typing(role: u32, state_low_word: u32) -> bool {
 /// Watches until dropped.
 pub(crate) struct TextFocusWatcher {
     stop: Arc<AtomicBool>,
+    clicked: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -48,16 +52,29 @@ impl TextFocusWatcher {
     /// input. Failures (no accessibility bus) are logged, never fatal.
     pub(crate) fn start(on_change: impl Fn(bool) + Send + 'static) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&stop);
+        let clicked = Arc::new(AtomicBool::new(false));
+        let (flag, click) = (Arc::clone(&stop), Arc::clone(&clicked));
         let thread = thread::Builder::new()
             .name("desklink-text-focus".into())
             .spawn(move || {
-                if let Err(error) = watch(&flag, &on_change) {
+                if let Err(error) = watch(&flag, &click, &on_change) {
                     eprintln!("[DeskLink] Desktop text-focus watching is unavailable: {error}");
                 }
             })
             .ok();
-        Self { stop, thread }
+        Self {
+            stop,
+            clicked,
+            thread,
+        }
+    }
+
+    /// The phone clicked on the desktop. A click into the text field that
+    /// already has focus moves no focus, so AT-SPI sends nothing: the field
+    /// is told again (see [`repeat_after_click`]), and the keyboard the
+    /// person put away comes back the way a phone's own field brings it.
+    pub(crate) fn clicked(&self) {
+        self.clicked.store(true, Ordering::Release);
     }
 }
 
@@ -70,17 +87,131 @@ impl Drop for TextFocusWatcher {
     }
 }
 
-/// Puts `IsEnabled` back as it was, however the watch ends.
-struct RestoreAccessibility {
-    session: gio::DBusConnection,
-    enabled_before: bool,
+/// Who needs accessibility on now (a watch, a phone's remembered control
+/// grant), and the setting as it was before DeskLink turned it on.
+#[derive(Default)]
+struct Accessibility {
+    holders: std::collections::HashSet<String>,
+    before: Option<bool>,
 }
 
-impl Drop for RestoreAccessibility {
-    fn drop(&mut self) {
-        if !self.enabled_before {
-            let _ = set_accessibility(&self.session, false);
+fn accessibility() -> &'static std::sync::Mutex<Accessibility> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<Accessibility>> = std::sync::OnceLock::new();
+    STATE.get_or_init(Default::default)
+}
+
+/// What to do with `IsEnabled`, given whether anybody holds it and what it
+/// was before DeskLink turned it on (`None`: DeskLink has not).
+#[derive(Debug, PartialEq)]
+pub(crate) enum AccessibilityStep {
+    /// Remember the current setting and turn it on.
+    TurnOn,
+    /// Nobody needs it any more: put this back.
+    PutBack(bool),
+    Nothing,
+}
+
+pub(crate) fn accessibility_step(wanted: bool, before: Option<bool>) -> AccessibilityStep {
+    match (wanted, before) {
+        (true, None) => AccessibilityStep::TurnOn,
+        (false, Some(before)) => AccessibilityStep::PutBack(before),
+        _ => AccessibilityStep::Nothing,
+    }
+}
+
+/// Keeps accessibility on while `holder` wants it; the setting as found is
+/// put back when the last holder lets go. Blocking D-Bus calls: not for the
+/// GTK thread.
+pub(crate) fn hold_accessibility(holder: &str, wanted: bool) {
+    let Ok(mut state) = accessibility().lock() else {
+        return;
+    };
+    if wanted {
+        state.holders.insert(holder.to_string());
+    } else {
+        state.holders.remove(holder);
+    }
+    let Ok(session) = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>) else {
+        return;
+    };
+    match accessibility_step(!state.holders.is_empty(), state.before) {
+        AccessibilityStep::TurnOn => match accessibility_enabled(&session) {
+            Ok(enabled) => {
+                state.before = Some(enabled);
+                if !enabled {
+                    match set_accessibility(&session, true) {
+                        Ok(()) => {
+                            debug_log!("[DeskLink] Accessibility turned on for text focus");
+                            if chromium_running() {
+                                HINT_PENDING.store(true, Ordering::Release);
+                            }
+                        }
+                        Err(error) => {
+                            eprintln!("[DeskLink] Could not turn accessibility on: {error}")
+                        }
+                    }
+                }
+            }
+            Err(error) => eprintln!("[DeskLink] Could not read the accessibility setting: {error}"),
+        },
+        AccessibilityStep::PutBack(before) => {
+            state.before = None;
+            if !before {
+                debug_log!("[DeskLink] Accessibility put back off");
+                let _ = set_accessibility(&session, false);
+            }
         }
+        AccessibilityStep::Nothing => {}
+    }
+}
+
+/// Lets go of every hold (DeskLink is quitting): the setting goes back.
+pub(crate) fn release_accessibility() {
+    let holders: Vec<String> = accessibility()
+        .lock()
+        .map(|state| state.holders.iter().cloned().collect())
+        .unwrap_or_default();
+    for holder in holders {
+        hold_accessibility(&holder, false);
+    }
+}
+
+static HINT_PENDING: AtomicBool = AtomicBool::new(false);
+static HINT_SHOWN: AtomicBool = AtomicBool::new(false);
+
+/// True once per run, after accessibility was turned on while a Chromium or
+/// Electron app was open: that app cannot report its text fields until it is
+/// restarted, and the person at the desk is told so.
+pub(crate) fn take_restart_hint() -> bool {
+    HINT_PENDING.swap(false, Ordering::AcqRel) && !HINT_SHOWN.swap(true, Ordering::AcqRel)
+}
+
+/// Process names of browsers and apps built on Chromium (Electron).
+pub(crate) fn is_chromium_family(comm: &str) -> bool {
+    const NAMES: [&str; 9] = [
+        "chrome", "chromium", "brave", "msedge", "vivaldi", "opera", "electron", "code", "slack",
+    ];
+    let comm = comm.trim();
+    NAMES
+        .iter()
+        .any(|name| comm == *name || comm.starts_with(&format!("{name}-")))
+}
+
+fn chromium_running() -> bool {
+    std::fs::read_dir("/proc")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("comm")).ok())
+        .any(|comm| is_chromium_family(&comm))
+}
+
+/// Lets go of a watch's hold however the watch ends.
+struct HoldAccessibility(String);
+
+impl Drop for HoldAccessibility {
+    fn drop(&mut self) {
+        hold_accessibility(&self.0, false);
     }
 }
 
@@ -122,14 +253,13 @@ fn set_accessibility(session: &gio::DBusConnection, enabled: bool) -> Result<(),
         .map_err(|error| error.to_string())
 }
 
-fn watch(stop: &AtomicBool, on_change: &dyn Fn(bool)) -> Result<(), String> {
+fn watch(stop: &AtomicBool, clicked: &AtomicBool, on_change: &dyn Fn(bool)) -> Result<(), String> {
     let session = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>)
         .map_err(|error| error.to_string())?;
-    let _restore = RestoreAccessibility {
-        enabled_before: accessibility_enabled(&session)?,
-        session: session.clone(),
-    };
-    set_accessibility(&session, true)?;
+    static WATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let holder = format!("watch-{}", WATCHES.fetch_add(1, Ordering::Relaxed));
+    hold_accessibility(&holder, true);
+    let _hold = HoldAccessibility(holder);
     let address = session
         .call_sync(
             Some(A11Y_BUS),
@@ -204,6 +334,8 @@ fn watch(stop: &AtomicBool, on_change: &dyn Fn(bool)) -> Result<(), String> {
                             on_change(editable);
                             *reported = Some(Reported {
                                 element,
+                                sender: sender.to_string(),
+                                path: path.to_string(),
                                 editable,
                                 at: now,
                             });
@@ -222,13 +354,31 @@ fn watch(stop: &AtomicBool, on_change: &dyn Fn(bool)) -> Result<(), String> {
             if let Some((sender, path)) = current_focus(&a11y) {
                 retry = look(&sender, &path, 0, &mut reported);
             }
+            // A click the phone made, waiting for the focus events it caused.
+            let mut click: Option<std::time::Instant> = None;
             while !stop.load(Ordering::Acquire) {
                 while context.pending() {
                     context.iteration(false);
                 }
+                if clicked.swap(false, Ordering::AcqRel) {
+                    click = Some(std::time::Instant::now());
+                }
                 // Only the latest focus matters; a newer one replaces a retry.
                 if let Some((sender, path)) = events.try_iter().last() {
                     retry = look(&sender, &path, 0, &mut reported);
+                } else if let Some(at) =
+                    click.filter(|at| at.elapsed() >= CLICK_SETTLE && retry.is_none())
+                {
+                    click = None;
+                    if let Some(last) = reported.as_mut().filter(|last| {
+                        repeat_after_click(Some(last), at)
+                            && state_word(&a11y, &last.sender, &last.path) & (1 << STATE_FOCUSED)
+                                != 0
+                    }) {
+                        debug_log!("[DeskLink] Text focus: clicked into {}", last.element);
+                        on_change(true);
+                        last.at = std::time::Instant::now();
+                    }
                 } else if let Some((sender, path, tries, at)) = retry.take() {
                     if std::time::Instant::now() >= at {
                         retry = look(&sender, &path, tries, &mut reported);
@@ -312,8 +462,21 @@ fn state_word(a11y: &gio::DBusConnection, sender: &str, path: &str) -> u32 {
 /// The last report sent to the phone: which element, what, when.
 pub(crate) struct Reported {
     element: String,
+    sender: String,
+    path: String,
     editable: bool,
     at: std::time::Instant,
+}
+
+/// How long after a click its focus events are waited for, before the field
+/// that kept focus is told again.
+const CLICK_SETTLE: Duration = Duration::from_millis(300);
+
+/// After a click at `clicked`, is the last report told again? Only a text
+/// field reported before the click (one the click focused has just been
+/// told); the caller also checks that it still has focus.
+pub(crate) fn repeat_after_click(last: Option<&Reported>, clicked: std::time::Instant) -> bool {
+    last.is_some_and(|last| last.editable && last.at <= clicked)
 }
 
 /// A burst of focus events for one element (a terminal sends three or four)
@@ -398,15 +561,82 @@ fn role(a11y: &gio::DBusConnection, sender: &str, path: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
+    fn reported(element: &str, editable: bool, at: std::time::Instant) -> Reported {
+        Reported {
+            element: element.to_string(),
+            sender: String::new(),
+            path: element.to_string(),
+            editable,
+            at,
+        }
+    }
+
+    /// The owner's case: GNOME Console already focused, keyboard put away,
+    /// a click into the terminal moves no focus and AT-SPI says nothing. The
+    /// field is told again after the click, but not a non-text focus, and not
+    /// a field the click itself focused (already told).
+    #[test]
+    fn a_click_into_the_focused_text_field_tells_the_phone_again() {
+        let t0 = std::time::Instant::now();
+        let later = t0 + Duration::from_secs(5);
+        assert!(repeat_after_click(
+            Some(&reported("console/term", true, t0)),
+            later
+        ));
+        assert!(!repeat_after_click(
+            Some(&reported("files/grid", false, t0)),
+            later
+        ));
+        assert!(!repeat_after_click(
+            Some(&reported(
+                "chrome/omnibox",
+                true,
+                later + Duration::from_millis(50)
+            )),
+            later
+        ));
+        assert!(!repeat_after_click(None, later));
+    }
+
+    #[test]
+    fn accessibility_is_turned_on_once_and_put_back_as_it_was() {
+        assert_eq!(accessibility_step(true, None), AccessibilityStep::TurnOn);
+        assert_eq!(
+            accessibility_step(true, Some(false)),
+            AccessibilityStep::Nothing
+        );
+        assert_eq!(
+            accessibility_step(false, Some(false)),
+            AccessibilityStep::PutBack(false)
+        );
+        assert_eq!(
+            accessibility_step(false, Some(true)),
+            AccessibilityStep::PutBack(true)
+        );
+        assert_eq!(accessibility_step(false, None), AccessibilityStep::Nothing);
+    }
+
+    #[test]
+    fn chromium_and_electron_processes_are_recognised() {
+        for comm in ["chrome\n", "chromium", "brave", "code", "chrome-sandbox"] {
+            assert!(is_chromium_family(comm), "{comm}");
+        }
+        for comm in [
+            "kgx",
+            "gnome-text-editor",
+            "firefox",
+            "codex",
+            "chromedriverx",
+        ] {
+            assert!(!is_chromium_family(comm), "{comm}");
+        }
+    }
+
     #[test]
     fn every_text_field_that_takes_focus_raises_the_keyboard_again() {
         let t0 = std::time::Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
-        let typing = |element: &str, ms: u64| Reported {
-            element: element.to_string(),
-            editable: true,
-            at: at(ms),
-        };
+        let typing = |element: &str, ms: u64| reported(element, true, at(ms));
         assert!(should_report(None, "app/a", true, t0), "first focus");
         assert!(should_report(None, "app/a", false, t0), "first focus");
         // The phone may have put its keyboard away (Back): the next field
@@ -438,11 +668,7 @@ mod tests {
             false,
             at(100)
         ));
-        let away = Reported {
-            element: "app/c".to_string(),
-            editable: false,
-            at: at(100),
-        };
+        let away = reported("app/c", false, at(100));
         assert!(!should_report(Some(&away), "app/d", false, at(200)));
         assert!(should_report(Some(&away), "app/a", true, at(200)));
     }
