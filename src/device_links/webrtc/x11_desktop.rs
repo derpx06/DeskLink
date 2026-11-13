@@ -32,14 +32,19 @@ const XK_SHIFT_L: u32 = 0xffe1;
 
 /// Whether desktop shares should use this module instead of the portal.
 pub(crate) fn wanted() -> bool {
+    let set = |name| std::env::var_os(name).is_some_and(|value| !value.is_empty());
     use_fallback(
-        std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+        crate::platform::x11_session(
+            std::env::var("XDG_SESSION_TYPE").ok().as_deref(),
+            set("WAYLAND_DISPLAY"),
+            set("DISPLAY"),
+        ),
         super::remote_desktop_portal::portal_available,
     )
 }
 
-fn use_fallback(session_type: Option<&str>, portal_available: impl FnOnce() -> bool) -> bool {
-    session_type.is_some_and(|kind| kind.eq_ignore_ascii_case("x11")) && !portal_available()
+fn use_fallback(x11: bool, portal_available: impl FnOnce() -> bool) -> bool {
+    x11 && !portal_available()
 }
 
 /// Group 1 of the server's keyboard mapping.
@@ -389,9 +394,8 @@ mod tests {
 
     #[test]
     fn the_fallback_is_for_x11_sessions_without_a_portal_only() {
-        assert!(use_fallback(Some("x11"), || false));
-        assert!(!use_fallback(Some("x11"), || true));
-        assert!(!use_fallback(Some("wayland"), || false));
-        assert!(!use_fallback(None, || false));
+        assert!(use_fallback(true, || false));
+        assert!(!use_fallback(true, || true));
+        assert!(!use_fallback(false, || false));
     }
 }

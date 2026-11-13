@@ -26,8 +26,13 @@ BuildRequires:  gcc
 BuildRequires:  meson >= 1.0.0
 BuildRequires:  gettext
 BuildRequires:  desktop-file-utils
-BuildRequires:  /usr/bin/glib-compile-resources
-BuildRequires:  /usr/bin/glib-compile-schemas
+# glib-compile-resources and glib-compile-schemas (zypper cannot resolve
+# file paths outside OBS).
+%if 0%{?suse_version}
+BuildRequires:  glib2-tools
+%else
+BuildRequires:  glib2-devel
+%endif
 BuildRequires:  pkgconfig(gtk4) >= 4.12
 BuildRequires:  pkgconfig(libadwaita-1)
 BuildRequires:  pkgconfig(vte-2.91-gtk4) >= 0.76
@@ -36,14 +41,20 @@ BuildRequires:  pkgconfig(gstreamer-base-1.0)
 BuildRequires:  pkgconfig(gstreamer-video-1.0)
 BuildRequires:  pkgconfig(gstreamer-sdp-1.0)
 BuildRequires:  pkgconfig(gstreamer-webrtc-1.0)
+# OpenSSL itself: on openSUSE pkgconfig(openssl) is also provided by
+# libressl-devel, which a resolver may pick and openssl-sys refuses.
+%if 0%{?suse_version}
+BuildRequires:  libopenssl-devel
+%else
 BuildRequires:  pkgconfig(openssl)
+%endif
 
 Requires:       xdg-desktop-portal
 %if 0%{?suse_version}
 Requires:       gstreamer-plugins-base
 Requires:       gstreamer-plugins-good
 Requires:       gstreamer-plugins-bad
-Requires:       gstreamer-plugins-libnice
+Requires:       gstreamer-libnice
 Requires:       gstreamer-plugin-pipewire
 # H.264 for phones that encode their screen in hardware; VP8 otherwise.
 Recommends:     gstreamer-plugins-libav
@@ -80,9 +91,15 @@ CARGOEOF
 
 %build
 %meson
+# Fedora's build flags ask rustc for full debug info, which this package
+# does not ship (see debug_package above); with the release profile's LTO it
+# took the final link past 4 GiB.
+export RUSTFLAGS="%{?build_rustflags} -Cdebuginfo=0"
 %meson_build
 
 %install
+# The same flags as %%build: meson install runs cargo again.
+export RUSTFLAGS="%{?build_rustflags} -Cdebuginfo=0"
 %meson_install
 
 %check

@@ -56,6 +56,7 @@ share DeskLink's address space either way.
 | `--talk-name=org.kde.StatusNotifierWatcher`, `--own-name=org.kde.StatusNotifierItem-2-1` | The tray icon. |
 | `--talk-name=org.gnome.Shell.Extensions` | The optional top-bar extension (turn on, turn off, state). |
 | `--talk-name=org.a11y.Bus` | Accessibility (screen readers). |
+| `--filesystem=xdg-run/pipewire-0` | Sound with the phone: its sound plays here and this computer's sound or microphone goes to it, as PipeWire streams (screen capture gets its PipeWire stream from the portal and does not need this). |
 | `--filesystem=xdg-download` | Where received files land. |
 | `--filesystem=~/DeskLink Bucket:create` | The Bucket folder, created on first use. |
 

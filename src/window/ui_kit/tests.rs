@@ -289,7 +289,8 @@ fn every_app_stylesheet_parses_without_errors() {
             provider.connect_parsing_error(move |_, section, error| {
                 sink.borrow_mut().push(format!("{section:?}: {error}"));
             });
-            provider.load_from_string(&format!("{}{css}", tokens::css(false, true, false)));
+            let modern = crate::application::modern_css();
+            provider.load_from_string(&format!("{}{css}", tokens::css(false, modern, false)));
             assert!(errors.borrow().is_empty(), "{name}: {:?}", errors.borrow());
         }
     });
@@ -299,7 +300,8 @@ fn every_app_stylesheet_parses_without_errors() {
 fn the_stylesheet_and_the_tokens_parse_without_errors_in_every_style() {
     crate::test_display::run(|| {
         for (dark, contrast) in [(false, false), (true, false), (false, true), (true, true)] {
-            for modern in [false, true] {
+            // Custom properties only where this GTK parses them, as at run time.
+            for modern in [false, crate::application::modern_css()] {
                 let provider = gtk::CssProvider::new();
                 let errors = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
                 let sink = errors.clone();

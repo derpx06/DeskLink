@@ -315,7 +315,9 @@ pub(super) fn setup_rows(facts: &SetupFacts) -> Vec<SetupRow> {
     // Screen sharing.
     if let Some(check) = find("share") {
         let (status, status_words) = status_of(check.level);
-        let through_portal = check.detail.starts_with("Through the desktop portal");
+        let through_portal = check
+            .detail
+            .starts_with(crate::platform::SHARE_THROUGH_DESKTOP);
         let detail = match check.level {
             Level::Ok if through_portal && facts.gnome => {
                 "The first time your phone asks to see or control this screen, GNOME shows a \

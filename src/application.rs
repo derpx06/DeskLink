@@ -1327,13 +1327,20 @@ fn accent_css(dark: bool, modern: bool, contrast: bool) -> String {
     css
 }
 
+/// Whether the running GTK parses CSS custom properties (`:root { --x: }`,
+/// GTK 4.16 with libadwaita 1.6). Older ones (Ubuntu 24.04: GTK 4.14,
+/// libadwaita 1.5) get the `@define-color` names alone.
+pub(crate) fn modern_css() -> bool {
+    adw::minor_version() >= 6
+}
+
 /// Loads the palette for the current style and keeps it in step: light,
 /// dark or high contrast, as the system or the Appearance setting changes.
 fn install_brand_styles() {
     let Some(display) = gtk::gdk::Display::default() else {
         return;
     };
-    let modern = adw::minor_version() >= 6;
+    let modern = modern_css();
     let palette = gtk::CssProvider::new();
     // Above `style.css`, whose token fallbacks this replaces.
     gtk::style_context_add_provider_for_display(

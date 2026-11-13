@@ -4480,7 +4480,7 @@ mod tests {
             // Another problem still shows, and a fix hides its banner.
             broken(true, false);
             assert!(window.assert_sticky_notice());
-            assert!(banner.title().contains("WebRTC plugins"));
+            assert!(banner.title().contains("Phones cannot connect"));
             broken(true, true);
             assert!(!window.assert_sticky_notice());
             assert!(!banner.is_revealed());

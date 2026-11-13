@@ -62,8 +62,11 @@ pub(crate) fn decode(
         }
     });
     let header = &bytes[..bytes.len().min(HEADER_BYTES)];
-    let _ = loader.write(header);
-    if too_big.get() {
+    // A loader that refused the header is finished: writing to it again is a
+    // GLib critical (and a GError-less failure on gdk-pixbuf 2.42.10, Ubuntu
+    // 24.04).
+    let refused = loader.write(header).is_err();
+    if refused || too_big.get() {
         let _ = loader.close();
         return None;
     }

@@ -23,6 +23,7 @@
         "--own-name=org.kde.StatusNotifierItem-2-1",
         "--talk-name=org.gnome.Shell.Extensions",
         "--talk-name=org.a11y.Bus",
+        "--filesystem=xdg-run/pipewire-0",
         "--filesystem=xdg-download",
         "--filesystem=~/DeskLink Bucket:create"
     ],

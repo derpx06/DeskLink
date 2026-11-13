@@ -1349,9 +1349,7 @@ const SHELL_EXTENSIONS_PATH: &str = "/org/gnome/Shell/Extensions";
 const EXTENSION_ACTIVE: f64 = 1.0;
 
 pub(crate) fn is_gnome(current_desktop: &str) -> bool {
-    current_desktop
-        .split(':')
-        .any(|desktop| desktop.eq_ignore_ascii_case("GNOME"))
+    crate::platform::is_gnome_shell(current_desktop)
 }
 
 fn call_extensions(
