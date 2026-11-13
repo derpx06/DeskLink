@@ -3817,9 +3817,10 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                 focus.as_ref().map(|widget| widget.widget_name())
             );
             if let Some(text) = focus.and_then(|widget| widget.downcast::<gtk::Text>().ok()) {
+                // Its length only: the focused field may be a password.
                 debug_log!(
-                    "[E2E] focus text {:?}, cursor {}, selection {:?}",
-                    text.text(),
+                    "[E2E] focus text of {} chars, cursor {}, selection {:?}",
+                    text.text().chars().count(),
                     text.position(),
                     text.selection_bounds()
                 );
