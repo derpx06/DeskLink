@@ -215,7 +215,7 @@ pub(crate) fn dial_number(text: &str) -> Option<String> {
 /// Numbers that reach emergency services (a few countries' short codes and
 /// 112/911/999). A call to one must never start from a computer: nothing
 /// tells the dispatcher where the caller is, and a stray tel: link must not
-/// dial it. The phone refuses them too (`CallTracker.isEmergency`).
+/// dial it. The phone refuses them too (`CallRequests.isEmergency`).
 const EMERGENCY: [&str; 20] = [
     "112", "911", "999", "000", "110", "119", "118", "122", "100", "101", "102", "108", "115",
     "117", "113", "144", "155", "190", "199", "933",
@@ -225,9 +225,9 @@ const EMERGENCY: [&str; 20] = [
 /// here: an emergency number, with or without a leading `+` or `00`.
 pub(crate) fn dial_refusal(number: &str) -> Option<&'static str> {
     let digits = number.trim_start_matches('+');
-    let digits = digits.strip_prefix("00").unwrap_or(digits);
-    EMERGENCY
-        .contains(&digits)
+    // Bare first: "000" is one, and stripping "00" from it left "0".
+    let bare = digits.strip_prefix("00").unwrap_or(digits);
+    (EMERGENCY.contains(&digits) || EMERGENCY.contains(&bare))
         .then_some("Emergency numbers cannot be dialled from the computer. Use the phone itself")
 }
 
@@ -394,7 +394,7 @@ mod tests {
 
     #[test]
     fn emergency_numbers_are_refused_and_premium_ones_flagged() {
-        for n in ["112", "911", "+112", "00112", "999"] {
+        for n in ["112", "911", "+112", "00112", "999", "000", "+000", "00000"] {
             assert!(dial_refusal(n).is_some(), "{n}");
             assert!(request(None, "dial", Some(n)).is_err(), "{n}");
         }
