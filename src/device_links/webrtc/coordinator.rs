@@ -5889,8 +5889,11 @@ mod tests {
     }
 
     /// The full row: 300 MiB, cut every ten seconds (on disk, not in /tmp),
-    /// over a Wi-Fi-like path (about 30 ms round trip with jitter, 0.5 %
-    /// loss) so it takes long enough to be cut several times.
+    /// over a Wi-Fi-like path (20 ms round trip, 0.5 % loss) so it takes
+    /// long enough to be cut several times. (Not with jitter: packets
+    /// overtaking each other by up to 10 ms brought SCTP down to about
+    /// 0.3 MB/s, which says more about usrsctp and reordering than about
+    /// resuming; see docs/testing/CONNECTION-HARDENING.md.)
     #[test]
     #[ignore = "300 MiB; run with --ignored chaos"]
     fn chaos_a_300_mib_transfer_cut_every_ten_seconds_arrives_whole() {
@@ -5903,7 +5906,6 @@ mod tests {
             crate::device_links::webrtc::chaos::Faults {
                 loss: 0.005,
                 delay: Duration::from_millis(10),
-                jitter: Duration::from_millis(10),
                 ..Default::default()
             },
         );
