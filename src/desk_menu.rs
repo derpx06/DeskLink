@@ -78,6 +78,21 @@ fn header_words(device: &DeviceView) -> String {
     words
 }
 
+/// The tray's tooltip when nothing is live: one line per paired phone,
+/// "realme 14 5G · Connected · 82% ⚡".
+pub(crate) fn tooltip(devices: &[DeviceView]) -> String {
+    let lines: Vec<String> = devices
+        .iter()
+        .filter(|device| device.trusted)
+        .map(header_words)
+        .collect();
+    if lines.is_empty() {
+        "No phone paired".to_string()
+    } else {
+        lines.join("\n")
+    }
+}
+
 fn device_icon(device: &DeviceView) -> &'static str {
     match device.device_type.as_str() {
         "tablet" => "tablet-symbolic",
@@ -144,6 +159,16 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
         TrayEntry::action("Send Clipboard", format!("send-clipboard:{}", phone.id))
             .icon("edit-paste-symbolic"),
     );
+    // The phone's screen here (it still has to agree), as in the top bar.
+    if crate::window::can_send_feature(
+        phone,
+        crate::device_links::packet::PACKET_TYPE_MOUSEPAD_REQUEST,
+    ) {
+        menu.push(
+            TrayEntry::action("Show Its Screen…", format!("show-screen:{}", phone.id))
+                .icon("video-display-symbolic"),
+        );
+    }
     if let Some(media) = phone
         .media_status
         .as_ref()
@@ -226,6 +251,10 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
             .icon("preferences-system-notifications-symbolic"),
         );
     }
+    menu.push(
+        TrayEntry::action("Settings…", format!("settings:{}", phone.id))
+            .icon("emblem-system-symbolic"),
+    );
     menu
 }
 
@@ -440,6 +469,22 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
                 .map(|device| device.name)
                 .unwrap_or_default();
             crate::shell_dbus::pick_and_send_files(app, &target, &name);
+        }
+        "show-screen" => {
+            // The phone still has to agree to share; the dialog says so.
+            let window = app.main_window();
+            window.present();
+            crate::remote_control::show_remote_control_dialog(
+                daemon,
+                target,
+                window.upcast_ref::<gtk::Window>(),
+            );
+        }
+        "settings" => {
+            let window = app.main_window();
+            window.present();
+            window.show_device(&target);
+            window.show_page("settings");
         }
         "notifications" => {
             app.activate();
@@ -666,6 +711,8 @@ mod tests {
             charge_time_remaining: None,
         });
         ready.terminal_sessions_attached = 1;
+        ready.incoming_capabilities =
+            vec![crate::device_links::packet::PACKET_TYPE_MOUSEPAD_REQUEST.to_string()];
         ready.notifications = vec![crate::device_links::device::DeviceNotification {
             id: "n".into(),
             app_name: "Signal".into(),
@@ -700,6 +747,8 @@ mod tests {
             "clipboard-off",
             "lock-hand-off",
             "open-file:/tmp/a.pdf",
+            "show-screen:p1",
+            "settings:p1",
             "open",
             "quit",
         ] {
@@ -719,6 +768,14 @@ mod tests {
             icon: "phone-symbolic".into(),
         }));
         assert!(menu.contains(&TrayEntry::Label("● Phone p1 — using 1 terminal".into())));
+        // The tooltip names each phone and its battery when nothing is live.
+        assert_eq!(
+            tooltip(&[phone("p9", false), phone("x", false)])
+                .lines()
+                .count(),
+            2
+        );
+        assert_eq!(tooltip(&[]), "No phone paired");
         assert_eq!(tray_icon(&[phone("p9", true)]), crate::tray::ICON_CONNECTED);
         assert_eq!(tray_icon(&[phone("p9", false)]), crate::tray::ICON_OFFLINE);
     }

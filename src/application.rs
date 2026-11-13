@@ -852,6 +852,7 @@ impl DesklinkApplication {
                     let icon = crate::desk_menu::tray_icon(&devices);
                     tray.update(
                         active.into_iter().map(|(_, line)| line).collect(),
+                        crate::desk_menu::tooltip(&devices),
                         menu,
                         icon,
                         // DeskLink's own extension is in the top bar already.

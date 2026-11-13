@@ -191,7 +191,7 @@ pub(super) struct SetupFacts<'a> {
 }
 
 /// The rows of "Set up this computer", in order: start at login,
-/// notifications, the top bar (GNOME), screen sharing, Glide, pairing keys,
+/// notifications, the top bar (GNOME) or the tray, screen sharing, Glide, pairing keys,
 /// video and sound support. Only what [`crate::platform`] found is said.
 pub(super) fn setup_rows(facts: &SetupFacts) -> Vec<SetupRow> {
     let find = |id: &str| facts.checks.iter().find(|check| check.id == id);
@@ -291,6 +291,24 @@ pub(super) fn setup_rows(facts: &SetupFacts) -> Vec<SetupRow> {
             status_words,
             detail: detail.to_string(),
             fix,
+        });
+    }
+
+    // The tray (every other desktop): shown, or this desktop's own step.
+    if let Some(check) = find("tray").filter(|_| !facts.gnome) {
+        let shown = check.level == Level::Ok;
+        rows.push(SetupRow {
+            id: "tray",
+            icon: "desklink-devices-symbolic",
+            title: "Tray icon",
+            status: if shown { Status::Ok } else { Status::Idle },
+            status_words: if shown { "On" } else { "Not shown" },
+            detail: if shown {
+                "Your phone's battery, connection and quick actions are in the tray.".to_string()
+            } else {
+                check.detail.clone()
+            },
+            fix: Fix::None,
         });
     }
 
@@ -1733,6 +1751,13 @@ mod tests {
             distro: Some(Distro::Fedora),
         });
         assert!(!ids(&rows).contains(&"extension"), "no top bar off GNOME");
+        let tray = rows.iter().find(|row| row.id == "tray").unwrap();
+        assert_eq!(tray.status, Status::Idle, "no tray host on this machine");
+        assert!(
+            tray.detail.contains("Waybar"),
+            "sway's own step: {}",
+            tray.detail
+        );
         let plugins = rows.iter().find(|row| row.id == "plugins").unwrap();
         assert_eq!(plugins.status, Status::Err);
         let Fix::Copy(command) = &plugins.fix else {

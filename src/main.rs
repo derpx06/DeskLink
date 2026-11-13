@@ -77,6 +77,7 @@ mod autostart;
 mod bucket_progress;
 mod config;
 mod desk_menu;
+mod desktop_env;
 mod device_links;
 mod image_limits;
 mod kde;

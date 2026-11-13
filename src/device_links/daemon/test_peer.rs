@@ -2059,6 +2059,7 @@ mod tests {
             locked: true,
             local: true,
             ready: true,
+            unlockable: true,
         };
         assert_eq!(
             approve("relay-phone", Some(&nonce), all_good),

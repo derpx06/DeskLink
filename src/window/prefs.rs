@@ -1629,14 +1629,15 @@ fn add_top_bar_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settin
     let tray = adw::ActionRow::builder().title("Tray icon").build();
     with_icon(&tray, "phone-symbolic");
     let indicator_off = crate::shell_dbus::appindicator_off();
-    tray.set_subtitle(if tray_hosted() {
-        "Shown"
+    tray.set_subtitle(&if tray_hosted() {
+        "Shown".to_string()
     } else if indicator_off.is_some() {
-        "Not shown — the AppIndicator extension is installed but off"
+        "Not shown — the AppIndicator extension is installed but off".to_string()
     } else if gnome {
-        "Not available — GNOME shows tray icons only with the AppIndicator extension"
+        "Not available — GNOME shows tray icons only with the AppIndicator extension".to_string()
     } else {
-        "Not available on this desktop"
+        // Each desktop's own step (Plasma's System Tray, Waybar's tray module…).
+        format!("Not shown — {}", crate::desktop_env::current().tray_setup())
     });
     if let Some(uuid) = indicator_off.filter(|_| !tray_hosted()) {
         let button = gtk::Button::builder()
