@@ -916,8 +916,13 @@ impl DesktopWebRtcPeer {
                 channel.close();
             }
         }
-        let promise = gst::Promise::new();
-        self.webrtcbin.emit_by_name::<()>("close", &[&promise]);
+        // webrtcbin's `close` action is GStreamer 1.26+ (Ubuntu 24.04 has
+        // 1.24, where emitting it panicked); without it the NULL state below
+        // closes the connection.
+        if gst::glib::subclass::SignalId::lookup("close", self.webrtcbin.type_()).is_some() {
+            let promise = gst::Promise::new();
+            self.webrtcbin.emit_by_name::<()>("close", &[&promise]);
+        }
         // The whole pipeline goes to NULL *before* the screen capture is touched.
         // `webrtcbin` is the downstream end, so it shuts down first, and that is
         // what frees a capture thread parked inside it; stopping the capture
