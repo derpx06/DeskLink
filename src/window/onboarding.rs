@@ -202,7 +202,7 @@ pub(super) fn setup_rows(facts: &SetupFacts) -> Vec<SetupRow> {
             .map(|packages| packages.command(facts.distro))
     };
     let with_install = |check: &Check| match install(check) {
-        Some(command) => format!("{}\n\nInstall: {command}", check.detail),
+        Some(_) => format!("{}\n\n{}", check.detail, super::INSTALL_HINT),
         None => check.detail.clone(),
     };
     let copy_or_none = |check: &Check| install(check).map_or(Fix::None, Fix::Copy);
@@ -424,7 +424,7 @@ pub(super) fn setup_rows(facts: &SetupFacts) -> Vec<SetupRow> {
                 .join(" ")
         };
         if !commands.is_empty() {
-            detail.push_str(&format!("\n\nInstall: {}", commands.join("\n")));
+            detail.push_str(&format!("\n\n{}", super::INSTALL_HINT));
         }
         rows.push(SetupRow {
             id: "plugins",
@@ -1766,7 +1766,11 @@ mod tests {
             panic!("{:?}", plugins.fix)
         };
         assert!(command.starts_with("sudo dnf install gstreamer1-plugins-bad-free"));
-        assert!(plugins.detail.contains("Install: sudo dnf"));
+        assert!(plugins.detail.contains(super::super::INSTALL_HINT));
+        assert!(
+            !plugins.detail.contains("sudo"),
+            "the command is behind Copy command"
+        );
         let autostart = &rows[0];
         assert_eq!(
             autostart.status,

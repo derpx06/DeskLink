@@ -37,14 +37,32 @@ fn list(rows: &[Check]) -> gtk::ListBox {
         .css_classes(["dl-row-group"])
         .build();
     for row in rows {
-        let subtitle = match row.install {
-            Some(packages) if row.level != Level::Ok => {
-                format!("{}\n\nInstall: {}", row.detail, packages.command(distro))
-            }
-            _ => row.detail.clone(),
+        // The package names are what people copy, so they sit behind
+        // "Copy command" (and in its tooltip); the row says it in words.
+        let command = row
+            .install
+            .filter(|_| row.level != Level::Ok)
+            .map(|packages| packages.command(distro));
+        let subtitle = match &command {
+            Some(_) => format!("{}\n\n{}", row.detail, super::INSTALL_HINT),
+            None => row.detail.clone(),
         };
         let (icon, tone) = look(row.level);
         let widget = list_row(icon, tone, row.title, Some(&subtitle));
+        if let Some(command) = command {
+            let copy = button(
+                ButtonKind::Tonal,
+                "Copy command",
+                Some("desklink-content-copy-symbolic"),
+            );
+            copy.set_valign(gtk::Align::Center);
+            copy.set_tooltip_text(Some(&command));
+            copy.connect_clicked(move |button| {
+                button.display().clipboard().set_text(&command);
+                super::toast_from(button, "Command copied");
+            });
+            widget.add_suffix(&copy);
+        }
         // The whole text, to read and to copy.
         widget.set_subtitle_selectable(true);
         widget.set_subtitle_lines(0);

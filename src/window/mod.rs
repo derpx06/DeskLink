@@ -2674,6 +2674,11 @@ pub(crate) fn device_type_label(device_type: &str) -> String {
 }
 
 /// "482913" → "482 913": two groups read aloud and compare more easily.
+/// Said where a "Copy command" button holds what to install: the package
+/// names stay behind the button, the words stay plain.
+pub(super) const INSTALL_HINT: &str =
+    "To install what is missing, copy the command and paste it into a terminal.";
+
 fn spaced_code(code: &str) -> String {
     let digits: Vec<char> = code.chars().collect();
     if digits.len() == 6 {

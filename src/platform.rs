@@ -623,7 +623,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             "share",
             "Share this screen and let the phone control it",
             Level::Missing,
-            "The video encoder DeskLink sends this screen with is not installed.",
+            "The video part DeskLink sends this screen with is not installed.",
             Some(GST_GOOD),
         )
         .tech("Needs GStreamer vp8enc (gst-plugins-good).")
@@ -653,7 +653,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
                 "view",
                 "Phone screen on this computer",
                 Level::Missing,
-                "The phone's screen cannot be shown: the video decoders are not installed.",
+                "The phone's screen cannot be shown: the video parts it needs are not installed.",
                 Some(GST_VIDEO),
             )
             .tech("No GStreamer VP8 or H.264 decoder (vp8dec, avdec_h264, openh264dec, vah264dec).")
@@ -675,7 +675,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             "sound",
             "Sound with the phone",
             Level::Missing,
-            "The sound codec DeskLink uses is not installed.",
+            "The sound part DeskLink uses is not installed.",
             Some(GST_BASE),
         )
         .tech("Needs GStreamer opusenc and opusdec (gst-plugins-base).")
