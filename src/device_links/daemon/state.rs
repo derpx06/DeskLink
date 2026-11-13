@@ -687,7 +687,7 @@ pub(super) fn upsert_notification_for(
         request_reply_id: packet
             .get_str("requestReplyId")
             .map(|value| sanitize_text(value, 240)),
-        actions: string_vec(packet.body.get("actions")).unwrap_or_default(),
+        actions: action_labels(packet.body.get("actions")),
         silent: packet.get_bool("silent").unwrap_or(false),
     };
 
@@ -741,9 +741,32 @@ fn string_vec(value: Option<&Value>) -> Option<Vec<String>> {
         })
     })
 }
+/// A notification's buttons as the desk shows them and sends them back when
+/// pressed (`build_notification_action_packet` trims): a blank label (Android
+/// 15's redaction blanks every title) or a repeated one could not be pressed,
+/// so neither becomes a button.
+fn action_labels(value: Option<&Value>) -> Vec<String> {
+    let mut labels: Vec<String> = Vec::new();
+    for label in string_vec(value).unwrap_or_default() {
+        let label = label.trim();
+        if !label.is_empty() && !labels.iter().any(|kept| kept == label) {
+            labels.push(label.to_string());
+        }
+    }
+    labels
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_buttons_drop_blank_and_repeated_labels() {
+        let actions = serde_json::json!(["", "  ", " Archive ", "Delete", "Archive", 3]);
+        assert_eq!(action_labels(Some(&actions)), ["Archive", "Delete"]);
+        // Android 15's redacted notification: three buttons, all blank.
+        assert!(action_labels(Some(&serde_json::json!(["", "", ""]))).is_empty());
+        assert!(action_labels(None).is_empty());
+    }
 
     /// A paired phone that is away must still have a row from startup — the
     /// relay never passes discovery, so nothing else would create it.
