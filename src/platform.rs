@@ -449,11 +449,18 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
                 Some(APPINDICATOR),
             ),
             _ => (
-                "No tray was found on this desktop (it needs a StatusNotifierItem host, such \
-                 as the tray in Plasma, Xfce, MATE, Cinnamon, Waybar or swaybar). DeskLink \
-                 still works: closing the window keeps it running, and you reopen it from \
-                 the launcher or by running `desklink` again.",
+                "No tray is showing DeskLink. DeskLink still works: closing the window keeps \
+                 it running, and you reopen it from the launcher or by running `desklink` \
+                 again.",
                 None,
+            ),
+        };
+        // The desktop's own step to get a tray (`desktop_env`).
+        let detail = match family {
+            Family::Gnome => detail.to_string(),
+            _ => format!(
+                "{} {detail}",
+                crate::desktop_env::detect(&probe.desktop).tray_setup()
             ),
         };
         check("tray", "System tray", Level::Limited, detail, install)
