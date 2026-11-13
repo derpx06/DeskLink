@@ -494,9 +494,21 @@ pub(crate) fn start_initiator(
     // One start at a time per phone: the wake, the beacon, the network change
     // and the ladder's own timer can all arrive within milliseconds, and each
     // used to build a pipeline or send its own restart request.
-    let Some(_starting) = claim_start(&binding.device_id) else {
+    let Some(starting) = claim_start(&binding.device_id) else {
         return Ok(());
     };
+    start_claimed(binding, sessions, config, devices, events, starting)
+}
+
+/// [`start_initiator`] for a caller that already holds the start claim.
+fn start_claimed(
+    binding: SessionBinding,
+    sessions: Arc<DeviceManager>,
+    config: Arc<Mutex<Config>>,
+    devices: Arc<Mutex<HashMap<String, DeviceView>>>,
+    events: Arc<Mutex<Vec<DaemonEvent>>>,
+    _starting: Starting,
+) -> Result<(), String> {
     // Its offer (or restart request) could never be delivered: a peer built
     // now only times out, rung after rung. The next link starts it.
     if binding.link.is_closed() {
@@ -741,13 +753,19 @@ pub(crate) fn handle_signaling_packet(
 /// Drops the current peer, caps the backoff ladder at its last rung (it does
 /// not reset it) and offers afresh. Used when the responder asks for a
 /// restart: it cannot rebuild on its own.
-fn restart_as_initiator(
+pub(crate) fn restart_as_initiator(
     binding: &SessionBinding,
     sessions: Arc<DeviceManager>,
     config: Arc<Mutex<Config>>,
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     events: Arc<Mutex<Vec<DaemonEvent>>>,
 ) -> Result<(), String> {
+    // A start already under way (a rebuild timer, a beacon) is the fresh
+    // offer the phone asks for: clearing it and then losing the claim to it
+    // left no peer, no timer and no error.
+    let Some(starting) = claim_start(&binding.device_id) else {
+        return Ok(());
+    };
     let replaced = sessions
         .with_session(binding, |session| {
             // Cap rather than reset: zeroing on every request meant a network
@@ -767,7 +785,7 @@ fn restart_as_initiator(
         "[DeskLink] Restarting WebRTC for {} at the peer's request",
         binding.device_id
     );
-    start_initiator(binding.clone(), sessions, config, devices, events)
+    start_claimed(binding.clone(), sessions, config, devices, events, starting)
 }
 
 /// Sends a paired feature through the authenticated WebRTC transport once the
@@ -3809,7 +3827,7 @@ fn device_name(devices: &Arc<Mutex<HashMap<String, DeviceView>>>, device_id: &st
 
 /// Marks a start of the WebRTC connection to `device_id` as under way; dropped
 /// when it ends.
-struct Starting(String);
+pub(crate) struct Starting(String);
 
 impl Drop for Starting {
     fn drop(&mut self) {
@@ -3827,7 +3845,7 @@ fn starting() -> &'static Mutex<std::collections::HashSet<String>> {
 
 /// The claim to start a connection to `device_id`, or `None` when one is
 /// already under way.
-fn claim_start(device_id: &str) -> Option<Starting> {
+pub(crate) fn claim_start(device_id: &str) -> Option<Starting> {
     starting()
         .lock()
         .ok()?

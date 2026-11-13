@@ -768,6 +768,46 @@ mod tests {
         assert!(!desktop.sessions.is_current(&current));
     }
 
+    /// The phone's restart request arrives while a start of ours is under
+    /// way (a rebuild timer, a beacon): that start is the fresh offer the
+    /// phone asks for, so it is left alone. Clearing it, then losing the
+    /// one-start-at-a-time claim to it, left no peer, no timer and no error.
+    #[test]
+    fn a_restart_request_never_tears_down_a_start_already_under_way() {
+        use crate::device_links::webrtc::{HandoverRuntime, WebRtcWireBinding};
+        let net = TestNetwork::new();
+        let (desktop, _phone) = paired_pair(&net);
+        let phone_id = desktop.peer_id();
+        let binding = desktop.sessions.current_binding(&phone_id).unwrap();
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let wire = WebRtcWireBinding::from_attempt("desktop", &phone_id, &attempt).unwrap();
+        desktop
+            .sessions
+            .with_session(&binding, |session| {
+                session.webrtc_attempt_id = Some(attempt.clone());
+                session.webrtc_handover = Some(HandoverRuntime::new(attempt.clone(), wire));
+            })
+            .unwrap();
+        let in_flight = crate::device_links::webrtc::coordinator::claim_start(&phone_id).unwrap();
+        crate::device_links::webrtc::coordinator::restart_as_initiator(
+            &binding,
+            Arc::clone(&desktop.sessions),
+            Arc::clone(&desktop.config),
+            Arc::clone(&desktop.devices),
+            Arc::clone(&desktop.events),
+        )
+        .unwrap();
+        assert_eq!(
+            desktop
+                .sessions
+                .with_session(&binding, |s| s.webrtc_attempt_id.clone())
+                .unwrap(),
+            Some(attempt),
+            "the start under way was torn down"
+        );
+        drop(in_flight);
+    }
+
     /// A rebuild (or a beacon's recovery sign) while the bootstrap socket is
     /// closed: the offer could never be delivered, so no peer is built, and
     /// above all none that asks a public STUN server (LAN operation never
