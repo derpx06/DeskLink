@@ -380,7 +380,10 @@ fn desktop_capture_needed(direction: remote_session::ScreenDirection) -> bool {
 /// candidate with no route to the peer costs ICE its full timeout before it is
 /// abandoned. See [`IceServerConfig::local_ip`] for why this matters far more
 /// than STUN here.
-fn ice_config_for(binding: &SessionBinding, config: &Arc<Mutex<Config>>) -> IceServerConfig {
+pub(crate) fn ice_config_for(
+    binding: &SessionBinding,
+    config: &Arc<Mutex<Config>>,
+) -> IceServerConfig {
     let mut ice = config
         .lock()
         .ok()
@@ -388,6 +391,12 @@ fn ice_config_for(binding: &SessionBinding, config: &Arc<Mutex<Config>>) -> IceS
         .unwrap_or_default();
     match binding.link.local_ip() {
         Some(ip) => ice.local_ips = vec![ip],
+        // No local address and no relay in this build: a closed LAN link.
+        // The default route's addresses, and never a server (LAN operation
+        // needs none); `start_initiator` builds nothing over a closed link.
+        None if !crate::device_links::relay_link::RELAY_ENABLED => {
+            ice.local_ips = crate::device_links::relay_link::route::default_route_addresses();
+        }
         // Bootstrapped through the relay: the internet path, with STUN for
         // the public address and the relay's TURN for when nothing direct
         // works.
@@ -488,6 +497,11 @@ pub(crate) fn start_initiator(
     let Some(_starting) = claim_start(&binding.device_id) else {
         return Ok(());
     };
+    // Its offer (or restart request) could never be delivered: a peer built
+    // now only times out, rung after rung. The next link starts it.
+    if binding.link.is_closed() {
+        return Ok(());
+    }
     let (local_device_id, remote_device_id) = local_and_remote_device_ids(&binding, &config)?;
     if local_device_id >= remote_device_id {
         let request_id = Uuid::new_v4().to_string();

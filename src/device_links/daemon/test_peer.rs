@@ -768,6 +768,40 @@ mod tests {
         assert!(!desktop.sessions.is_current(&current));
     }
 
+    /// A rebuild (or a beacon's recovery sign) while the bootstrap socket is
+    /// closed: the offer could never be delivered, so no peer is built, and
+    /// above all none that asks a public STUN server (LAN operation never
+    /// needs a server). The next link starts the negotiation.
+    #[test]
+    fn no_peer_is_built_over_a_closed_bootstrap_link_and_none_asks_a_server() {
+        let net = TestNetwork::new();
+        let (desktop, _phone) = paired_pair(&net);
+        let phone_id = desktop.peer_id();
+        let binding = desktop.sessions.current_binding(&phone_id).unwrap();
+        binding.link.close();
+        let ice =
+            crate::device_links::webrtc::coordinator::ice_config_for(&binding, &desktop.config);
+        assert!(
+            ice.stun_servers.is_empty() && ice.turn_servers.is_empty(),
+            "a LAN-only build asked {:?} / {:?}",
+            ice.stun_servers,
+            ice.turn_servers
+        );
+        crate::device_links::webrtc::coordinator::start_initiator(
+            binding.clone(),
+            Arc::clone(&desktop.sessions),
+            Arc::clone(&desktop.config),
+            Arc::clone(&desktop.devices),
+            Arc::clone(&desktop.events),
+        )
+        .unwrap();
+        assert_eq!(
+            desktop.sessions.active_webrtc_attempt(&binding).unwrap(),
+            None,
+            "a peer whose offer can never leave"
+        );
+    }
+
     /// A dozing phone (frozen by its OS) gets 90 s of LAN silence before its
     /// link is buried; an awake one keeps the 30 s budget.
     #[test]
