@@ -195,6 +195,11 @@ impl Page {
         if let Some(seen) = super::last_seen_words(device) {
             count.push_str(&format!(" · {seen}"));
         }
+        // The greyed list says why, and when it comes back.
+        let waiting = !device.feature_transport_ready && !notifications.is_empty();
+        if waiting {
+            count.push_str(&format!(" · Reply or dismiss once {} is back", device.name));
+        }
         self.count.set_label(&count);
         self.empty.root.set_visible(notifications.is_empty());
         self.empty.body.set_label(&empty_line(

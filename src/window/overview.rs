@@ -291,20 +291,16 @@ fn show_round_trip(win: &DesklinkWindow, device: &DeviceView) {
     }
 }
 
-/// " · charging", with the time to full when the phone knows it.
+/// "charging", with the time to full when the phone knows it.
 fn charging_words(remaining_ms: Option<i64>) -> String {
     match remaining_ms.map(|ms| (ms + 59_999) / 60_000) {
         Some(minutes) if minutes > 0 && minutes < 60 => {
-            format!(" · charging, full in {minutes} min")
+            format!("charging, full in {minutes} min")
         }
         Some(minutes) if minutes >= 60 => {
-            format!(
-                " · charging, full in {} h {} min",
-                minutes / 60,
-                minutes % 60
-            )
+            format!("charging, full in {} h {} min", minutes / 60, minutes % 60)
         }
-        _ => " · charging".to_string(),
+        _ => "charging".to_string(),
     }
 }
 
@@ -398,18 +394,24 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
             }
         }
         line.append(&ring);
-        let words = gtk::Box::builder().valign(gtk::Align::Center).build();
+        // The percent, the dot and the words are three labels, not one string
+        // with a leading " · ": right to left, that string's spaces went to
+        // the far end and the line read "25 min82%".
+        let words = gtk::Box::builder()
+            .spacing(4)
+            .valign(gtk::Align::Center)
+            .build();
         words.append(&percent);
-        if let Some(seen) = super::last_seen_words(device) {
-            words.append(&text(
-                &format!(" · {seen}"),
-                &["text-dim", "caption-strong"],
-            ));
-        } else if battery.is_charging && live {
-            words.append(&text(
-                &charging_words(battery.charge_time_remaining),
-                &["text-dim", "caption-strong"],
-            ));
+        let after = match super::last_seen_words(device) {
+            Some(seen) => Some(seen),
+            None if battery.is_charging && live => {
+                Some(charging_words(battery.charge_time_remaining))
+            }
+            None => None,
+        };
+        if let Some(after) = after {
+            words.append(&text("·", &["text-dim", "caption-strong"]));
+            words.append(&text(&after, &["text-dim", "caption-strong"]));
         }
         line.append(&words);
         info.append(&line);
@@ -1770,17 +1772,17 @@ mod tests {
 
     #[test]
     fn charging_says_when_the_phone_will_be_full() {
-        assert_eq!(charging_words(None), " · charging");
-        assert_eq!(charging_words(Some(-1)), " · charging");
-        assert_eq!(charging_words(Some(0)), " · charging");
+        assert_eq!(charging_words(None), "charging");
+        assert_eq!(charging_words(Some(-1)), "charging");
+        assert_eq!(charging_words(Some(0)), "charging");
         assert_eq!(
             charging_words(Some(25 * 60_000)),
-            " · charging, full in 25 min"
+            "charging, full in 25 min"
         );
-        assert_eq!(charging_words(Some(30_000)), " · charging, full in 1 min");
+        assert_eq!(charging_words(Some(30_000)), "charging, full in 1 min");
         assert_eq!(
             charging_words(Some(95 * 60_000)),
-            " · charging, full in 1 h 35 min"
+            "charging, full in 1 h 35 min"
         );
     }
 

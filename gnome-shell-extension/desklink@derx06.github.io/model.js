@@ -124,7 +124,7 @@ export function deviceChips(device) {
             });
         }
         if ((device.transfers ?? []).some(transfer => /^fast/i.test(transfer.lane)))
-            chips.push({id: 'lane', text: 'Fast lane', tone: 'ok'});
+            chips.push({id: 'lane', text: 'Fast, over Wi-Fi', tone: 'ok'});
         const sound = device.sound ?? {};
         if (sound.deskSound || sound.phoneMic || sound.phoneSound)
             chips.push({id: 'sound', text: 'Sound on', tone: 'info'});

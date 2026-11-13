@@ -339,9 +339,10 @@ impl Sidebar {
         // The phone asked for a Bucket that is not on yet.
         let bucket_asked = device.trusted && super::bucket::asked(&device.id);
         let key = format!(
-            "{}\n{shared}\n{unread}\n{}\n{bucket_asked}",
+            "{}\n{shared}\n{unread}\n{}\n{bucket_asked}\n{}",
             sessions.len(),
-            device.trusted
+            device.trusted,
+            device.name
         );
         if *self.rows_key.borrow() == key {
             return;
@@ -352,7 +353,11 @@ impl Sidebar {
                 end.remove(&child);
             }
             // A device still pairing has only its overview.
-            row.set_sensitive(device.trusted || name == "home");
+            let open = device.trusted || name == "home";
+            row.set_sensitive(open);
+            // Greyed, never silent: the pointer and a screen reader hear why.
+            let why = (!open).then(|| format!("Opens once {} is paired", device.name));
+            row.set_tooltip_text(why.as_deref());
             let title = PAGES
                 .iter()
                 .find(|(page, _, _)| page == name)
@@ -376,6 +381,9 @@ impl Sidebar {
                     label.push_str(&format!(", {unread} new"));
                 }
                 _ => {}
+            }
+            if let Some(why) = &why {
+                label.push_str(&format!(", {why}"));
             }
             row.update_property(&[gtk::accessible::Property::Label(&label)]);
         }

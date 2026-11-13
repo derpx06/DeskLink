@@ -54,7 +54,7 @@ test('chips: connection, route with round trip, battery, lane, sound, DND', () =
         settings: {dndShare: true},
     }));
     assert.deepEqual(chips.map(chip => chip.text),
-        ['Wi-Fi · 12 ms', '82% · charging', 'Fast lane', 'Sound on', 'DND shared']);
+        ['Wi-Fi · 12 ms', '82% · charging', 'Fast, over Wi-Fi', 'Sound on', 'DND shared']);
     assert.equal(deviceChips(phone({battery: 15, charging: false})).find(c => c.id === 'battery').tone, 'warn');
     assert.deepEqual(deviceChips(phone({ready: false, reachable: false, settings: {}})).map(c => c.text), []);
     assert.deepEqual(deviceChips(null), []);

@@ -20,8 +20,12 @@
     <file alias="icons/scalable/actions/desklink-accessibility-new-symbolic.svg">icons/desklink-accessibility-new-symbolic.svg</file>
     <file alias="icons/scalable/actions/desklink-add-symbolic.svg">icons/desklink-add-symbolic.svg</file>
     <file alias="icons/scalable/actions/desklink-arrow-back-symbolic.svg">icons/desklink-arrow-back-symbolic.svg</file>
+    <!-- Right to left, GTK picks this mirror on its own (the "-rtl" suffix). -->
+    <file alias="icons/scalable/actions/desklink-arrow-back-symbolic-rtl.svg">icons/desklink-arrow-back-symbolic-rtl.svg</file>
     <file alias="icons/scalable/actions/desklink-arrow-downward-symbolic.svg">icons/desklink-arrow-downward-symbolic.svg</file>
     <file alias="icons/scalable/actions/desklink-arrow-forward-symbolic.svg">icons/desklink-arrow-forward-symbolic.svg</file>
+    <!-- Right to left, GTK picks this mirror on its own (the "-rtl" suffix). -->
+    <file alias="icons/scalable/actions/desklink-arrow-forward-symbolic-rtl.svg">icons/desklink-arrow-forward-symbolic-rtl.svg</file>
     <file alias="icons/scalable/actions/desklink-arrow-upward-symbolic.svg">icons/desklink-arrow-upward-symbolic.svg</file>
     <file alias="icons/scalable/actions/desklink-badge-symbolic.svg">icons/desklink-badge-symbolic.svg</file>
     <file alias="icons/scalable/actions/desklink-battery-full-symbolic.svg">icons/desklink-battery-full-symbolic.svg</file>
@@ -30,6 +34,8 @@
     <file alias="icons/scalable/actions/desklink-check-symbolic.svg">icons/desklink-check-symbolic.svg</file>
     <file alias="icons/scalable/actions/desklink-check-circle-symbolic.svg">icons/desklink-check-circle-symbolic.svg</file>
     <file alias="icons/scalable/actions/desklink-chevron-right-symbolic.svg">icons/desklink-chevron-right-symbolic.svg</file>
+    <!-- Right to left, GTK picks this mirror on its own (the "-rtl" suffix). -->
+    <file alias="icons/scalable/actions/desklink-chevron-right-symbolic-rtl.svg">icons/desklink-chevron-right-symbolic-rtl.svg</file>
     <file alias="icons/scalable/actions/desklink-close-symbolic.svg">icons/desklink-close-symbolic.svg</file>
     <file alias="icons/scalable/actions/desklink-coffee-symbolic.svg">icons/desklink-coffee-symbolic.svg</file>
     <file alias="icons/scalable/actions/desklink-content-copy-symbolic.svg">icons/desklink-content-copy-symbolic.svg</file>

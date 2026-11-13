@@ -256,6 +256,8 @@ mod imp {
         /// The standing problem (`platform::sticky_notice`) the banner shows
         /// now, if any, and the ones the person dismissed this run.
         pub sticky_id: RefCell<Option<&'static str>>,
+        /// The standing problem's install command: its banner button copies it.
+        pub sticky_command: RefCell<Option<String>>,
         pub sticky_dismissed: RefCell<std::collections::HashSet<&'static str>>,
         /// The last error toast and when, so a repeating error toasts once.
         pub last_error_toast: RefCell<Option<(String, std::time::Instant)>>,
@@ -1211,7 +1213,9 @@ impl DesklinkWindow {
                     if let Some(dialog) = self.visible_dialog() {
                         if matches!(
                             dialog.title().as_str(),
-                            pairing::PAIR_TITLE | pairing::PAIR_CODE_TITLE
+                            pairing::PAIR_TITLE
+                                | pairing::PAIR_FIRST_TITLE
+                                | pairing::PAIR_CODE_TITLE
                         ) {
                             dialog.close();
                             was_pairing = true;
@@ -1908,12 +1912,25 @@ impl DesklinkWindow {
     fn assert_sticky_notice(&self) -> bool {
         let imp = self.imp();
         let notice = crate::platform::sticky_notice()
-            .filter(|(id, _)| !imp.sticky_dismissed.borrow().contains(id));
+            .filter(|(id, _, _)| !imp.sticky_dismissed.borrow().contains(id));
         let showing = imp.sticky_id.borrow().is_some();
         match notice {
-            Some((id, words)) if showing || !imp.error_banner.is_revealed() => {
-                imp.error_banner.set_title(&words);
-                imp.error_banner.set_button_label(Some("Dismiss"));
+            Some((id, words, command)) if showing || !imp.error_banner.is_revealed() => {
+                // An AdwBanner has one button: "Copy command" when there is
+                // something to install (it also puts the banner away, as the
+                // same need stays in Finish setting up), "Dismiss" otherwise.
+                let title = match &command {
+                    Some(_) => format!("{words} {INSTALL_HINT}"),
+                    None => words,
+                };
+                imp.error_banner.set_title(&title);
+                imp.error_banner
+                    .set_button_label(Some(if command.is_some() {
+                        "Copy command"
+                    } else {
+                        "Dismiss"
+                    }));
+                imp.sticky_command.replace(command);
                 imp.error_banner.set_revealed(true);
                 imp.sticky_id.replace(Some(id));
                 true
@@ -1929,13 +1946,18 @@ impl DesklinkWindow {
         }
     }
 
-    /// The banner button on a standing problem: dismisses it for this run.
+    /// The banner button on a standing problem: copies its install command
+    /// when it has one, and dismisses it for this run.
     /// `false` when the banner shows an error instead.
     fn dismiss_sticky_notice(&self) -> bool {
         let imp = self.imp();
         let Some(id) = imp.sticky_id.replace(None) else {
             return false;
         };
+        if let Some(command) = imp.sticky_command.take() {
+            self.clipboard().set_text(&command);
+            self.show_feature_toast("Command copied");
+        }
         imp.sticky_dismissed.borrow_mut().insert(id);
         imp.error_banner.set_revealed(false);
         true
@@ -2680,6 +2702,11 @@ pub(crate) fn device_type_label(device_type: &str) -> String {
 }
 
 /// "482913" → "482 913": two groups read aloud and compare more easily.
+/// Said where a "Copy command" button holds what to install: the package
+/// names stay behind the button, the words stay plain.
+pub(super) const INSTALL_HINT: &str =
+    "To install what is missing, copy the command and paste it into a terminal.";
+
 fn spaced_code(code: &str) -> String {
     let digits: Vec<char> = code.chars().collect();
     if digits.len() == 6 {
@@ -3705,6 +3732,11 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         // (underscores for spaces); again closes it.
         "palette" => palette::toggle(win, &format!("{id} {arg}").trim().replace('_', " ")),
         "system-check" => system_check::show_dialog(win),
+        // "fake-sticky": the phone link's parts missing, as the banner shows it.
+        "fake-sticky" => {
+            crate::platform::fake_missing_link();
+            win.assert_sticky_notice();
+        }
         // "fake-error TEXT": a daemon error, as the banner shows it.
         "fake-error" => win.report_error(&format!("{id} {arg}").trim().replace('_', " "), false),
         "open-codes" => win.show_discovery_dialog(false),
@@ -4387,6 +4419,10 @@ mod tests {
             broken(true, false);
             assert!(window.assert_sticky_notice());
             assert!(banner.title().contains("Phones cannot connect"));
+            // What to install is behind the button, never in the words.
+            assert!(!banner.title().contains("Install:") && !banner.title().contains("sudo"));
+            assert!(banner.title().contains(INSTALL_HINT));
+            assert_eq!(banner.button_label().as_deref(), Some("Copy command"));
             broken(true, true);
             assert!(!window.assert_sticky_notice());
             assert!(!banner.is_revealed());

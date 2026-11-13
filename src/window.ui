@@ -89,6 +89,8 @@
                         <property name="min-sidebar-width">232</property>
                         <property name="max-sidebar-width">248</property>
                         <property name="sidebar-width-fraction">0.2</property>
+                        <!-- In text units: with Large Text the names in the sidebar still fit. -->
+                        <property name="sidebar-width-unit">sp</property>
                         <property name="sidebar">
                           <object class="AdwNavigationPage">
                             <property name="title" translatable="yes">DeskLink</property>
