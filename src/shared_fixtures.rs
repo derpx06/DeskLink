@@ -330,5 +330,9 @@ fn the_desk_refuses_the_shared_emergency_numbers() {
             crate::device_links::calls::dial_refusal(&format!("+44{number}")).is_some(),
             "+44{number}"
         );
+        assert!(
+            crate::device_links::calls::dial_refusal(&format!("00{number}")).is_some(),
+            "00{number}"
+        );
     }
 }

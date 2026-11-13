@@ -225,19 +225,25 @@ pub(crate) const EMERGENCY: [&str; 20] = [
 /// here: an emergency number, bare, with a leading `+` or `00`, or behind a
 /// country code in international form (`+44 999`, `0044 112`, `+1 911`).
 pub(crate) fn dial_refusal(number: &str) -> Option<&'static str> {
-    // Bare first: Australia's 000 starts like the international prefix 00.
+    // Every reading of it: as typed (Australia's 000 starts like the
+    // international prefix 00) and with the international prefix taken off
+    // (`00` + 000), each also behind a country code.
     let bare = number.strip_prefix('+').unwrap_or(number);
     let international = number
         .strip_prefix('+')
-        .or_else(|| number.strip_prefix("00"))
-        .map(|digits| digits.strip_prefix("00").unwrap_or(digits));
+        .or_else(|| number.strip_prefix("00"));
     let emergency = EMERGENCY.contains(&bare)
         || international.is_some_and(|digits| {
-            EMERGENCY.iter().any(|code| {
-                digits
-                    .strip_suffix(*code)
-                    .is_some_and(|country| country.len() <= 3)
-            })
+            [Some(digits), digits.strip_prefix("00")]
+                .into_iter()
+                .flatten()
+                .any(|digits| {
+                    EMERGENCY.iter().any(|code| {
+                        digits
+                            .strip_suffix(*code)
+                            .is_some_and(|country| country.len() <= 3)
+                    })
+                })
         });
     emergency
         .then_some("Emergency numbers cannot be dialled from the computer. Use the phone itself")
@@ -406,7 +412,9 @@ mod tests {
 
     #[test]
     fn emergency_numbers_are_refused_and_premium_ones_flagged() {
-        for n in ["112", "911", "+112", "00112", "999", "000", "+000"] {
+        for n in [
+            "112", "911", "+112", "00112", "999", "000", "+000", "00000", "+00112",
+        ] {
             assert!(dial_refusal(n).is_some(), "{n}");
             assert!(request(None, "dial", Some(n)).is_err(), "{n}");
         }
