@@ -21,6 +21,7 @@ pub(crate) mod lan_scope;
 pub(crate) mod limits;
 pub(crate) mod logind;
 pub(crate) mod media_art;
+pub mod media_seek;
 pub(crate) mod mpris;
 pub(crate) mod notes;
 pub mod packet;

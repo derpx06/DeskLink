@@ -45,7 +45,11 @@ pub const INTERFACE: &str = "derx06.desklink.com.Shell1";
 /// `show-screen`, `media-prev`, `insert-*`, `open-*` and `unpair` actions.
 /// The security-sensitive switches can only be turned OFF here
 /// ([`SWITCHES`]); turning them on is the application's own page.
-const VERSION: u32 = 9;
+/// 10: `Devices[].media` gains `positionMs`, `lengthMs` (both as last reported;
+/// the client moves the bar on while `playing`) and `seekReason` (why the bar
+/// cannot seek, else empty); the `media-seek` action marks a seekable track and
+/// the `SeekMedia(device, position_ms)` method seeks it.
+const VERSION: u32 = 10;
 const INVALID_ARGS: &str = "org.freedesktop.DBus.Error.InvalidArgs";
 
 const XML: &str = r#"<node>
@@ -60,6 +64,10 @@ const XML: &str = r#"<node>
     <method name="Invoke">
       <arg name="device_id" type="s" direction="in"/>
       <arg name="action" type="s" direction="in"/>
+    </method>
+    <method name="SeekMedia">
+      <arg name="device_id" type="s" direction="in"/>
+      <arg name="position_ms" type="x" direction="in"/>
     </method>
     <method name="NotificationAction">
       <arg name="device_id" type="s" direction="in"/>
@@ -268,6 +276,10 @@ struct ShellMedia {
     title: String,
     artist: String,
     playing: bool,
+    position_ms: i64,
+    length_ms: i64,
+    /// Why the timeline cannot be used; empty when it can.
+    seek_reason: String,
 }
 
 fn shell_media(device: &DeviceView) -> Option<ShellMedia> {
@@ -279,6 +291,11 @@ fn shell_media(device: &DeviceView) -> Option<ShellMedia> {
         title: media.title.clone(),
         artist: media.artist.clone(),
         playing: media.is_playing,
+        position_ms: media.position.unwrap_or(0),
+        length_ms: media.length.unwrap_or(0),
+        seek_reason: crate::device_links::media_seek::blocked(media.can_seek, media.length)
+            .unwrap_or_default()
+            .to_string(),
     })
 }
 
@@ -507,6 +524,9 @@ fn actions(device: &DeviceView, settings: &AppSettings) -> Vec<&'static str> {
     }
     if shell_media(device).is_some() {
         actions.extend(["media-prev", "media-play-pause", "media-next"]);
+        if shell_media(device).is_some_and(|media| media.seek_reason.is_empty()) {
+            actions.push("media-seek");
+        }
     }
     // The window's own pages and its Unpair question, for a paired phone.
     if device.trusted {
@@ -691,6 +711,9 @@ impl ShellDevice {
             entry.insert("title", &media.title);
             entry.insert("artist", &media.artist);
             entry.insert("playing", media.playing);
+            entry.insert("positionMs", media.position_ms);
+            entry.insert("lengthMs", media.length_ms);
+            entry.insert("seekReason", &media.seek_reason);
             dict.insert_value("media", &entry.end());
         }
         if let Some(bucket) = &self.bucket {
@@ -1107,6 +1130,24 @@ fn call(app: &DesklinkApplication, method: &str, params: &Variant) -> Result<(),
             let devices = current(app);
             let device = check(&devices, &device_id, &action)?;
             perform(app, device, &action);
+            Ok(())
+        }
+        "SeekMedia" => {
+            let (device_id, position_ms) = params.get::<(String, i64)>().unwrap_or_default();
+            let devices = current(app);
+            check(&devices, &device_id, "media-seek")?;
+            let player = daemon
+                .devices()
+                .into_iter()
+                .find(|known| known.id == device_id)
+                .and_then(|known| known.media_status)
+                .map(|media| media.player)
+                .ok_or("nothing is playing")?;
+            daemon.send(DaemonCommand::SendMprisSetPosition(
+                device_id,
+                player,
+                position_ms,
+            ));
             Ok(())
         }
         "NotificationAction" | "NotificationReply" | "NotificationDismiss" => {
@@ -1758,9 +1799,13 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 19] = [
+const KNOWN_BUILDS: [&str; 21] = [
+    // The merged notifications + ext-seek build.
+    "82bbb00882dd33f3741a1d45c86e6ba39ca2e9b32b4237ea34152c219da468c3",
     // Notifications: one plan; a link change never re-banners.
     "978339f19e09ed6c22f083944bb9a2641c2ef3c481b9d0351ab5b3f7cc305149",
+    // The ext-seek build (timeline, tidier header, no clipped tiles).
+    "8ca439b2ba46a297bae63f5b30f1a32204c02e67b04bb14b416a4db6e6d6db83",
     // The current build (no wobbling window while a phone looks at this screen).
     "f7b1d5832081bd42eb8aaa027e115a3963208f9490d73840539df50f829bd347",
     // Links checked, focus kept only while open.
@@ -2718,6 +2763,8 @@ mod tests {
             position: None,
             length: None,
             can_seek: false,
+            position_at: None,
+            seek_hold: None,
             album_art_url: None,
             album_art: None,
         });
@@ -2725,6 +2772,18 @@ mod tests {
         for action in ["media-prev", "media-play-pause", "media-next"] {
             assert!(list.contains(&action), "{action}");
         }
+        // No length or no seeking: the bar is not offered, and says why.
+        assert!(!list.contains(&"media-seek"));
+        assert!(!shell_media(&device).unwrap().seek_reason.is_empty());
+        let media = device.media_status.as_mut().unwrap();
+        media.length = Some(200_000);
+        media.can_seek = true;
+        media.position = Some(30_000);
+        let list = actions(&device, &AppSettings::default());
+        assert!(list.contains(&"media-seek"));
+        let shown = shell_media(&device).unwrap();
+        assert_eq!((shown.position_ms, shown.length_ms), (30_000, 200_000));
+        assert_eq!(VERSION, 10);
     }
 
     /// The one table behind `SetSwitch`: every key resolves, a switch that is

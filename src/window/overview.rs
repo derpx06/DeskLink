@@ -46,6 +46,13 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     // The round trip changes every reading; it is updated in place.
     let steady = DeviceView {
         rtt_ms: None,
+        // The track's position moves in place, never by redrawing the page.
+        media_status: device.media_status.clone().map(|media| {
+            crate::device_links::device::MediaStatus {
+                position: None,
+                ..media
+            }
+        }),
         ..device.clone()
     };
     // What is ongoing on the phone, by id: the card is redrawn when an item
@@ -1064,20 +1071,13 @@ fn now_playing_bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Bo
         .hexpand(true)
         .valign(gtk::Align::Center)
         .build();
-    if let (Some(position), Some(length)) = (media.position, media.length.filter(|l| *l > 0)) {
-        let time = |ms: i64| format!("{}:{:02}", ms / 60_000, (ms / 1000) % 60);
-        progress.append(&text(&time(position), &["mono", "caption", "text-faint"]));
-        let level = gtk::LevelBar::builder()
-            .min_value(0.0)
-            .max_value(1.0)
-            .value((position as f64 / length as f64).clamp(0.0, 1.0))
-            .hexpand(true)
-            .valign(gtk::Align::Center)
-            .css_classes(["track"])
-            .build();
-        level.update_property(&[gtk::accessible::Property::Label("Track position")]);
-        progress.append(&level);
-        progress.append(&text(&time(length), &["mono", "caption", "text-faint"]));
+    if let Some(length) = media.length.filter(|l| *l > 0) {
+        let at = shown_position(media, std::time::Instant::now());
+        let pos = text(&clock(at), &["mono", "caption", "text-faint"]);
+        pos.set_widget_name(&format!("media-pos:{}", device.id));
+        progress.append(&pos);
+        progress.append(&seek_scale(daemon, device, media, &pos, at, length));
+        progress.append(&text(&clock(length), &["mono", "caption", "text-faint"]));
     }
     bar.append(&progress);
     bar.append(&media_controls(
@@ -1087,6 +1087,124 @@ fn now_playing_bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Bo
         media.is_playing,
     ));
     Some(bar)
+}
+
+fn clock(ms: i64) -> String {
+    format!("{}:{:02}", ms / 60_000, (ms / 1000) % 60)
+}
+
+/// Where the phone's track is now: the last report, moved on while it plays.
+fn shown_position(
+    media: &crate::device_links::device::MediaStatus,
+    now: std::time::Instant,
+) -> i64 {
+    let position = media.position.unwrap_or(0);
+    match media.position_at {
+        Some(at) => crate::device_links::media_seek::now_at(
+            position,
+            at,
+            now,
+            media.is_playing,
+            media.length,
+        ),
+        None => position,
+    }
+}
+
+/// The track's timeline: drag or click to seek the phone's player. Values go
+/// out at most five a second while dragging and always on release; the bar
+/// is dimmed, with the reason as its tooltip, when the player cannot seek.
+fn seek_scale(
+    daemon: &DaemonHandle,
+    device: &DeviceView,
+    media: &crate::device_links::device::MediaStatus,
+    pos: &gtk::Label,
+    at: i64,
+    length: i64,
+) -> gtk::Scale {
+    use crate::device_links::media_seek::{blocked, Throttle, DRAG_EVERY};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+    let scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, length as f64, 1000.0);
+    scale.set_draw_value(false);
+    scale.set_hexpand(true);
+    scale.set_valign(gtk::Align::Center);
+    scale.set_value(at as f64);
+    scale.add_css_class("track");
+    scale.set_widget_name(&format!("media-seek:{}", device.id));
+    scale.update_property(&[gtk::accessible::Property::Label("Track position")]);
+    let linked =
+        can_send_feature(device, PACKET_TYPE_MPRIS_REQUEST) && device.feature_transport_ready;
+    let reason = blocked(media.can_seek, media.length).or(if linked {
+        None
+    } else {
+        Some("Waiting for the phone")
+    });
+    scale.set_sensitive(reason.is_none());
+    scale.set_tooltip_text(reason);
+    let state = Rc::new(RefCell::new((Throttle::default(), None::<i64>)));
+    let scheduled = Rc::new(Cell::new(false));
+    let send = {
+        let (daemon, id, player) = (daemon.clone(), device.id.clone(), media.player.clone());
+        Rc::new(move |ms: i64| {
+            daemon.send(DaemonCommand::SendMprisSetPosition(
+                id.clone(),
+                player.clone(),
+                ms,
+            ))
+        })
+    };
+    {
+        let (state, scheduled, send, pos) =
+            (state.clone(), scheduled.clone(), send.clone(), pos.clone());
+        scale.connect_change_value(move |_, _, value| {
+            let ms = (value.round() as i64).clamp(0, length);
+            pos.set_label(&clock(ms));
+            let due = {
+                let mut state = state.borrow_mut();
+                state.1 = Some(ms);
+                state.0.due(std::time::Instant::now())
+            };
+            if due {
+                state.borrow_mut().1 = None;
+                send(ms);
+            } else if !scheduled.replace(true) {
+                let (state, scheduled, send) = (state.clone(), scheduled.clone(), send.clone());
+                gtk::glib::timeout_add_local_once(DRAG_EVERY, move || {
+                    scheduled.set(false);
+                    let pending = state.borrow_mut().1.take();
+                    if let Some(ms) = pending {
+                        state.borrow_mut().0.force(std::time::Instant::now());
+                        send(ms);
+                    }
+                });
+            }
+            gtk::glib::Propagation::Proceed
+        });
+    }
+    // The window leaves the bar alone while it is held (the page is redrawn
+    // with the phone's position as the finger moves otherwise).
+    let click = gtk::GestureClick::new();
+    click.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let scale = scale.clone();
+        click.connect_pressed(move |_, _, _, _| scale.add_css_class("seeking"));
+    }
+    {
+        let (scale, state, send) = (scale.clone(), state.clone(), send.clone());
+        click.connect_released(move |_, _, _, _| {
+            scale.remove_css_class("seeking");
+            let pending = state.borrow_mut().1.take();
+            if let Some(ms) = pending {
+                state.borrow_mut().0.force(std::time::Instant::now());
+                send(ms);
+            }
+        });
+    }
+    scale.add_controller(click);
+    scale
 }
 
 /// Previous, play/pause and next for the phone's player.
@@ -1572,6 +1690,35 @@ fn refresh_in_place(win: &DesklinkWindow, daemon: &DaemonHandle) {
         if let Some(label) = widget.downcast_ref::<gtk::Label>() {
             if label.label() != last {
                 label.set_label(&last);
+            }
+        }
+    }
+    for widget in named_widgets(&root, "media-seek:") {
+        let id = widget
+            .widget_name()
+            .trim_start_matches("media-seek:")
+            .to_string();
+        let Some(media) = daemon
+            .devices()
+            .into_iter()
+            .find(|device| device.id == id)
+            .and_then(|device| device.media_status)
+        else {
+            continue;
+        };
+        let at = shown_position(&media, std::time::Instant::now());
+        // Not under the finger.
+        if let Some(scale) = widget
+            .downcast_ref::<gtk::Scale>()
+            .filter(|scale| !scale.has_css_class("seeking"))
+        {
+            if (scale.value() - at as f64).abs() > 500.0 {
+                scale.set_value(at as f64);
+            }
+            for label in named_widgets(&root, &format!("media-pos:{id}")) {
+                if let Some(label) = label.downcast_ref::<gtk::Label>() {
+                    label.set_label(&clock(at));
+                }
             }
         }
     }

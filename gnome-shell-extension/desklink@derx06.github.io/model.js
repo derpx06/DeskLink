@@ -37,6 +37,16 @@ export function statusLine(device, now = new Date()) {
     return lastSeen(device, now) || 'Not connected';
 }
 
+/// The header's line under the phone's name: the link only (the route, the
+/// battery and the rest are the chips and the ring below it).
+export function headerLine(device, now = new Date()) {
+    if (!device)
+        return 'No phone connected';
+    if (device.ready)
+        return 'Connected';
+    return device.reachable ? 'Connecting…' : (lastSeen(device, now) || 'Not connected');
+}
+
 /// "Wi-Fi · 82%": the toggle's short subtitle (its title is the phone).
 export function shortStatus(device, now = new Date()) {
     if (!device?.ready)
@@ -100,12 +110,6 @@ export function deviceChips(device) {
     if (!device)
         return [];
     const chips = [];
-    if (device.ready)
-        chips.push({id: 'link', text: 'Connected', tone: 'ok'});
-    else if (device.reachable)
-        chips.push({id: 'link', text: 'Connecting…', tone: 'info'});
-    else
-        chips.push({id: 'link', text: 'Offline', tone: 'off'});
     if (device.ready) {
         if (ROUTE[device.path]) {
             const rtt = device.rttMs >= 0 ? ` · ${device.rttMs} ms` : '';
@@ -368,4 +372,65 @@ export function everythingSent(device, desk, extras = {}) {
             keys.add(button.key);
     }
     return {actions: [...actions], keys: [...keys]};
+}
+
+// ── The track's timeline ────────────────────────────────────────────────
+/// "3:07", or "1:02:03" from an hour.
+export function mediaClock(ms) {
+    const seconds = Math.max(0, Math.floor((ms ?? 0) / 1000));
+    const [h, m, s] = [Math.floor(seconds / 3600), Math.floor(seconds / 60) % 60, seconds % 60];
+    return h > 0 ? `${h}:${two(m)}:${two(s)}` : `${m}:${two(s)}`;
+}
+
+/// Where the track is: the position last reported (at `reportedAt`), moved on
+/// while it plays, inside [0, length]. A seek in flight (`held`) wins.
+export function mediaPosition(media, reportedAt, now, held = null) {
+    if (held && now < held.until)
+        return held.ms;
+    const length = media.lengthMs > 0 ? media.lengthMs : Infinity;
+    const moved = media.playing ? Math.max(0, now - reportedAt) : 0;
+    return Math.min(length, Math.max(0, (media.positionMs ?? 0) + moved));
+}
+
+/// Why the timeline cannot be used, in words; '' when it can. Older apps (no
+/// `lengthMs`) have no timeline at all: `null`.
+export function seekReason(device, media) {
+    if (!media || media.lengthMs === undefined)
+        return null;
+    if (media.seekReason)
+        return media.seekReason;
+    return device.actions.includes('media-seek') ? '' : 'Can\'t seek right now';
+}
+
+/// A dragged slider's values: at most one send per `every` ms, the last value
+/// always going out (on a timer, or at once from `flush` on release).
+export function seekThrottle({send, now, schedule, cancel, every = 200}) {
+    let last = -Infinity, pending = null, timer = null;
+    const fire = () => {
+        timer = null;
+        if (pending === null)
+            return;
+        const value = pending;
+        pending = null;
+        last = now();
+        send(value);
+    };
+    return {
+        change(value) {
+            pending = value;
+            const wait = every - (now() - last);
+            if (wait <= 0) {
+                if (timer !== null)
+                    cancel(timer);
+                fire();
+            } else if (timer === null) {
+                timer = schedule(wait, fire);
+            }
+        },
+        flush() {
+            if (timer !== null)
+                cancel(timer);
+            fire();
+        },
+    };
 }

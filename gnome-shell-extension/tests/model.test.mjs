@@ -5,7 +5,7 @@ import {readFileSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 
 import {
-    deviceChips, everythingSent, footer, lastSeen, looksLikeLink, quickTiles, sections,
+    deviceChips, everythingSent, footer, headerLine, lastSeen, mediaClock, mediaPosition, seekReason, seekThrottle, looksLikeLink, quickTiles, sections,
     sessionLine, shortStatus, statusLine, timer, duration,
 } from '../desklink@derx06.github.io/model.js';
 
@@ -54,9 +54,9 @@ test('chips: connection, route with round trip, battery, lane, sound, DND', () =
         settings: {dndShare: true},
     }));
     assert.deepEqual(chips.map(chip => chip.text),
-        ['Connected', 'Wi-Fi · 12 ms', '82% · charging', 'Fast lane', 'Sound on', 'DND shared']);
+        ['Wi-Fi · 12 ms', '82% · charging', 'Fast lane', 'Sound on', 'DND shared']);
     assert.equal(deviceChips(phone({battery: 15, charging: false})).find(c => c.id === 'battery').tone, 'warn');
-    assert.deepEqual(deviceChips(phone({ready: false, reachable: false, settings: {}})).map(c => c.text), ['Offline']);
+    assert.deepEqual(deviceChips(phone({ready: false, reachable: false, settings: {}})).map(c => c.text), []);
     assert.deepEqual(deviceChips(null), []);
     // A transfer over the secure link is not the fast lane.
     assert.ok(!deviceChips(phone({transfers: [{lane: 'over the secure link'}]})).some(c => c.id === 'lane'));
@@ -262,4 +262,57 @@ test('every action row is usable unless it says otherwise', () => {
     assert.ok(rows.length > 20);
     // The link waits for a link on the clipboard, Hand Off for a running terminal.
     assert.deepEqual(rows.filter(r => !r.enabled).map(r => r.id), ['send-link', 'lock-hand-off']);
+});
+
+test('the header says the link once; the chips carry the rest', () => {
+    assert.equal(headerLine(phone()), 'Connected');
+    assert.equal(headerLine(phone({ready: false})), 'Connecting…');
+    assert.equal(headerLine(phone({ready: false, reachable: false})), 'Not connected');
+    assert.ok(!deviceChips(phone()).some(c => c.text === 'Connected'));
+});
+
+test('the timeline moves on while playing, stays inside the track and yields to a seek in flight', () => {
+    const media = {playing: true, positionMs: 10_000, lengthMs: 200_000};
+    assert.equal(mediaPosition(media, 1000, 4000), 13_000);
+    assert.equal(mediaPosition({...media, playing: false}, 1000, 4000), 10_000);
+    assert.equal(mediaPosition({...media, positionMs: 199_000}, 0, 9000), 200_000);
+    assert.equal(mediaPosition({...media, lengthMs: 0}, 0, 9000), 19_000);
+    // Just sought to 90 s: the old report is not the position, for a moment.
+    assert.equal(mediaPosition(media, 1000, 2000, {ms: 90_000, until: 2500}), 90_000);
+    assert.equal(mediaPosition(media, 1000, 3000, {ms: 90_000, until: 2500}), 12_000);
+    assert.equal(mediaClock(187_000), '3:07');
+    assert.equal(mediaClock(3_723_000), '1:02:03');
+});
+
+test('a stream, a refusing player and an older app say why the timeline is off', () => {
+    const device = phone({actions: [...ALL_ACTIONS, 'media-seek']});
+    assert.equal(seekReason(device, {lengthMs: 200_000, seekReason: ''}), '');
+    assert.match(seekReason(device, {lengthMs: 0, seekReason: "Can't seek: live"}), /live/);
+    assert.equal(seekReason(device, {title: 'x'}), null); // an app older than interface 10: no bar
+    assert.match(seekReason(phone(), {lengthMs: 9, seekReason: ''}), /Can't seek/);
+});
+
+test('a dragged slider sends five a second at most, and the release sends the last value', () => {
+    let t = 0;
+    const sent = [], timers = [];
+    const throttle = seekThrottle({
+        send: v => sent.push(v), now: () => t,
+        schedule: (ms, fn) => timers.push({at: t + ms, fn}) , cancel: id => timers.splice(timers.indexOf(id), 1),
+    });
+    throttle.change(1); // goes out at once
+    for (const [at, v] of [[50, 2], [100, 3], [150, 4]]) {
+        t = at;
+        throttle.change(v);
+    }
+    assert.deepEqual(sent, [1]);
+    assert.equal(timers.length, 1); // one trailing send, not three
+    t = 200;
+    timers.shift().fn();
+    assert.deepEqual(sent, [1, 4]);
+    t = 230;
+    throttle.change(5);
+    throttle.flush(); // released: no waiting
+    assert.deepEqual(sent, [1, 4, 5]);
+    throttle.flush(); // nothing new: nothing sent
+    assert.deepEqual(sent, [1, 4, 5]);
 });

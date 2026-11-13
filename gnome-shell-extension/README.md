@@ -10,7 +10,7 @@ Header            name · "Connected · Wi-Fi · 82% ⚡" · battery ring
 Chips             Connected · Wi-Fi 12 ms · 82% charging · Fast lane · Sound on · DND shared
 Cards             Not connected (Try again / Reconnect) · a call (Answer, Decline, Mute, End)
 Quick actions     Files · Clipboard · Ring · Lock · Screen · Photo
-Now playing       previous · play/pause · next
+Now playing       previous · play/pause · next · a timeline (drag or click to seek; dimmed, with the reason, for a stream)
 Now               files moving (with their lane) · Files sync · the phone's timers · what is live here, with End
 Sections          one collapsed section each; the body scrolls when the screen is short
   Send & share        Send files · Send clipboard · Send copied link · Ping · recent files
@@ -63,7 +63,7 @@ the security keys refuse `on`) and `SendLink(device, link)`; and the actions
 `ping`, `send-link`, `show-screen`, `media-prev`, `insert-photo-file|scan|text|qr`,
 `open-files|notes|clipboard|snippets|notifications|contacts|terminals|settings` and
 `unpair`. An action is listed only when the phone takes it. An older app (interface
-below 9) simply shows fewer rows. `model.js` has no GNOME imports and says what the
+below 9) simply shows fewer rows; below 10 it has no timeline. Interface 10 adds `media.positionMs|lengthMs|seekReason`, the `media-seek` action and the `SeekMedia(device, position_ms)` method. `model.js` has no GNOME imports and says what the
 menu holds; `tests/model.test.mjs` also checks that every action and key it names is
 in `shell_dbus.rs`. Run the tests with `node --test gnome-shell-extension/tests/*.test.mjs`.
 

@@ -17,8 +17,12 @@ import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+import {Slider} from 'resource:///org/gnome/shell/ui/slider.js';
 
-import {deviceChips, footer, liveWords, quickTiles, sections, statusLine, timer, duration, lastSeen} from './model.js';
+import {
+    deviceChips, footer, headerLine, liveWords, mediaClock, mediaPosition, quickTiles, sections, seekReason, seekThrottle,
+    statusLine, timer, duration, lastSeen,
+} from './model.js';
 
 export {lastSeen, sessionLine, shortStatus, statusLine} from './model.js';
 
@@ -88,7 +92,7 @@ class BatteryRing extends St.Widget {
         super._init({
             layout_manager: new Clutter.BinLayout(),
             style_class: 'desklink-battery',
-            x_expand: true,
+            x_expand: false,
             x_align: Clutter.ActorAlign.END,
             y_align: Clutter.ActorAlign.CENTER,
         });
@@ -377,6 +381,8 @@ function scrolledSection(menu) {
         child: holder.actor,
     });
     wrapper.box.add_child(scroller);
+    if (menu.insetForScrollbar)
+        holder.actor.style = 'padding-right: 12px;';
     let alive = true;
     scroller.connect('destroy', () => (alive = false));
     const fit = () => {
@@ -385,11 +391,14 @@ function scrolledSection(menu) {
         try {
             const monitor = Main.layoutManager.findMonitorForActor?.(scroller) ?? Main.layoutManager.primaryMonitor;
             scroller.style = '';
+            holder.actor.style = menu.insetForScrollbar ? 'padding-right: 12px;' : '';
             const [, natural] = scroller.get_preferred_height(-1);
             const [, boxHeight] = menu.box.get_preferred_height(-1);
             const [, boxTop] = menu.box.get_transformed_position();
             const excess = boxTop + boxHeight - (monitor.y + monitor.height - 24);
             scroller.style = excess > 0 ? `max-height: ${Math.floor(Math.max(160, natural - excess))}px;` : '';
+            // The pill's own popup scrolls by itself when it is tall: its scrollbar needs the room too.
+            holder.actor.style = excess > 0 || menu.insetForScrollbar ? 'padding-right: 12px;' : '';
         } catch (error) {
             // Best effort: without it the menu is only as tall as it is.
         }
@@ -438,18 +447,127 @@ function addSection(menu, section, selected, ctx) {
         sub.menu.open(0);
 }
 
+/// The track's timeline: elapsed, a slider, the length. Dragging or clicking
+/// seeks the phone's player (at most five seeks a second, the last value
+/// always); a seek holds the bar for a moment so the old position still in
+/// flight does not pull it back. A stream or a player that cannot seek keeps
+/// the bar, dimmed, with the reason under it.
+function seekRow(selected, media, reason, ctx) {
+    const length = media.lengthMs;
+    const wrap = column({style_class: 'desklink-seek'});
+    const line = box({style_class: 'desklink-seek-line'});
+    const elapsed = dim(label('0:00', 'desklink-seek-time'));
+    const total = dim(label(length > 0 ? mediaClock(length) : '–:––', 'desklink-seek-time', {x_align: Clutter.ActorAlign.END}));
+    const slider = new Slider(0);
+    slider.x_expand = true;
+    slider.y_align = Clutter.ActorAlign.CENTER;
+    line.add_child(elapsed);
+    line.add_child(slider);
+    line.add_child(total);
+    wrap.add_child(line);
+
+    const usable = reason === '';
+    let base = {media, at: ctx.mediaAt ?? Date.now()};
+    let held = null, dragging = false, updating = false;
+    const named = position => {
+        slider.accessible_name = usable
+            ? `Track position, ${mediaClock(position)} of ${mediaClock(length)}`
+            : `Track position, unavailable. ${reason}`;
+    };
+    const show = position => {
+        updating = true;
+        slider.value = length > 0 ? Math.min(1, position / length) : 0;
+        elapsed.text = mediaClock(position);
+        updating = false;
+    };
+    const refresh = () => {
+        if (!dragging)
+            show(mediaPosition(base.media, base.at, Date.now(), held));
+    };
+    refresh();
+    named(mediaPosition(base.media, base.at, Date.now(), held));
+    if (!usable) {
+        slider.reactive = false;
+        slider.can_focus = false;
+        slider.opacity = 110;
+        wrap.add_child(dim(label(reason || 'Can\'t seek', 'desklink-card-subtitle desklink-seek-reason')));
+        ctx.tick(refresh);
+        ctx.onMedia?.((now, at) => { base = {media: now, at}; refresh(); });
+        return wrap;
+    }
+    const throttle = seekThrottle({
+        send: ms => {
+            held = {ms, until: Date.now() + 1500};
+            ctx.seek(selected.id, ms);
+        },
+        now: () => Date.now(),
+        schedule: (ms, fn) => GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+            fn();
+            return GLib.SOURCE_REMOVE;
+        }),
+        cancel: id => GLib.source_remove(id),
+    });
+    slider.connect('notify::value', () => {
+        if (updating)
+            return;
+        const ms = Math.round(slider.value * length);
+        held = {ms, until: Date.now() + 1500};
+        elapsed.text = mediaClock(ms);
+        named(ms);
+        throttle.change(ms);
+    });
+    slider.connect('drag-begin', () => (dragging = true));
+    slider.connect('drag-end', () => {
+        dragging = false;
+        throttle.flush();
+    });
+    let seconds = 0;
+    ctx.tick(() => {
+        refresh();
+        if (++seconds % 10 === 0 && !dragging)
+            named(mediaPosition(base.media, base.at, Date.now(), held));
+    });
+    ctx.onMedia?.((now, at) => { base = {media: now, at}; refresh(); });
+    return wrap;
+}
+
+/// Art, title, the three controls and, under them, the timeline.
+function mediaCard(selected, media, ctx, variant) {
+    const can = action => selected.actions.includes(action);
+    const card = column({style_class: 'desklink-media-card'});
+    const line = box({style_class: 'desklink-media'});
+    line.add_child(new St.Icon({icon_name: 'audio-x-generic-symbolic', style_class: `desklink-art ${variant}`, y_align: Clutter.ActorAlign.CENTER}));
+    const words = column();
+    words.add_child(label(media.title, 'desklink-card-title'));
+    if (media.artist)
+        words.add_child(dim(label(media.artist, 'desklink-card-subtitle')));
+    line.add_child(words);
+    if (can('media-prev'))
+        line.add_child(iconButton('media-skip-backward-symbolic', 'Previous track', () => ctx.invoke(selected.id, 'media-prev'), variant));
+    line.add_child(iconButton(media.playing ? 'media-playback-pause-symbolic' : 'media-playback-start-symbolic',
+        media.playing ? 'Pause' : 'Play', () => ctx.invoke(selected.id, 'media-play-pause'), variant));
+    line.add_child(iconButton('media-skip-forward-symbolic', 'Next track', () => ctx.invoke(selected.id, 'media-next'), variant));
+    card.add_child(line);
+    const reason = seekReason(selected, media);
+    if (reason !== null)
+        card.add_child(seekRow(selected, media, reason, ctx));
+    return card;
+}
+
 /// Builds the menu. `ctx`: devices, selected, desk, transfers, snippets,
 /// activities (this phone's ongoing items), activityText(item),
 /// linkInClipboard, openSection, sectionOpened(id, open),
 /// invoke(id, action), call(method, args), setSwitch(id, key, on),
-/// sendLink(id), select(id), appear(actor, key), tick(fn) (run every second
-/// while open), track(item, key).
+/// sendLink(id), seek(id, ms), mediaAt (when the media position was reported),
+/// onMedia(fn(media, at)) (the position moves in place, not by a rebuild),
+/// select(id), appear(actor, key), tick(fn) (run every second while open),
+/// track(item, key).
 export function fillMenu(menu, ctx) {
     const {devices, selected, desk, transfers, invoke} = ctx;
     const variant = `desklink-${styleVariant()}`;
     const can = (device, action) => device?.actions.includes(action);
     if (menu.setHeader) {
-        menu.setHeader('phone-symbolic', selected?.name ?? 'DeskLink', statusLine(selected));
+        menu.setHeader('phone-symbolic', selected?.name ?? 'DeskLink', headerLine(selected));
         ctx.ring?.set(selected?.ready ? selected.battery : -1, !!selected?.charging);
     }
     menu.removeAll();
@@ -457,7 +575,7 @@ export function fillMenu(menu, ctx) {
         // A plain popup menu has no header: a title row in its place.
         const title = column({style_class: 'desklink-head'});
         title.add_child(label(selected.name, 'desklink-card-title'));
-        title.add_child(dim(label(statusLine(selected), 'desklink-card-subtitle')));
+        title.add_child(dim(label(headerLine(selected), 'desklink-card-subtitle')));
         menu.addMenuItem(row(title));
     }
 
@@ -493,7 +611,9 @@ export function fillMenu(menu, ctx) {
     // screen is too short for it.
     const body = scrolledSection(menu);
     // How it is: connection, route, battery, lane, sound, Do Not Disturb.
-    body.addMenuItem(row(chipLines(deviceChips(selected), variant)));
+    const chips = deviceChips(selected);
+    if (chips.length > 0)
+        body.addMenuItem(row(chipLines(chips, variant)));
 
     // Not connected: when it was last here, and a way to try again.
     if (!selected.ready) {
@@ -561,23 +681,10 @@ export function fillMenu(menu, ctx) {
     }
     body.addMenuItem(row(grid));
 
-    // The phone's music.
+    // The phone's music: track, controls and the timeline.
     const media = selected.ready ? selected.media : null;
-    if (media) {
-        const line = box({style_class: 'desklink-media'});
-        line.add_child(new St.Icon({icon_name: 'audio-x-generic-symbolic', style_class: `desklink-art ${variant}`, y_align: Clutter.ActorAlign.CENTER}));
-        const words = column();
-        words.add_child(label(media.title, 'desklink-card-title'));
-        if (media.artist)
-            words.add_child(dim(label(media.artist, 'desklink-card-subtitle')));
-        line.add_child(words);
-        if (can(selected, 'media-prev'))
-            line.add_child(iconButton('media-skip-backward-symbolic', 'Previous track', () => invoke(selected.id, 'media-prev'), variant));
-        line.add_child(iconButton(media.playing ? 'media-playback-pause-symbolic' : 'media-playback-start-symbolic',
-            media.playing ? 'Pause' : 'Play', () => invoke(selected.id, 'media-play-pause'), variant));
-        line.add_child(iconButton('media-skip-forward-symbolic', 'Next track', () => invoke(selected.id, 'media-next'), variant));
-        body.addMenuItem(row(line));
-    }
+    if (media)
+        body.addMenuItem(row(mediaCard(selected, media, ctx, variant)));
 
     // Going on now: files moving, the Files sync, the phone's timers.
     const moving = selected.transfers ?? [];

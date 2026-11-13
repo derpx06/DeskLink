@@ -287,9 +287,11 @@ button.suggested-action { font-weight: 600; }
   background-color: @window_fg_color;
   color: @window_bg_color;
 }
-levelbar.track > trough { min-height: 4px; border-radius: 2px; }
-levelbar.track > trough > block.filled { background-color: @window_fg_color; border-radius: 2px; }
-levelbar.track > trough > block.empty { background-color: @surface_2; }
+scale.track { min-height: 20px; }
+scale.track > trough { min-height: 4px; border-radius: 2px; background-color: @surface_2; }
+scale.track > trough > highlight { background-color: @window_fg_color; border-radius: 2px; }
+scale.track > trough > slider { min-width: 12px; min-height: 12px; background-color: @window_fg_color; }
+scale.track:disabled { opacity: 0.5; }
 
 /* ── Banners ───────────────────────────────────────────────────────────── */
 /* The older banners (`.live-banner`, `.state-banner`), which the Bucket, Insert

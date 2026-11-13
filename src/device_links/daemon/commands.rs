@@ -349,12 +349,7 @@ impl DaemonWorker {
                 self.send_mpris_set_volume(&id, &player, volume)
             }
             DaemonCommand::SendMprisSetPosition(id, player, position_ms) => {
-                self.with_feature_transport(&id, |transport| {
-                    let mut packet = NetworkPacket::new(PACKET_TYPE_MPRIS_REQUEST);
-                    packet.set("player", player.as_str());
-                    packet.set("SetPosition", position_ms.max(0));
-                    transport.send(&packet)
-                });
+                self.send_mpris_set_position(&id, &player, position_ms)
             }
             DaemonCommand::SendMprisSeek(id, player, offset) => {
                 self.send_mpris_seek(&id, &player, offset)
@@ -622,6 +617,47 @@ impl DaemonWorker {
                 if let Some(media) = device.media_status.as_mut() {
                     media.is_playing = optimistic_playing(media.is_playing, action);
                 }
+            }
+        }
+    }
+
+    /// Seeks the phone's player. The bar shows the target at once and holds it
+    /// while the phone applies it (see `media_seek::HOLD`); a player that cannot
+    /// seek, or a track with no length, is never sent a request.
+    fn send_mpris_set_position(&self, device_id: &str, player: &str, position_ms: i64) {
+        let length = self
+            .devices
+            .lock()
+            .ok()
+            .and_then(|devices| {
+                devices
+                    .get(device_id)
+                    .and_then(|device| device.media_status.as_ref())
+                    .filter(|media| media.can_seek)
+                    .and_then(|media| media.length)
+            })
+            .filter(|length| *length > 0);
+        let Some(length) = length else { return };
+        let target = crate::device_links::media_seek::clamp(position_ms, Some(length));
+        let sent = self.with_feature_transport(device_id, |transport| {
+            let mut packet = NetworkPacket::new(PACKET_TYPE_MPRIS_REQUEST);
+            packet.set("player", player);
+            packet.set("SetPosition", target);
+            transport.send(&packet)
+        });
+        if let Ok(mut devices) = self.devices.lock() {
+            if let Some(media) = devices
+                .get_mut(device_id)
+                .filter(|device| sent && device.feature_transport_ready)
+                .and_then(|device| device.media_status.as_mut())
+            {
+                let now = std::time::Instant::now();
+                media.position = Some(target);
+                media.position_at = Some(now);
+                media.seek_hold = Some(crate::device_links::media_seek::Hold {
+                    target_ms: target,
+                    at: now,
+                });
             }
         }
     }
