@@ -63,8 +63,9 @@ const MOTION_EVERY: Duration = Duration::from_millis(4);
 const CHECK_EVERY: Duration = Duration::from_millis(250);
 /// The worker's nap while a session is armed but the pointer is here.
 const ARMED_NAP: Duration = Duration::from_millis(50);
-/// Re-arming the barrier (after the compositor disabled it) at most this
-/// often per minute; then glide stops with a reason instead of looping.
+/// Arming the barrier at most this often in any minute. A burst (monitors
+/// plugged, the lid closed, Extend started, a phone reconnecting) waits for
+/// the minute to roll over; it never turns glide off ([`next_arm_at`]).
 const REARMS_PER_MINUTE: usize = 6;
 /// Phone releases accepted per second (token bucket, refilled each second).
 const RELEASES_PER_SECOND: u32 = 10;
@@ -147,13 +148,24 @@ struct Barrier {
 
 impl Barrier {
     /// On the outer side of the zone furthest towards `edge` (as the
-    /// portal requires: on the union's boundary, inside one zone).
+    /// portal requires: on the union's boundary, inside one zone). Of two
+    /// screens that reach equally far, the longer edge wins, whatever order
+    /// the portal lists them in, so the edge does not move between re-arms.
     fn on(edge: Edge, zones: &[Zone]) -> Option<Self> {
+        use std::cmp::Reverse;
         let zone = *match edge {
-            Edge::Left => zones.iter().min_by_key(|zone| zone.x),
-            Edge::Right => zones.iter().max_by_key(|zone| zone.x + zone.width),
-            Edge::Top => zones.iter().min_by_key(|zone| zone.y),
-            Edge::Bottom => zones.iter().max_by_key(|zone| zone.y + zone.height),
+            Edge::Left => zones
+                .iter()
+                .min_by_key(|zone| (zone.x, Reverse(zone.height))),
+            Edge::Right => zones
+                .iter()
+                .max_by_key(|zone| (zone.x + zone.width, zone.height)),
+            Edge::Top => zones
+                .iter()
+                .min_by_key(|zone| (zone.y, Reverse(zone.width))),
+            Edge::Bottom => zones
+                .iter()
+                .max_by_key(|zone| (zone.y + zone.height, zone.width)),
         }?;
         if zone.width <= 0 || zone.height <= 0 {
             return None;
@@ -772,8 +784,10 @@ pub(crate) struct Status {
     pub(crate) problem: Option<String>,
     /// The desktop's "Capture Input" dialog is up and waiting for the person.
     pub(crate) asking: bool,
-    /// Glide is waiting instead of asking: the window offers "Ask again".
+    /// Glide is waiting instead of asking: the window offers "Turn On Again".
     pub(crate) can_ask_again: bool,
+    /// The barrier is armed on this edge: moving off it reaches the phone.
+    pub(crate) ready: Option<Edge>,
 }
 
 static STATUS: Mutex<Status> = Mutex::new(Status {
@@ -782,6 +796,7 @@ static STATUS: Mutex<Status> = Mutex::new(Status {
     problem: None,
     asking: false,
     can_ask_again: false,
+    ready: None,
 });
 
 pub(crate) fn status() -> Status {
@@ -794,6 +809,7 @@ pub(crate) fn status() -> Status {
             problem: None,
             asking: false,
             can_ask_again: false,
+            ready: None,
         })
 }
 
@@ -1197,17 +1213,15 @@ impl Portal {
         Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) })
     }
 
-    /// GetZones → SetPointerBarriers on `edge` → Enable.
-    fn arm(&mut self, context: &glib::MainContext, edge: Edge) -> Result<Barrier, String> {
+    /// GetZones → SetPointerBarriers on `edge` → Enable. Zones are read
+    /// afresh every time: they change with monitors, the lid and the scale.
+    fn arm(&mut self, context: &glib::MainContext, edge: Edge) -> Result<Barrier, ArmError> {
         let now = Instant::now();
         self.armed_at
-            .retain(|at| now.duration_since(*at) < Duration::from_secs(60));
-        if self.armed_at.len() >= REARMS_PER_MINUTE {
-            return Err("The desktop keeps turning glide off".to_string());
-        }
+            .retain(|at| now.saturating_duration_since(*at) < MINUTE);
         self.armed_at.push_back(now);
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let session = object_path(&self.handle)?;
+        let session = object_path(&self.handle).map_err(ArmError::Gone)?;
         let zones = request(
             context,
             &self.connection,
@@ -1219,9 +1233,13 @@ impl Portal {
                 session.clone(),
                 options(|dict| dict.insert("handle_token", token())),
             ]),
-        )?;
-        let zone_set = lookup::<u32>(&zones, "zone_set")?.unwrap_or(0);
-        let zones: Vec<Zone> = lookup::<Vec<(u32, u32, i32, i32)>>(&zones, "zones")?
+        )
+        .map_err(zones_error)?;
+        let zone_set = lookup::<u32>(&zones, "zone_set")
+            .map_err(ArmError::Retry)?
+            .unwrap_or(0);
+        let zones: Vec<Zone> = lookup::<Vec<(u32, u32, i32, i32)>>(&zones, "zones")
+            .map_err(ArmError::Retry)?
             .unwrap_or_default()
             .into_iter()
             .take(64)
@@ -1233,7 +1251,7 @@ impl Portal {
             })
             .collect();
         let barrier = Barrier::on(edge, &zones)
-            .ok_or_else(|| "This screen has no edge to glide from".to_string())?;
+            .ok_or_else(|| ArmError::Retry("This screen has no edge to glide from".to_string()))?;
         let position = glib::VariantDict::new(None);
         position.insert("barrier_id", 1u32);
         position.insert("position", (barrier.x1, barrier.y1, barrier.x2, barrier.y2));
@@ -1253,11 +1271,18 @@ impl Portal {
                 ),
                 zone_set.to_variant(),
             ]),
-        )?;
-        if lookup::<Vec<u32>>(&set, "failed_barriers")?.is_some_and(|failed| !failed.is_empty()) {
-            return Err("The desktop refused that edge".to_string());
+        )
+        .map_err(ArmError::Retry)?;
+        // Most often the zones changed between GetZones and here ("State out
+        // of date"): the next try reads them again.
+        if lookup::<Vec<u32>>(&set, "failed_barriers")
+            .map_err(ArmError::Retry)?
+            .is_some_and(|failed| !failed.is_empty())
+        {
+            return Err(ArmError::Retry("The desktop refused that edge".to_string()));
         }
-        self.call("Enable", tuple([session, options(|_| {})]))?;
+        self.call("Enable", tuple([session, options(|_| {})]))
+            .map_err(ArmError::Retry)?;
         self.enabled = true;
         Ok(barrier)
     }
@@ -1309,6 +1334,57 @@ impl Drop for Portal {
             None::<&gio::Cancellable>,
         );
     }
+}
+
+const MINUTE: Duration = Duration::from_secs(60);
+
+/// Why an arming failed, and so what follows.
+#[derive(Debug, PartialEq, Eq)]
+enum ArmError {
+    /// The desktop no longer knows the session: GNOME drops its half when the
+    /// screen locks and the portal's half lingers, answering every GetZones
+    /// with "denied". Only a new session (a new dialog) can work.
+    Gone(String),
+    /// Anything else (zones changed mid-way, no edge yet, Enable refused):
+    /// tried again, never given up.
+    Retry(String),
+}
+
+/// GetZones is the first thing every arming asks, so it is where a session
+/// the desktop forgot shows up. A timeout is only a busy portal.
+fn zones_error(error: String) -> ArmError {
+    if error.starts_with("Timed out") {
+        ArmError::Retry(error)
+    } else {
+        ArmError::Gone(error)
+    }
+}
+
+/// When the barrier may next be armed, given the armings of the last minute.
+fn next_arm_at(armed: &VecDeque<Instant>, now: Instant) -> Instant {
+    armed
+        .iter()
+        .rev()
+        .nth(REARMS_PER_MINUTE - 1)
+        .map_or(now, |at| (*at + MINUTE).max(now))
+}
+
+/// How long after the `failures`-th failed arming in a row to try again: at
+/// once (the zones are read afresh), then 1, 5, 15, 30 s, then every minute.
+/// Before, three failures turned glide off for the rest of the run.
+fn arm_retry_after(failures: u32) -> Duration {
+    const STEPS: [u64; 6] = [0, 1, 5, 15, 30, 60];
+    let step = (failures.max(1) as usize - 1).min(STEPS.len() - 1);
+    Duration::from_secs(STEPS[step])
+}
+
+/// Failed armings in a row before the window says so (it keeps trying).
+const ARM_RETRIES: u32 = 3;
+
+/// The computer slept between two looks at the clocks: the wall clock moved
+/// on while the monotonic one (which stops in a suspend) did not.
+fn slept(monotonic: Duration, wall: Duration) -> bool {
+    wall.saturating_sub(monotonic) > Duration::from_secs(5)
 }
 
 /// Whether this session can glide: Wayland, and a portal with InputCapture
@@ -1393,9 +1469,10 @@ fn person_is_here(device: &str) -> bool {
 }
 
 /// The barrier is armed only for a phone whose link is ready, that is not
-/// silent, that has said it allows glide, and while glide was not refused.
-fn wants_barrier(refused: bool, silent: bool, ready: bool, allowed: bool) -> bool {
-    !refused && !silent && ready && allowed
+/// silent and that has said it allows glide. Nothing else turns it off for
+/// good: a failed arming is tried again ([`arm_retry_after`]).
+fn wants_barrier(silent: bool, ready: bool, allowed: bool) -> bool {
+    !silent && ready && allowed
 }
 
 /// Whether the phone has said it allows glide (debug builds: or a test
@@ -1487,7 +1564,8 @@ enum After {
     Keep,
     /// Disable, so the next check sets the barrier again (new screens).
     Rearm,
-    /// Disable and drop the session; glide stops with this reason.
+    /// Drop the session (asked for again when the person is back); the
+    /// reason is logged.
     Close(&'static str),
 }
 
@@ -1527,16 +1605,13 @@ fn react(event: Event, glide: Option<&mut Glide>) -> (Vec<Out>, After) {
             if let Some(glide) = glide {
                 outs = glide.deactivated();
             }
-            After::Close(Why::Closed.words())
+            After::Close("the desktop closed the session")
         }
         Event::ReaderClosed => {
             if let Some(glide) = glide {
                 outs = glide.take_back();
             }
-            After::Close(
-                "Glide lost its connection to the desktop. DeskLink tries again in a few \
-                 minutes, or ask now.",
-            )
+            After::Close("the desktop ended the input socket")
         }
     };
     (outs, after)
@@ -1636,42 +1711,66 @@ struct State {
     glide: Option<Glide>,
     /// The setting the session was made for.
     current: Option<GlideSetting>,
-    /// The user (or the desktop) said no to it: not asked again until the
-    /// setting changes.
-    refused: bool,
     /// Arming failed this many times in a row, and when to try again.
     arm_failures: u32,
     retry_at: Option<Instant>,
     /// A refusal's back-off and whether the person was told, kept across
     /// re-armed sessions: (until, told).
     refusal: (Option<Instant>, bool),
-    /// The window shows the wait (`problem`, "Ask again").
+    /// The window shows the wait (`problem`, "Turn On Again").
     held_shown: bool,
     /// When the portal may be asked for a session (once per run).
     consent: Consent,
-}
-
-/// What a failed arming leads to: the desktop may be busy for a moment (a
-/// lock screen, a portal restarting), so it is tried again a few times, then
-/// glide says it is not working and waits for the user.
-#[derive(Debug, PartialEq, Eq)]
-enum ArmNext {
-    Retry(Duration),
-    GiveUp,
-}
-
-const ARM_RETRIES: u32 = 3;
-const ARM_RETRY_AFTER: Duration = Duration::from_secs(5);
-
-fn after_arm_error(failures: u32) -> ArmNext {
-    if failures < ARM_RETRIES {
-        ArmNext::Retry(ARM_RETRY_AFTER)
-    } else {
-        ArmNext::GiveUp
-    }
+    /// The phone's link was ready, and the person here, at the last check.
+    was_ready: bool,
+    was_here: bool,
+    /// Both clocks at the last check, to notice a sleep.
+    clocks: (Instant, std::time::SystemTime),
 }
 
 impl State {
+    fn new() -> Self {
+        Self {
+            portal: None,
+            glide: None,
+            current: None,
+            arm_failures: 0,
+            retry_at: None,
+            refusal: (None, false),
+            held_shown: false,
+            consent: Consent::new(),
+            was_ready: false,
+            was_here: true,
+            clocks: (Instant::now(), std::time::SystemTime::now()),
+        }
+    }
+
+    /// Arm again as soon as the rate allows (new screens, a wake, an unlock).
+    fn arm_now(&mut self) {
+        self.arm_failures = 0;
+        self.retry_at = None;
+    }
+
+    /// The session is gone (the desktop closed it, ended its input socket, or
+    /// no longer knows it): it is dropped, and a new one is asked for when
+    /// the person is back. Any capture was released by the caller.
+    fn close_session(&mut self, reason: &str) {
+        debug_log!("[Glide] session closed: {reason}; asks again when the person is back");
+        if let Some(mut closing) = self.portal.take() {
+            closing.disable();
+        }
+        self.glide = None;
+        self.arm_now();
+        self.consent.closed(Instant::now());
+        self.held_shown = true;
+        set_status(|status| {
+            status.gliding = None;
+            status.ready = None;
+            status.problem = Some(Why::Closed.words().to_string());
+            status.can_ask_again = true;
+        });
+    }
+
     /// Every way out ends here: the pointer goes back where it crossed, the
     /// phone is told, the session is disabled and closed. Used when the
     /// worker ends, however it ends.
@@ -1729,17 +1828,7 @@ fn worker(context: &glib::MainContext, commands: &Receiver<Command>) {
         end_worker();
         return;
     }
-    let mut state = State {
-        portal: None,
-        glide: None,
-        current: None,
-        refused: false,
-        arm_failures: 0,
-        retry_at: None,
-        refusal: (None, false),
-        consent: Consent::new(),
-        held_shown: false,
-    };
+    let mut state = State::new();
     // A panic must not leave the pointer captured, nor the top bar saying
     // glide is on: release, then say glide stopped.
     let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1853,24 +1942,18 @@ fn run(
             );
             match after {
                 After::Keep => {}
+                // The session is still good: zones are read again and the
+                // barrier set and enabled at the next check, no dialog.
                 After::Rearm => {
                     if let Some(portal) = state.portal.as_mut() {
+                        debug_log!(
+                            "[Glide] the desktop disabled the edge or changed screens; re-arming"
+                        );
                         portal.disable();
+                        state.arm_now();
                     }
                 }
-                After::Close(problem) => {
-                    if let Some(mut closing) = state.portal.take() {
-                        closing.disable();
-                    }
-                    state.glide = None;
-                    // Asked for again after a wait, never at once.
-                    state.consent.closed(Instant::now());
-                    set_status(|status| {
-                        status.gliding = None;
-                        status.problem = Some(problem.to_string());
-                        status.can_ask_again = true;
-                    });
-                }
+                After::Close(reason) => state.close_session(reason),
             }
         }
         if let Some(glide) = state.glide.as_mut() {
@@ -1904,14 +1987,44 @@ fn check(
     state: &mut State,
     outs: &mut Vec<Out>,
 ) {
+    let now = Instant::now();
+    let wall = std::time::SystemTime::now();
+    let (then, then_wall) = std::mem::replace(&mut state.clocks, (now, wall));
+    if slept(
+        now.saturating_duration_since(then),
+        wall.duration_since(then_wall).unwrap_or_default(),
+    ) {
+        // A wake is a return (even with no lock screen) and a new chance to arm.
+        debug_log!("[Glide] the computer slept");
+        state.consent.was_away(now);
+        state.arm_now();
+    }
     let setting = crate::device_links::config::app_settings().glide;
     let asked_again = ASK_AGAIN.swap(false, std::sync::atomic::Ordering::AcqRel);
     if asked_again && setting == state.current {
         // The person ended the wait; nothing else changed.
+        debug_log!("[Glide] turned on again by the person: every wait ends");
         state.consent.person_acts();
-        state.refused = false;
-        state.arm_failures = 0;
-        state.retry_at = None;
+        // And the edge is set again, so a session the desktop dropped
+        // without a word is found out (and asked for) now.
+        if let Some(portal) = state.portal.as_mut() {
+            let back = state
+                .glide
+                .as_mut()
+                .map(Glide::take_back)
+                .unwrap_or_default();
+            perform(
+                state
+                    .current
+                    .as_ref()
+                    .map(|setting| setting.device.as_str()),
+                back,
+                Some(&mut *portal),
+            );
+            portal.disable();
+            state.glide = None;
+        }
+        state.arm_now();
         state.held_shown = false;
         set_status(|status| {
             status.problem = None;
@@ -1942,11 +2055,10 @@ fn check(
             portal.armed_at.clear();
             state.glide = None;
         }
+        debug_log!("[Glide] setting now {setting:?}");
         state.current = setting;
         state.refusal = (None, false);
-        state.refused = false;
-        state.arm_failures = 0;
-        state.retry_at = None;
+        state.arm_now();
         // Switching Glide is the person acting: a wait after a Cancel ends.
         state.consent.person_acts();
         state.held_shown = false;
@@ -1956,47 +2068,63 @@ fn check(
             status.can_ask_again = false;
         });
     }
+    let device = state.current.as_ref().map(|setting| setting.device.clone());
     let gliding = state
         .glide
         .as_ref()
         .is_some_and(|glide| glide.active.is_some());
+    // Looked at all the time Glide is on (at most every 2 s; not while the
+    // pointer is on the phone, the person is plainly here), so a lock or an
+    // idle spell is seen even while the session is open.
+    let here = gliding
+        || device
+            .as_deref()
+            .is_none_or(|device| state.consent.here(now, &mut || person_is_here(device)));
+    let back = here && !std::mem::replace(&mut state.was_here, here);
+    if back && !gliding {
+        // Back at the computer (an unlock, the end of an idle spell): the
+        // edge is set again on fresh zones, which also finds out at once
+        // whether the desktop kept the session through the lock.
+        if let Some(portal) = state.portal.as_mut() {
+            debug_log!("[Glide] the person is back; re-arming");
+            if portal.enabled {
+                portal.disable();
+            }
+            state.glide = None;
+            state.arm_now();
+        }
+    }
     let silent = link_silent(
         gliding,
-        state
-            .current
-            .as_ref()
-            .and_then(|setting| inbound_silence(&setting.device)),
-        state
-            .current
-            .as_ref()
-            .is_some_and(|setting| is_dozing(&setting.device)),
+        device.as_deref().and_then(inbound_silence),
+        device.as_deref().is_some_and(is_dozing),
     );
-    let is_ready = state
-        .current
-        .as_ref()
-        .is_some_and(|setting| ready(&setting.device));
+    let is_ready = device.as_deref().is_some_and(ready);
     // The phone reports on every feature-ready: what it said before the link
-    // went away is not known any more.
-    if let (false, Some(setting)) = (is_ready, state.current.as_ref()) {
-        set_allowed(&setting.device, None);
+    // went away is not known any more. Forgotten when the link goes, not on
+    // every check while it is down: a report that arrives a moment before
+    // this side counts the link as ready must not be wiped.
+    if let (true, false, Some(device)) = (state.was_ready, is_ready, device.as_deref()) {
+        set_allowed(device, None);
     }
+    state.was_ready = is_ready;
     // The barrier is armed only while the phone says it allows glide: an
     // unknown state (an older phone, no report yet) is not a yes.
-    let allowed = state
-        .current
-        .as_ref()
-        .is_some_and(|setting| allows_glide(&setting.device));
-    let want = wants_barrier(state.refused, silent, is_ready, allowed);
+    let allowed = device.as_deref().is_some_and(allows_glide);
+    let want = wants_barrier(silent, is_ready, allowed);
     if state.portal.is_none() {
         // The one place a session is created, and so the one place the
         // desktop's dialog can come from.
-        let ready = want && state.current.is_some();
-        let device = state.current.as_ref().map(|setting| setting.device.clone());
-        let now = Instant::now();
+        let ready = want && device.is_some();
+        let was_held = state.consent.held();
         let step = state
             .consent
             .step(now, ready, || device.as_deref().is_none_or(person_is_here));
+        if was_held.is_some() && state.consent.held().is_none() {
+            debug_log!("[Glide] the wait ({was_held:?}) is over");
+        }
         if step == Step::Ask {
+            debug_log!("[Glide] asking the desktop for input capture");
             set_status(|status| {
                 status.asking = true;
                 status.problem = None;
@@ -2008,18 +2136,20 @@ fn check(
             set_status(|status| status.asking = false);
             match opened {
                 Ok(opened) => {
+                    debug_log!("[Glide] allowed");
                     state.consent.answered(Instant::now(), Outcome::Allowed);
                     state.portal = Some(opened);
+                    state.arm_now();
                     state.held_shown = false;
                 }
                 Err(error) => {
                     log_limited("open", &error);
-                    state
-                        .consent
-                        .answered(Instant::now(), Outcome::of_error(&error));
+                    let outcome = Outcome::of_error(&error);
+                    debug_log!("[Glide] the ask ended {outcome:?}: {error}");
+                    state.consent.answered(Instant::now(), outcome);
                     let words = match state.consent.held() {
-                        Some(Why::Declined) => Why::Declined.words().to_string(),
-                        _ => plain(&error),
+                        Some(why) => why.words().to_string(),
+                        None => plain(&error),
                     };
                     state.held_shown = true;
                     set_status(|status| {
@@ -2030,7 +2160,7 @@ fn check(
             }
             crate::device_links::daemon::state::nudge_tickers();
         } else if let Some(why) = state.consent.held() {
-            if !state.held_shown && state.current.is_some() {
+            if !state.held_shown && device.is_some() {
                 state.held_shown = true;
                 set_status(|status| {
                     status.problem = Some(why.words().to_string());
@@ -2038,7 +2168,7 @@ fn check(
                 });
             }
         } else if state.held_shown {
-            // The wait ran out on its own.
+            // The wait ended on its own (the person came back, the time ran out).
             state.held_shown = false;
             set_status(|status| {
                 status.problem = None;
@@ -2046,43 +2176,67 @@ fn check(
             });
         }
     }
+    let mut gone = None;
     if let (Some(open), Some(setting)) = (state.portal.as_mut(), state.current.as_ref()) {
-        if want && !open.enabled && state.retry_at.is_none_or(|at| Instant::now() >= at) {
-            match open.arm(context, setting.edge) {
-                Ok(barrier) => {
-                    let mut glide = Glide::new(barrier);
-                    #[cfg(debug_assertions)]
-                    if test_device(&setting.device) {
-                        // A test device has no phone to answer.
-                        glide.accept_needed = false;
+        // Not armed behind a lock screen: GNOME refuses it there, and drops
+        // the session anyway; the unlock arms (or asks) at once.
+        let due = state.retry_at.is_none_or(|at| now >= at);
+        if want && here && !open.enabled && due {
+            let at = next_arm_at(&open.armed_at, now);
+            if at > now {
+                debug_log!(
+                    "[Glide] armed {REARMS_PER_MINUTE} times this minute; next in {:?}",
+                    at - now
+                );
+                state.retry_at = Some(at);
+            } else {
+                match open.arm(context, setting.edge) {
+                    Ok(barrier) => {
+                        debug_log!(
+                            "[Glide] armed: {:?} edge ({}, {})-({}, {})",
+                            barrier.edge,
+                            barrier.x1,
+                            barrier.y1,
+                            barrier.x2,
+                            barrier.y2
+                        );
+                        let mut glide = Glide::new(barrier);
+                        #[cfg(debug_assertions)]
+                        if test_device(&setting.device) {
+                            // A test device has no phone to answer.
+                            glide.accept_needed = false;
+                        }
+                        (glide.backoff_until, glide.told) = state.refusal;
+                        state.glide = Some(glide);
+                        state.arm_now();
+                        set_status(|status| {
+                            status.problem = None;
+                            status.can_ask_again = false;
+                        });
                     }
-                    (glide.backoff_until, glide.told) = state.refusal;
-                    state.glide = Some(glide);
-                    state.arm_failures = 0;
-                    state.retry_at = None;
-                    set_status(|status| status.problem = None);
-                }
-                Err(error) => {
-                    log_limited("arm", &error);
-                    state.arm_failures += 1;
-                    // The rate limit is the desktop turning glide off over
-                    // and over: not retried.
-                    let next = if error.contains("keeps turning glide off") {
-                        ArmNext::GiveUp
-                    } else {
-                        after_arm_error(state.arm_failures)
-                    };
-                    match next {
-                        ArmNext::Retry(after) => state.retry_at = Some(Instant::now() + after),
-                        ArmNext::GiveUp => {
-                            state.refused = true;
-                            set_status(|status| status.problem = Some(plain(&error)));
+                    Err(ArmError::Gone(error)) => gone = Some(error),
+                    Err(ArmError::Retry(error)) => {
+                        log_limited("arm", &error);
+                        state.arm_failures += 1;
+                        let after = arm_retry_after(state.arm_failures);
+                        debug_log!("[Glide] arming failed ({error}); again in {after:?}");
+                        state.retry_at = Some(now + after);
+                        if state.arm_failures == ARM_RETRIES {
+                            let words = format!(
+                                "Glide could not set up the screen edge ({}). It keeps trying.",
+                                plain(&error)
+                            );
+                            set_status(|status| {
+                                status.problem = Some(words);
+                                status.can_ask_again = true;
+                            });
                         }
                     }
                 }
             }
         } else if !want && open.enabled {
             // The Release (and telling the phone) before Disable.
+            debug_log!("[Glide] disarmed (ready {is_ready}, allowed {allowed}, silent {silent})");
             let mut back = std::mem::take(outs);
             if let Some(glide) = state.glide.as_mut() {
                 back.extend(glide.take_back());
@@ -2090,6 +2244,19 @@ fn check(
             perform(Some(setting.device.as_str()), back, Some(&mut *open));
             open.disable();
         }
+    }
+    if let Some(error) = gone {
+        log_limited("arm", &error);
+        state.close_session(&format!("the desktop no longer knows it ({error})"));
+    }
+    let edge = state
+        .portal
+        .as_ref()
+        .filter(|portal| portal.enabled)
+        .and(state.current.as_ref())
+        .map(|setting| setting.edge);
+    if status().ready != edge {
+        set_status(|status| status.ready = edge);
     }
 }
 
@@ -2167,6 +2334,51 @@ mod tests {
         ];
         assert_eq!(Barrier::on(Edge::Right, &two).unwrap().x1, 3520);
         assert_eq!(Barrier::on(Edge::Left, &[]), None);
+    }
+
+    /// The layouts the zones change between (each change re-arms on the new
+    /// zones): an external monitor as primary with the laptop panel beside it
+    /// at a fractional scale, the lid closed, a monitor left of the primary
+    /// (negative x), and two screens stacked with the same right edge.
+    #[test]
+    fn the_edge_follows_the_layout_after_monitor_changes() {
+        let zone = |x, y, width, height| Zone {
+            x,
+            y,
+            width,
+            height,
+        };
+        let line = |barrier: Barrier| (barrier.x1, barrier.y1, barrier.x2, barrier.y2);
+        // External 2560x1440 primary, the laptop's 1920x1200 panel at 150 %.
+        let docked = [zone(0, 0, 2560, 1440), zone(2560, 320, 1280, 800)];
+        assert_eq!(
+            line(Barrier::on(Edge::Right, &docked).unwrap()),
+            (3840, 320, 3840, 1119)
+        );
+        // The lid closed: only the external monitor is left.
+        assert_eq!(
+            line(Barrier::on(Edge::Right, &docked[..1]).unwrap()),
+            (2560, 0, 2560, 1439)
+        );
+        // A monitor left of the primary.
+        let left_of = [zone(-2560, 0, 2560, 1440), zone(0, 0, 1536, 960)];
+        assert_eq!(
+            line(Barrier::on(Edge::Right, &left_of).unwrap()),
+            (1536, 0, 1536, 959)
+        );
+        assert_eq!(
+            line(Barrier::on(Edge::Left, &left_of).unwrap()),
+            (-2560, 0, -2560, 1439)
+        );
+        // Stacked, same right edge: the taller one, in either order.
+        let stacked = [zone(0, 0, 1920, 1080), zone(0, 1080, 1920, 1200)];
+        let reversed = [stacked[1], stacked[0]];
+        for zones in [stacked, reversed] {
+            assert_eq!(
+                line(Barrier::on(Edge::Right, &zones).unwrap()),
+                (1920, 1080, 1920, 2279)
+            );
+        }
     }
 
     #[test]
@@ -2491,18 +2703,12 @@ mod tests {
         let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());
         glide.activated(9, (1600.0, 200.0), &keys, Instant::now());
         let mut state = State {
-            portal: None,
             glide: Some(glide),
             current: Some(GlideSetting {
                 device: "e2e-release-all".into(),
                 edge: Edge::Right,
             }),
-            refused: false,
-            arm_failures: 0,
-            retry_at: None,
-            refusal: (None, false),
-            consent: Consent::new(),
-            held_shown: false,
+            ..State::new()
         };
         set_status(|status| status.gliding = Some("e2e-release-all".into()));
         state.release_all();
@@ -2510,14 +2716,74 @@ mod tests {
         assert_eq!(status().gliding, None);
     }
 
-    /// A desktop that is busy for a moment is asked again; one that keeps
-    /// failing is given up on, with a reason shown.
+    /// Before: three failed armings (zones that changed mid-way when a
+    /// monitor or Extend came and went) turned glide off for the rest of the
+    /// run. Now the first retry reads the zones again at once, and it backs
+    /// off to once a minute, never stopping.
     #[test]
-    fn arming_is_retried_a_few_times_then_given_up() {
-        assert_eq!(after_arm_error(1), ArmNext::Retry(ARM_RETRY_AFTER));
-        assert_eq!(after_arm_error(2), ArmNext::Retry(ARM_RETRY_AFTER));
-        assert_eq!(after_arm_error(ARM_RETRIES), ArmNext::GiveUp);
-        assert_eq!(after_arm_error(ARM_RETRIES + 5), ArmNext::GiveUp);
+    fn arming_is_retried_at_once_then_backs_off_and_never_gives_up() {
+        assert_eq!(arm_retry_after(1), Duration::ZERO, "fresh zones at once");
+        assert_eq!(arm_retry_after(2), Duration::from_secs(1));
+        assert_eq!(arm_retry_after(3), Duration::from_secs(5));
+        let mut last = Duration::ZERO;
+        for failures in 1..1000 {
+            let after = arm_retry_after(failures);
+            assert!(after >= last && after <= MINUTE, "{failures}");
+            last = after;
+        }
+        assert_eq!(last, MINUTE);
+    }
+
+    /// Before: the seventh arming in a minute gave up for the run ("The
+    /// desktop keeps turning glide off"), and a burst of monitor changes or
+    /// phone reconnects got there. Now a burst only waits for the minute.
+    #[test]
+    fn a_burst_of_armings_waits_for_the_minute_and_is_never_refused() {
+        let t = Instant::now();
+        let mut armed = VecDeque::new();
+        for n in 0..REARMS_PER_MINUTE as u64 {
+            let at = t + Duration::from_secs(n);
+            assert_eq!(next_arm_at(&armed, at), at, "{n}: at once");
+            armed.push_back(at);
+        }
+        let seventh = t + Duration::from_secs(10);
+        assert_eq!(next_arm_at(&armed, seventh), t + MINUTE);
+        assert_eq!(next_arm_at(&armed, t + MINUTE), t + MINUTE);
+        assert_eq!(
+            next_arm_at(&armed, t + 2 * MINUTE),
+            t + 2 * MINUTE,
+            "later: at once"
+        );
+    }
+
+    /// A session GNOME dropped (at a lock) answers GetZones with "denied":
+    /// before, that was retried three times and then glide stayed off for the
+    /// run, the dead session kept so even "Ask again" could not help. Now it
+    /// is dropped and a new one asked for. A busy portal is only retried.
+    #[test]
+    fn a_session_the_desktop_forgot_is_dropped_and_a_busy_one_retried() {
+        assert!(matches!(
+            zones_error("Desktop permission request GetZones was denied".into()),
+            ArmError::Gone(_)
+        ));
+        assert!(matches!(
+            zones_error("Timed out waiting for desktop portal GetZones".into()),
+            ArmError::Retry(_)
+        ));
+    }
+
+    #[test]
+    fn a_sleep_is_told_from_a_slow_turn() {
+        let secs = Duration::from_secs;
+        assert!(!slept(secs(0), secs(0)));
+        assert!(
+            !slept(secs(30), secs(31)),
+            "a slow turn (a dialog) is not a sleep"
+        );
+        assert!(
+            slept(secs(1), secs(3600)),
+            "an hour of wall clock in a second"
+        );
     }
 
     /// The keymap's answers are remembered for a while and then asked again;
@@ -2639,17 +2905,7 @@ mod tests {
     /// Nothing wakes the worker 250 times a second while glide is off.
     #[test]
     fn the_worker_sleeps_long_when_glide_is_off() {
-        let mut state = State {
-            portal: None,
-            glide: None,
-            current: None,
-            refused: false,
-            arm_failures: 0,
-            retry_at: None,
-            refusal: (None, false),
-            consent: Consent::new(),
-            held_shown: false,
-        };
+        let mut state = State::new();
         assert_eq!(nap(&state), CHECK_EVERY);
         let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());
         state.glide = Some(Glide::accepting(
@@ -2847,17 +3103,10 @@ mod tests {
     /// unknown (an older phone) and false both leave it disabled.
     #[test]
     fn the_barrier_is_armed_only_when_the_phone_allows_glide() {
-        assert!(wants_barrier(false, false, true, true));
-        assert!(
-            !wants_barrier(false, false, true, false),
-            "not allowed or unknown"
-        );
-        assert!(!wants_barrier(false, false, false, true), "link not ready");
-        assert!(!wants_barrier(false, true, true, true), "link silent");
-        assert!(
-            !wants_barrier(true, false, true, true),
-            "refused by the desktop"
-        );
+        assert!(wants_barrier(false, true, true));
+        assert!(!wants_barrier(false, true, false), "not allowed or unknown");
+        assert!(!wants_barrier(false, false, true), "link not ready");
+        assert!(!wants_barrier(true, true, true), "link silent");
         let phone = "w6f-phone-state";
         assert_eq!(phone_allows(phone), None, "no report yet");
         assert!(!allows_glide(phone));

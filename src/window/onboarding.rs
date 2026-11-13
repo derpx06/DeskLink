@@ -325,7 +325,7 @@ pub(super) fn setup_rows(facts: &SetupFacts) -> Vec<SetupRow> {
                 format!(
                     "Move your mouse across to the phone, off an edge of this screen. Turn it on \
                      in Settings after pairing; it then shows {dialog}, and once you allow it \
-                     you are not asked again until DeskLink restarts."
+                     you are asked again only after DeskLink restarts or the screen locks."
                 )
             } else {
                 format!("Move your mouse across to the phone. {}", check.detail)

@@ -51,7 +51,7 @@ impl Fix {
             Self::StartAtLogin => "Turn on",
             Self::OpenSettings(PRIVACY_PAGE) => "Open Privacy & security",
             Self::OpenSettings(_) => "Open Settings",
-            Self::AskGlide => "Ask again",
+            Self::AskGlide => "Turn on again",
             Self::TurnOnExtension => "Turn on",
             Self::LogOut => "Log out…",
             Self::ApproveControl(_) => "Approve now",
@@ -346,10 +346,10 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
         needs.push(Need {
             id: "glide",
             on_phone: false,
-            title: "Glide has no permission yet".into(),
+            title: "Glide is paused".into(),
             detail: format!(
-                "Move your mouse across to {name}. The desktop shows its Capture Input dialog \
-                 when Glide asks."
+                "It needs your OK on this computer again to move your mouse across to {name}. \
+                 Turn it on again and allow the Capture Input dialog."
             ),
             fix: Fix::AskGlide,
             allow: Some(Allow::AskGlide),
