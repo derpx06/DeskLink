@@ -479,3 +479,113 @@ fn a_banner_has_a_kind_a_role_and_words_for_screen_readers() {
         assert_eq!(empty.observe_children().n_items(), 3);
     });
 }
+
+/// The words both apps use for the same thing (the phone pins the same list in
+/// `GlossaryTest`): "Try again", "Touchpad", "computer", "Show phone screen".
+/// A word on the left may not appear in any string the desk shows.
+const OFF_GLOSSARY: &[(&str, &str)] = &[
+    ("Retry", "Try again"),
+    ("Trackpad", "Touchpad"),
+    ("PC", "computer"),
+    ("Show Phone Screen", "Show phone screen"),
+    ("Desk sound", "Computer sound"),
+    ("Lock desk", "Lock computer"),
+    ("Ring desk", "Ring computer"),
+    ("Turn Off", "Turn off"),
+];
+
+/// `word` in `text` with no letter or digit on either side.
+fn has_word(text: &str, word: &str) -> bool {
+    text.match_indices(word).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + word.len()..].chars().next();
+        !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
+/// The string literals on each line of the non-test part of `path`, a file or every source under a directory.
+fn literals(path: &std::path::Path, found: &mut Vec<(String, String)>) {
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path).unwrap().flatten() {
+            literals(&entry.path(), found);
+        }
+    } else if path.extension().is_some_and(|ext| ext == "rs")
+        && path.file_name().is_some_and(|name| name != "tests.rs")
+    {
+        let text = std::fs::read_to_string(path).unwrap();
+        let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+        for line in code
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+        {
+            for literal in line.split('"').skip(1).step_by(2) {
+                found.push((path.display().to_string(), literal.to_string()));
+            }
+        }
+    }
+}
+
+#[test]
+fn the_words_follow_the_glossary() {
+    assert!(has_word("Lock desk now", "Lock desk") && !has_word("Retrying", "Retry"));
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = Vec::new();
+    for part in [
+        "window",
+        "platform.rs",
+        "transfer_notice.rs",
+        "application.rs",
+        "tray.rs",
+    ] {
+        literals(&src.join(part), &mut found);
+    }
+    let off: Vec<String> = found
+        .iter()
+        .flat_map(|(file, text)| {
+            OFF_GLOSSARY
+                .iter()
+                .filter(|(word, _)| has_word(text, word))
+                .map(move |(word, say)| format!("{file}: {text:?} says {word:?}, say {say:?}"))
+        })
+        .collect();
+    assert!(off.is_empty(), "{off:#?}");
+}
+
+/// The machinery's words stay out of every page, not just the first run and the
+/// guide (`onboarding::assert_plain`). `mod.rs` matches error texts it is given and
+/// `platform.rs` names packages to install, so both are left out.
+#[test]
+fn no_page_names_the_machinery() {
+    const JARGON: &[&str] = &[
+        "WebRTC",
+        "peer",
+        "handover",
+        "mDNS",
+        "TLS",
+        "daemon",
+        "packet",
+        "plugin",
+        "codec",
+        "protocol",
+        "GStreamer",
+        "LAN",
+        "certificate",
+        "successfully",
+        "Please",
+        "relay",
+        "Relay",
+        "TURN",
+    ];
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = Vec::new();
+    for part in ["window", "transfer_notice.rs", "tray.rs"] {
+        literals(&src.join(part), &mut found);
+    }
+    let off: Vec<String> = found
+        .iter()
+        .filter(|(file, text)| !file.ends_with("window/mod.rs") && text.contains(' '))
+        .filter(|(_, text)| JARGON.iter().any(|word| has_word(text, word)))
+        .map(|(file, text)| format!("{file}: {text:?}"))
+        .collect();
+    assert!(off.is_empty(), "{off:#?}");
+}
