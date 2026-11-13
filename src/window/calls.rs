@@ -129,7 +129,7 @@ fn ringing_here(call: &PhoneCall) -> bool {
 
 /// The call as a card (`compact`: the bar over other pages).
 pub(super) fn card(daemon: &DaemonHandle, device: &DeviceView, compact: bool) -> Option<gtk::Box> {
-    if !device.feature_transport_ready {
+    if !device.feature_transport_ready || !shown_here() {
         return None;
     }
     let status = device.call_status.as_ref()?;
@@ -240,7 +240,16 @@ pub(super) fn card(daemon: &DaemonHandle, device: &DeviceView, compact: bool) ->
 }
 
 /// The phone with a call to show: one ringing first.
+/// "Show calls on this computer" (Settings, Calls): off hides the card, the
+/// bar and the ring notification, and the phone just rings.
+fn shown_here() -> bool {
+    crate::device_links::config::app_settings().calls_on_computer
+}
+
 fn calling(devices: &[DeviceView]) -> Option<&DeviceView> {
+    if !shown_here() {
+        return None;
+    }
     let live = || {
         devices
             .iter()
@@ -322,9 +331,10 @@ pub(super) fn notify(win: &DesklinkWindow, devices: &[DeviceView]) {
         return;
     };
     let imp = win.imp();
+    let shown = shown_here();
     let ringing: Vec<(&DeviceView, &PhoneCall)> = devices
         .iter()
-        .filter(|device| device.trusted && device.feature_transport_ready)
+        .filter(|device| shown && device.trusted && device.feature_transport_ready)
         .filter_map(|device| {
             let call = device.call_status.as_ref()?.ringing()?;
             Some((device, call))
@@ -363,11 +373,16 @@ pub(super) fn notify(win: &DesklinkWindow, devices: &[DeviceView]) {
         if !imp.notified_calls.borrow_mut().insert(key(device, call)) || banner_elsewhere {
             continue;
         }
-        let notification = gio::Notification::new(&call.caller());
-        let mut body = format!("Incoming call on {}", device.name);
-        if let (Some(_), Some(number)) = (&call.contact_name, &call.number) {
-            body.push_str(&format!(" · {number}"));
-        }
+        // Locked: the name and number stay off the lock screen unless allowed.
+        let (title, body) = crate::device_links::calls::ring_text(
+            &call.caller(),
+            call.number.as_deref(),
+            call.contact_name.is_some(),
+            &device.name,
+            crate::device_links::logind::locked().unwrap_or(false),
+            crate::device_links::config::app_settings().caller_on_lock_screen,
+        );
+        let notification = gio::Notification::new(&title);
         notification.set_body(Some(&body));
         notification.set_priority(gio::NotificationPriority::Urgent);
         notification.set_icon(&gio::ThemedIcon::new("call-start-symbolic"));
@@ -398,6 +413,17 @@ pub(super) fn missed(
 ) {
     let Some(app) = win.application() else {
         return;
+    };
+    let settings = crate::device_links::config::app_settings();
+    if !settings.calls_on_computer {
+        return;
+    }
+    let (caller, number) = if crate::device_links::logind::locked().unwrap_or(false)
+        && !settings.caller_on_lock_screen
+    {
+        (None, None)
+    } else {
+        (caller, number)
     };
     let title = match caller.as_ref().or(number.as_ref()) {
         Some(who) => format!("Missed call from {who}"),
@@ -440,6 +466,8 @@ const DIAL_ASK_EVERY: Duration = Duration::from_secs(3);
 enum Admit {
     Ask(String),
     NotANumber,
+    /// An emergency number: never from here.
+    Refused(&'static str),
     Throttled,
     /// A question is on screen already.
     Open,
@@ -451,6 +479,9 @@ fn admit(number: &str, open: bool, last: Option<Instant>, now: Instant) -> Admit
     let Some(number) = crate::device_links::calls::dial_number(number) else {
         return Admit::NotANumber;
     };
+    if let Some(why) = crate::device_links::calls::dial_refusal(&number) {
+        return Admit::Refused(why);
+    }
     if open {
         Admit::Open
     } else if !may_ask_to_dial(open, last, now) {
@@ -506,6 +537,10 @@ fn confirm_telephony(
             win.show_feature_toast("That is not a phone number");
             return;
         }
+        Admit::Refused(why) => {
+            win.show_feature_toast(why);
+            return;
+        }
         Admit::Throttled => {
             win.show_feature_toast(TOO_MANY_CALLS);
             return;
@@ -536,9 +571,14 @@ fn confirm_telephony(
             "_Message",
         )
     } else {
+        let warning = if crate::device_links::calls::looks_premium(&number) {
+            " This looks like a premium-rate number and may cost extra."
+        } else {
+            ""
+        };
         (
             format!("Call {number}?"),
-            format!("{} places the call.", phone.name),
+            format!("{} places the call.{warning}", phone.name),
             "_Call",
         )
     };

@@ -920,6 +920,35 @@ fn calls_group(
         )))
         .build();
     group.add(&pause_music_row(daemon, settings));
+    for (title, subtitle, icon, on, send, read) in [
+        (
+            "Show calls on this computer",
+            "Applies to every paired phone. A call bar, a notification with Answer and Decline, and missed calls. Off: calls only ring on the phone.",
+            "call-start-symbolic",
+            settings.calls_on_computer,
+            DaemonCommand::SetCallsOnComputer as fn(bool) -> DaemonCommand,
+            (|settings: &AppSettings, _: &str| settings.calls_on_computer) as fn(&AppSettings, &str) -> bool,
+        ),
+        (
+            "Show caller names on the lock screen",
+            "Off: while this computer is locked, a call says only \"Incoming call\".",
+            "changes-prevent-symbolic",
+            settings.caller_on_lock_screen,
+            DaemonCommand::SetCallerOnLockScreen,
+            |settings: &AppSettings, _: &str| settings.caller_on_lock_screen,
+        ),
+    ] {
+        let row = adw::SwitchRow::builder()
+            .title(title)
+            .subtitle(subtitle)
+            .active(on)
+            .build();
+        with_icon(&row, icon);
+        let daemon = daemon.clone();
+        toggled(&row, move |row| daemon.send(send(row.is_active())));
+        follow(&row, read);
+        group.add(&row);
+    }
     // F5 K4: names from the contacts the phone shares, off until asked.
     let names = adw::SwitchRow::builder()
         .title(esc(format!("Name callers from {}'s contacts", device.name)))

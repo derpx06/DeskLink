@@ -135,6 +135,7 @@ pub(crate) fn parse_error(packet: &NetworkPacket) -> Option<String> {
     let why = match packet.get_str("error")? {
         "permission" => "it needs the Phone permission (open DeskLink on the phone)",
         "no-call" => "there is no call",
+        "emergency" => "emergency numbers must be dialled on the phone itself",
         _ => "the phone could not do it",
     };
     Some(match packet.get_str("action").unwrap_or_default() {
@@ -174,6 +175,9 @@ pub(crate) fn request(
         }
         _ => {
             let number = number.and_then(dial_number).ok_or("Not a phone number")?;
+            if let Some(refusal) = dial_refusal(&number) {
+                return Err(refusal.to_string());
+            }
             packet.set("number", number);
         }
     }
@@ -206,6 +210,55 @@ pub(crate) fn dial_number(text: &str) -> Option<String> {
     }
     let digits = number.chars().filter(char::is_ascii_digit).count();
     (3..=24).contains(&digits).then_some(number)
+}
+
+/// Numbers that reach emergency services (a few countries' short codes and
+/// 112/911/999). A call to one must never start from a computer: nothing
+/// tells the dispatcher where the caller is, and a stray tel: link must not
+/// dial it. The phone refuses them too (`CallTracker.isEmergency`).
+const EMERGENCY: [&str; 20] = [
+    "112", "911", "999", "000", "110", "119", "118", "122", "100", "101", "102", "108", "115",
+    "117", "113", "144", "155", "190", "199", "933",
+];
+
+/// Why `number` (already through [`dial_number`]) must not be dialled from
+/// here: an emergency number, with or without a leading `+` or `00`.
+pub(crate) fn dial_refusal(number: &str) -> Option<&'static str> {
+    let digits = number.trim_start_matches('+');
+    let digits = digits.strip_prefix("00").unwrap_or(digits);
+    EMERGENCY
+        .contains(&digits)
+        .then_some("Emergency numbers cannot be dialled from the computer. Use the phone itself")
+}
+
+/// Whether `number` looks like a premium-rate line, so the confirmation says
+/// so (900/0900/1900/976 prefixes and UK 09 numbers); still allowed.
+pub(crate) fn looks_premium(number: &str) -> bool {
+    let n = number.trim_start_matches('+');
+    ["900", "0900", "1900", "976", "1976", "44909", "09"]
+        .iter()
+        .any(|prefix| n.starts_with(prefix))
+}
+
+/// What a ringing call's notification says: (title, body). While this
+/// computer is locked the caller's name and number stay off it unless the
+/// person allowed them there.
+pub(crate) fn ring_text(
+    caller: &str,
+    number: Option<&str>,
+    named: bool,
+    phone: &str,
+    locked: bool,
+    allow_on_lock: bool,
+) -> (String, String) {
+    if locked && !allow_on_lock {
+        return ("Incoming call".to_string(), format!("On {phone}"));
+    }
+    let mut body = format!("Incoming call on {phone}");
+    if let (true, Some(number)) = (named, number) {
+        body.push_str(&format!(" · {number}"));
+    }
+    (caller.to_string(), body)
 }
 
 fn percent_decode(text: &str) -> Option<String> {
@@ -337,6 +390,35 @@ mod tests {
             packet.body.extend(map);
         }
         packet
+    }
+
+    #[test]
+    fn emergency_numbers_are_refused_and_premium_ones_flagged() {
+        for n in ["112", "911", "+112", "00112", "999"] {
+            assert!(dial_refusal(n).is_some(), "{n}");
+            assert!(request(None, "dial", Some(n)).is_err(), "{n}");
+        }
+        for n in ["1120", "5551234", "+14155550100", "11"] {
+            assert!(dial_refusal(n).is_none(), "{n}");
+        }
+        assert!(looks_premium("0900123456") && looks_premium("+1900555"));
+        assert!(!looks_premium("5551234"));
+        let error = NetworkPacket::new("x");
+        assert!(error.get_str("error").is_none());
+    }
+
+    #[test]
+    fn the_lock_screen_hides_the_caller_unless_allowed() {
+        let ring = |locked, allow| ring_text("Alice", Some("555"), true, "Pixel", locked, allow);
+        assert_eq!(
+            ring(false, false),
+            ("Alice".into(), "Incoming call on Pixel · 555".into())
+        );
+        assert_eq!(ring(true, true), ring(false, false));
+        assert_eq!(
+            ring(true, false),
+            ("Incoming call".into(), "On Pixel".into())
+        );
     }
 
     #[test]
