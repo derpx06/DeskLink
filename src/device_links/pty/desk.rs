@@ -325,6 +325,8 @@ fn serve(stream: UnixStream) -> Result<(), String> {
 fn pump_output(session: &PtySession, mut stream: UnixStream, stop: &AtomicBool) {
     let mut offset = None;
     while !stop.load(Ordering::Acquire) {
+        // Read before looking, so output landing in between ends the wait.
+        let seen = super::session::change_generation();
         let Ok(resync) = session.resync(offset, 64 * 1024) else {
             return;
         };
@@ -343,7 +345,8 @@ fn pump_output(session: &PtySession, mut stream: UnixStream, stop: &AtomicBool) 
             let _ = stream.write_all(&encode(EXIT, &status.to_be_bytes()));
             return;
         }
-        std::thread::sleep(Duration::from_millis(12));
+        // Woken by new output; the timeout only bounds noticing `stop`.
+        super::session::wait_for_change(seen, Duration::from_millis(500));
     }
 }
 
