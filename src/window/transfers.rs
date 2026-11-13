@@ -299,8 +299,10 @@ fn empty_words(filter: Filter, any: bool, device: &str) -> (String, String) {
         (
             "No files yet".to_string(),
             format!(
-                "Files you send to or receive from {device} show up here for 30 days. Drop files \
-                 on this page, or press Send files."
+                "Files you send to or receive from {} show up here for 30 days. Drop files \
+                 on this page, or press Send files.",
+                // The name never breaks across lines ("Pixel" / "9").
+                device.replace(' ', "\u{a0}")
             ),
         )
     } else {
@@ -1984,7 +1986,7 @@ mod tests {
         assert_eq!(reason_words(""), "Something went wrong.");
         let (title, body) = empty_words(Filter::All, false, "Pixel 9");
         assert_eq!(title, "No files yet");
-        assert!(body.contains("Pixel 9"), "{body}");
+        assert!(body.contains("Pixel\u{a0}9"), "{body}");
         // A chip with nothing under it is not "no files yet".
         let (title, _) = empty_words(Filter::Archives, true, "Pixel 9");
         assert_eq!(title, "No archives");

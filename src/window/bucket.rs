@@ -522,6 +522,10 @@ fn off_card(device: &DeviceView, asked: bool) -> gtk::Box {
         },
         &["dl-secondary"],
     ));
+    words.append(&super::wrapped(
+        "It is “DeskLink Bucket” in your Home folder and the Files sidebar.",
+        &["dl-caption"],
+    ));
     head.append(&words);
     card.append(&head);
     let buttons = gtk::FlowBox::builder()
@@ -547,10 +551,6 @@ fn off_card(device: &DeviceView, asked: bool) -> gtk::Box {
     on.connect_clicked(move |_| folders::turn_on_bucket(&id));
     super::transfers::add_card(&buttons, &on);
     card.append(&buttons);
-    card.append(&super::wrapped(
-        "It is the folder DeskLink Bucket in your Home folder, also in the Files sidebar.",
-        &["dl-caption"],
-    ));
     let dropped = folders::dropped_pairs();
     if dropped > 0 {
         card.append(&super::wrapped(
