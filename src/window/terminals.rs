@@ -309,6 +309,8 @@ impl Page {
             .update_property(&[gtk::accessible::Property::Label(&whole)]);
         self.detach.set_visible(phone_attached);
         self.count.set_label(&format!("{} open", all.len()));
+        // "0 open" beside the empty state says nothing it does not.
+        self.count.set_visible(!all.is_empty());
         self.note.set_label(&format!(
             "Terminals keep running after you close this window. {} can open any of them.",
             device.name

@@ -2363,8 +2363,7 @@ fn session_summary(device: &DeviceView) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-const OFFLINE: &str =
-    "This computer is offline. Check its network connection; DeskLink reconnects by itself.";
+const OFFLINE: &str = "This computer is offline. DeskLink reconnects when the network is back.";
 
 fn is_offline_message(message: &str) -> bool {
     message == OFFLINE
