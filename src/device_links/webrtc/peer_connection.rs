@@ -1474,12 +1474,18 @@ fn answerer_adds_own_sections(version: (u32, u32, u32, u32)) -> bool {
     (version.0, version.1) < (1, 26)
 }
 
-/// Whether an answer offers H.264 next to VP8. `webrtcbin` before 1.26
-/// answers only the first of several preferred codecs, so H.264 first left
-/// out the VP8 this computer sends with: there the answer is VP8 alone and the
-/// phone sends VP8 too (no hardware H.264 from the phone on GStreamer 1.24).
+/// Whether an answer offers H.264 next to VP8. `webrtcbin` before 1.28
+/// answers only the first of several preferred codecs
+/// (`gst_sdp_media_set_media_from_caps`), so H.264 first left out the VP8 this
+/// computer sends with and its screen never reached the phone. There the
+/// answer is VP8 alone and the phone sends VP8 too (no hardware H.264 from the
+/// phone on GStreamer 1.24 and 1.26).
 fn answer_with_h264() -> bool {
-    super::screen::h264_decoder_available() && !answerer_adds_own_sections(gst::version())
+    super::screen::h264_decoder_available() && answers_every_codec(gst::version())
+}
+
+fn answers_every_codec(version: (u32, u32, u32, u32)) -> bool {
+    (version.0, version.1) >= (1, 28)
 }
 
 #[cfg(test)]
@@ -3764,6 +3770,9 @@ a=max-message-size:262144\r\n";
         assert!(!answerer_adds_own_sections((1, 26, 0, 0)));
         assert!(!answerer_adds_own_sections((1, 28, 6, 0)));
         assert!(!answerer_adds_own_sections((2, 0, 0, 0)));
+        assert!(!answers_every_codec((1, 24, 2, 0)));
+        assert!(!answers_every_codec((1, 26, 11, 0)));
+        assert!(answers_every_codec((1, 28, 0, 0)));
     }
 
     /// The section of `sdp` that starts at the first line beginning `m=<kind>`.
