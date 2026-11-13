@@ -51,11 +51,13 @@ pub(crate) fn source_name(source: Source) -> &'static str {
     }
 }
 
-fn parse_source(source: Option<&str>) -> Source {
-    if source == Some("mic") {
-        Source::Mic
-    } else {
-        Source::System
+/// `None` for a source this build does not know (a newer phone's): the
+/// request is answered "unsupported".
+fn parse_source(source: Option<&str>) -> Option<Source> {
+    match source {
+        None | Some("system") => Some(Source::System),
+        Some("mic") => Some(Source::Mic),
+        Some(_) => None,
     }
 }
 
@@ -231,7 +233,9 @@ pub(crate) fn handle(
     let id = message.remote_session_id.as_str();
     match message.kind {
         ControlKind::AudioRequest => {
-            let source = parse_source(message.source.as_deref());
+            let Some(source) = parse_source(message.source.as_deref()) else {
+                return Step::Deny(Box::new(deny(device_id, id, "unsupported", build)));
+            };
             if message.audio_direction.as_deref() != Some(DESK_TO_PHONE) {
                 // The requester hears; this desk is never asked to hear.
                 return Step::Deny(Box::new(deny(device_id, id, "unsupported", build)));
@@ -414,6 +418,16 @@ mod tests {
         ));
         let backwards = from_phone(ControlKind::AudioRequest, &id, PHONE_TO_DESK, "mic");
         match handle(device, &backwards, true, &build) {
+            Step::Deny(denied) => assert_eq!(denied.reason.as_deref(), Some("unsupported")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_source_a_newer_phone_asks_for_is_answered_unsupported() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let request = from_phone(ControlKind::AudioRequest, &id, DESK_TO_PHONE, "radio");
+        match handle("sound-phone-new", &request, true, &build) {
             Step::Deny(denied) => assert_eq!(denied.reason.as_deref(), Some("unsupported")),
             other => panic!("{other:?}"),
         }

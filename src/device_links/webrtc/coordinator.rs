@@ -4201,6 +4201,22 @@ fn handle_peer_envelope(
             // nothing and get the fallback.
             let mut request =
                 super::screen::ScreenRequest::from_parts(message.max_dimension, message.fps);
+            // A display mode this build does not know (a newer phone's) is
+            // answered as unsupported, never shown as a mirror nor dropped.
+            if message
+                .display
+                .as_deref()
+                .is_some_and(|display| !matches!(display, "mirror" | "extend"))
+            {
+                return deny_view(
+                    &peer,
+                    wire,
+                    attempt_id,
+                    &message.remote_session_id,
+                    sequence,
+                    "unsupported".to_string(),
+                );
+            }
             // A second display (F2) at the phone's own pixel size.
             if message.display.as_deref() == Some("extend") {
                 let size = message.screen_width.zip(message.screen_height);
