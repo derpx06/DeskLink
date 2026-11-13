@@ -307,6 +307,7 @@ dependencies = [
  "gst-plugin-gtk4",
  "gstreamer",
  "gstreamer-sdp",
+ "gstreamer-video",
  "gstreamer-webrtc",
  "gtk4",
  "hostname",

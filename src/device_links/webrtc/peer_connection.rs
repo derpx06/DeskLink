@@ -3239,6 +3239,340 @@ a=max-message-size:262144\r\n";
         );
     }
 
+    /// Phone→desk screen over loopback, measured. Run by hand:
+    /// `cargo test phone_screen_over_loopback -- --ignored --nocapture`
+    /// (`DESKLINK_P2D_FPS`, default 60; `DESKLINK_P2D_KBPS`, default 8000;
+    /// `DESKLINK_P2D_REFINE`, repeats of a still picture, default 5).
+    ///
+    /// A phone-sized capture (864x1920, what the phone sends of a 1080x2400
+    /// panel) of small glyph-like strokes, still and then scrolling at
+    /// 720 px/s, encoded by x264 as a stand-in for the phone's hardware H.264
+    /// (constrained baseline, no B-frames, zero latency), through this desk's
+    /// own receive chain: SRTP, ICE, jitter buffer, decodebin, conversion.
+    /// Like a phone's capture, a still screen sends nothing but the
+    /// refinement repeats (100 ms apart) of its first still frame.
+    /// Each frame carries its number in a strip of black and white blocks,
+    /// read back where frames enter the display sink: latency from encoder
+    /// input to decoded picture per frame, and the luma PSNR of what arrived.
+    #[test]
+    #[ignore]
+    fn phone_screen_over_loopback() {
+        use gst_video::prelude::*;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        const W: usize = 864;
+        const H: usize = 1920;
+        const TALL: usize = H * 2;
+        const BLOCK: usize = 32;
+        const BITS: usize = 16;
+        let env = |name: &str, default: usize| {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(default)
+        };
+        let fps = env("DESKLINK_P2D_FPS", 60);
+        let kbps = env("DESKLINK_P2D_KBPS", 8000) as u32;
+        let refine = env("DESKLINK_P2D_REFINE", 5);
+        // Whether frame `n` is captured: always while it moves (and in the
+        // first second, the stream starting); when still, its first frame
+        // and the refinement repeats.
+        let captured = move |n: usize| {
+            let at = n % (4 * fps);
+            let still = if at < fps {
+                at
+            } else {
+                at.saturating_sub(3 * fps)
+            };
+            n < fps
+                || (fps..3 * fps).contains(&at)
+                || (still % (fps / 10) == 0 && still / (fps / 10) <= refine)
+        };
+
+        // Rows of 2 px strokes in 12x28 cells: text-sized detail.
+        let mut seed = 0x2545_f491u32;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as usize
+        };
+        let mut page = vec![235u8; W * TALL];
+        for row in (BLOCK + 8..TALL - 28).step_by(28) {
+            for col in (16..W - 28).step_by(12) {
+                if rand() % 6 == 0 {
+                    continue;
+                }
+                for _ in 0..3 {
+                    let r = rand();
+                    let (x0, y0, len) = (col + r % 8, row + (r >> 3) % 14, 3 + (r >> 7) % 8);
+                    for step in 0..len {
+                        for thick in 0..2 {
+                            let (x, y) = if r & 0x1000 != 0 {
+                                (x0 + step.min(9), y0 + thick)
+                            } else {
+                                (x0 + thick, y0 + step)
+                            };
+                            page[y * W + x] = 30;
+                        }
+                    }
+                }
+            }
+        }
+        let page = Arc::new(page);
+        let frame_luma = move |n: usize| {
+            let period = 4 * fps;
+            let step = 720 / fps;
+            let at = n % period;
+            let offset = if at < fps {
+                0
+            } else if at < 3 * fps {
+                (at - fps) * step
+            } else {
+                2 * fps * step
+            };
+            let mut luma = page[offset * W..(offset + H) * W].to_vec();
+            for bit in 0..BITS {
+                let value = if n >> bit & 1 == 1 { 235 } else { 16 };
+                for y in 0..BLOCK {
+                    luma[y * W + bit * BLOCK..y * W + (bit + 1) * BLOCK].fill(value);
+                }
+            }
+            (luma, at >= fps && at < 3 * fps)
+        };
+
+        let pair = loopback();
+        wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let sender = &pair.answerer;
+        let make = |name: &str| gst::ElementFactory::make(name).build().unwrap();
+        let source = gst::ElementFactory::make("appsrc")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("format", "I420")
+                    .field("width", W as i32)
+                    .field("height", H as i32)
+                    .field("framerate", gst::Fraction::new(fps as i32, 1))
+                    .build(),
+            )
+            .property("is-live", true)
+            .property("format", gst::Format::Time)
+            .build()
+            .unwrap();
+        let encoder = make("x264enc");
+        encoder.set_property_from_str("tune", "zerolatency");
+        encoder.set_property_from_str("speed-preset", "superfast");
+        encoder.set_property("bitrate", kbps);
+        encoder.set_property("key-int-max", (fps * 20) as u32);
+        let profile = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-h264")
+                    .field("profile", "constrained-baseline")
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let payloader = make("rtph264pay");
+        payloader.set_property_from_str("aggregate-mode", "zero-latency");
+        payloader.set_property("config-interval", -1i32);
+        payloader.set_property("mtu", 1200u32);
+        let payload =
+            super::super::screen::negotiated_payload_in(&sender.webrtcbin, "video", "H264")
+                .expect("H.264 negotiated");
+        payloader.set_property("pt", payload);
+        let chain = [&source, &encoder, &profile, &payloader];
+        sender.pipeline.add_many(chain).unwrap();
+        gst::Element::link_many(chain).unwrap();
+        let mline = super::super::screen::negotiated_video_mline(&sender.webrtcbin).unwrap();
+        let sink = super::super::screen::section_pad(&sender.webrtcbin, mline).unwrap();
+        payloader.static_pad("src").unwrap().link(&sink).unwrap();
+        for element in chain.iter().rev() {
+            element.sync_state_with_parent().unwrap();
+        }
+
+        let base_ns = sender
+            .pipeline
+            .current_running_time()
+            .map_or(0, |time| time.nseconds())
+            + 200_000_000;
+        type Times = Arc<Mutex<HashMap<usize, Instant>>>;
+        let (sent, encoded, shown): (Times, Times, Times) = Default::default();
+        let frame_ns = 1_000_000_000 / fps as u64;
+        {
+            let encoded = Arc::clone(&encoded);
+            encoder.static_pad("src").unwrap().add_probe(
+                gst::PadProbeType::BUFFER,
+                move |_, info| {
+                    if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data {
+                        if let Some(pts) = buffer.pts() {
+                            let n =
+                                (pts.nseconds().saturating_sub(base_ns) + frame_ns / 2) / frame_ns;
+                            encoded
+                                .lock()
+                                .unwrap()
+                                .entry(n as usize)
+                                .or_insert_with(Instant::now);
+                        }
+                    }
+                    gst::PadProbeReturn::Ok
+                },
+            );
+        }
+        let seconds = 8;
+        let total = seconds * fps;
+        let pusher = {
+            let (source, sent, frame_luma) =
+                (source.clone(), Arc::clone(&sent), frame_luma.clone());
+            std::thread::spawn(move || {
+                let start = Instant::now();
+                for n in 0..total {
+                    let due = start + Duration::from_nanos(frame_ns * n as u64);
+                    if !captured(n) {
+                        continue;
+                    }
+                    std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                    let (luma, _) = frame_luma(n);
+                    let mut data = luma;
+                    data.resize(W * H * 3 / 2, 128);
+                    let mut buffer = gst::Buffer::from_mut_slice(data);
+                    buffer
+                        .get_mut()
+                        .unwrap()
+                        .set_pts(gst::ClockTime::from_nseconds(base_ns + frame_ns * n as u64));
+                    sent.lock().unwrap().insert(n, Instant::now());
+                    let _ = source.emit_by_name::<gst::FlowReturn>("push-buffer", &[&buffer]);
+                }
+            })
+        };
+
+        let stream = assert_far_side_decodes(&pair.offerer_events);
+        let pad = stream.sink_pad().unwrap();
+        type Snapshots = Arc<Mutex<HashMap<usize, (usize, Vec<u8>)>>>;
+        let snapshots: Snapshots = Default::default();
+        let format = Arc::new(Mutex::new(String::new()));
+        {
+            let (shown, snapshots, format) = (
+                Arc::clone(&shown),
+                Arc::clone(&snapshots),
+                Arc::clone(&format),
+            );
+            pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+                let now = Instant::now();
+                let Some(gst::PadProbeData::Buffer(buffer)) = &info.data else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Some(info) = pad
+                    .current_caps()
+                    .and_then(|caps| gst_video::VideoInfo::from_caps(&caps).ok())
+                else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                let Ok(frame) = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+                else {
+                    return gst::PadProbeReturn::Ok;
+                };
+                *format.lock().unwrap() =
+                    format!("{:?} {}x{}", info.format(), info.width(), info.height());
+                let stride = frame.plane_stride()[0] as usize;
+                let plane = frame.plane_data(0).unwrap();
+                let at = |x: usize, y: usize| plane[y * stride + x];
+                let n = (0..BITS)
+                    .filter(|bit| at(bit * BLOCK + BLOCK / 2, BLOCK / 2) > 128)
+                    .fold(0usize, |n, bit| n | 1 << bit);
+                // What a still screen ends up showing: its latest frame,
+                // per still period (and one mid-scroll frame per period).
+                let phase = n % (4 * fps);
+                let key = if (fps..3 * fps).contains(&phase) {
+                    if phase != 2 * fps {
+                        return gst::PadProbeReturn::Ok;
+                    }
+                    2 * (n / (4 * fps))
+                } else {
+                    2 * ((n + fps) / (4 * fps)) + 1
+                };
+                if shown.lock().unwrap().insert(n, now).is_none() {
+                    let luma = (0..H).flat_map(|y| (0..W).map(move |x| (x, y)));
+                    snapshots
+                        .lock()
+                        .unwrap()
+                        .insert(key, (n, luma.map(|(x, y)| at(x, y)).collect()));
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
+        pusher.join().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+
+        let (sent, encoded, shown) = (
+            sent.lock().unwrap(),
+            encoded.lock().unwrap(),
+            shown.lock().unwrap(),
+        );
+        let summary = |label: &str, mut values: Vec<f64>| {
+            values.sort_by(f64::total_cmp);
+            if values.is_empty() {
+                return eprintln!("P2D {label}: none");
+            }
+            let at = |q: f64| values[((values.len() - 1) as f64 * q) as usize];
+            eprintln!(
+                "P2D {label}: {} frames, median {:.1} ms, p95 {:.1} ms, max {:.1} ms",
+                values.len(),
+                at(0.5),
+                at(0.95),
+                at(1.0)
+            );
+        };
+        // The first second is the stream starting up (keyframe, decoder).
+        let steady = |n: &&usize| **n >= fps;
+        let delay =
+            |from: &HashMap<usize, Instant>, to: &HashMap<usize, Instant>, scrolling: bool| {
+                to.keys()
+                    .filter(steady)
+                    .filter(|n| frame_luma(**n).1 == scrolling)
+                    .filter_map(|n| Some(to[n].duration_since(*from.get(n)?).as_secs_f64() * 1e3))
+                    .collect::<Vec<_>>()
+            };
+        eprintln!(
+            "P2D {fps} fps, {kbps} kbps, {refine} refinements, decoded {}: {} sent, {} shown",
+            format.lock().unwrap(),
+            sent.len(),
+            shown.len()
+        );
+        summary(
+            "encode (x264 stand-in), still",
+            delay(&sent, &encoded, false),
+        );
+        summary(
+            "encode (x264 stand-in), scrolling",
+            delay(&sent, &encoded, true),
+        );
+        summary("encoded → shown, still", delay(&encoded, &shown, false));
+        summary("encoded → shown, scrolling", delay(&encoded, &shown, true));
+        summary("capture → shown, scrolling", delay(&sent, &shown, true));
+        let mut snapshots: Vec<_> = snapshots.lock().unwrap().drain().collect();
+        snapshots.sort_by_key(|(key, _)| *key);
+        // Key 1 is the stream starting up.
+        for (_, (n, luma)) in snapshots.iter().filter(|(key, _)| *key != 1) {
+            let (source, scrolling) = frame_luma(*n);
+            let rows = BLOCK * W..H * W;
+            let mse = source[rows.clone()]
+                .iter()
+                .zip(&luma[rows.clone()])
+                .map(|(a, b)| (f64::from(*a) - f64::from(*b)).powi(2))
+                .sum::<f64>()
+                / rows.len() as f64;
+            eprintln!(
+                "P2D frame {n} ({}): luma PSNR {:.2} dB",
+                if scrolling { "scrolling" } else { "still" },
+                10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
+            );
+        }
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
     /// F1 A1: one Opus section in the first offer, after video, answered
     /// sendrecv — and sound flows both ways over it.
     #[test]
