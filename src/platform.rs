@@ -989,6 +989,16 @@ fn store(rows: Vec<Check>) {
     GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
+/// Debug builds only (the screenshot harness): a machine missing what the
+/// phone link needs, so the standing-problem banner shows.
+#[cfg(debug_assertions)]
+pub fn fake_missing_link() {
+    store(evaluate(&Probe {
+        config_writable: true,
+        ..Probe::default()
+    }));
+}
+
 /// Replaces the report (tests fake a machine this way). Hold
 /// [`TEST_REPORT`] while it is set, and call [`clear_report_for_tests`] after.
 #[cfg(test)]
@@ -1047,21 +1057,22 @@ fn spawn_probe(log: bool, after: std::time::Duration) {
 const STICKY: [&str; 2] = ["link", "storage"];
 
 /// The standing problem to keep in front of the person, if any: its row id
-/// and the words (with the install command for this distribution).
-pub fn sticky_notice() -> Option<(&'static str, String)> {
+/// its plain words, and the install command for this distribution apart (the
+/// banner's "Copy command"), never in the words.
+pub fn sticky_notice() -> Option<(&'static str, String, Option<String>)> {
     sticky_from(&report()?, distro())
 }
 
-fn sticky_from(rows: &[Check], distro: Option<Distro>) -> Option<(&'static str, String)> {
+fn sticky_from(
+    rows: &[Check],
+    distro: Option<Distro>,
+) -> Option<(&'static str, String, Option<String>)> {
     STICKY.iter().find_map(|id| {
         let row = rows
             .iter()
             .find(|row| row.id == *id && row.level == Level::Missing)?;
-        let mut words = row.detail.clone();
-        if let Some(packages) = row.install {
-            words.push_str(&format!(" Install: {}", packages.command(distro)));
-        }
-        Some((*id, words))
+        let command = row.install.map(|packages| packages.command(distro));
+        Some((*id, row.detail.clone(), command))
     })
 }
 
@@ -2017,16 +2028,19 @@ mod tests {
         let mut probe = full();
         assert_eq!(sticky_from(&evaluate(&probe), None), None);
         probe.config_writable = false;
-        let (id, words) = sticky_from(&evaluate(&probe), None).unwrap();
+        let (id, words, command) = sticky_from(&evaluate(&probe), None).unwrap();
         assert_eq!(id, "storage");
         assert!(words.contains("configuration folder"));
+        assert_eq!(command, None);
         probe.elements.remove("webrtcbin");
-        let (id, words) = sticky_from(&evaluate(&probe), Some(Distro::Arch)).unwrap();
+        let (id, words, command) = sticky_from(&evaluate(&probe), Some(Distro::Arch)).unwrap();
         assert_eq!(id, "link", "the phone link comes first");
         assert!(
-            words.contains("sudo pacman -S gst-plugins-bad libnice"),
-            "{words}"
+            !words.contains("sudo"),
+            "the command is the button's: {words}"
         );
+        assert!(command
+            .is_some_and(|command| command.contains("sudo pacman -S gst-plugins-bad libnice")),);
         // A limit (no tray, no notifier) is never a banner.
         let probe = Probe {
             tray_host: false,
