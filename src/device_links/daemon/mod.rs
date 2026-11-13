@@ -255,6 +255,7 @@ impl DaemonWorker {
         // (the first-run tour). Before the plugin check: on a first run
         // GStreamer builds its registry, which takes seconds.
         paired_known.store(handle::LOAD_KNOWN, std::sync::atomic::Ordering::Release);
+        crate::startup("paired phones known");
         // What this computer must have for a link to work, said once and
         // plainly (not as "Can't reach the phone", six rungs later).
         if let Some(problem) = crate::device_links::webrtc::plugin_problem() {

@@ -137,7 +137,9 @@ mod imp {
 
     impl ApplicationImpl for DesklinkApplication {
         fn startup(&self) {
+            crate::startup("registered on the session bus");
             self.parent_startup();
+            crate::startup("GTK started");
             self.start_primary();
             crate::device_links::dnd::init();
             // Registered now (startup runs only in the primary instance), so
@@ -198,7 +200,10 @@ mod imp {
             crate::startup("window built");
 
             // Ask the window manager/compositor to present the window
-            window.connect_map(|_| crate::startup("window mapped"));
+            window.connect_map(|window| {
+                crate::startup("window mapped");
+                first_paint(window);
+            });
             window.present();
         }
 
@@ -226,17 +231,35 @@ mod imp {
             connection: &gio::DBusConnection,
             object_path: &str,
         ) -> Result<(), glib::Error> {
+            crate::startup("connected to the session bus");
             self.parent_dbus_register(connection, object_path)?;
             crate::shell_dbus::export(&self.obj(), connection);
             crate::phone_mpris::start(&self.obj());
             crate::search_provider::export(&self.obj(), connection);
             crate::kde::export(&self.obj(), connection);
+            crate::startup("D-Bus objects exported");
             Ok(())
         }
     }
 
     impl GtkApplicationImpl for DesklinkApplication {}
     impl AdwApplicationImpl for DesklinkApplication {}
+}
+
+/// `DESKLINK_DEBUG`: the moment the window's first frame is on screen
+/// (the frame clock's first `after-paint`), the number a launch is judged by.
+fn first_paint(window: &DesklinkWindow) {
+    let Some(clock) = window.frame_clock().filter(|_| crate::debug_logging()) else {
+        return;
+    };
+    let handler = std::rc::Rc::new(std::cell::Cell::new(None));
+    let once = handler.clone();
+    handler.set(Some(clock.connect_after_paint(move |clock| {
+        crate::startup("first frame painted");
+        if let Some(id) = once.take() {
+            clock.disconnect(id);
+        }
+    })));
 }
 
 /// Which phones' "approve it at this computer" notices to post and which to
