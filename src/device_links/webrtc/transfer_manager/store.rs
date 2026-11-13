@@ -564,6 +564,28 @@ impl Store {
     }
 
     /// Bytes free on the filesystem of the state directory, if it can be told.
+    /// The unfinished downloads from `device_id` held on disk: each one's id
+    /// and the size it will reach.
+    pub(super) fn held_for(&self, device_id: &str) -> Vec<(String, u64)> {
+        let Ok(entries) = fs::read_dir(&self.state_root) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                let id = name
+                    .strip_prefix(".desklink-")?
+                    .strip_suffix(".json")
+                    .filter(|id| !id.ends_with(".send"))?
+                    .to_string();
+                let record = self.read_regular(&name).ok().flatten()?;
+                let record = serde_json::from_slice::<ReceiveCheckpoint>(&record).ok()?;
+                (record.device_id == device_id).then_some((id, record.total_size))
+            })
+            .collect()
+    }
+
     pub fn free_bytes(&self) -> Option<u64> {
         use std::os::unix::ffi::OsStrExt;
         let path = std::ffi::CString::new(self.state_root.as_os_str().as_bytes()).ok()?;

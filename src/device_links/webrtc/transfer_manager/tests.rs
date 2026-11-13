@@ -1065,6 +1065,71 @@ fn a_third_incoming_transfer_is_told_to_wait_and_is_accepted_when_a_slot_frees()
     });
 }
 
+/// An offer is refused at the door, in words, when the disk would keep less
+/// than the margin or the phone's unfinished downloads would pass the cap;
+/// not halfway through the file.
+#[test]
+fn an_offer_with_no_room_is_refused_before_a_byte_arrives() {
+    let hand = Hand::new("no-room");
+    hand.manager
+        .probe(|engine| engine.faults.free_bytes = Some(super::recv::FREE_MARGIN_BYTES));
+    hand.send(hand.offer(id(1), "big.bin", 10 * BLOCK_BYTES));
+    let error = eventually("the refusal", || hand.reply(FileAction::Error));
+    assert_eq!(error.code.as_deref(), Some(code::REFUSED));
+    assert!(error.message.unwrap_or_default().contains("free space"));
+    assert!(hand.incoming().is_empty());
+
+    // Four 4 GiB partials from this phone already wait (16 GiB): one more is
+    // refused.
+    let full = Hand::new("partials-full");
+    let fresh = || uuid::Uuid::new_v4().hyphenated().to_string();
+    let (mine, theirs): (Vec<String>, String) = ((0..4).map(|_| fresh()).collect(), fresh());
+    full.manager.probe(move |engine| {
+        engine.faults.free_bytes = Some(1 << 50);
+        for held in &mine {
+            write_checkpoint(&engine.store, held, "alpha", super::MAX_TRANSFER_BYTES);
+        }
+        write_checkpoint(
+            &engine.store,
+            &theirs,
+            "someone-else",
+            super::MAX_TRANSFER_BYTES,
+        );
+    });
+    full.send(full.offer(id(1), "one-more.bin", BLOCK_BYTES));
+    let error = eventually("the refusal", || full.reply(FileAction::Error));
+    assert_eq!(error.code.as_deref(), Some(code::REFUSED));
+    assert!(error.message.unwrap_or_default().contains("unfinished"));
+
+    // Unknown free space is not a refusal; only this phone's partials count.
+    assert_eq!(super::recv::room_refusal(10, 0, None, 0), None);
+    assert_eq!(super::recv::room_refusal(10, 0, Some(1 << 40), 0), None);
+    assert_eq!(
+        full.manager
+            .probe(|engine| engine.store.held_for("alpha").len()),
+        4
+    );
+}
+
+fn write_checkpoint(store: &super::store::Store, id: &str, device: &str, total: u64) {
+    let checkpoint = super::store::ReceiveCheckpoint {
+        transfer_id: id.to_string(),
+        device_id: device.to_string(),
+        token: "t".into(),
+        filename: "f.bin".into(),
+        destination_name: "f.bin".into(),
+        total_size: total,
+        mtime: 0,
+        blocks_done: 0,
+        clipboard: false,
+        gallery: false,
+        capture_id: None,
+        folder: None,
+        content_sha256: None,
+    };
+    store.save_receive(&checkpoint, &[]).unwrap();
+}
+
 #[test]
 fn an_offer_that_cannot_be_accepted_is_answered_not_dropped() {
     let hand = Hand::new("refuse");

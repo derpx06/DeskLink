@@ -405,6 +405,31 @@ impl Incoming {
     }
 }
 
+/// Disk left free beyond a file being received.
+pub(super) const FREE_MARGIN_BYTES: u64 = 1 << 30;
+
+/// Why an offer of a `total`-byte file (`already` of it on disk) is refused,
+/// in words: the disk (`free`; unknown is not a refusal) would keep less than
+/// [`FREE_MARGIN_BYTES`], or the phone's other unfinished downloads (`held`,
+/// at their full sizes) and this one would pass `store::MAX_PARTIAL_BYTES`.
+pub(super) fn room_refusal(
+    total: u64,
+    already: u64,
+    free: Option<u64>,
+    held: u64,
+) -> Option<&'static str> {
+    let remaining = total.saturating_sub(already);
+    if free.is_some_and(|free| free < remaining.saturating_add(FREE_MARGIN_BYTES)) {
+        return Some("There is not enough free space on this computer for that file.");
+    }
+    if held.saturating_add(total) > super::store::MAX_PARTIAL_BYTES {
+        return Some(
+            "Too many unfinished files from this phone are waiting here. Finish or cancel them first.",
+        );
+    }
+    None
+}
+
 impl Engine {
     /// An offer: a new file to receive, a transfer we hold again, or a no.
     pub(super) fn on_offer(&mut self, net: &Net, message: FileControl) {
@@ -546,6 +571,13 @@ impl Engine {
             self.refused(&message, "two files are already arriving (busy)", None);
             return refuse(code::BUSY, None);
         }
+        // Room for it: on the disk, and within what one phone's unfinished
+        // downloads may hold (a phone offering, cutting and offering again
+        // grew them past the cap between the hourly sweeps).
+        if let Err(words) = self.room_for(&net.wire.peer_device_id, &id, total) {
+            self.refused(&message, "no room for it", Some(words));
+            return refuse(code::REFUSED, Some(words));
+        }
         let now = Instant::now();
         // A transfer held from before (a restart, a cut link) is not new.
         let resumed = matches!(self.store.load_receive(&id), Ok(Some(_)));
@@ -579,6 +611,33 @@ impl Engine {
                 && net.link.lane_target().is_some();
             net.send(incoming.accept_message(net));
         }
+    }
+
+    /// Whether `total` bytes more from `device_id` (transfer `id`) fit: see
+    /// [`room_refusal`].
+    fn room_for(&self, device_id: &str, id: &str, total: u64) -> Result<(), &'static str> {
+        let already = self
+            .store
+            .part_path(id)
+            .ok()
+            .and_then(|path| std::fs::symlink_metadata(path).ok())
+            .filter(std::fs::Metadata::is_file)
+            .map_or(0, |metadata| metadata.len());
+        let mut held = self.store.held_for(device_id);
+        for incoming in self.incoming.values() {
+            if incoming.device_id == device_id
+                && !held.iter().any(|(known, _)| *known == incoming.id)
+            {
+                held.push((incoming.id.clone(), incoming.total));
+            }
+        }
+        let held: u64 = held
+            .iter()
+            .filter(|(known, _)| known != id)
+            .map(|(_, size)| *size)
+            .sum();
+        let free = self.faults.free_bytes.or_else(|| self.store.free_bytes());
+        room_refusal(total, already, free, held).map_or(Ok(()), Err)
     }
 
     /// A lane connection asks to deliver `body.transfer_id` from a block (the
