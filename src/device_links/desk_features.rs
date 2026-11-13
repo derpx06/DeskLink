@@ -447,6 +447,8 @@ pub(crate) fn settings_packet(settings: &AppSettings, device_id: &str) -> Networ
     packet.set("keepAwakeAllowed", settings.lets_keep_awake(device_id));
     packet.set("clipboard", settings.clipboard_sync);
     packet.set("notifications", settings.shows_notifications(device_id));
+    // Derived from RELAY_ENABLED (no switch exists): kept on the wire for
+    // builds that still read them.
     packet.set("relayConfigured", settings.relay_configured());
     packet.set("relay", settings.relay_wanted());
     packet.set("commandAlerts", settings.alerts_commands_to(device_id));
@@ -475,11 +477,10 @@ pub(crate) fn push_settings() {
 }
 
 /// The allow-listed changes in a `desklink.settings.request`: `(key, value)`.
-/// Unknown keys, non-booleans, `unlockNearby` (desk only) and `relay` while
-/// no relay is set up are dropped.
+/// Unknown keys, non-booleans, `unlockNearby` (desk only) and `relay` (only
+/// `relay_link::RELAY_ENABLED` decides it) are dropped.
 pub(crate) fn parse_settings_request(
     packet: &NetworkPacket,
-    relay_configured: bool,
     keep_awake_allowed: bool,
 ) -> Vec<(String, bool)> {
     let Some(Value::Object(set)) = packet.body.get("set") else {
@@ -493,7 +494,6 @@ pub(crate) fn parse_settings_request(
             // It holds the laptop awake with the lid closed (a flat battery
             // and a hot bag): only a phone the person at this desk let.
             "keepAwake" => keep_awake_allowed,
-            "relay" => relay_configured,
             _ => false,
         })
         .collect();
@@ -507,14 +507,13 @@ fn current_value(settings: &AppSettings, device_id: &str, key: &str) -> Option<b
         "keepAwake" => settings.stay_awake,
         "clipboard" => settings.clipboard_sync,
         "notifications" => settings.shows_notifications(device_id),
-        "relay" => settings.relay_enabled,
         "commandAlerts" => settings.alerts_commands_to(device_id),
         _ => return None,
     })
 }
 
 /// The changes that change something: a phone resending its view of the
-/// settings must not save, log or reset the relay.
+/// settings must not save or log.
 fn real_changes(
     settings: &AppSettings,
     device_id: &str,
@@ -538,7 +537,6 @@ fn apply_change(settings: &mut AppSettings, device_id: &str, key: &str, value: b
                 settings.hidden_notifications.insert(device_id.to_string());
             }
         }
-        "relay" => settings.relay_enabled = value,
         "commandAlerts" => {
             if value {
                 settings.muted_command_alerts.remove(device_id);
@@ -566,11 +564,7 @@ pub(crate) fn handle_settings_request(device_id: &str, packet: &NetworkPacket) {
     let changes = real_changes(
         &settings,
         device_id,
-        parse_settings_request(
-            packet,
-            settings.relay_configured(),
-            settings.lets_keep_awake(device_id),
-        ),
+        parse_settings_request(packet, settings.lets_keep_awake(device_id)),
     );
     if !changes.is_empty() {
         let saved = daemon
@@ -592,9 +586,6 @@ pub(crate) fn handle_settings_request(device_id: &str, packet: &NetworkPacket) {
                         ConnectionEvent::SettingsChanged,
                         &format!("{key}={}", if *value { "on" } else { "off" }),
                     );
-                }
-                if changes.iter().any(|(key, _)| key == "relay") {
-                    super::relay_link::client::reset();
                 }
             }
             Err(error) => {
@@ -966,22 +957,19 @@ mod tests {
                 "clipboardNotBool": "yes",
             }),
         );
-        let without_relay = parse_settings_request(&packet, false, false);
+        let changes = parse_settings_request(&packet, false);
         assert_eq!(
-            without_relay,
+            changes,
             vec![
                 ("clipboard".to_string(), false),
                 ("commandAlerts".to_string(), true),
                 ("notifications".to_string(), false),
             ],
-            "keepAwake, unlockNearby, unknown keys and relay without a server are ignored"
+            "keepAwake, unlockNearby, unknown keys and relay (RELAY_ENABLED alone decides it) are ignored"
         );
-        let with_relay = parse_settings_request(&packet, true, false);
-        assert!(with_relay.contains(&("relay".to_string(), true)));
-        assert!(!with_relay.iter().any(|(key, _)| key == "unlockNearby"));
 
         let mut settings = AppSettings::default();
-        for (key, value) in with_relay {
+        for (key, value) in changes {
             apply_change(&mut settings, "phone", &key, value);
         }
         assert!(!settings.stay_awake, "a phone cannot turn keep-awake on");
@@ -990,7 +978,7 @@ mod tests {
         assert!(!settings.unlocks_from("phone"), "never from the phone");
 
         // A phone the person let may switch keep-awake; one that was not may not.
-        let allowed = parse_settings_request(&packet, false, true);
+        let allowed = parse_settings_request(&packet, true);
         assert!(allowed.contains(&("keepAwake".to_string(), true)));
         let mut settings = AppSettings::default();
         settings.keep_awake_phones.insert("phone".into());
@@ -1063,7 +1051,6 @@ mod tests {
             ("clipboard".to_string(), settings.clipboard_sync),
             ("notifications".to_string(), true),
             ("commandAlerts".to_string(), true),
-            ("relay".to_string(), settings.relay_enabled),
         ];
         assert!(real_changes(&settings, "phone", changes).is_empty());
     }

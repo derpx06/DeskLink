@@ -71,13 +71,6 @@ pub enum DaemonCommand {
     SetShellExtensionPromptDismissed(bool),
     /// The first-run welcome tour was shown.
     SetOnboardingSeen(bool),
-    /// Relay on/off and its address ("" = the built-in one).
-    SetRelay {
-        enabled: bool,
-        url: String,
-    },
-    /// Allow TURN when no direct path exists.
-    SetUseTurn(bool),
     /// Start DeskLink in the background at login.
     SetStartAtLogin(bool),
     /// Tell this phone when a long terminal command finishes (device id).
@@ -243,16 +236,6 @@ impl DaemonWorker {
             DaemonCommand::SetTerminalAccess(id, allowed) => self.set_terminal_access(&id, allowed),
             DaemonCommand::EndPhoneSessions(device_id) => self.end_phone_sessions(device_id),
             DaemonCommand::SetSessionPassword(password) => self.set_session_password(password),
-            DaemonCommand::SetRelay { enabled, url } => {
-                self.update_settings(|settings| {
-                    settings.relay_enabled = enabled;
-                    settings.relay_url = url;
-                });
-                crate::device_links::relay_link::client::reset();
-            }
-            DaemonCommand::SetUseTurn(on) => {
-                self.update_settings(|settings| settings.use_turn = on)
-            }
             DaemonCommand::SetStartAtLogin(on) => self.set_start_at_login(on),
             DaemonCommand::SetCommandAlerts(id, on) => self.update_settings(|settings| {
                 if on {

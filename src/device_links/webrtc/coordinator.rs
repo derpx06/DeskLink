@@ -386,21 +386,15 @@ fn ice_config_for(binding: &SessionBinding, config: &Arc<Mutex<Config>>) -> IceS
         .ok()
         .map(|config| config.ice_servers())
         .unwrap_or_default();
-    let settings = crate::device_links::config::app_settings();
     match binding.link.local_ip() {
         Some(ip) => ice.local_ips = vec![ip],
         // Bootstrapped through the relay: the internet path, with STUN for
-        // the public address and, if allowed, TURN for when nothing direct
+        // the public address and the relay's TURN for when nothing direct
         // works.
         None => {
             use crate::device_links::relay_link::{client, route};
             ice.local_ips = route::default_route_addresses();
-            let relay_servers = if crate::device_links::relay_link::turn_allowed(settings.use_turn)
-            {
-                client::ice_servers_for(&binding.device_id)
-            } else {
-                Vec::new()
-            };
+            let relay_servers = client::ice_servers_for(&binding.device_id);
             let (stun, turn) = client::webrtcbin_uris(&relay_servers);
             if ice.stun_servers.is_empty() {
                 ice.stun_servers = stun;
@@ -411,7 +405,8 @@ fn ice_config_for(binding: &SessionBinding, config: &Arc<Mutex<Config>>) -> IceS
             ice.turn_servers.extend(turn);
         }
     }
-    if !crate::device_links::relay_link::turn_allowed(settings.use_turn) {
+    // TURN comes with the relay and only with it: the LAN never needs it.
+    if !crate::device_links::relay_link::RELAY_ENABLED {
         ice.turn_servers.clear();
     }
     ice.relay_only =
