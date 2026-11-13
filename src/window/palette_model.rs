@@ -113,6 +113,7 @@ pub(crate) enum Action {
     HandOff,
     NewNote,
     NewTerminal,
+    Dial,
     PairAnother,
     History,
     Shortcuts,
@@ -632,7 +633,7 @@ pub(crate) fn offered_actions(phone: Option<&PhoneState>) -> Vec<Action> {
         }
         out.push(Action::HandOff);
     }
-    out.extend([Action::NewNote, Action::NewTerminal]);
+    out.extend([Action::NewNote, Action::NewTerminal, Action::Dial]);
     // What is in the Insert and Sound menus: found by a query.
     if let Some(phone) = phone.filter(|phone| phone.screen) {
         out.extend(phone.captures.iter().map(|index| Action::Insert(*index)));
@@ -667,6 +668,13 @@ fn desk_action(action: Action) -> Item {
             "desklink-terminal-symbolic",
             "shell console command line",
             None,
+        ),
+        Action::Dial => (
+            "Dial a number",
+            "Call with the phone, after asking",
+            "desklink-call-symbolic",
+            "phone call keypad dial pad",
+            Some("<control><shift>d"),
         ),
         Action::PairAnother => (
             "Pair another phone",
@@ -1440,6 +1448,7 @@ mod tests {
             [
                 "New note",
                 "New terminal",
+                "Dial a number",
                 "Pair another phone",
                 "Get started",
                 "Connection history",

@@ -9,6 +9,7 @@ pub(crate) mod desk_features;
 pub(crate) mod desk_notifications;
 pub mod device;
 pub mod device_info;
+pub(crate) mod dial_recents;
 pub(crate) mod dnd;
 pub(crate) mod eis;
 pub mod features;

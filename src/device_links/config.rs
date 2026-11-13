@@ -163,6 +163,14 @@ pub struct AppSettings {
     /// Pause this computer's music while the phone is in a call, and resume
     /// it after (on by default).
     pub pause_media_on_call: bool,
+    /// Show a phone's calls here (bar, notification, ring). On by default.
+    pub calls_on_computer: bool,
+    /// Keep the caller's name and number on a notification while this
+    /// computer is locked. Off by default: a lock screen is public.
+    pub caller_on_lock_screen: bool,
+    /// Play a soft sound here while a phone rings (on by default; quiet in
+    /// Do Not Disturb or with "Show calls" off).
+    pub ring_on_computer: bool,
 }
 
 impl Default for AppSettings {
@@ -193,6 +201,9 @@ impl Default for AppSettings {
             contact_caller_names: Default::default(),
             glide: None,
             pause_media_on_call: true,
+            calls_on_computer: true,
+            caller_on_lock_screen: false,
+            ring_on_computer: true,
         }
     }
 }

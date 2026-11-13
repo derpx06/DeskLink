@@ -29,7 +29,8 @@ use crate::DesklinkWindow;
 
 /// The key bindings (detailed action, accelerator), besides the page keys of
 /// `window::PAGE_ACCELS`. The shortcuts dialog lists these; a test reads both.
-pub(crate) const ACCELS: [(&str, &str); 9] = [
+pub(crate) const ACCELS: [(&str, &str); 10] = [
+    ("win.dial-pad", "<control><shift>d"),
     ("app.quit", "<control>q"),
     ("app.shortcuts", "<control>question"),
     ("app.preferences", "<control>comma"),

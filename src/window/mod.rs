@@ -26,6 +26,7 @@
 
 mod bucket;
 pub(crate) mod calls;
+mod dialpad;
 mod gallery;
 pub(crate) mod insert;
 mod sound;
@@ -317,6 +318,7 @@ mod imp {
             self.chosen_device_id.replace(last.clone());
             self.selected_device_id.replace(last);
 
+            calls::install_shortcuts(&obj);
             let window = obj.downgrade();
             self.narrow_breakpoint.connect_apply(move |_| {
                 if let Some(window) = window.upgrade() {
@@ -591,6 +593,9 @@ mod imp {
                         window.refresh_devices();
                     })
                     .build(),
+                gio::ActionEntry::builder("dial-pad")
+                    .activate(|window: &super::DesklinkWindow, _, _| window.show_dial_pad())
+                    .build(),
                 gio::ActionEntry::builder("pair-new")
                     .activate(|window: &super::DesklinkWindow, _, _| {
                         window.show_discovery_dialog(true)
@@ -842,6 +847,11 @@ impl DesklinkWindow {
             page.show_tab("notes");
             page.notes.open_id(id);
         }
+    }
+
+    /// The dial pad (Contacts page, Find anything, Ctrl+Shift+D).
+    pub fn show_dial_pad(&self) {
+        dialpad::show(self);
     }
 
     /// Shows one of `device_id`'s contacts (from GNOME search).

@@ -708,6 +708,7 @@ fn run_desk_action(window: &DesklinkWindow, action: Action) {
                 window.show_page("terminals");
             }
         }
+        Action::Dial => window.show_dial_pad(),
         Action::PairAnother => win_action(window, "pair-new", None),
         Action::History => app_action(window, "history"),
         Action::Shortcuts => app_action(window, "shortcuts"),
@@ -768,6 +769,7 @@ fn run_phone_action(window: &DesklinkWindow, id: &str, action: Action) {
         Action::HandOff => super::overview::hand_off(window, &device.name),
         Action::NewNote
         | Action::NewTerminal
+        | Action::Dial
         | Action::PairAnother
         | Action::History
         | Action::Shortcuts

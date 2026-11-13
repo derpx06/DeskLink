@@ -65,6 +65,9 @@ pub enum DaemonCommand {
     SetClipboardSync(bool),
     /// Settings -> Calls: this computer's players pause during a call.
     SetPauseMediaOnCall(bool),
+    SetCallsOnComputer(bool),
+    SetCallerOnLockScreen(bool),
+    SetRingOnComputer(bool),
     /// Show a phone's notifications here (device id, shown).
     SetShowNotifications(String, bool),
     /// The user answered "Not now" to the top-bar extension offer.
@@ -311,6 +314,15 @@ impl DaemonWorker {
             }
             DaemonCommand::SetPauseMediaOnCall(on) => {
                 self.update_settings(|settings| settings.pause_media_on_call = on)
+            }
+            DaemonCommand::SetCallsOnComputer(on) => {
+                self.update_settings(|settings| settings.calls_on_computer = on)
+            }
+            DaemonCommand::SetRingOnComputer(on) => {
+                self.update_settings(|settings| settings.ring_on_computer = on)
+            }
+            DaemonCommand::SetCallerOnLockScreen(on) => {
+                self.update_settings(|settings| settings.caller_on_lock_screen = on)
             }
             DaemonCommand::SetClipboardSync(on) => {
                 self.update_settings(|settings| settings.clipboard_sync = on)
