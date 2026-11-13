@@ -544,17 +544,13 @@ impl ControlMessage {
         } else if self.screen_width.is_some() || self.screen_height.is_some() {
             return Err("Remote-session screen size needs both dimensions".to_string());
         }
-        if self.kind == ControlKind::AudioControl
-            && !matches!(self.action.as_deref(), Some("mute" | "unmute" | "volume"))
-        {
-            return Err("Unknown audio action".to_string());
-        }
-        if self
-            .audio_direction
-            .as_deref()
-            .is_some_and(|direction| !matches!(direction, "desk-to-phone" | "phone-to-desk"))
-        {
-            return Err("Unknown audio direction".to_string());
+        // Forward compatibility: an audio action, audio direction, display
+        // mode or audio source this build does not know is not a malformed
+        // message. It passes here and its handler answers it as unsupported
+        // (an `audio-denied` or a view denial) or ignores it, instead of the
+        // whole message being dropped with the peer left waiting.
+        if self.kind == ControlKind::AudioControl && self.action.is_none() {
+            return Err("audio-control needs an action".to_string());
         }
         if self
             .text
@@ -563,25 +559,11 @@ impl ControlMessage {
         {
             return Err("Captured text is too long".to_string());
         }
-        if self
-            .display
-            .as_deref()
-            .is_some_and(|display| !matches!(display, "mirror" | "extend"))
-        {
-            return Err("Unknown screen display mode".to_string());
-        }
         if self.pages.is_some_and(|pages| !(1..=500).contains(&pages)) {
             return Err("Capture page count is out of range".to_string());
         }
         if self.kind == ControlKind::AudioRequest && self.audio_direction.is_none() {
             return Err("audio-request needs a direction".to_string());
-        }
-        if self
-            .source
-            .as_deref()
-            .is_some_and(|source| !matches!(source, "system" | "mic"))
-        {
-            return Err("Unknown audio source".to_string());
         }
         if self
             .sample_rate
@@ -1288,15 +1270,26 @@ mod tests {
 
         let mut request = message(ControlKind::AudioRequest, &id);
         assert!(request.validate(&wire(), attempt, 1_000).is_err());
+        // Values a newer peer may send pass validation: the handler answers
+        // them as unsupported instead of the message vanishing.
         request.audio_direction = Some("sideways".into());
-        assert!(request.validate(&wire(), attempt, 1_000).is_err());
+        assert!(request.validate(&wire(), attempt, 1_000).is_ok());
         request.audio_direction = Some("phone-to-desk".into());
         request.source = Some("radio".into());
-        assert!(request.validate(&wire(), attempt, 1_000).is_err());
+        assert!(request.validate(&wire(), attempt, 1_000).is_ok());
         request.source = Some("mic".into());
         assert!(request.validate(&wire(), attempt, 1_000).is_ok());
 
         let mut control = message(ControlKind::AudioControl, &id);
+        assert!(
+            control.validate(&wire(), attempt, 1_000).is_err(),
+            "no action"
+        );
+        control.action = Some("balance".into());
+        assert!(
+            control.validate(&wire(), attempt, 1_000).is_ok(),
+            "a newer action"
+        );
         control.action = Some("volume".into());
         control.value = Some(101);
         assert!(control.validate(&wire(), attempt, 1_000).is_err());
@@ -1364,6 +1357,26 @@ mod tests {
 
         let bytes = serde_json::to_vec(&value).unwrap();
         assert!(ControlMessage::from_json(&bytes).is_err());
+    }
+
+    /// A display mode a newer phone may ask for is a well-formed request
+    /// (the view handler denies it as unsupported); its other fields keep
+    /// their checks.
+    #[test]
+    fn an_unknown_display_mode_is_valid_and_its_sizes_are_still_checked() {
+        let mut request = message(ControlKind::RequestView, &Uuid::new_v4().to_string());
+        request.direction = Some(ScreenDirection::DesktopToPhone);
+        request.display = Some("hologram".into());
+        let parsed = ControlMessage::from_json(&request.to_json()).unwrap();
+        assert_eq!(parsed.display.as_deref(), Some("hologram"));
+        assert!(parsed
+            .validate(&wire(), "01234567-89ab-cdef-0123-456789abcdef", 1_000)
+            .is_ok());
+        request.screen_width = Some(0);
+        request.screen_height = Some(10);
+        assert!(request
+            .validate(&wire(), "01234567-89ab-cdef-0123-456789abcdef", 1_000)
+            .is_err());
     }
 
     #[test]

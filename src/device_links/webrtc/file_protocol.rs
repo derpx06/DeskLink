@@ -389,6 +389,19 @@ impl FileControl {
                 }
             }
         }
+        // Forward compatibility: a lane this build cannot use (a newer
+        // version, a kind or token it does not know) in an offer or an
+        // accept is dropped, and the file goes over WebRTC. Refusing the
+        // whole message left a newer peer's transfer unanswered.
+        if matches!(control.action, FileAction::Offer | FileAction::Accept)
+            && control
+                .lane
+                .as_ref()
+                .is_some_and(|lane| lane.validate().is_err() || lane.v != Some(1))
+        {
+            debug_log!("[DeskLink] Ignoring a file lane this build cannot use");
+            control.lane = None;
+        }
         Ok(control)
     }
 
@@ -791,6 +804,38 @@ mod tests {
 
     /// The lane's bodies are the shared vectors (W18): what an offer, an accept
     /// and a `lane` switch carry, read both ways, and what is refused.
+    #[test]
+    fn an_offer_or_accept_with_a_lane_this_build_cannot_use_goes_over_webrtc() {
+        let wire = wire();
+        for (action, lane) in [
+            (FileAction::Offer, serde_json::json!({"v": 2})),
+            (
+                FileAction::Offer,
+                serde_json::json!({"v": 1, "kind": "quic"}),
+            ),
+            (
+                FileAction::Accept,
+                serde_json::json!({"v": 1, "port": 1716, "token": "NOT-HEX"}),
+            ),
+        ] {
+            let mut body = serde_json::to_value(match action {
+                FileAction::Offer => offer(),
+                _ => from_phone(FileAction::Accept),
+            })
+            .unwrap();
+            body["lane"] = lane.clone();
+            let parsed = FileControl::from_json(body.to_string().as_bytes()).unwrap();
+            assert_eq!(parsed.lane, None, "{lane}");
+            assert_eq!(parsed.action, action);
+        }
+        // A switch to a lane it cannot use is still refused: it cannot follow it.
+        let mut switch = from_phone(FileAction::Lane);
+        switch.lane = Some(LaneField::switch("quic", 1, 0));
+        let parsed =
+            FileControl::from_json(serde_json::to_string(&switch).unwrap().as_bytes()).unwrap();
+        assert!(parsed.validate(&wire).is_err());
+    }
+
     #[test]
     fn the_lane_fields_are_the_shared_vectors() {
         let vectors: serde_json::Value =

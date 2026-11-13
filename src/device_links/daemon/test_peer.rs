@@ -718,9 +718,28 @@ mod tests {
         let phone_id = desktop.peer_id();
         let binding = desktop.sessions.current_binding(&phone_id).unwrap();
         binding.link.note_attached(true);
+        // A socket that stays open and quiet until shut down: with a dead
+        // one, the new link's reader tore the session down at once, racing
+        // the next step of the test (the flake).
+        struct Quiet(std::sync::atomic::AtomicBool);
+        impl crate::device_links::core::LinkTransport for Quiet {
+            fn send_packet(&self, _: &NetworkPacket) -> Result<(), String> {
+                Ok(())
+            }
+            fn read_byte(&self) -> Result<crate::device_links::core::ReadOutcome, String> {
+                if self.0.load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(crate::device_links::core::ReadOutcome::Closed);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok(crate::device_links::core::ReadOutcome::Idle)
+            }
+            fn shutdown(&self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         let attach = |dialed_by_us: bool| {
             let transport: Arc<dyn crate::device_links::core::LinkTransport> =
-                Arc::new(crate::device_links::core::link_transport::DeadTransport);
+                Arc::new(Quiet(std::sync::atomic::AtomicBool::new(false)));
             let link = SessionLink::new(
                 Arc::clone(&transport),
                 desktop.peer_certificate_pem.clone(),
@@ -764,8 +783,22 @@ mod tests {
         // link-race window, which decides two links dialed together).
         let current = desktop.sessions.current_binding(&phone_id).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1_100));
+        desktop
+            .sessions
+            .with_session(&current, |session| {
+                session.last_inbound_at = std::time::Instant::now();
+            })
+            .unwrap();
+        assert!(
+            !current.link.is_closed(),
+            "the incumbent is open and answering"
+        );
         attach(false).unwrap();
         assert!(!desktop.sessions.is_current(&current));
+        // Its reader ends with the test.
+        if let Some(last) = desktop.sessions.current_binding(&phone_id) {
+            last.link.close();
+        }
     }
 
     /// The phone's restart request arrives while a start of ours is under

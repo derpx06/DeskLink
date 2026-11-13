@@ -663,6 +663,19 @@ impl WebRtcTransferManager {
         }
     }
 
+    /// The most blocks any incoming transfer holds verified, for tests.
+    #[cfg(test)]
+    pub(crate) fn verified_incoming_blocks(&self) -> u64 {
+        self.probe(|engine| {
+            engine
+                .incoming
+                .values()
+                .map(|incoming| incoming.verified_blocks())
+                .max()
+                .unwrap_or(0)
+        })
+    }
+
     /// Runs `job` on the file thread with the engine, for tests.
     #[cfg(test)]
     fn probe<T: Send + 'static>(&self, job: impl FnOnce(&mut Engine) -> T + Send + 'static) -> T {
