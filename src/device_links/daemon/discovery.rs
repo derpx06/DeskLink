@@ -279,6 +279,10 @@ const MAX_ADDRESSES: usize = 3;
 /// [`MAX_ADDRESS_BACKOFF`]: not every few seconds for ever.
 const FIRST_ADDRESS_BACKOFF: Duration = Duration::from_secs(3);
 const MAX_ADDRESS_BACKOFF: Duration = Duration::from_secs(300);
+/// How long a dial may be in flight (connect 3 s, pinned handshake
+/// [`super::network::HANDSHAKE_LIMIT`], and room to register) before its
+/// address may be dialled again without hearing how it ended.
+const DIAL_LEASE: Duration = Duration::from_secs(10);
 
 /// Unverified addresses (a beacon's source, an mDNS answer, the card's
 /// address) a phone may have in the book at once. They are dialled like any
@@ -305,6 +309,10 @@ struct Address {
     /// Unicast beacons sent here since the last sign of the phone.
     beacons: u32,
     beacon_at: Option<Instant>,
+    /// A dial to it is in flight until this (see [`DIAL_LEASE`]); a wake
+    /// leaves it, so a sign of the phone never starts a second dial beside
+    /// the first.
+    dialling_until: Option<Instant>,
 }
 
 impl Address {
@@ -316,6 +324,7 @@ impl Address {
             verified,
             beacons: 0,
             beacon_at: None,
+            dialling_until: None,
         }
     }
 }
@@ -457,17 +466,33 @@ impl AddressBook {
         due
     }
 
-    /// The addresses to dial now: those whose backoff is over, newest first.
+    /// The addresses to dial now: those whose backoff is over and that are
+    /// not being dialled, newest first.
     pub(super) fn due(&self, device_id: &str, now: Instant) -> Vec<std::net::IpAddr> {
         self.phones
             .get(device_id)
             .map(|list| {
                 list.iter()
-                    .filter(|known| known.retry_at.is_none_or(|at| at <= now))
+                    .filter(|known| {
+                        known.retry_at.is_none_or(|at| at <= now)
+                            && known.dialling_until.is_none_or(|at| at <= now)
+                    })
                     .map(|known| known.ip)
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// [`Self::due`], each marked as being dialled until it is reported
+    /// [`Self::failed`] or [`Self::worked`] (or [`DIAL_LEASE`] passes).
+    pub(super) fn start_dials(&mut self, device_id: &str, now: Instant) -> Vec<std::net::IpAddr> {
+        let due = self.due(device_id, now);
+        if let Some(list) = self.phones.get_mut(device_id) {
+            for known in list.iter_mut().filter(|known| due.contains(&known.ip)) {
+                known.dialling_until = Some(now + DIAL_LEASE);
+            }
+        }
+        due
     }
 
     /// A dial to `ip` failed: it waits longer next time.
@@ -479,6 +504,7 @@ impl AddressBook {
         {
             known.failures = known.failures.saturating_add(1);
             known.retry_at = Some(now + address_backoff(known.failures));
+            known.dialling_until = None;
         }
     }
 
@@ -612,7 +638,7 @@ fn redial_targets(
         if let Some(remembered) = persisted.get(&device.id) {
             book.remembered(&device.id, remembered.ip());
         }
-        for ip in book.due(&device.id, now) {
+        for ip in book.start_dials(&device.id, now) {
             targets.push((info.clone(), ip, port));
         }
     }
@@ -1402,6 +1428,49 @@ mod tests {
             .all(|(info, _, port)| info.id == "multi" && *port == 1716));
     }
 
+    /// A dial still in flight (connect 3 s + handshake 5 s) is not started
+    /// again on the next 1 s tick: the repeats filled the host's three
+    /// handshake slots, which the phone's own dial back needs too.
+    #[test]
+    fn an_address_being_dialled_is_not_dialled_again_until_that_dial_ends() {
+        let info = plain_info("busy");
+        let mut view = DeviceView::from_info(&info, "10.0.0.8".to_string(), true);
+        view.trusted = true;
+        let devices: HashMap<String, DeviceView> = [("busy".to_string(), view)].into();
+        let known: HashMap<String, (DeviceInfo, u16)> = [("busy".to_string(), (info, 1716))].into();
+        let mut book = AddressBook::default();
+        book.seen("busy", ip("10.0.0.8"));
+        let now = Instant::now();
+        let mut tick = |at: Instant, book: &mut AddressBook| {
+            redial_targets(&devices, &known, &HashMap::new(), book, at, |_| true).len()
+        };
+        assert_eq!(tick(now, &mut book), 1);
+        for second in 1..=8 {
+            assert_eq!(
+                tick(now + Duration::from_secs(second), &mut book),
+                0,
+                "at {second} s"
+            );
+        }
+        // The dial failed: the address waits out its backoff, then goes again.
+        book.failed("busy", ip("10.0.0.8"), now + Duration::from_secs(8));
+        assert_eq!(tick(now + Duration::from_secs(10), &mut book), 0);
+        assert_eq!(tick(now + Duration::from_secs(11), &mut book), 1);
+        // A wake (a beacon, a network change) does not start a second dial
+        // beside the one in flight.
+        book.wake(Some("busy"));
+        assert_eq!(tick(now + Duration::from_secs(12), &mut book), 0);
+        // One that worked is dialled again whenever the link is wanted.
+        book.worked("busy", ip("10.0.0.8"));
+        assert_eq!(tick(now + Duration::from_secs(13), &mut book), 1);
+        // A dial that never reports back (a stuck thread) holds it no longer
+        // than the lease.
+        assert_eq!(
+            tick(now + Duration::from_secs(13) + DIAL_LEASE, &mut book),
+            1
+        );
+    }
+
     fn plain_info(id: &str) -> DeviceInfo {
         DeviceInfo {
             id: id.into(),
@@ -1454,8 +1523,9 @@ mod tests {
             2,
             "then again"
         );
-        // The seeds never reset a failure count.
+        // The seeds never reset a failure count (and the other dial worked).
         book.failed("seeded", ip("10.1.0.8"), start + Duration::from_secs(3));
+        book.worked("seeded", ip("10.1.0.9"));
         assert_eq!(address_backoff(2).as_secs(), 6);
         assert!(dialled(&mut book, start + Duration::from_secs(8)).len() == 1);
     }
