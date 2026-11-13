@@ -41,7 +41,13 @@ BuildRequires:  pkgconfig(gstreamer-base-1.0)
 BuildRequires:  pkgconfig(gstreamer-video-1.0)
 BuildRequires:  pkgconfig(gstreamer-sdp-1.0)
 BuildRequires:  pkgconfig(gstreamer-webrtc-1.0)
+# OpenSSL itself: on openSUSE pkgconfig(openssl) is also provided by
+# libressl-devel, which a resolver may pick and openssl-sys refuses.
+%if 0%{?suse_version}
+BuildRequires:  libopenssl-devel
+%else
 BuildRequires:  pkgconfig(openssl)
+%endif
 
 Requires:       xdg-desktop-portal
 %if 0%{?suse_version}
