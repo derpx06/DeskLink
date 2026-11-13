@@ -37,7 +37,6 @@ pub(crate) enum Fix {
     LogOut,
     /// Approve the phone controlling this screen, now, at the desk.
     ApproveControl(String),
-    NewTerminal,
     Reconnect(String),
     /// Copies an install command.
     Copy(String),
@@ -55,7 +54,6 @@ impl Fix {
             Self::TurnOnExtension => "Turn on",
             Self::LogOut => "Log out…",
             Self::ApproveControl(_) => "Approve now",
-            Self::NewTerminal => "New terminal",
             Self::Reconnect(_) => "Try again",
             Self::Copy(_) => "Copy command",
         })
@@ -382,8 +380,9 @@ pub(crate) enum Feature {
 
 /// Why `feature` cannot run on `phone` now, as a need with its fix; `None`
 /// when it can. Reachability first, then what the phone's build takes, then
-/// the feature's own requirements.
-pub(crate) fn blocker(feature: Feature, phone: &PhoneFacts, open_terminal: bool) -> Option<Need> {
+/// the feature's own requirements. No open terminal does not block Hand off:
+/// it offers to start one ([`super::overview::hand_off`]).
+pub(crate) fn blocker(feature: Feature, phone: &PhoneFacts) -> Option<Need> {
     let name = &phone.name;
     match phone.reach {
         Reach::Offline => {
@@ -430,16 +429,6 @@ pub(crate) fn blocker(feature: Feature, phone: &PhoneFacts, open_terminal: bool)
             fix: Fix::OpenSettings(PRIVACY_PAGE),
             allow: Some(Allow::TerminalAccess(phone.id.clone())),
         }),
-        Feature::HandOff if !open_terminal => Some(Need {
-            id: "open-terminal",
-            on_phone: false,
-            title: "Needs an open shared terminal".into(),
-            detail: format!(
-                "Hand off locks this computer and carries on in your newest terminal on {name}."
-            ),
-            fix: Fix::NewTerminal,
-            allow: None,
-        }),
         Feature::HandOff => None,
     }
 }
@@ -451,7 +440,6 @@ pub(crate) fn short(need: &Need) -> &'static str {
         "reach" => "Can't reach",
         "phone-update" => "Needs an update",
         "terminal-access" => "Needs access",
-        "open-terminal" => "Needs a terminal",
         _ => "Needs a step",
     }
 }
@@ -493,14 +481,6 @@ pub(crate) fn run(anchor: &impl IsA<gtk::Widget>, need: &Need) {
         },
         Fix::LogOut => crate::shell_dbus::log_out(),
         Fix::ApproveControl(id) => super::prefs::approve_remote_control(&window, id),
-        Fix::NewTerminal => {
-            gtk::prelude::WidgetExt::activate_action(
-                &window,
-                "win.new-terminal",
-                Some(&"shell".to_variant()),
-            )
-            .ok();
-        }
         Fix::Reconnect(id) => {
             if let Some(daemon) = daemon {
                 daemon.send(DaemonCommand::Reconnect(id.clone()));
@@ -961,30 +941,25 @@ mod tests {
     fn a_blocked_action_names_its_reason_and_fix() {
         let ping = Feature::Send(PACKET_TYPE_PING);
         let lock = Feature::Send(PACKET_TYPE_LOCK_REQUEST);
-        assert_eq!(blocker(ping, &phone(), true), None);
-        let need = blocker(lock, &phone(), true).unwrap();
+        assert_eq!(blocker(ping, &phone()), None);
+        let need = blocker(lock, &phone()).unwrap();
         assert_eq!(need.id, "phone-update");
         assert!(need.detail.contains("Update DeskLink on Pixel 9"));
         assert_eq!(short(&need), "Needs an update");
 
         let mut offline = phone();
         offline.reach = Reach::Offline;
-        let need = blocker(ping, &offline, true).unwrap();
+        let need = blocker(ping, &offline).unwrap();
         assert_eq!(need.fix, Fix::Reconnect("p1".into()));
         assert_eq!(short(&need), "Can't reach");
         offline.reach = Reach::Connecting;
-        assert_eq!(
-            short(&blocker(ping, &offline, true).unwrap()),
-            "Connecting…"
-        );
+        assert_eq!(short(&blocker(ping, &offline).unwrap()), "Connecting…");
 
-        assert_eq!(blocker(Feature::HandOff, &phone(), true), None);
-        let need = blocker(Feature::HandOff, &phone(), false).unwrap();
-        assert_eq!(need.title, "Needs an open shared terminal");
-        assert_eq!(need.fix, Fix::NewTerminal);
+        // No open terminal is not a blocker: Hand off offers to start one.
+        assert_eq!(blocker(Feature::HandOff, &phone()), None);
         let mut closed = phone();
         closed.terminal_access = false;
-        let need = blocker(Feature::HandOff, &closed, true).unwrap();
+        let need = blocker(Feature::HandOff, &closed).unwrap();
         assert_eq!(need.fix, Fix::OpenSettings(PRIVACY_PAGE));
         assert_eq!(short(&need), "Needs access");
     }

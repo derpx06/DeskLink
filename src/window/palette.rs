@@ -763,8 +763,8 @@ fn run_phone_action(window: &DesklinkWindow, id: &str, action: Action) {
         Action::Sound(what, on) => {
             daemon.send(DaemonCommand::Sound(device.id.clone(), what.into(), on))
         }
-        // As the Home tile: the daemon gates it per phone.
-        Action::HandOff => app_action(window, "lock-hand-off"),
+        // As the Home tile: with no open terminal it offers to start one.
+        Action::HandOff => super::overview::hand_off(window, &device.name),
         Action::NewNote
         | Action::NewTerminal
         | Action::PairAnother
