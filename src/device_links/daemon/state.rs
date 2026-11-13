@@ -687,7 +687,13 @@ pub(super) fn upsert_notification_for(
         request_reply_id: packet
             .get_str("requestReplyId")
             .map(|value| sanitize_text(value, 240)),
-        actions: string_vec(packet.body.get("actions")).unwrap_or_default(),
+        // A blank title is a button nobody can read or press (the desk refuses an
+        // empty action): Android 15 empties them on redacted, sensitive notifications.
+        actions: string_vec(packet.body.get("actions"))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|action| !action.trim().is_empty())
+            .collect(),
         silent: packet.get_bool("silent").unwrap_or(false),
     };
 
@@ -1397,6 +1403,16 @@ mod tests {
         assert!(devices.lock().unwrap()[&info.id].notifications.is_empty());
         settings.hidden_notifications.clear();
         assert!(upsert_notification_for(&settings, &devices, &info.id, &packet).is_some());
+    }
+
+    #[test]
+    fn a_notification_keeps_no_blank_action_titles() {
+        let (devices, info) = test_devices();
+        let mut packet = notification("sensitive");
+        packet.set("actions", serde_json::json!(["", " ", "Archive"]));
+        let settings = crate::device_links::config::AppSettings::default();
+        let kept = upsert_notification_for(&settings, &devices, &info.id, &packet).expect("kept");
+        assert_eq!(kept.actions, vec!["Archive".to_string()]);
     }
 
     #[test]
