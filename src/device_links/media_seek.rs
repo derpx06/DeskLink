@@ -105,7 +105,7 @@ pub(crate) fn plan(track: Option<&str>, position_ms: i64, current_ms: i64, lengt
             micros: target.saturating_mul(1000),
         },
         None => Plan::Relative {
-            micros: (target - current_ms).saturating_mul(1000),
+            micros: target.saturating_sub(current_ms).saturating_mul(1000),
         },
     }
 }
@@ -113,6 +113,16 @@ pub(crate) fn plan(track: Option<&str>, position_ms: i64, current_ms: i64, lengt
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A phone's position and a player's report are both outside input: a
+    /// far seek from a player reporting a negative position does not overflow.
+    #[test]
+    fn a_relative_seek_never_overflows() {
+        assert_eq!(
+            plan(None, i64::MAX, -5, 0),
+            Plan::Relative { micros: i64::MAX }
+        );
+    }
 
     #[test]
     fn a_position_stays_inside_the_track() {
