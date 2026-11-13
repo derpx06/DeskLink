@@ -21,7 +21,7 @@ fn unix_secs() -> i64 {
 /// Only silence is probed, so an active link never sends one of these.
 /// How long a link that is not paired, and not pairing, may stay open.
 pub(super) const UNPAIRED_LINK_MAX: std::time::Duration = std::time::Duration::from_secs(60);
-pub(super) const HEARTBEAT_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const HEARTBEAT_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Declare a peer gone after this much silence — three missed probes.
 ///
@@ -31,13 +31,13 @@ pub(super) const HEARTBEAT_IDLE: std::time::Duration = std::time::Duration::from
 /// livelock: it has been observed in both directions, once with the desktop
 /// discarding 170 of the phone's fresh sockets while holding a dead one, and
 /// once with the phone refusing to dial a desktop that was idle and waiting.
-pub(super) const HEARTBEAT_DEAD: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const HEARTBEAT_DEAD: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// [`HEARTBEAT_DEAD`] while the phone reports `dozing`: its OS has frozen it,
 /// so it cannot answer, and dropping the link once per freeze cycle would
 /// only churn it. The kernel TCP keepalive (30 s / 10 s / 3, answered by the
 /// phone's kernel even while frozen) still finds a phone that truly vanished.
-pub(super) const HEARTBEAT_DEAD_DOZING: std::time::Duration = std::time::Duration::from_secs(90);
+pub(crate) const HEARTBEAT_DEAD_DOZING: std::time::Duration = std::time::Duration::from_secs(90);
 
 /// The LAN link's silence budget for a phone that is (or is not) dozing.
 pub(super) fn heartbeat_dead(dozing: bool) -> std::time::Duration {

@@ -408,6 +408,103 @@ impl WebRtcPacketBridge {
 mod tests {
     use super::*;
 
+    /// Every number of the connection contract that Android must share,
+    /// pinned to the fixture both apps read (`testdata/connection_constants.json`,
+    /// a copy of which Android's `ConnectionConstantsTest` reads).
+    #[test]
+    fn connection_constants_match_the_shared_fixture() {
+        use crate::device_links::webrtc::coordinator as c;
+        let f: serde_json::Value =
+            serde_json::from_str(include_str!("../../../testdata/connection_constants.json"))
+                .unwrap();
+        let ms = |key: &str| f[key].as_u64().unwrap_or_else(|| panic!("{key}"));
+        let ladder: Vec<u64> = (0..)
+            .map_while(c::recovery_delay)
+            .map(|delay| delay.as_millis() as u64)
+            .collect();
+        let expected: Vec<u64> = f["recoveryLadderMillis"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap())
+            .collect();
+        assert_eq!(ladder, expected);
+        assert_eq!(
+            c::HEALTHY_AFTER.as_millis() as u64,
+            ms("healthyAfterMillis")
+        );
+        assert_eq!(
+            c::PEER_PROBE_AFTER.as_millis() as u64,
+            ms("peerProbeAfterMillis")
+        );
+        assert_eq!(
+            c::PEER_DEAD_AFTER.as_millis() as u64,
+            ms("peerDeadAfterMillis")
+        );
+        assert_eq!(
+            c::TRANSIENT_DISCONNECT_GRACE.as_millis() as u64,
+            ms("transientDisconnectGraceMillis")
+        );
+        assert_eq!(
+            crate::device_links::core::LINK_RACE_WINDOW.as_millis() as u64,
+            ms("linkRaceWindowMillis")
+        );
+        assert_eq!(MAX_PAYLOAD_BYTES as u64, ms("maxPayloadBytes"));
+        assert_eq!(MAX_ENVELOPE_BYTES as u64, ms("maxEnvelopeBytes"));
+        assert_eq!(
+            MAX_LIVENESS_ENVELOPE_BYTES as u64,
+            ms("maxLivenessEnvelopeBytes")
+        );
+        assert_eq!(LIVENESS_MAX_BUFFERED_BYTES, ms("livenessMaxBufferedBytes"));
+        assert_eq!(EVENTS_HIGH_WATER, ms("eventsHighWaterBytes"));
+        assert_eq!(EVENTS_LOW_WATER, ms("eventsLowWaterBytes"));
+        assert_eq!(
+            crate::device_links::core::PENDING_FEATURE_MAX_AGE.as_millis() as u64,
+            ms("pendingFeatureMaxAgeMillis")
+        );
+        assert_eq!(
+            crate::device_links::core::PENDING_FEATURE_LIMIT as u64,
+            f["pendingFeatureLimit"]["desktop"].as_u64().unwrap()
+        );
+        use crate::device_links::daemon as d;
+        assert_eq!(
+            d::HEARTBEAT_IDLE.as_millis() as u64,
+            ms("desktopHeartbeatIdleMillis")
+        );
+        assert_eq!(
+            d::HEARTBEAT_DEAD.as_millis() as u64,
+            ms("desktopHeartbeatDeadMillis")
+        );
+        assert_eq!(
+            d::HEARTBEAT_DEAD_DOZING.as_millis() as u64,
+            ms("desktopHeartbeatDeadDozingMillis")
+        );
+        // The phone's reader gives up a little after the desk does, never before.
+        assert!(ms("androidLanReaderIdleMillis") > ms("desktopHeartbeatDeadMillis"));
+        assert_eq!(f["bundlePolicy"], "max-bundle");
+        assert!(include_str!("peer_connection.rs")
+            .contains("\"bundle-policy\", gst_webrtc::WebRTCBundlePolicy::MaxBundle"));
+        let required: Vec<&str> = WebRtcChannel::REQUIRED.iter().map(|c| c.label()).collect();
+        assert_eq!(serde_json::json!(required), f["requiredChannels"]);
+        let channels: Vec<serde_json::Value> = WebRtcChannel::ALL
+            .iter()
+            .map(|c| {
+                serde_json::json!({"label": c.label(), "ordered": c.ordered(),
+                    "maxRetransmits": c.max_retransmits()})
+            })
+            .collect();
+        assert_eq!(serde_json::json!(channels), f["channels"]);
+        let lane = transfer_manager::Tunables::default();
+        assert_eq!(
+            lane.lane_retry.as_millis() as u64,
+            ms("laneRetryFirstMillis")
+        );
+        assert_eq!(
+            file_lane::PENALTY_MAX.as_millis() as u64,
+            ms("laneRetryMaxMillis")
+        );
+    }
+
     #[test]
     fn the_feature_budget_always_fits_one_wire_message() {
         // A packet whose JSON is the whole budget, of characters that need

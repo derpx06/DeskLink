@@ -13,5 +13,9 @@ pub use device_manager::{
 pub use device_session::{
     ConnectionGeneration, DeviceSession, ReplayCache, SessionBinding, SessionId, SessionState,
 };
+#[cfg(test)]
+pub use device_session::{PENDING_FEATURE_LIMIT, PENDING_FEATURE_MAX_AGE};
 pub use link_transport::{LinkTransport, ReadOutcome};
+#[cfg(test)]
+pub use session_link::LINK_RACE_WINDOW;
 pub use session_link::{link_race, RaceVerdict, SessionLink};
