@@ -1,0 +1,17 @@
+{
+  "_doc": "Body values both apps must agree on, beyond the packet types. Identical copies: protocol/testdata/desklink_v9/, DeskLink/testdata/ and desklink-mobile/src/test/resources/shared/; each side's test pins its own code to it (desk: shared_fixtures.rs, phone: protocol/WireValuesTest.kt).",
+  "settings": {
+    "_doc": "desklink.settings (desk to phone): reportKeys are always present, the phone ignores a report missing one. desklink.settings.request {set} from the phone: only settable keys are applied (keepAwake also needs the desk's per-phone switch).",
+    "reportKeys": ["keepAwake", "clipboard", "notifications", "relayConfigured", "relay", "commandAlerts", "unlockNearby"],
+    "settable": ["clipboard", "commandAlerts", "keepAwake", "notifications"]
+  },
+  "glideAsk": {"set": {"glide": true}},
+  "unlockRefusals": ["pref-off", "no-nonce", "expired", "wrong-device", "replayed", "not-locked", "not-lan", "not-ready", "failed", "unsupported"],
+  "telephony": {
+    "_doc": "callStates: desklink.telephony calls[].state. errors: desklink.telephony {error, action} ('failed' is the catch-all). emergency: numbers neither app dials (bare, '+' or '00' prefixed).",
+    "callStates": ["ringing", "dialing", "talking", "held"],
+    "actions": ["answer", "decline", "end", "silence", "mute", "unmute", "dial", "message"],
+    "errors": ["permission", "no-call", "failed", "emergency"],
+    "emergency": ["112", "911", "999", "000", "110", "119", "118", "122", "100", "101", "102", "108", "115", "117", "113", "144", "155", "190", "199", "933"]
+  }
+}
