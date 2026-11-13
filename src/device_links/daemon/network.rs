@@ -341,7 +341,29 @@ impl DeviceFlight {
         in_flight.push(device_id.to_string());
         Some(Self(device_id.to_string()))
     }
+
+    /// [`Self::claim`], waiting up to `wait` for the one in flight to end.
+    /// Two authenticated links to one phone at once (both sides dialing
+    /// after a restart) must both reach the link-race rule: refusing the
+    /// second outright let each side keep a different link and close the
+    /// other's, and they looped.
+    pub(super) fn claim_waiting(device_id: &str, wait: Duration) -> Option<Self> {
+        let until = std::time::Instant::now() + wait;
+        loop {
+            if let Some(flight) = Self::claim(device_id) {
+                return Some(flight);
+            }
+            if std::time::Instant::now() >= until {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
+
+/// How long a link waits for another link to the same phone to finish
+/// attaching (registering and starting its reader takes milliseconds).
+pub(super) const FLIGHT_WAIT: Duration = Duration::from_secs(2);
 
 impl Drop for DeviceFlight {
     fn drop(&mut self) {
@@ -531,6 +553,27 @@ mod tests {
         assert!(
             DeviceFlight::claim("flight-phone").is_some(),
             "free again once done"
+        );
+    }
+
+    #[test]
+    fn a_second_link_waits_for_the_first_to_attach_instead_of_being_refused() {
+        let first = DeviceFlight::claim("waiting-phone").expect("free");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(first);
+        });
+        assert!(
+            DeviceFlight::claim_waiting("waiting-phone", FLIGHT_WAIT).is_some(),
+            "judged once the first is attached"
+        );
+        releaser.join().unwrap();
+        let _held = DeviceFlight::claim("stuck-phone").unwrap();
+        let started = std::time::Instant::now();
+        assert!(DeviceFlight::claim_waiting("stuck-phone", Duration::from_millis(150)).is_none());
+        assert!(
+            started.elapsed() >= Duration::from_millis(150),
+            "bounded, not instant"
         );
     }
 

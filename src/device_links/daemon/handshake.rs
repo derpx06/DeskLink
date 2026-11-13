@@ -183,12 +183,14 @@ pub(super) fn finish_secure_link(
     // One connection attached per phone at a time — claimed only now that
     // the certificate is validated, so an unauthenticated peer claiming the
     // phone's id cannot hold it through a slow handshake.
-    let _flight = super::network::DeviceFlight::claim(&initial_info.id).ok_or_else(|| {
-        format!(
-            "A connection to {} is already being set up",
-            initial_info.id
-        )
-    })?;
+    let _flight =
+        super::network::DeviceFlight::claim_waiting(&initial_info.id, super::network::FLIGHT_WAIT)
+            .ok_or_else(|| {
+                format!(
+                    "A connection to {} is already being set up",
+                    initial_info.id
+                )
+            })?;
     attach_bootstrap_link(
         &initial_info.id,
         link,
