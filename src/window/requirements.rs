@@ -220,7 +220,7 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
         needs.push(Need {
             id: "notifications",
             on_phone: false,
-            title: "No notification service is running".into(),
+            title: "This desktop cannot show notifications".into(),
             detail: format!(
                 "Your phone's notifications and DeskLink's alerts need one to show here.{}",
                 facts
@@ -252,7 +252,7 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
         needs.push(Need {
             id: "plugins",
             on_phone: false,
-            title: "Video and sound plugins are missing".into(),
+            title: "Video and sound support is missing".into(),
             detail: if commands.is_empty() {
                 detail
             } else {
@@ -514,9 +514,10 @@ pub(crate) fn run(anchor: &impl IsA<gtk::Widget>, need: &Need) {
         Fix::TurnOnExtension => match crate::shell_dbus::turn_on_extension() {
             Ok(true) => window.show_feature_toast("Top bar menu installed. Log out to see it"),
             Ok(false) => window.show_feature_toast("Top bar menu turned on"),
-            Err(error) => {
-                window.show_feature_toast(&format!("Could not turn on the top bar menu: {error}"))
-            }
+            Err(error) => window.show_feature_toast(&format!(
+                "Could not turn on the top bar menu{}",
+                super::because(&error)
+            )),
         },
         Fix::LogOut => crate::shell_dbus::log_out(),
         Fix::ApproveControl(id) => super::prefs::approve_remote_control(&window, id),

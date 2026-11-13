@@ -121,7 +121,10 @@ fn tile(item: &Item, downloads: Option<PathBuf>) -> gtk::Box {
                         saved.file_name().unwrap_or_default().to_string_lossy()
                     ),
                 ),
-                Some(Err(error)) => toast_from(button, &format!("Could not save it: {error}")),
+                Some(Err(error)) => toast_from(
+                    button,
+                    &format!("Could not save it{}", super::because(&error.to_string())),
+                ),
                 None => toast_from(button, "There is no Downloads folder"),
             }
         }),

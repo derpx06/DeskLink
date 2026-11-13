@@ -987,6 +987,27 @@ pub(crate) fn build(sources: &Sources) -> Vec<Item> {
             &format!("setting preferences {words}"),
         ));
     }
+    // Each setting on its own, so it is found by its name or a word for it.
+    let phone = sources
+        .phone
+        .as_ref()
+        .map_or("your phone", |phone| &phone.name);
+    for row in &super::prefs::ROWS {
+        let Some(page) = sources.settings.iter().find(|page| page.index == row.group) else {
+            continue;
+        };
+        if row.phone && !sources.paired {
+            continue;
+        }
+        items.push(Item::new(
+            Target::Settings(row.group),
+            Group::Settings,
+            &row.title.replace("{phone}", phone),
+            &format!("Settings · {}", page.title),
+            page.icon,
+            &format!("setting {}", row.words),
+        ));
+    }
     items
 }
 
@@ -1688,5 +1709,41 @@ mod tests {
         let spaced = format!("a{}b", " ".repeat(1_000));
         assert!(one_line(&spaced, 20).ends_with('…'));
         assert_eq!(one_line("  a   b ", 20), "a b");
+    }
+
+    /// Find anything lists every setting on its own: found by its title and
+    /// by the word a person would type for it, and opening its page.
+    #[test]
+    fn every_setting_is_found_by_its_title_and_a_synonym() {
+        use super::super::prefs::{subpages, ROWS, SYNONYMS};
+        let mut sources = sources_with(Some(ready_phone()), 0);
+        sources.settings = subpages(true);
+        let items = build(&sources);
+        let name = ready_phone().name;
+        let finds = |query: &str, template: &str| -> bool {
+            let title = template.replace("{phone}", &name);
+            search(&items, query)
+                .iter()
+                .flat_map(|section| section.items.iter())
+                .any(|i| {
+                    items[*i].title == title && matches!(items[*i].target, Target::Settings(_))
+                })
+        };
+        for row in &ROWS {
+            assert!(
+                finds(&row.title.replace("{phone}", &name), row.title),
+                "{}",
+                row.title
+            );
+        }
+        for (query, template) in SYNONYMS {
+            assert!(finds(query, template), "{query} finds {template}");
+        }
+        // With no phone, only this computer's settings.
+        let mut alone = sources_with(None, 0);
+        alone.settings = subpages(false);
+        let items = build(&alone);
+        assert!(items.iter().any(|item| item.title == "Start at login"));
+        assert!(!items.iter().any(|item| item.title.starts_with("Unpair")));
     }
 }

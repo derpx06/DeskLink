@@ -45,11 +45,11 @@ impl Ended {
         match self {
             Self::Finished(Some(status)) => (
                 format!("Session ended (exit {status})"),
-                "Restart starts a new shell in the same folder.",
+                "Restart opens a new terminal in the same folder.",
             ),
             Self::Finished(None) => (
                 "Session ended".to_string(),
-                "Restart starts a new shell in the same folder.",
+                "Restart opens a new terminal in the same folder.",
             ),
             Self::Disconnected => (
                 "Disconnected from this terminal".to_string(),
