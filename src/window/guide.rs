@@ -744,6 +744,8 @@ mod tests {
             let (window, _commands) = window();
             window.present();
             window.refresh_devices();
+            // Past the first-run tour (it has no menu): the pairing page.
+            window.end_onboarding(false, false);
             gtk::prelude::WidgetExt::activate_action(&window, "win.guide", None)
                 .expect("the menu's action");
             assert!(guide_open(&window), "from the menu");
@@ -775,6 +777,7 @@ mod tests {
                 "a new note"
             );
 
+            window.leave_solo();
             let phone = super::super::debug_fake_device("paired", "Pixel 9");
             window.imp().fake_devices.borrow_mut().push(phone);
             window.refresh_devices();

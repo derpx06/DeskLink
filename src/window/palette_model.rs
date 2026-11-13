@@ -1421,6 +1421,7 @@ mod tests {
                 "New note",
                 "New terminal",
                 "Pair another phone",
+                "Get started",
                 "Connection history",
                 "Keyboard shortcuts"
             ]
