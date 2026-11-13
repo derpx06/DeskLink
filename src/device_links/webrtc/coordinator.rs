@@ -565,21 +565,28 @@ fn start_claimed(
         reset_device_webrtc_state(&binding.device_id);
         replaced.close();
     }
-    spawn_event_worker(
+    // Attached before the worker starts: a worker that ends at once (its
+    // attempt already replaced) detaches and stops the manager on its way
+    // out, and an attach after that registered lanes for a stopped engine.
+    let peer = sessions
+        .active_webrtc_peer(&binding, &attempt_id)
+        .map_err(|error| error.to_string())?;
+    attach_transfer_manager(&transfer_manager, &peer, &wire, Some(Arc::clone(&config)));
+    if let Err(error) = spawn_event_worker(
         binding.clone(),
         attempt_id.clone(),
         wire.clone(),
         receiver,
         Arc::clone(&sessions),
-        Arc::clone(&config),
+        config,
         devices,
         events,
         Arc::clone(&transfer_manager),
-    )?;
-    let peer = sessions
-        .active_webrtc_peer(&binding, &attempt_id)
-        .map_err(|error| error.to_string())?;
-    attach_transfer_manager(&transfer_manager, &peer, &wire, Some(config));
+    ) {
+        transfer_manager.detach();
+        transfer_manager.shut_down();
+        return Err(error);
+    }
     peer.create_offer()
 }
 
@@ -2758,21 +2765,28 @@ fn install_responder(
         reset_device_webrtc_state(&binding.device_id);
         replaced.close();
     }
-    spawn_event_worker(
+    // Attached before the worker starts: a worker that ends at once (its
+    // attempt already replaced) detaches and stops the manager on its way
+    // out, and an attach after that registered lanes for a stopped engine.
+    let peer = sessions
+        .active_webrtc_peer(&binding, &attempt_id)
+        .map_err(|error| error.to_string())?;
+    attach_transfer_manager(&transfer_manager, &peer, &wire, Some(Arc::clone(&config)));
+    if let Err(error) = spawn_event_worker(
         binding.clone(),
         attempt_id.clone(),
         wire.clone(),
         receiver,
         Arc::clone(&sessions),
-        Arc::clone(&config),
+        config,
         devices,
         events,
         Arc::clone(&transfer_manager),
-    )?;
-    let peer = sessions
-        .active_webrtc_peer(&binding, &attempt_id)
-        .map_err(|error| error.to_string())?;
-    attach_transfer_manager(&transfer_manager, &peer, &wire, Some(config));
+    ) {
+        transfer_manager.detach();
+        transfer_manager.shut_down();
+        return Err(error);
+    }
     Ok(peer)
 }
 
@@ -2999,10 +3013,8 @@ fn spawn_event_worker(
                             payload,
                             &config,
                         ) {
+                            // Never the end of the worker (see "Signal send failures").
                             eprintln!("[DeskLink] WebRTC local description failed: {error}");
-                            if is_fatal_signaling_error(&error) {
-                                break;
-                            }
                         }
                     }
                     PeerEvent::IceCandidate {
@@ -3023,10 +3035,8 @@ fn spawn_event_worker(
                             payload,
                             &config,
                         ) {
+                            // Never the end of the worker (see "Signal send failures").
                             eprintln!("[DeskLink] WebRTC ICE signaling failed: {error}");
-                            if is_fatal_signaling_error(&error) {
-                                break;
-                            }
                         }
                     }
                     PeerEvent::EndOfCandidates => {
@@ -3966,22 +3976,15 @@ pub(crate) fn recovery_delay(attempt: u32) -> Option<std::time::Duration> {
         .map(|millis| std::time::Duration::from_millis(*millis))
 }
 
-/// Whether a failed bootstrap signal should end this peer's event worker.
-///
-/// Losing the bootstrap socket while an authenticated WebRTC transport is
-/// retained is a designed state, and a late ICE candidate written into that
-/// closed socket fails as a matter of course. Ending the worker for it left the
-/// peer installed with nothing servicing its events: inbound features were
-/// dropped silently, and because `has_ready_webrtc` still reported true,
-/// discovery refused to dial a replacement and inbound sockets were discarded —
-/// wedged until the application restarted.
-///
-/// The peer itself is still healthy in that state, so the worker keeps running
-/// and the ordinary disconnect paths remain responsible for tearing it down.
-fn is_fatal_signaling_error(error: &str) -> bool {
-    !error.contains("Session link is closed")
-        && !error.contains("Session link has no network stream")
-}
+// Signal send failures: a bootstrap signal that cannot be sent never ends
+// the peer's event worker. Losing the bootstrap socket while an
+// authenticated WebRTC transport is retained is a designed state, and a late
+// ICE candidate written into that socket fails as a matter of course: as
+// "Session link is closed", or as a raw EPIPE / ECONNRESET when the socket
+// died before its reader noticed. Ending the worker for the latter tore down
+// a peer that could be healthy and feature-ready, with no rebuild and no
+// error. A negotiation the lost signal stalls is rebuilt by
+// `NEGOTIATION_TIMEOUT`; a ready peer never needed the signal.
 
 fn expired(since: Option<std::time::Instant>) -> bool {
     since.is_some_and(|since| since.elapsed() >= TRANSIENT_DISCONNECT_GRACE)
