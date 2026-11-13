@@ -362,7 +362,7 @@ const GST_GOOD: Packages = Packages {
 };
 const GST_VIDEO: Packages = Packages {
     debian: "gstreamer1.0-plugins-good gstreamer1.0-libav",
-    fedora: "gstreamer1-plugins-good gstreamer1-libav",
+    fedora: "gstreamer1-plugins-good gstreamer1-plugin-libav",
     arch: "gst-plugins-good gst-libav",
     opensuse: "gstreamer-plugins-good gstreamer-plugins-libav",
 };

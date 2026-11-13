@@ -15,6 +15,43 @@ floor is Rust 1.85, GTK 4.12, GStreamer 1.22, VTE 0.76 (its GTK 4 build,
 (Debian 13's compiler): `idna_adapter` stays at 1.1 and `image` at 0.25.6.
 Check `rust-version` before running `cargo update`.
 
+## Supported distributions
+
+Exact minimum versions (`src/meson.build` checks them before cargo runs):
+GTK 4.12, libadwaita 1.5, GStreamer 1.22 (with `gstreamer-webrtc-1.0`),
+OpenSSL 3.0, Rust 1.85, Meson 1.0. VTE 0.76 (`vte-2.91-gtk4`) is optional:
+`-Dvte=auto` (the default) builds without it when it is missing, and the
+Terminals page then shows a read-only preview with "Open in terminal
+window", which runs the session in the system terminal.
+
+Built and tested in clean chroots of each release (2026-11, `cargo test`
+under Xvfb, then the package installed into a pristine root of the same
+release and `desklink --check` run):
+
+DISTRO_TABLE
+
+Not supported natively: **Debian 12** (GTK 4.8, libadwaita 1.2, Rust 1.63,
+no newer GTK in bookworm-backports) and Ubuntu 22.04 (GTK 4.6). DeskLink
+uses about 130 widgets and calls from libadwaita 1.3 to 1.5 and GTK 4.10 to
+4.12 (dialogs, navigation views, breakpoints, `FileDialog`/`FileLauncher`), so
+there is no build for them: use the **Flatpak**, which carries its own GTK.
+Derivatives follow their base: Linux Mint 22, Pop!_OS 24.04, Zorin OS 18 and
+elementary OS 8 are Ubuntu 24.04; Manjaro and EndeavourOS are Arch.
+
+Build dependencies, per family:
+
+| Family | Packages |
+|---|---|
+| Debian 13, Ubuntu 24.04+ | `debhelper meson cargo rustc pkgconf gettext libglib2.0-dev-bin libgtk-4-dev libadwaita-1-dev libvte-2.91-gtk4-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev libssl-dev desktop-file-utils` (Ubuntu 24.04: `rustc-1.85 cargo-1.85`) |
+| Fedora | `cargo rust gcc meson gettext desktop-file-utils glib2-devel gtk4-devel libadwaita-devel vte291-gtk4-devel gstreamer1-devel gstreamer1-plugins-base-devel gstreamer1-plugins-bad-free-devel openssl-devel` |
+| openSUSE | `cargo rust gcc meson gettext-tools desktop-file-utils glib2-devel gtk4-devel libadwaita-devel vte-devel gstreamer-devel gstreamer-plugins-base-devel gstreamer-plugins-bad-devel libopenssl-devel` |
+| Arch | `rust meson gtk4 libadwaita vte4 gstreamer gst-plugins-base gst-plugins-bad libnice openssl` |
+
+Runtime: the packages above pull in what a fresh install needs to connect
+(`webrtcbin`, `nicesrc`, DTLS/SRTP/SCTP, VP8, Opus, `pipewiresrc`/`pipewiresink`,
+`ximagesrc` for X11 sessions without a portal); `desklink --check` lists
+anything still missing with the install command for the distribution.
+
 `gtk4paintablesink` is compiled into DeskLink and registered only when the
 system has none, so no package needs the distribution's GTK 4 GStreamer
 plugin (Ubuntu 24.04 has none).
