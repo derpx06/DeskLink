@@ -411,6 +411,31 @@ fn build_view(
         block.append(&ui_kit::row_group(&rows));
         list.append(&block);
     }
+    // Help: the Get started guide (also in the main menu and Find anything).
+    let guide = ui_kit::list_row(
+        "desklink-info-symbolic",
+        Tone::Neutral,
+        "Get started",
+        Some("What DeskLink can do, and how to start each one"),
+    );
+    guide.set_widget_name("settings-guide");
+    guide.set_activatable(true);
+    guide.add_suffix(
+        &gtk::Image::builder()
+            .icon_name("desklink-chevron-right-symbolic")
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build(),
+    );
+    guide.connect_activated(|row| {
+        row.activate_action("win.guide", None).ok();
+    });
+    let help = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .build();
+    help.append(&ui_kit::section_header("Help"));
+    help.append(&ui_kit::row_group(&[guide]));
+    list.append(&help);
 
     // Search: the matching rows themselves, under their group's name.
     let results = gtk::Box::builder()

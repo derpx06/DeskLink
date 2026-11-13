@@ -711,6 +711,7 @@ fn run_desk_action(window: &DesklinkWindow, action: Action) {
         Action::PairAnother => win_action(window, "pair-new", None),
         Action::History => app_action(window, "history"),
         Action::Shortcuts => app_action(window, "shortcuts"),
+        Action::Guide => win_action(window, "guide", None),
         _ => {}
     }
 }
@@ -769,7 +770,8 @@ fn run_phone_action(window: &DesklinkWindow, id: &str, action: Action) {
         | Action::NewTerminal
         | Action::PairAnother
         | Action::History
-        | Action::Shortcuts => {}
+        | Action::Shortcuts
+        | Action::Guide => {}
     }
 }
 

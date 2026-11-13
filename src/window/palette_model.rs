@@ -116,6 +116,8 @@ pub(crate) enum Action {
     PairAnother,
     History,
     Shortcuts,
+    /// The Get started guide.
+    Guide,
 }
 
 /// What choosing a row does.
@@ -432,7 +434,7 @@ impl PhoneState {
 }
 
 /// What `action` needs from the phone, for `requirements::blocker`.
-fn feature_of(action: Action) -> Option<super::requirements::Feature> {
+pub(crate) fn feature_of(action: Action) -> Option<super::requirements::Feature> {
     use super::requirements::Feature;
     Some(match action {
         Action::SendFiles | Action::SendLink => Feature::Send(PACKET_TYPE_SHARE_REQUEST),
@@ -641,7 +643,12 @@ pub(crate) fn offered_actions(phone: Option<&PhoneState>) -> Vec<Action> {
             Action::Sound("phone-sound", !phone.phone_sound_on),
         ]);
     }
-    out.extend([Action::PairAnother, Action::History, Action::Shortcuts]);
+    out.extend([
+        Action::PairAnother,
+        Action::Guide,
+        Action::History,
+        Action::Shortcuts,
+    ]);
     out
 }
 
@@ -667,6 +674,13 @@ fn desk_action(action: Action) -> Item {
             "desklink-add-symbolic",
             "connect new device qr code",
             Some("<control>n"),
+        ),
+        Action::Guide => (
+            "Get started",
+            "What DeskLink can do, and how",
+            "desklink-info-symbolic",
+            "guide help how tour tips start learn",
+            None,
         ),
         Action::History => (
             "Connection history",
