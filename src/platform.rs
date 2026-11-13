@@ -618,7 +618,7 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
         let pulse = if probe.pulse_socket {
             "This computer runs PulseAudio alone. "
         } else {
-            "No sound server answered. "
+            "No sound server is running. "
         };
         check(
             "sound",

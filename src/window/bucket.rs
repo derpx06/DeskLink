@@ -522,6 +522,10 @@ fn off_card(device: &DeviceView, asked: bool) -> gtk::Box {
         },
         &["dl-secondary"],
     ));
+    words.append(&super::wrapped(
+        "It is “DeskLink Bucket” in your Home folder and the Files sidebar.",
+        &["dl-caption"],
+    ));
     head.append(&words);
     card.append(&head);
     let buttons = gtk::FlowBox::builder()
@@ -547,10 +551,6 @@ fn off_card(device: &DeviceView, asked: bool) -> gtk::Box {
     on.connect_clicked(move |_| folders::turn_on_bucket(&id));
     super::transfers::add_card(&buttons, &on);
     card.append(&buttons);
-    card.append(&super::wrapped(
-        "It is the folder DeskLink Bucket in your Home folder, also in the Files sidebar.",
-        &["dl-caption"],
-    ));
     let dropped = folders::dropped_pairs();
     if dropped > 0 {
         card.append(&super::wrapped(
@@ -1285,7 +1285,7 @@ fn problem_banner(view: &PairView) -> Option<gtk::Box> {
                 button,
                 "Turn off the Bucket?",
                 "The phone keeps its copy; nothing is deleted on either side.",
-                "Turn Off",
+                "Turn off",
                 move || folders::remove(&id, BUCKET_ID),
             );
         });
@@ -1301,7 +1301,7 @@ fn problem_banner(view: &PairView) -> Option<gtk::Box> {
                 button,
                 "Empty the Bucket on the phone too?",
                 "Everything in it is removed from the phone (to its trash).",
-                "Empty It",
+                "Empty it",
                 move || folders::confirm_empty(&id, BUCKET_ID),
             );
         });
@@ -2152,18 +2152,19 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
     // The phone asked: the question is answered right here.
     let asking = view.is_none() && asked(&device.id);
     if asking {
-        let later = super::soft_button("Not Now");
+        let later = ui_kit::button(ButtonKind::Text, "Not now", None);
+        later.set_valign(gtk::Align::Center);
         let id = device.id.clone();
         later.connect_clicked(move |_| folders::decline(&id, BUCKET_ID));
         head.append(&later);
-        let on = super::soft_button("Turn On");
-        on.add_css_class("suggested-action");
+        let on = ui_kit::button(ButtonKind::Primary, "Turn on", None);
+        on.set_valign(gtk::Align::Center);
         let id = device.id.clone();
         on.connect_clicked(move |_| folders::turn_on_bucket(&id));
         head.append(&on);
     } else {
         head.append(&super::page_link(
-            if view.is_some() { "Open" } else { "Set Up" },
+            if view.is_some() { "Open" } else { "Set up" },
             "files",
         ));
     }

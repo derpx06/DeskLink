@@ -413,7 +413,7 @@ impl Sidebar {
             lines.append(&name);
             let status = gtk::Box::builder().spacing(8).build();
             status.append(&status_pill(words.status, words.word));
-            let detail = super::ellipsized(&words.short, &["dl-caption", "dl-mono"]);
+            let detail = super::ellipsized(&words.short, &["dl-caption"]);
             status.append(&detail);
             lines.append(&status);
             content.append(&lines);

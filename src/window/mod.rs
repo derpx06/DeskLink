@@ -1860,7 +1860,7 @@ impl DesklinkWindow {
             // place the file) can be sent again.
             let target = format!("{}\n{}", done.device_id, source.to_string_lossy());
             offer_retry(&target);
-            toast.set_button_label(Some("Try Again"));
+            toast.set_button_label(Some("Try again"));
             toast.set_action_name(Some("win.send-again"));
             toast.set_action_target_value(Some(&target.to_variant()));
         }
@@ -1961,7 +1961,7 @@ impl DesklinkWindow {
         if self.visible_dialog().is_some() {
             return;
         }
-        let dialog = adw::AlertDialog::new(Some("Error Details"), Some(&friendly_error(raw).0));
+        let dialog = adw::AlertDialog::new(Some("Error details"), Some(&friendly_error(raw).0));
         dialog.set_extra_child(Some(
             &gtk::Label::builder()
                 .label(raw)
@@ -2363,8 +2363,7 @@ fn session_summary(device: &DeviceView) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
-const OFFLINE: &str =
-    "This computer is offline. Check its network connection; DeskLink reconnects by itself.";
+const OFFLINE: &str = "This computer is offline. DeskLink reconnects when the network is back.";
 
 fn is_offline_message(message: &str) -> bool {
     message == OFFLINE
@@ -2792,15 +2791,6 @@ fn icon_button(icon: &str, label: &str, classes: &[&str]) -> gtk::Button {
         .build();
     button.update_property(&[gtk::accessible::Property::Label(label)]);
     button
-}
-
-/// A button showing only text, styled like the design's soft chips.
-fn soft_button(label: &str) -> gtk::Button {
-    gtk::Button::builder()
-        .label(label)
-        .valign(gtk::Align::Center)
-        .css_classes(["soft-button"])
-        .build()
 }
 
 /// "View All ›": an accent link to another page.
@@ -3978,7 +3968,7 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
         "refused" => {
             device.trusted = false;
             device.status = DeviceStatus::Discovered;
-            device.last_error = Some("Pairing request was rejected".to_string());
+            device.last_error = Some(pairing::NOT_ACCEPTED.to_string());
         }
         "connecting" => device.status = DeviceStatus::Paired,
         _ => {
@@ -4095,7 +4085,7 @@ mod tests {
                 .visible_dialog()
                 .and_downcast::<adw::AlertDialog>()
                 .expect("Details opens the error");
-            assert_eq!(dialog.heading().as_deref(), Some("Error Details"));
+            assert_eq!(dialog.heading().as_deref(), Some("Error details"));
             assert!(dialog.body().contains("identity changed"));
             dialog.close();
         });

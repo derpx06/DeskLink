@@ -1414,7 +1414,7 @@ fn add_top_bar_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settin
     });
     if let Some(uuid) = indicator_off.filter(|_| !tray_hosted()) {
         let button = gtk::Button::builder()
-            .label("Turn On")
+            .label("Turn on")
             .valign(gtk::Align::Center)
             .build();
         button.update_property(&[gtk::accessible::Property::Label(
@@ -1446,7 +1446,7 @@ fn add_top_bar_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settin
                 "Active — your phone, live sessions and quick actions in the top bar",
             );
             let off = gtk::Button::builder()
-                .label("Turn Off")
+                .label("Turn off")
                 .valign(gtk::Align::Center)
                 .build();
             off.update_property(&[gtk::accessible::Property::Label(
@@ -1470,7 +1470,7 @@ fn add_top_bar_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settin
                 "Off — your phone, live sessions and quick actions in the top bar, and Unlock on the lock screen. Turning it on also allows GNOME user extensions (a setting for all of them); Turn Off disables only this one.",
             );
             let button = gtk::Button::builder()
-                .label("Turn On")
+                .label("Turn on")
                 .valign(gtk::Align::Center)
                 .build();
             button.update_property(&[gtk::accessible::Property::Label("Turn on the top-bar menu")]);
@@ -1879,10 +1879,10 @@ fn ask_for_password(parent: &impl IsA<gtk::Widget>, done: impl Fn(Option<String>
     list.append(&confirm);
 
     let dialog = adw::AlertDialog::new(
-        Some("Session Password"),
+        Some("Session password"),
         Some("Your phone asks for this once per connection before it can view or control the screen or open a terminal."),
     );
-    dialog.add_responses(&[("cancel", "Cancel"), ("ok", "Set Password")]);
+    dialog.add_responses(&[("cancel", "Cancel"), ("ok", "Set password")]);
     dialog.set_response_appearance("ok", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("ok"));
     dialog.set_close_response("cancel");
@@ -2214,7 +2214,7 @@ fn add_glide_rows(
         row.add_prefix(&icon_square("dialog-warning-symbolic", 30, "row-icon"));
         if status.can_ask_again {
             let ask = gtk::Button::builder()
-                .label("Ask Again")
+                .label("Ask again")
                 .valign(gtk::Align::Center)
                 .build();
             ask.connect_clicked(|_| crate::device_links::glide::ask_again());

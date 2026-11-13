@@ -4,7 +4,7 @@
 
 use adw::prelude::*;
 
-use super::{icon_square, text, wrapped, DeviceView};
+use super::{text, wrapped, DeviceView};
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 
 fn send(daemon: &DaemonHandle, device: &DeviceView, what: &str, on: bool) {
@@ -89,29 +89,20 @@ fn bar(
     detail: String,
     what: &'static str,
 ) -> gtk::Box {
-    let bar = gtk::Box::builder()
-        .spacing(14)
-        .css_classes(["live-banner"])
-        .build();
-    bar.append(&icon_square(icon, 28, "live-icon"));
-    let words = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .hexpand(true)
-        .valign(gtk::Align::Center)
-        .build();
-    // What is in use, and by whom, wraps: it is what the bar is for.
-    words.append(&wrapped(&headline, &["heading"]));
-    words.append(&wrapped(&detail, &["text-dim"]));
-    bar.append(&words);
-    bar.update_property(&[gtk::accessible::Property::Label(&format!(
-        "{headline}, {detail}"
-    ))]);
-    let stop = super::soft_button("Stop");
-    stop.set_css_classes(&["coral-outline"]);
+    // The kit's live banner, like the "using this computer" strip above it.
+    let bar = super::ui_kit::banner::banner(
+        super::ui_kit::banner::BannerKind::Live,
+        icon,
+        &headline,
+        Some(&detail),
+    );
+    // The kit's End look, as on every live bar.
+    let stop = super::ui_kit::button(super::ui_kit::ButtonKind::Danger, "Stop", None);
+    stop.set_valign(gtk::Align::Center);
     let (daemon, view) = (daemon.clone(), device.clone());
     stop.connect_clicked(move |_| send(&daemon, &view, what, false));
-    bar.append(&stop);
-    bar
+    bar.add_action(&stop);
+    bar.root
 }
 
 /// The in-use bars: any capture of this computer's sound (coral, A5), and

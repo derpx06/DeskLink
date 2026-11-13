@@ -220,7 +220,7 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
                 "Your phone's notifications and DeskLink's alerts need one to show here.{}",
                 facts
                     .install(check)
-                    .map(|command| format!(" Install: {command}"))
+                    .map(|command| format!("\nInstall: {command}"))
                     .unwrap_or_default()
             ),
             fix: copy(check),
@@ -251,7 +251,7 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
             detail: if commands.is_empty() {
                 detail
             } else {
-                format!("{detail} Install: {}", commands.join("; "))
+                format!("{detail}\nInstall: {}", commands.join("; "))
             },
             fix: if commands.is_empty() {
                 Fix::None

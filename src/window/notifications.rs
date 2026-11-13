@@ -417,7 +417,7 @@ fn build_card(
     ))]);
 
     for action in notification.actions.iter().take(2) {
-        let button = ui_kit::button(ButtonKind::Text, action, None);
+        let button = ui_kit::button(ButtonKind::Tonal, action, None);
         let (daemon, device_id, key, action) = (
             daemon.clone(),
             device_id.to_string(),
