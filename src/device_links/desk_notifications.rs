@@ -195,6 +195,7 @@ fn from_gtk(args: &glib::Variant, name_of: impl Fn(&str) -> Option<String>) -> O
 
 /// Adds `note`, or replaces the one it updates (same origin); returns the
 /// stored copy with its `desk:` id.
+#[cfg(test)]
 fn upsert(state: &mut State, note: DeskNote) -> DeskNote {
     upsert_noting(state, note).0
 }
@@ -218,8 +219,8 @@ fn upsert_noting(state: &mut State, mut note: DeskNote) -> (DeskNote, bool) {
     let same = |known: &DeskNote| replaces(known, &note);
     if let Some(known) = state.notes.iter_mut().find(|known| same(known)) {
         note.id = known.id.clone();
-        let repeat = (&known.app_key, &known.title, &known.text)
-            == (&note.app_key, &note.title, &note.text);
+        let repeat =
+            (&known.app_key, &known.title, &known.text) == (&note.app_key, &note.title, &note.text);
         *known = note.clone();
         return (note, !repeat);
     }
@@ -322,7 +323,8 @@ pub(crate) fn send_snapshot(device_id: Option<&str>) {
 }
 
 fn added(note: Option<DeskNote>) {
-    if let Some((note, fresh)) = note.and_then(|note| with_state(|state| upsert_noting(state, note)))
+    if let Some((note, fresh)) =
+        note.and_then(|note| with_state(|state| upsert_noting(state, note)))
     {
         if fresh {
             forward(&note);

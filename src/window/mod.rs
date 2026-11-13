@@ -24,6 +24,7 @@
 //! dialogs, mirrored notifications, errors; each page lives in its own
 //! module and is redrawn only when what it shows has changed.
 
+pub(crate) mod announce;
 mod bucket;
 pub(crate) mod calls;
 mod dialpad;
@@ -259,7 +260,7 @@ mod imp {
         /// The last error toast and when, so a repeating error toasts once.
         pub last_error_toast: RefCell<Option<(String, std::time::Instant)>>,
         pub notified_pair_requests: RefCell<HashSet<String>>,
-        pub notified_remote_notifications: RefCell<HashMap<String, Announced>>,
+        pub notified_remote_notifications: RefCell<announce::Tracker>,
         /// Ringing calls ("device:callId") whose notification is up.
         pub notified_calls: RefCell<HashSet<String>>,
         /// What the call bar was last drawn from.
@@ -1738,89 +1739,39 @@ impl DesklinkWindow {
         }
 
         let settings = crate::device_links::config::app_settings();
-        let current_notifications = devices
-            .iter()
-            .flat_map(|device| {
-                device
-                    .notifications
-                    .iter()
-                    .map(|notification| format!("{}:{}", device.id, notification.id))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<std::collections::HashSet<_>>();
-        imp.notified_remote_notifications
-            .borrow_mut()
-            .retain(|notification_id, _| current_notifications.contains(notification_id));
-        let mut announced_now = 0;
-        for device in devices {
-            let shown = settings.shows_notifications(&device.id);
-            for notification in &device.notifications {
-                let unique_id = format!("{}:{}", device.id, notification.id);
-                // A conversation's notification keeps its id while new
-                // messages change its text: what was announced is the text,
-                // not just the id.
-                let signature = notification_signature(
-                    &notification.title,
-                    &notification.text,
-                    &notification.ticker,
+        let announce = imp.notified_remote_notifications.borrow_mut().pass(
+            devices,
+            &|id| settings.shows_notifications(id),
+            crate::shell_dbus::client_handles("notifications"),
+            std::time::Instant::now(),
+        );
+        for (device, notification) in announce {
+            let unique_id = format!("{}:{}", device.id, notification.id);
+            let title = if notification.title.is_empty() {
+                format!("{} on {}", notification.app_name, device.name)
+            } else {
+                format!("{}: {}", notification.app_name, notification.title)
+            };
+            let body = if notification.text.is_empty() {
+                notification.ticker.as_str()
+            } else {
+                notification.text.as_str()
+            };
+            // In front of the user: a toast; otherwise the desktop's own.
+            if self.is_active() && self.is_visible() {
+                let toast = adw::Toast::new(&format!("{title} — {body}"));
+                toast.set_use_markup(false);
+                toast.set_timeout(5);
+                toast.set_button_label(Some("View"));
+                toast.set_action_name(Some("win.show-page"));
+                toast.set_action_target_value(Some(&"notifications".to_variant()));
+                self.queue_toast(&toast);
+            } else {
+                self.send_app_notification(
+                    &format!("phone-notification-{unique_id}"),
+                    &title,
+                    body,
                 );
-                let now = std::time::Instant::now();
-                let announce = {
-                    let mut seen = imp.notified_remote_notifications.borrow_mut();
-                    let before = seen.get(&unique_id).copied();
-                    let verdict = announces(before, signature, now, announced_now);
-                    // Remembered whatever the verdict (hidden, a resync, held
-                    // back): turning mirroring back on replays nothing.
-                    seen.insert(
-                        unique_id.clone(),
-                        Announced {
-                            signature,
-                            at: if verdict {
-                                Some(now)
-                            } else {
-                                before.and_then(|b| b.at)
-                            },
-                        },
-                    );
-                    verdict
-                };
-                // Hidden: marked as seen, so turning mirroring back on does
-                // not replay the backlog. A resync (`silent`) never pops.
-                // With the top-bar extension on, it shows them as GNOME's
-                // own notifications: never twice.
-                if !announce
-                    || !pops_up(true, shown, notification.silent)
-                    || crate::shell_dbus::client_handles("notifications")
-                {
-                    continue;
-                }
-                announced_now += 1;
-                let title = if notification.title.is_empty() {
-                    format!("{} on {}", notification.app_name, device.name)
-                } else {
-                    format!("{}: {}", notification.app_name, notification.title)
-                };
-                let body = if notification.text.is_empty() {
-                    notification.ticker.as_str()
-                } else {
-                    notification.text.as_str()
-                };
-                // In front of the user: a toast; otherwise the desktop's own.
-                if self.is_active() && self.is_visible() {
-                    let toast = adw::Toast::new(&format!("{title} — {body}"));
-                    toast.set_use_markup(false);
-                    toast.set_timeout(5);
-                    toast.set_button_label(Some("View"));
-                    toast.set_action_name(Some("win.show-page"));
-                    toast.set_action_target_value(Some(&"notifications".to_variant()));
-                    self.queue_toast(&toast);
-                } else {
-                    self.send_app_notification(
-                        &format!("phone-notification-{unique_id}"),
-                        &title,
-                        body,
-                    );
-                }
             }
         }
     }
@@ -2343,56 +2294,7 @@ impl Drop for RefreshGuard<'_> {
     }
 }
 
-/// What was last announced for one phone notification: its text, and when.
-#[derive(Debug, Clone, Copy)]
-pub struct Announced {
-    signature: u64,
-    at: Option<std::time::Instant>,
-}
-
-/// The same conversation notification, a new message: the id stays, the text
-/// changes.
-fn notification_signature(title: &str, text: &str, ticker: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (title, text, ticker).hash(&mut hasher);
-    hasher.finish()
-}
-
-/// A conversation is announced again at most this often, and a burst at most
-/// [`ANNOUNCE_PER_PASS`] at a time (a group chat of thirty messages is not
-/// thirty banners).
-const ANNOUNCE_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_secs(4);
-const ANNOUNCE_PER_PASS: u32 = 3;
-
-/// Whether a notification whose id was `before` announced is announced now:
-/// first seen, or its text changed since and the last announcement is not
-/// recent; identical resends stay quiet.
-fn announces(
-    before: Option<Announced>,
-    signature: u64,
-    now: std::time::Instant,
-    announced_this_pass: u32,
-) -> bool {
-    if announced_this_pass >= ANNOUNCE_PER_PASS {
-        return false;
-    }
-    match before {
-        None => true,
-        Some(known) if known.signature == signature => false,
-        Some(known) => known
-            .at
-            .is_none_or(|at| now.saturating_duration_since(at) >= ANNOUNCE_AGAIN_AFTER),
-    }
-}
-
 /// "14:02" for `time`, or nothing.
-/// Whether a phone notification is announced here (toast or desktop
-/// notification): new, mirrored, and not a resync (`silent`).
-fn pops_up(is_new: bool, shown: bool, silent: bool) -> bool {
-    is_new && shown && !silent
-}
-
 /// "last seen 14:02" (or "last seen 3 Oct 14:02") while the phone's link is
 /// down and what it last reported is stale; `None` while it is live.
 pub(super) fn last_seen_words(device: &DeviceView) -> Option<String> {
@@ -3117,17 +3019,10 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             let device = debug_fake_device(id, arg);
             // Shown as already seen: no toasts in the screenshots.
             for notification in &device.notifications {
-                win.imp().notified_remote_notifications.borrow_mut().insert(
-                    format!("{}:{}", device.id, notification.id),
-                    Announced {
-                        signature: notification_signature(
-                            &notification.title,
-                            &notification.text,
-                            &notification.ticker,
-                        ),
-                        at: None,
-                    },
-                );
+                win.imp()
+                    .notified_remote_notifications
+                    .borrow_mut()
+                    .mark_seen(format!("{}:{}", device.id, notification.id), notification);
             }
             win.imp().fake_devices.borrow_mut().push(device);
             win.imp().snapshots.borrow_mut().clear();
@@ -4502,16 +4397,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn resynced_notifications_never_pop_up() {
-        assert!(pops_up(true, true, false));
-        assert!(
-            !pops_up(true, true, true),
-            "silent: a resync after reconnecting"
-        );
-        assert!(!pops_up(false, true, false), "already announced");
-        assert!(!pops_up(true, false, false), "hidden for this phone");
-    }
     use crate::device_links::device_info::DeviceInfo;
     use crate::device_links::packet::{PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_PING};
 
@@ -5037,53 +4922,6 @@ mod tests {
         assert_eq!(tabs, ["Notes", "Snippets", "Clipboard history"]);
         assert_eq!(notes_clipboard::tab_of("clipboard"), Some("clipboard"));
         assert_eq!(notes_clipboard::tab_of("files"), None);
-    }
-
-    /// A follow-up message in a conversation keeps the notification's id and
-    /// changes its text: announced again (not for an identical resend, not
-    /// within seconds of the last, not past three at once).
-    #[test]
-    fn a_follow_up_message_is_announced_and_a_resend_is_not() {
-        use std::time::{Duration, Instant};
-        let t0 = Instant::now();
-        let first = notification_signature("Mara", "Are you deploying today?", "");
-        let second = notification_signature("Mara", "Ping me when it is out", "");
-        // Never seen: announced.
-        assert!(announces(None, first, t0, 0));
-        let told = Announced {
-            signature: first,
-            at: Some(t0),
-        };
-        // The same text again (a resend, a resync): quiet.
-        assert!(!announces(
-            Some(told),
-            first,
-            t0 + Duration::from_secs(60),
-            0
-        ));
-        // New text a minute later: announced.
-        assert!(announces(
-            Some(told),
-            second,
-            t0 + Duration::from_secs(60),
-            0
-        ));
-        // New text a second later: held back (the next change announces).
-        assert!(!announces(
-            Some(told),
-            second,
-            t0 + Duration::from_secs(1),
-            0
-        ));
-        // A burst: at most three in one pass.
-        assert!(!announces(None, first, t0, ANNOUNCE_PER_PASS));
-        // Marked seen without an announcement (hidden or a resync): the next
-        // message announces at once.
-        let quiet = Announced {
-            signature: first,
-            at: None,
-        };
-        assert!(announces(Some(quiet), second, t0, 0));
     }
 
     /// Toasts never pile up: repeats are one, and only the newest few stay.

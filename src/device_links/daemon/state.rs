@@ -1066,6 +1066,98 @@ mod tests {
         packet
     }
 
+    /// Everything a person would call "twice": a phone's life as the desk
+    /// sees it, through the real state functions and the announce decision.
+    #[test]
+    fn a_phones_notifications_are_announced_once_each() {
+        use std::time::{Duration, Instant};
+        let (devices, info) = test_devices();
+        let mut tracker = crate::window::announce::Tracker::default();
+        let t0 = Instant::now();
+        let at = |secs: u64| t0 + Duration::from_secs(secs);
+        let post = |id: &str, text: &str, silent: bool| {
+            let mut packet = notification(id);
+            packet.set("title", "Mara");
+            packet.set("text", text);
+            packet.set("silent", silent);
+            upsert_notification(&devices, &info.id, &packet);
+        };
+        let ids = |ids: &[&str]| {
+            let mut snapshot =
+                NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_NOTIFICATION);
+            snapshot.set("snapshot", true);
+            snapshot.set("ids", json!(ids));
+            replace_notifications(&devices, &info.id, &snapshot);
+        };
+        let remove = |id: &str| remove_notification(&devices, &info.id, id);
+        let mut announced = |secs: u64| {
+            let mut views: Vec<DeviceView> = devices.lock().unwrap().values().cloned().collect();
+            for view in &mut views {
+                view.trusted = true;
+                view.feature_transport_ready = true;
+            }
+            tracker
+                .pass(&views, &|_| true, false, at(secs))
+                .iter()
+                .map(|(_, n)| (n.id.clone(), n.text.clone()))
+                .collect::<Vec<_>>()
+        };
+        let one = |id: &str, text: &str| vec![(id.to_string(), text.to_string())];
+
+        // The initial snapshot (a connect, or an app restart): silent, nothing pops.
+        ids(&["a", "b"]);
+        post("a", "hello", true);
+        post("b", "lunch?", true);
+        assert!(announced(0).is_empty(), "initial snapshot");
+        // A reconnect with the same snapshot, and again with a dismissal while away.
+        ids(&["a", "b"]);
+        post("a", "hello", true);
+        post("b", "lunch?", true);
+        assert!(announced(30).is_empty(), "reconnect, same snapshot");
+        // A new one.
+        post("c", "new", false);
+        assert_eq!(announced(31), one("c", "new"));
+        assert!(announced(32).is_empty(), "polled again: still one");
+        // A follow-up message (same id, new words), and an identical resend.
+        post("c", "second", false);
+        assert_eq!(announced(40), one("c", "second"), "changed text");
+        post("c", "second", false);
+        assert!(announced(50).is_empty(), "identical resend");
+        // Removed on the phone, posted again at once with the same words (cancel and notify).
+        remove("c");
+        assert!(announced(60).is_empty());
+        post("c", "second", false);
+        assert!(announced(61).is_empty(), "re-post of a removed one");
+        // Dismissed, and much later a real new post of the same words.
+        remove("c");
+        assert!(announced(62).is_empty());
+        assert!(announced(100).is_empty());
+        post("c", "second", false);
+        assert_eq!(announced(101), one("c", "second"), "a re-post long after");
+        // A dismissal sticks across a reconnect: the snapshot no longer lists it.
+        remove("c");
+        ids(&["a", "b"]);
+        post("a", "hello", true);
+        post("b", "lunch?", true);
+        assert!(announced(130).is_empty(), "dismissed stays gone");
+        // Progress ticking every second: one announcement, not one per tick.
+        let mut count = 0;
+        for tick in 0..30 {
+            post("d", &format!("Downloading {}%", tick * 3), false);
+            count += announced(200 + tick).len();
+        }
+        assert_eq!(count, 1, "a ticking progress notification");
+        // The same words from the same app under another id: one.
+        post("e", "twin", false);
+        post("f", "twin", false);
+        assert_eq!(announced(300).len(), 1, "same words under two ids");
+        // A phone that is not live announces nothing.
+        post("g", "ghost", false);
+        let mut views: Vec<DeviceView> = devices.lock().unwrap().values().cloned().collect();
+        views[0].feature_transport_ready = false;
+        assert!(tracker.pass(&views, &|_| true, false, at(400)).is_empty());
+    }
+
     /// J11: the snapshot's `accessGranted` is kept (absent from an old phone).
     #[test]
     fn a_snapshot_reports_whether_the_phone_may_read_notifications() {
