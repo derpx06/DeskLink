@@ -393,11 +393,14 @@ fn discovery_row(daemon: &DaemonHandle, device: DeviceView) -> adw::ActionRow {
     );
     row.set_activatable(false);
     let code = |key: &str| {
-        gtk::Label::builder()
+        let label = gtk::Label::builder()
             .label(spaced_code(key))
             .valign(gtk::Align::Center)
             .css_classes(["dl-mono", "heading", "accent"])
-            .build()
+            .build();
+        // As on the phone, whatever the language's direction.
+        label.set_direction(gtk::TextDirection::Ltr);
+        label
     };
     match &device.status {
         DeviceStatus::Discovered | DeviceStatus::Connected | DeviceStatus::Unreachable => {
@@ -472,6 +475,9 @@ fn pairing_code_label(code: &str) -> gtk::Label {
         .label(spaced_code(code))
         .css_classes(["mono", "pairing-code"])
         .build();
+    // Left to right in every language: right to left read "482 913" as
+    // "913 482", a code the phone does not show.
+    label.set_direction(gtk::TextDirection::Ltr);
     label.update_property(&[gtk::accessible::Property::Label(&format!(
         "Verification code {}",
         code.chars()
