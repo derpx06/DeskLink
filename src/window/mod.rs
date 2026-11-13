@@ -2794,15 +2794,6 @@ fn icon_button(icon: &str, label: &str, classes: &[&str]) -> gtk::Button {
     button
 }
 
-/// A button showing only text, styled like the design's soft chips.
-fn soft_button(label: &str) -> gtk::Button {
-    gtk::Button::builder()
-        .label(label)
-        .valign(gtk::Align::Center)
-        .css_classes(["soft-button"])
-        .build()
-}
-
 /// "View All ›": an accent link to another page.
 fn page_link(label: &str, page: &str) -> gtk::Button {
     let content = gtk::Box::builder().spacing(2).build();

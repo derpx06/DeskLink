@@ -169,9 +169,7 @@ popover.device-switcher > contents {
 }
 
 /* ── Buttons ───────────────────────────────────────────────────────────── */
-.soft-button,
 .raised-button,
-.coral-outline,
 .switch-chip {
   min-height: 32px;
   padding: 0 12px;
@@ -179,19 +177,10 @@ popover.device-switcher > contents {
   font-weight: 600;
   font-size: 0.93em;
 }
-.soft-button { background-color: @surface_2; box-shadow: none; }
-.soft-button:hover { background-color: alpha(currentColor, 0.1); }
-.soft-button.small { min-height: 28px; font-size: 0.86em; }
 .raised-button {
   background-color: @card_bg_color;
   box-shadow: 0 0 0 1px @card_edge, 0 1px 3px @card_shadow_near;
 }
-.coral-outline {
-  background-color: @card_bg_color;
-  color: @coral_text;
-  box-shadow: 0 0 0 1px @coral_border;
-}
-.coral-outline:hover { background-color: @coral_bg; }
 .coral-link { color: @coral_text; font-weight: 600; font-size: 0.86em; }
 .switch-chip {
   background-color: @surface_2;

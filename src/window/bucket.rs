@@ -2152,18 +2152,19 @@ pub(super) fn overview_card(device: &DeviceView) -> gtk::Box {
     // The phone asked: the question is answered right here.
     let asking = view.is_none() && asked(&device.id);
     if asking {
-        let later = super::soft_button("Not Now");
+        let later = ui_kit::button(ButtonKind::Text, "Not now", None);
+        later.set_valign(gtk::Align::Center);
         let id = device.id.clone();
         later.connect_clicked(move |_| folders::decline(&id, BUCKET_ID));
         head.append(&later);
-        let on = super::soft_button("Turn On");
-        on.add_css_class("suggested-action");
+        let on = ui_kit::button(ButtonKind::Primary, "Turn on", None);
+        on.set_valign(gtk::Align::Center);
         let id = device.id.clone();
         on.connect_clicked(move |_| folders::turn_on_bucket(&id));
         head.append(&on);
     } else {
         head.append(&super::page_link(
-            if view.is_some() { "Open" } else { "Set Up" },
+            if view.is_some() { "Open" } else { "Set up" },
             "files",
         ));
     }

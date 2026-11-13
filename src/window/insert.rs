@@ -5,7 +5,7 @@
 
 use adw::prelude::*;
 
-use super::{icon_square, wrapped, DeviceView};
+use super::DeviceView;
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 
 /// What each row asks for: kind, target, label, icon.
@@ -122,16 +122,6 @@ pub(super) fn bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Box
         "qr" => "a QR code",
         _ => "a photo",
     };
-    let bar = gtk::Box::builder()
-        .spacing(14)
-        .css_classes(["state-banner"])
-        .build();
-    bar.append(&icon_square("camera-photo-symbolic", 28, "live-icon"));
-    let words = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .hexpand(true)
-        .valign(gtk::Align::Center)
-        .build();
     let (headline, detail) = if capture.receiving {
         (
             format!("Receiving {what} from {}…", device.name),
@@ -143,15 +133,14 @@ pub(super) fn bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Box
             "Continue on the phone".to_string(),
         )
     };
-    words.append(&wrapped(&headline, &["heading"]));
-    if !detail.is_empty() {
-        words.append(&wrapped(&detail, &["text-dim"]));
-    }
-    bar.append(&words);
-    bar.update_property(&[gtk::accessible::Property::Label(&format!(
-        "{headline} {detail}"
-    ))]);
-    let cancel = super::soft_button("Cancel");
+    let bar = super::ui_kit::banner::banner(
+        super::ui_kit::banner::BannerKind::Info,
+        "camera-photo-symbolic",
+        &headline,
+        (!detail.is_empty()).then_some(detail.as_str()),
+    );
+    let cancel = super::ui_kit::button(super::ui_kit::ButtonKind::Tonal, "Cancel", None);
+    cancel.set_valign(gtk::Align::Center);
     let (daemon, id) = (daemon.clone(), device.id.clone());
     cancel.connect_clicked(move |_| {
         daemon.send(DaemonCommand::Capture(
@@ -160,8 +149,8 @@ pub(super) fn bar(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Box
             String::new(),
         ))
     });
-    bar.append(&cancel);
-    Some(bar)
+    bar.add_action(&cancel);
+    Some(bar.root)
 }
 
 #[cfg(test)]
