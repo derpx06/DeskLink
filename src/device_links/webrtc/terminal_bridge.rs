@@ -719,32 +719,22 @@ pub(crate) fn bridges() -> &'static Mutex<HashMap<String, TerminalBridge>> {
     BRIDGES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// What the pump threads sleep on while there is nothing to send: a counter
-/// bumped whenever any bridge is touched (a request, a reply, an alert, a
-/// revoke), so an idle pump neither polls nor misses a wake.
-static PUMP_WAKE: (Mutex<u64>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
-
-/// Something may be waiting for a pump: wakes every idle one.
+/// Something may be waiting for a pump (a request, a reply, an alert, a
+/// revoke): wakes every idle one. Pumps share the terminals' change signal,
+/// so new output wakes them too.
 pub(crate) fn wake_pumps() {
-    if let Ok(mut generation) = PUMP_WAKE.0.lock() {
-        *generation = generation.wrapping_add(1);
-        PUMP_WAKE.1.notify_all();
-    }
+    crate::device_links::pty::session::changed();
 }
 
 /// The wake counter now; hand it to [`wait_for_work`] *before* looking for
 /// work, so a wake in between is not lost.
 pub(crate) fn wake_generation() -> u64 {
-    PUMP_WAKE.0.lock().map_or(0, |generation| *generation)
+    crate::device_links::pty::session::change_generation()
 }
 
 /// Sleeps until a pump is woken after `seen`, or `timeout` passes.
 pub(crate) fn wait_for_work(seen: u64, timeout: std::time::Duration) {
-    if let Ok(generation) = PUMP_WAKE.0.lock() {
-        let _ = PUMP_WAKE
-            .1
-            .wait_timeout_while(generation, timeout, |generation| *generation == seen);
-    }
+    crate::device_links::pty::session::wait_for_change(seen, timeout);
 }
 
 /// Whether the connection holding `token` has nothing a pump could send, now
@@ -2637,15 +2627,15 @@ mod tests {
         let token = begin(&wire);
         assert_eq!(pump_is_idle(&phone, token), Some(true));
         // Nothing wakes it: the wait lasts the whole timeout. (Other tests
-        // touch bridges at the same time and wake every sleeper: one quiet
-        // wait in a few tries is the proof.)
+        // touch bridges and write to terminals at the same time, which wakes
+        // every sleeper: one quiet wait in many tries is the proof.)
         let mut seen = wake_generation();
         let mut slept = false;
-        for _ in 0..40 {
+        for _ in 0..400 {
             seen = wake_generation();
             let started = Instant::now();
-            wait_for_work(seen, Duration::from_millis(150));
-            if started.elapsed() >= Duration::from_millis(140) {
+            wait_for_work(seen, Duration::from_millis(100));
+            if started.elapsed() >= Duration::from_millis(90) {
                 slept = true;
                 break;
             }

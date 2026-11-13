@@ -325,6 +325,8 @@ fn serve(stream: UnixStream) -> Result<(), String> {
 fn pump_output(session: &PtySession, mut stream: UnixStream, stop: &AtomicBool) {
     let mut offset = None;
     while !stop.load(Ordering::Acquire) {
+        // Read before looking, so output landing in between ends the wait.
+        let seen = super::session::change_generation();
         let Ok(resync) = session.resync(offset, 64 * 1024) else {
             return;
         };
@@ -343,7 +345,8 @@ fn pump_output(session: &PtySession, mut stream: UnixStream, stop: &AtomicBool) 
             let _ = stream.write_all(&encode(EXIT, &status.to_be_bytes()));
             return;
         }
-        std::thread::sleep(Duration::from_millis(12));
+        // Woken by new output; the timeout only bounds noticing `stop`.
+        super::session::wait_for_change(seen, Duration::from_millis(500));
     }
 }
 
@@ -563,6 +566,17 @@ impl Drop for RawMode {
     }
 }
 
+/// The set holding only `SIGWINCH`.
+fn winch_set() -> libc::sigset_t {
+    // SAFETY: `sigemptyset` initialises the set before `sigaddset` reads it.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGWINCH);
+        set
+    }
+}
+
 fn window_size() -> (u16, u16) {
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
     if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == 0
@@ -602,9 +616,15 @@ pub(crate) fn run_client(id: &str, embedded: bool) -> i32 {
         return 1;
     }
     let raw = RawMode::enable();
+    // Blocked here, before the threads below exist, so they inherit the mask
+    // and the resize thread receives SIGWINCH with `sigtimedwait`.
+    let winch = winch_set();
+    // SAFETY: a valid, initialised signal set; only this thread's mask changes.
+    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &winch, std::ptr::null_mut()) };
 
-    // Keyboard → session, and window size changes (polled: no signal handler
-    // to get right, and a quarter second is unnoticeable for a resize).
+    // Keyboard → session, and window size changes (on SIGWINCH, without a
+    // handler: the resize thread waits for the signal itself, and looks
+    // every few seconds anyway in case another thread took it).
     let mut writer = match stream.try_clone() {
         Ok(writer) => writer,
         Err(_) => return 1,
@@ -630,8 +650,13 @@ pub(crate) fn run_client(id: &str, embedded: bool) -> i32 {
             .name("desk-size".into())
             .spawn(move || {
                 let mut last = window_size();
+                let timeout = libc::timespec {
+                    tv_sec: 5,
+                    tv_nsec: 0,
+                };
                 loop {
-                    std::thread::sleep(Duration::from_millis(250));
+                    // SAFETY: valid set and timeout; no siginfo is wanted.
+                    unsafe { libc::sigtimedwait(&winch, std::ptr::null_mut(), &timeout) };
                     let now = window_size();
                     if now != last {
                         last = now;

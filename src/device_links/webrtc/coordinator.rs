@@ -4855,16 +4855,23 @@ fn run_terminal_pump(
     sessions: &Arc<DeviceManager>,
     token: u64,
 ) {
+    let mut seen = terminal_bridge::wake_generation();
+    // The last pump found nothing to send.
+    let mut quiet = false;
     loop {
-        // Nothing attached and nothing queued: nothing can arrive by itself,
-        // so sleep until a request touches the bridge (or a second passes, to
-        // notice a peer that went away) instead of polling 125 times a second.
-        let seen = terminal_bridge::wake_generation();
+        // Nothing to send (nothing attached and nothing queued, or the last
+        // look found nothing): sleep until a request touches the bridge or a
+        // terminal writes, resizes or ends (or a second passes, to notice a
+        // peer that went away) instead of polling 125 times a second. While
+        // output flows it is batched every few milliseconds.
         match terminal_bridge::pump_is_idle(&wire.peer_device_id, token) {
-            Some(true) => terminal_bridge::wait_for_work(seen, TERMINAL_PUMP_IDLE),
-            Some(false) => thread::sleep(TERMINAL_PUMP_INTERVAL),
+            Some(idle) if idle || quiet => terminal_bridge::wait_for_work(seen, TERMINAL_PUMP_IDLE),
+            Some(_) => thread::sleep(TERMINAL_PUMP_INTERVAL),
             None => break,
         }
+        // Before looking: anything after this wakes the next wait.
+        seen = terminal_bridge::wake_generation();
+        quiet = false;
         if !sessions.is_current(binding) {
             break;
         }
@@ -4888,6 +4895,7 @@ fn run_terminal_pump(
             break;
         };
         if events.is_empty() {
+            quiet = true;
             continue;
         }
         if let Err(error) = send_terminal_events(&peer, wire, events) {

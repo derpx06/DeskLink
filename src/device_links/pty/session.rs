@@ -88,6 +88,35 @@ const ALLOWED_ENVIRONMENT: &[&str] = &[
 
 const FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
+/// Bumped whenever a session has new output, ends, or changes size (and by
+/// the phone bridge when a request touches it): the threads that stream
+/// output wait on this instead of polling the ring (an idle desk terminal
+/// window was 80 wakeups a second, an attached phone 125).
+static CHANGED: (Mutex<u64>, std::sync::Condvar) = (Mutex::new(0), std::sync::Condvar::new());
+
+/// Something a terminal pump may want to send happened: wakes every waiting one.
+pub(crate) fn changed() {
+    if let Ok(mut generation) = CHANGED.0.lock() {
+        *generation = generation.wrapping_add(1);
+        CHANGED.1.notify_all();
+    }
+}
+
+/// The change counter now; read it *before* looking for work and hand it to
+/// [`wait_for_change`], so a change in between is not lost.
+pub(crate) fn change_generation() -> u64 {
+    CHANGED.0.lock().map_or(0, |generation| *generation)
+}
+
+/// Sleeps until something changed after `seen`, or `timeout` passes.
+pub(crate) fn wait_for_change(seen: u64, timeout: Duration) {
+    if let Ok(generation) = CHANGED.0.lock() {
+        let _ = CHANGED
+            .1
+            .wait_timeout_while(generation, timeout, |generation| *generation == seen);
+    }
+}
+
 /// What a client needs to render after attaching.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Resync {
@@ -372,6 +401,7 @@ impl PtySession {
 
     pub(crate) fn desk_window_opened(&self) {
         self.desk_windows.fetch_add(1, Ordering::AcqRel);
+        changed();
     }
 
     pub(crate) fn desk_window_closed(&self) {
@@ -382,6 +412,7 @@ impl PtySession {
         if self.desk_windows.fetch_sub(1, Ordering::AcqRel) == 1 {
             *self.desk_size_lock() = None;
         }
+        changed();
     }
 
     /// Whether a terminal window at the desk shows this session. That window's
@@ -542,6 +573,7 @@ impl PtySession {
             .size
             .lock()
             .map_err(|_| "DeskLink terminal size lock poisoned".to_string())? = (rows, cols);
+        changed();
         Ok(())
     }
 
@@ -650,6 +682,7 @@ impl PtySession {
         if self.closed.swap(true, Ordering::SeqCst) {
             return;
         }
+        changed();
         let Some(session_id) = self.pid.and_then(|pid| i32::try_from(pid).ok()) else {
             if let Ok(mut child) = self.child.lock() {
                 let _ = child.kill();
@@ -921,6 +954,7 @@ fn spawn_reader(
             output.ring.push(bytes);
             output.last_activity = Instant::now();
             head.store(output.ring.head(), Ordering::Release);
+            changed();
             true
         };
         loop {
@@ -957,6 +991,7 @@ fn spawn_reader(
             }
         }
         eof.store(true, Ordering::Release);
+        changed();
     });
 }
 
@@ -1215,6 +1250,22 @@ mod tests {
             }
             other => panic!("expected exact replay, got {other:?}"),
         }
+    }
+
+    /// The pumps sleep on the change signal instead of polling the ring, so
+    /// output must end their wait at once (a 30 s wait here would fail the
+    /// test long before it timed out on its own).
+    #[test]
+    fn output_wakes_a_waiting_pump() {
+        let seen = change_generation();
+        let session = echo_session("wake");
+        let started = Instant::now();
+        while session.head() == 0 && started.elapsed() < Duration::from_secs(5) {
+            wait_for_change(seen, Duration::from_secs(30));
+        }
+        assert!(session.head() > 0, "no output was read");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_ne!(change_generation(), seen);
     }
 
     /// The reattach contract: an offset the ring still holds replays exactly,

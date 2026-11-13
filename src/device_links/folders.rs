@@ -2360,13 +2360,7 @@ fn run(context: &gtk::glib::MainContext, dir: PathBuf, messages: &Receiver<Messa
     }
     worker.publish();
     loop {
-        // Twice a second while a Bucket is on (file changes, transfers);
-        // every few seconds with none, when only a message can matter.
-        let nap = if worker.pairs.is_empty() {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_millis(500)
-        };
+        let nap = worker_nap(&worker.pairs, &worker.ready);
         match messages.recv_timeout(nap) {
             Ok(message) => worker.handle(message),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -2380,6 +2374,18 @@ fn run(context: &gtk::glib::MainContext, dir: PathBuf, messages: &Receiver<Messa
 }
 
 /// A pair's state file: per phone, as each phone's Bucket has id `bucket`.
+/// How long the Bucket worker waits for a message: twice a second while a
+/// Bucket's phone is connected (file changes, transfers), every five seconds
+/// otherwise, when only a message (a phone connecting, a setting) can matter
+/// and file changes simply wait for the phone.
+fn worker_nap(pairs: &[Live], ready: &HashSet<String>) -> Duration {
+    if pairs.iter().any(|live| ready.contains(&live.pair.device)) {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_secs(5)
+    }
+}
+
 fn book_file(device: &str, id: &str) -> String {
     let device: String = device
         .chars()
@@ -6570,6 +6576,30 @@ mod tests {
                 local.manifest.insert(path, entry);
             }
         }
+    }
+
+    /// The worker naps long unless a Bucket's own phone is connected: a
+    /// Bucket with its phone away does not wake the computer twice a second.
+    #[test]
+    fn the_worker_naps_long_while_no_bucket_phone_is_connected() {
+        let pair = Pair {
+            id: "pair-n".into(),
+            name: "root".into(),
+            root: std::env::temp_dir(),
+            device: "phone-n".into(),
+            include_hidden: false,
+            ignore: Vec::new(),
+            bucket: false,
+        };
+        let pairs = vec![Live::new(pair, Book::default())];
+        let long = Duration::from_secs(5);
+        assert_eq!(worker_nap(&[], &HashSet::new()), long);
+        assert_eq!(worker_nap(&pairs, &HashSet::new()), long);
+        assert_eq!(worker_nap(&pairs, &["other".to_string()].into()), long);
+        assert_eq!(
+            worker_nap(&pairs, &["phone-n".to_string()].into()),
+            Duration::from_millis(500)
+        );
     }
 
     /// The worker end to end, without a phone: scan, a phone's manifest, a
