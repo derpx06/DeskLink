@@ -472,7 +472,7 @@ impl FileControl {
             return Err("Invalid DeskLink WebRTC transfer size".to_string());
         }
         if self.max_frame_bytes.is_some_and(|size| {
-            !(FRAME_HEADER_BYTES + BLOCK_TRAILER_BYTES + 1..=262_144).contains(&size)
+            !(FRAME_HEADER_BYTES + BLOCK_TRAILER_BYTES + 1..=FRAME_BYTES_MAX).contains(&size)
         }) {
             return Err("Invalid DeskLink WebRTC file frame size".to_string());
         }
