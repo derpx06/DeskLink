@@ -56,6 +56,10 @@ const ShellProxy = Gio.DBusProxy.makeProxyWrapper(`<node>
       <arg name="device_id" type="s" direction="in"/>
       <arg name="action" type="s" direction="in"/>
     </method>
+    <method name="SeekMedia">
+      <arg name="device_id" type="s" direction="in"/>
+      <arg name="position_ms" type="x" direction="in"/>
+    </method>
     <method name="NotificationAction">
       <arg name="device_id" type="s" direction="in"/>
       <arg name="notification_id" type="s" direction="in"/>
@@ -304,6 +308,9 @@ export default class DeskLinkExtension extends Extension {
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
 
         this._button = new DeskLinkButton();
+        // As wide as the Quick Settings menu: the tiles and the timeline need it.
+        this._button.menu.box.style = 'min-width: 352px;';
+        this._button.menu.insetForScrollbar = true;
         this._pill = this._menuState();
         this._watchMenu(this._button.menu, this._pill);
         Main.panel.addToStatusArea(this.uuid, this._button);
@@ -413,9 +420,10 @@ export default class DeskLinkExtension extends Extension {
 
         // Quick Settings: everything, but not on the lock screen.
         const toggle = this._indicator.toggle;
-        toggle.visible = running && !locked && devices.length > 0;
+        // Running with no phone paired: still there, saying what to do.
+        toggle.visible = running && !locked;
         toggle.checked = !!selected?.ready;
-        toggle._setTitle(selected?.name ?? 'DeskLink', shortStatus(selected));
+        toggle._setTitle(selected?.name ?? 'DeskLink', selected ? shortStatus(selected) : 'Pair a phone');
         this._indicator.showConnected(running && !locked && devices.some(device => device.ready),
             live.length > 0);
         if (!locked)
@@ -426,7 +434,9 @@ export default class DeskLinkExtension extends Extension {
 
     _toggleClicked() {
         const selected = this._read('Devices', []).find(device => device.id === this._selected);
-        if (selected?.ready)
+        if (!selected)
+            this._invoke('', 'open'); // nothing paired: DeskLink's own window pairs one
+        else if (selected.ready)
             this._indicator.toggle.menu.open();
         else
             this._invoke('', 'reconnect');
@@ -473,8 +483,16 @@ export default class DeskLinkExtension extends Extension {
         // open menu is not thrown away every second. The Bucket's and the
         // transfers' progress and the round trip change all the time: the
         // first two are updated in place, the third is rounded.
+        // The track's position moves in place (a rebuild would drop a drag).
+        const media = selected?.media;
+        const mediaSig = media ? `${selected.id}|${media.title}|${media.positionMs}|${media.playing}` : '';
+        if (mediaSig !== state.mediaSig) {
+            state.mediaSig = mediaSig;
+            state.mediaAt = Date.now();
+        }
         const steady = devices.map(device => ({
             ...device,
+            media: device.media && {...device.media, positionMs: 0},
             bucket: !!device.bucket,
             rttMs: Math.round((device.rttMs ?? -1) / 25),
             transfers: (device.transfers ?? []).map(t => [t.name, t.incoming, t.paused, t.lane, t.fraction > 0]),
@@ -484,12 +502,15 @@ export default class DeskLinkExtension extends Extension {
         if (key === state.key) {
             state.bucketUpdate?.(selected?.bucket);
             state.transfersUpdate?.(selected?.transfers ?? []);
+            if (media)
+                state.mediaUpdate?.(media, state.mediaAt);
             return;
         }
         state.key = key;
         state.tickers = [];
         state.bucketUpdate = null;
         state.transfersUpdate = null;
+        state.mediaUpdate = null;
         state.items = new Map();
         const shown = new Set();
         fillMenu(menu, {
@@ -513,6 +534,9 @@ export default class DeskLinkExtension extends Extension {
             call: (method, args) => this._call(method, args),
             setSwitch: (id, switchKey, on) => this._setSwitch(id, switchKey, on),
             sendLink: id => this._sendLink(id),
+            seek: (id, ms) => this._seek(id, ms),
+            mediaAt: state.mediaAt,
+            onMedia: fn => (state.mediaUpdate = fn),
             select: id => {
                 this._selected = id;
                 state.key = null;
@@ -563,6 +587,14 @@ export default class DeskLinkExtension extends Extension {
             return;
         }
         proxy.SetSwitchRemote(deviceId, key, on, done);
+    }
+
+    /// The timeline: the menu stays open; an app older than interface 10 has no bar.
+    _seek(deviceId, ms) {
+        this._proxy?.SeekMediaRemote(deviceId, ms, (_result, error) => {
+            if (error)
+                console.warn(`DeskLink: seek failed: ${error.message}`);
+        });
     }
 
     /// "Send copied link": the clipboard's text, which the app checks again.
@@ -648,9 +680,11 @@ export default class DeskLinkExtension extends Extension {
         this._chipId = 0;
     }
 
-    _call(method, args) {
-        this._indicator?.toggle.menu.close();
-        this._button?.menu.close();
+    _call(method, args, keepOpen = false) {
+        if (!keepOpen) {
+            this._indicator?.toggle.menu.close();
+            this._button?.menu.close();
+        }
         this._proxy?.[`${method}Remote`](...args, (_result, error) => {
             if (error)
                 console.warn(`DeskLink: ${method} failed: ${error.message}`);
@@ -664,6 +698,7 @@ export default class DeskLinkExtension extends Extension {
             Shell.AppSystem.get_default().lookup_app(DESKTOP_FILE)?.activate();
             return;
         }
-        this._call('Invoke', [deviceId, action]);
+        // Play, pause and skip are made again and again: the menu stays.
+        this._call('Invoke', [deviceId, action], action.startsWith('media-'));
     }
 }

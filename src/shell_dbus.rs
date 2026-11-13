@@ -1799,7 +1799,9 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 18] = [
+const KNOWN_BUILDS: [&str; 19] = [
+    // The ext-seek build (timeline, tidier header, no clipped tiles).
+    "8ca439b2ba46a297bae63f5b30f1a32204c02e67b04bb14b416a4db6e6d6db83",
     // The current build (no wobbling window while a phone looks at this screen).
     "f7b1d5832081bd42eb8aaa027e115a3963208f9490d73840539df50f829bd347",
     // Links checked, focus kept only while open.

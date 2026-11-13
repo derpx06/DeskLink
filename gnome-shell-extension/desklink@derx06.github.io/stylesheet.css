@@ -100,9 +100,10 @@
 .desklink-dot.mint { background-color: #2fbf8f; }
 .desklink-dot.coral { background-color: #e5533d; }
 
-.desklink-battery { width: 40px; height: 40px; }
-.desklink-battery-ring { width: 40px; height: 40px; }
-.desklink-battery-label { font-size: 0.75em; font-weight: bold; }
+/* As tall as the name beside it: a taller ring pushes the line under the name away. */
+.desklink-battery { width: 30px; height: 30px; margin-left: 4px; }
+.desklink-battery-ring { width: 30px; height: 30px; }
+.desklink-battery-label { font-size: 0.62em; font-weight: bold; }
 
 .desklink-row.popup-menu-item { padding: 4px 0; }
 
@@ -176,7 +177,7 @@
 .button.desklink-tile {
   border-radius: 18px;
   min-height: 64px;
-  min-width: 88px;
+  min-width: 72px;
   padding: 8px 4px;
 }
 .desklink-tile-content { spacing: 6px; }
@@ -184,6 +185,12 @@
 .desklink-tile-label { font-size: 0.86em; font-weight: bold; }
 
 .desklink-media { spacing: 12px; }
+.desklink-media-card { spacing: 6px; }
+
+/* The track's timeline under the controls. */
+.desklink-seek-line { spacing: 8px; }
+.desklink-seek-time { font-size: 0.82em; font-feature-settings: "tnum"; min-width: 2.6em; }
+.desklink-seek-reason { padding-left: 2px; }
 .desklink-art {
   icon-size: 18px;
   width: 40px;
