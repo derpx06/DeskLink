@@ -406,6 +406,9 @@ impl DesktopWebRtcPeer {
                 .collect::<Vec<_>>()
                 .join(" | ")
         );
+        if sdp_type == WebRTCSDPType::Offer && answerer_adds_own_sections(gst::version()) {
+            self.add_answer_sections(sdp)?;
+        }
         let sdp = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes())
             .map_err(|error| format!("Invalid DeskLink WebRTC SDP: {error}"))?;
         let description = WebRTCSessionDescription::new(sdp_type, sdp);
@@ -1123,6 +1126,42 @@ impl DesktopWebRtcPeer {
         Ok(())
     }
 
+    /// GStreamer before 1.26 only (see [`answerer_adds_own_sections`]): the
+    /// answerer's own `sendrecv` video and sound sections, added before the
+    /// first offer is applied so `webrtcbin` pairs them with the offer's by
+    /// kind. Later offers on the same connection find them already there.
+    fn add_answer_sections(&self, offer: &str) -> Result<(), String> {
+        let has = |kind: &str| {
+            offer
+                .lines()
+                .any(|line| line.starts_with(&format!("m={kind} ")))
+        };
+        let existing = self
+            .webrtcbin
+            .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>("get-transceiver", &[&0i32]);
+        if existing.is_some() {
+            return Ok(());
+        }
+        if has("video") {
+            let caps = super::screen::answer_video_caps(
+                super::screen::twcc_extmap_id(offer),
+                answer_with_h264(),
+            );
+            let transceiver = self
+                .webrtcbin
+                .emit_by_name::<Option<gst_webrtc::WebRTCRTPTransceiver>>(
+                    "add-transceiver",
+                    &[&gst_webrtc::WebRTCRTPTransceiverDirection::Sendrecv, &caps],
+                )
+                .ok_or_else(|| "Could not add the DeskLink screen media section".to_string())?;
+            transceiver.set_property("do-nack", true);
+        }
+        if has("audio") {
+            self.add_audio_transceiver()?;
+        }
+        Ok(())
+    }
+
     fn create_local_channels(&self) -> Result<(), String> {
         for channel in WebRtcChannel::ALL {
             let options = channel_options(channel);
@@ -1384,7 +1423,7 @@ fn configure_video_transceivers(webrtcbin: &gst::Element) {
         .map(|sdp| {
             super::screen::answer_video_caps(
                 super::screen::twcc_extmap_id(&sdp),
-                super::screen::h264_decoder_available(),
+                answer_with_h264(),
             )
         });
     for index in 0i32..MAX_TRANSCEIVERS {
@@ -1423,6 +1462,24 @@ fn configure_video_transceivers(webrtcbin: &gst::Element) {
             }
         }
     }
+}
+
+/// Whether the answerer must add its own media sections before applying an
+/// offer. `webrtcbin` before GStreamer 1.26 creates the answerer's
+/// transceivers only while writing the answer, too late to make them
+/// `sendrecv`: it answered `recvonly`, so this computer could neither share
+/// its screen nor send sound (Ubuntu 24.04, GStreamer 1.24). From 1.26 the
+/// offer creates them and an added one would be a second, unmatched section.
+fn answerer_adds_own_sections(version: (u32, u32, u32, u32)) -> bool {
+    (version.0, version.1) < (1, 26)
+}
+
+/// Whether an answer offers H.264 next to VP8. `webrtcbin` before 1.26
+/// answers only the first of several preferred codecs, so H.264 first left
+/// out the VP8 this computer sends with: there the answer is VP8 alone and the
+/// phone sends VP8 too (no hardware H.264 from the phone on GStreamer 1.24).
+fn answer_with_h264() -> bool {
+    super::screen::h264_decoder_available() && !answerer_adds_own_sections(gst::version())
 }
 
 #[cfg(test)]
@@ -3698,6 +3755,15 @@ a=max-message-size:262144\r\n";
         );
         let _parked = second.stop();
         peer.close();
+    }
+
+    #[test]
+    fn only_gstreamer_before_1_26_needs_the_answerer_to_add_its_sections() {
+        assert!(answerer_adds_own_sections((1, 22, 0, 0)));
+        assert!(answerer_adds_own_sections((1, 24, 2, 0)));
+        assert!(!answerer_adds_own_sections((1, 26, 0, 0)));
+        assert!(!answerer_adds_own_sections((1, 28, 6, 0)));
+        assert!(!answerer_adds_own_sections((2, 0, 0, 0)));
     }
 
     /// The section of `sdp` that starts at the first line beginning `m=<kind>`.
