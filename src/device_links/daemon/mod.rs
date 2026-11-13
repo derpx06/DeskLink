@@ -461,13 +461,7 @@ impl DaemonWorker {
         }
 
         while let Ok(command) = self.command_rx.recv() {
-            match &command {
-                // Never log a password.
-                DaemonCommand::SetSessionPassword(_) => {
-                    debug_log!("[Daemon] Received command: SetSessionPassword(<redacted>)")
-                }
-                other => debug_log!("[Daemon] Received command: {other:?}"),
-            }
+            debug_log!("[Daemon] Received command: {}", command_name(&command));
             if self.handle_command(command) {
                 break;
             }
@@ -477,6 +471,31 @@ impl DaemonWorker {
             link.close();
         }
         Ok(())
+    }
+}
+
+/// A command as the log shows it: its name only. The fields carry what the
+/// person typed or was sent (a reply, shared text, a dialled number, keys for
+/// the remote desktop, the session password), and `DESKLINK_DEBUG` logs in
+/// release builds too.
+fn command_name(command: &DaemonCommand) -> String {
+    let shown = format!("{command:?}");
+    shown
+        .split(['(', '{', ' '])
+        .next()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[cfg(test)]
+mod command_log_tests {
+    use super::{command_name, DaemonCommand};
+
+    #[test]
+    fn a_logged_command_never_carries_what_was_typed() {
+        let reply = DaemonCommand::ReplyNotification("p".into(), "r".into(), "secret words".into());
+        assert_eq!(command_name(&reply), "ReplyNotification");
+        assert_eq!(command_name(&DaemonCommand::Discover), "Discover");
     }
 }
 
