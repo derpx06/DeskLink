@@ -465,7 +465,7 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
             Some("desklink-upload-file-symbolic"),
         );
         send.set_tooltip_text(Some(&format!("Send files to {} (Ctrl+O)", device.name)));
-        match blocker(Feature::Send(PACKET_TYPE_SHARE_REQUEST), &phone, true) {
+        match blocker(Feature::Send(PACKET_TYPE_SHARE_REQUEST), &phone) {
             Some(need) => unavailable(&send, &need),
             None => {
                 let (daemon, id) = (daemon.clone(), device.id.clone());
@@ -481,7 +481,7 @@ fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
             "Send clipboard",
             Some("desklink-content-paste-symbolic"),
         );
-        match blocker(Feature::Send(clipboard_type), &phone, true) {
+        match blocker(Feature::Send(clipboard_type), &phone) {
             Some(need) => unavailable(&clipboard, &need),
             None => {
                 clipboard.connect_clicked(move |button| {
@@ -571,11 +571,8 @@ fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> gtk::FlowBox {
             cell.set_focusable(false);
         }
     };
-    let open_terminal = crate::terminal_previews::sessions()
-        .iter()
-        .any(|info| info.exit_status.is_none());
     let phone = PhoneFacts::from_device(device);
-    let blocked = |feature| blocker(feature, &phone, open_terminal);
+    let blocked = |feature| blocker(feature, &phone);
     if desktop_sends(PACKET_TYPE_MOUSEPAD_REQUEST) {
         let need = blocked(Feature::Send(PACKET_TYPE_MOUSEPAD_REQUEST));
         let screen = tile(
@@ -666,9 +663,16 @@ fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> gtk::FlowBox {
     )));
     match blocked(Feature::HandOff) {
         Some(need) => unavailable(&hand_off, &need),
-        // Bound only when it can run: a bound action's state would make the
-        // tile live whatever it says.
-        None => hand_off.set_action_name(Some("app.lock-hand-off")),
+        // Drawn as usable with or without an open terminal: with none, the
+        // click offers to start one (no terminal is not a blocker).
+        None => {
+            let name = device.name.clone();
+            hand_off.connect_clicked(move |button| {
+                if let Some(window) = button.root().and_downcast::<DesklinkWindow>() {
+                    self::hand_off(&window, &name);
+                }
+            });
+        }
     }
     add(&hand_off);
     if let Some(more) = more_tile(daemon, device) {
@@ -691,7 +695,7 @@ fn more_tile(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Button> 
     let phone = PhoneFacts::from_device(device);
     // Each row: icon, title, hint, what it needs, what it does.
     let mut items: Vec<(&str, String, &str, Option<Need>, Run)> = Vec::new();
-    let need = |packet| blocker(Feature::Send(packet), &phone, true);
+    let need = |packet| blocker(Feature::Send(packet), &phone);
     if desktop_sends(PACKET_TYPE_LOCK_REQUEST) {
         items.push((
             "desklink-lock-symbolic",
@@ -808,6 +812,54 @@ fn more_tile(daemon: &DaemonHandle, device: &DeviceView) -> Option<gtk::Button> 
         }
     });
     Some(more)
+}
+
+/// The small prompt Hand off shows with no open terminal: (heading, body,
+/// button).
+fn no_terminal_words(phone: &str) -> (&'static str, String, &'static str) {
+    (
+        "No terminal to hand off",
+        format!(
+            "Start one now? DeskLink starts a shared terminal, then locks this computer and \
+             opens it on {phone}."
+        ),
+        "Start a terminal",
+    )
+}
+
+/// Hand off (the Home tile, the palette): lock here and carry on in the
+/// newest terminal on the phone. With no open terminal, a small prompt
+/// offers to start one, and then hands it off.
+pub(super) fn hand_off(window: &DesklinkWindow, phone: &str) {
+    if crate::device_links::pty::registry::newest_session().is_some() {
+        gtk::prelude::WidgetExt::activate_action(window, "app.lock-hand-off", None).ok();
+        return;
+    }
+    let (heading, body, start) = no_terminal_words(phone);
+    let dialog = adw::AlertDialog::new(Some(heading), Some(&body));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("start", start);
+    dialog.set_response_appearance("start", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("start"));
+    dialog.set_close_response("cancel");
+    let weak = window.downgrade();
+    dialog.connect_response(Some("start"), move |_, _| {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        match crate::device_links::pty::desk::new_desk_session() {
+            // Registered before this returns, so the hand-off finds it.
+            Ok(_) => {
+                gtk::prelude::WidgetExt::activate_action(&window, "app.lock-hand-off", None).ok();
+                window.refresh_soon();
+            }
+            Err(error) => {
+                eprintln!("[UI] Could not start a terminal: {error}");
+                window.show_feature_toast("Could not start a terminal");
+            }
+        }
+    });
+    dialog.present(Some(window));
 }
 
 /// Whether this build of DeskLink sends `packet` at all (a feature it has).
@@ -1560,6 +1612,15 @@ fn glide_bar(device: &DeviceView) -> gtk::Box {
 mod tests {
     use super::*;
 
+    /// No open terminal is a question with an answer, not a dead end.
+    #[test]
+    fn hand_off_with_no_terminal_offers_to_start_one() {
+        let (heading, body, start) = no_terminal_words("Pixel 9");
+        assert_eq!(heading, "No terminal to hand off");
+        assert!(body.starts_with("Start one now?") && body.contains("on Pixel 9"));
+        assert_eq!(start, "Start a terminal");
+    }
+
     #[test]
     fn charging_says_when_the_phone_will_be_full() {
         assert_eq!(charging_words(None), " · charging");
@@ -1694,7 +1755,6 @@ mod tests {
             blocker(
                 Feature::Send(PACKET_TYPE_PING),
                 &PhoneFacts::from_device(device),
-                true,
             )
             .map(|need| super::super::requirements::short(&need))
         };

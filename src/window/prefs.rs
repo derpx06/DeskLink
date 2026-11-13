@@ -2058,6 +2058,35 @@ fn add_glide_rows(
         });
         daemon.send(DaemonCommand::SetGlide(id.clone(), edge));
     });
+    // On here, off on the phone: said, with the ask where the phone takes it.
+    if current.is_some() && crate::device_links::glide::phone_allows(&device.id) == Some(false) {
+        let row = adw::ActionRow::builder()
+            .title(esc(format!("Glide is off on {phone}. Turn it on there.")))
+            .subtitle(esc(format!(
+                "On {phone}: DeskLink, Settings, Control, “Let {} control this phone”.",
+                crate::device_links::glide::desk_name()
+            )))
+            .build();
+        row.add_prefix(&icon_square(
+            "desklink-device-phone-symbolic",
+            30,
+            "row-icon",
+        ));
+        if crate::device_links::glide::can_ask_phone(&device.incoming_capabilities) {
+            let ask = gtk::Button::builder()
+                .label("Ask on phone")
+                .valign(gtk::Align::Center)
+                .build();
+            let id = device.id.clone();
+            ask.connect_clicked(move |button| {
+                crate::device_links::glide::ask_phone(&id);
+                button.set_label("Asked");
+                button.set_sensitive(false);
+            });
+            row.add_suffix(&ask);
+        }
+        group.add(&row);
+    }
     if status.asking {
         let row = adw::ActionRow::builder()
             .title("Waiting for your OK on this computer")

@@ -29,7 +29,7 @@ use crate::device_links::glide_consent::{Consent, Outcome, Step, Why};
 use crate::device_links::limits::{log_limited, Buckets};
 use crate::device_links::packet::{
     NetworkPacket, PACKET_TYPE_CLIPBOARD, PACKET_TYPE_MOUSEPAD_REQUEST,
-    PACKET_TYPE_SHARE_INPUT_DEVICES_REQUEST,
+    PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_INPUT_DEVICES_REQUEST,
 };
 use crate::device_links::webrtc::remote_desktop_portal::{
     lookup, object_path, options, pipewire_fd_index, request, token, tuple, PORTAL_BUS,
@@ -843,6 +843,37 @@ enum Command {
     HandedBack {
         device: String,
     },
+    /// The person asks the phone to turn Glide on there ([`ask_phone`]).
+    AskPhone(String),
+}
+
+/// The key in `desklink.settings.request {set: {glide: true}}`: this desk
+/// asks the phone to turn Glide on. The phone shows a prompt and the person
+/// decides there; nothing is switched for them (the phone's
+/// `Glide.SETTING_KEY`).
+pub(crate) const PHONE_SETTING_KEY: &str = "glide";
+
+/// The ask itself.
+pub(crate) fn turn_on_request() -> NetworkPacket {
+    let mut packet = NetworkPacket::new(PACKET_TYPE_SETTINGS_REQUEST);
+    let mut set = serde_json::Map::new();
+    set.insert(PHONE_SETTING_KEY.into(), true.into());
+    packet.set("set", serde_json::Value::Object(set));
+    packet
+}
+
+/// Whether the phone's build takes the ask (`incoming` is what it said it
+/// takes). An older phone only gets the words: turn it on there.
+pub(crate) fn can_ask_phone(incoming: &[String]) -> bool {
+    incoming
+        .iter()
+        .any(|packet| packet == PACKET_TYPE_SETTINGS_REQUEST)
+}
+
+/// The person pressed "Ask on phone": the phone shows "<computer> wants to
+/// use Glide. Turn on?".
+pub(crate) fn ask_phone(device_id: &str) {
+    send_command(Command::AskPhone(device_id.to_string()));
 }
 
 fn queue() -> &'static OnceLock<SyncSender<Command>> {
@@ -2003,6 +2034,10 @@ fn run(
                         }
                     }
                 }
+                Command::AskPhone(phone) => {
+                    debug_log!("[Glide] asking {phone} to turn Glide on there");
+                    deliver(&phone, &turn_on_request());
+                }
             }
         }
         while context.pending() {
@@ -3082,6 +3117,23 @@ mod tests {
         glide.activated(1, (1600.0, 1.0), &keys, Instant::now());
         state.glide = Some(glide);
         assert_eq!(nap(&state), MOTION_EVERY);
+    }
+
+    /// The ask the phone reads (its `Glide.asksToTurnOn`): exactly
+    /// `{set: {glide: true}}`, and only to a phone whose build takes it.
+    #[test]
+    fn the_ask_to_turn_glide_on_is_one_allow_listed_key() {
+        let ask = turn_on_request();
+        assert_eq!(ask.packet_type, PACKET_TYPE_SETTINGS_REQUEST);
+        assert_eq!(
+            serde_json::Value::Object(ask.body.clone()),
+            serde_json::json!({"set": {"glide": true}})
+        );
+        assert!(can_ask_phone(&[PACKET_TYPE_SETTINGS_REQUEST.to_string()]));
+        assert!(
+            !can_ask_phone(&["desklink.settings".to_string()]),
+            "an older phone"
+        );
     }
 
     #[test]

@@ -37,7 +37,8 @@ pub(crate) enum Fix {
     LogOut,
     /// Approve the phone controlling this screen, now, at the desk.
     ApproveControl(String),
-    NewTerminal,
+    /// Ask the phone to turn Glide on there (a prompt on the phone).
+    AskPhoneGlide(String),
     Reconnect(String),
     /// Copies an install command.
     Copy(String),
@@ -55,7 +56,7 @@ impl Fix {
             Self::TurnOnExtension => "Turn on",
             Self::LogOut => "Log out…",
             Self::ApproveControl(_) => "Approve now",
-            Self::NewTerminal => "New terminal",
+            Self::AskPhoneGlide(_) => "Ask on phone",
             Self::Reconnect(_) => "Try again",
             Self::Copy(_) => "Copy command",
         })
@@ -111,6 +112,9 @@ pub(crate) struct PhoneFacts {
     pub control_approved: bool,
     /// Glide is set to this phone.
     pub glide_here: bool,
+    /// The phone said Glide is off there (its switch for this computer, or
+    /// the accessibility service it needs).
+    pub glide_off_there: bool,
     /// Android lets it read notifications (`None`: an older phone, unknown).
     pub notification_access: Option<bool>,
 }
@@ -135,6 +139,7 @@ impl PhoneFacts {
                 .glide
                 .as_ref()
                 .is_some_and(|glide| glide.device == device.id),
+            glide_off_there: crate::device_links::glide::phone_allows(&device.id) == Some(false),
             notification_access: device.notification_access,
         }
     }
@@ -332,6 +337,9 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
             allow: None,
         });
     }
+    if phone.glide_here && phone.glide_off_there {
+        needs.push(glide_off_there(phone));
+    }
     if phone.glide_here && facts.glide_asking {
         needs.push(Need {
             id: "glide",
@@ -371,6 +379,35 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
     needs
 }
 
+/// Glide is on here but off on the phone: what to do there, and "Ask on
+/// phone" when its build can show the prompt (an older one: the words only).
+fn glide_off_there(phone: &PhoneFacts) -> Need {
+    let name = &phone.name;
+    let askable = crate::device_links::glide::can_ask_phone(&phone.incoming);
+    Need {
+        id: "glide-phone",
+        on_phone: true,
+        title: format!("Glide is off on {name}. Turn it on there."),
+        detail: if askable {
+            format!(
+                "{name} shows a prompt when you ask; or on {name}, open DeskLink, then Settings, \
+                 Control, and turn on control from this computer."
+            )
+        } else {
+            format!(
+                "On {name}, open DeskLink, then Settings, Control, and turn on control from this \
+                 computer."
+            )
+        },
+        fix: if askable {
+            Fix::AskPhoneGlide(phone.id.clone())
+        } else {
+            Fix::None
+        },
+        allow: None,
+    }
+}
+
 /// What an unavailable action is blocked by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Feature {
@@ -382,8 +419,9 @@ pub(crate) enum Feature {
 
 /// Why `feature` cannot run on `phone` now, as a need with its fix; `None`
 /// when it can. Reachability first, then what the phone's build takes, then
-/// the feature's own requirements.
-pub(crate) fn blocker(feature: Feature, phone: &PhoneFacts, open_terminal: bool) -> Option<Need> {
+/// the feature's own requirements. No open terminal does not block Hand off:
+/// it offers to start one ([`super::overview::hand_off`]).
+pub(crate) fn blocker(feature: Feature, phone: &PhoneFacts) -> Option<Need> {
     let name = &phone.name;
     match phone.reach {
         Reach::Offline => {
@@ -430,16 +468,6 @@ pub(crate) fn blocker(feature: Feature, phone: &PhoneFacts, open_terminal: bool)
             fix: Fix::OpenSettings(PRIVACY_PAGE),
             allow: Some(Allow::TerminalAccess(phone.id.clone())),
         }),
-        Feature::HandOff if !open_terminal => Some(Need {
-            id: "open-terminal",
-            on_phone: false,
-            title: "Needs an open shared terminal".into(),
-            detail: format!(
-                "Hand off locks this computer and carries on in your newest terminal on {name}."
-            ),
-            fix: Fix::NewTerminal,
-            allow: None,
-        }),
         Feature::HandOff => None,
     }
 }
@@ -451,7 +479,6 @@ pub(crate) fn short(need: &Need) -> &'static str {
         "reach" => "Can't reach",
         "phone-update" => "Needs an update",
         "terminal-access" => "Needs access",
-        "open-terminal" => "Needs a terminal",
         _ => "Needs a step",
     }
 }
@@ -493,13 +520,9 @@ pub(crate) fn run(anchor: &impl IsA<gtk::Widget>, need: &Need) {
         },
         Fix::LogOut => crate::shell_dbus::log_out(),
         Fix::ApproveControl(id) => super::prefs::approve_remote_control(&window, id),
-        Fix::NewTerminal => {
-            gtk::prelude::WidgetExt::activate_action(
-                &window,
-                "win.new-terminal",
-                Some(&"shell".to_variant()),
-            )
-            .ok();
+        Fix::AskPhoneGlide(id) => {
+            crate::device_links::glide::ask_phone(id);
+            window.show_feature_toast("Asked on the phone. Turn Glide on there");
         }
         Fix::Reconnect(id) => {
             if let Some(daemon) = daemon {
@@ -790,8 +813,46 @@ mod tests {
             unlock_on: true,
             control_approved: true,
             glide_here: false,
+            glide_off_there: false,
             notification_access: Some(true),
         }
+    }
+
+    /// Glide on here, off on the phone: said on the phone's line with the
+    /// ask when the phone's build takes it, the instruction alone when not;
+    /// nothing when Glide is not set to this phone or is on there.
+    #[test]
+    fn glide_off_on_the_phone_says_so_and_asks_when_it_can() {
+        let facts = |phone: PhoneFacts| Facts {
+            phone: Some(phone),
+            ..complete()
+        };
+        let glide_need = |phone: PhoneFacts| {
+            missing(&facts(phone))
+                .into_iter()
+                .find(|need| need.id == "glide-phone")
+        };
+        let mut off = phone();
+        off.glide_here = true;
+        off.glide_off_there = true;
+        let need = glide_need(off.clone()).expect("listed");
+        assert_eq!(need.title, "Glide is off on Pixel 9. Turn it on there.");
+        assert!(need.on_phone);
+        assert_eq!(need.fix, Fix::None, "an older phone: the words only");
+        assert!(need.detail.contains("Settings, Control"));
+        off.incoming
+            .push(crate::device_links::packet::PACKET_TYPE_SETTINGS_REQUEST.into());
+        let need = glide_need(off.clone()).expect("listed");
+        assert_eq!(need.fix, Fix::AskPhoneGlide("p1".into()));
+        assert_eq!(need.fix.label(), Some("Ask on phone"));
+        assert!(need.allow.is_none(), "never switched from here");
+
+        let mut on_there = off.clone();
+        on_there.glide_off_there = false;
+        assert_eq!(glide_need(on_there), None);
+        let mut not_here = off;
+        not_here.glide_here = false;
+        assert_eq!(glide_need(not_here), None);
     }
 
     fn complete() -> Facts {
@@ -961,30 +1022,25 @@ mod tests {
     fn a_blocked_action_names_its_reason_and_fix() {
         let ping = Feature::Send(PACKET_TYPE_PING);
         let lock = Feature::Send(PACKET_TYPE_LOCK_REQUEST);
-        assert_eq!(blocker(ping, &phone(), true), None);
-        let need = blocker(lock, &phone(), true).unwrap();
+        assert_eq!(blocker(ping, &phone()), None);
+        let need = blocker(lock, &phone()).unwrap();
         assert_eq!(need.id, "phone-update");
         assert!(need.detail.contains("Update DeskLink on Pixel 9"));
         assert_eq!(short(&need), "Needs an update");
 
         let mut offline = phone();
         offline.reach = Reach::Offline;
-        let need = blocker(ping, &offline, true).unwrap();
+        let need = blocker(ping, &offline).unwrap();
         assert_eq!(need.fix, Fix::Reconnect("p1".into()));
         assert_eq!(short(&need), "Can't reach");
         offline.reach = Reach::Connecting;
-        assert_eq!(
-            short(&blocker(ping, &offline, true).unwrap()),
-            "Connecting…"
-        );
+        assert_eq!(short(&blocker(ping, &offline).unwrap()), "Connecting…");
 
-        assert_eq!(blocker(Feature::HandOff, &phone(), true), None);
-        let need = blocker(Feature::HandOff, &phone(), false).unwrap();
-        assert_eq!(need.title, "Needs an open shared terminal");
-        assert_eq!(need.fix, Fix::NewTerminal);
+        // No open terminal is not a blocker: Hand off offers to start one.
+        assert_eq!(blocker(Feature::HandOff, &phone()), None);
         let mut closed = phone();
         closed.terminal_access = false;
-        let need = blocker(Feature::HandOff, &closed, true).unwrap();
+        let need = blocker(Feature::HandOff, &closed).unwrap();
         assert_eq!(need.fix, Fix::OpenSettings(PRIVACY_PAGE));
         assert_eq!(short(&need), "Needs access");
     }

@@ -807,8 +807,7 @@ pub(crate) struct Sources {
 pub(crate) fn build(sources: &Sources) -> Vec<Item> {
     let mut items = Vec::new();
 
-    // Actions. Open terminals decide Hand off.
-    let any_terminal_open = !sources.terminals.is_empty();
+    // Actions.
     for action in offered_actions(sources.phone.as_ref()) {
         let phone_item = sources
             .phone
@@ -816,9 +815,8 @@ pub(crate) fn build(sources: &Sources) -> Vec<Item> {
             .and_then(|phone| phone_action(phone, action));
         items.push(match (phone_item, &sources.phone) {
             (Some(mut item), Some(phone)) => {
-                let need = feature_of(action).and_then(|feature| {
-                    super::requirements::blocker(feature, &phone.facts, any_terminal_open)
-                });
+                let need = feature_of(action)
+                    .and_then(|feature| super::requirements::blocker(feature, &phone.facts));
                 match need {
                     Some(need) => {
                         item.subtitle = need.title.clone();
@@ -1365,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn hand_off_needs_terminal_access_then_an_open_terminal() {
+    fn hand_off_needs_terminal_access_but_not_an_open_terminal() {
         let mut phone = ready_phone();
         let hand_off = |phone: &PhoneState, terminals| {
             blocked_of(&build(&sources_with(Some(phone.clone()), terminals)))
@@ -1380,8 +1378,9 @@ mod tests {
         phone.facts.terminal_access = true;
         assert_eq!(hand_off(&phone, 1), None, "live with a terminal open");
         assert_eq!(
-            hand_off(&phone, 0).as_deref(),
-            Some("Needs an open shared terminal")
+            hand_off(&phone, 0),
+            None,
+            "and without: it offers to start one"
         );
     }
 
