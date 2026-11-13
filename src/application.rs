@@ -1138,6 +1138,11 @@ const PALETTE: &[(&str, &str, &str)] = &[
     ("sidebar_bg_color", "#efefeb", "#17171a"),
     ("sidebar_fg_color", "#18181b", "#f2f2f3"),
     ("sidebar_backdrop_color", "#efefeb", "#17171a"),
+    // An inner split view's list (Notes): between the sidebar and the window,
+    // in the same warm greys, not libadwaita's cool default.
+    ("secondary_sidebar_bg_color", "#f3f3f0", "#151518"),
+    ("secondary_sidebar_fg_color", "#18181b", "#f2f2f3"),
+    ("secondary_sidebar_backdrop_color", "#f3f3f0", "#151518"),
     ("popover_bg_color", "#ffffff", "#1b1b1e"),
     ("popover_fg_color", "#18181b", "#f2f2f3"),
     ("dialog_bg_color", "#ffffff", "#1b1b1e"),
