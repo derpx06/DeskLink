@@ -395,7 +395,8 @@ fn ice_config_for(binding: &SessionBinding, config: &Arc<Mutex<Config>>) -> IceS
         None => {
             use crate::device_links::relay_link::{client, route};
             ice.local_ips = route::default_route_addresses();
-            let relay_servers = if settings.use_turn {
+            let relay_servers = if crate::device_links::relay_link::turn_allowed(settings.use_turn)
+            {
                 client::ice_servers_for(&binding.device_id)
             } else {
                 Vec::new()
@@ -410,7 +411,7 @@ fn ice_config_for(binding: &SessionBinding, config: &Arc<Mutex<Config>>) -> IceS
             ice.turn_servers.extend(turn);
         }
     }
-    if !settings.use_turn {
+    if !crate::device_links::relay_link::turn_allowed(settings.use_turn) {
         ice.turn_servers.clear();
     }
     ice.relay_only =

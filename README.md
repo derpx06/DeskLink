@@ -13,7 +13,8 @@ GTK 4 and libadwaita desktop app; it pairs with the DeskLink Android app.
 - File transfer both ways, and a browser for the phone's files.
 - A presentation remote, ping, find-my-phone, battery status, and locking the
   desktop session from the phone.
-- Away from home: the DeskLink relay connects your devices across networks.
+- Works on your Wi-Fi network (LAN). Connecting away from home through the
+  DeskLink relay is built but switched off in 1.3 (see "Away from home").
 - No account. Devices pair directly by scanning a code.
 
 DeskLink speaks DeskLink Protocol v9. It grew out of KDE Connect but is not a
@@ -169,6 +170,12 @@ environment at build time; it becomes the default relay address. Without it
 the default is a placeholder, and users must enter a relay in Preferences.
 
 ## Away from home
+
+**Off in 1.3.** This release is LAN-only: the relay client, TURN and every
+relay setting are compiled out by one switch, `RELAY_ENABLED` in
+`src/device_links/relay_link/mod.rs` (and `BuildConfig.RELAY_ENABLED` in the
+Android app). Stored relay settings are kept and ignored. The rest of this
+section describes the feature for when it is switched back on.
 
 On the same network, devices find each other and connect directly. When they
 are apart, DeskLink can reach the phone through the **DeskLink relay**, a small

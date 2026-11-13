@@ -1462,6 +1462,13 @@ mod tests {
             ] {
                 assert!(!words.contains(banned), "{banned:?} in {words:?}");
             }
+            // 1.3 is LAN-only: nothing promises use off this network.
+            if !crate::device_links::relay_link::RELAY_ENABLED {
+                let lower = words.to_lowercase();
+                for promise in ["away from home", "anywhere", "internet", "another network"] {
+                    assert!(!lower.contains(promise), "{promise:?} in {words:?}");
+                }
+            }
         }
         for page in &TOUR {
             let rest: String = page.title.chars().skip(1).collect();

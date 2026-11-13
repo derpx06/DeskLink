@@ -976,7 +976,9 @@ fn percent_encode(value: &str) -> String {
 /// Debug builds only: ignore LAN links so the relay path can be tested on one
 /// network (`DESKLINK_FORCE_RELAY=1`).
 pub fn force_relay() -> bool {
-    cfg!(debug_assertions) && std::env::var("DESKLINK_FORCE_RELAY").as_deref() == Ok("1")
+    super::RELAY_ENABLED
+        && cfg!(debug_assertions)
+        && std::env::var("DESKLINK_FORCE_RELAY").as_deref() == Ok("1")
 }
 
 #[cfg(test)]

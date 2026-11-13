@@ -271,11 +271,22 @@ pub fn versions_skew(ours: &str, theirs: &str) -> bool {
 /// surface uses (device page, history, remote-control header; the GNOME
 /// Shell extension mirrors it). `None` for an unknown path.
 pub fn connection_path_label(path: &str) -> Option<&'static str> {
-    match path {
+    match shown_path(path) {
         "lan" => Some("Local network"),
         "direct" => Some("Over the internet"),
         "turn" => Some("Through a relay server"),
         _ => None,
+    }
+}
+
+/// `path` as a surface may show it. With the relay compiled out
+/// (`relay_link::RELAY_ENABLED`) every link began on the LAN, so nothing is
+/// named the internet or a relay: anything but `"lan"` reads as unknown (`""`).
+pub fn shown_path(path: &str) -> &str {
+    if super::relay_link::RELAY_ENABLED || path == "lan" {
+        path
+    } else {
+        ""
     }
 }
 

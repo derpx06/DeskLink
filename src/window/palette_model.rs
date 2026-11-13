@@ -722,7 +722,11 @@ const SETTINGS_WORDS: [&str; 10] = [
     "bucket downloads photos gallery folder",
     "password terminal access unlock unpair walk away security",
     "theme dark light accent tray icon top bar",
-    "relay internet history logs checks away",
+    if crate::device_links::relay_link::RELAY_ENABLED {
+        "relay internet history logs checks away"
+    } else {
+        "history logs checks"
+    },
 ];
 
 /// One settings subpage as the palette lists it.

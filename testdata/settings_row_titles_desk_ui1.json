@@ -23,10 +23,12 @@
     "Unpair Pixel 9…",
     "Style",
     "Tray icon",
-    "Reach this computer from anywhere",
     "Connection history",
     "System check",
-    "Crash reports",
+    "Crash reports"
+  ],
+  "relay": [
+    "Reach this computer from anywhere",
     "Connect Away From Home",
     "Use a Relay if Needed",
     "Status"

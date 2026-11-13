@@ -259,9 +259,11 @@ impl AppSettings {
         relay_url_or(&self.relay_url, DEFAULT_RELAY_URL)
     }
 
-    /// Whether a relay server is set up at all.
+    /// Whether a relay server is set up at all. Never while the relay is
+    /// compiled out (`relay_link::RELAY_ENABLED`): then nothing relay-related
+    /// runs, is offered to the phone, or can be switched on from it.
     pub fn relay_configured(&self) -> bool {
-        !self.relay_url().is_empty()
+        crate::device_links::relay_link::RELAY_ENABLED && !self.relay_url().is_empty()
     }
 
     /// Whether DeskLink should reach paired phones through the relay: on,
@@ -1300,9 +1302,39 @@ mod tests {
             assert!(!settings.relay_wanted(), "empty default: client not wanted");
         }
         settings.relay_url = "wss://mine.example/v1".into();
-        assert!(settings.relay_wanted());
+        assert_eq!(
+            settings.relay_wanted(),
+            crate::device_links::relay_link::RELAY_ENABLED,
+            "an address is enough only while the relay is compiled in"
+        );
         settings.relay_enabled = false;
         assert!(!settings.relay_wanted());
+    }
+
+    /// 1.3 ships LAN-only: with the switch off, even a stored relay address,
+    /// "on" and "Use TURN" (kept untouched in config.json) reach nothing.
+    #[test]
+    fn the_relay_compiled_out_ignores_every_stored_relay_setting() {
+        use crate::device_links::relay_link::{client, turn_allowed, RELAY_ENABLED};
+        if RELAY_ENABLED {
+            return;
+        }
+        let settings = AppSettings {
+            relay_enabled: true,
+            relay_url: "wss://mine.example/v1".into(),
+            use_turn: true,
+            ..AppSettings::default()
+        };
+        assert!(!settings.relay_configured());
+        assert!(!settings.relay_wanted());
+        assert!(
+            !turn_allowed(settings.use_turn),
+            "no TURN without the relay"
+        );
+        assert!(!client::force_relay());
+        let packet = crate::device_links::desk_features::settings_packet(&settings, "phone");
+        assert_eq!(packet.get_bool("relayConfigured"), Some(false));
+        assert_eq!(packet.get_bool("relay"), Some(false));
     }
 
     #[test]

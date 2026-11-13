@@ -11,6 +11,7 @@ use super::{clipboard, DesklinkWindow};
 use crate::device_links::config::AppSettings;
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::device_links::device::DeviceView;
+use crate::device_links::relay_link::RELAY_ENABLED;
 
 /// A switch that follows a setting a phone can also change, and how to read
 /// it. Synced in place each refresh: rebuilding the page would move focus.
@@ -185,7 +186,11 @@ const PAGES: [(Section, usize, &str, &str); 10] = [
         Section::Privacy,
         9,
         "desklink-tune-symbolic",
-        "Away from home, history, checks",
+        if RELAY_ENABLED {
+            "Away from home, history, checks"
+        } else {
+            "History, checks"
+        },
     ),
 ];
 
@@ -747,7 +752,9 @@ fn groups(
     add_top_bar_rows(&appearance, daemon, settings);
 
     let advanced = group(GROUPS[9]);
-    advanced.add(&away_row(daemon, settings));
+    if RELAY_ENABLED {
+        advanced.add(&away_row(daemon, settings));
+    }
     advanced.add(&history_row());
     advanced.add(&system_check_row());
     advanced.add(&logs_row());
@@ -812,7 +819,9 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>, daemon: &DaemonHandle)
     add_top_bar_rows(&appearance, daemon, &settings);
     page.add(&appearance);
     let advanced = group(GROUPS[9]);
-    advanced.add(&away_row(daemon, &settings));
+    if RELAY_ENABLED {
+        advanced.add(&away_row(daemon, &settings));
+    }
     advanced.add(&history_row());
     advanced.add(&system_check_row());
     advanced.add(&logs_row());
@@ -1175,7 +1184,12 @@ fn unlock_nearby_row(
     let phone = &device.name;
     let explained = format!(
         "When this computer is locked, {phone} can unlock it after you approve on the \
-         phone — only on the same network, never through the relay. Other phones cannot."
+         phone — only on the same network{}. Other phones cannot.",
+        if RELAY_ENABLED {
+            ", never through the relay"
+        } else {
+            ""
+        }
     );
     let row = adw::SwitchRow::builder()
         .title(format!("Unlock with {phone} nearby"))
@@ -2417,6 +2431,10 @@ mod tests {
                     if crate::shell_dbus::extension_possible() {
                         rows.extend(names("gnomeRows"));
                     }
+                    // The contract lists the relay row; compiled out, it is not built.
+                    if !RELAY_ENABLED {
+                        rows.retain(|row| row != "Reach this computer from anywhere");
+                    }
                     (group["title"].as_str().unwrap().to_string(), rows)
                 })
                 .collect();
@@ -2528,7 +2546,8 @@ mod tests {
             if crate::shell_dbus::extension_possible() {
                 before.extend(names("gnome"));
             }
-            before.extend(names(
+            let mut relay = names("relay");
+            relay.extend(names(
                 if crate::device_links::config::DEFAULT_RELAY_URL.is_empty() {
                     "relayCustom"
                 } else {
@@ -2540,12 +2559,25 @@ mod tests {
             for page in &view.pages {
                 all_titles(page.child().unwrap().upcast_ref(), &mut after);
             }
-            // The dialog behind "Reach this computer from anywhere" is built
-            // by the same function as before.
-            all_titles(
-                away_from_home_group(&daemon, &AppSettings::default()).upcast_ref(),
-                &mut after,
-            );
+            if RELAY_ENABLED {
+                before.extend(relay);
+                // The dialog behind "Reach this computer from anywhere" is
+                // built by the same function as before.
+                all_titles(
+                    away_from_home_group(&daemon, &AppSettings::default()).upcast_ref(),
+                    &mut after,
+                );
+            } else {
+                // Compiled out: no relay row on any page ("Status" is too
+                // plain a title to look for).
+                let shown: Vec<_> = relay
+                    .iter()
+                    .filter(|title| *title != "Status" && after.contains(title))
+                    .collect();
+                assert!(shown.is_empty(), "relay rows shown: {shown:?}");
+                let page_lines = PAGES.map(|(_, _, _, summary)| summary).join(" ");
+                assert!(!page_lines.to_lowercase().contains("away from home"));
+            }
             let missing: Vec<_> = before
                 .iter()
                 .filter(|title| !after.contains(title))
