@@ -45,6 +45,10 @@ pub(crate) enum Why {
     Declined,
     Unanswered,
     Failed,
+    /// The desktop ended the session while the person was away (a lock, a
+    /// sleep: GNOME drops it then).
+    Locked,
+    /// The desktop ended the session with the person here (a portal restart).
     Closed,
     /// [`ASKS_PER_RUN`] asks used up.
     Limit,
@@ -66,9 +70,13 @@ impl Why {
                 "The desktop's input capture did not start. Glide tries again when you are back, \
                  or in a few minutes."
             }
+            Why::Locked => {
+                "Paused: the screen was locked or the computer slept, and GNOME ends Glide then. \
+                 Glide asks again when you unlock."
+            }
             Why::Closed => {
-                "Paused: the desktop ended Glide, as GNOME does when the screen locks or the \
-                 computer sleeps. Glide asks again when you unlock or come back."
+                "Paused: the desktop ended Glide's permission. Glide asks again when you are back \
+                 after a lock or a break, or turn it on again now."
             }
             Why::Limit => "Stopped after asking several times. Turn it on again to ask once more.",
         }
@@ -76,7 +84,10 @@ impl Why {
 
     /// Whether the wait ends when the person comes back to the computer.
     fn ends_on_return(self) -> bool {
-        matches!(self, Why::Unanswered | Why::Failed | Why::Closed)
+        matches!(
+            self,
+            Why::Unanswered | Why::Failed | Why::Locked | Why::Closed
+        )
     }
 }
 
@@ -192,9 +203,12 @@ impl Consent {
             Phase::Open(_) | Phase::Asking => return Step::Wait,
             Phase::Held(why, since, until) => {
                 let timed_out = until.is_some_and(|until| now >= until);
-                let back = why.ends_on_return()
-                    && self.here(now, &mut present)
-                    && self.away_at.is_some_and(|at| at + AWAY_SLACK >= since);
+                let here = why.ends_on_return() && self.here(now, &mut present);
+                if why == Why::Closed && !here {
+                    // Seen away after all: the words say what happened.
+                    self.phase = Phase::Held(Why::Locked, since, until);
+                }
+                let back = here && self.away_at.is_some_and(|at| at + AWAY_SLACK >= since);
                 if !timed_out && !back {
                     return Step::Wait;
                 }
@@ -236,7 +250,9 @@ impl Consent {
                 self.asks = 0;
             }
         }
-        self.phase = Phase::Held(Why::Closed, now, None);
+        let away = self.away_at.is_some_and(|at| at + AWAY_SLACK >= now);
+        let why = if away { Why::Locked } else { Why::Closed };
+        self.phase = Phase::Held(why, now, None);
     }
 
     /// The person acted (switched Glide, pressed "Turn On Again"): any wait
@@ -364,10 +380,11 @@ mod tests {
         // GNOME drops the session as the lock screen comes up.
         let lock = t + secs(600);
         c.closed(lock);
-        assert_eq!(c.held(), Some(Why::Closed));
-        // Locked: no dialog, however long.
+        assert_eq!(c.held(), Some(Why::Closed), "not seen locked yet");
+        // Locked: no dialog, however long, and the words say why.
         for n in [3, 300, 3600] {
             assert_eq!(c.step(lock + secs(n), true, AWAY), Step::Wait, "{n}");
+            assert_eq!(c.held(), Some(Why::Locked));
         }
         // Unlocked: asked at once, the moment the person is back.
         assert_eq!(c.step(lock + secs(3603), true, HERE), Step::Ask);
@@ -379,9 +396,11 @@ mod tests {
         open(&mut c, t);
         let close = t + secs(600);
         c.closed(close);
-        // They keep working: never a sudden dialog.
+        // They keep working: never a sudden dialog, and the words do not
+        // blame a lock that did not happen.
         for n in [3, 301, 3600, 86_400] {
             assert_eq!(c.step(close + secs(n), true, HERE), Step::Wait, "{n}");
+            assert_eq!(c.held(), Some(Why::Closed));
         }
         // They lock and come back: asked then.
         assert_eq!(c.step(close + secs(86_403), true, AWAY), Step::Wait);
@@ -405,6 +424,7 @@ mod tests {
         // Seen locked, then the desktop's close is noticed 30 s later, unlocked.
         assert!(!c.here(t + secs(100), &mut || false));
         c.closed(t + secs(130));
+        assert_eq!(c.held(), Some(Why::Locked));
         assert_eq!(c.step(t + secs(133), true, HERE), Step::Ask);
         // An away long before the close does not.
         let (mut c, t) = (Consent::new(), Instant::now());
@@ -514,12 +534,15 @@ mod tests {
             Why::Declined,
             Why::Unanswered,
             Why::Failed,
+            Why::Locked,
             Why::Closed,
             Why::Limit,
         ] {
             let words = why.words().to_lowercase();
             assert!(
-                words.contains("back") || words.contains("turn it on again"),
+                words.contains("back")
+                    || words.contains("unlock")
+                    || words.contains("turn it on again"),
                 "{why:?}: {words}"
             );
         }

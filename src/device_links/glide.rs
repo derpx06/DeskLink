@@ -1351,12 +1351,26 @@ enum ArmError {
 }
 
 /// GetZones is the first thing every arming asks, so it is where a session
-/// the desktop forgot shows up. A timeout is only a busy portal.
+/// the desktop forgot shows up: the portal answered and refused it (its
+/// Response says denied or cancelled), or said the session is not there
+/// (`AccessDenied: Invalid session`, "Object does not exist"). Anything
+/// else (the portal restarting: `ServiceUnknown`, `NoReply`, a cancelled or
+/// timed-out call) is the bus, not the session, and is only retried.
 fn zones_error(error: String) -> ArmError {
-    if error.starts_with("Timed out") {
-        ArmError::Retry(error)
-    } else {
+    let refused = error.starts_with("Desktop permission request")
+        && (error.ends_with("was denied") || error.ends_with("was cancelled"));
+    let missing = [
+        "AccessDenied",
+        "Invalid session",
+        "UnknownObject",
+        "does not exist",
+    ]
+    .iter()
+    .any(|sign| error.contains(sign));
+    if refused || missing {
         ArmError::Gone(error)
+    } else {
+        ArmError::Retry(error)
     }
 }
 
@@ -1381,10 +1395,45 @@ fn arm_retry_after(failures: u32) -> Duration {
 /// Failed armings in a row before the window says so (it keeps trying).
 const ARM_RETRIES: u32 = 3;
 
-/// The computer slept between two looks at the clocks: the wall clock moved
-/// on while the monotonic one (which stops in a suspend) did not.
-fn slept(monotonic: Duration, wall: Duration) -> bool {
-    wall.saturating_sub(monotonic) > Duration::from_secs(5)
+/// Time spent suspended since boot: `CLOCK_BOOTTIME` counts a suspend and
+/// `CLOCK_MONOTONIC` does not, while a wall-clock step (NTP, a manual change)
+/// moves neither.
+fn suspended_so_far() -> Duration {
+    let read = |clock| {
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `time` is a valid, writable timespec for the call.
+        if unsafe { libc::clock_gettime(clock, &mut time) } == 0 {
+            Duration::new(
+                time.tv_sec.max(0) as u64,
+                time.tv_nsec.clamp(0, 999_999_999) as u32,
+            )
+        } else {
+            Duration::ZERO
+        }
+    };
+    let monotonic = read(libc::CLOCK_MONOTONIC);
+    read(libc::CLOCK_BOOTTIME).saturating_sub(monotonic)
+}
+
+/// The computer slept since the last look: its suspended time grew.
+fn slept(suspended_before: Duration, suspended_now: Duration) -> bool {
+    suspended_now.saturating_sub(suspended_before) > Duration::from_secs(5)
+}
+
+/// How long to wait before arming again after the desktop disabled the edge
+/// `disables` times this minute: at once for the first two (a monitor change
+/// sends Disabled and ZonesChanged), then backing off like a failed arming,
+/// so a desktop that keeps disabling it is not re-armed six times a minute
+/// for ever.
+fn rearm_delay(disables: usize) -> Duration {
+    if disables < 3 {
+        Duration::ZERO
+    } else {
+        arm_retry_after(disables as u32 - 1)
+    }
 }
 
 /// Whether this session can glide: Wayland, and a portal with InputCapture
@@ -1717,15 +1766,19 @@ struct State {
     /// A refusal's back-off and whether the person was told, kept across
     /// re-armed sessions: (until, told).
     refusal: (Option<Instant>, bool),
-    /// The window shows the wait (`problem`, "Turn On Again").
-    held_shown: bool,
+    /// The wait the window shows (`problem`, "Turn On Again").
+    held_shown: Option<Why>,
     /// When the portal may be asked for a session (once per run).
     consent: Consent,
     /// The phone's link was ready, and the person here, at the last check.
     was_ready: bool,
     was_here: bool,
-    /// Both clocks at the last check, to notice a sleep.
-    clocks: (Instant, std::time::SystemTime),
+    /// [`suspended_so_far`] at the last check, to notice a sleep.
+    suspended: Duration,
+    /// When the desktop disabled the edge this last minute ([`rearm_delay`]).
+    disables: VecDeque<Instant>,
+    /// GetZones said the session is gone once: one more fresh try first.
+    gone_once: bool,
 }
 
 impl State {
@@ -1737,12 +1790,41 @@ impl State {
             arm_failures: 0,
             retry_at: None,
             refusal: (None, false),
-            held_shown: false,
+            held_shown: None,
             consent: Consent::new(),
             was_ready: false,
             was_here: true,
-            clocks: (Instant::now(), std::time::SystemTime::now()),
+            suspended: suspended_so_far(),
+            disables: VecDeque::new(),
+            gone_once: false,
         }
+    }
+
+    /// The desktop disabled the edge or changed the screens (the session is
+    /// still good): nothing acts on the old barrier any more, and the edge is
+    /// set again on fresh zones, at once unless it keeps happening.
+    fn disabled_by_desktop(&mut self, now: Instant) {
+        self.glide = None;
+        self.disables
+            .retain(|at| now.saturating_duration_since(*at) < MINUTE);
+        if self.disables.len() >= 16 {
+            self.disables.pop_front();
+        }
+        self.disables.push_back(now);
+        self.arm_failures = 0;
+        let delay = rearm_delay(self.disables.len());
+        self.retry_at = (!delay.is_zero()).then(|| now + delay);
+    }
+
+    /// GetZones said the session is gone: true when it should be dropped
+    /// now. The first time, one more fresh GetZones is tried at once (a
+    /// portal that was mid-restart can answer that way once).
+    fn session_gone(&mut self) -> bool {
+        if std::mem::replace(&mut self.gone_once, true) {
+            return true;
+        }
+        self.retry_at = None;
+        false
     }
 
     /// Arm again as soon as the rate allows (new screens, a wake, an unlock).
@@ -1761,12 +1843,14 @@ impl State {
         }
         self.glide = None;
         self.arm_now();
+        self.gone_once = false;
         self.consent.closed(Instant::now());
-        self.held_shown = true;
+        self.held_shown = self.consent.held();
+        let words = self.held_shown.map(|why| why.words().to_string());
         set_status(|status| {
             status.gliding = None;
             status.ready = None;
-            status.problem = Some(Why::Closed.words().to_string());
+            status.problem = words;
             status.can_ask_again = true;
         });
     }
@@ -1950,7 +2034,7 @@ fn run(
                             "[Glide] the desktop disabled the edge or changed screens; re-arming"
                         );
                         portal.disable();
-                        state.arm_now();
+                        state.disabled_by_desktop(Instant::now());
                     }
                 }
                 After::Close(reason) => state.close_session(reason),
@@ -1988,11 +2072,10 @@ fn check(
     outs: &mut Vec<Out>,
 ) {
     let now = Instant::now();
-    let wall = std::time::SystemTime::now();
-    let (then, then_wall) = std::mem::replace(&mut state.clocks, (now, wall));
+    let suspended = suspended_so_far();
     if slept(
-        now.saturating_duration_since(then),
-        wall.duration_since(then_wall).unwrap_or_default(),
+        std::mem::replace(&mut state.suspended, suspended),
+        suspended,
     ) {
         // A wake is a return (even with no lock screen) and a new chance to arm.
         debug_log!("[Glide] the computer slept");
@@ -2025,7 +2108,7 @@ fn check(
             state.glide = None;
         }
         state.arm_now();
-        state.held_shown = false;
+        state.held_shown = None;
         set_status(|status| {
             status.problem = None;
             status.can_ask_again = false;
@@ -2061,7 +2144,7 @@ fn check(
         state.arm_now();
         // Switching Glide is the person acting: a wait after a Cancel ends.
         state.consent.person_acts();
-        state.held_shown = false;
+        state.held_shown = None;
         set_status(|status| {
             status.problem = None;
             status.gliding = None;
@@ -2140,7 +2223,7 @@ fn check(
                     state.consent.answered(Instant::now(), Outcome::Allowed);
                     state.portal = Some(opened);
                     state.arm_now();
-                    state.held_shown = false;
+                    state.held_shown = None;
                 }
                 Err(error) => {
                     log_limited("open", &error);
@@ -2151,7 +2234,7 @@ fn check(
                         Some(why) => why.words().to_string(),
                         None => plain(&error),
                     };
-                    state.held_shown = true;
+                    state.held_shown = state.consent.held();
                     set_status(|status| {
                         status.problem = Some(words);
                         status.can_ask_again = true;
@@ -2160,16 +2243,16 @@ fn check(
             }
             crate::device_links::daemon::state::nudge_tickers();
         } else if let Some(why) = state.consent.held() {
-            if !state.held_shown && device.is_some() {
-                state.held_shown = true;
+            if state.held_shown != Some(why) && device.is_some() {
+                state.held_shown = Some(why);
                 set_status(|status| {
                     status.problem = Some(why.words().to_string());
                     status.can_ask_again = true;
                 });
             }
-        } else if state.held_shown {
+        } else if state.held_shown.is_some() {
             // The wait ended on its own (the person came back, the time ran out).
-            state.held_shown = false;
+            state.held_shown = None;
             set_status(|status| {
                 status.problem = None;
                 status.can_ask_again = false;
@@ -2209,12 +2292,20 @@ fn check(
                         (glide.backoff_until, glide.told) = state.refusal;
                         state.glide = Some(glide);
                         state.arm_now();
+                        state.gone_once = false;
                         set_status(|status| {
                             status.problem = None;
                             status.can_ask_again = false;
                         });
                     }
-                    Err(ArmError::Gone(error)) => gone = Some(error),
+                    Err(ArmError::Gone(error)) => {
+                        log_limited("arm", &error);
+                        if state.session_gone() {
+                            gone = Some(error);
+                        } else {
+                            debug_log!("[Glide] the desktop says the session is gone ({error}); one more try");
+                        }
+                    }
                     Err(ArmError::Retry(error)) => {
                         log_limited("arm", &error);
                         state.arm_failures += 1;
@@ -2243,10 +2334,11 @@ fn check(
             }
             perform(Some(setting.device.as_str()), back, Some(&mut *open));
             open.disable();
+            // Nothing acts on a barrier that is not there.
+            state.glide = None;
         }
     }
     if let Some(error) = gone {
-        log_limited("arm", &error);
         state.close_session(&format!("the desktop no longer knows it ({error})"));
     }
     let edge = state
@@ -2759,31 +2851,96 @@ mod tests {
     /// A session GNOME dropped (at a lock) answers GetZones with "denied":
     /// before, that was retried three times and then glide stayed off for the
     /// run, the dead session kept so even "Ask again" could not help. Now it
-    /// is dropped and a new one asked for. A busy portal is only retried.
+    /// is dropped and a new one asked for. The bus failing under a portal
+    /// that restarts is not the session going: before this, every error but
+    /// a timeout dropped a healthy session.
     #[test]
-    fn a_session_the_desktop_forgot_is_dropped_and_a_busy_one_retried() {
-        assert!(matches!(
-            zones_error("Desktop permission request GetZones was denied".into()),
-            ArmError::Gone(_)
-        ));
-        assert!(matches!(
-            zones_error("Timed out waiting for desktop portal GetZones".into()),
-            ArmError::Retry(_)
-        ));
+    fn only_the_portal_saying_the_session_is_gone_drops_it() {
+        let gone = [
+            "Desktop permission request GetZones was denied",
+            "Desktop permission request GetZones was cancelled",
+            "Desktop portal GetZones failed: GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: \
+             Invalid session",
+            "Desktop portal GetZones failed: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: \
+             Object does not exist at path \u{201c}/org/gnome/Mutter/InputCapture/Session/u2\u{201d}",
+        ];
+        for error in gone {
+            assert!(
+                matches!(zones_error(error.into()), ArmError::Gone(_)),
+                "{error}"
+            );
+        }
+        let bus = [
+            "Timed out waiting for desktop portal GetZones",
+            "Desktop portal GetZones failed: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: \
+             The name is not activatable",
+            "Desktop portal GetZones failed: GDBus.Error:org.freedesktop.DBus.Error.NoReply: \
+             Message recipient disconnected from message bus without replying",
+            "Desktop portal GetZones failed: Operation was cancelled",
+            "Desktop portal GetZones returned no request handle",
+        ];
+        for error in bus {
+            assert!(
+                matches!(zones_error(error.into()), ArmError::Retry(_)),
+                "{error}"
+            );
+        }
     }
 
+    /// One "gone" answer gets one more fresh GetZones at once; the second
+    /// drops the session.
     #[test]
-    fn a_sleep_is_told_from_a_slow_turn() {
+    fn a_session_is_dropped_only_after_a_second_gone_answer() {
+        let mut state = State::new();
+        state.retry_at = Some(Instant::now() + MINUTE);
+        assert!(!state.session_gone(), "first: try again");
+        assert_eq!(state.retry_at, None, "at once");
+        assert!(state.session_gone(), "second: drop it");
+    }
+
+    /// Before: a forward step of the wall clock (NTP after boot) read as a
+    /// sleep and asked at once. Now only time the computer spent suspended
+    /// (boot clock minus monotonic clock) counts.
+    #[test]
+    fn a_sleep_is_the_suspended_time_growing_not_the_wall_clock() {
         let secs = Duration::from_secs;
         assert!(!slept(secs(0), secs(0)));
-        assert!(
-            !slept(secs(30), secs(31)),
-            "a slow turn (a dialog) is not a sleep"
-        );
-        assert!(
-            slept(secs(1), secs(3600)),
-            "an hour of wall clock in a second"
-        );
+        assert!(!slept(secs(100), secs(103)), "rounding");
+        assert!(slept(secs(100), secs(3700)), "an hour suspended");
+        let (before, now) = (suspended_so_far(), suspended_so_far());
+        assert!(!slept(before, now), "no suspend during a test");
+    }
+
+    /// Before: every Disabled or ZonesChanged re-armed at once, six times a
+    /// minute for ever if the desktop kept disabling it. Now the first two
+    /// re-arm at once and a storm backs off; and nothing keeps acting on the
+    /// barrier that was disabled.
+    #[test]
+    fn a_storm_of_disables_backs_off_and_drops_the_old_barrier() {
+        let t = Instant::now();
+        let mut state = State::new();
+        state.glide = Some(Glide::accepting(
+            Barrier::on(Edge::Right, &screen()).unwrap(),
+        ));
+        state.disabled_by_desktop(t);
+        assert!(state.glide.is_none(), "the old barrier is gone");
+        assert_eq!(state.retry_at, None, "first: at once");
+        state.disabled_by_desktop(t + Duration::from_secs(1));
+        assert_eq!(state.retry_at, None, "a monitor change sends two");
+        let mut last = Duration::ZERO;
+        for n in 2..20u64 {
+            let at = t + Duration::from_secs(n);
+            state.disabled_by_desktop(at);
+            let wait = state.retry_at.map(|retry| retry - at).unwrap_or_default();
+            assert!(wait >= last && wait <= MINUTE, "{n}: {wait:?}");
+            last = wait;
+        }
+        assert_eq!(last, MINUTE);
+        assert!(state.disables.len() <= 16);
+        // A quiet minute later: at once again.
+        state.disabled_by_desktop(t + 3 * MINUTE);
+        assert_eq!(state.retry_at, None);
+        assert_eq!(rearm_delay(3), Duration::from_secs(1));
     }
 
     /// The keymap's answers are remembered for a while and then asked again;
