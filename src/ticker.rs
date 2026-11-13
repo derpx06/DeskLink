@@ -45,13 +45,20 @@ pub(crate) fn every_tick_at(pace: fn() -> u32, run: impl FnMut() -> glib::Contro
 
 fn arm(ticker: &Rc<Ticker>, after: Duration) {
     let this = Rc::clone(ticker);
-    let id = glib::timeout_add_local_once(after, move || {
+    let run = move || {
         this.waiting.take();
         let flow = (this.run.borrow_mut())();
         if flow == glib::ControlFlow::Continue {
             arm(&this, Duration::from_secs(u64::from((this.pace)())));
         }
-    });
+    };
+    // Whole-second waits use GLib's seconds timers, which all fire on the
+    // same tick of the second: every ticker (and other such timers) shares one
+    // wakeup instead of each waking the computer on its own.
+    let id = match u32::try_from(after.as_secs()) {
+        Ok(seconds) if seconds > 0 => glib::timeout_add_seconds_local_once(seconds, run),
+        _ => glib::timeout_add_local_once(after, run),
+    };
     ticker.waiting.replace(Some(id));
 }
 
