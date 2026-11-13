@@ -1741,33 +1741,40 @@ fn add_top_bar_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settin
 }
 
 /// System, Light or Dark.
-fn appearance_row() -> adw::ComboRow {
+/// A row with the menu as its suffix rather than an `AdwComboRow`, whose
+/// value label ellipsizes first: at large text it read "S…". Here the
+/// title and subtitle wrap and the choice keeps its full width.
+fn appearance_row() -> adw::ActionRow {
     use crate::application::{appearance_scheme, load_appearance, save_appearance};
     let choices = ["system", "light", "dark"];
-    let row = adw::ComboRow::builder()
+    let row = adw::ActionRow::builder()
         .title("Style")
         .subtitle("Light, dark, or the same as your system")
-        .model(&gtk::StringList::new(&["System", "Light", "Dark"]))
-        .selected(
-            choices
-                .iter()
-                .position(|choice| *choice == load_appearance())
-                .unwrap_or(0) as u32,
-        )
         .build();
     row.add_prefix(&icon_square(
         "preferences-desktop-appearance-symbolic",
         30,
         "row-icon",
     ));
-    row.connect_selected_notify(move |row| {
+    let menu = gtk::DropDown::from_strings(&["System", "Light", "Dark"]);
+    menu.set_valign(gtk::Align::Center);
+    menu.set_selected(
+        choices
+            .iter()
+            .position(|choice| *choice == load_appearance())
+            .unwrap_or(0) as u32,
+    );
+    menu.update_property(&[gtk::accessible::Property::Label("Style")]);
+    menu.connect_selected_notify(move |menu| {
         let choice = choices
-            .get(row.selected() as usize)
+            .get(menu.selected() as usize)
             .copied()
             .unwrap_or("system");
         save_appearance(choice);
         adw::StyleManager::default().set_color_scheme(appearance_scheme(choice));
     });
+    row.add_suffix(&menu);
+    row.set_activatable_widget(Some(&menu));
     row
 }
 
