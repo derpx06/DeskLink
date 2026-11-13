@@ -858,6 +858,7 @@ impl DesktopScreenCapture {
                     &rate,
                     request.fps,
                     chain_stats.clone(),
+                    continuity.map(|continuity| continuity.ssrc),
                 ),
                 chain_stats,
                 pipeline: pipeline.clone(),
@@ -1196,6 +1197,7 @@ fn spawn_bitrate_controller(
     rate: &gst::Element,
     full_fps: i32,
     chain_stats: ChainStats,
+    ssrc: Option<u32>,
 ) -> Arc<AtomicBool> {
     let stop = Arc::new(AtomicBool::new(false));
     let (webrtcbin, encoder, rate, flag) = (
@@ -1221,7 +1223,7 @@ fn spawn_bitrate_controller(
                 else {
                     break;
                 };
-                let (report, bytes_sent) = match link_report(&webrtcbin) {
+                let (report, bytes_sent) = match link_report(&webrtcbin, ssrc) {
                     Ok(report) => report,
                     Err(why) => {
                         // Once per share: reopened shares on a phone logged
@@ -1277,7 +1279,10 @@ fn spawn_bitrate_controller(
 /// far, from `webrtcbin` stats; otherwise why there are none. Waits at most
 /// [`STATS_WAIT`], like the peer's own stats read: an unanswered request
 /// used to hold the controller for the rest of the share.
-fn link_report(webrtcbin: &gst::Element) -> Result<(LinkReport, u64), &'static str> {
+fn link_report(
+    webrtcbin: &gst::Element,
+    ssrc: Option<u32>,
+) -> Result<(LinkReport, u64), &'static str> {
     let (sender, receiver) = std::sync::mpsc::channel();
     let promise = gst::Promise::with_change_func(move |reply| {
         let _ = sender.send(reply.ok().flatten().map(|stats| stats.to_owned()));
@@ -1317,8 +1322,65 @@ fn link_report(webrtcbin: &gst::Element) -> Result<(LinkReport, u64), &'static s
             _ => {}
         }
     }
-    any.then_some((report, bytes))
+    if any {
+        return Ok((report, bytes));
+    }
+    // webrtcbin finds a sender by its SSRC map, and drops the entry when the
+    // sender times out between two shares; a reused `screen_ssrc` is never
+    // added back, so every share after the first had no stats at all (F12).
+    // rtpbin's own session still holds the source and the phone's reports.
+    ssrc.and_then(|ssrc| session_report(webrtcbin, ssrc))
         .ok_or("no receiver report from the phone for the screen stream")
+}
+
+/// The phone's last report about `ssrc`, from `webrtcbin`'s rtpbin session.
+fn session_report(webrtcbin: &gst::Element, ssrc: u32) -> Option<(LinkReport, u64)> {
+    let rtpbin = webrtcbin.downcast_ref::<gst::Bin>()?.by_name("rtpbin")?;
+    // Max-bundle: every section is session 0.
+    let session =
+        rtpbin.emit_by_name::<Option<gst::glib::Object>>("get-internal-session", &[&0u32])?;
+    let stats = session.property::<gst::Structure>("stats");
+    let sources = stats.get::<gst::glib::ValueArray>("source-stats").ok()?;
+    report_for_source(
+        sources
+            .iter()
+            .filter_map(|value| value.get::<gst::Structure>().ok()),
+        ssrc,
+    )
+}
+
+/// An rtpbin source-stats entry for our own `ssrc` turned into a report,
+/// once the phone has sent one (`have-rb`).
+pub(crate) fn report_for_source(
+    mut sources: impl Iterator<Item = gst::Structure>,
+    ssrc: u32,
+) -> Option<(LinkReport, u64)> {
+    let source = sources.find(|source| {
+        source.get::<u32>("ssrc").ok() == Some(ssrc)
+            && source.get::<bool>("internal").unwrap_or(false)
+    })?;
+    if !source.get::<bool>("have-rb").unwrap_or(false) {
+        return None;
+    }
+    let clock_rate = source
+        .get::<i32>("clock-rate")
+        .ok()
+        .filter(|rate| *rate > 0)
+        .unwrap_or(90_000);
+    let report = LinkReport {
+        loss: f64::from(source.get::<u32>("rb-fractionlost").unwrap_or(0)) / 256.0,
+        // NTP short format: 1/65536 s.
+        rtt_ms: source
+            .get::<u32>("rb-round-trip")
+            .ok()
+            .filter(|rtt| *rtt > 0)
+            .map(|rtt| f64::from(rtt) * 1000.0 / 65536.0),
+        jitter_ms: source
+            .get::<u32>("rb-jitter")
+            .ok()
+            .map(|jitter| f64::from(jitter) * 1000.0 / f64::from(clock_rate)),
+    };
+    Some((report, source.get::<u64>("octets-sent").unwrap_or(0)))
 }
 
 /// Longest the rate controller waits for `webrtcbin`'s stats.
@@ -1911,6 +1973,34 @@ mod tests {
         // Untouched when untagged, and an explicit "upright" tag changes nothing.
         let (_, _, upright) = run(Some("rotate-0"));
         assert_eq!(upright, reference);
+    }
+
+    #[test]
+    fn a_reshare_reads_the_phones_report_from_the_rtp_session() {
+        gst::init().unwrap();
+        let source = |ssrc: u32, internal: bool, have_rb: bool| {
+            gst::Structure::builder("application/x-rtp-source-stats")
+                .field("ssrc", ssrc)
+                .field("internal", internal)
+                .field("clock-rate", 90_000i32)
+                .field("octets-sent", 4_000u64)
+                .field("have-rb", have_rb)
+                .field("rb-fractionlost", 64u32)
+                .field("rb-jitter", 900u32)
+                .field("rb-round-trip", 3_277u32)
+                .build()
+        };
+        let (report, bytes) = report_for_source(
+            [source(7, false, true), source(42, true, true)].into_iter(),
+            42,
+        )
+        .expect("our own source, reported on");
+        assert_eq!(bytes, 4_000);
+        assert!((report.loss - 0.25).abs() < 1e-9);
+        assert!((report.jitter_ms.unwrap() - 10.0).abs() < 1e-9);
+        assert!((report.rtt_ms.unwrap() - 50.0).abs() < 0.1);
+        assert!(report_for_source([source(42, true, false)].into_iter(), 42).is_none());
+        assert!(report_for_source([source(42, false, true)].into_iter(), 42).is_none());
     }
 
     #[test]
