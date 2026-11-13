@@ -417,6 +417,32 @@ mod scenarios {
         }
     }
 
+    /// The path dies while the connection is being set up (offer sent,
+    /// nothing back): the attempt ends inside the negotiation timeout, the
+    /// way the coordinator ends it, and leaves nothing that stops the next
+    /// one from connecting at once.
+    #[test]
+    fn a_cut_during_negotiation_gives_up_in_time_and_the_next_attempt_connects() {
+        let chaos = Chaos::new(19);
+        chaos.blackhole(true);
+        let started = Instant::now();
+        assert!(try_link(
+            &chaos,
+            crate::device_links::webrtc::coordinator::NEGOTIATION_TIMEOUT
+        )
+        .is_none());
+        assert!(
+            started.elapsed()
+                < crate::device_links::webrtc::coordinator::NEGOTIATION_TIMEOUT
+                    + Duration::from_secs(2)
+        );
+        chaos.blackhole(false);
+        let linked = link(&chaos);
+        linked.send_numbers(0, 3, Duration::from_millis(10));
+        linked.all_arrived(2, Duration::from_secs(10));
+        linked.close();
+    }
+
     /// A hiccup shorter than the dead time (a Wi-Fi roam, a busy router):
     /// what was sent into it arrives in order once it ends, on the same
     /// connection, and nothing on the way asks for a rebuild.
