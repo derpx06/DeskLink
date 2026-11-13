@@ -36,6 +36,11 @@ flatpak-builder --user --install --force-clean build-flatpak derx06.desklink.com
 flatpak run derx06.desklink.com
 ```
 
+With the `org.flatpak.Builder` app instead of a host `flatpak-builder`, pass
+`--env=FLATPAK_USER_DIR=$HOME/.local/share/flatpak` to `flatpak run`: the app's
+own user installation is elsewhere, and the `rust-stable` extension installed
+with `--user` is not found (`rustc` missing in the desklink module).
+
 Use the `rust-stable` branch that matches the runtime's freedesktop base
 (the `GL` extension `versions` in `flatpak info -m org.gnome.Platform//51`). To build the working tree instead
 of the tag, temporarily replace the git source with

@@ -30,8 +30,8 @@ release and `desklink --check` run):
 |---|---|---|---|---|
 | Arch (2026-11) | 4.24 / 1.10 / 1.28 / 0.84 / 1.99 | yes (`makepkg`, `check()` 3/3) | 1518 of 1521 | yes, every element |
 | Ubuntu 24.04 LTS | 4.14 / 1.5 / 1.24 / 0.76 / 1.85 (`rustc-1.85`) | yes (`dpkg-buildpackage`) | 1516 of 1523 | yes, every element |
-| Debian 13 | 4.18 / 1.7 / 1.26 / 0.80 / 1.85 | yes (`dpkg-buildpackage`) | 1509 of 1523 (before the 1.26 codec fix) | yes |
-| Fedora 43 | 4.20 / 1.8 / 1.26 / 0.82 / 1.99 | F43_BUILD | F43_TESTS | F43_FRESH |
+| Debian 13 | 4.18 / 1.7 / 1.26 / 0.80 / 1.85 | yes (`dpkg-buildpackage`) | 1509 of 1523, run before the GStreamer 1.26 fixes that Fedora 43 confirms | yes |
+| Fedora 43 | 4.20 / 1.8 / 1.26 / 0.82 / 1.99 | yes (`rpmbuild`, `%check` 3/3) | 1519 of 1523 | yes; H.264 decoding needs `gstreamer1-plugin-openh264` (Cisco repository, on by default on Workstation) |
 | openSUSE Tumbleweed | 4.24 / 1.10 / 1.28 / 0.84 / 1.99 | TW_BUILD | TW_TESTS | TW_FRESH |
 | Flatpak (GNOME 51) | 4.24 / 1.10 / 1.28 / 0.84 (built) / stable | yes (`flatpak-builder`, local source) | — | `--check`: link and video ok |
 | Ubuntu 25.10, 26.04 | 4.20 / 1.8 / 1.26 / 0.80; 4.22 / 1.9 / 1.28 / 0.84 | meets the floor (versions checked, not built) | | |
