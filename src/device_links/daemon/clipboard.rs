@@ -278,11 +278,27 @@ pub(super) fn apply_phone_packet(
     ))
 }
 
-/// How long the clipboard poll rests: a second while sharing, and five with
-/// the switch off, when a look only finds the switch still off (an idle
-/// computer should not wake every second for that).
-fn poll_pause(sharing: bool) -> Duration {
-    Duration::from_millis(if sharing { 1000 } else { 5000 })
+/// How long the clipboard poll rests: a second while sharing without the
+/// owner watch; ten with it, which wakes the poll the moment the clipboard
+/// changes (the rest is only a safety net, so an idle computer is not woken
+/// every second to find the same clipboard); five with the switch off, when
+/// a look only finds the switch still off.
+fn poll_pause(sharing: bool, watched: bool) -> Duration {
+    Duration::from_millis(match (sharing, watched) {
+        (true, false) => 1000,
+        (true, true) => 10_000,
+        (false, _) => 5000,
+    })
+}
+
+/// The clipboard poll's thread, woken by the owner watch.
+static POLLER: std::sync::OnceLock<thread::Thread> = std::sync::OnceLock::new();
+
+/// The clipboard changed owner, or the watch ended: the poll looks now.
+fn wake_poller() {
+    if let Some(poller) = POLLER.get() {
+        poller.unpark();
+    }
 }
 
 /// What a phone's clipboard packet did here, for the debug log.
@@ -554,6 +570,7 @@ impl Watching {
 impl Drop for Watching {
     fn drop(&mut self) {
         OWNER_WATCHED.store(false, Ordering::Release);
+        wake_poller();
     }
 }
 
@@ -610,6 +627,7 @@ fn watch_owner_changes() {
             while let Ok(event) = conn.wait_for_event() {
                 if let Event::XfixesSelectionNotify(_) = event {
                     OWNER_GEN.fetch_add(1, Ordering::AcqRel);
+                    wake_poller();
                 }
             }
         });
@@ -770,11 +788,15 @@ impl DaemonWorker {
             // last read for text.
             let mut handle: Option<arboard::Clipboard> = None;
             let mut text_gen = u64::MAX;
-            let mut pause = poll_pause(true);
+            let _ = POLLER.set(thread::current());
+            let mut pause = poll_pause(true, false);
             while !shutdown.load(Ordering::Acquire) {
-                thread::sleep(pause);
+                // Woken early by a copy (see `wake_poller`).
+                thread::park_timeout(pause);
                 let sharing = crate::device_links::config::app_settings().clipboard_sync;
-                pause = poll_pause(sharing);
+                // A copy that could not be checked is asked about again soon.
+                let watched = OWNER_WATCHED.load(Ordering::Acquire) && text_gen != read_again();
+                pause = poll_pause(sharing, watched);
                 if !sharing {
                     handle = None;
                     continue;
@@ -1029,8 +1051,16 @@ mod tests {
 
     #[test]
     fn the_poll_rests_longer_with_sharing_off() {
-        assert_eq!(poll_pause(true), Duration::from_secs(1));
-        assert!(poll_pause(false) > poll_pause(true));
+        assert_eq!(poll_pause(true, false), Duration::from_secs(1));
+        assert!(poll_pause(false, false) > poll_pause(true, false));
+    }
+
+    /// With the owner watch waking it on every copy, the poll's own pace is
+    /// only a safety net: an idle computer is not woken every second.
+    #[test]
+    fn a_watched_clipboard_is_not_polled_every_second() {
+        assert!(poll_pause(true, true) >= Duration::from_secs(10));
+        assert!(poll_pause(false, true) > poll_pause(true, false));
     }
 
     #[test]
