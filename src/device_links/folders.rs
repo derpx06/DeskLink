@@ -136,15 +136,19 @@ fn is_false(value: &bool) -> bool {
 }
 
 /// A name another system (Windows, SAF) can hold too: bounded, with no
-/// `\` or `:`, no control characters, no trailing dot or space.
+/// `\` or `:`, no control characters, no trailing dot or space; and no bidi
+/// override (`invoice<U+202E>fdp.exe` shows as `invoiceexe.pdf`), which
+/// Downloads strips too (`sanitize_filename`).
 pub(crate) fn name_ok(segment: &str) -> bool {
     !segment.is_empty()
         && segment.len() <= MAX_NAME_BYTES
         && !matches!(segment, "." | "..")
         && !segment.ends_with(['.', ' '])
-        && !segment
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+        && !segment.chars().any(|c| {
+            c.is_control()
+                || crate::device_links::webrtc::file_protocol::is_bidi(c)
+                || matches!(c, '/' | '\\' | ':')
+        })
 }
 
 /// A path the Bucket holds: valid names, at most [`MAX_BUCKET_DEPTH`] folder
@@ -1358,7 +1362,10 @@ pub(crate) fn clean_name(raw: &str, fallback: &str) -> String {
     let mut name: String = raw
         .chars()
         .map(|c| {
-            if c.is_control() || matches!(c, '/' | '\\' | ':') {
+            if c.is_control()
+                || crate::device_links::webrtc::file_protocol::is_bidi(c)
+                || matches!(c, '/' | '\\' | ':')
+            {
                 '-'
             } else {
                 c
@@ -4285,6 +4292,8 @@ mod tests {
             "trailing.",
             "trailing ",
             "a\u{7}b",
+            "invoice\u{202E}fdp.exe",
+            "a\u{2066}b",
             &"x".repeat(256),
             &"é".repeat(128),
         ] {

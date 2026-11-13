@@ -714,7 +714,7 @@ fn validate_token(value: &str) -> Result<(), String> {
 /// dropped, an empty result, `.` or `..` becomes `file`, and at most 255 UTF-8
 /// bytes stay. Mirrored by `sanitizeFilename` on Android; both pass
 /// `testdata/filenames.json`.
-fn is_bidi(c: char) -> bool {
+pub(crate) fn is_bidi(c: char) -> bool {
     matches!(
         c,
         '\u{200E}' | '\u{200F}' | '\u{061C}' | '\u{2028}' | '\u{2029}'
