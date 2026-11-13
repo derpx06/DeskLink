@@ -244,6 +244,15 @@ pub(crate) fn held_links(device_id: &str) -> Option<(String, Vec<String>)> {
         .cloned()
 }
 
+/// Forgets the links held from `device_id` and when its last ones opened
+/// (it was unpaired): a gone phone's links never open from the notification.
+pub(crate) fn forget_links(device_id: &str) {
+    if let Ok(mut gate) = LINKS.lock() {
+        gate.opened.remove(device_id);
+        gate.held.remove(device_id);
+    }
+}
+
 /// Takes `url` off `device_id`'s held links; whether it was there. Only a
 /// held link opens from the notification: its action is on the session bus.
 pub(crate) fn take_held_link(device_id: &str, url: &str) -> bool {
@@ -1456,6 +1465,15 @@ mod tests {
         assert!(super::take_held_link(&phone, "https://h/3"));
         assert!(!super::take_held_link(&phone, "https://h/3"), "once");
         assert!(super::held_links(&phone).is_none(), "none left");
+        super::LINKS
+            .lock()
+            .unwrap()
+            .admit(&phone, "Pixel", "https://h/9", at(0));
+        crate::device_links::peers::forget_peer(&phone);
+        assert!(
+            !super::take_held_link(&phone, "https://h/9"),
+            "unpaired: gone"
+        );
     }
 
     #[test]

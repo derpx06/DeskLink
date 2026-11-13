@@ -44,6 +44,7 @@ fn forget_live_and_connection_state(device_id: &str) {
     daemon::discovery::forget_addresses(device_id);
     daemon::file_transfer::forget_waiting(device_id);
     daemon::pairing_commands::forget_proven(device_id);
+    daemon::packet_handler::forget_links(device_id);
     daemon::state::forget_error_time(device_id);
     sync::forget_device(device_id);
     session_lock::forget_unlock(device_id);
@@ -77,6 +78,7 @@ mod tests {
             "device_links/webrtc/coordinator.rs:USED",
             "device_links/webrtc/coordinator.rs:DOZING",
             "device_links/daemon/pairing_commands.rs:PROVEN",
+            "device_links/daemon/packet_handler.rs:LINKS",
             "device_links/webrtc/coordinator.rs:HEARD",
             "device_links/webrtc/screen.rs:PARKED",
             "device_links/webrtc/coordinator.rs:PROBE_NOW",
@@ -126,6 +128,9 @@ mod tests {
             "device_links/webrtc/text_focus.rs:STATE",
             // Throttles that expire by themselves.
             "device_links/daemon/discovery.rs:LAST",
+            // A lock-state answer in flight: its thread removes the entry
+            // when it has answered.
+            "device_links/daemon/packet_handler.rs:LOCK_ANSWERS",
             // When each unpaired card was last heard from: bounded (cleared at 1024), and only
             // decides which card makes room.
             "device_links/daemon/state.rs:UNTRUSTED_SEEN",
