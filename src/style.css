@@ -707,6 +707,23 @@ button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.0
 .ob-kicker { font-size: 0.87em; font-weight: 600; color: @dl_accent_text; }
 .ob-title { font-size: 1.87em; font-weight: 700; letter-spacing: -0.02em; }
 .ob-body { font-size: 1.07em; color: @dl_text_dim; }
+/* The glance: three lines of what it does, the three steps to start. */
+.ob-body.ob-glance-line { color: @dl_text; }
+.ob-steps { padding: 28px; }
+.ob-steps-title { font-size: 1.2em; font-weight: 700; }
+.ob-step { font-size: 1.07em; }
+.ob-step-num {
+  min-width: 32px;
+  min-height: 32px;
+  border-radius: 999px;
+  background-color: @dl_accent_container;
+  color: @dl_on_accent_container;
+  font-weight: 700;
+}
+.ob-body.ob-glance-footer { font-size: 0.93em; }
+/* Get started. */
+.dl-guide { margin: 4px 16px 24px 16px; }
+.dl-guide-not-now { margin-top: 4px; font-weight: 500; color: @dl_accent_text; }
 .ob-last-step { padding: 8px 24px 0 16px; }
 .ob-scene-card {
   padding: 24px;
