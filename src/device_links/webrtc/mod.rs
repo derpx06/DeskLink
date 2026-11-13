@@ -3,6 +3,8 @@
 pub(crate) mod audio;
 pub(crate) mod audio_session;
 pub(crate) mod capture;
+#[cfg(test)]
+mod chaos;
 pub(crate) mod coordinator;
 pub(crate) mod file_lane;
 pub(crate) mod file_protocol;

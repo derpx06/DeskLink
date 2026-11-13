@@ -5514,9 +5514,24 @@ mod tests {
 
     impl LiveRig {
         fn new(label: &str, base: std::path::PathBuf) -> Self {
+            Self::through(label, base, None)
+        }
+
+        /// The same over a [`crate::device_links::webrtc::chaos::Chaos`]
+        /// network. The state and download folders are named after the
+        /// side, so a rig built again on `base` is the same two devices
+        /// after a reconnect.
+        fn through(
+            label: &str,
+            base: std::path::PathBuf,
+            chaos: Option<&Arc<crate::device_links::webrtc::chaos::Chaos>>,
+        ) -> Self {
             use crate::device_links::webrtc::peer_connection::tests as net;
             use crate::device_links::webrtc::PeerEvent;
-            let pair = net::loopback();
+            let pair = match chaos {
+                Some(chaos) => net::loopback_through(chaos),
+                None => net::loopback(),
+            };
             let all = [
                 WebRtcChannel::Control,
                 WebRtcChannel::Events,
@@ -5668,13 +5683,25 @@ mod tests {
         }
 
         fn finished(self) {
+            let base = self.base.clone();
+            self.cut();
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        /// The connection is lost, as the coordinator's worker loses it:
+        /// the managers are detached and stopped, the peers closed. What is
+        /// on disk stays.
+        fn cut(self) {
             self.stop.store(true, Ordering::Release);
             for thread in self.threads {
                 let _ = thread.join();
             }
+            for manager in [&self.offerer, &self.answerer] {
+                manager.detach();
+                manager.shut_down();
+            }
             self.pair_offerer.close();
             self.pair_answerer.close();
-            let _ = std::fs::remove_dir_all(&self.base);
         }
     }
 
@@ -5774,6 +5801,112 @@ mod tests {
         }
         rig.finished();
         seconds
+    }
+
+    /// Bytes under `dir`, all the way down.
+    fn bytes_under(dir: &std::path::Path) -> u64 {
+        std::fs::read_dir(dir).map_or(0, |entries| {
+            entries
+                .flatten()
+                .map(|entry| match entry.metadata() {
+                    Ok(meta) if meta.is_dir() => bytes_under(&entry.path()),
+                    Ok(meta) => meta.len(),
+                    Err(_) => 0,
+                })
+                .sum()
+        })
+    }
+
+    /// A file sent over a network that is cut every `every`: each cut is
+    /// a black hole and then the end of the connection, the way a lost
+    /// Wi-Fi ends it; each reconnect is new peers and new managers on the
+    /// same disks, the way the coordinator rebuilds. The file arrives
+    /// whole, and the cuts cost at most a block and a frame queue each.
+    fn transfer_through_cuts(
+        label: &str,
+        base: std::path::PathBuf,
+        size: u64,
+        every: Duration,
+        at_most: u32,
+        faults: crate::device_links::webrtc::chaos::Faults,
+    ) {
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let source = base.join("cut.bin");
+        write_pattern_file(&source, size, 77);
+        let chaos = crate::device_links::webrtc::chaos::Chaos::new(5);
+        chaos.set(faults);
+        let mut rig = LiveRig::through(label, base.clone(), Some(&chaos));
+        rig.offerer.start_send(&source).unwrap();
+        let (mut cuts, started) = (0u32, Instant::now());
+        let completed = loop {
+            match rig.answerer_done.recv_timeout(every) {
+                Ok(completed) => break completed,
+                Err(_) => {
+                    cuts += 1;
+                    assert!(cuts <= at_most, "still not there after {cuts} cuts");
+                    let held = bytes_under(&base.join("a-state")) + bytes_under(&base.join("a-dl"));
+                    chaos.blackhole(true);
+                    std::thread::sleep(Duration::from_millis(300));
+                    rig.cut();
+                    chaos.blackhole(false);
+                    rig = LiveRig::through(label, base.clone(), Some(&chaos));
+                    // The coordinator resumes on feature-ready.
+                    rig.offerer.resume_sends();
+                    eprintln!(
+                        "[cuts] {label}: cut {cuts} at {:?}, {held} bytes held",
+                        started.elapsed()
+                    );
+                }
+            }
+        };
+        assert_eq!(std::fs::metadata(&completed.path).unwrap().len(), size);
+        assert_eq!(
+            sha_of_file(&completed.path),
+            sha_of_file(&source),
+            "arrived corrupted"
+        );
+        assert!(cuts >= 1, "the transfer was never cut: make it bigger");
+        eprintln!(
+            "[cuts] {label}: {size} bytes through {cuts} cuts in {:?}",
+            started.elapsed()
+        );
+        rig.finished();
+    }
+
+    /// The scenario row "a transfer with cuts", at test-suite size: cut
+    /// every 150 ms of connected time, so every cut lands mid-file.
+    #[test]
+    fn a_transfer_cut_mid_file_resumes_and_arrives_whole() {
+        transfer_through_cuts(
+            "cut-small",
+            live_base("cut-small"),
+            48 << 20,
+            Duration::from_millis(150),
+            40,
+            Default::default(),
+        );
+    }
+
+    /// The full row: 300 MiB, cut every ten seconds (on disk, not in /tmp),
+    /// over a Wi-Fi-like path (about 30 ms round trip with jitter, 0.5 %
+    /// loss) so it takes long enough to be cut several times.
+    #[test]
+    #[ignore = "300 MiB; run with --ignored chaos"]
+    fn chaos_a_300_mib_transfer_cut_every_ten_seconds_arrives_whole() {
+        transfer_through_cuts(
+            "cut-300",
+            bench_base("cut-300"),
+            300 << 20,
+            Duration::from_secs(10),
+            60,
+            crate::device_links::webrtc::chaos::Faults {
+                loss: 0.005,
+                delay: Duration::from_millis(10),
+                jitter: Duration::from_millis(10),
+                ..Default::default()
+            },
+        );
     }
 
     #[test]

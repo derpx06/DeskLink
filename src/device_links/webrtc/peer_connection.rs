@@ -2797,7 +2797,30 @@ a=max-message-size:262144\r\n";
         offer_audio: bool,
         munge: fn(SignalingMessageType, &str) -> String,
     ) -> Loopback {
+        loopback_via(offer_audio, munge, None)
+    }
+
+    /// A loopback whose every packet crosses `chaos` (see
+    /// [`super::super::chaos`]).
+    pub(crate) fn loopback_through(chaos: &Arc<super::super::chaos::Chaos>) -> Loopback {
+        loopback_via(
+            true,
+            |_, sdp| super::super::chaos::without_candidates(sdp),
+            Some(Arc::clone(chaos)),
+        )
+    }
+
+    fn loopback_via(
+        offer_audio: bool,
+        munge: fn(SignalingMessageType, &str) -> String,
+        chaos: Option<Arc<super::super::chaos::Chaos>>,
+    ) -> Loopback {
         let watchdog = Watchdog::start(LOOPBACK_LIMIT);
+        let relay = move |candidate: &str| match &chaos {
+            Some(chaos) => chaos.relay_candidate(candidate),
+            None => Some(candidate.to_string()),
+        };
+        let relay = Arc::new(relay);
         let ice = IceServerConfig {
             local_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
             ..IceServerConfig::default()
@@ -2813,7 +2836,9 @@ a=max-message-size:262144\r\n";
         let (answerer_app_tx, answerer_events) = mpsc::channel();
 
         let to = Arc::clone(&answerer);
+        let relay_o = Arc::clone(&relay);
         std::thread::spawn(move || {
+            let relay = relay_o;
             while let Ok(event) = offerer_raw.recv() {
                 if std::env::var("LOOPBACK_TRACE").is_ok() {
                     debug_log!("OFFERER event: {:?}", event);
@@ -2826,11 +2851,19 @@ a=max-message-size:262144\r\n";
                         sdp_m_line_index,
                         candidate,
                     } => {
-                        let _ = to.add_ice_candidate(sdp_m_line_index, &candidate);
+                        if let Some(candidate) = relay(&candidate) {
+                            let _ = to.add_ice_candidate(sdp_m_line_index, &candidate);
+                        }
                     }
                     PeerEvent::EndOfCandidates => to.end_of_candidates(0),
                     other => {
+                        // Ends with its peer: the threads hold each other's
+                        // peer, so neither would ever be freed otherwise.
+                        let closed = matches!(other, PeerEvent::Closed);
                         let _ = offerer_app_tx.send(other);
+                        if closed {
+                            break;
+                        }
                     }
                 }
             }
@@ -2849,11 +2882,19 @@ a=max-message-size:262144\r\n";
                         sdp_m_line_index,
                         candidate,
                     } => {
-                        let _ = to.add_ice_candidate(sdp_m_line_index, &candidate);
+                        if let Some(candidate) = relay(&candidate) {
+                            let _ = to.add_ice_candidate(sdp_m_line_index, &candidate);
+                        }
                     }
                     PeerEvent::EndOfCandidates => to.end_of_candidates(0),
                     other => {
+                        // Ends with its peer: the threads hold each other's
+                        // peer, so neither would ever be freed otherwise.
+                        let closed = matches!(other, PeerEvent::Closed);
                         let _ = answerer_app_tx.send(other);
+                        if closed {
+                            break;
+                        }
                     }
                 }
             }
@@ -2908,7 +2949,7 @@ a=max-message-size:262144\r\n";
     }
 
     /// `(threads, open fds)` of this process.
-    fn process_counts() -> (usize, usize) {
+    pub(crate) fn process_counts() -> (usize, usize) {
         let count = |path: &str| std::fs::read_dir(path).map_or(0, Iterator::count);
         (count("/proc/self/task"), count("/proc/self/fd"))
     }
@@ -2948,7 +2989,7 @@ a=max-message-size:262144\r\n";
 
     /// The tests that count the process's threads and descriptors, and the one
     /// that makes a hundred pairs, take turns.
-    static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Fifty peers built and closed one after another leave the process with
     /// the threads and file descriptors it started with (a leaked peer cost a
