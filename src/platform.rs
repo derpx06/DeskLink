@@ -346,7 +346,7 @@ const GST_BAD: Packages = Packages {
     debian: "gstreamer1.0-plugins-bad gstreamer1.0-nice",
     fedora: "gstreamer1-plugins-bad-free libnice-gstreamer1",
     arch: "gst-plugins-bad libnice",
-    opensuse: "gstreamer-plugins-bad gstreamer-plugins-libnice",
+    opensuse: "gstreamer-plugins-bad gstreamer-libnice",
 };
 const GST_BASE: Packages = Packages {
     debian: "gstreamer1.0-plugins-base",

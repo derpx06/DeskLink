@@ -48,7 +48,7 @@ Requires:       xdg-desktop-portal
 Requires:       gstreamer-plugins-base
 Requires:       gstreamer-plugins-good
 Requires:       gstreamer-plugins-bad
-Requires:       gstreamer-plugins-libnice
+Requires:       gstreamer-libnice
 Requires:       gstreamer-plugin-pipewire
 # H.264 for phones that encode their screen in hardware; VP8 otherwise.
 Recommends:     gstreamer-plugins-libav
