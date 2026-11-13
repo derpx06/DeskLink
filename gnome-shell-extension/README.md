@@ -7,7 +7,7 @@ DeskLink app running; while it is not, nothing is shown.
 
 ```
 Header            name · "Connected · Wi-Fi · 82% ⚡" · battery ring
-Chips             Connected · Wi-Fi 12 ms · 82% charging · Fast lane · Sound on · DND shared
+Chips             Connected · Wi-Fi 12 ms · 82% charging · Fast, over Wi-Fi · Sound on · DND shared
 Cards             Not connected (Try again / Reconnect) · a call (Answer, Decline, Mute, End)
 Quick actions     Files · Clipboard · Ring · Lock · Screen · Photo
 Now playing       previous · play/pause · next · a timeline (drag or click to seek; dimmed, with the reason, for a stream)
@@ -77,7 +77,7 @@ shows what it looks like on your screen. After `make install` and logging in aga
 2. Open each section; turn a switch on and off and see that the menu stays open and
    the app's Settings page agrees. Try a locked row: it should open DeskLink.
 3. Light and dark style; a small screen (the body should scroll, the footer stay).
-4. Start a file transfer and look for "Fast lane" and the progress bar.
+4. Start a file transfer and look for "Fast, over Wi-Fi" and the progress bar.
 
 ## Install locally
 
