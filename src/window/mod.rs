@@ -125,6 +125,9 @@ fn device_to_show(
 /// The pages, in sidebar order: (name, title, icon). The last is the
 /// sidebar's footer. Frequent pages cluster at the top; Contacts, which is
 /// read-only and rare, comes after Terminals (`UI-REDESIGN.md` 3.9).
+/// How long the page takes to fade in when the window first shows.
+const FIRST_FADE_MS: u32 = 180;
+
 const PAGES: &[(&str, &str, &str)] = &[
     ("home", "Home", "desklink-home-symbolic"),
     ("files", "Files", "desklink-folder-symbolic"),
@@ -267,6 +270,9 @@ mod imp {
         /// handler synchronously, and that handler refreshes again; the nested
         /// call must not redraw what the outer one is in the middle of.
         pub refreshing: Cell<bool>,
+        /// The window has been shown before (its first frame is the layout
+        /// alone; see `set_daemon`).
+        pub shown_once: Cell<bool>,
         /// Debug builds only: devices injected by the `e2e` action's
         /// `fake-device` verb, for screenshots without a phone.
         #[cfg(debug_assertions)]
@@ -300,6 +306,13 @@ mod imp {
             let obj = self.obj();
             self.page.replace("home".to_string());
             let last = sidebar::load_last_device();
+            // A phone was paired last time: the first frame is the real
+            // layout (sidebar, an empty page) while the phones are read, not
+            // an empty welcome page.
+            if last.is_some() {
+                self.main_stack.set_visible_child_name("devices");
+                obj.update_title();
+            }
             self.chosen_device_id.replace(last.clone());
             self.selected_device_id.replace(last);
 
@@ -1057,7 +1070,13 @@ impl DesklinkWindow {
         // when it does not: showing it brings them back at once.
         self.connect_map(|window| {
             crate::device_links::daemon::set_ui_visible(true);
-            window.refresh_soon();
+            // The first time, the page is drawn just after the window's first
+            // frame and faded in, so drawing it never holds the window back.
+            if window.imp().shown_once.replace(true) {
+                window.refresh_soon();
+            } else {
+                window.draw_after_first_frame();
+            }
             // Every ticker was waiting for a window nobody could see.
             crate::ticker::nudge_all();
         });
@@ -1560,6 +1579,36 @@ impl DesklinkWindow {
         unsafe {
             libc::malloc_trim(0);
         }
+    }
+
+    /// The page, drawn once the first frame is on screen, fading in.
+    fn draw_after_first_frame(&self) {
+        let Some(clock) = self.frame_clock() else {
+            return self.refresh_soon();
+        };
+        let handler = std::rc::Rc::new(std::cell::Cell::new(None));
+        let once = handler.clone();
+        let window = self.downgrade();
+        handler.set(Some(clock.connect_after_paint(move |clock| {
+            if let Some(id) = once.take() {
+                clock.disconnect(id);
+            }
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            let page = window.imp().page_stack.get();
+            page.set_opacity(0.0);
+            adw::TimedAnimation::new(
+                &page,
+                0.0,
+                1.0,
+                FIRST_FADE_MS,
+                adw::PropertyAnimationTarget::new(&page, "opacity"),
+            )
+            .play();
+            window.refresh_soon();
+            glib::idle_add_local_once(|| crate::startup("first page drawn"));
+        })));
     }
 
     fn refresh_soon(&self) {
