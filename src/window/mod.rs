@@ -34,6 +34,7 @@ mod vault_banner;
 pub(crate) use calls::{confirm_dial, confirm_message};
 mod clipboard;
 mod contacts;
+mod guide;
 pub(crate) mod history;
 mod notes;
 mod notes_clipboard;
@@ -573,6 +574,14 @@ mod imp {
                         if let Some(daemon) = window.imp().daemon.borrow().clone() {
                             daemon.send(DaemonCommand::Discover);
                             window.show_feature_toast("Searching for devices…");
+                        }
+                    })
+                    .build(),
+                // "Get started": what DeskLink does, one card each.
+                gio::ActionEntry::builder("guide")
+                    .activate(|window: &super::DesklinkWindow, _, _| {
+                        if window.visible_dialog().is_none() {
+                            super::guide::show(window);
                         }
                     })
                     .build(),
@@ -3764,6 +3773,19 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
             _ => adw::ColorScheme::Default,
         }),
         "open-pair" => win.show_discovery_dialog(true),
+        // "guide [scroll N|end]": the Get started guide, open or scrolled.
+        "guide" if id == "scroll" => {
+            if let Some(dialog) = win.visible_dialog() {
+                for scroll in named_widgets(dialog.upcast_ref(), "")
+                    .iter()
+                    .filter_map(|w| w.downcast_ref::<gtk::ScrolledWindow>())
+                {
+                    let adjustment = scroll.vadjustment();
+                    adjustment.set_value(arg.parse().unwrap_or(adjustment.upper()));
+                }
+            }
+        }
+        "guide" => guide::show(win),
         // "palette [QUERY]": "Find anything", with the words typed
         // (underscores for spaces); again closes it.
         "palette" => palette::toggle(win, &format!("{id} {arg}").trim().replace('_', " ")),

@@ -1,6 +1,7 @@
 //! The first-run welcome (`docs/UI-REDESIGN.md` 3.1 and 3.10, the phone's
-//! `screen/onboarding/`): five tour pages, "Set up this computer", then the
-//! existing pairing page with its QR code as the last step.
+//! `screen/onboarding/`): the glance (what DeskLink does and the three steps
+//! to start), three tour pages, "Set up this computer", then the existing
+//! pairing page with its QR code as the last step.
 //!
 //! Shown once, on a computer with no paired phone whose settings do not say
 //! it was seen ([`show_on_start`]); the main menu's "Welcome tour" replays it.
@@ -19,6 +20,33 @@ use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
 use crate::platform::{Check, Distro, Level};
 use crate::shell_dbus::ExtensionStatus;
 
+/// The very first screen: what DeskLink does and how to start, at a glance.
+/// The phone's first screen says the same words.
+pub(super) const GLANCE_KICKER: &str = "Welcome to DeskLink";
+pub(super) const GLANCE_TITLE: &str = "Your phone and computer, together";
+pub(super) const GLANCE_LINES: [(&str, &str); 3] = [
+    (
+        "desklink-desktop-windows-symbolic",
+        "See and control one screen from the other",
+    ),
+    (
+        "desklink-upload-file-symbolic",
+        "Send files, and copy on one, paste on the other",
+    ),
+    (
+        "desklink-notifications-symbolic",
+        "Phone notifications and terminals on both",
+    ),
+];
+pub(super) const GLANCE_STEPS_TITLE: &str = "Start in 3 steps";
+pub(super) const GLANCE_STEPS: [&str; 3] = [
+    "Install DeskLink on both",
+    "Pair once with a code",
+    "Done: they connect on their own",
+];
+pub(super) const GLANCE_FOOTER: &str = "No account. Only your paired devices can connect.";
+pub(super) const GLANCE_START: &str = "Get started";
+
 /// One page of the tour: the small line above the title, the title, the body.
 pub(super) struct TourPage {
     pub kicker: &'static str,
@@ -26,42 +54,29 @@ pub(super) struct TourPage {
     pub body: &'static str,
 }
 
-/// The tour, in order (the phone's five pages, said from the computer's side).
-pub(super) const TOUR: [TourPage; 5] = [
+/// The tour after the glance, in order: one idea, one scene, one sentence
+/// each, in the phone's words.
+pub(super) const TOUR: [TourPage; 3] = [
     TourPage {
-        kicker: "Welcome to DeskLink",
-        title: "Your phone and computer, together",
-        body: "Pair your phone once. After that, its notifications, screen and files are here, \
-               and this computer is one tap away on the phone.",
+        kicker: "Screens",
+        title: "See it. Steer it.",
+        body: "Watch one screen on the other, and use your phone as a touchpad and keyboard.",
     },
     TourPage {
-        kicker: "Screen and control",
-        title: "See it. Steer it.",
-        body: "Show your phone's screen in a window here. Or share this screen with your phone, \
-               and use the phone as its touchpad and keyboard.",
+        kicker: "Share",
+        title: "Files and copies, both ways",
+        body: "Send a file in a tap, and copy on one device to paste on the other.",
     },
     TourPage {
         kicker: "Terminals",
         title: "Terminals that follow you",
-        body: "Start a terminal on your phone and it opens here too, or pick up on the phone \
-               one you started at this computer. Both show the same session.",
-    },
-    TourPage {
-        kicker: "Share",
-        title: "Files, copies and notes, both ways",
-        body: "Drop files on this window to send them. Copy on one device and paste on the \
-               other, and keep notes that show up on both.",
-    },
-    TourPage {
-        kicker: "Private",
-        title: "Yours, end to end",
-        body: "What passes between your phone and this computer is encrypted, only phones you \
-               pair can connect, and there is no account to make.",
+        body: "Start a terminal on one device and pick it up on the other.",
     },
 ];
 
 /// The step after the tour: what this computer needs.
-pub(super) const SETUP: usize = TOUR.len();
+/// Step 0 is the glance, then the tour's pages, then this.
+pub(super) const SETUP: usize = TOUR.len() + 1;
 pub(super) const SETUP_KICKER: &str = "Set up";
 pub(super) const SETUP_TITLE: &str = "Set up this computer";
 pub(super) const SETUP_BODY: &str = "DeskLink checked what it needs on this computer. Fix what \
@@ -73,7 +88,7 @@ pub(super) fn show_on_start(seen: bool, any_paired: bool) -> bool {
     !seen && !any_paired
 }
 
-/// How many segments the progress shows: the tour, the setup step and, when
+/// How many segments the progress shows: the glance, the tour, the setup step and, when
 /// it ends in pairing, the pairing page.
 pub(super) fn segment_count(for_pairing: bool) -> usize {
     SETUP + 1 + usize::from(for_pairing)
@@ -88,8 +103,8 @@ pub(super) enum Nav {
 }
 
 /// Where `nav` goes from `step`: another step, or `None` to leave (to the
-/// pairing page, or back to the phones on a replay). Skip leaves the tour for
-/// the setup step; from the setup step it leaves.
+/// pairing page, or back to the phones on a replay). Skip leaves the glance or
+/// the tour for the setup step; from the setup step it leaves.
 pub(super) fn go(step: usize, nav: Nav) -> Option<usize> {
     match nav {
         Nav::Next if step < SETUP => Some(step + 1),
@@ -120,6 +135,7 @@ pub(super) fn key_nav(key: gdk::Key, rtl: bool) -> Option<Nav> {
 /// The main button's words on `step`.
 pub(super) fn next_label(step: usize, for_pairing: bool) -> &'static str {
     match step {
+        0 => GLANCE_START,
         step if step < SETUP => "Next",
         _ if for_pairing => "Continue",
         _ => "Done",
@@ -176,7 +192,7 @@ pub(super) struct SetupFacts<'a> {
 
 /// The rows of "Set up this computer", in order: start at login,
 /// notifications, the top bar (GNOME), screen sharing, Glide, pairing keys,
-/// the GStreamer plugins. Only what [`crate::platform`] found is said.
+/// video and sound support. Only what [`crate::platform`] found is said.
 pub(super) fn setup_rows(facts: &SetupFacts) -> Vec<SetupRow> {
     let find = |id: &str| facts.checks.iter().find(|check| check.id == id);
     let install = |check: &Check| {
@@ -376,7 +392,8 @@ pub(super) fn setup_rows(facts: &SetupFacts) -> Vec<SetupRow> {
             }
         }
         let mut detail = if worst == Level::Ok {
-            "GStreamer has what DeskLink needs for the connection, the phone's screen and sound."
+            "Ready: this computer has what DeskLink needs for the connection, the phone's \
+             screen and its sound."
                 .to_string()
         } else {
             parts
@@ -392,7 +409,7 @@ pub(super) fn setup_rows(facts: &SetupFacts) -> Vec<SetupRow> {
         rows.push(SetupRow {
             id: "plugins",
             icon: "desklink-movie-symbolic",
-            title: "Video and sound plugins",
+            title: "Video and sound",
             status,
             status_words,
             detail,
@@ -520,6 +537,7 @@ impl Onboarding {
             720.0,
             adw::LengthUnit::Sp,
         ));
+        stack.add_named(&glance_page(&narrow), Some("0"));
         let mut scenes = Vec::new();
         for (index, page) in TOUR.iter().enumerate() {
             let card = gtk::Box::builder()
@@ -549,7 +567,7 @@ impl Onboarding {
             narrow.add_setter(&layout, "spacing", Some(&24.to_value()));
             narrow.add_setter(&layout, "homogeneous", Some(&false.to_value()));
             narrow.add_setter(&card, "halign", Some(&gtk::Align::Fill.to_value()));
-            stack.add_named(&layout, Some(&index.to_string()));
+            stack.add_named(&layout, Some(&(index + 1).to_string()));
         }
         let setup_body = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -563,9 +581,9 @@ impl Onboarding {
         setup.append(&setup_body);
         stack.add_named(&setup, Some(&SETUP.to_string()));
 
-        let titles: Vec<&str> = TOUR
-            .iter()
-            .map(|page| page.title)
+        let titles: Vec<&str> = [GLANCE_TITLE]
+            .into_iter()
+            .chain(TOUR.iter().map(|page| page.title))
             .chain([SETUP_TITLE, "Pair a phone"])
             .take(segment_count(for_pairing))
             .collect();
@@ -759,11 +777,13 @@ impl Onboarding {
     pub(super) fn show(self: &Rc<Self>, step: usize) {
         let step = step.min(SETUP);
         self.step.set(step);
-        if let Some(card) = self.scenes.get(step) {
+        // Step 0 is the glance; tour page `n` is step `n + 1`.
+        let page = step.checked_sub(1);
+        if let Some((page, card)) = page.and_then(|page| Some((page, self.scenes.get(page)?))) {
             while let Some(child) = card.first_child() {
                 card.remove(&child);
             }
-            card.append(&scene(step, !animations_on()));
+            card.append(&scene(page, !animations_on()));
         }
         if step == SETUP {
             self.fill_setup();
@@ -781,7 +801,10 @@ impl Onboarding {
         self.skip.set_visible(step < SETUP);
         let words = next_label(step, self.for_pairing);
         self.next.set_label(words);
-        let title = TOUR.get(step).map_or(SETUP_TITLE, |page| page.title);
+        let title = match page {
+            None => GLANCE_TITLE,
+            Some(page) => TOUR.get(page).map_or(SETUP_TITLE, |page| page.title),
+        };
         let where_ = format!(
             "Step {} of {}: {title}",
             step + 1,
@@ -1065,6 +1088,98 @@ impl Drop for Onboarding {
     }
 }
 
+/// The glance: what DeskLink does in three lines on the left, the three
+/// steps to start in a card on the right (one column when narrow).
+fn glance_page(narrow: &adw::Breakpoint) -> gtk::Box {
+    let words = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .valign(gtk::Align::Center)
+        .hexpand(true)
+        .build();
+    words.append(&label(GLANCE_KICKER, &["ob-kicker"]));
+    let heading = label(GLANCE_TITLE, &["ob-title"]);
+    heading.set_accessible_role(gtk::AccessibleRole::Heading);
+    heading.update_property(&[gtk::accessible::Property::Level(1)]);
+    words.append(&heading);
+    let lines = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(14)
+        .margin_top(12)
+        .build();
+    for (icon, line) in GLANCE_LINES {
+        let row = gtk::Box::builder().spacing(14).build();
+        let square = icon_square(icon, Tone::Accent);
+        square.set_valign(gtk::Align::Center);
+        row.append(&square);
+        let words = label(line, &["ob-body", "ob-glance-line"]);
+        words.set_valign(gtk::Align::Center);
+        words.set_hexpand(true);
+        row.append(&words);
+        lines.append(&row);
+    }
+    words.append(&lines);
+
+    let steps = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .valign(gtk::Align::Center)
+        .css_classes(["ob-scene-card", "ob-steps"])
+        .build();
+    let title = label(GLANCE_STEPS_TITLE, &["ob-steps-title"]);
+    title.set_accessible_role(gtk::AccessibleRole::Heading);
+    title.update_property(&[gtk::accessible::Property::Level(2)]);
+    steps.append(&title);
+    let list = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(14)
+        .accessible_role(gtk::AccessibleRole::List)
+        .build();
+    for (index, step) in GLANCE_STEPS.iter().enumerate() {
+        let row = gtk::Box::builder()
+            .spacing(14)
+            .accessible_role(gtk::AccessibleRole::ListItem)
+            .build();
+        let number = gtk::Label::builder()
+            .label((index + 1).to_string())
+            .valign(gtk::Align::Center)
+            .css_classes(["ob-step-num"])
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build();
+        row.append(&number);
+        let words = label(step, &["ob-step"]);
+        words.set_valign(gtk::Align::Center);
+        words.set_hexpand(true);
+        row.append(&words);
+        row.update_property(&[gtk::accessible::Property::Label(&format!(
+            "Step {}: {step}",
+            index + 1
+        ))]);
+        list.append(&row);
+    }
+    steps.append(&list);
+    let footer = label(GLANCE_FOOTER, &["ob-body", "ob-glance-footer"]);
+    footer.set_margin_top(4);
+    steps.append(&footer);
+
+    let layout = gtk::Box::builder()
+        .spacing(40)
+        .homogeneous(true)
+        .valign(gtk::Align::Center)
+        .vexpand(true)
+        .build();
+    layout.append(&words);
+    layout.append(&steps);
+    narrow.add_setter(
+        &layout,
+        "orientation",
+        Some(&gtk::Orientation::Vertical.to_value()),
+    );
+    narrow.add_setter(&layout, "spacing", Some(&24.to_value()));
+    narrow.add_setter(&layout, "homogeneous", Some(&false.to_value()));
+    layout
+}
+
 /// The kicker, the title (a level 1 heading) and the body of a page.
 fn words_box(kicker: &str, title: &str, body: &str) -> gtk::Box {
     let words = gtk::Box::builder()
@@ -1144,13 +1259,6 @@ fn phone(canvas: &gtk::Fixed, x: f64, y: f64, w: i32, h: i32) -> gtk::Box {
     display
 }
 
-fn tile(icon: &str) -> gtk::CenterBox {
-    gtk::CenterBox::builder()
-        .css_classes(["ob-tile"])
-        .center_widget(&glyph(icon, 14, &[]))
-        .build()
-}
-
 fn term_lines(lines: &[&str], classes: &[&str]) -> gtk::Box {
     let term = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -1176,7 +1284,8 @@ fn term_lines(lines: &[&str], classes: &[&str]) -> gtk::Box {
     term
 }
 
-/// The scene of tour page `page`; `still` when animations are off.
+/// The scene of tour page `page` (screens, share, terminals); `still` when
+/// animations are off.
 pub(super) fn scene(page: usize, still: bool) -> gtk::Fixed {
     let canvas = gtk::Fixed::builder()
         .halign(gtk::Align::Center)
@@ -1192,49 +1301,6 @@ pub(super) fn scene(page: usize, still: bool) -> gtk::Fixed {
     canvas.update_state(&[gtk::accessible::State::Hidden(true)]);
     match page {
         0 => {
-            let screen = laptop(&canvas, 26.0, 56.0, 184, 116);
-            let mark = glyph("desklink-link-symbolic", 40, &["ob-accent"]);
-            mark.set_vexpand(true);
-            screen.append(&mark);
-            let display = phone(&canvas, 266.0, 40.0, 76, 148);
-            let grid = gtk::Grid::builder()
-                .row_spacing(6)
-                .column_spacing(6)
-                .halign(gtk::Align::Center)
-                .valign(gtk::Align::Center)
-                .vexpand(true)
-                .build();
-            for (index, icon) in [
-                "desklink-desktop-windows-symbolic",
-                "desklink-terminal-symbolic",
-                "desklink-folder-symbolic",
-                "desklink-content-paste-symbolic",
-            ]
-            .iter()
-            .enumerate()
-            {
-                grid.attach(&tile(icon), (index % 2) as i32, (index / 2) as i32, 1, 1);
-            }
-            display.append(&grid);
-            for (index, delay) in ["d1", "d2", "d3"].iter().enumerate() {
-                canvas.put(
-                    &shape(&["ob-packet", "travel", delay], 8, 8),
-                    222.0 + 12.0 * index as f64,
-                    110.0,
-                );
-            }
-            canvas.put(
-                &chip("desklink-wifi-symbolic", "Over Wi-Fi", "d1"),
-                26.0,
-                12.0,
-            );
-            canvas.put(
-                &chip("desklink-encrypted-symbolic", "Encrypted", "d2"),
-                196.0,
-                202.0,
-            );
-        }
-        1 => {
             let screen = laptop(&canvas, 20.0, 58.0, 196, 120);
             let window = shape(&["ob-window"], 96, 56);
             window.set_halign(gtk::Align::Start);
@@ -1262,11 +1328,7 @@ pub(super) fn scene(page: usize, still: bool) -> gtk::Fixed {
             }
             display.append(&keys);
             canvas.put(
-                &chip(
-                    "desklink-mobile-screen-share-symbolic",
-                    "Phone screen",
-                    "d1",
-                ),
+                &chip("desklink-desktop-windows-symbolic", "Desk screen", "d1"),
                 20.0,
                 14.0,
             );
@@ -1276,35 +1338,7 @@ pub(super) fn scene(page: usize, still: bool) -> gtk::Fixed {
                 204.0,
             );
         }
-        2 => {
-            let screen = laptop(&canvas, 18.0, 50.0, 214, 130);
-            screen.add_css_class("dark");
-            screen.append(&term_lines(
-                &[
-                    "$ ssh build-box",
-                    "$ cargo build --release",
-                    "   Compiling desklink",
-                    "    Finished in 41 s",
-                ],
-                &["ob-term"],
-            ));
-            let display = phone(&canvas, 266.0, 38.0, 78, 152);
-            display.add_css_class("dark");
-            display.append(&term_lines(
-                &["$ ssh build", "$ cargo build", " Compiling", " Finished"],
-                &["ob-term", "small"],
-            ));
-            canvas.put(
-                &chip(
-                    "desklink-terminal-symbolic",
-                    "Same terminal, both screens",
-                    "d1",
-                ),
-                76.0,
-                204.0,
-            );
-        }
-        3 => {
+        1 => {
             let screen = laptop(&canvas, 20.0, 60.0, 190, 118);
             let drop = gtk::CenterBox::builder()
                 .vexpand(true)
@@ -1358,30 +1392,80 @@ pub(super) fn scene(page: usize, still: bool) -> gtk::Fixed {
             );
         }
         _ => {
-            let shield = gtk::CenterBox::builder()
-                .css_classes(["ob-shield"])
-                .center_widget(&glyph("desklink-encrypted-symbolic", 48, &[]))
-                .build();
-            shield.set_size_request(112, 112);
-            canvas.put(&shield, 124.0, 62.0);
+            let screen = laptop(&canvas, 18.0, 50.0, 214, 130);
+            screen.add_css_class("dark");
+            screen.append(&term_lines(
+                &[
+                    "$ ssh build-box",
+                    "$ cargo build --release",
+                    "   Compiling desklink",
+                    "    Finished in 41 s",
+                ],
+                &["ob-term"],
+            ));
+            let display = phone(&canvas, 266.0, 38.0, 78, 152);
+            display.add_css_class("dark");
+            display.append(&term_lines(
+                &["$ ssh build", "$ cargo build", " Compiling", " Finished"],
+                &["ob-term", "small"],
+            ));
             canvas.put(
-                &chip("desklink-encrypted-symbolic", "Encrypted end to end", "d1"),
-                12.0,
-                24.0,
-            );
-            canvas.put(
-                &chip("desklink-link-symbolic", "Only paired phones", "d2"),
-                200.0,
-                34.0,
-            );
-            canvas.put(
-                &chip("desklink-person-symbolic", "No account", "d3"),
-                128.0,
-                196.0,
+                &chip(
+                    "desklink-terminal-symbolic",
+                    "Same terminal, both screens",
+                    "d1",
+                ),
+                76.0,
+                204.0,
             );
         }
     }
     canvas
+}
+
+/// The rules of `UI-REDESIGN.md` 5.1 for first-run and guide words: no
+/// protocol or technical words, no exclamation marks, nothing promised
+/// off this network while the relay is off (1.3).
+#[cfg(test)]
+pub(super) fn assert_plain(words: &str) {
+    for banned in [
+        "relay",
+        "WebRTC",
+        "peer",
+        "TURN",
+        "handover",
+        "!",
+        "Please",
+        "successfully",
+        "laptop",
+        "KDE",
+        "LAN",
+        "mDNS",
+        "TLS",
+        "protocol",
+        "daemon",
+        "packet",
+        "port",
+        "certificate",
+        "fingerprint",
+        "GStreamer",
+        "plugin",
+        "codec",
+    ] {
+        assert!(!words.contains(banned), "{banned:?} in {words:?}");
+    }
+    if !crate::device_links::relay_link::RELAY_ENABLED {
+        let lower = words.to_lowercase();
+        for promise in [
+            "away from home",
+            "anywhere",
+            "internet",
+            "another network",
+            "off your network",
+        ] {
+            assert!(!lower.contains(promise), "{promise:?} in {words:?}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1397,29 +1481,35 @@ mod tests {
         assert!(!show_on_start(true, true));
     }
 
-    /// Five tour pages, the setup step, then (unpaired) the pairing page:
-    /// Next walks them in order, Back goes one back and stops at the first,
-    /// Skip jumps from any tour page to setup and leaves from setup.
+    /// The glance, three tour pages, the setup step, then (unpaired) the
+    /// pairing page: Next walks them in order, Back goes one back and stops
+    /// at the first, Skip jumps from the glance or any tour page to setup and
+    /// leaves from setup.
     #[test]
     fn the_steps_go_in_order_and_skip_lands_on_setup() {
-        assert_eq!(TOUR.len(), 5);
-        assert_eq!(SETUP, 5);
-        assert_eq!(segment_count(true), 7, "tour, setup, pairing");
-        assert_eq!(segment_count(false), 6, "a replay ends at setup");
+        assert_eq!(TOUR.len(), 3);
+        assert_eq!(SETUP, 4);
+        assert_eq!(segment_count(true), 6, "glance, tour, setup, pairing");
+        assert_eq!(segment_count(false), 5, "a replay ends at setup");
         let mut step = 0;
         let mut seen = vec![step];
         while let Some(next) = go(step, Nav::Next) {
             step = next;
             seen.push(step);
         }
-        assert_eq!(seen, vec![0, 1, 2, 3, 4, 5], "then it leaves for pairing");
+        assert_eq!(seen, vec![0, 1, 2, 3, 4], "then it leaves for pairing");
         assert_eq!(go(0, Nav::Back), Some(0));
-        assert_eq!(go(5, Nav::Back), Some(4));
+        assert_eq!(go(SETUP, Nav::Back), Some(3));
         for page in 0..SETUP {
             assert_eq!(go(page, Nav::Skip), Some(SETUP));
         }
         assert_eq!(go(SETUP, Nav::Skip), None);
-        assert_eq!(next_label(0, true), "Next");
+        assert_eq!(
+            next_label(0, true),
+            "Get started",
+            "the glance's one button"
+        );
+        assert_eq!(next_label(1, true), "Next");
         assert_eq!(next_label(SETUP, true), "Continue");
         assert_eq!(next_label(SETUP, false), "Done");
     }
@@ -1438,8 +1528,64 @@ mod tests {
         assert_eq!(key_nav(Key::space, false), None);
     }
 
-    /// The copy follows the rules of `UI-REDESIGN.md` 5.1: sentence case, no
-    /// protocol words, no exclamation marks.
+    /// The glance and the tour say, word for word, what the phone's first
+    /// screen and tour say (`OnboardingCopyTest` pins the same lines there).
+    #[test]
+    fn the_glance_and_tour_match_the_phone() {
+        assert_eq!(GLANCE_KICKER, "Welcome to DeskLink");
+        assert_eq!(GLANCE_TITLE, "Your phone and computer, together");
+        assert_eq!(
+            GLANCE_LINES.map(|(_, line)| line),
+            [
+                "See and control one screen from the other",
+                "Send files, and copy on one, paste on the other",
+                "Phone notifications and terminals on both",
+            ]
+        );
+        assert_eq!(GLANCE_STEPS_TITLE, "Start in 3 steps");
+        assert_eq!(
+            GLANCE_STEPS,
+            [
+                "Install DeskLink on both",
+                "Pair once with a code",
+                "Done: they connect on their own",
+            ]
+        );
+        assert_eq!(
+            GLANCE_FOOTER,
+            "No account. Only your paired devices can connect."
+        );
+        assert_eq!(GLANCE_START, "Get started");
+        let tour: Vec<[&str; 3]> = TOUR
+            .iter()
+            .map(|page| [page.kicker, page.title, page.body])
+            .collect();
+        assert_eq!(
+            tour,
+            [
+                [
+                    "Screens",
+                    "See it. Steer it.",
+                    "Watch one screen on the other, and use your phone as a touchpad and keyboard."
+                ],
+                [
+                    "Share",
+                    "Files and copies, both ways",
+                    "Send a file in a tap, and copy on one device to paste on the other."
+                ],
+                [
+                    "Terminals",
+                    "Terminals that follow you",
+                    "Start a terminal on one device and pick it up on the other."
+                ],
+            ]
+        );
+        // One sentence a page.
+        for page in &TOUR {
+            assert_eq!(page.body.matches(". ").count(), 0, "{}", page.body);
+        }
+    }
+
     #[test]
     fn the_words_are_plain() {
         let mut all: Vec<&str> = TOUR
@@ -1447,39 +1593,27 @@ mod tests {
             .flat_map(|page| [page.kicker, page.title, page.body])
             .collect();
         all.extend([SETUP_KICKER, SETUP_TITLE, SETUP_BODY]);
+        all.extend([
+            GLANCE_KICKER,
+            GLANCE_TITLE,
+            GLANCE_STEPS_TITLE,
+            GLANCE_FOOTER,
+            GLANCE_START,
+        ]);
+        all.extend(GLANCE_LINES.map(|(_, line)| line));
+        all.extend(GLANCE_STEPS);
         for words in all {
-            for banned in [
-                "relay",
-                "WebRTC",
-                "peer",
-                "TURN",
-                "handover",
-                "!",
-                "Please",
-                "successfully",
-                "laptop",
-                "KDE",
-            ] {
-                assert!(!words.contains(banned), "{banned:?} in {words:?}");
-            }
-            // 1.3 is LAN-only: nothing promises use off this network.
-            if !crate::device_links::relay_link::RELAY_ENABLED {
-                let lower = words.to_lowercase();
-                for promise in ["away from home", "anywhere", "internet", "another network"] {
-                    assert!(!lower.contains(promise), "{promise:?} in {words:?}");
-                }
-            }
+            assert_plain(words);
         }
-        for page in &TOUR {
-            let rest: String = page.title.chars().skip(1).collect();
+        for title in TOUR.iter().map(|page| page.title).chain([GLANCE_TITLE]) {
+            let rest: String = title.chars().skip(1).collect();
             assert!(
                 !rest.split_whitespace().any(|word| word
                     .chars()
                     .next()
                     .is_some_and(char::is_uppercase)
                     && word != "Steer"),
-                "sentence case: {}",
-                page.title
+                "sentence case: {title}"
             );
         }
     }
@@ -1558,6 +1692,9 @@ mod tests {
         );
         for row in &rows {
             assert_eq!(row.status, Status::Ok, "{}: {}", row.id, row.detail);
+            // What a ready computer reads: no technical words.
+            assert_plain(row.title);
+            assert_plain(&row.detail);
         }
         let share = &rows[3];
         assert!(
@@ -1694,7 +1831,12 @@ mod tests {
             assert!(tour.for_pairing);
             assert_eq!(tour.step(), 0);
             assert!(!tour.back.get_visible(), "no Back on the first page");
-            assert!(tour.skip.get_visible());
+            assert!(tour.skip.get_visible(), "Skip on the glance too");
+            assert_eq!(
+                tour.next.label().as_deref(),
+                Some(GLANCE_START),
+                "one obvious button"
+            );
 
             let (paired, _commands) = window();
             let phone = super::super::debug_fake_device("paired", "Pixel 9");
@@ -1786,6 +1928,8 @@ mod tests {
             assert_eq!(visible(&window), "onboarding");
             let tour = window.imp().onboarding.borrow().clone().expect("the tour");
             assert!(!tour.for_pairing);
+            assert_eq!(tour.step(), 0, "a replay starts at the glance");
+            assert_eq!(tour.next.label().as_deref(), Some(GLANCE_START));
             tour.apply(Nav::Skip);
             assert_eq!(tour.next.label().as_deref(), Some("Done"));
             tour.apply(Nav::Next);
