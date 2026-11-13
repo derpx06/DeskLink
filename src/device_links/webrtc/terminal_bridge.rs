@@ -2627,15 +2627,15 @@ mod tests {
         let token = begin(&wire);
         assert_eq!(pump_is_idle(&phone, token), Some(true));
         // Nothing wakes it: the wait lasts the whole timeout. (Other tests
-        // touch bridges at the same time and wake every sleeper: one quiet
-        // wait in a few tries is the proof.)
+        // touch bridges and write to terminals at the same time, which wakes
+        // every sleeper: one quiet wait in many tries is the proof.)
         let mut seen = wake_generation();
         let mut slept = false;
-        for _ in 0..40 {
+        for _ in 0..400 {
             seen = wake_generation();
             let started = Instant::now();
-            wait_for_work(seen, Duration::from_millis(150));
-            if started.elapsed() >= Duration::from_millis(140) {
+            wait_for_work(seen, Duration::from_millis(100));
+            if started.elapsed() >= Duration::from_millis(90) {
                 slept = true;
                 break;
             }

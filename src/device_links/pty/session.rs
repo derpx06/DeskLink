@@ -1252,6 +1252,22 @@ mod tests {
         }
     }
 
+    /// The pumps sleep on the change signal instead of polling the ring, so
+    /// output must end their wait at once (a 30 s wait here would fail the
+    /// test long before it timed out on its own).
+    #[test]
+    fn output_wakes_a_waiting_pump() {
+        let seen = change_generation();
+        let session = echo_session("wake");
+        let started = Instant::now();
+        while session.head() == 0 && started.elapsed() < Duration::from_secs(5) {
+            wait_for_change(seen, Duration::from_secs(30));
+        }
+        assert!(session.head() > 0, "no output was read");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_ne!(change_generation(), seen);
+    }
+
     /// The reattach contract: an offset the ring still holds replays exactly,
     /// and anything older falls back to a snapshot rather than a corrupt
     /// stream that starts mid-escape-sequence.
