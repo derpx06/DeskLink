@@ -311,3 +311,24 @@ fn vcards_read_as_written() {
         assert_eq!(contact.emails, strings(&case["emails"]), "{}", case["case"]);
     }
 }
+
+/// The emergency numbers neither app dials (`wire_values.json`, `telephony`).
+#[test]
+fn the_desk_refuses_the_shared_emergency_numbers() {
+    let f = load(include_str!("../testdata/wire_values.json"));
+    let shared = strings(&f["telephony"]["emergency"]);
+    assert_eq!(
+        shared,
+        crate::device_links::calls::EMERGENCY.map(str::to_string)
+    );
+    for number in &shared {
+        assert!(
+            crate::device_links::calls::dial_refusal(number).is_some(),
+            "{number}"
+        );
+        assert!(
+            crate::device_links::calls::dial_refusal(&format!("+44{number}")).is_some(),
+            "+44{number}"
+        );
+    }
+}

@@ -216,18 +216,30 @@ pub(crate) fn dial_number(text: &str) -> Option<String> {
 /// 112/911/999). A call to one must never start from a computer: nothing
 /// tells the dispatcher where the caller is, and a stray tel: link must not
 /// dial it. The phone refuses them too (`CallTracker.isEmergency`).
-const EMERGENCY: [&str; 20] = [
+pub(crate) const EMERGENCY: [&str; 20] = [
     "112", "911", "999", "000", "110", "119", "118", "122", "100", "101", "102", "108", "115",
     "117", "113", "144", "155", "190", "199", "933",
 ];
 
 /// Why `number` (already through [`dial_number`]) must not be dialled from
-/// here: an emergency number, with or without a leading `+` or `00`.
+/// here: an emergency number, bare, with a leading `+` or `00`, or behind a
+/// country code in international form (`+44 999`, `0044 112`, `+1 911`).
 pub(crate) fn dial_refusal(number: &str) -> Option<&'static str> {
-    let digits = number.trim_start_matches('+');
-    let digits = digits.strip_prefix("00").unwrap_or(digits);
-    EMERGENCY
-        .contains(&digits)
+    // Bare first: Australia's 000 starts like the international prefix 00.
+    let bare = number.strip_prefix('+').unwrap_or(number);
+    let international = number
+        .strip_prefix('+')
+        .or_else(|| number.strip_prefix("00"))
+        .map(|digits| digits.strip_prefix("00").unwrap_or(digits));
+    let emergency = EMERGENCY.contains(&bare)
+        || international.is_some_and(|digits| {
+            EMERGENCY.iter().any(|code| {
+                digits
+                    .strip_suffix(*code)
+                    .is_some_and(|country| country.len() <= 3)
+            })
+        });
+    emergency
         .then_some("Emergency numbers cannot be dialled from the computer. Use the phone itself")
 }
 
@@ -394,11 +406,31 @@ mod tests {
 
     #[test]
     fn emergency_numbers_are_refused_and_premium_ones_flagged() {
-        for n in ["112", "911", "+112", "00112", "999"] {
+        for n in ["112", "911", "+112", "00112", "999", "000", "+000"] {
             assert!(dial_refusal(n).is_some(), "{n}");
             assert!(request(None, "dial", Some(n)).is_err(), "{n}");
         }
-        for n in ["1120", "5551234", "+14155550100", "11"] {
+        // Behind a country code, as typed or from a tel: link.
+        for n in [
+            "+44 999",
+            "0044 112",
+            "+1 911",
+            "+33112",
+            "tel:+49-110",
+            "+61 000",
+        ] {
+            let number = dial_number(n).unwrap();
+            assert!(dial_refusal(&number).is_some(), "{n}");
+            assert!(request(None, "dial", Some(n)).is_err(), "{n}");
+        }
+        for n in [
+            "1120",
+            "5551234",
+            "+14155550100",
+            "11",
+            "+4420 7946 0000",
+            "+1911555",
+        ] {
             assert!(dial_refusal(n).is_none(), "{n}");
         }
         assert!(looks_premium("0900123456") && looks_premium("+1900555"));
