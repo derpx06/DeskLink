@@ -5878,33 +5878,32 @@ mod tests {
         seconds
     }
 
-    /// Bytes under `dir`, all the way down.
-    fn bytes_under(dir: &std::path::Path) -> u64 {
-        std::fs::read_dir(dir).map_or(0, |entries| {
-            entries
-                .flatten()
-                .map(|entry| match entry.metadata() {
-                    Ok(meta) if meta.is_dir() => bytes_under(&entry.path()),
-                    Ok(meta) => meta.len(),
-                    Err(_) => 0,
-                })
-                .sum()
-        })
+    /// When [`transfer_through_cuts`] cuts the connection.
+    enum CutWhen {
+        /// After this much connected time (the soak row; timing-dependent).
+        Every(Duration),
+        /// Once the receiver holds this many more verified blocks than at
+        /// the last cut: every cut lands mid-file whatever the machine's
+        /// load, and each reconnect must make real progress.
+        AfterBlocks(u64),
     }
 
-    /// A file sent over a network that is cut every `every`: each cut is
+    /// A file sent over a network that is cut again and again: each cut is
     /// a black hole and then the end of the connection, the way a lost
     /// Wi-Fi ends it; each reconnect is new peers and new managers on the
     /// same disks, the way the coordinator rebuilds. The file arrives
-    /// whole, and the cuts cost at most a block and a frame queue each.
+    /// whole, and every reconnect goes on from the blocks already verified.
     fn transfer_through_cuts(
         label: &str,
         base: std::path::PathBuf,
         size: u64,
-        every: Duration,
+        when: CutWhen,
         at_most: u32,
         faults: crate::device_links::webrtc::chaos::Faults,
     ) {
+        // A reconnect that makes no progress for this long is stuck (it
+        // takes about a second on a loaded machine).
+        const STUCK: Duration = Duration::from_secs(120);
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).unwrap();
         let source = base.join("cut.bin");
@@ -5914,26 +5913,56 @@ mod tests {
         let mut rig = LiveRig::through(label, base.clone(), Some(&chaos));
         rig.offerer.start_send(&source).unwrap();
         let (mut cuts, started) = (0u32, Instant::now());
+        // Verified blocks held when the connection was last cut.
+        let mut held_at_cut = 0u64;
         let completed = loop {
-            match rig.answerer_done.recv_timeout(every) {
-                Ok(completed) => break completed,
-                Err(_) => {
-                    cuts += 1;
-                    assert!(cuts <= at_most, "still not there after {cuts} cuts");
-                    let held = bytes_under(&base.join("a-state")) + bytes_under(&base.join("a-dl"));
-                    chaos.blackhole(true);
-                    std::thread::sleep(Duration::from_millis(300));
-                    rig.cut();
-                    chaos.blackhole(false);
-                    rig = LiveRig::through(label, base.clone(), Some(&chaos));
-                    // The coordinator resumes on feature-ready.
-                    rig.offerer.resume_sends();
-                    eprintln!(
-                        "[cuts] {label}: cut {cuts} at {:?}, {held} bytes held",
-                        started.elapsed()
-                    );
+            let round = Instant::now();
+            let mut resumed_checked = cuts == 0;
+            let due = loop {
+                match rig.answerer_done.recv_timeout(Duration::from_millis(20)) {
+                    Ok(completed) => break Err(completed),
+                    Err(_) => {}
                 }
-            }
+                let verified = rig.answerer.verified_incoming_blocks();
+                // The first sight of the transfer after a reconnect: it
+                // goes on from what was verified, never from the start.
+                if !resumed_checked && verified > 0 {
+                    assert!(
+                        verified >= held_at_cut,
+                        "cut {cuts}: resumed at block {verified}, below the {held_at_cut} verified"
+                    );
+                    resumed_checked = true;
+                }
+                let cut_now = match when {
+                    CutWhen::Every(every) => round.elapsed() >= every,
+                    CutWhen::AfterBlocks(blocks) => verified >= held_at_cut + blocks,
+                };
+                if cut_now {
+                    break Ok(verified);
+                }
+                assert!(
+                    round.elapsed() < STUCK,
+                    "no progress past {verified} blocks in {STUCK:?} after cut {cuts}"
+                );
+            };
+            let verified = match due {
+                Err(completed) => break completed,
+                Ok(verified) => verified,
+            };
+            held_at_cut = held_at_cut.max(verified);
+            cuts += 1;
+            assert!(cuts <= at_most, "still not there after {cuts} cuts");
+            chaos.blackhole(true);
+            std::thread::sleep(Duration::from_millis(300));
+            rig.cut();
+            chaos.blackhole(false);
+            rig = LiveRig::through(label, base.clone(), Some(&chaos));
+            // The coordinator resumes on feature-ready.
+            rig.offerer.resume_sends();
+            eprintln!(
+                "[cuts] {label}: cut {cuts} at {:?}, {verified} blocks verified",
+                started.elapsed()
+            );
         };
         assert_eq!(std::fs::metadata(&completed.path).unwrap().len(), size);
         assert_eq!(
@@ -5950,15 +5979,18 @@ mod tests {
     }
 
     /// The scenario row "a transfer with cuts", at test-suite size: cut
-    /// every 150 ms of connected time, so every cut lands mid-file.
+    /// each time 6 more blocks are verified, so every cut lands mid-file
+    /// however loaded the machine is, and every reconnect has to resume.
     #[test]
     fn a_transfer_cut_mid_file_resumes_and_arrives_whole() {
+        let size = 48u64 << 20;
+        let step = 6;
         transfer_through_cuts(
             "cut-small",
             live_base("cut-small"),
-            48 << 20,
-            Duration::from_millis(150),
-            40,
+            size,
+            CutWhen::AfterBlocks(step),
+            (size >> 20) as u32 / step as u32 + 1,
             Default::default(),
         );
     }
@@ -5976,7 +6008,7 @@ mod tests {
             "cut-300",
             bench_base("cut-300"),
             300 << 20,
-            Duration::from_secs(10),
+            CutWhen::Every(Duration::from_secs(10)),
             60,
             crate::device_links::webrtc::chaos::Faults {
                 loss: 0.005,
