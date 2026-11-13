@@ -92,6 +92,8 @@ export RUSTFLAGS="${RUSTFLAGS:-} -Cdebuginfo=0"
 %meson_build
 
 %install
+# The same flags as %%build: meson install runs cargo again.
+export RUSTFLAGS="${RUSTFLAGS:-} -Cdebuginfo=0"
 %meson_install
 
 %check
