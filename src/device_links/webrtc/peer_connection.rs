@@ -682,6 +682,66 @@ impl DesktopWebRtcPeer {
         if self.closed.load(Ordering::Acquire) {
             return None;
         }
+        let from_stats = self.selected_pair_from_stats();
+        let complete = |pair: &SelectedPair| {
+            pair.types.len() == 2 && pair.types.iter().all(|kind| !kind.is_empty())
+        };
+        if from_stats.as_ref().is_some_and(complete) {
+            return from_stats;
+        }
+        // GStreamer 1.26's ICE transport leaves the selected pair out of the
+        // stats (1.28 fills it in): the path read as unknown, so unlocking
+        // with the phone was refused as "not on the LAN" and the fast lane
+        // was never used. The ICE agent itself still knows the pair.
+        match self.selected_pair_from_ice() {
+            Some((types, local_ip, remote_ip)) => Some(SelectedPair {
+                types,
+                local_ip,
+                remote_ip,
+                rtt: from_stats.and_then(|pair| pair.rtt),
+            }),
+            None => from_stats,
+        }
+    }
+
+    /// The selected pair as the ICE agent reports it (the transport the data
+    /// channels ride; with max-bundle every section shares it).
+    fn selected_pair_from_ice(
+        &self,
+    ) -> Option<(
+        Vec<String>,
+        Option<std::net::IpAddr>,
+        Option<std::net::IpAddr>,
+    )> {
+        use gst_webrtc::prelude::*;
+        let object = |owner: &gst::glib::Object, name: &str| {
+            owner
+                .find_property(name)
+                .and_then(|_| owner.property::<Option<gst::glib::Object>>(name))
+        };
+        let ice = object(self.webrtcbin.upcast_ref(), "ice-agent")?
+            .downcast::<gst_webrtc::WebRTCICE>()
+            .ok()?;
+        let sctp = object(self.webrtcbin.upcast_ref(), "sctp-transport")?;
+        let dtls = object(&sctp, "transport")?;
+        let transport = object(&dtls, "transport")?;
+        let stream = object(&transport, "stream")?
+            .downcast::<gst_webrtc::WebRTCICEStream>()
+            .ok()?;
+        let (local, remote) = ice.selected_pair(&stream)?;
+        let ip = |stats: &gst_webrtc::WebRTCICECandidateStats| {
+            stats
+                .ipaddr()
+                .and_then(crate::device_links::lan_scope::parse_candidate_ip)
+        };
+        Some((
+            vec![local.type_()?.to_string(), remote.type_()?.to_string()],
+            ip(&local),
+            ip(&remote),
+        ))
+    }
+
+    fn selected_pair_from_stats(&self) -> Option<SelectedPair> {
         let (sender, receiver) = mpsc::channel();
         let promise = gst::Promise::with_change_func(move |reply| {
             let _ = sender.send(reply.ok().flatten().map(|stats| stats.to_owned()));
