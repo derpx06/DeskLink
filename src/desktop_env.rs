@@ -119,10 +119,10 @@ impl Desktop {
             Self::Hyprland => "Add the \"tray\" module to Waybar (or use another bar with a tray).",
             Self::I3 => {
                 "i3bar shows only older tray icons. Run snixembed, or use a bar with a \
-                 StatusNotifier tray such as Waybar or polybar with its tray module."
+                 modern tray, such as Waybar or polybar with its tray module."
             }
             Self::Other => {
-                "Your panel needs a StatusNotifier tray (Plasma, Xfce, MATE, Cinnamon, LXQt, \
+                "Your panel needs a modern system tray (Plasma, Xfce, MATE, Cinnamon, LXQt, \
                  COSMIC, Waybar and swaybar have one)."
             }
         }
