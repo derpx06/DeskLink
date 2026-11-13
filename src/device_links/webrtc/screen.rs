@@ -891,10 +891,13 @@ impl DesktopScreenCapture {
             .filter(|payloader| payloader.has_property("seqnum", None))?;
         Some(RtpResume {
             seqnum: (payloader.property::<u32>("seqnum") as u16).wrapping_add(1),
-            // The id the payloader would give its next frame.
+            // One past the id the payloader would give its next frame: a
+            // frame still being pushed when the chain was detached may have
+            // gone out with that id already, and libwebrtc drops a repeat.
+            // A gap of one is harmless.
             picture_id: payloader
                 .has_property("picture-id", None)
-                .then(|| (payloader.property::<i32>("picture-id") & 0x7fff) as u16),
+                .then(|| ((payloader.property::<i32>("picture-id") + 1) & 0x7fff) as u16),
         })
     }
 
