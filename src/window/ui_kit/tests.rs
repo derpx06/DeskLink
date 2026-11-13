@@ -492,6 +492,8 @@ const OFF_GLOSSARY: &[(&str, &str)] = &[
     ("Lock desk", "Lock computer"),
     ("Ring desk", "Ring computer"),
     ("Turn Off", "Turn off"),
+    ("Handoff", "Hand off"),
+    ("Hand-off", "Hand off"),
 ];
 
 /// `word` in `text` with no letter or digit on either side.
