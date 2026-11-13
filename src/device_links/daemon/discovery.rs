@@ -508,6 +508,33 @@ impl AddressBook {
         }
     }
 
+    /// How a dial to `ip` ended: a pinned handshake verifies the address,
+    /// a failure backs it off (that address only: the phone's others are
+    /// still tried), and a dial that ended with nothing to verify (the link
+    /// was no longer wanted, the phone is unpaired or showed a new
+    /// certificate) only frees it.
+    pub(super) fn dial_ended(
+        &mut self,
+        device_id: &str,
+        ip: std::net::IpAddr,
+        outcome: &Result<bool, String>,
+        now: Instant,
+    ) {
+        match outcome {
+            Ok(true) => self.worked(device_id, ip),
+            Err(_) => self.failed(device_id, ip, now),
+            Ok(false) => {
+                if let Some(known) = self
+                    .phones
+                    .get_mut(device_id)
+                    .and_then(|list| list.iter_mut().find(|known| known.ip == ip))
+                {
+                    known.dialling_until = None;
+                }
+            }
+        }
+    }
+
     /// A dial to `ip` worked: the others are only fallbacks now, and `ip`
     /// stays first.
     pub(super) fn worked(&mut self, device_id: &str, ip: std::net::IpAddr) {
@@ -699,7 +726,7 @@ impl DaemonWorker {
                     let _ = thread::Builder::new().spawn(move || {
                         let _slot = slot;
                         let id = info.id.clone();
-                        match connect_to_device(
+                        let outcome = connect_to_device(
                             info,
                             SocketAddr::new(ip, port),
                             port,
@@ -707,22 +734,14 @@ impl DaemonWorker {
                             devices,
                             sessions,
                             events,
-                        ) {
-                            Ok(()) => {
-                                if let Ok(mut book) = addresses().lock() {
-                                    book.worked(&id, ip);
-                                }
-                            }
-                            Err(error) => {
-                                // Backoff for this address only: the phone's
-                                // others are still tried.
-                                if let Ok(mut book) = addresses().lock() {
-                                    book.failed(&id, ip, Instant::now());
-                                }
-                                debug_log!(
-                                    "[DL-WRTC-BOOT] redial of {id} at {ip}:{port} failed: {error}"
-                                );
-                            }
+                        );
+                        if let Ok(mut book) = addresses().lock() {
+                            book.dial_ended(&id, ip, &outcome, Instant::now());
+                        }
+                        if let Err(error) = outcome {
+                            debug_log!(
+                                "[DL-WRTC-BOOT] redial of {id} at {ip}:{port} failed: {error}"
+                            );
                         }
                     });
                 }
@@ -1096,7 +1115,7 @@ fn handle_identity_packet(
             Arc::clone(&sessions),
             events,
         );
-        if connected.is_ok() {
+        if connected == Ok(true) {
             // Authenticated over this address: now it is a verified one.
             if let Ok(mut book) = addresses().lock() {
                 book.worked(&info.id, address.ip());
@@ -1469,6 +1488,42 @@ mod tests {
             tick(now + Duration::from_secs(13) + DIAL_LEASE, &mut book),
             1
         );
+    }
+
+    /// Only a pinned handshake verifies an address: a dial that ended
+    /// without one (the link stopped being wanted while it connected, an
+    /// unpaired phone, a new certificate) leaves a beacon's address a
+    /// candidate, so it can never push out a verified one.
+    #[test]
+    fn only_a_pinned_handshake_verifies_the_address_dialled() {
+        let mut book = AddressBook::default();
+        let now = Instant::now();
+        for real in ["10.0.0.1", "10.0.0.2", "10.0.0.3"] {
+            book.seen("pinned", ip(real));
+        }
+        book.candidate("pinned", ip("10.0.0.66"));
+        assert_eq!(book.start_dials("pinned", now).len(), 4);
+        book.dial_ended("pinned", ip("10.0.0.66"), &Ok(false), now);
+        let verified = |book: &AddressBook| {
+            book.phones["pinned"]
+                .iter()
+                .filter(|known| known.verified)
+                .map(|known| known.ip.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(verified(&book), ["10.0.0.3", "10.0.0.2", "10.0.0.1"]);
+        assert_eq!(
+            book.due("pinned", now),
+            [ip("10.0.0.66")],
+            "freed, not backed off"
+        );
+        book.dial_ended("pinned", ip("10.0.0.1"), &Err("refused".into()), now);
+        assert!(
+            !book.due("pinned", now).contains(&ip("10.0.0.1")),
+            "backed off"
+        );
+        book.dial_ended("pinned", ip("10.0.0.66"), &Ok(true), now);
+        assert_eq!(verified(&book)[0], "10.0.0.66", "verified and first");
     }
 
     fn plain_info(id: &str) -> DeviceInfo {

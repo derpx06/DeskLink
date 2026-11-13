@@ -36,7 +36,7 @@ pub(super) fn finish_secure_link(
     sessions: Arc<DeviceManager>,
     events: Arc<Mutex<Vec<DaemonEvent>>>,
     dialed_by_us: bool,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let identity = config
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())?
@@ -152,7 +152,8 @@ pub(super) fn finish_secure_link(
                 sessions,
                 events,
             },
-        );
+        )
+        .map(|()| false);
     }
 
     // Merge, never replace. `insert` here rebuilt the `DeviceView` from the
@@ -202,6 +203,7 @@ pub(super) fn finish_secure_link(
         sessions,
         events,
     )
+    .map(|()| paired)
 }
 
 /// Whether a link may be admitted given the pinned-certificate check: as

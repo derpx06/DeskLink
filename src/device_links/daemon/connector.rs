@@ -212,4 +212,5 @@ fn accept_incoming_device(
     finish_secure_link(
         info, ssl_stream, deadline, config, devices, sessions, events, false,
     )
+    .map(|_| ())
 }

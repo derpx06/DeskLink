@@ -152,6 +152,10 @@ pub(super) fn validate_certificate_device_id(
     }
 }
 
+/// Dials a phone and attaches the link. `Ok(true)`: it authenticated with
+/// its pinned certificate, which is what verifies the address; `Ok(false)`:
+/// nothing to verify (the link was no longer wanted, or the phone is not
+/// paired or presented a new certificate).
 pub(super) fn connect_to_device(
     initial_info: DeviceInfo,
     address: SocketAddr,
@@ -160,7 +164,7 @@ pub(super) fn connect_to_device(
     devices: Arc<Mutex<HashMap<String, DeviceView>>>,
     sessions: Arc<DeviceManager>,
     events: Arc<Mutex<Vec<DaemonEvent>>>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // Discovery and an inbound connection can race. If the peer became
     // authoritative after discovery scheduled this worker, do not create a
     // duplicate TLS handshake that will be discarded by Android.
@@ -171,7 +175,7 @@ pub(super) fn connect_to_device(
             || sessions.peer_restarted(&initial_info.id, initial_info.instance_id.as_deref())
     };
     if !wanted() {
-        return Ok(());
+        return Ok(false);
     }
     // Without a timeout a peer that vanished costs ~2 minutes of SYN retries.
     let mut stream = TcpStream::connect_timeout(
@@ -198,7 +202,7 @@ pub(super) fn connect_to_device(
     identity.set("targetDeviceId", initial_info.id.clone());
     identity.set("targetProtocolVersion", PROTOCOL_VERSION);
     if !wanted() {
-        return Ok(());
+        return Ok(false);
     }
     stream
         .write_all(&identity.serialize_line().map_err(|err| err.to_string())?)
