@@ -246,6 +246,42 @@ mod imp {
     impl AdwApplicationImpl for DesklinkApplication {}
 }
 
+/// A web link's host, for a button ("Open example.com").
+fn link_host(url: &str) -> &str {
+    let rest = url
+        .split_once(':')
+        .map_or(url, |(_, rest)| rest)
+        .trim_start_matches('/');
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = host.rsplit('@').next().unwrap_or(host);
+    if host.is_empty() {
+        "link"
+    } else {
+        host
+    }
+}
+
+/// The held-links notification's (title, body).
+fn held_links_words(phone: &str, links: &[String]) -> (String, String) {
+    let title = match links.len() {
+        1 => format!("1 more link from {phone}"),
+        n => format!("{n} more links from {phone}"),
+    };
+    let hosts: Vec<&str> = links
+        .iter()
+        .rev()
+        .take(3)
+        .map(|url| link_host(url))
+        .collect();
+    (
+        title,
+        format!(
+            "Not opened yet, so they do not fill the screen: {}",
+            hosts.join(", ")
+        ),
+    )
+}
+
 /// `DESKLINK_DEBUG`: the moment the window's first frame is on screen
 /// (the frame clock's first `after-paint`), the number a launch is judged by.
 fn first_paint(window: &DesklinkWindow) {
@@ -481,6 +517,25 @@ impl DesklinkApplication {
                 }
             })
             .build();
+        // "Open" on the held-links notification: (device, url). Any process
+        // on the session bus can activate it, so only a link that phone sent
+        // and that is still held opens.
+        let open_held_link_action = gio::ActionEntry::builder("open-held-link")
+            .parameter_type(Some(glib::VariantTy::new("(ss)").expect("valid type")))
+            .activate(move |app: &Self, _, target| {
+                let Some((device, url)) =
+                    target.and_then(|target| target.get::<(String, String)>())
+                else {
+                    return;
+                };
+                if crate::device_links::daemon::take_held_link(&device, &url) {
+                    if let Err(error) = crate::device_links::daemon::open_link_now(&url) {
+                        eprintln!("[DeskLink] {error}");
+                    }
+                    app.show_held_links(&device);
+                }
+            })
+            .build();
         crate::send_to::add_action(self);
         crate::send_to::add_bucket_action(self);
         crate::send_to::add_direct_actions(self);
@@ -501,7 +556,30 @@ impl DesklinkApplication {
             show_received_action,
             call_action,
             dial_action,
+            open_held_link_action,
         ]);
+    }
+
+    /// The one notification for the web links held from `device_id`: "N
+    /// more links from <phone>", an Open button for each of the newest
+    /// three; withdrawn when none is left.
+    pub(crate) fn show_held_links(&self, device_id: &str) {
+        let id = format!("held-links-{device_id}");
+        let Some((phone, links)) = crate::device_links::daemon::held_links(device_id) else {
+            self.withdraw_notification(&id);
+            return;
+        };
+        let (title, body) = held_links_words(&phone, &links);
+        let notification = gio::Notification::new(&title);
+        notification.set_body(Some(&body));
+        for url in links.iter().rev().take(3) {
+            notification.add_button_with_target_value(
+                &format!("Open {}", link_host(url)),
+                "app.open-held-link",
+                Some(&(device_id, url.as_str()).to_variant()),
+            );
+        }
+        self.send_notification(Some(&id), &notification);
     }
 
     /// Like [`Self::dial_with`], for a text message.
@@ -1540,6 +1618,21 @@ fn take_unreported_crash(dir: &std::path::Path) -> bool {
         return false;
     }
     std::fs::write(&seen, b"").is_ok()
+}
+
+#[cfg(test)]
+mod held_links_tests {
+    #[test]
+    fn held_links_are_counted_and_named_by_host() {
+        let links = vec![
+            "https://a.example/x?y".to_string(),
+            "http://u@b.example:8080/".into(),
+        ];
+        let (title, body) = super::held_links_words("Pixel", &links);
+        assert_eq!(title, "2 more links from Pixel");
+        assert!(body.ends_with("b.example:8080, a.example"), "{body}");
+        assert_eq!(super::link_host("https:"), "link");
+    }
 }
 
 #[cfg(test)]

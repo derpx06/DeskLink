@@ -189,7 +189,8 @@ fn run_liveness_tick(
 pub use commands::DaemonCommand;
 pub use handle::{DaemonEvent, DaemonHandle};
 pub(crate) use packet_handler::{
-    admit_lock_operation, is_desktop_locked as desktop_locked, lock_desktop, open_link_now,
+    admit_lock_operation, held_links, is_desktop_locked as desktop_locked, lock_desktop,
+    open_link_now, take_held_link,
 };
 pub(crate) use state::{push_error as push_user_error, push_event};
 

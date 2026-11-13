@@ -48,6 +48,9 @@ pub enum DaemonEvent {
     /// A phone asks to open a link that is not a web page (mail, SMS, map,
     /// call): the person at the desk is asked, naming what it is.
     LinkRequest { phone: String, url: String },
+    /// Web links from a phone came faster than they open: held, and shown
+    /// in one notification (`daemon::held_links`).
+    LinksHeld { device_id: String },
     /// A QR code the phone scanned holds a Wi-Fi network: offer to join.
     WifiFromPhone {
         device_id: String,

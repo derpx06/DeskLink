@@ -1259,6 +1259,14 @@ impl DesklinkWindow {
                 | DaemonEvent::CaptureNotice { message, .. }
                 | DaemonEvent::GlideNotice { message, .. } => self.show_feature_toast(&message),
                 DaemonEvent::LinkRequest { phone, url } => self.ask_to_open_link(&phone, &url),
+                DaemonEvent::LinksHeld { device_id } => {
+                    if let Some(app) = self
+                        .application()
+                        .and_downcast::<crate::DesklinkApplication>()
+                    {
+                        app.show_held_links(&device_id);
+                    }
+                }
                 DaemonEvent::WifiFromPhone { network, .. } => self.offer_wifi(network),
                 // Handled by this refresh itself (the call card and notification).
                 DaemonEvent::CallChanged { .. } => {}

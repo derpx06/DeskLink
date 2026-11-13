@@ -150,12 +150,27 @@ pub(crate) fn opens_silently(url: &str) -> bool {
 /// default handler (GIO, no `xdg-open` needed); any other kind is first shown
 /// to the person at the desk as a question naming what it is.
 fn open_link_from_phone(
+    device_id: &str,
     url: &str,
     phone: &str,
     events: &Arc<Mutex<Vec<DaemonEvent>>>,
 ) -> Result<(), String> {
     if !openable_link(url) {
         return Err("DeskLink refused a link it does not open from a phone".to_string());
+    }
+    if opens_silently(url) {
+        let held = LINKS
+            .lock()
+            .ok()
+            .and_then(|mut gate| gate.admit(device_id, phone, url, std::time::Instant::now()));
+        if held.is_some() {
+            if let Ok(mut events) = events.lock() {
+                events.push(DaemonEvent::LinksHeld {
+                    device_id: device_id.to_string(),
+                });
+            }
+            return Ok(());
+        }
     }
     if !opens_silently(url) {
         if let Ok(mut events) = events.lock() {
@@ -167,6 +182,78 @@ fn open_link_from_phone(
         return Ok(());
     }
     open_link_now(url)
+}
+
+/// Web links a phone may open in a row; more within [`LINK_WINDOW`] are held.
+const LINKS_PER_WINDOW: usize = 3;
+const LINK_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+/// Held links kept per phone (the oldest give way).
+const HELD_LINKS_MAX: usize = 20;
+
+/// Web links from each phone: when the last ones opened, and the ones held
+/// for the person (one notification, "N more links from <phone>"), so a phone
+/// cannot fill the desk with tabs.
+#[derive(Default)]
+pub(crate) struct LinkGate {
+    opened: HashMap<String, std::collections::VecDeque<std::time::Instant>>,
+    held: HashMap<String, (String, Vec<String>)>,
+}
+
+static LINKS: std::sync::LazyLock<Mutex<LinkGate>> = std::sync::LazyLock::new(Default::default);
+
+impl LinkGate {
+    /// `None`: `url` opens now. `Some(n)`: it is held, `n` held in all.
+    fn admit(
+        &mut self,
+        device_id: &str,
+        phone: &str,
+        url: &str,
+        now: std::time::Instant,
+    ) -> Option<usize> {
+        let opened = self.opened.entry(device_id.to_string()).or_default();
+        while opened
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= LINK_WINDOW)
+        {
+            opened.pop_front();
+        }
+        if opened.len() < LINKS_PER_WINDOW {
+            opened.push_back(now);
+            return None;
+        }
+        let (name, held) = self.held.entry(device_id.to_string()).or_default();
+        *name = phone.to_string();
+        if !held.iter().any(|known| known == url) {
+            held.push(url.to_string());
+        }
+        if held.len() > HELD_LINKS_MAX {
+            held.remove(0);
+        }
+        Some(held.len())
+    }
+}
+
+/// The phone's name and the links held from `device_id`, newest last.
+pub(crate) fn held_links(device_id: &str) -> Option<(String, Vec<String>)> {
+    LINKS
+        .lock()
+        .ok()?
+        .held
+        .get(device_id)
+        .filter(|(_, links)| !links.is_empty())
+        .cloned()
+}
+
+/// Takes `url` off `device_id`'s held links; whether it was there. Only a
+/// held link opens from the notification: its action is on the session bus.
+pub(crate) fn take_held_link(device_id: &str, url: &str) -> bool {
+    LINKS.lock().is_ok_and(|mut gate| {
+        gate.held.get_mut(device_id).is_some_and(|(_, links)| {
+            let before = links.len();
+            links.retain(|known| known != url);
+            links.len() != before
+        })
+    })
 }
 
 /// Opens `url` in its default handler (after the check, or the person's yes).
@@ -841,7 +928,7 @@ pub(crate) fn dispatch_webrtc_feature_packet(
                 }
                 Ok(())
             } else if let Some(url) = packet.get_str("url") {
-                open_link_from_phone(url, &binding.link.info.name, events)
+                open_link_from_phone(device_id, url, &binding.link.info.name, events)
             } else {
                 Err("DeskLink WebRTC file transfer requires the file-data channel".to_string())
             }
@@ -1064,18 +1151,42 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             }
             let wants_state = packet.body.contains_key("requestLocked");
             let requested_lock = apply_lock_request(&packet);
-            if wants_state || requested_lock.is_some() {
+            let first = (wants_state || requested_lock.is_some())
+                && LOCK_ANSWERS.lock().is_ok_and(|mut answers| {
+                    ask_lock_answer(&mut answers, device_id, requested_lock.is_some())
+                });
+            // One answer in flight per phone: a query arriving meanwhile
+            // shares it (a flood of them used to start a thread each).
+            if first {
                 let sessions = Arc::clone(sessions);
                 let binding = binding.clone();
+                let device_id = device_id.clone();
                 thread::spawn(move || {
-                    // A command was applied, so the memo cannot be trusted for
-                    // the confirmation; a plain query may use it.
-                    let locked = if requested_lock.is_some() {
-                        thread::sleep(LOCK_SETTLE_DELAY);
-                        sample_desktop_lock_state()
-                    } else {
-                        is_desktop_locked()
-                    };
+                    let mut commanded = false;
+                    let locked =
+                        loop {
+                            let Some(command) = LOCK_ANSWERS.lock().ok().and_then(|mut answers| {
+                                take_lock_command(&mut answers, &device_id)
+                            }) else {
+                                return;
+                            };
+                            commanded |= command;
+                            // A command was applied, so the memo cannot be trusted
+                            // for the confirmation; a plain query may use it.
+                            let locked = if command {
+                                thread::sleep(LOCK_SETTLE_DELAY);
+                                sample_desktop_lock_state()
+                            } else {
+                                is_desktop_locked()
+                            };
+                            // A lock applied while this was sampled is answered
+                            // after its own settle: once more round.
+                            if LOCK_ANSWERS.lock().map_or(true, |mut answers| {
+                                finish_lock_answer(&mut answers, &device_id)
+                            }) {
+                                break locked;
+                            }
+                        };
                     let Ok(transport) =
                         crate::device_links::transport::FeatureTransport::for_binding(
                             &sessions, &binding,
@@ -1083,7 +1194,7 @@ pub(crate) fn dispatch_webrtc_feature_packet(
                     else {
                         return;
                     };
-                    if requested_lock == Some(true) {
+                    if commanded {
                         let mut acknowledgement = NetworkPacket::new(PACKET_TYPE_LOCK);
                         acknowledgement.set("lockResult", locked);
                         let _ = transport.send(&acknowledgement);
@@ -1126,6 +1237,41 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             packet.packet_type
         )),
     }
+}
+
+/// The lock-state answers in flight, per phone: whether a lock command
+/// arrived since the answer last sampled (it must settle and be confirmed).
+static LOCK_ANSWERS: std::sync::LazyLock<Mutex<HashMap<String, bool>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A lock query or command from `device_id`: whether it starts the answer
+/// (`true`), or joins the one in flight.
+fn ask_lock_answer(answers: &mut HashMap<String, bool>, device_id: &str, command: bool) -> bool {
+    match answers.get_mut(device_id) {
+        Some(pending) => {
+            *pending |= command;
+            false
+        }
+        None => {
+            answers.insert(device_id.to_string(), command);
+            true
+        }
+    }
+}
+
+/// Starts a sample: whether a command is to be settled (and clears it).
+fn take_lock_command(answers: &mut HashMap<String, bool>, device_id: &str) -> Option<bool> {
+    answers.get_mut(device_id).map(std::mem::take)
+}
+
+/// After a sample: done (the entry goes), or a command came meanwhile and
+/// another round is needed.
+fn finish_lock_answer(answers: &mut HashMap<String, bool>, device_id: &str) -> bool {
+    if answers.get(device_id) == Some(&true) {
+        return false;
+    }
+    answers.remove(device_id);
+    true
 }
 
 /// Applies a `setLocked` request to the desktop session.
@@ -1236,6 +1382,82 @@ fn spawn_player(program: &str, args: &[&str]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
 
+    /// A flood of lock queries from one phone shares one answer in flight; a
+    /// lock command that arrives meanwhile gets a settled round of its own.
+    #[test]
+    fn lock_queries_share_one_answer_per_phone() {
+        let mut answers = std::collections::HashMap::new();
+        assert!(
+            super::ask_lock_answer(&mut answers, "p", false),
+            "the first starts it"
+        );
+        for _ in 0..1000 {
+            assert!(!super::ask_lock_answer(&mut answers, "p", false));
+        }
+        assert!(
+            super::ask_lock_answer(&mut answers, "q", false),
+            "another phone"
+        );
+        assert_eq!(super::take_lock_command(&mut answers, "p"), Some(false));
+        assert!(
+            !super::ask_lock_answer(&mut answers, "p", true),
+            "a command joins"
+        );
+        assert!(
+            !super::finish_lock_answer(&mut answers, "p"),
+            "and is settled again"
+        );
+        assert_eq!(super::take_lock_command(&mut answers, "p"), Some(true));
+        assert!(super::finish_lock_answer(&mut answers, "p"));
+        assert!(
+            super::ask_lock_answer(&mut answers, "p", false),
+            "a later query starts anew"
+        );
+    }
+
+    /// Three web links in ten seconds open; more are held for the person, one
+    /// list per phone, and open again once the window has passed.
+    #[test]
+    fn a_phone_opens_three_links_in_ten_seconds_and_the_rest_wait() {
+        let mut gate = super::LinkGate::default();
+        let t0 = std::time::Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+        for n in 0..3 {
+            assert_eq!(
+                gate.admit("p", "Pixel", &format!("https://a/{n}"), at(0)),
+                None
+            );
+        }
+        assert_eq!(gate.admit("p", "Pixel", "https://a/3", at(1)), Some(1));
+        assert_eq!(gate.admit("p", "Pixel", "https://a/4", at(2)), Some(2));
+        assert_eq!(
+            gate.admit("q", "Tab", "https://b/0", at(2)),
+            None,
+            "another phone"
+        );
+        assert_eq!(gate.admit("p", "Pixel", "https://a/5", at(10)), None);
+        assert_eq!(gate.held["p"].1, ["https://a/3", "https://a/4"]);
+        for n in 0..50 {
+            gate.admit("p", "Pixel", &format!("https://c/{n}"), at(10));
+        }
+        assert_eq!(gate.held["p"].1.len(), super::HELD_LINKS_MAX);
+
+        // The notification's Open action (on the session bus) opens only a
+        // link that phone sent and that is still held, once.
+        let phone = format!("held-{}", uuid::Uuid::new_v4().simple());
+        for n in 0..4 {
+            super::LINKS
+                .lock()
+                .unwrap()
+                .admit(&phone, "Pixel", &format!("https://h/{n}"), at(0));
+        }
+        assert!(!super::take_held_link(&phone, "https://evil.example/"));
+        assert!(!super::take_held_link("another", "https://h/3"));
+        assert!(super::take_held_link(&phone, "https://h/3"));
+        assert!(!super::take_held_link(&phone, "https://h/3"), "once");
+        assert!(super::held_links(&phone).is_none(), "none left");
+    }
+
     #[test]
     fn only_web_links_open_without_asking_and_the_rest_ask_first() {
         for url in ["https://example.com/a", "HTTP://x.org", "http:rel"] {
@@ -1253,7 +1475,7 @@ mod tests {
         }
         // A mail link is a question, not an open.
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        assert!(super::open_link_from_phone("mailto:a@b.c", "Pixel", &events).is_ok());
+        assert!(super::open_link_from_phone("p", "mailto:a@b.c", "Pixel", &events).is_ok());
         match events.lock().unwrap().as_slice() {
             [crate::device_links::daemon::DaemonEvent::LinkRequest { phone, url }] => {
                 assert_eq!((phone.as_str(), url.as_str()), ("Pixel", "mailto:a@b.c"));
@@ -1262,7 +1484,7 @@ mod tests {
         }
         // A refused kind is an error and asks nothing.
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        assert!(super::open_link_from_phone("file:///etc/passwd", "Pixel", &events).is_err());
+        assert!(super::open_link_from_phone("p", "file:///etc/passwd", "Pixel", &events).is_err());
         assert!(events.lock().unwrap().is_empty());
     }
 
