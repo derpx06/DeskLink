@@ -388,8 +388,15 @@ impl AddressBook {
             return;
         }
         let list = self.phones.entry(device_id.to_string()).or_default();
+        // A dial in flight keeps its lease through a repeat sighting.
+        let dialling = list
+            .iter()
+            .find(|known| known.ip == ip)
+            .and_then(|known| known.dialling_until);
         list.retain(|known| known.ip != ip);
-        list.insert(0, Address::new(ip, true));
+        let mut address = Address::new(ip, true);
+        address.dialling_until = dialling;
+        list.insert(0, address);
         Self::trim_verified(list);
     }
 
@@ -523,15 +530,7 @@ impl AddressBook {
         match outcome {
             Ok(true) => self.worked(device_id, ip),
             Err(_) => self.failed(device_id, ip, now),
-            Ok(false) => {
-                if let Some(known) = self
-                    .phones
-                    .get_mut(device_id)
-                    .and_then(|list| list.iter_mut().find(|known| known.ip == ip))
-                {
-                    known.dialling_until = None;
-                }
-            }
+            Ok(false) => self.release(device_id, ip),
         }
     }
 
@@ -539,6 +538,29 @@ impl AddressBook {
     /// stays first.
     pub(super) fn worked(&mut self, device_id: &str, ip: std::net::IpAddr) {
         self.seen(device_id, ip);
+        self.release(device_id, ip);
+    }
+
+    #[cfg(test)]
+    fn dial_started_for_test(&mut self, device_id: &str, ip: std::net::IpAddr, now: Instant) {
+        if let Some(known) = self
+            .phones
+            .get_mut(device_id)
+            .and_then(|list| list.iter_mut().find(|known| known.ip == ip))
+        {
+            known.dialling_until = Some(now + DIAL_LEASE);
+        }
+    }
+
+    /// The dial to `ip` ended (or never started) with nothing to learn from.
+    pub(super) fn release(&mut self, device_id: &str, ip: std::net::IpAddr) {
+        if let Some(known) = self
+            .phones
+            .get_mut(device_id)
+            .and_then(|list| list.iter_mut().find(|known| known.ip == ip))
+        {
+            known.dialling_until = None;
+        }
     }
 
     /// Any sign of the phone (a network change, a beacon): every address is
@@ -715,15 +737,20 @@ impl DaemonWorker {
                 };
                 for (info, ip, port) in targets {
                     let Some(slot) = super::network::HandshakeSlot::claim(ip) else {
+                        // No dial started: the lease goes back at once.
+                        if let Ok(mut book) = addresses().lock() {
+                            book.release(&info.id, ip);
+                        }
                         continue;
                     };
+                    let (release_id, release_ip) = (info.id.clone(), ip);
                     let (config, devices, sessions, events) = (
                         Arc::clone(&config),
                         Arc::clone(&devices),
                         Arc::clone(&sessions),
                         Arc::clone(&events),
                     );
-                    let _ = thread::Builder::new().spawn(move || {
+                    let spawned = thread::Builder::new().spawn(move || {
                         let _slot = slot;
                         let id = info.id.clone();
                         let outcome = connect_to_device(
@@ -744,6 +771,11 @@ impl DaemonWorker {
                             );
                         }
                     });
+                    if spawned.is_err() {
+                        if let Ok(mut book) = addresses().lock() {
+                            book.release(&release_id, release_ip);
+                        }
+                    }
                 }
             }
         });
@@ -1479,6 +1511,20 @@ mod tests {
         // beside the one in flight.
         book.wake(Some("busy"));
         assert_eq!(tick(now + Duration::from_secs(12), &mut book), 0);
+        // A repeat sighting of the address (a persisted endpoint) keeps the lease.
+        book.dial_started_for_test("busy", ip("10.0.0.8"), now + Duration::from_secs(14));
+        book.seen("busy", ip("10.0.0.8"));
+        assert_eq!(
+            tick(now + Duration::from_secs(15), &mut book),
+            0,
+            "seen() dropped the lease"
+        );
+        book.release("busy", ip("10.0.0.8"));
+        assert_eq!(
+            tick(now + Duration::from_secs(15), &mut book),
+            1,
+            "a dial that never started is freed"
+        );
         // One that worked is dialled again whenever the link is wanted.
         book.worked("busy", ip("10.0.0.8"));
         assert_eq!(tick(now + Duration::from_secs(13), &mut book), 1);

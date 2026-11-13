@@ -5114,12 +5114,31 @@ fn send_signed_signal(
             "[DL-WRTC-BOOT] sent {message_type:?} to {} on session {} generation {}",
             binding.device_id, binding.session_id, binding.generation
         ),
-        Err(error) => eprintln!(
-            "[DL-WRTC-BOOT] FAILED to send {message_type:?} to {}: {error}",
-            binding.device_id
-        ),
+        Err(error) => {
+            eprintln!(
+                "[DL-WRTC-BOOT] FAILED to send {message_type:?} to {}: {error}",
+                binding.device_id
+            );
+            close_link_after_failed_write(&binding.link, error);
+        }
     }
     result
+}
+
+/// A write that failed on the socket itself (EPIPE, ECONNRESET, a write
+/// timeout) means the socket is dead whatever its reader has noticed: it is
+/// closed now, so the reader ends, `wants_bootstrap_connection` turns true and
+/// the redialer replaces it, instead of the link lingering up to 30 s (90 s
+/// dozing) until the liveness tick buries it. A WebRTC peer that is ready is
+/// untouched: the link is retained for it exactly as when the reader ends.
+/// "Closed" and "no stream" errors are not a write and need nothing.
+fn close_link_after_failed_write(link: &crate::device_links::core::SessionLink, error: &str) {
+    if error.contains("Session link is closed")
+        || error.contains("Session link has no network stream")
+    {
+        return;
+    }
+    link.close_at(link.epoch());
 }
 
 fn local_and_remote_device_ids(
@@ -5143,6 +5162,19 @@ fn now_millis() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_failed_write_closes_the_socket_but_closed_link_errors_do_not() {
+        use crate::device_links::core::SessionLink;
+        let link = SessionLink::test_placeholder("phone");
+        super::close_link_after_failed_write(&link, "Session link is closed");
+        assert!(!link.is_closed());
+        super::close_link_after_failed_write(&link, "Broken pipe (os error 32)");
+        assert!(
+            link.is_closed(),
+            "a dead socket is closed so the redialer replaces it"
+        );
+    }
+
     /// The capture watchdog: a quiet stream is rebuilt every
     /// `CAPTURE_STALL`, up to `CAPTURE_RESTARTS` times in a row (~15 s,
     /// longer than a WirePlumber restart), then the share is given up; only
