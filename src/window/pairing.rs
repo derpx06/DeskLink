@@ -21,6 +21,8 @@ use crate::link_glyph::Presentation;
 /// The titles of the pairing dialog (the window closes it when a scan pairs).
 pub(super) const PAIR_TITLE: &str = "Pair another phone";
 pub(super) const PAIR_CODE_TITLE: &str = "Pair with a code";
+/// A phone this computer asked that did not accept (refused, or let it lapse).
+pub(super) const NOT_ACCEPTED: &str = "Not accepted on the phone";
 
 /// What the welcome page says to do.
 pub(super) const WELCOME_HELP: &str = "Open DeskLink on your phone and scan this code.";
@@ -526,8 +528,7 @@ impl PairWatch {
                 // Asked, and now a stranger again (or gone): it did not accept.
                 Some(device) if device.status != DeviceStatus::PairRequestedByPeer => {
                     let mut gone = device.clone();
-                    gone.last_error
-                        .get_or_insert_with(|| "Pairing request was rejected".into());
+                    gone.last_error.get_or_insert_with(|| NOT_ACCEPTED.into());
                     newly.push(gone.name.clone());
                     self.refused.insert(id, (gone, now));
                 }
@@ -645,7 +646,10 @@ fn pair_page(device: &DeviceView, title: &str, help: &str) -> gtk::Box {
         .margin_top(48)
         .halign(gtk::Align::Center)
         .build();
-    view.append(&phone_line(device));
+    // The phone it is about sits apart from the question, not on top of it.
+    let phone = phone_line(device);
+    phone.set_margin_bottom(12);
+    view.append(&phone);
     view.append(
         &gtk::Label::builder()
             .label(title)
@@ -722,10 +726,10 @@ pub(super) fn pair_waiting_view(daemon: &DaemonHandle, device: &DeviceView) -> g
             "Accept the request on the phone."
         },
     );
-    view.append(&gtk::Spinner::builder().spinning(true).build());
     if let Some(key) = &device.verification_key {
         view.append(&pairing_code_label(key));
     }
+    view.append(&gtk::Spinner::builder().spinning(true).build());
     let cancel = button(ButtonKind::Text, "Cancel", None);
     cancel.set_halign(gtk::Align::Center);
     let (daemon, id) = (daemon.clone(), device.id.clone());
@@ -919,10 +923,7 @@ mod welcome_tests {
         assert_eq!(newly, ["Pixel 9"]);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].status, DeviceStatus::Discovered);
-        assert_eq!(
-            kept[0].last_error.as_deref(),
-            Some("Pairing request was rejected")
-        );
+        assert_eq!(kept[0].last_error.as_deref(), Some(NOT_ACCEPTED));
         // The same look again says nothing new and keeps it.
         let (kept, newly) = watch.observe(&[nearby()], t0);
         assert!(newly.is_empty() && kept.len() == 1);

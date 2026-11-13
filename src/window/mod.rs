@@ -3969,7 +3969,7 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
         "refused" => {
             device.trusted = false;
             device.status = DeviceStatus::Discovered;
-            device.last_error = Some("Pairing request was rejected".to_string());
+            device.last_error = Some(pairing::NOT_ACCEPTED.to_string());
         }
         "connecting" => device.status = DeviceStatus::Paired,
         _ => {
