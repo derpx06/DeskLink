@@ -215,7 +215,7 @@ pub(crate) fn dial_number(text: &str) -> Option<String> {
 /// Numbers that reach emergency services (a few countries' short codes and
 /// 112/911/999). A call to one must never start from a computer: nothing
 /// tells the dispatcher where the caller is, and a stray tel: link must not
-/// dial it. The phone refuses them too (`CallTracker.isEmergency`).
+/// dial it. The phone refuses them too (`CallRequests.isEmergency`).
 pub(crate) const EMERGENCY: [&str; 20] = [
     "112", "911", "999", "000", "110", "119", "118", "122", "100", "101", "102", "108", "115",
     "117", "113", "144", "155", "190", "199", "933",

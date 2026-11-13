@@ -337,3 +337,79 @@ fn the_desk_refuses_the_shared_emergency_numbers() {
         );
     }
 }
+
+// ── Body values both apps use (`wire_values.json`) ──────────────────────────
+
+#[test]
+fn the_wire_values_are_the_desks() {
+    use crate::device_links::{calls, desk_features, glide, unlock::Refusal};
+    let f = load(include_str!("../testdata/wire_values.json"));
+
+    // Settings: every report key is sent, and exactly the settable keys apply.
+    let report = desk_features::settings_packet(&Default::default(), "phone");
+    for key in strings(&f["settings"]["reportKeys"]) {
+        assert!(report.body.contains_key(&key), "{key} is reported");
+    }
+    let mut ask = packet_from(&serde_json::json!({}));
+    let every: serde_json::Map<String, Value> = [
+        "clipboard",
+        "commandAlerts",
+        "keepAwake",
+        "notifications",
+        "unlockNearby",
+        "relay",
+        "glide",
+        "dndSync",
+    ]
+    .iter()
+    .map(|key| (key.to_string(), Value::Bool(true)))
+    .collect();
+    ask.set("set", Value::Object(every));
+    let applied: Vec<String> = desk_features::parse_settings_request(&ask, true)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    assert_eq!(applied, strings(&f["settings"]["settable"]));
+
+    // Glide: the desk's ask, as the phone reads it.
+    assert_eq!(Value::Object(glide::turn_on_request().body), f["glideAsk"]);
+
+    // Unlock refusals: every code the desk can send.
+    let ours: Vec<&str> = [
+        Refusal::PrefOff,
+        Refusal::NoNonce,
+        Refusal::Expired,
+        Refusal::WrongDevice,
+        Refusal::Replayed,
+        Refusal::NotLocked,
+        Refusal::NotLan,
+        Refusal::NotReady,
+        Refusal::Failed,
+        Refusal::Unsupported,
+    ]
+    .iter()
+    .map(|refusal| refusal.code())
+    .collect();
+    assert_eq!(ours, strings(&f["unlockRefusals"]));
+
+    // Telephony: states read, actions sent, errors explained, numbers refused.
+    let t = &f["telephony"];
+    for state in strings(&t["callStates"]) {
+        let packet = packet_from(&serde_json::json!({"calls": [{"callId": "c", "state": state}]}));
+        assert!(
+            matches!(calls::parse_status(&packet), Some(Some(_))),
+            "{state} is a call"
+        );
+    }
+    assert_eq!(calls::ACTIONS.to_vec(), strings(&t["actions"]));
+    let generic = calls::parse_error(&packet_from(&serde_json::json!({"error": "?"})));
+    for error in strings(&t["errors"]) {
+        let words = calls::parse_error(&packet_from(&serde_json::json!({"error": error})));
+        assert_eq!(words == generic, error == "failed", "{error}");
+    }
+    for number in strings(&t["emergency"]) {
+        for dialled in [number.clone(), format!("+{number}"), format!("00{number}")] {
+            assert!(calls::dial_refusal(&dialled).is_some(), "{dialled}");
+        }
+    }
+}
