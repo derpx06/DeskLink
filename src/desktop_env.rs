@@ -233,16 +233,44 @@ pub(crate) fn unlock() -> Result<Route, UnlockError> {
         Route::Signal { pid, name } => {
             // hypridle/swayidle `unlock` hooks hear it too.
             let _ = crate::device_links::logind::unlock();
-            if unsafe { libc::kill(*pid, libc::SIGUSR1) } != 0 {
-                return Err(UnlockError::Failed(format!(
-                    "{name}: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
+            signal_locker(*pid, name).map_err(UnlockError::Failed)?;
         }
         Route::Logind => crate::device_links::logind::unlock().map_err(UnlockError::Failed)?,
     }
     Ok(route)
+}
+
+/// `SIGUSR1` to `pid` only while it is still this user's locker `name`. A
+/// pidfd pins the process across the check: a plain `kill` after the scan
+/// (and the logind call before it) could reach whatever program was given
+/// the pid of a locker that had just exited, and `SIGUSR1` ends most programs.
+fn signal_locker(pid: i32, name: &str) -> Result<(), String> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if raw < 0 {
+        return Err(format!("{name}: {}", std::io::Error::last_os_error()));
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+    let proc_dir = std::path::PathBuf::from(format!("/proc/{pid}"));
+    let still_it = std::fs::metadata(&proc_dir)
+        .is_ok_and(|meta| meta.uid() == unsafe { libc::getuid() })
+        && std::fs::read_to_string(proc_dir.join("comm")).is_ok_and(|comm| comm.trim() == name);
+    if !still_it {
+        return Err(format!("{name} is no longer running"));
+    }
+    let sent = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            libc::SIGUSR1,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if sent != 0 {
+        return Err(format!("{name}: {}", std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 /// The session-bus screensavers: each answers `GetActive` and `Lock`.
@@ -454,6 +482,28 @@ mod tests {
         }
         // A near name is not a locker.
         assert_eq!(route(&running(&["swaylock-helper"])), Route::Logind);
+    }
+
+    /// The unlock signal reaches the locker it was meant for, and never a
+    /// different program that holds the pid (a locker that exited and whose
+    /// pid was reused).
+    #[test]
+    fn the_unlock_signal_only_reaches_the_locker_it_names() {
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = other.id() as i32;
+        assert!(signal_locker(pid, "swaylock").is_err());
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "a program that is not the locker was signalled"
+        );
+        // The same pid under its own name is signalled (SIGUSR1 ends sleep).
+        assert_eq!(signal_locker(pid, "sleep"), Ok(()));
+        let status = other.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGUSR1));
     }
 
     #[test]
