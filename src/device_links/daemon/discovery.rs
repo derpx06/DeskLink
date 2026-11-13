@@ -36,7 +36,18 @@ pub(super) fn beacon_again() {
         book.wake(None);
     }
     BEACON_AGAIN.store(true, Ordering::Release);
+    let (lock, wake) = &*BEACON_WAKE;
+    let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+    wake.notify_all();
 }
+
+/// What the broadcaster sleeps on: a network change wakes it at once, so it
+/// no longer polls the flag 4 times a second (240 wakeups a minute).
+static BEACON_WAKE: std::sync::LazyLock<(Mutex<()>, std::sync::Condvar)> =
+    std::sync::LazyLock::new(|| (Mutex::new(()), std::sync::Condvar::new()));
+
+/// Longest the broadcaster sleeps before it looks at shutdown again.
+const BEACON_SLEEP_SLICE: Duration = Duration::from_secs(5);
 
 /// Tests elsewhere: a phone seen at `ip` whose dial just failed, and what is
 /// due to be dialled.
@@ -273,6 +284,8 @@ fn updated_endpoints(
 /// How often paired phones without a bootstrap link are considered for a
 /// redial (each address has its own backoff).
 const REDIAL_EVERY: Duration = Duration::from_secs(1);
+/// The redialer's tick while no phone is paired.
+const REDIAL_IDLE: Duration = Duration::from_secs(15);
 /// Addresses kept per phone (the newest IPv4s; one IPv6 on top).
 const MAX_ADDRESSES: usize = 3;
 /// A dead address is retried after this, doubling per failure up to
@@ -712,7 +725,17 @@ impl DaemonWorker {
         let shutdown = Arc::clone(&self.shutdown);
         thread::spawn(move || {
             while !shutdown.load(Ordering::Acquire) {
-                thread::sleep(REDIAL_EVERY);
+                // Nothing paired: nothing to redial, so it parks (a network
+                // change or beacon wakes it) instead of ticking every second.
+                let paired = devices
+                    .lock()
+                    .is_ok_and(|devices| devices.values().any(|device| device.trusted));
+                let (lock, wake) = &*BEACON_WAKE;
+                let held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = wake.wait_timeout(held, if paired { REDIAL_EVERY } else { REDIAL_IDLE });
+                if !paired {
+                    continue;
+                }
                 // Read before any lock: interfaces come and go (a hotspot,
                 // a VPN), and this computer never dials itself.
                 let own = own_addresses();
@@ -784,7 +807,8 @@ impl DaemonWorker {
     pub(super) fn start_udp_listener(&self) -> Result<(), String> {
         let socket = bind_udp_listener()?;
         socket
-            .set_read_timeout(Some(Duration::from_millis(500)))
+            // Only to look at `shutdown` again: 5 s, not 2 wakeups a second.
+            .set_read_timeout(Some(Duration::from_secs(5)))
             .map_err(|err| err.to_string())?;
         socket.set_broadcast(true).map_err(|err| err.to_string())?;
         let config = Arc::clone(&self.config);
@@ -852,7 +876,8 @@ impl DaemonWorker {
                 beacon_unreachable_paired(&config, &devices, tcp_port);
                 let wait_ms = BEACON_BURST_GAPS_MS.get(sent).copied().unwrap_or(15_000);
                 sent = sent.saturating_add(1);
-                for _ in 0..wait_ms / 250 {
+                let until = Instant::now() + Duration::from_millis(wait_ms);
+                loop {
                     if shutdown.load(Ordering::Acquire) {
                         break;
                     }
@@ -861,7 +886,17 @@ impl DaemonWorker {
                         sent = 0;
                         break;
                     }
-                    thread::sleep(Duration::from_millis(250));
+                    let left = until.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    let (lock, wake) = &*BEACON_WAKE;
+                    let held = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    // Re-checked under the lock a wake needs: none is lost.
+                    if BEACON_AGAIN.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    let _ = wake.wait_timeout(held, left.min(BEACON_SLEEP_SLICE));
                 }
             }
         });
