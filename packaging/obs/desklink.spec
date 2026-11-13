@@ -26,8 +26,13 @@ BuildRequires:  gcc
 BuildRequires:  meson >= 1.0.0
 BuildRequires:  gettext
 BuildRequires:  desktop-file-utils
-BuildRequires:  /usr/bin/glib-compile-resources
-BuildRequires:  /usr/bin/glib-compile-schemas
+# glib-compile-resources and glib-compile-schemas (zypper cannot resolve
+# file paths outside OBS).
+%if 0%{?suse_version}
+BuildRequires:  glib2-tools
+%else
+BuildRequires:  glib2-devel
+%endif
 BuildRequires:  pkgconfig(gtk4) >= 4.12
 BuildRequires:  pkgconfig(libadwaita-1)
 BuildRequires:  pkgconfig(vte-2.91-gtk4) >= 0.76
