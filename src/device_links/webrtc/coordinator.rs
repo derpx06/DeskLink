@@ -5935,9 +5935,8 @@ mod tests {
             let round = Instant::now();
             let mut resumed_checked = cuts == 0;
             let due = loop {
-                match rig.answerer_done.recv_timeout(Duration::from_millis(20)) {
-                    Ok(completed) => break Err(completed),
-                    Err(_) => {}
+                if let Ok(completed) = rig.answerer_done.recv_timeout(Duration::from_millis(20)) {
+                    break Err(completed);
                 }
                 let verified = rig.answerer.verified_incoming_blocks();
                 // The first sight of the transfer after a reconnect: it
