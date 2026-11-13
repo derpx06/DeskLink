@@ -1285,7 +1285,7 @@ fn problem_banner(view: &PairView) -> Option<gtk::Box> {
                 button,
                 "Turn off the Bucket?",
                 "The phone keeps its copy; nothing is deleted on either side.",
-                "Turn Off",
+                "Turn off",
                 move || folders::remove(&id, BUCKET_ID),
             );
         });
@@ -1301,7 +1301,7 @@ fn problem_banner(view: &PairView) -> Option<gtk::Box> {
                 button,
                 "Empty the Bucket on the phone too?",
                 "Everything in it is removed from the phone (to its trash).",
-                "Empty It",
+                "Empty it",
                 move || folders::confirm_empty(&id, BUCKET_ID),
             );
         });

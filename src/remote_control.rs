@@ -372,7 +372,7 @@ pub fn show_remote_control_dialog(
     // After the phone declined or stopped sharing: nothing asks again by
     // itself; the person does, here.
     let ask_again = gtk::Button::builder()
-        .label("Ask Again")
+        .label("Ask again")
         .halign(gtk::Align::Center)
         .css_classes(["pill", "suggested-action"])
         .visible(false)
