@@ -192,7 +192,7 @@ pub(super) struct SetupFacts<'a> {
 
 /// The rows of "Set up this computer", in order: start at login,
 /// notifications, the top bar (GNOME), screen sharing, Glide, pairing keys,
-/// the GStreamer plugins. Only what [`crate::platform`] found is said.
+/// video and sound support. Only what [`crate::platform`] found is said.
 pub(super) fn setup_rows(facts: &SetupFacts) -> Vec<SetupRow> {
     let find = |id: &str| facts.checks.iter().find(|check| check.id == id);
     let install = |check: &Check| {
@@ -392,7 +392,8 @@ pub(super) fn setup_rows(facts: &SetupFacts) -> Vec<SetupRow> {
             }
         }
         let mut detail = if worst == Level::Ok {
-            "GStreamer has what DeskLink needs for the connection, the phone's screen and sound."
+            "Ready: this computer has what DeskLink needs for the connection, the phone's \
+             screen and its sound."
                 .to_string()
         } else {
             parts
@@ -408,7 +409,7 @@ pub(super) fn setup_rows(facts: &SetupFacts) -> Vec<SetupRow> {
         rows.push(SetupRow {
             id: "plugins",
             icon: "desklink-movie-symbolic",
-            title: "Video and sound plugins",
+            title: "Video and sound",
             status,
             status_words,
             detail,
@@ -1447,6 +1448,9 @@ pub(super) fn assert_plain(words: &str) {
         "port",
         "certificate",
         "fingerprint",
+        "GStreamer",
+        "plugin",
+        "codec",
     ] {
         assert!(!words.contains(banned), "{banned:?} in {words:?}");
     }
@@ -1688,6 +1692,9 @@ mod tests {
         );
         for row in &rows {
             assert_eq!(row.status, Status::Ok, "{}: {}", row.id, row.detail);
+            // What a ready computer reads: no technical words.
+            assert_plain(row.title);
+            assert_plain(&row.detail);
         }
         let share = &rows[3];
         assert!(
