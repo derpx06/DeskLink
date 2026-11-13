@@ -197,6 +197,8 @@ impl TrayEntry {
 struct State {
     /// One line per active session, e.g. "Pixel 8 — controlling the screen".
     lines: Vec<String>,
+    /// The tooltip when nothing is live: each phone, its connection and battery.
+    summary: String,
     entries: Vec<TrayEntry>,
     revision: u32,
     /// One of the `ICON_*` names.
@@ -229,12 +231,22 @@ impl Tray {
     pub fn new(actions: TrayActions) -> Result<Self, String> {
         let connection = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>)
             .map_err(|error| error.to_string())?;
+        let theme_path = install_icons()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        Self::on_connection(connection, theme_path, actions)
+    }
+
+    /// [`Tray::new`] on `connection`, with the icons under `theme_path`.
+    fn on_connection(
+        connection: gio::DBusConnection,
+        theme_path: String,
+        actions: TrayActions,
+    ) -> Result<Self, String> {
         let node = gio::DBusNodeInfo::for_xml(XML).map_err(|error| error.to_string())?;
         let state = Rc::new(RefCell::new(State {
             icon: ICON_OFFLINE,
-            theme_path: install_icons()
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default(),
+            theme_path,
             ..State::default()
         }));
         let actions = Rc::new(actions);
@@ -342,11 +354,13 @@ impl Tray {
         self.hosted.registered.get() && self.hosted.host.get()
     }
 
-    /// Shows `lines` (one per active session; the tooltip), the menu
-    /// `entries` and the `icon` (an `ICON_*`). Signals only on change.
+    /// Shows `lines` (one per active session; the tooltip), else `summary`
+    /// (each phone and its battery), the menu `entries` and the `icon` (an
+    /// `ICON_*`). Signals only on change.
     pub fn update(
         &self,
         lines: Vec<String>,
+        summary: String,
         entries: Vec<TrayEntry>,
         icon: &'static str,
         passive: bool,
@@ -355,6 +369,7 @@ impl Tray {
         {
             let mut state = self.state.borrow_mut();
             if state.lines == lines
+                && state.summary == summary
                 && state.entries == entries
                 && state.icon == icon
                 && state.passive == passive
@@ -365,6 +380,7 @@ impl Tray {
             state.passive = passive;
             icon_changed = state.icon != icon;
             state.lines = lines;
+            state.summary = summary;
             state.entries = entries;
             state.icon = icon;
             state.revision = state.revision.wrapping_add(1);
@@ -482,7 +498,7 @@ fn item_property(name: &str, state: &State) -> Variant {
         "IconThemePath" => state.theme_path.to_variant(),
         "ToolTip" => {
             let body = if state.lines.is_empty() {
-                "No phone is using this computer".to_string()
+                state.summary.clone()
             } else {
                 state.lines.join("\n")
             };
@@ -706,6 +722,7 @@ mod tests {
         };
         let state = State {
             lines: vec!["Pixel — controlling the screen".into()],
+            summary: String::new(),
             entries: vec![
                 TrayEntry::Label("Pixel · Connected".into()),
                 TrayEntry::action("Ring Pixel", "ring:p1"),
@@ -826,6 +843,270 @@ mod tests {
             item_property("ToolTip", &state).type_().as_str(),
             "(sa(iiay)ss)"
         );
+    }
+
+    /// A private `dbus-daemon` for one test, stopped when dropped.
+    struct PrivateBus(std::process::Child, String);
+
+    impl PrivateBus {
+        fn start() -> Option<Self> {
+            use std::io::BufRead;
+            let mut child = std::process::Command::new("dbus-daemon")
+                .args(["--session", "--nofork", "--print-address=1"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .ok()?;
+            let mut address = String::new();
+            std::io::BufReader::new(child.stdout.take()?)
+                .read_line(&mut address)
+                .ok()?;
+            Some(Self(child, address.trim().to_string()))
+        }
+
+        fn connect(&self) -> gio::DBusConnection {
+            gio::DBusConnection::for_address_sync(
+                &self.1,
+                gio::DBusConnectionFlags::AUTHENTICATION_CLIENT
+                    | gio::DBusConnectionFlags::MESSAGE_BUS_CONNECTION,
+                None,
+                gio::Cancellable::NONE,
+            )
+            .expect("private bus")
+        }
+    }
+
+    impl Drop for PrivateBus {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    const WATCHER_XML: &str = r#"<node><interface name="org.kde.StatusNotifierWatcher">
+      <method name="RegisterStatusNotifierItem"><arg type="s" direction="in"/></method>
+      <property name="IsStatusNotifierHostRegistered" type="b" access="read"/>
+    </interface></node>"#;
+
+    /// Runs `context` until `done`, for at most five seconds.
+    fn spin(context: &glib::MainContext, done: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done() && std::time::Instant::now() < deadline {
+            context.iteration(false);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        done()
+    }
+
+    /// An asynchronous call from the host, waited for on `context` (the item
+    /// answers on the same thread, so a blocking call would deadlock).
+    fn host_call(
+        context: &glib::MainContext,
+        host: &gio::DBusConnection,
+        destination: &str,
+        path: &str,
+        interface: &str,
+        method: &str,
+        args: Variant,
+    ) -> Variant {
+        let reply = Rc::new(RefCell::new(None));
+        let sink = Rc::clone(&reply);
+        host.call(
+            Some(destination),
+            path,
+            interface,
+            method,
+            Some(&args),
+            None,
+            gio::DBusCallFlags::NONE,
+            2000,
+            gio::Cancellable::NONE,
+            move |result| *sink.borrow_mut() = Some(result),
+        );
+        assert!(
+            spin(context, || reply.borrow().is_some()),
+            "{method} answered"
+        );
+        let result = reply.borrow_mut().take().unwrap();
+        result.unwrap_or_else(|error| panic!("{method}: {error}"))
+    }
+
+    /// A dbusmenu node's `label` property.
+    fn label_of(node: &Variant) -> Option<String> {
+        node.child_value(1)
+            .get::<HashMap<String, Variant>>()?
+            .get("label")?
+            .get::<String>()
+    }
+
+    fn labels_of(node: &Variant, into: &mut Vec<String>) {
+        if let Some(label) = label_of(node) {
+            into.push(label);
+        }
+        let children = node.child_value(2);
+        for index in 0..children.n_children() {
+            labels_of(&children.child_value(index).as_variant().unwrap(), into);
+        }
+    }
+
+    /// A headless StatusNotifier host on a private bus: DeskLink registers
+    /// its item with the watcher, counts as shown once a host is there, and
+    /// the host reads the menu and clicks an entry through dbusmenu, as
+    /// Plasma, COSMIC, Xfce, Waybar and the rest do.
+    #[test]
+    fn a_tray_host_sees_the_item_reads_its_menu_and_clicks_an_entry() {
+        let Some(bus) = PrivateBus::start() else {
+            eprintln!("no dbus-daemon: the headless tray host test is skipped");
+            return;
+        };
+        let context = glib::MainContext::new();
+        context
+            .with_thread_default(|| {
+                // The host side: owns the watcher, records registrations.
+                let host = bus.connect();
+                let registered = Rc::new(RefCell::new(Vec::<String>::new()));
+                let node = gio::DBusNodeInfo::for_xml(WATCHER_XML).unwrap();
+                let sink = Rc::clone(&registered);
+                let _watcher = host
+                    .register_object(WATCHER_PATH, &node.lookup_interface(WATCHER).unwrap())
+                    .method_call(move |_, sender, _, _, _, params, invocation| {
+                        let (service,) = params.get::<(String,)>().unwrap();
+                        // The well-known name, or the sender's unique one.
+                        sink.borrow_mut().push(if service.starts_with('/') {
+                            sender.unwrap_or_default().to_string()
+                        } else {
+                            service
+                        });
+                        invocation.return_value(None);
+                    })
+                    .property(|_, _, _, _, _| true.to_variant())
+                    .build()
+                    .unwrap();
+                host.call_sync(
+                    Some("org.freedesktop.DBus"),
+                    "/org/freedesktop/DBus",
+                    "org.freedesktop.DBus",
+                    "RequestName",
+                    Some(&(WATCHER, 4u32).to_variant()),
+                    None,
+                    gio::DBusCallFlags::NONE,
+                    2000,
+                    gio::Cancellable::NONE,
+                )
+                .unwrap();
+
+                // DeskLink's side.
+                let ran = Rc::new(RefCell::new(Vec::<String>::new()));
+                let actions = TrayActions {
+                    open: Box::new(|| {}),
+                    run: Box::new({
+                        let ran = Rc::clone(&ran);
+                        move |action| ran.borrow_mut().push(action.to_string())
+                    }),
+                };
+                let tray = Tray::on_connection(bus.connect(), "/tmp".into(), actions).unwrap();
+                tray.update(
+                    Vec::new(),
+                    "Pixel · Connected · 82%".into(),
+                    vec![
+                        TrayEntry::Header {
+                            label: "Pixel · Connected · 82%".into(),
+                            icon: "phone-symbolic".into(),
+                        },
+                        TrayEntry::action("Ring", "ring:p1"),
+                        TrayEntry::action("Send Files…", "send-files:p1"),
+                        TrayEntry::action("Send Clipboard", "send-clipboard:p1"),
+                        TrayEntry::action("Show Its Screen…", "show-screen:p1"),
+                        TrayEntry::action("Lock", "lock:p1"),
+                        TrayEntry::action("Settings…", "settings:p1"),
+                        TrayEntry::Separator,
+                        TrayEntry::action("Open DeskLink", "open"),
+                    ],
+                    ICON_CONNECTED,
+                    false,
+                );
+                assert!(
+                    spin(&context, || tray.hosted()),
+                    "registered, and the watcher has a host"
+                );
+                let service = registered.borrow().first().cloned().unwrap();
+                assert_eq!(service, item_bus_name(std::process::id()));
+
+                // The host reads the item, then its menu.
+                let get = |name: &str| {
+                    host_call(
+                        &context,
+                        &host,
+                        &service,
+                        ITEM_PATH,
+                        PROPERTIES,
+                        "Get",
+                        (ITEM_INTERFACE, name).to_variant(),
+                    )
+                    .child_value(0)
+                    .as_variant()
+                    .unwrap()
+                };
+                assert_eq!(get("IconName").str(), Some(ICON_CONNECTED));
+                assert_eq!(get("Status").str(), Some("Active"));
+                assert_eq!(
+                    get("ToolTip").child_value(3).str(),
+                    Some("Pixel · Connected · 82%")
+                );
+                let menu = get("Menu");
+                assert_eq!(menu.str(), Some(MENU_PATH));
+                let layout = host_call(
+                    &context,
+                    &host,
+                    &service,
+                    MENU_PATH,
+                    MENU_INTERFACE,
+                    "GetLayout",
+                    (0i32, -1i32, Vec::<String>::new()).to_variant(),
+                );
+                let root = layout.child_value(1);
+                let mut labels = Vec::new();
+                labels_of(&root, &mut labels);
+                for wanted in [
+                    "Ring",
+                    "Send Files…",
+                    "Send Clipboard",
+                    "Show Its Screen…",
+                    "Lock",
+                    "Settings…",
+                    "Open DeskLink",
+                ] {
+                    assert!(
+                        labels.iter().any(|label| label == wanted),
+                        "{wanted}: {labels:?}"
+                    );
+                }
+
+                // Clicking "Ring" runs it.
+                let children = root.child_value(2);
+                let ring = (0..children.n_children())
+                    .map(|index| children.child_value(index).as_variant().unwrap())
+                    .find(|item| label_of(item).as_deref() == Some("Ring"))
+                    .unwrap()
+                    .child_value(0)
+                    .get::<i32>()
+                    .unwrap();
+                host_call(
+                    &context,
+                    &host,
+                    &service,
+                    MENU_PATH,
+                    MENU_INTERFACE,
+                    "Event",
+                    (ring, "clicked", 0i32.to_variant(), 0u32).to_variant(),
+                );
+                assert_eq!(*ran.borrow(), ["ring:p1"]);
+
+                // Passive (the GNOME extension is showing DeskLink): hosts hide it.
+                tray.update(Vec::new(), String::new(), Vec::new(), ICON_CONNECTED, true);
+                assert_eq!(get("Status").str(), Some("Passive"));
+            })
+            .unwrap();
     }
 
     #[test]
