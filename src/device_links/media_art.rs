@@ -77,7 +77,12 @@ pub(crate) fn art_for(url: &str, ready: impl FnOnce() + Send + 'static) -> Optio
         .spawn(move || {
             let art = read_source(&url)
                 .and_then(|bytes| encode(&bytes))
-                .map_err(|error| debug_log!("[DeskLink] No album art from {url}: {error}"))
+                .map_err(|error| {
+                    debug_log!(
+                        "[DeskLink] No album art from {}: {error}",
+                        source_words(&url)
+                    )
+                })
                 .ok()
                 .map(Arc::new);
             if let Ok(mut cache) = CACHE.lock() {
@@ -136,6 +141,12 @@ fn is_local_target(ip: std::net::IpAddr) -> bool {
                     .is_some_and(|v4| is_local_target(IpAddr::V4(v4)))
         }
     }
+}
+
+/// Where art came from, for the log: the host, never the path or query
+/// (they name the track, or carry a signed token).
+fn source_words(url: &str) -> String {
+    host_of(url).unwrap_or_else(|| "a local file".to_string())
 }
 
 /// The host part of an http(s) URL.
@@ -427,6 +438,18 @@ pub(crate) fn art_id(jpeg: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_logged_art_source_is_its_host_only() {
+        assert_eq!(
+            source_words("https://i.scdn.co/image/ab67?sig=secret"),
+            "i.scdn.co"
+        );
+        assert_eq!(
+            source_words("file:///home/me/Music/Song.jpg"),
+            "a local file"
+        );
+    }
 
     #[test]
     fn only_file_and_http_art_is_read() {

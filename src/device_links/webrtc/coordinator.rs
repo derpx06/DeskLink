@@ -2428,8 +2428,23 @@ fn authorize_desktop_remote_input(
     let actions = input_actions(packet)?;
     session.verify_peer_input(packet, owner_device_id, now)?;
     #[cfg(debug_assertions)]
-    debug_log!("[DeskLink] Phone input -> {actions:?}");
+    debug_log!("[DeskLink] Phone input -> {}", input_log(&actions));
     Ok(actions)
+}
+
+/// Phone input as the log shows it: what kind, never which keys or text.
+fn input_log(actions: &[PortalInputAction]) -> String {
+    let names: Vec<String> = actions
+        .iter()
+        .map(|action| match action {
+            PortalInputAction::TypeText { text, .. } => {
+                format!("TypeText({} chars)", text.chars().count())
+            }
+            PortalInputAction::Key { .. } => "Key".to_string(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    names.join(", ")
 }
 
 /// What `device_id` is doing with this computer's screen, for the UI.
@@ -5166,6 +5181,27 @@ fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod input_log_tests {
+    use super::{input_log, PortalInputAction};
+
+    #[test]
+    fn logged_phone_input_never_says_what_was_typed() {
+        let shown = input_log(&[
+            PortalInputAction::TypeText {
+                text: "hunter2".into(),
+                modifiers: 0,
+            },
+            PortalInputAction::Key {
+                keysym: 0x61,
+                pressed: true,
+            },
+            PortalInputAction::Scroll(0.0, 1.0),
+        ]);
+        assert_eq!(shown, "TypeText(7 chars), Key, Scroll(0.0, 1.0)");
+    }
 }
 
 #[cfg(test)]
