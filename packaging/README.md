@@ -74,7 +74,11 @@ before 1.26 `webrtcbin` makes an answerer's media sections only while writing
 the answer, so DeskLink adds its own first (otherwise it answered `recvonly`:
 no screen or sound from the computer); before 1.28 an answer carries one codec,
 so DeskLink answers VP8 alone and the phone sends VP8 instead of hardware H.264.
-1.24 has no `close` action on `webrtcbin` (not emitted there).
+1.24 has no `close` action on `webrtcbin` (not emitted there). 1.26 leaves the
+selected ICE pair out of `webrtcbin`'s stats, so DeskLink asks the ICE agent
+(without it the connection never read as the LAN: no unlocking with the phone,
+no fast lane). Fedora 43 (1.26) after these: every WebRTC test passes but one
+that needs a non-root process.
 
 `gtk4paintablesink` is compiled into DeskLink and registered only when the
 system has none, so no package needs the distribution's GTK 4 GStreamer
