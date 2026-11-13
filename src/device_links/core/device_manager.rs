@@ -351,6 +351,26 @@ impl DeviceManager {
         }
     }
 
+    /// Whether `device_id`'s link is open, carries `certificate_pem` and was
+    /// heard from within `within`: a link that needs no replacement.
+    pub fn answering_link(
+        &self,
+        device_id: &str,
+        certificate_pem: &str,
+        within: std::time::Duration,
+    ) -> bool {
+        let Ok(sessions) = self.sessions.lock() else {
+            return false;
+        };
+        sessions.get(device_id).is_some_and(|session| {
+            session.state != SessionState::Terminated
+                && session.last_inbound_at.elapsed() < within
+                && session.active_link.as_ref().is_some_and(|link| {
+                    !link.is_closed() && link.certificate_pem == certificate_pem
+                })
+        })
+    }
+
     /// The incumbent link's dialer and age, if it is open: what the link
     /// race rule compares a newly authenticated link with.
     pub fn incumbent_link(&self, device_id: &str) -> Option<(bool, std::time::Duration)> {

@@ -1441,7 +1441,7 @@ mod tests {
         let mut book = AddressBook::default();
         book.seen("busy", ip("10.0.0.8"));
         let now = Instant::now();
-        let mut tick = |at: Instant, book: &mut AddressBook| {
+        let tick = |at: Instant, book: &mut AddressBook| {
             redial_targets(&devices, &known, &HashMap::new(), book, at, |_| true).len()
         };
         assert_eq!(tick(now, &mut book), 1);

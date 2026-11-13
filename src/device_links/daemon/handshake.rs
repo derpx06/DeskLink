@@ -326,6 +326,25 @@ pub(crate) fn attach_bootstrap_link(
         link.close();
         return Ok(());
     }
+    // A second dial of ours finishing after the first (the phone's IPv4 and
+    // IPv6 are dialled together) is not needed while the first is open and
+    // answering, and registering it would throw away the negotiation the
+    // first link started, whether or not it is feature-ready yet. A link the
+    // phone dialed is taken: it would not dial while its own link worked.
+    if paired
+        && !restarted
+        && !supersede_live
+        && link.was_dialed_by_us()
+        && race == crate::device_links::core::RaceVerdict::NotARace
+        && sessions.answering_link(device_id, &link.certificate_pem, super::HEARTBEAT_IDLE * 2)
+    {
+        debug_log!(
+            "[DL-WRTC-BOOT] {} already has an answering link: closing our second dial",
+            device_id
+        );
+        link.close();
+        return Ok(());
+    }
     let replace_incumbent = race == crate::device_links::core::RaceVerdict::ReplaceIncumbent;
     let link_dialed_by_us = link.was_dialed_by_us();
     let adoption = if restarted || supersede_live || !paired {

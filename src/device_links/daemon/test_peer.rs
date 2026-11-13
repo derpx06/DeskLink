@@ -706,6 +706,68 @@ mod tests {
         );
     }
 
+    /// Two dials of ours to one phone (its IPv4 and IPv6, both due at once)
+    /// that finish one after the other: the second must not replace the
+    /// first while the first is open and answering, or every reconnect
+    /// throws away the negotiation the first link started. A link the
+    /// phone dialed is still taken (it would not dial a link it can use).
+    #[test]
+    fn a_second_dial_of_ours_does_not_replace_an_answering_link() {
+        let net = TestNetwork::new();
+        let (desktop, _phone) = paired_pair(&net);
+        let phone_id = desktop.peer_id();
+        let binding = desktop.sessions.current_binding(&phone_id).unwrap();
+        binding.link.note_attached(true);
+        let attach = |dialed_by_us: bool| {
+            let transport: Arc<dyn crate::device_links::core::LinkTransport> =
+                Arc::new(crate::device_links::core::link_transport::DeadTransport);
+            let link = SessionLink::new(
+                Arc::clone(&transport),
+                desktop.peer_certificate_pem.clone(),
+                desktop.local_public_der.clone(),
+                desktop.remote_public_der.clone(),
+                desktop.info.clone(),
+            )
+            .dialed_by_us(dialed_by_us);
+            super::super::handshake::attach_bootstrap_link(
+                &phone_id,
+                link,
+                transport,
+                true,
+                false,
+                Arc::clone(&desktop.config),
+                Arc::clone(&desktop.devices),
+                Arc::clone(&desktop.sessions),
+                Arc::clone(&desktop.events),
+            )
+        };
+        assert!(desktop.is_trusted());
+        attach(true).unwrap();
+        assert!(
+            desktop.sessions.is_current(&binding),
+            "our second dial replaced the answering link"
+        );
+        // Silent past the answering window: the new dial is welcome.
+        desktop
+            .sessions
+            .with_session(&binding, |session| {
+                session.last_inbound_at =
+                    std::time::Instant::now() - std::time::Duration::from_secs(25);
+            })
+            .unwrap();
+        attach(true).unwrap();
+        assert!(
+            !desktop.sessions.is_current(&binding),
+            "a silent link is replaced"
+        );
+        // A link the phone dialed replaces an answering one (outside the
+        // link-race window, which decides two links dialed together).
+        let current = desktop.sessions.current_binding(&phone_id).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        attach(false).unwrap();
+        assert!(!desktop.sessions.is_current(&current));
+    }
+
     /// A dozing phone (frozen by its OS) gets 90 s of LAN silence before its
     /// link is buried; an awake one keeps the 30 s budget.
     #[test]
