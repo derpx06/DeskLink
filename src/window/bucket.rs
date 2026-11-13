@@ -1272,7 +1272,13 @@ fn problem_banner(view: &PairView) -> Option<gtk::Box> {
         let root = view.pair.root.clone();
         create.connect_clicked(move |button| {
             if let Err(error) = folders::recreate_root(&root) {
-                super::toast_from(button, &format!("Could not create the folder: {error}"));
+                super::toast_from(
+                    button,
+                    &format!(
+                        "Could not create the folder{}",
+                        super::because(&error.to_string())
+                    ),
+                );
             }
         });
         bar.append(&create);

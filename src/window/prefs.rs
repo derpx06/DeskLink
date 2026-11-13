@@ -642,25 +642,29 @@ fn searchable(groups: &[adw::PreferencesGroup]) -> Vec<Searchable> {
         .collect()
 }
 
-/// Shows only the rows (and groups) whose title or words contain `query`;
-/// a group whose own title matches shows whole. True when anything shows.
+/// Shows only the rows (and groups) whose title, line or search words hold
+/// every word of `query`; a group whose own title does shows whole. True
+/// when anything shows.
 fn filter_groups(groups: &[Searchable], query: &str) -> bool {
     // Typed text against the plain words of the rows, not their markup.
     let query = query.trim().to_lowercase();
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let all_in = |text: &str| words.iter().all(|word| text.contains(word));
     let mut any = false;
     for Searchable { group, rows, shown } in groups {
-        let whole = query.is_empty() || plain(&group.title()).to_lowercase().contains(&query);
+        let whole = query.is_empty() || all_in(&plain(&group.title()).to_lowercase());
         let mut matching = 0;
         for (row, was_shown) in rows {
-            let mut words = plain(&row.title()).to_lowercase();
+            let title = plain(&row.title());
+            let mut text = format!("{title} {}", keywords_of(&title)).to_lowercase();
             if let Some(subtitle) = row
                 .downcast_ref::<adw::ActionRow>()
                 .and_then(|action| action.subtitle())
             {
-                words.push(' ');
-                words.push_str(&plain(&subtitle).to_lowercase());
+                text.push(' ');
+                text.push_str(&plain(&subtitle).to_lowercase());
             }
-            let matches = whole || words.contains(&query);
+            let matches = whole || all_in(&text);
             row.set_visible(*was_shown && matches);
             matching += usize::from(*was_shown && matches);
         }
@@ -669,6 +673,114 @@ fn filter_groups(groups: &[Searchable], query: &str) -> bool {
         any |= visible;
     }
     any
+}
+
+/// One setting as Settings search and Find anything know it.
+pub(super) struct SettingRow {
+    /// An index into [`GROUPS`].
+    pub(super) group: usize,
+    /// The row's title; `{phone}` is the phone's name.
+    pub(super) title: &'static str,
+    /// Shown only with a paired phone.
+    pub(super) phone: bool,
+    /// Words people type for it that the row does not say (never shown).
+    pub(super) words: &'static str,
+}
+
+const fn row(group: usize, title: &'static str, phone: bool, words: &'static str) -> SettingRow {
+    SettingRow {
+        group,
+        title,
+        phone,
+        words,
+    }
+}
+
+/// Every setting, group by group: the same titles as
+/// `testdata/settings_rows.json` (a test keeps the two in step).
+pub(super) const ROWS: [SettingRow; 30] = [
+    row(0, "Keep this computer awake while a phone is connected", false, "sleep suspend lid closed battery power stay awake caffeine"),
+    row(0, "Let this phone keep the computer awake", true, "sleep suspend lid battery power stay awake allow"),
+    row(0, "Start at login", false, "startup start at login autostart boot launch open automatically restart"),
+    row(0, "This computer's name", false, "rename name computer name hostname what phones see"),
+    row(0, "Pair another phone…", false, "pair add new phone connect second device qr code tablet"),
+    row(1, "Show {phone}'s notifications here", true, "alerts messages banners reply mirror popups"),
+    row(1, "Command alerts", true, "terminal finished done long running command notify notifications"),
+    row(1, "Send this computer's notifications to the phone", true, "forward desktop notifications alerts apps"),
+    row(1, "Share Do Not Disturb with {phone}", true, "dnd silent quiet mute focus banners notifications"),
+    row(2, "Share this computer's clipboard with phones", true, "copy paste sync clipboard text"),
+    row(3, "Pause music during calls", true, "media player music pause stop audio sound ring phone call"),
+    row(3, "Name callers from {phone}'s contacts", true, "caller id contacts names numbers people who is calling"),
+    row(4, "Phones may hear this computer's microphone", true, "mic microphone audio voice record sound listen"),
+    row(5, "Glide onto {phone}", true, "mouse keyboard pointer cursor trackpad touchpad edge move control screen edge"),
+    row(5, "Let the phone control mouse and keyboard", true, "remote control share screen screen sharing mouse keyboard trackpad touchpad approve allow permissions"),
+    row(6, "Bucket with {phone}", true, "shared folder files sync drop share"),
+    row(6, "Downloads folder", true, "download location save where files go received folder open"),
+    row(6, "Accept photos and screenshots from {phone}", true, "photos pictures images gallery camera screenshots automatic files"),
+    row(7, "Ask before terminal and screen access", false, "password session password pin lock secure protect screen sharing terminal privacy"),
+    row(7, "Terminal access", true, "terminal shell command line console allow permissions"),
+    row(7, "Unlock with {phone} nearby", true, "unlock lock screen login password nearby proximity"),
+    row(7, "Lock when I walk away with {phone}", true, "lock away leave walk screen lock security"),
+    row(7, "Unpair {phone}…", true, "unpair forget remove disconnect delete pair"),
+    row(8, "Style", false, "dark mode light theme night colours colors appearance"),
+    row(8, "Tray icon", false, "status icon top bar panel system tray indicator"),
+    row(8, "GNOME extension", false, "top bar menu panel quick settings lock screen"),
+    row(8, "Phone in the top bar", false, "top bar panel indicator icon"),
+    row(9, "Connection history", false, "log logs sessions past connections when activity"),
+    row(9, "System check", false, "requirements install missing problems troubleshoot diagnose fix permissions"),
+    row(9, "Crash reports", false, "logs bug report crash folder problems"),
+];
+
+/// Whether `title` is `template` with the phone's name in place of `{phone}`.
+pub(super) fn fits(template: &str, title: &str) -> bool {
+    match template.split_once("{phone}") {
+        Some((head, tail)) => {
+            title.len() > head.len() + tail.len()
+                && title.starts_with(head)
+                && title.ends_with(tail)
+        }
+        None => template == title,
+    }
+}
+
+/// What people type, and the setting it must find (Settings search and
+/// Find anything both).
+#[cfg(test)]
+pub(super) const SYNONYMS: [(&str, &str); 24] = [
+    (
+        "battery",
+        "Keep this computer awake while a phone is connected",
+    ),
+    ("notifications", "Show {phone}'s notifications here"),
+    ("lock", "Lock when I walk away with {phone}"),
+    ("unlock", "Unlock with {phone} nearby"),
+    ("files", "Bucket with {phone}"),
+    ("folder", "Downloads folder"),
+    ("download location", "Downloads folder"),
+    ("keyboard", "Let the phone control mouse and keyboard"),
+    ("mouse", "Glide onto {phone}"),
+    ("trackpad", "Glide onto {phone}"),
+    ("screen", "Ask before terminal and screen access"),
+    ("share screen", "Let the phone control mouse and keyboard"),
+    ("dark mode", "Style"),
+    ("sound", "Phones may hear this computer's microphone"),
+    ("microphone", "Phones may hear this computer's microphone"),
+    ("password", "Ask before terminal and screen access"),
+    ("pair", "Pair another phone…"),
+    ("unpair", "Unpair {phone}…"),
+    ("forget", "Unpair {phone}…"),
+    ("rename", "This computer's name"),
+    ("startup", "Start at login"),
+    ("start at login", "Start at login"),
+    ("privacy", "Ask before terminal and screen access"),
+    ("permissions", "Terminal access"),
+];
+
+/// The search words of the row titled `title` ("" for one not in [`ROWS`]).
+fn keywords_of(title: &str) -> &'static str {
+    ROWS.iter()
+        .find(|row| fits(row.title, title))
+        .map_or("", |row| row.words)
 }
 
 /// The groups of the Settings page, in the order the phone uses too:
@@ -713,6 +825,8 @@ fn groups(
     connection.add(&keep_awake_row(daemon, settings));
     connection.add(&phone_keep_awake_row(daemon, settings, device));
     connection.add(&start_at_login_row(daemon, settings));
+    connection.add(&computer_name_row());
+    connection.add(&pair_row());
 
     let notifications = group(GROUPS[1]);
     notifications.set_description(Some(
@@ -784,7 +898,7 @@ fn show_notifications_row(
 ) -> adw::SwitchRow {
     let shown = adw::SwitchRow::builder()
         .title(esc(format!("Show {}'s notifications here", device.name)))
-        .subtitle("On this desktop, with replies")
+        .subtitle("See them on this computer and reply from here")
         .active(settings.shows_notifications(&device.id))
         .build();
     with_icon(&shown, "preferences-system-notifications-symbolic");
@@ -799,6 +913,40 @@ fn show_notifications_row(
     shown
 }
 
+/// The name phones see for this computer: the system's own, changed there.
+fn computer_name_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("This computer's name")
+        .use_markup(false)
+        .build();
+    row.set_subtitle(&format!(
+        "Phones see it as {}. To change it, rename the computer in your system settings (About), then restart DeskLink.",
+        crate::device_links::glide::desk_name()
+    ));
+    with_icon(&row, "desklink-device-desktop-symbolic");
+    row
+}
+
+/// "Pair another phone…": the same window as the menu's and Ctrl+N.
+fn pair_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("Pair another phone…")
+        .subtitle("Connect a phone or tablet by scanning a QR code")
+        .activatable(true)
+        .build();
+    with_icon(&row, "desklink-add-symbolic");
+    row.add_suffix(
+        &gtk::Image::builder()
+            .icon_name("desklink-chevron-right-symbolic")
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build(),
+    );
+    row.connect_activated(|row| {
+        let _ = row.activate_action("win.pair-new", None);
+    });
+    row
+}
+
 /// The computer-wide settings as a dialog, for when no phone is paired.
 pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>, daemon: &DaemonHandle) {
     let settings = crate::device_links::config::app_settings();
@@ -810,6 +958,8 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>, daemon: &DaemonHandle)
     let connection = group(GROUPS[0]);
     connection.add(&keep_awake_row(daemon, &settings));
     connection.add(&start_at_login_row(daemon, &settings));
+    connection.add(&computer_name_row());
+    connection.add(&pair_row());
     page.add(&connection);
     let privacy = group(GROUPS[7]);
     privacy.add(&password_row(daemon, &settings));
@@ -835,7 +985,7 @@ fn sound_group(daemon: &DaemonHandle, settings: &AppSettings) -> adw::Preference
     let group = adw::PreferencesGroup::builder().title("Sound").build();
     let mic = adw::SwitchRow::builder()
         .title("Phones may hear this computer's microphone")
-        .subtitle("Only when one asks; a coral bar shows while it listens")
+        .subtitle("Only when a phone asks. A coral bar shows while it listens.")
         .active(settings.desk_mic_to_phone)
         .build();
     with_icon(&mic, "audio-input-microphone-symbolic");
@@ -1003,7 +1153,7 @@ fn bucket_row(device: &DeviceView) -> adw::SwitchRow {
 fn downloads_row() -> adw::ActionRow {
     let row = adw::ActionRow::builder()
         .title("Downloads folder")
-        .subtitle("Files from the phone land here; a name already taken becomes \"name (2)\"")
+        .subtitle("Files from your phone are saved in your Downloads folder. Click to open it.")
         .activatable(true)
         .build();
     with_icon(&row, "folder-download-symbolic");
@@ -1163,7 +1313,7 @@ fn with_icon(row: &impl IsA<adw::ActionRow>, icon: &str) {
 fn keep_awake_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
         .title("Keep this computer awake while a phone is connected")
-        .subtitle("Lid closed included, only while a paired phone is connected; it sleeps again when the phone goes away. Applies to every phone.")
+        .subtitle("Stops this computer going to sleep, even with the lid closed, while a paired phone is connected. It sleeps again when the phone goes away.")
         .active(settings.stay_awake)
         .build();
     with_icon(&row, "weather-clear-night-symbolic");
@@ -1349,9 +1499,9 @@ fn phone_keep_awake_row(
 
 fn start_at_login_row(daemon: &DaemonHandle, settings: &AppSettings) -> adw::SwitchRow {
     let row = adw::SwitchRow::builder()
-        .title("Start at Login")
+        .title("Start at login")
         .subtitle(crate::platform::note("autostart").map_or_else(
-            || glib::GString::from("Keeps this computer reachable after a restart"),
+            || glib::GString::from("Opens DeskLink in the background when you log in, so your phone can reach this computer"),
             esc,
         ))
         .subtitle_lines(0)
@@ -1400,7 +1550,7 @@ fn top_bar_key() -> String {
 /// "Log Out Now…" (GNOME asks to confirm).
 fn log_out_button() -> gtk::Button {
     let button = gtk::Button::builder()
-        .label("Log Out Now…")
+        .label("Log out now…")
         .valign(gtk::Align::Center)
         .build();
     button.connect_clicked(|_| crate::shell_dbus::log_out());
@@ -1441,7 +1591,10 @@ fn add_top_bar_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settin
                 let Some(button) = weak.upgrade() else { return };
                 button.set_sensitive(true);
                 if let Err(error) = result {
-                    super::toast_from(&button, &format!("Could not turn it on: {error}"));
+                    super::toast_from(
+                        &button,
+                        &format!("Could not turn it on{}", super::because(&error)),
+                    );
                 }
             });
         });
@@ -1471,7 +1624,10 @@ fn add_top_bar_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settin
                     button.set_sensitive(false);
                     super::toast_from(button, "Top-bar menu turned off");
                 }
-                Err(error) => super::toast_from(button, &format!("Could not turn it off: {error}")),
+                Err(error) => super::toast_from(
+                    button,
+                    &format!("Could not turn it off{}", super::because(&error)),
+                ),
             });
             menu.add_suffix(&off);
         }
@@ -1491,11 +1647,11 @@ fn add_top_bar_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settin
             button.connect_clicked(|button| match crate::shell_dbus::turn_on_extension() {
                 Ok(true) => {
                     let dialog = adw::AlertDialog::new(
-                        Some("Top-Bar Menu Installed"),
+                        Some("Top bar menu installed"),
                         Some(crate::shell_dbus::RELOGIN_NOTE),
                     );
                     dialog.add_response("later", "_Later");
-                    dialog.add_response("log-out", "_Log Out Now…");
+                    dialog.add_response("log-out", "_Log out now…");
                     dialog.set_close_response("later");
                     dialog.connect_response(Some("log-out"), |_, _| crate::shell_dbus::log_out());
                     dialog.present(Some(button));
@@ -1504,7 +1660,7 @@ fn add_top_bar_rows(group: &adw::PreferencesGroup, daemon: &DaemonHandle, settin
                 Err(error) => {
                     eprintln!("[UI] Could not turn on the top-bar menu: {error}");
                     let dialog = adw::AlertDialog::new(
-                        Some("Could Not Turn On the Top-Bar Menu"),
+                        Some("Could not turn on the top bar menu"),
                         Some(&error),
                     );
                     dialog.add_response("ok", "OK");
@@ -1524,6 +1680,7 @@ fn appearance_row() -> adw::ComboRow {
     let choices = ["system", "light", "dark"];
     let row = adw::ComboRow::builder()
         .title("Style")
+        .subtitle("Light, dark, or the same as your system")
         .model(&gtk::StringList::new(&["System", "Light", "Dark"]))
         .selected(
             choices
@@ -1621,9 +1778,9 @@ fn relay_host(url: &str) -> &str {
 
 fn password_subtitle(set: bool) -> &'static str {
     if set {
-        "Phones give this computer's session password once per connection"
+        "On: a phone enters this computer's password once per connection before it opens a terminal or sees the screen"
     } else {
-        "Pairing alone is enough"
+        "Off: pairing alone lets a phone open a terminal or see the screen"
     }
 }
 
@@ -1824,8 +1981,8 @@ fn remote_control_row(device: &DeviceView, approving: bool) -> adw::ActionRow {
     row.add_prefix(&icon_square("input-mouse-symbolic", 30, "row-icon"));
     let approve = gtk::Button::builder()
         .label(match (approving, approved) {
-            (true, _) => "Choose the Screen…",
-            (false, true) => "Approve Again…",
+            (true, _) => "Choose the screen…",
+            (false, true) => "Approve again…",
             (false, false) => "Approve…",
         })
         .sensitive(!approving)
@@ -2106,7 +2263,7 @@ mod tests {
             };
             let (wifi, battery, secret) = (
                 row("Keep awake", "While a phone is connected"),
-                row("Start at Login", "Keeps this computer reachable"),
+                row("Start at login", "Keeps this computer reachable"),
                 row("Hidden row", "Not for this machine"),
             );
             secret.set_visible(false);
@@ -2634,6 +2791,86 @@ mod tests {
             row.set_active(false);
             assert_eq!(sent.get(), 1);
             drop((daemon, commands));
+        });
+    }
+
+    /// The search table and the contract list the same rows, and every row
+    /// has words to be found by besides its title.
+    #[test]
+    fn every_contract_row_has_search_words_and_nothing_else_does() {
+        let table: serde_json::Value =
+            serde_json::from_str(include_str!("../../testdata/settings_rows.json")).unwrap();
+        let mut contract = Vec::new();
+        for (index, group) in table["groups"].as_array().unwrap().iter().enumerate() {
+            for key in ["rows", "gnomeRows"] {
+                for title in group[key].as_array().into_iter().flatten() {
+                    contract.push((index, title.as_str().unwrap().to_string()));
+                }
+            }
+        }
+        let rows: Vec<(usize, String)> = ROWS
+            .iter()
+            .map(|row| (row.group, row.title.to_string()))
+            .collect();
+        assert_eq!(rows, contract);
+        for row in &ROWS {
+            assert!(row.words.split_whitespace().count() >= 2, "{}", row.title);
+        }
+        assert!(fits("Glide onto {phone}", "Glide onto Pixel 9"));
+        assert!(!fits("Glide onto {phone}", "Glide onto "));
+        assert!(fits("Style", "Style") && !fits("Style", "Styles"));
+    }
+
+    /// Every row of every page says what it does under its title, and the
+    /// search finds each one by its title and by a word people use for it.
+    /// (Needs a display.)
+    #[test]
+    fn every_row_has_a_line_and_is_found_by_its_title_and_a_synonym() {
+        crate::test_display::run(|| {
+            let (view, _daemon) = view_for_tests();
+            let mut all = Vec::new();
+            for page in &view.pages {
+                rows_in(page.child().unwrap().upcast_ref(), &mut all);
+            }
+            let mut titles = Vec::new();
+            for row in &all {
+                if row.widget_name() == OWN_VISIBILITY {
+                    continue;
+                }
+                let title = plain(&row.title());
+                let line = row
+                    .downcast_ref::<adw::ActionRow>()
+                    .and_then(|row| row.subtitle())
+                    .unwrap_or_default();
+                assert!(!plain(&line).trim().is_empty(), "{title} has no line");
+                titles.push(title);
+            }
+            let search = SEARCH.with(|slot| slot.borrow().upgrade()).unwrap();
+            let shows = |query: &str, template: &str| -> bool {
+                search.set_text(query);
+                search.emit_by_name::<()>("search-changed", &[]);
+                all.iter().any(|row| {
+                    fits(template, &plain(&row.title()))
+                        && row.is_visible()
+                        && row
+                            .ancestor(adw::PreferencesGroup::static_type())
+                            .is_some_and(|group| group.is_visible())
+                })
+            };
+            for row in &ROWS {
+                let title = row.title.replace("{phone}", "Pixel 9");
+                if !titles.contains(&title) {
+                    // The GNOME rows exist only where the extension can.
+                    assert_eq!(row.group, 8, "{title} is not on its page");
+                    continue;
+                }
+                assert!(shows(&title, row.title), "the title finds {title}");
+            }
+            for (query, template) in SYNONYMS {
+                assert!(shows(query, template), "{query} finds {template}");
+            }
+            search.set_text("");
+            search.emit_by_name::<()>("search-changed", &[]);
         });
     }
 }

@@ -2007,7 +2007,7 @@ impl DesklinkWindow {
                     Poll::Gone => Err("NetworkManager did not answer".to_string()),
                 };
                 if let (Err(error), Some(window)) = (result, window.upgrade()) {
-                    window.show_feature_toast(&format!("Could not join: {error}"));
+                    window.show_feature_toast(&format!("Could not join{}", because(&error)));
                 }
                 glib::ControlFlow::Break
             });
@@ -2435,9 +2435,8 @@ fn friendly_error(raw: &str) -> (String, bool) {
         return (raw.to_string(), true);
     } else if saving && has(&["(os error 30)", "read-only file system"]) {
         (
-            "DeskLink cannot save anything: its settings folder is on a read-only file \
-             system. Make your home folder writable, or point XDG_CONFIG_HOME at a folder \
-             that is, then restart DeskLink.",
+            "DeskLink cannot save anything: its settings folder is read-only. Make your \
+             home folder writable, then restart DeskLink.",
             true,
         )
     } else if saving && has(&["(os error 28)", "no space left on device"]) {
@@ -2537,6 +2536,10 @@ fn friendly_error(raw: &str) -> (String, bool) {
             Some(at) if raw.ends_with(')') => &raw[..at],
             _ => raw,
         };
+        // Text written for developers stays behind Details.
+        if has_jargon(trimmed) {
+            return (SOMETHING_WENT_WRONG.to_string(), false);
+        }
         return (trimmed.to_string(), false);
     };
     (message.to_string(), lasting)
@@ -2562,6 +2565,104 @@ pub(crate) fn hero_error_words(raw: &str) -> (String, Option<String>) {
         "Something went wrong with the connection. DeskLink will try again.".to_string(),
         Some(raw.trim().to_string()),
     )
+}
+
+/// What an error says when its own words are for developers (they stay
+/// behind Details).
+const SOMETHING_WENT_WRONG: &str = "Something went wrong. Open Details to see more.";
+
+/// Words a person would not know. Shown text says "address", "network",
+/// "connection" or the feature's name instead; the jargon test reads the
+/// window's strings against the same lists.
+pub(crate) const JARGON: [&str; 50] = [
+    "webrtc",
+    "sdp",
+    "pty",
+    "tls",
+    "ssl",
+    "certificate",
+    "certificates",
+    "payload",
+    "handshake",
+    "daemon",
+    "portal",
+    "gstreamer",
+    "pipewire",
+    "codec",
+    "bitrate",
+    "ssrc",
+    "mime",
+    "uri",
+    "ip address",
+    "socket",
+    "packet",
+    "packets",
+    "protocol",
+    "mdns",
+    "udp",
+    "tcp",
+    "d bus",
+    "dbus",
+    "xdg",
+    "stun",
+    "peer",
+    "backend",
+    "json",
+    "hostname",
+    "subnet",
+    "ipv4",
+    "ipv6",
+    "plugin",
+    "plugins",
+    "signaling",
+    "handover",
+    "logind",
+    "mpris",
+    "encoder",
+    "decoder",
+    "vp8",
+    "h 264",
+    "rtp",
+    "uuid",
+    "websocket",
+];
+
+/// Jargon that is a word only in capitals ("turn" and "ice" are English).
+pub(crate) const JARGON_CAPS: [&str; 6] = ["ICE", "TURN", "LAN", "IP", "URL", "API"];
+
+/// Whether `text` uses a word from [`JARGON`] or [`JARGON_CAPS`] (whole
+/// words; "D-Bus" is "d bus", "H.264" is "h 264").
+pub(crate) fn has_jargon(text: &str) -> bool {
+    let words = |text: &str| {
+        let spaced: String = text
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { ' ' })
+            .collect();
+        format!(
+            " {} ",
+            spaced.split_whitespace().collect::<Vec<_>>().join(" ")
+        )
+    };
+    let lower = words(&text.to_lowercase());
+    let cased = words(text);
+    JARGON
+        .iter()
+        .any(|term| lower.contains(&format!(" {term} ")))
+        || JARGON_CAPS
+            .iter()
+            .any(|term| cased.contains(&format!(" {term} ")))
+}
+
+/// The end of a "Could not …" message: ": <reason>" when the reason reads
+/// as plain words, else "." (the reason is logged instead).
+pub(crate) fn because(error: &str) -> String {
+    let error = error.trim();
+    if error.is_empty() || looks_technical(error) || has_jargon(error) {
+        eprintln!("[UI] Not shown to the user: {error}");
+        ".".to_string()
+    } else {
+        format!(": {error}")
+    }
 }
 
 /// Text a person would not write: library names, error codes, paths.
@@ -4033,6 +4134,152 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
 }
 
 #[cfg(test)]
+mod jargon_tests {
+    /// The string literals of `text` (before its tests) a person may read,
+    /// with the line each starts on. Left out: log and assert lines, and
+    /// text matched against an error or a check's words.
+    fn shown_strings(text: &str) -> Vec<(usize, String)> {
+        let text = text.split("#[cfg(test)]").next().unwrap_or(text);
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i..].starts_with(b"//") {
+                i = bytes[i..]
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .map_or(bytes.len(), |end| i + end);
+                continue;
+            }
+            if bytes[i] == b'\'' {
+                // A char literal holding a quote: '"' or '\"'.
+                if bytes[i..].starts_with(b"'\"'") {
+                    i += 3;
+                    continue;
+                }
+                if bytes[i..].starts_with(b"'\\\"'") {
+                    i += 4;
+                    continue;
+                }
+            }
+            if bytes[i] != b'"' {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            let mut literal = String::new();
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                if bytes[i] == b'\\' {
+                    i += 1;
+                    match bytes.get(i) {
+                        Some(b'\n') => {
+                            while bytes.get(i + 1).is_some_and(|b| b.is_ascii_whitespace()) {
+                                i += 1;
+                            }
+                        }
+                        Some(b'n') => literal.push(' '),
+                        Some(&b) => literal.push(b as char),
+                        None => {}
+                    }
+                    i += 1;
+                    continue;
+                }
+                let c = text[i..].chars().next().unwrap();
+                literal.push(c);
+                i += c.len_utf8();
+            }
+            i += 1;
+            let line_start = text[..start].rfind('\n').map_or(0, |at| at + 1);
+            let line = &text[line_start..start];
+            let before = text[..start].trim_end();
+            let matcher = text[..start]
+                .rfind("has(&[")
+                .is_some_and(|at| !text[at..start].contains(']'));
+            let skipped = [
+                "eprintln!",
+                "println!",
+                "debug_log!",
+                "log::",
+                "panic!",
+                "assert",
+                ".expect(",
+                "unreachable!",
+            ]
+            .iter()
+            .any(|word| line.contains(word))
+                || matcher
+                || ["contains(", "starts_with(", "ends_with(", "find("]
+                    .iter()
+                    .any(|call| before.ends_with(call));
+            if !skipped && literal.contains(' ') {
+                out.push((text[..start].matches('\n').count() + 1, literal));
+            }
+        }
+        out
+    }
+
+    fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                // First-run onboarding has its own owner and pass.
+                && path
+                    .file_name()
+                    .is_some_and(|name| name != "tests.rs" && name != "onboarding.rs")
+            {
+                out.push(path);
+            }
+        }
+    }
+
+    /// No window text uses a word only a developer knows (`JARGON`): the
+    /// System check (platform.rs, package names) and Details keep those.
+    #[test]
+    fn the_window_says_nothing_in_jargon() {
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/window"),
+            &mut files,
+        );
+        let mut found = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (line, literal) in shown_strings(&text) {
+                if super::has_jargon(&literal) {
+                    found.push(format!("{}:{line}: {literal}", file.display()));
+                }
+            }
+        }
+        assert!(
+            found.is_empty(),
+            "jargon in the window:\n{}",
+            found.join("\n")
+        );
+    }
+
+    #[test]
+    fn jargon_is_found_as_whole_words_and_capitals() {
+        assert!(super::has_jargon("The WebRTC link failed"));
+        assert!(super::has_jargon("Needs the D-Bus session bus"));
+        assert!(super::has_jargon("Reached over the LAN"));
+        assert!(!super::has_jargon("Turn on Bluetooth and Wi-Fi"));
+        assert!(!super::has_jargon("Lock the screen when the ice melts"));
+        assert!(
+            !super::has_jargon("Unpaired peerless phones"),
+            "whole words only"
+        );
+        let found = shown_strings(
+            "fn f() {\n    // \"a WebRTC comment\"\n    eprintln!(\"the WebRTC log\");\n    \
+             label(\"Shown \\\n         text\");\n    if has(&[\"tls error\", \"ok\"]) {}\n}\n",
+        );
+        assert_eq!(found, vec![(4, "Shown text".to_string())]);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn pairing_errors_are_said_in_plain_words_and_the_reinstall_hint_is_right() {
@@ -4345,7 +4592,6 @@ mod tests {
         for raw in [
             "EOF while parsing a value at line 1 column 0",
             "Could not read the file: end of file reached in the notes",
-            "The certificate chooser is not available",
             "Cannot resolve the symlink for that folder",
             "Dissolved 3 sessions",
             "No space left on the screen for another tile",
