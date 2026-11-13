@@ -216,15 +216,11 @@ impl Client {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// On, a relay to reach (none is set up unless one was built in or
-    /// entered: then nothing is looked up or retried), and phones to reach.
+    /// A relay to reach (none is set up unless one was built in or set in
+    /// config.json: then nothing is looked up or retried), and phones to
+    /// reach. Tests pass their loopback relay in the context.
     fn wanted(&self) -> bool {
-        let settings = app_settings();
-        let reachable = if self.context.relay_url.is_some() {
-            settings.relay_enabled
-        } else {
-            settings.relay_wanted()
-        };
+        let reachable = self.context.relay_url.is_some() || app_settings().relay_wanted();
         reachable
             && self
                 .context
@@ -976,7 +972,9 @@ fn percent_encode(value: &str) -> String {
 /// Debug builds only: ignore LAN links so the relay path can be tested on one
 /// network (`DESKLINK_FORCE_RELAY=1`).
 pub fn force_relay() -> bool {
-    cfg!(debug_assertions) && std::env::var("DESKLINK_FORCE_RELAY").as_deref() == Ok("1")
+    super::RELAY_ENABLED
+        && cfg!(debug_assertions)
+        && std::env::var("DESKLINK_FORCE_RELAY").as_deref() == Ok("1")
 }
 
 #[cfg(test)]

@@ -87,13 +87,13 @@ pub struct AppSettings {
     /// means pairing alone is enough.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_password: Option<crate::device_links::session_lock::PasswordHash>,
-    /// Reach paired phones through the DeskLink relay when they are not on
-    /// this network.
+    /// Ignored: kept so config.json round-trips. `relay_link::RELAY_ENABLED`
+    /// alone decides whether the relay is used.
     pub relay_enabled: bool,
     /// A self-hosted relay (`wss://host/v1`); empty means the built-in one.
+    /// Set in config.json only (no UI).
     pub relay_url: String,
-    /// Allow media through a TURN server when no direct path exists. Off
-    /// means direct paths only, user-configured TURN servers included.
+    /// Ignored, like `relay_enabled`: TURN is used exactly when the relay is.
     pub use_turn: bool,
     /// Start in the background at login. `None` until decided: the first run
     /// turns it on, as a connection app is useless after a reboot otherwise.
@@ -259,15 +259,17 @@ impl AppSettings {
         relay_url_or(&self.relay_url, DEFAULT_RELAY_URL)
     }
 
-    /// Whether a relay server is set up at all.
+    /// Whether a relay server is set up at all. Never while the relay is
+    /// compiled out (`relay_link::RELAY_ENABLED`): then nothing relay-related
+    /// runs, is offered to the phone, or can be switched on from it.
     pub fn relay_configured(&self) -> bool {
-        !self.relay_url().is_empty()
+        crate::device_links::relay_link::RELAY_ENABLED && !self.relay_url().is_empty()
     }
 
-    /// Whether DeskLink should reach paired phones through the relay: on,
-    /// and a relay to reach.
+    /// Whether DeskLink should reach paired phones through the relay: compiled
+    /// in, and a relay to reach. The stored `relay_enabled` is not read.
     pub fn relay_wanted(&self) -> bool {
-        self.relay_enabled && self.relay_configured()
+        self.relay_configured()
     }
 }
 
@@ -1310,14 +1312,43 @@ mod tests {
         );
         let mut settings = AppSettings::default();
         if DEFAULT_RELAY_URL.is_empty() {
-            assert!(settings.relay_enabled, "on by default once one exists");
             assert!(!settings.relay_configured());
             assert!(!settings.relay_wanted(), "empty default: client not wanted");
         }
         settings.relay_url = "wss://mine.example/v1".into();
-        assert!(settings.relay_wanted());
+        assert_eq!(
+            settings.relay_wanted(),
+            crate::device_links::relay_link::RELAY_ENABLED,
+            "an address is enough only while the relay is compiled in"
+        );
         settings.relay_enabled = false;
+        assert_eq!(
+            settings.relay_wanted(),
+            crate::device_links::relay_link::RELAY_ENABLED,
+            "the stored switch is not read: the constant is the only control"
+        );
+    }
+
+    /// 1.3 ships LAN-only: with the switch off, even a stored relay address,
+    /// "on" and "Use TURN" (kept untouched in config.json) reach nothing.
+    #[test]
+    fn the_relay_compiled_out_ignores_every_stored_relay_setting() {
+        use crate::device_links::relay_link::{client, RELAY_ENABLED};
+        if RELAY_ENABLED {
+            return;
+        }
+        let settings = AppSettings {
+            relay_enabled: true,
+            relay_url: "wss://mine.example/v1".into(),
+            use_turn: true,
+            ..AppSettings::default()
+        };
+        assert!(!settings.relay_configured());
         assert!(!settings.relay_wanted());
+        assert!(!client::force_relay());
+        let packet = crate::device_links::desk_features::settings_packet(&settings, "phone");
+        assert_eq!(packet.get_bool("relayConfigured"), Some(false));
+        assert_eq!(packet.get_bool("relay"), Some(false));
     }
 
     #[test]

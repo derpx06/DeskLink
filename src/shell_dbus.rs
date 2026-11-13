@@ -369,7 +369,10 @@ fn shell_device(device: &DeviceView, settings: &AppSettings) -> ShellDevice {
             .map_or(-1, |battery| battery.current_charge.clamp(0, 100) as i32),
         charging: device.feature_transport_ready
             && battery.is_some_and(|battery| battery.is_charging),
-        path: device.connection_path.clone().unwrap_or_default(),
+        path: crate::device_links::device::shown_path(
+            device.connection_path.as_deref().unwrap_or_default(),
+        )
+        .to_string(),
         screen: match device.desktop_session {
             // Glide (F4): this computer's pointer is on the phone.
             DesktopSession::None

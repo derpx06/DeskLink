@@ -445,16 +445,19 @@ impl DaemonWorker {
         if super::config::app_settings().start_at_login.is_none() {
             self.set_start_at_login(true);
         }
-        crate::device_links::relay_link::client::start(
-            crate::device_links::relay_link::client::Context {
-                config: Arc::clone(&self.config),
-                devices: Arc::clone(&self.devices),
-                sessions: Arc::clone(&self.sessions),
-                events: Arc::clone(&self.events),
-                shutdown: Arc::clone(&self.shutdown),
-                relay_url: None,
-            },
-        );
+        // Compiled out: no relay thread, no connection, no TURN requests.
+        if crate::device_links::relay_link::RELAY_ENABLED {
+            crate::device_links::relay_link::client::start(
+                crate::device_links::relay_link::client::Context {
+                    config: Arc::clone(&self.config),
+                    devices: Arc::clone(&self.devices),
+                    sessions: Arc::clone(&self.sessions),
+                    events: Arc::clone(&self.events),
+                    shutdown: Arc::clone(&self.shutdown),
+                    relay_url: None,
+                },
+            );
+        }
 
         while let Ok(command) = self.command_rx.recv() {
             match &command {

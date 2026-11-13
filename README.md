@@ -13,7 +13,8 @@ GTK 4 and libadwaita desktop app; it pairs with the DeskLink Android app.
 - File transfer both ways, and a browser for the phone's files.
 - A presentation remote, ping, find-my-phone, battery status, and locking the
   desktop session from the phone.
-- Away from home: the DeskLink relay connects your devices across networks.
+- Works on your Wi-Fi network (LAN). Connecting away from home through the
+  DeskLink relay is built but switched off in 1.3 (see "Away from home").
 - No account. Devices pair directly by scanning a code.
 
 DeskLink speaks DeskLink Protocol v9. It grew out of KDE Connect but is not a
@@ -166,15 +167,22 @@ cargo build --release
 
 Release builds should set `DESKLINK_RELAY_URL=wss://<your relay>/v1` in the
 environment at build time; it becomes the default relay address. Without it
-the default is a placeholder, and users must enter a relay in Preferences.
+there is no default relay, and one can be set as `relay_url` in config.json.
 
 ## Away from home
 
+**Off in 1.3.** This release is LAN-only. The relay is controlled only in
+code, by `RELAY_ENABLED` in `src/device_links/relay_link/mod.rs` (and
+`BuildConfig.RELAY_ENABLED` in the Android app); there is no setting to turn
+it or TURN on or off. The rest of this section describes the feature for a
+build with it switched on.
+
 On the same network, devices find each other and connect directly. When they
 are apart, DeskLink can reach the phone through the **DeskLink relay**, a small
-WebSocket server that only forwards connection setup. Turn it on under
-Preferences → Away From Home, where you can also point DeskLink at your own
-relay and choose whether media may fall back to a TURN server.
+WebSocket server that only forwards connection setup; media that cannot go
+direct falls back to the relay's TURN server. To use your own relay, set
+`relay_url` (`wss://host/v1`) in `~/.config/desklink/config.json`; there is no
+UI for it.
 
 To run your own relay, see [`relay/deploy/DEPLOY.md`](relay/deploy/DEPLOY.md)
 and [`relay/README.md`](relay/README.md).
@@ -189,7 +197,7 @@ and [`relay/README.md`](relay/README.md).
   paired devices are online and talking to each other, their IP addresses
   (kept in memory only), and message sizes and timing. Screen video, files,
   clipboard and terminal data never pass through it.
-- If no direct path exists and TURN is allowed, encrypted media may flow
+- If no direct path exists, encrypted media may flow
   through a TURN server, which sees addresses and traffic volume but not
   content.
 

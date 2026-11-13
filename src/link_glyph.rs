@@ -11,6 +11,14 @@ use crate::application::token_color;
 use crate::device_links::device::{DeviceStatus, DeviceView};
 use crate::window::ui_kit::Status;
 
+/// The device's path as the glyph may name it (see `device::shown_path`).
+fn shown_path(device: &DeviceView) -> Option<&str> {
+    device
+        .connection_path
+        .as_deref()
+        .map(crate::device_links::device::shown_path)
+}
+
 /// How a device is linked to this computer, as the glyph's connector shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LinkState {
@@ -28,7 +36,7 @@ impl LinkState {
     pub(crate) fn of(device: &DeviceView) -> Self {
         match device.status {
             DeviceStatus::Paired if !device.feature_transport_ready => Self::Connecting,
-            DeviceStatus::Paired => match device.connection_path.as_deref() {
+            DeviceStatus::Paired => match shown_path(device) {
                 Some("turn") => Self::Relay,
                 _ => Self::Direct,
             },
@@ -102,7 +110,7 @@ impl Presentation {
             LinkState::Direct | LinkState::Relay => {
                 // The internet, direct or through the relay, reads the same:
                 // end to end encrypted either way.
-                let (route, short_route) = match (state, device.connection_path.as_deref()) {
+                let (route, short_route) = match (state, shown_path(device)) {
                     (LinkState::Relay, _) | (_, Some("direct")) => {
                         ("over the internet · encrypted", "Internet")
                     }
@@ -262,15 +270,24 @@ mod tests {
         );
 
         // The internet reads the same direct or through the relay, and the
-        // words never say "relay".
+        // words never say "relay". With the relay compiled out nothing says
+        // "internet" either: every link began on the LAN.
+        let internet = if crate::device_links::relay_link::RELAY_ENABLED {
+            "over the internet · encrypted · 9 ms"
+        } else {
+            "over Wi-Fi · 9 ms"
+        };
         for path in ["direct", "turn"] {
             phone.connection_path = Some(path.into());
             let words = Presentation::of(&phone);
-            assert_eq!(words.detail, "over the internet · encrypted · 9 ms");
+            assert_eq!(words.detail, internet);
             assert!(!words.detail.to_lowercase().contains("relay"));
         }
         phone.connection_path = Some("turn".into());
-        assert_eq!(LinkState::of(&phone), LinkState::Relay);
+        assert_eq!(
+            LinkState::of(&phone) == LinkState::Relay,
+            crate::device_links::relay_link::RELAY_ENABLED
+        );
     }
 
     /// The same words as the phone's and the shell menu's (3.0): one word per
