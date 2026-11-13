@@ -724,9 +724,12 @@ pub(super) fn handle_disconnect(
     sessions: &Arc<DeviceManager>,
     reason: String,
 ) -> bool {
+    // The socket judged gone is the one the link carries now.
+    let epoch = binding.link.epoch();
     disconnected(
         sessions.bootstrap_disconnected_if_current(binding, reason),
         binding,
+        epoch,
         devices,
     )
 }
@@ -744,6 +747,7 @@ pub(super) fn handle_reader_disconnect(
     disconnected(
         sessions.reader_disconnected(binding, epoch, reason),
         binding,
+        epoch,
         devices,
     )
 }
@@ -751,13 +755,16 @@ pub(super) fn handle_reader_disconnect(
 fn disconnected(
     result: crate::device_links::core::DisconnectResult,
     binding: &SessionBinding,
+    epoch: u64,
     devices: &Arc<Mutex<HashMap<String, DeviceView>>>,
 ) -> bool {
     if !result.was_current {
         return false;
     }
+    // A retained link may adopt a replacement socket once the session lock
+    // is released: only the socket that ended is closed.
     if let Some(link) = result.link {
-        link.close();
+        link.close_at(epoch);
     }
     if result.feature_transport_retained {
         debug_log!(

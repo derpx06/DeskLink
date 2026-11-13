@@ -234,6 +234,23 @@ impl SessionLink {
         self.carrier().shutdown();
     }
 
+    /// [`Self::close`], only while the link still carries the socket of
+    /// `epoch`: the end of a socket, judged under the session lock and acted
+    /// on after it, must not close a replacement adopted in between.
+    pub fn close_at(&self, epoch: u64) {
+        let carrier = {
+            let current = self
+                .transport
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if self.epoch() != epoch || self.closed.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            Arc::clone(&current)
+        };
+        carrier.shutdown();
+    }
+
     /// Whether this link has been closed.
     ///
     /// Deliberately the local flag rather than a question for the transport:
@@ -329,6 +346,44 @@ mod tests {
         assert_eq!(link_race(true, LINK_RACE_WINDOW, false, "a", "b"), NotARace);
         assert_eq!(link_race(false, MS(999), true, "a", "b"), ReplaceIncumbent);
         assert_eq!(LINK_RACE_WINDOW, MS(1000));
+    }
+
+    #[test]
+    fn closing_a_sockets_end_spares_a_socket_adopted_since() {
+        use std::sync::atomic::AtomicBool;
+        struct Flagged(Arc<AtomicBool>);
+        impl LinkTransport for Flagged {
+            fn send_packet(
+                &self,
+                _: &crate::device_links::packet::NetworkPacket,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+            fn read_byte(&self) -> Result<ReadOutcome, String> {
+                Ok(ReadOutcome::Closed)
+            }
+            fn shutdown(&self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let (old_down, new_down) = (
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let link = SessionLink::for_test("phone", Arc::new(Flagged(Arc::clone(&old_down))));
+        let judged = link.epoch();
+        link.adopt(Arc::new(Flagged(Arc::clone(&new_down))));
+        link.close_at(judged);
+        assert!(
+            !link.is_closed() && !new_down.load(Ordering::Acquire),
+            "the new socket lives"
+        );
+        link.close_at(link.epoch());
+        assert!(link.is_closed() && new_down.load(Ordering::Acquire));
+        assert!(
+            !old_down.load(Ordering::Acquire),
+            "adopt's caller shuts the old one"
+        );
     }
 
     #[test]
