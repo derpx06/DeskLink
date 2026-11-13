@@ -195,19 +195,33 @@ fn from_gtk(args: &glib::Variant, name_of: impl Fn(&str) -> Option<String>) -> O
 
 /// Adds `note`, or replaces the one it updates (same origin); returns the
 /// stored copy with its `desk:` id.
-fn upsert(state: &mut State, mut note: DeskNote) -> DeskNote {
-    state
-        .seen
-        .insert(note.app_key.clone(), note.app_name.clone());
-    let same = |known: &DeskNote| match (&known.origin, &note.origin) {
+fn upsert(state: &mut State, note: DeskNote) -> DeskNote {
+    upsert_noting(state, note).0
+}
+
+/// Whether `note` replaces `known` (the same origin).
+fn replaces(known: &DeskNote, note: &DeskNote) -> bool {
+    match (&known.origin, &note.origin) {
         (Origin::Gtk { .. }, Origin::Gtk { .. }) => known.origin == note.origin,
         (Origin::Fdo { server_id: a, .. }, Origin::Fdo { server_id: b, .. }) => *a != 0 && a == b,
         _ => false,
-    };
+    }
+}
+
+/// [`upsert`], and whether the phones have not seen this already: a notification
+/// replaced with the same words (a progress bar, a volume bubble, an app that
+/// re-sends on a timer) is not forwarded again.
+fn upsert_noting(state: &mut State, mut note: DeskNote) -> (DeskNote, bool) {
+    state
+        .seen
+        .insert(note.app_key.clone(), note.app_name.clone());
+    let same = |known: &DeskNote| replaces(known, &note);
     if let Some(known) = state.notes.iter_mut().find(|known| same(known)) {
         note.id = known.id.clone();
+        let repeat = (&known.app_key, &known.title, &known.text)
+            == (&note.app_key, &note.title, &note.text);
         *known = note.clone();
-        return note;
+        return (note, !repeat);
     }
     state.next += 1;
     note.id = format!("{ID_PREFIX}{}", state.next);
@@ -215,7 +229,7 @@ fn upsert(state: &mut State, mut note: DeskNote) -> DeskNote {
     if state.notes.len() > KEPT {
         state.notes.remove(0);
     }
-    note
+    (note, true)
 }
 
 /// The body sent to the phone (C1).
@@ -308,8 +322,13 @@ pub(crate) fn send_snapshot(device_id: Option<&str>) {
 }
 
 fn added(note: Option<DeskNote>) {
-    if let Some(note) = note.and_then(|note| with_state(|state| upsert(state, note))) {
-        forward(&note);
+    if let Some((note, fresh)) = note.and_then(|note| with_state(|state| upsert_noting(state, note)))
+    {
+        if fresh {
+            forward(&note);
+        } else {
+            debug_log!("[Notifications] {} unchanged, not sent again", note.id);
+        }
     }
 }
 
@@ -428,17 +447,21 @@ fn observe(message: &gio::DBusMessage) {
             };
             let serial = message.serial();
             let note = with_state(|state| {
-                let stored = upsert(state, note);
+                let (stored, fresh) = upsert_noting(state, note);
                 state
                     .pending
                     .insert((sender.clone(), serial), stored.id.clone());
                 if state.pending.len() > 200 {
                     state.pending.clear();
                 }
-                stored
+                (stored, fresh)
             });
-            if let Some(note) = note {
-                forward(&note);
+            if let Some((note, fresh)) = note {
+                if fresh {
+                    forward(&note);
+                } else {
+                    debug_log!("[Notifications] {} unchanged, not sent again", note.id);
+                }
             }
         }
         (gio::DBusMessageType::Signal, Some("org.freedesktop.DBus"), Some("NameOwnerChanged")) => {
@@ -846,6 +869,28 @@ mod tests {
             );
         }
         assert_eq!(state.notes.len(), KEPT, "capped");
+    }
+
+    /// A notification replaced with the same words is not sent to the phones again.
+    #[test]
+    fn a_replace_with_the_same_words_is_not_forwarded_again() {
+        let mut state = State::default();
+        let note = |text: &str| DeskNote {
+            id: String::new(),
+            app_key: "a".into(),
+            app_name: "A".into(),
+            title: "Download".into(),
+            text: text.into(),
+            time: 0,
+            origin: Origin::Gtk {
+                app_id: "a".into(),
+                id: "1".into(),
+            },
+        };
+        assert!(upsert_noting(&mut state, note("50%")).1, "new");
+        let (_, again) = upsert_noting(&mut state, note("50%"));
+        assert!(!again, "identical: quiet");
+        assert!(upsert_noting(&mut state, note("60%")).1, "changed words");
     }
 
     #[test]
