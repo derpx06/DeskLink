@@ -38,6 +38,12 @@ pub struct MediaStatus {
     pub position: Option<i64>,
     pub length: Option<i64>,
     pub can_seek: bool,
+    /// When `position` was reported: the bar moves on from there while playing.
+    #[serde(skip)]
+    pub position_at: Option<std::time::Instant>,
+    /// A seek just made: reports of the old position are ignored for a moment.
+    #[serde(skip)]
+    pub seek_hold: Option<crate::device_links::media_seek::Hold>,
     pub album_art_url: Option<String>,
     /// The phone's cover, from `albumArtData`.
     #[serde(skip)]

@@ -440,6 +440,8 @@ mod tests {
             position: Some(12_000),
             length: Some(281_000),
             can_seek: true,
+            position_at: None,
+            seek_hold: None,
             album_art_url: Some("content://media/42".into()),
             album_art: None,
         }

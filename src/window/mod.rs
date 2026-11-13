@@ -3244,6 +3244,8 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                     position: Some(72_000),
                     length: Some(281_000),
                     can_seek: true,
+                    position_at: None,
+                    seek_hold: None,
                     album_art_url: None,
                     album_art: None,
                 });

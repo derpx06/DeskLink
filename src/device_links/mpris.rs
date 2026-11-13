@@ -627,17 +627,26 @@ pub(crate) fn handle_request(device_id: &str, packet: &NetworkPacket) -> Result<
         changed = true;
     }
     if let (Some(player), Some(position_ms)) = (target, packet.get_i64("SetPosition")) {
-        if let Some(track) = &player.track_id {
-            let path = glib::variant::ObjectPath::try_from(track.as_str())
-                .map_err(|error| error.to_string())?;
-            call(
-                &bus,
-                &player.bus_name,
-                "SetPosition",
-                Some((path, position_ms.max(0).saturating_mul(1000)).to_variant()),
-            )?;
-            changed = true;
+        if !player.can_seek {
+            return Err(format!("{} does not allow seeking", player.name));
         }
+        match super::media_seek::plan(
+            player.track_id.as_deref(),
+            position_ms,
+            player.position_ms,
+            player.length_ms,
+        ) {
+            super::media_seek::Plan::Absolute { track, micros } => {
+                let path = glib::variant::ObjectPath::try_from(track.as_str())
+                    .map_err(|error| error.to_string())?;
+                let args = glib::Variant::tuple_from_iter([path.to_variant(), micros.to_variant()]);
+                call_with(&bus, &player.bus_name, "SetPosition", Some(&args))?;
+            }
+            super::media_seek::Plan::Relative { micros } => {
+                call(&bus, &player.bus_name, "Seek", Some(micros.to_variant()))?;
+            }
+        }
+        changed = true;
     }
     if let (Some(player), Some(volume)) = (target, packet.get_i64("setVolume")) {
         let level = (volume.clamp(0, 100) as f64) / 100.0;
@@ -690,12 +699,21 @@ fn call(
     argument: Option<glib::Variant>,
 ) -> Result<(), String> {
     let parameters = argument.map(|argument| glib::Variant::tuple_from_iter([argument]));
+    call_with(bus, name, method, parameters.as_ref())
+}
+
+fn call_with(
+    bus: &gio::DBusConnection,
+    name: &str,
+    method: &str,
+    parameters: Option<&glib::Variant>,
+) -> Result<(), String> {
     bus.call_sync(
         Some(name),
         PATH,
         PLAYER,
         method,
-        parameters.as_ref(),
+        parameters,
         None,
         gio::DBusCallFlags::NONE,
         1000,

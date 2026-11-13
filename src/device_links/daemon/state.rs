@@ -463,6 +463,8 @@ pub(super) fn update_media_from_packet(
             position: None,
             length: None,
             can_seek: false,
+            position_at: None,
+            seek_hold: None,
             album_art_url: None,
             album_art: None,
         });
@@ -500,7 +502,13 @@ pub(super) fn update_media_from_packet(
             media.volume = Some(volume.clamp(0, 150));
         }
         if let Some(position) = packet.get_i64("pos").or_else(|| packet.get_i64("position")) {
-            media.position = Some(position.max(0));
+            let now = std::time::Instant::now();
+            // A report made before the player applied a seek would pull the bar back.
+            if !media.seek_hold.is_some_and(|hold| hold.ignores(now)) {
+                media.position = Some(position.max(0));
+                media.position_at = Some(now);
+                media.seek_hold = None;
+            }
         }
         if let Some(length) = packet.get_i64("length") {
             media.length = Some(length.max(0));
@@ -1541,5 +1549,61 @@ mod tests {
         assert_eq!(media.position, Some(1234));
         assert_eq!(media.length, Some(9999));
         assert!(media.can_seek);
+    }
+
+    #[test]
+    fn a_stale_position_does_not_pull_the_bar_back_from_a_seek_in_flight() {
+        let (devices, info) = test_devices();
+        let report = |pos: i64| {
+            let mut packet = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_MPRIS);
+            packet.set("player", "vlc");
+            packet.set("title", "Track");
+            packet.set("pos", pos);
+            packet.set("length", 200_000);
+            packet.set("canSeek", true);
+            update_media_from_packet(&devices, &info.id, &packet);
+        };
+        let position = || {
+            devices.lock().unwrap()[&info.id]
+                .media_status
+                .as_ref()
+                .unwrap()
+                .position
+        };
+        report(10_000);
+        // The person seeks to 90 s: the bar says so at once.
+        let now = std::time::Instant::now();
+        {
+            let mut all = devices.lock().unwrap();
+            let media = all
+                .get_mut(&info.id)
+                .unwrap()
+                .media_status
+                .as_mut()
+                .unwrap();
+            media.position = Some(90_000);
+            media.seek_hold = Some(crate::device_links::media_seek::Hold {
+                target_ms: 90_000,
+                at: now,
+            });
+        }
+        report(10_500); // the old position, sent before the phone applied the seek
+        assert_eq!(position(), Some(90_000));
+        // Past the hold, reports count again.
+        {
+            let mut all = devices.lock().unwrap();
+            let media = all
+                .get_mut(&info.id)
+                .unwrap()
+                .media_status
+                .as_mut()
+                .unwrap();
+            media.seek_hold = Some(crate::device_links::media_seek::Hold {
+                target_ms: 90_000,
+                at: now - std::time::Duration::from_secs(5),
+            });
+        }
+        report(91_000);
+        assert_eq!(position(), Some(91_000));
     }
 }
