@@ -81,7 +81,8 @@ mod imp {
         /// does not.
         fn start_primary(&self) {
             let obj = self.obj();
-            crate::startup("application constructed");
+            // Just after GTK's own start-up (`parent_startup`).
+            crate::startup("GTK started");
             self.daemon.replace(Some(DaemonHandle::start()));
             crate::startup("daemon started");
             // What this system can do, found out off the main thread.
@@ -137,9 +138,7 @@ mod imp {
 
     impl ApplicationImpl for DesklinkApplication {
         fn startup(&self) {
-            crate::startup("registered on the session bus");
             self.parent_startup();
-            crate::startup("GTK started");
             self.start_primary();
             crate::device_links::dnd::init();
             // Registered now (startup runs only in the primary instance), so
