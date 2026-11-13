@@ -2,30 +2,40 @@
 //!
 //! `org.freedesktop.portal.InputCapture` shows a consent dialog ("Capture
 //! Input") on every `CreateSession`, and the GNOME 50 portal offers no way to
-//! remember the answer (see `docs/ARCHITECTURE.md`, Glide). So the only thing
-//! DeskLink controls is how often it asks: this is that policy, a pure state
-//! machine with the clock passed in.
+//! remember the answer (see `docs/ARCHITECTURE.md`, Glide). GNOME also ends
+//! the session itself when the screen locks (mutter drops it as the shield
+//! comes up), so a new dialog after every lock cannot be avoided. The only
+//! thing DeskLink controls is *when* it asks: this is that policy, a pure
+//! state machine with the clock passed in.
 //!
 //! * Ask only when Glide is on, a phone that allows it is feature-ready and the
 //!   person is at the computer (not locked, not idle).
 //! * Ask once per run: the session is kept across reconnects and link bounces.
-//! * A Cancel is remembered ([`DECLINED_FOR`]); an unanswered or failed ask,
-//!   or a session the desktop closed, waits a while; at most [`ASKS_PER_RUN`]
-//!   automatic asks in all. The person's own action (Glide switched, "Ask
-//!   again") clears the wait.
+//! * A session the desktop closed, an unanswered dialog and a failure are
+//!   asked again when the person comes back (seen away since, here now: the
+//!   unlock after a lock, the wake after a sleep), never on a timer while
+//!   they work; a Cancel is remembered ([`DECLINED_FOR`]); at most
+//!   [`ASKS_PER_RUN`] automatic asks that did not lead to a working session.
+//!   The person's own action (Glide switched, "Turn on again") ends any wait.
 
 use std::time::{Duration, Instant};
 
 /// A Cancel is not asked again for this long (and never on its own in a loop).
 pub(crate) const DECLINED_FOR: Duration = Duration::from_secs(8 * 3600);
-/// A dialog nobody answered (the portal gives up after two minutes).
+/// A dialog nobody answered (the portal gives up after two minutes) is asked
+/// again when the person comes back, or after this if they never seemed to leave.
 pub(crate) const UNANSWERED_FOR: Duration = Duration::from_secs(15 * 60);
-/// The portal failed for another reason.
+/// The portal failed for another reason (or when the person comes back).
 pub(crate) const FAILED_FOR: Duration = Duration::from_secs(5 * 60);
-/// The desktop closed a session that was working.
-pub(crate) const CLOSED_FOR: Duration = Duration::from_secs(5 * 60);
-/// Automatic asks per run, however they ended; then only the person asks.
+/// Automatic asks per run that did not lead to a working session; then only
+/// the person asks.
 pub(crate) const ASKS_PER_RUN: u32 = 3;
+/// A session that lived this long worked: the desktop closing it later (a
+/// lock) starts the count of [`ASKS_PER_RUN`] over.
+pub(crate) const WORKED_FOR: Duration = Duration::from_secs(60);
+/// The person seen away this long before the desktop closed the session
+/// still counts as away for it (the lock and the close race each other).
+const AWAY_SLACK: Duration = Duration::from_secs(60);
 /// How long an answer to "is the person here?" is reused.
 const PRESENCE_TTL: Duration = Duration::from_secs(2);
 
@@ -35,26 +45,49 @@ pub(crate) enum Why {
     Declined,
     Unanswered,
     Failed,
+    /// The desktop ended the session while the person was away (a lock, a
+    /// sleep: GNOME drops it then).
+    Locked,
+    /// The desktop ended the session with the person here (a portal restart).
     Closed,
     /// [`ASKS_PER_RUN`] asks used up.
     Limit,
 }
 
 impl Why {
-    /// The plain words for the window (the person can always "Ask again").
+    /// The plain words for the window (the person can always turn it on again).
     pub(crate) fn words(self) -> &'static str {
         match self {
-            Why::Declined => "Glide needs your OK to capture the mouse. Turn it on again to ask.",
+            Why::Declined => {
+                "Off for now because you said no to sharing the mouse. Glide does not ask \
+                 again for 8 hours unless you turn it on again."
+            }
             Why::Unanswered => {
-                "The permission window was not answered, so Glide is waiting. Ask again when you \
-                 are at the computer."
+                "Nobody answered the permission window. Glide asks again when you are back at \
+                 the computer."
             }
-            Why::Failed => "The desktop's input capture did not start. Ask again to retry.",
+            Why::Failed => {
+                "The desktop's input capture did not start. Glide tries again when you are back, \
+                 or in a few minutes."
+            }
+            Why::Locked => {
+                "Paused: the screen was locked or the computer slept, and GNOME ends Glide then. \
+                 Glide asks again when you unlock."
+            }
             Why::Closed => {
-                "The desktop stopped Glide. DeskLink tries again in a few minutes, or ask now."
+                "Paused: the desktop ended Glide's permission. Glide asks again when you are back \
+                 after a lock or a break, or turn it on again now."
             }
-            Why::Limit => "Glide stopped after asking several times. Ask again to try once more.",
+            Why::Limit => "Stopped after asking several times. Turn it on again to ask once more.",
         }
+    }
+
+    /// Whether the wait ends when the person comes back to the computer.
+    fn ends_on_return(self) -> bool {
+        matches!(
+            self,
+            Why::Unanswered | Why::Failed | Why::Locked | Why::Closed
+        )
     }
 }
 
@@ -88,10 +121,11 @@ pub(crate) enum Phase {
     Idle,
     /// The dialog is up.
     Asking,
-    /// A session exists (kept for the run).
-    Open,
-    /// Waiting, until the time given or (`None`) until the person acts.
-    Held(Why, Option<Instant>),
+    /// A session exists (kept for the run), since then.
+    Open(Instant),
+    /// Waiting since the first time, until the second (`None`: no timer),
+    /// or the person's return when [`Why::ends_on_return`], or their action.
+    Held(Why, Instant, Option<Instant>),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -106,6 +140,8 @@ pub(crate) struct Consent {
     phase: Phase,
     asks: u32,
     present: Option<(Instant, bool)>,
+    /// The last time the person was seen away (locked, idle, asleep).
+    away_at: Option<Instant>,
 }
 
 impl Consent {
@@ -114,6 +150,7 @@ impl Consent {
             phase: Phase::Idle,
             asks: 0,
             present: None,
+            away_at: None,
         }
     }
 
@@ -124,33 +161,14 @@ impl Consent {
 
     pub(crate) fn held(&self) -> Option<Why> {
         match self.phase {
-            Phase::Held(why, _) => Some(why),
+            Phase::Held(why, ..) => Some(why),
             _ => None,
         }
     }
 
-    /// Whether a session may be created now. `ready` is Glide on with a
-    /// feature-ready phone that allows it; `present` says whether the person
-    /// is at the computer and is only called when everything else holds.
-    pub(crate) fn step(
-        &mut self,
-        now: Instant,
-        ready: bool,
-        present: impl FnOnce() -> bool,
-    ) -> Step {
-        match self.phase {
-            Phase::Open | Phase::Asking => return Step::Wait,
-            Phase::Held(_, Some(until)) if now >= until => self.phase = Phase::Idle,
-            Phase::Held(..) => return Step::Wait,
-            Phase::Idle => {}
-        }
-        if !ready {
-            return Step::Wait;
-        }
-        if self.asks >= ASKS_PER_RUN {
-            self.phase = Phase::Held(Why::Limit, None);
-            return Step::Wait;
-        }
+    /// Whether the person is at the computer, looked up at most once per
+    /// [`PRESENCE_TTL`]; a "no" is remembered as a time they were away.
+    pub(crate) fn here(&mut self, now: Instant, present: &mut impl FnMut() -> bool) -> bool {
         let here = match self.present {
             Some((at, here)) if now.saturating_duration_since(at) < PRESENCE_TTL => here,
             _ => {
@@ -160,6 +178,52 @@ impl Consent {
             }
         };
         if !here {
+            self.away_at = Some(now);
+        }
+        here
+    }
+
+    /// The person was away without the session saying so (the computer
+    /// slept with no lock screen).
+    pub(crate) fn was_away(&mut self, now: Instant) {
+        self.away_at = Some(now);
+        self.present = None;
+    }
+
+    /// Whether a session may be created now. `ready` is Glide on with a
+    /// feature-ready phone that allows it; `present` says whether the person
+    /// is at the computer and is only called when its answer matters.
+    pub(crate) fn step(
+        &mut self,
+        now: Instant,
+        ready: bool,
+        mut present: impl FnMut() -> bool,
+    ) -> Step {
+        match self.phase {
+            Phase::Open(_) | Phase::Asking => return Step::Wait,
+            Phase::Held(why, since, until) => {
+                let timed_out = until.is_some_and(|until| now >= until);
+                let here = why.ends_on_return() && self.here(now, &mut present);
+                if why == Why::Closed && !here {
+                    // Seen away after all: the words say what happened.
+                    self.phase = Phase::Held(Why::Locked, since, until);
+                }
+                let back = here && self.away_at.is_some_and(|at| at + AWAY_SLACK >= since);
+                if !timed_out && !back {
+                    return Step::Wait;
+                }
+                self.phase = Phase::Idle;
+            }
+            Phase::Idle => {}
+        }
+        if !ready {
+            return Step::Wait;
+        }
+        if self.asks >= ASKS_PER_RUN {
+            self.phase = Phase::Held(Why::Limit, now, None);
+            return Step::Wait;
+        }
+        if !self.here(now, &mut present) {
             return Step::Wait;
         }
         self.asks += 1;
@@ -170,20 +234,29 @@ impl Consent {
     /// The portal answered the ask.
     pub(crate) fn answered(&mut self, now: Instant, outcome: Outcome) {
         self.phase = match outcome {
-            Outcome::Allowed => Phase::Open,
-            Outcome::Declined => Phase::Held(Why::Declined, Some(now + DECLINED_FOR)),
-            Outcome::Unanswered => Phase::Held(Why::Unanswered, Some(now + UNANSWERED_FOR)),
-            Outcome::Failed => Phase::Held(Why::Failed, Some(now + FAILED_FOR)),
+            Outcome::Allowed => Phase::Open(now),
+            Outcome::Declined => Phase::Held(Why::Declined, now, Some(now + DECLINED_FOR)),
+            Outcome::Unanswered => Phase::Held(Why::Unanswered, now, Some(now + UNANSWERED_FOR)),
+            Outcome::Failed => Phase::Held(Why::Failed, now, Some(now + FAILED_FOR)),
         };
     }
 
-    /// The desktop ended the session (or its input socket).
+    /// The desktop ended the session (or its input socket). Asked again when
+    /// the person comes back; a session that worked a while does not count
+    /// towards [`ASKS_PER_RUN`] (a lock is not a loop).
     pub(crate) fn closed(&mut self, now: Instant) {
-        self.phase = Phase::Held(Why::Closed, Some(now + CLOSED_FOR));
+        if let Phase::Open(since) = self.phase {
+            if now.saturating_duration_since(since) >= WORKED_FOR {
+                self.asks = 0;
+            }
+        }
+        let away = self.away_at.is_some_and(|at| at + AWAY_SLACK >= now);
+        let why = if away { Why::Locked } else { Why::Closed };
+        self.phase = Phase::Held(why, now, None);
     }
 
-    /// The person acted (switched Glide, pressed "Ask again"): any wait ends
-    /// and the count starts over. A live session or an open dialog stays.
+    /// The person acted (switched Glide, pressed "Turn on again"): any wait
+    /// ends and the count starts over. A live session or an open dialog stays.
     pub(crate) fn person_acts(&mut self) {
         self.asks = 0;
         self.present = None;
@@ -202,6 +275,11 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    fn open(c: &mut Consent, t: Instant) {
+        assert_eq!(c.step(t, true, HERE), Step::Ask);
+        c.answered(t, Outcome::Allowed);
     }
 
     #[test]
@@ -239,7 +317,7 @@ mod tests {
             assert_eq!(c.step(t + secs(n * 600), true, HERE), Step::Wait);
             assert_eq!(c.step(t + secs(n * 600), false, HERE), Step::Wait);
         }
-        assert_eq!(c.phase(), Phase::Open);
+        assert!(matches!(c.phase(), Phase::Open(_)));
     }
 
     #[test]
@@ -251,8 +329,9 @@ mod tests {
             Outcome::of_error("Desktop permission request CreateSession was cancelled"),
         );
         assert_eq!(c.held(), Some(Why::Declined));
-        // Reconnecting, hours later, still no dialog.
-        for n in [1, 60, 3600, 7 * 3600] {
+        // Reconnecting, a lock and an unlock, hours later: still no dialog.
+        assert_eq!(c.step(t + secs(60), true, AWAY), Step::Wait);
+        for n in [61, 3600, 7 * 3600] {
             assert_eq!(c.step(t + secs(n), true, HERE), Step::Wait, "{n}");
         }
         // After the long wait it may ask once more on its own.
@@ -260,11 +339,18 @@ mod tests {
     }
 
     #[test]
-    fn the_person_asking_again_ends_the_wait_at_once() {
+    fn the_person_turning_it_on_again_ends_any_wait_at_once() {
+        for outcome in [Outcome::Declined, Outcome::Unanswered, Outcome::Failed] {
+            let (mut c, t) = (Consent::new(), Instant::now());
+            assert_eq!(c.step(t, true, HERE), Step::Ask);
+            c.answered(t, outcome);
+            assert_eq!(c.step(t + secs(5), true, HERE), Step::Wait, "{outcome:?}");
+            c.person_acts();
+            assert_eq!(c.step(t + secs(6), true, HERE), Step::Ask, "{outcome:?}");
+        }
         let (mut c, t) = (Consent::new(), Instant::now());
-        assert_eq!(c.step(t, true, HERE), Step::Ask);
-        c.answered(t, Outcome::Declined);
-        assert_eq!(c.step(t + secs(5), true, HERE), Step::Wait);
+        open(&mut c, t);
+        c.closed(t + secs(5));
         c.person_acts();
         assert_eq!(c.step(t + secs(6), true, HERE), Step::Ask);
     }
@@ -285,8 +371,82 @@ mod tests {
         );
     }
 
+    /// Before: a lock closed the session and Glide asked again on a 5 minute
+    /// timer, wherever the person was, so the dialog came out of nowhere.
     #[test]
-    fn an_unanswered_dialog_or_a_failure_waits_then_tries_again() {
+    fn a_lock_that_closes_the_session_asks_again_at_the_unlock_not_on_a_timer() {
+        let (mut c, t) = (Consent::new(), Instant::now());
+        open(&mut c, t);
+        // GNOME drops the session as the lock screen comes up.
+        let lock = t + secs(600);
+        c.closed(lock);
+        assert_eq!(c.held(), Some(Why::Closed), "not seen locked yet");
+        // Locked: no dialog, however long, and the words say why.
+        for n in [3, 300, 3600] {
+            assert_eq!(c.step(lock + secs(n), true, AWAY), Step::Wait, "{n}");
+            assert_eq!(c.held(), Some(Why::Locked));
+        }
+        // Unlocked: asked at once, the moment the person is back.
+        assert_eq!(c.step(lock + secs(3603), true, HERE), Step::Ask);
+    }
+
+    #[test]
+    fn a_close_while_the_person_works_waits_for_them_and_never_pops_up_on_a_timer() {
+        let (mut c, t) = (Consent::new(), Instant::now());
+        open(&mut c, t);
+        let close = t + secs(600);
+        c.closed(close);
+        // They keep working: never a sudden dialog, and the words do not
+        // blame a lock that did not happen.
+        for n in [3, 301, 3600, 86_400] {
+            assert_eq!(c.step(close + secs(n), true, HERE), Step::Wait, "{n}");
+            assert_eq!(c.held(), Some(Why::Closed));
+        }
+        // They lock and come back: asked then.
+        assert_eq!(c.step(close + secs(86_403), true, AWAY), Step::Wait);
+        assert_eq!(c.step(close + secs(86_500), true, HERE), Step::Ask);
+    }
+
+    #[test]
+    fn a_sleep_without_a_lock_screen_counts_as_away() {
+        let (mut c, t) = (Consent::new(), Instant::now());
+        open(&mut c, t);
+        c.closed(t + secs(600));
+        assert_eq!(c.step(t + secs(603), true, HERE), Step::Wait);
+        c.was_away(t + secs(604));
+        assert_eq!(c.step(t + secs(605), true, HERE), Step::Ask);
+    }
+
+    #[test]
+    fn the_lock_seen_just_before_the_close_counts() {
+        let (mut c, t) = (Consent::new(), Instant::now());
+        open(&mut c, t);
+        // Seen locked, then the desktop's close is noticed 30 s later, unlocked.
+        assert!(!c.here(t + secs(100), &mut || false));
+        c.closed(t + secs(130));
+        assert_eq!(c.held(), Some(Why::Locked));
+        assert_eq!(c.step(t + secs(133), true, HERE), Step::Ask);
+        // An away long before the close does not.
+        let (mut c, t) = (Consent::new(), Instant::now());
+        assert!(!c.here(t, &mut || false));
+        open(&mut c, t + secs(3));
+        c.closed(t + secs(600));
+        assert_eq!(c.step(t + secs(603), true, HERE), Step::Wait);
+    }
+
+    #[test]
+    fn an_unanswered_dialog_asks_again_when_the_person_returns() {
+        let (mut c, t) = (Consent::new(), Instant::now());
+        assert_eq!(c.step(t, true, HERE), Step::Ask);
+        // The person had walked off; logind says so once the dialog times out.
+        let timeout = t + secs(120);
+        c.answered(timeout, Outcome::Unanswered);
+        assert_eq!(c.step(timeout + secs(1), true, AWAY), Step::Wait);
+        assert_eq!(c.step(timeout + secs(4), true, HERE), Step::Ask);
+    }
+
+    #[test]
+    fn an_unanswered_dialog_or_a_failure_with_the_person_here_waits_then_tries_again() {
         let (mut c, t) = (Consent::new(), Instant::now());
         assert_eq!(c.step(t, true, HERE), Step::Ask);
         c.answered(t, Outcome::Unanswered);
@@ -299,14 +459,47 @@ mod tests {
     }
 
     #[test]
-    fn a_session_the_desktop_closed_comes_back_later_not_at_once() {
+    fn a_return_with_no_ready_phone_waits_for_the_phone_not_for_another_return() {
         let (mut c, t) = (Consent::new(), Instant::now());
+        open(&mut c, t);
+        c.closed(t + secs(600));
+        assert_eq!(c.step(t + secs(603), false, AWAY), Step::Wait);
+        // Back, but the phone is still reconnecting.
+        assert_eq!(c.step(t + secs(606), false, HERE), Step::Wait);
+        assert_eq!(c.phase(), Phase::Idle);
+        assert_eq!(c.step(t + secs(620), true, HERE), Step::Ask);
+    }
+
+    /// Before: every ask counted, so the third lock of a day left Glide off
+    /// for the rest of the run.
+    #[test]
+    fn locks_all_day_never_use_up_the_asks() {
+        let (mut c, mut t) = (Consent::new(), Instant::now());
+        for _ in 0..10 {
+            open(&mut c, t);
+            t += WORKED_FOR;
+            c.closed(t);
+            assert_eq!(c.step(t + secs(3), true, AWAY), Step::Wait);
+            t += secs(6);
+        }
         assert_eq!(c.step(t, true, HERE), Step::Ask);
-        c.answered(t, Outcome::Allowed);
-        c.closed(t + secs(100));
-        assert_eq!(c.held(), Some(Why::Closed));
-        assert_eq!(c.step(t + secs(101), true, HERE), Step::Wait);
-        assert_eq!(c.step(t + secs(100) + CLOSED_FOR, true, HERE), Step::Ask);
+    }
+
+    #[test]
+    fn a_session_the_desktop_keeps_closing_at_once_is_a_loop_and_stops() {
+        let (mut c, mut t) = (Consent::new(), Instant::now());
+        for _ in 0..ASKS_PER_RUN {
+            open(&mut c, t);
+            c.closed(t + secs(1));
+            assert_eq!(c.step(t + secs(4), true, AWAY), Step::Wait);
+            t += secs(7);
+        }
+        assert_eq!(c.step(t, true, HERE), Step::Wait);
+        assert_eq!(c.held(), Some(Why::Limit));
+        assert_eq!(c.step(t + secs(10), true, AWAY), Step::Wait);
+        assert_eq!(c.step(t + secs(13), true, HERE), Step::Wait);
+        c.person_acts();
+        assert_eq!(c.step(t + secs(14), true, HERE), Step::Ask);
     }
 
     #[test]
@@ -332,6 +525,26 @@ mod tests {
         assert_eq!(c.phase(), Phase::Asking);
         c.answered(t, Outcome::Allowed);
         c.person_acts();
-        assert_eq!(c.phase(), Phase::Open);
+        assert!(matches!(c.phase(), Phase::Open(_)));
+    }
+
+    #[test]
+    fn every_wait_says_what_ends_it() {
+        for why in [
+            Why::Declined,
+            Why::Unanswered,
+            Why::Failed,
+            Why::Locked,
+            Why::Closed,
+            Why::Limit,
+        ] {
+            let words = why.words().to_lowercase();
+            assert!(
+                words.contains("back")
+                    || words.contains("unlock")
+                    || words.contains("turn it on again"),
+                "{why:?}: {words}"
+            );
+        }
     }
 }

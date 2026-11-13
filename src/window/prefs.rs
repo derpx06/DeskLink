@@ -75,11 +75,12 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     let key = serde_json::to_string(&(
         super::requirements::key(&needs),
         format!(
-            "{:?}{:?}{}{}",
+            "{:?}{:?}{}{}{:?}",
             glide_status.availability,
             glide_status.problem,
             glide_status.asking,
-            glide_status.can_ask_again
+            glide_status.can_ask_again,
+            glide_status.ready
         ),
         // The phone's "allowed" report changes the glide row's words.
         crate::device_links::glide::phone_allows(&device.id),
@@ -2046,7 +2047,7 @@ fn glide_explained(phone: &str, allowed: Option<bool>, computer: &str) -> String
         format!(
             "Move the pointer past the edge of this screen to use {phone} with this mouse and \
              keyboard. Esc+Super brings it back. GNOME asks you to allow this once each time \
-             DeskLink starts; it cannot remember the answer."
+             DeskLink starts and again after the screen locks; it cannot remember the answer."
         )
     } else {
         format!("Turn on “Let {computer} control this phone” on the phone first.")
@@ -2080,16 +2081,28 @@ fn add_glide_rows(
         Availability::Available => {}
     }
     let phone = device.name.clone();
-    let explained = glide_explained(
-        &phone,
-        crate::device_links::glide::phone_allows(&device.id),
-        &crate::device_links::glide::desk_name(),
-    );
     let current = settings
         .glide
         .as_ref()
         .filter(|glide| glide.device == device.id)
         .map(|glide| glide.edge);
+    let explained = match status.ready.filter(|edge| current == Some(*edge)) {
+        Some(edge) => format!(
+            "Ready: move the pointer off the {} edge of this screen to use {phone}. Esc+Super \
+             brings it back.",
+            match edge {
+                Edge::Left => "left",
+                Edge::Right => "right",
+                Edge::Top => "top",
+                Edge::Bottom => "bottom",
+            }
+        ),
+        None => glide_explained(
+            &phone,
+            crate::device_links::glide::phone_allows(&device.id),
+            &crate::device_links::glide::desk_name(),
+        ),
+    };
     let switch = adw::SwitchRow::builder()
         .title(esc(format!("Glide onto {phone}")))
         .subtitle(esc(&explained))
@@ -2197,7 +2210,7 @@ fn add_glide_rows(
     });
     if status.asking {
         let row = adw::ActionRow::builder()
-            .title("Waiting for your OK")
+            .title("Waiting for your OK on this computer")
             .subtitle("Approve “Capture Input” in the window that just opened.")
             .build();
         row.add_prefix(&icon_square("dialog-information-symbolic", 30, "row-icon"));
@@ -2205,7 +2218,7 @@ fn add_glide_rows(
     } else if let Some(problem) = status.problem.as_deref() {
         let row = adw::ActionRow::builder()
             .title(if status.can_ask_again {
-                "Glide is waiting for your OK"
+                "Glide is paused"
             } else {
                 "Glide is not working"
             })
@@ -2214,7 +2227,7 @@ fn add_glide_rows(
         row.add_prefix(&icon_square("dialog-warning-symbolic", 30, "row-icon"));
         if status.can_ask_again {
             let ask = gtk::Button::builder()
-                .label("Ask again")
+                .label("Turn on again")
                 .valign(gtk::Align::Center)
                 .build();
             ask.connect_clicked(|_| crate::device_links::glide::ask_again());
@@ -2388,6 +2401,7 @@ mod tests {
                 problem: None,
                 asking: false,
                 can_ask_again: false,
+                ready: None,
             };
             let (daemon, _commands) = DaemonHandle::detached();
             let groups = groups(&daemon, &AppSettings::default(), &device, &status, false);
@@ -2474,6 +2488,7 @@ mod tests {
             problem: None,
             asking: false,
             can_ask_again: false,
+            ready: None,
         };
         let (daemon, _commands) = DaemonHandle::detached();
         let view = build_view(
