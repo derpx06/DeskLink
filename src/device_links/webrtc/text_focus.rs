@@ -312,8 +312,7 @@ fn watch(stop: &AtomicBool, clicked: &AtomicBool, on_change: &dyn Fn(bool)) -> R
                 Some("focused"),
                 gio::DBusSignalFlags::NONE,
                 move |_, sender, path, _, _, parameters| {
-                    let gained = parameters.child_value(1).get::<i32>() == Some(1);
-                    if gained {
+                    if gained_focus(parameters) {
                         let _ = focused.send((sender.to_string(), path.to_string()));
                     }
                 },
@@ -557,9 +556,28 @@ fn role(a11y: &gio::DBusConnection, sender: &str, path: &str) -> Option<u32> {
     .and_then(|reply| reply.child_value(0).get::<u32>())
 }
 
+/// Whether an AT-SPI `StateChanged("focused", 1, …)` says focus arrived. Any
+/// process on the accessibility bus can send the signal, in any shape: a
+/// short body is "no", never a panic (one here aborts DeskLink).
+fn gained_focus(parameters: &glib::Variant) -> bool {
+    parameters
+        .try_child_value(1)
+        .and_then(|value| value.get::<i32>())
+        == Some(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_malformed_focus_signal_is_ignored() {
+        use glib::prelude::ToVariant;
+        assert!(!gained_focus(&("focused",).to_variant()));
+        assert!(!gained_focus(&"focused".to_variant()));
+        assert!(gained_focus(&("focused", 1i32, 0i32).to_variant()));
+        assert!(!gained_focus(&("focused", 0i32, 0i32).to_variant()));
+    }
 
     fn reported(element: &str, editable: bool, at: std::time::Instant) -> Reported {
         Reported {
