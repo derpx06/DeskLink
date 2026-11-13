@@ -4,8 +4,12 @@ The manifest is `../derx06.desklink.com.json`. It builds offline from a git tag:
 crates come from `cargo-sources.json`, generated from `Cargo.lock`. The
 `relay/` crate is a path dependency inside the checkout, so it needs no entry.
 
-The runtime is GNOME 51 because DeskLink needs GStreamer 1.28 (`gstreamer`
-feature `v1_28`); GNOME 49 and 50 ship 1.26.
+The runtime is GNOME 51 (GTK 4.24, libadwaita 1.10, GStreamer 1.28: the
+`webrtcbin` the file-transfer frame size was measured against). The build
+floor alone would allow GNOME 49 or 50 (GStreamer 1.26). The runtime has
+every GStreamer element DeskLink uses except `ximagesrc`, so X11 sessions
+without a screen-sharing portal cannot share the screen from the Flatpak
+(the System check says so).
 
 The GNOME runtime has no VTE, so the manifest builds it (GTK 4 only, the
 `vte` module) for the Terminals page's interactive terminal. Its release
@@ -82,6 +86,9 @@ of the tag, temporarily replace the git source with
   and the `org.a11y.Status` properties) to watch which text field has focus,
   so the phone's keyboard opens when the desktop expects typing.
 - **`--filesystem=xdg-download`** is where received files are saved.
+- **`--filesystem=xdg-run/pipewire-0`** is sound with the phone: DeskLink
+  plays and captures audio as PipeWire streams, and the sandbox has no
+  PipeWire socket without it (`desklink --check` says so).
 - Notifications, screen casting and remote input go through portals and need
   no permission.
 

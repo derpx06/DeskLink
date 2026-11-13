@@ -230,7 +230,11 @@ fn family(current_desktop: &str) -> Family {
         .filter(|name| !name.is_empty())
         .collect();
     let has = |wanted: &[&str]| names.iter().any(|name| wanted.contains(&name.as_str()));
-    if has(&["gnome", "gnome-classic", "gnome-flashback"]) {
+    // Budgie and GNOME Flashback list `GNOME` too (`Budgie:GNOME`) but have
+    // their own panel, tray and lock screen, and no GNOME Shell.
+    if has(&["budgie", "gnome-flashback"]) {
+        Family::Classic
+    } else if has(&["gnome", "gnome-classic"]) {
         Family::Gnome
     } else if has(&["kde"]) {
         Family::Kde
@@ -257,6 +261,26 @@ fn family(current_desktop: &str) -> Family {
         Family::Classic
     } else {
         Family::BareWm
+    }
+}
+
+/// Whether GNOME Shell is the desktop: its extensions, search providers and
+/// top bar exist nowhere else (not on Budgie or GNOME Flashback, which also
+/// list `GNOME`).
+pub fn is_gnome_shell(current_desktop: &str) -> bool {
+    family(current_desktop) == Family::Gnome
+}
+
+/// Whether this is an X11 session, the one rule for the probe and for the
+/// share itself (`x11_desktop::wanted`). `XDG_SESSION_TYPE` decides when it
+/// says x11 or wayland; where it is unset or `tty` (startx from a console
+/// login, a bare window manager) a `DISPLAY` without a `WAYLAND_DISPLAY` is
+/// X11.
+pub fn x11_session(session_type: Option<&str>, wayland_display: bool, x11_display: bool) -> bool {
+    match session_type.map(str::to_ascii_lowercase).as_deref() {
+        Some("x11") => true,
+        Some("wayland") => false,
+        _ => x11_display && !wayland_display,
     }
 }
 
@@ -486,7 +510,13 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
     // Desktop to phone video is VP8 (an H.264 encoder is only an experiment).
     let encoder = has("vp8enc");
     let portal_complete = has_portal("ScreenCast") && has_portal("RemoteDesktop");
-    let x11_direct = !wayland && probe.x11_display && !portal_complete;
+    let x11_direct = !wayland
+        && x11_session(
+            probe.session_type.as_deref(),
+            probe.wayland_display,
+            probe.x11_display,
+        )
+        && !portal_complete;
     rows.push(if !probe.session_bus && !x11_direct {
         check(
             "share",
@@ -614,7 +644,16 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             "Needs the Opus codec.",
             Some(GST_BASE),
         )
-    } else if !probe.pipewire_socket && !probe.flatpak {
+    } else if !probe.pipewire_socket && probe.flatpak {
+        check(
+            "sound",
+            "Sound with the phone",
+            Level::Missing,
+            "This Flatpak cannot reach PipeWire. Allow it with `flatpak override --user \
+             --filesystem=xdg-run/pipewire-0 derx06.desklink.com` and restart DeskLink.",
+            None,
+        )
+    } else if !probe.pipewire_socket {
         let pulse = if probe.pulse_socket {
             "This computer runs PulseAudio alone. "
         } else {
@@ -1268,12 +1307,15 @@ mod tests {
         for (value, expected) in [
             ("GNOME", Family::Gnome),
             ("ubuntu:GNOME", Family::Gnome),
-            ("GNOME-Flashback:GNOME", Family::Gnome),
             ("KDE", Family::Kde),
             ("X-Cinnamon", Family::Classic),
             ("XFCE", Family::Classic),
             ("MATE", Family::Classic),
-            ("Budgie:GNOME", Family::Gnome),
+            ("Budgie:GNOME", Family::Classic),
+            ("GNOME-Flashback:GNOME", Family::Classic),
+            ("GNOME-Classic:GNOME", Family::Gnome),
+            ("pop:GNOME", Family::Gnome),
+            ("Unity:Unity7:ubuntu", Family::Classic),
             ("COSMIC", Family::Cosmic),
             ("sway", Family::Wlroots),
             ("Hyprland", Family::Wlroots),
@@ -1391,6 +1433,145 @@ mod tests {
     }
 
     #[test]
+    fn x11_is_the_session_type_or_a_display_without_wayland() {
+        for (kind, wayland, x11, expected) in [
+            (Some("x11"), false, true, true),
+            (Some("X11"), true, true, true),
+            (Some("wayland"), false, true, false),
+            // startx from a console login keeps logind's `tty`.
+            (Some("tty"), false, true, true),
+            (None, false, true, true),
+            (Some(""), false, true, true),
+            // A compositor started from a tty, with Xwayland.
+            (Some("tty"), true, true, false),
+            (None, false, false, false),
+        ] {
+            assert_eq!(
+                x11_session(kind, wayland, x11),
+                expected,
+                "{kind:?} {wayland} {x11}"
+            );
+        }
+    }
+
+    #[test]
+    fn gnome_shell_extras_are_for_gnome_shell_only() {
+        for desktop in ["GNOME", "ubuntu:GNOME", "pop:GNOME", "GNOME-Classic:GNOME"] {
+            assert!(is_gnome_shell(desktop), "{desktop}");
+        }
+        for desktop in [
+            "Budgie:GNOME",
+            "GNOME-Flashback:GNOME",
+            "KDE",
+            "XFCE",
+            "sway",
+            "",
+        ] {
+            assert!(!is_gnome_shell(desktop), "{desktop}");
+        }
+        // Budgie has its own tray applet: no AppIndicator advice there.
+        let rows = evaluate(&Probe {
+            desktop: "Budgie:GNOME".into(),
+            tray_host: false,
+            ..full()
+        });
+        assert!(!row(&rows, "tray").detail.contains("AppIndicator"));
+        assert!(row(&rows, "tray").install.is_none());
+    }
+
+    /// What each desktop gets, from the facts it really offers: every feature
+    /// either works or is said plainly not to (packaging/README.md, "Desktops").
+    #[test]
+    fn every_desktop_gets_each_feature_or_a_plain_reason() {
+        use Level::{Limited as L, Missing as M, Ok as O};
+        let wayland =
+            |desktop: &str, portals: &[&str], sources: Option<u32>, capture: Option<u32>| Probe {
+                desktop: desktop.into(),
+                portals: names(portals),
+                screencast_sources: sources,
+                input_capture: capture,
+                ..full()
+            };
+        let x11 = |desktop: &str, session: Option<&str>, portals: &[&str]| Probe {
+            desktop: desktop.into(),
+            session_type: session.map(str::to_string),
+            wayland_display: false,
+            x11_display: true,
+            portals: names(portals),
+            screencast_sources: None,
+            input_capture: None,
+            ..full()
+        };
+        let all = ["ScreenCast", "RemoteDesktop", "InputCapture", "Background"];
+        let cases: [(&str, Probe, [Level; 5]); 11] = [
+            // name, probe: share, extend, glide, unlock, autostart
+            (
+                "GNOME",
+                wayland("GNOME", &all, Some(7), Some(3)),
+                [O, O, O, O, O],
+            ),
+            (
+                "Plasma 6.1+",
+                wayland("KDE", &all, Some(7), Some(3)),
+                [O, O, O, O, O],
+            ),
+            (
+                "Plasma 6.0",
+                wayland("KDE", &["ScreenCast", "RemoteDesktop"], Some(7), None),
+                [O, O, M, O, O],
+            ),
+            (
+                "Plasma on X11",
+                x11("KDE", Some("x11"), &[]),
+                [O, M, M, O, O],
+            ),
+            ("Xfce", x11("XFCE", Some("x11"), &[]), [O, M, M, L, O]),
+            (
+                "Cinnamon",
+                x11("X-Cinnamon", Some("x11"), &[]),
+                [O, M, M, L, O],
+            ),
+            ("MATE", x11("MATE", Some("x11"), &[]), [O, M, M, L, O]),
+            (
+                "sway",
+                wayland("sway", &["ScreenCast"], Some(3), None),
+                [M, M, M, L, L],
+            ),
+            (
+                "Hyprland",
+                wayland(
+                    "Hyprland",
+                    &["ScreenCast", "GlobalShortcuts"],
+                    Some(7),
+                    None,
+                ),
+                [M, M, M, L, L],
+            ),
+            (
+                "COSMIC",
+                wayland("COSMIC", &["ScreenCast"], Some(3), None),
+                [M, M, M, L, O],
+            ),
+            (
+                "i3 via startx",
+                x11("i3", Some("tty"), &[]),
+                [O, M, M, L, L],
+            ),
+        ];
+        for (name, probe, expected) in cases {
+            let rows = evaluate(&probe);
+            let got: Vec<Level> = ["share", "extend", "glide", "unlock", "autostart"]
+                .iter()
+                .map(|id| level(&rows, id))
+                .collect();
+            assert_eq!(got, expected, "{name}");
+            for row in rows.iter().filter(|row| row.level != Level::Ok) {
+                assert!(row.detail.len() > 20, "{name}: {} says too little", row.id);
+            }
+        }
+    }
+
+    #[test]
     fn a_wlroots_portal_without_remote_desktop_cannot_control() {
         let rows = evaluate(&Probe {
             desktop: "sway".into(),
@@ -1438,9 +1619,15 @@ mod tests {
         let sound = row(&rows, "sound");
         assert_eq!(sound.level, Level::Missing);
         assert!(sound.detail.contains("PulseAudio alone"));
-        // Inside a Flatpak the socket is not visible the same way: not judged.
+        // A Flatpak sees the socket only with `xdg-run/pipewire-0`.
         let rows = evaluate(&Probe {
             pipewire_socket: false,
+            flatpak: true,
+            ..full()
+        });
+        assert_eq!(level(&rows, "sound"), Level::Missing);
+        assert!(row(&rows, "sound").detail.contains("xdg-run/pipewire-0"));
+        let rows = evaluate(&Probe {
             flatpak: true,
             ..full()
         });

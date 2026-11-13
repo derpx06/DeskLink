@@ -1,0 +1,2 @@
+option('vte', type: 'feature', value: 'auto',
+  description: 'Interactive terminal in the Terminals page (VTE 0.76+, GTK 4 build)')
