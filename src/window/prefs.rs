@@ -723,7 +723,7 @@ const fn row(group: usize, title: &'static str, phone: bool, words: &'static str
 
 /// Every setting, group by group: the same titles as
 /// `testdata/settings_rows.json` (a test keeps the two in step).
-pub(super) const ROWS: [SettingRow; 30] = [
+pub(super) const ROWS: [SettingRow; 33] = [
     row(0, "Keep this computer awake while a phone is connected", false, "sleep suspend lid closed battery power stay awake caffeine"),
     row(0, "Let this phone keep the computer awake", true, "sleep suspend lid battery power stay awake allow"),
     row(0, "Start at login", false, "startup start at login autostart boot launch open automatically restart"),
@@ -735,6 +735,9 @@ pub(super) const ROWS: [SettingRow; 30] = [
     row(1, "Share Do Not Disturb with {phone}", true, "dnd silent quiet mute focus banners notifications"),
     row(2, "Share this computer's clipboard with phones", true, "copy paste sync clipboard text"),
     row(3, "Pause music during calls", true, "media player music pause stop audio sound ring phone call"),
+    row(3, "Show calls on this computer", true, "phone call incoming answer decline ring bar notification missed calls"),
+    row(3, "Show caller names on the lock screen", true, "privacy lock screen locked caller id name number hide show incoming call"),
+    row(3, "Ring on this computer", true, "ring sound chime tone phone call volume quiet silent"),
     row(3, "Name callers from {phone}'s contacts", true, "caller id contacts names numbers people who is calling"),
     row(4, "Phones may hear this computer's microphone", true, "mic microphone audio voice record sound listen"),
     row(5, "Glide onto {phone}", true, "mouse keyboard pointer cursor trackpad touchpad edge move control screen edge"),
