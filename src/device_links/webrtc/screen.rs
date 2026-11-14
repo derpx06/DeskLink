@@ -199,6 +199,32 @@ impl ScreenStreamInner {
     }
 }
 
+/// Whether `factory` is a decoder that holds every frame of a phone's H.264
+/// stream until the *next* frame arrives. GStreamer's VA-API H.264 decoder
+/// (`vah264dec`, 1.28) does so for streams with `pic_order_cnt_type` 2, which
+/// is what libwebrtc's and the phone's hardware encoders send: measured, a
+/// 5 fps stream came out 197 ms per frame through `vah264dec` (compliance
+/// auto, normal or flexible alike) against 2 ms through `avdec_h264`. Live,
+/// it showed as "after jitter buffer" equal to one frame interval at every
+/// rate (25 ms at 40 fps, 100 ms at 10 fps, seconds on a still screen): the
+/// last frame of every change, and every refined still, waited for the next.
+fn holds_a_frame(factory: &str) -> bool {
+    factory.starts_with("va") && factory.contains("h264") && factory.ends_with("dec")
+}
+
+/// `decodebin`'s candidate decoders reordered so that one that holds a frame
+/// ([`holds_a_frame`]) is tried only when nothing else can decode; `None`
+/// when the order stays as it is.
+pub(crate) fn low_latency_order(factories: &[String]) -> Option<Vec<usize>> {
+    let (mut order, held): (Vec<usize>, Vec<usize>) =
+        (0..factories.len()).partition(|&index| !holds_a_frame(&factories[index]));
+    if held.is_empty() || order.is_empty() {
+        return None;
+    }
+    order.extend(held);
+    Some(order)
+}
+
 /// Whether `decodebin` chose a VA-API decoder (whose DMABuf output the GTK
 /// sink takes without a copy), unless turned off for a regression hunt.
 fn zero_copy_wanted(decodebin: &gst::Element) -> bool {
@@ -434,6 +460,8 @@ pub(crate) fn attach_incoming_video(
     let convert = gst::ElementFactory::make("videoconvert")
         .build()
         .map_err(|error| format!("DeskLink screen conversion is unavailable: {error}"))?;
+    // A software decoder's frames are converted here, every frame on the path to the screen.
+    set_if_present(&convert, "n-threads", "4");
     // A live mirror shows each frame the moment it is decoded. With clock
     // sync every frame waited for its scheduled time, and as the phone's
     // timestamps drifted against this clock the wait grew: measured at 3–5 s
@@ -481,6 +509,22 @@ pub(crate) fn attach_incoming_video(
         let decode_bin = decode
             .downcast_ref::<gst::Bin>()
             .ok_or_else(|| "DeskLink screen decoder is not a bin".to_string())?;
+        decode.connect("autoplug-sort", false, |values| {
+            let factories = values.get(3)?.get::<gst::glib::ValueArray>().ok()?;
+            let names: Vec<String> = factories
+                .iter()
+                .map(|value| {
+                    value
+                        .get::<gst::ElementFactory>()
+                        .map(|factory| factory.name().to_string())
+                        .unwrap_or_default()
+                })
+                .collect();
+            let sorted = low_latency_order(&names).map(|order| {
+                gst::glib::ValueArray::from_values(order.into_iter().map(|i| factories[i].clone()))
+            });
+            Some(sorted.to_value())
+        });
         decode_bin.connect_deep_element_added(|_, _, element| {
             // Only video decoders have this property.
             if element.has_property("automatic-request-sync-points", None) {
@@ -581,6 +625,43 @@ pub(crate) fn attach_incoming_video(
     Ok(ScreenStream { inner })
 }
 
+/// What this desk has received from the phone's video stream so far.
+#[derive(Debug, PartialEq)]
+pub(crate) struct Inbound {
+    pub(crate) bytes: u64,
+    pub(crate) lost: i64,
+    pub(crate) nacks: u32,
+    pub(crate) plis: u32,
+    pub(crate) jitter_ms: Option<f64>,
+}
+
+/// The phone's video source among rtpbin's `source-stats`: the remote
+/// sender that has delivered the most bytes (the audio and the RTCP-only
+/// sources deliver far fewer).
+pub(crate) fn inbound_summary(sources: impl Iterator<Item = gst::Structure>) -> Option<Inbound> {
+    let source = sources
+        .filter(|source| {
+            !source.get::<bool>("internal").unwrap_or(true)
+                && source.get::<bool>("is-sender").unwrap_or(false)
+        })
+        .max_by_key(|source| source.get::<u64>("octets-received").unwrap_or(0))?;
+    let clock_rate = source
+        .get::<i32>("clock-rate")
+        .ok()
+        .filter(|rate| *rate > 0)
+        .unwrap_or(90_000);
+    Some(Inbound {
+        bytes: source.get::<u64>("octets-received").unwrap_or(0),
+        lost: source.get::<i32>("packets-lost").map_or(0, i64::from),
+        nacks: source.get::<u32>("sent-nack-count").unwrap_or(0),
+        plis: source.get::<u32>("sent-pli-count").unwrap_or(0),
+        jitter_ms: source
+            .get::<u32>("jitter")
+            .ok()
+            .map(|jitter| f64::from(jitter) * 1000.0 / f64::from(clock_rate)),
+    })
+}
+
 /// `DESKLINK_DEBUG`: a `phone-screen-stats` line every 2 s while a phone's
 /// screen is shown — what arrives (size, frames shown, kbps, loss, NACK/PLI
 /// sent, jitter) and what this desk adds after the jitter buffer: depayload,
@@ -674,46 +755,36 @@ fn watch_inbound(pad: &gst::Pad, inner: &Arc<ScreenStreamInner>) {
                         })
                 })
                 .unwrap_or_else(|| "?".into());
-            // The video stream is the inbound one carrying the most bytes.
-            let (sender, receiver) = std::sync::mpsc::channel();
-            let promise = gst::Promise::with_change_func(move |reply| {
-                let _ = sender.send(reply.ok().flatten().map(|stats| stats.to_owned()));
-            });
-            webrtcbin.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
-            let inbound = receiver
-                .recv_timeout(STATS_WAIT)
-                .ok()
-                .flatten()
-                .and_then(|reply| {
-                    reply
-                        .iter()
-                        .filter_map(|(_, value)| value.get::<gst::Structure>().ok())
-                        .filter(|stats| stats.name() == "inbound-rtp")
-                        .max_by_key(|stats| stats.get::<u64>("bytes-received").unwrap_or(0))
-                });
-            let field = |name: &str| {
-                inbound.as_ref().map_or("?".to_string(), |stats| {
-                    stats
-                        .value(name)
-                        .ok()
-                        .and_then(|v| v.serialize().ok())
-                        .map_or("?".to_string(), |v| v.to_string())
+            // rtpbin's own session: webrtcbin's `get-stats` had no
+            // `inbound-rtp` for this stream, so every line read "0 kbps, ?".
+            let inbound = webrtcbin
+                .downcast_ref::<gst::Bin>()
+                .and_then(|bin| bin.by_name("rtpbin"))
+                .and_then(|rtpbin| {
+                    rtpbin
+                        .emit_by_name::<Option<gst::glib::Object>>("get-internal-session", &[&0u32])
                 })
-            };
-            let received = inbound
-                .as_ref()
-                .and_then(|stats| stats.get::<u64>("bytes-received").ok())
-                .unwrap_or(bytes);
+                .and_then(|session| {
+                    let stats = session.property::<gst::Structure>("stats");
+                    let sources = stats.get::<gst::glib::ValueArray>("source-stats").ok()?;
+                    inbound_summary(
+                        sources
+                            .iter()
+                            .filter_map(|value| value.get::<gst::Structure>().ok()),
+                    )
+                });
+            let received = inbound.as_ref().map_or(bytes, |inbound| inbound.bytes);
             let seconds = since.elapsed().as_secs_f64();
+            let show = |value: Option<String>| value.unwrap_or_else(|| "?".to_string());
             eprintln!(
                 "[DeskLink] phone-screen-stats: {size} via {decoder}, shown {:.1} fps, in {} kbps, \
-                 lost {}, nack {}, pli {}, jitter {} s, after jitter buffer {} ms avg / {:.1} max",
+                 lost {}, nack {}, pli {}, jitter {} ms, after jitter buffer {} ms avg / {:.1} max",
                 (shown - frames) as f64 / seconds,
                 ((received.saturating_sub(bytes)) as f64 * 8.0 / seconds / 1000.0) as u64,
-                field("packets-lost"),
-                field("nack-count"),
-                field("pli-count"),
-                field("jitter"),
+                show(inbound.as_ref().map(|i| i.lost.to_string())),
+                show(inbound.as_ref().map(|i| i.nacks.to_string())),
+                show(inbound.as_ref().map(|i| i.plis.to_string())),
+                show(inbound.as_ref().and_then(|i| i.jitter_ms).map(|ms| format!("{ms:.1}"))),
                 if count == 0 { "-".to_string() } else { format!("{:.1}", sum / f64::from(count)) },
                 max,
             );
@@ -1292,6 +1363,11 @@ pub(crate) fn next_bitrate(current: u32, report: &LinkReport, baseline_ms: f64) 
         0.92
     } else if queueing {
         0.90
+    } else if report.rtt_ms.is_some_and(|rtt| rtt < 20.0) {
+        // A clean link a LAN away: up to 8 Mbps in ~8 s, not ~25 s. At 5% a
+        // second the phone's view stayed soft for its first half minute
+        // (measured: target 2.0 to 5.0 Mbps over 20 s at 5-15 ms rtt).
+        1.15
     } else {
         1.05
     };
@@ -2034,6 +2110,169 @@ const MAX_FPS: i64 = 60;
 mod tests {
     use super::*;
 
+    /// The phone's H.264 never goes to a decoder that holds each frame until the next one
+    /// (`vah264dec`, measured 197 ms a frame at 5 fps) while another decoder can take it.
+    #[test]
+    fn a_decoder_that_holds_a_frame_is_tried_last() {
+        let names = |list: &[&str]| list.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            low_latency_order(&names(&["vah264dec", "avdec_h264", "openh264dec"])),
+            Some(vec![1, 2, 0])
+        );
+        // Nothing else to try, or nothing held: the order stays.
+        assert_eq!(low_latency_order(&names(&["vah264dec"])), None);
+        assert_eq!(low_latency_order(&names(&["avdec_h264", "vavp8dec"])), None);
+        assert_eq!(low_latency_order(&names(&["vavp8dec", "vp8dec"])), None);
+    }
+
+    /// A phone's H.264 frame reaches the display when it arrives, not when the
+    /// next one does. libwebrtc's encoders (x264 here) send `pic_order_cnt_type`
+    /// 2, and `vah264dec` held each such frame until the next: one frame
+    /// interval of lag at every rate, seconds on a still screen.
+    #[test]
+    fn a_phone_h264_frame_is_shown_without_waiting_for_the_next() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        if gst::init().is_err()
+            || ["videotestsrc", "x264enc", "rtph264pay", "decodebin"]
+                .iter()
+                .any(|name| gst::ElementFactory::find(name).is_none())
+            || !h264_decoder_available()
+        {
+            return;
+        }
+        let pipeline = gst::Pipeline::new();
+        let make = |name: &str| gst::ElementFactory::make(name).build().unwrap();
+        let source = make("videotestsrc");
+        source.set_property("is-live", true);
+        source.set_property_from_str("pattern", "ball");
+        source.set_property("num-buffers", 16i32);
+        let raw = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("video/x-raw")
+                    .field("format", "I420")
+                    .field("width", 864i32)
+                    .field("height", 1920i32)
+                    .field("framerate", gst::Fraction::new(5, 1))
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let encoder = make("x264enc");
+        encoder.set_property_from_str("tune", "zerolatency");
+        encoder.set_property_from_str("speed-preset", "ultrafast");
+        let payloader = make("rtph264pay");
+        payloader.set_property("config-interval", -1i32);
+        let rtp = gst::ElementFactory::make("capsfilter")
+            .property(
+                "caps",
+                gst::Caps::builder("application/x-rtp")
+                    .field("media", "video")
+                    .field("encoding-name", "H264")
+                    .field("clock-rate", 90_000i32)
+                    .field("payload", H264_PAYLOAD)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let chain = [&source, &raw, &encoder, &payloader, &rtp];
+        pipeline.add_many(chain).unwrap();
+        gst::Element::link_many(chain).unwrap();
+        let pad = rtp.static_pad("src").unwrap();
+        let arrived: Arc<Mutex<HashMap<u64, Instant>>> = Arc::default();
+        {
+            let arrived = Arc::clone(&arrived);
+            pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(pts) = info.buffer().and_then(|buffer| buffer.pts()) {
+                    arrived
+                        .lock()
+                        .unwrap()
+                        .insert(pts.nseconds(), Instant::now());
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
+        let stream = attach_incoming_video(&pipeline, &pad).unwrap();
+        let waits: Arc<Mutex<Vec<f64>>> = Arc::default();
+        {
+            let (arrived, waits) = (Arc::clone(&arrived), Arc::clone(&waits));
+            stream
+                .sink_pad()
+                .unwrap()
+                .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                    let at = info
+                        .buffer()
+                        .and_then(|buffer| buffer.pts())
+                        .and_then(|pts| arrived.lock().unwrap().get(&pts.nseconds()).copied());
+                    if let Some(at) = at {
+                        waits.lock().unwrap().push(at.elapsed().as_secs_f64() * 1e3);
+                    }
+                    gst::PadProbeReturn::Ok
+                });
+        }
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let bus = pipeline.bus().unwrap();
+        let _ = bus.timed_pop_filtered(
+            gst::ClockTime::from_seconds(20),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        pipeline.set_state(gst::State::Null).unwrap();
+        let mut waits = waits.lock().unwrap().split_off(0);
+        assert!(waits.len() >= 8, "only {} frames decoded", waits.len());
+        // The first frames are the decoder starting up.
+        let mut steady = waits.split_off(3);
+        steady.sort_by(f64::total_cmp);
+        let median = steady[steady.len() / 2];
+        // A held frame waits a whole frame interval: 200 ms at 5 fps.
+        assert!(
+            median < 60.0,
+            "median {median:.1} ms from arrival to display"
+        );
+    }
+
+    /// The stats line reads the phone's stream from rtpbin's sources: the remote
+    /// sender with the most bytes, never this desk's own (internal) source.
+    #[test]
+    fn inbound_stats_come_from_the_phones_biggest_source() {
+        if gst::init().is_err() {
+            return;
+        }
+        let source = |internal: bool, sender: bool, octets: u64| {
+            gst::Structure::builder("application/x-rtp-source-stats")
+                .field("internal", internal)
+                .field("is-sender", sender)
+                .field("octets-received", octets)
+                .field("packets-lost", 3i32)
+                .field("sent-nack-count", 4u32)
+                .field("sent-pli-count", 1u32)
+                .field("jitter", 900u32)
+                .field("clock-rate", 90_000i32)
+                .build()
+        };
+        let summary = inbound_summary(
+            [
+                source(true, true, 9_000_000),
+                source(false, true, 40_000),
+                source(false, true, 5_000_000),
+                source(false, false, 7_000_000),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            summary,
+            Some(Inbound {
+                bytes: 5_000_000,
+                lost: 3,
+                nacks: 4,
+                plis: 1,
+                jitter_ms: Some(10.0),
+            })
+        );
+        assert_eq!(inbound_summary([source(true, true, 1)].into_iter()), None);
+    }
+
     /// A capture that tags its picture as rotated or flipped (PipeWire's video
     /// transform) comes out turned the right way; an untagged one is untouched.
     #[test]
@@ -2164,6 +2403,15 @@ mod tests {
         assert!(
             up > START_BITRATE && up <= START_BITRATE / 100 * 106,
             "a small probe up"
+        );
+        let lan = LinkReport {
+            rtt_ms: Some(6.0),
+            ..clean
+        };
+        let fast = next_bitrate(START_BITRATE, &lan, 6.0);
+        assert!(
+            fast > up && fast <= START_BITRATE / 100 * 116,
+            "a LAN round trip climbs faster"
         );
         let queueing = LinkReport {
             rtt_ms: Some(120.0),
