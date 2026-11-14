@@ -84,6 +84,7 @@ mod tests {
             "device_links/webrtc/coordinator.rs:PROBE_NOW",
             "device_links/webrtc/coordinator.rs:STREAKS",
             "device_links/glide.rs:ALLOWED",
+            "device_links/glide.rs:ASKS",
             "device_links/daemon/discovery.rs:KNOWN",
             "device_links/daemon/discovery.rs:PERSISTED",
             "device_links/daemon/clipboard.rs:LAST_SENT_BY_DEVICE",

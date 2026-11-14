@@ -117,6 +117,8 @@ pub(crate) struct PhoneFacts {
     pub glide_off_there: bool,
     /// The phone said Glide waits for it to be unlocked.
     pub glide_locked: bool,
+    /// Where the last "Ask on phone" stands.
+    pub glide_ask: Option<crate::device_links::glide::PhoneAsk>,
     /// Android lets it read notifications (`None`: an older phone, unknown).
     pub notification_access: Option<bool>,
 }
@@ -143,6 +145,7 @@ impl PhoneFacts {
                 .is_some_and(|glide| glide.device == device.id),
             glide_off_there: crate::device_links::glide::phone_allows(&device.id) == Some(false),
             glide_locked: crate::device_links::glide::phone_locked(&device.id),
+            glide_ask: crate::device_links::glide::phone_ask(&device.id),
             notification_access: device.notification_access,
         }
     }
@@ -397,12 +400,18 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
 /// Glide is on here but off on the phone: what to do there, and "Ask on
 /// phone" when its build can show the prompt (an older one: the words only).
 fn glide_off_there(phone: &PhoneFacts) -> Need {
+    use crate::device_links::glide::PhoneAsk;
     let name = &phone.name;
-    let askable = crate::device_links::glide::can_ask_phone(&phone.incoming);
+    // While the prompt is up on the phone there is nothing to press here.
+    let askable = crate::device_links::glide::can_ask_phone(&phone.incoming)
+        && phone.glide_ask != Some(PhoneAsk::Waiting);
     Need {
         id: "glide-phone",
         on_phone: true,
-        title: format!("Glide is off on {name}. Turn it on there."),
+        title: match phone.glide_ask {
+            Some(ask) => crate::device_links::glide::ask_words(name, ask),
+            None => format!("Glide is off on {name}. Turn it on there."),
+        },
         detail: if askable {
             format!(
                 "{name} shows a prompt when you ask; or on {name}, open DeskLink, then Settings, \
@@ -538,7 +547,7 @@ pub(crate) fn run(anchor: &impl IsA<gtk::Widget>, need: &Need) {
         Fix::ApproveControl(id) => super::prefs::approve_remote_control(&window, id),
         Fix::AskPhoneGlide(id) => {
             crate::device_links::glide::ask_phone(id);
-            window.show_feature_toast("Asked on the phone. Turn Glide on there");
+            window.show_feature_toast("Asked. Tap Allow on the phone");
         }
         Fix::Reconnect(id) => {
             if let Some(daemon) = daemon {
@@ -831,6 +840,7 @@ mod tests {
             glide_here: false,
             glide_off_there: false,
             glide_locked: false,
+            glide_ask: None,
             notification_access: Some(true),
         }
     }
@@ -870,6 +880,22 @@ mod tests {
         let need = glide_need(locked).expect("listed");
         assert_eq!(need.title, "Unlock Pixel 9 to use Glide");
         assert_eq!(need.fix, Fix::None);
+
+        // Asked: waiting says so with nothing to press; no answer or "Not
+        // now" says that, and the ask is offered again.
+        let mut asked = off.clone();
+        asked.glide_ask = Some(crate::device_links::glide::PhoneAsk::Waiting);
+        let need = glide_need(asked.clone()).expect("listed");
+        assert_eq!(need.title, "Waiting for Pixel 9: tap Allow on the phone");
+        assert_eq!(need.fix, Fix::None);
+        asked.glide_ask = Some(crate::device_links::glide::PhoneAsk::TimedOut);
+        let need = glide_need(asked).expect("listed");
+        assert!(
+            need.title.starts_with("Pixel 9 did not answer"),
+            "{}",
+            need.title
+        );
+        assert_eq!(need.fix, Fix::AskPhoneGlide("p1".into()));
 
         let mut on_there = off.clone();
         on_there.glide_off_there = false;

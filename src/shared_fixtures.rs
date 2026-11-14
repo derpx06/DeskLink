@@ -224,6 +224,7 @@ fn glide_bodies_are_classified_as_written() {
                 allowed: case["allowed"].as_bool().unwrap(),
                 entered: case["entered"].as_bool().unwrap(),
                 locked: case["reason"].as_str() == Some("locked"),
+                declined: case["reason"].as_str() == Some("declined"),
             },
             "handedBack" => PhoneReport::HandedBack,
             "release" => PhoneReport::Release,

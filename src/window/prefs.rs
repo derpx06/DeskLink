@@ -86,6 +86,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         // The phone's "allowed" report changes the glide row's words.
         crate::device_links::glide::phone_allows(&device.id),
         crate::device_links::glide::phone_locked(&device.id),
+        format!("{:?}", crate::device_links::glide::phone_ask(&device.id)),
         &device.id,
         &device.name,
         approving,
@@ -2302,27 +2303,46 @@ fn add_glide_rows(
         && crate::device_links::glide::phone_allows(&device.id) == Some(false)
         && !crate::device_links::glide::phone_locked(&device.id)
     {
+        use crate::device_links::glide::PhoneAsk;
+        let ask_state = crate::device_links::glide::phone_ask(&device.id);
+        let how = format!(
+            "On {phone}: DeskLink, Settings, Control, “Let {} control this phone”.",
+            crate::device_links::glide::desk_name()
+        );
+        let (title, subtitle) = match ask_state {
+            Some(ask) => (
+                crate::device_links::glide::ask_words(&phone, ask),
+                if ask == PhoneAsk::Waiting {
+                    format!("The prompt is in {phone}'s notifications. Or: {how}")
+                } else {
+                    how
+                },
+            ),
+            None => (format!("Glide is off on {phone}. Turn it on there."), how),
+        };
         let row = adw::ActionRow::builder()
-            .title(esc(format!("Glide is off on {phone}. Turn it on there.")))
-            .subtitle(esc(format!(
-                "On {phone}: DeskLink, Settings, Control, “Let {} control this phone”.",
-                crate::device_links::glide::desk_name()
-            )))
+            .title(esc(title))
+            .subtitle(esc(subtitle))
             .build();
         row.add_prefix(&icon_square(
             "desklink-device-phone-symbolic",
             30,
             "row-icon",
         ));
-        if crate::device_links::glide::can_ask_phone(&device.incoming_capabilities) {
+        if ask_state != Some(PhoneAsk::Waiting)
+            && crate::device_links::glide::can_ask_phone(&device.incoming_capabilities)
+        {
             let ask = gtk::Button::builder()
-                .label("Ask on phone")
+                .label(if ask_state.is_some() {
+                    "Ask again"
+                } else {
+                    "Ask on phone"
+                })
                 .valign(gtk::Align::Center)
                 .build();
             let id = device.id.clone();
             ask.connect_clicked(move |button| {
                 crate::device_links::glide::ask_phone(&id);
-                button.set_label("Asked");
                 button.set_sensitive(false);
             });
             row.add_suffix(&ask);

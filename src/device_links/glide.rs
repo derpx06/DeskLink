@@ -50,15 +50,23 @@ const PENDING_MAX: usize = 256;
 const PENDING_FRESH: Duration = Duration::from_millis(300);
 /// After the desk says the pointer is entering, the phone has this long to
 /// accept (see "W6 — glide allowed state"). Nothing is streamed meanwhile, and
-/// no answer is a refusal: the pointer comes back where it crossed.
-const ENTER_WAIT: Duration = Duration::from_millis(300);
-/// After a refusal, the edge is left alone this long: a crossing then is
-/// released at once, with nothing sent.
+/// no answer is a refusal: the pointer comes back where it crossed. It was
+/// 300 ms: a phone whose Wi-Fi had dozed off, or whose event thread was busy
+/// with a notification burst, answered later than that, so the crossing was
+/// refused and the edge then rested 5 s ("sometimes it doesn't work at all").
+const ENTER_WAIT: Duration = Duration::from_millis(1_000);
+/// After the phone refuses, the edge is left alone this long: a crossing then
+/// is released at once, with nothing sent.
 const REFUSED_BACKOFF: Duration = Duration::from_secs(5);
+/// After the phone did not answer in time (it said no to nothing), the rest
+/// is short: the next push on the edge tries again.
+const UNANSWERED_BACKOFF: Duration = Duration::from_secs(1);
 /// Input held while the phone has not accepted yet; beyond this, dropped.
 const HELD_MAX: usize = 64;
-/// Motion is coalesced: at most one motion packet per this long (250/s).
-const MOTION_EVERY: Duration = Duration::from_millis(4);
+/// Motion is coalesced: at most one motion packet per this long (125/s, one
+/// per frame of a 120 Hz phone panel; the phone draws its pointer once per
+/// frame anyway). Each packet carries the sum of the motion since the last.
+const MOTION_EVERY: Duration = Duration::from_millis(8);
 /// How often the worker re-reads the setting and the phone's link.
 const CHECK_EVERY: Duration = Duration::from_millis(250);
 /// The worker's nap with Glide switched off (nearly always): only the
@@ -489,14 +497,20 @@ impl Glide {
     /// The phone did not accept (it handed the pointer back, said it does not
     /// allow glide, or did not answer in time): the pointer is released where
     /// it crossed, nothing was streamed, and this edge is left alone for
-    /// [`REFUSED_BACKOFF`]. `tell_phone`: the phone is told to forget the
-    /// entry (it never answered).
+    /// [`REFUSED_BACKOFF`] ([`UNANSWERED_BACKOFF`] when it never answered).
+    /// `tell_phone`: the phone is told to forget the entry (it never
+    /// answered).
     fn refused(&mut self, now: Instant, tell_phone: bool) -> Vec<Out> {
         self.pending.clear();
         self.held.clear();
         self.entering = None;
         self.motion = (0.0, 0.0);
-        self.backoff_until = Some(now + REFUSED_BACKOFF);
+        let rest = if tell_phone {
+            UNANSWERED_BACKOFF
+        } else {
+            REFUSED_BACKOFF
+        };
+        self.backoff_until = Some(now + rest);
         let Some(activation) = self.active.take() else {
             return Vec::new();
         };
@@ -871,9 +885,88 @@ pub(crate) fn can_ask_phone(incoming: &[String]) -> bool {
 }
 
 /// The person pressed "Ask on phone": the phone shows "<computer> wants to
-/// use Glide. Turn on?".
+/// use Glide. Turn on?" with Allow and Not now, and this desk says it is
+/// waiting for that answer ([`phone_ask`]) until it comes or [`ASK_WAIT`] runs
+/// out.
 pub(crate) fn ask_phone(device_id: &str) {
+    note_ask(device_id, Some((Instant::now(), false)));
     send_command(Command::AskPhone(device_id.to_string()));
+}
+
+/// How long the desk waits for the person to answer the prompt on the phone.
+/// The phone's notification times out after the same time
+/// (`InputDevicesReceiverPlugin.ASK_TIMEOUT_MS`).
+pub(crate) const ASK_WAIT: Duration = Duration::from_secs(60);
+
+/// Where an "Ask on phone" stands, until the phone allows Glide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PhoneAsk {
+    /// The prompt is on the phone; nobody has answered yet.
+    Waiting,
+    /// The person tapped "Not now" on the phone.
+    Declined,
+    /// Nobody answered within [`ASK_WAIT`].
+    TimedOut,
+}
+
+/// The asks this run made: when, and whether the phone said "Not now".
+static ASKS: Mutex<Option<HashMap<String, (Instant, bool)>>> = Mutex::new(None);
+
+fn note_ask(device_id: &str, ask: Option<(Instant, bool)>) {
+    if let Ok(mut asks) = ASKS.lock() {
+        let asks = asks.get_or_insert_with(HashMap::new);
+        match ask {
+            Some(ask) if asks.len() < 64 || asks.contains_key(device_id) => {
+                asks.insert(device_id.to_string(), ask);
+            }
+            Some(_) => {}
+            None => {
+                asks.remove(device_id);
+            }
+        }
+    }
+}
+
+/// Where the last ask to `device_id` stands; `None` when there is none, or
+/// once the phone allows Glide (tested).
+fn ask_state(
+    ask: Option<(Instant, bool)>,
+    allowed: Option<bool>,
+    now: Instant,
+) -> Option<PhoneAsk> {
+    let (at, declined) = ask?;
+    if allowed == Some(true) {
+        None
+    } else if declined {
+        Some(PhoneAsk::Declined)
+    } else if now.saturating_duration_since(at) >= ASK_WAIT {
+        Some(PhoneAsk::TimedOut)
+    } else {
+        Some(PhoneAsk::Waiting)
+    }
+}
+
+/// Where the last "Ask on phone" to `device_id` stands (the window and the
+/// needs list show it).
+pub(crate) fn phone_ask(device_id: &str) -> Option<PhoneAsk> {
+    let ask = ASKS
+        .lock()
+        .ok()
+        .and_then(|asks| asks.as_ref().and_then(|asks| asks.get(device_id).copied()));
+    ask_state(ask, phone_allows(device_id), Instant::now())
+}
+
+/// What the person is told about an ask, in one line.
+pub(crate) fn ask_words(phone: &str, ask: PhoneAsk) -> String {
+    match ask {
+        PhoneAsk::Waiting => format!("Waiting for {phone}: tap Allow on the phone"),
+        PhoneAsk::Declined => {
+            format!("{phone} said not now. Ask again when you want to use Glide.")
+        }
+        PhoneAsk::TimedOut => {
+            format!("{phone} did not answer. Unlock it, look in its notifications, and ask again.")
+        }
+    }
 }
 
 fn queue() -> &'static OnceLock<SyncSender<Command>> {
@@ -960,6 +1053,7 @@ fn set_allowed(device_id: &str, allowed: Option<(bool, bool)>) {
 /// The phone is no longer ours: what it said about glide goes.
 pub(crate) fn forget_phone(device_id: &str) {
     set_allowed(device_id, None);
+    note_ask(device_id, None);
 }
 
 /// Everything the phone says on `desklink.shareinputdevices` (W6): a state
@@ -972,8 +1066,14 @@ pub(crate) fn on_phone_packet(device_id: &str, packet: &NetworkPacket) {
             allowed,
             entered,
             locked,
+            declined,
         } => {
             set_allowed(device_id, Some((allowed, locked)));
+            if allowed {
+                note_ask(device_id, None);
+            } else if declined {
+                note_ask(device_id, Some((Instant::now(), true)));
+            }
             send_command(Command::State {
                 device: device_id.to_string(),
                 allowed,
@@ -998,6 +1098,9 @@ pub(crate) enum PhoneReport {
         entered: bool,
         /// Not allowed only because the phone is locked (`reason: "locked"`).
         locked: bool,
+        /// Not allowed: the person tapped "Not now" on the desk's ask
+        /// (`reason: "declined"`).
+        declined: bool,
     },
     HandedBack,
     /// A release point (or a body that is neither: `phone_released` drops it).
@@ -1006,6 +1109,10 @@ pub(crate) enum PhoneReport {
 }
 
 pub(crate) fn classify_phone_packet(packet: &NetworkPacket) -> PhoneReport {
+    let reason = packet
+        .body
+        .get("reason")
+        .and_then(serde_json::Value::as_str);
     let release =
         packet.body.contains_key("releaseDeltax") || packet.body.contains_key("releaseDeltay");
     if let (false, Some(allowed)) = (
@@ -1023,12 +1130,8 @@ pub(crate) fn classify_phone_packet(packet: &NetworkPacket) -> PhoneReport {
                     .get("entered")
                     .and_then(serde_json::Value::as_bool)
                     == Some(true),
-            locked: !allowed
-                && packet
-                    .body
-                    .get("reason")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("locked"),
+            locked: !allowed && reason == Some("locked"),
+            declined: !allowed && reason == Some("declined"),
         }
     } else if packet
         .body
@@ -1841,6 +1944,12 @@ struct State {
     disables: VecDeque<Instant>,
     /// GetZones said the session is gone once: one more fresh try first.
     gone_once: bool,
+    /// The person just set Glide to this phone: if the phone says Glide is
+    /// off there, it is asked once, so the prompt comes without hunting for
+    /// "Ask on phone" ([`auto_ask`]).
+    auto_ask: Option<String>,
+    /// The first check (the setting read at start is not the person acting).
+    checked_once: bool,
 }
 
 impl State {
@@ -1859,6 +1968,8 @@ impl State {
             suspended: suspended_so_far(),
             disables: VecDeque::new(),
             gone_once: false,
+            auto_ask: None,
+            checked_once: false,
         }
     }
 
@@ -2131,6 +2242,27 @@ fn run(
     }
 }
 
+/// What to do about asking the phone after the person set Glide to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoAsk {
+    /// Ask now: the phone says Glide is off there.
+    Now,
+    /// Nothing to ask (it allows Glide, or is only locked), or nothing pending.
+    Never,
+    /// Its report has not come yet.
+    Later,
+}
+
+/// `pending`: the person just set Glide to this (ready) phone (tested).
+fn auto_ask(pending: bool, allowed: Option<bool>, locked: bool) -> AutoAsk {
+    match (pending, allowed) {
+        (false, _) | (true, Some(true)) => AutoAsk::Never,
+        (true, None) => AutoAsk::Later,
+        (true, Some(false)) if locked => AutoAsk::Never,
+        (true, Some(false)) => AutoAsk::Now,
+    }
+}
+
 /// Every [`CHECK_EVERY`]: the setting and the link are compared with what
 /// the session was made for, and the session follows.
 fn check(
@@ -2207,6 +2339,10 @@ fn check(
             state.glide = None;
         }
         debug_log!("[Glide] setting now {setting:?}");
+        state.auto_ask = setting
+            .as_ref()
+            .filter(|_| state.checked_once)
+            .map(|setting| setting.device.clone());
         state.current = setting;
         state.refusal = (None, false);
         state.arm_now();
@@ -2259,6 +2395,24 @@ fn check(
         set_allowed(device, None);
     }
     state.was_ready = is_ready;
+    state.checked_once = true;
+    if let Some(device) = device.as_deref().filter(|_| is_ready) {
+        let ask = auto_ask(
+            state.auto_ask.as_deref() == Some(device),
+            phone_allows(device),
+            phone_locked(device),
+        );
+        if ask != AutoAsk::Later {
+            state.auto_ask = None;
+        }
+        if ask == AutoAsk::Now
+            && crate::device_links::features::peer_accepts(device, PACKET_TYPE_SETTINGS_REQUEST)
+        {
+            debug_log!("[Glide] Glide is off on {device}; asking there");
+            note_ask(device, Some((now, false)));
+            deliver(device, &turn_on_request());
+        }
+    }
     // The barrier is armed only while the phone says it allows glide: an
     // unknown state (an older phone, no report yet) is not a yes.
     let allowed = device.as_deref().is_some_and(allows_glide);
@@ -2643,6 +2797,33 @@ mod tests {
         // Not finite: ignored.
         glide.input(Captured::Motion(f64::NAN, 1.0), &keys, start);
         assert_eq!(glide.motion, (0.0, 0.0));
+    }
+
+    /// A 1000 Hz gaming mouse for a second: at most one packet per 8 ms
+    /// (125, was 250 at 4 ms), and the motion they carry adds up exactly.
+    #[test]
+    fn a_1000_hz_mouse_sends_one_packet_per_frame_and_loses_no_motion() {
+        let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());
+        let start = Instant::now();
+        glide.activated(1, (1600.0, 0.0), &keys, start);
+        let (mut packets, mut dx, mut dy) = (0, 0.0, 0.0);
+        let mut count = |outs: Vec<Out>| {
+            for body in sent(&outs) {
+                packets += 1;
+                dx += body["dx"].as_f64().unwrap();
+                dy += body["dy"].as_f64().unwrap();
+            }
+        };
+        for ms in 0..1000u64 {
+            let at = start + Duration::from_millis(ms);
+            count(glide.input(Captured::Motion(0.75, -0.25), &keys, at));
+        }
+        count(glide.tick(start + Duration::from_millis(1000) + MOTION_EVERY));
+        assert!(packets <= 126, "{packets} packets");
+        assert!(
+            (dx - 750.0).abs() < 1e-6 && (dy + 250.0).abs() < 1e-6,
+            "{dx},{dy}"
+        );
     }
 
     #[test]
@@ -3249,22 +3430,124 @@ mod tests {
         assert_eq!(count_refused(&outs), 1);
     }
 
-    /// No answer within 300 ms is a refusal too: the pointer is back where it
-    /// crossed, the phone is told to forget the entry.
+    /// No answer within a second is a refusal too: the pointer is back where
+    /// it crossed, the phone is told to forget the entry, and the edge rests
+    /// only a second (the phone said no to nothing). A phone that answers in
+    /// 400 ms (a dozed Wi-Fi, a busy event thread) is not refused: at 300 ms
+    /// it was, and the edge then rested 5 s.
     #[test]
-    fn an_entry_the_phone_never_answers_is_given_back_after_300_ms() {
-        let mut glide = left();
+    fn an_entry_the_phone_never_answers_is_given_back_after_a_second() {
+        let mut slow = left();
         let start = Instant::now();
+        slow.activated(1, (-2.0, 120.0), &keys, start);
+        assert!(slow.tick(start + Duration::from_millis(400)).is_empty());
+        let outs = slow.accepted(&keys, start + Duration::from_millis(400));
+        assert_eq!(count_refused(&outs), 0);
+        assert!(slow.gliding(), "a slow accept still glides");
+
+        let mut glide = left();
         glide.activated(1, (-2.0, 120.0), &keys, start);
         glide.input(Captured::Motion(-9.0, 0.0), &keys, start);
-        assert!(glide.tick(start + Duration::from_millis(299)).is_empty());
+        assert!(glide.tick(start + Duration::from_millis(999)).is_empty());
         assert!(glide.gliding());
         let outs = glide.tick(start + ENTER_WAIT);
         assert_eq!(sent(&outs), vec![serde_json::json!({"exitEdge": 0})]);
         assert!(released_at(&outs).is_some());
         assert_eq!(count_refused(&outs), 1);
         assert!(!glide.gliding());
-        assert!(glide.tick(start + Duration::from_secs(1)).is_empty());
+        assert!(glide.tick(start + Duration::from_secs(2)).is_empty());
+        // The next push on the edge after a second tries again.
+        let again = start + ENTER_WAIT + UNANSWERED_BACKOFF;
+        assert_eq!(
+            sent(&glide.activated(2, (-2.0, 120.0), &keys, again)).len(),
+            1
+        );
+        assert!(glide.gliding());
+    }
+
+    /// An ask waits for the person on the phone: Allow ends it, "Not now"
+    /// says so, and nobody answering for a minute says that.
+    #[test]
+    fn an_ask_waits_for_the_phone_and_ends_clearly() {
+        let at = Instant::now();
+        assert_eq!(ask_state(None, Some(false), at), None, "never asked");
+        let asked = Some((at, false));
+        assert_eq!(ask_state(asked, Some(false), at), Some(PhoneAsk::Waiting));
+        assert_eq!(
+            ask_state(asked, None, at + ASK_WAIT - Duration::from_millis(1)),
+            Some(PhoneAsk::Waiting)
+        );
+        assert_eq!(
+            ask_state(asked, Some(false), at + ASK_WAIT),
+            Some(PhoneAsk::TimedOut)
+        );
+        assert_eq!(
+            ask_state(asked, Some(true), at),
+            None,
+            "allowed: nothing to wait for"
+        );
+        assert_eq!(
+            ask_state(Some((at, true)), Some(false), at),
+            Some(PhoneAsk::Declined)
+        );
+        assert_eq!(
+            ask_words("Pixel", PhoneAsk::Waiting),
+            "Waiting for Pixel: tap Allow on the phone"
+        );
+        assert!(ask_words("Pixel", PhoneAsk::TimedOut).starts_with("Pixel did not answer"));
+
+        // Through the phone's reports.
+        let phone = "ask-phone-state";
+        let report = |body: serde_json::Value| {
+            let mut packet =
+                NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_SHARE_INPUT_DEVICES);
+            for (key, value) in body.as_object().unwrap() {
+                packet.body.insert(key.clone(), value.clone());
+            }
+            packet
+        };
+        on_phone_packet(phone, &report(serde_json::json!({"allowed": false})));
+        note_ask(phone, Some((Instant::now(), false)));
+        assert_eq!(phone_ask(phone), Some(PhoneAsk::Waiting));
+        on_phone_packet(
+            phone,
+            &report(serde_json::json!({"allowed": false, "reason": "locked"})),
+        );
+        assert_eq!(
+            phone_ask(phone),
+            Some(PhoneAsk::Waiting),
+            "locked is not an answer"
+        );
+        on_phone_packet(
+            phone,
+            &report(serde_json::json!({"allowed": false, "reason": "declined"})),
+        );
+        assert_eq!(phone_ask(phone), Some(PhoneAsk::Declined));
+        note_ask(phone, Some((Instant::now(), false)));
+        on_phone_packet(phone, &report(serde_json::json!({"allowed": true})));
+        assert_eq!(phone_ask(phone), None, "Allow ends it");
+        on_phone_packet(phone, &report(serde_json::json!({"allowed": false})));
+        assert_eq!(phone_ask(phone), None, "and it is not shown again later");
+        forget_phone(phone);
+    }
+
+    /// Setting Glide to a phone that has it off asks the phone once; a phone
+    /// that allows it, or is only locked, is not asked; no report yet waits.
+    #[test]
+    fn setting_glide_to_a_phone_that_has_it_off_asks_there_once() {
+        assert_eq!(auto_ask(true, Some(false), false), AutoAsk::Now);
+        assert_eq!(auto_ask(true, None, false), AutoAsk::Later);
+        assert_eq!(auto_ask(true, Some(true), false), AutoAsk::Never);
+        assert_eq!(
+            auto_ask(true, Some(false), true),
+            AutoAsk::Never,
+            "locked: unlock, not allow"
+        );
+        assert_eq!(
+            auto_ask(false, Some(false), false),
+            AutoAsk::Never,
+            "only when the person just set it"
+        );
     }
 
     /// Accepted: what was held goes out in order, then it streams normally.
