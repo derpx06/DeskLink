@@ -37,13 +37,19 @@ export function statusLine(device, now = new Date()) {
     return lastSeen(device, now) || 'Not connected';
 }
 
-/// The header's line under the phone's name: the link only (the route, the
-/// battery and the rest are the chips and the ring below it).
+/// The header's line under the phone's name: the link in a few words
+/// ("Connected · Wi-Fi · 12 ms · charging"); the battery is the ring beside it.
 export function headerLine(device, now = new Date()) {
     if (!device)
         return 'No phone connected';
-    if (device.ready)
-        return 'Connected';
+    if (device.ready) {
+        const parts = ['Connected'];
+        if (ROUTE[device.path])
+            parts.push(device.rttMs >= 0 ? `${ROUTE[device.path]} · ${device.rttMs} ms` : ROUTE[device.path]);
+        if (device.charging && device.battery >= 0)
+            parts.push('charging');
+        return parts.join(' · ');
+    }
     return device.reachable ? 'Connecting…' : (lastSeen(device, now) || 'Not connected');
 }
 
@@ -104,40 +110,10 @@ export function timer(unixMillis, nowMs = Date.now()) {
     return h > 0 ? `${h}:${two(m)}:${two(s)}` : `${m}:${two(s)}`;
 }
 
-/// The status chips under the header: short, plain, each with a tone
-/// ('ok' mint, 'warn' coral, 'info' neutral, 'off' dimmed).
-export function deviceChips(device) {
-    if (!device)
-        return [];
-    const chips = [];
-    if (device.ready) {
-        if (ROUTE[device.path]) {
-            const rtt = device.rttMs >= 0 ? ` · ${device.rttMs} ms` : '';
-            chips.push({id: 'route', text: `${ROUTE[device.path]}${rtt}`, tone: 'info'});
-        }
-        if (device.battery >= 0) {
-            const low = device.battery <= 20 && !device.charging;
-            chips.push({
-                id: 'battery',
-                text: `${device.battery}%${device.charging ? ' · charging' : ''}`,
-                tone: low ? 'warn' : 'info',
-            });
-        }
-        if ((device.transfers ?? []).some(transfer => /^fast/i.test(transfer.lane)))
-            chips.push({id: 'lane', text: 'Fast, over Wi-Fi', tone: 'ok'});
-        const sound = device.sound ?? {};
-        if (sound.deskSound || sound.phoneMic || sound.phoneSound)
-            chips.push({id: 'sound', text: 'Sound on', tone: 'info'});
-    }
-    if (device.settings?.dndShare)
-        chips.push({id: 'dnd', text: 'DND shared', tone: 'info'});
-    return chips;
-}
-
 const has = (device, action) => !!device?.actions?.includes(action);
 
-/// The quick-action tiles: always these six, greyed out when the phone does
-/// not take one now.
+/// The quick-action tiles: these six, three to a row, greyed out when the
+/// phone does not take one now (and not shown at all while it is away).
 export function quickTiles(device) {
     const ready = !!device?.ready;
     const name = device?.name ?? 'the phone';
@@ -290,6 +266,44 @@ export function sections(device, desk, extras = {}) {
         act('reconnect', 'Look for the phone again', 'view-refresh-symbolic', {device: false}),
     ]);
     return out;
+}
+
+/// What the menu shows, top to bottom. Rows for what is going on now come
+/// only while something is: a call, music, files moving, the Files sync, the
+/// phone's timers, a phone using this computer. Every area is folded into
+/// More. A new kind of row is one more entry here and one more case in
+/// menu.js's `fillMenu`.
+export function menuBlocks(selected, devices = [], activities = []) {
+    if (!selected)
+        return ['empty'];
+    const blocks = [];
+    if (devices.length > 1)
+        blocks.push('switcher');
+    if (!selected.ready)
+        blocks.push('offline');
+    if (selected.call)
+        blocks.push('call');
+    if (selected.ready)
+        blocks.push('tiles');
+    if (selected.ready && selected.media)
+        blocks.push('media');
+    if ((selected.transfers ?? []).length > 0)
+        blocks.push('transfers');
+    if (selected.bucket)
+        blocks.push('bucket');
+    if (activities.some(item => item.device === selected.id))
+        blocks.push('activities');
+    if (devices.some(device => device.screen || device.terminals > 0))
+        blocks.push('live');
+    blocks.push('more', 'footer');
+    return blocks;
+}
+
+/// The words beside the folded More row: what in it wants a look ("3 new",
+/// "1 attached"); a switch that is on is not news.
+export function moreSummary(list) {
+    return list.filter(section => section.id === 'notifications' || section.id === 'terminals')
+        .map(section => section.subtitle).filter(Boolean).join(' · ');
 }
 
 /// The footer's three buttons.

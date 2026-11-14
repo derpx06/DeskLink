@@ -1799,7 +1799,9 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 22] = [
+const KNOWN_BUILDS: [&str; 23] = [
+    // The compact menu: header line, pill tiles, one music row, every area in More.
+    "e03918201c7c84592e19242f05859a6dcc977553a3d4423af013dedcbdda8c62",
     // The lane chip in the words of both apps ("Fast, over Wi-Fi").
     "8c8ad0ee0416248afe9e374ff44cb34e441c770a2d8d3679e5f4877af361910a",
     // The merged notifications + ext-seek build.

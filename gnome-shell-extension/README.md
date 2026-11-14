@@ -6,13 +6,15 @@ optional pill's, the same menu) holds everything the phone can do. It needs the
 DeskLink app running; while it is not, nothing is shown.
 
 ```
-Header            name · "Connected · Wi-Fi · 82% ⚡" · battery ring
-Chips             Connected · Wi-Fi 12 ms · 82% charging · Fast, over Wi-Fi · Sound on · DND shared
+Header            name · "Connected · Wi-Fi · 12 ms · charging" · battery ring
+Phones            one chip per phone, with two or more
 Cards             Not connected (Try again / Reconnect) · a call (Answer, Decline, Mute, End)
-Quick actions     Files · Clipboard · Ring · Lock · Screen · Photo
-Now playing       previous · play/pause · next · a timeline (drag or click to seek; dimmed, with the reason, for a stream)
-Now               files moving (with their lane) · Files sync · the phone's timers · what is live here, with End
-Sections          one collapsed section each; the body scrolls when the screen is short
+Quick actions     Files · Clipboard · Ring · Lock · Screen · Photo (pills, three to a row; hidden while away)
+Now playing       one row: title, previous · play/pause · next; the title opens the timeline
+                  (drag or click to seek; dimmed, with the reason, for a stream)
+Now               only while something is going on: files moving (with their lane) · Files sync ·
+                  the phone's timers · a phone using this computer, with End
+More              every area, folded; open it, pick one, Back returns
   Send & share        Send files · Send clipboard · Send copied link · Ping · recent files
   Insert from phone   Photo · Photo as a file · Scan a document · Text from a picture · QR code
   Sound               play this computer's sound there · phone as microphone · phone's sound here
@@ -29,6 +31,12 @@ Sections          one collapsed section each; the body scrolls when the screen i
 Footer            Open DeskLink · Settings · Pause / Resume notifications
 ```
 
+It is kept small: as wide as the Quick Settings grid (the pill's own menu is 24em, so large
+text widens it), rows on GNOME's 6/12 px rhythm with 16 px icons, and long names cut short
+instead of widening it. With one phone idle it is about 250 px tall; it opens folded again
+each time. `menuBlocks` in `model.js` says which rows show; a new kind of row is one entry
+there and one `case` in `menu.js` (a test checks that every kind is drawn).
+
 Switches change the app's own settings and keep the menu open. Security-sensitive
 ones (terminal access, unlock with the phone, accepting photos, keep-awake from
 the phone, glide, the microphone) can only be turned **off** here; the app itself
@@ -41,8 +49,9 @@ On the lock screen (`session-modes: ["user", "unlock-dialog"]`) it shows only
 nearby" is on in DeskLink's Preferences and the phone is connected on this
 network. The phone must still approve each unlock.
 
-While the phone has something ongoing (a timer, a download, navigation) the pill appears even when it is
-otherwise off and shows the first item with its live countdown or progress (`Activities` property; the
+The pill, when on, is the link glyph and the phone's battery. While the phone has something ongoing (a
+timer, a download, navigation) the pill appears even when it is otherwise off and shows the first item's
+live countdown or progress instead, cut to 16 characters (`Activities` property; the
 text is worked out by the helpers in `extension.js`, tested with `node --test gnome-shell-extension/tests/activity.test.mjs`).
 
 While a phone is viewing or controlling this screen, the "Compiz windows effect" extension's wobble is taken
@@ -72,12 +81,12 @@ in `shell_dbus.rs`. Run the tests with `node --test gnome-shell-extension/tests/
 The tests and a headless GNOME Shell 50 render the menu, but only the real session
 shows what it looks like on your screen. After `make install` and logging in again:
 
-1. Open the toggle's menu with one phone connected, then with the phone off: chips,
-   tiles and the Reconnect card.
-2. Open each section; turn a switch on and off and see that the menu stays open and
-   the app's Settings page agrees. Try a locked row: it should open DeskLink.
+1. Open the toggle's menu with one phone connected, then with the phone off: the
+   header line, tiles and the Reconnect card.
+2. Open More and each area; turn a switch on and off and see that the menu stays open
+   and the app's Settings page agrees. Try a locked row: it should open DeskLink.
 3. Light and dark style; a small screen (the body should scroll, the footer stay).
-4. Start a file transfer and look for "Fast, over Wi-Fi" and the progress bar.
+4. Start a file transfer and look for its lane and the progress bar.
 
 ## Install locally
 
