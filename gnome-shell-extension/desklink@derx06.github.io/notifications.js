@@ -120,7 +120,11 @@ class NotifyPlan {
             if (now - at >= TWIN_MS)
                 this._twins.delete(id);
         }
-        return ops;
+        // `entries` are newest first (the phone's time), and the tray puts
+        // each added notification on top: so shows run oldest first, or the
+        // tray would list them upside down (F21). Banners were decided above,
+        // newest first.
+        return [...ops.filter(op => op.op === 'withdraw'), ...ops.filter(op => op.op === 'show').reverse()];
     }
 
     /// Why `id` may not raise a banner now, or null when it may.

@@ -761,6 +761,7 @@ mod tests {
             request_reply_id: Some("r".into()),
             actions: Vec::new(),
             silent: false,
+            time: 0,
         }];
         let away = phone("p2", false);
         let recent = [LoggedFile {

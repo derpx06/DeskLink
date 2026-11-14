@@ -241,6 +241,7 @@ mod tests {
                 request_reply_id: None,
                 actions: Vec::new(),
                 silent: *silent,
+                time: 0,
             })
             .collect();
         view

@@ -23,6 +23,11 @@ fn unix_secs() -> i64 {
 pub(super) const UNPAIRED_LINK_MAX: std::time::Duration = std::time::Duration::from_secs(60);
 pub(crate) const HEARTBEAT_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// A link quiet this long gives way to one the phone dials (it dials only
+/// when it has no link of its own) and is probed when the phone beacons: a
+/// short Wi-Fi drop leaves the desk holding a socket no FIN ever ended (F20).
+pub(crate) const QUIET_LINK: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// Declare a peer gone after this much silence — three missed probes.
 ///
 /// Sits just below Android's 35 s reader idle limit (`LanLink.IDLE_TIMEOUT_MILLIS`),

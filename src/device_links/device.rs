@@ -75,6 +75,10 @@ pub struct DeviceNotification {
     /// popped up.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub silent: bool,
+    /// The phone's post time (ms since the epoch; 0 when it sent none): the
+    /// list is newest first by it, arrival only breaking ties (F21).
+    #[serde(default)]
+    pub time: i64,
 }
 
 /// A capture asked of the phone (F3), while open.

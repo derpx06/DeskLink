@@ -361,6 +361,10 @@ pub(crate) fn attach_bootstrap_link(
             // The newer link of a race wins even against an answering one.
             if replace_incumbent {
                 Duration::ZERO
+            } else if !link_dialed_by_us {
+                // The phone dials only when it has no link of its own: ours
+                // is a dead socket once it has been quiet a moment (F20).
+                super::QUIET_LINK
             } else {
                 super::HEARTBEAT_IDLE * 2
             },
