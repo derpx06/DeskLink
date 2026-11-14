@@ -38,17 +38,28 @@ fn wire_of(me: &str, peer: &str) -> WebRtcWireBinding {
     }
 }
 
-/// Short timers: the real ones are seconds and minutes.
+/// Short timers: the real ones are seconds and minutes. Except the stall
+/// note: a loaded test machine stalls a transfer for 400 ms easily, and the
+/// informational pause, resume and note it adds broke the counts and notes
+/// of tests about something else. The stall test shortens it ([`stalls`]).
 fn fast() -> Tunables {
     Tunables {
         checkpoint_blocks: 2,
         checkpoint_after: Duration::from_millis(40),
-        no_progress: Duration::from_millis(400),
+        no_progress: Duration::from_secs(3600),
         storage_retry: Duration::from_millis(100),
         busy_retry: Duration::from_millis(100),
         report_every: Duration::from_millis(5),
         storage_slack: 0,
         ..Tunables::default()
+    }
+}
+
+/// [`fast`] with a short stall time, for the tests of the stall note.
+fn stalls() -> Tunables {
+    Tunables {
+        no_progress: Duration::from_millis(400),
+        ..fast()
     }
 }
 
@@ -1571,11 +1582,18 @@ fn a_full_disk_pauses_with_storage_full_and_the_transfer_resumes_when_space_free
     assert_eq!(pause.reason.as_deref(), Some("storage-full"));
     // The person is told, in words, on the receiving side...
     eventually("the note", || {
-        (board::note(&id).as_deref() == Some(words::storage_full().as_str())).then_some(())
+        board::notes_shown(&id)
+            .contains(&words::storage_full())
+            .then_some(())
     });
-    // ...and the sender shows why it waits.
+    // ...and the sender shows why it waits. (Both sides' notes land on the
+    // one board of this process, each replacing the other's: what was shown,
+    // not what shows at the moment of a poll.)
     eventually("the sender's note", || {
-        board::note(&id).filter(|note| note.contains("no space"))
+        board::notes_shown(&id)
+            .iter()
+            .any(|note| note.contains("no space"))
+            .then_some(())
     });
     steady(
         "nothing is published while the disk is full",
@@ -1678,7 +1696,7 @@ fn frames_that_overflow_the_queue_restart_the_transfer_instead_of_being_lost() {
 #[test]
 fn a_silent_link_only_shows_a_note_and_the_transfer_carries_on_when_it_wakes() {
     // A phone that dozes mid-transfer: nothing moves either way for a while.
-    let rig = Rig::new("doze");
+    let rig = Rig::with("doze", stalls(), stalls(), super::FILE_QUEUE_MAX_BYTES);
     let bytes = payload(48 * BLOCK_BYTES as usize, 44);
     let source = rig.source("f.bin", &bytes);
     // The link stalls after a few blocks (the frames of the rest wait).

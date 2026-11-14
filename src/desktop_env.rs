@@ -494,6 +494,19 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = other.id() as i32;
+        // `spawn` returns once the kernel lets go of the parent, which is
+        // before the exec has renamed the child: until then its comm is
+        // still this test binary's (a window a loaded machine widens).
+        let started = std::time::Instant::now();
+        while std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .map_or(true, |comm| comm.trim() != "sleep")
+        {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(60),
+                "sleep never started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         assert!(signal_locker(pid, "swaylock").is_err());
         assert!(
             other.try_wait().unwrap().is_none(),

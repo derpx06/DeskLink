@@ -287,6 +287,76 @@ enum Cmd {
 /// a safety net, as every real reason to wake it arrives as a command.
 const IDLE_WAIT: Duration = Duration::from_secs(5);
 
+/// File threads told to stop that may still be draining their queue and
+/// writing their last checkpoints, by state folder. A reconnect is a new
+/// manager on the same folder, and its thread waits for these before it
+/// reads it: one that read the checkpoints first resumed from blocks before
+/// the ones already verified (and wrote the same partial file alongside).
+static RETIRING: Mutex<Vec<(PathBuf, Arc<Ended>)>> = Mutex::new(Vec::new());
+
+/// The longest a new file thread waits for a retiring one.
+// ponytail: a bound so a wedged old thread cannot stop every later transfer;
+// past it the new thread goes on as it did before this wait existed.
+const RETIRE_WAIT: Duration = Duration::from_secs(60);
+
+/// Set when a file thread has ended, its last checkpoints written.
+#[derive(Default)]
+struct Ended {
+    done: Mutex<bool>,
+    changed: std::sync::Condvar,
+}
+
+impl Ended {
+    fn set(&self) {
+        if let Ok(mut done) = self.done.lock() {
+            *done = true;
+        }
+        self.changed.notify_all();
+    }
+
+    fn is_set(&self) -> bool {
+        self.done.lock().map_or(true, |done| *done)
+    }
+
+    /// Whether it ended within `at_most`.
+    fn wait(&self, at_most: Duration) -> bool {
+        let Ok(done) = self.done.lock() else {
+            return true;
+        };
+        self.changed
+            .wait_timeout_while(done, at_most, |done| !*done)
+            .map_or(true, |(done, _)| *done)
+    }
+}
+
+/// Sets its [`Ended`] when the file thread ends, however it ends.
+struct SetOnDrop(Arc<Ended>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) {
+        self.0.set();
+    }
+}
+
+/// Waits for the retiring file threads of `root` other than `me`.
+fn wait_for_retiring(root: &Path, me: &Arc<Ended>) {
+    let waits: Vec<Arc<Ended>> = RETIRING
+        .lock()
+        .map(|retiring| {
+            retiring
+                .iter()
+                .filter(|(of, ended)| of == root && !Arc::ptr_eq(ended, me))
+                .map(|(_, ended)| Arc::clone(ended))
+                .collect()
+        })
+        .unwrap_or_default();
+    for ended in waits {
+        if !ended.wait(RETIRE_WAIT) {
+            eprintln!("[DeskLink] The previous file transfer thread has not ended; going on");
+        }
+    }
+}
+
 /// A restart-safe, bounded file transfer manager for one WebRTC peer. Cheap
 /// to call from any thread: every method queues work for the file thread.
 pub struct WebRtcTransferManager {
@@ -294,6 +364,8 @@ pub struct WebRtcTransferManager {
     shared: Arc<Shared>,
     store: Store,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The state folder and the end of this manager's file thread.
+    retire: (PathBuf, Arc<Ended>),
     /// The peer whose lanes this manager takes (registered at attach).
     lane_peer: Mutex<Option<(String, u64)>>,
 }
@@ -437,6 +509,7 @@ impl WebRtcTransferManager {
         tun: Tunables,
         queue_max: usize,
     ) -> Result<Self, String> {
+        let retire = (state_root.clone(), Arc::new(Ended::default()));
         let store = Store::new(state_root, destination_root)?;
         let shared = Arc::new(Shared {
             queued: AtomicUsize::new(0),
@@ -460,15 +533,21 @@ impl WebRtcTransferManager {
             faults: Faults::default(),
             closed: std::collections::VecDeque::new(),
         };
+        let (root, ended) = (retire.0.clone(), Arc::clone(&retire.1));
         let thread = std::thread::Builder::new()
             .name("desklink-file".into())
-            .spawn(move || engine.run(inbox))
+            .spawn(move || {
+                let _ended = SetOnDrop(Arc::clone(&ended));
+                wait_for_retiring(&root, &ended);
+                engine.run(inbox)
+            })
             .map_err(|error| format!("Could not start the file transfer thread: {error}"))?;
         Ok(Self {
             commands,
             shared,
             store,
             thread: Mutex::new(Some(thread)),
+            retire,
             lane_peer: Mutex::new(None),
         })
     }
@@ -509,12 +588,17 @@ impl WebRtcTransferManager {
     }
 
     /// Ends the file thread once everything queued before this has been
-    /// handled (its checkpoints written), without waiting for it. A manager
+    /// handled (its checkpoints written), without waiting for it (the next
+    /// manager on this state folder does, see [`RETIRING`]). A manager
     /// belongs to one peer; whoever else still holds it keeps a quiet handle.
     pub fn shut_down(&self) {
         if let Some((peer, instance)) = self.lane_peer.lock().ok().and_then(|mut peer| peer.take())
         {
             super::file_lane::unregister_receiver(&peer, instance);
+        }
+        if let Ok(mut retiring) = RETIRING.lock() {
+            retiring.retain(|(_, ended)| !ended.is_set());
+            retiring.push((self.retire.0.clone(), Arc::clone(&self.retire.1)));
         }
         let _ = self.commands.send(Cmd::Stop);
     }
@@ -685,8 +769,10 @@ impl WebRtcTransferManager {
                 let _ = reply.send(job(engine));
             })))
             .expect("the file thread runs");
+        // Generous: under load the thread may first finish a block's disk
+        // work, or wait for the file thread of the connection before it.
         answer
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(120))
             .expect("the file thread answers")
     }
 }

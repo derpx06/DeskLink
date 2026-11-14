@@ -322,6 +322,10 @@ impl TransferBoard {
     pub fn set_note(&mut self, id: &str, note: Option<String>) {
         match note {
             Some(note) if self.rows.iter().chain(&self.synced).any(|row| row.id == id) => {
+                #[cfg(test)]
+                if let Ok(mut noted) = NOTED.lock() {
+                    noted.push((id.to_string(), note.clone()));
+                }
                 self.notes.insert(id.to_string(), note);
             }
             _ => {
@@ -410,6 +414,26 @@ pub fn pause_device(device_id: &str) {
 /// Removes a listed transfer without an outcome (see [`TransferBoard::discard`]).
 pub fn discard(id: &str) {
     board().discard(id);
+}
+
+/// Tests: every note shown, in order. Both ends of a test's loopback share
+/// this board, so one end's note can replace the other's before a poll sees it.
+#[cfg(test)]
+static NOTED: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// Tests: the notes `id` has shown, in order.
+#[cfg(test)]
+pub fn notes_shown(id: &str) -> Vec<String> {
+    NOTED
+        .lock()
+        .map(|noted| {
+            noted
+                .iter()
+                .filter(|(of, _)| of == id)
+                .map(|(_, note)| note.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Says why a listed transfer is waiting; `None` clears it.
