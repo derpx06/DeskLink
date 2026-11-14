@@ -2194,6 +2194,12 @@ fn should_draw_pages(mapped: bool) -> bool {
 }
 
 /// What kind of link `url` is, in words for the question.
+/// Approve the phone controlling this screen (the desktop's own dialog):
+/// Allow on a phone's "control" ask.
+pub(crate) fn approve_control(window: &DesklinkWindow, device_id: &str) {
+    prefs::approve_remote_control(window, device_id);
+}
+
 pub(crate) fn link_kind_words(url: &str) -> &'static str {
     match url
         .split_once(':')
@@ -3061,6 +3067,34 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
                     .mark_seen(format!("{}:{}", device.id, notification.id), notification);
             }
             win.imp().fake_devices.borrow_mut().push(device);
+            win.imp().snapshots.borrow_mut().clear();
+            win.refresh_devices();
+        }
+        // "fake-phone-report KEY=on|off,...": the selected phone's Ask
+        // report (`asks`), as if it had sent one; "fake-ask KEY": the
+        // selected phone asks this computer for KEY (Ask on computer).
+        "fake-phone-report" | "fake-ask" => {
+            use crate::device_links::packet::{
+                NetworkPacket, PACKET_TYPE_SETTINGS, PACKET_TYPE_SETTINGS_REQUEST,
+            };
+            let Some(device) = win.selected_id() else {
+                return true;
+            };
+            if verb == "fake-ask" {
+                let mut packet = NetworkPacket::new(PACKET_TYPE_SETTINGS_REQUEST);
+                packet.set("set", serde_json::json!({ id: true }));
+                crate::device_links::asks::on_phone_request(&device, &packet);
+            } else {
+                let features: serde_json::Map<String, serde_json::Value> = id
+                    .split(',')
+                    .filter_map(|pair| pair.split_once('='))
+                    .map(|(key, on)| (key.to_string(), (on == "on").into()))
+                    .collect();
+                let mut packet = NetworkPacket::new(PACKET_TYPE_SETTINGS);
+                packet.set("features", serde_json::Value::Object(features));
+                packet.set("prompts", if arg == "blocked" { "off" } else { "on" });
+                crate::device_links::asks::on_phone_report(&device, &packet);
+            }
             win.imp().snapshots.borrow_mut().clear();
             win.refresh_devices();
         }

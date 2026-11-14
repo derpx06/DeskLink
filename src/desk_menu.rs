@@ -270,13 +270,62 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
 
 /// The whole menu: each phone (status, call, actions, music, notifications),
 /// what is live here, this computer's switches, recent files, the app.
+/// The phones' asks waiting here, as one line each ("Pixel asks to open
+/// terminals on this computer"), oldest first.
+pub(crate) fn ask_lines(devices: &[DeviceView]) -> Vec<String> {
+    ask_rows(devices, &crate::device_links::asks::incoming())
+        .into_iter()
+        .map(|(line, _, _)| line)
+        .collect()
+}
+
+/// `(line, device, key)` for each ask from a paired phone (tested).
+fn ask_rows(
+    devices: &[DeviceView],
+    asks: &[crate::device_links::asks::Incoming],
+) -> Vec<(String, String, &'static str)> {
+    asks.iter()
+        .filter_map(|ask| {
+            let phone = devices
+                .iter()
+                .find(|device| device.trusted && device.id == ask.device)?;
+            let line = crate::device_links::asks::prompt(&phone.name, ask.key)?;
+            Some((line, ask.device.clone(), ask.key))
+        })
+        .collect()
+}
+
+/// The asks at the top of the menu: what is asked, Allow, Not now. The
+/// menu works where notifications show no buttons.
+fn ask_entries(rows: &[(String, String, &'static str)]) -> Vec<TrayEntry> {
+    let mut menu = Vec::new();
+    for (line, device, key) in rows {
+        menu.push(TrayEntry::Header {
+            label: line.clone(),
+            icon: "dialog-question-symbolic".into(),
+        });
+        menu.push(
+            TrayEntry::action("Allow", format!("ask-allow:{device}|{key}"))
+                .icon("emblem-ok-symbolic"),
+        );
+        menu.push(TrayEntry::action(
+            "Not Now",
+            format!("ask-decline:{device}|{key}"),
+        ));
+    }
+    if !menu.is_empty() {
+        menu.push(TrayEntry::Separator);
+    }
+    menu
+}
+
 pub(crate) fn entries(
     devices: &[DeviceView],
     settings: &AppSettings,
     recent: &[LoggedFile],
     hand_off: bool,
 ) -> Vec<TrayEntry> {
-    let mut menu = Vec::new();
+    let mut menu = ask_entries(&ask_rows(devices, &crate::device_links::asks::incoming()));
     let phones: Vec<&DeviceView> = devices.iter().filter(|device| device.trusted).collect();
     if phones.is_empty() {
         menu.push(TrayEntry::Header {
@@ -506,6 +555,11 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
         "end-sessions" => app.activate_action("end-sessions", Some(&target.to_variant())),
         "open-bucket" => app.activate_action("open-bucket", Some(&target.to_variant())),
         "reconnect" => daemon.send(DaemonCommand::Reconnect(target)),
+        "ask-allow" | "ask-decline" => {
+            if let Some((device, key)) = target.split_once('|') {
+                app.answer_ask(device, key, verb == "ask-allow");
+            }
+        }
         "keep-awake-on" | "keep-awake-off" => {
             daemon.send(DaemonCommand::SetStayAwake(verb == "keep-awake-on"))
         }
@@ -627,6 +681,42 @@ mod tests {
         report(serde_json::json!({"allowed": true}));
         assert!(!tray().contains(&line), "cleared once allowed");
         crate::device_links::glide::forget_phone(&id);
+    }
+
+    /// A phone's ask waits in the tray too (where notifications show no
+    /// buttons): the line, Allow and Not now, for a paired phone only; and it
+    /// is a line, so the indicator asks for attention.
+    #[test]
+    fn a_phones_ask_is_answered_from_the_tray() {
+        let asks = vec![crate::device_links::asks::Incoming {
+            device: "tray-ask".into(),
+            key: "terminalAccess",
+            at: std::time::Instant::now(),
+        }];
+        let rows = ask_rows(&[phone("tray-ask", true)], &asks);
+        assert_eq!(
+            rows,
+            vec![(
+                "Phone tray-ask asks to open terminals on this computer".to_string(),
+                "tray-ask".to_string(),
+                "terminalAccess"
+            )]
+        );
+        let menu = actions(&ask_entries(&rows));
+        assert_eq!(
+            menu,
+            vec![
+                "ask-allow:tray-ask|terminalAccess".to_string(),
+                "ask-decline:tray-ask|terminalAccess".to_string()
+            ]
+        );
+        let mut stranger = phone("tray-ask", true);
+        stranger.trusted = false;
+        assert!(
+            ask_rows(&[stranger], &asks).is_empty(),
+            "paired phones only"
+        );
+        assert!(ask_entries(&[]).is_empty());
     }
 
     /// C2: the tray reaches "insert from phone" without the window, for a

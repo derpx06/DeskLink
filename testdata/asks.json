@@ -1,0 +1,45 @@
+{
+  "_doc": "Ask on phone / Ask on computer: one mechanism, both ways. A device asks its peer to turn on a feature only the peer can turn on with desklink.settings.request {set: {<key>: true}}, <key> from the peer's table below (toPhone: the desk asks the phone; toDesk: the phone asks the desk). The peer NEVER turns anything on from the packet: it shows a prompt (a notification with Allow and Not now, and a banner in its app) and only the person's Allow there turns the feature on. toDesk keys are never settable keys (wire_values.json settings.settable keep their direct meaning). The answerer's state rides its desklink.settings report (the phone now sends one too): features (every key of its table -> on), declined (the keys the person just answered Not now: only in the report sent for that answer), prompts ('on', or 'off' when its notifications cannot show the prompt: the asker then says to open DeskLink there, where the banner waits). The asker: waiting from its ask until an answer or waitSeconds; declined; timedOut; undelivered (the ask could not be sent, retried once when the link is ready); blocked (prompts off). A feature reported on ends the ask in any state (an answer after the timeout still counts). One pending ask per key per device; an ask nobody pressed for (automatic) at most every reaskSeconds; the answerer replaces, never stacks, a prompt and drops a repeat within dedupeSeconds. Identical copies: protocol/testdata/desklink_v9/, DeskLink/testdata/, desklink-mobile/src/test/resources/shared/.",
+  "waitSeconds": 60,
+  "reaskSeconds": 300,
+  "dedupeSeconds": 5,
+  "toPhone": {
+    "glide": "use Glide on this phone",
+    "contacts": "see your contacts",
+    "notifications": "show your notifications",
+    "calls": "show and answer your calls",
+    "media": "show and control your music",
+    "photos": "get your new photos and screenshots",
+    "dnd": "share Do Not Disturb",
+    "clipboard": "share the clipboard"
+  },
+  "toDesk": {
+    "terminalAccess": "open terminals on this computer",
+    "unlockNearby": "unlock this computer",
+    "galleryAccepted": "send photos and screenshots here",
+    "keepAwakeAllowed": "keep this computer awake",
+    "dndSync": "share Do Not Disturb",
+    "glide": "use Glide with this computer",
+    "control": "see and control this screen"
+  },
+  "examples": {
+    "ask": {"set": {"contacts": true}},
+    "report": {"features": {"contacts": false, "glide": true}, "prompts": "on"},
+    "declinedReport": {"features": {"contacts": false, "glide": true}, "declined": ["contacts"], "prompts": "on"},
+    "blockedReport": {"features": {"contacts": false}, "prompts": "off"}
+  },
+  "states": ["waiting", "declined", "timedOut", "undelivered", "blocked"],
+  "words": {
+    "prompt": "{device} asks to {feature}",
+    "allow": "Allow",
+    "notNow": "Not now",
+    "askOnPhone": "Ask on phone",
+    "askOnComputer": "Ask on computer",
+    "askAgain": "Ask again",
+    "waiting": "Waiting for {device}: tap Allow there",
+    "declined": "{device} said not now",
+    "timedOut": "{device} didn't answer",
+    "undelivered": "Couldn't reach {device}",
+    "blocked": "Notifications are off on {device}: open DeskLink there to allow"
+  }
+}

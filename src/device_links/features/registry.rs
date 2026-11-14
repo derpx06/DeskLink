@@ -21,7 +21,7 @@ use crate::device_links::packet::{
 /// WebRTC transport. Each entry has a matching arm in
 /// `packet_handler::dispatch_webrtc_feature_packet` and a DeskLink Android
 /// plugin that actually sends it.
-const DESKTOP_INCOMING: [&str; 28] = [
+const DESKTOP_INCOMING: [&str; 29] = [
     // Live activities (W13): the phone's ongoing items.
     PACKET_TYPE_ACTIVITY,
     // The fast file lane (W18): a marker both ways.
@@ -62,7 +62,10 @@ const DESKTOP_INCOMING: [&str; 28] = [
     PACKET_TYPE_SCREEN_READY,
     PACKET_TYPE_SCREEN_REQUEST,
     PACKET_TYPE_SCREEN_STOP,
-    // A phone changing an allow-listed desk setting.
+    // The phone's own settings report (Ask on phone: what it has on).
+    PACKET_TYPE_SETTINGS,
+    // A phone changing an allow-listed desk setting, or asking for one
+    // (Ask on computer: a prompt here, never a change).
     PACKET_TYPE_SETTINGS_REQUEST,
     PACKET_TYPE_SHARE_REQUEST,
     // The phone's calls: the incoming-call bar, Answer/Decline, the timer.
@@ -378,6 +381,7 @@ mod tests {
                 "desklink.screen.ready",
                 "desklink.screen.request",
                 "desklink.screen.stop",
+                "desklink.settings",
                 "desklink.settings.request",
                 "desklink.share.request",
                 "desklink.shareinputdevices",
@@ -565,6 +569,7 @@ mod tests {
                 "desklink.notification",
                 "desklink.notification.request",
                 "desklink.ping",
+                "desklink.settings",
                 "desklink.settings.request",
                 "desklink.share.request",
                 "desklink.shareinputdevices",
@@ -608,7 +613,7 @@ mod tests {
         );
         // The types in one direction only are directional pairs: what the
         // phone sends the desk accepts, what the desk sends the phone accepts.
-        assert_eq!(one_way.len(), 15, "{one_way:?}");
+        assert_eq!(one_way.len(), 14, "{one_way:?}");
     }
 
     /// Every type each registry lists, except the screen types, rides the

@@ -249,6 +249,8 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
         })
     };
     let gate = |feature: Feature| blocker(feature, phone).map(|need| from_need(&need));
+    // Off on the phone: Ask on phone (a request there; the person allows it).
+    let step = |key: &str| requirements::phone_step(phone, key).map(|need| from_need(&need));
     let on_phone = |action: Action, words: &str| -> Gate {
         feature_of(action).and_then(gate).unwrap_or_else(|| {
             ready(
@@ -320,7 +322,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
         format!("Photos from {name}"),
         format!("New photos and screenshots from {name} show up in Files."),
         if facts.photos {
-            open("Open Files", Target::Page("files"))
+            step("photos").unwrap_or_else(|| open("Open Files", Target::Page("files")))
         } else {
             turned_off("Files")
         },
@@ -448,6 +450,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
             "Calls".into(),
             format!("Answer and decline {name}'s calls here, and dial a number with it."),
             gate(Feature::Send(PACKET_TYPE_TELEPHONY_REQUEST))
+                .or_else(|| step("calls"))
                 .unwrap_or_else(|| open("Dial a number", Target::Action(Action::Dial))),
         );
     }
@@ -458,7 +461,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
             "desklink-person-symbolic",
             "Contacts".into(),
             format!("{name}'s contacts, to look up, call or copy."),
-            open("Open contacts", Target::Page("contacts")),
+            step("contacts").unwrap_or_else(|| open("Open contacts", Target::Page("contacts"))),
         );
     }
     if sends(PACKET_TYPE_FINDMYPHONE_REQUEST) {
@@ -502,6 +505,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
                  Home while it plays."
             ),
             gate(Feature::Send(PACKET_TYPE_MPRIS_REQUEST))
+                .or_else(|| step("media"))
                 .unwrap_or_else(|| ready("Play or pause", Go::Music(facts.player.clone()))),
         );
     }
@@ -516,7 +520,8 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
             "With clipboard sharing on, what you copy on one is ready to paste on the other."
                 .into(),
             if facts.clipboard_sync {
-                on_phone(Action::SendClipboard, "Send clipboard now")
+                step("clipboard")
+                    .unwrap_or_else(|| on_phone(Action::SendClipboard, "Send clipboard now"))
             } else {
                 turned_off("Clipboard")
             },
@@ -1265,7 +1270,7 @@ mod tests {
             .any(|t| t == PACKET_TYPE_SETTINGS_REQUEST));
         assert_eq!(
             glide(&said_no).1,
-            fix("Ask on phone", Fix::AskPhoneGlide("p".into()))
+            fix("Ask on phone", Fix::AskPhone("p".into(), "glide", false))
         );
         // Locked: unlock it, nothing to click here.
         let locked = glide(&with_phone(|p| {

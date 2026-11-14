@@ -41,6 +41,27 @@ pub(super) struct EmptyState {
     pub(super) root: gtk::Box,
     pub(super) title: gtk::Label,
     pub(super) body: gtk::Label,
+    /// The one button that takes the step the words name (Ask on phone…);
+    /// hidden while there is none ([`EmptyState::set_step`]).
+    pub(super) action: gtk::Button,
+    step: std::rc::Rc<std::cell::RefCell<Option<super::requirements::Need>>>,
+}
+
+impl EmptyState {
+    /// Shows `need`'s words and its fix as the one button, or (`None`) no
+    /// button and the words as they are.
+    pub(super) fn set_step(&self, need: Option<&super::requirements::Need>) {
+        let label = need.and_then(|need| need.fix.label());
+        self.action.set_visible(label.is_some());
+        if let Some(label) = label {
+            self.action.set_label(label);
+        }
+        if let Some(need) = need {
+            self.body
+                .set_label(&format!("{}. {}", need.title, need.detail));
+        }
+        self.step.replace(need.cloned());
+    }
 }
 
 pub(super) fn empty_state(icon: &str, title: &str, body: &str) -> EmptyState {
@@ -84,7 +105,25 @@ pub(super) fn empty_state(icon: &str, title: &str, body: &str) -> EmptyState {
         .build();
     root.append(&title);
     root.append(&body);
-    EmptyState { root, title, body }
+    let action = super::ui_kit::button(super::ui_kit::ButtonKind::Tonal, "Ask on phone", None);
+    action.set_halign(gtk::Align::Center);
+    action.set_visible(false);
+    let step = std::rc::Rc::new(std::cell::RefCell::new(None::<super::requirements::Need>));
+    let shown = std::rc::Rc::clone(&step);
+    action.connect_clicked(move |button| {
+        let need = shown.borrow().clone();
+        if let Some(need) = need {
+            super::requirements::run(button, &need);
+        }
+    });
+    root.append(&action);
+    EmptyState {
+        root,
+        title,
+        body,
+        action,
+        step,
+    }
 }
 
 /// What the history tab was drawn from: it is redrawn only when this changes.

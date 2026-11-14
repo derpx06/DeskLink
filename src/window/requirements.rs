@@ -39,8 +39,12 @@ pub(crate) enum Fix {
     LogOut,
     /// Approve the phone controlling this screen, now, at the desk.
     ApproveControl(String),
-    /// Ask the phone to turn Glide on there (a prompt on the phone).
-    AskPhoneGlide(String),
+    /// Ask the phone to turn a feature on there (`asks::TO_PHONE` key): a
+    /// prompt on the phone, which decides. `again`: asked before.
+    AskPhone(String, &'static str, bool),
+    /// Allow a phone's ask for this computer's `asks::TO_DESK` key (the
+    /// rows add Not now beside it).
+    AllowAsk(String, &'static str),
     /// Turn Glide on for this phone (on the right, as Settings' switch does),
     /// then show where it sits in Settings.
     TurnOnGlide(String),
@@ -63,7 +67,10 @@ impl Fix {
             Self::TurnOnExtension => "Turn on",
             Self::LogOut => "Log out…",
             Self::ApproveControl(_) => "Approve now",
-            Self::AskPhoneGlide(_) => "Ask on phone",
+            Self::AskPhone(_, _, again) => crate::device_links::asks::ask_label(
+                again.then_some(crate::device_links::asks::AskState::TimedOut),
+            ),
+            Self::AllowAsk(..) => "Allow",
             Self::TurnOnGlide(_) => "Turn on Glide",
             Self::TurnOnBucket(_) => "Turn on",
             Self::Reconnect(_) => "Try again",
@@ -130,6 +137,22 @@ pub(crate) struct PhoneFacts {
     pub glide_ask: Option<crate::device_links::glide::PhoneAsk>,
     /// Android lets it read notifications (`None`: an older phone, unknown).
     pub notification_access: Option<bool>,
+    /// It sends its own settings report, so it can be asked for any
+    /// `asks::TO_PHONE` feature (an older build: Glide only).
+    pub reports: bool,
+    /// Each `asks::TO_PHONE` feature: on there, and where an ask stands.
+    pub steps: Vec<PhoneStep>,
+    /// What it asks this computer to turn on, waiting for the person here.
+    pub asked: Vec<&'static str>,
+}
+
+/// One feature only the phone can turn on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PhoneStep {
+    pub key: &'static str,
+    /// `None`: the phone has not said.
+    pub on: Option<bool>,
+    pub ask: Option<crate::device_links::asks::AskState>,
 }
 
 impl PhoneFacts {
@@ -156,6 +179,20 @@ impl PhoneFacts {
             glide_locked: crate::device_links::glide::phone_locked(&device.id),
             glide_ask: crate::device_links::glide::phone_ask(&device.id),
             notification_access: device.notification_access,
+            reports: crate::device_links::asks::phone_reports(&device.id),
+            steps: crate::device_links::asks::TO_PHONE
+                .iter()
+                .map(|(key, _)| PhoneStep {
+                    key,
+                    on: crate::device_links::asks::phone_on(&device.id, key),
+                    ask: crate::device_links::asks::phone_ask(&device.id, key),
+                })
+                .collect(),
+            asked: crate::device_links::asks::incoming()
+                .into_iter()
+                .filter(|ask| ask.device == device.id)
+                .map(|ask| ask.key)
+                .collect(),
         }
     }
 }
@@ -309,6 +346,8 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
         return needs;
     };
     let name = &phone.name;
+    // What the phone asks this computer for: Allow or Not now, here.
+    needs.extend(asked_needs(phone));
     if !phone.terminal_access {
         needs.push(Need {
             id: "terminal-access",
@@ -391,7 +430,10 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
             allow: Some(Allow::AskGlide),
         });
     }
-    if phone.notification_access == Some(false) {
+    if let Some(need) = phone_step(phone, "notifications") {
+        needs.push(need);
+    } else if phone.notification_access == Some(false) && !phone.reports {
+        // An older phone: it cannot be asked, so the words say where.
         needs.push(Need {
             id: "phone-notification-access",
             on_phone: true,
@@ -420,26 +462,121 @@ fn glide_off_there(phone: &PhoneFacts) -> Need {
         on_phone: true,
         title: match phone.glide_ask {
             Some(ask) => crate::device_links::glide::ask_words(name, ask),
-            None => format!("Glide is off on {name}. Turn it on there."),
+            None => format!("Glide is off on {name}"),
         },
-        detail: if askable {
-            format!(
-                "{name} shows a prompt when you ask; or on {name}, open DeskLink, then Settings, \
-                 Control, and turn on control from this computer."
-            )
+        detail: if phone.glide_ask == Some(crate::device_links::asks::AskState::Waiting) {
+            format!("The request is in {name}'s notifications.")
+        } else if askable {
+            format!("Ask on phone shows a request on {name}: tap Allow there and Glide is on.")
         } else {
+            // An older phone cannot be asked: the words say where.
             format!(
                 "On {name}, open DeskLink, then Settings, Control, and turn on control from this \
                  computer."
             )
         },
         fix: if askable {
-            Fix::AskPhoneGlide(phone.id.clone())
+            Fix::AskPhone(phone.id.clone(), "glide", phone.glide_ask.is_some())
         } else {
             Fix::None
         },
         allow: None,
     }
+}
+
+/// What `phone` asks this computer to turn on (Ask on computer), each with
+/// Allow (and Not now in the rows).
+pub(crate) fn asked_needs(phone: &PhoneFacts) -> Vec<Need> {
+    let name = &phone.name;
+    phone
+        .asked
+        .iter()
+        .filter_map(|key| {
+            Some(Need {
+                id: "phone-asks",
+                on_phone: false,
+                title: crate::device_links::asks::prompt(name, key)?,
+                detail: format!("Allow turns it on for {name}. Nothing changes until you do."),
+                fix: Fix::AllowAsk(phone.id.clone(), key),
+                allow: None,
+            })
+        })
+        .collect()
+}
+
+/// Every ask either way for Find anything: the phone's asks, then each
+/// feature only the phone can turn on that is off there.
+pub(crate) fn ask_needs(phone: &PhoneFacts) -> Vec<Need> {
+    let mut needs = asked_needs(phone);
+    needs.extend(
+        crate::device_links::asks::TO_PHONE
+            .iter()
+            .filter_map(|(key, _)| phone_step(phone, key)),
+    );
+    needs
+}
+
+/// The need's id for a phone feature (the existing ones keep theirs).
+fn step_id(key: &str) -> &'static str {
+    match key {
+        "glide" => "glide-phone",
+        "notifications" => "phone-notification-access",
+        "contacts" => "phone-contacts",
+        "calls" => "phone-calls",
+        "media" => "phone-media",
+        "photos" => "phone-photos",
+        "dnd" => "phone-dnd",
+        _ => "phone-clipboard",
+    }
+}
+
+/// What is off on the phone, in a line.
+fn step_off_words(key: &str, name: &str) -> String {
+    match key {
+        "glide" => format!("Glide is off on {name}"),
+        "notifications" => format!("{name}'s notifications are off"),
+        "contacts" => format!("Contacts are off on {name}"),
+        "calls" => format!("Calls are off on {name}"),
+        "media" => format!("Music controls are off on {name}"),
+        "photos" => format!("Photos are off on {name}"),
+        "dnd" => format!("Do Not Disturb sharing needs access on {name}"),
+        _ => format!("Clipboard sharing is off on {name}"),
+    }
+}
+
+/// A feature only the phone can turn on (`asks::TO_PHONE`), off there: the
+/// need with "Ask on phone" (a prompt on the phone, where the person
+/// decides), or where the ask stands. `None` while it is on, or when the
+/// phone has not said (an older build, or no report yet).
+pub(crate) fn phone_step(phone: &PhoneFacts, key: &str) -> Option<Need> {
+    use crate::device_links::asks::AskState;
+    let step = phone.steps.iter().find(|step| step.key == key)?;
+    if step.on != Some(false) || !(phone.reports || key == "glide") {
+        return None;
+    }
+    let name = &phone.name;
+    let waiting = step.ask == Some(AskState::Waiting);
+    Some(Need {
+        id: step_id(key),
+        on_phone: true,
+        title: match step.ask {
+            Some(state) => crate::device_links::asks::words(state, name),
+            None => step_off_words(key, name),
+        },
+        detail: match step.ask {
+            Some(AskState::Waiting) => format!("The request is in {name}'s notifications."),
+            Some(AskState::Blocked) => format!(
+                "The request waits at the top of DeskLink on {name}. Ask again sends it again."
+            ),
+            _ => format!("Ask on phone shows a request on {name}: tap Allow there and it is on."),
+        },
+        fix: if waiting {
+            Fix::None
+        } else {
+            Fix::AskPhone(phone.id.clone(), step.key, step.ask.is_some())
+        },
+        allow: None,
+    })
 }
 
 /// What an unavailable action is blocked by.
@@ -548,9 +685,17 @@ pub(crate) fn run(anchor: &impl IsA<gtk::Widget>, need: &Need) {
         },
         Fix::LogOut => crate::shell_dbus::log_out(),
         Fix::ApproveControl(id) => super::prefs::approve_remote_control(&window, id),
-        Fix::AskPhoneGlide(id) => {
-            crate::device_links::glide::ask_phone(id);
+        Fix::AskPhone(id, key, _) => {
+            crate::device_links::asks::ask_phone(id, key, true);
             window.show_feature_toast("Asked. Tap Allow on the phone");
+        }
+        Fix::AllowAsk(id, key) => {
+            if let Some(app) = window
+                .application()
+                .and_downcast::<crate::application::DesklinkApplication>()
+            {
+                app.answer_ask(id, key, true);
+            }
         }
         Fix::TurnOnGlide(id) => {
             if let Some(daemon) = daemon {
@@ -733,9 +878,32 @@ pub(crate) fn rows(needs: &[Need]) -> gtk::ListBox {
             button.set_halign(gtk::Align::Start);
             button.set_margin_top(4);
             button.update_property(&[gtk::accessible::Property::Description(&need.title)]);
-            let need = need.clone();
-            button.connect_clicked(move |button| run(button, &need));
-            text.append(&button);
+            let fix_need = need.clone();
+            button.connect_clicked(move |button| run(button, &fix_need));
+            if let Fix::AllowAsk(id, key) = &need.fix {
+                // A phone's ask: Allow and Not now side by side.
+                let both = gtk::Box::builder().spacing(8).margin_top(4).build();
+                button.set_margin_top(0);
+                both.append(&button);
+                let not_now =
+                    super::ui_kit::button(super::ui_kit::ButtonKind::Text, "Not now", None);
+                not_now.update_property(&[gtk::accessible::Property::Description(&need.title)]);
+                let (id, key) = (id.clone(), *key);
+                not_now.connect_clicked(move |button| {
+                    if let Some(app) = button
+                        .root()
+                        .and_downcast::<gtk::Window>()
+                        .and_then(|window| window.application())
+                        .and_downcast::<crate::application::DesklinkApplication>()
+                    {
+                        app.answer_ask(&id, key, false);
+                    }
+                });
+                both.append(&not_now);
+                text.append(&both);
+            } else {
+                text.append(&button);
+            }
         }
         let content = gtk::Box::builder()
             .spacing(12)
@@ -853,6 +1021,233 @@ pub(crate) fn key(needs: &[Need]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule: wherever a feature is blocked, the person gets ONE action that
+    /// does it (a fix button here, Ask on phone, Allow on a phone's ask, the
+    /// desktop's own dialog, Copy command), never only instructions to go and do
+    /// it by hand. Every production string that still reads like such an
+    /// instruction is listed here with what goes with it, or why nothing can
+    /// (tested: `every_instruction_to_do_it_by_hand_has_its_action`).
+    const BY_HAND: &[(&str, &str)] = &[
+        // An older phone, which cannot be asked (no Ask report): the words alone.
+        (
+            "open DeskLink, then Settings, Control",
+            "legacy phone build; Ask on phone otherwise",
+        ),
+        (
+            "Settings, Permissions, Notification access.",
+            "legacy phone build (notification access); Ask on phone otherwise",
+        ),
+        (
+            "Turn on notification access in DeskLink on",
+            "legacy phone build; set_step shows Ask on phone",
+        ),
+        (
+            "Allow notification access in DeskLink on",
+            "legacy phone build; set_step shows Ask on phone",
+        ),
+        // The shared "blocked" words: the phone's notifications cannot show the
+        // request, which waits at the top of its app.
+        (
+            "open DeskLink there to allow",
+            "asks.json words.blocked; Ask again",
+        ),
+        // Owned by the screen-fix agent's phone-screen consent ask.
+        (
+            "Control is off on the phone. On your phone: Settings, Control",
+            "screen-fix: Ask on phone for the phone-screen view",
+        ),
+        // Panel applets: no desktop offers an API to add one; System check
+        // shows the step and DeskLink falls back to notifications.
+        ("Settings, Desktop, Panel", "no API: desktop panel applet"),
+        ("Settings, Panel.", "no API: desktop panel applet"),
+        // Not a blocked feature: the session notice's own click opens DeskLink.
+        (
+            "Open DeskLink to see more.",
+            "notification click opens the window",
+        ),
+        // Only an update of the phone's app does it.
+        (
+            "update DeskLink on the phone",
+            "no remote action: an app update",
+        ),
+        // Steps only the phone can take, where the phone already shows its
+        // own question or has nothing a computer could trigger.
+        (
+            "Open DeskLink on the phone and choose where its Bucket goes",
+            "the phone shows its own Bucket question (folders offer)",
+        ),
+        (
+            "Turn on the Bucket in DeskLink on the phone.",
+            "the phone shows its own Bucket question (folders offer)",
+        ),
+        (
+            "touch and hold the home screen to add DeskLink widgets",
+            "no API: a launcher action on the phone",
+        ),
+        (
+            "Update DeskLink on the phone",
+            "no remote action: an app update",
+        ),
+        // Pairing: the phone scans the code shown here; the window's Accept
+        // answers a phone's request.
+        (
+            "Open DeskLink on your phone and scan this code.",
+            "pairing: the code beside it",
+        ),
+        (
+            "Open DeskLink on your phone, on the same Wi-Fi",
+            "pairing: the code beside it",
+        ),
+        (
+            "Approve this phone in DeskLink on the computer first",
+            "pairing: the computer's Accept",
+        ),
+        (
+            "Open DeskLink to accept or reject the request.",
+            "notification click opens the window's Accept",
+        ),
+        // Where to find the whole list, after the list's own fixes.
+        (
+            "Settings, Advanced, System check",
+            "informational: Open system check",
+        ),
+    ];
+
+    /// Every string telling the person to do something by hand is in
+    /// [`BY_HAND`] with its action, and every entry still matches a string.
+    #[test]
+    fn every_instruction_to_do_it_by_hand_has_its_action() {
+        const PATTERNS: &[&str] = &[
+            "Settings, ",
+            "in DeskLink on",
+            "DeskLink on the phone",
+            "pen DeskLink on",
+            "pen DeskLink to",
+            "pen DeskLink there",
+            "On your phone:",
+            "on the phone first",
+            "Turn it on there",
+            "Turn on Calls",
+        ];
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        let (mut misses, mut used) = (Vec::new(), vec![false; BY_HAND.len()]);
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let production = text.split("\n#[cfg(test)]\nmod tests").next().unwrap_or("");
+            for (number, line) in production.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") || !line.contains('"') && !line.ends_with('\\') {
+                    continue;
+                }
+                if !PATTERNS.iter().any(|pattern| line.contains(pattern)) {
+                    continue;
+                }
+                match BY_HAND.iter().position(|(words, _)| line.contains(words)) {
+                    Some(index) => used[index] = true,
+                    None => misses.push(format!(
+                        "{}:{}: {}",
+                        file.strip_prefix(&root).unwrap().display(),
+                        number + 1,
+                        code
+                    )),
+                }
+            }
+        }
+        assert!(
+            misses.is_empty(),
+            "instructions with no action (add the button, or list why in BY_HAND):\n{}",
+            misses.join("\n")
+        );
+        let stale: Vec<_> = BY_HAND
+            .iter()
+            .zip(&used)
+            .filter(|(_, used)| !**used)
+            .map(|((words, _), _)| *words)
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "BY_HAND entries matching nothing: {stale:?}"
+        );
+    }
+
+    /// Each feature only the phone can turn on has its ask: off there, the
+    /// need says so with Ask on phone; asked, where it stands; waiting, no
+    /// button; on, nothing. An older phone that sends no report: no need.
+    #[test]
+    fn every_phone_step_has_an_ask() {
+        use crate::device_links::asks::{AskState, TO_PHONE};
+        for (key, _) in TO_PHONE {
+            let mut phone = phone();
+            phone.reports = true;
+            phone.steps = vec![PhoneStep {
+                key,
+                on: Some(false),
+                ask: None,
+            }];
+            let need = phone_step(&phone, key).unwrap_or_else(|| panic!("{key}"));
+            assert!(need.on_phone);
+            assert_eq!(need.fix, Fix::AskPhone("p1".into(), key, false), "{key}");
+            assert_eq!(need.fix.label(), Some("Ask on phone"));
+            assert!(need.detail.contains("Allow"), "{key}: {}", need.detail);
+            for (state, label) in [
+                (AskState::Declined, Some("Ask again")),
+                (AskState::TimedOut, Some("Ask again")),
+                (AskState::Undelivered, Some("Ask again")),
+                (AskState::Blocked, Some("Ask again")),
+                (AskState::Waiting, None),
+            ] {
+                phone.steps[0].ask = Some(state);
+                let need = phone_step(&phone, key).expect("listed");
+                assert_eq!(
+                    need.title,
+                    crate::device_links::asks::words(state, "Pixel 9")
+                );
+                assert_eq!(need.fix.label(), label, "{key} {state:?}");
+            }
+            phone.steps[0].on = Some(true);
+            assert_eq!(phone_step(&phone, key), None, "{key}: on");
+            phone.steps[0].on = Some(false);
+            phone.reports = false;
+            assert_eq!(
+                phone_step(&phone, key).is_some(),
+                key == "glide",
+                "{key}: an older phone can be asked for Glide only"
+            );
+        }
+    }
+
+    /// A phone's ask for this computer is a need with Allow (and Not now in
+    /// the rows), never switched on by itself.
+    #[test]
+    fn a_phones_ask_is_answered_here() {
+        let mut phone = phone();
+        phone.asked = vec!["terminalAccess"];
+        let needs = missing(&Facts {
+            phone: Some(phone),
+            ..complete()
+        });
+        let ask = needs
+            .iter()
+            .find(|need| need.id == "phone-asks")
+            .expect("listed");
+        assert_eq!(ask.title, "Pixel 9 asks to open terminals on this computer");
+        assert_eq!(ask.fix, Fix::AllowAsk("p1".into(), "terminalAccess"));
+        assert_eq!(ask.fix.label(), Some("Allow"));
+        assert!(ask.allow.is_none(), "not in Allow all: one at a time");
+    }
     use crate::device_links::packet::{PACKET_TYPE_LOCK_REQUEST, PACKET_TYPE_PING};
     use crate::platform::{evaluate, Probe};
     use gtk::{gio, glib};
@@ -871,6 +1266,9 @@ mod tests {
             glide_locked: false,
             glide_ask: None,
             notification_access: Some(true),
+            reports: false,
+            steps: Vec::new(),
+            asked: Vec::new(),
         }
     }
 
@@ -892,14 +1290,14 @@ mod tests {
         off.glide_here = true;
         off.glide_off_there = true;
         let need = glide_need(off.clone()).expect("listed");
-        assert_eq!(need.title, "Glide is off on Pixel 9. Turn it on there.");
+        assert_eq!(need.title, "Glide is off on Pixel 9");
         assert!(need.on_phone);
         assert_eq!(need.fix, Fix::None, "an older phone: the words only");
         assert!(need.detail.contains("Settings, Control"));
         off.incoming
             .push(crate::device_links::packet::PACKET_TYPE_SETTINGS_REQUEST.into());
         let need = glide_need(off.clone()).expect("listed");
-        assert_eq!(need.fix, Fix::AskPhoneGlide("p1".into()));
+        assert_eq!(need.fix, Fix::AskPhone("p1".into(), "glide", false));
         assert_eq!(need.fix.label(), Some("Ask on phone"));
         assert!(need.allow.is_none(), "never switched from here");
 
@@ -915,16 +1313,13 @@ mod tests {
         let mut asked = off.clone();
         asked.glide_ask = Some(crate::device_links::glide::PhoneAsk::Waiting);
         let need = glide_need(asked.clone()).expect("listed");
-        assert_eq!(need.title, "Waiting for Pixel 9: tap Allow on the phone");
+        assert_eq!(need.title, "Waiting for Pixel 9: tap Allow there");
         assert_eq!(need.fix, Fix::None);
         asked.glide_ask = Some(crate::device_links::glide::PhoneAsk::TimedOut);
         let need = glide_need(asked).expect("listed");
-        assert!(
-            need.title.starts_with("Pixel 9 did not answer"),
-            "{}",
-            need.title
-        );
-        assert_eq!(need.fix, Fix::AskPhoneGlide("p1".into()));
+        assert_eq!(need.title, "Pixel 9 didn't answer");
+        assert_eq!(need.fix, Fix::AskPhone("p1".into(), "glide", true));
+        assert_eq!(need.fix.label(), Some("Ask again"));
 
         let mut on_there = off.clone();
         on_there.glide_off_there = false;

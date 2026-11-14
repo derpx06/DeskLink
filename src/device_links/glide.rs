@@ -857,8 +857,6 @@ enum Command {
     HandedBack {
         device: String,
     },
-    /// The person asks the phone to turn Glide on there ([`ask_phone`]).
-    AskPhone(String),
 }
 
 /// The key in `desklink.settings.request {set: {glide: true}}`: this desk
@@ -867,13 +865,10 @@ enum Command {
 /// `Glide.SETTING_KEY`).
 pub(crate) const PHONE_SETTING_KEY: &str = "glide";
 
-/// The ask itself.
+/// The ask itself (`asks::request`; `asks::ask_phone` sends it).
+#[cfg(test)]
 pub(crate) fn turn_on_request() -> NetworkPacket {
-    let mut packet = NetworkPacket::new(PACKET_TYPE_SETTINGS_REQUEST);
-    let mut set = serde_json::Map::new();
-    set.insert(PHONE_SETTING_KEY.into(), true.into());
-    packet.set("set", serde_json::Value::Object(set));
-    packet
+    crate::device_links::asks::request(PHONE_SETTING_KEY)
 }
 
 /// Whether the phone's build takes the ask (`incoming` is what it said it
@@ -884,89 +879,18 @@ pub(crate) fn can_ask_phone(incoming: &[String]) -> bool {
         .any(|packet| packet == PACKET_TYPE_SETTINGS_REQUEST)
 }
 
-/// The person pressed "Ask on phone": the phone shows "<computer> wants to
-/// use Glide. Turn on?" with Allow and Not now, and this desk says it is
-/// waiting for that answer ([`phone_ask`]) until it comes or [`ASK_WAIT`] runs
-/// out.
-pub(crate) fn ask_phone(device_id: &str) {
-    note_ask(device_id, Some((Instant::now(), false)));
-    send_command(Command::AskPhone(device_id.to_string()));
-}
-
-/// How long the desk waits for the person to answer the prompt on the phone.
-/// The phone's notification times out after the same time
-/// (`InputDevicesReceiverPlugin.ASK_TIMEOUT_MS`).
-pub(crate) const ASK_WAIT: Duration = Duration::from_secs(60);
-
 /// Where an "Ask on phone" stands, until the phone allows Glide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PhoneAsk {
-    /// The prompt is on the phone; nobody has answered yet.
-    Waiting,
-    /// The person tapped "Not now" on the phone.
-    Declined,
-    /// Nobody answered within [`ASK_WAIT`].
-    TimedOut,
-}
-
-/// The asks this run made: when, and whether the phone said "Not now".
-static ASKS: Mutex<Option<HashMap<String, (Instant, bool)>>> = Mutex::new(None);
-
-fn note_ask(device_id: &str, ask: Option<(Instant, bool)>) {
-    if let Ok(mut asks) = ASKS.lock() {
-        let asks = asks.get_or_insert_with(HashMap::new);
-        match ask {
-            Some(ask) if asks.len() < 64 || asks.contains_key(device_id) => {
-                asks.insert(device_id.to_string(), ask);
-            }
-            Some(_) => {}
-            None => {
-                asks.remove(device_id);
-            }
-        }
-    }
-}
-
-/// Where the last ask to `device_id` stands; `None` when there is none, or
-/// once the phone allows Glide (tested).
-fn ask_state(
-    ask: Option<(Instant, bool)>,
-    allowed: Option<bool>,
-    now: Instant,
-) -> Option<PhoneAsk> {
-    let (at, declined) = ask?;
-    if allowed == Some(true) {
-        None
-    } else if declined {
-        Some(PhoneAsk::Declined)
-    } else if now.saturating_duration_since(at) >= ASK_WAIT {
-        Some(PhoneAsk::TimedOut)
-    } else {
-        Some(PhoneAsk::Waiting)
-    }
-}
+pub(crate) type PhoneAsk = crate::device_links::asks::AskState;
 
 /// Where the last "Ask on phone" to `device_id` stands (the window and the
 /// needs list show it).
 pub(crate) fn phone_ask(device_id: &str) -> Option<PhoneAsk> {
-    let ask = ASKS
-        .lock()
-        .ok()
-        .and_then(|asks| asks.as_ref().and_then(|asks| asks.get(device_id).copied()));
-    ask_state(ask, phone_allows(device_id), Instant::now())
+    crate::device_links::asks::phone_ask(device_id, PHONE_SETTING_KEY)
 }
 
-/// What the person is told about an ask, in one line.
+/// What the person is told about an ask, in one line (the shared words).
 pub(crate) fn ask_words(phone: &str, ask: PhoneAsk) -> String {
-    match ask {
-        PhoneAsk::Waiting => format!("Waiting for {phone}: tap Allow on the phone"),
-        PhoneAsk::Declined => {
-            format!("{phone} said not now. Ask again when you want to use Glide.")
-        }
-        PhoneAsk::TimedOut => {
-            format!("{phone} did not answer. Unlock it, look in its notifications, and ask again.")
-        }
-    }
+    crate::device_links::asks::words(ask, phone)
 }
 
 fn queue() -> &'static OnceLock<SyncSender<Command>> {
@@ -1053,7 +977,6 @@ fn set_allowed(device_id: &str, allowed: Option<(bool, bool)>) {
 /// The phone is no longer ours: what it said about glide goes.
 pub(crate) fn forget_phone(device_id: &str) {
     set_allowed(device_id, None);
-    note_ask(device_id, None);
 }
 
 /// Everything the phone says on `desklink.shareinputdevices` (W6): a state
@@ -1070,9 +993,9 @@ pub(crate) fn on_phone_packet(device_id: &str, packet: &NetworkPacket) {
         } => {
             set_allowed(device_id, Some((allowed, locked)));
             if allowed {
-                note_ask(device_id, None);
+                crate::device_links::asks::note_on(device_id, PHONE_SETTING_KEY);
             } else if declined {
-                note_ask(device_id, Some((Instant::now(), true)));
+                crate::device_links::asks::note_declined(device_id, PHONE_SETTING_KEY);
             }
             send_command(Command::State {
                 device: device_id.to_string(),
@@ -2173,10 +2096,6 @@ fn run(
                         }
                     }
                 }
-                Command::AskPhone(phone) => {
-                    debug_log!("[Glide] asking {phone} to turn Glide on there");
-                    deliver(&phone, &turn_on_request());
-                }
             }
         }
         while context.pending() {
@@ -2409,8 +2328,9 @@ fn check(
             && crate::device_links::features::peer_accepts(device, PACKET_TYPE_SETTINGS_REQUEST)
         {
             debug_log!("[Glide] Glide is off on {device}; asking there");
-            note_ask(device, Some((now, false)));
-            deliver(device, &turn_on_request());
+            // Not pressed for: the shared rate limit holds it to one per
+            // `asks::REASK`.
+            crate::device_links::asks::ask_phone(device, PHONE_SETTING_KEY, false);
         }
     }
     // The barrier is armed only while the phone says it allows glide: an
@@ -3469,35 +3389,20 @@ mod tests {
     /// says so, and nobody answering for a minute says that.
     #[test]
     fn an_ask_waits_for_the_phone_and_ends_clearly() {
-        let at = Instant::now();
-        assert_eq!(ask_state(None, Some(false), at), None, "never asked");
-        let asked = Some((at, false));
-        assert_eq!(ask_state(asked, Some(false), at), Some(PhoneAsk::Waiting));
-        assert_eq!(
-            ask_state(asked, None, at + ASK_WAIT - Duration::from_millis(1)),
-            Some(PhoneAsk::Waiting)
-        );
-        assert_eq!(
-            ask_state(asked, Some(false), at + ASK_WAIT),
-            Some(PhoneAsk::TimedOut)
-        );
-        assert_eq!(
-            ask_state(asked, Some(true), at),
-            None,
-            "allowed: nothing to wait for"
-        );
-        assert_eq!(
-            ask_state(Some((at, true)), Some(false), at),
-            Some(PhoneAsk::Declined)
-        );
         assert_eq!(
             ask_words("Pixel", PhoneAsk::Waiting),
-            "Waiting for Pixel: tap Allow on the phone"
+            "Waiting for Pixel: tap Allow there"
         );
-        assert!(ask_words("Pixel", PhoneAsk::TimedOut).starts_with("Pixel did not answer"));
+        assert_eq!(
+            ask_words("Pixel", PhoneAsk::TimedOut),
+            "Pixel didn't answer"
+        );
 
         // Through the phone's reports.
-        let phone = "ask-phone-state";
+        let phone = &format!(
+            "{}ask-phone-state",
+            crate::device_links::desk_features::TEST_OUTBOX_PREFIX
+        );
         let report = |body: serde_json::Value| {
             let mut packet =
                 NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_SHARE_INPUT_DEVICES);
@@ -3507,7 +3412,7 @@ mod tests {
             packet
         };
         on_phone_packet(phone, &report(serde_json::json!({"allowed": false})));
-        note_ask(phone, Some((Instant::now(), false)));
+        crate::device_links::asks::ask_phone(phone, PHONE_SETTING_KEY, true);
         assert_eq!(phone_ask(phone), Some(PhoneAsk::Waiting));
         on_phone_packet(
             phone,
@@ -3523,12 +3428,13 @@ mod tests {
             &report(serde_json::json!({"allowed": false, "reason": "declined"})),
         );
         assert_eq!(phone_ask(phone), Some(PhoneAsk::Declined));
-        note_ask(phone, Some((Instant::now(), false)));
+        crate::device_links::asks::ask_phone(phone, PHONE_SETTING_KEY, true);
         on_phone_packet(phone, &report(serde_json::json!({"allowed": true})));
         assert_eq!(phone_ask(phone), None, "Allow ends it");
         on_phone_packet(phone, &report(serde_json::json!({"allowed": false})));
         assert_eq!(phone_ask(phone), None, "and it is not shown again later");
         forget_phone(phone);
+        crate::device_links::asks::forget(phone);
     }
 
     /// Setting Glide to a phone that has it off asks the phone once; a phone

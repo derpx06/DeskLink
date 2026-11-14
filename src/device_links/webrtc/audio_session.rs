@@ -310,9 +310,9 @@ pub(crate) fn handle(
 pub(crate) fn reason_words(phone: &str, reason: &str) -> String {
     match reason {
         "busy" => format!("{phone}'s sound is already in use"),
-        "timeout" => format!("{phone} did not answer. Open DeskLink on {phone} and try again"),
+        "timeout" => format!("{phone} didn't answer. Try again with {phone} at hand"),
         "notifications" => {
-            format!("Turn on notifications for DeskLink on {phone} so it can ask, then try again")
+            crate::device_links::asks::words(crate::device_links::asks::AskState::Blocked, phone)
         }
         "permission" => format!("DeskLink may not record sound on {phone}"),
         "unsupported" => format!("{phone} cannot share its sound (it needs Android 10)"),
@@ -328,11 +328,11 @@ mod tests {
     fn a_refusal_the_phone_gives_is_said_in_plain_words_and_an_unknown_one_is_generic() {
         assert_eq!(
             reason_words("Pixel", "notifications"),
-            "Turn on notifications for DeskLink on Pixel so it can ask, then try again"
+            "Notifications are off on Pixel: open DeskLink there to allow"
         );
         assert_eq!(
             reason_words("Pixel", "timeout"),
-            "Pixel did not answer. Open DeskLink on Pixel and try again"
+            "Pixel didn't answer. Try again with Pixel at hand"
         );
         assert_eq!(
             reason_words("Pixel", "busy"),

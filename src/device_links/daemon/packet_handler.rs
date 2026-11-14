@@ -18,8 +18,9 @@ use crate::device_links::packet::{
     PACKET_TYPE_CLIPBOARD_CONNECT, PACKET_TYPE_FINDMYPHONE_REQUEST, PACKET_TYPE_HEARTBEAT,
     PACKET_TYPE_LOCK, PACKET_TYPE_LOCK_REQUEST, PACKET_TYPE_MOUSEPAD_REQUEST, PACKET_TYPE_MPRIS,
     PACKET_TYPE_MPRIS_REQUEST, PACKET_TYPE_NOTIFICATION, PACKET_TYPE_NOTIFICATION_REQUEST,
-    PACKET_TYPE_PAIR, PACKET_TYPE_PING, PACKET_TYPE_SETTINGS_REQUEST, PACKET_TYPE_SHARE_REQUEST,
-    PACKET_TYPE_TELEPHONY, PACKET_TYPE_UNLOCK_REQUEST, PACKET_TYPE_WEBRTC_SIGNAL_V1,
+    PACKET_TYPE_PAIR, PACKET_TYPE_PING, PACKET_TYPE_SETTINGS, PACKET_TYPE_SETTINGS_REQUEST,
+    PACKET_TYPE_SHARE_REQUEST, PACKET_TYPE_TELEPHONY, PACKET_TYPE_UNLOCK_REQUEST,
+    PACKET_TYPE_WEBRTC_SIGNAL_V1,
 };
 use crate::device_links::pairing::{needs_pair_reconfirmation, PairState};
 
@@ -1039,6 +1040,11 @@ pub(crate) fn dispatch_webrtc_feature_packet(
                     },
                 );
             } else if let Some(message) = calls::parse_error(&packet) {
+                // Refused for want of the Phone permission: the phone is
+                // asked for it (Ask on phone), so the words point at Allow.
+                if packet.get_str("error") == Some("permission") {
+                    crate::device_links::asks::ask_phone(device_id, "calls", true);
+                }
                 push_event(events, DaemonEvent::CallRefused { message });
             }
             Ok(())
@@ -1224,6 +1230,12 @@ pub(crate) fn dispatch_webrtc_feature_packet(
                     debug_log!("[DeskLink] Media request from {device_id} failed: {error}");
                 }
             });
+            Ok(())
+        }
+        // The phone's own settings report (Ask on phone): what it has on,
+        // what it just declined. A report: nothing here changes from it.
+        PACKET_TYPE_SETTINGS => {
+            crate::device_links::asks::on_phone_report(device_id, &packet);
             Ok(())
         }
         PACKET_TYPE_SETTINGS_REQUEST => {

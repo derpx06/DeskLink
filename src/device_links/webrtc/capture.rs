@@ -218,11 +218,9 @@ pub(crate) fn file_arrived(capture_id: &str) {
 pub(crate) fn reason_words(phone: &str, reason: Option<&str>) -> Option<String> {
     Some(match reason {
         Some("user") => return None,
-        Some("timeout") => {
-            format!("{phone} did not answer. Open DeskLink on {phone} and try again")
-        }
+        Some("timeout") => format!("{phone} didn't answer. Try again with {phone} at hand"),
         Some("notifications") => {
-            format!("Turn on notifications for DeskLink on {phone} so it can ask, then try again")
+            crate::device_links::asks::words(crate::device_links::asks::AskState::Blocked, phone)
         }
         Some("permission") => format!("DeskLink may not use the camera on {phone}"),
         Some("unsupported") => format!("{phone} cannot do that"),
@@ -546,7 +544,7 @@ mod tests {
         assert_eq!(
             handle("cap-b", "Pixel", &timeout),
             Outcome::Ended(Some(
-                "Pixel did not answer. Open DeskLink on Pixel and try again".into()
+                "Pixel didn't answer. Try again with Pixel at hand".into()
             ))
         );
         let third = begin("cap-b", "qr", "clipboard", &build);
@@ -589,11 +587,11 @@ mod tests {
     fn the_phones_refusal_reasons_are_said_in_plain_words() {
         assert_eq!(
             reason_words("Pixel", Some("notifications")).as_deref(),
-            Some("Turn on notifications for DeskLink on Pixel so it can ask, then try again")
+            Some("Notifications are off on Pixel: open DeskLink there to allow")
         );
         assert_eq!(
             reason_words("Pixel", Some("timeout")).as_deref(),
-            Some("Pixel did not answer. Open DeskLink on Pixel and try again")
+            Some("Pixel didn't answer. Try again with Pixel at hand")
         );
         assert_eq!(reason_words("Pixel", Some("user")), None);
         let odd = "<b>raw_reason</b>\u{7}";

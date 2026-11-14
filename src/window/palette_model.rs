@@ -852,6 +852,22 @@ pub(crate) fn build(sources: &Sources) -> Vec<Item> {
         });
     }
 
+    // Asks either way: Allow a phone's ask, or Ask on phone for what only
+    // the phone can turn on (works where notifications show no buttons).
+    if let Some(phone) = &sources.phone {
+        for need in super::requirements::ask_needs(&phone.facts) {
+            let title = need.title.clone();
+            items.push(Item::new(
+                Target::Blocked(need),
+                Group::Actions,
+                &title,
+                "",
+                "desklink-device-phone-symbolic",
+                "ask allow request phone turn on permission",
+            ));
+        }
+    }
+
     // Pages. The pages of a phone only for a paired one (as Ctrl+1 to 6);
     // the notes are the user's own either way.
     for (index, (name, words)) in PAGE_WORDS.iter().enumerate() {
