@@ -30,7 +30,7 @@ pub(crate) const KEEP: Duration = Duration::from_secs(600);
 
 /// What this desk may ask the phone to turn on, with the phone's words for it
 /// ("<computer> asks to <words>").
-pub(crate) const TO_PHONE: [(&str, &str); 8] = [
+pub(crate) const TO_PHONE: [(&str, &str); 9] = [
     ("glide", "use Glide on this phone"),
     ("contacts", "see your contacts"),
     ("notifications", "show your notifications"),
@@ -39,6 +39,8 @@ pub(crate) const TO_PHONE: [(&str, &str); 8] = [
     ("photos", "get your new photos and screenshots"),
     ("dnd", "share Do Not Disturb"),
     ("clipboard", "share the clipboard"),
+    // DeskLink's accessibility service there: the phone-screen window asks.
+    ("control", "control this phone"),
 ];
 
 /// What the phone may ask this desk to turn on, and the words of the prompt

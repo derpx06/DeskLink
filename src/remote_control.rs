@@ -83,18 +83,50 @@ thread_local! {
         RefCell::new(std::collections::HashMap::new());
 }
 
-/// Why the phone gave no control, and the fix, in the phone's own words.
-/// The phone refuses control of its screen for one reason a person can fix:
-/// DeskLink's accessibility service is off (it posts a notification that
-/// opens the setting). There is no per-computer switch for this.
-fn control_denied_text(denial: &str, phone: &str) -> String {
-    if denial.to_ascii_lowercase().contains("accessibility") {
-        format!(
-            "View only: control needs DeskLink\u{2019}s accessibility service on {phone}. \
-             Turn it on there (its notification opens the setting)."
-        )
-    } else {
-        format!("View only: {phone} did not allow control ({denial})")
+/// The phone's `asks.json` key for control of its screen.
+const CONTROL_KEY: &str = "control";
+
+/// Why the phone gave no control, and the one action. The phone refuses
+/// control of its screen for one reason a person can fix: DeskLink's
+/// accessibility service is off there. There is no per-computer switch for
+/// this. A phone that can be asked for it ([`Seen::askable`]) gets Ask on
+/// phone (its Allow opens the service's setup there); an older one posts its
+/// own notification, and the action asks for control again.
+fn control_denied(seen: Seen) -> Notice {
+    use crate::device_links::asks::{ask_label, words, AskState};
+    let (denial, phone) = (seen.denial.unwrap_or_default(), seen.phone);
+    let again = Some(("Ask again", Action::RequestControl));
+    if !denial.to_ascii_lowercase().contains("accessibility") {
+        return Notice {
+            text: format!("View only: {phone} did not allow control ({denial})"),
+            button: again,
+        };
+    }
+    if !seen.askable {
+        return Notice {
+            text: format!(
+                "View only: control needs DeskLink\u{2019}s accessibility service on {phone}. \
+                 Turn it on there (its notification opens the setting)."
+            ),
+            button: again,
+        };
+    }
+    match seen.control_ask {
+        Some(AskState::Waiting) => Notice {
+            text: words(AskState::Waiting, phone),
+            button: None,
+        },
+        Some(state) => Notice {
+            text: words(state, phone),
+            button: Some((ask_label(Some(state)), Action::AskPhone)),
+        },
+        None => Notice {
+            text: format!(
+                "View only: control needs DeskLink\u{2019}s accessibility service on {phone}. \
+                 Ask on phone shows a request there; its Allow opens the setup."
+            ),
+            button: Some((ask_label(None), Action::AskPhone)),
+        },
     }
 }
 
@@ -103,12 +135,27 @@ fn control_denied_text(denial: &str, phone: &str) -> String {
 const ACCESSIBILITY_STEPS: &str = "If the switch is greyed out: Settings → Apps → DeskLink → ⋮ → \
      Allow restricted settings, then turn on Accessibility → DeskLink.";
 
+/// The Ask on phone button: the shared ask for `control` (tested).
+fn ask_phone_for_control(device_id: &str) -> bool {
+    crate::device_links::asks::ask_phone(device_id, CONTROL_KEY, true)
+}
+
+/// What the strip's one button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Action {
+    /// Ask the phone for control again.
+    RequestControl,
+    /// Ask on phone (`asks.json` "control"): a request there whose Allow
+    /// opens DeskLink's accessibility setup.
+    AskPhone,
+}
+
 /// One line about the phone screen's state, shown in a strip *above* the picture
-/// (never over it). `ask` offers the one action: ask the phone for control.
+/// (never over it), with its one button (label and action), if any.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Notice {
     pub(crate) text: String,
-    pub(crate) ask: bool,
+    pub(crate) button: Option<(&'static str, Action)>,
 }
 
 /// What the window knows when it words its state.
@@ -126,6 +173,10 @@ pub(crate) struct Seen<'a> {
     pub(crate) ended: Option<&'a str>,
     pub(crate) lease_active: bool,
     pub(crate) phone: &'a str,
+    /// The phone can be asked for control (its report has `control`).
+    pub(crate) askable: bool,
+    /// Where an Ask on phone for control stands.
+    pub(crate) control_ask: Option<crate::device_links::asks::AskState>,
 }
 
 /// What the strip says. Control granted (`lease_active`) says nothing at all, so
@@ -134,7 +185,7 @@ pub(crate) struct Seen<'a> {
 /// its prompt to answer (asking for control then was refused every 2 s with
 /// "not being shared", read here as "Control is off", forever).
 pub(crate) fn status_notice(seen: Seen) -> Option<Notice> {
-    let say = |text: String| Some(Notice { text, ask: false });
+    let say = |text: String| Some(Notice { text, button: None });
     let phone = seen.phone;
     let waiting = || say(format!("Waiting for {phone}: tap Allow on the phone"));
     match seen.state {
@@ -146,10 +197,7 @@ pub(crate) fn status_notice(seen: Seen) -> Option<Notice> {
             SessionState::Viewing | SessionState::RequestingControl | SessionState::Controlling,
         ) if seen.lease_active => None,
         Some(SessionState::Viewing | SessionState::RequestingControl) if seen.denial.is_some() => {
-            Some(Notice {
-                text: control_denied_text(seen.denial.unwrap_or_default(), phone),
-                ask: true,
-            })
+            Some(control_denied(seen))
         }
         Some(
             SessionState::Viewing | SessionState::RequestingControl | SessionState::Controlling,
@@ -443,18 +491,25 @@ pub fn show_remote_control_dialog(
     let last_control_request = Rc::new(Cell::new(std::time::Instant::now()));
     // Automatic control requests since the last grant or click (backs off).
     let control_asks = Rc::new(Cell::new(0u32));
+    // What the strip's button does now (set with its label each tick).
+    let strip_action = Rc::new(Cell::new(Action::RequestControl));
     {
-        // The one action: ask the phone now (it shows its own prompt for what is missing).
-        let (daemon, device, last, asks) = (
+        let (daemon, device, last, asks, strip_action) = (
             daemon.clone(),
             Rc::clone(&device),
             Rc::clone(&last_control_request),
             Rc::clone(&control_asks),
+            Rc::clone(&strip_action),
         );
-        status.connect_button_clicked(move |_| {
-            daemon.send(DaemonCommand::RequestPhoneControl(device.to_string()));
-            last.set(std::time::Instant::now());
-            asks.set(0);
+        status.connect_button_clicked(move |_| match strip_action.get() {
+            Action::RequestControl => {
+                daemon.send(DaemonCommand::RequestPhoneControl(device.to_string()));
+                last.set(std::time::Instant::now());
+                asks.set(0);
+            }
+            Action::AskPhone => {
+                ask_phone_for_control(device.as_str());
+            }
         });
     }
     let nav_buttons: Vec<(glib::WeakRef<gtk::Button>, &'static str)> = nav_buttons
@@ -475,6 +530,8 @@ pub fn show_remote_control_dialog(
         let ask_again = ask_again.downgrade();
         let last_control_request = Rc::clone(&last_control_request);
         let control_asks = Rc::clone(&control_asks);
+        let strip_action = Rc::clone(&strip_action);
+        let control_on_was = Cell::new(false);
         let title = title.downgrade();
         let route = route.downgrade();
         let kind = kind.downgrade();
@@ -565,6 +622,20 @@ pub fn show_remote_control_dialog(
             if lease_active {
                 control_asks.set(0);
             }
+            // The phone reports control on (its Allow, then the setup): ask
+            // for control at once, not at the next backed-off retry.
+            let control_on = crate::device_links::asks::phone_on(device.as_str(), CONTROL_KEY);
+            if control_on == Some(true)
+                && !control_on_was.replace(true)
+                && !lease_active
+                && state == Some(SessionState::Viewing)
+            {
+                daemon.send(DaemonCommand::RequestPhoneControl(device.to_string()));
+                last_control_request.set(std::time::Instant::now());
+                control_asks.set(0);
+            } else if control_on != Some(true) {
+                control_on_was.set(false);
+            }
             // The phone's buttons work exactly when control is granted; when it is
             // not they say so instead of looking usable and doing nothing.
             if lease_was.replace(lease_active) != lease_active || tick.get() == 1 {
@@ -593,6 +664,8 @@ pub fn show_remote_control_dialog(
                 ended: ended.as_deref(),
                 lease_active,
                 phone: &phone,
+                askable: control_on.is_some(),
+                control_ask: crate::device_links::asks::phone_ask(device.as_str(), CONTROL_KEY),
             });
             let connecting = format!("Connecting to {phone}…");
             let waiting = paintable.is_none();
@@ -608,12 +681,16 @@ pub fn show_remote_control_dialog(
                 if status.title().as_str() != notice.text {
                     status.set_title(&notice.text);
                 }
-                let label = if notice.ask { "Ask again" } else { "" };
+                let label = notice.button.map_or("", |(label, _)| label);
                 if status.button_label().as_deref().unwrap_or("") != label {
                     status.set_button_label(Some(label));
                 }
+                if let Some((_, action)) = notice.button {
+                    strip_action.set(action);
+                }
                 let hint = notice
-                    .ask
+                    .button
+                    .is_some()
                     .then(|| format!("{} {ACCESSIBILITY_STEPS}", denial.as_deref().unwrap_or("")));
                 status.set_tooltip_text(hint.as_deref());
             }
@@ -1174,7 +1251,7 @@ mod tests {
         };
         let asking = notice(Some(SessionState::Viewing), None, false).unwrap();
         assert_eq!(asking.text, "View only: asking Pixel for control…");
-        assert!(!asking.ask);
+        assert_eq!(asking.button, None);
 
         let refused = notice(
             Some(SessionState::Viewing),
@@ -1182,7 +1259,11 @@ mod tests {
             false,
         )
         .unwrap();
-        assert!(refused.ask, "the one action is offered");
+        assert_eq!(
+            refused.button,
+            Some(("Ask again", Action::RequestControl)),
+            "an older phone: the one action asks for control again"
+        );
         assert!(
             refused.text.starts_with(
                 "View only: control needs DeskLink\u{2019}s accessibility service on Pixel"
@@ -1202,15 +1283,86 @@ mod tests {
             assert_eq!(notice(Some(state), Some("stale"), true), None);
         }
         // Revoked: it comes back.
-        assert!(
-            notice(Some(SessionState::Viewing), Some("x"), false)
-                .unwrap()
-                .ask
-        );
+        assert!(notice(Some(SessionState::Viewing), Some("x"), false)
+            .unwrap()
+            .button
+            .is_some());
         // Other states keep their own words and never offer to ask.
         let locked = notice(Some(SessionState::PausedLocked), None, false).unwrap();
-        assert!(!locked.ask);
+        assert_eq!(locked.button, None);
         assert_eq!(notice(Some(SessionState::Idle), None, false), None);
+    }
+
+    /// Refused for the accessibility service by a phone that can be asked:
+    /// Ask on phone beside the words, then where the ask stands, in this
+    /// window (waiting: no button; not now, no answer, unreachable, prompts
+    /// off: Ask again).
+    #[test]
+    fn an_accessibility_refusal_offers_ask_on_phone() {
+        use crate::device_links::asks::{words, AskState};
+        let notice = |control_ask| {
+            status_notice(Seen {
+                state: Some(SessionState::Viewing),
+                has_picture: true,
+                denial: Some("Enable DeskLink accessibility control on this Android device"),
+                phone: "Pixel",
+                askable: true,
+                control_ask,
+                ..Seen::default()
+            })
+            .unwrap()
+        };
+        let first = notice(None);
+        assert_eq!(first.button, Some(("Ask on phone", Action::AskPhone)));
+        assert!(first.text.contains("Ask on phone"), "{}", first.text);
+        assert!(!first.text.contains("Turn it on there"), "{}", first.text);
+        let waiting = notice(Some(AskState::Waiting));
+        assert_eq!(waiting.text, words(AskState::Waiting, "Pixel"));
+        assert_eq!(waiting.button, None);
+        for state in [
+            AskState::Declined,
+            AskState::TimedOut,
+            AskState::Undelivered,
+            AskState::Blocked,
+        ] {
+            let after = notice(Some(state));
+            assert_eq!(after.text, words(state, "Pixel"));
+            assert_eq!(after.button, Some(("Ask again", Action::AskPhone)));
+        }
+        // Another refusal is not the phone's to fix by an ask.
+        let other = status_notice(Seen {
+            state: Some(SessionState::Viewing),
+            has_picture: true,
+            denial: Some("busy"),
+            phone: "Pixel",
+            askable: true,
+            ..Seen::default()
+        })
+        .unwrap();
+        assert_eq!(other.button, Some(("Ask again", Action::RequestControl)));
+    }
+
+    /// The button's ask is the shared one: `desklink.settings.request
+    /// {set: {control: true}}`, a key the phone's table has.
+    #[test]
+    fn ask_on_phone_sends_the_control_request() {
+        use crate::device_links::{asks, desk_features};
+        let phone = format!("{}askctl", desk_features::TEST_OUTBOX_PREFIX);
+        assert!(ask_phone_for_control(&phone));
+        let sent = desk_features::test_sent(&phone);
+        let packet = sent.last().expect("sent");
+        assert_eq!(
+            packet.packet_type,
+            crate::device_links::packet::PACKET_TYPE_SETTINGS_REQUEST
+        );
+        assert_eq!(
+            packet.body.get("set"),
+            Some(&serde_json::json!({"control": true}))
+        );
+        assert_eq!(
+            asks::phone_ask(&phone, CONTROL_KEY),
+            Some(asks::AskState::Waiting)
+        );
     }
 
     /// Before the phone's picture the window waits for its person's Allow, and says

@@ -526,6 +526,7 @@ fn step_id(key: &str) -> &'static str {
         "media" => "phone-media",
         "photos" => "phone-photos",
         "dnd" => "phone-dnd",
+        "control" => "phone-control",
         _ => "phone-clipboard",
     }
 }
@@ -540,6 +541,7 @@ fn step_off_words(key: &str, name: &str) -> String {
         "media" => format!("Music controls are off on {name}"),
         "photos" => format!("Photos are off on {name}"),
         "dnd" => format!("Do Not Disturb sharing needs access on {name}"),
+        "control" => format!("Control of {name}'s screen is off"),
         _ => format!("Clipboard sharing is off on {name}"),
     }
 }
@@ -1052,10 +1054,11 @@ mod tests {
             "open DeskLink there to allow",
             "asks.json words.blocked; Ask again",
         ),
-        // Owned by the screen-fix agent's phone-screen consent ask.
+        // The phone-screen window's control refusal from an older phone,
+        // which cannot be asked for control (no "control" in its report).
         (
-            "Control is off on the phone. On your phone: Settings, Control",
-            "screen-fix: Ask on phone for the phone-screen view",
+            "Turn it on there (its notification opens the setting).",
+            "legacy phone build (its own notification opens the setup); Ask on phone otherwise",
         ),
         // Panel applets: no desktop offers an API to add one; System check
         // shows the step and DeskLink falls back to notifications.

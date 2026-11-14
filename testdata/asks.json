@@ -11,7 +11,8 @@
     "media": "show and control your music",
     "photos": "get your new photos and screenshots",
     "dnd": "share Do Not Disturb",
-    "clipboard": "share the clipboard"
+    "clipboard": "share the clipboard",
+    "control": "control this phone"
   },
   "toDesk": {
     "terminalAccess": "open terminals on this computer",
