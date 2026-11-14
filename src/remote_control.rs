@@ -83,11 +83,19 @@ thread_local! {
         RefCell::new(std::collections::HashMap::new());
 }
 
-/// How to turn on the phone's control: the phone's own per-computer switch.
-fn control_off_text(computer: &str) -> String {
-    format!(
-        "Control is off on the phone. On your phone: Settings, Control, turn on \u{201c}Let {computer} control this phone\u{201d}."
-    )
+/// Why the phone gave no control, and the fix, in the phone's own words.
+/// The phone refuses control of its screen for one reason a person can fix:
+/// DeskLink's accessibility service is off (it posts a notification that
+/// opens the setting). There is no per-computer switch for this.
+fn control_denied_text(denial: &str, phone: &str) -> String {
+    if denial.to_ascii_lowercase().contains("accessibility") {
+        format!(
+            "View only: control needs DeskLink\u{2019}s accessibility service on {phone}. \
+             Turn it on there (its notification opens the setting)."
+        )
+    } else {
+        format!("View only: {phone} did not allow control ({denial})")
+    }
 }
 
 /// A sideloaded app's accessibility switch is greyed out until Android's
@@ -103,47 +111,78 @@ pub(crate) struct Notice {
     pub(crate) ask: bool,
 }
 
+/// What the window knows when it words its state.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Seen<'a> {
+    pub(crate) state: Option<SessionState>,
+    /// The window stopped asking: the phone said no, stopped, or never answered.
+    pub(crate) gave_up: bool,
+    /// ... because the phone never answered within [`ASK_WAIT`].
+    pub(crate) timed_out: bool,
+    pub(crate) has_picture: bool,
+    /// Why the phone refused control.
+    pub(crate) denial: Option<&'a str>,
+    /// Why the phone ended the view ("declined": Not now on its prompt).
+    pub(crate) ended: Option<&'a str>,
+    pub(crate) lease_active: bool,
+    pub(crate) phone: &'a str,
+}
+
 /// What the strip says. Control granted (`lease_active`) says nothing at all, so
-/// the strip goes the moment the phone allows it, with no click.
-pub(crate) fn status_notice(
-    state: Option<SessionState>,
-    gave_up: bool,
-    has_picture: bool,
-    denial: Option<&str>,
-    lease_active: bool,
-    computer: &str,
-) -> Option<Notice> {
-    let say = |text: &str| {
-        Some(Notice {
-            text: text.to_string(),
-            ask: false,
-        })
-    };
-    match state {
-        Some(SessionState::RequestingView) => say("Approve screen sharing on the phone…"),
+/// the strip goes the moment the phone allows it, with no click. Before the
+/// phone's picture there is no control to ask for: the phone's person has
+/// its prompt to answer (asking for control then was refused every 2 s with
+/// "not being shared", read here as "Control is off", forever).
+pub(crate) fn status_notice(seen: Seen) -> Option<Notice> {
+    let say = |text: String| Some(Notice { text, ask: false });
+    let phone = seen.phone;
+    let waiting = || say(format!("Waiting for {phone}: tap Allow on the phone"));
+    match seen.state {
+        Some(SessionState::RequestingView) => waiting(),
         Some(
             SessionState::Viewing | SessionState::RequestingControl | SessionState::Controlling,
-        ) if lease_active => None,
-        Some(SessionState::Viewing | SessionState::RequestingControl) if denial.is_some() => {
+        ) if !seen.has_picture => waiting(),
+        Some(
+            SessionState::Viewing | SessionState::RequestingControl | SessionState::Controlling,
+        ) if seen.lease_active => None,
+        Some(SessionState::Viewing | SessionState::RequestingControl) if seen.denial.is_some() => {
             Some(Notice {
-                text: control_off_text(computer),
+                text: control_denied_text(seen.denial.unwrap_or_default(), phone),
                 ask: true,
             })
         }
-        Some(SessionState::Viewing | SessionState::RequestingControl) => {
-            say("Asking the phone for control…")
+        Some(
+            SessionState::Viewing | SessionState::RequestingControl | SessionState::Controlling,
+        ) => say(format!("View only: asking {phone} for control…")),
+        Some(SessionState::PausedLocked) => {
+            say(format!("{phone} is locked · unlock it to continue"))
         }
-        Some(SessionState::Controlling) if !has_picture => {
-            say("Allow screen sharing on the phone (check its notifications)…")
+        Some(SessionState::Stopped | SessionState::Idle) | None if seen.gave_up => {
+            if seen.timed_out {
+                say(format!("{phone} did not answer"))
+            } else if seen
+                .ended
+                .is_some_and(|why| why == "declined" || why.contains("not granted"))
+            {
+                say(format!("Not allowed on {phone}"))
+            } else {
+                say(format!("{phone} stopped sharing its screen"))
+            }
         }
-        Some(SessionState::Controlling) => say("Asking the phone for control…"),
-        Some(SessionState::PausedLocked) => say("Phone is locked · unlock it to continue"),
-        Some(SessionState::Stopped) if gave_up => {
-            say("The phone declined or stopped sharing its screen")
-        }
-        Some(SessionState::Stopped) => say("Screen stopped · reconnecting…"),
+        Some(SessionState::Stopped) => say("Screen stopped · reconnecting…".to_string()),
         _ => None,
     }
+}
+
+/// How long the window waits for the phone's person to allow the view: the
+/// phone's prompt goes after as long.
+const ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The wait before the `asked`-th automatic control request (0-based): the
+/// first 2 s after the picture, then doubling to 30 s. A refusal used to be
+/// asked again every 2 s for as long as the window was open.
+pub(crate) fn control_retry_after(asked: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((2u64 << asked.min(4)).min(30))
 }
 
 pub fn show_remote_control_dialog(
@@ -346,7 +385,7 @@ pub fn show_remote_control_dialog(
     // is granted.
     let status = adw::Banner::builder()
         .use_markup(false)
-        .button_label("Ask the phone")
+        .button_label("Ask again")
         .build();
     toolbar.add_top_bar(&status);
     let loading = gtk::Box::builder()
@@ -402,19 +441,22 @@ pub fn show_remote_control_dialog(
     }
     let link_ready = Rc::new(Cell::new(true));
     let last_control_request = Rc::new(Cell::new(std::time::Instant::now()));
+    // Automatic control requests since the last grant or click (backs off).
+    let control_asks = Rc::new(Cell::new(0u32));
     {
         // The one action: ask the phone now (it shows its own prompt for what is missing).
-        let (daemon, device, last) = (
+        let (daemon, device, last, asks) = (
             daemon.clone(),
             Rc::clone(&device),
             Rc::clone(&last_control_request),
+            Rc::clone(&control_asks),
         );
         status.connect_button_clicked(move |_| {
             daemon.send(DaemonCommand::RequestPhoneControl(device.to_string()));
             last.set(std::time::Instant::now());
+            asks.set(0);
         });
     }
-    let computer = glib::host_name().to_string();
     let nav_buttons: Vec<(glib::WeakRef<gtk::Button>, &'static str)> = nav_buttons
         .into_iter()
         .map(|(button, tooltip)| (button.downgrade(), tooltip))
@@ -432,6 +474,7 @@ pub fn show_remote_control_dialog(
         let link_ready = Rc::clone(&link_ready);
         let ask_again = ask_again.downgrade();
         let last_control_request = Rc::clone(&last_control_request);
+        let control_asks = Rc::clone(&control_asks);
         let title = title.downgrade();
         let route = route.downgrade();
         let kind = kind.downgrade();
@@ -483,28 +526,45 @@ pub fn show_remote_control_dialog(
             {
                 daemon.send(DaemonCommand::StartPhoneRemoteControl(device.to_string()));
             }
-            let gave_up = restarter.borrow().gave_up();
-            if let Some(button) = ask_again.upgrade() {
-                button.set_visible(gave_up);
-            }
-            // Viewing but not controlling: the phone refused (usually its
-            // accessibility service is off) or the request was lost. Keep
-            // asking, so turning the service on is all the user has to do.
-            if state == Some(SessionState::Viewing)
-                && last_control_request.get().elapsed() >= std::time::Duration::from_secs(2)
-            {
-                daemon.send(DaemonCommand::RequestPhoneControl(device.to_string()));
-                last_control_request.set(std::time::Instant::now());
-            }
-            let denial = session_control_denial(device.as_str());
             let paintable = crate::device_links::webrtc::screen::stream_for(device.as_str())
                 .and_then(|stream| stream.paintable());
             if picture.paintable() != paintable {
                 picture.set_paintable(paintable.as_ref());
             }
+            // The phone's person never answered its prompt: stop waiting, and say so.
+            if restarter.borrow_mut().waited_out(
+                state,
+                paintable.is_some(),
+                std::time::Instant::now(),
+            ) {
+                daemon.send(DaemonCommand::StopPhoneRemoteControl(device.to_string()));
+            }
+            let gave_up = restarter.borrow().gave_up();
+            if let Some(button) = ask_again.upgrade() {
+                // While the phone's prompt waits too: asking again shows it again.
+                button
+                    .set_visible(gave_up || restarter.borrow().waiting(state, paintable.is_some()));
+            }
+            // Viewing the picture but not controlling: the phone refused (its
+            // accessibility service is off) or the request was lost. Asked
+            // again with a growing wait, so turning the service on is all the
+            // user has to do, without a refusal every 2 s.
+            if state == Some(SessionState::Viewing)
+                && paintable.is_some()
+                && last_control_request.get().elapsed() >= control_retry_after(control_asks.get())
+            {
+                daemon.send(DaemonCommand::RequestPhoneControl(device.to_string()));
+                last_control_request.set(std::time::Instant::now());
+                control_asks.set(control_asks.get().saturating_add(1));
+            }
+            let denial = session_control_denial(device.as_str());
+            let ended = session_ended_reason(device.as_str());
             #[cfg(debug_assertions)]
             save_frame_on_request(&picture);
             let lease_active = remote_control_lease_active(device.as_str());
+            if lease_active {
+                control_asks.set(0);
+            }
             // The phone's buttons work exactly when control is granted; when it is
             // not they say so instead of looking usable and doing nothing.
             if lease_was.replace(lease_active) != lease_active || tick.get() == 1 {
@@ -514,27 +574,27 @@ pub fn show_remote_control_dialog(
                         button.set_tooltip_text(Some(if lease_active {
                             *tooltip
                         } else {
-                            "Needs control: it is off on the phone"
+                            "Needs control of the phone (see the strip above)"
                         }));
                     }
                 }
             }
-            let notice = status_notice(
+            let phone = title
+                .upgrade()
+                .map(|title| title.title().to_string())
+                .filter(|name| !name.is_empty() && name != "Phone Screen")
+                .unwrap_or_else(|| "the phone".to_string());
+            let notice = status_notice(Seen {
                 state,
                 gave_up,
-                paintable.is_some(),
-                denial.as_deref(),
+                timed_out: restarter.borrow().timed_out(),
+                has_picture: paintable.is_some(),
+                denial: denial.as_deref(),
+                ended: ended.as_deref(),
                 lease_active,
-                &computer,
-            );
-            let connecting = format!(
-                "Connecting to {}…",
-                title
-                    .upgrade()
-                    .map(|title| title.title().to_string())
-                    .filter(|name| !name.is_empty() && name != "Phone Screen")
-                    .unwrap_or_else(|| "the phone".to_string())
-            );
+                phone: &phone,
+            });
+            let connecting = format!("Connecting to {phone}…");
             let waiting = paintable.is_none();
             if let (Some(loading), Some(label)) = (loading.upgrade(), loading_label.upgrade()) {
                 loading.set_visible(waiting);
@@ -548,7 +608,7 @@ pub fn show_remote_control_dialog(
                 if status.title().as_str() != notice.text {
                     status.set_title(&notice.text);
                 }
-                let label = if notice.ask { "Ask the phone" } else { "" };
+                let label = if notice.ask { "Ask again" } else { "" };
                 if status.button_label().as_deref().unwrap_or("") != label {
                     status.set_button_label(Some(label));
                 }
@@ -745,38 +805,43 @@ pub fn show_remote_control_dialog(
         picture.add_controller(scroll);
     }
 
-    // Typing goes straight to the phone.
+    // Typing goes straight to the phone. In the capture phase: in the bubble
+    // phase the window's own key bindings (arrows and Tab move the focus,
+    // Space and Enter press a focused header button) took those keys first.
+    // Without control the keys stay this window's own.
     {
         let keys = gtk::EventControllerKey::new();
-        let send = Rc::clone(&send);
-        keys.connect_key_pressed(move |_, keyval, _, state| {
-            let mut payload = Map::new();
-            payload.insert(
-                "shift".to_string(),
-                Value::Bool(state.contains(gdk::ModifierType::SHIFT_MASK)),
-            );
-            payload.insert(
-                "ctrl".to_string(),
-                Value::Bool(state.contains(gdk::ModifierType::CONTROL_MASK)),
-            );
-            payload.insert(
-                "alt".to_string(),
-                Value::Bool(state.contains(gdk::ModifierType::ALT_MASK)),
-            );
-            payload.insert(
-                "super".to_string(),
-                Value::Bool(state.contains(gdk::ModifierType::SUPER_MASK)),
-            );
-            let special = map_gdk_key_to_special(keyval);
-            if special > 0 {
-                payload.insert("specialKey".to_string(), Value::from(special));
-            } else if let Some(text) = keyval.to_unicode().filter(|c| !c.is_control()) {
-                payload.insert("key".to_string(), Value::String(text.to_string()));
-            } else {
+        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let (send, device) = (Rc::clone(&send), Rc::clone(&device));
+        keys.connect_key_pressed(move |controller, keyval, _, state| {
+            if !remote_control_lease_active(device.as_str()) {
                 return glib::Propagation::Proceed;
             }
-            send(payload);
-            glib::Propagation::Stop
+            // Paste: the computer's clipboard is typed into the phone's field,
+            // whatever the phone's own clipboard holds.
+            if is_paste(keyval, state) {
+                if let Some(widget) = controller.widget() {
+                    let send = Rc::clone(&send);
+                    widget.clipboard().read_text_async(
+                        None::<&gtk::gio::Cancellable>,
+                        move |text| {
+                            if let Ok(Some(text)) = text {
+                                if let Some(payload) = paste_payload(&text) {
+                                    send(payload);
+                                }
+                            }
+                        },
+                    );
+                }
+                return glib::Propagation::Stop;
+            }
+            match key_payload(keyval, state) {
+                Some(payload) => {
+                    send(payload);
+                    glib::Propagation::Stop
+                }
+                None => glib::Propagation::Proceed,
+            }
         });
         window.add_controller(keys);
     }
@@ -847,6 +912,15 @@ fn session_control_denial(device_id: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn session_ended_reason(device_id: &str) -> Option<String> {
+    crate::device_links::webrtc::remote_session::sessions()
+        .lock()
+        .ok()?
+        .get(device_id)?
+        .ended_reason()
+        .map(str::to_string)
+}
+
 fn session_phone_screen(device_id: &str) -> Option<(i32, i32)> {
     crate::device_links::webrtc::remote_session::sessions()
         .lock()
@@ -857,6 +931,49 @@ fn session_phone_screen(device_id: &str) -> Option<(i32, i32)> {
 
 fn remote_control_lease_active(device_id: &str) -> bool {
     crate::device_links::webrtc::coordinator::has_remote_control_lease(device_id)
+}
+
+/// Ctrl+V or Shift+Insert.
+fn is_paste(keyval: Key, state: gdk::ModifierType) -> bool {
+    let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+    let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+    (ctrl && !shift && matches!(keyval, Key::v | Key::V)) || (shift && keyval == Key::Insert)
+}
+
+/// Text from the computer's clipboard, typed into the phone's focused field
+/// as one edit; at most 16 KiB (a data-channel message holds 128).
+pub(crate) fn paste_payload(text: &str) -> Option<Map<String, Value>> {
+    if text.is_empty() {
+        return None;
+    }
+    let text =
+        crate::device_links::webrtc::remote_session::cut_to_bytes(text.to_string(), 16 * 1024);
+    let mut payload = Map::new();
+    payload.insert("key".to_string(), Value::String(text));
+    Some(payload)
+}
+
+/// One key for the phone's focused field (`AccessibilityTyping` there): a
+/// special key by code, or the character it types. `None` for a key that
+/// types nothing (a lone modifier, a dead key).
+pub(crate) fn key_payload(keyval: Key, state: gdk::ModifierType) -> Option<Map<String, Value>> {
+    let mut payload = Map::new();
+    for (name, mask) in [
+        ("shift", gdk::ModifierType::SHIFT_MASK),
+        ("ctrl", gdk::ModifierType::CONTROL_MASK),
+        ("alt", gdk::ModifierType::ALT_MASK),
+        ("super", gdk::ModifierType::SUPER_MASK),
+    ] {
+        payload.insert(name.to_string(), Value::Bool(state.contains(mask)));
+    }
+    let special = map_gdk_key_to_special(keyval);
+    if special > 0 {
+        payload.insert("specialKey".to_string(), Value::from(special));
+    } else {
+        let text = keyval.to_unicode().filter(|c| !c.is_control())?;
+        payload.insert("key".to_string(), Value::String(text.to_string()));
+    }
+    Some(payload)
 }
 
 pub(crate) fn map_gdk_key_to_special(keyval: Key) -> i32 {
@@ -908,6 +1025,8 @@ fn release_held_drag(held: &Cell<bool>, send: &dyn Fn(Map<String, Value>)) {
 struct Restarter {
     last_ask: Option<std::time::Instant>,
     gave_up: bool,
+    /// Gave up because the phone never answered within [`ASK_WAIT`].
+    timed_out: bool,
     /// The session ended while the link was down: ask again when it is back.
     stopped_while_down: bool,
 }
@@ -922,6 +1041,46 @@ impl Restarter {
 
     fn sent(&mut self, now: std::time::Instant) {
         self.last_ask = Some(now);
+    }
+
+    fn timed_out(&self) -> bool {
+        self.timed_out
+    }
+
+    /// Whether the phone's person has its prompt to answer: asked, no
+    /// picture yet, not given up.
+    fn waiting(&self, state: Option<SessionState>, has_picture: bool) -> bool {
+        !self.gave_up
+            && !has_picture
+            && matches!(
+                state,
+                Some(
+                    SessionState::RequestingView
+                        | SessionState::Viewing
+                        | SessionState::RequestingControl
+                        | SessionState::Controlling
+                )
+            )
+    }
+
+    /// True once, when the phone has left its prompt unanswered for
+    /// [`ASK_WAIT`]: the caller stops the view, and the window says so
+    /// (never an endless spinner).
+    fn waited_out(
+        &mut self,
+        state: Option<SessionState>,
+        has_picture: bool,
+        now: std::time::Instant,
+    ) -> bool {
+        let out = self.waiting(state, has_picture)
+            && self
+                .last_ask
+                .is_some_and(|at| now.saturating_duration_since(at) >= ASK_WAIT);
+        if out {
+            self.gave_up = true;
+            self.timed_out = true;
+        }
+        out
     }
 
     fn ask_again(&mut self) {
@@ -1003,23 +1162,36 @@ mod tests {
     /// strip and the buttons enabled, with no click. Revoked: back.
     #[test]
     fn the_control_strip_follows_the_grant_and_goes_by_itself() {
-        let notice =
-            |state, denial, lease| status_notice(state, false, true, denial, lease, "desk");
+        let notice = |state, denial, lease| {
+            status_notice(Seen {
+                state,
+                has_picture: true,
+                denial,
+                lease_active: lease,
+                phone: "Pixel",
+                ..Seen::default()
+            })
+        };
         let asking = notice(Some(SessionState::Viewing), None, false).unwrap();
-        assert_eq!(asking.text, "Asking the phone for control…");
+        assert_eq!(asking.text, "View only: asking Pixel for control…");
         assert!(!asking.ask);
 
         let refused = notice(
             Some(SessionState::Viewing),
-            Some("accessibility is off"),
+            Some("Enable DeskLink accessibility control on this Android device"),
             false,
         )
         .unwrap();
         assert!(refused.ask, "the one action is offered");
-        assert_eq!(
-            refused.text,
-            "Control is off on the phone. On your phone: Settings, Control, turn on \u{201c}Let desk control this phone\u{201d}."
+        assert!(
+            refused.text.starts_with(
+                "View only: control needs DeskLink\u{2019}s accessibility service on Pixel"
+            ),
+            "{}",
+            refused.text
         );
+        // There is no "Let <computer> control this phone" switch for this: never sent there.
+        assert!(!refused.text.contains("Let "));
 
         // Granted: nothing is said, whatever the state or a stale reason says.
         for state in [
@@ -1039,6 +1211,121 @@ mod tests {
         let locked = notice(Some(SessionState::PausedLocked), None, false).unwrap();
         assert!(!locked.ask);
         assert_eq!(notice(Some(SessionState::Idle), None, false), None);
+    }
+
+    /// Before the phone's picture the window waits for its person's Allow, and says
+    /// so; it never reads a refusal of control into "Control is off" (the owner's
+    /// black window), and its end is explicit: declined, or no answer.
+    #[test]
+    fn before_the_picture_the_window_waits_for_allow_and_ends_explicitly() {
+        let seen = Seen {
+            phone: "realme 14 5G",
+            ..Seen::default()
+        };
+        for state in [
+            SessionState::RequestingView,
+            SessionState::Viewing,
+            SessionState::RequestingControl,
+        ] {
+            let waiting = status_notice(Seen {
+                state: Some(state),
+                denial: Some("The phone's screen is not being shared"),
+                ..seen
+            })
+            .unwrap();
+            assert_eq!(
+                waiting.text,
+                "Waiting for realme 14 5G: tap Allow on the phone"
+            );
+        }
+        let ended = |timed_out, ended| {
+            status_notice(Seen {
+                state: Some(SessionState::Stopped),
+                gave_up: true,
+                timed_out,
+                ended,
+                ..seen
+            })
+            .unwrap()
+            .text
+        };
+        assert_eq!(ended(true, None), "realme 14 5G did not answer");
+        assert_eq!(
+            ended(false, Some("declined")),
+            "Not allowed on realme 14 5G"
+        );
+        assert_eq!(
+            ended(
+                false,
+                Some("Phone screen-sharing permission was not granted")
+            ),
+            "Not allowed on realme 14 5G"
+        );
+        assert_eq!(
+            ended(false, None),
+            "realme 14 5G stopped sharing its screen"
+        );
+    }
+
+    /// No answer to the phone's prompt in [`ASK_WAIT`]: one stop, then the window has given up.
+    #[test]
+    fn an_unanswered_prompt_times_out_once() {
+        let start = std::time::Instant::now();
+        let mut restarter = Restarter::default();
+        restarter.sent(start);
+        let viewing = Some(SessionState::Viewing);
+        assert!(restarter.waiting(viewing, false));
+        assert!(!restarter.waited_out(viewing, false, start + std::time::Duration::from_secs(59)));
+        // A picture arrived: nothing to time out.
+        assert!(!restarter.waited_out(viewing, true, start + ASK_WAIT));
+        assert!(restarter.waited_out(viewing, false, start + ASK_WAIT));
+        assert!(restarter.gave_up() && restarter.timed_out());
+        assert!(!restarter.waited_out(viewing, false, start + ASK_WAIT * 2));
+        // Asking again starts over.
+        restarter.ask_again();
+        assert!(!restarter.timed_out() && !restarter.gave_up());
+    }
+
+    /// A refused control request is asked again with a growing wait, never every 2 s.
+    #[test]
+    fn control_is_asked_again_with_a_growing_wait() {
+        let waits: Vec<u64> = (0..8).map(|n| control_retry_after(n).as_secs()).collect();
+        assert_eq!(waits, [2, 4, 8, 16, 30, 30, 30, 30]);
+    }
+
+    /// Letters, Backspace, Enter, arrows and non-ASCII reach the phone; a lone
+    /// modifier does not; Ctrl+V and Shift+Insert paste the computer's clipboard.
+    #[test]
+    fn keys_reach_the_phone_as_its_typing_expects() {
+        let none = gdk::ModifierType::empty();
+        let key = |keyval, state| key_payload(keyval, state).map(Value::Object);
+        assert_eq!(key(Key::a, none).unwrap()["key"], "a");
+        assert_eq!(key(Key::eacute, none).unwrap()["key"], "é");
+        assert_eq!(key(Key::BackSpace, none).unwrap()["specialKey"], 1);
+        assert_eq!(key(Key::Return, none).unwrap()["specialKey"], 12);
+        assert_eq!(key(Key::Left, none).unwrap()["specialKey"], 4);
+        assert_eq!(key(Key::Down, none).unwrap()["specialKey"], 7);
+        let ctrl_a = key(Key::a, gdk::ModifierType::CONTROL_MASK).unwrap();
+        assert_eq!(
+            (ctrl_a["key"].clone(), ctrl_a["ctrl"].clone()),
+            ("a".into(), true.into())
+        );
+        assert_eq!(key(Key::Shift_L, gdk::ModifierType::SHIFT_MASK), None);
+        assert!(is_paste(Key::v, gdk::ModifierType::CONTROL_MASK));
+        assert!(is_paste(Key::Insert, gdk::ModifierType::SHIFT_MASK));
+        assert!(!is_paste(Key::v, none));
+        assert_eq!(
+            paste_payload("héllo\nworld").unwrap()["key"],
+            "héllo\nworld"
+        );
+        assert_eq!(paste_payload(""), None);
+        assert_eq!(
+            paste_payload(&"x".repeat(40_000)).unwrap()["key"]
+                .as_str()
+                .unwrap()
+                .len(),
+            16 * 1024
+        );
     }
 
     #[test]

@@ -681,6 +681,9 @@ pub struct RemoteSession {
     /// Why the phone last refused control (e.g. its accessibility service is
     /// off), so the window can say so instead of "requesting" forever.
     control_denial: Option<String>,
+    /// Why the phone ended the last view (`view-denied` / `screen-error`
+    /// reason: "Not now" on its prompt, a declined consent), for the window.
+    ended_reason: Option<String>,
     /// The last few sessions that ended: an offer for one of them is a
     /// leftover, never a new share.
     ended: std::collections::VecDeque<String>,
@@ -706,12 +709,17 @@ impl RemoteSession {
             state_since: Instant::now(),
             phone_screen: None,
             control_denial: None,
+            ended_reason: None,
             ended: std::collections::VecDeque::new(),
         }
     }
 
     pub fn control_denial(&self) -> Option<&str> {
         self.control_denial.as_deref()
+    }
+
+    pub fn ended_reason(&self) -> Option<&str> {
+        self.ended_reason.as_deref()
     }
 
     pub fn phone_screen(&self) -> Option<(i32, i32)> {
@@ -771,6 +779,7 @@ impl RemoteSession {
         let id = Uuid::new_v4().to_string();
         self.remote_session_id = Some(id.clone());
         self.control_denial = None;
+        self.ended_reason = None;
         self.direction = Some(direction);
         self.lease = None;
         self.peer_input_lease = None;
@@ -950,7 +959,15 @@ impl RemoteSession {
             // A denied view or a screen error ends the session: there is no
             // view left to show. (Mapping these to `Viewing` left the desktop's
             // dialog reading "Screen connected" after the phone said no.)
-            ControlKind::ViewDenied | ControlKind::ScreenError => self.stop(),
+            ControlKind::ViewDenied | ControlKind::ScreenError => {
+                self.stop();
+                self.ended_reason = Some(
+                    message
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| "The phone declined".to_string()),
+                );
+            }
             // Failing to grant *control* must not take a working view with it.
             ControlKind::ControlDenied => {
                 // With no session there is nothing to deny control of: ignored, not
@@ -1054,6 +1071,7 @@ impl RemoteSession {
         self.lease = None;
         self.peer_input_lease = None;
         self.control_denial = None;
+        self.ended_reason = None;
     }
 
     /// Converts a pending host authorization into a revocable peer-owned lease.
@@ -1803,6 +1821,16 @@ mod tests {
 
             assert_eq!(session.state(), SessionState::Stopped, "{kind:?}");
             assert_eq!(session.remote_session_id(), None, "{kind:?}");
+            // The window says why ("Not now" on the phone's prompt), until the next ask.
+            let mut said = message(kind, &id);
+            let id = session.begin_view(ScreenDirection::PhoneToDesktop);
+            said.remote_session_id = id.clone();
+            said.reason = Some("declined".to_string());
+            assert_eq!(session.ended_reason(), None);
+            session.accept(&said, 2_000).unwrap();
+            assert_eq!(session.ended_reason(), Some("declined"), "{kind:?}");
+            session.begin_view(ScreenDirection::PhoneToDesktop);
+            assert_eq!(session.ended_reason(), None, "{kind:?}");
         }
     }
 
