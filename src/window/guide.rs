@@ -69,7 +69,8 @@ enum Needs {
     Ready(Action),
 }
 
-fn settings(name: &str) -> Target {
+/// Settings at the subpage called `name` (one of `prefs::GROUPS`).
+pub(super) fn settings(name: &str) -> Target {
     Target::Settings(
         super::prefs::GROUPS
             .iter()

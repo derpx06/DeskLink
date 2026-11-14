@@ -28,6 +28,7 @@ pub(crate) mod announce;
 mod bucket;
 pub(crate) mod calls;
 mod dialpad;
+mod everything;
 mod gallery;
 pub(crate) mod insert;
 mod sound;
@@ -3192,6 +3193,25 @@ fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &str) -> bool 
         "scroll-to" => {
             if let Some((scroll, _)) = win.imp().bodies.borrow().get(id).cloned() {
                 scroll.vadjustment().set_value(arg.parse().unwrap_or(0.0));
+            }
+        }
+        // "where PREFIX": the centre of each shown widget named PREFIX...,
+        // in the window surface's pixels (for real clicks with xclick.py).
+        "where" => {
+            let (dx, dy) = gtk::prelude::NativeExt::surface_transform(win);
+            for widget in named_widgets(win.upcast_ref(), id) {
+                if let Some(at) = widget
+                    .is_mapped()
+                    .then(|| widget.compute_bounds(win))
+                    .flatten()
+                {
+                    debug_log!(
+                        "[E2E] where {} {} {}",
+                        widget.widget_name(),
+                        (dx + f64::from(at.x() + at.width() / 2.0)) as i32,
+                        (dy + f64::from(at.y() + at.height() / 2.0)) as i32
+                    );
+                }
             }
         }
         // "settings-page list|N|search [words]": walks Settings' subpages.
