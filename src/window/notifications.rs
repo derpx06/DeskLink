@@ -641,6 +641,7 @@ mod tests {
                 request_reply_id: Some("r1".into()),
                 actions: vec!["Snooze".into()],
                 silent: false,
+                time: 0,
             };
             let card = build_card(&daemon, "phone", &notification, "k".into());
             let widgets = descendants(card.widget.upcast_ref());
@@ -705,6 +706,7 @@ mod tests {
                 request_reply_id: Some("r1".into()),
                 actions: vec![],
                 silent: false,
+                time: 0,
             };
             let card = build_card(&daemon, "phone", &notification, "k".into());
             card.entry.set_text("yes, at five");

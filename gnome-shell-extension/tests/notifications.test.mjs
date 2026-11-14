@@ -27,6 +27,12 @@ test('the first read and a resync never banner', () => {
     assert.deepEqual(plan.sync([entry('a', 'hi'), entry('b', 'yo', {silent: true})], false, 1000), []);
 });
 
+test('shows run oldest first so the tray lists the newest on top', () => {
+    const plan = new NotifyPlan();
+    const ops = plan.sync([entry('c', '3'), entry('b', '2'), entry('a', '1')], true, 0);
+    assert.deepEqual(ops.map(op => op.id), ['p\u0000a', 'p\u0000b', 'p\u0000c']);
+});
+
 test('a new one banners; new words replace it, never add', () => {
     const plan = new NotifyPlan();
     plan.sync([], true, 0);

@@ -697,20 +697,23 @@ pub(super) fn upsert_notification_for(
             .map(|value| sanitize_text(value, 240)),
         actions: action_labels(packet.body.get("actions")),
         silent: packet.get_bool("silent").unwrap_or(false),
+        // Android sends `postTime` as a string.
+        time: packet
+            .get_i64("time")
+            .or_else(|| packet.get_str("time")?.parse().ok())
+            .unwrap_or(0),
     };
 
     if let Ok(mut devices) = devices.lock() {
         if let Some(device) = devices.get_mut(device_id) {
-            if let Some(existing) = device
+            device.notifications.retain(|existing| existing.id != id);
+            // Newest first by the phone's time; a tie goes in front (the
+            // later arrival), as every notification did before.
+            let at = device
                 .notifications
-                .iter_mut()
-                .find(|existing| existing.id == id)
-            {
-                *existing = notification.clone();
-            } else {
-                device.notifications.insert(0, notification.clone());
-                device.notifications.truncate(25);
-            }
+                .partition_point(|existing| existing.time > notification.time);
+            device.notifications.insert(at, notification.clone());
+            device.notifications.truncate(25);
         }
     }
 
@@ -1530,6 +1533,49 @@ mod tests {
         let settings = crate::device_links::config::AppSettings::default();
         let kept = upsert_notification_for(&settings, &devices, &info.id, &packet).expect("kept");
         assert_eq!(kept.actions, vec!["Archive".to_string()]);
+    }
+
+    /// F21: the order is the phone's post time (newest first), not arrival:
+    /// a resync after a desk restart sends them in any order.
+    #[test]
+    fn notifications_are_ordered_by_the_phones_time_not_arrival() {
+        let (devices, info) = test_devices();
+        let order = |arrivals: &[(&str, &str)]| {
+            devices
+                .lock()
+                .unwrap()
+                .get_mut(&info.id)
+                .unwrap()
+                .notifications
+                .clear();
+            for (id, time) in arrivals {
+                let mut packet =
+                    NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_NOTIFICATION);
+                packet.set("id", *id);
+                if !time.is_empty() {
+                    packet.set("time", *time);
+                }
+                upsert_notification(&devices, &info.id, &packet);
+            }
+            devices.lock().unwrap()[&info.id]
+                .notifications
+                .iter()
+                .map(|n| n.id.clone())
+                .collect::<Vec<_>>()
+        };
+        let newest_first = ["c", "b", "a"];
+        assert_eq!(
+            order(&[("a", "100"), ("b", "200"), ("c", "300")]),
+            newest_first
+        );
+        assert_eq!(
+            order(&[("c", "300"), ("a", "100"), ("b", "200")]),
+            newest_first
+        );
+        // Same time: the later arrival first.
+        assert_eq!(order(&[("x", "5"), ("y", "5")]), ["y", "x"]);
+        // An update moves to its new time.
+        assert_eq!(order(&[("a", "1"), ("b", "2"), ("a", "3")]), ["a", "b"]);
     }
 
     #[test]

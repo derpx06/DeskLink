@@ -623,6 +623,25 @@ impl DeviceManager {
             .unwrap_or(false)
     }
 
+    /// `device_id`'s open link, when nothing has come from the peer for
+    /// `quiet_for` or longer.
+    pub fn silent_link(
+        &self,
+        device_id: &str,
+        quiet_for: std::time::Duration,
+    ) -> Option<SessionBinding> {
+        let sessions = self.sessions.lock().ok()?;
+        let session = sessions.get(device_id)?;
+        if session.state == SessionState::Terminated
+            || session.last_inbound_at.elapsed() < quiet_for
+        {
+            return None;
+        }
+        session
+            .binding()
+            .filter(|binding| !binding.link.is_closed())
+    }
+
     pub fn has_live_bootstrap_link(&self, device_id: &str) -> bool {
         self.sessions
             .lock()

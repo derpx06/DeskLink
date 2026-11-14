@@ -4091,6 +4091,7 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
             request_reply_id: Some("r1".into()),
             actions: vec![],
             silent: false,
+            time: 0,
         },
         DeviceNotification {
             id: "2".into(),
@@ -4102,6 +4103,7 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
             request_reply_id: None,
             actions: vec![],
             silent: false,
+            time: 0,
         },
         DeviceNotification {
             id: "3".into(),
@@ -4113,6 +4115,7 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
             request_reply_id: None,
             actions: vec!["Snooze".into()],
             silent: false,
+            time: 0,
         },
     ];
     match kind {

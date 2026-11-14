@@ -618,6 +618,24 @@ fn beacon_may_act(device_id: &str, now: Instant) -> bool {
     }
 }
 
+/// Probes `device_id`'s link if it has been quiet for [`super::QUIET_LINK`]
+/// (on the phone's beacon). A socket the phone dropped with its network is
+/// answered by a reset now that the phone is back, which ends it and wakes
+/// the redialer, instead of waiting for the 10 s liveness probe. The send is
+/// on its own thread: the listener must not wait on a socket.
+pub(super) fn probe_silent_link(
+    sessions: &DeviceManager,
+    device_id: &str,
+) -> Option<thread::JoinHandle<()>> {
+    let binding = sessions.silent_link(device_id, super::QUIET_LINK)?;
+    thread::Builder::new()
+        .spawn(move || {
+            let probe = NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_HEARTBEAT);
+            let _ = binding.link.send_packet(&probe);
+        })
+        .ok()
+}
+
 /// How long a dead address waits after its `failures`-th failure.
 pub(super) fn address_backoff(failures: u32) -> Duration {
     FIRST_ADDRESS_BACKOFF
@@ -1113,6 +1131,7 @@ fn handle_identity_packet(
         crate::device_links::webrtc::coordinator::recovery_sign(
             &info.id, sessions, config, devices, events,
         );
+        probe_silent_link(sessions, &info.id);
     }
 
     // A closed link stays installed while a WebRTC transport outlives it, so

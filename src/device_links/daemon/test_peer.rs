@@ -706,6 +706,139 @@ mod tests {
         );
     }
 
+    /// F20: back from a short Wi-Fi drop, the phone dials in while the desk
+    /// still holds its old socket, open (no FIN crossed the drop) and quiet
+    /// since. The phone dials only when it has no link of its own, so its
+    /// link takes over once the old one has been quiet a few seconds, not
+    /// after the 20 s answering window; one heard just now is kept.
+    #[test]
+    fn a_link_the_phone_dials_replaces_one_quiet_for_a_few_seconds() {
+        use crate::device_links::webrtc::{HandoverRuntime, WebRtcWireBinding};
+        use std::time::{Duration, Instant};
+
+        let net = TestNetwork::new();
+        let (desktop, _phone) = paired_pair(&net);
+        let phone_id = desktop.peer_id();
+        let binding = desktop.sessions.current_binding(&phone_id).unwrap();
+        let attempt = uuid::Uuid::new_v4().to_string();
+        let wire = WebRtcWireBinding::from_attempt("desktop", &phone_id, &attempt).unwrap();
+        let heard = |ago: Duration| {
+            desktop
+                .sessions
+                .with_session(&binding, |session| {
+                    session.last_inbound_at = Instant::now() - ago;
+                })
+                .unwrap();
+        };
+        desktop
+            .sessions
+            .with_session(&binding, |session| {
+                let mut handover = HandoverRuntime::new(attempt.clone(), wire);
+                handover.record_offer("offer".into()).unwrap();
+                handover.record_answer("answer".into()).unwrap();
+                handover.mark_local_authenticated().unwrap();
+                handover.mark_remote_authenticated().unwrap();
+                handover.mark_local_capabilities_confirmed().unwrap();
+                handover.mark_remote_capabilities_confirmed().unwrap();
+                handover.mark_local_feature_ready().unwrap();
+                handover.mark_remote_feature_ready().unwrap();
+                session.webrtc_handover = Some(handover);
+            })
+            .unwrap();
+        struct Quiet(std::sync::atomic::AtomicBool);
+        impl crate::device_links::core::LinkTransport for Quiet {
+            fn send_packet(&self, _: &NetworkPacket) -> Result<(), String> {
+                Ok(())
+            }
+            fn read_byte(&self) -> Result<crate::device_links::core::ReadOutcome, String> {
+                if self.0.load(std::sync::atomic::Ordering::Acquire) {
+                    return Ok(crate::device_links::core::ReadOutcome::Closed);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(crate::device_links::core::ReadOutcome::Idle)
+            }
+            fn shutdown(&self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let phone_dials = || {
+            let transport: Arc<dyn crate::device_links::core::LinkTransport> =
+                Arc::new(Quiet(std::sync::atomic::AtomicBool::new(false)));
+            let link = SessionLink::new(
+                Arc::clone(&transport),
+                desktop.peer_certificate_pem.clone(),
+                desktop.local_public_der.clone(),
+                desktop.remote_public_der.clone(),
+                desktop.info.clone(),
+            )
+            .dialed_by_us(false);
+            super::super::handshake::attach_bootstrap_link(
+                &phone_id,
+                link,
+                transport,
+                true,
+                false,
+                Arc::clone(&desktop.config),
+                Arc::clone(&desktop.devices),
+                Arc::clone(&desktop.sessions),
+                Arc::clone(&desktop.events),
+            )
+            .unwrap();
+        };
+        // Outside the link-race window, which decides two links dialed together.
+        std::thread::sleep(Duration::from_millis(1_100));
+        let epoch = binding.link.epoch();
+        heard(Duration::ZERO);
+        phone_dials();
+        assert_eq!(binding.link.epoch(), epoch, "a link heard just now is kept");
+
+        heard(Duration::from_secs(5));
+        phone_dials();
+        assert!(desktop.sessions.is_current(&binding), "same generation");
+        assert_ne!(
+            binding.link.epoch(),
+            epoch,
+            "the phone's new socket was adopted"
+        );
+        assert!(desktop.sessions.has_ready_webrtc(&phone_id));
+        binding.link.close();
+    }
+
+    /// F20: a beacon from a phone whose link has been quiet a few seconds
+    /// probes that link at once. A socket the phone dropped with the network
+    /// is answered by a reset as soon as the phone is back, which ends it and
+    /// lets the redialer replace it, instead of waiting for the 10 s probe.
+    #[test]
+    fn a_beacon_probes_a_link_quiet_for_a_few_seconds() {
+        use std::time::{Duration, Instant};
+        let net = TestNetwork::new();
+        let (desktop, _phone) = paired_pair(&net);
+        let phone_id = desktop.peer_id();
+        let binding = desktop.sessions.current_binding(&phone_id).unwrap();
+        let heartbeats = || {
+            net.sent_by(0)
+                .iter()
+                .filter(|p| p.packet_type == crate::device_links::packet::PACKET_TYPE_HEARTBEAT)
+                .count()
+        };
+        let before = heartbeats();
+        assert!(
+            super::super::discovery::probe_silent_link(&desktop.sessions, &phone_id).is_none(),
+            "a link heard just now is not probed"
+        );
+        desktop
+            .sessions
+            .with_session(&binding, |session| {
+                session.last_inbound_at = Instant::now() - Duration::from_secs(5);
+            })
+            .unwrap();
+        super::super::discovery::probe_silent_link(&desktop.sessions, &phone_id)
+            .expect("probed")
+            .join()
+            .unwrap();
+        assert_eq!(heartbeats(), before + 1);
+    }
+
     /// Two dials of ours to one phone (its IPv4 and IPv6, both due at once)
     /// that finish one after the other: the second must not replace the
     /// first while the first is open and answering, or every reconnect
