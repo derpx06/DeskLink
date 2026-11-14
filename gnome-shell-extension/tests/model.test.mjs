@@ -5,8 +5,8 @@ import {readFileSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 
 import {
-    deviceChips, everythingSent, footer, headerLine, lastSeen, mediaClock, mediaPosition, seekReason, seekThrottle, looksLikeLink, quickTiles, sections,
-    sessionLine, shortStatus, statusLine, timer, duration,
+    everythingSent, footer, headerLine, lastSeen, mediaClock, mediaPosition, menuBlocks, moreSummary, seekReason, seekThrottle,
+    looksLikeLink, quickTiles, sections, sessionLine, shortStatus, statusLine, timer, duration,
 } from '../desklink@derx06.github.io/model.js';
 
 const ALL_ACTIONS = ['open', 'ring', 'lock', 'send-files', 'send-link', 'send-clipboard', 'ping', 'show-screen',
@@ -47,19 +47,13 @@ test('last seen shows the time today and the day before', () => {
     assert.equal(lastSeen({lastSeen: 0}, now), '');
 });
 
-test('chips: connection, route with round trip, battery, lane, sound, DND', () => {
-    const chips = deviceChips(phone({
-        transfers: [{name: 'a', lane: 'fast, over Wi-Fi'}],
-        sound: {deskSound: true},
-        settings: {dndShare: true},
-    }));
-    assert.deepEqual(chips.map(chip => chip.text),
-        ['Wi-Fi · 12 ms', '82% · charging', 'Fast, over Wi-Fi', 'Sound on', 'DND shared']);
-    assert.equal(deviceChips(phone({battery: 15, charging: false})).find(c => c.id === 'battery').tone, 'warn');
-    assert.deepEqual(deviceChips(phone({ready: false, reachable: false, settings: {}})).map(c => c.text), []);
-    assert.deepEqual(deviceChips(null), []);
-    // A transfer over the secure link is not the fast lane.
-    assert.ok(!deviceChips(phone({transfers: [{lane: 'over the secure link'}]})).some(c => c.id === 'lane'));
+test('the header line: the link, the route with its round trip, charging', () => {
+    assert.equal(headerLine(phone()), 'Connected · Wi-Fi · 12 ms · charging');
+    assert.equal(headerLine(phone({charging: false, path: 'turn', rttMs: -1})), 'Connected · Relay');
+    assert.equal(headerLine(phone({path: 'unknown', charging: false})), 'Connected');
+    assert.equal(headerLine(phone({ready: false})), 'Connecting…');
+    assert.equal(headerLine(phone({ready: false, reachable: false})), 'Not connected');
+    assert.equal(headerLine(null), 'No phone connected');
 });
 
 test('the six tiles follow what the phone takes and whether it is connected', () => {
@@ -264,11 +258,70 @@ test('every action row is usable unless it says otherwise', () => {
     assert.deepEqual(rows.filter(r => !r.enabled).map(r => r.id), ['send-link', 'lock-hand-off']);
 });
 
-test('the header says the link once; the chips carry the rest', () => {
-    assert.equal(headerLine(phone()), 'Connected');
-    assert.equal(headerLine(phone({ready: false})), 'Connecting…');
-    assert.equal(headerLine(phone({ready: false, reachable: false})), 'Not connected');
-    assert.ok(!deviceChips(phone()).some(c => c.text === 'Connected'));
+// The compact menu: only what is going on now is shown beyond the tiles; the
+// rest is folded into More.
+test('an idle phone is the tiles, More and the footer', () => {
+    assert.deepEqual(menuBlocks(phone(), [phone()]), ['tiles', 'more', 'footer']);
+    assert.deepEqual(menuBlocks(null, []), ['empty']);
+});
+
+test('rows for what is going on come only while it is', () => {
+    const busy = phone({
+        media: {title: 't', playing: true}, call: {id: 'c', state: 'ringing', incoming: true},
+        transfers: [{name: 'a', fraction: 0.5}], bucket: {line: 'Files', fraction: 0.2}, screen: 'view',
+    });
+    assert.deepEqual(menuBlocks(busy, [busy], [{device: 'p1', title: 'Pasta'}]),
+        ['call', 'tiles', 'media', 'transfers', 'bucket', 'activities', 'live', 'more', 'footer']);
+    // Another phone's timer is not this one's; another phone using this computer is.
+    const other = phone({id: 'p2', terminals: 1});
+    assert.deepEqual(menuBlocks(phone(), [phone(), other], [{device: 'p2', title: 'x'}]),
+        ['switcher', 'tiles', 'live', 'more', 'footer']);
+    // Music from a phone that is away is not playing here.
+    assert.ok(!menuBlocks(phone({ready: false, media: {title: 't'}}), [phone()]).includes('media'));
+});
+
+test('a phone that is away gets a way back instead of greyed-out tiles', () => {
+    assert.deepEqual(menuBlocks(phone({ready: false, reachable: false}), [phone()]), ['offline', 'more', 'footer']);
+});
+
+test('More says what in it wants a look', () => {
+    assert.equal(moreSummary(sections(phone(), desk(), {})), '3 new');
+    assert.equal(moreSummary(sections(phone({unread: 0, terminals: 2}), desk(), {})), '2 attached');
+    assert.equal(moreSummary(sections(phone({unread: 0, sound: {deskSound: true}}), desk(), {})), '');
+});
+
+// Folding everything into More must not lose anything: the actions and
+// switches the menu can send are exactly those of the menu before it was made
+// compact (2026-11-14).
+test('every action and switch is still reachable', () => {
+    const extras = {snippets: [{id: 's', label: 'S', text: 't'}], transfers: [{id: '/f', name: 'f', incoming: true, deviceName: 'Pixel'}]};
+    const {actions, keys} = everythingSent(phone(), desk(), extras);
+    assert.deepEqual(actions.sort(), ['call-answer', 'call-decline', 'call-end', 'call-mute', 'call-unmute', 'end-sessions',
+        'insert-photo', 'insert-photo-file', 'insert-qr', 'insert-scan', 'insert-text', 'lock', 'lock-hand-off', 'media-next',
+        'media-play-pause', 'media-prev', 'new-note', 'new-terminal', 'open', 'open-bucket', 'open-clipboard', 'open-contacts',
+        'open-files', 'open-notes', 'open-notifications', 'open-settings', 'open-terminals', 'ping', 'reconnect', 'ring',
+        'send-clipboard', 'send-files', 'send-link', 'show-screen', 'try-again', 'unpair']);
+    assert.deepEqual(keys.sort(), ['clipboard', 'commandAlerts', 'deskMic', 'deskSound', 'dndShare', 'forwardNotifications',
+        'galleryAccept', 'glide', 'keepAwake', 'namesCallers', 'pauseMediaOnCall', 'phoneKeepAwake', 'phoneMic', 'phoneSound',
+        'showNotifications', 'terminalAccess', 'unlockNearby', 'walkAway']);
+    const rows = sections(phone(), desk(), {...extras, linkInClipboard: true}).flatMap(s => s.rows);
+    assert.equal(rows.length, 44, 'every row of every area is in More');
+    // The blocks that draw the rest are all there for a phone that has them.
+    const busy = phone({media: {title: 't'}, call: {id: 'c'}, transfers: [{}], bucket: {}, screen: 'view'});
+    for (const block of ['tiles', 'media', 'call', 'transfers', 'bucket', 'live', 'more', 'footer'])
+        assert.ok(menuBlocks(busy, [busy]).includes(block), block);
+    assert.ok(menuBlocks(phone({ready: false}), [phone()]).includes('offline'));
+});
+
+// menu.js draws every block menuBlocks can return (a new kind of row needs both).
+test('the menu draws every kind of block', () => {
+    const menu = readFileSync(fileURLToPath(new URL('../desklink@derx06.github.io/menu.js', import.meta.url)), 'utf8');
+    const model = readFileSync(fileURLToPath(new URL('../desklink@derx06.github.io/model.js', import.meta.url)), 'utf8');
+    const body = model.slice(model.indexOf('export function menuBlocks'), model.indexOf('export function moreSummary'));
+    const kinds = [...body.matchAll(/'([a-z]+)'/g)].map(m => m[1]);
+    assert.ok(kinds.length >= 10);
+    for (const kind of kinds.filter(k => k !== 'empty'))
+        assert.ok(menu.includes(`case '${kind}':`), `menu.js draws no '${kind}'`);
 });
 
 test('the timeline moves on while playing, stays inside the track and yields to a seek in flight', () => {

@@ -3,18 +3,19 @@
 // DeskLink in GNOME Shell.
 //
 // Quick Settings is the primary surface: a toggle named after the phone
-// ("Connected · 82% · charging", or "last seen 14:02" while its link is down)
-// whose menu is the complete remote for a paired phone: status chips, six
-// quick actions, what is going on now, one section per area with every action
-// and setting (model.js says what, menu.js draws it), and a footer. Security
+// ("Wi-Fi · 82%", or "last seen 14:02" while its link is down) whose menu is
+// the complete remote for a paired phone, kept small: six quick actions, a row
+// for each thing going on now, every area with every action and setting
+// folded into More (model.js says what, menu.js draws it), and a footer. Security
 // switches can only be turned off here; the app turns them on. A small status
 // icon shows in the top bar while a phone is connected.
 //
 // The phones' notifications become GNOME notifications, and a call ringing on
 // a phone a critical banner with Answer and Decline (notifications.js).
 //
-// An extra pill in the top bar (the link glyph, a coral dot while a phone is
-// using this computer) is optional (DeskLink's Settings, off by default).
+// An extra pill in the top bar (the link glyph, the phone's battery, a coral
+// dot while a phone is using this computer) is optional (DeskLink's Settings,
+// off by default).
 // On the lock screen it shows only "Unlock with <phone>", and only while the
 // app offers that; the phone still has to approve.
 //
@@ -302,14 +303,16 @@ export default class DeskLinkExtension extends Extension {
         this._indicator.toggle.connect('clicked', () => this._toggleClicked());
         this._ring = new BatteryRing();
         this._indicator.toggle.menu.addHeaderSuffix(this._ring);
+        this._indicator.toggle.menu.box.add_style_class_name('desklink-menu');
         // Durations and call timers move while a menu is open.
         this._qs = this._menuState();
         this._watchMenu(this._indicator.toggle.menu, this._qs);
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
 
         this._button = new DeskLinkButton();
-        // As wide as the Quick Settings menu: the tiles and the timeline need it.
-        this._button.menu.box.style = 'min-width: 352px;';
+        // About as wide as the Quick Settings menu, in ems (desklink-pill-menu).
+        this._button.menu.box.add_style_class_name('desklink-menu');
+        this._button.menu.box.add_style_class_name('desklink-pill-menu');
         this._button.menu.insetForScrollbar = true;
         this._pill = this._menuState();
         this._watchMenu(this._button.menu, this._pill);
@@ -444,11 +447,12 @@ export default class DeskLinkExtension extends Extension {
 
     _menuState() {
         return {key: null, tickers: [], bucketUpdate: null, transfersUpdate: null, seen: new Set(),
-            openSection: null, items: new Map(), focus: null, link: false, tickId: 0};
+            openSection: null, moreOpen: false, mediaOpen: false, items: new Map(), focus: null, link: false, tickId: 0};
     }
 
     /// Seconds tick while the menu is open, and the clipboard is looked at
-    /// for "Send copied link".
+    /// for "Send copied link". The menu opens small again: More and the
+    /// timeline folded.
     _watchMenu(menu, state) {
         menu.connect('open-state-changed', (_menu, open) => {
             if (state.tickId)
@@ -457,10 +461,18 @@ export default class DeskLinkExtension extends Extension {
                 state.tickers.forEach(tick => tick());
                 return GLib.SOURCE_CONTINUE;
             }) : 0;
-            if (open)
-                this._lookAtClipboard(state);
-            else
+            if (!open) {
                 state.focus = null; // a closed menu keeps no focus to restore
+                return;
+            }
+            if (state.moreOpen || state.openSection || state.mediaOpen) {
+                state.moreOpen = false;
+                state.openSection = null;
+                state.mediaOpen = false;
+                state.key = null;
+                this._sync();
+            }
+            this._lookAtClipboard(state);
         });
     }
 
@@ -518,17 +530,11 @@ export default class DeskLinkExtension extends Extension {
             ring: menu === this._indicator?.toggle.menu ? this._ring : null,
             linkInClipboard: state.link,
             openSection: state.openSection,
-            sectionOpened: (id, open) => {
-                if (open) {
-                    state.openSection = id;
-                } else {
-                    if (state.openSection === id)
-                        state.openSection = null;
-                    // Rows of a section that closed are not where focus belongs.
-                    if (state.focus?.startsWith(`${id}:`))
-                        state.focus = null;
-                }
-            },
+            sectionShown: id => (state.openSection = id),
+            moreOpen: state.moreOpen,
+            moreOpened: open => (state.moreOpen = open),
+            mediaOpen: state.mediaOpen,
+            mediaOpened: open => (state.mediaOpen = open),
             activityText: item => this._activityText(item),
             invoke: (id, action) => this._invoke(id, action),
             call: (method, args) => this._call(method, args),
@@ -560,9 +566,10 @@ export default class DeskLinkExtension extends Extension {
             },
         });
         state.seen = shown;
+        // Rows hidden in a folded More are not mapped, so focus stays put.
         const focused = menu.isOpen && state.focus ? state.items.get(state.focus) : null;
         if (focused?.mapped)
-            focused.grabKeyFocus?.();
+            focused.grab_key_focus();
     }
 
     /// A switch in the menu: the app decides (a security one only goes off).
@@ -633,8 +640,9 @@ export default class DeskLinkExtension extends Extension {
         this._chipItems = items;
         this._button.visible = running && (!!desk.pill || items.length > 0) && devices.length > 0;
         this._button.showLabel(this._chipText());
+        const ongoing = items[0] ? `, ${items[0].title || items[0].app}` : '';
         this._button.showState(!!selected?.ready, live.length > 0,
-            selected ? `${selected.name}, ${statusLine(selected)}` : 'no phone connected');
+            selected ? `${selected.name}, ${statusLine(selected)}${ongoing}` : 'no phone connected');
         if (items.length > 0)
             this._startChipTimer();
         else
@@ -646,14 +654,16 @@ export default class DeskLinkExtension extends Extension {
             this._pill.key = null;
     }
 
-    /// The pill's text: the first ongoing item and its live part.
+    /// The pill's short text: the first ongoing item's live part ("4:32
+    /// left", "42%") or its name, cut short; else the phone's battery. The
+    /// whole of it is in the menu and in the pill's accessible name.
     _chipText() {
         const item = this._chipItems?.[0];
-        if (!item)
-            return null;
-        const live = liveText(item, Date.now());
-        const name = item.title || item.app;
-        return chipLabel(live ? `${name} ${live}` : name);
+        if (!item) {
+            const phone = this._read('Devices', []).find(device => device.id === this._selected);
+            return phone?.ready && phone.battery >= 0 ? `${phone.battery}%` : null;
+        }
+        return chipLabel(liveText(item, Date.now()) || item.title || item.app, 16);
     }
 
     /// One tick a second, only while something is ongoing.

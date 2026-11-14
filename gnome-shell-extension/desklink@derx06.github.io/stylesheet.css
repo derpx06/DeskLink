@@ -39,30 +39,6 @@
   margin-left: 8px;
 }
 
-.desklink-device-name {
-  font-weight: bold;
-}
-
-/* Quick Settings: the action row. Stock `.button` styling, so it follows
-   the accent colour and the high-contrast theme. */
-.desklink-actions {
-  spacing: 6px;
-}
-
-.desklink-action {
-  padding: 8px 4px;
-  min-width: 56px;
-}
-
-.desklink-action-label {
-  margin-top: 4px;
-  font-size: 0.85em;
-}
-
-.desklink-end-button {
-  padding: 3px 12px;
-}
-
 /* Reply to a phone notification. */
 .desklink-reply-dialog .modal-dialog-content-box {
   spacing: 12px;
@@ -89,7 +65,17 @@
   background-color: #e5533d;
 }
 
-/* ── Quick Settings menu ─────────────────────────────────────────────── */
+/* ── The menu ────────────────────────────────────────────────────────── */
+/* Compact and on GNOME's 6/12 px rhythm: rows are 6 px tall padding around
+   a 16 px icon, not the stock 9 px. Widths are never fixed in pixels: the
+   Quick Settings menu is as wide as the grid above it, and the pill's menu
+   is in ems, so large text grows it. Long words are cut, never widening it. */
+.desklink-menu .popup-menu-item { padding: 6px 12px; }
+.desklink-menu .popup-menu-item > StIcon,
+.desklink-row-icon { icon-size: 16px; }
+.desklink-menu .popup-separator-menu-item { padding: 3px 0; }
+.desklink-pill-menu { width: 24em; }
+
 /* Status marks: DeskLink's mint (connected) and coral (in use). */
 .desklink-dot {
   width: 8px;
@@ -101,41 +87,54 @@
 .desklink-dot.coral { background-color: #e5533d; }
 
 /* As tall as the name beside it: a taller ring pushes the line under the name away. */
-.desklink-battery { width: 30px; height: 30px; margin-left: 4px; }
-.desklink-battery-ring { width: 30px; height: 30px; }
+.desklink-battery { width: 28px; height: 28px; margin-left: 6px; }
+.desklink-battery-ring { width: 28px; height: 28px; }
 .desklink-battery-label { font-size: 0.62em; font-weight: bold; }
 
-.desklink-row.popup-menu-item { padding: 4px 0; }
+/* A custom row: its own content, flush with the stock rows' text. */
+.desklink-menu .desklink-row.popup-menu-item { padding: 3px 0; }
+.desklink-menu .desklink-progress-row.popup-menu-item { padding: 6px 12px; }
+.desklink-head { padding: 0 0 6px; }
+.desklink-head-title { font-weight: bold; font-size: 1.1em; }
+.desklink-line { spacing: 6px; }
+.desklink-row-title { font-weight: bold; }
+.desklink-row-detail { font-size: 0.86em; }
+.desklink-empty { padding: 12px 0; }
+.desklink-danger { color: #e5533d; }
+.desklink-light.desklink-danger, .desklink-light .desklink-danger { color: #b02f1b; }
 
+/* The phone switcher. */
 .desklink-chips { spacing: 6px; }
-.button.desklink-chip { padding: 6px 12px; border-radius: 999px; }
-.desklink-chip-content { spacing: 8px; }
+/* A button's minimum height is only its padding: without one in ems, a
+   scrolled (short-screen) menu squeezes its label out. */
+.button.desklink-chip { padding: 4px 12px; min-height: 1.3em; border-radius: 999px; }
+.desklink-chip-content { spacing: 6px; }
 
-/* Cards and tiles: a neutral wash over the menu, lighter in the dark
-   style and darker in the light one. */
+/* Cards, pills and round buttons: a neutral wash over the menu, lighter in
+   the dark style and darker in the light one. */
 .desklink-card {
   spacing: 12px;
-  padding: 10px 12px;
-  border-radius: 16px;
+  padding: 6px 6px 6px 12px;
+  border-radius: 12px;
 }
-.desklink-dark.desklink-card, .desklink-dark.desklink-art,
-.desklink-dark.desklink-tile, .desklink-dark.desklink-chip, .desklink-dark.desklink-round {
+.desklink-dark.desklink-card, .desklink-dark.desklink-art, .desklink-dark.desklink-tile,
+.desklink-dark.desklink-chip, .desklink-dark.desklink-round, .desklink-dark.desklink-footer-button {
   background-color: rgba(255, 255, 255, 0.07);
 }
-.desklink-light.desklink-card, .desklink-light.desklink-art,
-.desklink-light.desklink-tile, .desklink-light.desklink-chip, .desklink-light.desklink-round {
+.desklink-light.desklink-card, .desklink-light.desklink-art, .desklink-light.desklink-tile,
+.desklink-light.desklink-chip, .desklink-light.desklink-round, .desklink-light.desklink-footer-button {
   background-color: rgba(0, 0, 0, 0.05);
 }
-.desklink-dark.desklink-tile:hover, .desklink-dark.desklink-chip:hover,
-.desklink-dark.desklink-round:hover {
+.desklink-dark.desklink-tile:hover, .desklink-dark.desklink-chip:hover, .desklink-dark.desklink-round:hover,
+.desklink-dark.desklink-footer-button:hover, .desklink-dark.desklink-media-opener:hover {
   background-color: rgba(255, 255, 255, 0.12);
 }
-.desklink-light.desklink-tile:hover, .desklink-light.desklink-chip:hover,
-.desklink-light.desklink-round:hover {
+.desklink-light.desklink-tile:hover, .desklink-light.desklink-chip:hover, .desklink-light.desklink-round:hover,
+.desklink-light.desklink-footer-button:hover, .desklink-light.desklink-media-opener:hover {
   background-color: rgba(0, 0, 0, 0.09);
 }
 /* On: the accent, like a stock quick toggle (GNOME 47+). */
-.desklink-tile:checked, .desklink-chip:checked {
+.desklink-chip:checked {
   /* GNOME 45 and 46 have no accent colour: the declarations below are
      dropped there, so the fallback comes first. */
   background-color: #3584e4;
@@ -143,14 +142,11 @@
   background-color: -st-accent-color;
   color: -st-accent-fg-color;
 }
-.desklink-card-icon { icon-size: 18px; }
-.desklink-card-title { font-weight: bold; }
-.desklink-card-subtitle { font-size: 0.86em; }
 
 .desklink-call-icon {
   icon-size: 16px;
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   border-radius: 999px;
   color: #ffffff;
   background-color: #0b7a59;
@@ -158,8 +154,8 @@
 .desklink-call.ringing { border: 1px solid rgba(47, 191, 143, 0.6); }
 .button.desklink-round {
   padding: 0;
-  width: 36px;
-  height: 36px;
+  width: 32px;
+  height: 32px;
   min-height: 0;
   border-radius: 999px;
 }
@@ -168,88 +164,54 @@
 .desklink-round.desklink-answer:hover { background-color: #0e8f69; }
 .desklink-round.desklink-decline { color: #ffffff; background-color: #c4402c; }
 .desklink-round.desklink-decline:hover { background-color: #d4513c; }
-.button.desklink-pill-button { padding: 6px 14px; border-radius: 999px; }
+.button.desklink-pill-button { padding: 4px 12px; min-height: 0; border-radius: 999px; }
 .desklink-live { border: 1px solid rgba(229, 83, 61, 0.45); }
 
-/* The action grid: quick-toggle tiles (accent when on), never truncated. */
-.desklink-grid { spacing: 8px; }
-.desklink-grid-row { spacing: 8px; }
+/* The quick actions: pills like the Quick Settings toggles, three to a row. */
+.desklink-grid { spacing: 6px; }
+.desklink-grid-row { spacing: 6px; }
 .button.desklink-tile {
-  border-radius: 18px;
-  min-height: 64px;
-  min-width: 72px;
-  padding: 8px 4px;
+  border-radius: 999px;
+  min-height: 1.3em;
+  padding: 8px 10px;
 }
 .desklink-tile-content { spacing: 6px; }
-.desklink-tile-icon { icon-size: 18px; }
-.desklink-tile-label { font-size: 0.86em; font-weight: bold; }
+.desklink-tile-icon { icon-size: 16px; }
+.desklink-tile-label { font-size: 0.9em; font-weight: bold; }
 
-.desklink-media { spacing: 12px; }
-.desklink-media-card { spacing: 6px; }
-
-/* The track's timeline under the controls. */
-.desklink-seek-line { spacing: 8px; }
-.desklink-seek-time { font-size: 0.82em; font-feature-settings: "tnum"; min-width: 2.6em; }
-.desklink-seek-reason { padding-left: 2px; }
+/* The music: one row; the title opens the timeline. */
+.desklink-media { spacing: 6px; }
+.desklink-media-card { spacing: 3px; }
+.desklink-media-opener { padding: 3px 6px; border-radius: 8px; }
+.desklink-media-opener > StBoxLayout { spacing: 6px; }
+.desklink-chevron { icon-size: 12px; }
 .desklink-art {
-  icon-size: 18px;
-  width: 40px;
-  height: 40px;
-  border-radius: 12px;
+  icon-size: 16px;
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
 }
+.desklink-seek-line { spacing: 6px; }
+.desklink-seek-time { font-size: 0.82em; font-feature-settings: "tnum"; min-width: 2.6em; }
+.desklink-seek-reason { padding-left: 2px; font-size: 0.86em; }
 
-.desklink-file { spacing: 12px; }
-.desklink-thumb { icon-size: 32px; border-radius: 8px; }
-.desklink-file-name { font-weight: bold; }
-.desklink-empty { padding: 12px 0; }
-.desklink-bucket-words { spacing: 4px; }
-.desklink-bucket-words > StBoxLayout { spacing: 8px; }
-.desklink-bucket-icon { icon-size: 16px; }
+/* Something going on: one line and a thin bar. */
+.desklink-progress-words { spacing: 4px; }
 .desklink-progress {
-  height: 4px;
-  margin-top: 2px;
-  border-radius: 2px;
-  background-color: rgba(127, 127, 127, 0.3);
-}
-.desklink-progress-fill {
-  height: 4px;
-  border-radius: 2px;
-  background-color: #3584e4;
-  background-color: -st-accent-color;
+  height: 3px;
+  /* The fill is drawn in this colour, the track in it faded. GNOME 45 and
+     46 have no accent colour: the fallback comes first. */
+  color: #3584e4;
+  color: -st-accent-color;
 }
 
-/* ── Status chips under the header ───────────────────────────────────── */
-.desklink-chip-lines { spacing: 6px; }
-.desklink-chip-line { spacing: 6px; }
-.desklink-status-chip {
-  padding: 2px 10px;
-  border-radius: 999px;
-  font-size: 0.86em;
-  font-weight: bold;
-}
-.desklink-dark.desklink-status-chip.info { background-color: rgba(255, 255, 255, 0.10); }
-.desklink-light.desklink-status-chip.info { background-color: rgba(0, 0, 0, 0.08); }
-.desklink-dark.desklink-status-chip.off { background-color: rgba(255, 255, 255, 0.05); color: rgba(255, 255, 255, 0.6); }
-.desklink-light.desklink-status-chip.off { background-color: rgba(0, 0, 0, 0.04); color: rgba(0, 0, 0, 0.55); }
-/* Mint and coral keep their own contrast on both styles. */
-.desklink-status-chip.ok { background-color: rgba(47, 191, 143, 0.22); color: #2fbf8f; }
-.desklink-light.desklink-status-chip.ok { color: #0b7a59; }
-.desklink-status-chip.warn { background-color: rgba(229, 83, 61, 0.22); color: #e5533d; }
-.desklink-light.desklink-status-chip.warn { color: #b02f1b; }
-
-/* ── Sections and their rows ─────────────────────────────────────────── */
-.desklink-section-state { font-size: 0.86em; opacity: 0.7; margin-right: 6px; }
-.desklink-head { spacing: 2px; padding: 2px 0; }
-.desklink-danger { color: #e5533d; }
-.desklink-light.desklink-danger { color: #b02f1b; }
+/* Rows of More. */
+.desklink-file-name { font-weight: bold; }
+.desklink-next { opacity: 0.6; }
+.desklink-back { font-weight: bold; }
 
 /* ── Footer: Open DeskLink · Settings · Pause ────────────────────────── */
-.desklink-footer { spacing: 8px; }
-.button.desklink-footer-button { padding: 6px 8px; }
+.desklink-footer { spacing: 6px; }
+.button.desklink-footer-button { padding: 6px; min-height: 0; border-radius: 999px; }
 .desklink-footer-content { spacing: 6px; }
-.desklink-footer-icon { icon-size: 14px; }
-.desklink-footer-label { font-size: 0.9em; }
-.desklink-dark.desklink-footer-button { background-color: rgba(255, 255, 255, 0.07); }
-.desklink-light.desklink-footer-button { background-color: rgba(0, 0, 0, 0.05); }
-.desklink-dark.desklink-footer-button:hover { background-color: rgba(255, 255, 255, 0.12); }
-.desklink-light.desklink-footer-button:hover { background-color: rgba(0, 0, 0, 0.09); }
+.desklink-footer-label { font-size: 0.86em; }

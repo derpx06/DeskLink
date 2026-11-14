@@ -642,9 +642,9 @@ The design intent is in `docs/UI-REDESIGN.md` (a specification written 2026-11-0
 
 | File | Role |
 |---|---|
-| `model.js` | Pure data, no GNOME imports: `statusLine`, `deviceChips`, `quickTiles`, `sections`, `footer`, `looksLikeLink`. Unit-tested with Node (`gnome-shell-extension/tests/model.test.mjs`, which reads `shell_dbus.rs` to pin actions and switches against Rust) |
-| `menu.js` | Draws what the model returns with St/PopupMenu widgets (header, chips, six quick tiles, now-playing, "Now", collapsed sections, switch rows) |
-| `extension.js` | `QuickMenuToggle` + `SystemIndicator`; optional pill (`DeskLinkButton`) shown when the desk setting `pill` is on or the phone has activities, with the first activity's live countdown as its chip; on the lock screen only "Unlock with <phone>"; `WobbleGuard`; owns the `Gio.DBusProxy` |
+| `model.js` | Pure data, no GNOME imports: `statusLine`, `headerLine`, `menuBlocks` (which rows show), `quickTiles`, `sections` (folded into More), `footer`, `looksLikeLink`. Unit-tested with Node (`gnome-shell-extension/tests/model.test.mjs`, which reads `shell_dbus.rs` to pin actions and switches against Rust) |
+| `menu.js` | Draws what the model returns with St/PopupMenu widgets (header, six quick-action pills, a one-row now-playing, rows for what is going on now, every area folded into More, switch rows) |
+| `extension.js` | `QuickMenuToggle` + `SystemIndicator`; optional pill (`DeskLinkButton`) shown when the desk setting `pill` is on or the phone has activities, showing the phone battery, or the first activity live countdown cut to 16 characters; on the lock screen only "Unlock with <phone>"; `WobbleGuard`; owns the `Gio.DBusProxy` |
 | `notifications.js` | Phone notifications as GNOME notifications with reply, call banners with Answer/Decline |
 | `stylesheet.css`, `desklink-symbolic.svg`, `metadata.json` | |
 
