@@ -133,7 +133,8 @@ pub(crate) fn name_callers(
 /// A refused request, in the user's words.
 pub(crate) fn parse_error(packet: &NetworkPacket) -> Option<String> {
     let why = match packet.get_str("error")? {
-        "permission" => "it needs the Phone permission (open DeskLink on the phone)",
+        // The phone was asked for it at the same time (`asks`, "calls").
+        "permission" => "it needs the Phone permission. Tap Allow in the request on the phone",
         "no-call" => "there is no call",
         "emergency" => "emergency numbers must be dialled on the phone itself",
         _ => "the phone could not do it",
@@ -650,7 +651,7 @@ mod tests {
         );
         assert_eq!(
             parse_error(&packet(json!({"error": "permission", "action": "answer"}))).as_deref(),
-            Some("Could not answer the call: it needs the Phone permission (open DeskLink on the phone)")
+            Some("Could not answer the call: it needs the Phone permission. Tap Allow in the request on the phone")
         );
         assert_eq!(parse_error(&packet(json!({"calls": []}))), None);
     }

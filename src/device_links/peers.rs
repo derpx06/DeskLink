@@ -27,6 +27,7 @@ pub(crate) fn forget_identity_state(device_id: &str) {
     crate::device_links::folders::forget_device(device_id);
     crate::device_links::unlock::forget(device_id);
     glide::forget_phone(device_id);
+    crate::device_links::asks::forget(device_id);
     crate::device_links::walk_away::forget(device_id);
     crate::device_links::dnd::forget(device_id);
     mpris::forget_art_sent(device_id);
@@ -84,7 +85,8 @@ mod tests {
             "device_links/webrtc/coordinator.rs:PROBE_NOW",
             "device_links/webrtc/coordinator.rs:STREAKS",
             "device_links/glide.rs:ALLOWED",
-            "device_links/glide.rs:ASKS",
+            "device_links/asks.rs:ASKS",
+            "device_links/asks.rs:REPORTS",
             "device_links/daemon/discovery.rs:KNOWN",
             "device_links/daemon/discovery.rs:PERSISTED",
             "device_links/daemon/clipboard.rs:LAST_SENT_BY_DEVICE",

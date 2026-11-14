@@ -86,7 +86,12 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         // The phone's "allowed" report changes the glide row's words.
         crate::device_links::glide::phone_allows(&device.id),
         crate::device_links::glide::phone_locked(&device.id),
-        format!("{:?}", crate::device_links::glide::phone_ask(&device.id)),
+        // Every feature only the phone can turn on, and its ask.
+        format!(
+            "{:?}{:?}",
+            crate::device_links::glide::phone_ask(&device.id),
+            super::requirements::PhoneFacts::from_device(device).steps
+        ),
         &device.id,
         &device.name,
         approving,
@@ -867,13 +872,17 @@ fn groups(
     notifications.add(&command_alerts_row(daemon, settings, device));
     add_forward_rows(&notifications, daemon, settings);
     notifications.add(&dnd_row(daemon, settings, device));
+    phone_step_rows(&notifications, device, &["notifications", "dnd"]);
 
     let clipboard = group(GROUPS[2]);
     clipboard.add(&clipboard_row(daemon, settings));
+    phone_step_rows(&clipboard, device, &["clipboard"]);
 
     let calls = calls_group(daemon, settings, device);
+    phone_step_rows(&calls, device, &["calls", "contacts"]);
 
     let sound = sound_group(daemon, settings);
+    phone_step_rows(&sound, device, &["media"]);
 
     let control = group(GROUPS[5]);
     add_glide_rows(&control, daemon, settings, device, glide_status);
@@ -883,6 +892,7 @@ fn groups(
     files.add(&bucket_row(device));
     files.add(&downloads_row());
     files.add(&gallery_row(daemon, settings, device));
+    phone_step_rows(&files, device, &["photos"]);
 
     let privacy = group(GROUPS[7]);
     privacy.add(&password_row(daemon, settings));
@@ -1095,7 +1105,7 @@ fn calls_group(
     let group = adw::PreferencesGroup::builder()
         .title("Calls")
         .description(glib::markup_escape_text(&format!(
-            "Answer, decline and end {}'s calls here. Turn on Calls in DeskLink on the phone.",
+            "Answer, decline and end {}'s calls here.",
             device.name
         )))
         .build();
@@ -2020,6 +2030,8 @@ pub(super) fn approve_remote_control(window: &DesklinkWindow, id: &str) {
             return;
         };
         window.imp().approving.borrow_mut().remove(&id);
+        // The phone's "Ask on computer" for control follows the grant.
+        crate::device_links::desk_features::push_settings();
         match &outcome {
             Ok(true) => window.show_feature_toast("Approved"),
             Ok(false) => window.show_feature_toast(VIEW_ONLY),
@@ -2138,7 +2150,41 @@ fn glide_explained(phone: &str, allowed: Option<bool>, locked: bool, computer: &
              DeskLink starts and again after the screen locks; it cannot remember the answer."
         )
     } else {
-        format!("Turn on “Let {computer} control this phone” on the phone first.")
+        format!("{phone} needs to allow “Let {computer} control this phone” first.")
+    }
+}
+
+/// Each feature in `keys` (`asks::TO_PHONE`) that is off on the phone: what
+/// is off and the one button that asks the phone to turn it on (a request
+/// there; the person allows it), or where that ask stands.
+fn phone_step_rows(group: &adw::PreferencesGroup, device: &DeviceView, keys: &[&str]) {
+    let facts = super::requirements::PhoneFacts::from_device(device);
+    for key in keys {
+        let Some(need) = super::requirements::phone_step(&facts, key) else {
+            continue;
+        };
+        let row = adw::ActionRow::builder()
+            .title(esc(&need.title))
+            .subtitle(esc(&need.detail))
+            .build();
+        row.add_prefix(&icon_square(
+            "desklink-device-phone-symbolic",
+            30,
+            "row-icon",
+        ));
+        if let Some(label) = need.fix.label() {
+            let ask = gtk::Button::builder()
+                .label(label)
+                .valign(gtk::Align::Center)
+                .build();
+            ask.update_property(&[gtk::accessible::Property::Description(&need.title)]);
+            ask.connect_clicked(move |button| {
+                super::requirements::run(button, &need);
+                button.set_sensitive(false);
+            });
+            row.add_suffix(&ask);
+        }
+        group.add(&row);
     }
 }
 
@@ -2297,57 +2343,11 @@ fn add_glide_rows(
         });
         daemon.send(DaemonCommand::SetGlide(id.clone(), edge));
     });
-    // On here, off on the phone: said, with the ask where the phone takes it.
-    // (A locked phone is not "off": the row above says to unlock it.)
-    if current.is_some()
-        && crate::device_links::glide::phone_allows(&device.id) == Some(false)
-        && !crate::device_links::glide::phone_locked(&device.id)
-    {
-        use crate::device_links::glide::PhoneAsk;
-        let ask_state = crate::device_links::glide::phone_ask(&device.id);
-        let how = format!(
-            "On {phone}: DeskLink, Settings, Control, “Let {} control this phone”.",
-            crate::device_links::glide::desk_name()
-        );
-        let (title, subtitle) = match ask_state {
-            Some(ask) => (
-                crate::device_links::glide::ask_words(&phone, ask),
-                if ask == PhoneAsk::Waiting {
-                    format!("The prompt is in {phone}'s notifications. Or: {how}")
-                } else {
-                    how
-                },
-            ),
-            None => (format!("Glide is off on {phone}. Turn it on there."), how),
-        };
-        let row = adw::ActionRow::builder()
-            .title(esc(title))
-            .subtitle(esc(subtitle))
-            .build();
-        row.add_prefix(&icon_square(
-            "desklink-device-phone-symbolic",
-            30,
-            "row-icon",
-        ));
-        if ask_state != Some(PhoneAsk::Waiting)
-            && crate::device_links::glide::can_ask_phone(&device.incoming_capabilities)
-        {
-            let ask = gtk::Button::builder()
-                .label(if ask_state.is_some() {
-                    "Ask again"
-                } else {
-                    "Ask on phone"
-                })
-                .valign(gtk::Align::Center)
-                .build();
-            let id = device.id.clone();
-            ask.connect_clicked(move |button| {
-                crate::device_links::glide::ask_phone(&id);
-                button.set_sensitive(false);
-            });
-            row.add_suffix(&ask);
-        }
-        group.add(&row);
+    // On here, off on the phone: said, with Ask on phone where the phone
+    // takes it. (A locked phone is not "off": the row above says to unlock
+    // it.)
+    if current.is_some() && !crate::device_links::glide::phone_locked(&device.id) {
+        phone_step_rows(group, device, &["glide"]);
     }
     if status.asking {
         let row = adw::ActionRow::builder()
@@ -2602,7 +2602,7 @@ mod tests {
 
     #[test]
     fn the_glide_row_says_what_to_turn_on_until_the_phone_allows_it() {
-        let says = "Turn on “Let Desk control this phone” on the phone first.";
+        let says = "Pixel needs to allow “Let Desk control this phone” first.";
         assert_eq!(glide_explained("Pixel", None, false, "Desk"), says);
         assert_eq!(glide_explained("Pixel", Some(false), false, "Desk"), says);
         assert!(glide_explained("Pixel", Some(true), false, "Desk")

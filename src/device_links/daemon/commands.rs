@@ -463,6 +463,8 @@ impl DaemonWorker {
                 format!("Could not change terminal access: {error}"),
             );
         }
+        // The phone's report says it (Ask on computer follows it).
+        crate::device_links::desk_features::push_settings();
     }
 
     fn end_phone_sessions(&self, device_id: Option<String>) {

@@ -222,7 +222,7 @@ pub(super) fn cards(facts: &Facts) -> Vec<Card> {
         if reads {
             format!("Notifications from {name} show up here. Reply to them or dismiss them from this computer.")
         } else {
-            format!("Notifications from {name} show up here once you allow it on the phone: open DeskLink there and allow notification access.")
+            format!("Notifications from {name} show up here once {name} allows it. The Notifications page asks {name} for you.")
         },
         Needs::Pair,
         vec![(

@@ -207,6 +207,18 @@ impl Page {
             device.feature_transport_ready,
             device.notification_access,
         ));
+        // Off on the phone: Ask on phone, the one button that turns it on
+        // (a request there; the person allows it).
+        let step = notifications
+            .is_empty()
+            .then(|| {
+                super::requirements::phone_step(
+                    &super::requirements::PhoneFacts::from_device(device),
+                    "notifications",
+                )
+            })
+            .flatten();
+        self.empty.set_step(step.as_ref());
         // Dismiss, reply and actions go to the phone: none while the link
         // is down (the list is what it last reported).
         let ready = device.feature_transport_ready;

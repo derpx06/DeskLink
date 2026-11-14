@@ -104,6 +104,23 @@ pub(crate) fn send(device_id: &str, packet: &NetworkPacket) {
     }
 }
 
+/// Like [`send`], saying whether the packet went to a ready connection (an
+/// ask that did not is retried once the link is ready: `asks::on_ready`).
+pub(crate) fn try_send(device_id: &str, packet: &NetworkPacket) -> bool {
+    #[cfg(test)]
+    if device_id.starts_with(TEST_OUTBOX_PREFIX) {
+        send(device_id, packet);
+        return true;
+    }
+    let Some(daemon) = DAEMON.get() else {
+        return false;
+    };
+    match FeatureTransport::for_device(&daemon.sessions, device_id) {
+        Ok(transport) if transport.is_ready() => transport.send(packet).is_ok(),
+        _ => false,
+    }
+}
+
 /// Tests: packets sent to a device whose id starts with this are kept here
 /// instead of going to a connection.
 #[cfg(test)]
@@ -424,6 +441,7 @@ fn initial_snapshots(
 }
 
 fn send_initial_snapshots(device_id: &str) {
+    super::asks::on_ready(device_id);
     let theirs = super::sync::theirs(device_id);
     let accepts = super::features::peer_accepts(device_id, super::packet::PACKET_TYPE_NOTIFICATION);
     let (packets, media) = initial_snapshots(device_id, theirs.as_ref(), &own_instance(), accepts);
@@ -463,9 +481,28 @@ pub(crate) fn settings_packet(settings: &AppSettings, device_id: &str) -> Networ
     if let Some(dnd) = desk_dnd {
         packet.set("dnd", dnd);
     }
+    // Ask on computer (asks.json): what the phone may ask for, on or off,
+    // and whether the prompt here shows its buttons.
+    packet.set("features", super::asks::desk_report(settings, device_id));
+    packet.set(
+        "prompts",
+        if super::asks::prompts_shown() {
+            "on"
+        } else {
+            "off"
+        },
+    );
     let rev = super::sync::rev_of(std::slice::from_ref(&packet), &[]);
     packet.set("rev", rev);
     packet
+}
+
+/// The person tapped Not now on `device_id`'s ask for `key`: the report sent
+/// for that answer says so (`declined`), and no other report does.
+pub(crate) fn push_declined(device_id: &str, key: &str) {
+    let mut packet = settings_packet(&super::config::app_settings(), device_id);
+    packet.set("declined", serde_json::json!([key]));
+    send(device_id, &packet);
 }
 
 /// Sends every connected phone the desk's settings. Called after any change.
@@ -557,6 +594,9 @@ fn setting_not_saved_words(error: &str) -> String {
 /// A phone changed some of the desk's settings: apply, log, and tell every
 /// phone (the asker included) the result.
 pub(crate) fn handle_settings_request(device_id: &str, packet: &NetworkPacket) {
+    // What the phone asks this desk to turn on (Ask on computer): a prompt
+    // here, never a change.
+    super::asks::on_phone_request(device_id, packet);
     let Some(daemon) = DAEMON.get() else {
         return;
     };

@@ -28,7 +28,7 @@ pub(super) struct Page {
     stack: gtk::Stack,
     empty: clipboard::EmptyState,
     /// What is shown: the device, its name and the cache generation.
-    shown: RefCell<(String, String, u64, bool)>,
+    shown: RefCell<(String, String, u64, bool, Option<super::requirements::Need>)>,
     /// Every contact by uid, for the details (the list draws only some).
     contacts: Rc<RefCell<HashMap<String, Contact>>>,
     /// Every contact in order, the phone's name, and the search terms: what
@@ -201,6 +201,28 @@ fn draw(list: &gtk::ListBox, count: &gtk::Label, source: &Source) {
     });
 }
 
+/// Contacts are off on the phone: the need with Ask on phone (a request on
+/// the phone; the person allows it there), or where the ask stands.
+fn contacts_step(device: &DeviceView) -> Option<super::requirements::Need> {
+    super::requirements::phone_step(
+        &super::requirements::PhoneFacts::from_device(device),
+        "contacts",
+    )
+}
+
+/// The empty page's words. With a step its words and button come from it;
+/// without one the phone shares them, or cannot be asked (an older build).
+fn empty_words(phone: &str, step: bool) -> String {
+    if step {
+        String::new()
+    } else {
+        format!(
+            "{phone}'s contacts show here once it shares them. They are kept here encrypted, \
+             and removed when you unpair."
+        )
+    }
+}
+
 impl Page {
     pub(super) fn new(win: &DesklinkWindow) -> Self {
         let search = gtk::SearchEntry::builder()
@@ -239,7 +261,7 @@ impl Page {
         let empty = clipboard::empty_state(
             "desklink-person-symbolic",
             "No contacts yet",
-            "Turn on contacts to see them here.",
+            "Contacts from the phone show here.",
         );
         let stack = gtk::Stack::builder().vhomogeneous(false).build();
         stack.add_named(&list, Some("list"));
@@ -366,7 +388,14 @@ impl Page {
         let can_call = ready && can_send_feature(device, PACKET_TYPE_TELEPHONY_REQUEST);
         self.device.replace((device.id.clone(), can_call));
         let generation = contacts::generation();
-        let shown = (device.id.clone(), device.name.clone(), generation, can_call);
+        let step = contacts_step(device);
+        let shown = (
+            device.id.clone(),
+            device.name.clone(),
+            generation,
+            can_call,
+            step.clone(),
+        );
         if *self.shown.borrow() == shown {
             return;
         }
@@ -392,11 +421,10 @@ impl Page {
 
         if list.is_empty() {
             self.empty.title.set_label("No contacts yet");
-            self.empty.body.set_label(&format!(
-                "Turn on “Share contacts” for this computer in DeskLink on {}. \
-                 They are kept here encrypted, and removed when you unpair.",
-                device.name
-            ));
+            self.empty
+                .body
+                .set_label(&empty_words(&device.name, step.is_some()));
+            self.empty.set_step(step.as_ref());
             self.stack.set_visible_child_name("empty");
         } else {
             self.stack.set_visible_child_name("list");

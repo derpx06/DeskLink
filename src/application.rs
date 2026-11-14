@@ -536,6 +536,18 @@ impl DesklinkApplication {
                 }
             })
             .build();
+        // Allow / Not now on a phone's ask (Ask on computer): the one way
+        // the asked setting is turned on, from the person's click here.
+        let ask_answer_action = gio::ActionEntry::builder("ask-answer")
+            .parameter_type(Some(glib::VariantTy::new("(ssb)").expect("valid type")))
+            .activate(move |app: &Self, _, target| {
+                if let Some((device, key, allow)) =
+                    target.and_then(|target| target.get::<(String, String, bool)>())
+                {
+                    app.answer_ask(&device, &key, allow);
+                }
+            })
+            .build();
         crate::send_to::add_action(self);
         crate::send_to::add_bucket_action(self);
         crate::send_to::add_direct_actions(self);
@@ -557,6 +569,7 @@ impl DesklinkApplication {
             call_action,
             dial_action,
             open_held_link_action,
+            ask_answer_action,
         ]);
     }
 
@@ -627,6 +640,43 @@ impl DesklinkApplication {
             .borrow()
             .as_ref()
             .is_some_and(|tray| tray.hosted())
+    }
+
+    /// The person answered `device`'s ask for `key` here (the notification,
+    /// the window, the tray). Only an ask that is waiting turns anything on,
+    /// and only from this click: a phone's packet never does.
+    pub(crate) fn answer_ask(&self, device: &str, key: &str, allow: bool) {
+        use crate::device_links::daemon::DaemonCommand;
+        let Some(key) = crate::device_links::asks::take_incoming(device, key) else {
+            return;
+        };
+        self.withdraw_notification(&crate::device_links::asks::notice_id(device, key));
+        if !allow {
+            crate::device_links::desk_features::push_declined(device, key);
+            return;
+        }
+        let Some(daemon) = self.daemon_handle() else {
+            return;
+        };
+        let id = device.to_string();
+        match key {
+            "terminalAccess" => daemon.send(DaemonCommand::SetTerminalAccess(id, true)),
+            "unlockNearby" => daemon.send(DaemonCommand::SetUnlockNearby(id, true)),
+            "galleryAccepted" => daemon.send(DaemonCommand::SetGalleryAccept(id, true)),
+            "keepAwakeAllowed" => daemon.send(DaemonCommand::SetKeepAwakeFrom(id, true)),
+            "dndSync" => daemon.send(DaemonCommand::SetDndShare(id, true)),
+            "glide" => daemon.send(DaemonCommand::SetGlide(
+                id,
+                Some(crate::device_links::glide::Edge::Right),
+            )),
+            // A portal grant: Allow opens the desktop's own dialog.
+            "control" => {
+                let window = self.main_window();
+                window.present();
+                crate::window::approve_control(&window, device);
+            }
+            _ => {}
+        }
     }
 
     /// The main window, never the Phone Screen window that `active_window()`
@@ -915,6 +965,40 @@ impl DesklinkApplication {
                         app.send_notification(Some("dnd-problem"), &notification);
                     }
                 }
+                // Asks from a phone (Ask on computer): a notification with
+                // Allow and Not now, once per ask, withdrawn when answered.
+                if let Some(bus) = app.dbus_connection() {
+                    crate::device_links::asks::probe_buttons(&bus);
+                }
+                let (new_asks, gone_asks) = crate::device_links::asks::notices();
+                for id in gone_asks {
+                    app.withdraw_notification(&id);
+                }
+                for ask in new_asks {
+                    let phone = daemon
+                        .devices()
+                        .into_iter()
+                        .find(|device| device.id == ask.device)
+                        .map_or_else(|| "Your phone".to_string(), |device| device.name);
+                    let Some(title) = crate::device_links::asks::prompt(&phone, ask.key) else {
+                        continue;
+                    };
+                    let notification = gio::Notification::new(&title);
+                    notification.set_body(Some("Allow turns it on. Nothing changes until you do."));
+                    notification.set_priority(gio::NotificationPriority::High);
+                    for (label, allow) in [("Allow", true), ("Not now", false)] {
+                        notification.add_button_with_target_value(
+                            label,
+                            "app.ask-answer",
+                            Some(&(ask.device.as_str(), ask.key, allow).to_variant()),
+                        );
+                    }
+                    notification.set_default_action("app.show-window");
+                    app.send_notification(
+                        Some(&crate::device_links::asks::notice_id(&ask.device, ask.key)),
+                        &notification,
+                    );
+                }
                 if let Some(tray) = app.imp().tray.borrow().as_ref() {
                     let devices = daemon.devices();
                     let hand_off = devices.iter().any(|device| device.feature_transport_ready)
@@ -928,8 +1012,12 @@ impl DesklinkApplication {
                         hand_off,
                     );
                     let icon = crate::desk_menu::tray_icon(&devices);
+                    // A waiting ask is a line too: the indicator asks for
+                    // attention (the badge) while the window is closed.
+                    let mut lines: Vec<String> = active.into_iter().map(|(_, line)| line).collect();
+                    lines.extend(crate::desk_menu::ask_lines(&devices));
                     tray.update(
-                        active.into_iter().map(|(_, line)| line).collect(),
+                        lines,
                         crate::desk_menu::tooltip(&devices),
                         menu,
                         icon,
