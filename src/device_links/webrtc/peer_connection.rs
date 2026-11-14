@@ -2791,7 +2791,23 @@ a=max-message-size:262144\r\n";
         // Mirror at the laptop's size, Extend at the phone's, and back.
         let sizes = [(1280, 720), (960, 540)];
         for index in 1..10 {
+            // The share has sent packets past the probe before it is
+            // switched (a fixed 300 ms saw none of them on a loaded machine).
             std::thread::sleep(std::time::Duration::from_millis(300));
+            let shown = std::time::Instant::now();
+            while !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(share, _)| *share == index - 1)
+            {
+                assert!(
+                    shown.elapsed() < std::time::Duration::from_secs(60),
+                    "share {}: no packets past the probe",
+                    index - 1
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
             pair.answerer.stop_or_retire(capture);
             current.store(index, Ordering::SeqCst);
             let before = stream.frames_shown();
