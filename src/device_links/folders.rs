@@ -5477,32 +5477,35 @@ mod tests {
 
     #[test]
     fn an_unpaired_phone_loses_its_pairs_and_records_but_not_its_bucket_files() {
-        let (base, root, mut worker) = scratch_bucket("bucket-forget");
+        // Ids of this test's own: the refused and wanted records are
+        // process-wide, and other tests write "phone-b" into them while this
+        // one forgets (and asserts on) every record of its phone.
+        let phone = format!("phone-forget-{}", uuid::Uuid::new_v4().simple());
+        let other = format!("phone-other-{}", uuid::Uuid::new_v4().simple());
+        let base = scratch("bucket-forget");
+        let root = base.join("bucket");
+        fs::create_dir_all(&root).unwrap();
+        let mut worker = bucket_worker_for(&base, &root, &phone);
+        worker.ready = [phone.clone()].into();
         fs::write(root.join("keep.txt"), "x").unwrap();
-        mark_trash_refused("phone-b", "a.txt");
-        mark_trash_refused("phone-other", "a.txt");
+        mark_trash_refused(&phone, "a.txt");
+        mark_trash_refused(&other, "a.txt");
         WANTED.lock().unwrap().insert(
-            ("phone-b".into(), BUCKET_ID.into(), "k".into()),
+            (phone.clone(), BUCKET_ID.into(), "k".into()),
             entry("h", (0, 0)),
         );
         assert!(!worker.pairs.is_empty());
-        forget_device("phone-b");
-        worker.handle(Message::Forget("phone-b".into()));
-        assert!(worker
-            .pairs
-            .iter()
-            .all(|live| live.pair.device != "phone-b"));
+        forget_device(&phone);
+        worker.handle(Message::Forget(phone.clone()));
+        assert!(worker.pairs.iter().all(|live| live.pair.device != phone));
         assert!(root.join("keep.txt").exists(), "files stay");
-        assert!(!replace_anyway_offered("phone-b", "a.txt"));
-        assert!(
-            replace_anyway_offered("phone-other", "a.txt"),
-            "only this phone's"
-        );
+        assert!(!replace_anyway_offered(&phone, "a.txt"));
+        assert!(replace_anyway_offered(&other, "a.txt"), "only this phone's");
         assert!(WANTED
             .lock()
             .unwrap()
             .keys()
-            .all(|(owner, _, _)| owner != "phone-b"));
+            .all(|(owner, _, _)| *owner != phone));
         let _ = fs::remove_dir_all(&base);
     }
 

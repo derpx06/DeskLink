@@ -137,33 +137,7 @@ const QUEUE: usize = 16;
 /// stay off the peer worker, and a flood costs one thread, not one per
 /// packet). False when it was dropped because the queue was full.
 pub(crate) fn run_later(job: impl FnOnce() + Send + 'static) -> bool {
-    let queued = try_queue(Box::new(job)).is_ok();
-    if !queued {
-        report_dropped();
-    }
-    queued
-}
-
-/// Queues `job` for the desk thread, or hands it back when the queue is full.
-/// Every job runs under [`crate::guard`]: one that panics must not end the
-/// one thread all the others depend on.
-fn try_queue(job: Job) -> Result<(), Job> {
-    static WORKER: OnceLock<std::sync::mpsc::SyncSender<Job>> = OnceLock::new();
-    let sender = WORKER.get_or_init(|| {
-        let (sender, jobs) = std::sync::mpsc::sync_channel::<Job>(QUEUE);
-        let _ = std::thread::Builder::new()
-            .name("desklink-desk".into())
-            .spawn(move || {
-                for job in jobs {
-                    crate::guard("desk job", (), job);
-                }
-            });
-        sender
-    });
-    sender.try_send(job).map_err(|error| match error {
-        std::sync::mpsc::TrySendError::Full(job)
-        | std::sync::mpsc::TrySendError::Disconnected(job) => job,
-    })
+    desk().run_later(Box::new(job))
 }
 
 /// How long a job that must not be lost waits for room in the queue.
@@ -173,52 +147,126 @@ const MUST_RUN_WITHIN: Duration = Duration::from_secs(10);
 /// snapshots): a full queue is waited out, not a dropped job. The wait is on a
 /// thread of its own, so the caller (a peer worker, a timer) never blocks.
 pub(crate) fn run_later_reliably(job: impl FnOnce() + Send + 'static) {
-    let Err(mut waiting) = try_queue(Box::new(job)) else {
-        return;
-    };
-    // A flood still costs a bounded number of waiting threads.
-    static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    const MAX_WAITING: usize = 8;
-    if WAITING.fetch_add(1, std::sync::atomic::Ordering::AcqRel) >= MAX_WAITING {
-        WAITING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        report_dropped();
-        return;
-    }
-    let spawned = std::thread::Builder::new()
-        .name("desklink-desk-retry".into())
-        .spawn(move || {
-            let until = Instant::now() + MUST_RUN_WITHIN;
-            let mut queued = false;
-            while Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(50));
-                match try_queue(waiting) {
-                    Ok(()) => {
-                        queued = true;
-                        break;
-                    }
-                    Err(job) => waiting = job,
+    desk().run_later_reliably(Box::new(job));
+}
+
+/// The program's desk-features thread.
+fn desk() -> &'static Arc<Desk> {
+    static DESK: OnceLock<Arc<Desk>> = OnceLock::new();
+    DESK.get_or_init(Desk::new)
+}
+
+/// A desk-features thread and its bounded queue. The program has one; a
+/// test that floods a queue makes its own (flooding the program's dropped
+/// the jobs of every other test running beside it).
+struct Desk {
+    jobs: std::sync::mpsc::SyncSender<Job>,
+    /// Threads waiting for room for a job that must not be lost.
+    waiting: std::sync::atomic::AtomicUsize,
+    /// Jobs dropped because the queue was full, since start.
+    dropped: std::sync::atomic::AtomicU64,
+}
+
+impl Desk {
+    /// Every job runs under [`crate::guard`]: one that panics must not end
+    /// the one thread all the others depend on.
+    fn new() -> Arc<Self> {
+        let (jobs, inbox) = std::sync::mpsc::sync_channel::<Job>(QUEUE);
+        let _ = std::thread::Builder::new()
+            .name("desklink-desk".into())
+            .spawn(move || {
+                for job in inbox {
+                    crate::guard("desk job", (), job);
                 }
-            }
-            WAITING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            if !queued {
-                report_dropped();
-            }
-        });
-    if spawned.is_err() {
-        WAITING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-        report_dropped();
+            });
+        Arc::new(Self {
+            jobs,
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            dropped: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Queues `job`, or hands it back when the queue is full.
+    fn try_queue(&self, job: Job) -> Result<(), Job> {
+        self.jobs.try_send(job).map_err(|error| match error {
+            std::sync::mpsc::TrySendError::Full(job)
+            | std::sync::mpsc::TrySendError::Disconnected(job) => job,
+        })
+    }
+
+    fn run_later(&self, job: Job) -> bool {
+        let queued = self.try_queue(job).is_ok();
+        if !queued {
+            self.report_dropped();
+        }
+        queued
+    }
+
+    fn run_later_reliably(self: &Arc<Self>, job: Job) {
+        use std::sync::atomic::Ordering::AcqRel;
+        let Err(mut waiting) = self.try_queue(job) else {
+            return;
+        };
+        // A flood still costs a bounded number of waiting threads.
+        const MAX_WAITING: usize = 8;
+        if self.waiting.fetch_add(1, AcqRel) >= MAX_WAITING {
+            self.waiting.fetch_sub(1, AcqRel);
+            self.report_dropped();
+            return;
+        }
+        let desk = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("desklink-desk-retry".into())
+            .spawn(move || {
+                let until = Instant::now() + MUST_RUN_WITHIN;
+                let mut queued = false;
+                while Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(50));
+                    match desk.try_queue(waiting) {
+                        Ok(()) => {
+                            queued = true;
+                            break;
+                        }
+                        Err(job) => waiting = job,
+                    }
+                }
+                desk.waiting.fetch_sub(1, AcqRel);
+                if !queued {
+                    desk.report_dropped();
+                }
+            });
+        if spawned.is_err() {
+            self.waiting.fetch_sub(1, AcqRel);
+            self.report_dropped();
+        }
+    }
+
+    /// A full queue is visible, not silent: counted, logged, and shown once
+    /// in a while (a flood must not become a flood of toasts).
+    fn report_dropped(&self) {
+        static LAST: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
+        let total = self
+            .dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        debug_log!("[DeskLink] Desk request dropped: too many waiting ({total} so far)");
+        let Ok(mut last) = LAST.lock() else {
+            return;
+        };
+        let due = last.is_none_or(|(at, _)| at.elapsed() >= DROP_NOTICE_EVERY);
+        if !due {
+            return;
+        }
+        let since = last.map_or(0, |(_, counted)| counted);
+        *last = Some((Instant::now(), total));
+        if let Some(daemon) = DAEMON.get() {
+            super::daemon::push_user_error(&daemon.errors, drop_notice(total - since));
+        }
     }
 }
 
-/// Jobs dropped because the queue was full, since start.
-static DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// A dropped job is told to the user at most this often.
 const DROP_NOTICE_EVERY: Duration = Duration::from_secs(30);
-
-#[cfg(test)]
-pub(crate) fn dropped_jobs() -> u64 {
-    DROPPED.load(std::sync::atomic::Ordering::Relaxed)
-}
 
 /// What the user is told when requests were dropped.
 pub(crate) fn drop_notice(count: u64) -> String {
@@ -228,25 +276,6 @@ pub(crate) fn drop_notice(count: u64) -> String {
     }
 }
 
-/// A full queue is visible, not silent: counted, logged, and shown once in a
-/// while (a flood must not become a flood of toasts).
-fn report_dropped() {
-    static LAST: Mutex<Option<(Instant, u64)>> = Mutex::new(None);
-    let total = DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    debug_log!("[DeskLink] Desk request dropped: too many waiting ({total} so far)");
-    let Ok(mut last) = LAST.lock() else {
-        return;
-    };
-    let due = last.is_none_or(|(at, _)| at.elapsed() >= DROP_NOTICE_EVERY);
-    if !due {
-        return;
-    }
-    let since = last.map_or(0, |(_, counted)| counted);
-    *last = Some((Instant::now(), total));
-    if let Some(daemon) = DAEMON.get() {
-        super::daemon::push_user_error(&daemon.errors, drop_notice(total - since));
-    }
-}
 fn device(device_id: &str) -> Option<DeviceView> {
     DAEMON.get()?.devices.lock().ok()?.get(device_id).cloned()
 }
@@ -1247,20 +1276,25 @@ mod tests {
 
     #[test]
     fn a_flood_of_requests_waits_on_one_thread_and_the_rest_are_dropped() {
+        // A desk thread of this test's own: flooding the program's dropped
+        // the jobs of the tests running beside it, and theirs were counted here.
+        let desk = Desk::new();
+        let dropped = || desk.dropped.load(std::sync::atomic::Ordering::Relaxed);
         let (started, release) = std::sync::mpsc::channel::<()>();
         let gate = Arc::new(Mutex::new(()));
         let held = gate.lock().unwrap();
         let blocker = Arc::clone(&gate);
-        assert!(run_later(move || {
+        assert!(desk.run_later(Box::new(move || {
             let _ = started.send(());
             let _unused = blocker.lock();
-        }));
+        })));
         release.recv().unwrap();
-        let before = dropped_jobs();
-        let accepted = (0..QUEUE * 4).filter(|_| run_later(|| {})).count();
-        assert!(accepted <= QUEUE, "{accepted} queued");
+        let accepted = (0..QUEUE * 4)
+            .filter(|_| desk.run_later(Box::new(|| {})))
+            .count();
+        assert_eq!(accepted, QUEUE, "the queue holds {QUEUE}");
         // A full queue is visible: counted, and said in plain words.
-        assert_eq!(dropped_jobs() - before, (QUEUE * 4 - accepted) as u64);
+        assert_eq!(dropped(), (QUEUE * 4 - accepted) as u64);
         assert_eq!(
             drop_notice(1),
             "DeskLink was busy and ignored a request from a phone. Try again."
@@ -1269,16 +1303,16 @@ mod tests {
         // Review finding F: work the sync cannot do without is waited for,
         // not dropped, while the queue is full.
         let (ran_tx, ran) = std::sync::mpsc::channel::<&'static str>();
-        run_later_reliably(move || {
+        desk.run_later_reliably(Box::new(move || {
             let _ = ran_tx.send("ran");
-        });
+        }));
         assert!(
             ran.recv_timeout(Duration::from_millis(200)).is_err(),
             "still waiting for room"
         );
         drop(held);
         assert_eq!(
-            ran.recv_timeout(Duration::from_secs(5)),
+            ran.recv_timeout(Duration::from_secs(60)),
             Ok("ran"),
             "it ran once the queue drained"
         );

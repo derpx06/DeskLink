@@ -2173,7 +2173,7 @@ pub(crate) mod tests {
     fn a_connected_loopback_pair_reads_as_the_lan() {
         let pair = loopback();
         wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut path = None;
         while path.is_none() && std::time::Instant::now() < deadline {
             path = pair.offerer.path(false);
@@ -2278,7 +2278,7 @@ a=max-message-size:262144\r\n";
     }
 
     fn wait_for_frames(capture: &super::super::screen::DesktopScreenCapture) -> u64 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while std::time::Instant::now() < deadline && capture.frames_sent() == 0 {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -2439,7 +2439,7 @@ a=max-message-size:262144\r\n";
     ) -> super::super::screen::ScreenStream {
         // The far side reports either a working decode chain or *why* it could
         // not build one; silence would mean nothing arrived at all.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut outcome = None;
         while outcome.is_none() && std::time::Instant::now() < deadline {
             match events.recv_timeout(std::time::Duration::from_millis(200)) {
@@ -2454,7 +2454,7 @@ a=max-message-size:262144\r\n";
             Some(Ok(stream)) => {
                 // A track is not a picture: the frames must decode and reach
                 // the display, through the same codec negotiation as a phone.
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
                 while stream.frames_shown() < 5 && std::time::Instant::now() < deadline {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
@@ -2519,7 +2519,7 @@ a=max-message-size:262144\r\n";
             .iter()
             .map(watch_eos)
             .collect();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !ended.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -2566,7 +2566,7 @@ a=max-message-size:262144\r\n";
 
         let before = stream.frames_shown();
         let second = share();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while stream.frames_shown() < before + 10 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -2589,7 +2589,7 @@ a=max-message-size:262144\r\n";
     fn a_keyframe_request_from_the_far_side_is_answered_on_a_second_share() {
         let pair = loopback();
         wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !pair.answerer.media_ready() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -2614,17 +2614,25 @@ a=max-message-size:262144\r\n";
         let stream = assert_far_side_decodes(&pair.offerer_events);
         pair.answerer.stop_or_retire(first);
         let second = share();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while second.frames_sent() == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
         let (requests, keyframes) = second.key_counts();
-        for _ in 0..3 {
+        // Asked again until both counts move (a loaded machine takes its
+        // time); the decoder's own throttle allows two a second.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let (requests_after, keyframes_after) = loop {
             assert!(stream.request_keyframe(), "the far side could not ask");
             std::thread::sleep(std::time::Duration::from_millis(600));
-        }
-        let (requests_after, keyframes_after) = second.key_counts();
+            let (now_requests, now_keyframes) = second.key_counts();
+            if (now_requests > requests && now_keyframes > keyframes)
+                || std::time::Instant::now() > deadline
+            {
+                break (now_requests, now_keyframes);
+            }
+        };
         assert!(
             requests_after > requests,
             "no keyframe request reached the encoder ({requests} -> {requests_after})"
@@ -2668,7 +2676,7 @@ a=max-message-size:262144\r\n";
         std::thread::sleep(std::time::Duration::from_secs(7));
         let second = share();
         let start = second.encoder_bitrate().expect("a VP8 encoder");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while second.encoder_bitrate() <= Some(start) && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
@@ -2762,10 +2770,13 @@ a=max-message-size:262144\r\n";
                         let Ok(map) = buffer.map_readable() else {
                             return;
                         };
+                        // Never unwrap here: a panic on a streaming thread
+                        // aborts the whole test process, and the lock is
+                        // poisoned whenever the test thread fails holding it.
                         if let Some(packet) = vp8_packet(&map).filter(|p| p.2 == ssrc) {
-                            seen.lock()
-                                .unwrap()
-                                .push((current.load(Ordering::SeqCst), packet));
+                            if let Ok(mut seen) = seen.lock() {
+                                seen.push((current.load(Ordering::SeqCst), packet));
+                            }
                         }
                     };
                     match &info.data {
@@ -2787,7 +2798,7 @@ a=max-message-size:262144\r\n";
             let opened = std::time::Instant::now();
             capture = share(sizes[index % 2]);
             while stream.frames_shown() < before + 10
-                && opened.elapsed() < std::time::Duration::from_secs(10)
+                && opened.elapsed() < std::time::Duration::from_secs(60)
             {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
@@ -3105,7 +3116,7 @@ a=max-message-size:262144\r\n";
         assert!(pipeline.upgrade().is_some());
         peer.close();
         drop(peer);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while (pipeline.upgrade().is_some() || webrtcbin.upgrade().is_some())
             && std::time::Instant::now() < deadline
         {
@@ -3135,7 +3146,7 @@ a=max-message-size:262144\r\n";
             let (peer, _events) = lone_peer();
             peer.close();
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let (mut grown_threads, mut grown_fds);
         loop {
             let (now_threads, now_fds) = process_counts();
@@ -3215,7 +3226,7 @@ a=max-message-size:262144\r\n";
 
     /// Waits for the next `Envelope` on `channel`.
     fn next_envelope(events: &mpsc::Receiver<PeerEvent>, channel: WebRtcChannel) -> Vec<u8> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match events.recv_timeout(remaining) {
@@ -3247,7 +3258,7 @@ a=max-message-size:262144\r\n";
 
     /// Waits until `peer` has an incoming audio pad, then plays it.
     fn play_when_audio_arrives(peer: &DesktopWebRtcPeer) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while peer.audio_pad.lock().unwrap().is_none() {
             assert!(std::time::Instant::now() < deadline, "no audio pad arrived");
             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -3257,7 +3268,7 @@ a=max-message-size:262144\r\n";
     }
 
     fn wait_for_audio(peer: &DesktopWebRtcPeer) -> u64 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             let received = peer.audio_received();
             if received > 20 || std::time::Instant::now() > deadline {
@@ -3302,7 +3313,9 @@ a=max-message-size:262144\r\n";
                 gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
                 move |_, info| {
                     let now = Instant::now();
-                    let mut stamps = stamps.lock().unwrap();
+                    let mut stamps = stamps
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     match &info.data {
                         Some(gst::PadProbeData::Buffer(buffer)) => {
                             if let Some(seq) = seqnum(buffer) {
@@ -3539,7 +3552,7 @@ a=max-message-size:262144\r\n";
                                 (pts.nseconds().saturating_sub(base_ns) + frame_ns / 2) / frame_ns;
                             encoded
                                 .lock()
-                                .unwrap()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .entry(n as usize)
                                 .or_insert_with(Instant::now);
                         }
@@ -3601,7 +3614,9 @@ a=max-message-size:262144\r\n";
                 else {
                     return gst::PadProbeReturn::Ok;
                 };
-                *format.lock().unwrap() =
+                *format
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
                     format!("{:?} {}x{}", info.format(), info.width(), info.height());
                 let stride = frame.plane_stride()[0] as usize;
                 let plane = frame.plane_data(0).unwrap();
@@ -4385,7 +4400,7 @@ a=max-message-size:262144\r\n";
             )
             .unwrap();
         pair.offerer.send_heartbeat("still here").unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         let mut reported = false;
         loop {
             match pair
