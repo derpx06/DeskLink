@@ -22,6 +22,8 @@ pub(crate) const EXTENSION_NOTE: &str = "Turning it on also allows GNOME user ex
 
 /// The Settings subpage of passwords, terminals and unlocking.
 const PRIVACY_PAGE: usize = 7;
+/// The Settings subpage of Glide and remote control.
+pub(crate) const CONTROL_PAGE: usize = 5;
 
 /// What a need's button does.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +41,11 @@ pub(crate) enum Fix {
     ApproveControl(String),
     /// Ask the phone to turn Glide on there (a prompt on the phone).
     AskPhoneGlide(String),
+    /// Turn Glide on for this phone (on the right, as Settings' switch does),
+    /// then show where it sits in Settings.
+    TurnOnGlide(String),
+    /// Turn on the Bucket with this phone, then show it on the Files page.
+    TurnOnBucket(String),
     Reconnect(String),
     /// Copies an install command.
     Copy(String),
@@ -57,6 +64,8 @@ impl Fix {
             Self::LogOut => "Log out…",
             Self::ApproveControl(_) => "Approve now",
             Self::AskPhoneGlide(_) => "Ask on phone",
+            Self::TurnOnGlide(_) => "Turn on Glide",
+            Self::TurnOnBucket(_) => "Turn on",
             Self::Reconnect(_) => "Try again",
             Self::Copy(_) => "Copy command",
         })
@@ -193,7 +202,8 @@ impl Facts {
         self.checks.iter().find(|check| check.id == id)
     }
 
-    fn install(&self, check: &Check) -> Option<String> {
+    /// The command that installs what `check` misses, if it misses anything.
+    pub(crate) fn install(&self, check: &Check) -> Option<String> {
         check
             .install
             .filter(|_| check.level != Level::Ok)
@@ -523,14 +533,7 @@ pub(crate) fn run(anchor: &impl IsA<gtk::Widget>, need: &Need) {
             }
             window.show_feature_toast("Start at login turned on");
         }
-        Fix::OpenSettings(index) => {
-            super::prefs::show_group(*index);
-            if !window.show_page("settings") {
-                if let Some(app) = window.application() {
-                    app.activate_action("preferences", None);
-                }
-            }
-        }
+        Fix::OpenSettings(index) => open_settings(&window, *index),
         Fix::AskGlide => {
             crate::device_links::glide::ask_again();
             window.show_feature_toast("Glide will ask for permission");
@@ -549,6 +552,21 @@ pub(crate) fn run(anchor: &impl IsA<gtk::Widget>, need: &Need) {
             crate::device_links::glide::ask_phone(id);
             window.show_feature_toast("Asked. Tap Allow on the phone");
         }
+        Fix::TurnOnGlide(id) => {
+            if let Some(daemon) = daemon {
+                daemon.send(DaemonCommand::SetGlide(
+                    id.clone(),
+                    Some(crate::device_links::glide::Edge::Right),
+                ));
+            }
+            open_settings(&window, CONTROL_PAGE);
+            window.show_feature_toast("Glide turned on. Choose where the phone sits");
+        }
+        Fix::TurnOnBucket(id) => {
+            crate::device_links::folders::turn_on_bucket(id);
+            window.show_page("files");
+            window.show_feature_toast("Bucket turned on");
+        }
         Fix::Reconnect(id) => {
             if let Some(daemon) = daemon {
                 daemon.send(DaemonCommand::Reconnect(id.clone()));
@@ -560,6 +578,17 @@ pub(crate) fn run(anchor: &impl IsA<gtk::Widget>, need: &Need) {
         }
     }
     window.refresh_soon();
+}
+
+/// Settings at subpage `index` (the preferences window when no phone is
+/// paired, so there is no Settings page).
+fn open_settings(window: &super::DesklinkWindow, index: usize) {
+    super::prefs::show_group(index);
+    if !window.show_page("settings") {
+        if let Some(app) = window.application() {
+            app.activate_action("preferences", None);
+        }
+    }
 }
 
 /// Says why something is unavailable: the need in a dialog, with its fix as

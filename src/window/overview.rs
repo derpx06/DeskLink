@@ -1,6 +1,7 @@
 //! The Overview page: the phone in a hero band with its quick actions, what
 //! it is doing here, and a card for each feature under "On this computer"
-//! and "On <phone>".
+//! and "On <phone>"; last, every feature with where it is
+//! ([`super::everything`]).
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
@@ -61,9 +62,13 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         .into_iter()
         .map(|item| item.id.clone())
         .collect();
-    let needs = super::requirements::missing(&super::requirements::Facts::now(Some(device)));
+    let facts = super::requirements::Facts::now(Some(device));
+    let needs = super::requirements::missing(&facts);
+    // Every feature, at the end of the page: in the key by its states only.
+    let everything = super::everything::rows(&super::everything::Facts::now(facts, device));
     let key = serde_json::to_string(&(
         super::requirements::key(&needs),
+        super::everything::key(&everything),
         crate::terminal_previews::sessions()
             .iter()
             .any(|info| info.exit_status.is_none()),
@@ -124,6 +129,7 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         page.append(&tiles(daemon, device));
         page.append(&columns(daemon, device));
         page.append(&terminals_card(win, device));
+        page.append(&super::everything::section(daemon, device, &everything));
     } else if device.status == DeviceStatus::PairRequestedByPeer {
         page.append(&super::pairing::pair_request_view(daemon, device));
     } else if device.status == DeviceStatus::PairRequested {
