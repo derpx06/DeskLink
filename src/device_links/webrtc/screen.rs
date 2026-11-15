@@ -776,7 +776,15 @@ fn watch_inbound(pad: &gst::Pad, inner: &Arc<ScreenStreamInner>) {
     let weak = Arc::downgrade(inner);
     std::thread::spawn(move || {
         // The session outlives a share (F28): counted from this share's start.
-        let start = read_inbound();
+        // The phone's source reads as a sender only once this share's first
+        // packet is in, so the baseline waits for it (F32): read too early it
+        // was `None` and the share counted from the connection's start.
+        let start = (0..100).find_map(|_| {
+            read_inbound().or_else(|| {
+                std::thread::sleep(Duration::from_millis(50));
+                None
+            })
+        });
         let mut bytes = start.as_ref().map_or(0, |inbound| inbound.bytes);
         let (mut frames, mut since) = (0u64, Instant::now());
         let mut drops = udp_receive_buffer_drops();

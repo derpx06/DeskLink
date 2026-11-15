@@ -166,6 +166,8 @@ pub(crate) struct Seen<'a> {
     pub(crate) gave_up: bool,
     /// ... because the phone never answered within [`ASK_WAIT`].
     pub(crate) timed_out: bool,
+    /// The phone's person tapped Allow (F33): Android's own share sheet is next.
+    pub(crate) answered: bool,
     pub(crate) has_picture: bool,
     /// Why the phone refused control.
     pub(crate) denial: Option<&'a str>,
@@ -187,7 +189,13 @@ pub(crate) struct Seen<'a> {
 pub(crate) fn status_notice(seen: Seen) -> Option<Notice> {
     let say = |text: String| Some(Notice { text, button: None });
     let phone = seen.phone;
-    let waiting = || say(format!("Waiting for {phone}: tap Allow on the phone"));
+    let waiting = || {
+        say(if seen.answered {
+            format!("Waiting for {phone}: confirm sharing on the phone")
+        } else {
+            format!("Waiting for {phone}: tap Allow on the phone")
+        })
+    };
     match seen.state {
         Some(SessionState::RequestingView) => waiting(),
         Some(
@@ -206,7 +214,9 @@ pub(crate) fn status_notice(seen: Seen) -> Option<Notice> {
             say(format!("{phone} is locked · unlock it to continue"))
         }
         Some(SessionState::Stopped | SessionState::Idle) | None if seen.gave_up => {
-            if seen.timed_out {
+            if seen.timed_out && seen.answered {
+                say(format!("{phone} did not start sharing"))
+            } else if seen.timed_out {
                 say(format!("{phone} did not answer"))
             } else if seen
                 .ended
@@ -675,6 +685,7 @@ pub fn show_remote_control_dialog(
                 state,
                 gave_up,
                 timed_out: restarter.borrow().timed_out(),
+                answered: restarter.borrow().answered,
                 has_picture: paintable.is_some(),
                 denial: denial.as_deref(),
                 ended: ended.as_deref(),
@@ -1134,6 +1145,10 @@ struct Restarter {
     gave_up: bool,
     /// Gave up because the phone never answered within [`ASK_WAIT`].
     timed_out: bool,
+    /// The phone's person tapped Allow for this ask (F33).
+    answered: bool,
+    /// The phone said `view-granted` for this ask at least once.
+    acknowledged: bool,
     /// The session ended while the link was down: ask again when it is back.
     stopped_while_down: bool,
 }
@@ -1194,6 +1209,10 @@ impl Restarter {
     /// Android's sheet up): the wait for the picture starts from then.
     fn answering(&mut self, at: std::time::Instant) {
         if self.last_ask.is_some_and(|ask| at > ask) {
+            // The phone's first `view-granted` comes at once with the ask; only
+            // a later one is its person tapping Allow.
+            self.answered = self.acknowledged;
+            self.acknowledged = true;
             self.last_ask = Some(at);
         }
     }
@@ -1489,6 +1508,43 @@ mod tests {
         assert!(!restarter.waited_out(viewing, false, start + ASK_WAIT));
         assert!(!restarter.waited_out(viewing, false, start + std::time::Duration::from_secs(113)));
         assert!(restarter.waited_out(viewing, false, start + std::time::Duration::from_secs(114)));
+    }
+
+    /// F33: once the phone's person tapped Allow, the window stops saying
+    /// "tap Allow" and a timeout is not "did not answer". The phone's first
+    /// `view-granted`, sent at once with the ask, is not an answer.
+    #[test]
+    fn after_allow_the_window_says_the_phone_answered() {
+        let start = std::time::Instant::now();
+        let mut restarter = Restarter::default();
+        restarter.sent(start);
+        restarter.answering(start + std::time::Duration::from_millis(80));
+        assert!(!restarter.answered, "the phone's own acknowledgement");
+        restarter.answering(start + std::time::Duration::from_secs(9));
+        assert!(restarter.answered, "Allow tapped");
+        restarter.ask_again();
+        assert!(!restarter.answered);
+
+        let seen = Seen {
+            phone: "realme",
+            answered: true,
+            ..Seen::default()
+        };
+        let waiting = status_notice(Seen {
+            state: Some(SessionState::RequestingView),
+            ..seen
+        });
+        assert_eq!(
+            waiting.unwrap().text,
+            "Waiting for realme: confirm sharing on the phone"
+        );
+        let ended = status_notice(Seen {
+            state: Some(SessionState::Stopped),
+            gave_up: true,
+            timed_out: true,
+            ..seen
+        });
+        assert_eq!(ended.unwrap().text, "realme did not start sharing");
     }
 
     /// A refused control request is asked again with a growing wait, never every 2 s.
