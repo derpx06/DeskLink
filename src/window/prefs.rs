@@ -257,9 +257,12 @@ fn build_view(
     approving: bool,
 ) -> View {
     let groups = groups(daemon, settings, device, glide_status, approving);
+    // Markup, to set back while searching. libadwaita 1.5 (Ubuntu 24.04)
+    // hands back the shown text, which set as markup drew no heading for
+    // "Privacy & security"; later releases hand back the markup.
     let titles: Vec<String> = groups
         .iter()
-        .map(|group| group.title().to_string())
+        .map(|group| glib::markup_escape_text(&plain(&group.title())).to_string())
         .collect();
     let nav = adw::NavigationView::builder()
         .animate_transitions(true)
@@ -2470,8 +2473,9 @@ mod tests {
                     .unwrap()
             };
             assert_eq!(label(&row.title()), format!("Show {name}"));
+            // libadwaita 1.5 hands a subtitle back as the shown text.
             assert_eq!(
-                label(&row.subtitle().unwrap_or_default()),
+                plain(&row.subtitle().unwrap_or_default()),
                 format!("Tell {name}")
             );
             let group = adw::PreferencesGroup::builder()

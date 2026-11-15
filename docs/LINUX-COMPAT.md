@@ -15,7 +15,18 @@ Each one: its own packages from `packaging/` installed, `cargo build --release
 --locked` with the distribution's own Rust, then the binary started under
 Xvfb on a private D-Bus with no desktop (window up, daemon running, `--check`).
 
-DISTRO_TABLE
+| Distribution | GTK / adw / GStreamer / VTE / glib | Rust | Release build | Launch (Xvfb) + `--check` | Tests |
+|---|---|---|---|---|---|
+| Ubuntu 24.04 LTS | 4.14 / 1.5 / 1.24 / 0.76 / 2.80 | 1.85 (`rustc-1.85`) | yes, 6 min | yes R | UBUNTU_TESTS |
+| Debian 13 | 4.18 / 1.7 / 1.26 / 0.80 / 2.84 | 1.85 | yes, 7 min | yes R | not run |
+| Fedora 45 | 4.24 / 1.10 / 1.28 / 0.84 / 2.90 | 1.99 | yes, 4 min | yes R | not run |
+| openSUSE Tumbleweed (20261111) | 4.24 / 1.10 / 1.28 / 0.84 / 2.90 | 1.99 | yes, 5 min | yes R | not run |
+| Arch (2026-11) | 4.24 / 1.10 / 1.28 / 0.84 / 2.90 | 1.100 | yes, 5 min | yes R, plus sway and Xfce below | host gate (Manjaro) |
+
+Each launch: window mapped (`xwininfo`), alive after 25 s with no panic,
+`--check` exit 0, `--version`/`--help` answer without a display (fixed in this
+pass: they used to print the no-display error). No new API floor was found:
+the build is clean from libadwaita 1.5 / GTK 4.14 up to 1.10 / 4.24.
 
 Floor (checked by `src/meson.build`): GTK 4.12, libadwaita 1.5, GStreamer 1.22,
 OpenSSL 3.0, Rust 1.85; VTE 0.76 optional. Ubuntu 24.04 is the oldest native
@@ -59,6 +70,38 @@ there; the System check and the feature's own row say why and give the step.
 4. Fixed: DND was mirrored into GNOME's `show-banners` on any desktop that had
    the schema installed (Plasma, Xfce, Cinnamon usually do), where nothing reads
    it. It is now GNOME Shell only, and the row says so elsewhere. C
+
+## Next to KDE Connect and GSConnect
+
+Plasma ships `kdeconnectd`; GSConnect's daemon can run on GNOME even with its
+extension off (its Files helper starts it over D-Bus). Both use UDP 1716 with
+`SO_REUSEADDR`, as DeskLink does, and TCP from 1716 up.
+
+- **TCP:** DeskLink takes the first free port in 1716-1764 and announces it in
+  its identity; no clash. C
+- **Broadcast beacons** (phone → `255.255.255.255:1716`) reach every socket. R
+- **Unicast beacons** (the phone's announcement to the address it last reached
+  the desk on, used when a paired desk has no link) reach only **one** socket
+  among IPv4 listeners on the same port, the last bound. Measured (and pinned
+  by `a_unicast_datagram_reaches_one_of_two_sockets_sharing_a_port`): two IPv4
+  `SO_REUSEADDR` sockets get one copy between them; a dual-stack IPv6 socket
+  does **not** take IPv4 unicast from DeskLink's IPv4 socket, in either bind
+  order. GSConnect on this laptop holds `[::]:1716` (dual-stack) and KDE
+  Connect binds dual-stack too, so they do not take DeskLink's IPv4 beacons;
+  they do get IPv6 ones, which DeskLink never listened for. A slow reconnect
+  here is therefore not explained by GSConnect stealing IPv4 beacons. R
+- New: the probe reads `/proc/net/udp` and names any other program with an
+  IPv4 socket on 1716 (KDE Connect, GSConnect, Valent, Zorin Connect, or its
+  command name); the "Finding your phone" row turns Limited and stays as a
+  banner until dismissed: "<app> also listens for phones on this computer and
+  can take the messages your phone sends DeskLink... Turn <app> off, then
+  restart DeskLink." Probed at start, 5 s later and when the System check
+  opens. T
+- Not done (needs the phone): a port DeskLink owns alone. The desk would bind
+  an exclusive UDP port (no `SO_REUSEADDR`) and announce it as `udpPort` in
+  its identity; the phone would send its unicast beacons there (broadcasts stay
+  on 1716 for first discovery, `_desklink._udp` mDNS unchanged), plus an IPv6
+  listener so IPv6 unicast beacons are heard at all.
 
 ## Nested and headless sessions run for this table
 
