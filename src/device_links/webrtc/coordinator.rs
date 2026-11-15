@@ -4709,6 +4709,13 @@ fn finish_feature_ready(
     );
     flush_pending_features(binding, sessions);
     crate::device_links::connection_log::note_ready(&binding.device_id, true);
+    // Shown now, not at the next status pass and then the next window tick
+    // (F26: the label said Connected up to 2 s after feature-ready).
+    crate::device_links::daemon::state::reconcile_connection_status(
+        devices,
+        &sessions.connection_snapshot(),
+    );
+    crate::device_links::daemon::state::nudge_tickers();
     crate::device_links::desk_features::on_feature_ready(&binding.device_id);
     // A send a lost connection interrupted carries on where the
     // phone stopped; the phone does the same for its own sends.
