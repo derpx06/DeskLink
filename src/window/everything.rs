@@ -683,6 +683,14 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
         "Every key that does something.".into(),
         open("Show shortcuts", Target::Action(Action::Shortcuts)),
     );
+    add(
+        "about",
+        Group::Help,
+        "desklink-info-symbolic",
+        "About DeskLink".into(),
+        "Version, what's new, where to report a problem, and credits.".into(),
+        open("Open About", Target::Action(Action::About)),
+    );
     out
 }
 
@@ -1023,6 +1031,7 @@ mod tests {
             Action::History => "history",
             Action::Shortcuts => "shortcuts",
             Action::Guide => "guide",
+            Action::About => "about",
         }
     }
 

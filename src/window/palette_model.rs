@@ -119,6 +119,8 @@ pub(crate) enum Action {
     Shortcuts,
     /// The Get started guide.
     Guide,
+    /// The About dialog.
+    About,
 }
 
 /// What choosing a row does.
@@ -649,6 +651,7 @@ pub(crate) fn offered_actions(phone: Option<&PhoneState>) -> Vec<Action> {
         Action::Guide,
         Action::History,
         Action::Shortcuts,
+        Action::About,
     ]);
     out
 }
@@ -696,6 +699,13 @@ fn desk_action(action: Action) -> Item {
             "desklink-history-symbolic",
             "log connections",
             Some("<control>h"),
+        ),
+        Action::About => (
+            "About DeskLink",
+            "Version, what's new, report a problem, credits",
+            "desklink-info-symbolic",
+            "about version credits licence license developer derpx06 bug report problem new release notes",
+            None,
         ),
         _ => (
             "Keyboard shortcuts",

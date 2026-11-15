@@ -72,6 +72,7 @@ fn since_process_start_ms() -> f64 {
     }
 }
 
+mod about;
 mod application;
 mod autostart;
 mod bucket_progress;
