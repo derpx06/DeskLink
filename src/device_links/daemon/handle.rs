@@ -58,6 +58,8 @@ pub enum DaemonEvent {
     },
     /// The phone refused a call request, in the user's words.
     CallRefused { message: String },
+    /// The phone could not lock itself when asked (F30), in the user's words.
+    LockRefused { message: String },
     /// A new pairing replaced an older record of the same name that was
     /// offline and looked like the same phone reinstalled.
     PairingReplaced { name: String },
