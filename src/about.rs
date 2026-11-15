@@ -61,7 +61,22 @@ pub(crate) fn present(parent: &impl IsA<gtk::Widget>, daemon: Option<&DaemonHand
         // Translators: Replace "translator-credits" with your name/username, and optionally an email or URL.
         .translator_credits(gettext("translator-credits"))
         .copyright(format!("© 2026 {DEVELOPER}"))
-        .debug_info(debug_info(paired_phones))
+        .debug_info(debug_info(
+            paired_phones,
+            // Read here, on the initialised GTK thread.
+            [
+                (
+                    gtk::major_version(),
+                    gtk::minor_version(),
+                    gtk::micro_version(),
+                ),
+                (
+                    adw::major_version(),
+                    adw::minor_version(),
+                    adw::micro_version(),
+                ),
+            ],
+        ))
         .debug_info_filename("desklink-details.txt")
         .build();
     about.add_link("Privacy", PRIVACY);
@@ -96,23 +111,18 @@ pub(crate) fn present(parent: &impl IsA<gtk::Widget>, daemon: Option<&DaemonHand
 /// The lines "Troubleshooting" offers to copy into a bug report: versions,
 /// the kind of desktop and session, and a count of paired phones. No names,
 /// addresses, ids or keys.
-pub(crate) fn debug_info(paired_phones: usize) -> String {
+pub(crate) fn debug_info(paired_phones: usize, toolkit: [(u32, u32, u32); 2]) -> String {
+    let [(gtk_major, gtk_minor, gtk_micro), (adw_major, adw_minor, adw_micro)] = toolkit;
     let (gst_major, gst_minor, gst_micro, _) = gst::version();
     let env = |key: &str| std::env::var(key).unwrap_or_else(|_| "unknown".into());
     format!(
         "DeskLink {VERSION}\n\
-         GTK {}.{}.{}\n\
-         libadwaita {}.{}.{}\n\
+         GTK {gtk_major}.{gtk_minor}.{gtk_micro}\n\
+         libadwaita {adw_major}.{adw_minor}.{adw_micro}\n\
          GStreamer {gst_major}.{gst_minor}.{gst_micro}\n\
          Desktop: {}\n\
          Session: {}\n\
          Paired phones: {paired_phones}\n",
-        gtk::major_version(),
-        gtk::minor_version(),
-        gtk::micro_version(),
-        adw::major_version(),
-        adw::minor_version(),
-        adw::micro_version(),
         env("XDG_CURRENT_DESKTOP"),
         env("XDG_SESSION_TYPE"),
     )
@@ -126,12 +136,7 @@ mod tests {
     /// nothing that names a person, a computer or a phone.
     #[test]
     fn the_details_hold_versions_desktop_session_and_a_count_only() {
-        // The toolkit versions are read on an initialised GTK thread.
-        crate::test_display::run(the_details_hold_only_versions_and_a_count);
-    }
-
-    fn the_details_hold_only_versions_and_a_count() {
-        let info = debug_info(2);
+        let info = debug_info(2, [(4, 18, 1), (1, 8, 0)]);
         let keys: Vec<&str> = info
             .lines()
             .map(|line| line.split([' ', ':']).next().unwrap())

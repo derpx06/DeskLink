@@ -688,7 +688,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
         Group::Help,
         "desklink-info-symbolic",
         "About DeskLink".into(),
-        "Version, what's new, where to report a problem, and credits.".into(),
+        "Version, what's new, credits, and where to tell us when something goes wrong.".into(),
         open("Open About", Target::Action(Action::About)),
     );
     out

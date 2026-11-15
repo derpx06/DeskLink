@@ -1478,7 +1478,8 @@ mod tests {
                 "Pair another phone",
                 "Get started",
                 "Connection history",
-                "Keyboard shortcuts"
+                "Keyboard shortcuts",
+                "About DeskLink"
             ]
         );
         // Notes are the user's own; the pages of a phone are not there.
