@@ -71,6 +71,54 @@ fn enable_immediate_rtcp_feedback(webrtcbin: &gst::Element) {
     });
 }
 
+/// NACKs the phone's video, which `webrtcbin` left un-NACKed.
+///
+/// `webrtcbin` (1.28 and main, `jitter_buffer_set_retransmission`) sets a new
+/// jitterbuffer's `do-retransmission` by walking *every* SSRC the remote
+/// description listed in the bundle, applying each one's transceiver `do-nack`
+/// without comparing SSRCs: the last listed wins. The phone lists video, then
+/// audio, so its video took audio's `false`. Measured live: lost 489, nack 0,
+/// every loss a PLI and a keyframe (a ~2 s freeze per burst). This handler runs
+/// after `webrtcbin`'s and decides from the SSRC's own m-section instead.
+fn retransmit_by_media_section(webrtcbin: &gst::Element) {
+    let Some(rtpbin) = webrtcbin
+        .downcast_ref::<gst::Bin>()
+        .and_then(|bin| bin.by_name("rtpbin"))
+    else {
+        return;
+    };
+    let webrtcbin = webrtcbin.downgrade();
+    rtpbin.connect("new-jitterbuffer", false, move |values| {
+        let jitterbuffer = values[1].get::<gst::Element>().ok()?;
+        let ssrc = values[3].get::<u32>().ok()?;
+        let sdp = webrtcbin
+            .upgrade()?
+            .property::<Option<gst_webrtc::WebRTCSessionDescription>>("remote-description")?
+            .sdp()
+            .as_text()
+            .ok()?;
+        let kind = media_kind_of_ssrc(&sdp, ssrc)?;
+        if jitterbuffer.has_property("do-retransmission", None) {
+            jitterbuffer.set_property("do-retransmission", kind == "video");
+        }
+        None
+    });
+}
+
+/// The kind (`video`, `audio`) of the m-section that lists `ssrc`.
+fn media_kind_of_ssrc(sdp: &str, ssrc: u32) -> Option<&str> {
+    let tag = format!("a=ssrc:{ssrc} ");
+    let mut kind = None;
+    for line in sdp.lines() {
+        if let Some(media) = line.strip_prefix("m=") {
+            kind = media.split(' ').next();
+        } else if line.starts_with(&tag) {
+            return kind;
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub enum PeerEvent {
     LocalDescription {
@@ -272,6 +320,7 @@ impl DesktopWebRtcPeer {
             );
         }
         enable_immediate_rtcp_feedback(&webrtcbin);
+        retransmit_by_media_section(&webrtcbin);
         // Before the pipeline starts: candidate gathering begins as soon as the
         // element goes to Playing, so restricting it afterwards would be too
         // late for the first negotiation.
@@ -2421,6 +2470,50 @@ a=max-message-size:262144\r\n";
 
         assert_eq!(capture.payload_type(), 100);
         let _ = capture.stop();
+        peer.close();
+    }
+
+    /// The phone's offer lists its video SSRCs, then its audio SSRC. webrtcbin
+    /// gave every new jitterbuffer the `do-nack` of the *last* SSRC listed
+    /// (audio's false), so the phone's video was never NACKed: measured live,
+    /// lost 489, nack 0, each loss a PLI and a keyframe.
+    #[test]
+    fn the_phones_video_jitterbuffer_retransmits_and_its_audio_does_not() {
+        let audio = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:Zx4l\r\n\
+a=ice-pwd:Ye1kU7eZ1cTnL7l3fJQ7t0q2\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 4B:1C:3E:8A:0D:52:97:6F:B3:21:E4:7A:C8:19:5D:F0:2A:66:B1:93:0E:D7:48:AC:35:7B:E2:19:84:CF:60:1D\r\n\
+a=setup:actpass\r\n\
+a=mid:2\r\n\
+a=sendrecv\r\n\
+a=msid:desklink-audio 0b5e2d0c-7f1a-4d2e-9c3b-5a6f7e8d9c0b\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=rtcp-fb:111 transport-cc\r\n\
+a=fmtp:111 minptime=10;useinbandfec=1\r\n\
+a=ssrc:3333333333 cname:desklinkphone\r\n\
+a=ssrc:3333333333 msid:desklink-audio 0b5e2d0c-7f1a-4d2e-9c3b-5a6f7e8d9c0b\r\n";
+        let offer = PHONE_OFFER
+            .replace("a=group:BUNDLE 0 1", "a=group:BUNDLE 0 2 1")
+            .replace("m=application", &format!("{audio}m=application"));
+        let peer = answered_peer(&offer);
+        let rtpbin = peer
+            .webrtcbin
+            .downcast_ref::<gst::Bin>()
+            .and_then(|bin| bin.by_name("rtpbin"))
+            .unwrap();
+        let retransmits = |ssrc: u32| {
+            let jitterbuffer = gst::ElementFactory::make("rtpjitterbuffer")
+                .build()
+                .unwrap();
+            rtpbin.emit_by_name::<()>("new-jitterbuffer", &[&jitterbuffer, &0u32, &ssrc]);
+            jitterbuffer.property::<bool>("do-retransmission")
+        };
+        assert!(retransmits(1111111111), "the phone's video is NACKed");
+        assert!(!retransmits(3333333333), "its audio is not");
         peer.close();
     }
 
