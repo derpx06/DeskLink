@@ -10,6 +10,10 @@ fn bundled_icons() -> Vec<String> {
         .lines()
         .filter_map(|line| {
             let alias = line.split("alias=\"icons/scalable/").nth(1)?;
+            // The app's own icon (from data/), not one of the UI's symbolics.
+            if alias.starts_with("apps/") {
+                return None;
+            }
             let file = alias.split('/').nth(1)?.split('"').next()?;
             Some(file.strip_suffix(".svg")?.to_string())
         })
@@ -123,6 +127,15 @@ fn the_compiled_resources_hold_every_icon() {
         });
         assert!(found.is_ok(), "{name} is not in the compiled resources");
     }
+    assert!(
+        resources
+            .lookup_data(
+                "/derx06/desklink/com/icons/scalable/apps/derx06.desklink.com.svg",
+                gio::ResourceLookupFlags::NONE
+            )
+            .is_ok(),
+        "the app icon, for a binary that is not installed"
+    );
     assert!(resources
         .lookup_data(
             "/derx06/desklink/com/ui-kit.css",

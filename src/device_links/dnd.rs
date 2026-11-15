@@ -274,8 +274,16 @@ const KEY: &str = "show-banners";
 pub(crate) struct GnomeBanners(gtk::gio::Settings);
 
 impl GnomeBanners {
-    /// `None` on a desktop without the schema (or the key).
+    /// `None` on a desktop without the schema (or the key), and on every
+    /// desktop but GNOME Shell: Plasma, Xfce, Cinnamon and the rest often have
+    /// the schema installed but never read it, so writing it would claim a
+    /// Do Not Disturb that nothing shows.
     pub(crate) fn open() -> Option<Self> {
+        if !crate::platform::is_gnome_shell(
+            &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
+        ) {
+            return None;
+        }
         let source = gtk::gio::SettingsSchemaSource::default()?;
         let schema = source.lookup(SCHEMA, true)?;
         schema

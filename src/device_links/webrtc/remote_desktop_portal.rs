@@ -524,6 +524,19 @@ impl RemoteDesktopPortal {
         let connection = gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>)
             .map_err(|error| format!("Could not connect to the desktop portal: {error}"))?;
         let cursor_mode = ready_portal(&connection, if virtual_size.is_some() { 4 } else { 1 })?;
+        // wlroots compositors (sway, Hyprland, labwc, river, niri) have
+        // ScreenCast but no RemoteDesktop: the phone then watches, view
+        // only, as after a GNOME grant without Allow Remote Interaction.
+        // A new monitor needs RemoteDesktop's input socket, so not there.
+        let remote = offers(&connection, REMOTE_INTERFACE);
+        if !remote && virtual_size.is_some() {
+            return Err("This desktop cannot add a screen for the phone".to_string());
+        }
+        let session_interface = if remote {
+            REMOTE_INTERFACE
+        } else {
+            SCREEN_INTERFACE
+        };
         let context = glib::MainContext::new();
         context
             .with_thread_default(|| {
@@ -536,7 +549,7 @@ impl RemoteDesktopPortal {
                     &connection,
                     cancel,
                     PORTAL_PATH,
-                    REMOTE_INTERFACE,
+                    session_interface,
                     "CreateSession",
                     tuple([create_options]),
                 )?;
@@ -567,36 +580,38 @@ impl RemoteDesktopPortal {
                 };
 
                 let session_arg = object_path(&session_handle)?;
-                let device_options = options(|dict| {
-                    // Keyboard and pointer. The grant is remembered so the
-                    // phone alone can resume it later; a stored token resumes
-                    // it now. A stale or revoked token brings the dialog back.
-                    dict.insert("types", 3u32);
-                    // Debug builds: DESKLINK_PORTAL_PERSIST overrides, to test
-                    // how GNOME's dialog behaves in each mode.
-                    let persist_mode = if cfg!(debug_assertions) {
-                        std::env::var("DESKLINK_PORTAL_PERSIST")
-                            .ok()
-                            .and_then(|mode| mode.parse().ok())
-                            .unwrap_or(PERSIST_FOR_SESSION)
-                    } else {
-                        PERSIST_FOR_SESSION
-                    };
-                    dict.insert("persist_mode", persist_mode);
-                    if let Some(restore) = restore_token {
-                        dict.insert("restore_token", restore);
-                    }
-                    dict.insert("handle_token", token());
-                });
-                request(
-                    &context,
-                    &connection,
-                    cancel,
-                    PORTAL_PATH,
-                    REMOTE_INTERFACE,
-                    "SelectDevices",
-                    tuple([session_arg.clone(), device_options]),
-                )?;
+                if remote {
+                    let device_options = options(|dict| {
+                        // Keyboard and pointer. The grant is remembered so the
+                        // phone alone can resume it later; a stored token resumes
+                        // it now. A stale or revoked token brings the dialog back.
+                        dict.insert("types", 3u32);
+                        // Debug builds: DESKLINK_PORTAL_PERSIST overrides, to test
+                        // how GNOME's dialog behaves in each mode.
+                        let persist_mode = if cfg!(debug_assertions) {
+                            std::env::var("DESKLINK_PORTAL_PERSIST")
+                                .ok()
+                                .and_then(|mode| mode.parse().ok())
+                                .unwrap_or(PERSIST_FOR_SESSION)
+                        } else {
+                            PERSIST_FOR_SESSION
+                        };
+                        dict.insert("persist_mode", persist_mode);
+                        if let Some(restore) = restore_token {
+                            dict.insert("restore_token", restore);
+                        }
+                        dict.insert("handle_token", token());
+                    });
+                    request(
+                        &context,
+                        &connection,
+                        cancel,
+                        PORTAL_PATH,
+                        REMOTE_INTERFACE,
+                        "SelectDevices",
+                        tuple([session_arg.clone(), device_options]),
+                    )?;
+                }
 
                 let source_options = options(|dict| {
                     if virtual_size.is_some() {
@@ -630,7 +645,7 @@ impl RemoteDesktopPortal {
                     &connection,
                     cancel,
                     PORTAL_PATH,
-                    REMOTE_INTERFACE,
+                    session_interface,
                     "Start",
                     tuple([
                         session_arg.clone(),
@@ -927,21 +942,24 @@ pub(crate) fn portal_available() -> bool {
     };
     [REMOTE_INTERFACE, SCREEN_INTERFACE]
         .into_iter()
-        .all(|interface| {
-            connection
-                .call_sync(
-                    Some(PORTAL_BUS),
-                    PORTAL_PATH,
-                    "org.freedesktop.DBus.Properties",
-                    "Get",
-                    Some(&(interface, "version").to_variant()),
-                    None,
-                    gio::DBusCallFlags::NONE,
-                    2_000,
-                    None::<&gio::Cancellable>,
-                )
-                .is_ok()
-        })
+        .all(|interface| offers(&connection, interface))
+}
+
+/// Whether the portal has `interface` (it answers for its version).
+fn offers(connection: &gio::DBusConnection, interface: &str) -> bool {
+    connection
+        .call_sync(
+            Some(PORTAL_BUS),
+            PORTAL_PATH,
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            Some(&(interface, "version").to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            2_000,
+            None::<&gio::Cancellable>,
+        )
+        .is_ok()
 }
 
 pub(crate) fn input_actions(
@@ -1291,6 +1309,31 @@ pub(crate) fn token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Against the session's real portal: a share starts there, and comes
+    /// back view only exactly when the portal has no RemoteDesktop (sway's
+    /// xdg-desktop-portal-wlr with `chooser_type=none`, so nobody has to
+    /// pick). Run inside such a session:
+    /// `cargo test -- --ignored a_real_portal_share`.
+    #[test]
+    #[ignore = "needs a desktop session with a ScreenCast portal"]
+    fn a_real_portal_share_is_view_only_without_remote_desktop() {
+        let connection =
+            gio::bus_get_sync(gio::BusType::Session, None::<&gio::Cancellable>).unwrap();
+        let remote = offers(&connection, REMOTE_INTERFACE);
+        let cancel = AtomicBool::new(false);
+        let (portal, source) = RemoteDesktopPortal::start("", &cancel, None).unwrap();
+        eprintln!(
+            "remote desktop: {remote}; stream {}x{} node {}; devices {}",
+            source.width, source.height, source.node_id, source.granted_device_types
+        );
+        assert!(source.node_id != 0 && source.width > 0 && source.height > 0);
+        if !remote {
+            assert_eq!(source.granted_device_types, 0, "view only");
+            assert_eq!(source.token_to_remember(), None);
+        }
+        drop(portal);
+    }
     use crate::device_links::packet::NetworkPacket;
 
     #[test]

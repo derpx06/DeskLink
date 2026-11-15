@@ -374,16 +374,29 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
             screen.unwrap_or_else(|| ready("Sound options", Go::Sound)),
         );
     }
+    // Shared view only (a wlroots portal): watching works, so the row is
+    // not off; its line says what is missing.
+    let view_only = check("share").filter(|check| check.level == Level::Limited);
+    let share_off = || broken("share").filter(|_| view_only.is_none());
     add(
         "desk-screen",
         Group::Screen,
         "desklink-desktop-windows-symbolic",
         format!("This screen on {name}"),
-        format!(
-            "On {name}, tap Desk screen to watch this screen and use the phone as its trackpad \
-             and keyboard."
-        ),
-        broken("share")
+        match view_only {
+            Some(check) => format!(
+                "On {name}, tap Desk screen to watch this screen. {}",
+                check
+                    .detail
+                    .trim_start_matches(crate::platform::SHARE_THROUGH_DESKTOP)
+                    .trim()
+            ),
+            None => format!(
+                "On {name}, tap Desk screen to watch this screen and use the phone as its \
+                 trackpad and keyboard."
+            ),
+        },
+        share_off()
             .or_else(|| need("plugins"))
             .or_else(|| need("screen-control"))
             .unwrap_or_else(|| open("Control settings", guide::settings("Control"))),
@@ -394,15 +407,13 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
         "desklink-devices-symbolic",
         format!("{} as a second screen", facts.kind),
         format!("On {name}, open Desk screen and choose Extend, then drag windows onto it."),
-        broken("share")
-            .or_else(|| broken("extend"))
-            .unwrap_or_else(|| {
-                if facts.displays {
-                    ready("Arrange displays", Go::Do(Do::Displays))
-                } else {
-                    open("Control settings", guide::settings("Control"))
-                }
-            }),
+        share_off().or_else(|| broken("extend")).unwrap_or_else(|| {
+            if facts.displays {
+                ready("Arrange displays", Go::Do(Do::Displays))
+            } else {
+                open("Control settings", guide::settings("Control"))
+            }
+        }),
     );
     if sends(PACKET_TYPE_SHARE_INPUT_DEVICES_REQUEST) {
         add(
@@ -520,7 +531,8 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
             "With clipboard sharing on, what you copy on one is ready to paste on the other."
                 .into(),
             if facts.clipboard_sync {
-                step("clipboard")
+                broken("clipboard")
+                    .or_else(|| step("clipboard"))
                     .unwrap_or_else(|| on_phone(Action::SendClipboard, "Send clipboard now"))
             } else {
                 turned_off("Clipboard")
@@ -942,6 +954,7 @@ mod tests {
             desktop: "GNOME".into(),
             session_type: Some("wayland".into()),
             wayland_display: true,
+            x11_display: true,
             session_bus: true,
             system_bus: true,
             runtime_dir: true,
@@ -1174,6 +1187,40 @@ mod tests {
 
     /// A phone action: ready does what its tile does; away it is Try again;
     /// an older phone says to update it, with no button.
+    /// A wlroots portal (ScreenCast, no RemoteDesktop): the phone watches
+    /// this screen, so its row is not off, and Extend says its own reason.
+    #[test]
+    fn a_view_only_desktop_shares_the_screen_and_says_control_is_missing() {
+        let mut sway = facts();
+        sway.base.checks = evaluate(&Probe {
+            portals: ["ScreenCast"].map(String::from).into(),
+            session_names: ["org.freedesktop.portal.Desktop".to_string()].into(),
+            ..sway_probe()
+        });
+        let screen = row(&sway, "desk-screen");
+        assert!(!matches!(screen.state, State::Off(_)), "{:?}", screen.state);
+        assert!(screen.line.contains("not control it"), "{}", screen.line);
+        assert!(!screen.line.contains(crate::platform::SHARE_THROUGH_DESKTOP));
+        match row(&sway, "extend").state {
+            State::Off(why) => assert!(why.contains("second screen"), "{why}"),
+            other => panic!("extend: {other:?}"),
+        }
+    }
+
+    fn sway_probe() -> Probe {
+        Probe {
+            desktop: "sway".into(),
+            session_type: Some("wayland".into()),
+            wayland_display: true,
+            session_bus: true,
+            config_writable: true,
+            elements: ["webrtcbin", "pipewiresrc", "vp8enc", "vp8dec"]
+                .map(String::from)
+                .into(),
+            ..Probe::default()
+        }
+    }
+
     #[test]
     fn a_phone_action_says_what_it_needs() {
         let send = row(&facts(), "send");

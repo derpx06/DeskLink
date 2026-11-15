@@ -183,6 +183,9 @@ pub struct Probe {
     pub terminals: BTreeSet<String>,
     pub config_writable: bool,
     pub toolkit: String,
+    /// Other programs listening for phones on DeskLink's IPv4 discovery port
+    /// ([`discovery_sharers`]).
+    pub discovery_sharers: Vec<String>,
 }
 
 /// The elements the probe asks GStreamer about.
@@ -471,6 +474,41 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
         ))
     });
 
+    // Finding the phone: another IPv4 listener on the discovery port takes
+    // unicast beacons (the kernel gives each to one socket only).
+    rows.push(if probe.discovery_sharers.is_empty() {
+        check(
+            "discovery",
+            "Finding your phone",
+            Level::Ok,
+            "Only DeskLink listens for phones on this computer.",
+            None,
+        )
+    } else {
+        let names = and_list(&probe.discovery_sharers);
+        let (listen, it) = if probe.discovery_sharers.len() == 1 {
+            ("listens", "it")
+        } else {
+            ("listen", "them")
+        };
+        check(
+            "discovery",
+            "Finding your phone",
+            Level::Limited,
+            format!(
+                "{names} also {listen} for phones on this computer and can take the \
+                 messages your phone sends DeskLink, so your phone can take minutes to \
+                 reconnect. Turn {names} off (quit {it} and stop {it} starting at login, or \
+                 uninstall {it}), then restart DeskLink."
+            ),
+            None,
+        )
+        .tech(format!(
+            "Another IPv4 UDP socket is bound to port {DISCOVERY_PORT} (SO_REUSEADDR): each \
+             unicast beacon reaches only one of them."
+        ))
+    });
+
     // The tray.
     rows.push(if probe.tray_host {
         check(
@@ -530,6 +568,30 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             .tech("No org.freedesktop.Notifications server and no Notification portal.")
         },
     );
+
+    // The clipboard is read through X11 (XWayland on Wayland): Wayland lets
+    // only the focused window read it, and DeskLink is usually in the
+    // background (`daemon/clipboard.rs`).
+    rows.push(if probe.x11_display || !wayland {
+        check(
+            "clipboard",
+            "Shared clipboard",
+            Level::Ok,
+            "What you copy here can reach the phone.",
+            None,
+        )
+    } else {
+        check(
+            "clipboard",
+            "Shared clipboard",
+            Level::Limited,
+            "This session runs without X11 support (Xwayland), so what you copy here does not \
+             reach the phone; the phone's copies still arrive. Turn Xwayland on in your \
+             compositor's settings (on niri, run xwayland-satellite) and log in again.",
+            None,
+        )
+        .tech("No DISPLAY: the clipboard watch and password-manager hints need X11 or Xwayland.")
+    });
 
     // Sharing and controlling this computer.
     // Desktop to phone video is VP8 (an H.264 encoder is only an experiment).
@@ -596,19 +658,6 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             None,
         )
         .tech("No xdg-desktop-portal ScreenCast interface answered.")
-    } else if !has_portal("RemoteDesktop") {
-        check(
-            "share",
-            "Share this screen and let the phone control it",
-            Level::Missing,
-            format!(
-                "This desktop can show its screen to apps but cannot let them control it, and \
-                 DeskLink needs both. GNOME and KDE Plasma can; {} cannot on every desktop.",
-                portal_backend(family)
-            ),
-            None,
-        )
-        .tech("The portal has ScreenCast but no RemoteDesktop interface.")
     } else if !any(&["pipewiresrc"]) {
         check(
             "share",
@@ -627,6 +676,21 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             Some(GST_GOOD),
         )
         .tech("Needs GStreamer vp8enc (gst-plugins-good).")
+    } else if !has_portal("RemoteDesktop") {
+        // wlroots portals (xdg-desktop-portal-wlr, -hyprland): the phone
+        // watches, view only.
+        check(
+            "share",
+            "Share this screen and let the phone control it",
+            Level::Limited,
+            format!(
+                "{SHARE_THROUGH_DESKTOP} The phone can watch this screen but not control it: \
+                 this desktop lets apps show its screen, not control it. GNOME and KDE Plasma \
+                 can."
+            ),
+            None,
+        )
+        .tech("The portal has ScreenCast but no RemoteDesktop interface: view only.")
     } else {
         check(
             "share",
@@ -1054,7 +1118,7 @@ fn spawn_probe(log: bool, after: std::time::Duration) {
 /// The row ids whose loss is shown as a banner that stays until the person
 /// dismisses it (everything else is a Settings note): nothing connects, or
 /// nothing can be saved.
-const STICKY: [&str; 2] = ["link", "storage"];
+const STICKY: [&str; 3] = ["link", "storage", "discovery"];
 
 /// The standing problem to keep in front of the person, if any: its row id
 /// its plain words, and the install command for this distribution apart (the
@@ -1070,7 +1134,13 @@ fn sticky_from(
     STICKY.iter().find_map(|id| {
         let row = rows
             .iter()
-            .find(|row| row.id == *id && row.level == Level::Missing)?;
+            // Another program taking the phone's messages is only a limit,
+            // but one the person would never find: it is shown too.
+            .find(|row| {
+                row.id == *id
+                    && (row.level == Level::Missing
+                        || (row.id == "discovery" && row.level == Level::Limited))
+            })?;
         let command = row.install.map(|packages| packages.command(distro));
         Some((*id, row.detail.clone(), command))
     })
@@ -1272,7 +1342,118 @@ impl Probe {
         }
         probe.terminals = crate::device_links::pty::desk::installed_terminals();
         probe.config_writable = config_writable();
+        probe.discovery_sharers = discovery_sharers();
         probe
+    }
+}
+
+/// DeskLink's UDP discovery port, also KDE Connect's and GSConnect's.
+const DISCOVERY_PORT: u16 = crate::device_links::daemon::network::UDP_PORT;
+
+/// "A", "A and B", "A, B and C".
+fn and_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// The programs other than DeskLink with an IPv4 UDP socket on the
+/// discovery port. Both sides set `SO_REUSEADDR`, so the bind succeeds, and
+/// the kernel then gives each unicast datagram (a phone's beacon to the
+/// address it last reached this computer on) to one of the sockets only.
+/// Broadcasts reach all of them, and a dual-stack IPv6 socket (GSConnect's,
+/// KDE Connect's) loses IPv4 unicast to DeskLink's IPv4 one, so only IPv4
+/// listeners are counted.
+pub(crate) fn discovery_sharers() -> Vec<String> {
+    let table = std::fs::read_to_string("/proc/net/udp").unwrap_or_default();
+    holders(&udp4_inodes(&table, DISCOVERY_PORT), std::process::id())
+}
+
+/// The inodes of the sockets bound to `port` in `/proc/net/udp` text.
+fn udp4_inodes(table: &str, port: u16) -> Vec<u64> {
+    let suffix = format!(":{port:04X}");
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if !fields.get(1)?.ends_with(&suffix) {
+                return None;
+            }
+            fields.get(9)?.parse().ok().filter(|inode| *inode != 0)
+        })
+        .collect()
+}
+
+/// Who holds each socket in `inodes`, by name, leaving out process
+/// `own_pid`; a socket whose holder cannot be seen (another user's process)
+/// is "Another program".
+fn holders(inodes: &[u64], own_pid: u32) -> Vec<String> {
+    let mut names = Vec::new();
+    if inodes.is_empty() {
+        return names;
+    }
+    let mut seen = Vec::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(target) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let Some(inode) = target
+                .to_str()
+                .and_then(|t| t.strip_prefix("socket:["))
+                .and_then(|t| t.strip_suffix(']'))
+                .and_then(|t| t.parse::<u64>().ok())
+                .filter(|inode| inodes.contains(inode))
+            else {
+                continue;
+            };
+            seen.push(inode);
+            if pid != own_pid {
+                let read = |file: &str| std::fs::read(entry.path().join(file)).unwrap_or_default();
+                names.push(app_name(
+                    String::from_utf8_lossy(&read("comm")).trim(),
+                    &String::from_utf8_lossy(&read("cmdline")).replace('\0', " "),
+                ));
+            }
+        }
+    }
+    if inodes.iter().any(|inode| !seen.contains(inode)) {
+        names.push("Another program".to_string());
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// A process as the person knows it: the KDE Connect family by its name,
+/// anything else by its command name.
+fn app_name(comm: &str, cmdline: &str) -> String {
+    let cmdline = cmdline.to_ascii_lowercase();
+    if comm == "kdeconnectd" {
+        "KDE Connect".into()
+    } else if cmdline.contains("gsconnect") {
+        "GSConnect".into()
+    } else if cmdline.contains("zorin-connect") || cmdline.contains("zorin_connect") {
+        "Zorin Connect".into()
+    } else if comm == "valent" {
+        "Valent".into()
+    } else if comm.is_empty() {
+        "Another program".into()
+    } else {
+        comm.to_string()
     }
 }
 
@@ -1322,6 +1503,7 @@ mod tests {
             desktop: "GNOME".into(),
             session_type: Some("wayland".into()),
             wayland_display: true,
+            x11_display: true,
             runtime_dir: true,
             session_bus: true,
             system_bus: true,
@@ -1589,7 +1771,7 @@ mod tests {
             (
                 "sway",
                 wayland("sway", &["ScreenCast"], Some(3), None),
-                [M, M, M, L, L],
+                [L, M, M, L, L],
             ),
             (
                 "Hyprland",
@@ -1599,12 +1781,12 @@ mod tests {
                     Some(7),
                     None,
                 ),
-                [M, M, M, L, L],
+                [L, M, M, L, L],
             ),
             (
                 "COSMIC",
                 wayland("COSMIC", &["ScreenCast"], Some(3), None),
-                [M, M, M, L, O],
+                [L, M, M, L, O],
             ),
             (
                 "i3 via startx",
@@ -1626,15 +1808,158 @@ mod tests {
     }
 
     #[test]
-    fn a_wlroots_portal_without_remote_desktop_cannot_control() {
+    fn a_wlroots_portal_without_remote_desktop_shares_view_only() {
         let rows = evaluate(&Probe {
             desktop: "sway".into(),
             portals: names(&["ScreenCast"]),
             ..full()
         });
         let share = row(&rows, "share");
-        assert_eq!(share.level, Level::Missing);
+        assert_eq!(share.level, Level::Limited, "view only");
+        assert!(share.detail.starts_with(SHARE_THROUGH_DESKTOP));
+        assert!(share
+            .detail
+            .contains("watch this screen but not control it"));
         assert!(share.tech.contains("RemoteDesktop"));
+        // Not something to install: nothing would add remote control there.
+        assert_eq!(share.install, None);
+        // Watching still needs the PipeWire part and the encoder.
+        let mut probe = Probe {
+            desktop: "sway".into(),
+            portals: names(&["ScreenCast"]),
+            ..full()
+        };
+        probe.elements.remove("pipewiresrc");
+        assert_eq!(level(&evaluate(&probe), "share"), Level::Missing);
+    }
+
+    #[test]
+    fn a_wayland_session_without_xwayland_says_copies_here_do_not_reach_the_phone() {
+        assert_eq!(
+            level(&evaluate(&full()), "clipboard"),
+            Level::Ok,
+            "GNOME has Xwayland"
+        );
+        let rows = evaluate(&Probe {
+            desktop: "niri".into(),
+            x11_display: false,
+            ..full()
+        });
+        let clipboard = row(&rows, "clipboard");
+        assert_eq!(clipboard.level, Level::Limited);
+        assert!(clipboard.detail.contains("xwayland-satellite"));
+        let x11 = Probe {
+            session_type: Some("x11".into()),
+            wayland_display: false,
+            x11_display: true,
+            ..full()
+        };
+        assert_eq!(level(&evaluate(&x11), "clipboard"), Level::Ok);
+    }
+
+    #[test]
+    fn another_listener_on_the_discovery_port_is_named_and_kept_in_view() {
+        assert_eq!(level(&evaluate(&full()), "discovery"), Level::Ok);
+        let rows = evaluate(&Probe {
+            discovery_sharers: vec!["GSConnect".into(), "KDE Connect".into()],
+            ..full()
+        });
+        let row = row(&rows, "discovery");
+        assert_eq!(row.level, Level::Limited);
+        assert!(row
+            .detail
+            .starts_with("GSConnect and KDE Connect also listen for"));
+        assert!(row.detail.contains("Turn GSConnect and KDE Connect off"));
+        let (id, words, command) = sticky_from(&rows, None).unwrap();
+        assert_eq!((id, command), ("discovery", None), "a banner: {words}");
+        assert_eq!(
+            app_name("gjs", "gjs -m /usr/share/gnome-shell/extensions/gsconnect@andyholmes.github.io/service/daemon.js"),
+            "GSConnect"
+        );
+        assert_eq!(
+            app_name("kdeconnectd", "/usr/bin/kdeconnectd"),
+            "KDE Connect"
+        );
+        assert_eq!(app_name("", ""), "Another program");
+        assert_eq!(
+            and_list(&["A".into(), "B".into(), "C".into()]),
+            "A, B and C"
+        );
+    }
+
+    #[test]
+    fn the_proc_udp_table_gives_the_sockets_on_a_port() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n   23: 00000000:06B4 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 344901 2 00000000302a0e1b 0\n   24: 0100007F:06B4 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 5 2 00000000302a0e1b 0\n 2009: 0D01A8C0:0E76 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 168763 2 000000000295dcd8 0\n";
+        assert_eq!(udp4_inodes(table, 1716), [344901, 5]);
+        assert!(udp4_inodes(table, 1717).is_empty());
+    }
+
+    /// What the row is about, on this kernel: two IPv4 sockets sharing a
+    /// port with `SO_REUSEADDR` get each unicast datagram once between them
+    /// (a phone's beacon reaches one), and the probe sees the second holder.
+    /// A dual-stack IPv6 socket (GSConnect's) does not take IPv4 unicast from
+    /// an IPv4 one, so it is not counted.
+    #[test]
+    fn a_unicast_datagram_reaches_one_of_two_sockets_sharing_a_port() {
+        use socket2::{Domain, Socket, Type};
+        use std::net::{SocketAddr, UdpSocket};
+        let bind = |domain: Domain, addr: SocketAddr| -> std::io::Result<UdpSocket> {
+            let socket = Socket::new(domain, Type::DGRAM, None)?;
+            socket.set_reuse_address(true)?;
+            if domain == Domain::IPV6 {
+                socket.set_only_v6(false)?;
+            }
+            socket.bind(&addr.into())?;
+            Ok(socket.into())
+        };
+        let first = bind(Domain::IPV4, "0.0.0.0:0".parse().unwrap()).unwrap();
+        let port = first.local_addr().unwrap().port();
+        let second = bind(Domain::IPV4, SocketAddr::from(([0, 0, 0, 0], port))).unwrap();
+        let wait = std::time::Duration::from_millis(300);
+        let received = |sockets: &[&UdpSocket]| -> usize {
+            UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .send_to(b"beacon", ("127.0.0.1", port))
+                .unwrap();
+            sockets
+                .iter()
+                .filter(|socket| {
+                    socket.set_read_timeout(Some(wait)).unwrap();
+                    socket.recv(&mut [0; 16]).is_ok()
+                })
+                .count()
+        };
+        assert_eq!(
+            received(&[&first, &second]),
+            1,
+            "one of the two, never both"
+        );
+        let table = std::fs::read_to_string("/proc/net/udp").unwrap();
+        let inodes = udp4_inodes(&table, port);
+        assert_eq!(inodes.len(), 2);
+        assert!(
+            holders(&inodes, std::process::id()).is_empty(),
+            "both are ours"
+        );
+        assert_eq!(
+            holders(&inodes, 0).len(),
+            1,
+            "seen from outside: this program"
+        );
+        drop(second);
+        // A dual-stack listener (where IPv6 exists) leaves IPv4 unicast to us.
+        if let Ok(dual) = bind(Domain::IPV6, SocketAddr::from(([0u16; 8], port))) {
+            first.set_read_timeout(Some(wait)).unwrap();
+            UdpSocket::bind("127.0.0.1:0")
+                .unwrap()
+                .send_to(b"beacon", ("127.0.0.1", port))
+                .unwrap();
+            assert!(first.recv(&mut [0; 16]).is_ok(), "the IPv4 socket gets it");
+            dual.set_read_timeout(Some(wait)).unwrap();
+            assert!(dual.recv(&mut [0; 16]).is_err());
+            let table = std::fs::read_to_string("/proc/net/udp").unwrap();
+            assert_eq!(udp4_inodes(&table, port).len(), 1, "not in the IPv4 table");
+        }
     }
 
     #[test]
@@ -1753,6 +2078,7 @@ mod tests {
             runtime_dir: false,
             config_writable: false,
             wayland_display: false,
+            x11_display: false,
             ..full()
         });
         assert_eq!(level(&rows, "bus"), Level::Missing);

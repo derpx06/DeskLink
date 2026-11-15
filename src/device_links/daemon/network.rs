@@ -9,7 +9,7 @@ use crate::device_links::config::Config;
 use crate::device_links::core::{LinkTransport, ReadOutcome};
 use crate::device_links::packet::NetworkPacket;
 
-const UDP_PORT: u16 = 1716;
+pub(crate) const UDP_PORT: u16 = 1716;
 pub(super) const MIN_TCP_PORT: u16 = 1716;
 pub(super) const MAX_TCP_PORT: u16 = 1764;
 

@@ -8,6 +8,9 @@
     <file>files-ui.css</file>
     <file>fonts/JetBrainsMono.ttf</file>
     <file>fonts/JetBrainsMono-OFL.txt</file>
+    <!-- The app's own icon, found even when it is not installed (a binary run
+         from where it was built, an AppImage). -->
+    <file alias="icons/scalable/apps/derx06.desklink.com.svg">../data/icons/hicolor/scalable/apps/derx06.desklink.com.svg</file>
     <file alias="icons/scalable/devices/desklink-device-phone-symbolic.svg">icons/desklink-device-phone-symbolic.svg</file>
     <file alias="icons/scalable/devices/desklink-device-tablet-symbolic.svg">icons/desklink-device-tablet-symbolic.svg</file>
     <file alias="icons/scalable/devices/desklink-device-laptop-symbolic.svg">icons/desklink-device-laptop-symbolic.svg</file>
