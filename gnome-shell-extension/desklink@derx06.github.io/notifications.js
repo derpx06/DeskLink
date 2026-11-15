@@ -301,6 +301,7 @@ export class PhoneNotifications {
         });
         const quote = new St.Label({text: entry.body, style_class: 'desklink-reply-quote'});
         quote.clutter_text.line_wrap = true;
+        quote.opacity = 199; // faded in the dialog's own colour, light or dark
         const field = new St.Entry({
             hint_text: `Message on ${entry.deviceName}`,
             can_focus: true,

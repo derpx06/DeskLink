@@ -1801,7 +1801,10 @@ fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> 
 /// git history of `gnome-shell-extension/` with
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
-const KNOWN_BUILDS: [&str; 25] = [
+const KNOWN_BUILDS: [&str; 26] = [
+    // Top-bar UI pass: rows line up, icons that exist, the footer stays on a
+    // short screen, readable in the light style, focus rings.
+    "885de5bb337209bbfb06918befc3b63cf70c3f89e463bab105098d0b133f22aa",
     // The compact menu: header line, pill tiles, one music row, every area in More.
     "e03918201c7c84592e19242f05859a6dcc977553a3d4423af013dedcbdda8c62",
     // The tray adds notifications oldest first, so the newest is on top (F21).

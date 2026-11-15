@@ -20,7 +20,8 @@ export function lastSeen(device, now = new Date()) {
     return `last seen ${today ? time : `${seen.getDate()} ${MONTHS[seen.getMonth()]} ${time}`}`;
 }
 
-/// "Connected · Wi-Fi · 82% ⚡", "last seen 14:02", "Connecting…".
+/// "Connected · Wi-Fi · 82%, charging", "last seen 14:02", "Connecting…"
+/// (read out in accessible names, so words rather than a symbol).
 export function statusLine(device, now = new Date()) {
     if (!device)
         return 'No phone connected';
@@ -29,7 +30,7 @@ export function statusLine(device, now = new Date()) {
         if (ROUTE[device.path])
             parts.push(ROUTE[device.path]);
         if (device.battery >= 0)
-            parts.push(`${device.battery}%${device.charging ? ' ⚡' : ''}`);
+            parts.push(`${device.battery}%${device.charging ? ', charging' : ''}`);
         return parts.join(' · ');
     }
     if (device.reachable)
@@ -197,7 +198,7 @@ export function sections(device, desk, extras = {}) {
         has(device, 'insert-photo') && act('insert-photo', 'Take a photo', 'camera-photo-symbolic'),
         has(device, 'insert-photo-file') && act('insert-photo-file', 'Take a photo as a file', 'document-save-symbolic'),
         has(device, 'insert-scan') && act('insert-scan', 'Scan a document', 'scanner-symbolic'),
-        has(device, 'insert-text') && act('insert-text', 'Copy text from a picture', 'format-text-plain-symbolic'),
+        has(device, 'insert-text') && act('insert-text', 'Copy text from a picture', 'insert-text-symbolic'),
         has(device, 'insert-qr') && act('insert-qr', 'Scan a QR code', 'view-grid-symbolic'),
     ]);
     add('sound', 'audio-speakers-symbolic', 'Sound', [
@@ -223,7 +224,7 @@ export function sections(device, desk, extras = {}) {
         }),
         phoneSwitch(device, 'commandAlerts', 'Tell it when a command finishes'),
         deskSwitch(desk, 'pauseMediaOnCall', 'Pause music during calls'),
-        deskSwitch(desk, 'forwardNotifications', 'Send this computer\'s notifications'),
+        deskSwitch(desk, 'forwardNotifications', 'Send notifications from here'),
         has(device, 'open-notifications') &&
             act('open-notifications', unread ? `Open notifications (${unread})` : 'Open notifications', 'mail-unread-symbolic'),
     ], unread);
@@ -244,7 +245,7 @@ export function sections(device, desk, extras = {}) {
     add('files', 'folder-symbolic', 'Files', [
         has(device, 'open-bucket') && act('open-bucket', 'Open synced files', 'folder-symbolic'),
         has(device, 'open-files') && act('open-files', 'Files page', 'folder-open-symbolic'),
-        phoneSwitch(device, 'galleryAccept', 'Accept its photos and screenshots'),
+        phoneSwitch(device, 'galleryAccept', 'Accept its photos & screenshots'),
     ]);
     const privacy = present([
         phoneSwitch(device, 'unlockNearby', 'Unlock with the phone'),
@@ -261,7 +262,7 @@ export function sections(device, desk, extras = {}) {
         has(device, 'unpair') && act('unpair', `Unpair ${name}…`, 'edit-delete-symbolic', {danger: true}),
     ], onCount > 0 ? `${onCount} allowed` : '');
     add('computer', 'computer-symbolic', 'This computer', [
-        deskSwitch(desk, 'keepAwake', 'Keep awake while a phone is connected'),
+        deskSwitch(desk, 'keepAwake', 'Keep awake while connected'),
         desk?.handOff !== undefined && act('lock-hand-off', 'Lock & hand off', 'send-to-symbolic', {device: false, enabled: !!desk.handOff}),
         act('reconnect', 'Look for the phone again', 'view-refresh-symbolic', {device: false}),
     ]);
@@ -297,6 +298,14 @@ export function menuBlocks(selected, devices = [], activities = []) {
         blocks.push('live');
     blocks.push('more', 'footer');
     return blocks;
+}
+
+/// How tall the scrolled body may be when the menu is `excess` px taller
+/// than the screen leaves it (null: no limit). It gives way to the header and
+/// the footer, keeping at least one row, so the footer stays on even a short
+/// screen.
+export function bodyHeight(natural, excess, row = 40) {
+    return excess > 0 ? Math.max(row, Math.floor(natural - excess)) : null;
 }
 
 /// The words beside the folded More row: what in it wants a look ("3 new",

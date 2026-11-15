@@ -1,24 +1,23 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
-/* The link glyph: a computer square, the wire, a phone pill (as in the app). */
+/* The link glyph: a computer square, the wire, a phone pill (as in the app).
+   Painted in the top bar's text colour from extension.js (the bar is light in
+   the light style); lit, the wire and the phone are mint. */
 .desklink-glyph-computer {
   width: 9px;
   height: 9px;
   border-radius: 2.5px;
-  background-color: rgba(255, 255, 255, 0.95);
 }
 
 .desklink-glyph-wire {
   width: 11px;
   height: 2px;
-  background-color: rgba(255, 255, 255, 0.3);
 }
 
 .desklink-glyph-phone {
   width: 6px;
   height: 11px;
   border-radius: 2px;
-  background-color: rgba(255, 255, 255, 0.3);
 }
 
 .desklink-glyph-wire.live,
@@ -51,10 +50,6 @@
   font-size: 1.1em;
 }
 
-.desklink-reply-quote {
-  color: rgba(255, 255, 255, 0.7);
-}
-
 /* ── Top bar ─────────────────────────────────────────────────────────── */
 /* Beside the link glyph while a phone is using this computer. */
 .desklink-indicator-dot {
@@ -80,7 +75,7 @@
 .desklink-dot {
   width: 8px;
   height: 8px;
-  border-radius: 4px;
+  border-radius: 999px;
   background-color: rgba(128, 128, 128, 0.6);
 }
 .desklink-dot.mint { background-color: #2fbf8f; }
@@ -93,15 +88,20 @@
 
 /* A custom row: its own content, flush with the stock rows' text. */
 .desklink-menu .desklink-row.popup-menu-item { padding: 3px 0; }
-.desklink-menu .desklink-progress-row.popup-menu-item { padding: 6px 12px; }
+.desklink-menu .desklink-progress-row.popup-menu-item,
+.desklink-menu .desklink-inset-row.popup-menu-item { padding: 6px 12px; }
+/* A switch row's words start where an icon row's words do. */
+.desklink-icon-space { width: 16px; }
+.desklink-switch-words { spacing: 2px; }
 .desklink-head { padding: 0 0 6px; }
 .desklink-head-title { font-weight: bold; font-size: 1.1em; }
 .desklink-line { spacing: 6px; }
 .desklink-row-title { font-weight: bold; }
 .desklink-row-detail { font-size: 0.86em; }
 .desklink-empty { padding: 12px 0; }
-.desklink-danger { color: #e5533d; }
-.desklink-light.desklink-danger, .desklink-light .desklink-danger { color: #b02f1b; }
+/* Unpair: a red icon (3:1 or more on the menu), the words in the menu's colour. */
+.desklink-danger .popup-menu-icon { color: #ff938c; }
+.desklink-light.desklink-danger .popup-menu-icon { color: #c01c28; }
 
 /* The phone switcher. */
 .desklink-chips { spacing: 6px; }
@@ -109,6 +109,19 @@
    scrolled (short-screen) menu squeezes its label out. */
 .button.desklink-chip { padding: 4px 12px; min-height: 1.3em; border-radius: 999px; }
 .desklink-chip-content { spacing: 6px; }
+/* On the accent: the dot in the accent's text colour, hollow when not connected. */
+.desklink-chip:checked .desklink-dot {
+  /* 5 px and the border: as big as the 8 px dot. */
+  width: 5px;
+  height: 5px;
+  background-color: transparent;
+  border: 1.5px solid #ffffff;
+  border-color: -st-accent-fg-color;
+}
+.desklink-chip:checked .desklink-dot.mint {
+  background-color: #ffffff;
+  background-color: -st-accent-fg-color;
+}
 
 /* Cards, pills and round buttons: a neutral wash over the menu, lighter in
    the dark style and darker in the light one. */
@@ -173,7 +186,8 @@
 .button.desklink-tile {
   border-radius: 999px;
   min-height: 1.3em;
-  padding: 8px 10px;
+  /* Narrow sides: "Clipboard" was cut at 200 % with 10 px. */
+  padding: 8px 6px;
 }
 .desklink-tile-content { spacing: 6px; }
 .desklink-tile-icon { icon-size: 16px; }
@@ -183,6 +197,14 @@
 .desklink-media { spacing: 6px; }
 .desklink-media-card { spacing: 3px; }
 .desklink-media-opener { padding: 3px 6px; border-radius: 8px; }
+/* Not a .button: it draws the shell's focus ring itself (St paints an inset
+   shadow only over a background, hence the wash). */
+.desklink-media-opener:focus {
+  box-shadow: inset 0 0 0 2px rgba(53, 132, 228, 0.8);
+  box-shadow: inset 0 0 0 2px st-transparentize(-st-accent-color, 0.2);
+}
+.desklink-dark.desklink-media-opener:focus { background-color: rgba(255, 255, 255, 0.07); }
+.desklink-light.desklink-media-opener:focus { background-color: rgba(0, 0, 0, 0.05); }
 .desklink-media-opener > StBoxLayout { spacing: 6px; }
 .desklink-chevron { icon-size: 12px; }
 .desklink-art {

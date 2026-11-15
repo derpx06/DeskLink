@@ -21,7 +21,7 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Slider} from 'resource:///org/gnome/shell/ui/slider.js';
 
 import {
-    footer, headerLine, liveWords, mediaClock, mediaPosition, menuBlocks, moreSummary, quickTiles, sections, seekReason,
+    bodyHeight, footer, headerLine, liveWords, mediaClock, mediaPosition, menuBlocks, moreSummary, quickTiles, sections, seekReason,
     seekThrottle, statusLine, timer, duration,
 } from './model.js';
 
@@ -41,8 +41,9 @@ function label(text, styleClass, params = {}) {
     return actor;
 }
 
+/// Secondary words: faded, but still 4.5:1 against the menu in both styles.
 function dim(actor) {
-    actor.opacity = 178;
+    actor.opacity = 199;
     return actor;
 }
 
@@ -222,8 +223,18 @@ function progressItem(icon, activatable) {
 }
 
 /// A switch row that keeps the menu open (the stock one closes it on a click).
-function switchItem(text, on, onToggle) {
+/// An icon's room before its words, so they line up with the rows that have
+/// one; a note goes under the words, never beside the switch.
+function switchItem(text, on, onToggle, note = '') {
     const item = new PopupMenu.PopupSwitchMenuItem(text, !!on);
+    if (note) {
+        const words = column({x_expand: false, style_class: 'desklink-switch-words'});
+        item.remove_child(item.label);
+        words.add_child(item.label);
+        words.add_child(dim(label(note, 'desklink-row-detail')));
+        item.insert_child_at_index(words, 0);
+    }
+    item.insert_child_at_index(new St.Widget({style_class: 'desklink-icon-space'}), 0);
     item.activate = () => item.toggle();
     item.accessible_name = text;
     item.connect('toggled', (_item, state) => onToggle(state));
@@ -241,6 +252,7 @@ function sectionRow(entry, selected, ctx) {
         if (entry.note)
             item.add_child(trailing(entry.note));
         if (entry.danger) {
+            // A red icon; red words were unreadable on the menu (1.9:1).
             item.add_style_class_name('desklink-danger');
             item.add_style_class_name(`desklink-${styleVariant()}`);
         }
@@ -259,13 +271,11 @@ function sectionRow(entry, selected, ctx) {
             return item;
         }
         const item = switchItem(entry.label, entry.on, state =>
-            ctx.setSwitch(entry.scope === 'desk' ? '' : id, entry.key, state));
+            ctx.setSwitch(entry.scope === 'desk' ? '' : id, entry.key, state), entry.note);
         if (entry.sensitive)
             item.add_style_class_name('desklink-sensitive');
-        if (entry.note) {
+        if (entry.note)
             item.accessible_name = `${entry.label}, ${entry.note}`;
-            item.add_child(dim(label(entry.note, 'desklink-row-detail')));
-        }
         if (!entry.enabled)
             item.setSensitive(false);
         return item;
@@ -361,8 +371,6 @@ function scrolledSection(menu) {
         child: holder.actor,
     });
     wrapper.box.add_child(scroller);
-    if (menu.insetForScrollbar)
-        holder.actor.style = 'padding-right: 12px;';
     let alive = true;
     scroller.connect('destroy', () => (alive = false));
     const fit = () => {
@@ -371,14 +379,14 @@ function scrolledSection(menu) {
         try {
             const monitor = Main.layoutManager.findMonitorForActor?.(scroller) ?? Main.layoutManager.primaryMonitor;
             scroller.style = '';
-            holder.actor.style = menu.insetForScrollbar ? 'padding-right: 12px;' : '';
+            holder.actor.style = '';
             const [, natural] = scroller.get_preferred_height(-1);
             const [, boxHeight] = menu.box.get_preferred_height(-1);
             const [, boxTop] = menu.box.get_transformed_position();
-            const excess = boxTop + boxHeight - (monitor.y + monitor.height - 24);
-            scroller.style = excess > 0 ? `max-height: ${Math.floor(Math.max(160, natural - excess))}px;` : '';
-            // The pill's own popup scrolls by itself when it is tall: its scrollbar needs the room too.
-            holder.actor.style = excess > 0 || menu.insetForScrollbar ? 'padding-right: 12px;' : '';
+            const height = bodyHeight(natural, boxTop + boxHeight - (monitor.y + monitor.height - 24));
+            scroller.style = height === null ? '' : `max-height: ${height}px;`;
+            // Room for the scrollbar, only while there is one.
+            holder.actor.style = height === null ? '' : 'padding-right: 12px;';
         } catch (error) {
             // Best effort: without it the menu is only as tall as it is.
         }
@@ -645,8 +653,8 @@ export function fillMenu(menu, ctx) {
 
     const blocks = menuBlocks(selected, devices, activities);
     if (blocks.includes('empty')) {
-        menu.addMenuItem(row(dim(label('Pair a phone in DeskLink to see it here.', 'desklink-empty'))));
-        menu.addAction('Open DeskLink', () => invoke('', 'open'));
+        menu.addMenuItem(row(dim(label('Pair a phone in DeskLink to see it here.', 'desklink-empty')), 'desklink-inset-row'));
+        menu.addAction('Open DeskLink', () => invoke('', 'open'), 'focus-windows-symbolic');
         return;
     }
 
@@ -747,7 +755,7 @@ export function fillMenu(menu, ctx) {
         case 'transfers': {
             // Files moving: their progress moves every second, in place.
             const bars = selected.transfers.slice(0, 3).map((transfer, index) => {
-                const bar = progressItem(transfer.incoming ? 'folder-download-symbolic' : 'folder-upload-symbolic', false);
+                const bar = progressItem(transfer.incoming ? 'folder-download-symbolic' : 'document-send-symbolic', false);
                 bar.show = now => bar.update(`${now.incoming ? 'Receiving' : 'Sending'} ${now.name}`,
                     [now.paused ? 'Paused' : (now.fraction > 0 ? `${Math.round(now.fraction * 100)}%` : 'Preparing'), now.lane]
                         .filter(Boolean).join(' · '), now.fraction);
@@ -779,7 +787,7 @@ export function fillMenu(menu, ctx) {
                 const detail = dim(label(ctx.activityText(activity), 'desklink-row-detail'));
                 ctx.tick(() => (detail.text = ctx.activityText(activity)));
                 line.add_child(detail);
-                body.addMenuItem(row(line));
+                body.addMenuItem(row(line, 'desklink-inset-row'));
             }
             break;
         case 'live': {

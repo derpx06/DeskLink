@@ -154,6 +154,18 @@ class DeskLinkButton extends PanelMenu.Button {
         for (const part of [this._computer, this._wire, this._phone, this._dot, this._label])
             pill.add_child(part);
         this.add_child(pill);
+        // The glyph is drawn in the top bar's own text colour, light or dark.
+        this._pill = pill;
+        pill.connect('style-changed', () => this._tint());
+    }
+
+    _tint() {
+        const fg = this._pill.get_theme_node().get_foreground_color();
+        const paint = alpha => `background-color: rgba(${fg.red}, ${fg.green}, ${fg.blue}, ${alpha});`;
+        this._computer.style = paint(0.95);
+        // Lit, the wire and the phone are the mint of the stylesheet.
+        for (const part of [this._wire, this._phone])
+            part.style = part.has_style_class_name('live') ? null : paint(0.3);
     }
 
     showState(online, live, words) {
@@ -164,6 +176,8 @@ class DeskLinkButton extends PanelMenu.Button {
                 part.remove_style_class_name('live');
         }
         this._dot.visible = live;
+        if (this._pill.get_stage())
+            this._tint();
         this.accessible_name = `DeskLink: ${words}`;
     }
 
@@ -313,7 +327,6 @@ export default class DeskLinkExtension extends Extension {
         // About as wide as the Quick Settings menu, in ems (desklink-pill-menu).
         this._button.menu.box.add_style_class_name('desklink-menu');
         this._button.menu.box.add_style_class_name('desklink-pill-menu');
-        this._button.menu.insetForScrollbar = true;
         this._pill = this._menuState();
         this._watchMenu(this._button.menu, this._pill);
         Main.panel.addToStatusArea(this.uuid, this._button);

@@ -1,11 +1,11 @@
 // Run with: node --test gnome-shell-extension/tests/
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {readFileSync} from 'node:fs';
+import {existsSync, readFileSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 
 import {
-    everythingSent, footer, headerLine, lastSeen, mediaClock, mediaPosition, menuBlocks, moreSummary, seekReason, seekThrottle,
+    bodyHeight, everythingSent, footer, headerLine, lastSeen, mediaClock, mediaPosition, menuBlocks, moreSummary, seekReason, seekThrottle,
     looksLikeLink, quickTiles, sections, sessionLine, shortStatus, statusLine, timer, duration,
 } from '../desklink@derx06.github.io/model.js';
 
@@ -32,7 +32,8 @@ const ids = list => list.map(item => item.id);
 const section = (list, id) => list.find(entry => entry.id === id);
 
 test('the status line says it in plain words', () => {
-    assert.equal(statusLine(phone()), 'Connected · Wi-Fi · 82% ⚡');
+    // Read out as an accessible name: words, not a symbol a screen reader names.
+    assert.equal(statusLine(phone()), 'Connected · Wi-Fi · 82%, charging');
     assert.equal(statusLine(phone({ready: false})), 'Connecting…');
     assert.equal(statusLine(phone({ready: false, reachable: false})), 'Not connected');
     assert.equal(statusLine(null), 'No phone connected');
@@ -368,4 +369,39 @@ test('a dragged slider sends five a second at most, and the release sends the la
     assert.deepEqual(sent, [1, 4, 5]);
     throttle.flush(); // nothing new: nothing sent
     assert.deepEqual(sent, [1, 4, 5]);
+});
+
+// The icon theme has every icon the menu names: a missing one is drawn as a
+// stand-in (a folder for "Sending", a box for "Copy text").
+test('every icon the extension names is in the Adwaita icon theme', {skip: !existsSync('/usr/share/icons/Adwaita/symbolic')}, () => {
+    const names = new Set();
+    for (const file of ['menu.js', 'model.js', 'extension.js', 'notifications.js']) {
+        const source = readFileSync(fileURLToPath(new URL(`../desklink@derx06.github.io/${file}`, import.meta.url)), 'utf8');
+        for (const [, name] of source.matchAll(/'([a-z-]+-symbolic)'/g))
+            names.add(name);
+    }
+    assert.ok(names.size > 40);
+    const theme = ['actions', 'apps', 'categories', 'devices', 'emblems', 'legacy', 'mimetypes', 'places', 'status', 'ui']
+        .map(dir => `/usr/share/icons/Adwaita/symbolic/${dir}`);
+    const missing = [...names].filter(name => !theme.some(dir => existsSync(`${dir}/${name}.svg`)));
+    assert.deepEqual(missing, []);
+});
+
+// A switch row's words share the menu's width with the switch: longer ones
+// were cut ("Keep awake while a phone is conne…") at the default text size.
+test('switch rows have words short enough to be read whole', () => {
+    const rows = sections(phone(), desk({handOff: true}), {linkInClipboard: true}).flatMap(s => s.rows);
+    const switches = rows.filter(row => row.kind === 'switch');
+    assert.ok(switches.length >= 15);
+    for (const row of switches)
+        assert.ok(row.label.length <= 32, `"${row.label}" is ${row.label.length} characters`);
+});
+
+// The rows between the header and the footer scroll inside what the screen
+// leaves: the footer stays on screen even on a short one (1080p at 200%).
+test('the scrolled body gives way to the footer on a short screen', () => {
+    assert.equal(bodyHeight(400, 0), null, 'fits: no limit');
+    assert.equal(bodyHeight(400, 100), 300);
+    assert.equal(bodyHeight(400, 380), 40, 'at least one row stays');
+    assert.equal(bodyHeight(400, 900), 40);
 });
