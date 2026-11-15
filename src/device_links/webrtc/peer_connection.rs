@@ -825,7 +825,12 @@ impl DesktopWebRtcPeer {
         // GStreamer 1.26's ICE transport leaves the selected pair out of the
         // stats (1.28 fills it in): the path read as unknown, so unlocking
         // with the phone was refused as "not on the LAN" and the fast lane
-        // was never used. The ICE agent itself still knows the pair.
+        // was never used. The ICE agent itself still knows the pair. Only
+        // asked before 1.28: there the stats carry it, and 1.28's
+        // `selected_pair` aborts the process while no pair is selected yet.
+        if !ice_fallback_needed(gst::version()) {
+            return from_stats;
+        }
         match self.selected_pair_from_ice() {
             Some((types, local_ip, remote_ip)) => Some(SelectedPair {
                 types,
@@ -2169,12 +2174,27 @@ fn path_label(candidate_types: &[String], via_relay: bool) -> &'static str {
     }
 }
 
+/// Whether the ICE agent must be asked for the selected pair: only GStreamer
+/// before 1.28 leaves it out of the stats.
+fn ice_fallback_needed((major, minor, _, _): (u32, u32, u32, u32)) -> bool {
+    (major, minor) < (1, 28)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::sync::mpsc;
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn the_ice_agent_is_asked_for_the_pair_only_before_gstreamer_1_28() {
+        assert!(ice_fallback_needed((1, 26, 5, 0)));
+        assert!(ice_fallback_needed((1, 24, 0, 0)));
+        assert!(!ice_fallback_needed((1, 28, 0, 0)));
+        assert!(!ice_fallback_needed((1, 29, 1, 0)));
+        assert!(!ice_fallback_needed((2, 0, 0, 0)));
+    }
 
     /// The whole LAN-only guarantee of the fast lane: which pairs get an
     /// address to dial, over interfaces the test states.
