@@ -1381,7 +1381,8 @@ pub(crate) fn pick_and_send_files(app: &DesklinkApplication, device_id: &str, na
 /// Presents the main window (creating it if needed) and returns it.
 fn main_window(app: &DesklinkApplication) -> Option<gtk::Window> {
     app.activate();
-    app.active_window()
+    // Never the Phone Screen window, which is the app's own window too.
+    Some(app.main_window().upcast())
 }
 
 const EXTENSION_UUID: &str = "desklink@derx06.github.io";

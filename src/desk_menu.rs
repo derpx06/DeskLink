@@ -546,11 +546,10 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
             window.show_page("settings");
         }
         "notifications" => {
-            app.activate();
-            if let Some(window) = app.active_window().and_downcast::<crate::DesklinkWindow>() {
-                window.show_device(&target);
-                window.show_page("notifications");
-            }
+            let window = app.main_window();
+            window.present();
+            window.show_device(&target);
+            window.show_page("notifications");
         }
         "end-sessions" => app.activate_action("end-sessions", Some(&target.to_variant())),
         "open-bucket" => app.activate_action("open-bucket", Some(&target.to_variant())),

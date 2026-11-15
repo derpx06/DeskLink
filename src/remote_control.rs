@@ -274,14 +274,16 @@ pub fn show_remote_control_dialog(
     let device = Rc::new(device_id);
 
     // Phone-shaped by default; the picture keeps its aspect when resized.
+    // Its own window of the app, not one kept above the main window: the
+    // owner works in DeskLink (and other apps) beside the phone's screen.
     let window = adw::Window::builder()
-        .transient_for(parent)
         .modal(false)
         .default_width(420)
         .default_height(900)
         .title("Phone Screen")
         .css_classes(["remote-window"])
         .build();
+    window.set_application(parent.as_ref().application().as_ref());
 
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
