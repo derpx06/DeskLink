@@ -222,6 +222,19 @@ pub(crate) fn status_notice(seen: Seen) -> Option<Notice> {
     }
 }
 
+/// Whether the window may ask the phone for control: only while viewing a
+/// picture of the share the phone said is on screen (`screen-ready`, which
+/// the daemon answers with a control request itself). Before it the phone
+/// can only refuse ("not being shared"), and a picture still held from the
+/// previous share is not this one.
+pub(crate) fn may_ask_control(
+    state: Option<SessionState>,
+    has_picture: bool,
+    screen_ready: bool,
+) -> bool {
+    state == Some(SessionState::Viewing) && has_picture && screen_ready
+}
+
 /// How long the window waits for the phone's person to allow the view: the
 /// phone's prompt goes after as long.
 const ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -588,6 +601,9 @@ pub fn show_remote_control_dialog(
             if picture.paintable() != paintable {
                 picture.set_paintable(paintable.as_ref());
             }
+            if let Some(at) = session_granted_at(device.as_str()) {
+                restarter.borrow_mut().answering(at);
+            }
             // The phone's person never answered its prompt: stop waiting, and say so.
             if restarter.borrow_mut().waited_out(
                 state,
@@ -606,8 +622,8 @@ pub fn show_remote_control_dialog(
             // accessibility service is off) or the request was lost. Asked
             // again with a growing wait, so turning the service on is all the
             // user has to do, without a refusal every 2 s.
-            if state == Some(SessionState::Viewing)
-                && paintable.is_some()
+            let screen_ready = session_phone_screen(device.as_str()).is_some();
+            if may_ask_control(state, paintable.is_some(), screen_ready)
                 && last_control_request.get().elapsed() >= control_retry_after(control_asks.get())
             {
                 daemon.send(DaemonCommand::RequestPhoneControl(device.to_string()));
@@ -628,7 +644,7 @@ pub fn show_remote_control_dialog(
             if control_on == Some(true)
                 && !control_on_was.replace(true)
                 && !lease_active
-                && state == Some(SessionState::Viewing)
+                && may_ask_control(state, paintable.is_some(), screen_ready)
             {
                 daemon.send(DaemonCommand::RequestPhoneControl(device.to_string()));
                 last_control_request.set(std::time::Instant::now());
@@ -676,6 +692,12 @@ pub fn show_remote_control_dialog(
             let strip = !waiting && notice.is_some();
             if strip != status.is_revealed() {
                 status.set_revealed(strip);
+            }
+            if notice.is_none() && !status.title().is_empty() {
+                // Hidden is not enough: a screen reader still reads the strip's words.
+                status.set_title("");
+                status.set_button_label(None);
+                status.set_tooltip_text(None);
             }
             if let Some(notice) = &notice {
                 if status.title().as_str() != notice.text {
@@ -998,6 +1020,14 @@ fn session_ended_reason(device_id: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn session_granted_at(device_id: &str) -> Option<std::time::Instant> {
+    crate::device_links::webrtc::remote_session::sessions()
+        .lock()
+        .ok()?
+        .get(device_id)?
+        .granted_at()
+}
+
 fn session_phone_screen(device_id: &str) -> Option<(i32, i32)> {
     crate::device_links::webrtc::remote_session::sessions()
         .lock()
@@ -1158,6 +1188,14 @@ impl Restarter {
             self.timed_out = true;
         }
         out
+    }
+
+    /// The phone said again that its person is answering (Allow tapped,
+    /// Android's sheet up): the wait for the picture starts from then.
+    fn answering(&mut self, at: std::time::Instant) {
+        if self.last_ask.is_some_and(|ask| at > ask) {
+            self.last_ask = Some(at);
+        }
     }
 
     fn ask_again(&mut self) {
@@ -1438,7 +1476,48 @@ mod tests {
         assert!(!restarter.timed_out() && !restarter.gave_up());
     }
 
+    /// F25: the phone's second `view-granted` (Allow tapped, Android's sheet
+    /// up) restarts the wait; an older one does not shorten it.
+    #[test]
+    fn allow_on_the_phone_keeps_the_ask_alive() {
+        let start = std::time::Instant::now();
+        let viewing = Some(SessionState::Viewing);
+        let mut restarter = Restarter::default();
+        restarter.sent(start);
+        restarter.answering(start - std::time::Duration::from_secs(5));
+        restarter.answering(start + std::time::Duration::from_secs(54));
+        assert!(!restarter.waited_out(viewing, false, start + ASK_WAIT));
+        assert!(!restarter.waited_out(viewing, false, start + std::time::Duration::from_secs(113)));
+        assert!(restarter.waited_out(viewing, false, start + std::time::Duration::from_secs(114)));
+    }
+
     /// A refused control request is asked again with a growing wait, never every 2 s.
+    /// F29: a view granted but not yet on screen is not asked for control
+    /// (the phone refused each such ask, 6 in 15 s, with "not being shared").
+    #[test]
+    fn control_is_asked_only_once_the_phone_screen_is_ready() {
+        let viewing = Some(SessionState::Viewing);
+        assert!(
+            !may_ask_control(viewing, true, false),
+            "old picture, no screen-ready"
+        );
+        assert!(!may_ask_control(viewing, false, true));
+        assert!(may_ask_control(viewing, true, true));
+        assert!(!may_ask_control(
+            Some(SessionState::Controlling),
+            true,
+            true
+        ));
+        let mut session = crate::device_links::webrtc::remote_session::RemoteSession::new();
+        session.set_phone_screen(1080, 2400);
+        session.stop();
+        assert_eq!(
+            session.phone_screen(),
+            None,
+            "the next share says its screen again"
+        );
+    }
+
     #[test]
     fn control_is_asked_again_with_a_growing_wait() {
         let waits: Vec<u64> = (0..8).map(|n| control_retry_after(n).as_secs()).collect();
