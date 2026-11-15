@@ -71,6 +71,138 @@ fn enable_immediate_rtcp_feedback(webrtcbin: &gst::Element) {
     });
 }
 
+/// NACKs the phone's video, which `webrtcbin` left un-NACKed.
+///
+/// `webrtcbin` (1.28 and main, `jitter_buffer_set_retransmission`) sets a new
+/// jitterbuffer's `do-retransmission` by walking *every* SSRC the remote
+/// description listed in the bundle, applying each one's transceiver `do-nack`
+/// without comparing SSRCs: the last listed wins. The phone lists video, then
+/// audio, so its video took audio's `false`. Measured live: lost 489, nack 0,
+/// every loss a PLI and a keyframe (a ~2 s freeze per burst). This handler runs
+/// after `webrtcbin`'s and decides from the SSRC's own m-section instead.
+fn retransmit_by_media_section(webrtcbin: &gst::Element) {
+    let Some(rtpbin) = webrtcbin
+        .downcast_ref::<gst::Bin>()
+        .and_then(|bin| bin.by_name("rtpbin"))
+    else {
+        return;
+    };
+    let webrtcbin = webrtcbin.downgrade();
+    rtpbin.connect("new-jitterbuffer", false, move |values| {
+        let jitterbuffer = values[1].get::<gst::Element>().ok()?;
+        let ssrc = values[3].get::<u32>().ok()?;
+        let sdp = webrtcbin
+            .upgrade()?
+            .property::<Option<gst_webrtc::WebRTCSessionDescription>>("remote-description")?
+            .sdp()
+            .as_text()
+            .ok()?;
+        let kind = media_kind_of_ssrc(&sdp, ssrc)?;
+        if jitterbuffer.has_property("do-retransmission", None) {
+            jitterbuffer.set_property("do-retransmission", kind == "video");
+        }
+        None
+    });
+}
+
+/// webrtcbin's stats, waiting at most [`STATS_WAIT`].
+fn webrtcbin_stats(webrtcbin: &gst::Element) -> Option<Vec<gst::Structure>> {
+    let (sender, receiver) = mpsc::channel();
+    let promise = gst::Promise::with_change_func(move |reply| {
+        let _ = sender.send(reply.ok().flatten().map(|stats| stats.to_owned()));
+    });
+    webrtcbin.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+    let reply = receiver.recv_timeout(STATS_WAIT).ok().flatten()?;
+    Some(
+        reply
+            .iter()
+            .filter_map(|(_, value)| value.get::<gst::Structure>().ok())
+            .collect(),
+    )
+}
+
+/// The local port of the selected ICE pair, from the stats. (Not from the ICE
+/// agent: GStreamer 1.28's `GstWebRTCNice` has no `get_selected_pair`, and
+/// asking for it aborts the process.)
+fn selected_local_port(webrtcbin: &gst::Element) -> Option<u16> {
+    let stats = webrtcbin_stats(webrtcbin)?;
+    let field = |stats: &gst::Structure, name: &str| stats.get::<String>(name).ok();
+    let by_id = |id: &str| {
+        stats
+            .iter()
+            .find(|entry| field(entry, "id").as_deref() == Some(id))
+    };
+    let pair_id = stats
+        .iter()
+        .find_map(|entry| field(entry, "selected-candidate-pair-id"))?;
+    let local = by_id(&field(by_id(&pair_id)?, "local-candidate-id")?)?;
+    u16::try_from(local.get::<u32>("port").ok()?).ok()
+}
+
+/// Asked of the kernel for the ICE socket's receive buffer. It grants at most
+/// twice `net.core.rmem_max` (212992 by default, so 416 KiB) without
+/// privileges; asking for more lets a raised sysctl take effect.
+const ICE_RECEIVE_BUFFER_BYTES: usize = 4 << 20;
+
+/// Widens the receive buffer of the UDP socket(s) on `port`: libnice leaves
+/// its sockets at `rmem_default`, about 100 KB of payload once the kernel's
+/// per-packet overhead is counted. Measured on the phone mirror: a 10-15
+/// Mbps keyframe burst overflowed it (`Udp RcvbufErrors` rose by 197 while
+/// the stream lost 185 packets), and every drop became a PLI and another
+/// keyframe. webrtcbin exposes no socket, so this finds it by port among this
+/// process's descriptors. Returns the size the kernel reports afterwards.
+fn widen_receive_buffer(port: u16) -> Option<usize> {
+    udp_sockets_on(port)
+        .iter()
+        .filter_map(|fd| {
+            let socket = socket2::SockRef::from(fd);
+            socket.set_recv_buffer_size(ICE_RECEIVE_BUFFER_BYTES).ok()?;
+            socket.recv_buffer_size().ok()
+        })
+        .max()
+}
+
+/// This process's UDP sockets bound to `port`, duplicated.
+fn udp_sockets_on(port: u16) -> Vec<std::os::fd::OwnedFd> {
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        // SAFETY: borrowed only to duplicate it at once; a descriptor closed
+        // in between fails the duplication.
+        .filter_map(|fd| {
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
+                .try_clone_to_owned()
+                .ok()
+        })
+        .filter(|fd| {
+            let socket = socket2::SockRef::from(fd);
+            socket.r#type().ok() == Some(socket2::Type::DGRAM)
+                && socket
+                    .local_addr()
+                    .ok()
+                    .and_then(|address| address.as_socket())
+                    .is_some_and(|address| address.port() == port)
+        })
+        .collect()
+}
+
+/// The kind (`video`, `audio`) of the m-section that lists `ssrc`.
+fn media_kind_of_ssrc(sdp: &str, ssrc: u32) -> Option<&str> {
+    let tag = format!("a=ssrc:{ssrc} ");
+    let mut kind = None;
+    for line in sdp.lines() {
+        if let Some(media) = line.strip_prefix("m=") {
+            kind = media.split(' ').next();
+        } else if line.starts_with(&tag) {
+            return kind;
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 pub enum PeerEvent {
     LocalDescription {
@@ -272,6 +404,7 @@ impl DesktopWebRtcPeer {
             );
         }
         enable_immediate_rtcp_feedback(&webrtcbin);
+        retransmit_by_media_section(&webrtcbin);
         // Before the pipeline starts: candidate gathering begins as soon as the
         // element goes to Playing, so restricting it afterwards would be too
         // late for the first negotiation.
@@ -742,17 +875,7 @@ impl DesktopWebRtcPeer {
     }
 
     fn selected_pair_from_stats(&self) -> Option<SelectedPair> {
-        let (sender, receiver) = mpsc::channel();
-        let promise = gst::Promise::with_change_func(move |reply| {
-            let _ = sender.send(reply.ok().flatten().map(|stats| stats.to_owned()));
-        });
-        self.webrtcbin
-            .emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
-        let reply = receiver.recv_timeout(STATS_WAIT).ok().flatten()?;
-        let stats: Vec<gst::Structure> = reply
-            .iter()
-            .filter_map(|(_, value)| value.get::<gst::Structure>().ok())
-            .collect();
+        let stats = webrtcbin_stats(&self.webrtcbin)?;
         let field = |stats: &gst::Structure, name: &str| stats.get::<String>(name).ok();
         let by_id = |id: &str| {
             stats
@@ -1727,6 +1850,20 @@ fn install_webrtcbin_callbacks(
     // process when that worker invokes it.  The event sender is Send + Sync,
     // so use the cross-thread signal connection and forward only a string.
     webrtcbin.connect_notify(Some("connection-state"), move |element, _| {
+        let state = element.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
+        if state == gst_webrtc::WebRTCPeerConnectionState::Connected {
+            // Off this thread: the stats are waited for, and this
+            // callback must never wait on anything.
+            let webrtcbin = element.downgrade();
+            std::thread::spawn(move || {
+                let port = webrtcbin
+                    .upgrade()
+                    .and_then(|webrtcbin| selected_local_port(&webrtcbin))?;
+                let size = widen_receive_buffer(port);
+                debug_log!("[DeskLink] ICE socket :{port} receive buffer: {size:?} bytes");
+                Some(())
+            });
+        }
         let state = element.property_value("connection-state");
         let _ = state_events.send(PeerEvent::ConnectionChanged(format!("{state:?}")));
     });
@@ -2188,6 +2325,32 @@ pub(crate) mod tests {
         pair.answerer.close();
     }
 
+    /// Once connected, the ICE socket's receive buffer is wider than the
+    /// kernel's default: at the default a phone's keyframe burst overflowed
+    /// it, and every dropped packet became a PLI and another keyframe.
+    #[test]
+    fn a_connected_peer_widens_its_ice_socket_receive_buffer() {
+        let default = socket2::SockRef::from(&std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+            .recv_buffer_size()
+            .unwrap();
+        let pair = loopback();
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let port = selected_local_port(&pair.answerer.webrtcbin).unwrap();
+        let size = || {
+            udp_sockets_on(port)
+                .iter()
+                .filter_map(|fd| socket2::SockRef::from(fd).recv_buffer_size().ok())
+                .max()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while size() <= Some(default) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(size() > Some(default), "{:?}, default {default}", size());
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
     /// What libwebrtc (Android) offers when the phone is the initiator: one
     /// `sendrecv` VP8 video section — the phone attaches a track in both roles —
     /// plus the data-channel section. Hand-written from a real offer's shape so
@@ -2421,6 +2584,50 @@ a=max-message-size:262144\r\n";
 
         assert_eq!(capture.payload_type(), 100);
         let _ = capture.stop();
+        peer.close();
+    }
+
+    /// The phone's offer lists its video SSRCs, then its audio SSRC. webrtcbin
+    /// gave every new jitterbuffer the `do-nack` of the *last* SSRC listed
+    /// (audio's false), so the phone's video was never NACKed: measured live,
+    /// lost 489, nack 0, each loss a PLI and a keyframe.
+    #[test]
+    fn the_phones_video_jitterbuffer_retransmits_and_its_audio_does_not() {
+        let audio = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:Zx4l\r\n\
+a=ice-pwd:Ye1kU7eZ1cTnL7l3fJQ7t0q2\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 4B:1C:3E:8A:0D:52:97:6F:B3:21:E4:7A:C8:19:5D:F0:2A:66:B1:93:0E:D7:48:AC:35:7B:E2:19:84:CF:60:1D\r\n\
+a=setup:actpass\r\n\
+a=mid:2\r\n\
+a=sendrecv\r\n\
+a=msid:desklink-audio 0b5e2d0c-7f1a-4d2e-9c3b-5a6f7e8d9c0b\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=rtcp-fb:111 transport-cc\r\n\
+a=fmtp:111 minptime=10;useinbandfec=1\r\n\
+a=ssrc:3333333333 cname:desklinkphone\r\n\
+a=ssrc:3333333333 msid:desklink-audio 0b5e2d0c-7f1a-4d2e-9c3b-5a6f7e8d9c0b\r\n";
+        let offer = PHONE_OFFER
+            .replace("a=group:BUNDLE 0 1", "a=group:BUNDLE 0 2 1")
+            .replace("m=application", &format!("{audio}m=application"));
+        let peer = answered_peer(&offer);
+        let rtpbin = peer
+            .webrtcbin
+            .downcast_ref::<gst::Bin>()
+            .and_then(|bin| bin.by_name("rtpbin"))
+            .unwrap();
+        let retransmits = |ssrc: u32| {
+            let jitterbuffer = gst::ElementFactory::make("rtpjitterbuffer")
+                .build()
+                .unwrap();
+            rtpbin.emit_by_name::<()>("new-jitterbuffer", &[&jitterbuffer, &0u32, &ssrc]);
+            jitterbuffer.property::<bool>("do-retransmission")
+        };
+        assert!(retransmits(1111111111), "the phone's video is NACKed");
+        assert!(!retransmits(3333333333), "its audio is not");
         peer.close();
     }
 
