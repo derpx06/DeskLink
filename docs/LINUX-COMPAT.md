@@ -17,11 +17,11 @@ Xvfb on a private D-Bus with no desktop (window up, daemon running, `--check`).
 
 | Distribution | GTK / adw / GStreamer / VTE / glib | Rust | Release build | Launch (Xvfb) + `--check` | Tests |
 |---|---|---|---|---|---|
-| Ubuntu 24.04 LTS | 4.14 / 1.5 / 1.24 / 0.76 / 2.80 | 1.85 (`rustc-1.85`) | yes, 6 min | yes R | UBUNTU_TESTS |
+| Ubuntu 24.04 LTS | 4.14 / 1.5 / 1.24 / 0.76 / 2.80 | 1.85 (`rustc-1.85`) | yes, 6 min | yes R | 1650 of 1653 R (left: a relay test that needs a default route, absent in the loopback-only namespace; one that drops to `nobody`, impossible as root in a user namespace; the known GStreamer 1.24 bitrate one). Fixed on the way: two libadwaita 1.5 failures, one of them a real Settings-search heading bug |
 | Debian 13 | 4.18 / 1.7 / 1.26 / 0.80 / 2.84 | 1.85 | yes, 7 min | yes R | not run |
 | Fedora 45 | 4.24 / 1.10 / 1.28 / 0.84 / 2.90 | 1.99 | yes, 4 min | yes R | not run |
 | openSUSE Tumbleweed (20261111) | 4.24 / 1.10 / 1.28 / 0.84 / 2.90 | 1.99 | yes, 5 min | yes R | not run |
-| Arch (2026-11) | 4.24 / 1.10 / 1.28 / 0.84 / 2.90 | 1.100 | yes, 5 min | yes R, plus sway and Xfce below | host gate (Manjaro) |
+| Arch (2026-11) | 4.24 / 1.10 / 1.28 / 0.84 / 2.90 | 1.100 | yes, 5 min | yes R, plus sway and Xfce below | host gate (Manjaro): 1653 of 1653, twice |
 
 Each launch: window mapped (`xwininfo`), alive after 25 s with no panic,
 `--check` exit 0, `--version`/`--help` answer without a display (fixed in this
