@@ -2354,7 +2354,7 @@ fn take_retry(target: &str) -> bool {
 pub(crate) fn saved_in(path: &std::path::Path) -> String {
     saved_in_with(
         path,
-        glib::user_special_dir(glib::UserDirectory::Downloads).as_deref(),
+        crate::device_links::transfer_log::downloads_dir().as_deref(),
     )
 }
 

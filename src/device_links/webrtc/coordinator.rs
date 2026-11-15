@@ -4027,7 +4027,8 @@ fn new_transfer_manager(config: &Arc<Mutex<Config>>) -> Result<Arc<WebRtcTransfe
         .transfer_state_paths();
     // Moving old state is file IO: not under the configuration lock.
     let transfer_state = paths.prepare();
-    let downloads = dirs::download_dir().unwrap_or_else(|| transfer_state.join("downloads"));
+    let downloads = crate::device_links::transfer_log::downloads_dir()
+        .unwrap_or_else(|| transfer_state.join("downloads"));
     let manager = Arc::new(WebRtcTransferManager::new(transfer_state, downloads)?);
     // A photo or scan a desk asked for (F3) has arrived.
     manager.set_completion_hook(|completed| {

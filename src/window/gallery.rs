@@ -25,14 +25,24 @@ pub(super) fn strip(device: &DeviceView) -> Option<gtk::Box> {
             .into_iter()
             .take(STRIP_ITEMS)
             .collect();
-        return build(device, true, &items, dirs::download_dir());
+        return build(
+            device,
+            true,
+            &items,
+            crate::device_links::transfer_log::downloads_dir(),
+        );
     }
     let on = crate::device_links::config::app_settings().accepts_gallery_from(&device.id);
     let items: Vec<Item> = gallery::list(&device.id)
         .into_iter()
         .take(STRIP_ITEMS)
         .collect();
-    build(device, on, &items, dirs::download_dir())
+    build(
+        device,
+        on,
+        &items,
+        crate::device_links::transfer_log::downloads_dir(),
+    )
 }
 
 fn build(

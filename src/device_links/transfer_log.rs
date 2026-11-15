@@ -50,6 +50,17 @@ fn log_path() -> Option<PathBuf> {
     )
 }
 
+/// Where received files go: the desktop's Downloads folder, or `~/Downloads`
+/// where no `user-dirs.dirs` names one (a bare window manager, a minimal
+/// install), never a hidden folder nobody would look in.
+pub fn downloads_dir() -> Option<PathBuf> {
+    downloads_dir_from(dirs::download_dir(), dirs::home_dir())
+}
+
+fn downloads_dir_from(named: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
+    named.or_else(|| home.map(|home| home.join("Downloads")))
+}
+
 /// Records a file received from `device_id`, now at `path`.
 pub fn record_received(device_id: &str, name: &str, path: &std::path::Path) {
     let size = std::fs::metadata(path).map_or(0, |meta| meta.len());
@@ -113,6 +124,20 @@ pub fn prune() {
 mod tests {
     use super::*;
     use crate::device_links::connection_log::RETENTION;
+
+    #[test]
+    fn without_named_folders_files_go_to_downloads_in_home() {
+        let named = PathBuf::from("/home/a/Téléchargements");
+        assert_eq!(
+            downloads_dir_from(Some(named.clone()), Some("/home/a".into())),
+            Some(named)
+        );
+        assert_eq!(
+            downloads_dir_from(None, Some("/home/a".into())),
+            Some(PathBuf::from("/home/a/Downloads"))
+        );
+        assert_eq!(downloads_dir_from(None, None), None);
+    }
 
     fn file(ts: u64, name: &str) -> LoggedFile {
         LoggedFile {

@@ -1256,7 +1256,7 @@ fn downloads_row() -> adw::ActionRow {
             .build(),
     );
     row.connect_activated(|row| {
-        let Some(dir) = glib::user_special_dir(glib::UserDirectory::Downloads) else {
+        let Some(dir) = crate::device_links::transfer_log::downloads_dir() else {
             return;
         };
         gtk::FileLauncher::new(Some(&gio::File::for_path(dir))).launch(
