@@ -40,6 +40,8 @@ const BODY_CHARS: usize = 400;
 pub(crate) enum Group {
     Actions,
     Pages,
+    /// The rows of Home's "Everything DeskLink does".
+    Features,
     Phones,
     Terminals,
     Files,
@@ -51,9 +53,10 @@ pub(crate) enum Group {
 }
 
 impl Group {
-    pub(crate) const ALL: [Group; 10] = [
+    pub(crate) const ALL: [Group; 11] = [
         Group::Actions,
         Group::Pages,
+        Group::Features,
         Group::Phones,
         Group::Terminals,
         Group::Files,
@@ -68,6 +71,7 @@ impl Group {
         match self {
             Self::Actions => "Actions",
             Self::Pages => "Go to",
+            Self::Features => "Features",
             Self::Phones => "Phones",
             Self::Terminals => "Terminals",
             Self::Files => "Recent files",
@@ -88,7 +92,12 @@ impl Group {
         match self {
             Self::Actions => IDLE_ACTIONS,
             Self::Phones | Self::Terminals | Self::Files | Self::Notes => IDLE_PER_GROUP,
-            Self::Pages | Self::Snippets | Self::Clipboard | Self::Contacts | Self::Settings => 0,
+            Self::Pages
+            | Self::Features
+            | Self::Snippets
+            | Self::Clipboard
+            | Self::Contacts
+            | Self::Settings => 0,
         }
     }
 }
@@ -147,6 +156,10 @@ pub(crate) enum Target {
     },
     /// An action that cannot run now: choosing it says why, with the fix.
     Blocked(super::requirements::Need),
+    /// A row of Home's "Everything DeskLink does" (its id): Home is shown
+    /// with that row's button focused, for a row whose button is a menu or a
+    /// fix rather than a place to go.
+    Feature(&'static str),
 }
 
 /// One row.
@@ -723,15 +736,99 @@ fn desk_action(action: Action) -> Item {
 
 /// The pages, as `window::PAGES` has them, with the Ctrl+digit that opens
 /// each (`PAGE_ACCELS`) and words that find it.
-const PAGE_WORDS: [(&str, &str); 7] = [
-    ("home", "overview start"),
-    ("files", "transfers received sent bucket downloads"),
-    ("notes", "snippets clipboard history"),
-    ("notifications", "messages alerts"),
-    ("terminals", "shell sessions"),
-    ("contacts", "address book people"),
-    ("settings", "preferences options"),
+pub(crate) const PAGE_SYNONYMS: [(&str, &str); 7] = [
+    ("home", "overview start main dashboard phone"),
+    (
+        "files",
+        "transfers received sent bucket downloads send share photos pictures gallery",
+    ),
+    ("notes", "snippets clipboard history copy paste write memo"),
+    ("notifications", "messages alerts banners reply"),
+    ("terminals", "shell sessions console command line"),
+    ("contacts", "address book people calls dial numbers"),
+    ("settings", "preferences options setup configure"),
 ];
+
+/// Words that find each row of Home's "Everything DeskLink does", by id,
+/// besides its title and line (a test walks every row).
+pub(crate) const FEATURE_WORDS: [(&str, &str); 35] = [
+    ("send", "share upload transfer files"),
+    ("link", "url web address browser open"),
+    ("bucket", "shared folder sync files drop"),
+    ("photos", "pictures gallery images camera screenshots"),
+    ("files", "transfers received sent downloads"),
+    (
+        "phone-screen",
+        "mirror cast see my phone view control remote display",
+    ),
+    ("insert", "camera photo scan document qr text ocr picture"),
+    ("sound", "audio speakers microphone mic"),
+    (
+        "desk-screen",
+        "cast share my screen mirror computer display",
+    ),
+    ("extend", "second display monitor extra screen"),
+    (
+        "glide",
+        "mouse touchpad trackpad pointer cursor keyboard edge",
+    ),
+    ("notifications", "alerts messages banners reply"),
+    ("forward", "alerts desktop notifications send"),
+    ("calls", "phone call dial answer ring"),
+    ("contacts", "people address book numbers dial"),
+    ("ring", "find lost locate"),
+    ("lock-phone", "secure screen"),
+    ("nudge", "ping buzz vibrate"),
+    ("music", "media player play pause song"),
+    ("clipboard", "copy paste sync"),
+    ("clip-history", "copied copy paste past"),
+    ("notes", "write memo text"),
+    ("snippets", "saved text pinned templates"),
+    ("terminals", "shell console command line"),
+    ("hand-off", "walk away continue carry on"),
+    ("lock", "unlock lock screen password"),
+    ("walk-away", "auto lock leave away"),
+    ("top-bar", "panel tray indicator menu extension"),
+    ("start-at-login", "startup autostart boot launch"),
+    ("widgets", "quick settings tiles home screen"),
+    ("pair", "add new phone connect qr code"),
+    ("guide", "help tour how start learn"),
+    (
+        "trouble",
+        "help offline problem fix troubleshoot network wifi",
+    ),
+    ("history", "log past connections"),
+    ("shortcuts", "keys hotkeys help"),
+];
+
+/// One row of Home's "Everything DeskLink does", as the palette lists it.
+#[derive(Clone, Debug)]
+pub(crate) struct FeatureEntry {
+    pub(crate) id: &'static str,
+    pub(crate) title: String,
+    pub(crate) line: String,
+    pub(crate) icon: &'static str,
+    pub(crate) target: Target,
+}
+
+/// The palette's rows for Home's feature rows: a row whose button goes
+/// somewhere goes there; any other shows the row on Home.
+pub(super) fn feature_entries(rows: &[super::everything::Row]) -> Vec<FeatureEntry> {
+    use super::everything::Go;
+    use super::guide::Do;
+    rows.iter()
+        .map(|row| FeatureEntry {
+            id: row.id,
+            title: row.title.clone(),
+            line: row.line.clone(),
+            icon: row.icon,
+            target: match &row.button {
+                Some((_, Go::Do(Do::Run(target)))) => target.clone(),
+                _ => Target::Feature(row.id),
+            },
+        })
+        .collect()
+}
 
 /// What the settings subpages are found by besides their title and summary.
 const SETTINGS_WORDS: [&str; 10] = [
@@ -822,6 +919,8 @@ pub(crate) struct Sources {
     pub(crate) settings: Vec<SettingsPage>,
     /// `window::PAGES` titles and icons, by name.
     pub(crate) pages: Vec<(&'static str, &'static str, &'static str)>,
+    /// Home's "Everything DeskLink does", for the selected phone.
+    pub(crate) features: Vec<FeatureEntry>,
 }
 
 /// Every item the palette can list for `sources`, in the order each group
@@ -870,7 +969,7 @@ pub(crate) fn build(sources: &Sources) -> Vec<Item> {
 
     // Pages. The pages of a phone only for a paired one (as Ctrl+1 to 6);
     // the notes are the user's own either way.
-    for (index, (name, words)) in PAGE_WORDS.iter().enumerate() {
+    for (index, (name, words)) in PAGE_SYNONYMS.iter().enumerate() {
         let Some((_, title, icon)) = sources.pages.iter().find(|(page, _, _)| page == name) else {
             continue;
         };
@@ -909,6 +1008,29 @@ pub(crate) fn build(sources: &Sources) -> Vec<Item> {
                 "page go open",
             ));
         }
+    }
+
+    // Home's feature rows. One that is already an action or a page by the
+    // same name adds its words to that row instead of a second row.
+    for feature in &sources.features {
+        let words = FEATURE_WORDS
+            .iter()
+            .find(|(id, _)| *id == feature.id)
+            .map_or("", |(_, words)| words);
+        let folded = fold(&one_line(&feature.title, TITLE_CHARS));
+        if let Some(same) = items.iter_mut().find(|item| item.folded_title == folded) {
+            same.folded_rest.push(' ');
+            same.folded_rest.push_str(&fold(words));
+            continue;
+        }
+        items.push(Item::new(
+            feature.target.clone(),
+            Group::Features,
+            &feature.title,
+            &feature.line,
+            feature.icon,
+            &format!("feature {words}"),
+        ));
     }
 
     for (id, name, icon, line) in &sources.others {

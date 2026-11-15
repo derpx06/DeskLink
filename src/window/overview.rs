@@ -13,7 +13,7 @@ use super::ui_kit::{
     status_pill, tile, ButtonKind, TileKind, Tone,
 };
 use super::{
-    can_send_feature, clock_time, confirm, device_type_label, ellipsized, named_widgets,
+    can_send_feature, clock_time, device_type_label, ellipsized, named_widgets,
     pick_and_send_files, session_summary, text, toast_from, wrapped, DesklinkWindow, QuickAction,
 };
 use crate::device_links::daemon::{DaemonCommand, DaemonHandle};
@@ -54,6 +54,10 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
                 ..media
             }
         }),
+        // Ongoing items are keyed by id below; their progress and the
+        // clock offset of each snapshot change in place. Kept in the key,
+        // every snapshot redrew Home under the pointer and ate the click.
+        activity: None,
         ..device.clone()
     };
     // What is ongoing on the phone, by id: the card is redrawn when an item
@@ -1357,17 +1361,13 @@ fn live_strip(
     let end = button(ButtonKind::Danger, "End all", None);
     end.set_tooltip_text(Some("End the phone's sessions on this computer"));
     let (daemon, id, name) = (daemon.clone(), device.id.clone(), device.name.clone());
+    // Cutting the phone off loses nothing (the terminals keep running and
+    // it can start again), so it happens at once, and the toast says so.
     end.connect_clicked(move |button| {
-        let (daemon, id, target) = (daemon.clone(), id.clone(), button.clone());
-        confirm(
+        daemon.send(DaemonCommand::EndPhoneSessions(Some(id.clone())));
+        toast_from(
             button,
-            &format!("End sessions with {name}?"),
-            "The phone stops using the screen and its terminals here. The terminals keep running.",
-            "_End sessions",
-            move || {
-                daemon.send(DaemonCommand::EndPhoneSessions(Some(id.clone())));
-                toast_from(&target, "Sessions ended");
-            },
+            &format!("Ended {name}'s sessions. The terminals keep running"),
         );
     });
     strip.add_action(&end);

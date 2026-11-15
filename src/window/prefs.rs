@@ -756,7 +756,7 @@ pub(super) const ROWS: [SettingRow; 33] = [
     row(7, "Terminal access", true, "terminal shell command line console allow permissions"),
     row(7, "Unlock with {phone} nearby", true, "unlock lock screen login password nearby proximity"),
     row(7, "Lock when I walk away with {phone}", true, "lock away leave walk screen lock security"),
-    row(7, "Unpair {phone}…", true, "unpair forget remove disconnect delete pair"),
+    row(7, "Unpair {phone}…", true, "unpair forget remove phone disconnect delete pair"),
     row(8, "Style", false, "dark mode light theme night colours colors appearance"),
     row(8, "Tray icon", false, "status icon top bar panel system tray indicator"),
     row(8, "GNOME extension", false, "top bar menu panel quick settings lock screen"),
@@ -781,7 +781,7 @@ pub(super) fn fits(template: &str, title: &str) -> bool {
 /// What people type, and the setting it must find (Settings search and
 /// Find anything both).
 #[cfg(test)]
-pub(super) const SYNONYMS: [(&str, &str); 24] = [
+pub(super) const SYNONYMS: [(&str, &str); 33] = [
     (
         "battery",
         "Keep this computer awake while a phone is connected",
@@ -809,6 +809,15 @@ pub(super) const SYNONYMS: [(&str, &str); 24] = [
     ("start at login", "Start at login"),
     ("privacy", "Ask before terminal and screen access"),
     ("permissions", "Terminal access"),
+    ("gallery", "Accept photos and screenshots from {phone}"),
+    ("pictures", "Accept photos and screenshots from {phone}"),
+    ("touchpad", "Glide onto {phone}"),
+    ("copy paste", "Share this computer's clipboard with phones"),
+    ("alerts", "Show {phone}'s notifications here"),
+    ("calls", "Show calls on this computer"),
+    ("shell", "Terminal access"),
+    ("remove phone", "Unpair {phone}…"),
+    ("contacts", "Name callers from {phone}'s contacts"),
 ];
 
 /// The search words of the row titled `title` ("" for one not in [`ROWS`]).

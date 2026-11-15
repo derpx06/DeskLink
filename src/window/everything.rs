@@ -1328,6 +1328,95 @@ mod tests {
         }
     }
 
+    /// Find anything finds every row of this list, every sidebar page and
+    /// every setting by its title and by a word people use for it; a row
+    /// that is also an action is listed once.
+    #[test]
+    fn find_anything_finds_every_feature_page_and_setting_by_title_and_synonym() {
+        use super::super::palette_model::{
+            build, feature_entries, fold, search, PhoneState, Sources, Target, FEATURE_WORDS,
+            PAGE_SYNONYMS,
+        };
+        let rows = rows(&facts());
+        let device = super::super::debug_fake_device("paired", "Pixel 9");
+        let sources = Sources {
+            paired: true,
+            phone: Some(PhoneState::from_device(&device)),
+            pages: super::super::PAGES.to_vec(),
+            settings: super::super::prefs::subpages(true),
+            features: feature_entries(&rows),
+            ..Sources::default()
+        };
+        let items = build(&sources);
+        let finds = |query: &str, title: &str| {
+            search(&items, query)
+                .iter()
+                .flat_map(|section| section.items.iter())
+                .any(|i| fold(&items[*i].title) == fold(title))
+        };
+        for row in &rows {
+            let (_, words) = FEATURE_WORDS
+                .iter()
+                .find(|(id, _)| *id == row.id)
+                .unwrap_or_else(|| panic!("{} has no words in FEATURE_WORDS", row.id));
+            assert!(finds(&row.title, &row.title), "its title finds {}", row.id);
+            let word = words.split_whitespace().next().unwrap();
+            assert!(finds(word, &row.title), "{word} finds {}", row.id);
+            assert_eq!(
+                items
+                    .iter()
+                    .filter(
+                        |item| item.group != super::super::palette_model::Group::Settings
+                            && fold(&item.title) == fold(&row.title)
+                    )
+                    .count(),
+                1,
+                "{} is listed once (bar its settings page)",
+                row.title
+            );
+        }
+        for (id, _) in FEATURE_WORDS {
+            assert!(rows.iter().any(|row| row.id == id), "{id} is no row");
+        }
+        for (name, title, _) in super::super::PAGES {
+            assert!(finds(title, title), "its title finds the {name} page");
+            let word = PAGE_SYNONYMS
+                .iter()
+                .find(|(page, _)| page == name)
+                .map(|(_, words)| words.split_whitespace().next().unwrap())
+                .unwrap();
+            assert!(
+                search(&items, word)
+                    .iter()
+                    .flat_map(|section| section.items.iter())
+                    .any(|i| items[*i].target == Target::Page(name)),
+                "{word} finds the {name} page"
+            );
+        }
+        // The owner's own words.
+        for (query, title) in [
+            ("pictures", "Photos from Pixel 9"),
+            ("gallery", "Photos from Pixel 9"),
+            ("mouse", "Glide"),
+            ("touchpad", "Glide"),
+            ("mirror", "Phone screen"),
+            ("cast", "Phone screen"),
+            ("see my phone", "Phone screen"),
+            ("unlock", "Lock and unlock"),
+            ("copy paste", "Copy on one, paste on the other"),
+            ("dial", "Dial a number"),
+            ("contacts", "Contacts"),
+            ("alerts", "Pixel 9's notifications"),
+            ("share", "Send files"),
+            ("bucket", "Bucket"),
+            ("shell", "New terminal"),
+            ("forget", "Unpair Pixel 9…"),
+            ("remove phone", "Unpair Pixel 9…"),
+        ] {
+            assert!(finds(query, title), "{query} finds {title}");
+        }
+    }
+
     /// Home ends with the section: a row for each feature, and a button
     /// that does something: Turn on Glide sends the setting and opens
     /// Settings; New note opens a note to type in.
