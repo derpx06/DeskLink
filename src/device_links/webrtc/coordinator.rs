@@ -192,6 +192,7 @@ pub(crate) fn take_share_failures() -> Vec<(String, String)> {
 /// not when they declined it themselves.
 fn tell_desk_about_failure(reason: &str) -> bool {
     reason != super::remote_desktop_portal::DECLINED_HERE
+        && reason != super::remote_desktop_portal::LOCKED_HERE
 }
 
 /// Held while a share waits for the portal's answer; gone when it answers
@@ -1871,7 +1872,10 @@ fn run_desktop_portal_worker(
             eprintln!(
                 "[DeskLink] Desktop screen/control portal setup failed for {device_id}: {error}"
             );
-            let reason = super::remote_desktop_portal::plain_portal_error(&error);
+            let reason = super::remote_desktop_portal::plain_portal_error_when(
+                &error,
+                crate::desktop_env::locked(),
+            );
             if tell_desk_about_failure(&reason) {
                 if let Ok(mut failed) = share_failures().lock() {
                     failed.push((device_id.clone(), reason.clone()));
@@ -5389,6 +5393,9 @@ mod tests {
         assert!(!super::tell_desk_about_failure(&plain_portal_error(
             "Desktop permission request was denied"
         )));
+        assert!(!super::tell_desk_about_failure(
+            super::super::remote_desktop_portal::LOCKED_HERE
+        ));
         assert!(super::tell_desk_about_failure(&plain_portal_error(
             "Could not attach video to the negotiated WebRTC screen track"
         )));

@@ -231,6 +231,19 @@ pub(crate) fn pick_cursor_mode(available: u32) -> Option<u32> {
 /// leaves this computer; it stays in the desk's log.
 /// The phone's reason when the person at this computer said no.
 pub(crate) const DECLINED_HERE: &str = "Screen sharing was declined on this computer";
+/// The phone's reason when the portal refused because this computer is locked
+/// (GNOME denies `CreateSession` under the lock screen; nobody said no).
+pub(crate) const LOCKED_HERE: &str = "This computer is locked. Unlock it and try again";
+
+/// [`plain_portal_error`], said as a locked computer when it is one.
+pub(crate) fn plain_portal_error_when(error: &str, locked: bool) -> String {
+    let plain = plain_portal_error(error);
+    if locked && plain == DECLINED_HERE {
+        LOCKED_HERE.to_string()
+    } else {
+        plain
+    }
+}
 
 pub(crate) fn plain_portal_error(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
@@ -1357,6 +1370,18 @@ mod tests {
             PortalVerdict::Ready(Some(2))
         );
         assert_eq!(portal_verdict(Some((1, 2)), 4), PortalVerdict::Missing(1));
+    }
+
+    /// F31: a refusal under the lock screen is not the person declining.
+    #[test]
+    fn a_refusal_on_a_locked_computer_says_it_is_locked() {
+        let denied = "Desktop permission request CreateSession was denied";
+        assert_eq!(plain_portal_error_when(denied, true), LOCKED_HERE);
+        assert_eq!(plain_portal_error_when(denied, false), DECLINED_HERE);
+        assert_eq!(
+            plain_portal_error_when("Timed out waiting for desktop portal Start", true),
+            "Nobody answered the screen-sharing prompt on this computer"
+        );
     }
 
     #[test]
