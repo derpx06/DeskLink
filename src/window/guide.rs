@@ -410,12 +410,24 @@ pub(super) fn run(window: &DesklinkWindow, what: &Do) {
         Do::Discover => {
             gtk::prelude::WidgetExt::activate_action(window, "win.discover", None).ok();
         }
-        Do::Displays => {
-            if let Some(settings) = glib::find_program_in_path("gnome-control-center") {
-                let _ = std::process::Command::new(settings).arg("display").spawn();
-            }
-        }
+        Do::Displays => open_display_settings(),
     }
+}
+
+/// The desktop's display settings, in their own window. Reaped when it is
+/// closed, so it never lingers as a zombie of DeskLink (F23).
+pub(super) fn open_display_settings() {
+    if let Some(settings) = glib::find_program_in_path("gnome-control-center") {
+        spawn_reaped(std::process::Command::new(settings).arg("display"));
+    }
+}
+
+/// Starts `command` and waits for it on its own thread; its pid, if it started.
+fn spawn_reaped(command: &mut std::process::Command) -> Option<u32> {
+    let mut child = command.spawn().ok()?;
+    let pid = child.id();
+    std::thread::spawn(move || drop(child.wait()));
+    Some(pid)
 }
 
 fn label(text: &str, classes: &[&str]) -> gtk::Label {
@@ -532,6 +544,22 @@ pub(super) fn show(window: &DesklinkWindow) {
 
 #[cfg(test)]
 mod tests {
+    /// A program it starts is reaped when it exits, not left a zombie (F23).
+    #[test]
+    fn a_program_started_for_the_user_is_reaped_when_it_exits() {
+        let pid = super::spawn_reaped(&mut std::process::Command::new("true")).unwrap();
+        let proc_dir = format!("/proc/{pid}");
+        let started = std::time::Instant::now();
+        while std::path::Path::new(&proc_dir).exists() {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{pid} is still there: {:?}",
+                std::fs::read_to_string(format!("{proc_dir}/stat"))
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
     use super::*;
 
     fn phone(reach: Reach) -> PhoneFacts {

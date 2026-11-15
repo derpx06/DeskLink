@@ -1325,15 +1325,12 @@ fn live_strip(
         Some(&live_detail(summary, since)),
     );
     // A second display (F2) is placed with the desktop's display settings.
-    if device.desktop_extended {
-        if let Some(settings) = gtk::glib::find_program_in_path("gnome-control-center") {
-            let arrange = button(ButtonKind::Outline, "Arrange…", None);
-            arrange.set_tooltip_text(Some("Place the phone's display beside this screen"));
-            arrange.connect_clicked(move |_| {
-                let _ = std::process::Command::new(&settings).arg("display").spawn();
-            });
-            strip.add_action(&arrange);
-        }
+    if device.desktop_extended && gtk::glib::find_program_in_path("gnome-control-center").is_some()
+    {
+        let arrange = button(ButtonKind::Outline, "Arrange…", None);
+        arrange.set_tooltip_text(Some("Place the phone's display beside this screen"));
+        arrange.connect_clicked(|_| super::guide::open_display_settings());
+        strip.add_action(&arrange);
     }
     // Its speaker toggle (F1): this computer's sound to the phone too.
     if device.desktop_session != DesktopSession::None {
