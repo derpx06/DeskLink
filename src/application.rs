@@ -20,10 +20,8 @@
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
-use gettextrs::gettext;
 use gtk::{gio, glib};
 
-use crate::config::VERSION;
 use crate::device_links::daemon::DaemonHandle;
 use crate::DesklinkWindow;
 
@@ -1236,18 +1234,7 @@ impl DesklinkApplication {
         let Some(window) = self.window_for_dialog() else {
             return;
         };
-        let about = adw::AboutDialog::builder()
-            .application_name("DeskLink")
-            .application_icon("derx06.desklink.com")
-            .developer_name("manas")
-            .version(VERSION)
-            .developers(vec!["manas"])
-            // Translators: Replace "translator-credits" with your name/username, and optionally an email or URL.
-            .translator_credits(gettext("translator-credits"))
-            .copyright("© 2026 manas")
-            .build();
-
-        about.present(Some(&window));
+        crate::about::present(&window, self.daemon_handle().as_ref());
     }
 
     /// The Settings page, or the computer-wide part as a dialog while no

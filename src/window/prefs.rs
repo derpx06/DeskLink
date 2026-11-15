@@ -730,7 +730,7 @@ const fn row(group: usize, title: &'static str, phone: bool, words: &'static str
 
 /// Every setting, group by group: the same titles as
 /// `testdata/settings_rows.json` (a test keeps the two in step).
-pub(super) const ROWS: [SettingRow; 33] = [
+pub(super) const ROWS: [SettingRow; 34] = [
     row(0, "Keep this computer awake while a phone is connected", false, "sleep suspend lid closed battery power stay awake caffeine"),
     row(0, "Let this phone keep the computer awake", true, "sleep suspend lid battery power stay awake allow"),
     row(0, "Start at login", false, "startup start at login autostart boot launch open automatically restart"),
@@ -764,6 +764,7 @@ pub(super) const ROWS: [SettingRow; 33] = [
     row(9, "Connection history", false, "log logs sessions past connections when activity"),
     row(9, "System check", false, "requirements install missing problems troubleshoot diagnose fix permissions"),
     row(9, "Crash reports", false, "logs bug report crash folder problems"),
+    row(9, "About", false, "about version credits licence license developer new release notes problem"),
 ];
 
 /// Whether `title` is `template` with the phone's name in place of `{phone}`.
@@ -921,6 +922,7 @@ fn groups(
     advanced.add(&history_row());
     advanced.add(&system_check_row());
     advanced.add(&logs_row());
+    advanced.add(&about_row());
 
     // The group titles are fixed (see GROUPS); calls and sound build theirs.
     calls.set_title(&glib::markup_escape_text(GROUPS[3]));
@@ -1024,6 +1026,7 @@ pub(crate) fn show_dialog(parent: &impl IsA<gtk::Widget>, daemon: &DaemonHandle)
     advanced.add(&history_row());
     advanced.add(&system_check_row());
     advanced.add(&logs_row());
+    advanced.add(&about_row());
     page.add(&advanced);
     dialog.add(&page);
     dialog.present(Some(parent));
@@ -1349,6 +1352,31 @@ fn logs_row() -> adw::ActionRow {
                 }
             },
         );
+    });
+    row
+}
+
+/// "About": straight to the About dialog, also over the Settings dialog
+/// (where the `app.about` action would wait for that dialog to close).
+fn about_row() -> adw::ActionRow {
+    let row = adw::ActionRow::builder()
+        .title("About")
+        .subtitle("Version, what's new, report a problem, credits")
+        .activatable(true)
+        .build();
+    with_icon(&row, "desklink-info-symbolic");
+    row.add_suffix(
+        &gtk::Image::builder()
+            .icon_name("desklink-chevron-right-symbolic")
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build(),
+    );
+    row.connect_activated(|row| {
+        let daemon = row
+            .root()
+            .and_downcast::<DesklinkWindow>()
+            .and_then(|window| window.daemon());
+        crate::about::present(row, daemon.as_ref());
     });
     row
 }
