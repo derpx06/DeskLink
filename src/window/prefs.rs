@@ -2086,9 +2086,9 @@ fn remote_control_row(device: &DeviceView, approving: bool) -> adw::ActionRow {
     )]);
     row.add_suffix(&forget);
     row.add_suffix(&approve);
-    // A desktop that cannot share its screen says why, instead of a button
-    // that opens nothing.
-    if let Some(reason) = crate::platform::reason("share") {
+    // A desktop that cannot share its screen, or shares it view only (no
+    // control to approve), says why instead of a button that opens nothing.
+    if let Some(reason) = crate::platform::note("share") {
         approve.set_sensitive(false);
         row.set_subtitle(&esc(reason));
         row.set_subtitle_lines(0);
@@ -2478,7 +2478,9 @@ mod tests {
                 .title(esc("Privacy & security"))
                 .description(esc(format!("Answer {name}'s calls")))
                 .build();
-            assert_eq!(label(&group.title()), "Privacy & security");
+            // libadwaita 1.5 hands back the shown text, later releases the
+            // markup that was set: either way it reads as typed.
+            assert_eq!(plain(&group.title()), "Privacy & security");
         });
     }
 
@@ -2577,9 +2579,9 @@ mod tests {
                 .collect();
             assert_eq!(groups.len(), table.len());
             for (group, (title, rows)) in groups.iter().zip(&table) {
-                let shown = gtk::pango::parse_markup(&group.title(), '\0')
-                    .map(|(_, plain, _)| plain.to_string())
-                    .unwrap();
+                // libadwaita 1.5 (Ubuntu 24.04) hands back the shown text,
+                // later releases the markup that was set.
+                let shown = plain(&group.title());
                 assert_eq!(&shown, title);
                 // The relay's read-only status line (compiled in only) is not
                 // a setting, so the contract does not list it.

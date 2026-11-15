@@ -1,0 +1,74 @@
+# DeskLink 1.3 on Linux: distributions and desktops
+
+What builds and runs where, and what each feature does on each desktop. Rows
+that cannot work say so in **Settings → Advanced → System check** and in
+`desklink --check`, with the one step to fix them (`src/platform.rs`). Longer
+background: `phone_connect/docs/LINUX-SUPPORT.md` and `DESKTOP-INTEGRATION.md`.
+
+Checked 2026-11-15. **R** = run (in a rootless chroot of the distribution, or a
+nested session on the author's machine), **T** = unit test with a faked desktop,
+**C** = code reading only.
+
+## Distributions
+
+Each one: its own packages from `packaging/` installed, `cargo build --release
+--locked` with the distribution's own Rust, then the binary started under
+Xvfb on a private D-Bus with no desktop (window up, daemon running, `--check`).
+
+DISTRO_TABLE
+
+Floor (checked by `src/meson.build`): GTK 4.12, libadwaita 1.5, GStreamer 1.22,
+OpenSSL 3.0, Rust 1.85; VTE 0.76 optional. Ubuntu 24.04 is the oldest native
+target; Debian 12 and Ubuntu 22.04 are below it (use the Flatpak).
+
+## Desktops
+
+`yes` works · `diff` works, differently (the cell says how) · `no` not possible
+there; the System check and the feature's own row say why and give the step.
+
+| Feature | GNOME (W/X11) | Plasma 6 Wayland | Plasma X11 | Xfce, Cinnamon, MATE, Budgie (X11) | wlroots: sway, Hyprland, labwc, river, niri | COSMIC | Plain X11 WM, no portal |
+|---|---|---|---|---|---|---|---|
+| Pair, LAN link, files, phone notifications, terminals | yes | yes R | yes | yes R(Xfce) | yes R(sway) | yes | yes R |
+| Tray / panel | own top-bar extension (or AppIndicator) | System Tray | System Tray | panel's StatusNotifier applet (the row names it) | Waybar/swaybar tray | Notifications Tray | needs a tray host (snixembed); else the window reopens from a notification |
+| Clipboard both ways | yes (via Xwayland) | yes | yes | yes | yes with Xwayland; without it only phone → desk, said (1) | as wlroots | yes |
+| Send to phone from the file manager | Files: Scripts | Dolphin menu | Dolphin menu | Thunar "Send To", Nemo and Caja Scripts (2) | "Open With" entry | "Open With" entry | "Open With" entry |
+| Search from the desktop | Activities search | KRunner | KRunner | in-app palette | in-app palette | in-app palette | in-app palette |
+| This screen on the phone, phone controls it | yes (portal) | yes (portal) R(check) | yes, X11 capture + XTest after approval at the desk | same as Plasma X11 R(check) | diff: view only (3) | diff: view only unless its portal has RemoteDesktop | yes, X11 capture R(check) |
+| Phone screen on this computer | yes | yes | yes | yes | yes | yes | yes |
+| Phone as a second display (Extend) | Wayland only | yes, no per-monitor scale | no | no | no | no | no |
+| Glide (pointer onto the phone) | GNOME 45+, Wayland | Plasma 6.1+ | no | no | no | no | no |
+| Sound with the phone | PipeWire (PulseAudio-only: no, install line given) | same | same | same | same | same | same |
+| Lock from the phone | yes | yes | yes | yes (their screensavers) | needs swayidle/hypridle | yes | needs xss-lock or a locker |
+| Unlock with the phone | yes | yes | yes | limited: not promised | swaylock/hyprlock yes; others refused, said | limited | i3lock & co. refused, said |
+| Start at login | yes | yes | yes | yes | no: the `exec` line to add is shown | yes | no: the line is shown |
+| Keep awake while linked | yes (logind/elogind) | yes | yes | yes | yes | yes | yes |
+| Do Not Disturb shared | yes | no, said (4) | no, said | no, said | no, said | no, said | no, said |
+
+1. New in this pass: a "Shared clipboard" row (Limited) when a Wayland session
+   has no `DISPLAY`; DeskLink reads the clipboard through X11 because Wayland
+   lets only the focused window read it. T
+2. New: Nemo (`~/.local/share/nemo/scripts`) and Caja (`~/.config/caja/scripts`)
+   get the same per-phone scripts as Nautilus; Thunar gets one entry per phone in
+   `~/.local/share/Thunar/sendto` (its Send To menu). T
+3. New: with ScreenCast but no RemoteDesktop (xdg-desktop-portal-wlr,
+   -hyprland) the share opens a ScreenCast-only session and the phone gets the
+   view-only state it already had for a GNOME grant without remote interaction.
+   The row is Limited ("can watch this screen but not control it"), the
+   approve-control button is off with that reason, Extend gives its own reason.
+   Before: no share at all. T + R(see below)
+4. Fixed: DND was mirrored into GNOME's `show-banners` on any desktop that had
+   the schema installed (Plasma, Xfce, Cinnamon usually do), where nothing reads
+   it. It is now GNOME Shell only, and the row says so elsewhere. C
+
+## Nested and headless sessions run for this table
+
+DESKTOP_RUNS
+
+## Still needs a real install or the owner
+
+- A real phone share on sway/Hyprland (view only end to end), and on Plasma 6
+  Wayland (portal dialog, control, Extend without scale).
+- Cinnamon, MATE and Budgie sessions (only their `XDG_CURRENT_DESKTOP` logic
+  and X11 path were exercised), COSMIC, and lock/unlock on each lock screen.
+- The tray icon on each panel applet, and the Thunar/Nemo/Caja menus with a
+  paired phone.

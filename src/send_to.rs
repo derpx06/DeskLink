@@ -1,5 +1,6 @@
 //! "Send to <phone>" from Files: `desklink --send-files [--to <device>]
-//! <paths…>`, a Nautilus script per paired phone and a Dolphin service menu.
+//! <paths…>`, a script per paired phone for Nautilus, Nemo and Caja, a
+//! Dolphin service menu and Thunar "Send To" entries.
 //!
 //! The command runs before GTK starts: it asks the running DeskLink (over
 //! its own D-Bus name, the `app.send-files` action) to send the files,
@@ -760,6 +761,40 @@ fn nautilus_wanted(current_desktop: &str, installed: bool) -> bool {
         })
 }
 
+/// Whether `XDG_CURRENT_DESKTOP` names one of `names` (any case).
+fn has_desktop(current_desktop: &str, names: &[&str]) -> bool {
+    current_desktop
+        .split(':')
+        .any(|desktop| names.iter().any(|name| desktop.eq_ignore_ascii_case(name)))
+}
+
+/// Which base folder a scripts folder is under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Base {
+    Data,
+    Config,
+}
+
+/// The scripts folders of the file managers used here (Nautilus, Nemo,
+/// Caja: the same script format), each where its desktop is running or the
+/// program is installed.
+fn script_folders(
+    current_desktop: &str,
+    installed: impl Fn(&str) -> bool,
+) -> Vec<(Base, &'static str)> {
+    let mut folders = Vec::new();
+    if nautilus_wanted(current_desktop, installed("nautilus")) {
+        folders.push((Base::Data, "nautilus/scripts"));
+    }
+    if has_desktop(current_desktop, &["X-Cinnamon", "Cinnamon"]) || installed("nemo") {
+        folders.push((Base::Data, "nemo/scripts"));
+    }
+    if has_desktop(current_desktop, &["MATE"]) || installed("caja") {
+        folders.push((Base::Config, "caja/scripts"));
+    }
+    folders
+}
+
 /// Whether `program` is on `$PATH`.
 fn on_path(program: &str) -> bool {
     std::env::var_os("PATH")
@@ -971,6 +1006,29 @@ fn write_if_changed(path: &Path, content: &str, executable: bool) -> std::io::Re
 
 /// One script per paired phone (`(id, name)`), and none for any other.
 fn sync_scripts(dir: &Path, exe: &Path, phones: &[(String, String)]) -> std::io::Result<()> {
+    sync_per_phone(dir, phones, "", true, |id, _| script(exe, id))
+}
+
+/// Thunar's "Send To" entry for a phone (`$XDG_DATA_HOME/Thunar/sendto`):
+/// a desktop file outside `applications/`, so it shows in no app menu.
+pub(crate) fn thunar_sendto(exe: &Path, device_id: &str, phone: &str) -> String {
+    let name: String = phone.chars().filter(|c| !c.is_control()).collect();
+    format!(
+        "[Desktop Entry]\n# Written by DeskLink; removed when this phone is unpaired.\n{SCRIPT_MARK}{device_id}\nType=Application\nVersion=1.0\nName={name}\nIcon=derx06.desklink.com\nExec={} --send-files --to {device_id} -- %F\n",
+        desktop_exec_quoted(exe),
+    )
+}
+
+/// One file per paired phone in `dir`, found again by its [`SCRIPT_MARK`]
+/// line, named `Send to <phone>` + `suffix`; none for any other phone, and
+/// files that are not ours are left alone.
+fn sync_per_phone(
+    dir: &Path,
+    phones: &[(String, String)],
+    suffix: &str,
+    executable: bool,
+    content: impl Fn(&str, &str) -> String,
+) -> std::io::Result<()> {
     // Ours, by the phone each is for.
     let mut existing: Vec<(PathBuf, String)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -995,13 +1053,14 @@ fn sync_scripts(dir: &Path, exe: &Path, phones: &[(String, String)]) -> std::io:
         if duplicate {
             file.push_str(&format!(" ({})", id.chars().take(6).collect::<String>()));
         }
+        file.push_str(suffix);
         // A renamed phone: its old script goes.
         for (path, owner) in &existing {
             if owner == id && path.file_name() != Some(std::ffi::OsStr::new(&file)) {
                 let _ = std::fs::remove_file(path);
             }
         }
-        write_if_changed(&dir.join(file), &script(exe, id), true)?;
+        write_if_changed(&dir.join(file), &content(id, name), executable)?;
     }
     Ok(())
 }
@@ -1036,12 +1095,20 @@ pub fn start(app: &DesklinkApplication) {
             update_desktop_database(&open_data.join("applications"));
         }
     });
-    let scripts = data.join("nautilus").join("scripts");
     let service_menu = data.join("kio").join("servicemenus").join(SERVICE_MENU);
+    let thunar = data.join("Thunar").join("sendto");
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-    // Each file manager's extra only where it is used.
-    let nautilus = nautilus_wanted(&desktop, on_path("nautilus"));
+    // Each file manager's extra only where it is used. Nemo (Cinnamon) and
+    // Caja (MATE) run Nautilus-style scripts from their own folders.
+    let script_dirs: Vec<PathBuf> = script_folders(&desktop, on_path)
+        .into_iter()
+        .map(|(base, path)| match base {
+            Base::Data => data.join(path),
+            Base::Config => glib::user_config_dir().join(path),
+        })
+        .collect();
     let dolphin = crate::kde::is_kde(&desktop) || on_path("dolphin");
+    let thunar_wanted = has_desktop(&desktop, &["XFCE"]) || on_path("thunar");
     // The paired phones the scripts were last written for.
     let last = std::cell::RefCell::new(None::<Vec<(String, String)>>);
     let weak = app.downgrade();
@@ -1060,8 +1127,8 @@ pub fn start(app: &DesklinkApplication) {
             .collect();
         phones.sort();
         if last.borrow().as_ref() != Some(&phones) {
-            if nautilus {
-                if let Err(error) = sync_scripts(&scripts, &exe, &phones) {
+            for scripts in &script_dirs {
+                if let Err(error) = sync_scripts(scripts, &exe, &phones) {
                     eprintln!("[DeskLink] Could not update the Files scripts: {error}");
                 }
                 // F8b: "Add to DeskLink Bucket", while a phone is paired.
@@ -1071,6 +1138,14 @@ pub fn start(app: &DesklinkApplication) {
                 } else {
                     write_if_changed(&bucket, &bucket_script(&exe), true)
                 };
+            }
+            if thunar_wanted {
+                let written = sync_per_phone(&thunar, &phones, ".desktop", false, |id, name| {
+                    thunar_sendto(&exe, id, name)
+                });
+                if let Err(error) = written {
+                    eprintln!("[DeskLink] Could not update Thunar's Send To menu: {error}");
+                }
             }
             if dolphin {
                 let written = if phones.is_empty() {
@@ -1421,6 +1496,54 @@ mod tests {
         let renamed = vec![("p1".to_string(), "Pixel 9".to_string())];
         sync_scripts(&dir, exe, &renamed).unwrap();
         assert!(dir.join("Send to Pixel 9").exists() && !dir.join("Send to Pixel").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_file_manager_gets_its_scripts_where_it_is_used() {
+        let none = |_: &str| false;
+        let folders = |desktop| script_folders(desktop, none);
+        assert_eq!(folders("ubuntu:GNOME"), [(Base::Data, "nautilus/scripts")]);
+        assert_eq!(folders("X-Cinnamon"), [(Base::Data, "nemo/scripts")]);
+        assert_eq!(folders("MATE"), [(Base::Config, "caja/scripts")]);
+        assert!(folders("KDE").is_empty() && folders("XFCE").is_empty());
+        assert_eq!(
+            script_folders("XFCE", |program| program == "caja").len(),
+            1,
+            "installed anyway"
+        );
+    }
+
+    #[test]
+    fn thunar_send_to_entries_follow_the_paired_phones() {
+        let dir = std::env::temp_dir().join(format!("desklink-sendto-{}", uuid::Uuid::new_v4()));
+        let exe = Path::new("/usr/bin/desk link");
+        let write = |phones: &[(String, String)]| {
+            sync_per_phone(&dir, phones, ".desktop", false, |id, name| {
+                thunar_sendto(exe, id, name)
+            })
+            .unwrap()
+        };
+        let phones = vec![
+            ("p1".to_string(), "Pixel".to_string()),
+            ("p2".to_string(), "Tab".to_string()),
+        ];
+        write(&phones);
+        let entry = std::fs::read_to_string(dir.join("Send to Pixel.desktop")).unwrap();
+        assert!(entry.starts_with("[Desktop Entry]\n"));
+        assert!(entry.contains("\nName=Pixel\n"));
+        assert!(entry.contains("\nExec=\"/usr/bin/desk link\" --send-files --to p1 -- %F\n"));
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.join("Send to Pixel.desktop"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0, "a menu entry, not a program");
+        write(&phones[..1]);
+        assert!(
+            !dir.join("Send to Tab.desktop").exists(),
+            "unpaired: removed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

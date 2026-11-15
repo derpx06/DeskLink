@@ -156,6 +156,13 @@ fn main() -> glib::ExitCode {
         return send_to::run_dial_cli(&args[1]);
     }
 
+    // `desklink --version`, and `--help` (GApplication's) below: answered
+    // without a display, from a console or over SSH.
+    if args.len() == 2 && args[1] == "--version" {
+        println!("DeskLink {}", config::VERSION);
+        return glib::ExitCode::SUCCESS;
+    }
+
     startup("main");
     install_crash_reporter();
 
@@ -168,7 +175,7 @@ fn main() -> glib::ExitCode {
         std::env::var_os("XDG_RUNTIME_DIR")
             .is_some_and(|dir| std::path::Path::new(&dir).join("wayland-0").exists()),
     )
-    .filter(|_| !instance_running())
+    .filter(|_| !asks_for_help(&args) && !instance_running())
     {
         eprintln!("DeskLink: {problem}");
         return glib::ExitCode::FAILURE;
@@ -200,6 +207,14 @@ fn main() -> glib::ExitCode {
     // terminal.
     startup("application created; running");
     app.run()
+}
+
+/// `-h`, `--help`, `--help-all`, `--help-gapplication`: GApplication prints
+/// its help and exits before any window, so no display is needed.
+fn asks_for_help(args: &[String]) -> bool {
+    args.iter()
+        .skip(1)
+        .any(|arg| arg == "-h" || arg.starts_with("--help"))
 }
 
 fn env_set(name: &str) -> bool {
@@ -256,6 +271,15 @@ mod display_tests {
         assert!(super::no_display(true, false, false).is_none());
         assert!(super::no_display(false, true, false).is_none());
         assert!(super::no_display(false, false, true).is_none());
+        let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+        assert!(super::asks_for_help(&args(&["desklink", "--help"])));
+        assert!(super::asks_for_help(&args(&["desklink", "--help-all"])));
+        assert!(super::asks_for_help(&args(&["desklink", "-h"])));
+        assert!(!super::asks_for_help(&args(&["desklink"])));
+        assert!(
+            !super::asks_for_help(&args(&["--help"])),
+            "the program's own name"
+        );
     }
 }
 

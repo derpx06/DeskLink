@@ -531,6 +531,30 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
         },
     );
 
+    // The clipboard is read through X11 (XWayland on Wayland): Wayland lets
+    // only the focused window read it, and DeskLink is usually in the
+    // background (`daemon/clipboard.rs`).
+    rows.push(if probe.x11_display || !wayland {
+        check(
+            "clipboard",
+            "Shared clipboard",
+            Level::Ok,
+            "What you copy here can reach the phone.",
+            None,
+        )
+    } else {
+        check(
+            "clipboard",
+            "Shared clipboard",
+            Level::Limited,
+            "This session runs without X11 support (Xwayland), so what you copy here does not \
+             reach the phone; the phone's copies still arrive. Turn Xwayland on in your \
+             compositor's settings (on niri, run xwayland-satellite) and log in again.",
+            None,
+        )
+        .tech("No DISPLAY: the clipboard watch and password-manager hints need X11 or Xwayland.")
+    });
+
     // Sharing and controlling this computer.
     // Desktop to phone video is VP8 (an H.264 encoder is only an experiment).
     let encoder = has("vp8enc");
@@ -596,19 +620,6 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             None,
         )
         .tech("No xdg-desktop-portal ScreenCast interface answered.")
-    } else if !has_portal("RemoteDesktop") {
-        check(
-            "share",
-            "Share this screen and let the phone control it",
-            Level::Missing,
-            format!(
-                "This desktop can show its screen to apps but cannot let them control it, and \
-                 DeskLink needs both. GNOME and KDE Plasma can; {} cannot on every desktop.",
-                portal_backend(family)
-            ),
-            None,
-        )
-        .tech("The portal has ScreenCast but no RemoteDesktop interface.")
     } else if !any(&["pipewiresrc"]) {
         check(
             "share",
@@ -627,6 +638,21 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
             Some(GST_GOOD),
         )
         .tech("Needs GStreamer vp8enc (gst-plugins-good).")
+    } else if !has_portal("RemoteDesktop") {
+        // wlroots portals (xdg-desktop-portal-wlr, -hyprland): the phone
+        // watches, view only.
+        check(
+            "share",
+            "Share this screen and let the phone control it",
+            Level::Limited,
+            format!(
+                "{SHARE_THROUGH_DESKTOP} The phone can watch this screen but not control it: \
+                 this desktop lets apps show its screen, not control it. GNOME and KDE Plasma \
+                 can."
+            ),
+            None,
+        )
+        .tech("The portal has ScreenCast but no RemoteDesktop interface: view only.")
     } else {
         check(
             "share",
@@ -1322,6 +1348,7 @@ mod tests {
             desktop: "GNOME".into(),
             session_type: Some("wayland".into()),
             wayland_display: true,
+            x11_display: true,
             runtime_dir: true,
             session_bus: true,
             system_bus: true,
@@ -1589,7 +1616,7 @@ mod tests {
             (
                 "sway",
                 wayland("sway", &["ScreenCast"], Some(3), None),
-                [M, M, M, L, L],
+                [L, M, M, L, L],
             ),
             (
                 "Hyprland",
@@ -1599,12 +1626,12 @@ mod tests {
                     Some(7),
                     None,
                 ),
-                [M, M, M, L, L],
+                [L, M, M, L, L],
             ),
             (
                 "COSMIC",
                 wayland("COSMIC", &["ScreenCast"], Some(3), None),
-                [M, M, M, L, O],
+                [L, M, M, L, O],
             ),
             (
                 "i3 via startx",
@@ -1626,15 +1653,53 @@ mod tests {
     }
 
     #[test]
-    fn a_wlroots_portal_without_remote_desktop_cannot_control() {
+    fn a_wlroots_portal_without_remote_desktop_shares_view_only() {
         let rows = evaluate(&Probe {
             desktop: "sway".into(),
             portals: names(&["ScreenCast"]),
             ..full()
         });
         let share = row(&rows, "share");
-        assert_eq!(share.level, Level::Missing);
+        assert_eq!(share.level, Level::Limited, "view only");
+        assert!(share.detail.starts_with(SHARE_THROUGH_DESKTOP));
+        assert!(share
+            .detail
+            .contains("watch this screen but not control it"));
         assert!(share.tech.contains("RemoteDesktop"));
+        // Not something to install: nothing would add remote control there.
+        assert_eq!(share.install, None);
+        // Watching still needs the PipeWire part and the encoder.
+        let mut probe = Probe {
+            desktop: "sway".into(),
+            portals: names(&["ScreenCast"]),
+            ..full()
+        };
+        probe.elements.remove("pipewiresrc");
+        assert_eq!(level(&evaluate(&probe), "share"), Level::Missing);
+    }
+
+    #[test]
+    fn a_wayland_session_without_xwayland_says_copies_here_do_not_reach_the_phone() {
+        assert_eq!(
+            level(&evaluate(&full()), "clipboard"),
+            Level::Ok,
+            "GNOME has Xwayland"
+        );
+        let rows = evaluate(&Probe {
+            desktop: "niri".into(),
+            x11_display: false,
+            ..full()
+        });
+        let clipboard = row(&rows, "clipboard");
+        assert_eq!(clipboard.level, Level::Limited);
+        assert!(clipboard.detail.contains("xwayland-satellite"));
+        let x11 = Probe {
+            session_type: Some("x11".into()),
+            wayland_display: false,
+            x11_display: true,
+            ..full()
+        };
+        assert_eq!(level(&evaluate(&x11), "clipboard"), Level::Ok);
     }
 
     #[test]
@@ -1753,6 +1818,7 @@ mod tests {
             runtime_dir: false,
             config_writable: false,
             wayland_display: false,
+            x11_display: false,
             ..full()
         });
         assert_eq!(level(&rows, "bus"), Level::Missing);

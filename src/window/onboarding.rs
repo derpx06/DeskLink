@@ -1643,6 +1643,7 @@ mod tests {
             desktop: "GNOME".into(),
             session_type: Some("wayland".into()),
             wayland_display: true,
+            x11_display: true,
             runtime_dir: true,
             session_bus: true,
             system_bus: true,
