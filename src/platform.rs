@@ -1368,7 +1368,28 @@ fn and_list(names: &[String]) -> String {
 /// listeners are counted.
 pub(crate) fn discovery_sharers() -> Vec<String> {
     let table = std::fs::read_to_string("/proc/net/udp").unwrap_or_default();
-    holders(&udp4_inodes(&table, DISCOVERY_PORT), std::process::id())
+    let own_exe = std::fs::read_link("/proc/self/exe").ok();
+    holders(
+        &udp4_inodes(&table, DISCOVERY_PORT),
+        std::process::id(),
+        own_exe.as_deref(),
+    )
+}
+
+/// Whether a holder is this DeskLink: this process, or another process of
+/// the same program (`desklink --check` asks while the app runs: the app's
+/// own socket is not a rival, F45). A replaced binary reads "(deleted)".
+fn is_this_app(
+    pid: u32,
+    own_pid: u32,
+    exe: Option<&std::path::Path>,
+    own_exe: Option<&std::path::Path>,
+) -> bool {
+    let plain = |path: &std::path::Path| {
+        let text = path.to_string_lossy();
+        text.strip_suffix(" (deleted)").unwrap_or(&text).to_string()
+    };
+    pid == own_pid || matches!((exe, own_exe), (Some(a), Some(b)) if plain(a) == plain(b))
 }
 
 /// The inodes of the sockets bound to `port` in `/proc/net/udp` text.
@@ -1387,10 +1408,10 @@ fn udp4_inodes(table: &str, port: u16) -> Vec<u64> {
         .collect()
 }
 
-/// Who holds each socket in `inodes`, by name, leaving out process
-/// `own_pid`; a socket whose holder cannot be seen (another user's process)
-/// is "Another program".
-fn holders(inodes: &[u64], own_pid: u32) -> Vec<String> {
+/// Who holds each socket in `inodes`, by name, leaving out this DeskLink
+/// (`is_this_app`); a socket whose holder cannot be seen (another user's
+/// process) is "Another program".
+fn holders(inodes: &[u64], own_pid: u32, own_exe: Option<&std::path::Path>) -> Vec<String> {
     let mut names = Vec::new();
     if inodes.is_empty() {
         return names;
@@ -1421,7 +1442,8 @@ fn holders(inodes: &[u64], own_pid: u32) -> Vec<String> {
                 continue;
             };
             seen.push(inode);
-            if pid != own_pid {
+            let exe = std::fs::read_link(entry.path().join("exe")).ok();
+            if !is_this_app(pid, own_pid, exe.as_deref(), own_exe) {
                 let read = |file: &str| std::fs::read(entry.path().join(file)).unwrap_or_default();
                 names.push(app_name(
                     String::from_utf8_lossy(&read("comm")).trim(),
@@ -1887,6 +1909,30 @@ mod tests {
         );
     }
 
+    /// F45: `desklink --check` while DeskLink runs listed the app itself
+    /// ("Turn desklink off"). The same program is never a rival; another
+    /// build of it (a Flatpak beside a native one) still is.
+    #[test]
+    fn the_running_app_is_not_counted_as_a_rival_by_its_own_check() {
+        use std::path::Path;
+        let me = Path::new("/home/u/.local/bin/desklink");
+        assert!(is_this_app(7, 7, None, None));
+        assert!(is_this_app(8, 7, Some(me), Some(me)));
+        assert!(is_this_app(
+            8,
+            7,
+            Some(Path::new("/home/u/.local/bin/desklink (deleted)")),
+            Some(me)
+        ));
+        assert!(!is_this_app(
+            8,
+            7,
+            Some(Path::new("/app/bin/desklink")),
+            Some(me)
+        ));
+        assert!(!is_this_app(8, 7, None, Some(me)));
+    }
+
     #[test]
     fn the_proc_udp_table_gives_the_sockets_on_a_port() {
         let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n   23: 00000000:06B4 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 344901 2 00000000302a0e1b 0\n   24: 0100007F:06B4 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 5 2 00000000302a0e1b 0\n 2009: 0D01A8C0:0E76 00000000:0000 07 00000000:00000000 00:00000000 00000000  1000        0 168763 2 000000000295dcd8 0\n";
@@ -1938,11 +1984,11 @@ mod tests {
         let inodes = udp4_inodes(&table, port);
         assert_eq!(inodes.len(), 2);
         assert!(
-            holders(&inodes, std::process::id()).is_empty(),
+            holders(&inodes, std::process::id(), None).is_empty(),
             "both are ours"
         );
         assert_eq!(
-            holders(&inodes, 0).len(),
+            holders(&inodes, 0, None).len(),
             1,
             "seen from outside: this program"
         );
