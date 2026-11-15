@@ -366,7 +366,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
             "sound",
             Group::Screen,
             "desklink-volume-up-symbolic",
-            "Sound both ways".into(),
+            "Sound".into(),
             format!(
                 "Play {name}'s sound here, this computer's sound on {name}, or use {name} as a \
                  microphone."
@@ -431,7 +431,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
             "forward",
             Group::Phone,
             "desklink-notifications-active-symbolic",
-            format!("This computer's alerts on {name}"),
+            format!("This computer's notifications on {name}"),
             format!("Notifications from apps here show on {name} too."),
             gate(Feature::Send(PACKET_TYPE_NOTIFICATION)).unwrap_or_else(|| {
                 if facts.forward {
@@ -469,7 +469,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
             "ring",
             Group::Phone,
             "desklink-ring-volume-symbolic",
-            "Find my phone".into(),
+            format!("Ring {kind}"),
             format!("Make {name} ring so you can find it, even when it is on silent."),
             on_phone(Action::Ring, &format!("Ring {kind}")),
         );
@@ -499,7 +499,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
             "music",
             Group::Phone,
             "desklink-music-note-symbolic",
-            "Music".into(),
+            "Music and videos".into(),
             format!(
                 "Play, pause and skip {name}'s music from here. Its controls show at the top of \
                  Home while it plays."
@@ -516,7 +516,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
             "clipboard",
             Group::Notes,
             "desklink-content-paste-symbolic",
-            "Copy on one, paste on the other".into(),
+            "Clipboard".into(),
             "With clipboard sharing on, what you copy on one is ready to paste on the other."
                 .into(),
             if facts.clipboard_sync {
@@ -539,7 +539,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
         "notes",
         Group::Notes,
         "desklink-edit-note-symbolic",
-        "Notes on both".into(),
+        "Notes".into(),
         format!("Write a note here and it is on {name} too, and the other way round."),
         // The guide's button: the Notes page would open on whichever of its
         // tabs was last shown.
@@ -559,7 +559,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
         "terminals",
         Group::Computer,
         "desklink-terminal-symbolic",
-        "Terminals on both".into(),
+        "Terminals".into(),
         format!("Start a shared terminal here or on {name}, and carry on from either one."),
         need("terminal-access")
             .unwrap_or_else(|| open("Open terminals", Target::Page("terminals"))),
@@ -627,7 +627,7 @@ pub(super) fn rows(facts: &Facts) -> Vec<Row> {
         "widgets",
         Group::Computer,
         "desklink-device-phone-symbolic",
-        "Widgets and Quick Settings tiles".into(),
+        "Tiles and widgets (on the phone)".into(),
         format!(
             "On {name}: touch and hold the home screen to add DeskLink widgets, and edit Quick \
              Settings to add its tiles."
@@ -1403,10 +1403,20 @@ mod tests {
             ("cast", "Phone screen"),
             ("see my phone", "Phone screen"),
             ("unlock", "Lock and unlock"),
-            ("copy paste", "Copy on one, paste on the other"),
+            ("copy paste", "Clipboard"),
             ("dial", "Dial a number"),
             ("contacts", "Contacts"),
             ("alerts", "Pixel 9's notifications"),
+            // The names these rows had before they took the phone's.
+            ("find my phone", "Ring phone"),
+            ("sound both ways", "Sound"),
+            ("copy on one", "Clipboard"),
+            ("notes on both", "Notes"),
+            ("terminals on both", "Terminals"),
+            ("quick settings tiles", "Tiles and widgets (on the phone)"),
+            ("alerts on", "This computer's notifications on Pixel 9"),
+            ("music", "Music and videos"),
+            ("ping", "Send a nudge"),
             ("share", "Send files"),
             ("bucket", "Bucket"),
             ("shell", "New terminal"),

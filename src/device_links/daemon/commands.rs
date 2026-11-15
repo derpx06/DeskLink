@@ -398,7 +398,7 @@ impl DaemonWorker {
     fn send_ping(&self, device_id: &str) {
         self.with_feature_transport(device_id, |transport| {
             let mut packet = NetworkPacket::new(PACKET_TYPE_PING);
-            packet.set("message", "Ping from DeskLink");
+            packet.set("message", "Nudge from DeskLink");
             transport.send(&packet)
         });
     }

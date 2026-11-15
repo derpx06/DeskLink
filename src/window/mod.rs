@@ -1263,12 +1263,12 @@ impl DesklinkWindow {
                 } => {
                     self.send_feature_notification(
                         &format!("desklink-ping-{device_id}-{}", glib::monotonic_time()),
-                        &format!("Ping from {device_name}"),
+                        &format!("Nudge from {device_name}"),
                         message
                             .as_deref()
-                            .unwrap_or("Your phone sent a Ping through DeskLink."),
+                            .unwrap_or("Your phone sent a nudge through DeskLink."),
                     );
-                    self.show_feature_toast(&format!("Ping received from {device_name}"));
+                    self.show_feature_toast(&format!("Nudge from {device_name}"));
                 }
                 DaemonEvent::FindPhoneReceived {
                     device_id,
@@ -1885,7 +1885,7 @@ impl DesklinkWindow {
                 DaemonCommand::SendLockRequest(id, true),
                 format!("Locking {name}"),
             ),
-            QuickAction::Ping => (DaemonCommand::SendPing(id), "Ping sent".to_string()),
+            QuickAction::Ping => (DaemonCommand::SendPing(id), "Nudge sent".to_string()),
             QuickAction::Clipboard => (
                 DaemonCommand::SendClipboard(id),
                 format!("Clipboard sent to {name}"),
