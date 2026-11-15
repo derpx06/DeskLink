@@ -74,6 +74,10 @@ pub struct Tracker {
     gone: HashMap<String, (u64, Instant)>,
     /// (device, words) announced lately.
     twins: HashMap<(String, u64), Instant>,
+    /// The last verdict logged per id: the log says a verdict once, not every pass.
+    logged: HashMap<String, (bool, &'static str)>,
+    #[cfg(test)]
+    lines: usize,
 }
 
 impl Tracker {
@@ -116,6 +120,7 @@ impl Tracker {
         let before: Vec<String> = self.seen.keys().cloned().collect();
         for id in before {
             if !present.contains(&id) {
+                self.logged.remove(&id);
                 if let Some(seen) = self.seen.remove(&id) {
                     self.gone.insert(id, (seen.signature, now));
                 }
@@ -199,13 +204,21 @@ impl Tracker {
                         },
                     },
                 );
-                debug_log!(
-                    "[Notifications] announce {unique_id} sig={sig:016x}: {} ({})",
-                    if announce { "shown" } else { "skipped" },
-                    match verdict {
-                        Ok(reason) | Err(reason) => reason,
+                let reason = match verdict {
+                    Ok(reason) | Err(reason) => reason,
+                };
+                if self.logged.insert(unique_id.clone(), (announce, reason))
+                    != Some((announce, reason))
+                {
+                    #[cfg(test)]
+                    {
+                        self.lines += 1;
                     }
-                );
+                    debug_log!(
+                        "[Notifications] announce {unique_id} sig={sig:016x}: {} ({reason})",
+                        if announce { "shown" } else { "skipped" },
+                    );
+                }
                 if announce {
                     announced += 1;
                     self.twins.insert(twin_key, now);
@@ -249,6 +262,22 @@ mod tests {
 
     /// Mirroring off, or the extension showing them, announces nothing, and
     /// what was marked then is not replayed when it changes back.
+    /// F27: a pass logs only the verdicts that changed, not every notification every second.
+    #[test]
+    fn the_log_says_each_verdict_once() {
+        let t0 = Instant::now();
+        let views = [view(&[("a", "hi", false), ("b", "yo", false)])];
+        let mut tracker = Tracker::default();
+        tracker.pass(&views, &|_| true, false, t0);
+        assert_eq!(tracker.lines, 2, "new");
+        tracker.pass(&views, &|_| true, false, t0);
+        assert_eq!(tracker.lines, 4, "now unchanged");
+        for _ in 0..5 {
+            tracker.pass(&views, &|_| true, false, t0);
+        }
+        assert_eq!(tracker.lines, 4, "still unchanged: nothing logged");
+    }
+
     #[test]
     fn hidden_and_extension_shown_ones_are_marked_not_replayed() {
         let t0 = Instant::now();
