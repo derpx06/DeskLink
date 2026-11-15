@@ -296,6 +296,8 @@ pub fn show_remote_control_dialog(
                     device.to_string(),
                     payload,
                 ));
+            } else {
+                debug_log!("[Phone screen] input dropped: this computer holds no control lease");
             }
         })
     };
@@ -796,6 +798,7 @@ pub fn show_remote_control_dialog(
             // The gesture's own widget, not a captured `picture`: the
             // gesture is attached to the picture, so that would be a cycle.
             drag.connect_drag_begin(move |gesture, x, y| {
+                debug_log!("[Phone screen] press at {x:.0},{y:.0}");
                 if let Some(picture) = gesture.widget() {
                     picture.grab_focus();
                 }
@@ -860,6 +863,11 @@ pub fn show_remote_control_dialog(
                     Press::Tap => {
                         if let Some(point) = to_phone(sx, sy) {
                             send(at(action("singleclick"), point));
+                        } else {
+                            debug_log!(
+                                "[Phone screen] tap at {sx:.0},{sy:.0} not on the phone's picture \
+                                 (no picture, no phone screen size, or outside it)"
+                            );
                         }
                     }
                 }
