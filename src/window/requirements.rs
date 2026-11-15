@@ -250,6 +250,16 @@ impl Facts {
 
 /// Everything still missing, this computer's first, then the phone's, in a
 /// fixed order. Empty when all is set up.
+
+/// The setup step's title for the media checks that are not ok: only what is
+/// actually missing is named.
+fn plugins_title(ids: &[&str]) -> &'static str {
+    match (ids.contains(&"sound"), ids.iter().any(|id| *id != "sound")) {
+        (true, false) => "Sound support is missing",
+        (false, _) => "Video support is missing",
+        (true, true) => "Video and sound support is missing",
+    }
+}
 pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
     let mut needs = Vec::new();
     let copy = |check: &Check| facts.install(check).map_or(Fix::None, Fix::Copy);
@@ -305,7 +315,7 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
         needs.push(Need {
             id: "plugins",
             on_phone: false,
-            title: "Video and sound support is missing".into(),
+            title: plugins_title(&plugins.iter().map(|check| check.id).collect::<Vec<_>>()).into(),
             detail: if commands.is_empty() {
                 detail
             } else {
@@ -1492,6 +1502,18 @@ mod tests {
             panic!("{:?}", needs[1].fix)
         };
         assert!(command.starts_with("sudo apt install"), "{command}");
+    }
+
+    /// A computer missing only its sound server is told about sound, not
+    /// "video and sound" (every bare X11 session without PipeWire, F-p25).
+    #[test]
+    fn only_what_is_missing_is_named() {
+        assert_eq!(plugins_title(&["sound"]), "Sound support is missing");
+        assert_eq!(plugins_title(&["view"]), "Video support is missing");
+        assert_eq!(
+            plugins_title(&["link", "sound"]),
+            "Video and sound support is missing"
+        );
     }
 
     /// An unavailable action says why and what fixes it: reachability first,
