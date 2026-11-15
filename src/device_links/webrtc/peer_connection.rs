@@ -80,6 +80,20 @@ fn enable_immediate_rtcp_feedback(webrtcbin: &gst::Element) {
 /// audio, so its video took audio's `false`. Measured live: lost 489, nack 0,
 /// every loss a PLI and a keyframe (a ~2 s freeze per burst). This handler runs
 /// after `webrtcbin`'s and decides from the SSRC's own m-section instead.
+///
+/// It also turns off `rtx-next-seqnum`, for every jitterbuffer. With it on, the
+/// jitterbuffer guesses when the *next* packet is due (one frame interval after
+/// the last) and, when it is not there 40 ms later, NACKs it and declares it
+/// lost. The phone sends frames only when the picture changes (a still screen is
+/// five refinement frames 100 ms apart, then silence), so every pause was
+/// reported as a lost packet the phone had never sent: the depayloader turned it
+/// into a missing-data gap, the decoder asked for a keyframe and dropped every
+/// frame until one came, and the late "lost" packet was thrown away when it did
+/// arrive. Measured (F24): pli 0 -> 117 with lost 0, ~1.4 keyframes a second on
+/// a still screen, and each scroll starting behind a keyframe that held the
+/// phone's pacer for 0.5-1.9 s. A packet really missing is still seen as a gap
+/// by the next one to arrive, NACKed, and if it does not come back in time the
+/// decoder asks for a keyframe as before.
 fn retransmit_by_media_section(webrtcbin: &gst::Element) {
     let Some(rtpbin) = webrtcbin
         .downcast_ref::<gst::Bin>()
@@ -90,6 +104,9 @@ fn retransmit_by_media_section(webrtcbin: &gst::Element) {
     let webrtcbin = webrtcbin.downgrade();
     rtpbin.connect("new-jitterbuffer", false, move |values| {
         let jitterbuffer = values[1].get::<gst::Element>().ok()?;
+        if jitterbuffer.has_property("rtx-next-seqnum", None) {
+            jitterbuffer.set_property("rtx-next-seqnum", false);
+        }
         let ssrc = values[3].get::<u32>().ok()?;
         let sdp = webrtcbin
             .upgrade()?
@@ -2648,6 +2665,137 @@ a=ssrc:3333333333 msid:desklink-audio 0b5e2d0c-7f1a-4d2e-9c3b-5a6f7e8d9c0b\r\n";
         };
         assert!(retransmits(1111111111), "the phone's video is NACKed");
         assert!(!retransmits(3333333333), "its audio is not");
+        peer.close();
+    }
+
+    /// F24: a still phone screen is five refinement frames 100 ms apart, then
+    /// nothing until the picture changes. The jitterbuffer used to guess the next
+    /// packet's arrival, NACK it and declare it lost 40 ms after each pause: a
+    /// keyframe request (PLI) per pause with nothing lost, ~1.4 a second. Packets
+    /// that all arrive, at the phone's own uneven pace, must report no loss and
+    /// ask for no retransmission; a packet really missing must still be lost
+    /// (and so still recovered by a keyframe) within a fraction of a second.
+    #[test]
+    fn a_paused_phone_stream_is_not_lost_and_a_missing_packet_still_is() {
+        use std::sync::atomic::AtomicU32;
+        use std::time::Instant;
+
+        let peer = answered_peer(PHONE_OFFER);
+        let rtpbin = peer
+            .webrtcbin
+            .downcast_ref::<gst::Bin>()
+            .and_then(|bin| bin.by_name("rtpbin"))
+            .unwrap();
+        // As rtpbin configures it for webrtcbin, then the desk's own hook.
+        let jitterbuffer = gst::ElementFactory::make("rtpjitterbuffer")
+            .property("latency", JITTER_BUFFER_LATENCY_MS)
+            .property("do-lost", true)
+            .build()
+            .unwrap();
+        rtpbin.emit_by_name::<()>("new-jitterbuffer", &[&jitterbuffer, &0u32, &1111111111u32]);
+        assert!(jitterbuffer.property::<bool>("do-retransmission"));
+
+        let source = gst::ElementFactory::make("appsrc")
+            .property(
+                "caps",
+                gst::Caps::builder("application/x-rtp")
+                    .field("media", "video")
+                    .field("clock-rate", 90_000i32)
+                    .field("encoding-name", "H264")
+                    .field("payload", 96i32)
+                    .build(),
+            )
+            .property("is-live", true)
+            .property("do-timestamp", true)
+            .property("format", gst::Format::Time)
+            .build()
+            .unwrap();
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .build()
+            .unwrap();
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([&source, &jitterbuffer, &sink]).unwrap();
+        gst::Element::link_many([&source, &jitterbuffer, &sink]).unwrap();
+
+        let (lost, nacked) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+        let count = |counter: &Arc<AtomicU32>, name: &'static str| {
+            let counter = Arc::clone(counter);
+            move |_: &gst::Pad, info: &mut gst::PadProbeInfo| {
+                if let Some(gst::PadProbeData::Event(event)) = &info.data {
+                    if event.structure().is_some_and(|s| s.name() == name) {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            }
+        };
+        jitterbuffer.static_pad("src").unwrap().add_probe(
+            gst::PadProbeType::EVENT_DOWNSTREAM,
+            count(&lost, "GstRTPPacketLost"),
+        );
+        jitterbuffer.static_pad("sink").unwrap().add_probe(
+            gst::PadProbeType::EVENT_UPSTREAM,
+            count(&nacked, "GstRTPRetransmissionRequest"),
+        );
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        let start = Instant::now();
+        let mut seq: u16 = 1000;
+        // Three packets per frame, the last one marked, sent `at` after start.
+        let mut frame = |at_ms: u64, skip: Option<usize>| {
+            let at = Duration::from_millis(at_ms);
+            if let Some(wait) = at.checked_sub(start.elapsed()) {
+                std::thread::sleep(wait);
+            }
+            let rtp_time = 90_000u32 + at_ms as u32 * 90;
+            for packet in 0..3 {
+                let mut bytes = vec![0x80, 96 | if packet == 2 { 0x80 } else { 0 }];
+                bytes.extend_from_slice(&seq.to_be_bytes());
+                bytes.extend_from_slice(&rtp_time.to_be_bytes());
+                bytes.extend_from_slice(&1111111111u32.to_be_bytes());
+                bytes.extend_from_slice(&[0x41; 200]);
+                seq = seq.wrapping_add(1);
+                if skip != Some(packet) {
+                    let _ = source.emit_by_name::<gst::FlowReturn>(
+                        "push-buffer",
+                        &[&gst::Buffer::from_mut_slice(bytes)],
+                    );
+                }
+            }
+        };
+        // Two still-screen pauses: refinement bursts at 0 and 700 ms.
+        for burst in [0, 700] {
+            for k in 0..5 {
+                frame(burst + k * 100, None);
+            }
+        }
+        frame(1500, None);
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            (lost.load(Ordering::SeqCst), nacked.load(Ordering::SeqCst)),
+            (0, 0),
+            "nothing was missing: no loss and no retransmission request (lost, nacked)"
+        );
+
+        // A packet really missing: the next one shows the gap.
+        frame(1700, Some(1));
+        frame(1717, None);
+        let deadline = Instant::now() + Duration::from_millis(400);
+        while lost.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            lost.load(Ordering::SeqCst),
+            1,
+            "a missing packet is still lost"
+        );
+        assert!(
+            nacked.load(Ordering::SeqCst) >= 1,
+            "and was asked for first"
+        );
+
+        pipeline.set_state(gst::State::Null).unwrap();
         peer.close();
     }
 

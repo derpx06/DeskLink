@@ -506,6 +506,10 @@ pub(crate) fn attach_incoming_video(
         // *every* lost packet, and on Wi-Fi that was ~10 requests a second —
         // each answered with an 84 KB hardware keyframe that backed up the
         // phone's pacer (170–280 ms per packet) and caused more loss.
+        //
+        // The decoder asks on the jitterbuffer's packet-lost events (a
+        // missing-data gap from the depayloader), not on corrupt output, so
+        // those must mean real loss: see `retransmit_by_media_section` (F24).
         let decode_bin = decode
             .downcast_ref::<gst::Bin>()
             .ok_or_else(|| "DeskLink screen decoder is not a bin".to_string())?;
@@ -635,6 +639,20 @@ pub(crate) struct Inbound {
     pub(crate) jitter_ms: Option<f64>,
 }
 
+impl Inbound {
+    /// Counted from `start` instead of the session's beginning (bytes stay
+    /// absolute: they are differenced line by line).
+    pub(crate) fn since(&self, start: &Inbound) -> Inbound {
+        Inbound {
+            bytes: self.bytes,
+            lost: self.lost - start.lost,
+            nacks: self.nacks.saturating_sub(start.nacks),
+            plis: self.plis.saturating_sub(start.plis),
+            jitter_ms: self.jitter_ms,
+        }
+    }
+}
+
 /// The phone's video source among rtpbin's `source-stats`: the remote
 /// sender that has delivered the most bytes (the audio and the RTCP-only
 /// sources deliver far fewer).
@@ -736,9 +754,31 @@ fn watch_inbound(pad: &gst::Pad, inner: &Arc<ScreenStreamInner>) {
             gst::PadProbeReturn::Ok
         });
     }
+    // rtpbin's own session: webrtcbin's `get-stats` had no `inbound-rtp` for
+    // this stream, so every line read "0 kbps, ?".
+    let read_inbound = move || {
+        webrtcbin
+            .downcast_ref::<gst::Bin>()
+            .and_then(|bin| bin.by_name("rtpbin"))
+            .and_then(|rtpbin| {
+                rtpbin.emit_by_name::<Option<gst::glib::Object>>("get-internal-session", &[&0u32])
+            })
+            .and_then(|session| {
+                let stats = session.property::<gst::Structure>("stats");
+                let sources = stats.get::<gst::glib::ValueArray>("source-stats").ok()?;
+                inbound_summary(
+                    sources
+                        .iter()
+                        .filter_map(|value| value.get::<gst::Structure>().ok()),
+                )
+            })
+    };
     let weak = Arc::downgrade(inner);
     std::thread::spawn(move || {
-        let (mut frames, mut bytes, mut since) = (0u64, 0u64, Instant::now());
+        // The session outlives a share (F28): counted from this share's start.
+        let start = read_inbound();
+        let mut bytes = start.as_ref().map_or(0, |inbound| inbound.bytes);
+        let (mut frames, mut since) = (0u64, Instant::now());
         let mut drops = udp_receive_buffer_drops();
         loop {
             std::thread::sleep(Duration::from_secs(2));
@@ -780,24 +820,10 @@ fn watch_inbound(pad: &gst::Pad, inner: &Arc<ScreenStreamInner>) {
                         })
                 })
                 .unwrap_or_else(|| "?".into());
-            // rtpbin's own session: webrtcbin's `get-stats` had no
-            // `inbound-rtp` for this stream, so every line read "0 kbps, ?".
-            let inbound = webrtcbin
-                .downcast_ref::<gst::Bin>()
-                .and_then(|bin| bin.by_name("rtpbin"))
-                .and_then(|rtpbin| {
-                    rtpbin
-                        .emit_by_name::<Option<gst::glib::Object>>("get-internal-session", &[&0u32])
-                })
-                .and_then(|session| {
-                    let stats = session.property::<gst::Structure>("stats");
-                    let sources = stats.get::<gst::glib::ValueArray>("source-stats").ok()?;
-                    inbound_summary(
-                        sources
-                            .iter()
-                            .filter_map(|value| value.get::<gst::Structure>().ok()),
-                    )
-                });
+            let inbound = read_inbound().map(|now| match &start {
+                Some(start) => now.since(start),
+                None => now,
+            });
             let received = inbound.as_ref().map_or(bytes, |inbound| inbound.bytes);
             let seconds = since.elapsed().as_secs_f64();
             let show = |value: Option<String>| value.unwrap_or_else(|| "?".to_string());
@@ -2309,6 +2335,23 @@ mod tests {
             })
         );
         assert_eq!(inbound_summary([source(true, true, 1)].into_iter()), None);
+    }
+
+    /// F28: the RTP session outlives a share, so a second share's stats line
+    /// counts loss, NACKs and PLIs from its own start, not the first share's.
+    #[test]
+    fn a_shares_stats_count_from_its_own_start() {
+        let at = |bytes, lost, nacks, plis| Inbound {
+            bytes,
+            lost,
+            nacks,
+            plis,
+            jitter_ms: Some(2.0),
+        };
+        assert_eq!(
+            at(9_000, 90, 710, 175).since(&at(8_000, 85, 706, 172)),
+            at(9_000, 5, 4, 3)
+        );
     }
 
     /// A capture that tags its picture as rotated or flipped (PipeWire's video
