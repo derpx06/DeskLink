@@ -62,7 +62,16 @@ there; the System check and the feature's own row say why and give the step.
 
 ## Nested and headless sessions run for this table
 
-DESKTOP_RUNS
+All in their own network namespace (loopback only), private D-Bus, HOME and
+runtime dir; never the live session. `desklink --check` in each, window
+screenshotted.
+
+| Session | Result |
+|---|---|
+| Plasma 6.7 Wayland: nested `kwin_wayland` (X11 backend inside Xvfb) + `plasmashell`, xdg-desktop-portal-kde | Window up; tray icon in the System Tray (tray row ok); share, Extend, Glide, unlock rows ok through the KDE portal; sound missing (no PipeWire in the sandbox, install line given). Without Xwayland the new clipboard row says so. |
+| sway (headless, pixman) + xdg-desktop-portal-wlr + PipeWire, Arch chroot | Window up; share row **limited, view only**; Extend and Glide missing with reasons; start-at-login gives the `exec` line; tray row names Waybar/swaybar. The ignored test `a_real_portal_share_is_view_only_without_remote_desktop` opened a real ScreenCast-only session through xdpw: `remote desktop: false; stream 1280x860 node 46; devices 0`. |
+| Xfce (xfwm4, xfce4-panel, xfce4-notifyd, Xvfb), Arch chroot | Window up; DeskLink's icon in the panel's Status Tray (tray ok); notifications ok; share ok through X11 capture; Extend/Glide missing with reasons. |
+| Plain X11, no desktop name, portal without backends, no tray, no notification daemon (each distribution) | Window up, daemon running; share ok through X11 capture; tray and notifications limited with each step (`apt install dunst`...). |
 
 ## Still needs a real install or the owner
 
