@@ -238,7 +238,7 @@ pub(super) fn history_box(on: bool) -> gtk::Box {
             if on {
                 "Text you copy here or on the phone appears here."
             } else {
-                "Sharing is off. Nothing is copied between the devices."
+                "Sharing is off. Turn it on above to copy between the devices."
             },
         );
         rows.append(&empty.root);

@@ -573,23 +573,17 @@ fn new_terminal_button(folders: &gtk::gio::Menu) -> adw::SplitButton {
     button
 }
 
-/// Detaches `device` from every terminal, after asking.
+/// Detaches `device` from every terminal at once: nothing is lost (the
+/// terminals keep running, the phone can open them again), so no question.
 fn detach_device(parent: &impl IsA<gtk::Widget>, device_id: &str, name: &str) {
-    let (id, target) = (device_id.to_string(), parent.as_ref().clone());
-    let name_owned = name.to_string();
-    confirm(
+    end_device_sessions(device_id);
+    toast_from(
         parent,
-        &format!("Detach {name}?"),
-        "The terminals keep running here, and the phone can open them again.",
-        "_Detach",
-        move || {
-            end_device_sessions(&id);
-            toast_from(&target, &format!("Detached {name_owned}"));
-            if let Some(window) = target.root().and_downcast::<DesklinkWindow>() {
-                window.refresh_soon();
-            }
-        },
+        &format!("Detached {name}. The terminals keep running, and it can open them again"),
     );
+    if let Some(window) = parent.root().and_downcast::<DesklinkWindow>() {
+        window.refresh_soon();
+    }
 }
 
 /// One session's dark tile: title, started time, its last lines, and who

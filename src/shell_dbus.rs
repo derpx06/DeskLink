@@ -1363,18 +1363,19 @@ pub(crate) fn pick_and_send_files(app: &DesklinkApplication, device_id: &str, na
     };
     let window = main_window(app);
     let id = device_id.to_string();
-    gtk::FileDialog::builder()
-        .title(format!("Send Files to {name}"))
-        .modal(true)
-        .build()
-        .open_multiple(window.as_ref(), gio::Cancellable::NONE, move |files| {
+    crate::window::send_files_dialog(&format!("Send Files to {name}")).open_multiple(
+        window.as_ref(),
+        gio::Cancellable::NONE,
+        move |files| {
             let Ok(files) = files else { return };
+            crate::window::remember_send_folder(&files);
             for file in files.iter::<gio::File>().flatten() {
                 if let Some(path) = file.path() {
                     daemon.send(DaemonCommand::SendFile(id.clone(), path));
                 }
             }
-        });
+        },
+    );
 }
 
 /// Presents the main window (creating it if needed) and returns it.

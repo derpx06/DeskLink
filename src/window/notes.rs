@@ -488,8 +488,15 @@ impl Page {
         let empty = clipboard::empty_state(
             "desklink-edit-note-symbolic",
             "No note selected",
-            "Pick a note, or start a new one with +",
+            "Pick a note on the left, or start a new one.",
         );
+        let start = ui_kit::button(
+            ButtonKind::Primary,
+            "New note",
+            Some("desklink-add-symbolic"),
+        );
+        start.set_halign(gtk::Align::Center);
+        empty.root.append(&start);
         let stack = gtk::Stack::new();
         stack.add_named(&editing, Some("editor"));
         stack.add_named(&empty.root, Some("none"));
@@ -604,7 +611,7 @@ impl Page {
             tidy,
             shown: Cell::new(u64::MAX),
         };
-        for button in [add, first] {
+        for button in [add, first, start] {
             let win = win.downgrade();
             button.connect_clicked(move |_| {
                 if let Some(win) = win.upgrade() {

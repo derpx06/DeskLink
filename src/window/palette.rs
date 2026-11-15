@@ -223,6 +223,16 @@ fn gather(window: &DesklinkWindow) -> Sources {
         contacts,
         settings: super::prefs::subpages(paired),
         pages: super::PAGES.to_vec(),
+        features: devices
+            .iter()
+            .find(|device| Some(&device.id) == selected.as_ref())
+            .map(|device| {
+                let base = super::requirements::Facts::now(Some(device));
+                model::feature_entries(&super::everything::rows(&super::everything::Facts::now(
+                    base, device,
+                )))
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -694,6 +704,7 @@ pub(super) fn run(window: &DesklinkWindow, target: &Target) {
         }
         Target::Contact { device, uid } => window.show_contact(device, uid),
         Target::Blocked(need) => super::requirements::explain(window, need),
+        Target::Feature(id) => window.show_feature_row(id),
     }
 }
 
@@ -830,7 +841,8 @@ mod tests {
             palette.entry.set_text("send fil");
             let first = palette.items[palette.order.borrow()[0].1].title.clone();
             assert_eq!(first, "Send files");
-            assert_eq!(palette.count.label(), "1 result");
+            // Home's feature rows that say "send" and "files" follow it.
+            assert!(palette.count.label().contains("result"));
             assert_eq!(palette.selected(), Some(0));
 
             palette.entry.set_text("qqqzzz");

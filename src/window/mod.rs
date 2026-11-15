@@ -234,6 +234,9 @@ mod imp {
         /// What each page was last drawn from; a page is redrawn only when
         /// this changes.
         pub snapshots: RefCell<HashMap<String, String>>,
+        /// A mouse button or a finger is down on the window: nothing is
+        /// redrawn under it (that would drop the click), but after it lifts.
+        pub pointer_held: Cell<bool>,
         /// The simple pages' bodies, by page name.
         pub bodies: RefCell<HashMap<String, (gtk::ScrolledWindow, gtk::Box)>>,
         pub(super) sidebar: RefCell<Option<sidebar::Sidebar>>,
@@ -321,6 +324,7 @@ mod imp {
             }
             self.chosen_device_id.replace(last.clone());
             self.selected_device_id.replace(last);
+            remember_window_size(&obj);
 
             calls::install_shortcuts(&obj);
             let window = obj.downgrade();
@@ -360,6 +364,7 @@ mod imp {
                 .build();
             self.sidebar.replace(Some(sidebar::Sidebar::new(&obj)));
             sidebar::install_window_drop(&obj);
+            obj.hold_redraws_while_pressed();
             // The tile row follows the window as it is resized.
             obj.connect_default_width_notify(|window| {
                 let window = window.downgrade();
@@ -853,6 +858,75 @@ impl DesklinkWindow {
         }
     }
 
+    /// Watches presses on the whole window (before any widget sees them,
+    /// claiming nothing) for [`Self::refresh_devices`].
+    fn hold_redraws_while_pressed(&self) {
+        let legacy = gtk::EventControllerLegacy::new();
+        legacy.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = self.downgrade();
+        legacy.connect_event(move |_, event| {
+            use gtk::gdk::EventType;
+            let held = match event.event_type() {
+                EventType::ButtonPress | EventType::TouchBegin => true,
+                EventType::ButtonRelease | EventType::TouchEnd | EventType::TouchCancel => false,
+                // A release that went elsewhere (a drag and drop took it).
+                EventType::MotionNotify
+                    if !event.modifier_state().intersects(
+                        gtk::gdk::ModifierType::BUTTON1_MASK
+                            | gtk::gdk::ModifierType::BUTTON2_MASK
+                            | gtk::gdk::ModifierType::BUTTON3_MASK,
+                    ) && weak
+                        .upgrade()
+                        .is_some_and(|window| window.imp().pointer_held.get()) =>
+                {
+                    false
+                }
+                _ => return glib::Propagation::Proceed,
+            };
+            if let Some(window) = weak.upgrade() {
+                window.imp().pointer_held.set(held);
+                if !held {
+                    window.refresh_soon();
+                }
+            }
+            glib::Propagation::Proceed
+        });
+        self.add_controller(legacy);
+    }
+
+    /// Shows Home with the "Everything DeskLink does" row `id` on screen and
+    /// its button focused (from "Find anything"), once Home is redrawn.
+    fn show_feature_row(&self, id: &str) {
+        if !self.show_page("home") {
+            self.show_feature_toast("Pair a phone to use that");
+            return;
+        }
+        let (weak, id) = (self.downgrade(), id.to_string());
+        glib::timeout_add_local_once(std::time::Duration::from_millis(250), move || {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            let Some((_, body)) = window.imp().bodies.borrow().get("home").cloned() else {
+                return;
+            };
+            let named = |root: &gtk::Widget, name: &str| {
+                named_widgets(root, name)
+                    .into_iter()
+                    .find(|widget| widget.widget_name() == name)
+            };
+            let section = named(body.upcast_ref(), "everything");
+            // The button when the row has one; the row itself (made
+            // focusable for this) when it only says why it is off.
+            let target = section.and_then(|section| {
+                named(&section, &format!("everything-{id}"))
+                    .or_else(|| named(&section, &id).inspect(|row| row.set_focusable(true)))
+            });
+            if let Some(target) = target {
+                target.grab_focus();
+            }
+        });
+    }
+
     /// The dial pad (Contacts page, Find anything, Ctrl+Shift+D).
     pub fn show_dial_pad(&self) {
         dialpad::show(self);
@@ -1160,7 +1234,10 @@ impl DesklinkWindow {
     fn refresh_devices(&self) {
         crate::device_links::daemon::set_ui_visible(self.is_visible());
         let imp = self.imp();
-        if imp.refreshing.get() {
+        // Not while a click is under way: a page or list redrawn between
+        // press and release takes the button away and the click is lost.
+        // The release refreshes (`hold_redraws_while_pressed`).
+        if imp.refreshing.get() || imp.pointer_held.get() {
             return;
         }
         let Some(daemon) = imp.daemon.borrow().clone() else {
@@ -1186,12 +1263,12 @@ impl DesklinkWindow {
                 } => {
                     self.send_feature_notification(
                         &format!("desklink-ping-{device_id}-{}", glib::monotonic_time()),
-                        &format!("Ping from {device_name}"),
+                        &format!("Nudge from {device_name}"),
                         message
                             .as_deref()
-                            .unwrap_or("Your phone sent a Ping through DeskLink."),
+                            .unwrap_or("Your phone sent a nudge through DeskLink."),
                     );
-                    self.show_feature_toast(&format!("Ping received from {device_name}"));
+                    self.show_feature_toast(&format!("Nudge from {device_name}"));
                 }
                 DaemonEvent::FindPhoneReceived {
                     device_id,
@@ -1808,7 +1885,7 @@ impl DesklinkWindow {
                 DaemonCommand::SendLockRequest(id, true),
                 format!("Locking {name}"),
             ),
-            QuickAction::Ping => (DaemonCommand::SendPing(id), "Ping sent".to_string()),
+            QuickAction::Ping => (DaemonCommand::SendPing(id), "Nudge sent".to_string()),
             QuickAction::Clipboard => (
                 DaemonCommand::SendClipboard(id),
                 format!("Clipboard sent to {name}"),
@@ -2779,6 +2856,61 @@ fn has_label_descendant(widget: &gtk::Widget) -> bool {
     false
 }
 
+/// Where the window's size is kept: `~/.config/desklink/window-size`
+/// ("width height maximized"), beside `last-device`.
+fn window_size_path() -> Option<std::path::PathBuf> {
+    Some(dirs::config_dir()?.join("desklink").join("window-size"))
+}
+
+/// "1180 760 0" as a size and whether it was maximized; nothing for text
+/// that is not a sane size.
+fn parse_window_size(text: &str) -> Option<(i32, i32, bool)> {
+    let mut parts = text.split_whitespace();
+    let width: i32 = parts.next()?.parse().ok()?;
+    let height: i32 = parts.next()?.parse().ok()?;
+    let maximized = parts.next() == Some("1");
+    ((360..=10_000).contains(&width) && (294..=10_000).contains(&height))
+        .then_some((width, height, maximized))
+}
+
+/// Opens at the size it had last time, and keeps the size when it is
+/// closed (hidden) or the app quits.
+fn remember_window_size(window: &DesklinkWindow) {
+    // Test windows leave the person's own size alone.
+    if cfg!(test) {
+        return;
+    }
+    if let Some((width, height, maximized)) = window_size_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| parse_window_size(&text))
+    {
+        window.set_default_size(width, height);
+        if maximized {
+            window.maximize();
+        }
+    }
+    let save = |window: &DesklinkWindow| {
+        let (width, height) = window.default_size();
+        let Some(path) = window_size_path() else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let text = format!("{width} {height} {}", u8::from(window.is_maximized()));
+        let _ = std::fs::write(path, text);
+    };
+    window.connect_close_request(move |window| {
+        save(window);
+        glib::Propagation::Proceed
+    });
+    window.connect_unrealize(move |window| {
+        if let Some(window) = window.downcast_ref::<DesklinkWindow>() {
+            save(window);
+        }
+    });
+}
+
 /// Every widget under `root` whose name starts with `prefix`.
 fn named_widgets(root: &gtk::Widget, prefix: &str) -> Vec<gtk::Widget> {
     let mut found = Vec::new();
@@ -2942,19 +3074,51 @@ pub(crate) fn confirm(
     });
 }
 
+/// Where the last files sent from were picked: `~/.config/desklink/send-folder`.
+fn send_folder_path() -> Option<std::path::PathBuf> {
+    Some(dirs::config_dir()?.join("desklink").join("send-folder"))
+}
+
+/// A file dialog for sending, opened in the folder files were last sent from.
+pub(crate) fn send_files_dialog(title: &str) -> gtk::FileDialog {
+    let dialog = gtk::FileDialog::builder().title(title).modal(true).build();
+    let folder = send_folder_path()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(std::path::PathBuf::from)
+        .filter(|folder| folder.is_dir());
+    if let Some(folder) = folder {
+        dialog.set_initial_folder(Some(&gio::File::for_path(folder)));
+    }
+    dialog
+}
+
+/// Remembers the folder of the first of `files` for [`send_files_dialog`].
+pub(crate) fn remember_send_folder(files: &gio::ListModel) {
+    let folder = files
+        .item(0)
+        .and_downcast::<gio::File>()
+        .and_then(|file| file.path())
+        .and_then(|path| path.parent().map(std::path::Path::to_path_buf));
+    if let (Some(folder), Some(path)) = (folder, send_folder_path()) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, folder.to_string_lossy().as_bytes());
+    }
+}
+
 /// Asks for files and sends each to `id`.
 fn pick_and_send_files(daemon: &DaemonHandle, id: &str, widget: &impl IsA<gtk::Widget>) {
     let Some(root) = widget.root().and_downcast::<gtk::Window>() else {
         return;
     };
-    let dialog = gtk::FileDialog::builder()
-        .title("Select Files to Send")
-        .build();
+    let dialog = send_files_dialog("Select Files to Send");
     let (daemon, id) = (daemon.clone(), id.to_string());
     dialog.open_multiple(Some(&root), gio::Cancellable::NONE, move |result| {
         let Ok(files) = result else {
             return;
         };
+        remember_send_folder(&files);
         for file in files.iter::<gio::File>().flatten() {
             if let Some(path) = file.path() {
                 debug_log!("[UI] Selected file to send: {:?}", path);
@@ -4370,6 +4534,21 @@ mod jargon_tests {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_remembered_window_size_is_read_only_when_sane() {
+        assert_eq!(
+            super::parse_window_size("1180 760 0"),
+            Some((1180, 760, false))
+        );
+        assert_eq!(
+            super::parse_window_size("900 600 1\n"),
+            Some((900, 600, true))
+        );
+        assert_eq!(super::parse_window_size("10 10 0"), None);
+        assert_eq!(super::parse_window_size("wide"), None);
+        assert_eq!(super::parse_window_size(""), None);
+    }
+
+    #[test]
     fn pairing_errors_are_said_in_plain_words_and_the_reinstall_hint_is_right() {
         for (raw, needle) in [
             (
@@ -4394,6 +4573,48 @@ mod tests {
     }
 
     use super::*;
+
+    /// A press anywhere holds every redraw until it is released, so the
+    /// button under the pointer is still the one released on (the owner's
+    /// "clicks don't work"). (Skipped without a display.)
+    #[test]
+    fn nothing_is_redrawn_between_press_and_release() {
+        crate::test_display::run(|| {
+            let resources = crate::load_resources().expect("the bundled resources");
+            gio::resources_register(&resources);
+            let app = adw::Application::builder()
+                .application_id("derx06.desklink.com.test")
+                .build();
+            let window = DesklinkWindow::new(&app);
+            let (daemon, _commands) = DaemonHandle::detached();
+            daemon.set_load_state_for_tests(crate::device_links::daemon::handle::LOAD_KNOWN);
+            window.set_daemon(daemon);
+            let phone = debug_fake_device("paired", "Pixel 9");
+            let id = phone.id.clone();
+            window.imp().fake_devices.borrow_mut().push(phone);
+            window.select_device(&id);
+            window.present();
+            let pump = || {
+                let context = glib::MainContext::default();
+                for _ in 0..30 {
+                    while context.iteration(false) {}
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            };
+            pump();
+            window.refresh_devices();
+            pump();
+            let drawn = || window.imp().snapshots.borrow().contains_key("home");
+            assert!(drawn(), "Home is drawn");
+            window.imp().snapshots.borrow_mut().clear();
+            window.imp().pointer_held.set(true);
+            window.refresh_devices();
+            assert!(!drawn(), "held: nothing is redrawn");
+            window.imp().pointer_held.set(false);
+            window.refresh_devices();
+            assert!(drawn(), "released: redrawn");
+        });
+    }
 
     /// The "This phone's identity changed" notice is a banner that stays
     /// until the situation does, with one button, Details, which opens the
