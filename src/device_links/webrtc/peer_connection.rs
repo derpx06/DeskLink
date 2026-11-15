@@ -105,6 +105,90 @@ fn retransmit_by_media_section(webrtcbin: &gst::Element) {
     });
 }
 
+/// webrtcbin's stats, waiting at most [`STATS_WAIT`].
+fn webrtcbin_stats(webrtcbin: &gst::Element) -> Option<Vec<gst::Structure>> {
+    let (sender, receiver) = mpsc::channel();
+    let promise = gst::Promise::with_change_func(move |reply| {
+        let _ = sender.send(reply.ok().flatten().map(|stats| stats.to_owned()));
+    });
+    webrtcbin.emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
+    let reply = receiver.recv_timeout(STATS_WAIT).ok().flatten()?;
+    Some(
+        reply
+            .iter()
+            .filter_map(|(_, value)| value.get::<gst::Structure>().ok())
+            .collect(),
+    )
+}
+
+/// The local port of the selected ICE pair, from the stats. (Not from the ICE
+/// agent: GStreamer 1.28's `GstWebRTCNice` has no `get_selected_pair`, and
+/// asking for it aborts the process.)
+fn selected_local_port(webrtcbin: &gst::Element) -> Option<u16> {
+    let stats = webrtcbin_stats(webrtcbin)?;
+    let field = |stats: &gst::Structure, name: &str| stats.get::<String>(name).ok();
+    let by_id = |id: &str| {
+        stats
+            .iter()
+            .find(|entry| field(entry, "id").as_deref() == Some(id))
+    };
+    let pair_id = stats
+        .iter()
+        .find_map(|entry| field(entry, "selected-candidate-pair-id"))?;
+    let local = by_id(&field(by_id(&pair_id)?, "local-candidate-id")?)?;
+    u16::try_from(local.get::<u32>("port").ok()?).ok()
+}
+
+/// Asked of the kernel for the ICE socket's receive buffer. It grants at most
+/// twice `net.core.rmem_max` (212992 by default, so 416 KiB) without
+/// privileges; asking for more lets a raised sysctl take effect.
+const ICE_RECEIVE_BUFFER_BYTES: usize = 4 << 20;
+
+/// Widens the receive buffer of the UDP socket(s) on `port`: libnice leaves
+/// its sockets at `rmem_default`, about 100 KB of payload once the kernel's
+/// per-packet overhead is counted. Measured on the phone mirror: a 10-15
+/// Mbps keyframe burst overflowed it (`Udp RcvbufErrors` rose by 197 while
+/// the stream lost 185 packets), and every drop became a PLI and another
+/// keyframe. webrtcbin exposes no socket, so this finds it by port among this
+/// process's descriptors. Returns the size the kernel reports afterwards.
+fn widen_receive_buffer(port: u16) -> Option<usize> {
+    udp_sockets_on(port)
+        .iter()
+        .filter_map(|fd| {
+            let socket = socket2::SockRef::from(fd);
+            socket.set_recv_buffer_size(ICE_RECEIVE_BUFFER_BYTES).ok()?;
+            socket.recv_buffer_size().ok()
+        })
+        .max()
+}
+
+/// This process's UDP sockets bound to `port`, duplicated.
+fn udp_sockets_on(port: u16) -> Vec<std::os::fd::OwnedFd> {
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        // SAFETY: borrowed only to duplicate it at once; a descriptor closed
+        // in between fails the duplication.
+        .filter_map(|fd| {
+            unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }
+                .try_clone_to_owned()
+                .ok()
+        })
+        .filter(|fd| {
+            let socket = socket2::SockRef::from(fd);
+            socket.r#type().ok() == Some(socket2::Type::DGRAM)
+                && socket
+                    .local_addr()
+                    .ok()
+                    .and_then(|address| address.as_socket())
+                    .is_some_and(|address| address.port() == port)
+        })
+        .collect()
+}
+
 /// The kind (`video`, `audio`) of the m-section that lists `ssrc`.
 fn media_kind_of_ssrc(sdp: &str, ssrc: u32) -> Option<&str> {
     let tag = format!("a=ssrc:{ssrc} ");
@@ -791,17 +875,7 @@ impl DesktopWebRtcPeer {
     }
 
     fn selected_pair_from_stats(&self) -> Option<SelectedPair> {
-        let (sender, receiver) = mpsc::channel();
-        let promise = gst::Promise::with_change_func(move |reply| {
-            let _ = sender.send(reply.ok().flatten().map(|stats| stats.to_owned()));
-        });
-        self.webrtcbin
-            .emit_by_name::<()>("get-stats", &[&None::<gst::Pad>, &promise]);
-        let reply = receiver.recv_timeout(STATS_WAIT).ok().flatten()?;
-        let stats: Vec<gst::Structure> = reply
-            .iter()
-            .filter_map(|(_, value)| value.get::<gst::Structure>().ok())
-            .collect();
+        let stats = webrtcbin_stats(&self.webrtcbin)?;
         let field = |stats: &gst::Structure, name: &str| stats.get::<String>(name).ok();
         let by_id = |id: &str| {
             stats
@@ -1776,6 +1850,20 @@ fn install_webrtcbin_callbacks(
     // process when that worker invokes it.  The event sender is Send + Sync,
     // so use the cross-thread signal connection and forward only a string.
     webrtcbin.connect_notify(Some("connection-state"), move |element, _| {
+        let state = element.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
+        if state == gst_webrtc::WebRTCPeerConnectionState::Connected {
+            // Off this thread: the stats are waited for, and this
+            // callback must never wait on anything.
+            let webrtcbin = element.downgrade();
+            std::thread::spawn(move || {
+                let port = webrtcbin
+                    .upgrade()
+                    .and_then(|webrtcbin| selected_local_port(&webrtcbin))?;
+                let size = widen_receive_buffer(port);
+                debug_log!("[DeskLink] ICE socket :{port} receive buffer: {size:?} bytes");
+                Some(())
+            });
+        }
         let state = element.property_value("connection-state");
         let _ = state_events.send(PeerEvent::ConnectionChanged(format!("{state:?}")));
     });
@@ -2233,6 +2321,32 @@ pub(crate) mod tests {
             pair.offerer.selected_pair_types()
         );
         assert_eq!(path.map(|path| path.label), Some("lan"));
+        pair.offerer.close();
+        pair.answerer.close();
+    }
+
+    /// Once connected, the ICE socket's receive buffer is wider than the
+    /// kernel's default: at the default a phone's keyframe burst overflowed
+    /// it, and every dropped packet became a PLI and another keyframe.
+    #[test]
+    fn a_connected_peer_widens_its_ice_socket_receive_buffer() {
+        let default = socket2::SockRef::from(&std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+            .recv_buffer_size()
+            .unwrap();
+        let pair = loopback();
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let port = selected_local_port(&pair.answerer.webrtcbin).unwrap();
+        let size = || {
+            udp_sockets_on(port)
+                .iter()
+                .filter_map(|fd| socket2::SockRef::from(fd).recv_buffer_size().ok())
+                .max()
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while size() <= Some(default) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(size() > Some(default), "{:?}, default {default}", size());
         pair.offerer.close();
         pair.answerer.close();
     }

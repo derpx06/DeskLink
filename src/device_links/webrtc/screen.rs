@@ -662,6 +662,30 @@ pub(crate) fn inbound_summary(sources: impl Iterator<Item = gst::Structure>) -> 
     })
 }
 
+/// UDP datagrams the kernel dropped because a socket's receive buffer was
+/// full, IPv4 and IPv6, every socket on this machine (`/proc/net/snmp{,6}`).
+fn udp_receive_buffer_drops() -> Option<u64> {
+    let snmp = std::fs::read_to_string("/proc/net/snmp").ok()?;
+    let mut udp = snmp.lines().filter(|line| line.starts_with("Udp: "));
+    let (names, values) = (udp.next()?, udp.next()?);
+    let index = names
+        .split_whitespace()
+        .position(|name| name == "RcvbufErrors")?;
+    let v4 = values.split_whitespace().nth(index)?.parse::<u64>().ok()?;
+    let v6 = std::fs::read_to_string("/proc/net/snmp6")
+        .ok()
+        .and_then(|snmp6| {
+            snmp6.lines().find_map(|line| {
+                line.strip_prefix("Udp6RcvbufErrors")?
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+            })
+        })
+        .unwrap_or(0);
+    Some(v4 + v6)
+}
+
 /// `DESKLINK_DEBUG`: a `phone-screen-stats` line every 2 s while a phone's
 /// screen is shown — what arrives (size, frames shown, kbps, loss, NACK/PLI
 /// sent, jitter) and what this desk adds after the jitter buffer: depayload,
@@ -715,6 +739,7 @@ fn watch_inbound(pad: &gst::Pad, inner: &Arc<ScreenStreamInner>) {
     let weak = Arc::downgrade(inner);
     std::thread::spawn(move || {
         let (mut frames, mut bytes, mut since) = (0u64, 0u64, Instant::now());
+        let mut drops = udp_receive_buffer_drops();
         loop {
             std::thread::sleep(Duration::from_secs(2));
             let Some(inner) = weak
@@ -776,14 +801,21 @@ fn watch_inbound(pad: &gst::Pad, inner: &Arc<ScreenStreamInner>) {
             let received = inbound.as_ref().map_or(bytes, |inbound| inbound.bytes);
             let seconds = since.elapsed().as_secs_f64();
             let show = |value: Option<String>| value.unwrap_or_else(|| "?".to_string());
+            let drops_now = udp_receive_buffer_drops();
+            let dropped = drops
+                .zip(drops_now)
+                .map(|(was, now)| now.saturating_sub(was));
+            drops = drops_now;
             eprintln!(
                 "[DeskLink] phone-screen-stats: {size} via {decoder}, shown {:.1} fps, in {} kbps, \
-                 lost {}, nack {}, pli {}, jitter {} ms, after jitter buffer {} ms avg / {:.1} max",
+                 lost {}, nack {}, pli {}, udp drops {}, jitter {} ms, \
+                 after jitter buffer {} ms avg / {:.1} max",
                 (shown - frames) as f64 / seconds,
                 ((received.saturating_sub(bytes)) as f64 * 8.0 / seconds / 1000.0) as u64,
                 show(inbound.as_ref().map(|i| i.lost.to_string())),
                 show(inbound.as_ref().map(|i| i.nacks.to_string())),
                 show(inbound.as_ref().map(|i| i.plis.to_string())),
+                show(dropped.map(|n| n.to_string())),
                 show(inbound.as_ref().and_then(|i| i.jitter_ms).map(|ms| format!("{ms:.1}"))),
                 if count == 0 { "-".to_string() } else { format!("{:.1}", sum / f64::from(count)) },
                 max,
@@ -2230,6 +2262,12 @@ mod tests {
             median < 60.0,
             "median {median:.1} ms from arrival to display"
         );
+    }
+
+    /// The stats line's `udp drops` reads the kernel's counter on Linux.
+    #[test]
+    fn the_kernels_udp_receive_buffer_drops_are_read() {
+        assert!(udp_receive_buffer_drops().is_some());
     }
 
     /// The stats line reads the phone's stream from rtpbin's sources: the remote
