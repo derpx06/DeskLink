@@ -1642,32 +1642,39 @@ fn session_report(webrtcbin: &gst::Element, ssrc: u32) -> Option<(LinkReport, u6
 }
 
 /// An rtpbin source-stats entry for our own `ssrc` turned into a report,
-/// once the phone has sent one (`have-rb`).
+/// once the phone has sent one (`have-rb`). GStreamer 1.24 keeps that report
+/// on the phone's source instead (`rb-ssrc` naming ours), so that is read
+/// when ours has none.
 pub(crate) fn report_for_source(
-    mut sources: impl Iterator<Item = gst::Structure>,
+    sources: impl Iterator<Item = gst::Structure>,
     ssrc: u32,
 ) -> Option<(LinkReport, u64)> {
-    let source = sources.find(|source| {
+    let sources: Vec<gst::Structure> = sources.collect();
+    let source = sources.iter().find(|source| {
         source.get::<u32>("ssrc").ok() == Some(ssrc)
             && source.get::<bool>("internal").unwrap_or(false)
     })?;
-    if !source.get::<bool>("have-rb").unwrap_or(false) {
-        return None;
-    }
+    let about_ours = sources.iter().filter(|other| {
+        !other.get::<bool>("internal").unwrap_or(true)
+            && other.get::<u32>("rb-ssrc").ok() == Some(ssrc)
+    });
+    let rb = std::iter::once(source)
+        .chain(about_ours)
+        .find(|source| source.get::<bool>("have-rb").unwrap_or(false))?;
     let clock_rate = source
         .get::<i32>("clock-rate")
         .ok()
         .filter(|rate| *rate > 0)
         .unwrap_or(90_000);
     let report = LinkReport {
-        loss: f64::from(source.get::<u32>("rb-fractionlost").unwrap_or(0)) / 256.0,
+        loss: f64::from(rb.get::<u32>("rb-fractionlost").unwrap_or(0)) / 256.0,
         // NTP short format: 1/65536 s.
-        rtt_ms: source
+        rtt_ms: rb
             .get::<u32>("rb-round-trip")
             .ok()
             .filter(|rtt| *rtt > 0)
             .map(|rtt| f64::from(rtt) * 1000.0 / 65536.0),
-        jitter_ms: source
+        jitter_ms: rb
             .get::<u32>("rb-jitter")
             .ok()
             .map(|jitter| f64::from(jitter) * 1000.0 / f64::from(clock_rate)),
@@ -2479,6 +2486,40 @@ mod tests {
         assert!((report.rtt_ms.unwrap() - 50.0).abs() < 0.1);
         assert!(report_for_source([source(42, true, false)].into_iter(), 42).is_none());
         assert!(report_for_source([source(42, false, true)].into_iter(), 42).is_none());
+    }
+
+    /// GStreamer 1.24 (Ubuntu 24.04) keeps the phone's report about our
+    /// stream on the phone's own source (`rb-ssrc` = ours), not on ours: a
+    /// reopened share there never raised its bitrate.
+    #[test]
+    fn a_reshare_reads_the_report_kept_on_the_phones_source_too() {
+        gst::init().unwrap();
+        let ours = gst::Structure::builder("application/x-rtp-source-stats")
+            .field("ssrc", 42u32)
+            .field("internal", true)
+            .field("clock-rate", 90_000i32)
+            .field("octets-sent", 4_000u64)
+            .build();
+        let phone = |rb_ssrc: u32| {
+            gst::Structure::builder("application/x-rtp-source-stats")
+                .field("ssrc", 7u32)
+                .field("internal", false)
+                .field("clock-rate", -1i32)
+                .field("have-rb", true)
+                .field("rb-ssrc", rb_ssrc)
+                .field("rb-fractionlost", 64u32)
+                .field("rb-jitter", 900u32)
+                .field("rb-round-trip", 3_277u32)
+                .build()
+        };
+        let (report, bytes) = report_for_source([phone(42), ours.clone()].into_iter(), 42)
+            .expect("the phone's report about our stream");
+        assert_eq!(bytes, 4_000);
+        assert!((report.loss - 0.25).abs() < 1e-9);
+        assert!((report.jitter_ms.unwrap() - 10.0).abs() < 1e-9);
+        assert!((report.rtt_ms.unwrap() - 50.0).abs() < 0.1);
+        // A report about another stream is not about ours.
+        assert!(report_for_source([phone(9), ours].into_iter(), 42).is_none());
     }
 
     #[test]
