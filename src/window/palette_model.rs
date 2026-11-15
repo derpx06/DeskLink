@@ -761,7 +761,7 @@ pub(crate) const PAGE_SYNONYMS: [(&str, &str); 7] = [
 
 /// Words that find each row of Home's "Everything DeskLink does", by id,
 /// besides its title and line (a test walks every row).
-pub(crate) const FEATURE_WORDS: [(&str, &str); 35] = [
+pub(crate) const FEATURE_WORDS: [(&str, &str); 36] = [
     ("send", "share upload transfer files"),
     ("link", "url web address browser open"),
     ("bucket", "shared folder sync files drop"),
@@ -812,6 +812,10 @@ pub(crate) const FEATURE_WORDS: [(&str, &str); 35] = [
     ),
     ("history", "log past connections"),
     ("shortcuts", "keys hotkeys help"),
+    (
+        "about",
+        "version credits licence license bug problem derpx06",
+    ),
 ];
 
 /// One row of Home's "Everything DeskLink does", as the palette lists it.
