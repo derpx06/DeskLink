@@ -1325,7 +1325,9 @@ impl DesklinkWindow {
                     caller,
                     number,
                 } => calls::missed(self, &device_id, &device_name, caller, number),
-                DaemonEvent::CallRefused { message } => self.show_feature_toast(&message),
+                DaemonEvent::CallRefused { message } | DaemonEvent::LockRefused { message } => {
+                    self.show_feature_toast(&message)
+                }
                 DaemonEvent::PairingReplaced { name } => {
                     let text = format!(
                         "The earlier pairing of {name} was replaced. If that was a different phone, pair it again."

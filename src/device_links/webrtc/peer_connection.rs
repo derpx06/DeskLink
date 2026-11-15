@@ -2142,7 +2142,12 @@ pub(crate) fn lane_address_of(
     }
     let (local, remote) = (pair.local_ip?, pair.remote_ip?);
     let scoped = matches!(remote, std::net::IpAddr::V6(ip) if ip.segments()[0] & 0xffc0 == 0xfe80);
-    (!scoped && crate::device_links::lan_scope::is_nearby(local, remote, interfaces))
+    // A phone behind this computer's NAT (an emulator) is seen at this
+    // computer's own address: a lane dialled there reaches only itself.
+    let own = interfaces
+        .iter()
+        .any(|(mine, _)| mine.to_canonical() == remote.to_canonical());
+    (!scoped && !own && crate::device_links::lan_scope::is_nearby(local, remote, interfaces))
         .then_some(remote)
 }
 
@@ -2272,6 +2277,15 @@ pub(crate) mod tests {
         assert_eq!(
             some(pair(&["host"], Some("192.168.1.2"), Some("192.168.1.3"))),
             None
+        );
+        assert_eq!(
+            some(pair(
+                &["host", "peer-reflexive"],
+                Some("192.168.1.2"),
+                Some("192.168.1.2")
+            )),
+            None,
+            "this computer's own address (a phone behind its NAT)"
         );
         assert_eq!(
             some(pair(&[], Some("192.168.1.2"), Some("192.168.1.3"))),

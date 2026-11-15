@@ -1141,7 +1141,15 @@ pub(crate) fn dispatch_webrtc_feature_packet(
                 binding, &packet,
             )
         }
-        PACKET_TYPE_LOCK | PACKET_TYPE_LOCK_REQUEST => {
+        // The phone's answer to the desk's Lock: a report, never a command
+        // (its own arm, so nothing here can lock or unlock this computer).
+        PACKET_TYPE_LOCK => {
+            if let Some(message) = lock_report_notice(&packet, &binding.link.info.name) {
+                push_event(events, DaemonEvent::LockRefused { message });
+            }
+            Ok(())
+        }
+        PACKET_TYPE_LOCK_REQUEST => {
             // Answer the same two questions the LAN reader answers, so the
             // phone's lock control behaves identically on both transports
             // instead of silently losing its confirmation after handover.
@@ -1308,10 +1316,10 @@ pub(crate) fn apply_lock_request(packet: &NetworkPacket) -> Option<bool> {
     // the user asked for ends up locking this desktop too — the exact bug the
     // Android lock plugin had in the mirror direction.
     //
-    // Keeping the check on the field rather than the packet type makes it
-    // structurally safe: `desklink.lock` is kept out of `DESKTOP_INCOMING`, but
-    // `desklink.lock.request` is accepted, and a status-shaped body arriving
-    // under that type would otherwise still be obeyed.
+    // Keeping the check on the field as well as the packet type makes it
+    // structurally safe: `desklink.lock` (the phone's report) has its own arm
+    // that never comes here, and a status-shaped body arriving under
+    // `desklink.lock.request` would otherwise still be obeyed.
     let requested_lock = packet.get_bool("setLocked")?;
     // Unlocking is never taken from a packet: any paired phone could open this
     // desktop. Unlock with the phone needs its own opt-in and checks.
@@ -1354,6 +1362,18 @@ pub(crate) fn admit_lock_operation() -> bool {
 /// [`crate::desktop_env::lock`]).
 pub(crate) fn lock_desktop() {
     crate::desktop_env::lock();
+}
+
+/// What the person is told about the phone's `desklink.lock` report: only a
+/// failed lock (`lockResult: false`, DeskLink's accessibility service off
+/// there) says anything. The report's other fields (`isLocked`, a stray
+/// `setLocked`) are the phone's state and are never acted on.
+pub(crate) fn lock_report_notice(packet: &NetworkPacket, phone: &str) -> Option<String> {
+    (packet.get_bool("lockResult") == Some(false)).then(|| {
+        format!(
+            "Couldn\u{2019}t lock {phone}: turn on DeskLink\u{2019}s accessibility service there"
+        )
+    })
 }
 
 /// The phone asked this computer to make itself known. The notification is
@@ -1402,6 +1422,27 @@ fn spawn_player(program: &str, args: &[&str]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// F30: the phone's `desklink.lock` report says a failed lock, and only that;
+    /// a command-shaped body is read as nothing.
+    #[test]
+    fn the_phones_lock_report_says_a_failed_lock_and_commands_nothing() {
+        use crate::device_links::packet::{NetworkPacket, PACKET_TYPE_LOCK};
+        let report = |key: &str, value: bool| {
+            let mut packet = NetworkPacket::new(PACKET_TYPE_LOCK);
+            packet.set(key, value);
+            super::lock_report_notice(&packet, "Pixel")
+        };
+        assert_eq!(
+            report("lockResult", false).as_deref(),
+            Some(
+                "Couldn\u{2019}t lock Pixel: turn on DeskLink\u{2019}s accessibility service there"
+            )
+        );
+        assert_eq!(report("lockResult", true), None);
+        assert_eq!(report("isLocked", false), None);
+        assert_eq!(report("setLocked", true), None);
+    }
 
     /// A flood of lock queries from one phone shares one answer in flight; a
     /// lock command that arrives meanwhile gets a settled round of its own.

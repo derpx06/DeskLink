@@ -554,15 +554,26 @@ impl AddressBook {
         self.release(device_id, ip);
     }
 
-    #[cfg(test)]
-    fn dial_started_for_test(&mut self, device_id: &str, ip: std::net::IpAddr, now: Instant) {
-        if let Some(known) = self
+    /// Takes the lease on `ip` for a dial outside the redialer (a beacon's):
+    /// false while a dial to it is in flight already. One dial per phone
+    /// address at a time (F26): parallel dials from one source are what the
+    /// phone resets (one TCP connection per address per second), and while
+    /// they hang they hold every handshake slot this computer gives the
+    /// phone's address, so the phone's own dial in was refused too. An address
+    /// the book does not hold (an unpaired phone) has nothing to share.
+    pub(super) fn try_dial(&mut self, device_id: &str, ip: std::net::IpAddr, now: Instant) -> bool {
+        let Some(known) = self
             .phones
             .get_mut(device_id)
             .and_then(|list| list.iter_mut().find(|known| known.ip == ip))
-        {
-            known.dialling_until = Some(now + DIAL_LEASE);
+        else {
+            return true;
+        };
+        if known.dialling_until.is_some_and(|at| at > now) {
+            return false;
         }
+        known.dialling_until = Some(now + DIAL_LEASE);
+        true
     }
 
     /// The dial to `ip` ended (or never started) with nothing to learn from.
@@ -1187,9 +1198,23 @@ fn handle_identity_packet(
     let sessions = Arc::clone(sessions);
     let events = Arc::clone(events);
 
+    // Not beside a dial to this address already in flight (the redialer's,
+    // or an earlier beacon's in the same burst).
+    if !addresses().lock().map_or(true, |mut book| {
+        book.try_dial(&info.id, address.ip(), Instant::now())
+    }) {
+        return;
+    }
+    let release = |id: &str| {
+        if let Ok(mut book) = addresses().lock() {
+            book.release(id, address.ip());
+        }
+    };
     let Some(slot) = super::network::HandshakeSlot::claim(address.ip()) else {
+        release(&info.id);
         return;
     };
+    let id = info.id.clone();
     let spawned = thread::Builder::new().spawn(move || {
         let _slot = slot;
         let connected = connect_to_device(
@@ -1201,10 +1226,13 @@ fn handle_identity_packet(
             Arc::clone(&sessions),
             events,
         );
-        if connected == Ok(true) {
-            // Authenticated over this address: now it is a verified one.
-            if let Ok(mut book) = addresses().lock() {
+        if let Ok(mut book) = addresses().lock() {
+            if connected == Ok(true) {
+                // Authenticated over this address: now it is a verified one.
                 book.worked(&info.id, address.ip());
+            } else {
+                // Freed, not backed off: the redialer's own tries judge the address.
+                book.release(&info.id, address.ip());
             }
         }
         if let Err(error) = connected {
@@ -1223,6 +1251,7 @@ fn handle_identity_packet(
         }
     });
     if let Err(error) = spawned {
+        release(&id);
         eprintln!("[Daemon] could not start an outgoing connection thread: {error}");
     }
 }
@@ -1230,6 +1259,32 @@ fn handle_identity_packet(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F26: a beacon's dial and the redialer's never dial one phone address at
+    /// the same time (the phone resets all but one, and the hung ones held
+    /// every handshake slot the phone's own dial in needed).
+    #[test]
+    fn one_phone_address_is_dialled_once_at_a_time() {
+        let (now, phone) = (Instant::now(), "10.0.0.8".parse().unwrap());
+        let mut book = AddressBook::default();
+        book.candidate("p", phone);
+        assert!(book.try_dial("p", phone, now), "the beacon's dial");
+        assert!(
+            !book.try_dial("p", phone, now),
+            "a second beacon in the burst"
+        );
+        assert!(book.start_dials("p", now).is_empty(), "the redialer waits");
+        book.release("p", phone);
+        assert_eq!(book.start_dials("p", now), vec![phone]);
+        assert!(
+            !book.try_dial("p", phone, now),
+            "the redialer's dial is in flight"
+        );
+        assert!(
+            book.try_dial("unpaired", phone, now),
+            "not in the book: nothing to share"
+        );
+    }
 
     #[test]
     fn paired_phones_without_a_live_link_are_redialled_at_their_last_address() {
@@ -1566,7 +1621,8 @@ mod tests {
         book.wake(Some("busy"));
         assert_eq!(tick(now + Duration::from_secs(12), &mut book), 0);
         // A repeat sighting of the address (a persisted endpoint) keeps the lease.
-        book.dial_started_for_test("busy", ip("10.0.0.8"), now + Duration::from_secs(14));
+        // Nor does a beacon's dial.
+        assert!(!book.try_dial("busy", ip("10.0.0.8"), now + Duration::from_secs(14)));
         book.seen("busy", ip("10.0.0.8"));
         assert_eq!(
             tick(now + Duration::from_secs(15), &mut book),

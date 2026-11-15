@@ -687,6 +687,10 @@ pub struct RemoteSession {
     /// The last few sessions that ended: an offer for one of them is a
     /// leftover, never a new share.
     ended: std::collections::VecDeque<String>,
+    /// When the phone last said `view-granted`: at once on the ask, and again
+    /// when its person taps Allow (Android's own sheet comes next), so the
+    /// window keeps waiting while they answer (F25).
+    granted_at: Option<Instant>,
 }
 
 impl Default for RemoteSession {
@@ -711,7 +715,12 @@ impl RemoteSession {
             control_denial: None,
             ended_reason: None,
             ended: std::collections::VecDeque::new(),
+            granted_at: None,
         }
+    }
+
+    pub fn granted_at(&self) -> Option<Instant> {
+        self.granted_at
     }
 
     pub fn control_denial(&self) -> Option<&str> {
@@ -898,6 +907,9 @@ impl RemoteSession {
                 self.set_state(SessionState::RequestingView);
             }
             ControlKind::ViewGranted | ControlKind::ScreenReady => {
+                if message.kind == ControlKind::ViewGranted {
+                    self.granted_at = Some(Instant::now());
+                }
                 self.direction = message.direction.or(self.direction);
                 // The phone says what its screen is *now*: a rotation sends
                 // another `screen-ready` with the new size, which moves the
@@ -1061,6 +1073,9 @@ impl RemoteSession {
 
     pub fn stop(&mut self) {
         self.set_state(SessionState::Stopped);
+        // The next share says its screen again (`screen-ready`): until then
+        // there is no picture of it to control.
+        self.phone_screen = None;
         if let Some(id) = self.remote_session_id.take() {
             if self.ended.len() == 8 {
                 self.ended.pop_front();

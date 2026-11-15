@@ -21,7 +21,7 @@ use crate::device_links::packet::{
 /// WebRTC transport. Each entry has a matching arm in
 /// `packet_handler::dispatch_webrtc_feature_packet` and a DeskLink Android
 /// plugin that actually sends it.
-const DESKTOP_INCOMING: [&str; 29] = [
+const DESKTOP_INCOMING: [&str; 30] = [
     // Live activities (W13): the phone's ongoing items.
     PACKET_TYPE_ACTIVITY,
     // The fast file lane (W18): a marker both ways.
@@ -41,6 +41,10 @@ const DESKTOP_INCOMING: [&str; 29] = [
     PACKET_TYPE_CLIPBOARD,
     PACKET_TYPE_CLIPBOARD_CONNECT,
     PACKET_TYPE_FINDMYPHONE_REQUEST,
+    // The phone's answer to the desk's Lock (`lockResult`): a report only,
+    // in its own arm (`packet_handler::lock_report_notice`) that never locks
+    // or unlocks this computer, so a failed lock is told here (F30).
+    PACKET_TYPE_LOCK,
     // The phone's Lock button, and its approval of an unlock (with the desk's
     // nonce; see `unlock`). Handled by `packet_handler::apply_lock_request`.
     PACKET_TYPE_LOCK_REQUEST,
@@ -96,7 +100,7 @@ const DESKTOP_OUTGOING: [&str; 31] = [
     // Lock & Hand Off: the terminal to continue on the phone.
     PACKET_TYPE_HANDOFF,
     // The lock-state confirmation sent back to the phone, and an unlock
-    // refusal. Outgoing only: a phone's lock *state* is never an instruction.
+    // refusal. A phone's lock *state* is never an instruction.
     PACKET_TYPE_LOCK,
     PACKET_TYPE_LOCK_REQUEST,
     PACKET_TYPE_MOUSEPAD_REQUEST,
@@ -369,6 +373,7 @@ mod tests {
                 "desklink.filelane.v1",
                 "desklink.findmyphone.request",
                 "desklink.folders",
+                "desklink.lock",
                 "desklink.lock.request",
                 "desklink.mousepad.request",
                 "desklink.mpris",
@@ -561,6 +566,7 @@ mod tests {
                 "desklink.filelane.v1",
                 "desklink.findmyphone.request",
                 "desklink.folders",
+                "desklink.lock",
                 "desklink.lock.request",
                 "desklink.mousepad.request",
                 "desklink.mpris",
@@ -613,7 +619,7 @@ mod tests {
         );
         // The types in one direction only are directional pairs: what the
         // phone sends the desk accepts, what the desk sends the phone accepts.
-        assert_eq!(one_way.len(), 14, "{one_way:?}");
+        assert_eq!(one_way.len(), 13, "{one_way:?}");
     }
 
     /// Every type each registry lists, except the screen types, rides the

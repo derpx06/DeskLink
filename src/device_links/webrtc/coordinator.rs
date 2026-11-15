@@ -192,6 +192,7 @@ pub(crate) fn take_share_failures() -> Vec<(String, String)> {
 /// not when they declined it themselves.
 fn tell_desk_about_failure(reason: &str) -> bool {
     reason != super::remote_desktop_portal::DECLINED_HERE
+        && reason != super::remote_desktop_portal::LOCKED_HERE
 }
 
 /// Held while a share waits for the portal's answer; gone when it answers
@@ -1871,7 +1872,10 @@ fn run_desktop_portal_worker(
             eprintln!(
                 "[DeskLink] Desktop screen/control portal setup failed for {device_id}: {error}"
             );
-            let reason = super::remote_desktop_portal::plain_portal_error(&error);
+            let reason = super::remote_desktop_portal::plain_portal_error_when(
+                &error,
+                crate::desktop_env::locked(),
+            );
             if tell_desk_about_failure(&reason) {
                 if let Ok(mut failed) = share_failures().lock() {
                     failed.push((device_id.clone(), reason.clone()));
@@ -4705,6 +4709,13 @@ fn finish_feature_ready(
     );
     flush_pending_features(binding, sessions);
     crate::device_links::connection_log::note_ready(&binding.device_id, true);
+    // Shown now, not at the next status pass and then the next window tick
+    // (F26: the label said Connected up to 2 s after feature-ready).
+    crate::device_links::daemon::state::reconcile_connection_status(
+        devices,
+        &sessions.connection_snapshot(),
+    );
+    crate::device_links::daemon::state::nudge_tickers();
     crate::device_links::desk_features::on_feature_ready(&binding.device_id);
     // A send a lost connection interrupted carries on where the
     // phone stopped; the phone does the same for its own sends.
@@ -5389,6 +5400,9 @@ mod tests {
         assert!(!super::tell_desk_about_failure(&plain_portal_error(
             "Desktop permission request was denied"
         )));
+        assert!(!super::tell_desk_about_failure(
+            super::super::remote_desktop_portal::LOCKED_HERE
+        ));
         assert!(super::tell_desk_about_failure(&plain_portal_error(
             "Could not attach video to the negotiated WebRTC screen track"
         )));
