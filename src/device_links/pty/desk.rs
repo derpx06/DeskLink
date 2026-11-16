@@ -354,6 +354,10 @@ fn pump_output(session: &PtySession, mut stream: UnixStream, stop: &AtomicBool) 
     while !stop.load(Ordering::Acquire) {
         // Read before looking, so output landing in between ends the wait.
         let seen = super::session::change_generation();
+        // Read before the output too: finished after an empty read could be
+        // a reader that pushed the last line and hit the end in between, and
+        // that line was never sent.
+        let finished = session.finished();
         let Ok(resync) = session.resync(offset, 64 * 1024) else {
             return;
         };
@@ -368,7 +372,7 @@ fn pump_output(session: &PtySession, mut stream: UnixStream, stop: &AtomicBool) 
             }
             continue;
         }
-        if let Some(status) = session.finished() {
+        if let Some(status) = finished {
             let _ = stream.write_all(&encode(EXIT, &status.to_be_bytes()));
             return;
         }
