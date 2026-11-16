@@ -1164,7 +1164,7 @@ mod tests {
         let (mut misses, mut used) = (Vec::new(), vec![false; BY_HAND.len()]);
         for file in files {
             let text = std::fs::read_to_string(&file).unwrap();
-            let production = text.split("\n#[cfg(test)]\nmod tests").next().unwrap_or("");
+            let production = crate::source_scan::production(&text);
             for (number, line) in production.lines().enumerate() {
                 let code = line.trim_start();
                 if code.starts_with("//") || !line.contains('"') && !line.ends_with('\\') {

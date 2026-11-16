@@ -1451,7 +1451,7 @@ mod tests {
     fn the_desk_sends_plain_clipboard_packets_only() {
         let sources = [include_str!("clipboard.rs"), include_str!("commands.rs")];
         for source in sources {
-            let production = source.split("#[cfg(test)]").next().unwrap();
+            let production = &crate::source_scan::production(source);
             assert!(!production.contains("NetworkPacket::new(PACKET_TYPE_CLIPBOARD_CONNECT"));
             assert!(!production.contains(
                 "NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_CLIPBOARD_CONNECT"

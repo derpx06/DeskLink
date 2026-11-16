@@ -4408,11 +4408,22 @@ fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
 
 #[cfg(test)]
 mod jargon_tests {
-    /// The string literals of `text` (before its tests) a person may read,
+    /// A `#[cfg(test)] mod tests;` line near the top does not end the scan:
+    /// the words after it are read, test items are not.
+    #[test]
+    fn the_scan_reads_past_a_test_module_declaration() {
+        let found = shown_strings(crate::source_scan::SPLIT_FIXTURE);
+        let texts: Vec<&str> = found.iter().map(|(_, text)| text.as_str()).collect();
+        assert!(texts.contains(&"Open the WebRTC page"), "{texts:?}");
+        assert!(texts.contains(&"Turn on the relay"), "{texts:?}");
+        assert!(!texts.contains(&"test-only words"), "{texts:?}");
+    }
+
+    /// The string literals of `text` (outside its `#[cfg(test)]` items) a person may read,
     /// with the line each starts on. Left out: log and assert lines, and
     /// text matched against an error or a check's words.
     fn shown_strings(text: &str) -> Vec<(usize, String)> {
-        let text = text.split("#[cfg(test)]").next().unwrap_or(text);
+        let text = &crate::source_scan::production(text);
         let bytes = text.as_bytes();
         let mut out = Vec::new();
         let mut i = 0;
@@ -4529,11 +4540,17 @@ mod jargon_tests {
             &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/window"),
             &mut files,
         );
+        // Shell commands the person copies as they are (Help > Firewall): the
+        // port and protocol words are the command. Found when the scan stopped
+        // ending at the first `#[cfg(test)]`.
+        const COMMANDS: [&str; 2] = ["sudo firewall-cmd ", "sudo ufw "];
         let mut found = Vec::new();
         for file in files {
             let text = std::fs::read_to_string(&file).unwrap();
             for (line, literal) in shown_strings(&text) {
-                if super::has_jargon(&literal) {
+                if super::has_jargon(&literal)
+                    && !COMMANDS.iter().any(|command| literal.starts_with(command))
+                {
                     found.push(format!("{}:{line}: {literal}", file.display()));
                 }
             }

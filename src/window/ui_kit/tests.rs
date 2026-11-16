@@ -528,7 +528,7 @@ fn literals(path: &std::path::Path, found: &mut Vec<(String, String)>) {
         && path.file_name().is_some_and(|name| name != "tests.rs")
     {
         let text = std::fs::read_to_string(path).unwrap();
-        let code = text.split("#[cfg(test)]").next().unwrap_or_default();
+        let code = crate::source_scan::production(&text);
         for line in code
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
@@ -538,6 +538,22 @@ fn literals(path: &std::path::Path, found: &mut Vec<(String, String)>) {
             }
         }
     }
+}
+
+/// The literal scan reads past a `#[cfg(test)] mod tests;` declaration and
+/// leaves test items out.
+#[test]
+fn the_literal_scan_reads_past_a_test_module_declaration() {
+    let dir = std::env::temp_dir().join(format!("desklink-scan-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("page.rs"), crate::source_scan::SPLIT_FIXTURE).unwrap();
+    let mut found = Vec::new();
+    literals(&dir, &mut found);
+    let _ = std::fs::remove_dir_all(&dir);
+    let texts: Vec<&str> = found.iter().map(|(_, text)| text.as_str()).collect();
+    assert!(texts.contains(&"Open the WebRTC page"), "{texts:?}");
+    assert!(texts.contains(&"Turn on the relay"), "{texts:?}");
+    assert!(!texts.contains(&"test-only words"), "{texts:?}");
 }
 
 #[test]
@@ -596,9 +612,18 @@ fn no_page_names_the_machinery() {
     for part in ["window", "transfer_notice.rs", "tray.rs"] {
         literals(&src.join(part), &mut found);
     }
+    // Shown only when the relay is built in (`RELAY_ENABLED`): there "relay"
+    // is the feature's own name. Found when the scan stopped ending at the
+    // first `#[cfg(test)]`.
+    const RELAY_BUILD_ONLY: [&str; 3] = [
+        "relay internet history logs checks away",
+        ", never through the relay",
+        "no relay server built in",
+    ];
     let off: Vec<String> = found
         .iter()
         .filter(|(file, text)| !file.ends_with("window/mod.rs") && text.contains(' '))
+        .filter(|(_, text)| !RELAY_BUILD_ONLY.contains(&text.as_str()))
         .filter(|(_, text)| JARGON.iter().any(|word| has_word(text, word)))
         .map(|(file, text)| format!("{file}: {text:?}"))
         .collect();

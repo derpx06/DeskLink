@@ -177,29 +177,6 @@ mod tests {
                         || text.contains(&format!("{kind}<(String"))
                 })
         }
-        /// The source without its `#[cfg(test)]` items: a test module (it
-        /// ends at the first `}` in column 0, as rustfmt writes it) or a
-        /// test-only static. Code after a test module is still scanned.
-        fn production(text: &str) -> String {
-            let mut kept = String::new();
-            let mut lines = text.lines();
-            while let Some(line) = lines.next() {
-                if line.trim() == "#[cfg(test)]" {
-                    let Some(item) = lines.next() else { break };
-                    if item.starts_with("mod ") && !item.trim_end().ends_with(';') {
-                        for inner in lines.by_ref() {
-                            if inner == "}" {
-                                break;
-                            }
-                        }
-                    }
-                    continue;
-                }
-                kept.push_str(line);
-                kept.push('\n');
-            }
-            kept
-        }
         /// Whether `struct <name>` in `text` holds a device-keyed map or set.
         fn struct_holds_keyed(text: &str, name: &str) -> bool {
             let Some(start) = text
@@ -217,7 +194,8 @@ mod tests {
                 if path.is_dir() {
                     scan(&path, root, found);
                 } else if path.extension().is_some_and(|ext| ext == "rs") {
-                    let text = production(&std::fs::read_to_string(&path).unwrap());
+                    let text =
+                        crate::source_scan::production(&std::fs::read_to_string(&path).unwrap());
                     let mut lines = text.lines().peekable();
                     while let Some(line) = lines.next() {
                         let trimmed = line.trim_start();

@@ -910,8 +910,8 @@ mod tests {
                     scan(&path, found);
                 } else if path.extension().is_some_and(|ext| ext == "rs") {
                     let text = std::fs::read_to_string(&path).unwrap();
-                    // Production code only: stop at the test module.
-                    let text = text.split("#[cfg(test)]").next().unwrap_or_default();
+                    // Production code only: every `#[cfg(test)]` item left out.
+                    let text = crate::source_scan::production(&text);
                     if text.contains("\"dial\"") && text.contains("Telephony(") {
                         found.push(path.display().to_string());
                     }

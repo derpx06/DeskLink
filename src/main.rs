@@ -94,6 +94,8 @@ mod send_to;
 mod shared_fixtures;
 mod shell_dbus;
 mod signals;
+#[cfg(test)]
+mod source_scan;
 mod terminal_previews;
 #[cfg(test)]
 mod test_display;

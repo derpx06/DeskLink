@@ -209,10 +209,7 @@ mod shared_fixture_tests {
     #[test]
     fn the_packet_types_are_the_shared_fixture() {
         let source = include_str!("packet.rs");
-        let production = source
-            .split("#[cfg(test)]\nmod shared_fixture_tests")
-            .next()
-            .unwrap();
+        let production = &crate::source_scan::production(source);
         let mut ours: Vec<String> = Vec::new();
         let mut lines = production.lines().peekable();
         while let Some(line) = lines.next() {

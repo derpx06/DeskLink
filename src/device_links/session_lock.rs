@@ -415,20 +415,8 @@ mod tests {
                 3usize,
             ),
         ];
-        // The source up to its first inline test module (`mod tests {`); a
-        // `#[cfg(test)] mod tests;` declaration is not one.
-        fn production(source: &str) -> &str {
-            let end = source
-                .match_indices("#[cfg(test)]\nmod ")
-                .find(|(at, _)| {
-                    let line = source[at + 17..].lines().next().unwrap_or_default();
-                    line.trim_end().ends_with('{')
-                })
-                .map_or(source.len(), |(at, _)| at);
-            &source[..end]
-        }
         for (name, source, expected) in sources {
-            let production = production(source);
+            let production = crate::source_scan::production(source);
             let mut seen = 0;
             for needle in ["session_lock::check(", "session_lock::is_unlocked("] {
                 for (at, _) in production.match_indices(needle) {

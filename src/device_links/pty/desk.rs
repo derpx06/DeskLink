@@ -799,10 +799,7 @@ mod tests {
     #[test]
     fn the_socket_is_never_under_a_shared_directory() {
         assert!(socket_path().is_some(), "a runtime or cache directory");
-        let source = include_str!("desk.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
+        let source = &crate::source_scan::production(include_str!("desk.rs"));
         assert!(
             !source.contains("temp_dir()"),
             "no fallback to a world-writable directory"

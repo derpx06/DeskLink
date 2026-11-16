@@ -2593,10 +2593,7 @@ mod tests {
     /// Every top-bar verb passes the sender check first (no path around it).
     #[test]
     fn the_sender_is_checked_before_any_verb_runs() {
-        let source = include_str!("shell_dbus.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
+        let source = &crate::source_scan::production(include_str!("shell_dbus.rs"));
         let gate = source
             .find("is_the_shell_caller(&connection, sender)")
             .unwrap();
@@ -3018,10 +3015,7 @@ mod tests {
             "the Shell sees the name"
         );
         // No broadcast: every PropertiesChanged names its destination.
-        let source = include_str!("shell_dbus.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
+        let source = &crate::source_scan::production(include_str!("shell_dbus.rs"));
         assert_eq!(source.matches(".emit_signal(").count(), 1);
         assert!(source.contains("emit_signal(\n        Some(destination),"));
     }
