@@ -300,7 +300,7 @@ fn serve(stream: UnixStream) -> Result<(), String> {
                 if let Some((rows, cols)) = desk_size.filter(|_| !embedded) {
                     session.desk_window_resized(window, rows, cols, true);
                 }
-                if session.write_input(&bytes).is_err() {
+                if !write_from_desk(&session, &bytes) {
                     break;
                 }
             }
@@ -320,6 +320,33 @@ fn serve(stream: UnixStream) -> Result<(), String> {
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let _ = output.join();
     Ok(())
+}
+
+/// Hands the desk's keystrokes to the session; false once it no longer
+/// takes input. A full queue (a large paste while the program is busy) is
+/// waited out for as long as the session lives: it used to close the desk
+/// window, and then to drop the chunk after 2 s, so a paste could run a
+/// command with its middle missing. This thread serves only this window, so
+/// the wait blocks nobody else.
+fn write_from_desk(session: &PtySession, bytes: &[u8]) -> bool {
+    keep_writing(
+        || session.write_input(bytes),
+        || session.finished().is_none() && !session.is_closed(),
+    )
+}
+
+/// [`write_from_desk`]'s loop: tries `write` until it takes the bytes (true)
+/// or `alive` says the session ended (false). Never gives up on a live one.
+fn keep_writing(mut write: impl FnMut() -> Result<(), String>, alive: impl Fn() -> bool) -> bool {
+    loop {
+        if write().is_ok() {
+            return true;
+        }
+        if !alive() {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn pump_output(session: &PtySession, mut stream: UnixStream, stop: &AtomicBool) {
@@ -795,6 +822,27 @@ mod tests {
     }
 
     use super::*;
+
+    /// A program not reading for longer than the old 2 s give-up still gets
+    /// every chunk of a paste, in order; a session that ended stops the wait.
+    #[test]
+    fn a_full_input_queue_is_waited_out_never_dropped() {
+        let mut attempts = 0;
+        // Full for about 2.5 s, then the program reads again.
+        assert!(keep_writing(
+            || {
+                attempts += 1;
+                if attempts > 250 {
+                    Ok(())
+                } else {
+                    Err("full".into())
+                }
+            },
+            || true,
+        ));
+        assert_eq!(attempts, 251, "the chunk was kept until it was taken");
+        assert!(!keep_writing(|| Err("full".into()), || false));
+    }
 
     #[test]
     fn the_socket_is_never_under_a_shared_directory() {
