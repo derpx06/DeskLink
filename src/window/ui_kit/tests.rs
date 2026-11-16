@@ -563,7 +563,7 @@ fn the_words_follow_the_glossary() {
     let mut found = Vec::new();
     for part in [
         "window",
-        "platform.rs",
+        "platform",
         "transfer_notice.rs",
         "application.rs",
         "tray.rs",
@@ -584,7 +584,7 @@ fn the_words_follow_the_glossary() {
 
 /// The machinery's words stay out of every page, not just the first run and the
 /// guide (`onboarding::assert_plain`). `words.rs` matches error texts it is given
-/// (`mod.rs` stays left out too, as before the split) and `platform.rs` names
+/// (`mod.rs` stays left out too, as before the split) and `platform/` names
 /// packages to install, so they are left out.
 #[test]
 fn no_page_names_the_machinery() {

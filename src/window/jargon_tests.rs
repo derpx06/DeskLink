@@ -125,7 +125,7 @@ fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 }
 
 /// No window text uses a word only a developer knows (`JARGON`): the
-/// System check (platform.rs, package names) and Details keep those.
+/// System check (platform/, package names) and Details keep those.
 #[test]
 fn the_window_says_nothing_in_jargon() {
     let mut files = Vec::new();
