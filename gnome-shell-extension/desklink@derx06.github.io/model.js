@@ -530,7 +530,7 @@ export function seekReason(device, media) {
         return null;
     if (media.seekReason)
         return media.seekReason;
-    return device.actions.includes('media-seek') ? '' : 'Can\'t seek right now';
+    return device.actions?.includes('media-seek') ? '' : 'Can\'t seek right now';
 }
 
 /// A dragged slider's values: at most one send per `every` ms, the last value

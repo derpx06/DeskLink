@@ -52,3 +52,13 @@ Interface version stays 10; an older app that lacks a field simply shows fewer m
 Stock Quick Settings header, accent colour (`-st-accent-color`) for the primary button, accent dot, checked
 chip; symbolic icons only; no fixed pixel widths; rendered at 100 %/200 %, light/dark, large text and RTL.
 Notifications and the call banner keep the 3.3 card (app icon, title, one paragraph, buttons under it).
+
+## Checked in batch 2 (headless Shell, `.tools/screenshots/p38-topbar/`)
+- High contrast (dark and light): tiles, chips, cards, buttons keep their borders and focus rings.
+- Keyboard (`keyboard/`): Tab goes End -> "+N more" -> the tiles in order, each with the accent ring; Escape closes;
+  the pair and Try again buttons take focus.
+- Every area of More (`all-areas/`), including the new "Lock the phone" row.
+- Older app: a device without `actions`, `settings`, `unread`, `transfers` or `rttMs` draws what it has (the
+  tiles greyed, no switches, no latency) and nothing throws (`an old app's bare device still gives a menu`).
+- Notifications and calls are GNOME's own message cards (one source per app and phone, so they group; the
+  banner expands to the full paragraph and the buttons); Answer/Decline appear only when the app offers them.

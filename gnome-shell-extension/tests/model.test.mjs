@@ -485,3 +485,18 @@ test('the visibility gate shows at once, hides after the delay, closing before h
     gate.set(true); gate.set(false); gate.cancel();
     assert.equal(timers.size, 0);
 });
+
+// An older app (interface below 9/10) lacks fields: nothing throws, the menu simply shows less.
+test('an old app\'s bare device still gives a menu', () => {
+    const bare = {id: 'old', name: 'Old', paired: true, reachable: true, ready: true, battery: 50, path: 'lan', screen: '', terminals: 0};
+    const list = sections(bare, {}, {});
+    assert.deepEqual(list.map(entry => entry.id), ['notes', 'computer']);          // only what needs no action or setting
+    assert.ok(quickTiles(bare).every(tile => !tile.enabled));                       // nothing offered: all greyed
+    assert.deepEqual(menuBlocks(bare, [bare]), ['tiles', 'more', 'footer']);
+    assert.equal(chipState(bare).unread, 0);
+    assert.deepEqual(panelBadge([bare]), {badge: null, words: 'Old connected'});
+    assert.equal(headerLine(bare), 'Connected · Wi-Fi');                           // no rtt: no latency
+    assert.equal(seekReason(bare, {title: 't', playing: true}), null);             // no timeline before interface 10
+    assert.equal(seekReason(bare, {title: 't', lengthMs: 100}), 'Can\'t seek right now');
+    assert.deepEqual(footer(bare, {}).map(button => button.id), ['open']);
+});

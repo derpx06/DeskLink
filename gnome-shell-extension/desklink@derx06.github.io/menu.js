@@ -582,7 +582,7 @@ function seekRow(selected, media, reason, ctx) {
 /// and next. The title opens the timeline under it (when the app has one),
 /// and it stays open across rebuilds while the menu is.
 function mediaCard(selected, media, ctx, variant) {
-    const can = action => selected.actions.includes(action);
+    const can = action => !!selected.actions?.includes(action);
     const card = column({style_class: 'desklink-media-card'});
     const line = box({style_class: 'desklink-media'});
     card.add_child(line);
@@ -638,7 +638,7 @@ function mediaCard(selected, media, ctx, variant) {
 export function fillMenu(menu, ctx) {
     const {devices, selected, desk, transfers, invoke} = ctx;
     const variant = `desklink-${styleVariant()}`;
-    const can = (device, action) => device?.actions.includes(action);
+    const can = (device, action) => !!device?.actions?.includes(action);
     const activities = (ctx.activities ?? []).filter(item => item.device === selected?.id);
     if (menu.setHeader) {
         menu.setHeader(headerGlyph(selected).icon, selected?.name ?? 'DeskLink', headerLine(selected));
@@ -712,7 +712,7 @@ export function fillMenu(menu, ctx) {
         case 'offline': {
             // Not connected (the header says since when): a way to try again.
             const card = box({style_class: `desklink-card ${variant}`});
-            card.add_child(new St.Icon({icon_name: 'network-offline-symbolic', style_class: 'desklink-row-icon', y_align: Clutter.ActorAlign.CENTER}));
+            card.add_child(new St.Icon({icon_name: 'network-wireless-offline-symbolic', style_class: 'desklink-row-icon', y_align: Clutter.ActorAlign.CENTER}));
             const words = column();
             words.add_child(label(selected.reachable ? 'Connecting…' : 'Not connected', 'desklink-row-title'));
             words.add_child(wrapped(dim(label(offlineHint(selected), 'desklink-row-detail'))));
