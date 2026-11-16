@@ -821,3 +821,34 @@ fn only_the_shell_reads_the_private_properties() {
     assert_eq!(source.matches(".emit_signal(").count(), 1);
     assert!(source.contains("emit_signal(\n        Some(destination),"));
 }
+
+/// The top bar gets a notification's words as one paragraph: its tray and
+/// reply dialog would show every blank line of a long message.
+#[test]
+fn the_top_bar_gets_a_notifications_words_as_one_paragraph() {
+    let info = crate::device_links::device_info::DeviceInfo::local("p".into(), "Pixel".into());
+    let mut device = DeviceView::from_info(&info, "10.0.0.2".into(), true);
+    device.trusted = true;
+    device.notifications = vec![crate::device_links::device::DeviceNotification {
+        id: "n".into(),
+        app_name: "WhatsApp".into(),
+        title: "Writers' Circle".into(),
+        text: "Hours left!\n\nChoose:\n♦ Home\n♦ The Last Train\n\nHappy writing!".into(),
+        ticker: String::new(),
+        is_clearable: true,
+        request_reply_id: None,
+        actions: Vec::new(),
+        silent: false,
+        time: 0,
+        app_icon: None,
+    }];
+    let list = notifications_variant(&[device], &AppSettings::default());
+    let body = glib::VariantDict::new(Some(&list.child_value(0)))
+        .lookup::<String>("body")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        body,
+        "Hours left! Choose: ♦ Home ♦ The Last Train Happy writing!"
+    );
+}

@@ -102,13 +102,15 @@ pub(super) fn notifications_variant(devices: &[DeviceView], settings: &AppSettin
                     crate::window::notifications::app_icon(&notification.app_name),
                 );
                 dict.insert("title", &notification.title);
+                // One paragraph: the tray and the reply dialog cap lines
+                // per paragraph, or not at all.
                 dict.insert(
                     "body",
-                    if notification.text.is_empty() {
+                    crate::window::notifications::one_paragraph(if notification.text.is_empty() {
                         &notification.ticker
                     } else {
                         &notification.text
-                    },
+                    }),
                 );
                 dict.insert("actions", &notification.actions);
                 dict.insert("replyable", notification.request_reply_id.is_some());
