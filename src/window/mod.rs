@@ -194,6 +194,8 @@ mod imp {
         #[template_child]
         pub split_view: TemplateChild<adw::NavigationSplitView>,
         #[template_child]
+        pub sidebar_header: TemplateChild<adw::HeaderBar>,
+        #[template_child]
         pub content_page: TemplateChild<adw::NavigationPage>,
         #[template_child]
         pub drop_hint: TemplateChild<gtk::Label>,
@@ -325,6 +327,20 @@ mod imp {
             self.chosen_device_id.replace(last.clone());
             self.selected_device_id.replace(last);
             remember_window_size(&obj);
+            // Window buttons or the window icon at the start (Xfce's
+            // "icon,menu:minimize,maximize,close") sit in the sidebar's
+            // header beside its two buttons: "DeskLink" no longer fits there
+            // and read "Des…". The title is left out then; the window's own
+            // title still says DeskLink.
+            if let Some(settings) = gtk::Settings::default() {
+                let header = self.sidebar_header.get();
+                let fit = move |settings: &gtk::Settings| {
+                    let layout = settings.gtk_decoration_layout().unwrap_or_default();
+                    header.set_show_title(!crowded_start(&layout));
+                };
+                fit(&settings);
+                settings.connect_gtk_decoration_layout_notify(fit);
+            }
 
             calls::install_shortcuts(&obj);
             let window = obj.downgrade();
@@ -5284,5 +5300,38 @@ mod tests {
             toast_plan(&live(&["a", "b", "c", "d"]), "e"),
             ToastPlan::Dismiss(2)
         );
+    }
+}
+
+/// Whether a `gtk-decoration-layout` puts anything at the start of a header
+/// bar (before the colon): the window icon, the menu or a window button.
+pub(crate) fn crowded_start(layout: &str) -> bool {
+    layout
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .any(|item| matches!(item, "icon" | "menu" | "minimize" | "maximize" | "close"))
+}
+
+#[cfg(test)]
+mod decoration_tests {
+    #[test]
+    fn only_a_layout_with_something_at_the_start_crowds_the_sidebar_title() {
+        assert!(
+            super::crowded_start("icon,menu:minimize,maximize,close"),
+            "Xfce"
+        );
+        assert!(
+            super::crowded_start("close,minimize,maximize:"),
+            "buttons on the left"
+        );
+        assert!(!super::crowded_start(":minimize,maximize,close"), "GNOME");
+        assert!(
+            !super::crowded_start("appmenu:close"),
+            "GTK 3's appmenu shows nothing in GTK 4"
+        );
+        assert!(!super::crowded_start(""));
     }
 }

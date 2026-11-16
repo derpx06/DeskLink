@@ -98,7 +98,7 @@
                             <property name="child">
                               <object class="AdwToolbarView">
                                 <child type="top">
-                                  <object class="AdwHeaderBar">
+                                  <object class="AdwHeaderBar" id="sidebar_header">
                                     <child type="start">
                                       <object class="GtkButton">
                                         <property name="icon-name">desklink-add-symbolic</property>
