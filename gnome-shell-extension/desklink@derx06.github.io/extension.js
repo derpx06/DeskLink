@@ -36,7 +36,7 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
 import {BatteryRing, fillMenu, shortStatus, statusLine, styleVariant} from './menu.js';
-import {looksLikeLink, panelBadge, pillVisible} from './model.js';
+import {looksLikeLink, panelBadge, pillVisible, visibilityGate} from './model.js';
 import {PhoneCalls, PhoneNotifications} from './notifications.js';
 
 const BUS_NAME = 'derx06.desklink.com';
@@ -335,6 +335,20 @@ export default class DeskLinkExtension extends Extension {
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
 
         this._button = new DeskLinkButton();
+        this._button.visible = false; // no flash of an empty glyph at login
+        // Closing the menu first: a hidden button must not keep a menu grab.
+        this._pillGate = visibilityGate({
+            show: () => (this._button.visible = true),
+            hide: () => {
+                this._button.menu.close();
+                this._button.visible = false;
+            },
+            schedule: (ms, fn) => GLib.timeout_add(GLib.PRIORITY_DEFAULT, ms, () => {
+                fn();
+                return GLib.SOURCE_REMOVE;
+            }),
+            cancel: id => GLib.source_remove(id),
+        });
         // About as wide as the Quick Settings menu, in ems (desklink-pill-menu).
         this._button.menu.box.add_style_class_name('desklink-menu');
         this._button.menu.box.add_style_class_name('desklink-pill-menu');
@@ -373,9 +387,8 @@ export default class DeskLinkExtension extends Extension {
         this._indicator.quickSettingsItems.forEach(item => item.destroy());
         this._indicator.destroy();
         this._indicator = null;
-        if (this._hidePill)
-            GLib.source_remove(this._hidePill);
-        this._hidePill = 0;
+        this._pillGate.cancel();
+        this._pillGate = null;
         this._button.destroy();
         this._button = null;
     }
@@ -645,34 +658,13 @@ export default class DeskLinkExtension extends Extension {
         return text || (item.kind ?? '');
     }
 
-    /// Shown at once, hidden after 300 ms of being unwanted, so a link that
-    /// flaps does not make the top bar jump.
-    _setPillVisible(want) {
-        if (want) {
-            if (this._hidePill) {
-                GLib.source_remove(this._hidePill);
-                this._hidePill = 0;
-            }
-            this._button.visible = true;
-        } else if (this._button.visible && !this._hidePill) {
-            this._hidePill = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
-                this._hidePill = 0;
-                this._button.visible = false;
-                return GLib.SOURCE_REMOVE;
-            });
-        }
-    }
-
     _syncPill(locked, running, devices, desk, live, selected) {
         const menu = this._button.menu;
         if (locked) {
             menu.removeAll();
             this._pill.key = null;
             const unlockers = devices.filter(device => device.actions.includes('unlock-via-phone'));
-            if (this._hidePill)
-                GLib.source_remove(this._hidePill);
-            this._hidePill = 0;
-            this._button.visible = running && unlockers.length > 0;
+            this._pillGate.now(running && unlockers.length > 0);
             this._chipItems = [];
             this._stopChipTimer();
             this._button.showState(true, null, 'unlock with your phone');
@@ -684,9 +676,11 @@ export default class DeskLinkExtension extends Extension {
         // Ongoing items on the phone (timers, downloads, navigation): the pill
         // shows the first one's live countdown or progress, even when the
         // pill is otherwise off, and goes when nothing is ongoing.
-        const items = running ? liveItems(this._read('Activities', []), Date.now()) : [];
+        // Only a connected phone's items: an away phone's timer must not show the pill.
+        const readyIds = new Set(devices.filter(device => device.ready).map(device => device.id));
+        const items = running ? liveItems(this._read('Activities', []).filter(item => readyIds.has(item.device)), Date.now()) : [];
         this._chipItems = items;
-        this._setPillVisible(pillVisible({running, pillOn: desk.pill, items, devices}));
+        this._pillGate.set(pillVisible({running, pillOn: desk.pill, items, devices}));
         this._button.showLabel(this._chipText());
         const ongoing = items[0] ? `, ${items[0].title || items[0].app}` : '';
         this._button.showState(!!selected?.ready, panelBadge(devices).badge,

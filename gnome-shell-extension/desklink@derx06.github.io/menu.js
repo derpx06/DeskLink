@@ -21,7 +21,7 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Slider} from 'resource:///org/gnome/shell/ui/slider.js';
 
 import {
-    EMPTY, bodyHeight, chipState, footer, headerGlyph, headerLine, liveWords, offlineHint, mediaClock, mediaPosition, menuBlocks, moreSummary, quickTiles, sections, seekReason,
+    EMPTY, NOW_ROWS, bodyHeight, chipState, footer, headerGlyph, headerLine, liveWords, offlineHint, mediaClock, mediaPosition, menuBlocks, moreSummary, quickTiles, sections, seekReason,
     seekThrottle, statusLine, timer, duration,
 } from './model.js';
 
@@ -663,7 +663,7 @@ export function fillMenu(menu, ctx) {
         const empty = column({style_class: 'desklink-empty'});
         empty.add_child(label(EMPTY.title, 'desklink-row-title'));
         empty.add_child(wrapped(dim(label(EMPTY.hint, 'desklink-row-detail'))));
-        const pair = textButton(EMPTY.button, () => invoke('', 'open'), 'desklink-primary');
+        const pair = textButton(EMPTY.button, () => invoke('', 'open'));
         pair.x_expand = false;
         pair.x_align = Clutter.ActorAlign.START;
         empty.add_child(pair);
@@ -674,6 +674,9 @@ export function fillMenu(menu, ctx) {
     // Everything between the phone's name and the footer scrolls when the
     // screen is too short for it.
     const body = scrolledSection(menu);
+    // "Now" rows are capped (NOW_ROWS); the rest are counted into "+N more".
+    let nowShown = 0, nowHidden = 0;
+    const room = () => (nowShown < NOW_ROWS ? ++nowShown : (++nowHidden, 0));
     for (const block of blocks) {
         switch (block) {
         case 'switcher': {
@@ -757,6 +760,14 @@ export function fillMenu(menu, ctx) {
             break;
         }
         case 'tiles': {
+            if (nowHidden > 0) {
+                const rest = new PopupMenu.PopupImageMenuItem(`+${nowHidden} more`, 'view-more-horizontal-symbolic');
+                rest.add_style_class_name('desklink-inset-row');
+                rest.add_child(trailing('in DeskLink'));
+                rest.accessible_name = `${nowHidden} more going on. Opens DeskLink.`;
+                rest.connect('activate', () => invoke('', 'open'));
+                body.addMenuItem(rest);
+            }
             // The four quick actions, one row of large tiles, all the same width.
             const grid = column({style_class: 'desklink-grid'});
             const tiles = quickTiles(selected).map(entry => tile(entry.icon, entry.label, {
@@ -775,7 +786,7 @@ export function fillMenu(menu, ctx) {
             break;
         case 'transfers': {
             // Files moving: their progress moves every second, in place.
-            const bars = selected.transfers.slice(0, 3).map((transfer, index) => {
+            const bars = selected.transfers.slice(0, 3).filter(() => room()).map((transfer, index) => {
                 const bar = progressItem(transfer.incoming ? 'folder-download-symbolic' : 'document-send-symbolic', false);
                 bar.show = now => bar.update(`${now.incoming ? 'Receiving' : 'Sending'} ${now.name}`,
                     [now.paused ? 'Paused' : (now.fraction > 0 ? `${Math.round(now.fraction * 100)}%` : 'Preparing'), now.lane]
@@ -790,6 +801,8 @@ export function fillMenu(menu, ctx) {
         }
         case 'bucket': {
             // The Files sync.
+            if (!room())
+                break;
             const bucket = selected.bucket;
             const bar = progressItem('folder-symbolic', true);
             bar.update(bucket.line, bucket.detail, bucket.fraction);
@@ -802,6 +815,8 @@ export function fillMenu(menu, ctx) {
         case 'activities':
             // The phone's timers, downloads, navigation.
             for (const activity of activities.slice(0, 2)) {
+                if (!room())
+                    continue;
                 const line = box({style_class: 'desklink-line'});
                 line.add_child(new St.Icon({icon_name: 'alarm-symbolic', style_class: 'desklink-row-icon', y_align: Clutter.ActorAlign.CENTER}));
                 line.add_child(label(activity.title || activity.app, 'desklink-row-title', {x_expand: true}));
@@ -815,6 +830,8 @@ export function fillMenu(menu, ctx) {
             // A phone using this computer, with End.
             const live = devices.filter(device => device.screen || device.terminals > 0);
             for (const device of live) {
+                if (!room())
+                    continue;
                 const card = box({style_class: `desklink-card ${variant} desklink-live`});
                 card.add_child(new St.Widget({style_class: 'desklink-dot coral', y_align: Clutter.ActorAlign.CENTER}));
                 card.add_child(new St.Icon({

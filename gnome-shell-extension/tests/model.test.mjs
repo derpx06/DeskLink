@@ -6,7 +6,7 @@ import {fileURLToPath} from 'node:url';
 
 import {
     bodyHeight, everythingSent, footer, headerLine, lastSeen, mediaClock, mediaPosition, menuBlocks, moreSummary, seekReason, seekThrottle,
-    looksLikeLink, quickTiles, headerGlyph, offlineHint, EMPTY, chipState, panelBadge, pillVisible, sections, sessionLine, shortStatus, statusLine, timer, duration,
+    looksLikeLink, quickTiles, headerGlyph, offlineHint, EMPTY, chipState, panelBadge, pillVisible, visibilityGate, sections, sessionLine, shortStatus, statusLine, timer, duration,
 } from '../desklink@derx06.github.io/model.js';
 
 const ALL_ACTIONS = ['open', 'ring', 'lock', 'send-files', 'send-link', 'send-clipboard', 'ping', 'show-screen',
@@ -281,7 +281,7 @@ test('rows for what is going on come only while it is', () => {
         transfers: [{name: 'a', fraction: 0.5}], bucket: {line: 'Files', fraction: 0.2}, screen: 'view',
     });
     assert.deepEqual(menuBlocks(busy, [busy], [{device: 'p1', title: 'Pasta'}]),
-        ['call', 'transfers', 'bucket', 'activities', 'live', 'tiles', 'media', 'more', 'footer']);
+        ['call', 'live', 'transfers', 'bucket', 'activities', 'tiles', 'media', 'more', 'footer']);
     // Another phone's timer is not this one's; another phone using this computer is.
     const other = phone({id: 'p2', terminals: 1});
     assert.deepEqual(menuBlocks(phone(), [phone(), other], [{device: 'p2', title: 'x'}]),
@@ -426,7 +426,7 @@ test('the offline card says what to do next, the empty menu how to start', () =>
     assert.equal(offlineHint(phone()), '');
     assert.equal(offlineHint(phone({ready: false})), 'Waiting for the phone to answer.');
     assert.match(offlineHint(phone({ready: false, reachable: false})), /^Open DeskLink on Pixel and keep it on the same Wi-Fi/);
-    assert.equal(EMPTY.button, 'Pair a phone');
+    assert.equal(EMPTY.button, 'Open DeskLink to pair');
 });
 
 test('a chip says connected, connecting or away, and what wants a look', () => {
@@ -457,4 +457,31 @@ test('the pill hides unless a phone is connected and it has something to show', 
     assert.equal(pillVisible({...on, pillOn: false}), false);
     assert.equal(pillVisible({...on, pillOn: false, items: [{}]}), true);
     assert.equal(pillVisible({...on, running: false}), false);
+});
+
+test('the visibility gate shows at once, hides after the delay, closing before hiding', () => {
+    const log = [], timers = new Map();
+    let next = 1;
+    const gate = visibilityGate({
+        show: () => log.push('show'), hide: () => log.push('close+hide'),
+        schedule: (ms, fn) => { timers.set(next, fn); return next++; },
+        cancel: id => { timers.delete(id); log.push('cancel'); },
+    });
+    gate.set(false);                       // starts hidden: nothing to do
+    assert.deepEqual(log, []);
+    gate.set(true); gate.set(true);
+    assert.deepEqual(log, ['show']);
+    gate.set(false); gate.set(false);      // one pending hide, not two
+    assert.equal(timers.size, 1);
+    gate.set(true);                        // a flap: the hide is dropped, no second show
+    assert.deepEqual(log, ['show', 'cancel']);
+    assert.equal(timers.size, 0);
+    gate.set(false);
+    const [id, fire] = [...timers][0]; timers.delete(id); fire(); // the delay passes
+    assert.deepEqual(log, ['show', 'cancel', 'close+hide']);
+    gate.set(true);
+    gate.now(false);                       // the lock screen: at once
+    assert.deepEqual(log.slice(-2), ['show', 'close+hide']);
+    gate.set(true); gate.set(false); gate.cancel();
+    assert.equal(timers.size, 0);
 });

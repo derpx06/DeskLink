@@ -149,7 +149,7 @@ export function offlineHint(device) {
 export const EMPTY = {
     title: 'No phone yet',
     hint: 'Open DeskLink on your phone, then pair it from DeskLink on this computer.',
-    button: 'Pair a phone',
+    button: 'Open DeskLink to pair',
 };
 
 /// A phone chip's state: 'ready' (connected), 'connecting', 'away', and what
@@ -168,6 +168,45 @@ export function chipState(device) {
 /// no empty chrome behind.
 export function pillVisible({running, pillOn, items, devices}) {
     return !!running && devices.some(device => device.ready) && (!!pillOn || items.length > 0);
+}
+
+/// Shows at once, hides only after `delay` ms of being unwanted (a link that
+/// flaps must not make the top bar jump). Starts hidden. `now(want)` skips the
+/// delay (the lock screen); `cancel()` drops a pending hide (disable).
+export function visibilityGate({show, hide, schedule, cancel, delay = 300}) {
+    let timer = null, shown = false;
+    const clear = () => {
+        if (timer !== null)
+            cancel(timer);
+        timer = null;
+    };
+    const apply = want => {
+        shown = want;
+        if (want)
+            show();
+        else
+            hide();
+    };
+    return {
+        set(want) {
+            if (want) {
+                clear();
+                if (!shown)
+                    apply(true);
+            } else if (shown && timer === null) {
+                timer = schedule(delay, () => {
+                    timer = null;
+                    apply(false);
+                });
+            }
+        },
+        now(want) {
+            clear();
+            if (want !== shown)
+                apply(want);
+        },
+        cancel: clear,
+    };
 }
 
 /// The top bar glyph's badge and its words (the accessible name; GNOME has no
@@ -348,14 +387,14 @@ export function menuBlocks(selected, devices = [], activities = []) {
     if (selected.call)
         blocks.push('call');
     // What is happening now comes first; it is simply absent when nothing is.
+    if (devices.some(device => device.screen || device.terminals > 0))
+        blocks.push('live');
     if ((selected.transfers ?? []).length > 0)
         blocks.push('transfers');
     if (selected.bucket)
         blocks.push('bucket');
     if (activities.some(item => item.device === selected.id))
         blocks.push('activities');
-    if (devices.some(device => device.screen || device.terminals > 0))
-        blocks.push('live');
     if (selected.ready)
         blocks.push('tiles');
     if (selected.ready && selected.media)
@@ -363,6 +402,11 @@ export function menuBlocks(selected, devices = [], activities = []) {
     blocks.push('more', 'footer');
     return blocks;
 }
+
+/// How many "now" rows (sessions, files moving, sync, timers) the menu draws
+/// before folding the rest into "+N more": more would push the tiles and More
+/// out of a short screen.
+export const NOW_ROWS = 2;
 
 /// How tall the scrolled body may be when the menu is `excess` px taller
 /// than the screen leaves it (null: no limit). It gives way to the header and

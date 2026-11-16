@@ -87,7 +87,6 @@
 .desklink-dot.coral { background-color: #e5533d; }
 .desklink-dot.amber { background-color: #e5a50a; }
 .desklink-chip-count { font-size: 0.82em; font-weight: bold; }
-.button.desklink-primary { background-color: #3584e4; color: #ffffff; background-color: -st-accent-color; color: -st-accent-fg-color; }
 
 /* As tall as the name beside it: a taller ring pushes the line under the name away. */
 .desklink-battery { width: 28px; height: 28px; margin-left: 6px; }

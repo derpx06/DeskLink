@@ -27,7 +27,10 @@ Settings header, chips, pill tiles, More), but
 [ Open DeskLink | Settings | Pause   ]
 ```
 
-No phone: "No phone yet" / one sentence on how to pair / a "Pair a phone" button.
+No phone: "No phone yet" / one sentence on how to pair / an "Open DeskLink to pair" button (stock button: the accent
+with white text is 3.9:1 on some accents, so no custom primary style).
+"Now" rows are capped at two (sessions first, then files, sync, timers) with a "+N more · in DeskLink" row,
+so the tiles and More stay reachable on a short screen.
 Offline: card with the reason in plain words ("Open DeskLink on <phone> and keep it on the same Wi-Fi as
 this computer.") and Try again. The Quick Settings tile stays as the entry point and says "Not connected".
 
