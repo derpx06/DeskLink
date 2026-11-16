@@ -38,10 +38,43 @@ Gate 3 is the one that flips on its own: ColorOS/Android switch the service off 
 | 13 | - | Keyboard. | **by design**: keys go through `AccessibilityTyping.handle` only while gliding (or controlling); it refuses password fields and the lock screen; the phone refuses the whole glide while locked. The keyboard agent (keyboard-2) owns `AccessibilityTyping.kt`, untouched here. |
 | 14 | S3 | Phone indicator and stop. | **by design**: the cursor overlay, an ongoing notification ("<desk> is using this phone", Stop action) and Home's row; idle end after 10 minutes without a packet (`IDLE_END_MS`). |
 
+## Fault-injection evidence (added after the first review stop)
+
+- Desk: `glide::tests::simulated_faults_never_leave_the_pointer_or_a_button_stuck` runs 3000 seeded random sequences
+  of 80 events each against `Glide` with a model of the portal capture and the phone's held button: portal Activated
+  (also again while active, i.e. a double enter or an enter during a hand-back), compositor Deactivated, `take_back`
+  (link down or silent, Glide off, lock, zones changed), phone release, accept, refusal, ticks past `ENTER_WAIT`,
+  left/right press and release, motion, scroll, keys, lost input and an EIS reader close. Invariants: no button is left
+  held once the pointer is back, the indicator always matches the machine, an unanswered enter ends within the wait,
+  and every sequence ends in a known idle. A mutation check (making `let_go` a no-op) fails it at seed 4.
+  `an_unanswered_enter_is_refused_within_the_wait_and_told_once` pins the refusal path and the single notice.
+- Phone: `GlideSimulationTest` runs 3000 seeded sequences of begin (also from another desk, and again while gliding),
+  end, motion, idle and junk edges against `Glide`: one desk owns the glide, `end` always returns to idle, the idle bound
+  ends a glide, entry is on screen, and a hand-back is only ever on the entry edge, along it, inside the desk's edge length,
+  never from inside the screen.
+- Not modelled (needs the real portal or Android): a panic in the worker (the `catch_unwind` + `release_all` path is
+  covered by reading and the existing worker tests), the accessibility unbind mid-glide and a screen-off or lock mid-glide
+  on the phone (each calls `endActive`/`stop`, which is `Glide.end` plus `stopSwipe`, the states the simulation covers;
+  `GlideLetGoTest` covers the held drag).
+- Logging: every transition writes `[Glide] HH:MM:SS.mmmZ <what and why>` (debug logging, no input content):
+  crossing, accepted, refused (phone handed back / did not answer in time / edge resting), back (phone handed back at
+  the edge / desk took it: Esc+Super, link, Glide off, screens / the desktop ended the capture), plus the existing
+  arm, disarm, session closed and re-arm lines. The phone logs `Glide refused (allowed, service, locked)` per refused enter.
+
+| Cause | Covered by |
+|---|---|
+| 1 accessibility off | `a_phone_with_its_accessibility_service_off...`, fixtures both sides, `GlideAllowedTest` |
+| 2 settings lost | `glide_follows_a_replaced_pairing` |
+| 3 edges | `GlideTest`, `GlideSimulationTest` (all four edges) |
+| 4 link / lock / dark | simulation (`take_back`, silence, refusal), `GlideAllowedTest`, `GlideLetGoTest` |
+| 5 lost press/release | simulation (button held never survives a return) |
+| 6 portal | simulation (Deactivated, reader Closed) and existing worker tests |
+| 7 hand back | simulation (bounded refusal, every exit) |
+
 ## What was not run
 
-- The live emulator and a private desk instance with a fresh identity (the INCIDENT rule makes that a heavy harness
-  and the emulator was in use by other rows); a real mouse crossing cannot be automated on GNOME. The desk side is
+- The live emulator and a private desk instance with a fresh identity (the INCIDENT rule makes that a heavy harness,
+  memory is tight and swap is full; the simulations above carry the evidence instead); a real mouse crossing cannot be automated on GNOME. The desk side is
   covered by the pure state machine's tests (`glide/tests.rs`, 1000+ lines, including refusal, bounce, drag release,
   held input, back-off, link silence), the phone side by the Robolectric tests under
   `plugins/inputdevicesreceiver/`. The new wire value is pinned in the shared fixture on both sides.

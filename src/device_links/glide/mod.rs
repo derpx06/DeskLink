@@ -112,6 +112,26 @@ const KEY_LOOKUP: Duration = Duration::from_millis(500);
 /// Keys remembered by the main-thread lookup cache.
 const KEY_CACHE_MAX: usize = 1024;
 
+/// One line per state transition, for diagnosing a failure from the log
+/// (debug logging only; no input content, only what happened and why).
+/// The time is UTC, to the millisecond.
+pub(super) fn transition(what: &str) {
+    if !crate::debug_logging() {
+        return;
+    }
+    let since = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let day = since.as_secs() % 86_400;
+    eprintln!(
+        "[Glide] {:02}:{:02}:{:02}.{:03}Z {what}",
+        day / 3_600,
+        day % 3_600 / 60,
+        day % 60,
+        since.subsec_millis()
+    );
+}
+
 /// Where the phone sits, beside this screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

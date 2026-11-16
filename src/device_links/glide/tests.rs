@@ -1099,3 +1099,183 @@ fn a_phone_with_its_accessibility_service_off_is_not_asked_to_allow_glide() {
     assert!(!phone_needs_service(phone));
     forget_phone(phone);
 }
+
+// ---- Fault-injection simulation -------------------------------------------
+// Random event sequences (fixed seed) against the state machine with a model of
+// the portal and of the phone's held button. Every sequence may contain lost
+// input, link drops (take_back), double enters, an enter during a hand-back,
+// the phone saying no, the compositor ending the capture, and silence past
+// ENTER_WAIT. Invariants: no button is left held on the phone once the
+// pointer is back, the portal capture is released with it, the state
+// machine and the model agree on where the pointer is, an unanswered enter
+// ends within ENTER_WAIT, and every sequence ends in a known idle.
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+/// What the portal and the phone would hold, from the outs alone.
+#[derive(Default)]
+struct World {
+    captured: Option<u32>,
+    left_held: bool,
+    on_phone: bool,
+    refused: u32,
+}
+
+impl World {
+    fn apply(&mut self, outs: Vec<Out>) {
+        for out in outs {
+            match out {
+                Out::Send(packet) => {
+                    if packet.body.get("singlehold").is_some() {
+                        self.left_held = true;
+                    }
+                    if packet.body.get("singlerelease").is_some() {
+                        self.left_held = false;
+                    }
+                }
+                Out::Release { activation, .. } => {
+                    if self.captured == Some(activation) {
+                        self.captured = None;
+                    }
+                }
+                Out::Gliding(on) => self.on_phone = on,
+                Out::Refused => self.refused += 1,
+                Out::Clipboard => {}
+            }
+        }
+    }
+}
+
+fn check(glide: &Glide, world: &World, seed: u64, step: usize) {
+    let tag = format!("seed {seed} step {step}");
+    // Pointer here -> nothing held on the phone, nothing captured by us.
+    if glide.active.is_none() && world.captured.is_some() {
+        // Only a capture the compositor itself still holds (an Activated that
+        // came after our release) may remain; then Gliding must not be on.
+        assert!(!world.on_phone, "{tag}: on phone without an active glide");
+    }
+    if glide.active.is_none() {
+        assert!(!glide.left_down, "{tag}: left_down while idle");
+        assert!(!world.left_held, "{tag}: phone left holding a button");
+    }
+    assert_eq!(
+        world.on_phone,
+        glide.active.is_some(),
+        "{tag}: indicator disagrees with the machine"
+    );
+}
+
+#[test]
+fn simulated_faults_never_leave_the_pointer_or_a_button_stuck() {
+    let barrier = Barrier::on(Edge::Right, &screen()).unwrap();
+    for seed in 1..=3000u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let mut glide = if rng.below(4) == 0 {
+            Glide::accepting(barrier)
+        } else {
+            Glide::new(barrier)
+        };
+        let mut world = World::default();
+        let base = Instant::now();
+        let mut at = Duration::ZERO;
+        let mut activation = 0u32;
+        let mut entering_since: Option<Duration> = None;
+        for step in 0..80 {
+            at += Duration::from_millis(rng.below(400));
+            let now = base + at;
+            let outs = match rng.below(16) {
+                0 | 1 => {
+                    // The portal activates (sometimes again while already active).
+                    activation += 1;
+                    world.captured = Some(activation);
+                    entering_since.get_or_insert(at);
+                    glide.activated(activation, (1600.0, rng.below(1000) as f64), &keys, now)
+                }
+                2 => {
+                    world.captured = None; // the compositor ended it
+                    entering_since = None;
+                    glide.deactivated()
+                }
+                3 => glide.take_back(), // link down, glide off, zones changed, lock
+                4 => glide.phone_released(rng.below(50) as f64, rng.below(900) as f64, now),
+                5 => {
+                    entering_since = None;
+                    glide.accepted(&keys, now)
+                }
+                6 => {
+                    entering_since = None;
+                    glide.disallowed(now)
+                }
+                7 => glide.tick(now + Duration::from_secs(rng.below(3))),
+                8 => glide.input(Captured::Button(BTN_LEFT, true), &keys, now),
+                9 => glide.input(Captured::Button(BTN_LEFT, false), &keys, now),
+                10 => glide.input(Captured::Button(BTN_RIGHT, rng.below(2) == 0), &keys, now),
+                11 => glide.input(
+                    Captured::Motion(rng.below(40) as f64 - 20.0, 3.0),
+                    &keys,
+                    now,
+                ),
+                12 => glide.input(Captured::Scroll(0.0, 4.0), &keys, now),
+                13 => glide.input(Captured::Key(30, rng.below(2) == 0), &keys, now),
+                14 => {
+                    // Lost input: nothing arrives; time passes.
+                    at += Duration::from_millis(900);
+                    Vec::new()
+                }
+                _ => glide.input(Captured::Closed, &keys, now),
+            };
+            world.apply(outs);
+            if glide.active.is_none() {
+                entering_since = None;
+            }
+            // An unanswered enter ends within ENTER_WAIT of its first tick.
+            if let (Some(since), true) = (entering_since, glide.active.is_some()) {
+                if at.saturating_sub(since) > ENTER_WAIT + Duration::from_secs(3) {
+                    let tick = glide.tick(base + at);
+                    world.apply(tick);
+                }
+            }
+            check(&glide, &world, seed, step);
+        }
+        // Whatever happened, taking the pointer back ends in a known idle.
+        world.apply(glide.take_back());
+        world.apply(glide.deactivated());
+        assert!(glide.active.is_none(), "seed {seed}: not idle");
+        assert!(!world.left_held, "seed {seed}: button held at the end");
+        assert!(!world.on_phone, "seed {seed}: indicator on at the end");
+        assert!(world.captured.is_none() || glide.active.is_none());
+    }
+}
+
+#[test]
+fn an_unanswered_enter_is_refused_within_the_wait_and_told_once() {
+    let barrier = Barrier::on(Edge::Right, &screen()).unwrap();
+    let mut glide = Glide::new(barrier);
+    let now = Instant::now();
+    glide.activated(1, (1600.0, 300.0), &keys, now);
+    assert!(glide.tick(now + ENTER_WAIT / 2).is_empty());
+    let outs = glide.tick(now + ENTER_WAIT);
+    assert!(outs.iter().any(|o| matches!(o, Out::Release { .. })));
+    assert!(outs.iter().any(|o| matches!(o, Out::Refused)));
+    assert!(glide.active.is_none());
+    // The edge rests, then a second silent crossing is released without a second notice.
+    let again = glide.activated(
+        2,
+        (1600.0, 300.0),
+        &keys,
+        now + ENTER_WAIT + Duration::from_millis(10),
+    );
+    assert!(again.iter().any(|o| matches!(o, Out::Release { .. })));
+    assert!(!again.iter().any(|o| matches!(o, Out::Refused)));
+}

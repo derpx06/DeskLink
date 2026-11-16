@@ -212,11 +212,17 @@ impl Glide {
         // A refusal just now: the pointer goes straight back, nothing is
         // sent, nothing streams.
         if self.backoff_until.is_some_and(|until| now < until) {
+            transition("crossing released at once: this edge is resting after a refusal");
             self.pending.clear();
             let (x, y) = self.barrier.inside(cursor.0, cursor.1);
             return vec![Out::Release { activation, x, y }];
         }
         let was = self.active.replace(activation);
+        transition(if was.is_some() {
+            "crossing again while already on the phone"
+        } else {
+            "crossing: telling the phone, waiting for it to accept"
+        });
         // Already on the phone (and accepted) when the portal activates again:
         // nothing new to wait for.
         let waiting = was.is_none() || self.entering.is_some();
@@ -249,6 +255,7 @@ impl Glide {
         if self.active.take().is_none() {
             return Vec::new();
         }
+        transition("back: the desktop ended the capture (lock, session end or edge change)");
         let mut out: Vec<Out> = self.let_go().into_iter().collect();
         out.push(Out::Send(Self::taken_back()));
         out.push(Out::Gliding(false));
@@ -264,6 +271,7 @@ impl Glide {
         let Some(activation) = self.active.take() else {
             return Vec::new();
         };
+        transition("back: the desk took the pointer (Esc+Super, link down or silent, Glide off, screens changed)");
         let (x, y) = self.barrier.inside(self.crossed.0, self.crossed.1);
         let mut out: Vec<Out> = self.let_go().into_iter().collect();
         out.extend([
@@ -290,6 +298,7 @@ impl Glide {
         let Some(activation) = self.active.take() else {
             return Vec::new();
         };
+        transition("back: the phone handed the pointer back at the edge");
         let (x, y) = self.barrier.release_point(dx, dy);
         let mut out: Vec<Out> = self.let_go().into_iter().collect();
         out.extend([Out::Release { activation, x, y }, Out::Gliding(false)]);
@@ -306,6 +315,7 @@ impl Glide {
             return Vec::new();
         }
         self.told = false;
+        transition("the phone accepted the pointer: streaming");
         self.mods = Mods::default();
         let mut out = Vec::new();
         for captured in std::mem::take(&mut self.held) {
@@ -332,6 +342,11 @@ impl Glide {
             REFUSED_BACKOFF
         };
         self.backoff_until = Some(now + rest);
+        transition(if tell_phone {
+            "enter refused: the phone did not answer in time"
+        } else {
+            "enter refused: the phone handed it back or says Glide is not allowed"
+        });
         let Some(activation) = self.active.take() else {
             return Vec::new();
         };
