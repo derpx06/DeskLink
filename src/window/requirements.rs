@@ -248,9 +248,6 @@ impl Facts {
     }
 }
 
-/// Everything still missing, this computer's first, then the phone's, in a
-/// fixed order. Empty when all is set up.
-
 /// The setup step's title for the media checks that are not ok: only what is
 /// actually missing is named.
 fn plugins_title(ids: &[&str]) -> &'static str {
@@ -260,6 +257,9 @@ fn plugins_title(ids: &[&str]) -> &'static str {
         (true, true) => "Video and sound support is missing",
     }
 }
+
+/// Everything still missing, this computer's first, then the phone's, in a
+/// fixed order. Empty when all is set up.
 pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
     let mut needs = Vec::new();
     let copy = |check: &Check| facts.install(check).map_or(Fix::None, Fix::Copy);
