@@ -109,7 +109,8 @@ fn control_denied(seen: Seen) -> Notice {
         return Notice {
             text: format!(
                 "View only: Android turned off DeskLink\u{2019}s accessibility service on {phone} \
-                 (it does after an update or a force stop). Turn it on again there."
+                 (it does after an update or a force stop). Turn it on again there \
+                 (off and on, if it still shows on)."
             ),
             button: if seen.askable {
                 Some((ask_label(seen.control_ask), Action::AskPhone))
@@ -204,6 +205,47 @@ pub(crate) struct Seen<'a> {
 
 /// How long the strip keeps a word about typing after the last key.
 const TYPING_HINT_FOR: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Input the window could not send for want of control: counted, and logged
+/// with the count at most every [`InputDrops::EVERY`], never per event (a drag
+/// is dozens a second).
+#[derive(Debug, Default)]
+pub(crate) struct InputDrops {
+    count: u32,
+    logged: Option<std::time::Instant>,
+}
+
+impl InputDrops {
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+
+    /// Counts one drop; how many to log now, when it is time to.
+    pub(crate) fn dropped(&mut self, now: std::time::Instant) -> Option<u32> {
+        self.count += 1;
+        if self
+            .logged
+            .is_some_and(|at| now.saturating_duration_since(at) < Self::EVERY)
+        {
+            return None;
+        }
+        self.logged = Some(now);
+        Some(std::mem::take(&mut self.count))
+    }
+}
+
+/// Input without control: logged (paced), and when the phone says control is
+/// off there, asked on the phone, whose Allow opens the accessibility setup.
+/// Only input asks; viewing never does (asks' own pacing: never while one
+/// waits, an automatic one at most every `REASK`).
+fn input_without_control(device_id: &str, drops: &RefCell<InputDrops>) {
+    if let Some(count) = drops.borrow_mut().dropped(std::time::Instant::now()) {
+        debug_log!(
+            "[Phone screen] {count} input event(s) kept: this computer holds no control of the phone"
+        );
+    }
+    if crate::device_links::asks::phone_on(device_id, CONTROL_KEY) == Some(false) {
+        crate::device_links::asks::ask_phone(device_id, CONTROL_KEY, false);
+    }
+}
 
 /// What the strip says when the phone's keys reached no text field there.
 pub(crate) fn typing_words(code: &str, phone: &str) -> String {
@@ -364,9 +406,11 @@ pub fn show_remote_control_dialog(
 
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
+    let drops: Rc<RefCell<InputDrops>> = Rc::default();
     let send = {
         let daemon = daemon.clone();
         let device = Rc::clone(&device);
+        let drops = Rc::clone(&drops);
         Rc::new(move |payload: Map<String, Value>| {
             if remote_control_lease_active(device.as_str()) {
                 daemon.send(DaemonCommand::SendMousepadRequest(
@@ -374,7 +418,7 @@ pub fn show_remote_control_dialog(
                     payload,
                 ));
             } else {
-                debug_log!("[Phone screen] input dropped: this computer holds no control lease");
+                input_without_control(device.as_str(), &drops);
             }
         })
     };
@@ -1038,13 +1082,14 @@ pub fn show_remote_control_dialog(
         let without_control = {
             let (daemon, device, picture) =
                 (daemon.clone(), Rc::clone(&device), picture.downgrade());
-            let (typed, last, asks) = (
+            let (typed, last, asks, drops) = (
                 Rc::clone(&typed_without_control),
                 Rc::clone(&last_control_request),
                 Rc::clone(&control_asks),
+                Rc::clone(&drops),
             );
             Rc::new(move || {
-                debug_log!("[Phone screen] key kept: this computer holds no control of the phone");
+                input_without_control(device.as_str(), &drops);
                 typed.set(Some(std::time::Instant::now()));
                 let has_picture = picture.upgrade().is_some_and(|p| p.paintable().is_some());
                 if may_ask_control(
@@ -1730,6 +1775,29 @@ mod tests {
             notice.text
         );
         assert_eq!(notice.button, Some(("Ask on phone", Action::AskPhone)));
+    }
+
+    /// Every input kept for want of control is counted, but logged at most
+    /// every 3 s with the count (a drag is dozens of events a second).
+    #[test]
+    fn kept_input_is_logged_paced_with_its_count() {
+        let mut drops = InputDrops::default();
+        let t = std::time::Instant::now();
+        assert_eq!(drops.dropped(t), Some(1), "the first is said at once");
+        for ms in [10, 500, 2_999] {
+            assert_eq!(
+                drops.dropped(t + std::time::Duration::from_millis(ms)),
+                None
+            );
+        }
+        assert_eq!(
+            drops.dropped(t + std::time::Duration::from_secs(3)),
+            Some(4)
+        );
+        assert_eq!(
+            drops.dropped(t + std::time::Duration::from_secs(7)),
+            Some(1)
+        );
     }
 
     /// Keys never vanish (owner 11-16): typed without control, the strip says
