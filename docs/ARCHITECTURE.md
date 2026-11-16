@@ -231,6 +231,7 @@ window/ (GTK pages)  ──DaemonCommand──►  daemon/  ──►  features 
 | `device_links/core/device_manager/` | `DeviceManager`: registration, adoption, bindings, liveness, leases | `outcomes`, `disconnects` + `webrtc_state` (one registry type) |
 | `device_links/webrtc/remote_session/` | constants, field names, registry | `message` (pure), `session` |
 | `device_links/notes/` | limits, sealed store, packet entry, relaying | `model`, `merge`, `wire`, `edits` |
+| `device_links/daemon/test_peer/` | the two-peer test harness | `tests` |
 
 Accepted large items: `platform::evaluate` and `window::debug_verbs::debug_ui_verb` are single long functions (a rule table and a verb `match`); splitting them is a logic edit, left for a later change with its own tests.
 
