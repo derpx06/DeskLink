@@ -63,19 +63,19 @@ there; the System check and the feature's own row say why and give the step.
 
 | Feature | GNOME (W/X11) | Plasma 6 Wayland | Plasma X11 | Xfce, Cinnamon, MATE, Budgie (X11) | wlroots: sway, Hyprland, labwc, river, niri | COSMIC | Plain X11 WM, no portal |
 |---|---|---|---|---|---|---|---|
-| Pair, LAN link, files, phone notifications, terminals | yes | yes R | yes | yes R(Xfce) | yes R(sway) | yes | yes R |
-| Tray / panel | own top-bar extension (or AppIndicator) | System Tray | System Tray | panel's StatusNotifier applet (the row names it) | Waybar/swaybar tray | Notifications Tray | needs a tray host (snixembed); else the window reopens from a notification |
-| Clipboard both ways | yes (via Xwayland) | yes | yes | yes | yes with Xwayland; without it only phone → desk, said (1) | as wlroots | yes |
+| Pair, LAN link, files, phone notifications, terminals | yes R | yes R | yes | yes R (Xfce, Cinnamon, MATE) | yes R(sway) | yes | yes R |
+| Tray / panel | own top-bar extension (or AppIndicator) R | System Tray R | System Tray | Xfce status tray R; Cinnamon's XApp Status with `xapp-sn-watcher` R; Debian MATE has no watcher: the notification fallback R (the row says so) | Waybar tray; swaybar hosts it but draws the icon dark on its bar R | Notifications Tray | needs a tray host (snixembed); else the window reopens from a notification |
+| Clipboard both ways | yes (via Xwayland) R | yes R (wl-clipboard: `wl-paste` reads Wayland apps' copies, `wl-copy` places the phone's) (5) | yes | yes R | yes R on sway with wl-clipboard (5); without Xwayland only phone → desk, said (1) | as wlroots | yes |
 | Send to phone from the file manager | Files: Scripts | Dolphin menu | Dolphin menu | Thunar "Send To", Nemo and Caja Scripts (2) | "Open With" entry | "Open With" entry | "Open With" entry |
 | Search from the desktop | Activities search | KRunner | KRunner | in-app palette | in-app palette | in-app palette | in-app palette |
-| This screen on the phone, phone controls it | yes (portal) | yes (portal) R(check) | yes, X11 capture + XTest after approval at the desk | same as Plasma X11 R(check) | diff: view only (3) | diff: view only unless its portal has RemoteDesktop | yes, X11 capture R(check) |
+| This screen on the phone, phone controls it | yes (portal) R | yes (portal) R | yes, X11 capture + XTest after approval at the desk | same as Plasma X11 R (Xfce, Cinnamon, MATE) | diff: view only (3) R(sway) | diff: view only unless its portal has RemoteDesktop | yes, X11 capture R(check) |
 | Phone screen on this computer | yes | yes | yes | yes | yes | yes | yes |
 | Phone as a second display (Extend) | Wayland only | yes, no per-monitor scale | no | no | no | no | no |
 | Glide (pointer onto the phone) | GNOME 45+, Wayland | Plasma 6.1+ | no | no | no | no | no |
 | Sound with the phone | PipeWire (PulseAudio-only: no, install line given) | same | same | same | same | same | same |
 | Lock from the phone | yes | yes | yes | yes (their screensavers) | needs swayidle/hypridle | yes | needs xss-lock or a locker |
 | Unlock with the phone | yes | yes | yes | limited: not promised | swaylock/hyprlock yes; others refused, said | limited | i3lock & co. refused, said |
-| Start at login | yes | yes | yes | yes | no: the `exec` line to add is shown | yes | no: the line is shown |
+| Start at login | yes R | yes R | yes | yes R | no: the `exec` line to add is shown, and the setup step does not offer it R | yes | no: the line is shown |
 | Keep awake while linked | yes (logind/elogind) | yes | yes | yes | yes | yes | yes |
 | Do Not Disturb shared | yes | no, said (4) | no, said | no, said | no, said | no, said | no, said |
 
@@ -91,9 +91,34 @@ there; the System check and the feature's own row say why and give the step.
    The row is Limited ("can watch this screen but not control it"), the
    approve-control button is off with that reason, Extend gives its own reason.
    Before: no share at all. T + R(see below)
+5. New (phase 2.6): on a Wayland session that is not GNOME, `wl-paste --watch`
+   wakes the clipboard poll and the text and password hint are read with
+   `wl-paste`; a phone's copy goes through `wl-copy` first. KWin hands a
+   Wayland app's copy to Xwayland only for a focused X11 window, and wlroots
+   hands Xwayland's to Wayland apps the same way, so the X11 selection alone
+   missed most copies on Plasma and every phone copy on sway. R (sway, Plasma)
 4. Fixed: DND was mirrored into GNOME's `show-banners` on any desktop that had
    the schema installed (Plasma, Xfce, Cinnamon usually do), where nothing reads
    it. It is now GNOME Shell only, and the row says so elsewhere. C
+
+## Real desktop sessions (phase 2.6, 2026-11-16)
+
+GNOME 50.1 (Ubuntu 26.04, Wayland), KDE Plasma 6.3 (Wayland), Xfce 4.20,
+Cinnamon and MATE 1.27 (X11) and sway 1.10, each in its own qemu/KVM VM with
+autologin, DeskLink installed with meson and paired with the Android
+emulator: window, light/dark following the desktop, 360 px, 150-200 %,
+notifications and their click/buttons, tray, start at login after a re-login,
+file chooser, default applications, links, screen share and control through
+each desktop's portal or X11, terminals, files and clipboard both ways, the
+GNOME top-bar extension. Fixed on the way: the Open With helpers made DeskLink
+the default for text, images and PDFs where nothing pins defaults; a click on
+a notification did nothing outside GNOME; "desklink" as the app name; dark
+themes on Xfce, MATE and Cinnamon ignored; Wayland-app copies on Plasma and
+phone copies on sway; a blank shortcuts row on libadwaita < 1.8; the sidebar
+title clipped by Xfce's window icon; Start at login offered on sway and shown
+on when its entry was gone; wrong tray advice for MATE and Cinnamon; the
+view-only refusal on sway naming a GNOME switch. Details and evidence:
+`phone_connect/docs/LINUX-SUPPORT.md`, `.tools/screenshots/p26-de/INDEX.md`.
 
 ## Next to KDE Connect and GSConnect
 
