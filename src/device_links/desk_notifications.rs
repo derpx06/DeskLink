@@ -387,6 +387,15 @@ pub(crate) fn close_from_phone(id: &str) {
         return;
     };
     debug_log!("[Notifications] {id} dismissed on the phone: closing it here");
+    // On the desk-features thread, blocking: this runs on a peer's event
+    // worker, where gio's async call panics (GTK owns the main context).
+    super::desk_features::run_later(move || close_on_the_server(&note));
+}
+
+/// Asks the notification server to close `note` (the desk-features thread).
+/// Blocks that thread up to 3 s if the server hangs; the thread's queue is
+/// bounded, so other phones' jobs wait at most that long behind it.
+fn close_on_the_server(note: &DeskNote) {
     let Ok(bus) = gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE) else {
         return;
     };
@@ -407,7 +416,7 @@ pub(crate) fn close_from_phone(id: &str) {
             (app_id.as_str(), id.as_str()).to_variant(),
         ),
     };
-    bus.call(
+    if let Err(error) = bus.call_sync(
         Some(name),
         path,
         interface,
@@ -417,12 +426,9 @@ pub(crate) fn close_from_phone(id: &str) {
         gio::DBusCallFlags::NONE,
         3000,
         gio::Cancellable::NONE,
-        |reply| {
-            if let Err(error) = reply {
-                debug_log!("[Notifications] Could not close it here: {error}");
-            }
-        },
-    );
+    ) {
+        debug_log!("[Notifications] Could not close it here: {error}");
+    }
 }
 
 /// One message the monitor saw.
@@ -616,11 +622,28 @@ fn rebuild() {
     let _ = std::thread::Builder::new()
         .name("desklink-notify-monitor".into())
         .spawn(|| {
-            if let Err(error) = monitor() {
-                MONITOR_REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+            // A slow bus at login (the 5 s BecomeMonitor timeout) is tried
+            // again; only a refusal is final (it was final for any error).
+            for attempt in 1..=MONITOR_ATTEMPTS {
+                let Err(error) = monitor() else {
+                    return;
+                };
                 eprintln!("[Notifications] Cannot watch this computer's notifications: {error}");
+                if refused_by(&error) || attempt == MONITOR_ATTEMPTS {
+                    MONITOR_REFUSED.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_secs(10 * u64::from(attempt)));
             }
         });
+}
+
+/// Tries before watching notifications is given up as refused.
+const MONITOR_ATTEMPTS: u32 = 4;
+
+/// Whether the bus refused to let DeskLink monitor (final), not merely failed.
+fn refused_by(error: &str) -> bool {
+    error.contains("AccessDenied") || error.contains("Access denied")
 }
 
 fn monitor() -> Result<(), String> {
@@ -707,7 +730,9 @@ fn monitor() -> Result<(), String> {
     static MONITOR: Mutex<Option<gio::DBusConnection>> = Mutex::new(None);
     if let Ok(mut monitor) = MONITOR.lock() {
         if let Some(old) = monitor.replace(connection) {
-            old.close(gio::Cancellable::NONE, |_| {});
+            // Blocking: an async close panics off the main context, here
+            // while holding MONITOR, which poisoned it and stopped forwarding.
+            let _ = old.close_sync(gio::Cancellable::NONE);
         }
     }
     Ok(())
@@ -716,6 +741,63 @@ fn monitor() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_timeout_is_not_a_refusal() {
+        assert!(refused_by(
+            "GDBus.Error:org.freedesktop.DBus.Error.AccessDenied: Rejected"
+        ));
+        assert!(!refused_by("Timeout was reached"));
+        assert!(!refused_by(
+            "GDBus.Error:org.freedesktop.DBus.Error.NoReply: no reply"
+        ));
+    }
+
+    /// gio's async calls panic on a thread that does not own the main
+    /// context, and the daemon's threads never do (GTK owns it): a phone
+    /// dismissing a desk notification killed the peer's event worker, and an
+    /// async `close` on the monitor thread poisoned its lock.
+    #[test]
+    fn the_daemon_never_makes_an_async_bus_call() {
+        fn scan(dir: &std::path::Path, found: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan(&path, found);
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && !crate::source_scan::is_test_file(&path)
+                {
+                    let text =
+                        crate::source_scan::production(&std::fs::read_to_string(&path).unwrap());
+                    for (number, line) in text.lines().enumerate() {
+                        if line.contains("bus.call(") || line.contains("connection.call(") {
+                            found.push(format!("{}:{}", path.display(), number + 1));
+                        }
+                    }
+                    // Any other async gio call: a callback closure right after
+                    // the cancellable (`close`, `flush`, `call_with_unix_fd_list`...).
+                    let flat: String = text.split_whitespace().collect();
+                    if flat.contains("Cancellable::NONE,|")
+                        || flat.contains("Cancellable::NONE,move|")
+                    {
+                        found.push(format!(
+                            "{}: async gio call with a callback",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+        }
+        let mut found = Vec::new();
+        scan(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/device_links"),
+            &mut found,
+        );
+        assert!(
+            found.is_empty(),
+            "async D-Bus calls off the main thread: {found:?}"
+        );
+    }
 
     fn notify(
         app: &str,
