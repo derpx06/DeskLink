@@ -22,6 +22,7 @@ use gtk::glib::{self, prelude::*};
 
 mod probe;
 mod rules;
+#[cfg(test)]
 use probe::*;
 #[cfg(test)]
 use rules::*;
@@ -395,6 +396,9 @@ const WATCHER: &str = "org.kde.StatusNotifierWatcher";
 const PORTAL: &str = "org.freedesktop.portal.Desktop";
 
 pub(super) const LOGIND: &str = "org.freedesktop.login1";
+
+/// DeskLink's UDP discovery port, also KDE Connect's and GSConnect's.
+const DISCOVERY_PORT: u16 = crate::device_links::daemon::network::UDP_PORT;
 
 #[cfg(test)]
 mod tests;

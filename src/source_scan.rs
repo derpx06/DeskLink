@@ -9,13 +9,25 @@
 //!
 //! May depend on: std only.
 
-/// Whether `path` is a test module of its own (`tests.rs`, `*_tests.rs`):
-/// the `#[cfg(test)]` is on its `mod` line in the parent, so the whole file
-/// is test code.
+/// Whether `path` is a test module of its own (`tests.rs`, `*_tests.rs`, or
+/// any file under a module's `tests/` directory): the `#[cfg(test)]` is on
+/// its `mod` line in the parent, so the whole file is test code.
 pub(crate) fn is_test_file(path: &std::path::Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs"))
+    // Only directories below `src/` count, so a checkout under some `tests`
+    // folder does not turn every file into a test file.
+    let in_tests_dir = path.parent().is_some_and(|dir| {
+        let parts: Vec<&std::ffi::OsStr> = dir.components().map(|part| part.as_os_str()).collect();
+        let below_src = parts
+            .iter()
+            .rposition(|part| *part == "src")
+            .map_or(&parts[..], |at| &parts[at + 1..]);
+        below_src.iter().any(|part| *part == "tests")
+    });
+    in_tests_dir
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs"))
 }
 
 /// The production part of every non-test file of a module directory, as one
@@ -165,6 +177,13 @@ mod tests {
         assert!(!super::is_test_file(Path::new("src/window/mod.rs")));
         assert!(!super::is_test_file(Path::new(
             "src/device_links/tests_helper.rs"
+        )));
+        // A module's `tests/` directory holds only test code.
+        assert!(super::is_test_file(Path::new(
+            "src/device_links/webrtc/transfer_manager/tests/lane.rs"
+        )));
+        assert!(super::is_test_file(Path::new(
+            "src/device_links/webrtc/transfer_manager/tests/mod.rs"
         )));
     }
 

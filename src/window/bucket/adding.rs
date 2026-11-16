@@ -1,7 +1,8 @@
 //! Putting things in the Bucket from the page: choosing files or a folder,
 //! drops and paste.
 //!
-//! Sibling edges: `browse` (the folder being shown).
+//! Sibling edges: `browse` (the folder being shown, and its selection:
+//! `selecting`, `set_selecting`, `select_all`).
 
 use super::*;
 

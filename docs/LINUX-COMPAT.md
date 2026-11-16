@@ -2,7 +2,7 @@
 
 What builds and runs where, and what each feature does on each desktop. Rows
 that cannot work say so in **Settings → Advanced → System check** and in
-`desklink --check`, with the one step to fix them (`src/platform.rs`). Longer
+`desklink --check`, with the one step to fix them (`src/platform/`). Longer
 background: `phone_connect/docs/LINUX-SUPPORT.md` and `DESKTOP-INTEGRATION.md`.
 
 Checked 2026-11-15 and 2026-11-16. **R** = run (in a container of the distribution, or a

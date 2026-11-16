@@ -209,9 +209,6 @@ impl Probe {
     }
 }
 
-/// DeskLink's UDP discovery port, also KDE Connect's and GSConnect's.
-pub(super) const DISCOVERY_PORT: u16 = crate::device_links::daemon::network::UDP_PORT;
-
 /// The programs other than DeskLink with an IPv4 UDP socket on the
 /// discovery port. Both sides set `SO_REUSEADDR`, so the bind succeeds, and
 /// the kernel then gives each unicast datagram (a phone's beacon to the

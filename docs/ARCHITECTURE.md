@@ -180,6 +180,65 @@ A change to anything in this table is a **paired edit** (workspace `CLAUDE.md`, 
 
 ---
 
+### 3.5 Module rules (phase 3, 1.3)
+
+The desk code is split by responsibility: no file over about 1 000 lines of production code, except the few noted below. A large area is a directory module: `mod.rs` is its **facade**, and the files next to it are its **parts**.
+
+**What a facade holds.** The module doc (what the module owns, its layout, what it may depend on), the shared types and limits, the entry points the rest of the crate calls, and an explicit re-export list headed `// The crate-facing surface`. Nothing outside the module names a part (`folders::worker::...`); it names the facade (`folders::start`).
+
+**What a part holds.** One responsibility, with a `//!` doc that says what it owns and lists its **sibling edges** (the parts it uses) and its outside dependencies. A part starts with `use super::*;`, so it sees the facade's shared items; the facade sees the parts through private `use part::*;` imports.
+
+**Visibility.** Private by default. An item another part uses is `pub(super)`; an item the rest of the crate uses is `pub(crate)` and re-exported by the facade; an item the parent's siblings use (inside `window/`) is `pub(in crate::window)` and re-exported `pub(super)`. Test-only re-exports carry `#[cfg(test)]`. An item that only the module's own `tests.rs` reaches is `pub(super)` too: that is the accepted cost of keeping tests in a sibling file (they were an inline `mod tests` before the split), not a sign another part uses it.
+
+**Dependency rules (one way).**
+
+```
+window/ (GTK pages)  ──DaemonCommand──►  daemon/  ──►  features (folders, glide, notes, …)
+        ▲                                   │                     │
+        └──── DeviceView / events ◄─────────┘                     ▼
+                                                    FeatureTransport ──► webrtc/coordinator ──► peer_connection
+```
+
+* The UI never reaches the network: it talks to `DaemonHandle` only.
+* Features send through `FeatureTransport`, never a raw link or GStreamer.
+* No feature imports another feature's internals; shared code lives in a small named module (`limits`, `private_fs`, `lan_scope`, `vault`) only when two or more features use it.
+* **No cycles between the parts of a module.** The one allowed exception is a type whose methods are split over several files by responsibility (`folders::Worker` over `worker`/`bucket`/`engine`, `DesklinkWindow` over `navigation`/`refresh`/`notices`, `DesktopWebRtcPeer` over `screen_share`/`audio_tracks`/`selected_pair`): one type in several files, documented in its module doc. `.tools/overnight/modtools/deps.py <dir>` lists the edges and any cycle.
+* Tests live in `tests.rs` (or topic files under `tests/`) and are declared **at the end** of `mod.rs` with `#[cfg(test)] mod tests;`.
+
+**Tests that read the sources.** Several tests scan the code (window words and jargon, who may place a call, the by-hand instruction list, the per-device store list in `peers.rs`, the W7 session-password pin, the shell_dbus and pty pins). They all read through `source_scan::production` (blanks only `#[cfg(test)]` items, keeps line numbers) and skip test files with `source_scan::is_test_file`; a pin that must cover a whole directory module uses `source_scan::module_sources`, which fails when a file of the module is missing from its list. When you move code, run the full suite: these tests name files.
+
+**Where things live (split modules).**
+
+| Module | Facade (`mod.rs`) | Parts |
+|---|---|---|
+| `device_links/folders/` | limits, window snapshot, worker messages, crate calls | `model` (pure planner), `state`, `scan`, `disk`, `store`, `wire`, `import`, `report`, `worker` + `bucket` + `engine` (one `Worker`) |
+| `device_links/glide/` | setting, status, commands, phone reports | `machine` (pure), `input_packets`, `portal`, `worker` |
+| `device_links/config/` | trust store (`Config`), replacement candidates | `settings` (+ mirrors), `cleanup`, `files` |
+| `device_links/webrtc/coordinator/` | signalling entry points, shared helpers, `forget_liveness` | `signing`, `peer_worker` (hub), `envelopes`, `terminal_pump`, `file_link`, `liveness`, `recovery`, `ice_setup`, `desktop_share`, `share_worker`, `desktop_input`, `phone_remote` |
+| `device_links/webrtc/peer_connection/` | `DesktopWebRtcPeer`, events, core methods | `screen_share`, `audio_tracks`, `selected_pair`, `callbacks`, `video_sdp`, `rtp_tuning` |
+| `device_links/webrtc/screen/` | roles, caps/TWCC, negotiated lookups, `ScreenRequest` | `inbound`, `desktop_capture`, `encoder`, `bitrate` |
+| `device_links/webrtc/terminal_bridge/` | limits, events, audit | `bridge` (one device's state machine), `registry` |
+| `device_links/webrtc/transfer_manager` | engine | `send`, `recv`, `store`, `replay`; tests by topic under `tests/` |
+| `shell_dbus/` | interface, export + sender gate, properties | `model` (pure), `variants`, `methods`, `clients`, `extension`, `extension_files` |
+| `platform/` | types, report store, API, bus names | `rules` (`evaluate`, pure), `probe` (the only I/O) |
+| `window/` | page table, window type, shared helpers | `imp`, `navigation`/`refresh`/`notices` (one window type), `words`, `blocks`, `debug_verbs`, one module per page |
+| `window/prefs/` | live switches, pages, navigation | `groups`, `computer_rows`, `phone_rows`, `search` |
+| `window/bucket/` | page build, cards | `browse`, `live`, `toolbar`, `tiles`, `adding` |
+
+Accepted large items: `platform::evaluate` and `window::debug_verbs::debug_ui_verb` are single long functions (a rule table and a verb `match`); splitting them is a logic edit, left for a later change with its own tests.
+
+**How to add a feature (desk).**
+
+1. Wire constants first: add the packet type to `device_links/packet.rs` **and** `DeskLinkProtocol.kt` with the identical string (section 3.4); add a shared fixture if the body is non-trivial.
+2. Create the feature module under `device_links/<feature>.rs` (or `<feature>/mod.rs` with parts once it grows past ~800 lines): state, wire handling, tests. Send only through `FeatureTransport`; dispatch on packet type, never on which body keys are present.
+3. Register it: incoming/outgoing types in `features/registry.rs` (`DESKTOP_INCOMING`, `DESKTOP_OUTGOING`, `WEBRTC_PROFILE`), mirrored by the phone's `WebRtcFeatureProfile.enabled`; route the type in `daemon/dispatcher.rs` / `packet_handler.rs`.
+4. A UI action: a `DaemonCommand` variant in `daemon/commands.rs`, handled in the daemon; the page reads `DeviceView` / events, never the network.
+5. Per-device state: forget it in `peers::forget_peer` (the store-list test fails until you list it).
+6. Settings: see "C. Add a setting" below; a page: "D. Add a desk page".
+7. Run `cargo fmt`, `cargo clippy --all-targets -- -D warnings`, `cargo test` (twice for flakes) and `protocol/check-fixtures.sh`; the phone side gets its mirrored change and `./gradlew testDebugUnitTest`.
+
+Docs follow-up: the testdata `_note` texts in the shared fixtures are mirrored byte-for-byte in three places and were left as they are; ARCHITECTURE.md line-number references (`file.rs:NNN`) are being replaced by file + item names as files move.
+
 ## 4. Identity, pairing and trust
 
 ### 4.1 Identity
@@ -604,7 +663,7 @@ The design intent is in `docs/UI-REDESIGN.md` (a specification written 2026-11-0
 
 **The daemon boundary.** The UI never blocks on the network. `DaemonHandle` (`daemon/handle.rs:84`) holds an `mpsc` command sender and `Arc<Mutex<..>>` snapshots of devices, errors and events. `ticker.rs` polls `daemon.devices()`, `drain_errors()` and `drain_events()` at the daemon's pace (1 s with a window, 3 s with a phone live and nothing shown, 5 s otherwise, `daemon/mod.rs:68-102`); `wake_ui` (`daemon/state.rs:377`, coalesced) delivers a change at once. To add a UI action, add a `DaemonCommand` first (`daemon/commands.rs:16`).
 
-**Window.** `window/` (`mod.rs` page table and shared helpers; `imp.rs` the GObject; `navigation.rs`, `refresh.rs`, `notices.rs` the window's methods; `words.rs`, `blocks.rs`, `debug_verbs.rs`) built from `window.ui`: `AdwApplicationWindow` 1180x760, minimum 360x294. A `main_stack` (crossfade) has `welcome`, `devices` and `solo`. `devices` holds an `AdwNavigationSplitView` with `sidebar.rs` (device card and switcher, page list with count badges, window-wide file drop) and a content page containing the header, `error_banner` (`AdwBanner`; standing problems are re-asserted at every poll until dismissed or fixed), `call_bar` and `page_bin` (an `AdwBreakpointBin`). Pages (`PAGES` in `window/mod.rs`, `Ctrl+1..6`): **Home** (`overview.rs`), **Files** (`transfers.rs`, `bucket.rs`, `gallery.rs`, viewers `viewer.rs`/`pdf_view.rs`), **Notes & clipboard** (`notes_clipboard.rs`), **Notifications**, **Terminals**, **Contacts**, and **Settings** in the footer (`prefs/`). Calls, Insert and Sound are features of the Home/chrome, not pages. Breakpoints: split view collapses at `max-width: 860sp`, `narrow` at 480sp, the page area is `compact` at 760sp; `apply_layout` reflows named widgets.
+**Window.** `window/` (`mod.rs` page table and shared helpers; `imp.rs` the GObject; `navigation.rs`, `refresh.rs`, `notices.rs` the window's methods; `words.rs`, `blocks.rs`, `debug_verbs.rs`) built from `window.ui`: `AdwApplicationWindow` 1180x760, minimum 360x294. A `main_stack` (crossfade) has `welcome`, `devices` and `solo`. `devices` holds an `AdwNavigationSplitView` with `sidebar.rs` (device card and switcher, page list with count badges, window-wide file drop) and a content page containing the header, `error_banner` (`AdwBanner`; standing problems are re-asserted at every poll until dismissed or fixed), `call_bar` and `page_bin` (an `AdwBreakpointBin`). Pages (`PAGES` in `window/mod.rs`, `Ctrl+1..6`): **Home** (`overview.rs`), **Files** (`transfers.rs`, `bucket/`, `gallery.rs`, viewers `viewer.rs`/`pdf_view.rs`), **Notes & clipboard** (`notes_clipboard.rs`), **Notifications**, **Terminals**, **Contacts**, and **Settings** in the footer (`prefs/`). Calls, Insert and Sound are features of the Home/chrome, not pages. Breakpoints: split view collapses at `max-width: 860sp`, `narrow` at 480sp, the page area is `compact` at 760sp; `apply_layout` reflows named widgets.
 
 **Settings** (`window/prefs/`: `mod.rs` pages and navigation, `groups.rs`, `computer_rows.rs`, `phone_rows.rs`, `search.rs`): a list-then-subpage `AdwNavigationView` with search. `GROUPS` are the ten in the shared contract, in order: Connection, Notifications, Clipboard, Calls, Sound, Control, Files, Privacy & security, Appearance, Advanced. When no phone is paired only Connection (computer-wide rows), Privacy & security, Appearance and Advanced appear.
 
