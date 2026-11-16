@@ -511,7 +511,7 @@ pub(super) const SWITCHES: [SwitchSpec; 18] = [
 
 /// A phone's switch as published (`None`: not a state switch; sound is in
 /// `Devices[].sound`).
-pub(super) fn phone_switch(key: &str, device: &DeviceView, settings: &AppSettings) -> Option<bool> {
+fn phone_switch(key: &str, device: &DeviceView, settings: &AppSettings) -> Option<bool> {
     let id = device.id.as_str();
     Some(match key {
         "showNotifications" => settings.shows_notifications(id),

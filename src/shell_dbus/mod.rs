@@ -376,9 +376,9 @@ fn property_values(app: &DesklinkApplication) -> std::collections::HashMap<&'sta
     ])
 }
 
-pub(super) const EXTENSION_UUID: &str = "desklink@derx06.github.io";
+const EXTENSION_UUID: &str = "desklink@derx06.github.io";
 
-pub(super) fn user_extension_dir() -> std::path::PathBuf {
+fn user_extension_dir() -> std::path::PathBuf {
     glib::user_data_dir()
         .join("gnome-shell")
         .join("extensions")

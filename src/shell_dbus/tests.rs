@@ -375,51 +375,24 @@ fn a_disabled_extension_no_longer_handles_notifications() {
     assert!(!handles(&caps, "calls", Some(true)), "never said so");
 }
 
-/// Every top-bar verb passes the sender check first (no path around it).
-/// Every non-test file of `shell_dbus/` (mod.rs first), test items left out:
-/// what the pins below read. Fails when a file is missing from the list.
+/// Every non-test file of `shell_dbus/` (mod.rs first), test items left out;
+/// fails when a file of the module is missing from the list.
 fn production_sources() -> String {
-    let sources = [
-        include_str!("mod.rs"),
-        include_str!("clients.rs"),
-        include_str!("extension.rs"),
-        include_str!("extension_files.rs"),
-        include_str!("methods.rs"),
-        include_str!("model.rs"),
-        include_str!("variants.rs"),
-    ];
-    let listed = [
-        "mod.rs",
-        "clients.rs",
-        "extension.rs",
-        "extension_files.rs",
-        "methods.rs",
-        "model.rs",
-        "variants.rs",
-    ];
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shell_dbus");
-    let mut present: Vec<String> = std::fs::read_dir(dir)
-        .unwrap()
-        .flatten()
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| {
-            name.ends_with(".rs") && !crate::source_scan::is_test_file(std::path::Path::new(name))
-        })
-        .collect();
-    present.sort();
-    let mut expected: Vec<String> = listed.iter().map(|name| name.to_string()).collect();
-    expected.sort();
-    assert_eq!(
-        present, expected,
-        "a shell_dbus file is missing from production_sources"
-    );
-    sources
-        .iter()
-        .map(|source| crate::source_scan::production(source))
-        .collect::<Vec<_>>()
-        .join("\n")
+    crate::source_scan::module_sources(
+        "shell_dbus",
+        &[
+            ("mod.rs", include_str!("mod.rs")),
+            ("clients.rs", include_str!("clients.rs")),
+            ("extension.rs", include_str!("extension.rs")),
+            ("extension_files.rs", include_str!("extension_files.rs")),
+            ("methods.rs", include_str!("methods.rs")),
+            ("model.rs", include_str!("model.rs")),
+            ("variants.rs", include_str!("variants.rs")),
+        ],
+    )
 }
 
+/// Every top-bar verb passes the sender check first (no path around it).
 #[test]
 fn the_sender_is_checked_before_any_verb_runs() {
     let source = &production_sources();

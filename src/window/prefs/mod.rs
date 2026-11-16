@@ -36,7 +36,7 @@ pub(super) use search::{GROUPS, ROWS};
 
 /// A switch that follows a setting a phone can also change, and how to read
 /// it. Synced in place each refresh: rebuilding the page would move focus.
-pub(crate) type LiveSwitch = (
+type LiveSwitch = (
     glib::WeakRef<adw::SwitchRow>,
     fn(&AppSettings, &str) -> bool,
 );

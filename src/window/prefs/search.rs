@@ -94,13 +94,13 @@ pub(super) fn filter_groups(groups: &[Searchable], query: &str) -> bool {
 /// One setting as Settings search and Find anything know it.
 pub(in crate::window) struct SettingRow {
     /// An index into [`GROUPS`].
-    pub(crate) group: usize,
+    pub(in crate::window) group: usize,
     /// The row's title; `{phone}` is the phone's name.
-    pub(crate) title: &'static str,
+    pub(in crate::window) title: &'static str,
     /// Shown only with a paired phone.
-    pub(crate) phone: bool,
+    pub(in crate::window) phone: bool,
     /// Words people type for it that the row does not say (never shown).
-    pub(crate) words: &'static str,
+    pub(in crate::window) words: &'static str,
 }
 
 const fn row(group: usize, title: &'static str, phone: bool, words: &'static str) -> SettingRow {

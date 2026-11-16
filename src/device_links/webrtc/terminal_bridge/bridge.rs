@@ -568,7 +568,7 @@ impl TerminalBridge {
 }
 
 /// The error a `create` gets when its folder is not a readable directory.
-pub(super) const BAD_CWD: &str = "bad-cwd";
+const BAD_CWD: &str = "bad-cwd";
 
 /// Where a `create` asked to start, resolved; `None` when it asked for
 /// nothing or for somewhere unusable.

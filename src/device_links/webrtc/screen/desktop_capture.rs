@@ -1,6 +1,7 @@
 //! This desktop's screen going to the phone: [`DesktopScreenCapture`] (start,
 //! attach to the negotiated section, stop until idle), RTP continuity across
-//! shares, chain statistics, and the debug self-test.
+//! shares, and the debug self-test. It reads the chain's statistics from a
+//! `ChainStats` (owned by `bitrate`).
 //!
 //! Sibling edges: `encoder` (the chain and sources), `bitrate` (the
 //! controller and chain statistics). Outside: `remote_desktop_portal`, `config`

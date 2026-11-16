@@ -22,7 +22,7 @@ pub(super) fn bridges() -> &'static Mutex<HashMap<String, TerminalBridge>> {
 /// Something may be waiting for a pump (a request, a reply, an alert, a
 /// revoke): wakes every idle one. Pumps share the terminals' change signal,
 /// so new output wakes them too.
-pub(super) fn wake_pumps() {
+fn wake_pumps() {
     crate::device_links::pty::session::changed();
 }
 

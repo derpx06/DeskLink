@@ -363,7 +363,7 @@ const MAX_FPS: i64 = 60;
 /// string form avoids guessing an enum's or flags' Rust type; the guard is
 /// because `set_property` panics on an absent name and GStreamer plugins differ
 /// between versions.
-pub(super) fn set_if_present(element: &gst::Element, name: &str, value: &str) {
+fn set_if_present(element: &gst::Element, name: &str, value: &str) {
     if element.has_property(name, None) {
         element.set_property_from_str(name, value);
     }
