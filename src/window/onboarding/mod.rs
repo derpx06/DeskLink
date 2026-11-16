@@ -97,29 +97,39 @@ pub(super) struct Onboarding {
     poll: Cell<u64>,
 }
 
-/// Below this width (sp) a tour scene is drawn at [`TIGHT_SCALE`].
+/// Below this width (px: the scene is drawn in px, whatever the text size)
+/// a tour scene is drawn at [`TIGHT_SCALE`].
 const TIGHT_WIDTH: f64 = 480.0;
 /// 360 px of scene becomes 252: with the card and page margins, 348 px.
 const TIGHT_SCALE: f32 = 0.7;
+/// Two columns need 2 x 408 px for the scene's card + 40 + the margins: one
+/// column below this many px, or this many sp (the words grow with the text).
+const NARROW_WIDTH: f64 = 920.0;
 
-/// A tour scene, scaled down in a tight window (a fixed canvas cannot shrink;
-/// a transformed child of a `gtk::Fixed` is measured at its drawn size).
-fn fitted_scene(page: usize, still: bool, tight: bool) -> gtk::Widget {
-    let canvas = scene(page, still);
-    if !tight {
-        return canvas.upcast();
-    }
+/// A tour scene in a holder that can draw it smaller: a fixed canvas cannot
+/// shrink, but a transformed child of a `gtk::Fixed` is measured at its drawn
+/// size.
+fn fitted_scene(page: usize, still: bool, tight: bool) -> gtk::Fixed {
     let holder = gtk::Fixed::builder()
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
         .can_target(false)
         .build();
-    holder.put(&canvas, 0.0, 0.0);
-    holder.set_child_transform(
-        &canvas,
-        Some(&gtk::gsk::Transform::new().scale(TIGHT_SCALE, TIGHT_SCALE)),
-    );
-    holder.upcast()
+    holder.put(&scene(page, still), 0.0, 0.0);
+    fit(&holder, tight);
+    holder
+}
+
+/// Draws the scene in `holder` at full size or at [`TIGHT_SCALE`], in place:
+/// it is not rebuilt, so its animation does not start over.
+fn fit(holder: &gtk::Fixed, tight: bool) {
+    if let Some(canvas) = holder.first_child() {
+        let scale = if tight { TIGHT_SCALE } else { 1.0 };
+        holder.set_child_transform(
+            &canvas,
+            Some(&gtk::gsk::Transform::new().scale(scale, scale)),
+        );
+    }
 }
 
 fn animations_on() -> bool {
@@ -174,18 +184,22 @@ impl Onboarding {
             .hhomogeneous(false)
             .build();
 
-        // One column below the width two columns of a full scene need (2 x
-        // 408 + 40 + the margins); below `TIGHT_WIDTH` the scene is drawn
-        // smaller too. A bin applies one breakpoint at a time (the last that
-        // matches), so `tight` carries the same setters as `narrow`.
-        let breakpoint = |width| {
-            adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+        // One column below the width two columns need (`NARROW_WIDTH`, in px
+        // for the scene or sp for the words); below `TIGHT_WIDTH` px the scene
+        // is drawn smaller too. A bin applies one breakpoint at a time (the
+        // last that matches), so `tight` carries the same setters as `narrow`.
+        let max_width = |width, unit| {
+            adw::BreakpointCondition::new_length(
                 adw::BreakpointConditionLengthType::MaxWidth,
                 width,
-                adw::LengthUnit::Sp,
-            ))
+                unit,
+            )
         };
-        let (narrow, tight) = (breakpoint(920.0), breakpoint(TIGHT_WIDTH));
+        let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_or(
+            max_width(NARROW_WIDTH, adw::LengthUnit::Px),
+            max_width(NARROW_WIDTH, adw::LengthUnit::Sp),
+        ));
+        let tight = adw::Breakpoint::new(max_width(TIGHT_WIDTH, adw::LengthUnit::Px));
         let narrow_set = |object: &gtk::Widget, property: &str, value: glib::Value| {
             for point in [&narrow, &tight] {
                 point.add_setter(object, property, Some(&value));
@@ -409,7 +423,7 @@ impl Onboarding {
             let redraw = move |_: &adw::Breakpoint| {
                 if let Some(this) = weak.upgrade() {
                     this.tight.set(applied);
-                    this.draw_scene();
+                    this.fit_scene();
                 }
             };
             if applied {
@@ -440,6 +454,15 @@ impl Onboarding {
         let leave = self.on_leave.borrow_mut().take();
         if let Some(leave) = leave {
             leave();
+        }
+    }
+
+    /// Resizes the shown scene for the window's width, without rebuilding it.
+    fn fit_scene(&self) {
+        for card in &self.scenes {
+            if let Some(holder) = card.first_child().and_downcast::<gtk::Fixed>() {
+                fit(&holder, self.tight.get());
+            }
         }
     }
 
@@ -635,7 +658,9 @@ impl Onboarding {
             .build();
         text.append(&line);
         let detail = label(&row.detail, &["dl-secondary"]);
+        // Copied with the mouse (install commands), never a Tab stop.
         detail.set_selectable(true);
+        detail.set_focusable(false);
         text.append(&detail);
         if let Some(action) = self.fix_widget(row) {
             action.set_halign(gtk::Align::Start);

@@ -605,41 +605,60 @@ fn check_again_keeps_the_keyboard_focus() {
 }
 
 /// Every page of the tour fits the window it is shown in, from the 360 px
-/// minimum to a half-screen 800 px: nothing is cut off on the right (the
-/// scene at its full 360 px plus the card made 456 px; two columns of it
-/// needed 904 px).
+/// minimum to a half-screen 800 px, at text scales 0.8, 1 and 1.25: nothing
+/// is cut off on the right (the scene at its full 360 px plus the card made
+/// 456 px; two columns of it needed 904 px). The scene is drawn smaller only
+/// in a window under 480 px, whatever the text size (it is drawn in px).
 #[test]
 fn every_page_fits_a_narrow_window() {
     crate::test_display::run(|| {
-        for width in [360, 560, 800, 1100] {
-            let (window, _commands) = window_with_tour();
-            window.set_default_size(width, 700);
-            window.present();
-            let tour = window.imp().onboarding.borrow().clone().unwrap();
-            let bin = tour
-                .root
-                .content()
-                .and_downcast::<adw::BreakpointBin>()
-                .expect("the breakpoint bin");
-            let context = glib::MainContext::default();
-            let settle = || {
-                for _ in 0..40 {
-                    while context.iteration(false) {}
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+        let settings = gtk::Settings::default().expect("GTK settings");
+        let dpi = settings.gtk_xft_dpi();
+        for scale in [0.8, 1.0, 1.25] {
+            settings.set_gtk_xft_dpi((96.0 * 1024.0 * scale) as i32);
+            for width in [360, 560, 800, 1100] {
+                let (window, _commands) = window_with_tour();
+                window.set_default_size(width, 700);
+                window.present();
+                let tour = window.imp().onboarding.borrow().clone().unwrap();
+                let bin = tour
+                    .root
+                    .content()
+                    .and_downcast::<adw::BreakpointBin>()
+                    .expect("the breakpoint bin");
+                let context = glib::MainContext::default();
+                let settle = || {
+                    for _ in 0..40 {
+                        while context.iteration(false) {}
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                };
+                for step in 0..SETUP {
+                    tour.show(step);
+                    settle();
+                    let content = bin.child().expect("the page");
+                    let (min, _, _, _) = content.measure(gtk::Orientation::Horizontal, -1);
+                    assert!(
+                        min <= bin.width(),
+                        "step {step} at {width} px, text x{scale}: needs {min} px, has {}",
+                        bin.width()
+                    );
                 }
-            };
-            for step in 0..SETUP {
-                tour.show(step);
-                settle();
-                let content = bin.child().expect("the page");
-                let (min, _, _, _) = content.measure(gtk::Orientation::Horizontal, -1);
-                assert!(
-                    min <= bin.width(),
-                    "step {step} at {width} px needs {min} px, has {}",
-                    bin.width()
+                assert_eq!(
+                    tour.tight.get(),
+                    bin.width() < 480,
+                    "the scene is smaller only under 480 px ({width} px, text x{scale})"
                 );
+                // Resizing the scene keeps the same one (its animation goes on).
+                tour.show(1);
+                let card = &tour.scenes[0];
+                let before = card.first_child().expect("the scene");
+                tour.tight.set(!tour.tight.get());
+                tour.fit_scene();
+                assert_eq!(card.first_child(), Some(before), "fitted in place");
+                window.close();
             }
-            window.close();
         }
+        settings.set_gtk_xft_dpi(dpi);
     });
 }
