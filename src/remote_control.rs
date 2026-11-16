@@ -104,13 +104,13 @@ fn control_denied(seen: Seen) -> Notice {
     }
     // It was on and the phone's system switched it off (ColorOS does on every
     // force stop and app update): said as such, not as never set up.
-    let stopped = denial.contains("turned off");
+    let stopped = denial.contains("turned off") || denial.contains("not running");
     if stopped && seen.control_ask != Some(AskState::Waiting) {
         return Notice {
             text: format!(
-                "View only: Android turned off DeskLink\u{2019}s accessibility service on {phone} \
-                 (it does after an update or a force stop). Turn it on again there \
-                 (off and on, if it still shows on)."
+                "View only: DeskLink\u{2019}s accessibility service is not running on {phone} \
+                 (some phones turn it off after an update or a force stop). Turn it on again \
+                 there (off and on, if it still shows on)."
             ),
             button: if seen.askable {
                 Some((ask_label(seen.control_ask), Action::AskPhone))
@@ -206,24 +206,31 @@ pub(crate) struct Seen<'a> {
 /// How long the strip keeps a word about typing after the last key.
 const TYPING_HINT_FOR: std::time::Duration = std::time::Duration::from_secs(6);
 
-/// Input the window could not send for want of control: counted, and logged
-/// with the count at most every [`InputDrops::EVERY`], never per event (a drag
-/// is dozens a second).
-#[derive(Debug, Default)]
-pub(crate) struct InputDrops {
+/// Events counted, and logged with the count at most once per interval,
+/// never per event: a drag is dozens a second, and a line per key would give
+/// away the rhythm (and length) of what is typed, a password too.
+#[derive(Debug)]
+pub(crate) struct PacedCount {
+    every: std::time::Duration,
     count: u32,
     logged: Option<std::time::Instant>,
 }
 
-impl InputDrops {
-    const EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+impl PacedCount {
+    pub(crate) fn every(every: std::time::Duration) -> Self {
+        Self {
+            every,
+            count: 0,
+            logged: None,
+        }
+    }
 
-    /// Counts one drop; how many to log now, when it is time to.
-    pub(crate) fn dropped(&mut self, now: std::time::Instant) -> Option<u32> {
+    /// Counts one event; how many to log now, when it is time to.
+    pub(crate) fn count(&mut self, now: std::time::Instant) -> Option<u32> {
         self.count += 1;
         if self
             .logged
-            .is_some_and(|at| now.saturating_duration_since(at) < Self::EVERY)
+            .is_some_and(|at| now.saturating_duration_since(at) < self.every)
         {
             return None;
         }
@@ -232,12 +239,48 @@ impl InputDrops {
     }
 }
 
+/// Keys, text and pastes sent to the phone: counted, at most a line a second.
+fn sent_to_phone(sent: &RefCell<PacedCount>) {
+    if let Some(count) = sent.borrow_mut().count(std::time::Instant::now()) {
+        debug_log!("[Phone screen] {count} key, text or paste event(s) sent");
+    }
+}
+
+/// Whether a key pressed without control was meant as typing into the phone
+/// (said in the strip, and control asked for), not moving about this window:
+/// text, Backspace, Delete, Enter or a paste, but not Tab, arrows or Escape,
+/// and not Space or Enter pressing the window's own focused button.
+pub(crate) fn is_typing(keyval: Key, state: gdk::ModifierType, focus_on_button: bool) -> bool {
+    if is_paste(keyval, state) {
+        return true;
+    }
+    if focus_on_button
+        && matches!(
+            keyval,
+            Key::space | Key::KP_Space | Key::Return | Key::KP_Enter
+        )
+    {
+        return false;
+    }
+    let shortcut = state.intersects(
+        gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::ALT_MASK
+            | gdk::ModifierType::SUPER_MASK,
+    );
+    match keyval {
+        Key::BackSpace | Key::Delete | Key::Return | Key::KP_Enter => true,
+        _ => {
+            !shortcut && map_gdk_key_to_special(keyval) == 0 && key_payload(keyval, state).is_some()
+        }
+    }
+}
+
 /// Input without control: logged (paced), and when the phone says control is
 /// off there, asked on the phone, whose Allow opens the accessibility setup.
 /// Only input asks; viewing never does (asks' own pacing: never while one
 /// waits, an automatic one at most every `REASK`).
-fn input_without_control(device_id: &str, drops: &RefCell<InputDrops>) {
-    if let Some(count) = drops.borrow_mut().dropped(std::time::Instant::now()) {
+fn input_without_control(device_id: &str, drops: &RefCell<PacedCount>) {
+    if let Some(count) = drops.borrow_mut().count(std::time::Instant::now()) {
         debug_log!(
             "[Phone screen] {count} input event(s) kept: this computer holds no control of the phone"
         );
@@ -247,12 +290,28 @@ fn input_without_control(device_id: &str, drops: &RefCell<InputDrops>) {
     }
 }
 
+/// The strip's words for the phone's control denial `denial` (`wire_values.json`
+/// pins the phone's reasons).
+#[cfg(test)]
+pub(crate) fn denial_words(denial: &str, phone: &str) -> String {
+    control_denied(Seen {
+        state: Some(SessionState::Viewing),
+        has_picture: true,
+        denial: Some(denial),
+        phone,
+        askable: true,
+        ..Seen::default()
+    })
+    .text
+}
+
 /// What the strip says when the phone's keys reached no text field there.
 pub(crate) fn typing_words(code: &str, phone: &str) -> String {
     use crate::device_links::packet::{
-        TYPING_ACCESSIBILITY_OFF, TYPING_NOT_EDITABLE, TYPING_NO_TEXT_FIELD,
+        TYPING_ACCESSIBILITY_OFF, TYPING_LOCKED, TYPING_NOT_EDITABLE, TYPING_NO_TEXT_FIELD,
     };
     match code {
+        TYPING_LOCKED => format!("Typing: {phone} is locked \u{b7} unlock it first"),
         TYPING_NO_TEXT_FIELD => {
             format!("Typing: no text field is selected on {phone} \u{b7} click one first")
         }
@@ -406,7 +465,12 @@ pub fn show_remote_control_dialog(
 
     let toolbar = adw::ToolbarView::new();
     let header = adw::HeaderBar::new();
-    let drops: Rc<RefCell<InputDrops>> = Rc::default();
+    let drops = Rc::new(RefCell::new(PacedCount::every(
+        std::time::Duration::from_secs(3),
+    )));
+    let sent = Rc::new(RefCell::new(PacedCount::every(
+        std::time::Duration::from_secs(1),
+    )));
     let send = {
         let daemon = daemon.clone();
         let device = Rc::clone(&device);
@@ -643,6 +707,15 @@ pub fn show_remote_control_dialog(
     let strip_action = Rc::new(Cell::new(Action::RequestControl));
     // When a key was last typed here without control of the phone.
     let typed_without_control: Rc<Cell<Option<std::time::Instant>>> = Rc::default();
+    // Typing: keys in the capture phase (in the bubble phase the window's own
+    // bindings took arrows, Tab, Space and Enter first), text through an input
+    // method. The input method is attached only while this computer controls
+    // the phone (the tick does it): attached without control, it took every
+    // printable key, Space too, from the window's own focused button.
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let im = gtk::IMMulticontext::new();
+    im.set_client_widget(Some(&picture));
     {
         let (daemon, device, last, asks, strip_action) = (
             daemon.clone(),
@@ -688,6 +761,7 @@ pub fn show_remote_control_dialog(
         let kind = kind.downgrade();
         let tick = Cell::new(0u32);
         let lease_was = Cell::new(false);
+        let (keys, im) = (keys.downgrade(), im.downgrade());
         let paint_watch: RefCell<Option<PaintWatch>> = RefCell::default();
         glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
             let (Some(picture), Some(status)) = (picture.upgrade(), status.upgrade()) else {
@@ -800,6 +874,22 @@ pub fn show_remote_control_dialog(
             // The phone's buttons work exactly when control is granted; when it is
             // not they say so instead of looking usable and doing nothing.
             if lease_was.replace(lease_active) != lease_active || tick.get() == 1 {
+                if let (Some(keys), Some(im)) = (keys.upgrade(), im.upgrade()) {
+                    if lease_active {
+                        // Candidates (IBus transliteration for Marathi or
+                        // Hindi) pop up at the picture's bottom centre.
+                        im.set_cursor_location(&gdk::Rectangle::new(
+                            picture.width() / 2,
+                            (picture.height() - 1).max(0),
+                            1,
+                            1,
+                        ));
+                        keys.set_im_context(Some(&im));
+                    } else {
+                        im.reset();
+                        keys.set_im_context(None::<&gtk::IMContext>);
+                    }
+                }
                 for (button, tooltip) in &nav_buttons {
                     if let Some(button) = button.upgrade() {
                         button.set_sensitive(lease_active);
@@ -878,9 +968,14 @@ pub fn show_remote_control_dialog(
         let device = Rc::clone(&device);
         let speaker = speaker.downgrade();
         let (held_drag, send) = (Rc::clone(&held_drag), Rc::clone(&send));
+        let im = im.downgrade();
         window.connect_close_request(move |_| {
             // Closing mid-drag: the finger comes up first.
             release_held_drag(&held_drag, &*send);
+            // Nothing half composed is left in the input method.
+            if let Some(im) = im.upgrade() {
+                im.reset();
+            }
             OPEN_WINDOWS.with(|open| open.borrow_mut().remove(device.as_str()));
             if speaker.upgrade().is_some_and(|speaker| speaker.is_active()) {
                 daemon.send(DaemonCommand::Sound(
@@ -1071,11 +1166,6 @@ pub fn show_remote_control_dialog(
     // composing shows under the picture. Without control the keys stay this
     // window's own, and the strip says typing needs control (asking for it).
     {
-        let keys = gtk::EventControllerKey::new();
-        keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-        let im = gtk::IMMulticontext::new();
-        im.set_client_widget(Some(&picture));
-        keys.set_im_context(Some(&im));
         // A key with nowhere to go: said in the strip, and control asked for
         // now (the phone may have just turned its service on), not at the
         // next backed-off retry.
@@ -1105,17 +1195,18 @@ pub fn show_remote_control_dialog(
             })
         };
         {
-            let (send, device, without_control) = (
+            let (send, device, without_control, sent) = (
                 Rc::clone(&send),
                 Rc::clone(&device),
                 Rc::clone(&without_control),
+                Rc::clone(&sent),
             );
             im.connect_commit(move |_, text| {
                 if !remote_control_lease_active(device.as_str()) {
                     return without_control();
                 }
                 if let Some(payload) = paste_payload(text) {
-                    debug_log!("[Phone screen] text sent ({} chars)", text.chars().count());
+                    sent_to_phone(&sent);
                     send(payload);
                 }
             });
@@ -1151,16 +1242,15 @@ pub fn show_remote_control_dialog(
                 }
             });
         }
-        let (send, device) = (Rc::clone(&send), Rc::clone(&device));
+        let (send, device, sent) = (Rc::clone(&send), Rc::clone(&device), Rc::clone(&sent));
         keys.connect_key_pressed(move |controller, keyval, _, state| {
             if !remote_control_lease_active(device.as_str()) {
-                // Moving about the window (Tab, arrows, Escape) is not typing.
-                let typing = is_paste(keyval, state)
-                    || matches!(
-                        keyval,
-                        Key::BackSpace | Key::Delete | Key::Return | Key::KP_Enter
-                    );
-                if typing {
+                let focus_on_button = controller
+                    .widget()
+                    .and_then(|widget| widget.downcast::<gtk::Window>().ok())
+                    .and_then(|window| gtk::prelude::GtkWindowExt::focus(&window))
+                    .is_some_and(|focus| focus.is::<gtk::Button>());
+                if is_typing(keyval, state, focus_on_button) {
                     without_control();
                 }
                 return glib::Propagation::Proceed;
@@ -1169,19 +1259,19 @@ pub fn show_remote_control_dialog(
             // whatever the phone's own clipboard holds.
             if is_paste(keyval, state) {
                 if let Some(widget) = controller.widget() {
-                    let send = Rc::clone(&send);
+                    let (send, sent) = (Rc::clone(&send), Rc::clone(&sent));
                     widget.clipboard().read_text_async(
                         None::<&gtk::gio::Cancellable>,
-                        move |text| {
-                            if let Ok(Some(text)) = text {
+                        move |text| match text {
+                            Ok(Some(text)) => {
                                 if let Some(payload) = paste_payload(&text) {
-                                    debug_log!(
-                                        "[Phone screen] paste sent ({} chars)",
-                                        text.chars().count()
-                                    );
+                                    sent_to_phone(&sent);
                                     send(payload);
                                 }
                             }
+                            _ => debug_log!(
+                                "[Phone screen] paste: no text on this computer's clipboard"
+                            ),
                         },
                     );
                 }
@@ -1189,12 +1279,7 @@ pub fn show_remote_control_dialog(
             }
             match key_payload(keyval, state) {
                 Some(payload) => {
-                    debug_log!(
-                        "[Phone screen] key sent ({})",
-                        payload
-                            .get("specialKey")
-                            .map_or("text".to_string(), |code| format!("special {code}"))
-                    );
+                    sent_to_phone(&sent);
                     send(payload);
                     glib::Propagation::Stop
                 }
@@ -1770,7 +1855,7 @@ mod tests {
         })
         .unwrap();
         assert!(
-            notice.text.contains("Android turned off"),
+            notice.text.contains("is not running on Pixel"),
             "{}",
             notice.text
         );
@@ -1781,23 +1866,53 @@ mod tests {
     /// every 3 s with the count (a drag is dozens of events a second).
     #[test]
     fn kept_input_is_logged_paced_with_its_count() {
-        let mut drops = InputDrops::default();
+        let mut drops = PacedCount::every(std::time::Duration::from_secs(3));
         let t = std::time::Instant::now();
-        assert_eq!(drops.dropped(t), Some(1), "the first is said at once");
+        assert_eq!(drops.count(t), Some(1), "the first is said at once");
         for ms in [10, 500, 2_999] {
-            assert_eq!(
-                drops.dropped(t + std::time::Duration::from_millis(ms)),
-                None
+            assert_eq!(drops.count(t + std::time::Duration::from_millis(ms)), None);
+        }
+        assert_eq!(drops.count(t + std::time::Duration::from_secs(3)), Some(4));
+        assert_eq!(drops.count(t + std::time::Duration::from_secs(7)), Some(1));
+    }
+
+    /// Without control, typing is said in the strip (and control asked for);
+    /// moving about the window is not, nor pressing its own focused button.
+    #[test]
+    fn typing_without_control_is_text_editing_keys_or_a_paste() {
+        use gdk::ModifierType as M;
+        let none = M::empty();
+        for key in [
+            Key::a,
+            Key::space,
+            Key::BackSpace,
+            Key::Delete,
+            Key::Return,
+            Key::KP_Enter,
+        ] {
+            assert!(is_typing(key, none, false), "{key:?}");
+        }
+        assert!(is_typing(Key::v, M::CONTROL_MASK, false), "paste");
+        assert!(is_typing(Key::A, M::SHIFT_MASK, false), "capital");
+        for key in [
+            Key::Tab,
+            Key::Left,
+            Key::Up,
+            Key::Escape,
+            Key::Home,
+            Key::F5,
+            Key::Shift_L,
+        ] {
+            assert!(!is_typing(key, none, false), "{key:?}");
+        }
+        assert!(!is_typing(Key::w, M::CONTROL_MASK, false), "a shortcut");
+        for key in [Key::space, Key::Return, Key::KP_Enter] {
+            assert!(
+                !is_typing(key, none, true),
+                "{key:?} presses the focused button"
             );
         }
-        assert_eq!(
-            drops.dropped(t + std::time::Duration::from_secs(3)),
-            Some(4)
-        );
-        assert_eq!(
-            drops.dropped(t + std::time::Duration::from_secs(7)),
-            Some(1)
-        );
+        assert!(is_typing(Key::a, none, true), "a letter is still typing");
     }
 
     /// Keys never vanish (owner 11-16): typed without control, the strip says

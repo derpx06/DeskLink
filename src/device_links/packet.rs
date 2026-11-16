@@ -91,6 +91,8 @@ pub const TYPING_ACCESSIBILITY_OFF: &str = "accessibility-off";
 pub const TYPING_NO_TEXT_FIELD: &str = "no-text-field";
 pub const TYPING_NOT_EDITABLE: &str = "not-editable";
 pub const TYPING_TEXT_REFUSED: &str = "text-refused";
+/// The phone is locked: nothing is typed into its lock screen.
+pub const TYPING_LOCKED: &str = "locked";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NetworkPacket {

@@ -7,7 +7,12 @@
   },
   "glideAsk": {"set": {"glide": true}},
   "unlockRefusals": ["pref-off", "no-nonce", "expired", "wrong-device", "replayed", "not-locked", "not-lan", "not-ready", "failed", "unsupported"],
-  "typingRefusals": ["accessibility-off", "no-text-field", "not-editable", "text-refused"],
+  "typingRefusals": ["accessibility-off", "no-text-field", "not-editable", "text-refused", "locked"],
+  "controlDenials": {
+    "_doc": "remote-session control-denied reason when the phone's accessibility service is not running: never turned on, or stopped by Android after it ran (a force stop or an update on some phones). The desk words them apart.",
+    "accessibilityOff": "Enable DeskLink accessibility control on this Android device",
+    "stoppedByAndroid": "Android turned off DeskLink accessibility control on this Android device (after an update or a force stop)"
+  },
   "_typingRefusalsDoc": "remote-session input-focus {editable: false, reason} from the phone while the desk's Phone Screen window types into it: why its keys reached no text field (editable: true clears it).",
   "telephony": {
     "_doc": "callStates: desklink.telephony calls[].state. errors: desklink.telephony {error, action} ('failed' is the catch-all). emergency: numbers neither app dials (bare, '+' or '00' prefixed).",

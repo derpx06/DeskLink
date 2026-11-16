@@ -396,7 +396,8 @@ fn the_wire_values_are_the_desks() {
     // Typing refusals from the phone: each has the Phone Screen window's own
     // words ("text-refused" is the catch-all), and they are the desk's codes.
     use crate::device_links::packet::{
-        TYPING_ACCESSIBILITY_OFF, TYPING_NOT_EDITABLE, TYPING_NO_TEXT_FIELD, TYPING_TEXT_REFUSED,
+        TYPING_ACCESSIBILITY_OFF, TYPING_LOCKED, TYPING_NOT_EDITABLE, TYPING_NO_TEXT_FIELD,
+        TYPING_TEXT_REFUSED,
     };
     let codes = strings(&f["typingRefusals"]);
     assert_eq!(
@@ -405,9 +406,22 @@ fn the_wire_values_are_the_desks() {
             TYPING_ACCESSIBILITY_OFF,
             TYPING_NO_TEXT_FIELD,
             TYPING_NOT_EDITABLE,
-            TYPING_TEXT_REFUSED
+            TYPING_TEXT_REFUSED,
+            TYPING_LOCKED
         ]
     );
+    // The phone's control denials for a service that is not running: never
+    // turned on, or stopped by Android after it ran. Each worded apart.
+    let denials = &f["controlDenials"];
+    for (key, stopped) in [("accessibilityOff", false), ("stoppedByAndroid", true)] {
+        let notice = crate::remote_control::denial_words(denials[key].as_str().unwrap(), "P");
+        assert_eq!(
+            notice.contains("is not running"),
+            stopped,
+            "{key}: {notice}"
+        );
+        assert!(notice.contains("accessibility service"), "{key}: {notice}");
+    }
     let catch_all = crate::remote_control::typing_words("?", "P");
     for code in codes {
         let words = crate::remote_control::typing_words(&code, "P");
