@@ -43,12 +43,16 @@ pub struct DesklinkWindow {
     #[template_child]
     pub compact_breakpoint: TemplateChild<adw::Breakpoint>,
     #[template_child]
+    pub wide_breakpoint: TemplateChild<adw::Breakpoint>,
+    #[template_child]
     pub toast_overlay: TemplateChild<adw::ToastOverlay>,
     /// The window is phone-narrow: grids go one to a line.
     pub narrow: Cell<bool>,
     /// The page area is under 760sp wide (window narrow, or the sidebar
     /// takes the room): rows stack.
     pub compact: Cell<bool>,
+    /// The page area is 1200sp or wider: Home goes to two columns.
+    pub wide: Cell<bool>,
     pub daemon: RefCell<Option<DaemonHandle>>,
     pub selected_device_id: RefCell<Option<String>>,
     /// The device the person chose (or the remembered one); see
@@ -192,6 +196,20 @@ impl ObjectImpl for DesklinkWindow {
                 self.compact_breakpoint.connect_apply(changed);
             } else {
                 self.compact_breakpoint.connect_unapply(changed);
+            }
+        }
+        for wide in [true, false] {
+            let window = obj.downgrade();
+            let changed = move |_: &adw::Breakpoint| {
+                if let Some(window) = window.upgrade() {
+                    window.imp().wide.set(wide);
+                    window.apply_layout();
+                }
+            };
+            if wide {
+                self.wide_breakpoint.connect_apply(changed);
+            } else {
+                self.wide_breakpoint.connect_unapply(changed);
             }
         }
 

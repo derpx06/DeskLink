@@ -5,20 +5,17 @@
 
 use super::*;
 
-/// Where the tile row gets fewer columns (its width in px, the window sets
-/// them as it is resized, `apply_tile_columns`): below 840 it has three, below
-/// 560 two, so there is never an orphan tile on a line of its own.
-const TILE_STEPS: [(i32, u32); 2] = [(840, 3), (560, 2)];
+/// The gap between tiles, px.
+const TILE_GAP: i32 = 12;
 
-/// How many tiles a row of `width` px holds.
-pub(in crate::window) fn tile_columns(width: i32) -> u32 {
-    let mut columns = 6;
-    for (below, fewer) in TILE_STEPS {
-        if width < below {
-            columns = fewer;
-        }
-    }
-    columns
+/// How many tiles a row of `width` px holds when each needs `tile` px: six,
+/// three or two (6 divides into rows of 6, 3 and 2, so there is never an
+/// orphan tile on a line of its own, like "More" alone under five).
+pub(in crate::window) fn tile_columns(width: i32, tile: i32) -> u32 {
+    [6, 3]
+        .into_iter()
+        .find(|&n| n * tile.max(1) + (n - 1) * TILE_GAP <= width)
+        .unwrap_or(2) as u32
 }
 
 /// A control that cannot be used now: it looks disabled but stays a focus
@@ -50,9 +47,9 @@ pub(super) fn tiles(daemon: &DaemonHandle, device: &DeviceView) -> gtk::FlowBox 
         .selection_mode(gtk::SelectionMode::None)
         .homogeneous(true)
         .min_children_per_line(2)
-        .max_children_per_line(tile_columns(1000))
-        .column_spacing(12)
-        .row_spacing(12)
+        .max_children_per_line(3)
+        .column_spacing(TILE_GAP as u32)
+        .row_spacing(TILE_GAP as u32)
         .build();
     flow.set_widget_name("tile-row");
     let add = |tile: &gtk::Button| {

@@ -87,7 +87,8 @@
                     <property name="child">
                       <object class="AdwNavigationSplitView" id="split_view">
                         <property name="min-sidebar-width">232</property>
-                        <property name="max-sidebar-width">248</property>
+                        <!-- Up to 300 on a big window (20 % of 1500 and more). -->
+                        <property name="max-sidebar-width">300</property>
                         <property name="sidebar-width-fraction">0.2</property>
                         <!-- In text units: with Large Text the names in the sidebar still fit. -->
                         <property name="sidebar-width-unit">sp</property>
@@ -284,6 +285,16 @@
                                     <child>
                                       <object class="AdwBreakpoint" id="compact_breakpoint">
                                         <condition>max-width: 760sp</condition>
+                                      </object>
+                                    </child>
+                                    <!-- A big window: pages use the width for structure (Home in two
+                                         columns), never for longer lines (`apply_layout`). From a page
+                                         of 1200sp (a window of about 1500 px): two columns of 600, the
+                                         hero's status line on one line; at 1100 they were 560 and it
+                                         wrapped "over / Wi-Fi". -->
+                                    <child>
+                                      <object class="AdwBreakpoint" id="wide_breakpoint">
+                                        <condition>min-width: 1200sp</condition>
                                       </object>
                                     </child>
                                     <property name="child">

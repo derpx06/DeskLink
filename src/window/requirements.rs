@@ -1695,28 +1695,26 @@ mod tests {
                 find(&card, &|w| w.is::<gtk::Label>() && w.is_focusable()).is_none(),
                 "no label in the card is a Tab stop"
             );
-            // The tile row comes before the card: the card (often several
-            // steps tall) must not push it below the fold.
+            // The tile row comes before the card in reading order: the card
+            // (often several steps tall) must not push it below the fold. The
+            // tiles are in Home's first column, the card in its second.
             let tiles = find(&root, &|w| w.widget_name() == "tile-row" && w.is_mapped())
                 .expect("the tile row");
-            let page = card.parent().expect("on the Home page");
-            assert_eq!(tiles.parent().as_ref(), Some(&page), "siblings on Home");
-            let index = |widget: &gtk::Widget| {
-                let mut child = page.first_child();
-                let mut at = 0;
-                while let Some(next) = child {
-                    if &next == widget {
-                        return at;
-                    }
-                    at += 1;
-                    child = next.next_sibling();
-                }
-                usize::MAX
-            };
-            assert!(
-                index(&tiles) < index(&card),
-                "the actions come before Finish setting up"
+            let left = tiles.parent().expect("a Home column");
+            let right = card.parent().expect("a Home column");
+            let split = left.parent().expect("Home's columns");
+            assert_eq!(split.widget_name(), "home-split");
+            assert_eq!(
+                right.parent().as_ref(),
+                Some(&split),
+                "both in Home's columns"
             );
+            assert_eq!(
+                split.first_child().as_ref(),
+                Some(&left),
+                "the actions come first"
+            );
+            assert_ne!(left, right, "Finish setting up is in the second column");
             let hand_off = find(&root, &|w| {
                 w.has_css_class("dl-unavailable")
                     && w.is_mapped()

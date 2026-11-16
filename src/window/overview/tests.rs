@@ -97,18 +97,22 @@ fn the_more_tile_names_what_is_in_it() {
 }
 
 /// Six tiles in a row, then three by two, then two by three: never one
-/// alone on a line.
+/// alone on a line, from the width the row has and the width a tile needs
+/// (the owner's 1920 px window showed five, then More alone).
 #[test]
 fn the_tile_row_never_leaves_an_orphan() {
-    assert_eq!(tile_columns(1000), 6);
-    assert_eq!(tile_columns(840), 6);
-    assert_eq!(tile_columns(839), 3);
-    assert_eq!(tile_columns(560), 3);
-    assert_eq!(tile_columns(559), 2);
-    assert_eq!(tile_columns(280), 2);
-    // 6 tiles divide into rows of 6, 3 and 2.
-    for width in [1000, 700, 300] {
-        assert_eq!(6 % tile_columns(width), 0, "{width}");
+    // Tiles of 140 px with 12 px gaps: six need 900, three 444.
+    assert_eq!(tile_columns(900, 140), 6);
+    assert_eq!(
+        tile_columns(880, 140),
+        3,
+        "five would fit: not six, so three"
+    );
+    assert_eq!(tile_columns(444, 140), 3);
+    assert_eq!(tile_columns(443, 140), 2);
+    assert_eq!(tile_columns(200, 140), 2, "two at least: the row wraps");
+    for (width, tile) in [(1000, 150), (700, 150), (300, 150), (1600, 230)] {
+        assert_eq!(6 % tile_columns(width, tile), 0, "{width}");
     }
 }
 
@@ -261,4 +265,133 @@ fn a_long_copied_line_is_cut_short() {
     assert_eq!(shown.chars().count(), 201);
     assert!(shown.ends_with('…'));
     assert_eq!(preview_line("short\nmore"), "short");
+}
+
+/// A window showing Home for a fake phone in `state`, `width` px wide.
+fn home_window(state: &str, width: i32) -> super::super::DesklinkWindow {
+    use adw::subclass::prelude::ObjectSubclassIsExt;
+    let resources = crate::load_resources().expect("the bundled resources");
+    gtk::gio::resources_register(&resources);
+    let app = adw::Application::builder()
+        .application_id("derx06.desklink.com.test")
+        .build();
+    let window = super::super::DesklinkWindow::new(&app);
+    let (daemon, _commands) = DaemonHandle::detached();
+    window.set_daemon(daemon);
+    let phone = super::super::debug_fake_device(state, "Pixel 9");
+    let id = phone.id.clone();
+    window.imp().fake_devices.borrow_mut().push(phone);
+    window.select_device(&id);
+    // A narrow window shows the sidebar first: the page, as after a click.
+    window.imp().split_view.set_show_content(true);
+    window.set_default_size(width, 1000);
+    window.present();
+    let context = gtk::glib::MainContext::default();
+    for _ in 0..60 {
+        while context.iteration(false) {}
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    window.refresh_devices();
+    for _ in 0..60 {
+        while context.iteration(false) {}
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    window
+}
+
+fn shown(window: &super::super::DesklinkWindow, name: &str) -> Option<gtk::Widget> {
+    named_widgets(window.upcast_ref(), name)
+        .into_iter()
+        .find(|widget| widget.is_mapped())
+}
+
+/// A big window shows Home in two columns, the phone and its actions on the
+/// left and what needs a look on the right; below the breakpoint, one
+/// column in reading order. At every width the page fits: nothing is wider
+/// than the window (the owner's 1920 px window had 400 px empty each side
+/// and tiles five, then More alone). The test display is 1280 px wide, so
+/// the two-column state is set as the breakpoint sets it, and the
+/// breakpoint's own condition is checked. (Needs a display.)
+#[test]
+fn home_uses_a_big_window_and_fits_every_width() {
+    use adw::subclass::prelude::ObjectSubclassIsExt;
+    crate::test_display::run(|| {
+        let check = |window: &super::super::DesklinkWindow, width: i32, two: bool| {
+            let split = shown(window, "home-split").expect("Home's columns");
+            let split = split.downcast::<gtk::Box>().unwrap();
+            let horizontal = split.orientation() == gtk::Orientation::Horizontal;
+            assert_eq!(horizontal, two, "{width} px: two columns");
+            let left = split.first_child().expect("the left column");
+            assert!(
+                shown(window, "tile-row")
+                    .is_some_and(|tiles| tiles.parent().as_ref() == Some(&left)),
+                "{width} px: the actions are with the phone"
+            );
+            let (min, _, _, _) = split.measure(gtk::Orientation::Horizontal, -1);
+            assert!(min <= width, "{width} px: Home needs {min} px");
+            if let Some(tiles) = shown(window, "tile-row").and_downcast::<gtk::FlowBox>() {
+                let columns = tiles.max_children_per_line();
+                assert_eq!(
+                    6 % columns,
+                    0,
+                    "{width} px: {columns} tiles a row, no orphan"
+                );
+            }
+        };
+        for width in [360, 800, 1100] {
+            let window = home_window("paired", width);
+            check(&window, width, false);
+            window.close();
+        }
+        // The page area at the breakpoint: 1200 px (a window of about 1500).
+        let window = home_window("paired", 1280);
+        let imp = window.imp();
+        assert_eq!(
+            imp.wide_breakpoint
+                .condition()
+                .map(|c| c.to_str().to_string())
+                .as_deref(),
+            Some("min-width: 1200sp")
+        );
+        imp.compact.set(false);
+        imp.wide.set(true);
+        window.apply_layout();
+        check(&window, 1200, true);
+        let clamp = shown(&window, "home-clamp")
+            .and_downcast::<adw::Clamp>()
+            .unwrap();
+        assert_eq!(clamp.maximum_size(), HOME_WIDE_WIDTH);
+        imp.wide.set(false);
+        window.apply_layout();
+        check(&window, 1200, false);
+        assert_eq!(clamp.maximum_size(), HOME_WIDTH);
+        window.close();
+    });
+}
+
+/// Away, Home is the hero and what came in: no row of tiles that each say
+/// "Can't reach", no setup steps that need the phone, no feature list
+/// repeating it; Try again is there once. (Needs a display.)
+#[test]
+fn an_away_phone_gets_a_calm_home() {
+    crate::test_display::run(|| {
+        let window = home_window("unreachable", 1920);
+        assert!(shown(&window, "tile-row").is_none(), "no tiles");
+        assert!(shown(&window, "finish-setup").is_none(), "no setup steps");
+        assert!(shown(&window, "everything").is_none(), "no feature list");
+        assert_eq!(
+            named_widgets(window.upcast_ref(), "hero-reconnect")
+                .iter()
+                .filter(|widget| widget.is_mapped())
+                .count(),
+            1,
+            "one Try again"
+        );
+        window.close();
+
+        let window = home_window("paired", 1920);
+        assert!(shown(&window, "tile-row").is_some(), "back: the tiles");
+        assert!(shown(&window, "everything").is_some(), "back: the list");
+        window.close();
+    });
 }

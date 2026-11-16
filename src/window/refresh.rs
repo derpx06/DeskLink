@@ -581,13 +581,21 @@ impl DesklinkWindow {
     /// page's margins off), now and once the layout has settled.
     pub(super) fn apply_tile_columns(&self) {
         let imp = self.imp();
-        let width = imp.page_stack.width();
-        if width <= 0 {
-            return;
-        }
-        let margins = if imp.narrow.get() { 24 } else { 64 };
-        let columns = overview::tile_columns((width - margins).min(880));
         for widget in named_widgets(imp.page_stack.upcast_ref(), "tile-row") {
+            // The width the row really has (one Home column of two on a big
+            // window), and how wide a tile is with its words on one line.
+            let width = widget
+                .parent()
+                .map(|column| column.width())
+                .unwrap_or_default();
+            if width <= 0 {
+                continue;
+            }
+            let tile = widget
+                .first_child()
+                .map(|child| child.measure(gtk::Orientation::Horizontal, -1).1)
+                .unwrap_or_default();
+            let columns = overview::tile_columns(width, tile);
             if let Some(flow) = widget.downcast_ref::<gtk::FlowBox>() {
                 if flow.max_children_per_line() != columns {
                     flow.set_max_children_per_line(columns);
@@ -602,6 +610,7 @@ impl DesklinkWindow {
     pub(super) fn apply_layout(&self) {
         let narrow = self.imp().narrow.get();
         let compact = narrow || self.imp().compact.get();
+        let wide = !compact && self.imp().wide.get();
         // Tighter page edges, for `style.css`.
         if narrow {
             self.add_css_class("narrow");
@@ -617,6 +626,27 @@ impl DesklinkWindow {
                             gtk::Orientation::Vertical
                         } else {
                             gtk::Orientation::Horizontal
+                        });
+                    }
+                }
+                // Home: two columns side by side on a big window, else one.
+                "home-split" => {
+                    if let Some(split) = widget.downcast_ref::<gtk::Box>() {
+                        split.set_orientation(if wide {
+                            gtk::Orientation::Horizontal
+                        } else {
+                            gtk::Orientation::Vertical
+                        });
+                        split.set_homogeneous(wide);
+                        split.set_spacing(if wide { 24 } else { 16 });
+                    }
+                }
+                "home-clamp" => {
+                    if let Some(clamp) = widget.downcast_ref::<adw::Clamp>() {
+                        clamp.set_maximum_size(if wide {
+                            overview::HOME_WIDE_WIDTH
+                        } else {
+                            overview::HOME_WIDTH
                         });
                     }
                 }

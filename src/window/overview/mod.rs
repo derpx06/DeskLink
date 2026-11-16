@@ -142,28 +142,53 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         if let Some(summary) = session_summary(device) {
             page.append(&live_strip(daemon, device, &summary, since.as_deref()));
         }
-        page.append(&hero(daemon, device, &minute));
+        // Two columns on a big window (`home-split`, `apply_layout`): the
+        // phone and what to do with it on the left, what needs a look and
+        // what came in on the right; one column, in that reading order,
+        // otherwise. "Everything DeskLink does" spans both, last.
+        let left = column();
+        let right = column();
+        left.append(&hero(daemon, device, &minute));
         if let Some(card) = activity_card(device, &settings) {
-            page.append(&card);
+            left.append(&card);
         }
         if let Some(bar) = now_playing_bar(daemon, device) {
-            page.append(&bar);
+            left.append(&bar);
         }
         // Can't reach is said once, in the hero, with its Try again.
         if device.status == DeviceStatus::Paired && !device.feature_transport_ready {
-            page.append(&reconnecting_row(device));
+            left.append(&reconnecting_row(device));
         }
-        // The actions near the top, after the hero and what is going on now
-        // (activity, Now playing, Connecting; UI-REDESIGN 3.11), and before
-        // "Finish setting up": that card, often several steps tall, hid them
-        // below the fold when it came first.
-        page.append(&tiles(daemon, device));
-        if let Some(card) = super::requirements::card(daemon, &needs) {
-            page.append(&card);
+        // Away, nothing here can reach the phone: the hero says so once, with
+        // Try again; the tiles (each "Can't reach"), the setup steps (they
+        // need the phone) and the feature list wait until it is back.
+        let away = device.status == DeviceStatus::Unreachable;
+        // The actions after the hero and what is going on now (activity, Now
+        // playing, Connecting; UI-REDESIGN 3.11), before "Finish setting up":
+        // that card, often several steps tall, hid them below the fold when it
+        // came first.
+        if !away {
+            left.append(&tiles(daemon, device));
+            if let Some(card) = super::requirements::card(daemon, &needs) {
+                right.append(&card);
+            }
         }
-        page.append(&columns(daemon, device));
-        page.append(&terminals_card(win, device));
-        page.append(&super::everything::section(daemon, device, &everything));
+        right.append(&columns(daemon, device));
+        right.append(&terminals_card(win, device));
+        let split = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(16)
+            .homogeneous(false)
+            .build();
+        split.set_widget_name("home-split");
+        split.append(&left);
+        split.append(&right);
+        page.append(&split);
+        // Away, every feature would say "Can't reach" again (it is the one
+        // thing to know, and the hero says it): the list waits too.
+        if !away {
+            page.append(&super::everything::section(daemon, device, &everything));
+        }
     } else if device.status == DeviceStatus::PairRequestedByPeer {
         page.append(&super::pairing::pair_request_view(daemon, device));
     } else if device.status == DeviceStatus::PairRequested {
@@ -172,14 +197,32 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         page.append(&super::pairing::pair_idle_view(daemon, device));
     }
     let clamp = adw::Clamp::builder()
-        .maximum_size(944)
+        .maximum_size(HOME_WIDTH)
         .tightening_threshold(800)
         .child(&page)
         .build();
+    // Wider on a big window, for two columns (`apply_layout`).
+    clamp.set_widget_name("home-clamp");
     win.replace_body("home", &clamp);
     refresh_in_place(win, daemon);
     show_round_trip(win, device);
     show_clock(win, &minute);
+}
+
+/// Home's width in one column, and in two on a big window (each column then
+/// about as wide as the one column: the extra width is structure, not longer
+/// lines).
+pub(in crate::window) const HOME_WIDTH: i32 = 944;
+pub(in crate::window) const HOME_WIDE_WIDTH: i32 = 1640;
+
+/// A column of Home's cards.
+fn column() -> gtk::Box {
+    gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(16)
+        .hexpand(true)
+        .valign(gtk::Align::Start)
+        .build()
 }
 
 /// The phone picture's clock, in place: the page is not rebuilt (and its
