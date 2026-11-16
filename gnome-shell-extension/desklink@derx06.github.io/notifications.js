@@ -11,6 +11,7 @@ import Clutter from 'gi://Clutter';
 import St from 'gi://St';
 import GLib from 'gi://GLib';
 
+import {has} from './model.js';
 import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
@@ -403,7 +404,7 @@ export class PhoneCalls {
             notification.setUrgency(MessageTray.Urgency.CRITICAL);
         }
         for (const [action, label] of [['call-answer', 'Answer'], ['call-decline', 'Decline']]) {
-            if (device.actions.includes(action))
+            if (has(device, action))
                 notification.addAction(label, () => this._call('Invoke', [device.id, action]));
         }
         const record = {notification, withdrawn: false};

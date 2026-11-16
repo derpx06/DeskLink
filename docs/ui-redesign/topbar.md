@@ -59,6 +59,10 @@ Notifications and the call banner keep the 3.3 card (app icon, title, one paragr
   the pair and Try again buttons take focus.
 - Every area of More (`all-areas/`), including the new "Lock the phone" row.
 - Older app: a device without `actions`, `settings`, `unread`, `transfers` or `rttMs` draws what it has (the
-  tiles greyed, no switches, no latency) and nothing throws (`an old app's bare device still gives a menu`).
+  tiles greyed, no switches, no latency) and every read of the action list goes through one tested helper, `has()` (a test scans the three files for an unguarded `.actions.includes`), so a missing list is "offers nothing" (`an old app's bare device still gives a menu`). A connected phone that takes none of the four tiles gets a dim line saying so, and the greyed tiles say "not available" to a screen reader.
 - Notifications and calls are GNOME's own message cards (one source per app and phone, so they group; the
   banner expands to the full paragraph and the buttons); Answer/Decline appear only when the app offers them.
+- Short screen (under 700 px high, e.g. 1080p at 200 %): tiles and music come first, one "now" row follows
+  (`menuBlocks(..., short)`), so the tiles are visible without scrolling. Actions that open a window (Files,
+  Screen, Ring...) close the menu on purpose (`_call`); only media buttons keep it open. Enter on a tile was
+  rendered (`keyboard/08-09`). The header's status line wraps instead of being cut in RTL.

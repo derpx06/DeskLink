@@ -21,7 +21,7 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Slider} from 'resource:///org/gnome/shell/ui/slider.js';
 
 import {
-    EMPTY, NOW_ROWS, bodyHeight, chipState, footer, headerGlyph, headerLine, liveWords, offlineHint, mediaClock, mediaPosition, menuBlocks, moreSummary, quickTiles, sections, seekReason,
+    EMPTY, NOW_ROWS, bodyHeight, has, tilesNote, chipState, footer, headerGlyph, headerLine, liveWords, offlineHint, mediaClock, mediaPosition, menuBlocks, moreSummary, quickTiles, sections, seekReason,
     seekThrottle, statusLine, timer, duration,
 } from './model.js';
 
@@ -159,7 +159,7 @@ function tile(icon, text, {name = text, enabled = true, variant = '', onClick}) 
         can_focus: enabled,
         reactive: enabled,
         x_expand: true,
-        accessible_name: name,
+        accessible_name: enabled ? name : `${name}, not available`,
     });
     if (!enabled)
         button.add_style_pseudo_class('insensitive');
@@ -582,7 +582,7 @@ function seekRow(selected, media, reason, ctx) {
 /// and next. The title opens the timeline under it (when the app has one),
 /// and it stays open across rebuilds while the menu is.
 function mediaCard(selected, media, ctx, variant) {
-    const can = action => !!selected.actions?.includes(action);
+    const can = action => has(selected, action);
     const card = column({style_class: 'desklink-media-card'});
     const line = box({style_class: 'desklink-media'});
     card.add_child(line);
@@ -638,11 +638,17 @@ function mediaCard(selected, media, ctx, variant) {
 export function fillMenu(menu, ctx) {
     const {devices, selected, desk, transfers, invoke} = ctx;
     const variant = `desklink-${styleVariant()}`;
-    const can = (device, action) => !!device?.actions?.includes(action);
     const activities = (ctx.activities ?? []).filter(item => item.device === selected?.id);
     if (menu.setHeader) {
         menu.setHeader(headerGlyph(selected).icon, selected?.name ?? 'DeskLink', headerLine(selected));
         ctx.ring?.set(selected?.ready ? selected.battery : -1, !!selected?.charging);
+        // The header's line wraps instead of being cut (the ring takes width, most in RTL).
+        const line = headerLine(selected);
+        const find = actor => actor instanceof St.Label && actor.text === line
+            ? actor : actor.get_children?.().map(find).find(Boolean);
+        const sub = find(menu.box);
+        if (sub)
+            wrapped(sub);
     }
     menu.removeAll();
     if (!menu.setHeader && selected) {
@@ -658,7 +664,9 @@ export function fillMenu(menu, ctx) {
         menu.addMenuItem(row(head));
     }
 
-    const blocks = menuBlocks(selected, devices, activities);
+    // A short screen (1080p at 200 %): tiles first, one row of "now".
+    const short = (Main.layoutManager.primaryMonitor?.height ?? 1000) < 700;
+    const blocks = menuBlocks(selected, devices, activities, short);
     if (blocks.includes('empty')) {
         const empty = column({style_class: 'desklink-empty'});
         empty.add_child(label(EMPTY.title, 'desklink-row-title'));
@@ -676,7 +684,7 @@ export function fillMenu(menu, ctx) {
     const body = scrolledSection(menu);
     // "Now" rows are capped (NOW_ROWS); the rest are counted into "+N more".
     // On a short screen (1080p at 200 %) one row, so the tiles stay near the top.
-    const nowLimit = (Main.layoutManager.primaryMonitor?.height ?? 1000) < 700 ? 1 : NOW_ROWS;
+    const nowLimit = short ? 1 : NOW_ROWS;
     let nowShown = 0, nowHidden = 0;
     const room = () => (nowShown < nowLimit ? ++nowShown : (++nowHidden, 0));
     for (const block of blocks) {
@@ -717,7 +725,7 @@ export function fillMenu(menu, ctx) {
             words.add_child(label(selected.reachable ? 'Connecting…' : 'Not connected', 'desklink-row-title'));
             words.add_child(wrapped(dim(label(offlineHint(selected), 'desklink-row-detail'))));
             card.add_child(words);
-            card.add_child(can(selected, 'try-again')
+            card.add_child(has(selected, 'try-again')
                 ? textButton('Try again', () => invoke(selected.id, 'try-again'))
                 : textButton('Reconnect', () => invoke('', 'reconnect')));
             ctx.appear(card, `offline:${selected.id}`);
@@ -745,16 +753,16 @@ export function fillMenu(menu, ctx) {
             words.add_child(detail);
             card.add_child(words);
             if (ringing) {
-                if (can(selected, 'call-decline'))
+                if (has(selected, 'call-decline'))
                     card.add_child(iconButton('call-stop-symbolic', 'Decline', () => invoke(selected.id, 'call-decline'), 'desklink-decline'));
-                if (can(selected, 'call-answer'))
+                if (has(selected, 'call-answer'))
                     card.add_child(iconButton('call-start-symbolic', 'Answer', () => invoke(selected.id, 'call-answer'), 'desklink-answer'));
             } else {
-                if (can(selected, 'call-mute'))
+                if (has(selected, 'call-mute'))
                     card.add_child(iconButton('microphone-sensitivity-muted-symbolic', 'Mute', () => invoke(selected.id, 'call-mute'), variant));
-                if (can(selected, 'call-unmute'))
+                if (has(selected, 'call-unmute'))
                     card.add_child(iconButton('audio-input-microphone-symbolic', 'Unmute', () => invoke(selected.id, 'call-unmute'), variant));
-                if (can(selected, 'call-end'))
+                if (has(selected, 'call-end'))
                     card.add_child(iconButton('call-stop-symbolic', 'End call', () => invoke(selected.id, 'call-end'), 'desklink-decline'));
             }
             ctx.appear(card, `call:${call.id}:${call.state}`);
@@ -780,6 +788,9 @@ export function fillMenu(menu, ctx) {
             line.layout_manager.homogeneous = true;
             tiles.forEach(t => line.add_child(t));
             grid.add_child(line);
+            const why = tilesNote(selected);
+            if (why)
+                grid.add_child(wrapped(dim(label(why, 'desklink-row-detail'))));
             body.addMenuItem(row(grid));
             break;
         }

@@ -36,7 +36,7 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
 import {BatteryRing, fillMenu, shortStatus, statusLine, styleVariant} from './menu.js';
-import {looksLikeLink, panelBadge, pillVisible, visibilityGate} from './model.js';
+import {has, looksLikeLink, panelBadge, pillVisible, visibilityGate} from './model.js';
 import {PhoneCalls, PhoneNotifications} from './notifications.js';
 
 const BUS_NAME = 'derx06.desklink.com';
@@ -663,7 +663,7 @@ export default class DeskLinkExtension extends Extension {
         if (locked) {
             menu.removeAll();
             this._pill.key = null;
-            const unlockers = devices.filter(device => device.actions.includes('unlock-via-phone'));
+            const unlockers = devices.filter(device => has(device, 'unlock-via-phone'));
             this._pillGate.now(running && unlockers.length > 0);
             this._chipItems = [];
             this._stopChipTimer();

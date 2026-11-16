@@ -74,8 +74,8 @@ pub(super) fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a 
 /// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
 /// stamp, is still ours and safe to update.
 pub(super) const KNOWN_BUILDS: [&str; 28] = [
-    // Batch 2: an old app's bare device is safe, the offline glyph, keyboard walk checked.
-    "7c241f0c6225015f53e2acd66d5a4b5a13a9a8449fb9d21d351a7d1d60c16d6b",
+    // Batch 2: old-app safe, offline glyph, short-screen order, tiles note, wrapped header.
+    "5eafa7fc3c291f27400e8c4fc76169fd35217fa13a04dc3f43801368fccad697",
     // Top-bar redesign: what is happening now first, four large tiles, a
     // plain offline/empty state, chip and panel badges, the pill hides offline.
     "76b5364d49dd6e55fd515cff36b51ac0855e6d5be128ad55897666122d71ce4c",

@@ -6,7 +6,7 @@ import {fileURLToPath} from 'node:url';
 
 import {
     bodyHeight, everythingSent, footer, headerLine, lastSeen, mediaClock, mediaPosition, menuBlocks, moreSummary, seekReason, seekThrottle,
-    looksLikeLink, quickTiles, headerGlyph, offlineHint, EMPTY, chipState, panelBadge, pillVisible, visibilityGate, sections, sessionLine, shortStatus, statusLine, timer, duration,
+    looksLikeLink, quickTiles, headerGlyph, offlineHint, EMPTY, chipState, panelBadge, pillVisible, visibilityGate, has, tilesNote, sections, sessionLine, shortStatus, statusLine, timer, duration,
 } from '../desklink@derx06.github.io/model.js';
 
 const ALL_ACTIONS = ['open', 'ring', 'lock', 'send-files', 'send-link', 'send-clipboard', 'ping', 'show-screen',
@@ -499,4 +499,24 @@ test('an old app\'s bare device still gives a menu', () => {
     assert.equal(seekReason(bare, {title: 't', playing: true}), null);             // no timeline before interface 10
     assert.equal(seekReason(bare, {title: 't', lengthMs: 100}), 'Can\'t seek right now');
     assert.deepEqual(footer(bare, {}).map(button => button.id), ['open']);
+});
+
+test('one helper says whether the app offers an action, and no file reads the list unguarded', () => {
+    assert.equal(has(phone(), 'ring'), true);
+    assert.equal(has(phone({actions: ['open']}), 'ring'), false);
+    assert.equal(has({id: 'old'}, 'ring'), false);   // an old app sends no list
+    assert.equal(has(null, 'ring'), false);
+    for (const file of ['menu.js', 'extension.js', 'notifications.js']) {
+        const text = readFileSync(fileURLToPath(new URL(`../desklink@derx06.github.io/${file}`, import.meta.url)), 'utf8');
+        assert.ok(!/\.actions\.includes/.test(text), `${file} reads .actions without a guard`);
+    }
+});
+
+test('a connected phone that takes no tile says why; a short screen puts the tiles first', () => {
+    assert.equal(tilesNote(phone()), '');
+    assert.equal(tilesNote(phone({ready: false})), '');
+    assert.equal(tilesNote(phone({actions: ['open']})), 'This version of DeskLink on Pixel can\'t do this yet');
+    const busy = phone({media: {title: 't'}, transfers: [{name: 'a'}], screen: 'view'});
+    assert.deepEqual(menuBlocks(busy, [busy], [], true), ['tiles', 'media', 'live', 'transfers', 'more', 'footer']);
+    assert.deepEqual(menuBlocks(phone({ready: false}), [phone()], [], true), ['offline', 'more', 'footer']);
 });

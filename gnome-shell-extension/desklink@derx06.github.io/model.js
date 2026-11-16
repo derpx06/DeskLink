@@ -113,7 +113,8 @@ export function timer(unixMillis, nowMs = Date.now()) {
     return h > 0 ? `${h}:${two(m)}:${two(s)}` : `${m}:${two(s)}`;
 }
 
-const has = (device, action) => !!device?.actions?.includes(action);
+/// Whether the app offers `action` for `device` (an old app may send no list at all).
+export const has = (device, action) => !!device?.actions?.includes(action);
 
 /// The quick-action tiles: the four most used, in one row of large tiles,
 /// greyed out when the phone does not take one now (and not shown at all
@@ -127,6 +128,14 @@ export function quickTiles(device) {
         {id: 'show-screen', icon: 'video-display-symbolic', label: 'Screen', name: `Show the screen of ${name}`},
         {id: 'ring', icon: 'audio-volume-high-symbolic', label: 'Ring', name: `Ring ${name}`},
     ].map(tile => ({...tile, action: tile.id, enabled: ready && has(device, tile.id)}));
+}
+
+/// One dim line under the tiles when the phone is connected but takes none of
+/// them (an older DeskLink on it): greyed tiles alone give no reason.
+export function tilesNote(device) {
+    if (!device?.ready || quickTiles(device).some(tile => tile.enabled))
+        return '';
+    return `This version of DeskLink on ${device.name} can't do this yet`;
 }
 
 /// The header's avatar: the phone, or the screen glyph while the phone's
@@ -376,7 +385,7 @@ export function sections(device, desk, extras = {}) {
 /// timers, a phone using this computer; then the quick tiles and the music. Every area is folded into
 /// More. A new kind of row is one more entry here and one more case in
 /// menu.js's `fillMenu`.
-export function menuBlocks(selected, devices = [], activities = []) {
+export function menuBlocks(selected, devices = [], activities = [], short = false) {
     if (!selected)
         return ['empty'];
     const blocks = [];
@@ -387,6 +396,13 @@ export function menuBlocks(selected, devices = [], activities = []) {
     if (selected.call)
         blocks.push('call');
     // What is happening now comes first; it is simply absent when nothing is.
+    // On a short screen (`short`) the tiles and music come first: they would
+    // be scrolled out of view under the rows.
+    if (short && selected.ready) {
+        blocks.push('tiles');
+        if (selected.media)
+            blocks.push('media');
+    }
     if (devices.some(device => device.screen || device.terminals > 0))
         blocks.push('live');
     if ((selected.transfers ?? []).length > 0)
@@ -395,9 +411,9 @@ export function menuBlocks(selected, devices = [], activities = []) {
         blocks.push('bucket');
     if (activities.some(item => item.device === selected.id))
         blocks.push('activities');
-    if (selected.ready)
+    if (!short && selected.ready)
         blocks.push('tiles');
-    if (selected.ready && selected.media)
+    if (!short && selected.ready && selected.media)
         blocks.push('media');
     blocks.push('more', 'footer');
     return blocks;
