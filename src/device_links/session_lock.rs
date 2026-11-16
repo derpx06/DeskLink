@@ -361,20 +361,74 @@ mod tests {
     /// proof carry to the next. Pinned at the five call sites.
     #[test]
     fn every_gate_passes_the_session_id_never_the_generation() {
+        // Every non-test file of the coordinator, read as one source: a gate
+        // added to any of them is counted.
+        let coordinator: String = [
+            include_str!("webrtc/coordinator/desktop_input.rs"),
+            include_str!("webrtc/coordinator/desktop_share.rs"),
+            include_str!("webrtc/coordinator/envelopes.rs"),
+            include_str!("webrtc/coordinator/file_link.rs"),
+            include_str!("webrtc/coordinator/ice_setup.rs"),
+            include_str!("webrtc/coordinator/liveness.rs"),
+            include_str!("webrtc/coordinator/mod.rs"),
+            include_str!("webrtc/coordinator/peer_worker.rs"),
+            include_str!("webrtc/coordinator/phone_remote.rs"),
+            include_str!("webrtc/coordinator/recovery.rs"),
+            include_str!("webrtc/coordinator/share_worker.rs"),
+            include_str!("webrtc/coordinator/signing.rs"),
+            include_str!("webrtc/coordinator/terminal_pump.rs"),
+        ]
+        .join("\n");
+        let listed = [
+            "desktop_input.rs",
+            "desktop_share.rs",
+            "envelopes.rs",
+            "file_link.rs",
+            "ice_setup.rs",
+            "liveness.rs",
+            "mod.rs",
+            "peer_worker.rs",
+            "phone_remote.rs",
+            "recovery.rs",
+            "share_worker.rs",
+            "signing.rs",
+            "terminal_pump.rs",
+        ];
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/device_links/webrtc/coordinator");
+        let mut present: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".rs") && !name.ends_with("tests.rs"))
+            .collect();
+        present.sort();
+        assert_eq!(
+            present, listed,
+            "a coordinator file is missing from this pin"
+        );
         let sources = [
-            (
-                "coordinator.rs",
-                include_str!("webrtc/coordinator.rs"),
-                2usize,
-            ),
+            ("coordinator/", coordinator.as_str(), 2usize),
             (
                 "terminal_bridge.rs",
                 include_str!("webrtc/terminal_bridge.rs"),
                 3usize,
             ),
         ];
+        // The source up to its first inline test module (`mod tests {`); a
+        // `#[cfg(test)] mod tests;` declaration is not one.
+        fn production(source: &str) -> &str {
+            let end = source
+                .match_indices("#[cfg(test)]\nmod ")
+                .find(|(at, _)| {
+                    let line = source[at + 17..].lines().next().unwrap_or_default();
+                    line.trim_end().ends_with('{')
+                })
+                .map_or(source.len(), |(at, _)| at);
+            &source[..end]
+        }
         for (name, source, expected) in sources {
-            let production = source.split("#[cfg(test)]\nmod ").next().unwrap();
+            let production = production(source);
             let mut seen = 0;
             for needle in ["session_lock::check(", "session_lock::is_unlocked("] {
                 for (at, _) in production.match_indices(needle) {

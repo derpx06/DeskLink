@@ -30,7 +30,7 @@ Non-goals stated in the repo: interoperability with KDE Connect, KDE branding, a
 | **Desk** | The Linux desktop app (GNOME first; other desktops per section 14). Owns the portal/PipeWire/GStreamer integration. | Paired phones only, by pinned certificate |
 | **Phone** | The Android app. A foreground service holds the link; Compose UI on top. | Paired desks only, by pinned certificate |
 | **Relay** (optional) | `DeskLink/relay/`, a WebSocket forwarder at `wss://<host>/v1` plus TURN-credential minting. Untrusted: it learns IP addresses, certificate fingerprints and timing, never content (`docs/RELAY.md`). The built-in URL is empty unless a build sets `DESKLINK_RELAY_URL` (`DeskLink/src/device_links/config.rs:200`, `desklink-mobile/build.gradle.kts:44-51`). | Nobody |
-| **TURN / STUN** | Cloudflare Realtime TURN or coturn for media when no direct path exists; the desktop's default STUN constant is `stun://stun.cloudflare.com:3478` (`webrtc/coordinator.rs:400`). ICE servers are empty by default for LAN operation. | Nobody |
+| **TURN / STUN** | Cloudflare Realtime TURN or coturn for media when no direct path exists; the desktop's default STUN constant is `stun://stun.cloudflare.com:3478` (`DEFAULT_STUN_SERVER`, `webrtc/coordinator/ice_setup.rs`). ICE servers are empty by default for LAN operation. | Nobody |
 | **GNOME Shell extension** | Top-bar menu inside the shell process. Talks to the desk app over the session bus (`derx06.desklink.com.Shell1`). | The app, by bus name |
 
 ### 2.2 Context diagram
@@ -117,7 +117,7 @@ main.rs ─► application.rs ─► window/ (GTK pages, ui_kit)           main 
 | `device_links/core/` | `device_manager.rs` (generation-based session registry), `device_session.rs`, `session_link.rs` (+ `link_race`), `link_transport.rs` |
 | `device_links/transport.rs` | `FeatureTransport`: the only boundary paired features use to send |
 | `device_links/features/registry.rs` | `DESKTOP_INCOMING`, `DESKTOP_OUTGOING`, `WEBRTC_PROFILE`, peer profile intersection |
-| `device_links/webrtc/` | `coordinator.rs` (negotiation, recovery, liveness, remote/portal plumbing), `peer_connection.rs` (`webrtcbin`), `handover.rs`, `signaling.rs`, `ice.rs`, `mod.rs` (channels, envelope), `file_protocol.rs`, `transfer_manager{,/send,recv,store,replay}.rs`, `transfer_board.rs`, `file_lane.rs`, `remote_session.rs`, `screen.rs`, `remote_desktop_portal.rs`, `virtual_display.rs`, `x11_desktop.rs`, `capture.rs`, `audio*.rs`, `terminal_{bridge,protocol}.rs`, `text_focus.rs` |
+| `device_links/webrtc/` | `coordinator/` (`mod.rs` signalling entry points; `signing`, `peer_worker`, `envelopes`, `liveness`, `recovery`, `ice_setup`, `file_link`, `terminal_pump`, `desktop_share`, `share_worker`, `desktop_input`, `phone_remote`: negotiation, recovery, liveness, remote/portal plumbing), `peer_connection.rs` (`webrtcbin`), `handover.rs`, `signaling.rs`, `ice.rs`, `mod.rs` (channels, envelope), `file_protocol.rs`, `transfer_manager{,/send,recv,store,replay}.rs`, `transfer_board.rs`, `file_lane.rs`, `remote_session.rs`, `screen.rs`, `remote_desktop_portal.rs`, `virtual_display.rs`, `x11_desktop.rs`, `capture.rs`, `audio*.rs`, `terminal_{bridge,protocol}.rs`, `text_focus.rs` |
 | `device_links/pty/` | Own PTY server: `session`, `registry`, `ring`, `desk` (socket + terminal windows), `launchers`, `jobs`, `host`, `conformance` |
 | `device_links/relay_link/` | Relay client and the end-to-end link (`client`, `handshake`, `crypto`, `transport`, `route`) |
 | `device_links/` (feature modules) | `pairing.rs`, `pairing_qr.rs`, `pairing_transport.rs`, `config.rs`, `device_info.rs`, `peers.rs`, `session_lock.rs`, `unlock.rs`, `walk_away.rs`, `logind.rs`, `notes.rs`, `contacts.rs`, `folders/` (facade `mod.rs`, planner `model.rs`, worker `worker.rs`), `gallery.rs`, `activity.rs`, `dnd.rs`, `calls.rs`, `mpris.rs`, `media_art.rs`, `desk_features.rs`, `desk_notifications.rs`, `glide.rs`, `eis.rs`, `sync.rs`, `vault.rs`, `private_fs.rs`, `lan_scope.rs`, `limits.rs`, `transfer_log.rs`, `connection_log.rs` |
@@ -162,7 +162,7 @@ A change to anything in this table is a **paired edit** (workspace `CLAUDE.md`, 
 | Enabled feature profile (33) | `WEBRTC_PROFILE` (`registry.rs:135`) | `WebRtcFeatureProfile.enabled` | `profile.json` (F); `profile_matches_the_android_webrtc_feature_profile`, `profileMatchesTheDesktopFeatureRegistry` |
 | Removed types (15) | `REMOVED_TYPES` (`registry.rs:271`) | profile exclusion | `removed_types.json` (F) |
 | Handover / signaling | `webrtc/handover.rs`, `signaling.rs` | `WebRtcHandover.kt`, `WebRtcSignaling.kt` | |
-| Recovery constants | `RECOVERY_BACKOFF_MILLIS`, `PEER_PROBE_AFTER`, `PEER_DEAD_AFTER`, `HEALTHY_AFTER` (`coordinator.rs`) | `WebRtcRecoveryPolicy.kt`, `PeerLiveness.kt` | see 5.5 for differences |
+| Recovery constants | `RECOVERY_BACKOFF_MILLIS`, `PEER_PROBE_AFTER`, `PEER_DEAD_AFTER`, `HEALTHY_AFTER` (`coordinator/recovery.rs`, `coordinator/liveness.rs`) | `WebRtcRecoveryPolicy.kt`, `PeerLiveness.kt` | see 5.5 for differences |
 | QR pairing proof | `pairing_qr.rs` `proof` | `QrPairing.kt` `proofBytes` | `qr_proof.json` (F) |
 | Relay E2E link | `relay_link/crypto.rs` | `backends/relay/RelayLinkCrypto.kt` | `relay_e2e.json`, `auth_sign_input.json` (F); vector in `docs/RELAY.md` |
 | Off-LAN seam | `pairing_transport.rs` | `backends/PairingTransport.kt` | per-side tests |
@@ -251,7 +251,7 @@ With the flag off, a Relay carrier may carry `webrtc.signal.v1`, `heartbeat` and
 
 1. **Discovery.** The desk broadcasts a beacon burst (0, 1, 3, 7 s, then every 15 s; `BEACON_BURST_GAPS_MS`, `discovery.rs`) and advertises `_desklink._udp` over mDNS; the phone announces at 0/0.3/1/3/7 s and browses mDNS. A beacon only creates a candidate address.
 2. **Bootstrap TCP.** The side that dials runs the pinned mutual TLS handshake (4.2). Identity and heartbeat travel here, plus pairing and the signed handover. Kernel keepalive is set on LAN sockets: idle 30 s, interval 10 s, 3 probes (`network.rs:50-52`).
-3. **WebRTC handover.** The device with the lexicographically **lower id is the deterministic offerer** (`start_initiator`, `coordinator.rs:406`: if `local >= remote` the desk sends a signed `restart_request` instead of offering). Signed `desklink.webrtc.signal.v1` packets (offer, answer, ICE, end-of-candidates, ice-restart, restart-request, close) travel over the bootstrap link. Over the resulting data channels a handover authenticates and confirms capabilities (5.3).
+3. **WebRTC handover.** The device with the lexicographically **lower id is the deterministic offerer** (`start_initiator`, `coordinator/mod.rs`: if `local >= remote` the desk sends a signed `restart_request` instead of offering). Signed `desklink.webrtc.signal.v1` packets (offer, answer, ICE, end-of-candidates, ice-restart, restart-request, close) travel over the bootstrap link. Over the resulting data channels a handover authenticates and confirms capabilities (5.3).
 4. **Feature-ready.** Control, events and liveness channels are open and both sides sent `feature-ready`. Queued feature packets flush in order; each side sends `sync.have` and holds initial snapshots up to 1000 ms (5.9).
 5. **Steady state.** WebRTC carries all features; the LAN TCP link is kept as the keep-alive and thaw path (5.6).
 
@@ -259,7 +259,7 @@ Schedule: when the desk is the initiator it starts negotiation at 250, 1000, 200
 
 ### 5.2 State diagram
 
-There is no single enum for the whole link. The diagram below is derived from `DeviceConnection {linked, paired, feature_transport_ready}` (`device_manager.rs:106`), `HandoverState` (`handover.rs:15`), `Liveness {Fine, Probe, Dead}` and `PeerStateAction` (`coordinator.rs:3446,3805`) and the recovery counter.
+There is no single enum for the whole link. The diagram below is derived from `DeviceConnection {linked, paired, feature_transport_ready}` (`device_manager.rs:106`), `HandoverState` (`handover.rs:15`), `Liveness {Fine, Probe, Dead}` and `PeerStateAction` (`coordinator/liveness.rs`) and the recovery counter.
 
 ```mermaid
 stateDiagram-v2
@@ -316,7 +316,7 @@ Each process generates a random `instanceId` (`device_info.rs:26`, `DeviceInfo.P
 
 ### 5.6 The desk always holds a LAN TCP link
 
-`wants_bootstrap_connection` is `!has_live_bootstrap_link` and **deliberately ignores a surviving WebRTC peer** (`device_manager.rs:584`), so discovery keeps dialling. If the bootstrap socket closes while the peer is feature-ready, the session stays `Ready` with `feature_transport_retained` and only the socket closes (`bootstrap_disconnected`, `:795`); the redialer then dials and `adopt_or_keep` (`:298`) swaps the replacement socket in place (same link, same generation) provided the certificate PEM is identical. `PeerWorkerGuard` (`coordinator.rs:3135`) clears the session's peer on any worker exit including a panic unwind; an orphaned peer would drop inbound features while reporting feature-ready and pin `wants_bootstrap_connection` false.
+`wants_bootstrap_connection` is `!has_live_bootstrap_link` and **deliberately ignores a surviving WebRTC peer** (`device_manager.rs:584`), so discovery keeps dialling. If the bootstrap socket closes while the peer is feature-ready, the session stays `Ready` with `feature_transport_retained` and only the socket closes (`bootstrap_disconnected`, `:795`); the redialer then dials and `adopt_or_keep` (`:298`) swaps the replacement socket in place (same link, same generation) provided the certificate PEM is identical. `PeerWorkerGuard` (`coordinator/peer_worker.rs`) clears the session's peer on any worker exit including a panic unwind; an orphaned peer would drop inbound features while reporting feature-ready and pin `wants_bootstrap_connection` false.
 
 ### 5.7 Link race and generation ownership
 
@@ -405,7 +405,7 @@ The 23 `@LoadablePlugin` classes (`plugins/`, counted by file): Activity, Batter
 
 ### 7.4 `FeatureTransport` and queueing
 
-`transport.rs`: `FeatureTransport::send` (`:76`) sends via `coordinator::send_feature_packet` when WebRTC is ready and the binding is current; refuses packets outside `outgoing_capabilities()` ("is not enabled in the DeskLink feature profile"); otherwise `queue_feature`. The queue is `PENDING_FEATURE_LIMIT` = **64** entries with `PENDING_FEATURE_MAX_AGE` = **30 s**, oldest evicted first, flushed in order on feature-ready (`flush_pending_features`, `coordinator.rs:3478`); `clear_webrtc_state` keeps it so a rebuild loses nothing. `should_surface_send_error` swallows generation-replacement and handover-in-progress errors (normal recovery states). The Android `Device.kt` queue is `BoundedPendingQueue(256)` with the same 30 s age (`:163,1688`), flushed under `sendOrderLock`, evicting the oldest *non-user-action* entry first; stale entries fail instead of sending. **Remote input is never queued** (its lease is minted by the WebRTC coordinator).
+`transport.rs`: `FeatureTransport::send` (`:76`) sends via `coordinator::send_feature_packet` when WebRTC is ready and the binding is current; refuses packets outside `outgoing_capabilities()` ("is not enabled in the DeskLink feature profile"); otherwise `queue_feature`. The queue is `PENDING_FEATURE_LIMIT` = **64** entries with `PENDING_FEATURE_MAX_AGE` = **30 s**, oldest evicted first, flushed in order on feature-ready (`flush_pending_features`, `coordinator/envelopes.rs`); `clear_webrtc_state` keeps it so a rebuild loses nothing. `should_surface_send_error` swallows generation-replacement and handover-in-progress errors (normal recovery states). The Android `Device.kt` queue is `BoundedPendingQueue(256)` with the same 30 s age (`:163,1688`), flushed under `sendOrderLock`, evicting the oldest *non-user-action* entry first; stale entries fail instead of sending. **Remote input is never queued** (its lease is minted by the WebRTC coordinator).
 
 ### 7.5 Feature map
 
@@ -522,7 +522,7 @@ Message type `desklink.remote-session.v1` (version 1) on the control channel; vi
 | View request | desk expires at 150 s; phone gives up at 135 s (`REMOTE_REQUEST_TIMEOUT_SECONDS`); the desk's portal times out at 120 s and answers first | `:40`; `WebRtcSessionCoordinator.kt:2822`; `remote_desktop_portal.rs:27` |
 | Control request | 30 s | `:41` |
 | No video | desk reports `screen-error` if a started capture produces none within 10 s | `docs/WEBRTC.md` |
-| Capture stall | 3 s, 3 restarts | `coordinator.rs:287-293` |
+| Capture stall | 3 s, 3 restarts | `CAPTURE_STALL`, `CAPTURE_RESTARTS` in `coordinator/share_worker.rs` |
 
 A message that *ends* a session (`release`, `screen-stopped`, `view-denied`, `control-denied`, `screen-error`) is honoured only for the current session id. A retry releases the previous session first. "Live" means a frame reached a renderer. The **answerer** raises every video transceiver to `sendrecv` before answering (`configure_video_transceivers`); otherwise it answers `a=recvonly` and can never send a frame.
 
@@ -881,7 +881,7 @@ Found while writing this document; none was fixed. The code is taken as authorit
 | 4 | `phone_connect/CLAUDE.md`: meson "regenerates `src/config.rs` from `src/config.rs.in`" | No meson file references `config.rs.in`; `src/config.rs` is hand-written and checked in |
 | 5 | `flatpak/README.md`: runtime GNOME 51 "because DeskLink needs GStreamer 1.28 (`v1_28`)" | `Cargo.toml` uses `v1_22`; CI/Debian/RPM state a 1.22 floor |
 | 6 | `SECURITY.md` supported versions: only 1.0.x; `packaging/obs/_service` has `revision v1.0.0` | Version is 1.3.0 everywhere else |
-| 7 | `webrtc/mod.rs` comment: the `Terminal` channel is "reserved for a future ... feature"; `application.rs:63` comment: "port 1717"; `daemon/mod.rs` comment: "Android's 120 s idle reaper" | Terminals use the channel (`coordinator.rs:2995`, `terminal_bridge.rs`); the TCP range is 1716-1764; Android's `IDLE_TIMEOUT_MILLIS` is 35 s |
+| 7 | `webrtc/mod.rs` comment: the `Terminal` channel is "reserved for a future ... feature"; `application.rs:63` comment: "port 1717"; `daemon/mod.rs` comment: "Android's 120 s idle reaper" | Terminals use the channel (`coordinator/terminal_pump.rs`, `terminal_bridge.rs`); the TCP range is 1716-1764; Android's `IDLE_TIMEOUT_MILLIS` is 35 s |
 | 8 | `docs/WEBRTC.md`, `CLAUDE.md`: a negotiation not feature-ready within 10 s is rebuilt; `PEER_PROBE_AFTER`/`PEER_DEAD_AFTER` "mirrored on Android" | The 10 s rule and `PEER_DEAD_AFTER_DOZING` exist only on the desk; Android has a 5 s answer watchdog and a 20 s attempt-stall check, and reports `dozing` instead. Android's recovery policy never stops, whereas the desk stops initiating after the sixth rung |
 | 9 | `CLAUDE.md`: redialer dials "last three IPv4s and one IPv6" | Only `MAX_ADDRESSES = 3` plus 2 unverified candidates and a comment were found; no code enforcing an IPv6 slot was located |
 | 10 | Docs list six delta-resync features | `sync.rs` `FEATURES` has seven (`activity` is the extra) |
@@ -899,7 +899,7 @@ Found while writing this document; none was fixed. The code is taken as authorit
 | 22 | `CLAUDE.md`: row/notification say "fast lane" or "over WebRTC"; W18 section 2: lane address from bootstrap link or redialer | UI words are "fast, over Wi-Fi" / "over the secure link" / "through the internet (slower)"; the address comes only from the selected ICE pair |
 | 23 | `docs/PAIRING_AUDIT.md` | Stale: pairing timeouts are now 30 s on both sides; its line numbers no longer apply |
 | 24 | `CLAUDE.md`: "recovery ... the replaced phone gets `pair:false` when it next speaks" | Implemented statelessly on the desk (`notify_peer_not_paired`, any packet from an unpaired peer, 5 s damping); only Android persists an owed `pair:false` |
-| 25 | `CLAUDE.md`: ICE servers "empty by default" | True for configuration; a relay-bootstrapped peer falls back to a hard-coded `stun://stun.cloudflare.com:3478` (`coordinator.rs:400`) |
+| 25 | `CLAUDE.md`: ICE servers "empty by default" | True for configuration; a relay-bootstrapped peer falls back to a hard-coded `stun://stun.cloudflare.com:3478` (`DEFAULT_STUN_SERVER`, `coordinator/ice_setup.rs`) |
 | 26 | Workspace `CLAUDE.md` does not mention `tools/` or `.tools/` | `tools/` holds `device_e2e.sh`, `emulator_e2e.sh`, `tcp_relay.py`; `.tools/` the gate scripts. The gate scripts lock `desklink-cargo.lock` (absent now) and `gate-phone.sh` omits `--max-workers=2` |
 | 27 | `docs/FEATURE-STATUS.md`, `docs/UI-REDESIGN.md` cite logs and harnesses under `~/.cache` | Deleted in the 2026-11-05 cache wipe; no campaign script is on disk |
 | 28 | Static counts | 1,413 `#[test]` in the desk tree vs 1,412 recorded passes (8 ignored); 1,459 `@Test` in the phone tree vs 1,734 recorded |
