@@ -85,6 +85,8 @@ pub(super) struct Onboarding {
     pub next: gtk::Button,
     pub skip: gtk::Button,
     scenes: Vec<gtk::Box>,
+    /// The window is too narrow for a scene at full size: it is drawn smaller.
+    tight: Cell<bool>,
     setup_body: gtk::Box,
     daemon: DaemonHandle,
     /// Called once when the person leaves the last step or skips out.
@@ -93,6 +95,31 @@ pub(super) struct Onboarding {
     closed: Rc<Cell<bool>>,
     /// The latest setup poll: an older one (an earlier Check again) stops.
     poll: Cell<u64>,
+}
+
+/// Below this width (sp) a tour scene is drawn at [`TIGHT_SCALE`].
+const TIGHT_WIDTH: f64 = 480.0;
+/// 360 px of scene becomes 252: with the card and page margins, 348 px.
+const TIGHT_SCALE: f32 = 0.7;
+
+/// A tour scene, scaled down in a tight window (a fixed canvas cannot shrink;
+/// a transformed child of a `gtk::Fixed` is measured at its drawn size).
+fn fitted_scene(page: usize, still: bool, tight: bool) -> gtk::Widget {
+    let canvas = scene(page, still);
+    if !tight {
+        return canvas.upcast();
+    }
+    let holder = gtk::Fixed::builder()
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .can_target(false)
+        .build();
+    holder.put(&canvas, 0.0, 0.0);
+    holder.set_child_transform(
+        &canvas,
+        Some(&gtk::gsk::Transform::new().scale(TIGHT_SCALE, TIGHT_SCALE)),
+    );
+    holder.upcast()
 }
 
 fn animations_on() -> bool {
@@ -147,12 +174,24 @@ impl Onboarding {
             .hhomogeneous(false)
             .build();
 
-        let narrow = adw::Breakpoint::new(adw::BreakpointCondition::new_length(
-            adw::BreakpointConditionLengthType::MaxWidth,
-            720.0,
-            adw::LengthUnit::Sp,
-        ));
-        stack.add_named(&glance_page(&narrow), Some("0"));
+        // One column below the width two columns of a full scene need (2 x
+        // 408 + 40 + the margins); below `TIGHT_WIDTH` the scene is drawn
+        // smaller too. A bin applies one breakpoint at a time (the last that
+        // matches), so `tight` carries the same setters as `narrow`.
+        let breakpoint = |width| {
+            adw::Breakpoint::new(adw::BreakpointCondition::new_length(
+                adw::BreakpointConditionLengthType::MaxWidth,
+                width,
+                adw::LengthUnit::Sp,
+            ))
+        };
+        let (narrow, tight) = (breakpoint(920.0), breakpoint(TIGHT_WIDTH));
+        let narrow_set = |object: &gtk::Widget, property: &str, value: glib::Value| {
+            for point in [&narrow, &tight] {
+                point.add_setter(object, property, Some(&value));
+            }
+        };
+        stack.add_named(&glance_page(&narrow_set), Some("0"));
         let mut scenes = Vec::new();
         for (index, page) in TOUR.iter().enumerate() {
             let card = gtk::Box::builder()
@@ -174,14 +213,15 @@ impl Onboarding {
                 .build();
             layout.append(&card);
             layout.append(&words);
-            narrow.add_setter(
-                &layout,
+            let layout_widget = layout.upcast_ref::<gtk::Widget>();
+            narrow_set(
+                layout_widget,
                 "orientation",
-                Some(&gtk::Orientation::Vertical.to_value()),
+                gtk::Orientation::Vertical.to_value(),
             );
-            narrow.add_setter(&layout, "spacing", Some(&24.to_value()));
-            narrow.add_setter(&layout, "homogeneous", Some(&false.to_value()));
-            narrow.add_setter(&card, "halign", Some(&gtk::Align::Fill.to_value()));
+            narrow_set(layout_widget, "spacing", 24.to_value());
+            narrow_set(layout_widget, "homogeneous", false.to_value());
+            narrow_set(card.upcast_ref(), "halign", gtk::Align::Fill.to_value());
             stack.add_named(&layout, Some(&(index + 1).to_string()));
         }
         let setup_body = gtk::Box::builder()
@@ -281,6 +321,7 @@ impl Onboarding {
             .child(&content)
             .build();
         bin.add_breakpoint(narrow);
+        bin.add_breakpoint(tight.clone());
 
         let header = adw::HeaderBar::builder()
             .show_title(false)
@@ -302,6 +343,7 @@ impl Onboarding {
             next,
             skip,
             scenes,
+            tight: Cell::new(false),
             setup_body,
             daemon: daemon.clone(),
             on_leave: RefCell::new(Some(Box::new(on_leave))),
@@ -362,6 +404,20 @@ impl Onboarding {
             }
         });
         this.root.add_controller(keys);
+        for applied in [true, false] {
+            let weak = Rc::downgrade(&this);
+            let redraw = move |_: &adw::Breakpoint| {
+                if let Some(this) = weak.upgrade() {
+                    this.tight.set(applied);
+                    this.draw_scene();
+                }
+            };
+            if applied {
+                tight.connect_apply(redraw);
+            } else {
+                tight.connect_unapply(redraw);
+            }
+        }
         this.show(step);
         this
     }
@@ -387,19 +443,25 @@ impl Onboarding {
         }
     }
 
+    /// Draws the shown tour page's scene afresh (its animation plays again),
+    /// smaller in a tight window.
+    fn draw_scene(&self) {
+        // Step 0 is the glance; tour page `n` is step `n + 1`.
+        let page = self.step.get().checked_sub(1);
+        if let Some((page, card)) = page.and_then(|page| Some((page, self.scenes.get(page)?))) {
+            while let Some(child) = card.first_child() {
+                card.remove(&child);
+            }
+            card.append(&fitted_scene(page, !animations_on(), self.tight.get()));
+        }
+    }
+
     /// Shows `step`: its page, the bars up to it, its buttons. The scene is
     /// built afresh, so its animation plays when the page is seen.
     pub(super) fn show(self: &Rc<Self>, step: usize) {
         let step = step.min(SETUP);
         self.step.set(step);
-        // Step 0 is the glance; tour page `n` is step `n + 1`.
-        let page = step.checked_sub(1);
-        if let Some((page, card)) = page.and_then(|page| Some((page, self.scenes.get(page)?))) {
-            while let Some(child) = card.first_child() {
-                card.remove(&child);
-            }
-            card.append(&scene(page, !animations_on()));
-        }
+        self.draw_scene();
         if step == SETUP {
             self.fill_setup();
         }
@@ -416,7 +478,7 @@ impl Onboarding {
         self.skip.set_visible(step < SETUP);
         let words = next_label(step, self.for_pairing);
         self.next.set_label(words);
-        let title = match page {
+        let title = match step.checked_sub(1) {
             None => GLANCE_TITLE,
             Some(page) => TOUR.get(page).map_or(SETUP_TITLE, |page| page.title),
         };

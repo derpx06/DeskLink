@@ -603,3 +603,43 @@ fn check_again_keeps_the_keyboard_focus() {
         window.close();
     });
 }
+
+/// Every page of the tour fits the window it is shown in, from the 360 px
+/// minimum to a half-screen 800 px: nothing is cut off on the right (the
+/// scene at its full 360 px plus the card made 456 px; two columns of it
+/// needed 904 px).
+#[test]
+fn every_page_fits_a_narrow_window() {
+    crate::test_display::run(|| {
+        for width in [360, 560, 800, 1100] {
+            let (window, _commands) = window_with_tour();
+            window.set_default_size(width, 700);
+            window.present();
+            let tour = window.imp().onboarding.borrow().clone().unwrap();
+            let bin = tour
+                .root
+                .content()
+                .and_downcast::<adw::BreakpointBin>()
+                .expect("the breakpoint bin");
+            let context = glib::MainContext::default();
+            let settle = || {
+                for _ in 0..40 {
+                    while context.iteration(false) {}
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            };
+            for step in 0..SETUP {
+                tour.show(step);
+                settle();
+                let content = bin.child().expect("the page");
+                let (min, _, _, _) = content.measure(gtk::Orientation::Horizontal, -1);
+                assert!(
+                    min <= bin.width(),
+                    "step {step} at {width} px needs {min} px, has {}",
+                    bin.width()
+                );
+            }
+            window.close();
+        }
+    });
+}

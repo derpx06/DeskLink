@@ -7,7 +7,7 @@ use super::*;
 
 /// The glance: what DeskLink does in three lines on the left, the three
 /// steps to start in a card on the right (one column when narrow).
-pub(super) fn glance_page(narrow: &adw::Breakpoint) -> gtk::Box {
+pub(super) fn glance_page(narrow: &dyn Fn(&gtk::Widget, &str, glib::Value)) -> gtk::Box {
     let words = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -87,13 +87,10 @@ pub(super) fn glance_page(narrow: &adw::Breakpoint) -> gtk::Box {
         .build();
     layout.append(&words);
     layout.append(&steps);
-    narrow.add_setter(
-        &layout,
-        "orientation",
-        Some(&gtk::Orientation::Vertical.to_value()),
-    );
-    narrow.add_setter(&layout, "spacing", Some(&24.to_value()));
-    narrow.add_setter(&layout, "homogeneous", Some(&false.to_value()));
+    let widget = layout.upcast_ref::<gtk::Widget>();
+    narrow(widget, "orientation", gtk::Orientation::Vertical.to_value());
+    narrow(widget, "spacing", 24.to_value());
+    narrow(widget, "homogeneous", false.to_value());
     layout
 }
 
