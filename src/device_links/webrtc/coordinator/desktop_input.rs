@@ -48,27 +48,64 @@ pub(crate) fn dispatch_desktop_remote_input(
     };
     // Not past what a person (or glide, 500 a second) can produce, and never
     // a backlog: while the portal is slow or wedged, input waiting seconds
-    // would be replayed as stale clicks and keys when it came back.
-    if !PORTAL_INPUT_RATE.allow(&binding.device_id) {
+    // would be replayed as stale clicks and keys when it came back. Releases
+    // are the exception: a dropped one left the button or key held, so every
+    // later move dragged on the desk.
+    let actions = if PORTAL_INPUT_RATE.allow(&binding.device_id) {
+        actions
+    } else {
         crate::device_links::limits::log_limited(
             "portal-input-rate",
             "Remote input arrived faster than it can be applied; some was dropped",
         );
+        releases(&actions)
+    };
+    if actions.is_empty() {
         return Ok(());
     }
-    match sender.try_send(DesktopPortalCommand::Input(actions)) {
-        Ok(()) => Ok(()),
-        Err(mpsc::TrySendError::Full(_)) => {
-            crate::device_links::limits::log_limited(
-                "portal-input-full",
-                "The desktop is not taking remote input; some was dropped",
-            );
-            Ok(())
-        }
-        Err(mpsc::TrySendError::Disconnected(_)) => {
-            Err("Desktop portal worker has stopped".to_string())
+    let mut command = DesktopPortalCommand::Input(actions);
+    let give_up = std::time::Instant::now() + RELEASE_WAIT;
+    loop {
+        match sender.try_send(command) {
+            Ok(()) => return Ok(()),
+            Err(mpsc::TrySendError::Full(DesktopPortalCommand::Input(back))) => {
+                // Full: the releases wait a moment for room; the rest goes.
+                let kept = releases(&back);
+                if kept.is_empty() || std::time::Instant::now() >= give_up {
+                    crate::device_links::limits::log_limited(
+                        "portal-input-full",
+                        "The desktop is not taking remote input; some was dropped",
+                    );
+                    return Ok(());
+                }
+                command = DesktopPortalCommand::Input(kept);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(mpsc::TrySendError::Full(_)) => return Ok(()),
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                return Err("Desktop portal worker has stopped".to_string())
+            }
         }
     }
+}
+
+/// How long a release waits for room in a full portal queue.
+const RELEASE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The button and key releases in `actions`, in order: what may never be
+/// dropped by the rate limit or a full queue.
+pub(super) fn releases(actions: &[PortalInputAction]) -> Vec<PortalInputAction> {
+    actions
+        .iter()
+        .filter(|action| {
+            matches!(
+                action,
+                PortalInputAction::Button { pressed: false, .. }
+                    | PortalInputAction::Key { pressed: false, .. }
+            )
+        })
+        .cloned()
+        .collect()
 }
 
 /// Input packets accepted per second from one phone for the desktop share.

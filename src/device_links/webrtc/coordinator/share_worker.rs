@@ -744,43 +744,22 @@ fn run_desktop_portal_worker(
                 {
                     scroll_open = Some(std::time::Instant::now());
                 }
-                for action in coalesce_motion(actions) {
-                    let held = match &action {
-                        PortalInputAction::Button { evdev_code, .. } => Some((false, *evdev_code)),
-                        PortalInputAction::Key { keysym, .. } => Some((true, *keysym)),
-                        _ => None,
-                    };
-                    let pressed = match &action {
-                        PortalInputAction::Button { pressed, .. }
-                        | PortalInputAction::Key { pressed, .. } => Some(*pressed),
-                        _ => None,
-                    };
-                    let described = format!("{action:?}");
-                    if let Err(error) = portal.apply(action) {
-                        eprintln!(
-                            "[DeskLink] Portal input dispatch failed for {described}: {error}"
-                        );
-                        // A revoked session is what makes every call fail; without
-                        // this check it is noticed only after 500 ms of idle, which
-                        // continuous motion never allows.
-                        if portal.is_session_closed() {
-                            portal_revoked = true;
-                            break 'serve;
-                        }
-                        break;
+                let clicked = || {
+                    if let Some(watcher) = &text_focus {
+                        watcher.clicked();
                     }
-                    if let (Some(held), Some(pressed)) = (held, pressed) {
-                        if pressed && !held.0 {
-                            if let Some(watcher) = &text_focus {
-                                watcher.clicked();
-                            }
-                        }
-                        if pressed {
-                            held_inputs.insert(held);
-                        } else {
-                            held_inputs.remove(&held);
-                        }
-                    }
+                };
+                if apply_input_batch(
+                    &*portal,
+                    coalesce_motion(actions),
+                    &mut held_inputs,
+                    clicked,
+                ) {
+                    // A revoked session is what makes every call fail; without
+                    // this check it is noticed only after 500 ms of idle, which
+                    // continuous motion never allows.
+                    portal_revoked = true;
+                    break 'serve;
                 }
                 // Held keys and buttons are released whenever the phone no longer
                 // holds input — not only when a lease *expires*: a pause, a stale
@@ -868,4 +847,61 @@ pub(super) fn screen_stopped(
     stopped.reason =
         Some(crate::device_links::webrtc::remote_desktop_portal::plain_portal_error(&reason));
     stopped
+}
+
+/// Applies one batch of the phone's input to the shared desktop and keeps the
+/// set of keys and buttons it holds pressed. Returns true when the session
+/// was revoked underneath (every call then fails).
+///
+/// A failed call (a D-Bus timeout under load, "Invalid position" after a
+/// scale change) skips the rest of the batch **except its releases**: the
+/// release of a tap often rides behind a move, and dropping it left the
+/// button held, so every later move dragged on the desk.
+pub(super) fn apply_input_batch(
+    portal: &dyn DesktopSession,
+    actions: Vec<PortalInputAction>,
+    held_inputs: &mut std::collections::HashSet<(bool, i32)>,
+    mut clicked: impl FnMut(),
+) -> bool {
+    let mut failed = false;
+    for action in actions {
+        let held = match &action {
+            PortalInputAction::Button { evdev_code, .. } => Some((false, *evdev_code)),
+            PortalInputAction::Key { keysym, .. } => Some((true, *keysym)),
+            _ => None,
+        };
+        let pressed = match &action {
+            PortalInputAction::Button { pressed, .. } | PortalInputAction::Key { pressed, .. } => {
+                Some(*pressed)
+            }
+            _ => None,
+        };
+        // After a failure only releases go, and only of what is held here
+        // (one this side never pressed would be a stray release).
+        if failed
+            && !(pressed == Some(false) && held.is_some_and(|held| held_inputs.contains(&held)))
+        {
+            continue;
+        }
+        let described = format!("{action:?}");
+        if let Err(error) = portal.apply(action) {
+            eprintln!("[DeskLink] Portal input dispatch failed for {described}: {error}");
+            if portal.is_session_closed() {
+                return true;
+            }
+            failed = true;
+            continue;
+        }
+        if let (Some(held), Some(pressed)) = (held, pressed) {
+            if pressed && !held.0 {
+                clicked();
+            }
+            if pressed {
+                held_inputs.insert(held);
+            } else {
+                held_inputs.remove(&held);
+            }
+        }
+    }
+    false
 }

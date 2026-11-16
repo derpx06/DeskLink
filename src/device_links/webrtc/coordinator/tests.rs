@@ -1779,3 +1779,143 @@ fn a_parked_phone_stream_is_shown_again_outside_the_session_lock() {
         "still shown again"
     );
 }
+
+use super::{apply_input_batch, DesktopSession, PortalInputAction};
+
+/// A desktop whose pointer moves fail (a D-Bus timeout, "Invalid position").
+struct RefusingMoves {
+    applied: std::cell::RefCell<Vec<String>>,
+}
+
+impl DesktopSession for RefusingMoves {
+    fn active(&self) -> crate::device_links::webrtc::remote_desktop_portal::PortalStream {
+        crate::device_links::webrtc::remote_desktop_portal::PortalStream {
+            node_id: 1,
+            width: 100,
+            height: 100,
+            pipewire_serial: None,
+        }
+    }
+    fn stream_count(&self) -> usize {
+        1
+    }
+    fn next_stream(&self) -> crate::device_links::webrtc::remote_desktop_portal::PortalStream {
+        self.active()
+    }
+    fn knows_active_pixels(&self) -> bool {
+        true
+    }
+    fn set_active_pixels(&self, _size: (i32, i32)) {}
+    fn is_session_closed(&self) -> bool {
+        false
+    }
+    fn pointer_motion(&self, _dx: f64, _dy: f64) -> Result<(), String> {
+        Err("timed out".into())
+    }
+    fn pointer_motion_absolute(&self, _x: f64, _y: f64) -> Result<(), String> {
+        Err("Invalid position".into())
+    }
+    fn pointer_button(&self, evdev_button: i32, pressed: bool) -> Result<(), String> {
+        self.applied
+            .borrow_mut()
+            .push(format!("button {evdev_button} {pressed}"));
+        Ok(())
+    }
+    fn pointer_axis(&self, _dx: f64, _dy: f64, _finish: bool) -> Result<(), String> {
+        Ok(())
+    }
+    fn keyboard_keysym(&self, _keysym: i32, _pressed: bool) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[test]
+fn a_refused_move_still_lets_the_button_go() {
+    let desk = RefusingMoves {
+        applied: Default::default(),
+    };
+    let mut held = std::collections::HashSet::new();
+    let press = PortalInputAction::Button {
+        evdev_code: 0x110,
+        pressed: true,
+    };
+    assert!(!apply_input_batch(&desk, vec![press], &mut held, || {}));
+    assert!(held.contains(&(false, 0x110)));
+    let batch = vec![
+        PortalInputAction::AbsoluteMotion(10.0, 10.0),
+        PortalInputAction::Button {
+            evdev_code: 0x111,
+            pressed: true,
+        },
+        PortalInputAction::Button {
+            evdev_code: 0x110,
+            pressed: false,
+        },
+    ];
+    assert!(!apply_input_batch(&desk, batch, &mut held, || {}));
+    assert!(
+        held.is_empty(),
+        "the release after the failed move was applied"
+    );
+    assert_eq!(
+        *desk.applied.borrow(),
+        vec!["button 272 true", "button 272 false"],
+        "a press after the failure is skipped, the release is not"
+    );
+}
+
+/// A release never falls to the rate limit or a full queue; the rest may.
+#[test]
+fn only_releases_survive_a_rate_limited_or_full_input_batch() {
+    let batch = vec![
+        PortalInputAction::AbsoluteMotion(1.0, 1.0),
+        PortalInputAction::Button {
+            evdev_code: 0x110,
+            pressed: true,
+        },
+        PortalInputAction::Button {
+            evdev_code: 0x110,
+            pressed: false,
+        },
+        PortalInputAction::Key {
+            keysym: 0x61,
+            pressed: false,
+        },
+    ];
+    assert_eq!(
+        super::desktop_input::releases(&batch),
+        vec![
+            PortalInputAction::Button {
+                evdev_code: 0x110,
+                pressed: false
+            },
+            PortalInputAction::Key {
+                keysym: 0x61,
+                pressed: false
+            },
+        ]
+    );
+}
+
+/// After a failure, a release goes only for what is held here: a release
+/// of a button this side never pressed is not sent.
+#[test]
+fn after_a_failure_only_held_inputs_are_released() {
+    let desk = RefusingMoves {
+        applied: Default::default(),
+    };
+    let mut held = std::collections::HashSet::new();
+    let batch = vec![
+        PortalInputAction::AbsoluteMotion(10.0, 10.0),
+        PortalInputAction::Button {
+            evdev_code: 0x112,
+            pressed: false,
+        },
+    ];
+    assert!(!apply_input_batch(&desk, batch, &mut held, || {}));
+    assert!(
+        desk.applied.borrow().is_empty(),
+        "{:?}",
+        desk.applied.borrow()
+    );
+}
