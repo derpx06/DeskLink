@@ -791,11 +791,13 @@ mod tests {
     #[test]
     fn the_tray_says_what_to_do_when_the_phones_accessibility_is_off() {
         let device = phone("tray-service", true);
-        let mut settings = AppSettings::default();
-        settings.glide = Some(crate::device_links::glide::GlideSetting {
-            device: "tray-service".into(),
-            edge: crate::device_links::glide::Edge::Right,
-        });
+        let settings = AppSettings {
+            glide: Some(crate::device_links::glide::GlideSetting {
+                device: "tray-service".into(),
+                edge: crate::device_links::glide::Edge::Right,
+            }),
+            ..AppSettings::default()
+        };
         let mut report = crate::device_links::packet::NetworkPacket::new(
             crate::device_links::packet::PACKET_TYPE_SHARE_INPUT_DEVICES,
         );

@@ -1370,7 +1370,8 @@ fn an_accept_after_the_compositor_ended_the_capture_resurrects_nothing() {
 #[test]
 fn a_link_drop_in_every_state_ends_idle_with_one_release_and_one_indicator_off() {
     let now = Instant::now();
-    let setups: Vec<(&str, Box<dyn Fn(&mut Glide)>, bool)> = vec![
+    type Setup = (&'static str, Box<dyn Fn(&mut Glide)>, bool);
+    let setups: Vec<Setup> = vec![
         ("idle", Box::new(|_| {}), false),
         (
             "entering",
