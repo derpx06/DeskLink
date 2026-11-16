@@ -211,11 +211,7 @@ pub mod network;
 pub mod packet_handler;
 pub mod pairing_commands;
 mod power;
-#[cfg(test)]
-mod robust_fuzz;
 pub mod state;
-#[cfg(test)]
-pub mod test_peer;
 pub mod validation;
 
 pub(super) struct DaemonWorker {
@@ -536,3 +532,8 @@ mod keep_awake_tests {
         assert!(!crate::device_links::config::AppSettings::default().stay_awake);
     }
 }
+
+#[cfg(test)]
+mod robust_fuzz;
+#[cfg(test)]
+pub mod test_peer;

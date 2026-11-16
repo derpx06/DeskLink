@@ -3,8 +3,6 @@
 pub(crate) mod audio;
 pub(crate) mod audio_session;
 pub(crate) mod capture;
-#[cfg(test)]
-mod chaos;
 pub(crate) mod coordinator;
 pub(crate) mod file_lane;
 pub(crate) mod file_protocol;
@@ -762,3 +760,6 @@ mod shared_envelope_tests {
         text.bytes().rev().take_while(|byte| *byte == b'=').count()
     }
 }
+
+#[cfg(test)]
+mod chaos;

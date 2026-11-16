@@ -60,13 +60,6 @@ use super::{
 };
 use crate::device_links::daemon::state::mark_error;
 
-#[cfg(test)]
-mod denial_tests;
-#[cfg(test)]
-mod input_log_tests;
-#[cfg(test)]
-mod tests;
-
 mod desktop_input;
 mod desktop_share;
 mod envelopes;
@@ -542,3 +535,10 @@ pub(crate) fn forget_liveness(device_id: &str) {
     recovery::forget(device_id);
     ice_setup::forget(device_id);
 }
+
+#[cfg(test)]
+mod denial_tests;
+#[cfg(test)]
+mod input_log_tests;
+#[cfg(test)]
+mod tests;

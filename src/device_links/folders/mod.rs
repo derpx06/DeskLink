@@ -41,11 +41,6 @@ use super::limits::{log_limited, Buckets};
 use super::packet::{NetworkPacket, PACKET_TYPE_FOLDERS};
 use super::webrtc::file_protocol::{validate_relpath, FolderRef};
 
-#[cfg(test)]
-mod property_tests;
-#[cfg(test)]
-mod tests;
-
 mod bucket;
 mod disk;
 mod engine;
@@ -511,3 +506,8 @@ pub(crate) fn test_want(device_id: &str, folder: &FolderRef, sha256: &str, size:
 /// Requested files, by (device, pair, path): the entry asked for.
 /// Shared with the transfer manager's offer check.
 static WANTED: Mutex<BTreeMap<(String, String, String), Entry>> = Mutex::new(BTreeMap::new());
+
+#[cfg(test)]
+mod property_tests;
+#[cfg(test)]
+mod tests;
