@@ -480,7 +480,7 @@ mod tests {
         // The phone's reader gives up a little after the desk does, never before.
         assert!(ms("androidLanReaderIdleMillis") > ms("desktopHeartbeatDeadMillis"));
         assert_eq!(f["bundlePolicy"], "max-bundle");
-        assert!(include_str!("peer_connection.rs")
+        assert!(include_str!("peer_connection/mod.rs")
             .contains("\"bundle-policy\", gst_webrtc::WebRTCBundlePolicy::MaxBundle"));
         let required: Vec<&str> = WebRtcChannel::REQUIRED.iter().map(|c| c.label()).collect();
         assert_eq!(serde_json::json!(required), f["requiredChannels"]);

@@ -1,0 +1,2695 @@
+//! Tests of the peer: SDP and codec rules, ICE path readings, and real
+//! `webrtcbin` peers over loopback (screen, sound, data channels, teardown).
+//! The loopback helpers are `pub(crate)` for `chaos` and the coordinator's tests.
+
+use std::sync::mpsc;
+use std::sync::Arc;
+
+use super::*;
+
+#[test]
+fn the_ice_agent_is_asked_for_the_pair_only_before_gstreamer_1_28() {
+    assert!(ice_fallback_needed((1, 26, 5, 0)));
+    assert!(ice_fallback_needed((1, 24, 0, 0)));
+    assert!(!ice_fallback_needed((1, 28, 0, 0)));
+    assert!(!ice_fallback_needed((1, 29, 1, 0)));
+    assert!(!ice_fallback_needed((2, 0, 0, 0)));
+}
+
+/// The whole LAN-only guarantee of the fast lane: which pairs get an
+/// address to dial, over interfaces the test states.
+#[test]
+fn a_lane_address_comes_only_from_a_local_host_or_prflx_pair() {
+    let ip = |text: &str| -> std::net::IpAddr { text.parse().unwrap() };
+    let interfaces = vec![
+        (ip("192.168.1.2"), 24),
+        (ip("fd00::2"), 64),
+        (ip("8.8.8.8"), 24),
+        (ip("127.0.0.1"), 8),
+        (ip("100.64.0.2"), 10),
+        (ip("fe80::2"), 64),
+    ];
+    let pair = |types: &[&str], local: Option<&str>, remote: Option<&str>| SelectedPair {
+        types: types.iter().map(|kind| kind.to_string()).collect(),
+        rtt: None,
+        local_ip: local.map(ip),
+        remote_ip: remote.map(ip),
+    };
+    let some = |p: SelectedPair| lane_address_of(&p, &interfaces);
+    // Good ones.
+    assert_eq!(
+        some(pair(
+            &["host", "host"],
+            Some("192.168.1.2"),
+            Some("192.168.1.3")
+        )),
+        Some(ip("192.168.1.3"))
+    );
+    assert_eq!(
+        some(pair(
+            &["host", "peer-reflexive"],
+            Some("192.168.1.2"),
+            Some("192.168.1.9")
+        )),
+        Some(ip("192.168.1.9"))
+    );
+    assert_eq!(
+        some(pair(&["host", "host"], Some("fd00::2"), Some("fd00::5"))),
+        Some(ip("fd00::5")),
+        "a unique-local IPv6 pair is local"
+    );
+    // Not a direct local pair.
+    for types in [
+        ["host", "server-reflexive"],
+        ["server-reflexive", "host"],
+        ["relayed", "host"],
+        ["host", "relayed"],
+        ["server-reflexive", "server-reflexive"],
+    ] {
+        assert_eq!(
+            some(pair(&types, Some("192.168.1.2"), Some("192.168.1.3"))),
+            None,
+            "{types:?}"
+        );
+    }
+    assert_eq!(
+        some(pair(&["host"], Some("192.168.1.2"), Some("192.168.1.3"))),
+        None
+    );
+    assert_eq!(
+        some(pair(
+            &["host", "peer-reflexive"],
+            Some("192.168.1.2"),
+            Some("192.168.1.2")
+        )),
+        None,
+        "this computer's own address (a phone behind its NAT)"
+    );
+    assert_eq!(
+        some(pair(&[], Some("192.168.1.2"), Some("192.168.1.3"))),
+        None
+    );
+    // Addresses that are not the local network.
+    let host = ["host", "host"];
+    assert_eq!(
+        some(pair(&host, Some("8.8.8.8"), Some("8.8.8.9"))),
+        None,
+        "public"
+    );
+    assert_eq!(
+        some(pair(&host, Some("127.0.0.1"), Some("127.0.0.2"))),
+        None,
+        "loopback"
+    );
+    assert_eq!(
+        some(pair(&host, Some("100.64.0.2"), Some("100.64.0.3"))),
+        None,
+        "carrier-grade"
+    );
+    assert_eq!(
+        some(pair(&host, Some("192.168.1.2"), Some("192.168.2.3"))),
+        None,
+        "private, but not on our subnet"
+    );
+    assert_eq!(
+        some(pair(&host, Some("192.168.1.77"), Some("192.168.1.3"))),
+        None,
+        "not one of our own addresses"
+    );
+    assert_eq!(
+        some(pair(&host, Some("192.168.1.2"), Some("8.8.8.9"))),
+        None,
+        "a public remote"
+    );
+    assert_eq!(
+        some(pair(&host, Some("fe80::2"), Some("fe80::9"))),
+        None,
+        "scoped link-local needs its zone"
+    );
+    assert_eq!(some(pair(&host, None, Some("192.168.1.3"))), None);
+    assert_eq!(some(pair(&host, Some("192.168.1.2"), None)), None);
+}
+
+#[test]
+fn path_label_follows_the_shared_rule() {
+    let label = |types: &[&str], via_relay| {
+        let types: Vec<String> = types.iter().map(|kind| kind.to_string()).collect();
+        path_label(&types, via_relay)
+    };
+    assert_eq!(label(&["relay", "host"], false), "turn");
+    assert_eq!(label(&["host", "relay"], true), "turn");
+    assert_eq!(label(&["host", "host"], false), "lan");
+    assert_eq!(label(&["host", "prflx"], false), "lan");
+    assert_eq!(label(&["prflx", "prflx"], false), "lan");
+    assert_eq!(label(&["host", "host"], true), "direct");
+    assert_eq!(label(&["host", "srflx"], false), "direct");
+    assert_eq!(label(&["srflx", "srflx"], false), "direct");
+    assert_eq!(label(&["host"], false), "direct");
+    assert_eq!(label(&[], false), "direct");
+    assert_eq!(label(&["", ""], false), "direct");
+    // webrtcbin's own spellings (its stats).
+    assert_eq!(label(&["host", "peer-reflexive"], false), "lan");
+    assert_eq!(label(&["relayed", "host"], false), "turn");
+    assert_eq!(label(&["host", "server-reflexive"], false), "direct");
+}
+
+/// What webrtcbin really reports for a connected pair, and that it
+/// reads as the LAN: two peers on loopback.
+#[test]
+fn a_connected_loopback_pair_reads_as_the_lan() {
+    let pair = loopback();
+    wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut path = None;
+    while path.is_none() && std::time::Instant::now() < deadline {
+        path = pair.offerer.path(false);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    eprintln!(
+        "[test] candidate types: {:?}",
+        pair.offerer.selected_pair_types()
+    );
+    assert_eq!(path.map(|path| path.label), Some("lan"));
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// Once connected, the ICE socket's receive buffer is wider than the
+/// kernel's default: at the default a phone's keyframe burst overflowed
+/// it, and every dropped packet became a PLI and another keyframe.
+#[test]
+fn a_connected_peer_widens_its_ice_socket_receive_buffer() {
+    let default = socket2::SockRef::from(&std::net::UdpSocket::bind("127.0.0.1:0").unwrap())
+        .recv_buffer_size()
+        .unwrap();
+    let pair = loopback();
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    let port = selected_local_port(&pair.answerer.webrtcbin).unwrap();
+    let size = || {
+        udp_sockets_on(port)
+            .iter()
+            .filter_map(|fd| socket2::SockRef::from(fd).recv_buffer_size().ok())
+            .max()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while size() <= Some(default) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(size() > Some(default), "{:?}, default {default}", size());
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// What libwebrtc (Android) offers when the phone is the initiator: one
+/// `sendrecv` VP8 video section — the phone attaches a track in both roles —
+/// plus the data-channel section. Hand-written from a real offer's shape so
+/// the desktop's *answerer* role can be exercised without a phone.
+const PHONE_OFFER: &str = "v=0\r\n\
+o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1\r\n\
+a=extmap-allow-mixed\r\n\
+a=msid-semantic: WMS desklink-screen\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:Zx4l\r\n\
+a=ice-pwd:Ye1kU7eZ1cTnL7l3fJQ7t0q2\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 4B:1C:3E:8A:0D:52:97:6F:B3:21:E4:7A:C8:19:5D:F0:2A:66:B1:93:0E:D7:48:AC:35:7B:E2:19:84:CF:60:1D\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=extmap:1 urn:ietf:params:rtp-hdrext:toffset\r\n\
+a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time\r\n\
+a=extmap:3 urn:3gpp:video-orientation\r\n\
+a=extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01\r\n\
+a=sendrecv\r\n\
+a=msid:desklink-screen 6f5d7f10-5c2e-4c0e-9a55-1f2e0b1d3c44\r\n\
+a=rtcp-mux\r\n\
+a=rtcp-rsize\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtcp-fb:96 goog-remb\r\n\
+a=rtcp-fb:96 transport-cc\r\n\
+a=rtcp-fb:96 ccm fir\r\n\
+a=rtcp-fb:96 nack\r\n\
+a=rtcp-fb:96 nack pli\r\n\
+a=rtpmap:97 rtx/90000\r\n\
+a=fmtp:97 apt=96\r\n\
+a=ssrc-group:FID 1111111111 2222222222\r\n\
+a=ssrc:1111111111 cname:desklinkphone\r\n\
+a=ssrc:1111111111 msid:desklink-screen 6f5d7f10-5c2e-4c0e-9a55-1f2e0b1d3c44\r\n\
+a=ssrc:2222222222 cname:desklinkphone\r\n\
+a=ssrc:2222222222 msid:desklink-screen 6f5d7f10-5c2e-4c0e-9a55-1f2e0b1d3c44\r\n\
+m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:Zx4l\r\n\
+a=ice-pwd:Ye1kU7eZ1cTnL7l3fJQ7t0q2\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 4B:1C:3E:8A:0D:52:97:6F:B3:21:E4:7A:C8:19:5D:F0:2A:66:B1:93:0E:D7:48:AC:35:7B:E2:19:84:CF:60:1D\r\n\
+a=setup:actpass\r\n\
+a=mid:1\r\n\
+a=sctp-port:5000\r\n\
+a=max-message-size:262144\r\n";
+
+/// Blocks until the peer produces its local answer.
+fn wait_for_answer(receiver: &mpsc::Receiver<PeerEvent>) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match receiver.recv_timeout(remaining) {
+            Ok(PeerEvent::LocalDescription {
+                message_type: SignalingMessageType::Answer,
+                sdp,
+            }) => return sdp,
+            Ok(PeerEvent::Error(error)) => panic!("negotiation failed: {error}"),
+            Ok(_) => {}
+            Err(_) => panic!("no answer was produced within 15s"),
+        }
+    }
+}
+
+/// An answerer with the phone's offer applied and answered — the state the
+/// desktop is in when a screen share starts.
+fn answered_peer(offer: &str) -> DesktopWebRtcPeer {
+    let (sender, receiver) = mpsc::channel();
+    let peer = DesktopWebRtcPeer::new(false, sender, &IceServerConfig::default()).unwrap();
+    peer.set_remote_description(SignalingMessageType::Offer, offer)
+        .unwrap();
+    wait_for_answer(&receiver);
+    // Keep draining so the peer's event sender never blocks or errors.
+    std::thread::spawn(move || while receiver.recv().is_ok() {});
+    peer
+}
+
+fn test_source() -> gst::Element {
+    gst::ElementFactory::make("videotestsrc")
+        .property("is-live", true)
+        .build()
+        .expect("videotestsrc")
+}
+
+fn wait_for_frames(capture: &super::super::screen::DesktopScreenCapture) -> u64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while std::time::Instant::now() < deadline && capture.frames_sent() == 0 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    capture.frames_sent()
+}
+
+/// The whole desktop video path except PipeWire: source → scale → VP8 → RTP
+/// → the section the phone's offer negotiated. This is the path that has
+/// never carried a frame; a chain that "attaches" to a fresh, unnegotiated
+/// transceiver reports success and sends nothing.
+#[test]
+fn the_screen_chain_binds_to_the_negotiated_section_and_produces_rtp() {
+    let peer = answered_peer(PHONE_OFFER);
+
+    let capture = super::super::screen::DesktopScreenCapture::attach_source(
+        &peer.pipeline,
+        &peer.webrtcbin,
+        test_source(),
+        None,
+        1920,
+        1080,
+        super::super::screen::ScreenRequest::FALLBACK,
+        None,
+    )
+    .expect("the chain must attach to the answered video section");
+
+    assert!(
+        wait_for_frames(&capture) > 0,
+        "the encoder chain produced no RTP"
+    );
+    assert_eq!(capture.payload_type(), 96);
+    assert!(!peer.media_ready(), "no connection: not ready for media");
+    // No connection in a unit test, so the chain parks inside `webrtcbin`:
+    // `stop` must hand it back instead of hanging, and `close` frees it.
+    assert!(capture.stop().is_err());
+    peer.close();
+}
+
+/// A share that fails to start on a phone's connection (a PipeWire
+/// stream that would not start) must leave the video section to the
+/// next one: it asked for `sink_0` again, which `webrtcbin` already had,
+/// and every later share on that connection failed until a restart.
+#[test]
+fn a_failed_share_leaves_the_answered_section_to_the_next_share() {
+    let peer = answered_peer(PHONE_OFFER);
+    let share = |source| {
+        super::super::screen::DesktopScreenCapture::attach_source(
+            &peer.pipeline,
+            &peer.webrtcbin,
+            source,
+            None,
+            1280,
+            720,
+            super::super::screen::ScreenRequest::FALLBACK,
+            None,
+        )
+    };
+    for _ in 0..2 {
+        let broken = gst::ElementFactory::make("filesrc")
+            .property("location", "/nonexistent/desklink-screen")
+            .build()
+            .unwrap();
+        assert!(share(broken).is_err());
+    }
+    let capture = share(test_source()).expect("the next share attaches");
+    assert!(wait_for_frames(&capture) > 0, "the next share sent nothing");
+    let _ = capture.stop();
+    peer.close();
+}
+
+/// A share's retry never takes or overwrites the capture of a share
+/// that started meanwhile; a first start replaces whatever is there.
+#[test]
+fn a_retry_leaves_a_newer_shares_capture_alone() {
+    assert!(held_by_another_share(Some(2), 1, true));
+    assert!(!held_by_another_share(Some(1), 1, true), "its own");
+    assert!(!held_by_another_share(None, 1, true), "nothing there");
+    assert!(
+        !held_by_another_share(Some(2), 1, false),
+        "a first start replaces"
+    );
+}
+
+/// The section's pad still linked to a chain that never let go of it (a
+/// share that failed or was parked mid-way) must not stop the next share:
+/// asking `webrtcbin` for that pad by name again ("already has a pad named
+/// sink_0") failed every later share on the connection.
+#[test]
+fn a_share_takes_over_the_section_pad_from_a_stale_chain() {
+    let peer = answered_peer(PHONE_OFFER);
+    let stale = gst::ElementFactory::make("fakesrc").build().unwrap();
+    peer.pipeline.add(&stale).unwrap();
+    let pad = peer
+        .webrtcbin
+        .static_pad("sink_0")
+        .or_else(|| peer.webrtcbin.request_pad_simple("sink_0"))
+        .unwrap();
+    stale.static_pad("src").unwrap().link(&pad).unwrap();
+
+    let capture = super::super::screen::DesktopScreenCapture::attach_source(
+        &peer.pipeline,
+        &peer.webrtcbin,
+        test_source(),
+        None,
+        1280,
+        720,
+        super::super::screen::ScreenRequest::FALLBACK,
+        None,
+    )
+    .expect("the share takes the section over");
+    assert!(wait_for_frames(&capture) > 0, "the share sent nothing");
+    assert!(!stale.static_pad("src").unwrap().is_linked());
+    let _ = capture.stop();
+    peer.close();
+}
+
+/// libwebrtc hands out dynamic payload types; VP8 is not always 96. Sending
+/// with the wrong one is a stream the phone silently ignores.
+#[test]
+fn the_screen_chain_uses_the_payload_type_the_phone_offered() {
+    let offer = PHONE_OFFER
+        .replace("SAVPF 96 97", "SAVPF 100 101")
+        .replace("a=rtpmap:96", "a=rtpmap:100")
+        .replace("a=rtcp-fb:96", "a=rtcp-fb:100")
+        .replace("a=rtpmap:97", "a=rtpmap:101")
+        .replace("a=fmtp:97 apt=96", "a=fmtp:101 apt=100");
+    let peer = answered_peer(&offer);
+
+    let capture = super::super::screen::DesktopScreenCapture::attach_source(
+        &peer.pipeline,
+        &peer.webrtcbin,
+        test_source(),
+        None,
+        1280,
+        720,
+        super::super::screen::ScreenRequest::FALLBACK,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(capture.payload_type(), 100);
+    let _ = capture.stop();
+    peer.close();
+}
+
+/// The phone's offer lists its video SSRCs, then its audio SSRC. webrtcbin
+/// gave every new jitterbuffer the `do-nack` of the *last* SSRC listed
+/// (audio's false), so the phone's video was never NACKed: measured live,
+/// lost 489, nack 0, each loss a PLI and a keyframe.
+#[test]
+fn the_phones_video_jitterbuffer_retransmits_and_its_audio_does_not() {
+    let audio = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:Zx4l\r\n\
+a=ice-pwd:Ye1kU7eZ1cTnL7l3fJQ7t0q2\r\n\
+a=ice-options:trickle\r\n\
+a=fingerprint:sha-256 4B:1C:3E:8A:0D:52:97:6F:B3:21:E4:7A:C8:19:5D:F0:2A:66:B1:93:0E:D7:48:AC:35:7B:E2:19:84:CF:60:1D\r\n\
+a=setup:actpass\r\n\
+a=mid:2\r\n\
+a=sendrecv\r\n\
+a=msid:desklink-audio 0b5e2d0c-7f1a-4d2e-9c3b-5a6f7e8d9c0b\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+a=rtcp-fb:111 transport-cc\r\n\
+a=fmtp:111 minptime=10;useinbandfec=1\r\n\
+a=ssrc:3333333333 cname:desklinkphone\r\n\
+a=ssrc:3333333333 msid:desklink-audio 0b5e2d0c-7f1a-4d2e-9c3b-5a6f7e8d9c0b\r\n";
+    let offer = PHONE_OFFER
+        .replace("a=group:BUNDLE 0 1", "a=group:BUNDLE 0 2 1")
+        .replace("m=application", &format!("{audio}m=application"));
+    let peer = answered_peer(&offer);
+    let rtpbin = peer
+        .webrtcbin
+        .downcast_ref::<gst::Bin>()
+        .and_then(|bin| bin.by_name("rtpbin"))
+        .unwrap();
+    let retransmits = |ssrc: u32| {
+        let jitterbuffer = gst::ElementFactory::make("rtpjitterbuffer")
+            .build()
+            .unwrap();
+        rtpbin.emit_by_name::<()>("new-jitterbuffer", &[&jitterbuffer, &0u32, &ssrc]);
+        jitterbuffer.property::<bool>("do-retransmission")
+    };
+    assert!(retransmits(1111111111), "the phone's video is NACKed");
+    assert!(!retransmits(3333333333), "its audio is not");
+    peer.close();
+}
+
+/// F24: a still phone screen is five refinement frames 100 ms apart, then
+/// nothing until the picture changes. The jitterbuffer used to guess the next
+/// packet's arrival, NACK it and declare it lost 40 ms after each pause: a
+/// keyframe request (PLI) per pause with nothing lost, ~1.4 a second. Packets
+/// that all arrive, at the phone's own uneven pace, must report no loss and
+/// ask for no retransmission; a packet really missing must still be lost
+/// (and so still recovered by a keyframe) within a fraction of a second.
+#[test]
+fn a_paused_phone_stream_is_not_lost_and_a_missing_packet_still_is() {
+    use std::sync::atomic::AtomicU32;
+    use std::time::Instant;
+
+    let peer = answered_peer(PHONE_OFFER);
+    let rtpbin = peer
+        .webrtcbin
+        .downcast_ref::<gst::Bin>()
+        .and_then(|bin| bin.by_name("rtpbin"))
+        .unwrap();
+    // As rtpbin configures it for webrtcbin, then the desk's own hook.
+    let jitterbuffer = gst::ElementFactory::make("rtpjitterbuffer")
+        .property("latency", JITTER_BUFFER_LATENCY_MS)
+        .property("do-lost", true)
+        .build()
+        .unwrap();
+    rtpbin.emit_by_name::<()>("new-jitterbuffer", &[&jitterbuffer, &0u32, &1111111111u32]);
+    assert!(jitterbuffer.property::<bool>("do-retransmission"));
+
+    let source = gst::ElementFactory::make("appsrc")
+        .property(
+            "caps",
+            gst::Caps::builder("application/x-rtp")
+                .field("media", "video")
+                .field("clock-rate", 90_000i32)
+                .field("encoding-name", "H264")
+                .field("payload", 96i32)
+                .build(),
+        )
+        .property("is-live", true)
+        .property("do-timestamp", true)
+        .property("format", gst::Format::Time)
+        .build()
+        .unwrap();
+    let sink = gst::ElementFactory::make("fakesink")
+        .property("sync", false)
+        .build()
+        .unwrap();
+    let pipeline = gst::Pipeline::new();
+    pipeline.add_many([&source, &jitterbuffer, &sink]).unwrap();
+    gst::Element::link_many([&source, &jitterbuffer, &sink]).unwrap();
+
+    let (lost, nacked) = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+    let count = |counter: &Arc<AtomicU32>, name: &'static str| {
+        let counter = Arc::clone(counter);
+        move |_: &gst::Pad, info: &mut gst::PadProbeInfo| {
+            if let Some(gst::PadProbeData::Event(event)) = &info.data {
+                if event.structure().is_some_and(|s| s.name() == name) {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        }
+    };
+    jitterbuffer.static_pad("src").unwrap().add_probe(
+        gst::PadProbeType::EVENT_DOWNSTREAM,
+        count(&lost, "GstRTPPacketLost"),
+    );
+    jitterbuffer.static_pad("sink").unwrap().add_probe(
+        gst::PadProbeType::EVENT_UPSTREAM,
+        count(&nacked, "GstRTPRetransmissionRequest"),
+    );
+    pipeline.set_state(gst::State::Playing).unwrap();
+
+    let start = Instant::now();
+    let mut seq: u16 = 1000;
+    // Three packets per frame, the last one marked, sent `at` after start.
+    let mut frame = |at_ms: u64, skip: Option<usize>| {
+        let at = Duration::from_millis(at_ms);
+        if let Some(wait) = at.checked_sub(start.elapsed()) {
+            std::thread::sleep(wait);
+        }
+        let rtp_time = 90_000u32 + at_ms as u32 * 90;
+        for packet in 0..3 {
+            let mut bytes = vec![0x80, 96 | if packet == 2 { 0x80 } else { 0 }];
+            bytes.extend_from_slice(&seq.to_be_bytes());
+            bytes.extend_from_slice(&rtp_time.to_be_bytes());
+            bytes.extend_from_slice(&1111111111u32.to_be_bytes());
+            bytes.extend_from_slice(&[0x41; 200]);
+            seq = seq.wrapping_add(1);
+            if skip != Some(packet) {
+                let _ = source.emit_by_name::<gst::FlowReturn>(
+                    "push-buffer",
+                    &[&gst::Buffer::from_mut_slice(bytes)],
+                );
+            }
+        }
+    };
+    // Two still-screen pauses: refinement bursts at 0 and 700 ms.
+    for burst in [0, 700] {
+        for k in 0..5 {
+            frame(burst + k * 100, None);
+        }
+    }
+    frame(1500, None);
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(
+        (lost.load(Ordering::SeqCst), nacked.load(Ordering::SeqCst)),
+        (0, 0),
+        "nothing was missing: no loss and no retransmission request (lost, nacked)"
+    );
+
+    // A packet really missing: the next one shows the gap.
+    frame(1700, Some(1));
+    frame(1717, None);
+    let deadline = Instant::now() + Duration::from_millis(400);
+    while lost.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        lost.load(Ordering::SeqCst),
+        1,
+        "a missing packet is still lost"
+    );
+    assert!(
+        nacked.load(Ordering::SeqCst) >= 1,
+        "and was asked for first"
+    );
+
+    pipeline.set_state(gst::State::Null).unwrap();
+    peer.close();
+}
+
+// ---- Two real peers connected over loopback --------------------------------
+//
+// Both ends are desktop code, so this proves the desktop's own transport, not
+// cross-stack interop. But it is real ICE, DTLS and SCTP on real `webrtcbin`s,
+// which is what the single-peer tests above cannot reach: with a connected
+// transport nothing parks, so this is where the *connected* shutdown path and
+// steady-state media flow are actually exercised.
+
+/// The far side builds a decode chain for the incoming track and frames
+/// actually decode and reach its display — a track alone is not a picture.
+fn assert_far_side_decodes(
+    events: &mpsc::Receiver<PeerEvent>,
+) -> super::super::screen::ScreenStream {
+    // The far side reports either a working decode chain or *why* it could
+    // not build one; silence would mean nothing arrived at all.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut outcome = None;
+    while outcome.is_none() && std::time::Instant::now() < deadline {
+        match events.recv_timeout(std::time::Duration::from_millis(200)) {
+            Ok(PeerEvent::ScreenStream(stream)) => outcome = Some(Ok(stream)),
+            Ok(PeerEvent::Error(error)) if error.contains("screen") => outcome = Some(Err(error)),
+            _ => {}
+        }
+    }
+    match outcome {
+        Some(Ok(stream)) => {
+            // A track is not a picture: the frames must decode and reach
+            // the display, through the same codec negotiation as a phone.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while stream.frames_shown() < 5 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(
+                stream.frames_shown() >= 5,
+                "the far side decoded {} frames",
+                stream.frames_shown()
+            );
+            stream
+        }
+        Some(Err(error)) => panic!("far side got the track but could not display it: {error}"),
+        None => panic!("the far side never received the video track"),
+    }
+}
+
+/// A capture that ends (here: a source that stops after a few frames; on a
+/// desktop, a PipeWire node that went away) must not EOS webrtcbin's shared
+/// video sink: that ended the screen track, and the next share on the same
+/// connection never reached the far side's picture.
+#[test]
+fn an_ending_capture_never_sends_eos_into_webrtcbin() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let pair = loopback();
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    let watch_eos = |pad: &gst::Pad| {
+        let seen = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&seen);
+        pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+            if let Some(gst::PadProbeData::Event(event)) = &info.data {
+                if event.type_() == gst::EventType::Eos {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+        seen
+    };
+    let source = gst::ElementFactory::make("videotestsrc")
+        .property("is-live", true)
+        .property("num-buffers", 5i32)
+        .build()
+        .unwrap();
+    let ended = watch_eos(&source.static_pad("src").unwrap());
+    let share = |source| {
+        super::super::screen::DesktopScreenCapture::attach_source(
+            &pair.answerer.pipeline,
+            &pair.answerer.webrtcbin,
+            source,
+            None,
+            640,
+            360,
+            super::super::screen::ScreenRequest::FALLBACK,
+            Some(pair.answerer.screen_continuity()),
+        )
+        .unwrap()
+    };
+    let first = share(source);
+    let reached: Vec<_> = pair
+        .answerer
+        .webrtcbin
+        .sink_pads()
+        .iter()
+        .map(watch_eos)
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !ended.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(ended.load(Ordering::SeqCst), "the first capture ended");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        !reached.iter().any(|seen| seen.load(Ordering::SeqCst)),
+        "EOS reached webrtcbin's video sink"
+    );
+    let _ = first.stop();
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// Reopening Remote input starts a second share on the same connection.
+/// It must reach the picture the far side already shows: with a fresh
+/// SSRC per share it was a stranger to a phone that had bound its picture
+/// to the first one, and the phone sat on "waiting for the first picture".
+#[test]
+fn a_second_share_on_the_same_connection_reaches_the_same_picture() {
+    let pair = loopback();
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    let share = || {
+        super::super::screen::DesktopScreenCapture::attach_source(
+            &pair.answerer.pipeline,
+            &pair.answerer.webrtcbin,
+            test_source(),
+            None,
+            1280,
+            720,
+            super::super::screen::ScreenRequest::FALLBACK,
+            Some(pair.answerer.screen_continuity()),
+        )
+        .unwrap()
+    };
+    let first = share();
+    let stream = assert_far_side_decodes(&pair.offerer_events);
+    pair.answerer.stop_or_retire(first);
+    assert!(
+        pair.answerer.screen_continuity().resume.is_some(),
+        "a share that sent packets knows where to continue"
+    );
+    assert!(pair.answerer.retired_captures.lock().unwrap().is_empty());
+
+    let before = stream.frames_shown();
+    let second = share();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while stream.frames_shown() < before + 10 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        stream.frames_shown() >= before + 10,
+        "the second share never reached the far side's picture ({} -> {})",
+        before,
+        stream.frames_shown()
+    );
+    assert!(second.stop().is_ok());
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// The phone's keyframe request (PLI) must reach the encoder and be
+/// answered, on a second share too (same SSRC, continued sequence
+/// numbers): a decoder that lost its picture shows nothing until a
+/// keyframe comes.
+#[test]
+fn a_keyframe_request_from_the_far_side_is_answered_on_a_second_share() {
+    let pair = loopback();
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while !pair.answerer.media_ready() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        pair.answerer.media_ready(),
+        "a connected peer with its channels open is ready for media"
+    );
+    let share = || {
+        super::super::screen::DesktopScreenCapture::attach_source(
+            &pair.answerer.pipeline,
+            &pair.answerer.webrtcbin,
+            test_source(),
+            None,
+            1280,
+            720,
+            super::super::screen::ScreenRequest::FALLBACK,
+            Some(pair.answerer.screen_continuity()),
+        )
+        .unwrap()
+    };
+    let first = share();
+    let stream = assert_far_side_decodes(&pair.offerer_events);
+    pair.answerer.stop_or_retire(first);
+    let second = share();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while second.frames_sent() == 0 && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let (requests, keyframes) = second.key_counts();
+    // Asked again until both counts move (a loaded machine takes its
+    // time); the decoder's own throttle allows two a second.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let (requests_after, keyframes_after) = loop {
+        assert!(stream.request_keyframe(), "the far side could not ask");
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        let (now_requests, now_keyframes) = second.key_counts();
+        if (now_requests > requests && now_keyframes > keyframes)
+            || std::time::Instant::now() > deadline
+        {
+            break (now_requests, now_keyframes);
+        }
+    };
+    assert!(
+        requests_after > requests,
+        "no keyframe request reached the encoder ({requests} -> {requests_after})"
+    );
+    assert!(
+        keyframes_after > keyframes,
+        "the encoder made no keyframe for the request ({keyframes} -> {keyframes_after})"
+    );
+    assert!(second.stop().is_ok());
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// The bitrate controller runs per share and steers by the far side's
+/// receiver reports. A share reopened more than 5 s after the last one got
+/// none for its whole life (F12): the idle screen SSRC timed out as a
+/// sender, `webrtcbin` dropped it from its stats, and never took the
+/// reused SSRC back. So the second share opens after that timeout here,
+/// and must still get reports and raise its bitrate on a clean link.
+#[test]
+fn a_second_share_on_one_connection_adapts_its_bitrate() {
+    let pair = loopback();
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    let share = || {
+        super::super::screen::DesktopScreenCapture::attach_source(
+            &pair.answerer.pipeline,
+            &pair.answerer.webrtcbin,
+            test_source(),
+            None,
+            1280,
+            720,
+            super::super::screen::ScreenRequest::FALLBACK,
+            Some(pair.answerer.screen_continuity()),
+        )
+        .unwrap()
+    };
+    let first = share();
+    let _stream = assert_far_side_decodes(&pair.offerer_events);
+    pair.answerer.stop_or_retire(first);
+    // Longer than rtpsession's sender timeout (5 s at the least).
+    std::thread::sleep(std::time::Duration::from_secs(7));
+    let second = share();
+    let start = second.encoder_bitrate().expect("a VP8 encoder");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while second.encoder_bitrate() <= Some(start) && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        second.encoder_bitrate() > Some(start),
+        "the second share's bitrate never moved from {start}"
+    );
+    let _ = second.stop();
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// One screen packet as `webrtcbin` is handed it: sequence number, RTP
+/// timestamp, SSRC, VP8 picture id, and whether it starts a keyframe.
+fn vp8_packet(data: &[u8]) -> Option<(u16, u32, u32, Option<u16>, bool)> {
+    let word = |at: usize| {
+        data.get(at..at + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let seq = u16::from_be_bytes([*data.get(2)?, *data.get(3)?]);
+    let (ts, ssrc) = (word(4)?, word(8)?);
+    let mut at = 12 + 4 * usize::from(data[0] & 0x0f);
+    if data[0] & 0x10 != 0 {
+        let words = u16::from_be_bytes([*data.get(at + 2)?, *data.get(at + 3)?]);
+        at += 4 + 4 * usize::from(words);
+    }
+    // RFC 7741 payload descriptor.
+    let first = *data.get(at)?;
+    let start = first & 0x10 != 0 && first & 0x07 == 0;
+    at += 1;
+    let mut picture_id = None;
+    if first & 0x80 != 0 {
+        let flags = *data.get(at)?;
+        at += 1;
+        if flags & 0x80 != 0 {
+            let high = *data.get(at)?;
+            if high & 0x80 != 0 {
+                picture_id = Some(u16::from(high & 0x7f) << 8 | u16::from(*data.get(at + 1)?));
+                at += 2;
+            } else {
+                picture_id = Some(u16::from(high));
+                at += 1;
+            }
+        }
+        at += usize::from(flags & 0x40 != 0) + usize::from(flags & 0x30 != 0);
+    }
+    // The VP8 payload header's P bit is 0 on a keyframe.
+    let keyframe = start && data.get(at)? & 0x01 == 0;
+    Some((seq, ts, ssrc, picture_id, keyframe))
+}
+
+/// Opening the desk's screen again and again on one connection (and
+/// switching between Mirror and Extend, a new share at a new size) must
+/// show a picture every time. To the phone it is one stream: libwebrtc
+/// drops every frame whose VP8 picture id is not after the last one it
+/// decoded, and lets a keyframe jump back only with a newer timestamp.
+/// Each share's payloader started at a random picture id and timestamp,
+/// so about half of the reopened views never showed a picture (F8). So
+/// every share starts with a keyframe whose sequence number, picture id
+/// and timestamp carry on just after the previous share's last packet,
+/// and reaches the far side's picture.
+#[test]
+fn every_share_on_one_connection_carries_the_picture_stream_on() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let pair = loopback();
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    let share = |(width, height)| {
+        super::super::screen::DesktopScreenCapture::attach_source(
+            &pair.answerer.pipeline,
+            &pair.answerer.webrtcbin,
+            test_source(),
+            None,
+            width,
+            height,
+            super::super::screen::ScreenRequest::FALLBACK,
+            Some(pair.answerer.screen_continuity()),
+        )
+        .unwrap()
+    };
+    let current = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut capture = share((1280, 720));
+    let stream = assert_far_side_decodes(&pair.offerer_events);
+    let ssrc = pair.answerer.screen_ssrc;
+    for pad in pair.answerer.webrtcbin.sink_pads() {
+        let (current, seen) = (Arc::clone(&current), Arc::clone(&seen));
+        pad.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+            move |_, info| {
+                let note = |buffer: &gst::BufferRef| {
+                    let Ok(map) = buffer.map_readable() else {
+                        return;
+                    };
+                    // Never unwrap here: a panic on a streaming thread
+                    // aborts the whole test process, and the lock is
+                    // poisoned whenever the test thread fails holding it.
+                    if let Some(packet) = vp8_packet(&map).filter(|p| p.2 == ssrc) {
+                        if let Ok(mut seen) = seen.lock() {
+                            seen.push((current.load(Ordering::SeqCst), packet));
+                        }
+                    }
+                };
+                match &info.data {
+                    Some(gst::PadProbeData::Buffer(buffer)) => note(buffer),
+                    Some(gst::PadProbeData::BufferList(list)) => list.iter().for_each(note),
+                    _ => {}
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+    }
+    // Mirror at the laptop's size, Extend at the phone's, and back.
+    let sizes = [(1280, 720), (960, 540)];
+    for index in 1..10 {
+        // The share has sent packets past the probe before it is
+        // switched (a fixed 300 ms saw none of them on a loaded machine).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let shown = std::time::Instant::now();
+        while !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(share, _)| *share == index - 1)
+        {
+            assert!(
+                shown.elapsed() < std::time::Duration::from_secs(60),
+                "share {}: no packets past the probe",
+                index - 1
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        pair.answerer.stop_or_retire(capture);
+        current.store(index, Ordering::SeqCst);
+        let before = stream.frames_shown();
+        let opened = std::time::Instant::now();
+        capture = share(sizes[index % 2]);
+        while stream.frames_shown() < before + 10
+            && opened.elapsed() < std::time::Duration::from_secs(60)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            stream.frames_shown() >= before + 10,
+            "share {index} never reached the far side's picture"
+        );
+        let packets = seen.lock().unwrap();
+        let last = packets.iter().rev().find(|(share, _)| *share == index - 1);
+        let first = packets.iter().find(|(share, _)| *share == index);
+        let (Some((_, last)), Some((_, first))) = (last, first) else {
+            panic!("share {index}: no packets seen around the switch");
+        };
+        assert!(first.4, "share {index} does not start with a keyframe");
+        let seq_step = first.0.wrapping_sub(last.0);
+        assert!(
+            (1..64).contains(&seq_step),
+            "share {index}: sequence {} after {}",
+            first.0,
+            last.0
+        );
+        let (Some(id), Some(last_id)) = (first.3, last.3) else {
+            panic!("share {index}: no VP8 picture ids");
+        };
+        let id_step = id.wrapping_sub(last_id) & 0x7fff;
+        assert!(
+            (1..8).contains(&id_step),
+            "share {index}: picture id {id} after {last_id}"
+        );
+        let ts_step = first.1.wrapping_sub(last.1);
+        assert!(
+            ts_step > 0 && ts_step < 90_000 * 5,
+            "share {index}: timestamp {} after {}",
+            first.1,
+            last.1
+        );
+    }
+    assert!(pair.answerer.retired_captures.lock().unwrap().is_empty());
+    let _ = capture.stop();
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// A capture that fails to start (as a PipeWire stream that would not
+/// negotiate did) must leave the screen track usable: the next share
+/// reaches the far side's picture.
+#[test]
+fn a_failed_capture_leaves_the_screen_track_for_the_next_share() {
+    let pair = loopback();
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    let share = |source| {
+        super::super::screen::DesktopScreenCapture::attach_source(
+            &pair.answerer.pipeline,
+            &pair.answerer.webrtcbin,
+            source,
+            None,
+            1280,
+            720,
+            super::super::screen::ScreenRequest::FALLBACK,
+            Some(pair.answerer.screen_continuity()),
+        )
+    };
+    // Cannot start: its file does not exist.
+    let broken = gst::ElementFactory::make("filesrc")
+        .property("location", "/nonexistent/desklink-screen")
+        .build()
+        .unwrap();
+    assert!(share(broken).is_err());
+    let working = share(test_source()).unwrap();
+    let stream = assert_far_side_decodes(&pair.offerer_events);
+    assert!(stream.frames_shown() > 0);
+    assert!(working.stop().is_ok());
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+pub(crate) struct Loopback {
+    pub(crate) offerer: Arc<DesktopWebRtcPeer>,
+    pub(crate) answerer: Arc<DesktopWebRtcPeer>,
+    pub(crate) offerer_events: mpsc::Receiver<PeerEvent>,
+    pub(crate) answerer_events: mpsc::Receiver<PeerEvent>,
+    _watchdog: Watchdog,
+}
+
+/// How long a loopback test may take before the run is stopped. Tests
+/// take seconds; this is for a GStreamer deadlock (a state change
+/// waiting on a blocked streaming thread), which otherwise hangs the
+/// whole suite with nothing to say which test.
+const LOOPBACK_LIMIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Ends the test run, naming the test, if it outlives its limit; the
+/// test ending (the loopback dropped) disarms it.
+struct Watchdog(Arc<std::sync::atomic::AtomicBool>);
+
+impl Watchdog {
+    fn start(limit: std::time::Duration) -> Self {
+        use std::sync::atomic::Ordering;
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let test = std::thread::current()
+            .name()
+            .unwrap_or("a loopback test")
+            .to_string();
+        let watching = Arc::clone(&done);
+        std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + limit;
+            while std::time::Instant::now() < deadline {
+                if watching.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            eprintln!("{test} hung for {limit:?}: stopping the test run");
+            std::process::abort();
+        });
+        Self(done)
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Wires two peers together: signalling events from each are applied to the
+/// other, everything else is handed to the test.
+pub(crate) fn loopback() -> Loopback {
+    loopback_with(true, |_, sdp| sdp.to_string())
+}
+
+/// A loopback whose descriptions pass through `munge` on the way across
+/// (to stand in for an older phone), and whose offerer adds the audio
+/// section only with `offer_audio`.
+pub(crate) fn loopback_with(
+    offer_audio: bool,
+    munge: fn(SignalingMessageType, &str) -> String,
+) -> Loopback {
+    loopback_via(offer_audio, munge, None)
+}
+
+/// A loopback whose every packet crosses `chaos` (see
+/// [`super::super::chaos`]).
+pub(crate) fn loopback_through(chaos: &Arc<super::super::chaos::Chaos>) -> Loopback {
+    loopback_via(
+        true,
+        |_, sdp| super::super::chaos::without_candidates(sdp),
+        Some(Arc::clone(chaos)),
+    )
+}
+
+fn loopback_via(
+    offer_audio: bool,
+    munge: fn(SignalingMessageType, &str) -> String,
+    chaos: Option<Arc<super::super::chaos::Chaos>>,
+) -> Loopback {
+    let watchdog = Watchdog::start(LOOPBACK_LIMIT);
+    let relay = move |candidate: &str| match &chaos {
+        Some(chaos) => chaos.relay_candidate(candidate),
+        None => Some(candidate.to_string()),
+    };
+    let relay = Arc::new(relay);
+    let ice = IceServerConfig {
+        local_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+        ..IceServerConfig::default()
+    };
+    let (offerer_tx, offerer_raw) = mpsc::channel();
+    let (answerer_tx, answerer_raw) = mpsc::channel();
+    NO_AUDIO_SECTION.with(|flag| flag.set(!offer_audio));
+    let offerer = DesktopWebRtcPeer::new(true, offerer_tx, &ice);
+    NO_AUDIO_SECTION.with(|flag| flag.set(false));
+    let offerer = Arc::new(offerer.unwrap());
+    let answerer = Arc::new(DesktopWebRtcPeer::new(false, answerer_tx, &ice).unwrap());
+    let (offerer_app_tx, offerer_events) = mpsc::channel();
+    let (answerer_app_tx, answerer_events) = mpsc::channel();
+
+    let to = Arc::clone(&answerer);
+    let relay_o = Arc::clone(&relay);
+    std::thread::spawn(move || {
+        let relay = relay_o;
+        while let Ok(event) = offerer_raw.recv() {
+            if std::env::var("LOOPBACK_TRACE").is_ok() {
+                debug_log!("OFFERER event: {:?}", event);
+            }
+            match event {
+                PeerEvent::LocalDescription { message_type, sdp } => {
+                    let _ = to.set_remote_description(message_type, &munge(message_type, &sdp));
+                }
+                PeerEvent::IceCandidate {
+                    sdp_m_line_index,
+                    candidate,
+                } => {
+                    if let Some(candidate) = relay(&candidate) {
+                        let _ = to.add_ice_candidate(sdp_m_line_index, &candidate);
+                    }
+                }
+                PeerEvent::EndOfCandidates => to.end_of_candidates(0),
+                other => {
+                    // Ends with its peer: the threads hold each other's
+                    // peer, so neither would ever be freed otherwise.
+                    let closed = matches!(other, PeerEvent::Closed);
+                    let _ = offerer_app_tx.send(other);
+                    if closed {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    let to = Arc::clone(&offerer);
+    std::thread::spawn(move || {
+        while let Ok(event) = answerer_raw.recv() {
+            if std::env::var("LOOPBACK_TRACE").is_ok() {
+                debug_log!("ANSWERER event: {:?}", event);
+            }
+            match event {
+                PeerEvent::LocalDescription { message_type, sdp } => {
+                    let _ = to.set_remote_description(message_type, &munge(message_type, &sdp));
+                }
+                PeerEvent::IceCandidate {
+                    sdp_m_line_index,
+                    candidate,
+                } => {
+                    if let Some(candidate) = relay(&candidate) {
+                        let _ = to.add_ice_candidate(sdp_m_line_index, &candidate);
+                    }
+                }
+                PeerEvent::EndOfCandidates => to.end_of_candidates(0),
+                other => {
+                    // Ends with its peer: the threads hold each other's
+                    // peer, so neither would ever be freed otherwise.
+                    let closed = matches!(other, PeerEvent::Closed);
+                    let _ = answerer_app_tx.send(other);
+                    if closed {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    offerer.create_offer().unwrap();
+    Loopback {
+        offerer,
+        answerer,
+        offerer_events,
+        answerer_events,
+        _watchdog: watchdog,
+    }
+}
+
+/// Waits until every channel in `channels` is open on the peer whose events
+/// are `events`. Open notifications arrive in any order, so waiting for them
+/// one at a time loses the ones that came early.
+pub(crate) fn wait_for_channels(events: &mpsc::Receiver<PeerEvent>, channels: &[WebRtcChannel]) {
+    let mut pending: Vec<WebRtcChannel> = channels.to_vec();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !pending.is_empty() {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match events.recv_timeout(remaining) {
+            Ok(PeerEvent::ChannelOpened(opened)) => pending.retain(|c| *c != opened),
+            Ok(PeerEvent::Error(error)) => panic!("peer error while connecting: {error}"),
+            Ok(_) => {}
+            Err(_) => panic!("{pending:?} never opened over loopback"),
+        }
+    }
+}
+
+/// A computer without the WebRTC plugins is told so in words naming what to
+/// install; one with them hears nothing.
+#[test]
+fn missing_gstreamer_plugins_are_named_in_plain_words() {
+    let has_all = |_: &str| true;
+    assert!(missing_elements(has_all).is_empty());
+    assert_eq!(missing_words(&[]), None);
+    let without_nice = |name: &str| name != "nicesrc" && name != "webrtcbin";
+    let missing = missing_elements(without_nice);
+    assert_eq!(missing, ["webrtcbin", "nicesrc"]);
+    let words = missing_words(&missing).unwrap();
+    assert!(words.starts_with("DeskLink needs the GStreamer WebRTC plugins"));
+    assert!(words.contains("gst-plugins-bad") && words.contains("libnice"));
+    assert!(words.contains("webrtcbin, nicesrc"));
+    // This machine has them (the loopback tests need them).
+    assert_eq!(plugin_problem(), None);
+}
+
+/// `(threads, open fds)` of this process.
+pub(crate) fn process_counts() -> (usize, usize) {
+    let count = |path: &str| std::fs::read_dir(path).map_or(0, Iterator::count);
+    (count("/proc/self/task"), count("/proc/self/fd"))
+}
+
+fn lone_peer() -> (DesktopWebRtcPeer, mpsc::Receiver<PeerEvent>) {
+    let ice = IceServerConfig {
+        local_ips: vec![std::net::IpAddr::from([127, 0, 0, 1])],
+        ..IceServerConfig::default()
+    };
+    let (events, receiver) = mpsc::channel();
+    (
+        DesktopWebRtcPeer::new(true, events, &ice).expect("a peer builds"),
+        receiver,
+    )
+}
+
+/// The pipeline of a closed, dropped peer is finalized: nothing it made
+/// (the `pad-added` closure above all) keeps it alive. A replaced peer used
+/// to keep its whole pipeline, ICE agent, sockets and threads for ever.
+#[test]
+fn a_closed_peer_frees_its_pipeline() {
+    let (peer, _events) = lone_peer();
+    let pipeline = peer.pipeline.downgrade();
+    let webrtcbin = peer.webrtcbin.downgrade();
+    assert!(pipeline.upgrade().is_some());
+    peer.close();
+    drop(peer);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while (pipeline.upgrade().is_some() || webrtcbin.upgrade().is_some())
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(pipeline.upgrade().is_none(), "the pipeline leaked");
+    assert!(webrtcbin.upgrade().is_none(), "webrtcbin leaked");
+}
+
+/// The tests that count the process's threads and descriptors, and the one
+/// that makes a hundred pairs, take turns.
+pub(crate) static HEAVY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Fifty peers built and closed one after another leave the process with
+/// the threads and file descriptors it started with (a leaked peer cost a
+/// thread and ten descriptors each, so about a hundred rebuilds reached
+/// the 1024-descriptor limit).
+#[test]
+fn fifty_rebuilds_do_not_grow_threads_or_descriptors() {
+    // Not beside the teardown stress test, whose threads would count.
+    let _alone = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
+    // One to settle process-wide singletons (GStreamer, libnice).
+    drop(lone_peer());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let (threads, fds) = process_counts();
+    for _ in 0..50 {
+        let (peer, _events) = lone_peer();
+        peer.close();
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let (mut grown_threads, mut grown_fds);
+    loop {
+        let (now_threads, now_fds) = process_counts();
+        grown_threads = now_threads.saturating_sub(threads);
+        grown_fds = now_fds.saturating_sub(fds);
+        // Other tests run beside this one: allow their noise, not 50 leaks.
+        if (grown_threads <= 20 && grown_fds <= 60) || std::time::Instant::now() > deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    eprintln!("[test] after 50 peers: +{grown_threads} threads, +{grown_fds} fds");
+    assert!(grown_threads <= 20, "+{grown_threads} threads");
+    assert!(grown_fds <= 60, "+{grown_fds} descriptors");
+}
+
+/// What a description says about the largest data-channel message: both
+/// sides advertise 256 KiB, the most libwebrtc allows.
+fn advertise_256_kib(_: SignalingMessageType, sdp: &str) -> String {
+    let mut text = sdp.trim_end().to_string();
+    text.push_str("\r\na=max-message-size:262144\r\n");
+    text
+}
+
+/// **The measurement behind the file frame size.** The plan was 192 KiB
+/// frames if 256 KiB messages crossed intact; they cannot: GStreamer's
+/// `webrtcbin` keeps the SCTP transport's `max-message-size` at 65 536
+/// (it follows a *smaller* advertised value, never a larger one), and a
+/// send over that fails locally. The file protocol therefore keeps its
+/// 60 KiB frames. If a GStreamer upgrade lifts the limit this fails, and
+/// the frame size can be reconsidered (with a phone to prove the other
+/// direction).
+#[test]
+fn webrtcbin_never_carries_a_data_channel_message_over_64_kib() {
+    let pair = loopback_with(true, advertise_256_kib);
+    wait_for_channels(&pair.offerer_events, &[WebRtcChannel::FileData]);
+    wait_for_channels(&pair.answerer_events, &[WebRtcChannel::FileData]);
+    for peer in [&pair.offerer, &pair.answerer] {
+        let transport = peer
+            .webrtcbin
+            .property::<Option<gst_webrtc::WebRTCSCTPTransport>>("sctp-transport")
+            .expect("an SCTP transport");
+        assert_eq!(transport.max_message_size(), 65_536);
+    }
+    let channel = pair
+        .offerer
+        .channels
+        .lock()
+        .unwrap()
+        .get(&WebRtcChannel::FileData)
+        .cloned()
+        .unwrap();
+    let big = gst::glib::Bytes::from_owned(vec![1u8; 196_608]);
+    assert!(
+        channel.send_data_full(Some(&big)).is_err(),
+        "192 KiB is refused"
+    );
+    let fits = gst::glib::Bytes::from_owned(vec![1u8; 61_440]);
+    assert!(channel.send_data_full(Some(&fits)).is_ok(), "60 KiB goes");
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// Waits until `channel` is open on the peer whose events are `events`.
+pub(crate) fn wait_for_channel(events: &mpsc::Receiver<PeerEvent>, channel: WebRtcChannel) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match events.recv_timeout(remaining) {
+            Ok(PeerEvent::ChannelOpened(opened)) if opened == channel => return,
+            Ok(PeerEvent::Error(error)) => panic!("peer error while connecting: {error}"),
+            Ok(_) => {}
+            Err(_) => panic!("{channel:?} never opened over loopback"),
+        }
+    }
+}
+
+/// Waits for the next `Envelope` on `channel`.
+fn next_envelope(events: &mpsc::Receiver<PeerEvent>, channel: WebRtcChannel) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match events.recv_timeout(remaining) {
+            Ok(PeerEvent::Envelope {
+                channel: got,
+                bytes,
+                ..
+            }) if got == channel => return bytes,
+            Ok(_) => {}
+            Err(_) => panic!("no message arrived on {channel:?}"),
+        }
+    }
+}
+
+/// Stamped with the pipeline's running time, as `pipewiresrc` is in use
+/// (`do-timestamp`), and like it never waiting on the clock itself: a
+/// live `audiotestsrc` started on a running connection often sat in its
+/// own clock wait after two buffers, which `pipewiresrc` (pushed by
+/// PipeWire) never does. Bounded, so it cannot run on.
+fn audio_source() -> gst::Element {
+    gst::ElementFactory::make("audiotestsrc")
+        .property("is-live", false)
+        .property("do-timestamp", true)
+        .property("samplesperbuffer", 480i32)
+        .property("num-buffers", 2_000i32)
+        .build()
+        .unwrap()
+}
+
+/// Waits until `peer` has an incoming audio pad, then plays it.
+fn play_when_audio_arrives(peer: &DesktopWebRtcPeer) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while peer.audio_pad.lock().unwrap().is_none() {
+        assert!(std::time::Instant::now() < deadline, "no audio pad arrived");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    peer.start_audio_playback(super::super::audio::Output::Speakers, "test")
+        .unwrap();
+}
+
+fn wait_for_audio(peer: &DesktopWebRtcPeer) -> u64 {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let received = peer.audio_received();
+        if received > 20 || std::time::Instant::now() > deadline {
+            return received;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// The phone's `audio-ready` comes before its first packet: playback
+/// asked for then starts when the stream arrives.
+#[test]
+fn sound_asked_for_before_it_arrives_plays_when_it_does() {
+    let pair = loopback();
+    wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    assert!(pair.answerer.audio_pad.lock().unwrap().is_none());
+    pair.answerer
+        .start_audio_playback(super::super::audio::Output::Speakers, "test")
+        .unwrap();
+    pair.offerer
+        .start_audio_send_from(super::super::audio::Source::System, audio_source())
+        .unwrap();
+    assert!(wait_for_audio(&pair.answerer) > 20, "nothing played");
+}
+
+/// F1 latency over loopback: each RTP packet's time from the payloader
+/// to the far side's webrtcbin output (SRTP, ICE, jitter buffer). Run by
+/// hand: `cargo test sound_latency -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn sound_latency_over_loopback() {
+    use std::collections::HashMap;
+    use std::time::Instant;
+    type Stamps = Arc<Mutex<HashMap<u16, Instant>>>;
+    fn seqnum(buffer: &gst::BufferRef) -> Option<u16> {
+        let map = buffer.map_readable().ok()?;
+        (map.len() > 4).then(|| u16::from_be_bytes([map[2], map[3]]))
+    }
+    fn stamp(pad: &gst::Pad, stamps: Stamps) {
+        pad.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+            move |_, info| {
+                let now = Instant::now();
+                let mut stamps = stamps
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                match &info.data {
+                    Some(gst::PadProbeData::Buffer(buffer)) => {
+                        if let Some(seq) = seqnum(buffer) {
+                            stamps.entry(seq).or_insert(now);
+                        }
+                    }
+                    Some(gst::PadProbeData::BufferList(list)) => {
+                        for buffer in list.iter() {
+                            if let Some(seq) = seqnum(buffer) {
+                                stamps.entry(seq).or_insert(now);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+    }
+    let pair = loopback();
+    wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    let ticks = audio_source();
+    ticks.set_property_from_str("wave", "ticks");
+    pair.offerer
+        .start_audio_send_from(super::super::audio::Source::System, ticks)
+        .unwrap();
+    play_when_audio_arrives(&pair.answerer);
+    let (sent, heard): (Stamps, Stamps) = Default::default();
+    let sink = pair
+        .offerer
+        .webrtcbin
+        .sink_pads()
+        .into_iter()
+        .find(|pad| {
+            pad.peer()
+                .and_then(|peer| peer.parent_element())
+                .and_then(|element| element.factory())
+                .is_some_and(|factory| factory.name() == "rtpopuspay")
+        })
+        .unwrap();
+    stamp(&sink, Arc::clone(&sent));
+    stamp(
+        &pair.answerer.audio_pad.lock().unwrap().clone().unwrap(),
+        Arc::clone(&heard),
+    );
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let (sent, heard) = (sent.lock().unwrap(), heard.lock().unwrap());
+    let mut delays: Vec<f64> = heard
+        .iter()
+        .filter_map(|(seq, at)| Some(at.duration_since(*sent.get(seq)?).as_secs_f64() * 1e3))
+        .collect();
+    delays.sort_by(f64::total_cmp);
+    assert!(delays.len() > 100, "only {} packets matched", delays.len());
+    let at = |q: f64| delays[((delays.len() - 1) as f64 * q) as usize];
+    eprintln!(
+        "SOUND LATENCY {} packets: median {:.2} ms, p95 {:.2} ms, max {:.2} ms",
+        delays.len(),
+        at(0.5),
+        at(0.95),
+        at(1.0)
+    );
+}
+
+/// Phone→desk screen over loopback, measured. Run by hand:
+/// `cargo test phone_screen_over_loopback -- --ignored --nocapture`
+/// (`DESKLINK_P2D_FPS`, default 60; `DESKLINK_P2D_KBPS`, default 8000;
+/// `DESKLINK_P2D_REFINE`, repeats of a still picture, default 5).
+///
+/// A phone-sized capture (864x1920, what the phone sends of a 1080x2400
+/// panel) of small glyph-like strokes, still and then scrolling at
+/// 720 px/s, encoded by x264 as a stand-in for the phone's hardware H.264
+/// (constrained baseline, no B-frames, zero latency), through this desk's
+/// own receive chain: SRTP, ICE, jitter buffer, decodebin, conversion.
+/// Like a phone's capture, a still screen sends nothing but the
+/// refinement repeats (100 ms apart) of its first still frame.
+/// Each frame carries its number in a strip of black and white blocks,
+/// read back where frames enter the display sink: latency from encoder
+/// input to decoded picture per frame, and the luma PSNR of what arrived.
+#[test]
+#[ignore]
+fn phone_screen_over_loopback() {
+    use gst_video::prelude::*;
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+    const W: usize = 864;
+    const H: usize = 1920;
+    const TALL: usize = H * 2;
+    const BLOCK: usize = 32;
+    const BITS: usize = 16;
+    let env = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let fps = env("DESKLINK_P2D_FPS", 60);
+    let kbps = env("DESKLINK_P2D_KBPS", 8000) as u32;
+    let refine = env("DESKLINK_P2D_REFINE", 5);
+    // Whether frame `n` is captured: always while it moves (and in the
+    // first second, the stream starting); when still, its first frame
+    // and the refinement repeats.
+    let captured = move |n: usize| {
+        let at = n % (4 * fps);
+        let still = if at < fps {
+            at
+        } else {
+            at.saturating_sub(3 * fps)
+        };
+        n < fps
+            || (fps..3 * fps).contains(&at)
+            || (still % (fps / 10) == 0 && still / (fps / 10) <= refine)
+    };
+
+    // Rows of 2 px strokes in 12x28 cells: text-sized detail.
+    let mut seed = 0x2545_f491u32;
+    let mut rand = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed as usize
+    };
+    let mut page = vec![235u8; W * TALL];
+    for row in (BLOCK + 8..TALL - 28).step_by(28) {
+        for col in (16..W - 28).step_by(12) {
+            if rand() % 6 == 0 {
+                continue;
+            }
+            for _ in 0..3 {
+                let r = rand();
+                let (x0, y0, len) = (col + r % 8, row + (r >> 3) % 14, 3 + (r >> 7) % 8);
+                for step in 0..len {
+                    for thick in 0..2 {
+                        let (x, y) = if r & 0x1000 != 0 {
+                            (x0 + step.min(9), y0 + thick)
+                        } else {
+                            (x0 + thick, y0 + step)
+                        };
+                        page[y * W + x] = 30;
+                    }
+                }
+            }
+        }
+    }
+    let page = Arc::new(page);
+    let frame_luma = move |n: usize| {
+        let period = 4 * fps;
+        let step = 720 / fps;
+        let at = n % period;
+        let offset = if at < fps {
+            0
+        } else if at < 3 * fps {
+            (at - fps) * step
+        } else {
+            2 * fps * step
+        };
+        let mut luma = page[offset * W..(offset + H) * W].to_vec();
+        for bit in 0..BITS {
+            let value = if n >> bit & 1 == 1 { 235 } else { 16 };
+            for y in 0..BLOCK {
+                luma[y * W + bit * BLOCK..y * W + (bit + 1) * BLOCK].fill(value);
+            }
+        }
+        (luma, at >= fps && at < 3 * fps)
+    };
+
+    let pair = loopback();
+    wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    let sender = &pair.answerer;
+    let make = |name: &str| gst::ElementFactory::make(name).build().unwrap();
+    let source = gst::ElementFactory::make("appsrc")
+        .property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("format", "I420")
+                .field("width", W as i32)
+                .field("height", H as i32)
+                .field("framerate", gst::Fraction::new(fps as i32, 1))
+                .build(),
+        )
+        .property("is-live", true)
+        .property("format", gst::Format::Time)
+        .build()
+        .unwrap();
+    let encoder = make("x264enc");
+    encoder.set_property_from_str("tune", "zerolatency");
+    encoder.set_property_from_str("speed-preset", "superfast");
+    encoder.set_property("bitrate", kbps);
+    encoder.set_property("key-int-max", (fps * 20) as u32);
+    let profile = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gst::Caps::builder("video/x-h264")
+                .field("profile", "constrained-baseline")
+                .build(),
+        )
+        .build()
+        .unwrap();
+    let payloader = make("rtph264pay");
+    payloader.set_property_from_str("aggregate-mode", "zero-latency");
+    payloader.set_property("config-interval", -1i32);
+    payloader.set_property("mtu", 1200u32);
+    let payload = super::super::screen::negotiated_payload_in(&sender.webrtcbin, "video", "H264")
+        .expect("H.264 negotiated");
+    payloader.set_property("pt", payload);
+    let chain = [&source, &encoder, &profile, &payloader];
+    sender.pipeline.add_many(chain).unwrap();
+    gst::Element::link_many(chain).unwrap();
+    let mline = super::super::screen::negotiated_video_mline(&sender.webrtcbin).unwrap();
+    let sink = super::super::screen::section_pad(&sender.webrtcbin, mline).unwrap();
+    payloader.static_pad("src").unwrap().link(&sink).unwrap();
+    for element in chain.iter().rev() {
+        element.sync_state_with_parent().unwrap();
+    }
+
+    let base_ns = sender
+        .pipeline
+        .current_running_time()
+        .map_or(0, |time| time.nseconds())
+        + 200_000_000;
+    type Times = Arc<Mutex<HashMap<usize, Instant>>>;
+    let (sent, encoded, shown): (Times, Times, Times) = Default::default();
+    let frame_ns = 1_000_000_000 / fps as u64;
+    {
+        let encoded = Arc::clone(&encoded);
+        encoder
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data {
+                    if let Some(pts) = buffer.pts() {
+                        let n = (pts.nseconds().saturating_sub(base_ns) + frame_ns / 2) / frame_ns;
+                        encoded
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .entry(n as usize)
+                            .or_insert_with(Instant::now);
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            });
+    }
+    let seconds = 8;
+    let total = seconds * fps;
+    let pusher = {
+        let (source, sent, frame_luma) = (source.clone(), Arc::clone(&sent), frame_luma.clone());
+        std::thread::spawn(move || {
+            let start = Instant::now();
+            for n in 0..total {
+                let due = start + Duration::from_nanos(frame_ns * n as u64);
+                if !captured(n) {
+                    continue;
+                }
+                std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                let (luma, _) = frame_luma(n);
+                let mut data = luma;
+                data.resize(W * H * 3 / 2, 128);
+                let mut buffer = gst::Buffer::from_mut_slice(data);
+                buffer
+                    .get_mut()
+                    .unwrap()
+                    .set_pts(gst::ClockTime::from_nseconds(base_ns + frame_ns * n as u64));
+                sent.lock().unwrap().insert(n, Instant::now());
+                let _ = source.emit_by_name::<gst::FlowReturn>("push-buffer", &[&buffer]);
+            }
+        })
+    };
+
+    let stream = assert_far_side_decodes(&pair.offerer_events);
+    let pad = stream.sink_pad().unwrap();
+    type Snapshots = Arc<Mutex<HashMap<usize, (usize, Vec<u8>)>>>;
+    let snapshots: Snapshots = Default::default();
+    let format = Arc::new(Mutex::new(String::new()));
+    {
+        let (shown, snapshots, format) = (
+            Arc::clone(&shown),
+            Arc::clone(&snapshots),
+            Arc::clone(&format),
+        );
+        pad.add_probe(gst::PadProbeType::BUFFER, move |pad, info| {
+            let now = Instant::now();
+            let Some(gst::PadProbeData::Buffer(buffer)) = &info.data else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let Some(info) = pad
+                .current_caps()
+                .and_then(|caps| gst_video::VideoInfo::from_caps(&caps).ok())
+            else {
+                return gst::PadProbeReturn::Ok;
+            };
+            let Ok(frame) = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
+            else {
+                return gst::PadProbeReturn::Ok;
+            };
+            *format
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                format!("{:?} {}x{}", info.format(), info.width(), info.height());
+            let stride = frame.plane_stride()[0] as usize;
+            let plane = frame.plane_data(0).unwrap();
+            let at = |x: usize, y: usize| plane[y * stride + x];
+            let n = (0..BITS)
+                .filter(|bit| at(bit * BLOCK + BLOCK / 2, BLOCK / 2) > 128)
+                .fold(0usize, |n, bit| n | 1 << bit);
+            // What a still screen ends up showing: its latest frame,
+            // per still period (and one mid-scroll frame per period).
+            let phase = n % (4 * fps);
+            let key = if (fps..3 * fps).contains(&phase) {
+                if phase != 2 * fps {
+                    return gst::PadProbeReturn::Ok;
+                }
+                2 * (n / (4 * fps))
+            } else {
+                2 * ((n + fps) / (4 * fps)) + 1
+            };
+            if shown.lock().unwrap().insert(n, now).is_none() {
+                let luma = (0..H).flat_map(|y| (0..W).map(move |x| (x, y)));
+                snapshots
+                    .lock()
+                    .unwrap()
+                    .insert(key, (n, luma.map(|(x, y)| at(x, y)).collect()));
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+    pusher.join().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (sent, encoded, shown) = (
+        sent.lock().unwrap(),
+        encoded.lock().unwrap(),
+        shown.lock().unwrap(),
+    );
+    let summary = |label: &str, mut values: Vec<f64>| {
+        values.sort_by(f64::total_cmp);
+        if values.is_empty() {
+            return eprintln!("P2D {label}: none");
+        }
+        let at = |q: f64| values[((values.len() - 1) as f64 * q) as usize];
+        eprintln!(
+            "P2D {label}: {} frames, median {:.1} ms, p95 {:.1} ms, max {:.1} ms",
+            values.len(),
+            at(0.5),
+            at(0.95),
+            at(1.0)
+        );
+    };
+    // The first second is the stream starting up (keyframe, decoder).
+    let steady = |n: &&usize| **n >= fps;
+    let delay = |from: &HashMap<usize, Instant>, to: &HashMap<usize, Instant>, scrolling: bool| {
+        to.keys()
+            .filter(steady)
+            .filter(|n| frame_luma(**n).1 == scrolling)
+            .filter_map(|n| Some(to[n].duration_since(*from.get(n)?).as_secs_f64() * 1e3))
+            .collect::<Vec<_>>()
+    };
+    eprintln!(
+        "P2D {fps} fps, {kbps} kbps, {refine} refinements, decoded {}: {} sent, {} shown",
+        format.lock().unwrap(),
+        sent.len(),
+        shown.len()
+    );
+    summary(
+        "encode (x264 stand-in), still",
+        delay(&sent, &encoded, false),
+    );
+    summary(
+        "encode (x264 stand-in), scrolling",
+        delay(&sent, &encoded, true),
+    );
+    summary("encoded → shown, still", delay(&encoded, &shown, false));
+    summary("encoded → shown, scrolling", delay(&encoded, &shown, true));
+    summary("capture → shown, scrolling", delay(&sent, &shown, true));
+    let mut snapshots: Vec<_> = snapshots.lock().unwrap().drain().collect();
+    snapshots.sort_by_key(|(key, _)| *key);
+    // Key 1 is the stream starting up.
+    for (_, (n, luma)) in snapshots.iter().filter(|(key, _)| *key != 1) {
+        let (source, scrolling) = frame_luma(*n);
+        let rows = BLOCK * W..H * W;
+        let mse = source[rows.clone()]
+            .iter()
+            .zip(&luma[rows.clone()])
+            .map(|(a, b)| (f64::from(*a) - f64::from(*b)).powi(2))
+            .sum::<f64>()
+            / rows.len() as f64;
+        eprintln!(
+            "P2D frame {n} ({}): luma PSNR {:.2} dB",
+            if scrolling { "scrolling" } else { "still" },
+            10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10()
+        );
+    }
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// F1 A1: one Opus section in the first offer, after video, answered
+/// sendrecv — and sound flows both ways over it.
+#[test]
+fn sound_flows_both_ways_over_the_first_negotiation() {
+    let pair = loopback();
+    wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    let offer = pair
+        .offerer
+        .webrtcbin
+        .property::<Option<WebRTCSessionDescription>>("local-description")
+        .unwrap()
+        .sdp()
+        .as_text()
+        .unwrap();
+    let audio = media_section(&offer, "audio");
+    assert!(
+        audio.contains("OPUS/48000/2") || audio.contains("opus/48000/2"),
+        "{audio}"
+    );
+    for fmtp in [
+        "minptime=10",
+        "useinbandfec=1",
+        "stereo=1",
+        "maxaveragebitrate=128000",
+    ] {
+        assert!(audio.contains(fmtp), "{fmtp} missing in:\n{audio}");
+    }
+    assert!(audio.contains("a=sendrecv"));
+    assert!(
+        offer.find("m=video").unwrap() < offer.find("m=audio").unwrap(),
+        "audio after video"
+    );
+    let answer = pair
+        .answerer
+        .webrtcbin
+        .property::<Option<WebRTCSessionDescription>>("local-description")
+        .unwrap()
+        .sdp()
+        .as_text()
+        .unwrap();
+    assert!(
+        media_section(&answer, "audio").contains("a=sendrecv"),
+        "{answer}"
+    );
+    assert!(pair.offerer.audio_negotiated() && pair.answerer.audio_negotiated());
+
+    // Offerer → answerer.
+    pair.offerer
+        .start_audio_send_from(super::super::audio::Source::System, audio_source())
+        .unwrap();
+    play_when_audio_arrives(&pair.answerer);
+    assert!(
+        wait_for_audio(&pair.answerer) > 20,
+        "answerer heard nothing"
+    );
+    // Answerer → offerer, at the same time.
+    pair.answerer
+        .start_audio_send_from(super::super::audio::Source::Mic, audio_source())
+        .unwrap();
+    play_when_audio_arrives(&pair.offerer);
+    assert!(wait_for_audio(&pair.offerer) > 20, "offerer heard nothing");
+    assert!(pair.offerer.audio_sent() > 0 && pair.answerer.audio_sent() > 0);
+
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// A second sound session on the same connection reuses the section.
+///
+/// Ignored: under load (the full suite on a busy machine, about one run
+/// in six) the second session's first push sits in the `clocksync`
+/// webrtcbin puts in front of the audio sink, although its `sync` reads
+/// false. Not reproduced alone; unknown whether `pipewiresrc` (PipeWire
+/// pushes, it never waits on the clock) can meet it. Run by hand:
+/// `cargo test second_sound_session -- --ignored`.
+#[test]
+#[ignore]
+fn a_second_sound_session_on_the_same_connection_is_heard() {
+    let pair = loopback();
+    wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    pair.offerer
+        .start_audio_send_from(super::super::audio::Source::System, audio_source())
+        .unwrap();
+    play_when_audio_arrives(&pair.answerer);
+    assert!(
+        wait_for_audio(&pair.answerer) > 20,
+        "the first session was not heard"
+    );
+    // Stopping and starting again reuses the same section.
+    pair.offerer.stop_audio_send();
+    pair.answerer.stop_audio_playback();
+    pair.offerer
+        .start_audio_send_from(super::super::audio::Source::System, audio_source())
+        .unwrap();
+    pair.answerer
+        .start_audio_playback(super::super::audio::Output::Microphone, "test")
+        .unwrap();
+    let heard = wait_for_audio(&pair.answerer);
+    let pad = pair.answerer.audio_pad.lock().unwrap().clone();
+    assert!(
+        heard > 20,
+        "a second session heard {heard} packets: sent {}, playing {:?}, pad {:?} -> {:?}",
+        pair.offerer.audio_sent(),
+        pair.answerer.audio_playback(),
+        pad.as_ref().map(|p| p.name()),
+        pad.and_then(|p| p.peer())
+            .and_then(|p| p.parent_element())
+            .map(|e| e.name())
+    );
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// An older phone answers the audio section rejected: everything else
+/// keeps working and sound is simply unavailable.
+#[test]
+fn an_answer_without_audio_leaves_the_rest_working() {
+    fn reject_audio(kind: SignalingMessageType, sdp: &str) -> String {
+        if kind != SignalingMessageType::Answer {
+            return sdp.to_string();
+        }
+        // Rejected the way libwebrtc rejects: port 0, inactive, and out
+        // of the BUNDLE group.
+        let section = &sdp[sdp.find("m=audio").unwrap()..];
+        let mid = section
+            .lines()
+            .find_map(|line| line.strip_prefix("a=mid:"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let mut in_audio = false;
+        sdp.split_inclusive('\n')
+            .map(|line| {
+                if line.starts_with("a=group:BUNDLE") {
+                    let kept: Vec<&str> = line
+                        .trim_end()
+                        .split(' ')
+                        .filter(|part| *part != mid)
+                        .collect();
+                    return format!("{}\r\n", kept.join(" "));
+                }
+                if line.starts_with("m=") {
+                    in_audio = line.starts_with("m=audio");
+                    if in_audio {
+                        let mut parts: Vec<&str> = line.splitn(3, ' ').collect();
+                        parts[1] = "0";
+                        return parts.join(" ");
+                    }
+                }
+                if in_audio && line.starts_with("a=sendrecv") {
+                    return line.replace("sendrecv", "inactive");
+                }
+                line.to_string()
+            })
+            .collect()
+    }
+    let pair = loopback_with(true, reject_audio);
+    wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    pair.answerer
+        .send_text(WebRtcChannel::Control, "still here")
+        .unwrap();
+    assert_eq!(
+        next_envelope(&pair.offerer_events, WebRtcChannel::Control),
+        b"still here"
+    );
+    assert!(!pair.offerer.audio_negotiated());
+    assert!(pair
+        .offerer
+        .start_audio_send_from(super::super::audio::Source::System, audio_source())
+        .is_err());
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// An older phone offers no audio section: the desk answers what it was
+/// offered, and the connection works.
+#[test]
+fn an_offer_without_audio_is_answered_and_works() {
+    let pair = loopback_with(false, |_, sdp| sdp.to_string());
+    wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    pair.offerer
+        .send_text(WebRtcChannel::Control, "old phone")
+        .unwrap();
+    assert_eq!(
+        next_envelope(&pair.answerer_events, WebRtcChannel::Control),
+        b"old phone"
+    );
+    assert!(!pair.answerer.audio_negotiated());
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+#[test]
+fn two_peers_connect_over_loopback_and_carry_data_both_ways() {
+    let pair = loopback();
+    wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+
+    pair.offerer
+        .send_text(WebRtcChannel::Control, "offerer says hello")
+        .unwrap();
+    assert_eq!(
+        next_envelope(&pair.answerer_events, WebRtcChannel::Control),
+        b"offerer says hello"
+    );
+    pair.answerer
+        .send_text(WebRtcChannel::Control, "answerer replies")
+        .unwrap();
+    assert_eq!(
+        next_envelope(&pair.offerer_events, WebRtcChannel::Control),
+        b"answerer replies"
+    );
+
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// Tearing a real peer down while the far side is still sending must never
+/// abort the process: `sctpdec` asserts a source pad exists for every
+/// stream it receives on, and closing a channel removes that pad (see
+/// `shut_inbound_data`). A hundred real pairs, traffic in flight both ways
+/// from threads of their own, one side closed first and the other still
+/// sending. Before the fix this aborted about one run in thirteen under
+/// load. It runs in a process of its own (the inner test below), so an
+/// abort fails this test instead of taking every other test with it.
+#[test]
+fn real_peers_torn_down_with_traffic_in_flight_never_abort_the_process() {
+    let exe = std::env::current_exe().unwrap();
+    // The test's name without the crate's.
+    let inner = format!(
+        "{}::real_peers_torn_down_inner",
+        module_path!().split_once("::").map_or("", |(_, rest)| rest)
+    );
+    let output = std::process::Command::new(exe)
+        .args([
+            inner.as_str(),
+            "--exact",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the teardown stress run failed or aborted ({:?}):\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // And it really ran (a name that matches nothing also "succeeds").
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "the inner stress test did not run:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// After `shut_inbound_data` an `sctpdec` of a live pair has its way in
+/// shut: found (a rename of the element would make the guard a silent
+/// no-op) and inactive.
+#[test]
+fn closing_a_peer_shuts_every_sctpdec_it_has() {
+    let _alone = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
+    let pair = loopback();
+    wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+    let sctpdecs = |peer: &DesktopWebRtcPeer| -> Vec<gst::Element> {
+        let bin = peer.pipeline.dynamic_cast_ref::<gst::Bin>().unwrap();
+        bin.iterate_recurse()
+            .into_iter()
+            .flatten()
+            .filter(|e| e.factory().is_some_and(|f| f.name() == "sctpdec"))
+            .collect()
+    };
+    let found = sctpdecs(&pair.offerer);
+    assert!(!found.is_empty(), "no sctpdec in a connected peer");
+    assert!(found
+        .iter()
+        .all(|e| e.static_pad("sink").unwrap().is_active()));
+    pair.offerer.shut_inbound_data();
+    assert!(
+        found
+            .iter()
+            .all(|e| !e.static_pad("sink").unwrap().is_active()),
+        "the way in is not shut"
+    );
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+#[test]
+#[ignore = "run by real_peers_torn_down_with_traffic_in_flight_never_abort_the_process, in its own process"]
+fn real_peers_torn_down_inner() {
+    let _alone = HEAVY.lock().unwrap_or_else(|e| e.into_inner());
+    for round in 0..100u64 {
+        let pair = loopback();
+        wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+        wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let senders: Vec<_> = [Arc::clone(&pair.offerer), Arc::clone(&pair.answerer)]
+            .into_iter()
+            .map(|peer| {
+                let stop = Arc::clone(&stop);
+                std::thread::spawn(move || {
+                    let text = "x".repeat(900);
+                    while !stop.load(Ordering::Acquire) {
+                        let _ = peer.send_text(WebRtcChannel::Control, &text);
+                        let _ = peer.send_text(WebRtcChannel::Events, &text);
+                        std::thread::sleep(std::time::Duration::from_micros(300));
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(5 + round % 25));
+        // One side goes first and the other keeps sending into it.
+        let (first, second) = if round % 2 == 0 {
+            (&pair.offerer, &pair.answerer)
+        } else {
+            (&pair.answerer, &pair.offerer)
+        };
+        first.close();
+        std::thread::sleep(std::time::Duration::from_millis(round % 7));
+        second.close();
+        stop.store(true, Ordering::Release);
+        for sender in senders {
+            sender.join().unwrap();
+        }
+    }
+}
+
+/// Screen video from the *answerer* — the role the desktop plays when the
+/// phone is the initiator — over a real connection: it keeps flowing (nothing
+/// is parked), and stopping the share is clean instead of handed back.
+#[test]
+fn the_answerer_streams_screen_video_over_a_live_connection_and_stops_cleanly() {
+    let pair = loopback();
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+
+    let capture = super::super::screen::DesktopScreenCapture::attach_source(
+        &pair.answerer.pipeline,
+        &pair.answerer.webrtcbin,
+        test_source(),
+        None,
+        1280,
+        720,
+        super::super::screen::ScreenRequest::FALLBACK,
+        None,
+    )
+    .expect("the answerer must be able to attach its screen to the negotiated section");
+
+    assert!(wait_for_frames(&capture) > 0, "no video produced");
+    let early = capture.frames_sent();
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        capture.frames_sent() > early + 10,
+        "video stalled once past the first packets (parked behind the transport?): {} -> {}",
+        early,
+        capture.frames_sent()
+    );
+    // The phone-is-initiator case: the offerer must see the picture.
+    assert_far_side_decodes(&pair.offerer_events);
+
+    assert!(
+        capture.stop().is_ok(),
+        "on a live connection nothing is parked, so stopping must complete"
+    );
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// The other role: the desktop as *offerer* (its id sorts lower), streaming to
+/// the phone. The far side must actually receive it — a decode chain is built
+/// for the incoming track — not just see the sender report packets.
+#[test]
+fn the_offerer_streams_screen_video_and_the_far_side_starts_receiving_it() {
+    let pair = loopback();
+    wait_for_channel(&pair.offerer_events, WebRtcChannel::Control);
+
+    let capture = super::super::screen::DesktopScreenCapture::attach_source(
+        &pair.offerer.pipeline,
+        &pair.offerer.webrtcbin,
+        test_source(),
+        None,
+        1280,
+        720,
+        super::super::screen::ScreenRequest::FALLBACK,
+        None,
+    )
+    .expect("the offerer must be able to attach its screen to its own video section");
+    assert!(wait_for_frames(&capture) > 0, "no video produced");
+
+    assert_far_side_decodes(&pair.answerer_events);
+
+    assert!(
+        capture.stop().is_ok(),
+        "a live connection must stop cleanly"
+    );
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+/// Closing a peer that is mid-share must return promptly, connected or not.
+#[test]
+fn closing_a_connected_peer_with_an_active_share_does_not_hang() {
+    let pair = loopback();
+    wait_for_channel(&pair.answerer_events, WebRtcChannel::Control);
+    let _capture = super::super::screen::DesktopScreenCapture::attach_source(
+        &pair.answerer.pipeline,
+        &pair.answerer.webrtcbin,
+        test_source(),
+        None,
+        1280,
+        720,
+        super::super::screen::ScreenRequest::FALLBACK,
+        None,
+    )
+    .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let started = std::time::Instant::now();
+    pair.answerer.close();
+    pair.offerer.close();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "close took {:?}",
+        started.elapsed()
+    );
+}
+
+/// A chain nothing is flowing through has nothing parked in `webrtcbin`, so
+/// `stop` winds it down completely rather than handing it back.
+#[test]
+fn a_quiet_capture_stops_cleanly_and_leaves_the_peer_usable() {
+    let peer = answered_peer(PHONE_OFFER);
+    let silent = gst::ElementFactory::make("appsrc")
+        .property("is-live", true)
+        .build()
+        .expect("appsrc");
+    let capture = super::super::screen::DesktopScreenCapture::attach_source(
+        &peer.pipeline,
+        &peer.webrtcbin,
+        silent,
+        None,
+        1280,
+        720,
+        super::super::screen::ScreenRequest::FALLBACK,
+        None,
+    )
+    .unwrap();
+
+    assert!(capture.stop().is_ok(), "an idle chain must stop cleanly");
+    peer.close();
+}
+
+/// A second share on the same peer must reuse the section's pad and still
+/// carry media. (The first share here ends cleanly — an idle chain — because
+/// a chain left *parked* in a connection that never came up holds the pad's
+/// stream lock; a real share only starts on a ready connection, and a lost
+/// one rebuilds the peer.)
+#[test]
+fn a_second_share_reuses_the_same_section_and_carries_media() {
+    let peer = answered_peer(PHONE_OFFER);
+    let attach = |source: gst::Element| {
+        super::super::screen::DesktopScreenCapture::attach_source(
+            &peer.pipeline,
+            &peer.webrtcbin,
+            source,
+            None,
+            1280,
+            720,
+            super::super::screen::ScreenRequest::FALLBACK,
+            None,
+        )
+        .unwrap()
+    };
+    let silent = || {
+        gst::ElementFactory::make("appsrc")
+            .property("is-live", true)
+            .build()
+            .expect("appsrc")
+    };
+
+    let first = attach(silent());
+    assert!(first.stop().is_ok());
+
+    let second = attach(test_source());
+    assert!(
+        wait_for_frames(&second) > 0,
+        "the second share produced nothing"
+    );
+    let _parked = second.stop();
+    peer.close();
+}
+
+#[test]
+fn only_gstreamer_before_1_26_needs_the_answerer_to_add_its_sections() {
+    assert!(answerer_adds_own_sections((1, 22, 0, 0)));
+    assert!(answerer_adds_own_sections((1, 24, 2, 0)));
+    assert!(!answerer_adds_own_sections((1, 26, 0, 0)));
+    assert!(!answerer_adds_own_sections((1, 28, 6, 0)));
+    assert!(!answerer_adds_own_sections((2, 0, 0, 0)));
+    assert!(!answers_every_codec((1, 24, 2, 0)));
+    assert!(!answers_every_codec((1, 26, 11, 0)));
+    assert!(answers_every_codec((1, 28, 0, 0)));
+}
+
+/// The section of `sdp` that starts at the first line beginning `m=<kind>`.
+fn media_section<'a>(sdp: &'a str, kind: &str) -> &'a str {
+    let start = sdp
+        .find(&format!("m={kind} "))
+        .unwrap_or_else(|| panic!("no m={kind} section in:\n{sdp}"));
+    let rest = &sdp[start..];
+    let end = rest[1..].find("\nm=").map_or(rest.len(), |i| i + 2);
+    &rest[..end]
+}
+
+/// The paired phone (device id sorts lower) is the WebRTC initiator, so the
+/// desktop is the **answerer** — and it is the desktop that has to send the
+/// screen video. An answerer's transceiver is created by the remote offer,
+/// not by us; if it answers `recvonly` the phone gets an m-line that can
+/// never carry a frame, however healthy everything else looks.
+#[test]
+fn an_answerer_will_send_screen_video_when_the_phone_offers_sendrecv() {
+    let (sender, receiver) = mpsc::channel();
+    let peer = DesktopWebRtcPeer::new(false, sender, &IceServerConfig::default()).unwrap();
+    peer.set_remote_description(SignalingMessageType::Offer, PHONE_OFFER)
+        .unwrap();
+
+    let answer = wait_for_answer(&receiver);
+    peer.close();
+
+    let video = media_section(&answer, "video");
+    assert!(
+        video.contains("a=sendrecv"),
+        "the desktop must answer sendrecv to be able to send its screen; answered:\n{video}"
+    );
+    assert!(
+        video.contains("VP8/90000"),
+        "the answer must keep the negotiated VP8 codec:\n{video}"
+    );
+    // Without TWCC the phone's congestion control is loss-only and its
+    // pacer holds every packet ~100 ms; the offer's id must be echoed.
+    assert!(
+        video.contains(
+            "a=extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"
+        ),
+        "the answer must negotiate transport-wide congestion control:\n{video}"
+    );
+}
+
+#[test]
+fn the_phone_is_never_told_the_screen_streams_ssrc() {
+    let sdp = "v=0\r\nm=video 9 X 100 96\r\na=mid:0\r\na=ssrc-group:FID 0 3880827048\r\n\
+                   a=ssrc:3880827048 msid:user@host webrtctransceiver0\r\na=sendrecv\r\n\
+                   m=application 9 Y webrtc-datachannel\r\na=ssrc:7 cname:keep\r\n";
+    let out = without_video_ssrcs(sdp);
+    assert!(!out.contains("a=ssrc-group"), "{out}");
+    assert!(!out.contains("a=ssrc:3880827048"), "{out}");
+    assert!(out.contains("a=sendrecv\r\n") && out.contains("a=mid:0\r\n"));
+    // Other sections are untouched, line endings included.
+    assert!(out.contains("a=ssrc:7 cname:keep\r\n"));
+    assert_eq!(without_video_ssrcs("v=0\r\n"), "v=0\r\n");
+}
+
+#[test]
+fn the_desk_states_its_own_h264_receive_level() {
+    let sdp = "v=0\r\nm=audio 9 X 111\r\na=fmtp:111 profile-level-id=42e01f\r\n\
+                   m=video 9 X 102 96\r\na=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n\
+                   a=fmtp:96 x-google-start-bitrate=800\r\n";
+    let out = with_h264_receive_level(sdp);
+    assert!(out.contains(
+        "a=fmtp:102 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e028\r\n"
+    ));
+    assert!(
+        out.contains("a=fmtp:111 profile-level-id=42e01f"),
+        "only the video section"
+    );
+    assert!(out.contains("a=fmtp:96 x-google-start-bitrate=800"));
+}
+
+/// `get-transceiver` takes a **`gint`**, and `emit_by_name` panics on a
+/// mismatched argument type — inside a GStreamer promise callback, where a
+/// panic aborts the process rather than surfacing.
+///
+/// This shipped as `0u32..` and took the daemon down with "Incompatible
+/// argument type in argument 0 for signal 'get-transceiver' (expected gint,
+/// got guint)" the first time a remote description arrived. Nothing in the
+/// type system catches it: the values are marshalled dynamically. Only
+/// firing the signal for real does.
+#[test]
+fn configure_video_transceivers_marshals_its_index_to_a_real_webrtcbin() {
+    let (sender, _receiver) = mpsc::channel();
+    let peer = DesktopWebRtcPeer::new(true, sender, &IceServerConfig::default()).unwrap();
+
+    // The initiator has a video transceiver, so this walks a populated list
+    // and then runs off the end — both paths the promise callback takes.
+    configure_video_transceivers(&peer.webrtcbin);
+
+    peer.close();
+}
+
+/// End-of-candidates is signalled by a **NULL** candidate, and
+/// `emit_by_name` panics on a signature it cannot marshal — so this is
+/// pinned against a real `webrtcbin` rather than assumed. The same class of
+/// mistake against the `ice-agent` property once killed the peer's event
+/// worker on every negotiation.
+#[test]
+fn end_of_candidates_marshals_a_null_candidate_to_a_real_webrtcbin() {
+    let (sender, _receiver) = mpsc::channel();
+    let peer = DesktopWebRtcPeer::new(true, sender, &IceServerConfig::default()).unwrap();
+
+    peer.end_of_candidates(0);
+
+    // And the empty-string path stays rejected, so the two cannot be
+    // confused: `add_ice_candidate` must never be the way this is sent.
+    assert!(peer.add_ice_candidate(0, "").is_err());
+    peer.close();
+}
+
+#[test]
+fn initiator_creates_each_cross_platform_channel_once() {
+    let (sender, _receiver) = mpsc::channel();
+    let peer = DesktopWebRtcPeer::new(true, sender, &IceServerConfig::default()).unwrap();
+    let channels = peer.channels.lock().unwrap();
+
+    assert_eq!(channels.len(), WebRtcChannel::ALL.len());
+    assert!(channels.contains_key(&WebRtcChannel::Control));
+    assert!(channels.contains_key(&WebRtcChannel::InputRealtime));
+    drop(channels);
+    peer.close();
+}
+
+/// The liveness channel: heartbeats arrive on their own channel, in a
+/// reliable ordered channel the feature channels cannot delay, an
+/// oversized message is dropped (the channel stays), and the link is
+/// only feature-ready once the required channels are open.
+#[test]
+fn heartbeats_cross_a_real_connection_on_the_liveness_channel() {
+    let pair = loopback();
+    wait_for_channels(
+        &pair.offerer_events,
+        &[
+            WebRtcChannel::Control,
+            WebRtcChannel::Events,
+            WebRtcChannel::Liveness,
+        ],
+    );
+    wait_for_channels(
+        &pair.answerer_events,
+        &[
+            WebRtcChannel::Control,
+            WebRtcChannel::Events,
+            WebRtcChannel::Liveness,
+        ],
+    );
+    assert!(pair.offerer.required_channels_open());
+    assert!(pair.answerer.required_channels_open());
+    assert!(pair.offerer.send_heartbeat("ping").unwrap());
+    assert_eq!(
+        next_envelope(&pair.answerer_events, WebRtcChannel::Liveness),
+        b"ping"
+    );
+    // A feature burst on `events` cannot sit in front of a probe.
+    for _ in 0..40 {
+        pair.offerer
+            .send_text(WebRtcChannel::Events, &"x".repeat(MAX_WIRE_MESSAGE_BYTES))
+            .unwrap();
+    }
+    pair.answerer.send_heartbeat("probe").unwrap();
+    assert_eq!(
+        next_envelope(&pair.offerer_events, WebRtcChannel::Liveness),
+        b"probe"
+    );
+    // Over 2 KiB is dropped and reported; a normal one still arrives.
+    pair.offerer
+        .send_text(
+            WebRtcChannel::Liveness,
+            &"x".repeat(super::super::MAX_LIVENESS_ENVELOPE_BYTES + 1),
+        )
+        .unwrap();
+    pair.offerer.send_heartbeat("still here").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut reported = false;
+    loop {
+        match pair
+            .answerer_events
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        {
+            Ok(PeerEvent::Error(error)) if error.contains("oversized") => reported = true,
+            Ok(PeerEvent::Envelope {
+                channel: WebRtcChannel::Liveness,
+                bytes,
+                ..
+            }) => {
+                assert_eq!(bytes, b"still here", "the oversized one was dropped");
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => panic!("no heartbeat after the oversized message"),
+        }
+    }
+    assert!(reported);
+    pair.offerer.close();
+    pair.answerer.close();
+}
+
+#[test]
+fn sends_on_events_wait_in_order_above_the_high_water_mark_and_are_bounded() {
+    let mut held = Held::default();
+    assert!(!held.must_wait(0) && !held.must_wait(EVENTS_HIGH_WATER));
+    assert!(held.must_wait(EVENTS_HIGH_WATER + 1));
+    assert!(held.push("first") && held.push("second"));
+    // Something waiting: later sends queue behind it, whatever the buffer.
+    assert!(held.must_wait(0));
+    assert_eq!(
+        held.next(EVENTS_HIGH_WATER + 1),
+        None,
+        "still over the mark"
+    );
+    assert_eq!(held.next(EVENTS_LOW_WATER).as_deref(), Some("first"));
+    assert_eq!(held.next(0).as_deref(), Some("second"));
+    assert_eq!(held.next(0), None);
+    assert!(!held.must_wait(0));
+    // Bounded: messages and bytes.
+    for _ in 0..EVENTS_MAX_HELD_MESSAGES {
+        assert!(held.push("m"));
+    }
+    assert!(!held.push("one too many"));
+    let mut big = Held::default();
+    assert!(big.push(&"x".repeat(EVENTS_MAX_HELD_BYTES)));
+    assert!(!big.push("y"), "past the byte budget");
+    assert_eq!(big.next(0).unwrap().len(), EVENTS_MAX_HELD_BYTES);
+    assert!(big.push("y"), "room again once it drains");
+}
+
+#[test]
+fn file_data_is_bounded_and_nonempty() {
+    assert!(validate_file_data(&[1]).is_ok());
+    assert!(validate_file_data(&[]).is_err());
+    assert!(validate_file_data(&vec![0; MAX_ENVELOPE_BYTES + 1]).is_err());
+    assert!(validate_file_data(&vec![0; MAX_WIRE_MESSAGE_BYTES + 1]).is_err());
+    assert!(validate_file_data(&vec![0; MAX_WIRE_MESSAGE_BYTES]).is_ok());
+}
+
+/// Over 64 KiB is refused as a plain error before any data channel sees
+/// it: handed to `sctpenc` it puts the whole association in an error
+/// state and every channel dies (the 16 s rebuild loop).
+#[test]
+fn a_message_over_one_wire_message_is_refused_before_the_channel() {
+    let (sender, _receiver) = mpsc::channel();
+    let peer = DesktopWebRtcPeer::new(true, sender, &IceServerConfig::default()).unwrap();
+    let error = peer
+        .send_text(
+            WebRtcChannel::Events,
+            &"x".repeat(MAX_WIRE_MESSAGE_BYTES + 1),
+        )
+        .unwrap_err();
+    assert!(error.contains("too large"), "{error}");
+    // At the limit it gets as far as the (unopened) channel.
+    let error = peer
+        .send_text(WebRtcChannel::Events, &"x".repeat(MAX_WIRE_MESSAGE_BYTES))
+        .unwrap_err();
+    assert!(error.contains("not open"), "{error}");
+    peer.close();
+}
+#[test]
+fn answer_creation_reads_the_answer_promise_field() {
+    assert_eq!(
+        local_description_promise_field(SignalingMessageType::Answer).unwrap(),
+        "answer"
+    );
+}
+
+#[test]
+fn empty_local_ice_candidate_marks_gathering_complete() {
+    assert!(matches!(
+        local_ice_event(0, String::new()),
+        PeerEvent::EndOfCandidates
+    ));
+}
