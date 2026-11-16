@@ -5,28 +5,52 @@ that cannot work say so in **Settings → Advanced → System check** and in
 `desklink --check`, with the one step to fix them (`src/platform.rs`). Longer
 background: `phone_connect/docs/LINUX-SUPPORT.md` and `DESKTOP-INTEGRATION.md`.
 
-Checked 2026-11-15. **R** = run (in a rootless chroot of the distribution, or a
+Checked 2026-11-15 and 2026-11-16. **R** = run (in a container of the distribution, or a
 nested session on the author's machine), **T** = unit test with a faked desktop,
 **C** = code reading only.
 
 ## Distributions
 
-Each one: its own packages from `packaging/` installed, `cargo build --release
---locked` with the distribution's own Rust, then the binary started under
-Xvfb on a private D-Bus with no desktop (window up, daemon running, `--check`).
+Each one (2026-11-16, phase 2.5): a Docker container of the distribution
+(host network), its own packages installed from `packaging/` (Debian
+`control` with `mk-build-deps`, the RPM spec's BuildRequires and Requires, the
+PKGBUILD's depends), built with meson as an ordinary user (`cargo build
+--release` inside, the distribution's own Rust), `meson install` into `/usr`,
+the whole test suite as that user under Xvfb, `desklink --check`, then the
+installed binary in a headless X11 session (Xvfb, a private D-Bus session bus,
+no portal backend, no notification daemon, no tray, no window manager) holding
+a copy of a paired desk's identity, connected to the Android emulator, and
+every feature in the next table driven end to end. Evidence and screenshots:
+`phone_connect/.tools/screenshots/p25-distro/INDEX.md`.
 
-| Distribution | GTK / adw / GStreamer / VTE / glib | Rust | Release build | Launch (Xvfb) + `--check` | Tests |
-|---|---|---|---|---|---|
-| Ubuntu 24.04 LTS | 4.14 / 1.5 / 1.24 / 0.76 / 2.80 | 1.85 (`rustc-1.85`) | yes, 6 min | yes R | 1650 of 1653 R (left: a relay test that needs a default route, absent in the loopback-only namespace; one that drops to `nobody`, impossible as root in a user namespace; the known GStreamer 1.24 bitrate one). Fixed on the way: two libadwaita 1.5 failures, one of them a real Settings-search heading bug |
-| Debian 13 | 4.18 / 1.7 / 1.26 / 0.80 / 2.84 | 1.85 | yes, 7 min | yes R | not run |
-| Fedora 45 | 4.24 / 1.10 / 1.28 / 0.84 / 2.90 | 1.99 | yes, 4 min | yes R | not run |
-| openSUSE Tumbleweed (20261111) | 4.24 / 1.10 / 1.28 / 0.84 / 2.90 | 1.99 | yes, 5 min | yes R | not run |
-| Arch (2026-11) | 4.24 / 1.10 / 1.28 / 0.84 / 2.90 | 1.100 | yes, 5 min | yes R, plus sway and Xfce below | host gate (Manjaro): 1653 of 1653, twice |
+| Distribution | GTK / adw / GStreamer / VTE / glib | Rust | meson build | Tests (uid 1000) | `--check` | Feature smoke with a phone |
+|---|---|---|---|---|---|---|
+| Ubuntu 24.04 LTS | 4.14 / 1.5 / 1.24 / 0.76 / 2.80 | 1.85 (`rustc-1.85`) | yes, 4.5 min R | 1672 of 1673, then all after the GStreamer 1.24 fix below R | exit 0 R | all R |
+| Ubuntu 26.04 LTS | 4.22 / 1.9 / 1.28 / 0.84 / 2.88 | 1.93 | yes, 4 min R | 1675 of 1675 R | exit 0 R | all R |
+| Debian 13 | 4.18 / 1.7 / 1.26 / 0.80 / 2.84 | 1.85 | yes, 4.5 min R | 1675 of 1675 R | exit 0 R | all R |
+| Fedora 45 | 4.24 / 1.10 / 1.28 / 0.84 / 2.90 | 1.99 | yes, 3 min R | 1675 of 1675 R | exit 0 R | all R, installed with no H.264 decoder: the desk offers VP8 only and the phone's screen still shows |
+| openSUSE Tumbleweed (20261111) | 4.24 / 1.10 / 1.28 / 0.84 / 2.90 | 1.99 | yes, 3.5 min R | 1675 of 1675 R | exit 0 R | all R; H.264 through `openh264dec` (libav is Packman-only) |
+| Arch (2026-11-16) | 4.24 / 1.10 / 1.28 / 0.84 / 2.90 | 1.100 | yes, 3.5 min R (exactly the PKGBUILD's depends) | 1675 of 1675 R | exit 0 R | all R |
 
-Each launch: window mapped (`xwininfo`), alive after 25 s with no panic,
-`--check` exit 0, `--version`/`--help` answer without a display (fixed in this
-pass: they used to print the no-display error). No new API floor was found:
-the build is clean from libadwaita 1.5 / GTK 4.14 up to 1.10 / 4.24.
+The smoke, on each: feature-ready over WebRTC; a phone notification listed
+on the desk; clipboard both ways; 100 MiB both ways with matching SHA-256 (the
+received file in `~/Downloads`); a shared terminal started at the desk (xterm
+running `desklink --attach-terminal`), listed on the phone and typed into from
+it; a contact added on the phone reaching the desk; ring, nudge and a link both
+ways; the phone's screen shown in the Phone Screen window; the app restarted
+and feature-ready again in about 3 s. The emulator encodes its screen as VP8
+(no hardware H.264), so the desk's H.264 receive chain was run through the unit
+test that feeds it an x264 stream, where the distribution ships x264.
+
+Found and fixed in these runs: GStreamer 1.24 keeps the phone's receiver
+report on the phone's RTP source, so a reopened desk share never raised its
+bitrate on Ubuntu 24.04; without `xdg-user-dirs` (a bare window manager, a
+minimal install) received files went to a hidden state folder and the Open
+Downloads buttons did nothing, now `~/Downloads`; the media setup step said
+"Video and sound support is missing" when only PipeWire was absent; Debian
+packaging lacked `libxml2-utils` (xmllint) for the resource bundle. The
+earlier chroot failures (prefs on libadwaita 1.5, the transfer test that drops
+to `nobody`, the relay test) all pass as an ordinary user with a network.
 
 Floor (checked by `src/meson.build`): GTK 4.12, libadwaita 1.5, GStreamer 1.22,
 OpenSSL 3.0, Rust 1.85; VTE 0.76 optional. Ubuntu 24.04 is the oldest native
