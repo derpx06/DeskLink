@@ -2089,8 +2089,9 @@ fn offer_extension(app: &DesklinkApplication) {
                     }
                     Err(error) => {
                         eprintln!("[Shell] Could not turn on the top-bar menu: {error}");
-                        let notification =
-                            gio::Notification::new("Could not turn on the top-bar menu");
+                        let notification = crate::application::desk_notification(
+                            "Could not turn on the top-bar menu",
+                        );
                         notification.set_body(Some(&error));
                         notification
                     }
@@ -2113,8 +2114,9 @@ fn offer_extension(app: &DesklinkApplication) {
                 enable_extension(&uuid, move |result| {
                     app.withdraw_notification("shell-extension");
                     if let Err(error) = result {
-                        let notification =
-                            gio::Notification::new("Could not show DeskLink in the top bar");
+                        let notification = crate::application::desk_notification(
+                            "Could not show DeskLink in the top bar",
+                        );
                         notification.set_body(Some(&error));
                         app.send_notification(Some("shell-extension"), &notification);
                     }
@@ -2149,7 +2151,8 @@ fn offer_extension(app: &DesklinkApplication) {
         }
         match install_extension_files(&user_extension_dir()) {
             Ok(true) => {
-                let notification = gio::Notification::new("DeskLink's top-bar menu was updated");
+                let notification =
+                    crate::application::desk_notification("DeskLink's top-bar menu was updated");
                 notification.set_body(Some(RELOGIN_NOTE));
                 notification.add_button("Log Out Now", "app.log-out");
                 app.send_notification(Some("shell-extension"), &notification);
@@ -2174,7 +2177,8 @@ fn offer_extension(app: &DesklinkApplication) {
         // An AppIndicator extension that is only off: the one-click fix
         // (not needed while our own extension shows DeskLink).
         if let Some(uuid) = appindicator_off().filter(|_| !extension_active()) {
-            let notification = gio::Notification::new("Show DeskLink in the top bar");
+            let notification =
+                crate::application::desk_notification("Show DeskLink in the top bar");
             notification.set_body(Some(
                 "Turn on the AppIndicator extension that is already installed to see DeskLink's icon in the top bar.",
             ));
@@ -2197,7 +2201,8 @@ fn offer_extension(app: &DesklinkApplication) {
                 if is_active(&extension_info(&reply)) {
                     return;
                 }
-                let notification = gio::Notification::new("Show DeskLink in the top bar");
+                let notification =
+                    crate::application::desk_notification("Show DeskLink in the top bar");
                 notification.set_body(Some(
                     "See your phone's battery and connection, and act on it, from the top bar.",
                 ));

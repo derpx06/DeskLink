@@ -593,7 +593,7 @@ impl DesklinkApplication {
             return;
         };
         let (title, body) = held_links_words(&phone, &links);
-        let notification = gio::Notification::new(&title);
+        let notification = crate::application::desk_notification(&title);
         notification.set_body(Some(&body));
         for url in links.iter().rev().take(3) {
             notification.add_button_with_target_value(
@@ -736,7 +736,8 @@ impl DesklinkApplication {
                 CloseAction::HideAndTell => {
                     // No tray to show where it went: said each session.
                     if take_hide_notice(&mut app.imp().told_hidden.borrow_mut()) {
-                        let note = gio::Notification::new("DeskLink is still running");
+                        let note =
+                            crate::application::desk_notification("DeskLink is still running");
                         note.set_body(Some(
                             "There is no tray on this desktop, so DeskLink stays connected in \
                              the background. Click here, or start DeskLink from your launcher, \
@@ -749,7 +750,8 @@ impl DesklinkApplication {
                 CloseAction::Hide => {
                     // Once, ever: closing did not quit, and nothing said so (J16).
                     if take_first_hide(&crate::device_links::config::desklink_config_root()) {
-                        let note = gio::Notification::new("DeskLink is still running");
+                        let note =
+                            crate::application::desk_notification("DeskLink is still running");
                         note.set_body(Some(
                             "Closing the window keeps DeskLink connected in the background. \
                              Quit it from the tray or the app menu.",
@@ -829,7 +831,7 @@ impl DesklinkApplication {
                 if !hosted {
                     for (device, line) in &active {
                         if notified.insert(device.id.clone()) {
-                            let notification = gio::Notification::new(line);
+                            let notification = crate::application::desk_notification(line);
                             notification.set_body(Some("Open DeskLink to see more."));
                             notification.add_button_with_target_value(
                                 "End Session",
@@ -855,8 +857,9 @@ impl DesklinkApplication {
                         .into_iter()
                         .find(|device| device.id == offer.device)
                         .map_or(offer.name.clone(), |device| device.name);
-                    let notification =
-                        gio::Notification::new(&format!("{phone} wants to share a Bucket"));
+                    let notification = crate::application::desk_notification(&format!(
+                        "{phone} wants to share a Bucket"
+                    ));
                     notification.set_body(Some(
                         "One place for files, pictures, text and links on both devices.",
                     ));
@@ -970,7 +973,8 @@ impl DesklinkApplication {
                             .map(|d| d.id.clone())
                             .collect(),
                     ) {
-                        let notification = gio::Notification::new("Do Not Disturb was not shared");
+                        let notification =
+                            crate::application::desk_notification("Do Not Disturb was not shared");
                         notification.set_body(Some(&problem));
                         app.send_notification(Some("dnd-problem"), &notification);
                     }
@@ -993,7 +997,7 @@ impl DesklinkApplication {
                     let Some(title) = crate::device_links::asks::prompt(&phone, ask.key) else {
                         continue;
                     };
-                    let notification = gio::Notification::new(&title);
+                    let notification = crate::application::desk_notification(&title);
                     notification.set_body(Some("Allow turns it on. Nothing changes until you do."));
                     notification.set_priority(gio::NotificationPriority::High);
                     for (label, allow) in [("Allow", true), ("Not now", false)] {
@@ -1055,8 +1059,9 @@ impl DesklinkApplication {
             let id = format!("walk-away-{}", device.id);
             match observe(&device.id, seen) {
                 Some(Step::Warn) => {
-                    let notification =
-                        gio::Notification::new("Locking this computer in 10 seconds");
+                    let notification = crate::application::desk_notification(
+                        "Locking this computer in 10 seconds",
+                    );
                     notification.set_body(Some(&format!(
                         "{} has been out of reach. Cancel to stay unlocked.",
                         glib::markup_escape_text(&device.name)
@@ -1224,7 +1229,7 @@ impl DesklinkApplication {
         if !self.is_registered() || !take_unreported_crash(&dir) {
             return;
         }
-        let notification = gio::Notification::new("DeskLink stopped unexpectedly");
+        let notification = crate::application::desk_notification("DeskLink stopped unexpectedly");
         notification.set_body(Some(&format!(
             "A crash report was saved in {}. Attaching it to a bug report helps fix this.",
             dir.display()
@@ -1633,6 +1638,15 @@ pub(crate) fn appearance_scheme(choice: &str) -> adw::ColorScheme {
         "dark" => adw::ColorScheme::ForceDark,
         _ => crate::theme_hint::system_scheme(),
     }
+}
+
+/// A notification with DeskLink's icon. GNOME Shell takes the icon from the
+/// application; Plasma, Xfce, MATE and Cinnamon draw a generic one or none
+/// when the notification names none.
+pub(crate) fn desk_notification(title: &str) -> gio::Notification {
+    let notification = gio::Notification::new(title);
+    notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+    notification
 }
 
 /// `content` under a plain header bar, for a dialog or a pushed subpage.
