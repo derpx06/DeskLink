@@ -565,7 +565,7 @@ fn the_words_follow_the_glossary() {
         "window",
         "platform",
         "transfer_notice.rs",
-        "application.rs",
+        "application",
         "tray.rs",
     ] {
         literals(&src.join(part), &mut found);

@@ -2,7 +2,7 @@
  *
  * The palette — light and dark tokens for libadwaita's named colours and our
  * own (surface_2, hairline, text_dim, mint, coral, terminal_bg, …), from the
- * DeskLink design — is loaded by application.rs, which swaps it as the style
+ * DeskLink design — is loaded by application/styles.rs, which swaps it as the style
  * changes (libadwaita 1.5 has no colour-scheme media queries). The fallbacks
  * below only keep the rules valid before it loads. */
 @define-color surface_2 alpha(currentColor, 0.055);

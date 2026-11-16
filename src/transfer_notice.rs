@@ -5,7 +5,7 @@
 //! The state is the transfer board's (nothing new is counted here): the rows
 //! that are listed now, and the outcomes it keeps. This module only decides
 //! *what to say and when*, from a snapshot and a clock, so it can be tested
-//! with a fake one; `application.rs` posts what it returns.
+//! with a fake one; `application/indicator.rs` posts what it returns.
 //!
 //! - Nothing for a transfer that has not run for [`QUALIFIES_AFTER`].
 //! - The progress notification is updated in place (one id per phone), at most

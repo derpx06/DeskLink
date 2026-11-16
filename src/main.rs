@@ -209,7 +209,7 @@ fn main() -> glib::ExitCode {
     // Create a new GtkApplication. The application manages our main loop,
     // application windows, integration with the window manager/compositor, and
     // desktop features such as file opening and single-instance applications.
-    // HANDLES_OPEN: `tel:` links arrive as `open` (see `application.rs`).
+    // HANDLES_OPEN: `tel:` links arrive as `open` (see `application/`).
     let app = DesklinkApplication::new("derx06.desklink.com", &gio::ApplicationFlags::HANDLES_OPEN);
 
     // Run the application. This function will block until the application
@@ -357,7 +357,7 @@ fn prune_crash_reports(dir: &std::path::Path, keep: usize) {
 /// default hook. Only the first one of a process is kept (what follows is
 /// usually its echo), the directory keeps the newest [`CRASH_REPORTS_KEPT`],
 /// and a panic that a `guard()` catches is a log line, never a report. The
-/// next start mentions it (`application.rs`).
+/// next start mentions it (`application/actions.rs`).
 fn install_crash_reporter() {
     static WROTE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);

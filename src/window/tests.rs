@@ -573,7 +573,7 @@ fn the_shortcuts_dialog_lists_the_keys_the_application_binds() {
         PALETTE_ACCEL.replace('<', "&lt;").replace('>', "&gt;")
     )));
     // The plain list of older libadwaita says it too.
-    assert!(include_str!("../application.rs").contains("(\"Find anything\", \"Ctrl+K\")"));
+    assert!(include_str!("../application/actions.rs").contains("(\"Find anything\", \"Ctrl+K\")"));
 }
 
 #[test]

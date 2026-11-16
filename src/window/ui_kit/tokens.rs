@@ -1,6 +1,6 @@
 //! The shared design tokens (`docs/UI-REDESIGN.md` 2.1), value for value the
 //! phone's `DeskLinkColors`. Every name is `dl_*`: the older palette in
-//! `application.rs` keeps serving the windows that are not redesigned yet,
+//! `application/styles.rs` keeps serving the windows that are not redesigned yet,
 //! and the redesign waves switch a window over by using these.
 //!
 //! Emitted by [`css`] as `@define-color dl_x` (libadwaita 1.5) and, from 1.6,

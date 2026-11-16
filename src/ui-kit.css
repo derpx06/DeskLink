@@ -2,7 +2,7 @@
  * phone and the desk, as classes. Colours are only `@dl_*` names (see
  * window/ui_kit/tokens.rs; none is written here), sizes are `em` of the
  * window font (15 px base) or the shape/spacing scale below, so text scaling
- * works. Loaded by application.rs above style.css; the builders that put
+ * works. Loaded by application/styles.rs above style.css; the builders that put
  * these classes on widgets are in window/ui_kit/mod.rs.
  *
  * Shape scale (px):  8 thumbnails, 12 buttons/fields/segmented/toasts/icon

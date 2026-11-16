@@ -899,7 +899,7 @@ mod tests {
 
     /// Nothing but the confirmation starts a dial: the only production files
     /// that mention both the `"dial"` verb and a telephony command are this
-    /// one (which asks first) and `application.rs`, whose `app.call` hands a
+    /// one (which asks first) and `application/`, whose `app.call` hands a
     /// dial to the same confirmation (`call_action_kind`).
     #[test]
     fn only_the_confirmation_dialog_places_a_call() {
@@ -931,10 +931,8 @@ mod tests {
             "{found:?}"
         );
         assert!(
-            found
-                .iter()
-                .all(|path| path.ends_with("window/calls.rs")
-                    || path.ends_with("src/application.rs")),
+            found.iter().all(|path| path.ends_with("window/calls.rs")
+                || path.contains("/src/application/")),
             "{found:?}"
         );
     }
