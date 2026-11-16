@@ -266,15 +266,15 @@ fn serve(stream: UnixStream) -> Result<(), String> {
     // several windows, the last one to resize or type wins.
     let mut desk_size = Some((rows, cols));
     session.touch();
-    session.desk_window_opened();
-    session.desk_window_size(rows, cols, false);
-    struct Closed<'a>(&'a PtySession);
+    let window = session.desk_window_opened();
+    session.desk_window_resized(window, rows, cols, false);
+    struct Closed<'a>(&'a PtySession, u64);
     impl Drop for Closed<'_> {
         fn drop(&mut self) {
-            self.0.desk_window_closed();
+            self.0.desk_window_closed(self.1);
         }
     }
-    let _closed = Closed(&session);
+    let _closed = Closed(&session, window);
 
     // The pump only notices a closed socket when it writes, which an idle
     // shell never makes it do: it is told to stop instead.
@@ -298,7 +298,7 @@ fn serve(stream: UnixStream) -> Result<(), String> {
                 // embedded terminal's input may be VTE's own replies: the
                 // window says when the person typed, `desk_acted`.)
                 if let Some((rows, cols)) = desk_size.filter(|_| !embedded) {
-                    session.desk_window_size(rows, cols, true);
+                    session.desk_window_resized(window, rows, cols, true);
                 }
                 if session.write_input(&bytes).is_err() {
                     break;
@@ -310,7 +310,7 @@ fn serve(stream: UnixStream) -> Result<(), String> {
                 desk_size = Some((rows.clamp(1, 1000), cols.clamp(1, 1000)));
                 // A terminal window resized is the person acting; the
                 // embedded one resizes with the page's layout.
-                session.desk_window_size(rows, cols, !embedded);
+                session.desk_window_resized(window, rows, cols, !embedded);
             }
             Ok(_) => {}
             Err(_) => break,

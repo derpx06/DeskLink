@@ -168,6 +168,10 @@ pub(crate) fn snapshot_bytes(parser: &vt100::Parser) -> Vec<u8> {
     out
 }
 
+/// The desk windows open on a session, each with the size it last reported
+/// (`None` before its first); the last one reported or typed last.
+type DeskWindows = Vec<(u64, Option<(u16, u16)>)>;
+
 pub(crate) struct PtySession {
     id: String,
     title: String,
@@ -193,17 +197,18 @@ pub(crate) struct PtySession {
     closed: AtomicBool,
     exited_seen: OnceLock<Instant>,
     size: Mutex<(u16, u16)>,
-    /// Terminal windows open on it at the desk. While there is one, it alone
-    /// sets the size: a phone's keyboard or layout changing kept squeezing the
-    /// desk window to the phone's shape.
-    desk_windows: AtomicU64,
+    /// Terminal windows open on it at the desk, each with the size it last
+    /// reported; the last entry is the window that reported or typed last.
+    /// While there is one, it alone sets the size: a phone's keyboard or
+    /// layout changing kept squeezing the desk window to the phone's shape.
+    /// When one of two closes, the other's size is put back (F40).
+    desk_windows: Mutex<DeskWindows>,
+    next_desk_window: AtomicU64,
     /// The phone that holds an explicit claim on the size (it created the
     /// session, or the person tapped "Phone size"). While it does, a desk
     /// window shows the program top-left instead of setting the size, until
     /// the desk takes it back by being resized or typed in.
     phone_claim: Mutex<Option<String>>,
-    /// The last size a desk window reported, to go back to when the claim ends.
-    desk_size: Mutex<Option<(u16, u16)>>,
     /// When it was started, for the desk's terminal details.
     started: std::time::SystemTime,
 }
@@ -335,9 +340,9 @@ impl PtySession {
             closed: AtomicBool::new(false),
             exited_seen: OnceLock::new(),
             size: Mutex::new((rows, cols)),
-            desk_windows: AtomicU64::new(0),
+            desk_windows: Mutex::new(Vec::new()),
+            next_desk_window: AtomicU64::new(0),
             phone_claim: Mutex::new(None),
-            desk_size: Mutex::new(None),
             started: std::time::SystemTime::now(),
         };
         // SAFETY: dup of the master fd for the reader's own poll; the reader closes it.
@@ -393,32 +398,58 @@ impl PtySession {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn desk_size_lock(&self) -> std::sync::MutexGuard<'_, Option<(u16, u16)>> {
-        self.desk_size
+    fn desk_lock(&self) -> std::sync::MutexGuard<'_, DeskWindows> {
+        self.desk_windows
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    pub(crate) fn desk_window_opened(&self) {
-        self.desk_windows.fetch_add(1, Ordering::AcqRel);
-        changed();
+    /// The size of the desk window that reported or typed last.
+    fn desk_size(&self) -> Option<(u16, u16)> {
+        self.desk_lock().last().and_then(|(_, size)| *size)
     }
 
-    pub(crate) fn desk_window_closed(&self) {
-        // The last window going away forgets its size. A phone's claim stays:
-        // a window closing (or the DeskLink window hiding its terminal) is not
-        // the person acting at the desk, and the next window to open must not
-        // squeeze the phone's view either. The phone lets go by detaching.
-        if self.desk_windows.fetch_sub(1, Ordering::AcqRel) == 1 {
-            *self.desk_size_lock() = None;
+    /// A desk window opened; the returned token names it to
+    /// [`Self::desk_window_resized`] and [`Self::desk_window_closed`].
+    pub(crate) fn desk_window_opened(&self) -> u64 {
+        let window = self.next_desk_window.fetch_add(1, Ordering::AcqRel) + 1;
+        self.desk_lock().push((window, None));
+        changed();
+        window
+    }
+
+    /// A desk window closed. If it was the one that set the size and another
+    /// is still open, that one's size is put back (it showed the program at
+    /// the closed window's shape until it was typed in). A phone's claim
+    /// stays: a window closing (or the DeskLink window hiding its terminal) is
+    /// not the person acting at the desk. The phone lets go by detaching.
+    pub(crate) fn desk_window_closed(&self, window: u64) {
+        // The claim first, held across the window list and the resize (the
+        // order every other path takes): a resize of the remaining window
+        // between the two could otherwise be undone by a stale size.
+        let claim = self.claim();
+        let back = {
+            let mut windows = self.desk_lock();
+            let was_last = windows.last().is_some_and(|(id, _)| *id == window);
+            windows.retain(|(id, _)| *id != window);
+            windows
+                .last()
+                .and_then(|(_, size)| *size)
+                .filter(|_| was_last)
+        };
+        if let Some((rows, cols)) = back {
+            if claim.is_none() && self.size() != (rows, cols) {
+                let _ = self.resize(rows, cols);
+            }
         }
+        drop(claim);
         changed();
     }
 
     /// Whether a terminal window at the desk shows this session. That window's
     /// terminal answers the program's queries, so the phone must not.
     pub(crate) fn has_desk_window(&self) -> bool {
-        self.desk_windows.load(Ordering::Acquire) > 0
+        !self.desk_lock().is_empty()
     }
 
     /// Whether a desk window owns the size; a phone then views it as it is.
@@ -487,15 +518,16 @@ impl PtySession {
             return;
         }
         *claim = None;
-        let desk = *self.desk_size_lock();
-        if let Some((rows, cols)) = desk.filter(|_| self.has_desk_window()) {
+        if let Some((rows, cols)) = self.desk_size() {
             let _ = self.resize(rows, cols);
         }
     }
 
     /// A desk window attached or was resized. It sets the size unless a phone
     /// holds the claim; `typed` is the person acting at the desk, which takes
-    /// the claim back.
+    /// the claim back. Without a window token (the DeskLink window's own
+    /// terminal, which says only its size) it is the open window of that size,
+    /// else the last one.
     ///
     /// The claim lock is held across the resize: `phone_sets_size` therefore
     /// never reads "released" while the size is still the phone's (a reader
@@ -503,8 +535,30 @@ impl PtySession {
     /// gap between the two).
     pub(crate) fn desk_window_size(&self, rows: u16, cols: u16, acted: bool) {
         let (rows, cols) = clamp_size(rows, cols);
-        *self.desk_size_lock() = Some((rows, cols));
+        let window = {
+            let windows = self.desk_lock();
+            windows
+                .iter()
+                .rposition(|(_, size)| *size == Some((rows, cols)))
+                .or(windows.len().checked_sub(1))
+                .map(|index| windows[index].0)
+        };
+        self.desk_window_resized(window.unwrap_or(0), rows, cols, acted);
+    }
+
+    /// Desk window `window` reported `rows` x `cols` (it attached, was resized
+    /// or typed in): it becomes the window that sets the size.
+    pub(crate) fn desk_window_resized(&self, window: u64, rows: u16, cols: u16, acted: bool) {
+        let (rows, cols) = clamp_size(rows, cols);
+        // The claim first, as in `desk_window_closed`.
         let mut claim = self.claim();
+        {
+            let mut windows = self.desk_lock();
+            if let Some(index) = windows.iter().position(|(id, _)| *id == window) {
+                windows.remove(index);
+                windows.push((window, Some((rows, cols))));
+            }
+        }
         if acted {
             *claim = None;
         }
@@ -1305,7 +1359,7 @@ mod tests {
         assert_eq!(session.size(), (30, 100));
         assert_eq!(session.resize_unless_held("a", 30, 100, true), Ok(true));
         // A desk window owns the size: held back.
-        session.desk_window_opened();
+        let window = session.desk_window_opened();
         assert_eq!(session.resize_unless_held("a", 50, 90, false), Ok(false));
         assert_eq!(session.size(), (30, 100));
         // Phone `a` claims it: `a` resizes, `b` is held back, the desk window
@@ -1318,9 +1372,33 @@ mod tests {
         // The claim goes: the desk window owns it again.
         session.release_phone_claim("a");
         assert_eq!(session.resize_unless_held("a", 40, 40, false), Ok(false));
-        session.desk_window_closed();
+        session.desk_window_closed(window);
         assert_eq!(session.resize_unless_held("b", 40, 41, false), Ok(true));
         assert_eq!(session.size(), (40, 41));
+    }
+
+    #[test]
+    fn closing_one_of_two_desk_windows_gives_the_size_to_the_other() {
+        let session = PtySession::spawn(None, 24, 80).expect("spawn shell");
+        let a = session.desk_window_opened();
+        session.desk_window_resized(a, 40, 120, false);
+        let b = session.desk_window_opened();
+        session.desk_window_resized(b, 30, 90, false);
+        assert_eq!(session.size(), (30, 90));
+        session.desk_window_closed(b);
+        assert_eq!(
+            session.size(),
+            (40, 120),
+            "the window left sets the size again"
+        );
+        // Closing a window that did not set the size changes nothing.
+        let c = session.desk_window_opened();
+        session.desk_window_resized(c, 20, 70, false);
+        session.desk_window_resized(a, 41, 121, true);
+        session.desk_window_closed(c);
+        assert_eq!(session.size(), (41, 121));
+        session.desk_window_closed(a);
+        assert!(!session.has_desk_window());
     }
 
     /// A panic while the claim was held must not make every later caller panic.

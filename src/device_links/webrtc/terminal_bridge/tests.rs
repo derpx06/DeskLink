@@ -247,7 +247,7 @@ fn an_open_desk_window_owns_the_size_and_the_phone_is_told() {
 
     // A desk window opens at its own size.
     let session = registry.get(&id).unwrap();
-    session.desk_window_opened();
+    let desk_window = session.desk_window_opened();
     session.desk_window_size(40, 120, true);
     assert_eq!(
         told(bridge.pump(usize::MAX / 2, &mut registry)),
@@ -272,7 +272,7 @@ fn an_open_desk_window_owns_the_size_and_the_phone_is_told() {
     );
 
     // The desk window closes; the phone's next keystroke takes its size.
-    session.desk_window_closed();
+    session.desk_window_closed(desk_window);
     bridge
         .handle_chunk(&input(&id, b"x"), &mut registry)
         .unwrap();
@@ -309,7 +309,7 @@ fn the_phone_that_made_the_session_keeps_the_size_until_the_desk_acts() {
     };
 
     // The window the desk opens for it attaches at its own size, which changes nothing.
-    session.desk_window_opened();
+    let desk_window = session.desk_window_opened();
     session.desk_window_size(40, 120, false);
     assert!(session.has_desk_window() && !session.desk_sets_size());
     resize(&mut bridge, &mut registry, 30, 50, None);
@@ -339,7 +339,7 @@ fn the_phone_that_made_the_session_keeps_the_size_until_the_desk_acts() {
     assert_eq!(session.size(), (40, 120));
 
     // The last window closing leaves the size to the phone.
-    session.desk_window_closed();
+    session.desk_window_closed(desk_window);
     assert!(!session.has_desk_window());
     registry.close(&id);
 }
@@ -379,7 +379,7 @@ fn only_the_writer_can_claim_the_size() {
     let id = create(&mut owner, &mut registry, Some(sleeping_command()));
     let session = registry.get(&id).unwrap();
     session.release_phone_claim("phone-1");
-    session.desk_window_opened();
+    let desk_window = session.desk_window_opened();
     session.desk_window_size(40, 120, true);
     attach(&mut owner, &mut registry, &id);
     let mut viewer = new_bridge("phone-2");
@@ -392,7 +392,7 @@ fn only_the_writer_can_claim_the_size() {
     viewer.handle_control(&claim, &mut registry).unwrap();
     assert!(!session.phone_sets_size());
     assert_eq!(session.size(), (40, 120));
-    session.desk_window_closed();
+    session.desk_window_closed(desk_window);
     registry.close(&id);
 }
 
