@@ -191,6 +191,11 @@ fn main() -> glib::ExitCode {
         eprintln!("[DeskLink] Translations are off: {error}");
     }
 
+    // The name notification servers (Plasma, Xfce, MATE, Cinnamon, dunst)
+    // print over every notification and screen readers announce; without it
+    // GLib falls back to the program name, "desklink".
+    glib::set_application_name("DeskLink");
+
     // Load resources
     let resources = load_resources().expect("Could not load resources");
     gio::resources_register(&resources);
