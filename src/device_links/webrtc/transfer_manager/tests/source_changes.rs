@@ -109,3 +109,20 @@ fn a_file_that_keeps_changing_fails_after_two_restarts() {
     });
     assert!(names(&rig.downloads("b")).is_empty());
 }
+
+#[test]
+fn troubles_found_in_later_rounds_end_their_own_sends() {
+    // Round 1: send 1 fails; round 2: send 0 fails. Removing 1 then 0 is right;
+    // the old reverse of the found order removed 0 then the stale 1 (send 2).
+    let order: Vec<usize> = super::super::send::highest_index_first(vec![(1, "b"), (0, "a")])
+        .into_iter()
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(order, vec![1, 0]);
+    let order: Vec<usize> =
+        super::super::send::highest_index_first(vec![(0, "a"), (2, "c"), (1, "b")])
+            .into_iter()
+            .map(|(index, _)| index)
+            .collect();
+    assert_eq!(order, vec![2, 1, 0]);
+}

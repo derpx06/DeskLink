@@ -1488,7 +1488,7 @@ impl Engine {
                 troubled.push((index, trouble));
             }
         }
-        for (index, trouble) in troubled.into_iter().rev() {
+        for (index, trouble) in highest_index_first(troubled) {
             self.source_trouble(index, trouble);
         }
     }
@@ -1522,7 +1522,7 @@ impl Engine {
             // is not "sent" until the receiver says it is (`complete`).
             board::set_note(&outgoing.id, Some(&words::finishing()));
         }
-        for (index, trouble) in troubled.into_iter().rev() {
+        for (index, trouble) in highest_index_first(troubled) {
             self.source_trouble(index, trouble);
         }
     }
@@ -1605,7 +1605,7 @@ impl Engine {
                 break;
             }
         }
-        for (index, trouble) in troubled.into_iter().rev() {
+        for (index, trouble) in highest_index_first(troubled) {
             self.source_trouble(index, trouble);
         }
     }
@@ -1759,4 +1759,13 @@ impl Engine {
             self.start_outgoing(Outgoing::new(stored, 0));
         }
     }
+}
+
+/// Sends that met trouble, in the order they can be removed from the list
+/// they index: highest first. They are found over several rounds, so a lower
+/// index may come after a higher one (removing by stale indexes ended a
+/// healthy send, or panicked past the end).
+pub(super) fn highest_index_first<T>(mut troubled: Vec<(usize, T)>) -> Vec<(usize, T)> {
+    troubled.sort_by_key(|(index, _)| std::cmp::Reverse(*index));
+    troubled
 }
