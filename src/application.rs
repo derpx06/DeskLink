@@ -1297,7 +1297,12 @@ impl DesklinkApplication {
             ("Close window", "Ctrl+W"),
             ("Quit", "Ctrl+Q"),
         ] {
-            let row = adw::ActionRow::builder().title(title).build();
+            // Plain text: a row title is markup, and the "&" in the first
+            // one left it blank.
+            let row = adw::ActionRow::builder()
+                .title(title)
+                .use_markup(false)
+                .build();
             row.add_suffix(
                 &gtk::Label::builder()
                     .label(shortcut)
