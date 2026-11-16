@@ -393,6 +393,27 @@ fn the_wire_values_are_the_desks() {
     .collect();
     assert_eq!(ours, strings(&f["unlockRefusals"]));
 
+    // Typing refusals from the phone: each has the Phone Screen window's own
+    // words ("text-refused" is the catch-all), and they are the desk's codes.
+    use crate::device_links::packet::{
+        TYPING_ACCESSIBILITY_OFF, TYPING_NOT_EDITABLE, TYPING_NO_TEXT_FIELD, TYPING_TEXT_REFUSED,
+    };
+    let codes = strings(&f["typingRefusals"]);
+    assert_eq!(
+        codes,
+        [
+            TYPING_ACCESSIBILITY_OFF,
+            TYPING_NO_TEXT_FIELD,
+            TYPING_NOT_EDITABLE,
+            TYPING_TEXT_REFUSED
+        ]
+    );
+    let catch_all = crate::remote_control::typing_words("?", "P");
+    for code in codes {
+        let words = crate::remote_control::typing_words(&code, "P");
+        assert_eq!(words == catch_all, code == TYPING_TEXT_REFUSED, "{code}");
+    }
+
     // Telephony: states read, actions sent, errors explained, numbers refused.
     let t = &f["telephony"];
     for state in strings(&t["callStates"]) {

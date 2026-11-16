@@ -96,6 +96,10 @@ pub struct RemoteSession {
     /// when its person taps Allow (Android's own sheet comes next), so the
     /// window keeps waiting while they answer (F25).
     granted_at: Option<Instant>,
+    /// Why the keys typed in the Phone Screen window last reached no text
+    /// field on the phone, and when it said so (its `input-focus
+    /// {editable: false, reason}`; `editable: true` clears it).
+    typing_refusal: Option<(String, Instant)>,
 }
 
 impl Default for RemoteSession {
@@ -121,7 +125,16 @@ impl RemoteSession {
             ended_reason: None,
             ended: std::collections::VecDeque::new(),
             granted_at: None,
+            typing_refusal: None,
         }
+    }
+
+    /// The phone's last word on the keys typed at it: a `TYPING_*` code, and
+    /// when it came.
+    pub fn typing_refusal(&self) -> Option<(&str, Instant)> {
+        self.typing_refusal
+            .as_ref()
+            .map(|(code, at)| (code.as_str(), *at))
     }
 
     pub fn granted_at(&self) -> Option<Instant> {
@@ -202,6 +215,7 @@ impl RemoteSession {
         let id = Uuid::new_v4().to_string();
         self.remote_session_id = Some(id.clone());
         self.control_denial = None;
+        self.typing_refusal = None;
         self.ended_reason = None;
         self.direction = Some(direction);
         self.lease = None;
@@ -223,6 +237,7 @@ impl RemoteSession {
         }
         self.remote_session_id = Some(id.to_string());
         self.control_denial = None;
+        self.typing_refusal = None;
         self.direction = Some(ScreenDirection::PhoneToDesktop);
         self.lease = None;
         self.peer_input_lease = None;
@@ -251,10 +266,16 @@ impl RemoteSession {
         let mismatched =
             self.remote_session_id.as_deref() != Some(message.remote_session_id.as_str());
         match message.kind {
-            // The desktop reports its own focus; a phone claiming it is not a
-            // report about anything this side can act on.
+            // The sharing side reports its own focus: the phone, only about
+            // its screen shown here (whether this window's keys reached a
+            // text field there), never about the desktop's.
             ControlKind::InputFocus => {
-                return Err("input-focus is reported by the desktop only".to_string());
+                if mismatched || self.direction != Some(ScreenDirection::PhoneToDesktop) {
+                    return Err(
+                        "input-focus from the phone is only about its screen shown here"
+                            .to_string(),
+                    );
+                }
             }
             // A request starts a session, and a heartbeat is checked against the
             // lease it quotes. An offer is answered by the coordinator.
@@ -290,9 +311,12 @@ impl RemoteSession {
         }
 
         match message.kind {
-            // Refused above; never applied. An offer is taken up with
-            // `adopt_offer`, not here.
-            ControlKind::InputFocus | ControlKind::OfferView => {}
+            ControlKind::InputFocus => {
+                self.typing_refusal = (message.editable == Some(false))
+                    .then(|| (message.reason.clone().unwrap_or_default(), Instant::now()));
+            }
+            // An offer is taken up with `adopt_offer`, not here.
+            ControlKind::OfferView => {}
             // Sound and capture are not the screen session.
             ControlKind::AudioRequest
             | ControlKind::AudioReady
@@ -500,6 +524,7 @@ impl RemoteSession {
         self.lease = None;
         self.peer_input_lease = None;
         self.control_denial = None;
+        self.typing_refusal = None;
         self.ended_reason = None;
     }
 

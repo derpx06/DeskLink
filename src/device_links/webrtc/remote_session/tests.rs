@@ -104,10 +104,10 @@ fn audio_messages_round_trip_with_their_own_direction() {
     }
 }
 
-/// The desktop reports text focus with `editable`; the field survives the
-/// wire, and a phone sending the report is refused, not acted on.
+/// The sharing side reports text focus with `editable`; the field survives
+/// the wire. A phone's report counts only about its own screen shown here.
 #[test]
-fn input_focus_reports_round_trip_and_are_desktop_only() {
+fn input_focus_reports_round_trip_and_count_only_from_the_sharing_side() {
     let id = Uuid::new_v4().to_string();
     let mut report = message(ControlKind::InputFocus, &id);
     report.editable = Some(true);
@@ -120,7 +120,43 @@ fn input_focus_reports_round_trip_and_are_desktop_only() {
     );
 
     let mut session = RemoteSession::new();
-    assert!(session.accept(&parsed, 1_000).is_err());
+    assert!(session.accept(&parsed, 1_000).is_err(), "no session");
+    // This desk shares its own screen: the phone has nothing to report on.
+    let mut desk_share = RemoteSession::new();
+    let shared = desk_share.begin_view(ScreenDirection::DesktopToPhone);
+    assert!(desk_share
+        .accept(&message(ControlKind::InputFocus, &shared), 1_000)
+        .is_err());
+}
+
+/// The phone says why the Phone Screen window's keys reached no text field
+/// (F: keys vanished, owner 11-16); typing that works again clears it, and a
+/// new share starts with nothing said.
+#[test]
+fn the_phone_says_why_typing_reached_no_field_and_a_success_clears_it() {
+    let mut session = RemoteSession::new();
+    let id = session.begin_view(ScreenDirection::PhoneToDesktop);
+    let mut refused = message(ControlKind::InputFocus, &id);
+    refused.editable = Some(false);
+    refused.reason = Some(crate::device_links::packet::TYPING_NO_TEXT_FIELD.to_string());
+    session.accept(&refused, 1_000).unwrap();
+    assert_eq!(
+        session.typing_refusal().map(|(code, _)| code),
+        Some("no-text-field")
+    );
+    let mut typed = message(ControlKind::InputFocus, &id);
+    typed.editable = Some(true);
+    session.accept(&typed, 1_000).unwrap();
+    assert!(session.typing_refusal().is_none());
+
+    session.accept(&refused, 1_000).unwrap();
+    let stale = message(ControlKind::InputFocus, &Uuid::new_v4().to_string());
+    assert!(
+        session.accept(&stale, 1_000).is_err(),
+        "another share's report"
+    );
+    session.begin_view(ScreenDirection::PhoneToDesktop);
+    assert!(session.typing_refusal().is_none());
 }
 
 #[test]

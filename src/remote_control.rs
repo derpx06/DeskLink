@@ -102,6 +102,22 @@ fn control_denied(seen: Seen) -> Notice {
             button: again,
         };
     }
+    // It was on and the phone's system switched it off (ColorOS does on every
+    // force stop and app update): said as such, not as never set up.
+    let stopped = denial.contains("turned off");
+    if stopped && seen.control_ask != Some(AskState::Waiting) {
+        return Notice {
+            text: format!(
+                "View only: Android turned off DeskLink\u{2019}s accessibility service on {phone} \
+                 (it does after an update or a force stop). Turn it on again there."
+            ),
+            button: if seen.askable {
+                Some((ask_label(seen.control_ask), Action::AskPhone))
+            } else {
+                again
+            },
+        };
+    }
     if !seen.askable {
         return Notice {
             text: format!(
@@ -179,6 +195,33 @@ pub(crate) struct Seen<'a> {
     pub(crate) askable: bool,
     /// Where an Ask on phone for control stands.
     pub(crate) control_ask: Option<crate::device_links::asks::AskState>,
+    /// The phone's recent word on keys typed here that reached no text field
+    /// there (a `TYPING_*` code).
+    pub(crate) typing: Option<&'a str>,
+    /// A key was typed here a moment ago without control of the phone.
+    pub(crate) typed_without_control: bool,
+}
+
+/// How long the strip keeps a word about typing after the last key.
+const TYPING_HINT_FOR: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// What the strip says when the phone's keys reached no text field there.
+pub(crate) fn typing_words(code: &str, phone: &str) -> String {
+    use crate::device_links::packet::{
+        TYPING_ACCESSIBILITY_OFF, TYPING_NOT_EDITABLE, TYPING_NO_TEXT_FIELD,
+    };
+    match code {
+        TYPING_NO_TEXT_FIELD => {
+            format!("Typing: no text field is selected on {phone} \u{b7} click one first")
+        }
+        TYPING_NOT_EDITABLE => {
+            format!("Typing: what is selected on {phone} does not take text \u{b7} click a text field")
+        }
+        TYPING_ACCESSIBILITY_OFF => format!(
+            "Typing needs DeskLink\u{2019}s accessibility service on {phone} \u{b7} turn it on there"
+        ),
+        _ => format!("Typing: the app on {phone} did not take that key"),
+    }
 }
 
 /// What the strip says. Control granted (`lease_active`) says nothing at all, so
@@ -187,6 +230,40 @@ pub(crate) struct Seen<'a> {
 /// its prompt to answer (asking for control then was refused every 2 s with
 /// "not being shared", read here as "Control is off", forever).
 pub(crate) fn status_notice(seen: Seen) -> Option<Notice> {
+    let notice = state_notice(seen);
+    let shown = seen.has_picture
+        && matches!(
+            seen.state,
+            Some(
+                SessionState::Viewing | SessionState::RequestingControl | SessionState::Controlling
+            )
+        );
+    if !shown {
+        return notice;
+    }
+    // Keys never vanish: with control, the phone's word on why they reached
+    // no text field; without it, that typing needs control first.
+    if seen.lease_active {
+        return seen
+            .typing
+            .map(|code| Notice {
+                text: typing_words(code, seen.phone),
+                button: None,
+            })
+            .or(notice);
+    }
+    match notice {
+        Some(mut notice) if seen.typed_without_control => {
+            let why = notice.text.trim_start_matches("View only: ");
+            notice.text = format!("Typing needs control \u{b7} {why}");
+            Some(notice)
+        }
+        notice => notice,
+    }
+}
+
+/// What the strip says about the session itself.
+fn state_notice(seen: Seen) -> Option<Notice> {
     let say = |text: String| Some(Notice { text, button: None });
     let phone = seen.phone;
     let waiting = || {
@@ -520,6 +597,8 @@ pub fn show_remote_control_dialog(
     let control_asks = Rc::new(Cell::new(0u32));
     // What the strip's button does now (set with its label each tick).
     let strip_action = Rc::new(Cell::new(Action::RequestControl));
+    // When a key was last typed here without control of the phone.
+    let typed_without_control: Rc<Cell<Option<std::time::Instant>>> = Rc::default();
     {
         let (daemon, device, last, asks, strip_action) = (
             daemon.clone(),
@@ -558,6 +637,7 @@ pub fn show_remote_control_dialog(
         let last_control_request = Rc::clone(&last_control_request);
         let control_asks = Rc::clone(&control_asks);
         let strip_action = Rc::clone(&strip_action);
+        let typed_without_control = Rc::clone(&typed_without_control);
         let control_on_was = Cell::new(false);
         let title = title.downgrade();
         let route = route.downgrade();
@@ -692,6 +772,9 @@ pub fn show_remote_control_dialog(
                 .map(|title| title.title().to_string())
                 .filter(|name| !name.is_empty() && name != "Phone Screen")
                 .unwrap_or_else(|| "the phone".to_string());
+            let typing = session_typing_refusal(device.as_str())
+                .filter(|(_, at)| at.elapsed() < TYPING_HINT_FOR)
+                .map(|(code, _)| code);
             let notice = status_notice(Seen {
                 state,
                 gave_up,
@@ -704,6 +787,10 @@ pub fn show_remote_control_dialog(
                 phone: &phone,
                 askable: control_on.is_some(),
                 control_ask: crate::device_links::asks::phone_ask(device.as_str(), CONTROL_KEY),
+                typing: typing.as_deref(),
+                typed_without_control: typed_without_control
+                    .get()
+                    .is_some_and(|at| at.elapsed() < TYPING_HINT_FOR),
             });
             let connecting = format!("Connecting to {phone}…");
             let waiting = paintable.is_none();
@@ -935,13 +1022,102 @@ pub fn show_remote_control_dialog(
     // Typing goes straight to the phone. In the capture phase: in the bubble
     // phase the window's own key bindings (arrows and Tab move the focus,
     // Space and Enter press a focused header button) took those keys first.
-    // Without control the keys stay this window's own.
+    // Text comes through an input method (compose keys, dead keys, IBus for
+    // Marathi or Hindi, emoji), committed to the phone whole; what it is still
+    // composing shows under the picture. Without control the keys stay this
+    // window's own, and the strip says typing needs control (asking for it).
     {
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let im = gtk::IMMulticontext::new();
+        im.set_client_widget(Some(&picture));
+        keys.set_im_context(Some(&im));
+        // A key with nowhere to go: said in the strip, and control asked for
+        // now (the phone may have just turned its service on), not at the
+        // next backed-off retry.
+        let without_control = {
+            let (daemon, device, picture) =
+                (daemon.clone(), Rc::clone(&device), picture.downgrade());
+            let (typed, last, asks) = (
+                Rc::clone(&typed_without_control),
+                Rc::clone(&last_control_request),
+                Rc::clone(&control_asks),
+            );
+            Rc::new(move || {
+                debug_log!("[Phone screen] key kept: this computer holds no control of the phone");
+                typed.set(Some(std::time::Instant::now()));
+                let has_picture = picture.upgrade().is_some_and(|p| p.paintable().is_some());
+                if may_ask_control(
+                    session_state(device.as_str()),
+                    has_picture,
+                    session_phone_screen(device.as_str()).is_some(),
+                ) && last.get().elapsed() >= std::time::Duration::from_secs(2)
+                {
+                    daemon.send(DaemonCommand::RequestPhoneControl(device.to_string()));
+                    last.set(std::time::Instant::now());
+                    asks.set(0);
+                }
+            })
+        };
+        {
+            let (send, device, without_control) = (
+                Rc::clone(&send),
+                Rc::clone(&device),
+                Rc::clone(&without_control),
+            );
+            im.connect_commit(move |_, text| {
+                if !remote_control_lease_active(device.as_str()) {
+                    return without_control();
+                }
+                if let Some(payload) = paste_payload(text) {
+                    debug_log!("[Phone screen] text sent ({} chars)", text.chars().count());
+                    send(payload);
+                }
+            });
+        }
+        let composing = gtk::Label::builder()
+            .halign(gtk::Align::Center)
+            .valign(gtk::Align::End)
+            .margin_bottom(12)
+            .css_classes(["osd", "toolbar"])
+            .visible(false)
+            .build();
+        overlay.add_overlay(&composing);
+        {
+            let composing = composing.downgrade();
+            im.connect_preedit_changed(move |im| {
+                let (text, _, _) = im.preedit_string();
+                if let Some(label) = composing.upgrade() {
+                    label.set_label(&text);
+                    label.set_visible(!text.is_empty());
+                }
+            });
+        }
+        // The input method follows the window's focus.
+        {
+            let im = im.downgrade();
+            window.connect_is_active_notify(move |window| {
+                if let Some(im) = im.upgrade() {
+                    if window.is_active() {
+                        im.focus_in();
+                    } else {
+                        im.focus_out();
+                    }
+                }
+            });
+        }
         let (send, device) = (Rc::clone(&send), Rc::clone(&device));
         keys.connect_key_pressed(move |controller, keyval, _, state| {
             if !remote_control_lease_active(device.as_str()) {
+                // Moving about the window (Tab, arrows, Escape) is not typing.
+                let typing = is_paste(keyval, state)
+                    || matches!(
+                        keyval,
+                        Key::BackSpace | Key::Delete | Key::Return | Key::KP_Enter
+                    );
+                if typing {
+                    without_control();
+                }
                 return glib::Propagation::Proceed;
             }
             // Paste: the computer's clipboard is typed into the phone's field,
@@ -954,6 +1130,10 @@ pub fn show_remote_control_dialog(
                         move |text| {
                             if let Ok(Some(text)) = text {
                                 if let Some(payload) = paste_payload(&text) {
+                                    debug_log!(
+                                        "[Phone screen] paste sent ({} chars)",
+                                        text.chars().count()
+                                    );
                                     send(payload);
                                 }
                             }
@@ -964,6 +1144,12 @@ pub fn show_remote_control_dialog(
             }
             match key_payload(keyval, state) {
                 Some(payload) => {
+                    debug_log!(
+                        "[Phone screen] key sent ({})",
+                        payload
+                            .get("specialKey")
+                            .map_or("text".to_string(), |code| format!("special {code}"))
+                    );
                     send(payload);
                     glib::Propagation::Stop
                 }
@@ -1151,6 +1337,15 @@ fn session_granted_at(device_id: &str) -> Option<std::time::Instant> {
         .ok()?
         .get(device_id)?
         .granted_at()
+}
+
+fn session_typing_refusal(device_id: &str) -> Option<(String, std::time::Instant)> {
+    crate::device_links::webrtc::remote_session::sessions()
+        .lock()
+        .ok()?
+        .get(device_id)?
+        .typing_refusal()
+        .map(|(code, at)| (code.to_string(), at))
 }
 
 fn session_phone_screen(device_id: &str) -> Option<(i32, i32)> {
@@ -1511,6 +1706,99 @@ mod tests {
         })
         .unwrap();
         assert_eq!(other.button, Some(("Ask again", Action::RequestControl)));
+    }
+
+    /// Android turned the service off (ColorOS on a force stop or an update):
+    /// said as such, with the same one-click ask.
+    #[test]
+    fn a_service_android_turned_off_is_said_so() {
+        let notice = status_notice(Seen {
+            state: Some(SessionState::Viewing),
+            has_picture: true,
+            denial: Some(
+                "Android turned off DeskLink accessibility control on this Android device \
+                 (after an update or a force stop)",
+            ),
+            phone: "Pixel",
+            askable: true,
+            ..Seen::default()
+        })
+        .unwrap();
+        assert!(
+            notice.text.contains("Android turned off"),
+            "{}",
+            notice.text
+        );
+        assert_eq!(notice.button, Some(("Ask on phone", Action::AskPhone)));
+    }
+
+    /// Keys never vanish (owner 11-16): typed without control, the strip says
+    /// typing needs control (with the reason and its button); with control,
+    /// it says why the phone's keys reached no text field, then goes.
+    #[test]
+    fn keys_that_reach_nothing_are_said_in_the_strip() {
+        let viewing = Seen {
+            state: Some(SessionState::Viewing),
+            has_picture: true,
+            phone: "Pixel",
+            ..Seen::default()
+        };
+        let asking = status_notice(Seen {
+            typed_without_control: true,
+            ..viewing
+        })
+        .unwrap();
+        assert_eq!(
+            asking.text,
+            "Typing needs control \u{b7} asking Pixel for control\u{2026}"
+        );
+        let refused = status_notice(Seen {
+            typed_without_control: true,
+            denial: Some("Enable DeskLink accessibility control on this Android device"),
+            askable: true,
+            ..viewing
+        })
+        .unwrap();
+        assert!(
+            refused.text.starts_with("Typing needs control"),
+            "{}",
+            refused.text
+        );
+        assert_eq!(refused.button, Some(("Ask on phone", Action::AskPhone)));
+
+        let controlling = Seen {
+            state: Some(SessionState::Controlling),
+            lease_active: true,
+            ..viewing
+        };
+        assert_eq!(
+            status_notice(controlling),
+            None,
+            "typing works: nothing said"
+        );
+        let no_field = status_notice(Seen {
+            typing: Some(crate::device_links::packet::TYPING_NO_TEXT_FIELD),
+            ..controlling
+        })
+        .unwrap();
+        assert!(
+            no_field.text.contains("no text field is selected on Pixel"),
+            "{}",
+            no_field.text
+        );
+        assert_eq!(no_field.button, None);
+        // Before the picture there is nothing to type into yet: the wait is said.
+        let early = status_notice(Seen {
+            has_picture: false,
+            typing: Some("no-text-field"),
+            ..controlling
+        })
+        .unwrap();
+        assert!(
+            early.text.starts_with("Waiting for Pixel"),
+            "{}",
+            early.text
+        );
     }
 
     /// The button's ask is the shared one: `desklink.settings.request

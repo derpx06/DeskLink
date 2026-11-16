@@ -84,6 +84,14 @@ pub const PACKET_TYPE_TELEPHONY: &str = "desklink.telephony";
 pub const PACKET_TYPE_TELEPHONY_REQUEST: &str = "desklink.telephony.request";
 pub const PACKET_TYPE_WEBRTC_SIGNAL_V1: &str = "desklink.webrtc.signal.v1";
 
+/// Why keys typed in the Phone Screen window reached no text field on the
+/// phone: the `reason` of its remote-session `input-focus {editable: false}`
+/// (mirrored in `DeskLinkProtocol.kt`, pinned by `wire_values.json`).
+pub const TYPING_ACCESSIBILITY_OFF: &str = "accessibility-off";
+pub const TYPING_NO_TEXT_FIELD: &str = "no-text-field";
+pub const TYPING_NOT_EDITABLE: &str = "not-editable";
+pub const TYPING_TEXT_REFUSED: &str = "text-refused";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct NetworkPacket {
     pub id: i64,

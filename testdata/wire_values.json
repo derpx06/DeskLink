@@ -7,6 +7,8 @@
   },
   "glideAsk": {"set": {"glide": true}},
   "unlockRefusals": ["pref-off", "no-nonce", "expired", "wrong-device", "replayed", "not-locked", "not-lan", "not-ready", "failed", "unsupported"],
+  "typingRefusals": ["accessibility-off", "no-text-field", "not-editable", "text-refused"],
+  "_typingRefusalsDoc": "remote-session input-focus {editable: false, reason} from the phone while the desk's Phone Screen window types into it: why its keys reached no text field (editable: true clears it).",
   "telephony": {
     "_doc": "callStates: desklink.telephony calls[].state. errors: desklink.telephony {error, action} ('failed' is the catch-all). emergency: numbers neither app dials (bare, '+' or '00' prefixed).",
     "callStates": ["ringing", "dialing", "talking", "held"],
