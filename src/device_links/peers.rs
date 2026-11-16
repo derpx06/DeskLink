@@ -193,7 +193,9 @@ mod tests {
                 let path = entry.path();
                 if path.is_dir() {
                     scan(&path, root, found);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && !crate::source_scan::is_test_file(&path)
+                {
                     let text =
                         crate::source_scan::production(&std::fs::read_to_string(&path).unwrap());
                     let mut lines = text.lines().peekable();

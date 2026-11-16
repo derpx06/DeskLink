@@ -908,7 +908,9 @@ mod tests {
                 let path = entry.path();
                 if path.is_dir() {
                     scan(&path, found);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && !crate::source_scan::is_test_file(&path)
+                {
                     let text = std::fs::read_to_string(&path).unwrap();
                     // Production code only: every `#[cfg(test)]` item left out.
                     let text = crate::source_scan::production(&text);

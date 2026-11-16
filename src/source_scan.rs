@@ -9,6 +9,15 @@
 //!
 //! May depend on: std only.
 
+/// Whether `path` is a test module of its own (`tests.rs`, `*_tests.rs`):
+/// the `#[cfg(test)]` is on its `mod` line in the parent, so the whole file
+/// is test code.
+pub(crate) fn is_test_file(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs"))
+}
+
 /// `text` with every `#[cfg(test)]` item blanked out, each of its lines left
 /// empty so line numbers stay: an inline module, a function, a static, a
 /// `thread_local!`, a block, or a one-line `mod x;`/`use` declaration (with the
@@ -120,6 +129,17 @@ pub(crate) const SPLIT_FIXTURE: &str = concat!(
 #[cfg(test)]
 mod tests {
     use super::{production, SPLIT_FIXTURE as SPLIT};
+
+    #[test]
+    fn test_files_are_known_by_name() {
+        use std::path::Path;
+        assert!(super::is_test_file(Path::new("src/window/tests.rs")));
+        assert!(super::is_test_file(Path::new("src/window/jargon_tests.rs")));
+        assert!(!super::is_test_file(Path::new("src/window/mod.rs")));
+        assert!(!super::is_test_file(Path::new(
+            "src/device_links/tests_helper.rs"
+        )));
+    }
 
     #[test]
     fn a_test_module_declared_at_the_top_does_not_end_the_scan() {

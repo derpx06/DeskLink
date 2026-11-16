@@ -1153,7 +1153,9 @@ mod tests {
                 let path = entry.path();
                 if path.is_dir() {
                     walk(&path, out);
-                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                } else if path.extension().is_some_and(|ext| ext == "rs")
+                    && !crate::source_scan::is_test_file(&path)
+                {
                     out.push(path);
                 }
             }

@@ -525,7 +525,7 @@ fn literals(path: &std::path::Path, found: &mut Vec<(String, String)>) {
             literals(&entry.path(), found);
         }
     } else if path.extension().is_some_and(|ext| ext == "rs")
-        && path.file_name().is_some_and(|name| name != "tests.rs")
+        && !crate::source_scan::is_test_file(path)
     {
         let text = std::fs::read_to_string(path).unwrap();
         let code = crate::source_scan::production(&text);

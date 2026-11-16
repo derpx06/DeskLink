@@ -4524,7 +4524,8 @@ mod jargon_tests {
                 // First-run onboarding has its own owner and pass.
                 && path
                     .file_name()
-                    .is_some_and(|name| name != "tests.rs" && name != "onboarding.rs")
+                    .is_some_and(|name| name != "onboarding.rs")
+                && !crate::source_scan::is_test_file(&path)
             {
                 out.push(path);
             }
