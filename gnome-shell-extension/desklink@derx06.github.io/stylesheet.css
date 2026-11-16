@@ -138,11 +138,13 @@
   border-radius: 12px;
 }
 .desklink-dark.desklink-card, .desklink-dark.desklink-art, .desklink-dark.desklink-tile,
-.desklink-dark.desklink-chip, .desklink-dark.desklink-round, .desklink-dark.desklink-footer-button {
+.desklink-dark.desklink-chip, .desklink-dark.desklink-round, .desklink-dark.desklink-footer-button,
+.desklink-dark.desklink-pill-button {
   background-color: rgba(255, 255, 255, 0.07);
 }
 .desklink-light.desklink-card, .desklink-light.desklink-art, .desklink-light.desklink-tile,
-.desklink-light.desklink-chip, .desklink-light.desklink-round, .desklink-light.desklink-footer-button {
+.desklink-light.desklink-chip, .desklink-light.desklink-round, .desklink-light.desklink-footer-button,
+.desklink-light.desklink-pill-button {
   background-color: rgba(0, 0, 0, 0.05);
 }
 .desklink-dark.desklink-tile:hover, .desklink-dark.desklink-chip:hover, .desklink-dark.desklink-round:hover,

@@ -76,7 +76,7 @@ pub(super) fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a 
 pub(super) const KNOWN_BUILDS: [&str; 27] = [
     // Top-bar redesign: what is happening now first, four large tiles, a
     // plain offline/empty state, chip and panel badges, the pill hides offline.
-    "9ae7ed1d56a012a04827d1eeb219b9febc434c883c1fd380d825e70a1a6e530a",
+    "76b5364d49dd6e55fd515cff36b51ac0855e6d5be128ad55897666122d71ce4c",
     // Top-bar UI pass: rows line up, icons that exist, the footer stays on a
     // short screen, readable in the light style, focus rings.
     "885de5bb337209bbfb06918befc3b63cf70c3f89e463bab105098d0b133f22aa",

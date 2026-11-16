@@ -663,7 +663,7 @@ export function fillMenu(menu, ctx) {
         const empty = column({style_class: 'desklink-empty'});
         empty.add_child(label(EMPTY.title, 'desklink-row-title'));
         empty.add_child(wrapped(dim(label(EMPTY.hint, 'desklink-row-detail'))));
-        const pair = textButton(EMPTY.button, () => invoke('', 'open'));
+        const pair = textButton(EMPTY.button, () => invoke('', 'open'), variant);
         pair.x_expand = false;
         pair.x_align = Clutter.ActorAlign.START;
         empty.add_child(pair);
@@ -675,8 +675,10 @@ export function fillMenu(menu, ctx) {
     // screen is too short for it.
     const body = scrolledSection(menu);
     // "Now" rows are capped (NOW_ROWS); the rest are counted into "+N more".
+    // On a short screen (1080p at 200 %) one row, so the tiles stay near the top.
+    const nowLimit = (Main.layoutManager.primaryMonitor?.height ?? 1000) < 700 ? 1 : NOW_ROWS;
     let nowShown = 0, nowHidden = 0;
-    const room = () => (nowShown < NOW_ROWS ? ++nowShown : (++nowHidden, 0));
+    const room = () => (nowShown < nowLimit ? ++nowShown : (++nowHidden, 0));
     for (const block of blocks) {
         switch (block) {
         case 'switcher': {
