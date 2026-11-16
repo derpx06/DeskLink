@@ -166,6 +166,16 @@ fn verdict_of(targets: Option<&[String]>, detection: Option<bool>) -> Option<boo
 }
 
 fn clipboard_targets() -> Option<Vec<String>> {
+    if WAYLAND_READ.load(Ordering::Acquire) {
+        record_detection(true);
+        let output = wl_paste(&["--list-types"]).filter(|output| output.status.success())?;
+        return Some(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::to_string)
+                .collect(),
+        );
+    }
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, CreateWindowAux, WindowClass};
     use x11rb::protocol::Event;
@@ -586,6 +596,86 @@ fn should_read(watched: bool, generation: u64, read: u64, nobody: bool) -> bool 
     !(watched && nobody && generation == read)
 }
 
+/// Copies made in Wayland apps are read with wl-clipboard's `wl-paste`, on
+/// compositors with the data-control protocol (Plasma, sway, Hyprland,
+/// COSMIC...): KWin hands a Wayland app's copy to Xwayland only while an X11
+/// window has focus, so the X11 selection alone missed nearly every copy made
+/// on Plasma. Set while `wl-paste --watch` runs.
+static WAYLAND_READ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether to read the Wayland clipboard: a Wayland session that is not
+/// GNOME. Mutter mirrors every copy into Xwayland and has no data-control
+/// (`wl-paste` would open a window there to get the clipboard).
+fn wayland_reader_wanted(wayland_display: bool, desktop: &str) -> bool {
+    wayland_display
+        && !desktop
+            .split(':')
+            .any(|name| name.eq_ignore_ascii_case("GNOME"))
+}
+
+/// `wl-paste` with `args`, given at most two seconds (a copying app that
+/// never answers must not stall the clipboard thread). `None` when it could
+/// not run or ran out of time.
+fn wl_paste(args: &[&str]) -> Option<std::process::Output> {
+    std::process::Command::new("timeout")
+        .args(["2", "wl-paste"])
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.code() != Some(124))
+}
+
+/// The Wayland clipboard's text; empty when it holds none.
+fn wayland_text() -> String {
+    wl_paste(&["--no-newline", "--type", "text"])
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+/// Watches the Wayland clipboard: every change bumps the owner generation and
+/// wakes the poll, which then reads with `wl-paste`. Ends (and the poll goes
+/// back to X11) when `wl-paste` is missing or the compositor has no
+/// data-control.
+fn watch_wayland_changes() {
+    if !wayland_reader_wanted(
+        std::env::var_os("WAYLAND_DISPLAY").is_some(),
+        &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
+    ) {
+        return;
+    }
+    let _ = thread::Builder::new()
+        .name("desklink-clip-wayland".into())
+        .spawn(|| {
+            use std::io::BufRead;
+            // One line per change; the command drains what it is handed.
+            let Ok(mut child) = std::process::Command::new("wl-paste")
+                .args(["--watch", "sh", "-c", "cat > /dev/null; echo"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            else {
+                return;
+            };
+            let Some(changes) = child.stdout.take() else {
+                let _ = child.kill();
+                return;
+            };
+            WAYLAND_READ.store(true, Ordering::Release);
+            let watching = Watching::begin();
+            for _ in std::io::BufReader::new(changes).lines() {
+                OWNER_GEN.fetch_add(1, Ordering::AcqRel);
+                wake_poller();
+            }
+            WAYLAND_READ.store(false, Ordering::Release);
+            drop(watching);
+            let _ = child.wait();
+        });
+}
+
 fn watch_owner_changes() {
     let _ = thread::Builder::new()
         .name("desklink-clip-owner".into())
@@ -781,6 +871,7 @@ impl DaemonWorker {
             // Clipboard page can say so before anything is copied.
             record_detection(x11rb::connect(None).is_ok());
             watch_owner_changes();
+            watch_wayland_changes();
             // The owner change last looked at for an image.
             let mut image_gen = OWNER_GEN.load(Ordering::Acquire);
             // One connection to the clipboard, kept (a new one every second
@@ -814,24 +905,33 @@ impl DaemonWorker {
                     continue;
                 }
                 text_gen = generation;
-                if handle.is_none() {
-                    handle = arboard::Clipboard::new().ok();
-                }
-                let Some(clipboard) = handle.as_mut() else {
-                    continue;
-                };
-
-                let current_text = match clipboard.get_text() {
-                    Ok(text) => text,
-                    Err(arboard::Error::ContentNotAvailable) => String::new(),
-                    Err(_) => {
-                        handle = None;
-                        String::new()
+                let wayland = WAYLAND_READ.load(Ordering::Acquire);
+                let current_text = if wayland {
+                    wayland_text()
+                } else {
+                    if handle.is_none() {
+                        handle = arboard::Clipboard::new().ok();
+                    }
+                    let Some(clipboard) = handle.as_mut() else {
+                        continue;
+                    };
+                    match clipboard.get_text() {
+                        Ok(text) => text,
+                        Err(arboard::Error::ContentNotAvailable) => String::new(),
+                        Err(_) => {
+                            handle = None;
+                            String::new()
+                        }
                     }
                 };
                 note_current(&current_text);
                 forget_examined(&mut examined, &current_text);
                 if current_text.is_empty() {
+                    // Images are read from X11 only: a Wayland reader's X11
+                    // selection may be an old copy.
+                    if wayland {
+                        continue;
+                    }
                     // No text: perhaps an image, read once per copy.
                     let generation = OWNER_GEN.load(Ordering::Acquire);
                     if generation != image_gen {
@@ -1032,6 +1132,17 @@ fn remember_if_sent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_wayland_clipboard_is_read_on_every_wayland_desktop_but_gnome() {
+        for desktop in ["KDE", "sway", "Hyprland", "COSMIC", "niri", ""] {
+            assert!(wayland_reader_wanted(true, desktop), "{desktop}");
+        }
+        for desktop in ["GNOME", "ubuntu:GNOME", "Pop:GNOME", "gnome"] {
+            assert!(!wayland_reader_wanted(true, desktop), "{desktop}");
+        }
+        assert!(!wayland_reader_wanted(false, "KDE"), "an X11 session");
+    }
 
     #[test]
     fn a_phone_with_clipboard_sharing_off_is_not_told_about_a_copy_too_large() {
