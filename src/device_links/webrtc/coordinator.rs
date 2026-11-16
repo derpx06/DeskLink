@@ -4367,15 +4367,10 @@ fn handle_peer_envelope(
                 } else {
                     response.reason =
                         Some(unlocked.err().or(authorization.err()).unwrap_or_else(|| {
-                            if can_control {
-                                "The approved desktop-control session is not active".to_string()
-                            } else {
-                                // The portal was approved for the picture only.
-                                "The computer shared its screen without control. Reopen the \
-                             screen and, on the computer, turn on \"Allow remote interaction\" \
-                             before sharing."
-                                    .to_string()
-                            }
+                            control_denied_reason(
+                                can_control,
+                                crate::platform::note("share").is_some(),
+                            )
                         }));
                     // Back to the view the request was made on. A request
                     // that was itself refused changed nothing, and applying
@@ -5209,6 +5204,42 @@ fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+/// Why the phone may not control this screen when the session and password
+/// allowed it: the control session lapsed, the desktop can only show its
+/// screen (sway, Hyprland, COSMIC: ScreenCast without RemoteDesktop, so
+/// there is no switch to turn on), or the picture alone was approved.
+fn control_denied_reason(can_control: bool, view_only_desktop: bool) -> String {
+    if can_control {
+        "The approved desktop-control session is not active".to_string()
+    } else if view_only_desktop {
+        "This computer's desktop lets the phone watch its screen but not control it. Only \
+         GNOME and KDE Plasma allow control."
+            .to_string()
+    } else {
+        "The computer shared its screen without control. Reopen the screen and, on the \
+         computer, turn on \"Allow remote interaction\" before sharing."
+            .to_string()
+    }
+}
+
+#[cfg(test)]
+mod denial_tests {
+    use super::control_denied_reason;
+
+    #[test]
+    fn a_view_only_desktop_is_not_told_to_turn_on_a_switch_it_lacks() {
+        let sway = control_denied_reason(false, true);
+        assert!(!sway.contains("Allow remote interaction"), "{sway}");
+        assert!(
+            sway.contains("watch its screen but not control it"),
+            "{sway}"
+        );
+        let gnome = control_denied_reason(false, false);
+        assert!(gnome.contains("Allow remote interaction"), "{gnome}");
+        assert!(control_denied_reason(true, true).contains("not active"));
+    }
 }
 
 #[cfg(test)]
