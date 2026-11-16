@@ -166,7 +166,7 @@ mod tests {
             // Keyed by verb, and the page's own browsing state (the thread's
             // UI).
             "send_to.rs:LIMITER",
-            "window/bucket.rs:BROWSE",
+            "window/bucket/browse.rs:BROWSE",
         ];
         /// A map or set keyed by a device id, or by a tuple starting with one.
         fn keyed(text: &str) -> bool {
