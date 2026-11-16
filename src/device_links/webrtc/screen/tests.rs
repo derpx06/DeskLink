@@ -113,7 +113,13 @@ fn a_phone_h264_frame_is_shown_without_waiting_for_the_next() {
         &[gst::MessageType::Eos, gst::MessageType::Error],
     );
     std::thread::sleep(Duration::from_millis(300));
+    let caps = stream.sink_pad().unwrap().current_caps().unwrap();
     pipeline.set_state(gst::State::Null).unwrap();
+    // A phone screen is sRGB whatever the H.264 stream's colour description says.
+    assert_eq!(
+        sink_colorimetry(&caps).transfer(),
+        gst_video::VideoTransferFunction::Srgb
+    );
     let mut waits = waits.lock().unwrap().split_off(0);
     assert!(waits.len() >= 8, "only {} frames decoded", waits.len());
     // The first frames are the decoder starting up.
@@ -758,4 +764,102 @@ fn the_frame_folder_must_be_private_and_its_files_are() {
     );
     let _ = std::fs::remove_file(&link);
     std::fs::remove_dir_all(&base).unwrap();
+}
+
+/// A phone's VP8 screen reaches the sink as what it is (sRGB, BT.601), not as
+/// camera video: GTK converted the decoder's BT.709 transfer to sRGB and the
+/// phone's grey 17 showed as 33.
+#[test]
+fn a_phone_vp8_screen_reaches_the_sink_as_srgb_bt601() {
+    if gst::init().is_err()
+        || ["videotestsrc", "vp8enc", "rtpvp8pay", "decodebin"]
+            .iter()
+            .any(|name| gst::ElementFactory::find(name).is_none())
+    {
+        return;
+    }
+    let pipeline = gst::Pipeline::new();
+    let make = |name: &str| gst::ElementFactory::make(name).build().unwrap();
+    let source = make("videotestsrc");
+    source.set_property("num-buffers", 3i32);
+    let raw = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("format", "I420")
+                .field("width", 864i32)
+                .field("height", 1920i32)
+                .build(),
+        )
+        .build()
+        .unwrap();
+    let encoder = make("vp8enc");
+    let payloader = make("rtpvp8pay");
+    let rtp = gst::ElementFactory::make("capsfilter")
+        .property("caps", video_caps(false))
+        .build()
+        .unwrap();
+    let chain = [&source, &raw, &encoder, &payloader, &rtp];
+    pipeline.add_many(chain).unwrap();
+    gst::Element::link_many(chain).unwrap();
+    let stream = attach_incoming_video(&pipeline, &rtp.static_pad("src").unwrap()).unwrap();
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let _ = pipeline.bus().unwrap().timed_pop_filtered(
+        gst::ClockTime::from_seconds(20),
+        &[gst::MessageType::Eos, gst::MessageType::Error],
+    );
+    let caps = stream
+        .sink_pad()
+        .unwrap()
+        .current_caps()
+        .expect("the sink got caps");
+    pipeline.set_state(gst::State::Null).unwrap();
+    let colorimetry = sink_colorimetry(&caps);
+    assert_eq!(
+        colorimetry.transfer(),
+        gst_video::VideoTransferFunction::Srgb,
+        "{caps}"
+    );
+    assert_eq!(
+        colorimetry.matrix(),
+        gst_video::VideoColorMatrix::Bt601,
+        "{caps}"
+    );
+}
+
+/// The colorimetry the sink was given, as the sink reads it (field, else
+/// GStreamer's default for the size).
+fn sink_colorimetry(caps: &gst::Caps) -> gst_video::VideoColorimetry {
+    gst_video::VideoInfo::from_caps(caps).unwrap().colorimetry()
+}
+
+/// H.264 keeps the matrix and range its stream signals; only the transfer is
+/// the screen's.
+#[test]
+fn a_phone_h264_screen_keeps_its_signalled_matrix_and_range() {
+    use gst_video::{VideoColorMatrix, VideoColorRange, VideoColorimetry, VideoTransferFunction};
+    gst::init().unwrap();
+    let caps = |colorimetry: &str| {
+        gst::Caps::builder("video/x-raw")
+            .field("format", "I420")
+            .field("colorimetry", colorimetry)
+            .build()
+    };
+    let read = |caps: &gst::Caps| -> VideoColorimetry {
+        caps.structure(0)
+            .unwrap()
+            .get::<&str>("colorimetry")
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let fixed = screen_colorimetry(&caps("bt709"), false).unwrap();
+    assert_eq!(read(&fixed).transfer(), VideoTransferFunction::Srgb);
+    assert_eq!(read(&fixed).matrix(), VideoColorMatrix::Bt709);
+    let full_601 = caps("1:4:5:4");
+    let fixed = screen_colorimetry(&full_601, false).unwrap();
+    assert_eq!(read(&fixed).range(), VideoColorRange::Range0_255);
+    assert_eq!(read(&fixed).matrix(), VideoColorMatrix::Bt601);
+    // Already right: left alone.
+    assert!(screen_colorimetry(&fixed, false).is_none());
 }

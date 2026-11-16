@@ -1,5 +1,6 @@
 //! The phone's screen arriving here: the decoded [`ScreenStream`] the window
-//! shows, low-latency decoder choice, parking a pad while no window shows it,
+//! shows, low-latency decoder choice, the picture's real colorimetry
+//! ([`screen_colorimetry`]), parking a pad while no window shows it,
 //! the per-device stream registry, and the inbound statistics and watch.
 //!
 //! Sibling edges: none (the parent's caps and `set_if_present`).
@@ -77,6 +78,75 @@ pub(super) fn low_latency_order(factories: &[String]) -> Option<Vec<usize>> {
     }
     order.extend(held);
     Some(order)
+}
+
+/// The colorimetry a phone screen really has, for decoded `caps` that say
+/// otherwise; `None` when they are right already.
+///
+/// A phone screen is an sRGB picture, but decoders label it as camera video:
+/// colorimetry `bt709` (signalled, or GStreamer's default above 576 lines),
+/// BT.709 transfer. GTK (gtk4paintablesink 0.15 sets the texture's colour
+/// state from the caps) then converted that transfer to sRGB and lifted every
+/// dark tone: the phone's grey 17 showed as 33, 198 as 204. VP8 carries no
+/// colour description, and the phone's VP8 is libwebrtc's conversion (BT.601
+/// limited range, sRGB/BT.709 primaries), so the default BT.709 matrix shifted
+/// saturated colours. H.264 keeps the matrix, range and primaries the decoder
+/// reports (signalled, else GStreamer's size default).
+pub(super) fn screen_colorimetry(caps: &gst::CapsRef, vp8: bool) -> Option<gst::Caps> {
+    use gst_video::{
+        VideoColorMatrix, VideoColorPrimaries, VideoColorRange, VideoColorimetry,
+        VideoTransferFunction,
+    };
+    let structure = caps.structure(0)?;
+    let said: VideoColorimetry = match structure.get::<&str>("colorimetry") {
+        Ok(text) => text.parse().ok()?,
+        // No colorimetry field: what GStreamer assumes for a picture this size
+        // (DMABuf caps say `DMA_DRM`, so the default is read off a plain format).
+        Err(_) => gst_video::VideoInfo::builder(
+            gst_video::VideoFormat::Nv12,
+            structure.get::<i32>("width").ok()?.try_into().ok()?,
+            structure.get::<i32>("height").ok()?.try_into().ok()?,
+        )
+        .build()
+        .ok()?
+        .colorimetry(),
+    };
+    let real = if vp8 {
+        VideoColorimetry::new(
+            VideoColorRange::Range16_235,
+            VideoColorMatrix::Bt601,
+            VideoTransferFunction::Srgb,
+            VideoColorPrimaries::Bt709,
+        )
+    } else {
+        VideoColorimetry::new(
+            said.range(),
+            said.matrix(),
+            VideoTransferFunction::Srgb,
+            said.primaries(),
+        )
+    };
+    if real == said && structure.has_field("colorimetry") {
+        return None;
+    }
+    let mut fixed = caps.to_owned();
+    fixed
+        .make_mut()
+        .structure_mut(0)?
+        .set("colorimetry", real.to_string());
+    Some(fixed)
+}
+
+/// Whether `decodebin` decodes VP8 (the decoder it chose says so).
+fn decodes_vp8(decodebin: &gst::Element) -> bool {
+    let Some(bin) = decodebin.downcast_ref::<gst::Bin>() else {
+        return false;
+    };
+    bin.iterate_recurse().into_iter().flatten().any(|element| {
+        element.factory().is_some_and(|factory| {
+            factory.has_type(gst::ElementFactoryType::DECODER) && factory.name().contains("vp8")
+        })
+    })
 }
 
 /// Whether `decodebin` chose a VA-API decoder (whose DMABuf output the GTK
@@ -413,6 +483,22 @@ pub(crate) fn attach_incoming_video(
         // `DESKLINK_SCREEN_COPY=1` forces the converting path.
         let (convert_for_decode, sink_for_decode) = (convert.clone(), sink.clone());
         decode.connect_pad_added(move |bin, decoded| {
+            // Before linking: the decoder's caps are sent on the link. The
+            // decoder exists by now (its output is what this pad carries).
+            let vp8 = decodes_vp8(bin);
+            decoded.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+                let fixed = match &info.data {
+                    Some(gst::PadProbeData::Event(event)) => match event.view() {
+                        gst::EventView::Caps(caps) => screen_colorimetry(caps.caps(), vp8),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(fixed) = fixed {
+                    info.data = Some(gst::PadProbeData::Event(gst::event::Caps::new(&fixed)));
+                }
+                gst::PadProbeReturn::Ok
+            });
             let direct = zero_copy_wanted(bin);
             let linked = if direct {
                 sink_for_decode
