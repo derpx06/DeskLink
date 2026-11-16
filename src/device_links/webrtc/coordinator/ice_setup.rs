@@ -77,3 +77,10 @@ pub(super) fn addresses_vanished(used: &[std::net::IpAddr], present: &[std::net:
 /// supplied one: the same provider as the default TURN service. Never used on
 /// the LAN, which needs no server.
 const DEFAULT_STUN_SERVER: &str = "stun://stun.cloudflare.com:3478";
+
+/// Forgets the addresses `device_id`'s peer gathered on (see [`forget_liveness`]).
+pub(super) fn forget(device_id: &str) {
+    if let Ok(mut used) = ice_addresses().lock() {
+        used.remove(device_id);
+    }
+}

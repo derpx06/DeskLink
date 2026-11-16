@@ -6,16 +6,16 @@
 //!
 //! Layout: this file holds the signalling entry points (start, inbound
 //! signalling, restart, sending a feature packet), the helpers every part
-//! uses (`now_millis`, `device_name`, `is_paired`), and the crate-facing
-//! re-exports. `signing` builds and
+//! uses (`now_millis`, `device_name`, `is_paired`), the per-device
+//! `forget_liveness`, and the crate-facing re-exports. `signing` builds and
 //! checks the signed records, `peer_worker` runs a peer (the hub, with the
 //! `PeerWorkerGuard`), `envelopes` handles the handover and live envelopes,
 //! `terminal_pump` the terminal channel, `file_link` the transfers,
 //! `liveness` and `recovery` keep a link alive or give up explicitly,
 //! `ice_setup` picks ICE servers and addresses, `desktop_share`,
 //! `share_worker` and `desktop_input` share this computer's screen, and
-//! `phone_remote` views and controls the phone. Each module doc lists its
-//! sibling edges. May depend on: `core`,
+//! `phone_remote` views and controls the phone. The parts have no cycles;
+//! each module doc lists its sibling edges. May depend on: `core`,
 //! `features`, `daemon` (state, events), `packet`, `config`, the sibling
 //! `webrtc` modules.
 
@@ -105,8 +105,8 @@ pub(crate) use file_link::{
 };
 pub(crate) use ice_setup::ice_config_for;
 pub(crate) use liveness::{
-    classify_peer_state, data_silence, forget_liveness, is_dozing, link_silence, liveness,
-    note_heartbeat, probe_soon, Liveness, PeerStateAction, NEGOTIATION_TIMEOUT, PEER_DEAD_AFTER,
+    classify_peer_state, data_silence, is_dozing, link_silence, liveness, note_heartbeat,
+    probe_soon, Liveness, PeerStateAction, NEGOTIATION_TIMEOUT, PEER_DEAD_AFTER,
     PEER_DEAD_AFTER_DOZING, PEER_PROBE_AFTER, TRANSIENT_DISCONNECT_GRACE,
 };
 pub(crate) use peer_worker::rebuild_peers_off_the_network;
@@ -534,4 +534,11 @@ pub(super) fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+/// The device is gone (unpaired): what is remembered of its liveness goes.
+pub(crate) fn forget_liveness(device_id: &str) {
+    liveness::forget(device_id);
+    recovery::forget(device_id);
+    ice_setup::forget(device_id);
 }

@@ -1,8 +1,8 @@
 //! Data-channel liveness: peer-state classification and its constants, the
 //! inbound and silence clocks, dozing reports, probes, keepalives, and
-//! forgetting a device's liveness state.
+//! forgetting a device's clocks.
 //!
-//! Sibling edges: `recovery`, `ice_setup` (forgetting their per-device state). Outside: `packet`,
+//! Sibling edges: none (the parent's helpers only). Outside: `packet`,
 //! `peer_connection`.
 
 use super::*;
@@ -78,8 +78,8 @@ pub(crate) fn data_silence(device_id: &str) -> Option<std::time::Duration> {
         .map(std::time::Instant::elapsed)
 }
 
-/// The device is gone (unpaired): what is remembered of its liveness goes.
-pub(crate) fn forget_liveness(device_id: &str) {
+/// Forgets `device_id`'s liveness clocks (see [`forget_liveness`]).
+pub(super) fn forget(device_id: &str) {
     if let Ok(mut heard) = data_inbound().lock() {
         heard.remove(device_id);
     }
@@ -88,12 +88,6 @@ pub(crate) fn forget_liveness(device_id: &str) {
     }
     if let Ok(mut woke) = probe_now().lock() {
         woke.remove(device_id);
-    }
-    if let Ok(mut streaks) = lacking_streaks().lock() {
-        streaks.remove(device_id);
-    }
-    if let Ok(mut used) = ice_addresses().lock() {
-        used.remove(device_id);
     }
 }
 

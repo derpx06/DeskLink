@@ -264,3 +264,10 @@ pub(crate) fn recovery_delay(attempt: u32) -> Option<std::time::Duration> {
 // a peer that could be healthy and feature-ready, with no rebuild and no
 // error. A negotiation the lost signal stalls is rebuilt by
 // `NEGOTIATION_TIMEOUT`; a ready peer never needed the signal.
+
+/// Forgets `device_id`'s lacking-channel streak (see [`forget_liveness`]).
+pub(super) fn forget(device_id: &str) {
+    if let Ok(mut streaks) = lacking_streaks().lock() {
+        streaks.remove(device_id);
+    }
+}
