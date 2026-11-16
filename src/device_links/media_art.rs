@@ -39,6 +39,21 @@ pub(crate) struct Art {
 enum Entry {
     Loading,
     Done(Option<Arc<Art>>),
+    /// A read that failed: tried again after [`RETRY_AFTER`] (a Wi-Fi blip
+    /// left a whole album without art until four other covers evicted it).
+    Failed(std::time::Instant),
+}
+
+const RETRY_AFTER: Duration = Duration::from_secs(60);
+
+/// What a cached entry says now: the art, nothing yet, or read it again.
+fn cached(entry: &Entry, now: std::time::Instant) -> Option<Option<Arc<Art>>> {
+    match entry {
+        Entry::Done(art) => Some(art.clone()),
+        Entry::Loading => Some(None),
+        Entry::Failed(at) if now.saturating_duration_since(*at) < RETRY_AFTER => Some(None),
+        Entry::Failed(_) => None,
+    }
 }
 
 static CACHE: Mutex<VecDeque<(String, Entry)>> = Mutex::new(VecDeque::new());
@@ -60,16 +75,17 @@ pub(crate) fn art_for(url: &str, ready: impl FnOnce() + Send + 'static) -> Optio
         let Ok(mut cache) = CACHE.lock() else {
             return None;
         };
-        if let Some((_, entry)) = cache.iter().find(|(known, _)| known == url) {
-            return match entry {
-                Entry::Done(art) => art.clone(),
-                Entry::Loading => None,
-            };
+        if let Some((_, entry)) = cache.iter_mut().find(|(known, _)| known == url) {
+            match cached(entry, std::time::Instant::now()) {
+                Some(art) => return art,
+                None => *entry = Entry::Loading,
+            }
+        } else {
+            if cache.len() >= CACHED {
+                cache.pop_front();
+            }
+            cache.push_back((url.to_string(), Entry::Loading));
         }
-        if cache.len() >= CACHED {
-            cache.pop_front();
-        }
-        cache.push_back((url.to_string(), Entry::Loading));
     }
     let url = url.to_string();
     let _ = std::thread::Builder::new()
@@ -87,7 +103,10 @@ pub(crate) fn art_for(url: &str, ready: impl FnOnce() + Send + 'static) -> Optio
                 .map(Arc::new);
             if let Ok(mut cache) = CACHE.lock() {
                 if let Some((_, entry)) = cache.iter_mut().find(|(known, _)| *known == url) {
-                    *entry = Entry::Done(art);
+                    *entry = match art {
+                        Some(art) => Entry::Done(Some(art)),
+                        None => Entry::Failed(std::time::Instant::now()),
+                    };
                 }
             }
             ready();
@@ -438,6 +457,20 @@ pub(crate) fn art_id(jpeg: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed read is not the answer for ever: after a minute it is tried again.
+    #[test]
+    fn a_failed_fetch_is_tried_again_after_a_while() {
+        let now = std::time::Instant::now();
+        let failed = Entry::Failed(now);
+        assert_eq!(
+            cached(&failed, now + Duration::from_secs(5)),
+            Some(None),
+            "not yet"
+        );
+        assert_eq!(cached(&failed, now + RETRY_AFTER), None, "read again");
+        assert_eq!(cached(&Entry::Loading, now), Some(None));
+    }
 
     #[test]
     fn a_logged_art_source_is_its_host_only() {

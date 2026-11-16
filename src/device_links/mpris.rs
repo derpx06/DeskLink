@@ -571,6 +571,15 @@ fn send_with_art(device_id: &str, mut packet: NetworkPacket, art: Option<&super:
     super::desk_features::send(device_id, &packet);
 }
 
+/// `device_id`'s waiting seek / volume requests: gone with the phone.
+pub(crate) fn forget_latest(device_id: &str) {
+    if let Ok(mut latest) = LATEST.lock() {
+        if let Some(latest) = latest.as_mut() {
+            latest.retain(|(device, _, _), _| device != device_id);
+        }
+    }
+}
+
 /// A phone (re)connected: it gets the picture again with the next state.
 pub(crate) fn forget_art_sent(device_id: &str) {
     if let Ok(mut sent) = ART_SENT.lock() {
@@ -596,6 +605,109 @@ fn target<'a>(
         );
     }
     active(players, last_playing).or(players.first())
+}
+
+/// What a phone's request only sets to an absolute value (a seek bar dragged
+/// sends `SetPosition` up to 5 times a second): only the newest of each kind
+/// is worth applying. A relative `Seek` or an action is never folded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Latest {
+    Position,
+    Volume,
+}
+
+impl Latest {
+    pub(crate) fn of(packet: &NetworkPacket) -> Option<Self> {
+        if packet.get_str("action").is_some() || packet.get_i64("Seek").is_some() {
+            return None;
+        }
+        match (
+            packet.get_i64("SetPosition").is_some(),
+            packet.get_i64("setVolume").is_some(),
+        ) {
+            (true, false) => Some(Self::Position),
+            (false, true) => Some(Self::Volume),
+            _ => None,
+        }
+    }
+}
+
+/// The newest absolute request per phone, player and kind, waiting for the desk
+/// thread. A drag queued one job per step: the one desk thread (unlock
+/// answers and notifications wait behind it) replayed stale seeks for
+/// seconds, and its full queue dropped the final one.
+// Spelled out (not an alias): peers.rs's store-list test finds device-keyed stores by their type.
+#[allow(clippy::type_complexity)]
+static LATEST: Mutex<Option<HashMap<(String, String, Latest), NetworkPacket>>> = Mutex::new(None);
+
+/// The player a request names ("" for the active one): each has its own
+/// slot, so a drag on one player never swallows a request for another.
+pub(crate) fn request_player(packet: &NetworkPacket) -> String {
+    packet.get_str("player").unwrap_or_default().to_string()
+}
+
+/// Keeps `packet` as `device_id`'s newest of `kind` for its player; true
+/// when no job is waiting for that slot yet (the caller queues one, which
+/// takes it).
+pub(crate) fn hold_latest(device_id: &str, kind: Latest, packet: NetworkPacket) -> bool {
+    let key = (device_id.to_string(), request_player(&packet), kind);
+    LATEST.lock().is_ok_and(|mut latest| {
+        latest
+            .get_or_insert_with(HashMap::new)
+            .insert(key, packet)
+            .is_none()
+    })
+}
+
+/// The newest request of `kind` for `player` held for `device_id`, now taken.
+pub(crate) fn take_latest(device_id: &str, player: &str, kind: Latest) -> Option<NetworkPacket> {
+    LATEST
+        .lock()
+        .ok()?
+        .as_mut()?
+        .remove(&(device_id.to_string(), player.to_string(), kind))
+}
+
+/// Phones with a delayed refresh waiting, and whether another change came
+/// in meanwhile: one settle thread per phone, however many requests.
+static SETTLING: Mutex<Option<HashMap<String, bool>>> = Mutex::new(None);
+
+/// A change for `device_id` needs a refresh a moment later; true when the
+/// caller must start the thread (none is waiting for this phone).
+fn settle_wanted(device_id: &str) -> bool {
+    let Ok(mut settling) = SETTLING.lock() else {
+        return false;
+    };
+    let settling = settling.get_or_insert_with(HashMap::new);
+    match settling.get_mut(device_id) {
+        Some(again) => {
+            *again = true;
+            false
+        }
+        None => {
+            settling.insert(device_id.to_string(), false);
+            true
+        }
+    }
+}
+
+/// The settle thread refreshed `device_id`: true when another change came
+/// in since and it must wait and refresh once more.
+fn settle_again(device_id: &str) -> bool {
+    let Ok(mut settling) = SETTLING.lock() else {
+        return false;
+    };
+    let settling = settling.get_or_insert_with(HashMap::new);
+    match settling.get_mut(device_id) {
+        Some(again) if *again => {
+            *again = false;
+            true
+        }
+        _ => {
+            settling.remove(device_id);
+            false
+        }
+    }
 }
 
 /// A phone's `desklink.mpris.request` for the desk's players. After a
@@ -666,9 +778,29 @@ pub(crate) fn handle_request(device_id: &str, packet: &NetworkPacket) -> Result<
     }
     // The state now (asked for, or just changed), not at the next poll.
     refresh_and_send(&bus, device_id);
-    if changed {
-        std::thread::sleep(SETTLE);
-        refresh_and_send(&bus, device_id);
+    if changed && settle_wanted(device_id) {
+        // Not on the desk thread: it serves every phone and feature. One
+        // thread per phone: a drag no longer starts one per step.
+        let device_id = device_id.to_string();
+        let spawned = std::thread::Builder::new()
+            .name("desklink-media-settle".into())
+            .spawn({
+                let device_id = device_id.clone();
+                move || loop {
+                    std::thread::sleep(SETTLE);
+                    if let Ok(bus) =
+                        gio::bus_get_sync(gio::BusType::Session, gio::Cancellable::NONE)
+                    {
+                        refresh_and_send(&bus, &device_id);
+                    }
+                    if !settle_again(&device_id) {
+                        break;
+                    }
+                }
+            });
+        if spawned.is_err() {
+            while settle_again(&device_id) {}
+        }
     }
     Ok(())
 }
@@ -721,6 +853,92 @@ fn call_with(
     )
     .map(|_| ())
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod latest_tests {
+    use super::*;
+
+    fn request(key: &str, value: i64) -> NetworkPacket {
+        let mut packet = NetworkPacket::new("desklink.mpris.request");
+        packet.set(key, value);
+        packet
+    }
+
+    #[test]
+    fn a_burst_of_seeks_runs_only_the_newest() {
+        let device = format!("latest-{}", std::process::id());
+        assert_eq!(
+            Latest::of(&request("SetPosition", 1)),
+            Some(Latest::Position)
+        );
+        assert_eq!(
+            Latest::of(&request("Seek", 1)),
+            None,
+            "relative: never folded"
+        );
+        assert!(hold_latest(
+            &device,
+            Latest::Position,
+            request("SetPosition", 10)
+        ));
+        assert!(!hold_latest(
+            &device,
+            Latest::Position,
+            request("SetPosition", 20)
+        ));
+        assert!(!hold_latest(
+            &device,
+            Latest::Position,
+            request("SetPosition", 30)
+        ));
+        // The volume has its own slot.
+        assert!(hold_latest(
+            &device,
+            Latest::Volume,
+            request("setVolume", 40)
+        ));
+        let newest = take_latest(&device, "", Latest::Position).unwrap();
+        assert_eq!(newest.get_i64("SetPosition"), Some(30));
+        assert_eq!(take_latest(&device, "", Latest::Position), None);
+        assert_eq!(
+            take_latest(&device, "", Latest::Volume)
+                .unwrap()
+                .get_i64("setVolume"),
+            Some(40)
+        );
+        // Another player has its own slot.
+        let mut other = request("SetPosition", 50);
+        other.set("player", "vlc");
+        assert!(hold_latest(&device, Latest::Position, other));
+        assert!(hold_latest(
+            &device,
+            Latest::Position,
+            request("SetPosition", 60)
+        ));
+        assert_eq!(
+            take_latest(&device, "vlc", Latest::Position)
+                .unwrap()
+                .get_i64("SetPosition"),
+            Some(50)
+        );
+        assert!(take_latest(&device, "", Latest::Position).is_some());
+    }
+
+    #[test]
+    fn a_burst_of_changes_waits_on_one_settle_thread_per_phone() {
+        let device = format!("settle-{}", std::process::id());
+        assert!(settle_wanted(&device), "the first change starts the thread");
+        assert!(!settle_wanted(&device), "the next ones ride on it");
+        assert!(!settle_wanted(&device));
+        assert!(settle_again(&device), "it refreshes once more for them");
+        assert!(!settle_again(&device), "then it ends");
+        assert!(
+            settle_wanted(&device),
+            "and a later change starts one again"
+        );
+        assert!(!settle_again(&device));
+    }
 }
 
 #[cfg(test)]

@@ -1230,6 +1230,26 @@ pub(crate) fn dispatch_webrtc_feature_packet(
             Ok(())
         }
         PACKET_TYPE_MPRIS_REQUEST => {
+            use crate::device_links::mpris;
+            // A seek or volume drag: only the newest is applied, by one job.
+            if let Some(kind) = mpris::Latest::of(&packet) {
+                let player = mpris::request_player(&packet);
+                if mpris::hold_latest(device_id, kind, packet.clone()) {
+                    let (phone, held_player) = (device_id.clone(), player.clone());
+                    let queued = crate::device_links::desk_features::run_later(move || {
+                        if let Some(packet) = mpris::take_latest(&phone, &held_player, kind) {
+                            if let Err(error) = mpris::handle_request(&phone, &packet) {
+                                debug_log!("[DeskLink] Media request from {phone} failed: {error}");
+                            }
+                        }
+                    });
+                    // Dropped (queue full): the slot must not wait for a job that never runs.
+                    if !queued {
+                        let _ = mpris::take_latest(device_id, &player, kind);
+                    }
+                }
+                return Ok(());
+            }
             // D-Bus calls to the players: off the peer worker.
             let (device_id, packet) = (device_id.clone(), packet.clone());
             crate::device_links::desk_features::run_later(move || {

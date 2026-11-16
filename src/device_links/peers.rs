@@ -31,6 +31,7 @@ pub(crate) fn forget_identity_state(device_id: &str) {
     crate::device_links::walk_away::forget(device_id);
     crate::device_links::dnd::forget(device_id);
     mpris::forget_art_sent(device_id);
+    mpris::forget_latest(device_id);
     daemon::clipboard::forget_sent_to(device_id);
 }
 
@@ -73,6 +74,7 @@ mod tests {
         const FORGOTTEN: &[&str] = &[
             "device_links/sync.rs:STATE",
             "device_links/mpris.rs:ART_SENT",
+            "device_links/mpris.rs:LATEST",
             "device_links/webrtc/transfer_manager/store.rs:CANCELLED",
             "device_links/features/registry.rs:PROFILES",
             "device_links/webrtc/remote_session/mod.rs:SESSIONS",
@@ -158,6 +160,8 @@ mod tests {
             "device_links/desk_notifications.rs:STATE",
             // Keyed by media player.
             "device_links/mpris.rs:SHOWN",
+            // A settle thread's own entry: it removes it when it ends.
+            "device_links/mpris.rs:SETTLING",
             // Terminal sessions outlive their phone while DeskLink runs, by
             // design.
             "device_links/pty/registry.rs:REGISTRY",
