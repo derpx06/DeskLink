@@ -1635,6 +1635,28 @@ mod tests {
                 find(&card, &|w| w.widget_name() == "terminal-access").is_some(),
                 "terminal access is listed"
             );
+            // The tile row comes first, right under the hero: the card
+            // (often several steps tall) must not push it below the fold.
+            let tiles = find(&root, &|w| w.widget_name() == "tile-row" && w.is_mapped())
+                .expect("the tile row");
+            let page = card.parent().expect("on the Home page");
+            assert_eq!(tiles.parent().as_ref(), Some(&page), "siblings on Home");
+            let index = |widget: &gtk::Widget| {
+                let mut child = page.first_child();
+                let mut at = 0;
+                while let Some(next) = child {
+                    if &next == widget {
+                        return at;
+                    }
+                    at += 1;
+                    child = next.next_sibling();
+                }
+                usize::MAX
+            };
+            assert!(
+                index(&tiles) < index(&card),
+                "the actions come before Finish setting up"
+            );
             let hand_off = find(&root, &|w| {
                 w.has_css_class("dl-unavailable")
                     && w.is_mapped()

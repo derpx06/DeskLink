@@ -143,9 +143,6 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
             page.append(&live_strip(daemon, device, &summary, since.as_deref()));
         }
         page.append(&hero(daemon, device, &minute));
-        if let Some(card) = super::requirements::card(daemon, &needs) {
-            page.append(&card);
-        }
         if let Some(card) = activity_card(device, &settings) {
             page.append(&card);
         }
@@ -156,7 +153,12 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         if device.status == DeviceStatus::Paired && !device.feature_transport_ready {
             page.append(&reconnecting_row(device));
         }
+        // The actions right under the hero (UI-REDESIGN 3.11); a long
+        // "Finish setting up" card above them hid them below the fold.
         page.append(&tiles(daemon, device));
+        if let Some(card) = super::requirements::card(daemon, &needs) {
+            page.append(&card);
+        }
         page.append(&columns(daemon, device));
         page.append(&terminals_card(win, device));
         page.append(&super::everything::section(daemon, device, &everything));
