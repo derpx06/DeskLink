@@ -49,7 +49,7 @@ locks are recovered, queues are bounded and blocking reads have deadlines.
 | X10 | S3 | `transfer_manager/recv.rs` | A part that could not be placed counts toward the 16 GiB per phone for 7 days. | listed |
 | X11 | S3 perf | `recv.rs` / `store.rs` | About 8 fsyncs and two directory scans per new incoming file. | listed: not measured |
 | X12 | S4 | `store.rs` `enforce_partial_cap` | The global partial cap could remove another phone's live part. | listed |
-| X13 | S4 | `store.rs` `sweep_stages` | A received file named `.desklink-*.stage` is swept after 7 days. | listed |
+| X13 | S4 | `store.rs` `sweep_stages` | A received file named `.desklink-*.stage` is swept after 7 days. | **fixed**: such a name is received as `_desklink-*` (`a_received_file_never_takes_a_staging_name`) |
 | X14 | S4 | `vault.rs` `seal_later`, `folders/import.rs` | A direct seal under the pending lock; an import reports added when the queue dropped it. | listed |
 
 ## Terminals

@@ -477,6 +477,16 @@ impl Store {
     /// entry", so a dangling symlink counts, and a suffix never pushes the
     /// name past the 255-byte filesystem limit.
     pub fn available_destination_name(&self, filename: &str) -> Result<String, String> {
+        // DeskLink's own working names (`.desklink-<id>.stage`) are swept
+        // after a week: a received file never takes one.
+        let renamed;
+        let filename = if filename.starts_with(".desklink-") {
+            // The dot becomes an underscore: same length, never hidden.
+            renamed = format!("_{}", &filename[1..]);
+            renamed.as_str()
+        } else {
+            filename
+        };
         let taken = |name: &str| -> Result<bool, String> {
             Ok(fs::symlink_metadata(self.destination_path(name)?).is_ok())
         };
@@ -1315,6 +1325,17 @@ mod tests {
         forget_device("tablet");
         assert!(store.load_receive(OTHER).unwrap().is_none());
         assert!(store.stored_sends().is_empty());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn a_received_file_never_takes_a_staging_name() {
+        let (store, base) = store("stage-name");
+        let name = store
+            .available_destination_name(".desklink-0f8fad5b-d9cb-469f-a165-70867728950e.stage")
+            .unwrap();
+        assert!(!name.starts_with(".desklink-"), "{name}");
+        assert_eq!(store.available_destination_name("a.txt").unwrap(), "a.txt");
         let _ = fs::remove_dir_all(base);
     }
 
