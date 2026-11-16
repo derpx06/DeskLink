@@ -854,29 +854,65 @@ fn the_top_bar_gets_a_notifications_words_as_one_paragraph() {
 }
 
 /// Notification buttons speak sentence case, like every other label
-/// (UI-REDESIGN 5.1): "Log out now" and "Turn on", never "Log Out Now".
+/// (UI-REDESIGN 5.1): "Log out now", "Turn on", "Call back", never "Log Out
+/// Now". Every `add_button` of the files that post notifications is read; a
+/// label that is not a literal (a loop over a list, a `format!` with a host
+/// name) is counted and pinned per file, so a new one gets looked at.
 #[test]
 fn notification_buttons_are_sentence_case() {
-    let sources = [
-        include_str!("extension.rs"),
-        include_str!("../application/indicator.rs"),
-    ]
-    .map(crate::source_scan::production)
-    .join("\n");
-    // The first string literal after each `add_button(` / `add_button_with_target_value(`.
-    let labels: Vec<&str> = sources
-        .split("add_button")
-        .skip(1)
-        .filter_map(|rest| rest.split('"').nth(1))
-        .collect();
-    assert!(labels.len() >= 6, "the scan found the buttons: {labels:?}");
-    for label in labels {
-        let title_case = label
-            .split_whitespace()
-            .skip(1)
-            // "Files" is GNOME's app, a name ("Show in Files").
-            .filter(|word| *word != "Files")
-            .any(|word| word.chars().next().is_some_and(char::is_uppercase));
-        assert!(!title_case, "\"{label}\" is Title Case");
+    // (file, its text, buttons whose label is a variable: what they say)
+    let files: [(&str, &str, usize); 5] = [
+        ("shell_dbus/extension.rs", include_str!("extension.rs"), 0),
+        (
+            "application/indicator.rs",
+            include_str!("../application/indicator.rs"),
+            1,
+        ), // "Allow", "Not now"
+        (
+            "application/mod.rs",
+            include_str!("../application/mod.rs"),
+            0,
+        ),
+        ("window/calls.rs", include_str!("../window/calls.rs"), 1), // "Answer", "Decline", "Silence"
+        (
+            "bucket_progress.rs",
+            include_str!("../bucket_progress.rs"),
+            0,
+        ),
+    ];
+    let mut checked = 0;
+    for (name, text, variables) in files {
+        let source = crate::source_scan::production(text);
+        let mut found_variables = 0;
+        for call in source.split("add_button").skip(1) {
+            let Some(args) = call
+                .strip_prefix('(')
+                .or_else(|| call.strip_prefix("_with_target_value("))
+            else {
+                continue;
+            };
+            let args = args.trim_start();
+            let literal = args
+                .strip_prefix("&format!(\"")
+                .or_else(|| args.strip_prefix('"'))
+                .and_then(|rest| rest.split('"').next());
+            let Some(label) = literal else {
+                found_variables += 1;
+                continue;
+            };
+            checked += 1;
+            let title_case = label
+                .split_whitespace()
+                .skip(1)
+                // Names: GNOME's Files app and DeskLink's Bucket.
+                .filter(|word| !["Files", "Bucket"].contains(word))
+                .any(|word| word.chars().next().is_some_and(char::is_uppercase));
+            assert!(!title_case, "{name}: \"{label}\" is Title Case");
+        }
+        assert_eq!(
+            found_variables, variables,
+            "{name}: buttons labelled from a variable"
+        );
     }
+    assert!(checked >= 12, "the scan found the buttons ({checked})");
 }

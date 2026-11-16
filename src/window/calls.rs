@@ -583,7 +583,7 @@ pub(super) fn notify(win: &DesklinkWindow, devices: &[DeviceView]) {
     }
 }
 
-/// "Missed call from Alice", with Call Back when the number came.
+/// "Missed call from Alice", with Call back when the number came.
 pub(super) fn missed(
     win: &DesklinkWindow,
     device_id: &str,
@@ -618,7 +618,7 @@ pub(super) fn missed(
     notification.set_icon(&gio::ThemedIcon::new("call-missed-symbolic"));
     if let Some(number) = &number {
         notification.add_button_with_target_value(
-            "Call Back",
+            "Call back",
             "app.call",
             Some(&(device_id, "dial", number.as_str()).to_variant()),
         );
