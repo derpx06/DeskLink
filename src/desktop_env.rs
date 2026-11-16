@@ -93,12 +93,13 @@ impl Desktop {
                  panel, Panel, Add New Items."
             }
             Self::Cinnamon => {
-                "Cinnamon shows DeskLink with the XApp Status applet. If it is missing, \
-                 right-click the panel, choose Applets and add it."
+                "Cinnamon shows DeskLink with the XApp Status applet, through the \
+                 xapp-sn-watcher package (install it if it is missing). If the applet is \
+                 missing, right-click the panel, choose Applets and add it."
             }
             Self::Mate => {
-                "Add the Indicator Applet Complete (or the Notification Area) to the panel: \
-                 right-click the panel, Add to Panel."
+                "MATE's Notification Area does not show DeskLink by itself. Add the Indicator \
+                 Applet Complete to the panel (right-click the panel, Add to Panel)."
             }
             Self::Budgie => {
                 "Add the System Tray applet (Budgie 10.8 or newer) in Budgie Desktop \
