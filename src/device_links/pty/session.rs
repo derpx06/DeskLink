@@ -1775,9 +1775,9 @@ mod tests {
     #[test]
     fn closing_a_session_kills_its_background_jobs() {
         let mut command = CommandBuilder::new("/bin/sh");
-        command.args(["-c", "set -m; sleep 300 & echo job=$!; wait"]);
+        command.args(["-c", "set -m; sleep 300 & echo job=$! end; wait"]);
         let session = PtySession::spawn(Some(command), 24, 80).expect("spawn job runner");
-        assert!(wait_for_contents(&session, "job="), "job never started");
+        assert!(wait_for_contents(&session, " end"), "job never started");
         let screen = session.output.lock().unwrap().parser.screen().contents();
         let pid: i32 = screen
             .split("job=")
@@ -1785,6 +1785,8 @@ mod tests {
             .and_then(|rest| rest.split_whitespace().next())
             .and_then(|pid| pid.parse().ok())
             .expect("job pid");
+        // Waited for " end": the reader hands over output in chunks, and "job=12"
+        // of "job=12345" was read as a pid that was some other running process.
         assert!(process_alive(pid), "the job should be running");
 
         session.close();
@@ -1803,10 +1805,10 @@ mod tests {
         let mut command = CommandBuilder::new("/bin/sh");
         command.args([
             "-c",
-            "trap '' HUP; set -m; sleep 300 & echo job=$!; while :; do sleep 1; done",
+            "trap '' HUP; set -m; sleep 300 & echo job=$! end; while :; do sleep 1; done",
         ]);
         let session = PtySession::spawn(Some(command), 24, 80).expect("spawn stubborn shell");
-        assert!(wait_for_contents(&session, "job="), "job never started");
+        assert!(wait_for_contents(&session, " end"), "job never started");
         let screen = session.output.lock().unwrap().parser.screen().contents();
         let pid: i32 = screen
             .split("job=")
@@ -1814,6 +1816,8 @@ mod tests {
             .and_then(|rest| rest.split_whitespace().next())
             .and_then(|pid| pid.parse().ok())
             .expect("job pid");
+        // Waited for " end": the reader hands over output in chunks, and "job=12"
+        // of "job=12345" was read as a pid that was some other running process.
 
         session.close();
 
