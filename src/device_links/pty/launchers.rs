@@ -110,7 +110,7 @@ fn probe_installed() -> Vec<String> {
 /// that prints a banner cannot invent a launcher.
 fn installed_on_host() -> Vec<String> {
     let argv = super::host::host_probe(super::host::PROBE_INSTALLED, KNOWN_LAUNCHERS);
-    let output = run_with_timeout(&argv).unwrap_or_default();
+    let output = run_with_timeout(&argv, PROBE_TIMEOUT).unwrap_or_default();
     let text = String::from_utf8_lossy(&output);
     KNOWN_LAUNCHERS
         .iter()
@@ -140,12 +140,15 @@ fn probe_login_path() -> Option<OsString> {
     let script = format!("printf '\\n{MARKER}%s{MARKER}\\n' \"$PATH\"");
     let argv: Vec<OsString> =
         [shell, "-l".into(), "-i".into(), "-c".into(), script.into()].to_vec();
-    parse_probe(&run_with_timeout(&argv)?)
+    parse_probe(&run_with_timeout(&argv, PROBE_TIMEOUT)?)
 }
 
 /// Runs `argv` with no input and returns its standard output, or `None` if
-/// it could not start or outlived [`PROBE_TIMEOUT`] (it is then killed).
-fn run_with_timeout(argv: &[OsString]) -> Option<Vec<u8>> {
+/// it could not start or outlived `timeout` (it is then killed). The output
+/// is read as it comes: a profile that leaves a background job holding
+/// stdout (`nohup x &` in `.profile`) must not keep the probe waiting for
+/// an end of file that never comes (that wedged the session registry).
+fn run_with_timeout(argv: &[OsString], timeout: Duration) -> Option<Vec<u8>> {
     let (program, args) = argv.split_first()?;
     let mut child = Command::new(program)
         .args(args)
@@ -155,24 +158,47 @@ fn run_with_timeout(argv: &[OsString]) -> Option<Vec<u8>> {
         .spawn()
         .ok()?;
     let mut stdout = child.stdout.take()?;
-    let reader = thread::spawn(move || {
-        let mut output = Vec::new();
-        let _ = stdout.read_to_end(&mut output);
-        output
-    });
-    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let (chunks, arrived) = std::sync::mpsc::channel::<Vec<u8>>();
+    // Detached: it ends when the last holder of the pipe closes it.
+    let _ = thread::Builder::new()
+        .name("desklink-path-probe".into())
+        .spawn(move || {
+            let mut buffer = [0u8; 4096];
+            while let Ok(read @ 1..) = stdout.read(&mut buffer) {
+                if chunks.send(buffer[..read].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+    let deadline = Instant::now() + timeout;
+    let mut output = Vec::new();
+    let mut exited = false;
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
-            _ => {
+        match arrived.recv_timeout(Duration::from_millis(20)) {
+            Ok(chunk) => output.extend_from_slice(&chunk),
+            // End of file: everything has been read.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) if exited => break,
+            // Closed before the shell is reaped: no busy loop while it exits.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                thread::sleep(Duration::from_millis(5))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        exited = exited || matches!(child.try_wait(), Ok(Some(_)));
+        // The shell is done and said what was asked: a job it left behind may keep the pipe.
+        if exited && parse_probe(&output).is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            if !exited {
                 let _ = child.kill();
                 let _ = child.wait();
                 return None;
             }
+            break;
         }
     }
-    reader.join().ok()
+    Some(output)
 }
 
 fn parse_probe(output: &[u8]) -> Option<OsString> {
@@ -186,6 +212,25 @@ fn parse_probe(output: &[u8]) -> Option<OsString> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_probe_whose_background_job_keeps_stdout_returns_by_its_deadline() {
+        let argv: Vec<OsString> = [
+            "sh",
+            "-c",
+            "sleep 30 & printf '\\n__DESKLINK_PATH__/x__DESKLINK_PATH__\\n'",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        let started = Instant::now();
+        let output = run_with_timeout(&argv, Duration::from_millis(1500)).expect("the shell ended");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(parse_probe(&output), Some(OsString::from("/x")));
+    }
 
     #[test]
     fn the_probe_output_is_read_between_the_markers_only() {
