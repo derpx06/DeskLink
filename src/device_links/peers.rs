@@ -141,8 +141,8 @@ mod tests {
             "device_links/connection_log.rs:NAMES",
             "device_links/connection_log.rs:READY",
             // The trust store's own mirrors.
-            "device_links/config.rs:MIRROR",
-            "device_links/config.rs:TOKENS",
+            "device_links/config/settings.rs:MIRROR",
+            "device_links/config/settings.rs:TOKENS",
             // A snapshot being assembled; times out.
             "device_links/contacts.rs:PENDING",
             // A marker that a deleted book must not come back from a late
