@@ -5304,7 +5304,9 @@ mod tests {
 }
 
 /// Whether a `gtk-decoration-layout` puts anything at the start of a header
-/// bar (before the colon): the window icon, the menu or a window button.
+/// bar (before the colon): the window icon or a window button. GTK 4 draws
+/// nothing for "menu" (there are no app menus), which is Cinnamon's and
+/// MATE's start.
 pub(crate) fn crowded_start(layout: &str) -> bool {
     layout
         .split(':')
@@ -5312,7 +5314,7 @@ pub(crate) fn crowded_start(layout: &str) -> bool {
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
-        .any(|item| matches!(item, "icon" | "menu" | "minimize" | "maximize" | "close"))
+        .any(|item| matches!(item, "icon" | "minimize" | "maximize" | "close"))
 }
 
 #[cfg(test)]
@@ -5328,6 +5330,10 @@ mod decoration_tests {
             "buttons on the left"
         );
         assert!(!super::crowded_start(":minimize,maximize,close"), "GNOME");
+        assert!(
+            !super::crowded_start("menu:minimize,maximize,close"),
+            "Cinnamon, MATE"
+        );
         assert!(
             !super::crowded_start("appmenu:close"),
             "GTK 3's appmenu shows nothing in GTK 4"
