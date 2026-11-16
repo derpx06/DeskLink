@@ -444,6 +444,8 @@ impl DaemonWorker {
         self.start_mdns_advertiser();
         self.start_clipboard_listener();
         self.start_status_reconciler();
+        // What later network signals are compared with.
+        network::note_network_view(self.network_view());
         // First run: start at login unless the user already decided.
         // Later runs: an entry the desktop's own Autostart settings removed
         // turns the switch off rather than reading on while nothing starts.

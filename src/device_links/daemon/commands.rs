@@ -98,6 +98,10 @@ pub enum DaemonCommand {
     LockAndHandOff,
     /// The network changed: reconnect the relay now.
     NetworkChanged,
+    /// The OS says the network changed: acted on as [`Self::NetworkChanged`]
+    /// only when an interface a phone's link can depend on changed
+    /// (`network::network_view`), never for a container's veth or bridge.
+    NetworkMaybeChanged,
     /// Set, change (`Some`) or remove (`None`) the session password.
     SetSessionPassword(Option<String>),
     /// Stop phones viewing/controlling this screen and detach their
@@ -309,6 +313,15 @@ impl DaemonWorker {
                 }
             }
             DaemonCommand::NetworkChanged => self.network_changed(),
+            DaemonCommand::NetworkMaybeChanged => {
+                let changed = super::network::note_network_view(self.network_view());
+                if changed.is_empty() {
+                    debug_log!("[Daemon] Network signal ignored: no interface a link uses changed");
+                } else {
+                    debug_log!("[Daemon] Network changed on {}", changed.join(", "));
+                    self.network_changed();
+                }
+            }
             DaemonCommand::SetStayAwake(on) => {
                 self.update_settings(|settings| settings.stay_awake = on)
             }
@@ -697,6 +710,21 @@ impl DaemonWorker {
     /// LAN links on addresses this computer no longer has, and rebuild peers
     /// whose addresses all went; the redialer and the phones' answers to the
     /// beacons bring the links back.
+    /// The network as a phone's link sees it now (see `network::network_view`).
+    pub(super) fn network_view(&self) -> super::network::NetworkView {
+        let bootstrap: Vec<std::net::IpAddr> = self
+            .sessions
+            .current_bindings()
+            .iter()
+            .filter_map(|binding| binding.link.local_ip())
+            .collect();
+        super::network::network_view(
+            &super::network::local_interfaces(),
+            &super::network::default_route_interfaces(),
+            &bootstrap,
+        )
+    }
+
     fn network_changed(&self) {
         // A network change (or the computer waking) is never a walk away:
         // the count of a minute out of reach starts again.

@@ -271,8 +271,8 @@ impl DesklinkApplication {
         });
     }
 
-    /// Reconnects the relay whenever the network changes (debounced: one
-    /// switch fires several signals).
+    /// Tells the daemon whenever the OS says the network changed (debounced:
+    /// one switch fires several signals); it acts only on a real change.
     pub(super) fn watch_network(&self) {
         let pending: std::rc::Rc<std::cell::Cell<Option<glib::SourceId>>> = Default::default();
         let app = self.downgrade();
@@ -284,8 +284,9 @@ impl DesklinkApplication {
             let pending_inner = pending.clone();
             pending.set(Some(glib::timeout_add_seconds_local_once(2, move || {
                 pending_inner.set(None);
+                // The daemon decides whether it touched a phone's link.
                 if let Some(daemon) = app.upgrade().and_then(|app| app.daemon_handle()) {
-                    daemon.send(crate::device_links::daemon::DaemonCommand::NetworkChanged);
+                    daemon.send(crate::device_links::daemon::DaemonCommand::NetworkMaybeChanged);
                 }
             })));
         });

@@ -299,10 +299,102 @@ pub(crate) fn local_interfaces() -> Vec<(String, IpAddr)> {
 
 /// Interfaces that never reach a phone: loopback, containers, VMs, VPNs.
 pub(crate) fn is_virtual_interface(name: &str) -> bool {
-    const VIRTUAL: [&str; 11] = [
+    const VIRTUAL: [&str; 12] = [
         "lo", "docker", "virbr", "veth", "tun", "tap", "wg", "br-", "vmnet", "vboxnet", "podman",
+        "vnet",
     ];
     VIRTUAL.iter().any(|prefix| name.starts_with(prefix))
+}
+
+/// What of this computer's network a phone's link can depend on: each
+/// interface holding a default route (marked with no address), and the
+/// addresses of every interface that holds a default route, carries a
+/// bootstrap link's local address, or is not a virtual one. A container
+/// restarting adds and removes veth/bridge interfaces every few seconds; the
+/// OS calls each one a network change, and acting on it woke every redialer,
+/// beacon burst and recovery ladder for nothing.
+pub(crate) type NetworkView = std::collections::BTreeSet<(String, Option<IpAddr>)>;
+
+pub(crate) fn network_view(
+    interfaces: &[(String, IpAddr)],
+    default_route: &[String],
+    bootstrap: &[IpAddr],
+) -> NetworkView {
+    let routed = |name: &str| default_route.iter().any(|routed| routed == name);
+    let mut view: NetworkView = default_route
+        .iter()
+        .filter(|name| name.as_str() != "lo")
+        .map(|name| (name.clone(), None))
+        .collect();
+    view.extend(
+        interfaces
+            .iter()
+            .filter(|(name, ip)| name != "lo" && !ip.is_loopback())
+            .filter(|(name, ip)| {
+                routed(name) || bootstrap.contains(ip) || !is_virtual_interface(name)
+            })
+            .map(|(name, ip)| (name.clone(), Some(*ip))),
+    );
+    view
+}
+
+/// The interfaces holding a default route, from `/proc/net/route` (IPv4)
+/// and `/proc/net/ipv6_route`.
+pub(crate) fn default_route_interfaces() -> Vec<String> {
+    let read = |path: &str| std::fs::read_to_string(path).unwrap_or_default();
+    let mut found = default_routes(&read("/proc/net/route"), &read("/proc/net/ipv6_route"));
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// [`default_route_interfaces`] from the two files' text.
+fn default_routes(ipv4: &str, ipv6: &str) -> Vec<String> {
+    let v4 = ipv4.lines().skip(1).filter_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // Iface Destination Gateway Flags RefCnt Use Metric Mask ...; flag 1 = up.
+        let up = cols
+            .get(3)
+            .and_then(|flags| u32::from_str_radix(flags, 16).ok())
+            .is_some_and(|flags| flags & 1 != 0);
+        (cols.len() > 7 && cols[1] == "00000000" && cols[7] == "00000000" && up)
+            .then(|| cols[0].to_string())
+    });
+    let v6 = ipv6.lines().filter_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        // dest prefix src prefix next-hop metric refcnt use flags iface
+        (cols.len() == 10
+            && cols[0].bytes().all(|b| b == b'0')
+            && cols[1] == "00"
+            && cols[9] != "lo")
+            .then(|| cols[9].to_string())
+    });
+    v4.chain(v6).collect()
+}
+
+/// The view last acted on (seeded when the daemon starts).
+static LAST_VIEW: Mutex<Option<NetworkView>> = Mutex::new(None);
+
+/// Records `view`; the interfaces that differ from the last one, empty when
+/// nothing a link depends on changed (or on the first look).
+pub(crate) fn note_network_view(view: NetworkView) -> Vec<String> {
+    let mut last = LAST_VIEW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let changed = last
+        .as_ref()
+        .map_or_else(Vec::new, |last| changed_interfaces(last, &view));
+    *last = Some(view);
+    changed
+}
+
+fn changed_interfaces(before: &NetworkView, now: &NetworkView) -> Vec<String> {
+    let mut names: Vec<String> = before
+        .symmetric_difference(now)
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.dedup();
+    names
 }
 
 /// The IPv4 addresses a phone on the same network can dial: not loopback,
@@ -474,6 +566,61 @@ fn ssl_connector_builder(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_container_restarting_is_not_a_network_change() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let wifi = ("wlp2s0".to_string(), ip("192.168.1.13"));
+        let routed = vec!["wlp2s0".to_string()];
+        let base = vec![
+            wifi.clone(),
+            ("lo".to_string(), ip("127.0.0.1")),
+            ("docker0".to_string(), ip("172.17.0.1")),
+        ];
+        let before = network_view(&base, &routed, &[]);
+        // dependency-track restarting: a veth and a bridge come and go.
+        let mut churn = base.clone();
+        churn.push(("veth3f2a1b0".to_string(), ip("fe80::1")));
+        churn.push(("br-4c1d2e".to_string(), ip("172.18.0.1")));
+        churn.push(("vnet0".to_string(), ip("fe80::2")));
+        assert_eq!(
+            changed_interfaces(&before, &network_view(&churn, &routed, &[])),
+            Vec::<String>::new()
+        );
+        // Wi-Fi taking a new address is one.
+        let moved = vec![("wlp2s0".to_string(), ip("192.168.1.20"))];
+        assert_eq!(
+            changed_interfaces(&before, &network_view(&moved, &routed, &[])),
+            vec!["wlp2s0".to_string()]
+        );
+        // The default route moving to a VPN is one, though tun0 is virtual.
+        let vpn = [base.clone(), vec![("tun0".to_string(), ip("10.8.0.2"))]].concat();
+        let via_vpn = network_view(&vpn, &["tun0".to_string()], &[]);
+        assert!(changed_interfaces(&before, &via_vpn).contains(&"tun0".to_string()));
+        // A virtual interface carrying a phone's bootstrap link counts.
+        let hotspot = [base, vec![("virbr0".to_string(), ip("192.168.122.1"))]].concat();
+        let linked = network_view(&hotspot, &routed, &[ip("192.168.122.1")]);
+        assert_eq!(
+            changed_interfaces(&before, &linked),
+            vec!["virbr0".to_string()]
+        );
+    }
+
+    #[test]
+    fn default_routes_are_read_from_the_kernel_tables() {
+        let v4 =
+            "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n\
+            wlp2s0\t00000000\t0101A8C0\t0003\t0\t0\t600\t00000000\t0\t0\t0\n\
+            wlp2s0\t0001A8C0\t00000000\t0001\t0\t0\t600\t00FFFFFF\t0\t0\t0\n\
+            docker0\t000011AC\t00000000\t0001\t0\t0\t0\t0000FFFF\t0\t0\t0\n";
+        let v6 = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000258 00000001 00000000 00000003 wlp2s0\n\
+            00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo\n\
+            fe800000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 veth1\n";
+        assert_eq!(
+            default_routes(v4, v6),
+            vec!["wlp2s0".to_string(), "wlp2s0".to_string()]
+        );
+    }
+
     use super::*;
 
     #[test]
