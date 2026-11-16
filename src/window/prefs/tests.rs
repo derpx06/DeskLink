@@ -228,14 +228,19 @@ fn the_relay_reads_as_its_host() {
 #[test]
 fn the_glide_row_says_what_to_turn_on_until_the_phone_allows_it() {
     let says = "Pixel needs to allow “Let Desk control this phone” first.";
-    assert_eq!(glide_explained("Pixel", None, false, "Desk"), says);
-    assert_eq!(glide_explained("Pixel", Some(false), false, "Desk"), says);
-    assert!(
-        glide_explained("Pixel", Some(true), false, "Desk").starts_with("Move the pointer past")
+    assert_eq!(glide_explained("Pixel", None, false, false, "Desk"), says);
+    assert_eq!(
+        glide_explained("Pixel", Some(false), false, false, "Desk"),
+        says
     );
+    assert!(glide_explained("Pixel", Some(true), false, false, "Desk")
+        .starts_with("Move the pointer past"));
     // A locked phone: the step, not a setting to turn on.
-    assert!(glide_explained("Pixel", Some(false), true, "Desk")
+    assert!(glide_explained("Pixel", Some(false), true, false, "Desk")
         .starts_with("Unlock Pixel to use Glide"));
+    // Accessibility off on the phone: its switch is on, so the words say where to go.
+    assert!(glide_explained("Pixel", Some(false), false, true, "Desk")
+        .starts_with("Turn on DeskLink in Pixel's Accessibility settings"));
 }
 
 /// Each of the ten groups has one place in the list, in the groups' order.

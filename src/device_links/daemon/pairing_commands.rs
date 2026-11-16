@@ -437,7 +437,12 @@ pub(super) fn consider_replacement(
     let removed = config
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())
-        .and_then(|mut config| config.untrust_device(&candidate.old_id));
+        .and_then(|mut config| {
+            // The same phone paired again: Glide onto it moves to the new
+            // pairing (the old one's setting would otherwise vanish with it).
+            config.move_glide(&candidate.old_id, &candidate.new_id)?;
+            config.untrust_device(&candidate.old_id)
+        });
     if let Err(error) = removed {
         super::state::push_error(errors, error);
         return;
@@ -616,6 +621,30 @@ mod replaced_tests {
             setup.events.lock().unwrap().as_slice(),
             [super::super::DaemonEvent::PairingReplaced { name }] if name == "realme 14 5G"
         ));
+    }
+
+    /// Review finding C: two phones of one model must not delete each other.
+    #[test]
+    fn glide_follows_a_replaced_pairing() {
+        let setup = replacing("10.5.0.7", "10.5.0.7");
+        let edge = crate::device_links::glide::Edge::Left;
+        setup
+            .config
+            .lock()
+            .unwrap()
+            .update_settings(|settings| {
+                settings.glide = Some(crate::device_links::glide::GlideSetting {
+                    device: "old-phone".into(),
+                    edge,
+                })
+            })
+            .unwrap();
+        run(&setup);
+        let glide = setup.config.lock().unwrap().app_settings_for_tests().glide;
+        assert_eq!(
+            glide.map(|g| (g.device, g.edge)),
+            Some(("new-phone".to_string(), edge))
+        );
     }
 
     /// Review finding C: two phones of one model must not delete each other.

@@ -356,8 +356,15 @@ pub(super) fn glide_explained(
     phone: &str,
     allowed: Option<bool>,
     locked: bool,
+    service_off: bool,
     computer: &str,
 ) -> String {
+    if service_off {
+        return format!(
+            "{}. Android switches it off after an update or a force-stop.",
+            crate::device_links::glide::service_words(phone)
+        );
+    }
     if locked {
         return format!(
             "{}. It works again as soon as {phone} is unlocked.",
@@ -441,7 +448,13 @@ pub(super) fn add_glide_rows(
         .as_ref()
         .filter(|glide| glide.device == device.id)
         .map(|glide| glide.edge);
+    // Set to this phone, but its link is not up: the barrier waits for the
+    // phone's own report, so say that instead of "needs to allow".
+    let waiting = current.is_some() && !device.feature_transport_ready;
     let explained = match status.ready.filter(|edge| current == Some(*edge)) {
+        _ if waiting => {
+            format!("Waiting for {phone} to connect. Glide is ready as soon as it does.")
+        }
         Some(edge) => format!(
             "Ready: move the pointer off the {} edge of this screen to use {phone}. Esc+Super \
              brings it back.",
@@ -456,6 +469,7 @@ pub(super) fn add_glide_rows(
             &phone,
             crate::device_links::glide::phone_allows(&device.id),
             crate::device_links::glide::phone_locked(&device.id),
+            crate::device_links::glide::phone_needs_service(&device.id),
             &crate::device_links::glide::desk_name(),
         ),
     };
@@ -567,7 +581,10 @@ pub(super) fn add_glide_rows(
     // On here, off on the phone: said, with Ask on phone where the phone
     // takes it. (A locked phone is not "off": the row above says to unlock
     // it.)
-    if current.is_some() && !crate::device_links::glide::phone_locked(&device.id) {
+    if current.is_some()
+        && !crate::device_links::glide::phone_locked(&device.id)
+        && !crate::device_links::glide::phone_needs_service(&device.id)
+    {
         phone_step_rows(group, device, &["glide"]);
     }
     if status.asking {

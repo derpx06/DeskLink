@@ -225,7 +225,10 @@ fn perform(device: Option<&str>, outs: Vec<Out>, portal: Option<&mut Portal>) {
                 crate::device_links::webrtc::capture::notify(
                     crate::device_links::daemon::handle::DaemonEvent::GlideNotice {
                         device_id: device.to_string(),
-                        message: format!("{phone} did not accept the pointer"),
+                        message: format!(
+                            "{phone} did not accept the pointer. Check that its screen is on and \
+                             unlocked."
+                        ),
                     },
                 );
             }
@@ -763,7 +766,7 @@ fn check(
         let ask = auto_ask(
             state.auto_ask.as_deref() == Some(device),
             phone_allows(device),
-            phone_locked(device),
+            phone_locked(device) || phone_needs_service(device),
         );
         if ask != AutoAsk::Later {
             state.auto_ask = None;

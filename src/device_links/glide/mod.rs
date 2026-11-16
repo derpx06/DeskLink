@@ -301,22 +301,35 @@ pub(crate) fn start() {
     }
 }
 
-/// What each phone last reported about glide: `allowed`, and whether it
-/// said no only because it is locked (`reason: "locked"`). Unknown until it
+/// What each phone last reported about glide: `allowed`, whether it said no
+/// only because it is locked (`reason: "locked"`), and whether only because
+/// its accessibility service is off or not bound (`reason: "accessibility"`). Unknown until it
 /// reports, and forgotten whenever its link is not ready: the phone reports
 /// on every feature-ready.
-static ALLOWED: Mutex<Option<HashMap<String, (bool, bool)>>> = Mutex::new(None);
+static ALLOWED: Mutex<Option<HashMap<String, (bool, bool, bool)>>> = Mutex::new(None);
 
 /// Whether the phone has said it allows glide: `None` until it reports (an
 /// older phone never does).
 pub(crate) fn phone_allows(device_id: &str) -> Option<bool> {
-    report_of(device_id).map(|(allowed, _)| allowed)
+    report_of(device_id).map(|(allowed, ..)| allowed)
 }
 
 /// Whether the phone said glide waits only for it to be unlocked (cleared by
 /// its next `allowed: true`).
 pub(crate) fn phone_locked(device_id: &str) -> bool {
-    report_of(device_id).is_some_and(|(_, locked)| locked)
+    report_of(device_id).is_some_and(|(_, locked, _)| locked)
+}
+
+/// Whether the phone said Glide is allowed there but its accessibility
+/// service (which places the pointer) is off: ColorOS switches it off after
+/// an update or a force-stop. Allowing Glide again would change nothing.
+pub(crate) fn phone_needs_service(device_id: &str) -> bool {
+    report_of(device_id).is_some_and(|(_, _, service)| service)
+}
+
+/// What the person is told while the service is off: the step on the phone.
+pub(crate) fn service_words(phone: &str) -> String {
+    format!("Turn on DeskLink in {phone}'s Accessibility settings to use Glide")
 }
 
 /// What the person is told while the phone is locked: no fix, the step.
@@ -324,7 +337,7 @@ pub(crate) fn unlock_words(phone: &str) -> String {
     format!("Unlock {phone} to use Glide")
 }
 
-fn report_of(device_id: &str) -> Option<(bool, bool)> {
+fn report_of(device_id: &str) -> Option<(bool, bool, bool)> {
     ALLOWED.lock().ok().and_then(|known| {
         known
             .as_ref()
@@ -332,7 +345,7 @@ fn report_of(device_id: &str) -> Option<(bool, bool)> {
     })
 }
 
-fn set_allowed(device_id: &str, allowed: Option<(bool, bool)>) {
+fn set_allowed(device_id: &str, allowed: Option<(bool, bool, bool)>) {
     if let Ok(mut known) = ALLOWED.lock() {
         let known = known.get_or_insert_with(HashMap::new);
         match allowed {
@@ -365,8 +378,9 @@ pub(crate) fn on_phone_packet(device_id: &str, packet: &NetworkPacket) {
             entered,
             locked,
             declined,
+            service_off,
         } => {
-            set_allowed(device_id, Some((allowed, locked)));
+            set_allowed(device_id, Some((allowed, locked, service_off)));
             if allowed {
                 crate::device_links::asks::note_on(device_id, PHONE_SETTING_KEY);
             } else if declined {
@@ -399,6 +413,9 @@ pub(crate) enum PhoneReport {
         /// Not allowed: the person tapped "Not now" on the desk's ask
         /// (`reason: "declined"`).
         declined: bool,
+        /// Not allowed only because its accessibility service is off
+        /// (`reason: "accessibility"`).
+        service_off: bool,
     },
     HandedBack,
     /// A release point (or a body that is neither: `phone_released` drops it).
@@ -430,6 +447,7 @@ pub(crate) fn classify_phone_packet(packet: &NetworkPacket) -> PhoneReport {
                     == Some(true),
             locked: !allowed && reason == Some("locked"),
             declined: !allowed && reason == Some("declined"),
+            service_off: !allowed && reason == Some("accessibility"),
         }
     } else if packet
         .body

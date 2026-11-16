@@ -672,6 +672,25 @@ impl Config {
         saved
     }
 
+    /// The same phone paired again under a new id: Glide onto it, if set,
+    /// continues onto the new pairing on the same edge.
+    pub fn move_glide(&mut self, old_id: &str, new_id: &str) -> Result<(), String> {
+        match self.stored.settings.glide.clone() {
+            Some(glide) if glide.device == old_id => self.update_settings(|settings| {
+                settings.glide = Some(crate::device_links::glide::GlideSetting {
+                    device: new_id.to_string(),
+                    edge: glide.edge,
+                });
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn app_settings_for_tests(&self) -> AppSettings {
+        self.stored.settings.clone()
+    }
+
     pub fn untrust_device(&mut self, device_id: &str) -> Result<(), String> {
         let previous = self.stored.trusted_devices.remove(device_id);
         mirror_terminal_access(device_id, false);

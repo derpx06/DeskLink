@@ -133,6 +133,9 @@ pub(crate) struct PhoneFacts {
     pub glide_off_there: bool,
     /// The phone said Glide waits for it to be unlocked.
     pub glide_locked: bool,
+    /// The phone said Glide is allowed there but its accessibility service
+    /// is off (so asking it to allow Glide changes nothing).
+    pub glide_service_off: bool,
     /// Where the last "Ask on phone" stands.
     pub glide_ask: Option<crate::device_links::glide::PhoneAsk>,
     /// Android lets it read notifications (`None`: an older phone, unknown).
@@ -177,6 +180,7 @@ impl PhoneFacts {
                 .is_some_and(|glide| glide.device == device.id),
             glide_off_there: crate::device_links::glide::phone_allows(&device.id) == Some(false),
             glide_locked: crate::device_links::glide::phone_locked(&device.id),
+            glide_service_off: crate::device_links::glide::phone_needs_service(&device.id),
             glide_ask: crate::device_links::glide::phone_ask(&device.id),
             notification_access: device.notification_access,
             reports: crate::device_links::asks::phone_reports(&device.id),
@@ -419,6 +423,8 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
             fix: Fix::None,
             allow: None,
         });
+    } else if phone.glide_here && phone.glide_service_off {
+        needs.push(glide_service_off(phone));
     } else if phone.glide_here && phone.glide_off_there {
         needs.push(glide_off_there(phone));
     }
@@ -462,6 +468,29 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
         });
     }
     needs
+}
+
+/// Glide is allowed on the phone but its accessibility service is off: the
+/// step there, and "Ask on phone" for control where its build takes it (that
+/// ask opens the Accessibility settings there).
+fn glide_service_off(phone: &PhoneFacts) -> Need {
+    let name = &phone.name;
+    let askable = phone.reports && phone.steps.iter().any(|step| step.key == "control");
+    Need {
+        id: "glide-phone",
+        on_phone: true,
+        title: crate::device_links::glide::service_words(name),
+        detail: format!(
+            "Android switches DeskLink's accessibility access off after an update or a \
+             force-stop. Glide cannot place the pointer on {name} until it is on again."
+        ),
+        fix: if askable {
+            Fix::AskPhone(phone.id.clone(), "control", false)
+        } else {
+            Fix::None
+        },
+        allow: None,
+    }
 }
 
 /// Glide is on here but off on the phone: what to do there, and "Ask on
@@ -1286,6 +1315,7 @@ mod tests {
             glide_here: false,
             glide_off_there: false,
             glide_locked: false,
+            glide_service_off: false,
             glide_ask: None,
             notification_access: Some(true),
             reports: false,

@@ -97,12 +97,14 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
     let key = serde_json::to_string(&(
         super::requirements::key(&needs),
         format!(
-            "{:?}{:?}{}{}{:?}",
+            "{:?}{:?}{}{}{:?}{}{}",
             glide_status.availability,
             glide_status.problem,
             glide_status.asking,
             glide_status.can_ask_again,
-            glide_status.ready
+            glide_status.ready,
+            crate::device_links::glide::phone_needs_service(&device.id),
+            device.feature_transport_ready
         ),
         // The phone's "allowed" report changes the glide row's words.
         crate::device_links::glide::phone_allows(&device.id),

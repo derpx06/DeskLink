@@ -1070,3 +1070,32 @@ fn the_barrier_is_armed_only_when_the_phone_allows_glide() {
     set_allowed(phone, None);
     assert_eq!(phone_allows(phone), None, "forgotten when the link goes");
 }
+
+#[test]
+fn a_phone_with_its_accessibility_service_off_is_not_asked_to_allow_glide() {
+    let report = |body: serde_json::Value| {
+        let mut packet =
+            NetworkPacket::new(crate::device_links::packet::PACKET_TYPE_SHARE_INPUT_DEVICES);
+        for (key, value) in body.as_object().unwrap() {
+            packet.body.insert(key.clone(), value.clone());
+        }
+        packet
+    };
+    let phone = "p39-service";
+    on_phone_packet(
+        phone,
+        &report(serde_json::json!({"allowed": false, "reason": "accessibility"})),
+    );
+    assert_eq!(phone_allows(phone), Some(false));
+    assert!(phone_needs_service(phone));
+    assert!(!phone_locked(phone));
+    // Nothing for the auto-ask to do: allowing Glide there changes nothing.
+    assert_eq!(
+        auto_ask(true, Some(false), phone_needs_service(phone)),
+        AutoAsk::Never
+    );
+    // The next report that allows it clears the step.
+    on_phone_packet(phone, &report(serde_json::json!({"allowed": true})));
+    assert!(!phone_needs_service(phone));
+    forget_phone(phone);
+}

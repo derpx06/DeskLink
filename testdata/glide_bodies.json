@@ -7,6 +7,7 @@
     {"name": "entered needs allowed", "body": {"allowed": false, "entered": true},                "report": "state", "allowed": false, "entered": false},
     {"name": "locked",               "body": {"allowed": false, "reason": "locked"},              "report": "state", "allowed": false, "entered": false, "reason": "locked"},
     {"name": "declined",             "body": {"allowed": false, "reason": "declined"},            "report": "state", "allowed": false, "entered": false, "reason": "declined"},
+    {"name": "accessibility off",    "body": {"allowed": false, "reason": "accessibility"},       "report": "state", "allowed": false, "entered": false, "reason": "accessibility"},
     {"name": "hand back",            "body": {"exitEdge": 0},                                     "report": "handedBack"},
     {"name": "release point",        "body": {"releaseDeltax": 0.5, "releaseDeltay": -0.25},     "report": "release"},
     {"name": "release beats allowed", "body": {"allowed": true, "releaseDeltax": 1, "releaseDeltay": 2}, "report": "release"},

@@ -155,6 +155,16 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
             &phone.name,
         )));
     }
+    if settings
+        .glide
+        .as_ref()
+        .is_some_and(|glide| glide.device == phone.id)
+        && crate::device_links::glide::phone_needs_service(&phone.id)
+    {
+        menu.push(TrayEntry::Label(crate::device_links::glide::service_words(
+            &phone.name,
+        )));
+    }
     menu.push(
         TrayEntry::action("Ring", format!("ring:{}", phone.id)).icon("audio-volume-high-symbolic"),
     );
