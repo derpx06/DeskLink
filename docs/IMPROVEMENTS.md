@@ -60,7 +60,7 @@ locks are recovered, queues are bounded and blocking reads have deadlines.
 | T2 | S2 | `pty/session.rs`, `pty/desk.rs` (F40) | One shared session in two desk windows: when the one that set the size closed, the other kept showing the program at the closed window's size. | **fixed** (each window keeps its size; `closing_one_of_two_desk_windows_gives_the_size_to_the_other`) |
 | T3 | S2 | `pty/registry.rs` `reap_idle` | The idle reaper closed a session shown in a desk window (an editor left open over a weekend). | **fixed** (`a_session_shown_at_the_desk_is_not_closed_as_idle`) |
 | T4 | S3 | `pty/desk.rs` | A full input queue (a large paste into a busy program) closed the desk window's connection. | **fixed**: waited out for as long as the session lives, never dropped (a dropped middle could run a truncated command; review) (`a_full_input_queue_is_waited_out_never_dropped`) |
-| T5 | S3 | `terminal_bridge/bridge.rs` | The pump serves attached terminals in a fixed order: a flooding one can starve another. | listed |
+| T5 | S3 | `terminal_bridge/bridge.rs` | The pump serves attached terminals in a fixed order: a flooding one can starve another. | **fixed**: each pump starts one further on (`a_flooding_terminal_does_not_starve_another`) |
 | T6 | S3 | `pty/desk.rs` `pump_output` | `finished()` is read after the output, so the last line can be lost at exit. | **fixed**: read before the output, as the phone bridge does |
 | T7 | S3 perf | `pty/session.rs` | One global condvar wakes every pump on every 4 KiB read. | listed: not measured |
 | T8 | S3 | `pty/session.rs` | A reaped session whose background job keeps the slave leaks its reader and writer threads. | listed |
@@ -83,9 +83,9 @@ locks are recovered, queues are bounded and blocking reads have deadlines.
 |---|---|---|---|---|
 | F1 | S1 | `desk_notifications.rs` `close_from_phone` | An async gio D-Bus call on a peer's event worker: gio panics on a thread that does not own the main context, so dismissing a desk notification on the phone killed the worker and dropped the peer. | **fixed** (blocking call on the desk thread; `the_daemon_never_makes_an_async_bus_call` pins all of `device_links/`) |
 | F2 | S2 | `mpris.rs`, `daemon/packet_handler.rs` | A seek-bar drag queued one job per step on the one desk thread (300 ms sleep each): stale seeks replayed for seconds and the full queue dropped the final one. | **fixed** (newest absolute request per phone, player and kind; one settle thread per phone; `a_burst_of_seeks_runs_only_the_newest`, `a_burst_of_changes_waits_on_one_settle_thread_per_phone`) |
-| F3 | S3 | `calls.rs` `MediaHold` | A call that ends before its pause job ran leaves the players paused. | listed |
+| F3 | S3 | `calls.rs` `MediaHold` | A call that ends before its pause job ran leaves the players paused. | **fixed**: the resume job takes the list when it runs (`a_call_that_ends_before_its_pause_ran_still_resumes_what_it_paused`) |
 | F4 | S3 | `session_lock.rs` | One phone reconnecting voids another phone's correct password being hashed (it asks again). | **fixed**: the epoch is per device (`another_phones_reconnect_does_not_void_a_right_password`; the straddle test still holds) |
-| F5 | S3 | `desk_features.rs` unlock | An approval inside the 500 ms settle window is dropped without an `unlockRefused` answer. | listed: needs the check reordered and its own review (security path) |
+| F5 | S3 | `desk_features.rs` unlock | An approval inside the 500 ms settle window is dropped without an `unlockRefused` answer. | **fixed**: answered `not-ready`, nonce not spent (`an_approval_inside_the_settle_window_is_answered_not_dropped`). A flood that fills the desk queue still drops silently (16 waiting) |
 | F6 | S3 | `phone_mpris.rs`, `mpris.rs` | `Position` is announced in `PropertiesChanged`, waking the desk's own reader. | listed |
 | F7 | S3 | `media_art.rs` | A failed art fetch is cached until evicted. | **fixed**: tried again after 60 s (`a_failed_fetch_is_tried_again_after_a_while`) |
 | F8 | S3 | `window/calls.rs`, `walk_away.rs` | Sync logind calls on the GTK thread per call event. | listed |
@@ -115,7 +115,7 @@ the Shell1 sender gate is right and PropertiesChanged is sent only on change.
 | U2 | S2 | `autostart.rs` | An AppImage registered its mount's binary (`/tmp/.mount_*`) to start at login. | **fixed** (`$APPIMAGE`; pinned in the autostart test) |
 | U3 | S3 | `window/refresh.rs` | While a mouse button is held, events (call alerts, pings) wait for the release. | listed: the event arm also rebuilds lists, so the gate cannot simply move |
 | U4 | S3 perf | `shell_dbus/mod.rs` | The top-bar properties are rebuilt each tick on desktops that are not GNOME. | listed |
-| U5 | S3 | `device_links/asks.rs` | `probe_buttons` makes sync D-Bus calls on the GTK thread once a minute (500 ms each). | listed |
+| U5 | S3 | `device_links/asks.rs` | `probe_buttons` makes sync D-Bus calls on the GTK thread once a minute (500 ms each). | **fixed**: on its own thread, blocking calls only (no unit test: the answer logic keeps its tests) |
 | U6 | S4 | `search_provider.rs`, `kde.rs` | `ActivateResult` / `Run` have no caller gate. | listed: any process that can call them already runs as the user and can read DeskLink's key |
 | U7 | S3 perf | `platform/mod.rs` | `/etc/os-release` was read on the GTK thread every Home tick. | **fixed** (read once) |
 | U8 | S4 | `window/overview/mod.rs` | Home's rebuild key holds all 25 notifications. | listed |
