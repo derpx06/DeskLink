@@ -1,7 +1,9 @@
 //! The Notifications page: the phone's notifications, grouped by app (the
 //! app with the newest first), each with Reply (an inline entry, sent to the
-//! phone), its own actions and Dismiss; a filter (All, Messages: the ones
-//! that take a reply, Other) and Clear all. Cards are the kit's; Delete or
+//! phone), its own actions and Dismiss; a filter (All, Can reply: the ones
+//! with Reply, which is how DeskLink knows a message, Other) and Clear all,
+//! which clears what the filter shows. An app with one notification shown
+//! has no heading: its card already names the app. Cards are the kit's; Delete or
 //! Backspace on a focused card dismisses it and Enter opens its reply.
 //!
 //! Cards are kept by notification id and only added, removed or reordered
@@ -41,15 +43,15 @@ struct Card {
 pub(super) enum Filter {
     #[default]
     All,
-    /// The ones that take a reply: someone wrote to you.
-    Messages,
+    /// The ones that take a reply (a chat, often an email too).
+    CanReply,
     Other,
 }
 
 impl Filter {
     const CHIPS: [(Filter, &'static str); 3] = [
         (Filter::All, "All"),
-        (Filter::Messages, "Messages"),
+        (Filter::CanReply, "Can reply"),
         (Filter::Other, "Other"),
     ];
 
@@ -57,26 +59,46 @@ impl Filter {
         let message = notification.request_reply_id.is_some();
         match self {
             Self::All => true,
-            Self::Messages => message,
+            Self::CanReply => message,
             Self::Other => !message,
         }
     }
 }
 
-/// The notifications by app, in the order of each app's newest (the list
+/// The name an app's heading says ("Other app" when the phone sent none).
+fn app_label(app: &str) -> &str {
+    if app.trim().is_empty() {
+        "Other app"
+    } else {
+        app
+    }
+}
+
+/// What `filter` shows, by app, in the order of each app's newest (the list
 /// comes newest first), the app's own in their order: (app, ids).
-pub(super) fn by_app(notifications: &[DeviceNotification]) -> Vec<(String, Vec<String>)> {
+pub(super) fn by_app(
+    notifications: &[DeviceNotification],
+    filter: Filter,
+) -> Vec<(String, Vec<String>)> {
     let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-    for notification in notifications {
-        match groups
-            .iter_mut()
-            .find(|(app, _)| *app == notification.app_name)
-        {
+    for notification in notifications.iter().filter(|n| filter.shows(n)) {
+        let app = app_label(&notification.app_name);
+        match groups.iter_mut().find(|(name, _)| name == app) {
             Some((_, ids)) => ids.push(notification.id.clone()),
-            None => groups.push((notification.app_name.clone(), vec![notification.id.clone()])),
+            None => groups.push((app.to_string(), vec![notification.id.clone()])),
         }
     }
     groups
+}
+
+/// What Clear all dismisses with `filter` on: what it shows, if the phone
+/// lets it be cleared.
+pub(super) fn to_clear(notifications: &[DeviceNotification], filter: Filter) -> Vec<String> {
+    notifications
+        .iter()
+        .filter(|n| n.is_clearable && filter.shows(n))
+        .map(|n| n.id.clone())
+        .collect()
 }
 
 #[derive(Debug)]
@@ -102,7 +124,9 @@ impl Page {
         clipboard::ensure_css();
         let count = wrapped("", &["dl-secondary"]);
         let clear = ui_kit::button(ButtonKind::Tonal, "Clear all", None);
-        clear.set_tooltip_text(Some("Dismiss every notification here and on the phone"));
+        clear.set_tooltip_text(Some(
+            "Dismiss the notifications shown here, here and on the phone",
+        ));
         let header = gtk::Box::builder()
             .spacing(10)
             .valign(gtk::Align::Center)
@@ -113,7 +137,10 @@ impl Page {
         header.append(&clear);
         // The filter, one choice, scrolling sideways when it does not fit.
         let filter = Rc::new(Cell::new(Filter::All));
-        let chips = gtk::Box::builder().spacing(8).build();
+        let chips = gtk::Box::builder()
+            .spacing(8)
+            .accessible_role(gtk::AccessibleRole::Group)
+            .build();
         chips.set_widget_name("notification-filter");
         chips.update_property(&[gtk::accessible::Property::Label("Show")]);
         let mut first: Option<gtk::ToggleButton> = None;
@@ -160,7 +187,14 @@ impl Page {
             .css_classes(["page-margins"])
             .build();
         page.append(&header);
-        page.append(&chips);
+        page.append(
+            &gtk::ScrolledWindow::builder()
+                .child(&chips)
+                .hscrollbar_policy(gtk::PolicyType::Automatic)
+                .vscrollbar_policy(gtk::PolicyType::Never)
+                .propagate_natural_height(true)
+                .build(),
+        );
         page.append(&list);
         page.append(&empty.root);
         page.append(&hidden.root);
@@ -176,7 +210,7 @@ impl Page {
             )
             .build();
 
-        let window = win.downgrade();
+        let (window, shown) = (win.downgrade(), filter.clone());
         clear.connect_clicked(move |button| {
             let Some(window) = window.upgrade() else {
                 return;
@@ -191,11 +225,9 @@ impl Page {
             else {
                 return;
             };
-            for notification in device.notifications.iter().filter(|n| n.is_clearable) {
-                daemon.send(DaemonCommand::DismissNotification(
-                    device.id.clone(),
-                    notification.id.clone(),
-                ));
+            // What the filter shows, not the ones it hides.
+            for id in to_clear(&device.notifications, shown.get()) {
+                daemon.send(DaemonCommand::DismissNotification(device.id.clone(), id));
             }
             toast_from(button, "Notifications cleared");
         });
@@ -288,19 +320,35 @@ impl Page {
         }
         let filter = self.filter.get();
         let shown_here = notifications.iter().filter(|n| filter.shows(n)).count();
-        if !notifications.is_empty() && shown_here == 0 {
-            count.push_str(match filter {
-                Filter::Messages => " · no messages",
-                _ => " · nothing else",
-            });
+        if filter != Filter::All && !notifications.is_empty() {
+            // "2 of 4 new": what the filter shows, of all of them.
+            count = count.replacen(
+                &format!("{} new", notifications.len()),
+                &format!("{shown_here} of {} new", notifications.len()),
+                1,
+            );
         }
         self.count.set_label(&count);
-        self.empty.root.set_visible(notifications.is_empty());
-        self.empty.body.set_label(&empty_line(
-            &device.name,
-            device.feature_transport_ready,
-            device.notification_access,
-        ));
+        // Nothing at all, or nothing the filter lets through: the empty state
+        // says which.
+        let filtered_out = !notifications.is_empty() && shown_here == 0;
+        self.empty
+            .root
+            .set_visible(notifications.is_empty() || filtered_out);
+        self.empty.title.set_label(match (filtered_out, filter) {
+            (true, Filter::CanReply) => "Nothing to reply to",
+            (true, _) => "Nothing else",
+            (false, _) => "No notifications",
+        });
+        self.empty.body.set_label(&if filtered_out {
+            "Choose All to see every notification.".to_string()
+        } else {
+            empty_line(
+                &device.name,
+                device.feature_transport_ready,
+                device.notification_access,
+            )
+        });
         // Off on the phone: Ask on phone, the one button that turns it on
         // (a request there; the person allows it).
         let step = notifications
@@ -317,12 +365,13 @@ impl Page {
         // is down (the list is what it last reported).
         let ready = device.feature_transport_ready;
         self.list.set_sensitive(ready);
-        self.clear.set_sensitive(
-            ready
-                && notifications
-                    .iter()
-                    .any(|notification| notification.is_clearable),
-        );
+        self.clear
+            .set_sensitive(ready && !to_clear(notifications, filter).is_empty());
+        self.clear.set_label(if filter == Filter::All {
+            "Clear all"
+        } else {
+            "Clear these"
+        });
 
         let mut cards = self.cards.borrow_mut();
         cards.retain(|card| {
@@ -402,16 +451,30 @@ impl Page {
 }
 
 impl Page {
-    /// Puts each app's heading before its cards, the apps in the order of
-    /// their newest, and shows what the filter lets through (a heading only
-    /// over a card that shows). Cards are moved, never rebuilt: a reply being
+    /// Shows what the filter lets through, the apps in the order of their
+    /// newest, each app's heading (with how many show) before its cards when
+    /// more than one shows. Cards are moved, never rebuilt: a reply being
     /// typed stays.
     fn group(&self, cards: &[Card], notifications: &[DeviceNotification]) {
         let filter = self.filter.get();
-        let groups = by_app(notifications);
+        // Every app with its shown ids; built once a refresh (no search per id).
+        let groups = by_app(notifications, filter);
+        let by_id: HashMap<&str, &Card> =
+            cards.iter().map(|card| (card.id.as_str(), card)).collect();
+        let shown: std::collections::HashSet<&str> = groups
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().map(String::as_str))
+            .collect();
+        for card in cards {
+            card.widget.set_visible(shown.contains(card.id.as_str()));
+        }
         let mut headings = self.headings.borrow_mut();
+        // An app with one notification shown has no heading: its card says
+        // the app already. The others keep theirs, counting what shows.
         headings.retain(|app, heading| {
-            let keep = groups.iter().any(|(name, _)| name == app);
+            let keep = groups
+                .iter()
+                .any(|(name, ids)| name == app && ids.len() > 1);
             if !keep {
                 self.list.remove(heading);
             }
@@ -419,38 +482,27 @@ impl Page {
         });
         let mut previous: Option<gtk::Widget> = None;
         for (app, ids) in &groups {
-            let heading = headings.entry(app.clone()).or_insert_with(|| {
-                let heading = ui_kit::section_header(app);
-                heading.set_margin_top(8);
-                self.list.append(&heading);
-                heading
-            });
-            let words = if ids.len() > 1 {
-                format!("{app} · {}", ids.len())
-            } else {
-                app.clone()
-            };
-            if heading.label() != words {
-                heading.set_label(&words);
+            if ids.len() > 1 {
+                let heading = headings.entry(app.clone()).or_insert_with(|| {
+                    let heading = ui_kit::section_header(app);
+                    heading.set_margin_top(8);
+                    self.list.append(&heading);
+                    heading
+                });
+                let words = format!("{app} · {}", ids.len());
+                if heading.label() != words {
+                    heading.set_label(&words);
+                }
+                self.list.reorder_child_after(heading, previous.as_ref());
+                previous = Some(heading.clone().upcast());
             }
-            self.list.reorder_child_after(heading, previous.as_ref());
-            previous = Some(heading.clone().upcast());
-            let mut any = false;
             for id in ids {
-                let Some(card) = cards.iter().find(|card| &card.id == id) else {
-                    continue;
-                };
-                let shows = notifications
-                    .iter()
-                    .find(|n| &n.id == id)
-                    .is_some_and(|n| filter.shows(n));
-                card.widget.set_visible(shows);
-                any |= shows;
-                self.list
-                    .reorder_child_after(&card.widget, previous.as_ref());
-                previous = Some(card.widget.clone().upcast());
+                if let Some(card) = by_id.get(id.as_str()) {
+                    self.list
+                        .reorder_child_after(&card.widget, previous.as_ref());
+                    previous = Some(card.widget.clone().upcast());
+                }
             }
-            heading.set_visible(any);
         }
     }
 }
@@ -1125,27 +1177,46 @@ mod tests {
     }
 
     /// Grouped by app, the app with the newest first, each app's own in the
-    /// order they came (newest first).
+    /// order they came (newest first); the filter decides what is grouped,
+    /// and Clear all clears only that. An app with no name is "Other app".
     #[test]
     fn notifications_group_by_app_newest_app_first() {
-        let list = [
+        let mut list = vec![
             one("1", "Signal", true),
             one("2", "GitHub", false),
             one("3", "Signal", true),
             one("4", "Calendar", false),
+            one("5", "", false),
         ];
-        let groups = by_app(&list);
+        list[3].is_clearable = false;
+        let groups = by_app(&list, Filter::All);
         let names: Vec<&str> = groups.iter().map(|(app, _)| app.as_str()).collect();
-        assert_eq!(names, ["Signal", "GitHub", "Calendar"]);
+        assert_eq!(names, ["Signal", "GitHub", "Calendar", "Other app"]);
         assert_eq!(groups[0].1, ["1", "3"]);
-        assert!(Filter::Messages.shows(&list[0]) && !Filter::Messages.shows(&list[1]));
+        let replies = by_app(&list, Filter::CanReply);
+        assert_eq!(
+            replies,
+            [("Signal".to_string(), vec!["1".to_string(), "3".to_string()])]
+        );
         assert!(Filter::Other.shows(&list[1]) && !Filter::Other.shows(&list[0]));
         assert!(list.iter().all(|n| Filter::All.shows(n)));
+        assert_eq!(
+            to_clear(&list, Filter::CanReply),
+            ["1", "3"],
+            "not the hidden ones"
+        );
+        assert_eq!(
+            to_clear(&list, Filter::Other),
+            ["2", "5"],
+            "not one the phone keeps"
+        );
+        assert_eq!(to_clear(&list, Filter::All), ["1", "2", "3", "5"]);
     }
 
-    /// On the page: each app's heading before its cards ("Signal · 2"), and
-    /// the Messages filter hides the rest, headings included. (Needs a
-    /// display.)
+    /// On the page: a heading before an app's cards when it has more than one
+    /// shown ("Signal · 2"), none over a lone card (it names its app); the
+    /// filter hides the rest and the counts follow it; filtering to nothing
+    /// shows the empty state saying so. (Needs a display.)
     #[test]
     fn the_page_shows_app_headings_and_filters() {
         crate::test_display::run(|| {
@@ -1162,9 +1233,9 @@ mod tests {
                 one("1", "Signal", true),
                 one("2", "GitHub", false),
                 one("3", "Signal", true),
+                one("6", "Signal", false),
             ];
             let page = Page::new(&window);
-            page.update(&window, &daemon, &device);
             let order = |page: &Page| {
                 let mut out = Vec::new();
                 let mut child = page.list.first_child();
@@ -1179,21 +1250,34 @@ mod tests {
                 }
                 out
             };
+            page.update(&window, &daemon, &device);
+            assert_eq!(order(&page), ["Signal · 3", "card", "card", "card", "card"]);
+            assert_eq!(page.count.label(), "4 new");
+            page.filter.set(Filter::CanReply);
+            page.update(&window, &daemon, &device);
             assert_eq!(
                 order(&page),
-                ["Signal · 2", "card", "card", "GitHub", "card"]
+                ["Signal · 2", "card", "card"],
+                "counts what shows"
             );
-            page.filter.set(Filter::Messages);
-            page.update(&window, &daemon, &device);
-            assert_eq!(order(&page), ["Signal · 2", "card", "card"]);
+            assert_eq!(page.count.label(), "2 of 4 new");
+            assert_eq!(page.clear.label().as_deref(), Some("Clear these"));
             page.filter.set(Filter::Other);
             page.update(&window, &daemon, &device);
-            assert_eq!(order(&page), ["GitHub", "card"]);
-            // The phone dismissed GitHub's: its heading goes too.
-            device.notifications.remove(1);
+            assert_eq!(order(&page), ["card", "card"], "lone cards, no headings");
+            // Nothing can be replied to: the empty state says so.
+            device
+                .notifications
+                .retain(|n| n.request_reply_id.is_none());
+            page.filter.set(Filter::CanReply);
+            page.update(&window, &daemon, &device);
+            assert!(order(&page).is_empty());
+            assert!(page.empty.root.is_visible());
+            assert_eq!(page.empty.title.label(), "Nothing to reply to");
             page.filter.set(Filter::All);
             page.update(&window, &daemon, &device);
-            assert_eq!(order(&page), ["Signal · 2", "card", "card"]);
+            assert!(!page.empty.root.is_visible());
+            assert_eq!(page.clear.label().as_deref(), Some("Clear all"));
         });
     }
 }

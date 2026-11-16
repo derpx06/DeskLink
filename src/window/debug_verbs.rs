@@ -273,6 +273,55 @@ pub(super) fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &st
             // As after a key press: the ring shows.
             gtk::prelude::GtkWindowExt::set_focus_visible(win, true);
         }
+        // "fake-notification APP TITLE [reply]": one more notification on the
+        // selected fake phone (underscores for spaces), newest first.
+        "fake-notification" => {
+            let selected = win.selected_id().unwrap_or_default();
+            let mut fakes = win.imp().fake_devices.borrow_mut();
+            if let Some(device) = fakes.iter_mut().find(|device| device.id == selected) {
+                let (title, reply) = match arg.strip_suffix(" reply") {
+                    Some(title) => (title, true),
+                    None => (arg, false),
+                };
+                let n = device.notifications.len() + 100;
+                device.notifications.insert(
+                    0,
+                    crate::device_links::device::DeviceNotification {
+                        id: n.to_string(),
+                        app_name: id.replace('_', " "),
+                        title: title.replace('_', " "),
+                        text: "Sent just now".into(),
+                        ticker: String::new(),
+                        is_clearable: true,
+                        request_reply_id: reply.then(|| format!("r{n}")),
+                        actions: Vec::new(),
+                        silent: false,
+                        time: gtk::glib::real_time() / 1000,
+                        app_icon: None,
+                    },
+                );
+            }
+            drop(fakes);
+            win.imp().snapshots.borrow_mut().clear();
+            win.refresh_devices();
+        }
+        // "notif-filter N": the Notifications page's Nth filter chip (0 All).
+        "notif-filter" => {
+            if let Some(chips) = named_widgets(win.upcast_ref(), "notification-filter").first() {
+                let mut child = chips.first_child();
+                let mut n: usize = id.parse().unwrap_or(0);
+                while let Some(chip) = child {
+                    if n == 0 {
+                        if let Some(chip) = chip.downcast_ref::<gtk::ToggleButton>() {
+                            chip.set_active(true);
+                        }
+                        break;
+                    }
+                    n -= 1;
+                    child = chip.next_sibling();
+                }
+            }
+        }
         "open-reply" => {
             if let Some(page) = win.imp().notifications.borrow().as_ref() {
                 page.open_reply(id);

@@ -247,6 +247,8 @@ impl Sidebar {
         }
         self.update_card(win, device);
         // Files moving to or from this phone now, for the Files row's count.
+        // A row with no device id (a debug build's fake transfer) counts for
+        // every phone, as on Home's Files card.
         let moving = win.daemon().map_or(0, |daemon| {
             super::transfers::rows(&daemon)
                 .iter()
