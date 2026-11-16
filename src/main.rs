@@ -99,6 +99,7 @@ mod terminal_previews;
 mod test_display;
 #[cfg(test)]
 mod test_privileges;
+mod theme_hint;
 mod thumbnails;
 mod ticker;
 mod transfer_notice;

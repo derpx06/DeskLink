@@ -1555,6 +1555,12 @@ fn install_brand_styles() {
         move |manager| update(manager)
     });
     manager.connect_high_contrast_notify(move |manager| update(manager));
+    // Xfce, MATE and Cinnamon go dark through the GTK theme alone.
+    crate::theme_hint::follow(|| {
+        if load_appearance() == "system" {
+            adw::StyleManager::default().set_color_scheme(appearance_scheme("system"));
+        }
+    });
 }
 
 /// Makes the bundled JetBrains Mono (SIL OFL 1.1, licence beside it in the
@@ -1625,7 +1631,7 @@ pub(crate) fn appearance_scheme(choice: &str) -> adw::ColorScheme {
     match choice {
         "light" => adw::ColorScheme::ForceLight,
         "dark" => adw::ColorScheme::ForceDark,
-        _ => adw::ColorScheme::Default,
+        _ => crate::theme_hint::system_scheme(),
     }
 }
 
