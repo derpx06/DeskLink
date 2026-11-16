@@ -309,8 +309,11 @@ pub(crate) struct MediaHold {
 pub(crate) enum HoldStep {
     /// The first call began: pause what is playing, then `record` it.
     Pause,
-    /// The last call ended: play these again.
-    Resume(Vec<String>),
+    /// The last call ended: play again what was paused for it, taken when
+    /// the job runs ([`MediaHold::take_paused`]): a call that ended before
+    /// its pause job ran had recorded nothing yet, and its players stayed
+    /// paused.
+    Resume,
     Nothing,
 }
 
@@ -330,13 +333,18 @@ impl MediaHold {
         }
         match (before, !self.in_call.is_empty()) {
             (false, true) => HoldStep::Pause,
-            (true, false) => HoldStep::Resume(std::mem::take(&mut self.paused)),
+            (true, false) => HoldStep::Resume,
             _ => HoldStep::Nothing,
         }
     }
 
     pub(crate) fn record(&mut self, paused: Vec<String>) {
         self.paused.extend(paused);
+    }
+
+    /// The players to resume, once.
+    pub(crate) fn take_paused(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.paused)
     }
 }
 
@@ -387,7 +395,14 @@ pub(crate) fn hold_media(device_id: &str, in_call: bool) {
                     hold.get_or_insert_with(MediaHold::default).record(paused);
                 }
             }
-            HoldStep::Resume(players) => super::mpris::play(&players),
+            // Taken now, on the desk worker after the pause job before it.
+            HoldStep::Resume => {
+                let players = HOLD
+                    .lock()
+                    .map(|mut hold| hold.get_or_insert_with(MediaHold::default).take_paused())
+                    .unwrap_or_default();
+                super::mpris::play(&players);
+            }
             HoldStep::Nothing => {}
         }
     });
@@ -669,13 +684,30 @@ mod tests {
             HoldStep::Nothing,
             "b is still in a call"
         );
+        assert_eq!(hold.update("b", false), HoldStep::Resume);
         assert_eq!(
-            hold.update("b", false),
-            HoldStep::Resume(vec!["org.mpris.MediaPlayer2.spotify".into()])
+            hold.take_paused(),
+            vec!["org.mpris.MediaPlayer2.spotify".to_string()]
         );
         // Resumed once: a later "no call" resumes nothing again.
         assert_eq!(hold.update("b", false), HoldStep::Nothing);
         assert_eq!(hold.update("a", true), HoldStep::Pause);
-        assert_eq!(hold.update("a", false), HoldStep::Resume(Vec::new()));
+        assert_eq!(hold.update("a", false), HoldStep::Resume);
+        assert!(hold.take_paused().is_empty());
+    }
+
+    #[test]
+    fn a_call_that_ends_before_its_pause_ran_still_resumes_what_it_paused() {
+        let mut hold = MediaHold::default();
+        assert_eq!(hold.update("a", true), HoldStep::Pause);
+        // The call ends while the pause job is still queued on the desk
+        // worker: the resume is decided now, the players recorded later.
+        assert_eq!(hold.update("a", false), HoldStep::Resume);
+        hold.record(vec!["org.mpris.MediaPlayer2.spotify".into()]);
+        // The resume job runs after the pause job (one ordered worker).
+        assert_eq!(
+            hold.take_paused(),
+            vec!["org.mpris.MediaPlayer2.spotify".to_string()]
+        );
     }
 }
