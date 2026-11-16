@@ -42,6 +42,22 @@ pub(super) struct TerminalBridge {
     /// Terminals another phone is attached to, refreshed before each use
     /// (for `sessions[].attached`).
     pub(super) elsewhere: HashSet<String>,
+    /// Where the next pump starts among the attached terminals: each pump
+    /// starts one further on, so a flooding terminal cannot keep another's
+    /// output waiting behind it.
+    next_first: usize,
+}
+
+/// `ids` in a stable order, started one further on each call (`next_first`
+/// counts the calls): a flooding terminal cannot keep another waiting.
+pub(super) fn rotated(mut ids: Vec<String>, next_first: &mut usize) -> Vec<String> {
+    ids.sort_unstable();
+    if !ids.is_empty() {
+        let first = *next_first % ids.len();
+        ids.rotate_left(first);
+        *next_first = first + 1;
+    }
+    ids
 }
 
 impl TerminalBridge {
@@ -54,6 +70,7 @@ impl TerminalBridge {
             outbox_bytes: 0,
             input_refusal_reported: false,
             elsewhere: HashSet::new(),
+            next_first: 0,
         }
     }
 
@@ -406,7 +423,11 @@ impl TerminalBridge {
             return events;
         }
 
-        for id in self.attached.keys().cloned().collect::<Vec<_>>() {
+        let ids = rotated(
+            self.attached.keys().cloned().collect(),
+            &mut self.next_first,
+        );
+        for id in ids {
             if remaining == 0 {
                 break;
             }

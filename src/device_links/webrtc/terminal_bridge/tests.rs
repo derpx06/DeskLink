@@ -162,6 +162,53 @@ fn is_control(action: TerminalAction) -> impl Fn(&TerminalEvent) -> bool {
 }
 
 #[test]
+fn the_pump_starts_one_terminal_further_on_each_time() {
+    let ids = || vec!["b".to_string(), "c".to_string(), "a".to_string()];
+    let mut next = 0;
+    let firsts: Vec<String> = (0..4)
+        .map(|_| bridge::rotated(ids(), &mut next)[0].clone())
+        .collect();
+    assert_eq!(firsts, ["a", "b", "c", "a"]);
+    assert!(bridge::rotated(Vec::new(), &mut next).is_empty());
+}
+
+/// Two terminals flooding at once both get output early: the pump starts one
+/// further on each time instead of always serving the same one first.
+#[test]
+fn a_flooding_terminal_does_not_starve_another() {
+    let mut registry = TerminalRegistry::new();
+    let mut bridge = new_bridge("phone-1");
+    let flood = || {
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "read line; head -c 300000 /dev/zero | tr '\\0' x; sleep 30".to_string(),
+        ]
+    };
+    let a = create(&mut bridge, &mut registry, Some(flood()));
+    let b = create(&mut bridge, &mut registry, Some(flood()));
+    attach(&mut bridge, &mut registry, &a);
+    attach(&mut bridge, &mut registry, &b);
+    poke(&mut bridge, &mut registry, &a);
+    poke(&mut bridge, &mut registry, &b);
+    // Both floods are well past one pump's budget before pumping.
+    std::thread::sleep(Duration::from_millis(800));
+    let mut served = HashSet::new();
+    for _ in 0..6 {
+        for event in bridge.pump(1, &mut registry) {
+            if let TerminalEvent::SendChunk(chunk) = event {
+                if !chunk.data.is_empty() {
+                    served.insert(chunk.terminal_id);
+                }
+            }
+        }
+    }
+    registry.close(&a);
+    registry.close(&b);
+    assert_eq!(served.len(), 2, "only {served:?} got output");
+}
+
+#[test]
 fn listing_reports_created_sessions() {
     let mut registry = TerminalRegistry::new();
     let mut bridge = new_bridge("phone-1");
