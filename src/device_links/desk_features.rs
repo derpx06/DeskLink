@@ -766,8 +766,11 @@ pub(crate) fn handle_unlock_request(device_id: &str, packet: &NetworkPacket) {
 
 /// The phone approved an unlock (`setLocked: false` with the nonce).
 pub(crate) fn handle_unlock_approval(device_id: &str, nonce: Option<&str>) {
-    // The same flood damper as locking: one operation per settle window.
+    // The same flood damper as locking: one operation per settle window. A
+    // damped approval is answered (it used to vanish, leaving the phone
+    // waiting); its nonce is not spent, so trying again works.
     if !super::daemon::admit_lock_operation() {
+        refuse(device_id, Refusal::NotReady);
         return;
     }
     match unlock::approve(device_id, nonce, conditions(device_id)) {
@@ -1281,6 +1284,18 @@ mod tests {
             }),
             Refusal::Failed
         );
+    }
+
+    #[test]
+    fn an_approval_inside_the_settle_window_is_answered_not_dropped() {
+        let device = format!("{TEST_OUTBOX_PREFIX}damped-unlock");
+        // A lock operation just happened: the approval is damped.
+        super::super::daemon::admit_lock_operation();
+        handle_unlock_approval(&device, Some("nonce"));
+        let sent = test_sent(&device);
+        assert_eq!(sent.len(), 1, "one answer: {sent:?}");
+        assert_eq!(sent[0].packet_type, PACKET_TYPE_LOCK);
+        assert_eq!(sent[0].get_str("unlockRefused"), Some("not-ready"));
     }
 
     #[test]
