@@ -153,8 +153,10 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         if device.status == DeviceStatus::Paired && !device.feature_transport_ready {
             page.append(&reconnecting_row(device));
         }
-        // The actions right under the hero (UI-REDESIGN 3.11); a long
-        // "Finish setting up" card above them hid them below the fold.
+        // The actions near the top, after the hero and what is going on now
+        // (activity, Now playing, Connecting; UI-REDESIGN 3.11), and before
+        // "Finish setting up": that card, often several steps tall, hid them
+        // below the fold when it came first.
         page.append(&tiles(daemon, device));
         if let Some(card) = super::requirements::card(daemon, &needs) {
             page.append(&card);

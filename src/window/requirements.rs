@@ -887,8 +887,10 @@ pub(crate) fn rows(needs: &[Need]) -> gtk::ListBox {
         };
         text.append(&line(&need.title, &["dl-need-title"]));
         let detail = line(&need.detail, &["dl-secondary"]);
-        // An install command is read and copied whole.
+        // An install command is read and copied whole, with the mouse: not a
+        // Tab stop (each one took the focus and selected all its words).
         detail.set_selectable(true);
+        detail.set_focusable(false);
         text.append(&detail);
         if let Some(label) = need.fix.label() {
             let button = super::ui_kit::button(super::ui_kit::ButtonKind::Tonal, label, None);
@@ -1635,8 +1637,13 @@ mod tests {
                 find(&card, &|w| w.widget_name() == "terminal-access").is_some(),
                 "terminal access is listed"
             );
-            // The tile row comes first, right under the hero: the card
-            // (often several steps tall) must not push it below the fold.
+            // Keyboard: Tab goes from fix to fix, not through every line of words.
+            assert!(
+                find(&card, &|w| w.is::<gtk::Label>() && w.is_focusable()).is_none(),
+                "no label in the card is a Tab stop"
+            );
+            // The tile row comes before the card: the card (often several
+            // steps tall) must not push it below the fold.
             let tiles = find(&root, &|w| w.widget_name() == "tile-row" && w.is_mapped())
                 .expect("the tile row");
             let page = card.parent().expect("on the Home page");
