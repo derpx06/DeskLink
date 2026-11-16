@@ -32,6 +32,7 @@ locks are recovered, queues are bounded and blocking reads have deadlines.
 | W10 | S4 | `daemon/mod.rs` | The 1 Hz reconciler waits for `get-stats` (up to 2 s) and LAN probes inline. | listed |
 | W11 | S4 | `daemon/packet_handler.rs` | The LAN reader reads one byte per lock round. | listed: LAN carries only signalling |
 | W12 | S4 | `peer_connection/mod.rs` | A pipeline that fails to start is dropped without going to Null (ICE sockets and threads linger). | **fixed**: set to Null on failure |
+| W13 | S2 | `application/actions.rs`, `daemon/network.rs` | Every OS network signal was a network change: a restart-looping container (veth/bridge every ~35 s) woke every redialer, beacon burst and recovery ladder, 30 times in a day, seen just before peer silences. | **fixed**: acted on only when an interface with a default route, a bootstrap address, or a non-virtual name changed (`a_container_restarting_is_not_a_network_change`, `default_routes_are_read_from_the_kernel_tables`) |
 
 ## Transfers and files
 
