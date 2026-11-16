@@ -669,6 +669,10 @@ pub(super) fn upsert_notification_for(
     device_id: &str,
     packet: &NetworkPacket,
 ) -> Option<DeviceNotification> {
+    // The icon is kept even while this phone's notifications are hidden:
+    // the phone sends it once per connection, and turning them on again
+    // would otherwise show glyphs until the next one.
+    let app_icon = app_icon(packet);
     if !settings.shows_notifications(device_id) {
         return None;
     }
@@ -702,7 +706,7 @@ pub(super) fn upsert_notification_for(
             .get_i64("time")
             .or_else(|| packet.get_str("time")?.parse().ok())
             .unwrap_or(0),
-        app_icon: app_icon(packet),
+        app_icon,
     };
 
     if let Ok(mut devices) = devices.lock() {
