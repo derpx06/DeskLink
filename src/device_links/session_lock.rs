@@ -95,6 +95,10 @@ struct DeviceState {
     /// passed the check before any failure was recorded, and one burst got more
     /// than [`FREE_ATTEMPTS`] tries.
     in_flight: u32,
+    /// Bumped when this device's unlock is forgotten (unpaired, new
+    /// identity): a guess hashed across it counts for nothing. Per device: one
+    /// phone reconnecting voided another phone's right password.
+    epoch: u64,
 }
 
 /// What [`SessionLock::begin`] decided without hashing.
@@ -102,16 +106,17 @@ pub enum Precheck {
     Allowed,
     Denied(String),
     /// Hash `offered` (outside any lock) and report with [`SessionLock::finish`].
-    /// Carries the lock's epoch: if an unpair or a password change happens
-    /// while hashing, the answer no longer counts.
+    /// Carries the sum of the lock's epoch and this device's: if the password
+    /// changes, or this device is unpaired or gets a new identity, while
+    /// hashing, the answer no longer counts.
     Verify(u64),
 }
 
 #[derive(Default)]
 pub struct SessionLock {
     devices: HashMap<String, DeviceState>,
-    /// Bumped by every unlock-forgetting event (unpair, new identity,
-    /// password change).
+    /// Bumped when the password changes (every device's unlock goes); a
+    /// device's own unpair or new identity bumps only its own epoch.
     epoch: u64,
 }
 
@@ -165,7 +170,7 @@ impl SessionLock {
             return Precheck::Denied(PASSWORD_WRONG.to_string());
         }
         state.in_flight += 1;
-        Precheck::Verify(self.epoch)
+        Precheck::Verify(self.epoch.wrapping_add(state.epoch))
     }
 
     /// Records the outcome of hashing `offered`.
@@ -178,8 +183,9 @@ impl SessionLock {
         epoch: u64,
         now: Instant,
     ) -> Result<(), String> {
-        let changed = epoch != self.epoch;
         let state = self.devices.entry(device_id.to_string()).or_default();
+        // Both only ever grow, so the sum moved iff either did.
+        let changed = epoch != self.epoch.wrapping_add(state.epoch);
         state.in_flight = state.in_flight.saturating_sub(1);
         // A right answer to a question asked before the password changed or
         // the phone was unpaired unlocks nothing; nor does one that arrives
@@ -190,6 +196,7 @@ impl SessionLock {
         if correct {
             *state = DeviceState {
                 unlocked_session: Some(session),
+                epoch: state.epoch,
                 ..DeviceState::default()
             };
             return Ok(());
@@ -235,8 +242,8 @@ impl SessionLock {
     /// identity). Its failures and lockout stay: they are a property of the
     /// guessing, not of the connection.
     pub fn forget_unlock(&mut self, device_id: &str) {
-        self.epoch += 1;
         if let Some(state) = self.devices.get_mut(device_id) {
+            state.epoch += 1;
             state.unlocked_session = None;
             state.last_wrong = None;
         }
@@ -496,6 +503,24 @@ mod tests {
                 "{event}"
             );
         }
+    }
+
+    /// Another phone reconnecting (its unlock forgotten) does not void a
+    /// right password this phone is having hashed.
+    #[test]
+    fn another_phones_reconnect_does_not_void_a_right_password() {
+        let stored = cheap("hunter2");
+        let now = Instant::now();
+        let mut lock = SessionLock::default();
+        let _ = lock.check(Some(&stored), "b", 7, Some("hunter2"), now);
+        let Precheck::Verify(epoch) = lock.begin(Some(&stored), "a", 1, Some("hunter2"), now)
+        else {
+            panic!("a first offer is verified");
+        };
+        lock.forget_unlock("b");
+        assert_eq!(lock.finish("a", 1, "hunter2", true, epoch, now), Ok(()));
+        // The phone that was forgotten is asked again.
+        assert!(lock.check(Some(&stored), "b", 7, None, now).is_err());
     }
 
     fn session_of(attempt: &str) -> u64 {
