@@ -224,6 +224,8 @@ mod tests {
                         let Some(rest) = trimmed
                             .strip_prefix("static ")
                             .or_else(|| trimmed.strip_prefix("pub static "))
+                            .or_else(|| trimmed.strip_prefix("pub(crate) static "))
+                            .or_else(|| trimmed.strip_prefix("pub(super) static "))
                         else {
                             continue;
                         };
