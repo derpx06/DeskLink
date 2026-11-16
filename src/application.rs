@@ -476,6 +476,17 @@ impl DesklinkApplication {
         let show_window_action = gio::ActionEntry::builder("show-window")
             .activate(move |app: &Self, _, _| app.main_window().present())
             .build();
+        // A notification's click: the window, on the page it is about.
+        let show_page_action = gio::ActionEntry::builder("show-page")
+            .parameter_type(Some(glib::VariantTy::STRING))
+            .activate(move |app: &Self, _, target| {
+                let window = app.main_window();
+                window.present();
+                if let Some(page) = target.and_then(|target| target.get::<String>()) {
+                    window.show_page(&page);
+                }
+            })
+            .build();
         let history_action = gio::ActionEntry::builder("history")
             .activate(move |app: &Self, _, _| app.show_history())
             .build();
@@ -558,6 +569,7 @@ impl DesklinkApplication {
             lock_hand_off_action,
             history_action,
             show_window_action,
+            show_page_action,
             open_bucket_action,
             turn_on_bucket_action,
             walk_away_cancel_action,

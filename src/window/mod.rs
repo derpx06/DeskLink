@@ -1859,10 +1859,11 @@ impl DesklinkWindow {
                 toast.set_action_target_value(Some(&"notifications".to_variant()));
                 self.queue_toast(&toast);
             } else {
-                self.send_app_notification(
+                self.send_app_notification_for(
                     &format!("phone-notification-{unique_id}"),
                     &title,
                     body,
+                    Some("notifications"),
                 );
             }
         }
@@ -1898,12 +1899,25 @@ impl DesklinkWindow {
     }
 
     fn send_app_notification(&self, id: &str, title: &str, body: &str) {
+        self.send_app_notification_for(id, title, body, None);
+    }
+
+    /// A notification that opens the window when clicked, on `page` if one is
+    /// named. The default action is explicit: GLib's freedesktop backend
+    /// (Plasma, Xfce, MATE, Cinnamon, dunst) offers a click only for one, and
+    /// without it clicking a phone's notification did nothing.
+    fn send_app_notification_for(&self, id: &str, title: &str, body: &str, page: Option<&str>) {
         let Some(application) = self.application() else {
             return;
         };
         let notification = gio::Notification::new(title);
         notification.set_body(Some(body));
         notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+        match page {
+            Some(page) => notification
+                .set_default_action_and_target_value("app.show-page", Some(&page.to_variant())),
+            None => notification.set_default_action("app.show-window"),
+        }
         application.send_notification(Some(id), &notification);
     }
 
@@ -1915,6 +1929,7 @@ impl DesklinkWindow {
         notification.set_body(Some(body));
         notification.set_priority(gio::NotificationPriority::High);
         notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
+        notification.set_default_action("app.show-window");
         application.send_notification(Some(id), &notification);
     }
 
