@@ -687,7 +687,7 @@ button.file-card:hover .file-preview { background-color: alpha(currentColor, 0.0
   background-color: @surface_2;
 }
 
-/* ── Welcome tour (window/onboarding.rs) ───────────────────────────────── */
+/* ── Welcome tour (window/onboarding/) ────────────────────────────────── */
 .ob-segments { margin: 0 24px; }
 .ob-brand-row { margin: 4px 24px 0 24px; min-height: 40px; }
 .ob-seg {

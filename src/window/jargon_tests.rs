@@ -110,13 +110,12 @@ fn shown_strings(text: &str) -> Vec<(usize, String)> {
 fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
     for entry in std::fs::read_dir(dir).unwrap().flatten() {
         let path = entry.path();
+        // First-run onboarding (`onboarding/`) has its own owner and pass.
         if path.is_dir() {
-            sources(&path, out);
+            if path.file_name().is_some_and(|name| name != "onboarding") {
+                sources(&path, out);
+            }
         } else if path.extension().is_some_and(|ext| ext == "rs")
-            // First-run onboarding has its own owner and pass.
-            && path
-                .file_name()
-                .is_some_and(|name| name != "onboarding.rs")
             && !crate::source_scan::is_test_file(&path)
         {
             out.push(path);
