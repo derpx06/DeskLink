@@ -368,6 +368,7 @@ pub(super) fn handle_peer_envelope(
         // or clearing the preview changes GStreamer element state, which can wait
         // on the GTK main loop — and the main loop takes this same lock.
         let teardown;
+        let mut resume = false;
         let request_control = {
             let mut open = remote_session::sessions()
                 .lock()
@@ -384,8 +385,9 @@ pub(super) fn handle_peer_envelope(
                 && message.direction == Some(remote_session::ScreenDirection::PhoneToDesktop)
             {
                 // A second view of the phone arrives on the pad the first one
-                // parked; show it again (the first view comes via pad-added).
-                crate::device_links::webrtc::screen::resume_parked(&wire.peer_device_id);
+                // parked; it is shown again after the lock (the first view
+                // comes via pad-added).
+                resume = true;
                 // A second `screen-ready` is the phone turning its screen:
                 // the size is taken (in `accept`), control is not asked again.
                 if matches!(
@@ -393,21 +395,37 @@ pub(super) fn handle_peer_envelope(
                     remote_session::SessionState::Controlling
                         | remote_session::SessionState::RequestingControl
                 ) {
-                    return Ok(());
+                    None
+                } else {
+                    session.begin_control()?;
+                    Some(remote_session::ControlMessage::new(
+                        remote_session::ControlKind::RequestControl,
+                        attempt_id,
+                        wire,
+                        &message.remote_session_id,
+                        session.next_sequence(),
+                        now_millis(),
+                    ))
                 }
-                session.begin_control()?;
-                Some(remote_session::ControlMessage::new(
-                    remote_session::ControlKind::RequestControl,
-                    attempt_id,
-                    wire,
-                    &message.remote_session_id,
-                    session.next_sequence(),
-                    now_millis(),
-                ))
             } else {
                 None
             }
         };
+        // A desk stop may have run while the picture was being shown again
+        // (it waits on the main loop): a stream nobody wants any more goes.
+        if resume && crate::device_links::webrtc::screen::resume_parked(&wire.peer_device_id) {
+            let wanted = remote_session::sessions()
+                .lock()
+                .ok()
+                .and_then(|open| {
+                    open.get(&wire.peer_device_id)
+                        .map(|session| session.shows_phone_screen(&message.remote_session_id))
+                })
+                .unwrap_or(false);
+            if !wanted {
+                crate::device_links::webrtc::screen::clear_stream(&wire.peer_device_id);
+            }
+        }
         if teardown {
             crate::device_links::webrtc::screen::clear_stream(&wire.peer_device_id);
             stop_desktop_portal_session(&wire.peer_device_id, None);

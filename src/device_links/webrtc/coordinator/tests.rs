@@ -1752,3 +1752,30 @@ fn a_stale_path_reading_answers_at_once_and_is_refreshed_in_the_background() {
     }
     assert_eq!(link.path(), (None, false), "the refresh replaced it");
 }
+
+/// No GStreamer state change runs under the remote-session lock: showing a
+/// parked phone stream again starts a GTK sink, which waits for the main
+/// loop, and the main loop's Phone Screen tick takes that lock every 33 ms.
+/// It did so at a reshare (p3.4): the desk hung for good, the stalled
+/// receive path took the data channels down with it.
+#[test]
+fn a_parked_phone_stream_is_shown_again_outside_the_session_lock() {
+    let source = crate::source_scan::production(include_str!("envelopes.rs"));
+    let start = source
+        .find("let request_control = {")
+        .expect("the session-lock block");
+    let end = start + source[start..].find("\n        };").expect("its end");
+    let locked = &source[start..end];
+    assert!(locked.contains("remote_session::sessions()"), "{locked}");
+    for call in [
+        "resume_parked(",
+        "clear_stream(",
+        "stop_desktop_portal_session(",
+    ] {
+        assert!(!locked.contains(call), "{call} under the session lock");
+    }
+    assert!(
+        source[end..].contains("resume_parked("),
+        "still shown again"
+    );
+}

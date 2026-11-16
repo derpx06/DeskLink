@@ -749,6 +749,15 @@ impl RemoteSession {
         self.remote_session_id.as_deref()
     }
 
+    /// Whether this session still wants the phone's screen of share `id`:
+    /// a picture shown again while the lock was free may have been stopped
+    /// (or replaced) meanwhile, and must then go again.
+    pub fn shows_phone_screen(&self, id: &str) -> bool {
+        self.remote_session_id.as_deref() == Some(id)
+            && self.direction == Some(ScreenDirection::PhoneToDesktop)
+            && !matches!(self.state, SessionState::Idle | SessionState::Stopped)
+    }
+
     pub fn direction(&self) -> Option<ScreenDirection> {
         self.direction
     }
@@ -1620,6 +1629,18 @@ mod tests {
         // Another session's id is still refused.
         let other = message(ControlKind::RequestControl, &Uuid::new_v4().to_string());
         assert!(session.accept(&other, 5_000).is_err());
+    }
+
+    #[test]
+    fn a_phone_screen_stopped_while_it_was_shown_again_is_not_wanted() {
+        let mut session = RemoteSession::new();
+        let id = session.begin_view(ScreenDirection::PhoneToDesktop);
+        assert!(session.shows_phone_screen(&id));
+        assert!(!session.shows_phone_screen(&Uuid::new_v4().to_string()));
+        session.stop();
+        assert!(!session.shows_phone_screen(&id));
+        let desk = session.begin_view(ScreenDirection::DesktopToPhone);
+        assert!(!session.shows_phone_screen(&desk));
     }
 
     #[test]

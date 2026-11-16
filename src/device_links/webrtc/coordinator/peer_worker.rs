@@ -577,16 +577,17 @@ pub(super) fn reset_device_webrtc_state(device_id: &str) {
     crate::device_links::webrtc::capture::end(device_id);
     // What the phone said it had belongs to the connection that ended.
     crate::device_links::sync::forget_connection(device_id);
-    crate::device_links::webrtc::screen::clear_stream(device_id);
-    crate::device_links::webrtc::screen::forget_parked(device_id);
     // The session state must not outlive its peer: a stale `Controlling`
     // lease survived a rebuild, and this side's own heartbeats kept it alive
-    // while the UI read "Control active".
+    // while the UI read "Control active". Stopped before the picture goes,
+    // so a picture being shown again meanwhile sees it and goes too.
     if let Ok(mut open) = remote_session::sessions().lock() {
         if let Some(session) = open.get_mut(device_id) {
             session.stop();
         }
     }
+    crate::device_links::webrtc::screen::clear_stream(device_id);
+    crate::device_links::webrtc::screen::forget_parked(device_id);
     // Transfers ride this peer. Both sides keep their checkpoints and the
     // phone resumes them when it reconnects (this side re-offers its own
     // sends): shown as paused, not as failures.
