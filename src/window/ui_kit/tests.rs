@@ -583,8 +583,9 @@ fn the_words_follow_the_glossary() {
 }
 
 /// The machinery's words stay out of every page, not just the first run and the
-/// guide (`onboarding::assert_plain`). `mod.rs` matches error texts it is given and
-/// `platform.rs` names packages to install, so both are left out.
+/// guide (`onboarding::assert_plain`). `words.rs` matches error texts it is given
+/// (`mod.rs` stays left out too, as before the split) and `platform.rs` names
+/// packages to install, so they are left out.
 #[test]
 fn no_page_names_the_machinery() {
     const JARGON: &[&str] = &[
@@ -622,7 +623,11 @@ fn no_page_names_the_machinery() {
     ];
     let off: Vec<String> = found
         .iter()
-        .filter(|(file, text)| !file.ends_with("window/mod.rs") && text.contains(' '))
+        .filter(|(file, text)| {
+            !file.ends_with("window/mod.rs")
+                && !file.ends_with("window/words.rs")
+                && text.contains(' ')
+        })
         .filter(|(_, text)| !RELAY_BUILD_ONLY.contains(&text.as_str()))
         .filter(|(_, text)| JARGON.iter().any(|word| has_word(text, word)))
         .map(|(file, text)| format!("{file}: {text:?}"))
