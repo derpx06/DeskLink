@@ -307,8 +307,16 @@ pub(super) fn handle_from(
                         }
                         let id = note.id.clone();
                         let modified = note.modified;
-                        // A new id, or a conflict copy, needs room.
-                        if shelf.notes.len() >= MAX_NOTE_ENTRIES {
+                        // A full shelf takes only what adds no entry: a straight
+                        // edit of a note it holds (or the same version, or one
+                        // it already descends from). A new id needs room, and so
+                        // does a sibling edit, which makes a conflict copy: let
+                        // through, those grew the shelf past its cap.
+                        let adds_no_entry = shelf
+                            .notes
+                            .get(&id)
+                            .is_some_and(|local| super::merge::not_siblings(local, &note));
+                        if !adds_no_entry && shelf.notes.len() >= MAX_NOTE_ENTRIES {
                             crate::device_links::limits::log_limited(
                                 "notes-full",
                                 "Notes are full; one was refused",

@@ -272,9 +272,14 @@ impl DesktopWebRtcPeer {
             Arc::clone(&held),
         )?;
 
-        pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|error| format!("Could not start DeskLink WebRTC pipeline: {error:?}"))?;
+        if let Err(error) = pipeline.set_state(gst::State::Playing) {
+            // Back to Null before it is dropped: a half-started webrtcbin
+            // keeps its ICE agent's sockets and threads otherwise.
+            let _ = pipeline.set_state(gst::State::Null);
+            return Err(format!(
+                "Could not start DeskLink WebRTC pipeline: {error:?}"
+            ));
+        }
 
         let peer = Self {
             pipeline,

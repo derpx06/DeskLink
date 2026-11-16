@@ -542,3 +542,30 @@ fn typing_over_a_note_that_changed_underneath_keeps_the_arrival_as_a_copy() {
     .unwrap();
     assert!(none.is_none());
 }
+
+/// A full shelf still takes a straight edit of a note it holds, but not a
+/// sibling edit: that makes a conflict copy, a new entry, and 50 of them grew
+/// a full shelf to 4050 entries.
+#[test]
+fn a_full_shelf_takes_straight_edits_but_no_conflict_copies() {
+    let notes: Vec<Note> = (0..MAX_NOTE_ENTRIES)
+        .map(|index| note(&format!("n{index}"), "old", 100, 50))
+        .collect();
+    let mut shelf = shelf_with(&notes);
+    let mut packet = NetworkPacket::new(PACKET_TYPE_NOTES);
+    packet.set("op", "items");
+    let mut items = vec![serde_json::to_value(note("n1", "edited from ours", 200, 100)).unwrap()];
+    for index in 2..52 {
+        // Edited from a version we never had: siblings of ours.
+        items.push(serde_json::to_value(note(&format!("n{index}"), "sibling", 200, 70)).unwrap());
+    }
+    packet.set("items", items);
+    handle(&mut shelf, Kind::Notes, &packet);
+    assert_eq!(shelf.notes["n1"].body, "edited from ours");
+    assert_eq!(
+        shelf.notes.len(),
+        MAX_NOTE_ENTRIES,
+        "no conflict copy on a full shelf"
+    );
+    assert_eq!(shelf.notes["n2"].body, "old");
+}

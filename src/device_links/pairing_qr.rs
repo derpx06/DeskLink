@@ -310,6 +310,9 @@ pub fn verify(
     *mine = mine.saturating_add(1);
     live.total_failures += 1;
     if live.total_failures >= MAX_TOTAL_FAILURES {
+        // Retired, not just dropped: the real phone scanning it is told the
+        // code expired (and the page shows a new one), not "no code".
+        retire(live.secret);
         *pending = None;
     }
     Err("Invalid QR pairing proof".to_string())

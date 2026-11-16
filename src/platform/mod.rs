@@ -110,11 +110,16 @@ pub fn distro_from_os_release(text: &str) -> Option<Distro> {
 }
 
 /// This computer's family, from `/etc/os-release` (or `/usr/lib/os-release`).
+/// Read once: Home asks on the GTK thread every tick, and it does not change
+/// while DeskLink runs.
 pub fn distro() -> Option<Distro> {
-    ["/etc/os-release", "/usr/lib/os-release"]
-        .iter()
-        .find_map(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| distro_from_os_release(&text))
+    static DISTRO: std::sync::OnceLock<Option<Distro>> = std::sync::OnceLock::new();
+    *DISTRO.get_or_init(|| {
+        ["/etc/os-release", "/usr/lib/os-release"]
+            .iter()
+            .find_map(|path| std::fs::read_to_string(path).ok())
+            .and_then(|text| distro_from_os_release(&text))
+    })
 }
 
 impl Packages {

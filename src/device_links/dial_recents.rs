@@ -45,8 +45,10 @@ fn save_to(path: &Path, numbers: &[String]) {
     if numbers.is_empty() {
         let _ = std::fs::remove_file(path);
     } else if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-        let _ = serde_json::to_string(numbers).map(|text| std::fs::write(path, text));
+        // Dialled numbers: private and atomic, like every other store.
+        let _ = crate::device_links::private_fs::create_dir_all(dir);
+        let _ = serde_json::to_string(numbers)
+            .map(|text| crate::device_links::private_fs::write(path, text.as_bytes()));
     }
 }
 

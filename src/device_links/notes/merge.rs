@@ -58,6 +58,16 @@ pub(super) fn merge_note(shelf: &mut Shelf, incoming: Note) -> Merged {
     merge_note_from(shelf, incoming, "")
 }
 
+/// Whether merging `incoming` over `local` makes no conflict copy: the same
+/// version, or one is an ancestor of the other. Only siblings make a copy.
+pub(super) fn not_siblings(local: &Note, incoming: &Note) -> bool {
+    (local.modified == incoming.modified && local.same_content(incoming))
+        || incoming.parent == local.modified
+        || incoming.ancestors.contains(&local.modified)
+        || local.parent == incoming.modified
+        || local.ancestors.contains(&incoming.modified)
+}
+
 /// N2: `incoming` came from phone `peer` (empty: unknown), which therefore holds it.
 pub(super) fn merge_note_from(shelf: &mut Shelf, incoming: Note, peer: &str) -> Merged {
     let Some(local) = shelf.notes.get(&incoming.id).cloned() else {

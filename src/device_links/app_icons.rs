@@ -59,8 +59,10 @@ fn acceptable(hash: &str, png: &[u8]) -> bool {
 /// Keeps the phone's `appIcon` (base64 PNG) under `hash`. Returns whether it
 /// was kept; anything else is dropped.
 pub(crate) fn store(hash: &str, data: &str) -> bool {
-    if data.len() > MAX_PNG_BYTES.div_ceil(3) * 4 || known(hash) {
-        return known(hash);
+    // `known` reads and decodes the file on a memory miss: once.
+    let known = known(hash);
+    if data.len() > MAX_PNG_BYTES.div_ceil(3) * 4 || known {
+        return known;
     }
     let Ok(png) = base64::engine::general_purpose::STANDARD.decode(data) else {
         return false;
