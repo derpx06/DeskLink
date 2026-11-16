@@ -84,7 +84,7 @@ mod tests {
             "device_links/webrtc/screen.rs:PARKED",
             "device_links/webrtc/coordinator/liveness.rs:PROBE_NOW",
             "device_links/webrtc/coordinator/recovery.rs:STREAKS",
-            "device_links/glide.rs:ALLOWED",
+            "device_links/glide/mod.rs:ALLOWED",
             "device_links/asks.rs:ASKS",
             "device_links/asks.rs:REPORTS",
             "device_links/daemon/discovery.rs:KNOWN",
