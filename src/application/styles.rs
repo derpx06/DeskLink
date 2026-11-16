@@ -81,7 +81,7 @@ pub(super) const TOKENS: &[(&str, &str, &str)] = &[
     // av, avt: notification avatars.
     ("avatar_bg", "#e8ecf9", "#28305a"),
     ("avatar_fg", "#2f55d4", "#dfe5ff"),
-    // rd, rdb: End Session, Unpair.
+    // rd, rdb: End session, Unpair.
     ("danger", "#c93030", "#ff6b6b"),
     (
         "danger_bg",

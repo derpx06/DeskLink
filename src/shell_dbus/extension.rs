@@ -236,7 +236,7 @@ pub const RELOGIN_NOTE: &str =
 /// says "Not now".
 pub(super) fn offer_extension(app: &DesklinkApplication) {
     app.add_action_entries([
-        // The notification's "Turn On": the user's click.
+        // The notification's "Turn on": the user's click.
         gio::ActionEntry::builder("shell-extension-show")
             .activate(|app: &DesklinkApplication, _, _| {
                 let notification = match turn_on_extension() {
@@ -244,7 +244,7 @@ pub(super) fn offer_extension(app: &DesklinkApplication) {
                     Ok(true) => {
                         let notification = gio::Notification::new("Top-bar menu turned on");
                         notification.set_body(Some(RELOGIN_NOTE));
-                        notification.add_button("Log Out Now", "app.log-out");
+                        notification.add_button("Log out now", "app.log-out");
                         notification
                     }
                     Err(error) => {
@@ -259,7 +259,7 @@ pub(super) fn offer_extension(app: &DesklinkApplication) {
                 app.send_notification(Some("shell-extension"), &notification);
             })
             .build(),
-        // "Turn On" for an installed AppIndicator extension: the tray icon
+        // "Turn on" for an installed AppIndicator extension: the tray icon
         // shows at once.
         gio::ActionEntry::builder("tray-host-on")
             .parameter_type(Some(glib::VariantTy::STRING))
@@ -314,7 +314,7 @@ pub(super) fn offer_extension(app: &DesklinkApplication) {
                 let notification =
                     crate::application::desk_notification("DeskLink's top-bar menu was updated");
                 notification.set_body(Some(RELOGIN_NOTE));
-                notification.add_button("Log Out Now", "app.log-out");
+                notification.add_button("Log out now", "app.log-out");
                 app.send_notification(Some("shell-extension"), &notification);
             }
             Ok(false) => {}
@@ -343,7 +343,7 @@ pub(super) fn offer_extension(app: &DesklinkApplication) {
                 "Turn on the AppIndicator extension that is already installed to see DeskLink's icon in the top bar.",
             ));
             notification.add_button_with_target_value(
-                "Turn On",
+                "Turn on",
                 "app.tray-host-on",
                 Some(&uuid.to_variant()),
             );
@@ -366,7 +366,7 @@ pub(super) fn offer_extension(app: &DesklinkApplication) {
                 notification.set_body(Some(
                     "See your phone's battery and connection, and act on it, from the top bar.",
                 ));
-                notification.add_button("Turn On", "app.shell-extension-show");
+                notification.add_button("Turn on", "app.shell-extension-show");
                 notification.add_button("Not now", "app.shell-extension-dismiss");
                 app.send_notification(Some("shell-extension"), &notification);
             },
@@ -398,7 +398,7 @@ pub(super) fn without_extension(enabled: Vec<String>) -> Vec<String> {
 }
 
 /// "Turn off": disables only DeskLink's extension. The system-wide
-/// `disable-user-extensions` switch that "Turn On" may have flipped is left
+/// `disable-user-extensions` switch that "Turn on" may have flipped is left
 /// as it is (other extensions may depend on it now).
 pub fn turn_off_extension() -> Result<(), String> {
     let settings = gio::Settings::new("org.gnome.shell");

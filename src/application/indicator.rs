@@ -71,7 +71,7 @@ impl DesklinkApplication {
                             let notification = crate::application::desk_notification(line);
                             notification.set_body(Some("Open DeskLink to see more."));
                             notification.add_button_with_target_value(
-                                "End Session",
+                                "End session",
                                 "app.end-sessions",
                                 Some(&device.id.to_variant()),
                             );
@@ -101,7 +101,7 @@ impl DesklinkApplication {
                         "One place for files, pictures, text and links on both devices.",
                     ));
                     notification.add_button_with_target_value(
-                        "Turn On",
+                        "Turn on",
                         "app.bucket-turn-on",
                         Some(&offer.device.to_variant()),
                     );

@@ -407,7 +407,7 @@ pub(super) fn top_bar_key() -> String {
     )
 }
 
-/// "Log Out Now…" (GNOME asks to confirm).
+/// "Log out now…" (GNOME asks to confirm).
 fn log_out_button() -> gtk::Button {
     let button = gtk::Button::builder()
         .label("Log out now…")

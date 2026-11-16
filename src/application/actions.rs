@@ -57,7 +57,7 @@ impl DesklinkApplication {
                 window.show_page("files");
             })
             .build();
-        // "Turn On" on the notification that says a phone asked for a Bucket.
+        // "Turn on" on the notification that says a phone asked for a Bucket.
         let turn_on_bucket_action = gio::ActionEntry::builder("bucket-turn-on")
             .parameter_type(Some(glib::VariantTy::STRING))
             .activate(move |app: &Self, _, target| {

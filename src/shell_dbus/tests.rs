@@ -852,3 +852,31 @@ fn the_top_bar_gets_a_notifications_words_as_one_paragraph() {
         "Hours left! Choose: ♦ Home ♦ The Last Train Happy writing!"
     );
 }
+
+/// Notification buttons speak sentence case, like every other label
+/// (UI-REDESIGN 5.1): "Log out now" and "Turn on", never "Log Out Now".
+#[test]
+fn notification_buttons_are_sentence_case() {
+    let sources = [
+        include_str!("extension.rs"),
+        include_str!("../application/indicator.rs"),
+    ]
+    .map(crate::source_scan::production)
+    .join("\n");
+    // The first string literal after each `add_button(` / `add_button_with_target_value(`.
+    let labels: Vec<&str> = sources
+        .split("add_button")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').nth(1))
+        .collect();
+    assert!(labels.len() >= 6, "the scan found the buttons: {labels:?}");
+    for label in labels {
+        let title_case = label
+            .split_whitespace()
+            .skip(1)
+            // "Files" is GNOME's app, a name ("Show in Files").
+            .filter(|word| *word != "Files")
+            .any(|word| word.chars().next().is_some_and(char::is_uppercase));
+        assert!(!title_case, "\"{label}\" is Title Case");
+    }
+}

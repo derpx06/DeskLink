@@ -101,7 +101,7 @@ out and back in. On X11, Alt+F2 `r` restarts the Shell instead.
 
 Distribution packages built with Meson install it system-wide to
 `/usr/share/gnome-shell/extensions/`. The app also carries a copy: its
-"Turn On" button (Preferences → Appearance → Top-bar menu, or the one-time
+"Turn on" button (Preferences → Appearance → Top-bar menu, or the one-time
 notification on GNOME without a tray host) writes it to
 `~/.local/share/gnome-shell/extensions/` when missing or outdated, then sets
 `org.gnome.shell disable-user-extensions=false` and adds it to
