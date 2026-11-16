@@ -449,8 +449,14 @@ impl DaemonWorker {
         self.start_clipboard_listener();
         self.start_status_reconciler();
         // First run: start at login unless the user already decided.
-        if super::config::app_settings().start_at_login.is_none() {
-            self.set_start_at_login(true);
+        // Later runs: an entry the desktop's own Autostart settings removed
+        // turns the switch off rather than reading on while nothing starts.
+        match super::config::app_settings().start_at_login {
+            None => self.set_start_at_login(true),
+            Some(true) if crate::autostart::turned_off_elsewhere() => {
+                self.set_start_at_login(false)
+            }
+            Some(_) => {}
         }
         // Compiled out: no relay thread, no connection, no TURN requests.
         if crate::device_links::relay_link::RELAY_ENABLED {

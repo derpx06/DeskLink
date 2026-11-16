@@ -98,6 +98,27 @@ pub fn set(enabled: bool) -> Result<(), String> {
     std::fs::write(&path, entry(&executable)).map_err(|error| error.to_string())
 }
 
+/// Whether an autostart entry's text still starts the program: present, and
+/// not switched off the way desktops' own Autostart settings do it
+/// (`Hidden=true`, `X-GNOME-Autostart-enabled=false`).
+fn starts(text: Option<&str>) -> bool {
+    text.is_some_and(|text| {
+        !text.lines().map(str::trim).any(|line| {
+            line.eq_ignore_ascii_case("Hidden=true")
+                || line.eq_ignore_ascii_case("X-GNOME-Autostart-enabled=false")
+        })
+    })
+}
+
+/// A native install whose entry was removed or switched off outside DeskLink
+/// (the desktop's Autostart settings, a restored or copied home): the
+/// setting must follow it, or the switch reads on while nothing starts.
+/// Unknown in a Flatpak (the portal keeps the entry), so never there.
+pub fn turned_off_elsewhere() -> bool {
+    !in_flatpak()
+        && entry_path().is_some_and(|path| !starts(std::fs::read_to_string(path).ok().as_deref()))
+}
+
 /// `org.freedesktop.portal.Background.RequestBackground`. Fire and forget:
 /// the portal may show its own dialog, and its answer arrives later as a
 /// signal nobody needs here.
@@ -138,6 +159,18 @@ fn request_background(enabled: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    #[test]
+    fn an_entry_removed_or_switched_off_by_the_desktop_does_not_start() {
+        let ours = super::entry("/usr/bin/desklink");
+        assert!(super::starts(Some(&ours)));
+        assert!(!super::starts(None));
+        assert!(!super::starts(Some(&format!("{ours}Hidden=true\n"))));
+        assert!(!super::starts(Some(&ours.replace(
+            "X-GNOME-Autostart-enabled=true",
+            "X-GNOME-Autostart-enabled=false"
+        ))));
+    }
 
     #[test]
     fn the_entry_starts_the_background_service_without_a_window() {
