@@ -116,6 +116,8 @@ menubutton.device-card > button:focus-visible { outline: 2px solid @dl_accent_te
   color: @dl_text;
 }
 .navigation-sidebar > row:selected .nav-label { font-weight: 600; }
+/* Accent is for selection: the selected page's glyph says where you are at a glance. */
+.navigation-sidebar > row:selected image { color: @dl_accent_text; }
 .navigation-sidebar > row:focus-visible { outline: 2px solid @dl_accent_text; outline-offset: -2px; }
 .navigation-sidebar > row:disabled { opacity: 0.38; }
 .sidebar-footer { padding-top: 8px; padding-bottom: 12px; }
