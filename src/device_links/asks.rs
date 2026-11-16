@@ -574,11 +574,11 @@ fn default_action_as_button(server: Option<&str>) -> bool {
     server == Some("Xfce Notify Daemon")
 }
 
-/// Asks the session bus who shows notifications, and with what. Main loop,
-/// at most once a minute; a changed answer is reported to the phones.
+/// Asks the session bus who shows notifications, and with what: at most
+/// once a minute, on its own thread (up to three blocking calls of 500 ms
+/// each froze the window while a notification server hung); a changed
+/// answer is reported to the phones.
 pub(crate) fn probe_buttons(bus: &gtk::gio::DBusConnection) {
-    use gtk::gio;
-    use gtk::glib::prelude::*;
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
     {
         let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -587,6 +587,17 @@ pub(crate) fn probe_buttons(bus: &gtk::gio::DBusConnection) {
         }
         *last = Some(Instant::now());
     }
+    let bus = bus.clone();
+    // Blocking calls only (`call_sync` is safe on any thread; an async gio
+    // call off the main context is not).
+    let _ = std::thread::Builder::new()
+        .name("desklink-ask-probe".into())
+        .spawn(move || probe_buttons_now(&bus));
+}
+
+fn probe_buttons_now(bus: &gtk::gio::DBusConnection) {
+    use gtk::gio;
+    use gtk::glib::prelude::*;
     let has_owner = |name: &str| {
         bus.call_sync(
             Some("org.freedesktop.DBus"),
@@ -623,7 +634,7 @@ pub(crate) fn probe_buttons(bus: &gtk::gio::DBusConnection) {
             .map(|(caps,)| caps)
         })
         .flatten();
-    // Asked once: the server is the session's, and this is one more call on the main loop.
+    // Asked once: the server is the session's.
     static SERVER_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if caps.is_some() && !SERVER_ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         let server = bus
