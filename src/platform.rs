@@ -799,7 +799,13 @@ pub fn evaluate(probe: &Probe) -> Vec<Check> {
                 "extend",
                 "Phone as a second display (Extend)",
                 Level::Missing,
-                if wayland {
+                if wayland && family == Family::Kde {
+                    "This version of KDE Plasma's screen sharing cannot add a second screen. \
+                     A newer xdg-desktop-portal-kde can."
+                } else if wayland && family == Family::Gnome {
+                    "This version of GNOME's screen sharing cannot add a second screen. A newer \
+                     xdg-desktop-portal-gnome can."
+                } else if wayland {
                     "This desktop cannot add a second screen for DeskLink. GNOME and KDE Plasma \
                      can."
                 } else {
@@ -2093,6 +2099,28 @@ mod tests {
             });
             assert_eq!(level(&rows, "extend"), expected, "{desktop}");
         }
+    }
+
+    #[test]
+    fn extend_on_a_plasma_whose_portal_has_no_virtual_screen_names_the_portal_not_plasma() {
+        // Plasma 6.3 (Debian 13): ScreenCast offers monitors and windows only.
+        let rows = evaluate(&Probe {
+            desktop: "KDE".into(),
+            screencast_sources: Some(3),
+            ..full()
+        });
+        let extend = row(&rows, "extend");
+        assert_eq!(extend.level, Level::Missing);
+        assert!(
+            !extend.detail.contains("KDE Plasma can"),
+            "{}",
+            extend.detail
+        );
+        assert!(
+            extend.detail.contains("xdg-desktop-portal-kde"),
+            "{}",
+            extend.detail
+        );
     }
 
     #[test]
