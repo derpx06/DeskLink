@@ -260,12 +260,13 @@ impl ObjectImpl for DesklinkWindow {
                         .margin_bottom(28)
                         .build();
                     body.append(&slot);
-                    body.append(
-                        &adw::Clamp::builder()
-                            .maximum_size(1000)
-                            .child(&transfers.content)
-                            .build(),
-                    );
+                    // Wider on a big window: more cards a line (`apply_layout`).
+                    let clamp = adw::Clamp::builder()
+                        .maximum_size(FILES_WIDTH)
+                        .child(&transfers.content)
+                        .build();
+                    clamp.set_widget_name("files-clamp");
+                    body.append(&clamp);
                     let scroll = gtk::ScrolledWindow::builder()
                         .hscrollbar_policy(gtk::PolicyType::Never)
                         .vexpand(true)

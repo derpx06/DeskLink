@@ -387,7 +387,11 @@ impl Page {
                     .selection_mode(gtk::SelectionMode::None)
                     .homogeneous(true)
                     .min_children_per_line(1)
-                    .max_children_per_line(if win.imp().narrow.get() { 1 } else { 3 })
+                    .max_children_per_line(match (win.imp().narrow.get(), win.imp().wide.get()) {
+                        (true, _) => 1,
+                        (_, true) => 4,
+                        _ => 3,
+                    })
                     .column_spacing(14)
                     .row_spacing(14)
                     .build();

@@ -202,9 +202,10 @@ impl Kick {
     }
 }
 
-/// Cards a line in the grids: one to five, as wide allows.
+/// Cards a line in the grids: one to five, as wide allows (eight on a big
+/// window, `apply_layout`).
 pub(super) fn grid() -> gtk::FlowBox {
-    gtk::FlowBox::builder()
+    let grid = gtk::FlowBox::builder()
         .selection_mode(gtk::SelectionMode::None)
         .homogeneous(true)
         .min_children_per_line(1)
@@ -212,7 +213,9 @@ pub(super) fn grid() -> gtk::FlowBox {
         .column_spacing(14)
         .row_spacing(14)
         .valign(gtk::Align::Start)
-        .build()
+        .build();
+    grid.set_widget_name("card-grid");
+    grid
 }
 
 /// Adds `card` to `grid`; Tab and the arrow keys go card to card, not to
@@ -305,6 +308,8 @@ impl Page {
         let moving = grid();
         moving.set_visible(false);
         moving.set_max_children_per_line(1);
+        // One a line at any width: not one of the card grids.
+        moving.set_widget_name("moving");
         moving.set_homogeneous(false);
         moving.set_row_spacing(8);
         moving.update_property(&[gtk::accessible::Property::Label("Moving now")]);

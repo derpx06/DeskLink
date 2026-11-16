@@ -161,6 +161,11 @@ fn device_to_show(
 /// How long the page takes to fade in when the window first shows.
 const FIRST_FADE_MS: u32 = 180;
 
+/// The Files page's width (the Bucket and the transfers), and on a big
+/// window: more cards a line, each the same size.
+const FILES_WIDTH: i32 = 1000;
+const FILES_WIDE_WIDTH: i32 = 1600;
+
 const PAGES: &[(&str, &str, &str)] = &[
     ("home", "Home", "desklink-home-symbolic"),
     ("files", "Files", "desklink-folder-symbolic"),

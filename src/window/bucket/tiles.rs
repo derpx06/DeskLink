@@ -26,6 +26,8 @@ pub(super) fn grid(
     grid.set_column_spacing(12);
     grid.set_row_spacing(12);
     grid.set_max_children_per_line(6);
+    // Eight on a big window (`apply_layout`).
+    grid.set_widget_name("bucket-grid");
     grid.update_property(&[gtk::accessible::Property::Label("Bucket items")]);
     let root = view.pair.root.clone();
     // What the viewer can page through: this level's files.

@@ -93,13 +93,13 @@ pub(super) fn update(win: &DesklinkWindow, device: &DeviceView) {
         Some(view) => fill(win, &page, &view, device),
         None => page.append(&off_card(device, offer.is_some())),
     }
-    win.replace_body(
-        "bucket",
-        &adw::Clamp::builder()
-            .maximum_size(1000)
-            .child(&page)
-            .build(),
-    );
+    let clamp = adw::Clamp::builder()
+        .maximum_size(super::FILES_WIDTH)
+        .child(&page)
+        .build();
+    // Wider on a big window, like the transfers under it (`apply_layout`).
+    clamp.set_widget_name("files-clamp");
+    win.replace_body("bucket", &clamp);
 }
 
 /// Whether `device_id`'s phone has asked for a Bucket that is not on yet: the

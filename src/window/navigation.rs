@@ -315,6 +315,9 @@ impl DesklinkWindow {
         imp.split_view.set_show_content(true);
         imp.snapshots.borrow_mut().remove(name);
         self.update_title();
+        // A page drawn while another was shown is laid out for the window's
+        // width now (a big window's columns, wider list, more cards a line).
+        self.apply_layout();
         self.refresh_soon();
         true
     }

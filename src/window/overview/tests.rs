@@ -513,3 +513,62 @@ fn a_phone_the_ladder_gave_up_on_is_away_too() {
         window.close();
     });
 }
+
+/// The other pages on a big window use the width for structure: Files and
+/// the Bucket wider with eight cards a line, the Notes list wider beside the
+/// note, four terminals a line; back to their usual layout below the
+/// breakpoint. (Needs a display.)
+#[test]
+fn the_other_pages_use_a_big_window() {
+    use adw::subclass::prelude::ObjectSubclassIsExt;
+    crate::test_display::run(|| {
+        let window = home_window("paired", 1280);
+        for page in ["files", "notes", "terminals"] {
+            window.show_page(page);
+            spin();
+        }
+        let imp = window.imp();
+        let check = |wide: bool| {
+            imp.compact.set(false);
+            imp.wide.set(wide);
+            window.apply_layout();
+            for clamp in named_widgets(window.upcast_ref(), "files-clamp") {
+                let clamp = clamp.downcast::<adw::Clamp>().unwrap();
+                assert_eq!(
+                    clamp.maximum_size(),
+                    if wide {
+                        super::super::FILES_WIDE_WIDTH
+                    } else {
+                        super::super::FILES_WIDTH
+                    }
+                );
+            }
+            for grid in named_widgets(window.upcast_ref(), "card-grid") {
+                let grid = grid.downcast::<gtk::FlowBox>().unwrap();
+                assert_eq!(grid.max_children_per_line(), if wide { 8 } else { 5 });
+            }
+            let notes = named_widgets(window.upcast_ref(), "notes-split")
+                .into_iter()
+                .next()
+                .and_downcast::<adw::NavigationSplitView>()
+                .expect("the Notes split");
+            assert_eq!(notes.max_sidebar_width(), if wide { 420.0 } else { 320.0 });
+            for grid in named_widgets(window.upcast_ref(), "terminal-grid") {
+                let grid = grid.downcast::<gtk::FlowBox>().unwrap();
+                assert_eq!(grid.max_children_per_line(), if wide { 4 } else { 3 });
+            }
+            // The one-a-line list of moving files is not a card grid.
+            for moving in named_widgets(window.upcast_ref(), "moving") {
+                let moving = moving.downcast::<gtk::FlowBox>().unwrap();
+                assert_eq!(moving.max_children_per_line(), 1);
+            }
+        };
+        check(true);
+        check(false);
+        assert!(
+            !named_widgets(window.upcast_ref(), "files-clamp").is_empty(),
+            "Files was drawn"
+        );
+        window.close();
+    });
+}

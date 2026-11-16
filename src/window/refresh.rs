@@ -652,7 +652,28 @@ impl DesklinkWindow {
                 }
                 "terminal-grid" => {
                     if let Some(grid) = widget.downcast_ref::<gtk::FlowBox>() {
-                        grid.set_max_children_per_line(if narrow { 1 } else { 3 });
+                        grid.set_max_children_per_line(match (narrow, wide) {
+                            (true, _) => 1,
+                            (_, true) => 4,
+                            _ => 3,
+                        });
+                    }
+                }
+                // Files and the Bucket: wider, more cards a line on a big
+                // window; each card keeps its size.
+                "files-clamp" => {
+                    if let Some(clamp) = widget.downcast_ref::<adw::Clamp>() {
+                        clamp.set_maximum_size(if wide { FILES_WIDE_WIDTH } else { FILES_WIDTH });
+                    }
+                }
+                "card-grid" | "bucket-grid" => {
+                    if let Some(grid) = widget.downcast_ref::<gtk::FlowBox>() {
+                        let normal = if widget.widget_name() == "card-grid" {
+                            5
+                        } else {
+                            6
+                        };
+                        grid.set_max_children_per_line(if wide { 8 } else { normal });
                     }
                 }
                 // Right-aligned beside the hero's name; under it when the
@@ -662,10 +683,13 @@ impl DesklinkWindow {
                 } else {
                     gtk::Align::End
                 }),
-                // Notes: the list or the note, one at a time, when narrow.
+                // Notes: the list or the note, one at a time, when narrow;
+                // on a big window a wider list (the note keeps its measure).
                 "notes-split" => {
                     if let Some(split) = widget.downcast_ref::<adw::NavigationSplitView>() {
                         split.set_collapsed(compact);
+                        split.set_max_sidebar_width(if wide { 420.0 } else { 320.0 });
+                        split.set_sidebar_width_fraction(if wide { 0.32 } else { 0.25 });
                     }
                 }
                 // Notes and Snippets with no phone: the switcher.
