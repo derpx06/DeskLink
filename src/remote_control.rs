@@ -1078,12 +1078,26 @@ impl PaintWatch {
 
 impl Drop for PaintWatch {
     fn drop(&mut self) {
-        if let Some(id) = self.invalidated.take() {
-            self.paintable.disconnect(id);
+        // A disposed object (the stream's paintable once its sink stopped,
+        // the clock of a closed window) has dropped its handlers already:
+        // disconnecting one again is a GLib critical.
+        fn disconnect(object: &impl IsA<glib::Object>, id: Option<glib::SignalHandlerId>) {
+            let Some(id) = id else { return };
+            // SAFETY: a live object (held by this watch) and an id GLib handed
+            // out for it; GLib never reuses handler ids, so a dropped handler's
+            // id cannot name another one.
+            let connected = unsafe {
+                glib::gobject_ffi::g_signal_handler_is_connected(
+                    object.as_ref().as_ptr(),
+                    id.as_raw(),
+                ) != 0
+            };
+            if connected {
+                object.disconnect(id);
+            }
         }
-        if let Some(id) = self.painted.take() {
-            self.clock.disconnect(id);
-        }
+        disconnect(&self.paintable, self.invalidated.take());
+        disconnect(&self.clock, self.painted.take());
     }
 }
 
