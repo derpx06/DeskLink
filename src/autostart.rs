@@ -76,6 +76,12 @@ fn executable(path_var: Option<std::ffi::OsString>, current: Option<PathBuf>) ->
         .filter(|path| path.is_absolute())
 }
 
+/// The file that started this DeskLink: an AppImage's own file, not the
+/// binary inside its mount (`/tmp/.mount_*`), which is gone by the next login.
+fn this_program(appimage: Option<PathBuf>, current: Option<PathBuf>) -> Option<PathBuf> {
+    appimage.filter(|path| path.is_absolute()).or(current)
+}
+
 /// Turns starting at login on or off.
 pub fn set(enabled: bool) -> Result<(), String> {
     if in_flatpak() {
@@ -88,7 +94,11 @@ pub fn set(enabled: bool) -> Result<(), String> {
             _ => Ok(()),
         };
     }
-    let executable = executable(std::env::var_os("PATH"), std::env::current_exe().ok())
+    let running = this_program(
+        std::env::var_os("APPIMAGE").map(PathBuf::from),
+        std::env::current_exe().ok(),
+    );
+    let executable = executable(std::env::var_os("PATH"), running)
         .ok_or("DeskLink could not find its own program to start at login")?
         .to_string_lossy()
         .into_owned();
@@ -219,6 +229,18 @@ mod tests {
         );
         // Neither, or only a relative path: nothing, never a bare name.
         assert_eq!(super::executable(None, None), None);
+        // An AppImage starts its own file at login, not its mount's binary.
+        assert_eq!(
+            super::this_program(
+                Some(PathBuf::from("/home/u/DeskLink.AppImage")),
+                Some(PathBuf::from("/tmp/.mount_x/usr/bin/desklink")),
+            ),
+            Some(PathBuf::from("/home/u/DeskLink.AppImage"))
+        );
+        assert_eq!(
+            super::this_program(None, Some(PathBuf::from("/opt/desklink/desklink"))),
+            Some(PathBuf::from("/opt/desklink/desklink"))
+        );
         assert_eq!(
             super::executable(None, Some(PathBuf::from("desklink"))),
             None
