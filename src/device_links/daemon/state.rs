@@ -702,6 +702,7 @@ pub(super) fn upsert_notification_for(
             .get_i64("time")
             .or_else(|| packet.get_str("time")?.parse().ok())
             .unwrap_or(0),
+        app_icon: app_icon(packet),
     };
 
     if let Ok(mut devices) = devices.lock() {
@@ -718,6 +719,21 @@ pub(super) fn upsert_notification_for(
     }
 
     Some(notification)
+}
+
+/// The notification's `appIconHash` when the icon is here: kept now from
+/// `appIcon` (the phone sends the picture once per app and connection), or
+/// from before.
+fn app_icon(packet: &NetworkPacket) -> Option<String> {
+    use crate::device_links::app_icons;
+    let hash = packet
+        .get_str("appIconHash")
+        .filter(|hash| app_icons::valid_hash(hash))?;
+    let here = match packet.get_str("appIcon") {
+        Some(data) => app_icons::store(hash, data),
+        None => app_icons::known(hash),
+    };
+    here.then(|| hash.to_string())
 }
 
 pub(super) fn remove_notification(

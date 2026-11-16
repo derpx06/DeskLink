@@ -115,14 +115,13 @@ impl DesklinkWindow {
             } else {
                 format!("{}: {}", notification.app_name, notification.title)
             };
-            let body = if notification.text.is_empty() {
-                notification.ticker.as_str()
-            } else {
-                notification.text.as_str()
-            };
+            // One paragraph: the desktop's banner and the toast cap lines
+            // per paragraph, or not at all.
+            let body =
+                super::notifications::one_paragraph(super::notifications::body(notification));
             // In front of the user: a toast; otherwise the desktop's own.
             if self.is_active() && self.is_visible() {
-                let toast = adw::Toast::new(&format!("{title} — {body}"));
+                let toast = adw::Toast::new(&banner_line(&format!("{title} — {body}")));
                 toast.set_use_markup(false);
                 toast.set_timeout(5);
                 toast.set_button_label(Some("View"));
@@ -130,11 +129,11 @@ impl DesklinkWindow {
                 toast.set_action_target_value(Some(&"notifications".to_variant()));
                 self.queue_toast(&toast);
             } else {
-                self.send_app_notification_for(
+                self.send_phone_notification(
                     &format!("phone-notification-{unique_id}"),
                     &title,
-                    body,
-                    Some("notifications"),
+                    &body,
+                    notification.app_icon.as_deref(),
                 );
             }
         }
@@ -189,6 +188,25 @@ impl DesklinkWindow {
                 .set_default_action_and_target_value("app.show-page", Some(&page.to_variant())),
             None => notification.set_default_action("app.show-window"),
         }
+        application.send_notification(Some(id), &notification);
+    }
+
+    /// A phone's notification as the desktop's own: opens the Notifications
+    /// page; the app's icon when the phone sent one.
+    fn send_phone_notification(&self, id: &str, title: &str, body: &str, icon: Option<&str>) {
+        let Some(application) = self.application() else {
+            return;
+        };
+        let notification = gio::Notification::new(title);
+        notification.set_body(Some(body));
+        match icon.and_then(crate::device_links::app_icons::png) {
+            Some(png) => notification.set_icon(&gio::BytesIcon::new(&glib::Bytes::from(&*png))),
+            None => notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic")),
+        }
+        notification.set_default_action_and_target_value(
+            "app.show-page",
+            Some(&"notifications".to_variant()),
+        );
         application.send_notification(Some(id), &notification);
     }
 
@@ -519,5 +537,13 @@ impl DesklinkWindow {
         toast.set_use_markup(false);
         toast.set_timeout(3);
         self.queue_toast(&toast);
+    }
+}
+
+/// A toast's words: at most 160 characters (a toast is one or two lines).
+fn banner_line(words: &str) -> String {
+    match words.char_indices().nth(160) {
+        Some((at, _)) => format!("{}…", &words[..at]),
+        None => words.to_string(),
     }
 }

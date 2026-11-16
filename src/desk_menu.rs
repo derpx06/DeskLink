@@ -851,6 +851,7 @@ mod tests {
             actions: Vec::new(),
             silent: false,
             time: 0,
+            app_icon: None,
         }];
         let away = phone("p2", false);
         let recent = [LoggedFile {

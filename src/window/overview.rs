@@ -9,8 +9,8 @@ use adw::subclass::prelude::*;
 use super::requirements::{blocker, Feature, Need, PhoneFacts};
 use super::ui_kit::banner::{banner, BannerKind};
 use super::ui_kit::{
-    button, card as kit_card, icon_button as kit_icon_button, icon_square as kit_icon_square,
-    status_pill, tile, ButtonKind, TileKind, Tone,
+    button, card as kit_card, icon_button as kit_icon_button, status_pill, tile, ButtonKind,
+    TileKind, Tone,
 };
 use super::{
     can_send_feature, clock_time, device_type_label, ellipsized, named_widgets,
@@ -1560,26 +1560,23 @@ fn notifications_card(device: &DeviceView) -> gtk::Box {
         .build();
     if shown && !device.notifications.is_empty() {
         for newest in device.notifications.iter().take(2) {
+            // The app's square at the top, then the heading, two lines of
+            // the words and Reply under them (never centred beside them).
             let row = gtk::Box::builder().spacing(12).build();
-            row.append(&kit_icon_square(
-                super::notifications::app_icon(&newest.app_name),
-                Tone::Accent,
-            ));
+            row.append(&super::notifications::app_square(newest));
             let words = gtk::Box::builder()
                 .orientation(gtk::Orientation::Vertical)
                 .spacing(2)
                 .hexpand(true)
-                .valign(gtk::Align::Center)
                 .build();
             words.append(&super::notifications::heading_line(newest));
-            words.append(&ellipsized(
-                super::notifications::body(newest),
-                &["dl-secondary"],
-            ));
+            words.append(&super::notifications::body_label(newest, 2));
             row.append(&words);
             if newest.request_reply_id.is_some() {
                 let reply = button(ButtonKind::Tonal, "Reply", Some("desklink-reply-symbolic"));
-                reply.set_valign(gtk::Align::Center);
+                reply.set_halign(gtk::Align::End);
+                reply.set_margin_top(6);
+                reply.add_css_class("dl-note-action");
                 // Replies go to the phone: only while it is connected.
                 reply.set_sensitive(device.feature_transport_ready);
                 let id = newest.id.clone();
@@ -1591,7 +1588,7 @@ fn notifications_card(device: &DeviceView) -> gtk::Box {
                         }
                     }
                 });
-                row.append(&reply);
+                words.append(&reply);
             }
             body.append(&row);
         }

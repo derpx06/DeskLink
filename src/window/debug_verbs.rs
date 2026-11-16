@@ -265,6 +265,14 @@ pub(super) fn debug_ui_verb(win: &DesklinkWindow, verb: &str, id: &str, arg: &st
             }
         }
         // "open-reply ID": notification ID's reply entry.
+        // "focus-note N": the Nth notification card has the keyboard focus.
+        "focus-note" => {
+            if let Some(page) = win.imp().notifications.borrow().as_ref() {
+                page.focus_card(id.parse().unwrap_or(0));
+            }
+            // As after a key press: the ring shows.
+            gtk::prelude::GtkWindowExt::set_focus_visible(win, true);
+        }
         "open-reply" => {
             if let Some(page) = win.imp().notifications.borrow().as_ref() {
                 page.open_reply(id);
@@ -906,6 +914,7 @@ fn debug_xkeys(spec: &str) {
         match name {
             "Return" => 0xff0d,
             "Tab" => 0xff09,
+            "space" => 0x20,
             "Escape" => 0xff1b,
             "Left" => 0xff51,
             "Up" => 0xff52,
@@ -1053,6 +1062,7 @@ pub(super) fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
         threshold_event: None,
         charge_time_remaining: Some(25 * 60_000),
     });
+    let now_ms = gtk::glib::real_time() / 1000;
     device.notifications = vec![
         // A long, multi-paragraph message with buttons (the owner's
         // WhatsApp screenshot).
@@ -1074,7 +1084,8 @@ pub(super) fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
             request_reply_id: Some("r4".into()),
             actions: vec!["Mark as read".into(), "Mute".into()],
             silent: false,
-            time: 0,
+            time: now_ms - 2 * 60_000,
+            app_icon: fake_app_icon(0x25d366ff),
         },
         DeviceNotification {
             id: "1".into(),
@@ -1086,7 +1097,8 @@ pub(super) fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
             request_reply_id: Some("r1".into()),
             actions: vec![],
             silent: false,
-            time: 0,
+            time: now_ms - 5 * 60_000,
+            app_icon: fake_app_icon(0x3a76f0ff),
         },
         DeviceNotification {
             id: "2".into(),
@@ -1098,7 +1110,8 @@ pub(super) fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
             request_reply_id: None,
             actions: vec![],
             silent: false,
-            time: 0,
+            time: now_ms - 40 * 60_000,
+            app_icon: None,
         },
         DeviceNotification {
             id: "3".into(),
@@ -1110,7 +1123,8 @@ pub(super) fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
             request_reply_id: None,
             actions: vec!["Snooze".into()],
             silent: false,
-            time: 0,
+            time: now_ms - 90 * 60_000,
+            app_icon: None,
         },
     ];
     match kind {
@@ -1202,4 +1216,37 @@ pub(super) fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
         });
     }
     device
+}
+
+/// A made-up app icon (a disc of `rgba` with a white dot), kept the way the
+/// phone's are; its hash.
+#[cfg(debug_assertions)]
+fn fake_app_icon(rgba: u32) -> Option<String> {
+    use base64::Engine;
+    let mut pixels = vec![0u8; 64 * 64 * 4];
+    for (index, pixel) in pixels.chunks_mut(4).enumerate() {
+        let (x, y) = ((index % 64) as f64 - 31.5, (index / 64) as f64 - 31.5);
+        let distance = (x * x + y * y).sqrt();
+        if distance < 13.0 {
+            pixel.copy_from_slice(&[255, 255, 255, 255]);
+        } else if distance < 31.5 {
+            pixel.copy_from_slice(&rgba.to_be_bytes());
+        }
+    }
+    let pixbuf = gtk::gdk_pixbuf::Pixbuf::from_bytes(
+        &gtk::glib::Bytes::from_owned(pixels),
+        gtk::gdk_pixbuf::Colorspace::Rgb,
+        true,
+        8,
+        64,
+        64,
+        64 * 4,
+    );
+    let png = pixbuf.save_to_bufferv("png", &[]).ok()?;
+    let hash = crate::device_links::app_icons::hash_of(&png);
+    crate::device_links::app_icons::store(
+        &hash,
+        &base64::engine::general_purpose::STANDARD.encode(&png),
+    )
+    .then_some(hash)
 }

@@ -79,6 +79,10 @@ pub struct DeviceNotification {
     /// list is newest first by it, arrival only breaking ties (F21).
     #[serde(default)]
     pub time: i64,
+    /// The app's icon (`appIconHash`), when this desk holds it
+    /// (`app_icons`); `None` shows the glyph for the app's kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_icon: Option<String>,
 }
 
 /// A capture asked of the phone (F3), while open.

@@ -255,6 +255,7 @@ mod tests {
                 actions: Vec::new(),
                 silent: *silent,
                 time: 0,
+                app_icon: None,
             })
             .collect();
         view

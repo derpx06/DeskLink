@@ -24,6 +24,8 @@ struct Card {
     /// What the card was drawn from.
     key: String,
     widget: gtk::Box,
+    /// "Title · App · 2 min ago", brought up to date at each refresh.
+    heading: gtk::Label,
     entry: gtk::Entry,
     revealer: gtk::Revealer,
     /// What a reply is sent under now. The phone mints a new id each time it
@@ -150,6 +152,14 @@ impl Page {
         }
     }
 
+    /// Debug builds: the `index`th card has the keyboard focus (screenshots).
+    #[cfg(debug_assertions)]
+    pub(super) fn focus_card(&self, index: usize) {
+        if let Some(card) = self.cards.borrow().get(index) {
+            card.widget.grab_focus();
+        }
+    }
+
     /// Opens notification `id`'s reply entry, now or once its card exists.
     pub(super) fn open_reply(&self, id: &str) {
         self.pending_reply.replace(Some(id.to_string()));
@@ -240,6 +250,7 @@ impl Page {
         });
         let mut previous: Option<gtk::Box> = None;
         let mut built = false;
+        let now = glib::DateTime::now_local().ok();
         for notification in notifications {
             let key = serde_json::to_string(notification).unwrap_or_default();
             let position = cards.iter().position(|card| card.id == notification.id);
@@ -280,6 +291,11 @@ impl Page {
                 .unwrap_or_default();
             self.list
                 .reorder_child_after(&cards[index].widget, previous.as_ref());
+            // "2 min ago" moves on.
+            let markup = heading_markup(notification, &now);
+            if cards[index].heading.label() != markup {
+                cards[index].heading.set_markup(&markup);
+            }
             previous = Some(cards[index].widget.clone());
         }
         drop(cards);
@@ -346,28 +362,54 @@ fn glyph(app: &str) -> &'static str {
     }
 }
 
-/// "Mara · Signal": the title in bold, then the app. It wraps (two lines at
-/// most) rather than being cut to a few letters beside the buttons.
-pub(super) fn heading_line(notification: &DeviceNotification) -> gtk::Box {
-    let line = gtk::Box::builder().build();
-    let label = if notification.title.is_empty() {
-        wrapped(&notification.app_name, &["heading"])
-    } else {
-        let label = wrapped("", &["heading"]);
-        label.set_use_markup(true);
-        label.set_markup(&format!(
-            "{}<span weight=\"normal\" size=\"smaller\" alpha=\"60%\"> · {}</span>",
-            gtk::glib::markup_escape_text(&notification.title),
-            gtk::glib::markup_escape_text(&notification.app_name),
-        ));
-        label
-    };
+/// "Mara · Signal · 2 min ago": the title in bold, then the app and when it
+/// came, dim. It wraps (two lines at most) rather than being cut to a few
+/// letters.
+pub(super) fn heading_line(notification: &DeviceNotification) -> gtk::Label {
+    let label = wrapped("", &["heading"]);
+    label.set_use_markup(true);
+    label.set_markup(&heading_markup(
+        notification,
+        &glib::DateTime::now_local().ok(),
+    ));
     label.set_lines(2);
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     label.set_hexpand(true);
     super::tooltip_when_cut(&label);
-    line.append(&label);
-    line
+    label
+}
+
+/// The markup of [`heading_line`]: the title (else the app) in bold, then
+/// the app (when there is a title) and the time, dim.
+fn heading_markup(notification: &DeviceNotification, now: &Option<glib::DateTime>) -> String {
+    let mut dim: Vec<String> = Vec::new();
+    let title = if notification.title.is_empty() {
+        &notification.app_name
+    } else {
+        dim.push(notification.app_name.clone());
+        &notification.title
+    };
+    if let Some(when) = when_words(notification.time, now) {
+        dim.push(when);
+    }
+    let mut markup = glib::markup_escape_text(&one_paragraph(title)).to_string();
+    if !dim.is_empty() {
+        markup.push_str(&format!(
+            "<span weight=\"normal\" size=\"smaller\" alpha=\"60%\"> · {}</span>",
+            glib::markup_escape_text(&dim.join(" · "))
+        ));
+    }
+    markup
+}
+
+/// "2 min ago" for the phone's post time (ms); nothing when it sent none.
+fn when_words(time_ms: i64, now: &Option<glib::DateTime>) -> Option<String> {
+    let now = now.as_ref()?;
+    if time_ms <= 0 {
+        return None;
+    }
+    let when = glib::DateTime::from_unix_local(time_ms / 1000).ok()?;
+    Some(super::history::time_label(now, &when))
 }
 
 /// What the notification says.
@@ -377,6 +419,53 @@ pub(super) fn body(notification: &DeviceNotification) -> &str {
     } else {
         &notification.text
     }
+}
+
+/// The lines a notification's words get on a card before "…".
+pub(super) const BODY_LINES: i32 = 4;
+
+/// One paragraph: blank lines dropped and every run of spaces and line
+/// breaks one space. Pango caps lines per paragraph, so a message of ten
+/// short paragraphs was never cut (the owner's 15-line WhatsApp card).
+pub(crate) fn one_paragraph(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// A label of the notification's words as one paragraph, cut at `lines`;
+/// hovering it, or the card's accessible label, gives the whole text.
+pub(super) fn body_label(notification: &DeviceNotification, lines: i32) -> gtk::Label {
+    let said = text(&one_paragraph(body(notification)), &["dl-secondary"]);
+    said.set_wrap(true);
+    said.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    said.set_lines(lines);
+    said.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    super::tooltip_when_cut(&said);
+    said
+}
+
+/// The app's square: the phone's icon for the app when it sent one, else
+/// the kit's glyph for its kind of app.
+pub(super) fn app_square(notification: &DeviceNotification) -> gtk::Widget {
+    let texture = notification
+        .app_icon
+        .as_deref()
+        .and_then(crate::device_links::app_icons::png)
+        .and_then(|png| {
+            crate::image_limits::decode(&png, Some("png"), crate::image_limits::MAX_ART_PIXELS)
+        })
+        .map(|pixbuf| gtk::gdk::Texture::for_pixbuf(&pixbuf));
+    let square: gtk::Widget = match texture {
+        Some(texture) => gtk::Image::builder()
+            .paintable(&texture)
+            .pixel_size(40)
+            .css_classes(["dl-app-icon"])
+            .accessible_role(gtk::AccessibleRole::Presentation)
+            .build()
+            .upcast(),
+        None => ui_kit::icon_square(glyph(&notification.app_name), Tone::Accent).upcast(),
+    };
+    square.set_valign(gtk::Align::Start);
+    square
 }
 
 fn build_card(
@@ -389,49 +478,68 @@ fn build_card(
     card.set_spacing(0);
     card.add_css_class("dl-note-card");
     card.set_focusable(true);
-    // The words, then the buttons: with a button of its own (reply or an
-    // action) they go under the words when the page is narrow (the
-    // `responsive` box turns vertical), so the title keeps its room; a card
-    // with only its Dismiss cross keeps it beside the words.
-    let top = gtk::Box::builder().spacing(10).build();
-    if notification.request_reply_id.is_some() || !notification.actions.is_empty() {
-        top.set_widget_name("responsive");
-    }
-    let lead = gtk::Box::builder().spacing(12).hexpand(true).build();
+    // The app's square, then a column: the heading with Dismiss at the top
+    // right, the words (one paragraph, four lines), and the buttons in a row
+    // under them (`responsive`: stacked when the page is narrow). Nothing is
+    // centred beside a tall text.
+    let head = gtk::Box::builder().spacing(12).build();
+    let column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(4)
+        .hexpand(true)
+        .build();
+    let line = gtk::Box::builder().spacing(4).build();
     let actions = gtk::Box::builder()
         .spacing(8)
         .halign(gtk::Align::End)
-        .valign(gtk::Align::Center)
+        .margin_top(8)
+        .css_classes(["dl-note-actions"])
         .build();
+    actions.set_widget_name("responsive");
     let who = if notification.title.is_empty() {
         &notification.app_name
     } else {
         &notification.title
     };
-    lead.append(&ui_kit::icon_square(
-        glyph(&notification.app_name),
-        Tone::Accent,
-    ));
-    let words = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(2)
-        .hexpand(true)
-        .valign(gtk::Align::Center)
-        .build();
-    words.append(&heading_line(notification));
-    let said = text(body(notification), &["dl-secondary"]);
-    said.set_wrap(true);
-    said.set_wrap_mode(gtk::pango::WrapMode::WordChar);
-    said.set_lines(3);
-    said.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    words.append(&said);
-    lead.append(&words);
+    head.append(&app_square(notification));
+    let heading = heading_line(notification);
+    heading.set_valign(gtk::Align::Center);
+    line.append(&heading);
+    column.append(&line);
+    let said = body_label(notification, BODY_LINES);
+    column.append(&said);
+    head.append(&column);
     // The card reads as one thing: who, what the notification says.
     card.update_property(&[gtk::accessible::Property::Label(&format!(
         "{who}, {}: {}",
         notification.app_name,
         body(notification)
     ))]);
+    // A click on the words, or Space on the card, shows them all (the
+    // paragraphs as sent) and folds them again.
+    let full = body(notification).trim().to_string();
+    let short = said.label().to_string();
+    let toggle = {
+        let said = said.downgrade();
+        move || {
+            if let Some(said) = said.upgrade() {
+                let open = said.lines() == BODY_LINES;
+                said.set_label(if open { &full } else { &short });
+                said.set_lines(if open { -1 } else { BODY_LINES });
+                said.set_ellipsize(if open {
+                    gtk::pango::EllipsizeMode::None
+                } else {
+                    gtk::pango::EllipsizeMode::End
+                });
+            }
+        }
+    };
+    let click = gtk::GestureClick::new();
+    click.connect_released({
+        let toggle = toggle.clone();
+        move |_, _, _, _| toggle()
+    });
+    said.add_controller(click);
 
     for action in notification.actions.iter().take(2) {
         let button = ui_kit::button(ButtonKind::Tonal, action, None);
@@ -463,7 +571,11 @@ fn build_card(
     let mut reply_button = None;
     let reply_id = Rc::new(RefCell::new(notification.request_reply_id.clone()));
     if notification.request_reply_id.is_some() {
-        let reply = ui_kit::button(ButtonKind::Tonal, "Reply", Some("desklink-reply-symbolic"));
+        let reply = ui_kit::button(
+            ButtonKind::Primary,
+            "Reply",
+            Some("desklink-reply-symbolic"),
+        );
         let (shown, field) = (revealer.downgrade(), entry.downgrade());
         reply.connect_clicked(move |_| {
             if let (Some(revealer), Some(entry)) = (shown.upgrade(), field.upgrade()) {
@@ -531,7 +643,8 @@ fn build_card(
     let mut dismiss_button = None;
     if notification.is_clearable {
         let dismiss = ui_kit::icon_button("desklink-close-symbolic", "Dismiss");
-        dismiss.set_valign(gtk::Align::Center);
+        dismiss.set_valign(gtk::Align::Start);
+        dismiss.add_css_class("dl-note-dismiss");
         let (daemon, device_id, id) = (
             daemon.clone(),
             device_id.to_string(),
@@ -544,11 +657,12 @@ fn build_card(
                 id.clone(),
             ));
         });
-        actions.append(&dismiss);
+        line.append(&dismiss);
         dismiss_button = Some(dismiss);
     }
     // Keyboard: on the card itself (not while typing a reply), Delete or
-    // Backspace dismisses it and Enter opens the reply.
+    // Backspace dismisses it, Enter opens the reply and Space shows all the
+    // words.
     let keys = gtk::EventControllerKey::new();
     {
         let (card_weak, dismiss, reply) = (
@@ -576,21 +690,26 @@ fn build_card(
                         return glib::Propagation::Stop;
                     }
                 }
+                Key::space => {
+                    toggle();
+                    return glib::Propagation::Stop;
+                }
                 _ => {}
             }
             glib::Propagation::Proceed
         });
     }
     card.add_controller(keys);
-    actions.set_visible(actions.first_child().is_some());
-    top.append(&lead);
-    top.append(&actions);
-    card.append(&top);
+    if actions.first_child().is_some() {
+        column.append(&actions);
+    }
+    card.append(&head);
     card.append(&revealer);
     Card {
         id: notification.id.clone(),
         key,
         widget: card,
+        heading,
         entry,
         revealer,
         reply_id,
@@ -642,6 +761,7 @@ mod tests {
                 actions: vec!["Snooze".into()],
                 silent: false,
                 time: 0,
+                app_icon: None,
             };
             let card = build_card(&daemon, "phone", &notification, "k".into());
             let widgets = descendants(card.widget.upcast_ref());
@@ -679,6 +799,130 @@ mod tests {
         });
     }
 
+    /// A WhatsApp-like message of many short paragraphs is one paragraph on
+    /// the card: Pango caps lines per paragraph, so ten paragraphs of one line
+    /// each were never cut.
+    #[test]
+    fn a_multi_paragraph_message_becomes_one_paragraph() {
+        let said = "⏳ Just a few hours left!\n\nChoose from our 4 prompts:\n\
+                    ♦ The Feeling of Home 🏡\n♦ The Last Train\r\n\n\n  Happy   writing! ✍️\n";
+        assert_eq!(
+            one_paragraph(said),
+            "⏳ Just a few hours left! Choose from our 4 prompts: ♦ The Feeling of Home 🏡 \
+             ♦ The Last Train Happy writing! ✍️"
+        );
+        assert_eq!(one_paragraph("  \n\t "), "");
+        assert_eq!(one_paragraph("one"), "one");
+    }
+
+    fn whatsapp() -> DeviceNotification {
+        DeviceNotification {
+            id: "4".into(),
+            app_name: "WhatsApp".into(),
+            title: "Writers' Circle".into(),
+            text: "Line one\n\nLine two\nLine three\n\nLine four\nLine five".into(),
+            ticker: String::new(),
+            is_clearable: true,
+            request_reply_id: Some("r4".into()),
+            actions: vec!["Mark as read".into(), "Mute".into()],
+            silent: false,
+            time: 0,
+            app_icon: None,
+        }
+    }
+
+    /// The words are one paragraph capped at four lines (the whole text in
+    /// the card's accessible label); the buttons sit in a row *under* the
+    /// words, in the same column, never centred beside them; Dismiss is in
+    /// the heading's line, at its top right. (Needs a display.)
+    #[test]
+    fn the_card_caps_its_words_and_puts_the_buttons_under_them() {
+        crate::test_display::run(|| {
+            let (daemon, _commands) = DaemonHandle::detached();
+            let card = build_card(&daemon, "phone", &whatsapp(), "k".into());
+            let widgets = descendants(card.widget.upcast_ref());
+            let said = widgets
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Label>())
+                .find(|label| label.label().starts_with("Line one"))
+                .expect("the words");
+            assert_eq!(
+                said.label(),
+                "Line one Line two Line three Line four Line five"
+            );
+            assert_eq!(said.lines(), BODY_LINES);
+            assert_eq!(said.ellipsize(), gtk::pango::EllipsizeMode::End);
+            assert!(said.wraps());
+
+            let actions = widgets
+                .iter()
+                .find(|w| w.has_css_class("dl-note-actions"))
+                .expect("the buttons' row");
+            // Under the words: the next sibling in one vertical column.
+            assert_eq!(
+                said.next_sibling().as_ref(),
+                Some(actions),
+                "the buttons come right after the words"
+            );
+            let column = said.parent().and_downcast::<gtk::Box>().unwrap();
+            assert_eq!(column.orientation(), gtk::Orientation::Vertical);
+            assert_eq!(actions.halign(), gtk::Align::End);
+            let labels: Vec<String> = descendants(actions)
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Label>())
+                .map(|l| l.label().to_string())
+                .collect();
+            assert_eq!(labels, ["Mark as read", "Mute", "Reply"]);
+            // Reply is the primary one.
+            let reply = descendants(actions)
+                .into_iter()
+                .filter_map(|w| w.downcast::<gtk::Button>().ok())
+                .last()
+                .unwrap();
+            assert!(reply.has_css_class("dl-btn-primary"));
+            // Dismiss is beside the heading, not in the buttons' row.
+            let dismiss = widgets
+                .iter()
+                .filter_map(|w| w.downcast_ref::<gtk::Button>())
+                .find(|b| b.tooltip_text().as_deref() == Some("Dismiss"))
+                .unwrap();
+            assert!(!dismiss.is_ancestor(actions));
+            assert_eq!(dismiss.valign(), gtk::Align::Start);
+            // Nothing is centred beside the words: the square is at the top.
+            let head = column.parent().unwrap();
+            assert_eq!(head.first_child().unwrap().valign(), gtk::Align::Start);
+        });
+    }
+
+    /// A card with no buttons has no empty row under its words.
+    #[test]
+    fn a_card_without_buttons_has_no_buttons_row() {
+        crate::test_display::run(|| {
+            let (daemon, _commands) = DaemonHandle::detached();
+            let mut plain = whatsapp();
+            plain.actions.clear();
+            plain.request_reply_id = None;
+            let card = build_card(&daemon, "phone", &plain, "k".into());
+            assert!(!descendants(card.widget.upcast_ref())
+                .iter()
+                .any(|w| w.has_css_class("dl-note-actions")));
+        });
+    }
+
+    #[test]
+    fn the_heading_says_the_app_and_when() {
+        let mut note = whatsapp();
+        let now = glib::DateTime::from_local(2026, 11, 16, 12, 0, 0.0).ok();
+        note.time = now.as_ref().unwrap().add_minutes(-2).unwrap().to_unix() * 1000;
+        assert_eq!(
+            heading_markup(&note, &now),
+            "Writers&apos; Circle<span weight=\"normal\" size=\"smaller\" alpha=\"60%\"> · WhatsApp · 2 min ago</span>"
+        );
+        note.time = 0;
+        note.title.clear();
+        assert_eq!(heading_markup(&note, &now), "WhatsApp");
+    }
+
     #[test]
     fn each_kind_of_app_has_a_glyph() {
         assert_eq!(app_icon("Signal"), "user-available-symbolic");
@@ -707,6 +951,7 @@ mod tests {
                 actions: vec![],
                 silent: false,
                 time: 0,
+                app_icon: None,
             };
             let card = build_card(&daemon, "phone", &notification, "k".into());
             card.entry.set_text("yes, at five");

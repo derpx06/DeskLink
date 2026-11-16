@@ -41,6 +41,12 @@ row.dl-mono-row label.title { font-family: "JetBrains Mono", monospace; font-siz
 .dl-note-card:focus-visible { outline: 2px solid @dl_accent_text; outline-offset: 2px; }
 .dl-note-card .dl-app { font-size: 0.8em; color: @dl_text_dim; }
 .dl-note-card .dl-who { font-size: 0.93em; font-weight: 700; }
+/* Compact buttons in a row under the words, and Dismiss in the top corner. */
+.dl-note-actions .dl-btn, .dl-btn.dl-note-action { min-height: 32px; min-width: 64px; padding: 0 14px; border-radius: 10px; }
+.dl-note-actions .dl-btn-content, .dl-note-action .dl-btn-content { min-height: 32px; }
+.dl-note-actions .dl-btn-content image, .dl-note-action .dl-btn-content image { -gtk-icon-size: 18px; }
+.dl-note-dismiss { min-width: 32px; min-height: 32px; margin: -6px -6px 0 0; }
+.dl-note-dismiss image { -gtk-icon-size: 20px; }
 .dl-reply-bar {
   min-height: 40px;
   padding: 0 4px 0 12px;

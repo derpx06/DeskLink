@@ -14,4 +14,13 @@
     "errors": ["permission", "no-call", "failed", "emergency"],
     "emergency": ["112", "911", "999", "000", "110", "119", "118", "122", "100", "101", "102", "108", "115", "117", "113", "144", "155", "190", "199", "933"]
   }
+,
+  "notificationAppIcon": {
+    "_doc": "desklink.notification (phone to desk), optional: appIconHash names the app's launcher icon (the first hashHexChars hex characters of the PNG's SHA-256) on every notification; appIcon (base64 PNG, at most maxPngBytes, at most maxSide px a side) rides only on the first notification of an app per connection. The desk keeps an icon only when its own hash of the bytes matches.",
+    "fields": {"hash": "appIconHash", "png": "appIcon"},
+    "hashHexChars": 32,
+    "maxPngBytes": 8192,
+    "maxSide": 64,
+    "vector": {"png": "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAdElEQVR42mNkwAJUL6f9xyZ+W3cWI7oYE7GacckxEqMRn2uYGCgETOTYjqyHEZ/mWzozGRgYGBjUrqTjdwE+zehsogzApgGXIdQJRHSAzc+4wgGnC5A14AtERnKjEZaYmHClcbqlREZSMhM21zIRk2XxyQEAPZIxeUhOVnUAAAAASUVORK5CYII=", "hash": "06622631263c2b56ee68abe0feaa7f51"}
+  }
 }
