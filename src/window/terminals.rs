@@ -143,10 +143,18 @@ impl Page {
         list.append(&access);
         list.append(&grid);
         list.append(&note);
+        // On a very big window the previews stay a readable size, centred,
+        // instead of three at the left and a quarter of the page empty.
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
-            .child(&list)
+            .child(
+                &adw::Clamp::builder()
+                    .maximum_size(1600)
+                    .tightening_threshold(1200)
+                    .child(&list)
+                    .build(),
+            )
             .build();
 
         let detail = gtk::Box::builder()

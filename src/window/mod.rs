@@ -164,7 +164,8 @@ const FIRST_FADE_MS: u32 = 180;
 /// The Files page's width (the Bucket and the transfers), and on a big
 /// window: more cards a line, each the same size.
 const FILES_WIDTH: i32 = 1000;
-const FILES_WIDE_WIDTH: i32 = 1600;
+/// Eight Bucket tiles (about 222 px and a 12 px gap each) need 1860 px.
+const FILES_WIDE_WIDTH: i32 = 1900;
 
 const PAGES: &[(&str, &str, &str)] = &[
     ("home", "Home", "desklink-home-symbolic"),

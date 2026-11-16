@@ -517,21 +517,30 @@ fn a_phone_the_ladder_gave_up_on_is_away_too() {
 /// The other pages on a big window use the width for structure: Files and
 /// the Bucket wider with eight cards a line, the Notes list wider beside the
 /// note, four terminals a line; back to their usual layout below the
-/// breakpoint. (Needs a display.)
+/// breakpoint. A page shown while the window is already big is laid out for
+/// it at once (show_page runs the layout pass: nothing else is called here).
+/// (Needs a display.)
 #[test]
 fn the_other_pages_use_a_big_window() {
     use adw::subclass::prelude::ObjectSubclassIsExt;
     crate::test_display::run(|| {
         let window = home_window("paired", 1280);
-        for page in ["files", "notes", "terminals"] {
-            window.show_page(page);
-            spin();
-        }
         let imp = window.imp();
+        let notes = || {
+            named_widgets(window.upcast_ref(), "notes-split")
+                .into_iter()
+                .next()
+                .and_downcast::<adw::NavigationSplitView>()
+                .expect("the Notes split")
+        };
         let check = |wide: bool| {
             imp.compact.set(false);
             imp.wide.set(wide);
-            window.apply_layout();
+            // Only the pages being shown: show_page lays them out.
+            for page in ["files", "terminals", "notes"] {
+                assert!(window.show_page(page), "{page}");
+                spin();
+            }
             for clamp in named_widgets(window.upcast_ref(), "files-clamp") {
                 let clamp = clamp.downcast::<adw::Clamp>().unwrap();
                 assert_eq!(
@@ -547,12 +556,15 @@ fn the_other_pages_use_a_big_window() {
                 let grid = grid.downcast::<gtk::FlowBox>().unwrap();
                 assert_eq!(grid.max_children_per_line(), if wide { 8 } else { 5 });
             }
-            let notes = named_widgets(window.upcast_ref(), "notes-split")
-                .into_iter()
-                .next()
-                .and_downcast::<adw::NavigationSplitView>()
-                .expect("the Notes split");
-            assert_eq!(notes.max_sidebar_width(), if wide { 420.0 } else { 320.0 });
+            // The Bucket's grid takes the same rule, from 6.
+            assert_eq!(window.card_columns(6), if wide { 8 } else { 6 });
+            assert_eq!(window.card_columns(5), if wide { 8 } else { 5 });
+            let split = notes();
+            assert_eq!(split.max_sidebar_width(), if wide { 420.0 } else { 320.0 });
+            assert_eq!(
+                split.sidebar_width_fraction(),
+                if wide { 0.32 } else { 0.25 }
+            );
             for grid in named_widgets(window.upcast_ref(), "terminal-grid") {
                 let grid = grid.downcast::<gtk::FlowBox>().unwrap();
                 assert_eq!(grid.max_children_per_line(), if wide { 4 } else { 3 });
@@ -565,6 +577,7 @@ fn the_other_pages_use_a_big_window() {
         };
         check(true);
         check(false);
+        check(true);
         assert!(
             !named_widgets(window.upcast_ref(), "files-clamp").is_empty(),
             "Files was drawn"

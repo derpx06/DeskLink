@@ -604,6 +604,18 @@ impl DesklinkWindow {
         }
     }
 
+    /// Cards a line in a Files or Bucket grid: `normal`, or eight on a big
+    /// window (a grid drawn while it is big starts so, not at the next resize).
+    pub(super) fn card_columns(&self, normal: u32) -> u32 {
+        let imp = self.imp();
+        let compact = imp.narrow.get() || imp.compact.get();
+        if imp.wide.get() && !compact {
+            8
+        } else {
+            normal
+        }
+    }
+
     /// Lays named boxes and grids out for the window's width: the overview's
     /// two columns and the hero stack when phone-narrow, the terminal grid
     /// goes one to a line.
@@ -673,7 +685,7 @@ impl DesklinkWindow {
                         } else {
                             6
                         };
-                        grid.set_max_children_per_line(if wide { 8 } else { normal });
+                        grid.set_max_children_per_line(self.card_columns(normal));
                     }
                 }
                 // Right-aligned beside the hero's name; under it when the

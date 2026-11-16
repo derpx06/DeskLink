@@ -557,6 +557,7 @@ impl Page {
                 .build();
             group.append(&ui_kit::section_header(&day));
             let cards = grid();
+            cards.set_max_children_per_line(win.card_columns(5));
             cards.update_property(&[gtk::accessible::Property::Label(&day)]);
             for (entry, file) in members {
                 let card: gtk::Widget = if file.exists {
