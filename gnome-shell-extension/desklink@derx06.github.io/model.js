@@ -56,8 +56,10 @@ export function headerLine(device, now = new Date()) {
 
 /// "Wi-Fi · 82%": the toggle's short subtitle (its title is the phone).
 export function shortStatus(device, now = new Date()) {
-    if (!device?.ready)
+    if (!device)
         return statusLine(device, now);
+    if (!device.ready)
+        return device.reachable ? 'Connecting…' : 'Not connected'; // the header has "last seen"
     const parts = [];
     if (ROUTE[device.path])
         parts.push(ROUTE[device.path]);
@@ -113,19 +115,79 @@ export function timer(unixMillis, nowMs = Date.now()) {
 
 const has = (device, action) => !!device?.actions?.includes(action);
 
-/// The quick-action tiles: these six, three to a row, greyed out when the
-/// phone does not take one now (and not shown at all while it is away).
+/// The quick-action tiles: the four most used, in one row of large tiles,
+/// greyed out when the phone does not take one now (and not shown at all
+/// while it is away). Lock and Photo are in More.
 export function quickTiles(device) {
     const ready = !!device?.ready;
     const name = device?.name ?? 'the phone';
     return [
         {id: 'send-files', icon: 'document-send-symbolic', label: 'Files', name: `Send files to ${name}`},
         {id: 'send-clipboard', icon: 'edit-paste-symbolic', label: 'Clipboard', name: `Send the clipboard to ${name}`},
-        {id: 'ring', icon: 'audio-volume-high-symbolic', label: 'Ring', name: `Ring ${name}`},
-        {id: 'lock', icon: 'system-lock-screen-symbolic', label: 'Lock', name: `Lock ${name}`},
         {id: 'show-screen', icon: 'video-display-symbolic', label: 'Screen', name: `Show the screen of ${name}`},
-        {id: 'insert-photo', icon: 'camera-photo-symbolic', label: 'Photo', name: `Take a photo with ${name} and put it on the clipboard`},
+        {id: 'ring', icon: 'audio-volume-high-symbolic', label: 'Ring', name: `Ring ${name}`},
     ].map(tile => ({...tile, action: tile.id, enabled: ready && has(device, tile.id)}));
+}
+
+/// The header's avatar: the phone, or the screen glyph while the phone's
+/// screen is shown here or this computer's is on the phone (`live`).
+export function headerGlyph(device) {
+    const live = !!device?.ready && !!device.screen;
+    return {icon: live ? 'video-display-symbolic' : 'phone-symbolic', live};
+}
+
+/// What the offline card says, in plain words: the next step, not an error.
+export function offlineHint(device) {
+    if (!device || device.ready)
+        return '';
+    if (device.reachable)
+        return 'Waiting for the phone to answer.';
+    return `Open DeskLink on ${device.name} and keep it on the same Wi-Fi as this computer.`;
+}
+
+/// The menu with no phone paired: what to do, in two short lines.
+export const EMPTY = {
+    title: 'No phone yet',
+    hint: 'Open DeskLink on your phone, then pair it from DeskLink on this computer.',
+    button: 'Pair a phone',
+};
+
+/// A phone chip's state: 'ready' (connected), 'connecting', 'away', and what
+/// wants a look on it (`unread`, `live`).
+export function chipState(device) {
+    return {
+        state: device.ready ? 'ready' : (device.reachable ? 'connecting' : 'away'),
+        unread: device.unread > 0 ? device.unread : 0,
+        live: !!device.screen || device.terminals > 0,
+    };
+}
+
+/// Whether the optional pill is on the top bar: only while a phone is
+/// connected and it has something to show (the pill is switched on in
+/// DeskLink, or a timer/download is going). An offline phone, or none, leaves
+/// no empty chrome behind.
+export function pillVisible({running, pillOn, items, devices}) {
+    return !!running && devices.some(device => device.ready) && (!!pillOn || items.length > 0);
+}
+
+/// The top bar glyph's badge and its words (the accessible name; GNOME has no
+/// hover text for a panel icon). Coral while a phone uses this computer, else
+/// the accent for unread notifications or a transfer; `null` when quiet.
+export function panelBadge(devices) {
+    const ready = devices.filter(device => device.ready);
+    if (ready.length === 0)
+        return {badge: null, words: 'No phone connected'};
+    const unread = ready.reduce((sum, device) => sum + Math.max(0, device.unread ?? 0), 0);
+    const moving = ready.some(device => (device.transfers ?? []).length > 0);
+    const live = ready.some(device => device.screen || device.terminals > 0);
+    const words = [ready.length === 1 ? `${ready[0].name} connected` : `${ready.length} phones connected`];
+    if (live)
+        words.push('using this computer');
+    if (moving)
+        words.push('transferring files');
+    if (unread > 0)
+        words.push(`${unread} new notification${unread === 1 ? '' : 's'}`);
+    return {badge: live ? 'live' : (unread > 0 || moving ? 'accent' : null), words: words.join(', ')};
 }
 
 // Rows -----------------------------------------------------------------
@@ -239,6 +301,7 @@ export function sections(device, desk, extras = {}) {
     ], device.terminals > 0 ? `${device.terminals} attached` : '');
     add('screen', 'video-display-symbolic', 'Screen & control', [
         has(device, 'show-screen') && act('show-screen', 'Show its screen…', 'video-display-symbolic'),
+        has(device, 'lock') && act('lock', 'Lock the phone', 'system-lock-screen-symbolic'),
         has(device, 'end-sessions') && act('end-sessions', 'End what it is doing here', 'process-stop-symbolic'),
         phoneSwitch(device, 'glide', 'Glide the mouse onto it'),
     ]);
@@ -269,9 +332,9 @@ export function sections(device, desk, extras = {}) {
     return out;
 }
 
-/// What the menu shows, top to bottom. Rows for what is going on now come
-/// only while something is: a call, music, files moving, the Files sync, the
-/// phone's timers, a phone using this computer. Every area is folded into
+/// What the menu shows, top to bottom. What is going on now comes first and
+/// only while something is: a call, files moving, the Files sync, the phone's
+/// timers, a phone using this computer; then the quick tiles and the music. Every area is folded into
 /// More. A new kind of row is one more entry here and one more case in
 /// menu.js's `fillMenu`.
 export function menuBlocks(selected, devices = [], activities = []) {
@@ -284,10 +347,7 @@ export function menuBlocks(selected, devices = [], activities = []) {
         blocks.push('offline');
     if (selected.call)
         blocks.push('call');
-    if (selected.ready)
-        blocks.push('tiles');
-    if (selected.ready && selected.media)
-        blocks.push('media');
+    // What is happening now comes first; it is simply absent when nothing is.
     if ((selected.transfers ?? []).length > 0)
         blocks.push('transfers');
     if (selected.bucket)
@@ -296,6 +356,10 @@ export function menuBlocks(selected, devices = [], activities = []) {
         blocks.push('activities');
     if (devices.some(device => device.screen || device.terminals > 0))
         blocks.push('live');
+    if (selected.ready)
+        blocks.push('tiles');
+    if (selected.ready && selected.media)
+        blocks.push('media');
     blocks.push('more', 'footer');
     return blocks;
 }

@@ -6,7 +6,7 @@ import {fileURLToPath} from 'node:url';
 
 import {
     bodyHeight, everythingSent, footer, headerLine, lastSeen, mediaClock, mediaPosition, menuBlocks, moreSummary, seekReason, seekThrottle,
-    looksLikeLink, quickTiles, sections, sessionLine, shortStatus, statusLine, timer, duration,
+    looksLikeLink, quickTiles, headerGlyph, offlineHint, EMPTY, chipState, panelBadge, pillVisible, sections, sessionLine, shortStatus, statusLine, timer, duration,
 } from '../desklink@derx06.github.io/model.js';
 
 const ALL_ACTIONS = ['open', 'ring', 'lock', 'send-files', 'send-link', 'send-clipboard', 'ping', 'show-screen',
@@ -38,6 +38,8 @@ test('the status line says it in plain words', () => {
     assert.equal(statusLine(phone({ready: false, reachable: false})), 'Not connected');
     assert.equal(statusLine(null), 'No phone connected');
     assert.equal(shortStatus(phone({charging: false, path: 'turn'})), 'Relay · 82%');
+    assert.equal(shortStatus(phone({ready: false, reachable: false})), 'Not connected');
+    assert.equal(shortStatus(phone({ready: false})), 'Connecting…');
 });
 
 test('last seen shows the time today and the day before', () => {
@@ -57,9 +59,9 @@ test('the header line: the link, the route with its round trip, charging', () =>
     assert.equal(headerLine(null), 'No phone connected');
 });
 
-test('the six tiles follow what the phone takes and whether it is connected', () => {
+test('the four tiles follow what the phone takes and whether it is connected', () => {
     const tiles = quickTiles(phone());
-    assert.deepEqual(ids(tiles), ['send-files', 'send-clipboard', 'ring', 'lock', 'show-screen', 'insert-photo']);
+    assert.deepEqual(ids(tiles), ['send-files', 'send-clipboard', 'show-screen', 'ring']);
     assert.ok(tiles.every(tile => tile.enabled));
     const without = quickTiles(phone({actions: ['open', 'ring']}));
     assert.deepEqual(without.filter(t => t.enabled).map(t => t.id), ['ring']);
@@ -279,11 +281,11 @@ test('rows for what is going on come only while it is', () => {
         transfers: [{name: 'a', fraction: 0.5}], bucket: {line: 'Files', fraction: 0.2}, screen: 'view',
     });
     assert.deepEqual(menuBlocks(busy, [busy], [{device: 'p1', title: 'Pasta'}]),
-        ['call', 'tiles', 'media', 'transfers', 'bucket', 'activities', 'live', 'more', 'footer']);
+        ['call', 'transfers', 'bucket', 'activities', 'live', 'tiles', 'media', 'more', 'footer']);
     // Another phone's timer is not this one's; another phone using this computer is.
     const other = phone({id: 'p2', terminals: 1});
     assert.deepEqual(menuBlocks(phone(), [phone(), other], [{device: 'p2', title: 'x'}]),
-        ['switcher', 'tiles', 'live', 'more', 'footer']);
+        ['switcher', 'live', 'tiles', 'more', 'footer']);
     // Music from a phone that is away is not playing here.
     assert.ok(!menuBlocks(phone({ready: false, media: {title: 't'}}), [phone()]).includes('media'));
 });
@@ -313,7 +315,7 @@ test('every action and switch is still reachable', () => {
         'galleryAccept', 'glide', 'keepAwake', 'namesCallers', 'pauseMediaOnCall', 'phoneKeepAwake', 'phoneMic', 'phoneSound',
         'showNotifications', 'terminalAccess', 'unlockNearby', 'walkAway']);
     const rows = sections(phone(), desk(), {...extras, linkInClipboard: true}).flatMap(s => s.rows);
-    assert.equal(rows.length, 44, 'every row of every area is in More');
+    assert.equal(rows.length, 45, 'every row of every area is in More');
     // The blocks that draw the rest are all there for a phone that has them.
     const busy = phone({media: {title: 't'}, call: {id: 'c'}, transfers: [{}], bucket: {}, screen: 'view'});
     for (const block of ['tiles', 'media', 'call', 'transfers', 'bucket', 'live', 'more', 'footer'])
@@ -411,4 +413,48 @@ test('the scrolled body gives way to the footer on a short screen', () => {
     assert.equal(bodyHeight(400, 100), 300);
     assert.equal(bodyHeight(400, 380), 40, 'at least one row stays');
     assert.equal(bodyHeight(400, 900), 40);
+});
+
+test('the header glyph turns into the screen while the screen is shared', () => {
+    assert.deepEqual(headerGlyph(phone()), {icon: 'phone-symbolic', live: false});
+    assert.deepEqual(headerGlyph(phone({screen: 'view'})), {icon: 'video-display-symbolic', live: true});
+    assert.equal(headerGlyph(phone({screen: 'view', ready: false})).live, false);
+    assert.equal(headerGlyph(null).icon, 'phone-symbolic');
+});
+
+test('the offline card says what to do next, the empty menu how to start', () => {
+    assert.equal(offlineHint(phone()), '');
+    assert.equal(offlineHint(phone({ready: false})), 'Waiting for the phone to answer.');
+    assert.match(offlineHint(phone({ready: false, reachable: false})), /^Open DeskLink on Pixel and keep it on the same Wi-Fi/);
+    assert.equal(EMPTY.button, 'Pair a phone');
+});
+
+test('a chip says connected, connecting or away, and what wants a look', () => {
+    assert.deepEqual(chipState(phone()), {state: 'ready', unread: 3, live: false});
+    assert.equal(chipState(phone({ready: false})).state, 'connecting');
+    assert.equal(chipState(phone({ready: false, reachable: false, unread: 0})).state, 'away');
+    assert.equal(chipState(phone({terminals: 1})).live, true);
+});
+
+test('the panel badge: coral when a phone uses this computer, accent for news, none when quiet', () => {
+    assert.deepEqual(panelBadge([]), {badge: null, words: 'No phone connected'});
+    assert.deepEqual(panelBadge([phone({unread: 0})]), {badge: null, words: 'Pixel connected'});
+    assert.deepEqual(panelBadge([phone()]), {badge: 'accent', words: 'Pixel connected, 3 new notifications'});
+    assert.equal(panelBadge([phone({unread: 1})]).words, 'Pixel connected, 1 new notification');
+    assert.equal(panelBadge([phone({unread: 0, transfers: [{}]})]).badge, 'accent');
+    const live = panelBadge([phone({screen: 'view'}), phone({id: 'p2'})]);
+    assert.equal(live.badge, 'live');
+    assert.match(live.words, /^2 phones connected, using this computer/);
+    assert.equal(panelBadge([phone({ready: false, unread: 5})]).badge, null);
+});
+
+test('the pill hides unless a phone is connected and it has something to show', () => {
+    const on = {running: true, pillOn: true, items: [], devices: [phone()]};
+    assert.equal(pillVisible(on), true);
+    assert.equal(pillVisible({...on, devices: []}), false);
+    assert.equal(pillVisible({...on, devices: [phone({ready: false})]}), false);
+    assert.equal(pillVisible({...on, devices: [phone({ready: false, reachable: false})], items: [{}]}), false);
+    assert.equal(pillVisible({...on, pillOn: false}), false);
+    assert.equal(pillVisible({...on, pillOn: false, items: [{}]}), true);
+    assert.equal(pillVisible({...on, running: false}), false);
 });

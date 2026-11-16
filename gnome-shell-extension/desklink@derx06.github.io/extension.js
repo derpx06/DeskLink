@@ -36,7 +36,7 @@ import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 
 import {BatteryRing, fillMenu, shortStatus, statusLine, styleVariant} from './menu.js';
-import {looksLikeLink} from './model.js';
+import {looksLikeLink, panelBadge, pillVisible} from './model.js';
 import {PhoneCalls, PhoneNotifications} from './notifications.js';
 
 const BUS_NAME = 'derx06.desklink.com';
@@ -98,6 +98,15 @@ function centered(params) {
     return {y_align: Clutter.ActorAlign.CENTER, ...params};
 }
 
+/// Shows `dot` for a `panelBadge` kind ('live' coral, 'accent'), hides it for null.
+function showBadge(dot, badge) {
+    dot.visible = badge !== null;
+    if (badge === 'accent')
+        dot.add_style_class_name('accent');
+    else
+        dot.remove_style_class_name('accent');
+}
+
 const DeskLinkToggle = GObject.registerClass(
 class DeskLinkToggle extends QuickMenuToggle {
     _init() {
@@ -133,10 +142,12 @@ class DeskLinkIndicator extends SystemIndicator {
         this.quickSettingsItems.push(this.toggle);
     }
 
-    showConnected(connected, live) {
+    /// `summary` is `panelBadge(devices)`: a coral dot while a phone uses this
+    /// computer, an accent one for news or a transfer, none when quiet.
+    showConnected(connected, summary) {
         this._icon.visible = connected;
-        this._dot.visible = connected && live;
-        this._icon.accessible_name = live ? 'Phone connected, using this computer' : 'Phone connected';
+        showBadge(this._dot, connected ? summary.badge : null);
+        this._icon.accessible_name = summary.words;
     }
 });
 
@@ -168,14 +179,14 @@ class DeskLinkButton extends PanelMenu.Button {
             part.style = part.has_style_class_name('live') ? null : paint(0.3);
     }
 
-    showState(online, live, words) {
+    showState(online, badge, words) {
         for (const part of [this._wire, this._phone]) {
             if (online)
                 part.add_style_class_name('live');
             else
                 part.remove_style_class_name('live');
         }
-        this._dot.visible = live;
+        showBadge(this._dot, badge);
         if (this._pill.get_stage())
             this._tint();
         this.accessible_name = `DeskLink: ${words}`;
@@ -362,6 +373,9 @@ export default class DeskLinkExtension extends Extension {
         this._indicator.quickSettingsItems.forEach(item => item.destroy());
         this._indicator.destroy();
         this._indicator = null;
+        if (this._hidePill)
+            GLib.source_remove(this._hidePill);
+        this._hidePill = 0;
         this._button.destroy();
         this._button = null;
     }
@@ -441,7 +455,7 @@ export default class DeskLinkExtension extends Extension {
         toggle.checked = !!selected?.ready;
         toggle._setTitle(selected?.name ?? 'DeskLink', selected ? shortStatus(selected) : 'Pair a phone');
         this._indicator.showConnected(running && !locked && devices.some(device => device.ready),
-            live.length > 0);
+            panelBadge(devices));
         if (!locked)
             this._fillMenu(toggle.menu, this._qs, devices, selected, desk);
 
@@ -631,16 +645,37 @@ export default class DeskLinkExtension extends Extension {
         return text || (item.kind ?? '');
     }
 
+    /// Shown at once, hidden after 300 ms of being unwanted, so a link that
+    /// flaps does not make the top bar jump.
+    _setPillVisible(want) {
+        if (want) {
+            if (this._hidePill) {
+                GLib.source_remove(this._hidePill);
+                this._hidePill = 0;
+            }
+            this._button.visible = true;
+        } else if (this._button.visible && !this._hidePill) {
+            this._hidePill = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 300, () => {
+                this._hidePill = 0;
+                this._button.visible = false;
+                return GLib.SOURCE_REMOVE;
+            });
+        }
+    }
+
     _syncPill(locked, running, devices, desk, live, selected) {
         const menu = this._button.menu;
         if (locked) {
             menu.removeAll();
             this._pill.key = null;
             const unlockers = devices.filter(device => device.actions.includes('unlock-via-phone'));
+            if (this._hidePill)
+                GLib.source_remove(this._hidePill);
+            this._hidePill = 0;
             this._button.visible = running && unlockers.length > 0;
             this._chipItems = [];
             this._stopChipTimer();
-            this._button.showState(true, false, 'unlock with your phone');
+            this._button.showState(true, null, 'unlock with your phone');
             this._button.showLabel(unlockers.length === 1 ? `Unlock with ${unlockers[0].name}` : 'Unlock');
             for (const device of unlockers)
                 menu.addAction(`Unlock with ${device.name}`, () => this._invoke(device.id, 'unlock-via-phone'));
@@ -651,10 +686,10 @@ export default class DeskLinkExtension extends Extension {
         // pill is otherwise off, and goes when nothing is ongoing.
         const items = running ? liveItems(this._read('Activities', []), Date.now()) : [];
         this._chipItems = items;
-        this._button.visible = running && (!!desk.pill || items.length > 0) && devices.length > 0;
+        this._setPillVisible(pillVisible({running, pillOn: desk.pill, items, devices}));
         this._button.showLabel(this._chipText());
         const ongoing = items[0] ? `, ${items[0].title || items[0].app}` : '';
-        this._button.showState(!!selected?.ready, live.length > 0,
+        this._button.showState(!!selected?.ready, panelBadge(devices).badge,
             selected ? `${selected.name}, ${statusLine(selected)}${ongoing}` : 'no phone connected');
         if (items.length > 0)
             this._startChipTimer();

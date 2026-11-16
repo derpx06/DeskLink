@@ -2,9 +2,9 @@
 //
 // The top-bar menu's content, drawn from model.js and kept small: the phone's
 // name with its link and a battery ring, a phone switcher with two or more
-// phones, six quick actions as pills, one row for the phone's music (its
-// timeline on request), a row for each thing going on now (only while one
-// is), every area folded into More, and a footer. Stock St/PopupMenu widgets
+// phones, a row for each thing going on now (only while one is), four large
+// quick tiles, one row for the phone's music (its timeline on request), every
+// area folded into More, and a footer. Stock St/PopupMenu widgets
 // and the shell's own button and quick-toggle styles, so it follows
 // light/dark, the accent colour and high contrast; only the mint and coral
 // status marks are DeskLink's own.
@@ -21,7 +21,7 @@ import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Slider} from 'resource:///org/gnome/shell/ui/slider.js';
 
 import {
-    bodyHeight, footer, headerLine, liveWords, mediaClock, mediaPosition, menuBlocks, moreSummary, quickTiles, sections, seekReason,
+    EMPTY, bodyHeight, chipState, footer, headerGlyph, headerLine, liveWords, offlineHint, mediaClock, mediaPosition, menuBlocks, moreSummary, quickTiles, sections, seekReason,
     seekThrottle, statusLine, timer, duration,
 } from './model.js';
 
@@ -38,6 +38,13 @@ export function styleVariant() {
 function label(text, styleClass, params = {}) {
     const actor = new St.Label({text, style_class: styleClass, y_align: Clutter.ActorAlign.CENTER, ...params});
     actor.clutter_text.ellipsize = 3; // Pango.EllipsizeMode.END
+    return actor;
+}
+
+/// A label that wraps onto more lines instead of being cut.
+function wrapped(actor) {
+    actor.clutter_text.ellipsize = 0; // Pango.EllipsizeMode.NONE
+    actor.clutter_text.line_wrap = true;
     return actor;
 }
 
@@ -140,12 +147,12 @@ class BatteryRing extends St.Widget {
     }
 });
 
-/// One pill of the action grid: a 16 px icon and a short label that is cut
+/// One large tile of the action row: an icon over a short label that is cut
 /// short rather than widening the menu.
 function tile(icon, text, {name = text, enabled = true, variant = '', onClick}) {
-    const content = new St.BoxLayout({x_expand: true, x_align: Clutter.ActorAlign.CENTER, style_class: 'desklink-tile-content'});
-    content.add_child(new St.Icon({icon_name: icon, style_class: 'desklink-tile-icon', y_align: Clutter.ActorAlign.CENTER}));
-    content.add_child(label(text, 'desklink-tile-label'));
+    const content = new St.BoxLayout({vertical: true, x_expand: true, x_align: Clutter.ActorAlign.CENTER, style_class: 'desklink-tile-content'});
+    content.add_child(new St.Icon({icon_name: icon, style_class: 'desklink-tile-icon', x_align: Clutter.ActorAlign.CENTER}));
+    content.add_child(label(text, 'desklink-tile-label', {x_align: Clutter.ActorAlign.CENTER}));
     const button = new St.Button({
         child: content,
         style_class: `button desklink-tile ${variant}`,
@@ -634,7 +641,7 @@ export function fillMenu(menu, ctx) {
     const can = (device, action) => device?.actions.includes(action);
     const activities = (ctx.activities ?? []).filter(item => item.device === selected?.id);
     if (menu.setHeader) {
-        menu.setHeader('phone-symbolic', selected?.name ?? 'DeskLink', headerLine(selected));
+        menu.setHeader(headerGlyph(selected).icon, selected?.name ?? 'DeskLink', headerLine(selected));
         ctx.ring?.set(selected?.ready ? selected.battery : -1, !!selected?.charging);
     }
     menu.removeAll();
@@ -653,8 +660,14 @@ export function fillMenu(menu, ctx) {
 
     const blocks = menuBlocks(selected, devices, activities);
     if (blocks.includes('empty')) {
-        menu.addMenuItem(row(dim(label('Pair a phone in DeskLink to see it here.', 'desklink-empty')), 'desklink-inset-row'));
-        menu.addAction('Open DeskLink', () => invoke('', 'open'), 'focus-windows-symbolic');
+        const empty = column({style_class: 'desklink-empty'});
+        empty.add_child(label(EMPTY.title, 'desklink-row-title'));
+        empty.add_child(wrapped(dim(label(EMPTY.hint, 'desklink-row-detail'))));
+        const pair = textButton(EMPTY.button, () => invoke('', 'open'), 'desklink-primary');
+        pair.x_expand = false;
+        pair.x_align = Clutter.ActorAlign.START;
+        empty.add_child(pair);
+        menu.addMenuItem(row(empty, 'desklink-inset-row'));
         return;
     }
 
@@ -667,16 +680,23 @@ export function fillMenu(menu, ctx) {
             // Phones: one chip each, the shown one checked.
             const chips = box({style_class: 'desklink-chips'});
             for (const device of devices) {
+                const state = chipState(device);
                 const phoneChip = new St.Button({
                     style_class: `button desklink-chip ${variant}`,
                     toggle_mode: true,
                     checked: device.id === selected.id,
                     can_focus: true,
-                    accessible_name: `${device.name}, ${statusLine(device)}`,
+                    accessible_name: [`${device.name}, ${statusLine(device)}`,
+                        state.unread ? `${state.unread} new` : '', state.live ? 'using this computer' : ''].filter(Boolean).join(', '),
                 });
                 const content = box({style_class: 'desklink-chip-content'});
-                content.add_child(new St.Widget({style_class: `desklink-dot ${device.ready ? 'mint' : ''}`, y_align: Clutter.ActorAlign.CENTER}));
+                const dot = {ready: 'mint', connecting: 'amber', away: ''}[state.state];
+                content.add_child(new St.Widget({style_class: `desklink-dot ${dot}`, y_align: Clutter.ActorAlign.CENTER}));
                 content.add_child(label(device.name, 'desklink-chip-label'));
+                if (state.unread)
+                    content.add_child(label(`${state.unread > 99 ? '99+' : state.unread}`, 'desklink-chip-count'));
+                if (state.live)
+                    content.add_child(new St.Widget({style_class: 'desklink-dot coral', y_align: Clutter.ActorAlign.CENTER}));
                 phoneChip.child = content;
                 phoneChip.connect('clicked', () => ctx.select(device.id));
                 chips.add_child(phoneChip);
@@ -688,7 +708,10 @@ export function fillMenu(menu, ctx) {
             // Not connected (the header says since when): a way to try again.
             const card = box({style_class: `desklink-card ${variant}`});
             card.add_child(new St.Icon({icon_name: 'network-offline-symbolic', style_class: 'desklink-row-icon', y_align: Clutter.ActorAlign.CENTER}));
-            card.add_child(label(selected.reachable ? 'Connecting…' : 'Not connected', 'desklink-row-title', {x_expand: true}));
+            const words = column();
+            words.add_child(label(selected.reachable ? 'Connecting…' : 'Not connected', 'desklink-row-title'));
+            words.add_child(wrapped(dim(label(offlineHint(selected), 'desklink-row-detail'))));
+            card.add_child(words);
             card.add_child(can(selected, 'try-again')
                 ? textButton('Try again', () => invoke(selected.id, 'try-again'))
                 : textButton('Reconnect', () => invoke('', 'reconnect')));
@@ -734,18 +757,16 @@ export function fillMenu(menu, ctx) {
             break;
         }
         case 'tiles': {
-            // Six quick actions, three pills to a row, all the same width.
+            // The four quick actions, one row of large tiles, all the same width.
             const grid = column({style_class: 'desklink-grid'});
             const tiles = quickTiles(selected).map(entry => tile(entry.icon, entry.label, {
                 variant, name: entry.name, enabled: entry.enabled,
                 onClick: () => invoke(selected.id, entry.action),
             }));
-            for (let i = 0; i < tiles.length; i += 3) {
-                const line = box({style_class: 'desklink-grid-row'});
-                line.layout_manager.homogeneous = true;
-                tiles.slice(i, i + 3).forEach(t => line.add_child(t));
-                grid.add_child(line);
-            }
+            const line = box({style_class: 'desklink-grid-row'});
+            line.layout_manager.homogeneous = true;
+            tiles.forEach(t => line.add_child(t));
+            grid.add_child(line);
             body.addMenuItem(row(grid));
             break;
         }

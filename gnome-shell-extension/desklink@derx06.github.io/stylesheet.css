@@ -34,6 +34,11 @@
   background-color: #e5533d;
 }
 
+.desklink-live-dot.accent, .desklink-indicator-dot.accent {
+  background-color: #3584e4;
+  background-color: -st-accent-color;
+}
+
 .desklink-pill-label {
   margin-left: 8px;
 }
@@ -80,6 +85,9 @@
 }
 .desklink-dot.mint { background-color: #2fbf8f; }
 .desklink-dot.coral { background-color: #e5533d; }
+.desklink-dot.amber { background-color: #e5a50a; }
+.desklink-chip-count { font-size: 0.82em; font-weight: bold; }
+.button.desklink-primary { background-color: #3584e4; color: #ffffff; background-color: -st-accent-color; color: -st-accent-fg-color; }
 
 /* As tall as the name beside it: a taller ring pushes the line under the name away. */
 .desklink-battery { width: 28px; height: 28px; margin-left: 6px; }
@@ -98,7 +106,7 @@
 .desklink-line { spacing: 6px; }
 .desklink-row-title { font-weight: bold; }
 .desklink-row-detail { font-size: 0.86em; }
-.desklink-empty { padding: 12px 0; }
+.desklink-empty { spacing: 6px; padding: 6px 0; }
 /* Unpair: a red icon (3:1 or more on the menu), the words in the menu's colour. */
 .desklink-danger .popup-menu-icon { color: #ff938c; }
 .desklink-light.desklink-danger .popup-menu-icon { color: #c01c28; }
@@ -180,18 +188,17 @@
 .button.desklink-pill-button { padding: 4px 12px; min-height: 0; border-radius: 999px; }
 .desklink-live { border: 1px solid rgba(229, 83, 61, 0.45); }
 
-/* The quick actions: pills like the Quick Settings toggles, three to a row. */
+/* The quick actions: four large tiles, an icon over a short label. */
 .desklink-grid { spacing: 6px; }
 .desklink-grid-row { spacing: 6px; }
 .button.desklink-tile {
-  border-radius: 999px;
+  border-radius: 16px;
   min-height: 1.3em;
-  /* Narrow sides: "Clipboard" was cut at 200 % with 10 px. */
-  padding: 8px 6px;
+  padding: 10px 4px;
 }
-.desklink-tile-content { spacing: 6px; }
-.desklink-tile-icon { icon-size: 16px; }
-.desklink-tile-label { font-size: 0.9em; font-weight: bold; }
+.desklink-tile-content { spacing: 4px; }
+.desklink-tile-icon { icon-size: 20px; }
+.desklink-tile-label { font-size: 0.86em; font-weight: bold; }
 
 /* The music: one row; the title opens the timeline. */
 .desklink-media { spacing: 6px; }
