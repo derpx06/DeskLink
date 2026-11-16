@@ -100,6 +100,8 @@ mod terminal_previews;
 #[cfg(test)]
 mod test_display;
 #[cfg(test)]
+mod test_env;
+#[cfg(test)]
 mod test_privileges;
 mod theme_hint;
 mod thumbnails;
