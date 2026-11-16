@@ -610,8 +610,34 @@ fn a_stopped_view_is_shown_again_on_the_same_pad() {
         attach_incoming_video(&pipeline, &source_pad).unwrap(),
     );
     clear_stream("phone-again");
+    let asked = Arc::new(AtomicU64::new(0));
+    let counter = Arc::clone(&asked);
+    // Seen where the request leaves the source upstream (towards the sender).
+    source.static_pad("sink").unwrap().add_probe(
+        gst::PadProbeType::EVENT_UPSTREAM,
+        move |_, info| {
+            if let Some(gst::PadProbeData::Event(event)) = &info.data {
+                if event
+                    .structure()
+                    .is_some_and(|s| s.name() == "GstForceKeyUnit")
+                {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            gst::PadProbeReturn::Ok
+        },
+    );
 
+    // Live, as webrtcbin's pad is (a pad of a stopped element refuses events).
+    pipeline.set_state(gst::State::Playing).unwrap();
     assert!(resume_parked("phone-again"));
+    // The phone's encoder carries on from the first view: without a
+    // keyframe the new decoder showed nothing for ~0.5-0.7 s (emulator).
+    assert_eq!(
+        asked.load(Ordering::Relaxed),
+        1,
+        "a keyframe is asked for at once"
+    );
     assert!(stream_for("phone-again").is_some());
     assert_eq!(
         pipeline.children().len(),
@@ -622,6 +648,7 @@ fn a_stopped_view_is_shown_again_on_the_same_pad() {
     assert!(!resume_parked("phone-again"), "nothing parked any more");
     clear_stream("phone-again");
     forget_parked("phone-again");
+    pipeline.set_state(gst::State::Null).unwrap();
 }
 
 #[test]

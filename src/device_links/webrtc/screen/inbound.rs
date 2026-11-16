@@ -174,6 +174,12 @@ pub(crate) fn resume_parked(device_id: &str) -> bool {
     });
     match attached {
         Ok(stream) => {
+            // The phone's encoder carries on from the first view and sends
+            // delta frames the new decoder cannot start from. Asked now, the
+            // picture comes with the next frame; left to the decoder it took
+            // 0.2-0.5 s more on the emulator (a fresh decoder asks only once
+            // it has failed to decode). One request per reshare.
+            stream.request_keyframe();
             publish_stream(device_id, stream);
             true
         }
@@ -213,7 +219,6 @@ impl ScreenStream {
 
     /// Asks the sender for a keyframe the way a decoder does (an upstream
     /// `GstForceKeyUnit`, which the RTP session turns into a PLI).
-    #[cfg(test)]
     pub(crate) fn request_keyframe(&self) -> bool {
         self.inner
             .source_pad
