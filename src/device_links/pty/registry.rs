@@ -180,7 +180,13 @@ impl TerminalRegistry {
         let idle: Vec<String> = self
             .sessions
             .iter()
-            .filter(|(id, session)| !attached.contains(*id) && session.idle_for() >= idle_for)
+            // A window at the desk is a client too: a quiet editor left open
+            // over a weekend is not forgotten.
+            .filter(|(id, session)| {
+                !attached.contains(*id)
+                    && !session.has_desk_window()
+                    && session.idle_for() >= idle_for
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in &idle {
@@ -554,6 +560,24 @@ mod tests {
         assert_eq!(closed, vec![forgotten.id]);
         assert!(registry.get(&watched.id).is_some());
         registry.close(&watched.id);
+    }
+
+    #[test]
+    fn a_session_shown_at_the_desk_is_not_closed_as_idle() {
+        let mut registry = TerminalRegistry::new();
+        let shown = registry
+            .create(Some(sleeping_command()), 24, 80, "phone-1")
+            .unwrap();
+        let session = registry.get(&shown.id).unwrap();
+        let window = session.desk_window_opened();
+        assert!(registry
+            .reap_idle(&HashSet::new(), Duration::ZERO)
+            .is_empty());
+        session.desk_window_closed(window);
+        assert_eq!(
+            registry.reap_idle(&HashSet::new(), Duration::ZERO),
+            vec![shown.id]
+        );
     }
 
     #[test]
