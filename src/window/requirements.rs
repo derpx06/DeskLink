@@ -264,7 +264,12 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
     let mut needs = Vec::new();
     let copy = |check: &Check| facts.install(check).map_or(Fix::None, Fix::Copy);
 
-    if !facts.start_at_login {
+    // Not where the desktop starts nothing at login (sway, Hyprland, i3):
+    // Settings says what to add to the compositor's config instead.
+    let autostart_works = facts
+        .check("autostart")
+        .is_none_or(|check| check.level == Level::Ok);
+    if !facts.start_at_login && autostart_works {
         needs.push(Need {
             id: "start-at-login",
             on_phone: false,
@@ -1402,6 +1407,24 @@ mod tests {
             "{:?}",
             missing(&complete())
         );
+    }
+
+    /// sway, Hyprland, i3: the compositor reads no XDG autostart entry, so
+    /// "Turn on" would write one nothing starts (the Settings row says what
+    /// to add to the compositor's config instead).
+    #[test]
+    fn start_at_login_is_not_offered_where_the_desktop_starts_nothing() {
+        let mut facts = complete();
+        facts.start_at_login = false;
+        assert!(ids(&missing(&facts)).contains(&"start-at-login"));
+        for check in facts
+            .checks
+            .iter_mut()
+            .filter(|check| check.id == "autostart")
+        {
+            check.level = Level::Limited;
+        }
+        assert!(!ids(&missing(&facts)).contains(&"start-at-login"));
     }
 
     /// Every missing piece, in order, each with what it unlocks and its one
