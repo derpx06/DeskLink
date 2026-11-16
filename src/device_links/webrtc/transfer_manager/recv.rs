@@ -460,6 +460,13 @@ impl Engine {
         let Some(key) = id_bytes(&id) else {
             return;
         };
+        // Cancelled here while the phone was away: the phone is told now.
+        if super::store::cancelled_while_away(&net.wire.peer_device_id, &id) {
+            let mut cancel = net.msg(FileAction::Cancel, &id, &token);
+            cancel.code = Some(code::USER.to_string());
+            net.send(cancel);
+            return;
+        }
         let folder = message.folder_ref();
         // F8: only a file folder sync asked for, for this phone's pair.
         if let Some(reference) = &folder {

@@ -571,6 +571,9 @@ impl DaemonWorker {
             // Paused or offline: there is no one to tell, and the row must
             // still go (it used to stay for ever, with a raw error) (I7).
             debug_log!("[Daemon] Cancelled locally, the phone was not told: {error}");
+            // Its records go too: a stored send was offered again at the next
+            // connection, and a part resumed by the phone's re-offer.
+            crate::device_links::webrtc::transfer_manager::forget_transfer(device_id, transfer_id);
             crate::device_links::webrtc::transfer_board::finish(
                 transfer_id,
                 crate::device_links::webrtc::transfer_board::Outcome::Cancelled,

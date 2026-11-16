@@ -73,6 +73,7 @@ mod tests {
         const FORGOTTEN: &[&str] = &[
             "device_links/sync.rs:STATE",
             "device_links/mpris.rs:ART_SENT",
+            "device_links/webrtc/transfer_manager/store.rs:CANCELLED",
             "device_links/features/registry.rs:PROFILES",
             "device_links/webrtc/remote_session/mod.rs:SESSIONS",
             "device_links/webrtc/screen/inbound.rs:STREAMS",

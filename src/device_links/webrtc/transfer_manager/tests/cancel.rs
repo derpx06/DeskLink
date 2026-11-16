@@ -115,3 +115,21 @@ fn a_bucket_item_removed_while_it_moves_is_cancelled_as_removed() {
     let cancel = rig.ab.sent(FileAction::Cancel).remove(0);
     assert_eq!(cancel.code.as_deref(), Some("removed"));
 }
+
+/// Cancelled while the phone is away (the engine is detached, no one to
+/// tell): remembered, so the phone's re-offer at the next connection is
+/// refused instead of starting it again.
+#[test]
+fn a_cancel_while_detached_is_remembered_for_the_re_offer() {
+    let rig = Rig::new("cancel-away");
+    let source = rig.source("f.bin", &payload(6 * BLOCK_BYTES as usize, 24));
+    let id = rig.a().start_send(&source).unwrap();
+    eventually("some blocks", || {
+        (!rig.ba.sent(FileAction::BlockAck).is_empty()).then_some(())
+    });
+    rig.a().detach();
+    rig.a().cancel_transfer(&id, code::USER).unwrap();
+    assert!(
+        crate::device_links::webrtc::transfer_manager::store::cancelled_while_away(&rig.ids.1, &id)
+    );
+}

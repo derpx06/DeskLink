@@ -45,7 +45,7 @@ use recv::Incoming;
 use send::Outgoing;
 use store::Store;
 
-pub(crate) use store::{forget_device, install_state_dir};
+pub(crate) use store::{forget_device, forget_transfer, install_state_dir};
 
 /// The largest clipboard image accepted or sent (contract C3).
 pub const MAX_CLIPBOARD_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
@@ -532,6 +532,7 @@ impl WebRtcTransferManager {
             link_down_until: None,
             faults: Faults::default(),
             closed: std::collections::VecDeque::new(),
+            last_peer: None,
         };
         let (root, ended) = (retire.0.clone(), Arc::clone(&retire.1));
         let thread = std::thread::Builder::new()
@@ -793,6 +794,9 @@ struct Engine {
     /// Transfers that ended or were refused lately, and how: what a frame
     /// that belongs to none is told apart by (the last 64).
     closed: std::collections::VecDeque<([u8; 16], &'static str)>,
+    /// The phone this engine last served: a cancel while it is away is
+    /// remembered under its id, so its re-offer is refused.
+    last_peer: Option<String>,
 }
 
 impl Engine {
@@ -888,6 +892,7 @@ impl Engine {
     fn handle(&mut self, command: Cmd) {
         crate::guard("file transfer", (), || match command {
             Cmd::Attach(wire, link) => {
+                self.last_peer = Some(wire.peer_device_id.clone());
                 self.net = Some(Arc::new(Net { link, wire }));
             }
             Cmd::Detach => {
@@ -1103,17 +1108,21 @@ impl Engine {
 
     /// The user's (or the Bucket's) cancel.
     fn cancel(&mut self, id: &str, why: &'static str) -> Result<(), String> {
-        let tell = |net: &Option<Arc<Net>>, token: &str| {
-            if let Some(net) = net {
+        // No one to tell (the phone is away): a tombstone instead, or the
+        // phone's re-offer at the next connection started it again.
+        let tell = |net: &Option<Arc<Net>>, peer: &Option<String>, token: &str| match (net, peer) {
+            (Some(net), _) => {
                 let mut message = net.msg(FileAction::Cancel, id, token);
                 message.code = Some(why.to_string());
                 net.send(message);
             }
+            (None, Some(peer)) => store::remember_cancelled(peer, id),
+            (None, None) => {}
         };
         if let Some(key) = id_bytes(id) {
             if let Some(incoming) = self.incoming.remove(&key) {
                 self.note_closed(key, "cancelled here");
-                tell(&self.net, &incoming.token);
+                tell(&self.net, &self.last_peer, &incoming.token);
                 incoming.discard(&self.store);
                 board::finish(id, Outcome::Cancelled);
                 return Ok(());
@@ -1124,7 +1133,7 @@ impl Engine {
             // A send that never left the queue was never offered: no one to
             // tell.
             if outgoing.was_offered() {
-                tell(&self.net, &outgoing.token);
+                tell(&self.net, &self.last_peer, &outgoing.token);
             }
             outgoing.discard(&self.store);
             board::finish(id, Outcome::Cancelled);

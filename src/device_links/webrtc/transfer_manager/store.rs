@@ -650,6 +650,9 @@ pub(super) fn register_engine(peer: &str, flag: &std::sync::Arc<std::sync::atomi
 /// not write it back. A phone paired again later gets a new engine, which this
 /// never touches.
 pub(crate) fn forget_device(device_id: &str) {
+    if let Ok(mut cancelled) = cancelled_away().lock() {
+        cancelled.retain(|(device, _)| device != device_id);
+    }
     // The engines first: whatever they write before they notice is removed by
     // the purge below, or by their own purge once they do.
     if let Ok(engines) = engines().lock() {
@@ -667,6 +670,93 @@ pub(crate) fn forget_device(device_id: &str) {
         .unwrap_or_default();
     for root in roots {
         purge_device(&root, device_id);
+    }
+}
+
+/// Transfers cancelled while their phone was away, so a re-offer of one is
+/// refused. In memory: a restart forgets them.
+// ponytail: process-lifetime set (cap 256); a tombstone file if a re-offer after a restart matters.
+// Spelled out (not an alias): peers.rs's store-list test finds device-keyed stores by their type.
+#[allow(clippy::type_complexity)]
+fn cancelled_away() -> &'static std::sync::Mutex<std::collections::HashSet<(String, String)>> {
+    static CANCELLED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<(String, String)>>,
+    > = std::sync::OnceLock::new();
+    CANCELLED.get_or_init(Default::default)
+}
+
+/// `transfer_id` of `device_id` was cancelled while the phone was away (no
+/// engine held it to tell the phone): its records go now, or a send was
+/// offered again at the next connection and a part resumed, and a re-offer
+/// of it is refused ([`cancelled_while_away`]).
+pub(crate) fn forget_transfer(device_id: &str, transfer_id: &str) {
+    if super::super::file_protocol::id_bytes(transfer_id).is_none() {
+        return;
+    }
+    remember_cancelled(device_id, transfer_id);
+    let roots = state_roots()
+        .lock()
+        .map(|roots| roots.clone())
+        .unwrap_or_default();
+    for root in roots {
+        let store = Store {
+            state_root: root.clone(),
+            destination_root: root,
+        };
+        if owned_by::<SendCheckpoint>(&store, &Store::send_name(transfer_id), device_id) {
+            let _ = store.remove_send(transfer_id);
+        }
+        if owned_by::<ReceiveCheckpoint>(&store, &Store::checkpoint_name(transfer_id), device_id) {
+            let _ = store.remove_receive(transfer_id);
+        }
+    }
+}
+
+/// Remembers that `transfer_id` of `device_id` was cancelled while the phone
+/// was away: its re-offer is refused ([`cancelled_while_away`]).
+pub(super) fn remember_cancelled(device_id: &str, transfer_id: &str) {
+    if let Ok(mut cancelled) = cancelled_away().lock() {
+        if cancelled.len() >= 256 {
+            cancelled.clear();
+        }
+        cancelled.insert((device_id.to_string(), transfer_id.to_string()));
+    }
+}
+
+/// Whether `transfer_id` was cancelled here while `device_id` was away.
+pub(super) fn cancelled_while_away(device_id: &str, transfer_id: &str) -> bool {
+    cancelled_away().lock().is_ok_and(|cancelled| {
+        cancelled.contains(&(device_id.to_string(), transfer_id.to_string()))
+    })
+}
+
+/// Whether the record `name` in `store` is `device_id`'s.
+fn owned_by<T: serde::de::DeserializeOwned + RecordOwner>(
+    store: &Store,
+    name: &str,
+    device_id: &str,
+) -> bool {
+    store
+        .read_regular(name)
+        .ok()
+        .flatten()
+        .and_then(|bytes| serde_json::from_slice::<T>(&bytes).ok())
+        .is_some_and(|record| record.owner() == device_id)
+}
+
+trait RecordOwner {
+    fn owner(&self) -> &str;
+}
+
+impl RecordOwner for SendCheckpoint {
+    fn owner(&self) -> &str {
+        &self.device_id
+    }
+}
+
+impl RecordOwner for ReceiveCheckpoint {
+    fn owner(&self) -> &str {
+        &self.device_id
     }
 }
 
@@ -688,23 +778,14 @@ pub(super) fn purge_device(root: &Path, device_id: &str) -> usize {
             continue;
         };
         if let Some(id) = inner.strip_suffix(".send.json") {
-            let owned = store
-                .read_regular(name)
-                .ok()
-                .flatten()
-                .and_then(|bytes| serde_json::from_slice::<SendCheckpoint>(&bytes).ok())
-                .is_some_and(|record| record.device_id == device_id);
-            if owned && store.remove_send(id).is_ok() {
+            if owned_by::<SendCheckpoint>(&store, name, device_id) && store.remove_send(id).is_ok()
+            {
                 gone += 1;
             }
         } else if let Some(id) = inner.strip_suffix(".json") {
-            let owned = store
-                .read_regular(name)
-                .ok()
-                .flatten()
-                .and_then(|bytes| serde_json::from_slice::<ReceiveCheckpoint>(&bytes).ok())
-                .is_some_and(|record| record.device_id == device_id);
-            if owned && store.remove_receive(id).is_ok() {
+            if owned_by::<ReceiveCheckpoint>(&store, name, device_id)
+                && store.remove_receive(id).is_ok()
+            {
                 gone += 1;
             }
         }
@@ -1234,6 +1315,44 @@ mod tests {
         forget_device("tablet");
         assert!(store.load_receive(OTHER).unwrap().is_none());
         assert!(store.stored_sends().is_empty());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// A transfer cancelled while its phone was away: its send record and
+    /// part go (the send was offered again at the next connection), another
+    /// phone's transfer under the same id stays, and a re-offer is refused.
+    #[test]
+    fn a_transfer_cancelled_while_the_phone_is_away_is_not_offered_again() {
+        let (store, base) = store("away");
+        install_state_dir(store.state_root());
+        let device = format!("away-{}", uuid::Uuid::new_v4().simple());
+        let mut held = checkpoint(1);
+        held.device_id = device.clone();
+        store.create_part(&held.transfer_id).unwrap();
+        store.save_receive(&held, &[[3u8; 32]]).unwrap();
+        let send = SendCheckpoint {
+            transfer_id: ID.to_string(),
+            device_id: device.clone(),
+            token: "token".to_string(),
+            filename: "a.txt".to_string(),
+            total_size: 3,
+            mtime: 5,
+            source: PathBuf::from("/home/me/a.txt"),
+            history: true,
+            clipboard_mime: None,
+            folder: None,
+            content_sha256: None,
+            restarts: 0,
+        };
+        store.save_send(&send).unwrap();
+        assert!(!cancelled_while_away(&device, ID));
+        forget_transfer("someone-else", ID);
+        assert_eq!(store.stored_sends().len(), 1, "another phone's id: kept");
+        forget_transfer(&device, ID);
+        assert!(store.stored_sends().is_empty());
+        assert!(store.load_receive(ID).unwrap().is_none());
+        assert!(!store.part_path(ID).unwrap().exists());
+        assert!(cancelled_while_away(&device, ID));
         let _ = fs::remove_dir_all(base);
     }
 
