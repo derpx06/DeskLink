@@ -141,7 +141,7 @@ test('Send copied link waits for a link on the clipboard', () => {
 });
 
 // The same vectors as `only_web_addresses_and_site_names_become_links` in
-// src/window/overview.rs.
+// src/window/overview/tests.rs (`link_to_send` is in overview/links.rs).
 test('only web addresses and site names are links', () => {
     for (const typed of ['https://example.org/a?b=c', 'http://example.org', 'example.org', ' example.org ',
         'www.example.com/path?x=1', 'sub.example.co.uk', 'example.org:8080/x', 'HTTPS://Example.org',
