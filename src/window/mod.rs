@@ -81,6 +81,7 @@ use crate::device_links::features::FeatureRegistry;
 use crate::device_links::webrtc::transfer_board::{Finished, Outcome};
 
 mod blocks;
+#[cfg(debug_assertions)]
 mod debug_verbs;
 mod imp;
 mod navigation;
@@ -88,6 +89,7 @@ mod notices;
 mod refresh;
 mod words;
 use blocks::*;
+#[cfg(debug_assertions)]
 use debug_verbs::*;
 use words::*;
 
