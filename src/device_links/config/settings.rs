@@ -192,7 +192,7 @@ impl AppSettings {
 
     /// Whether screenshots and photos from `device_id` are accepted (W12).
     pub fn accepts_gallery_from(&self, device_id: &str) -> bool {
-        self.gallery_devices.contains(device_id)
+        self.gallery_devices.contains(device_id) || gallery_forced_for_tests(device_id)
     }
 
     /// Whether Do Not Disturb is shared with `device_id` (W14).
@@ -237,14 +237,31 @@ pub fn app_settings() -> AppSettings {
         .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
 }
 
-/// Tests: turns photos from `device_id` on or off in the process-wide view.
+/// Tests: devices a test turned photos on for. Kept apart from the settings
+/// mirror: any other test loading or saving settings replaces the mirror (the
+/// flaky `a_gallery_image_is_refused_unless_turned_on...`).
+#[cfg(test)]
+static GALLERY_FOR_TESTS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn gallery_forced_for_tests(device_id: &str) -> bool {
+    GALLERY_FOR_TESTS
+        .lock()
+        .is_ok_and(|on| on.iter().any(|id| id == device_id))
+}
+
+#[cfg(not(test))]
+fn gallery_forced_for_tests(_device_id: &str) -> bool {
+    false
+}
+
+/// Tests: turns photos from `device_id` on or off, whatever the settings say.
 #[cfg(test)]
 pub(crate) fn set_gallery_for_tests(device_id: &str, on: bool) {
-    if let Ok(mut mirror) = settings_mirror().lock() {
+    if let Ok(mut forced) = GALLERY_FOR_TESTS.lock() {
+        forced.retain(|id| id != device_id);
         if on {
-            mirror.gallery_devices.insert(device_id.to_string());
-        } else {
-            mirror.gallery_devices.remove(device_id);
+            forced.push(device_id.to_string());
         }
     }
 }

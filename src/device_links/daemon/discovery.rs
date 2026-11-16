@@ -166,6 +166,13 @@ pub(super) fn persist_paired_endpoint(
         return;
     };
     note_address(device_id, ip);
+    // Tests share one endpoints file per process and prune it to the paired
+    // set they give: a handshake test's own set erased the discovery tests'
+    // entries mid-run (the flaky `concurrent_persist_and_unpersist...`).
+    // Those call `persist_endpoint` themselves; a handshake writes nothing.
+    if cfg!(test) {
+        return;
+    }
     let device_id = device_id.to_string();
     let _ = thread::Builder::new()
         .name("desklink-endpoints".into())
