@@ -517,7 +517,20 @@ pub(crate) fn set_clipboard_text_from_remote(content: &str) {
                 .lock()
                 .is_ok_and(|last| *last == content)
         };
-        if !latest() || set_x11(&content, &latest) {
+        if !latest() {
+            return;
+        }
+        // Where the Wayland clipboard is read (Plasma, sway, Hyprland...), it
+        // is written first too: wlroots hands Xwayland's selection to Wayland
+        // apps only while an X11 window has focus, so on sway a phone's copy
+        // set through X11 never reached foot or any Wayland app.
+        if !cfg!(test)
+            && WAYLAND_READ.load(Ordering::Acquire)
+            && pipe_to_copier("wl-copy", WL_COPY_ARGS, &content)
+        {
+            return;
+        }
+        if set_x11(&content, &latest) {
             return;
         }
         // A Wayland-only compositor (no XWayland): wl-clipboard's `wl-copy`
