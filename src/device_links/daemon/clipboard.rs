@@ -232,10 +232,8 @@ fn clipboard_targets() -> Option<Vec<String>> {
     None
 }
 
-/// When a phone's copy last arrived, and when the desk's own clipboard last
-/// changed (Unix milliseconds; 0 never).
+/// When a phone's copy last arrived (Unix milliseconds; 0 never).
 static REMOTE_AT: AtomicU64 = AtomicU64::new(0);
-static LOCAL_CHANGED_AT: AtomicU64 = AtomicU64::new(0);
 
 /// How long a phone's copy may take to land on this clipboard. Text first
 /// seen here before that is older than the phone's copy and is never sent
@@ -256,11 +254,43 @@ fn superseded(seen_ms: u64, remote_ms: u64) -> bool {
     remote_ms != 0 && seen_ms < remote_ms.saturating_add(SETTLE_MS)
 }
 
-/// `clipboard.connect` (sent on every connection) is the phone's clipboard
-/// as of `timestamp`; it replaces the desk's only when newer than the desk's
-/// own last change. An unknown time (absent or 0) never does.
-fn connect_is_newer(timestamp: Option<u64>, local_changed_ms: u64) -> bool {
-    timestamp.is_some_and(|at| at > 0 && at > local_changed_ms)
+/// Whether this computer's clipboard holds nothing at all (no text, no
+/// image, nothing else); false whenever that cannot be told. What a phone's
+/// `clipboard.connect` may fill.
+#[cfg(not(test))]
+fn clipboard_is_empty() -> bool {
+    if WAYLAND_READ.load(Ordering::Acquire) {
+        let Ok(output) = std::process::Command::new("timeout")
+            .args(["2", "wl-paste", "--list-types"])
+            .stdin(std::process::Stdio::null())
+            .output()
+        else {
+            return false;
+        };
+        return if output.status.success() {
+            output.stdout.iter().all(u8::is_ascii_whitespace)
+        } else {
+            String::from_utf8_lossy(&output.stderr).contains("Nothing is copied")
+        };
+    }
+    clipboard_targets().is_some_and(|targets| {
+        targets.iter().all(|target| {
+            matches!(
+                target.as_str(),
+                "TARGETS" | "TIMESTAMP" | "MULTIPLE" | "SAVE_TARGETS"
+            )
+        })
+    })
+}
+
+/// Tests: whether the clipboard counts as empty (never the real one).
+#[cfg(test)]
+static TEST_CLIPBOARD_EMPTY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn clipboard_is_empty() -> bool {
+    TEST_CLIPBOARD_EMPTY.load(Ordering::Acquire)
 }
 
 /// A phone's `desklink.clipboard` / `desklink.clipboard.connect` packet,
@@ -330,6 +360,13 @@ const CLOCK_SKEW_MS: u64 = 10_000;
 /// (not a placement from a phone): what a phone's `copiedAt` is ordered by.
 static LOCAL_COPY_AT: AtomicU64 = AtomicU64::new(0);
 
+/// DeskLink started at `now`: what the clipboard held then is as new as that
+/// (its real time is unknown), so a phone's plain copy made before the start
+/// never replaces it.
+fn note_started(now: u64) {
+    let _ = LOCAL_COPY_AT.compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+}
+
 /// [`clipboard_from_phone`] with the phone's `copiedAt` (when it said): the
 /// time the phone's copy was made, which orders it against the copies made
 /// here. Absent (an older phone), a plain copy is news, as before.
@@ -358,14 +395,18 @@ pub(super) fn clipboard_from_phone_at(
                 return "ignored: older than a copy made at this computer";
             }
         }
-        // The phone's clipboard as of connecting: it replaces this one only
-        // when it differs and is newer than this computer's last change.
-        Some(timestamp) => {
+        // The phone's clipboard as of connecting only ever fills an empty
+        // clipboard here, whatever it says about its time: a desk that had
+        // just started (no time of its own) and a phone that stamps the time
+        // it read its clipboard (builds before 1.3) put the phone's old copy
+        // over the laptop's on every restart. A copy made on the phone while
+        // the desk was off is sent again from the phone ("Send clipboard").
+        Some(_) => {
             if current_text().is_some_and(|current| current == content) {
                 return "unchanged";
             }
-            if !connect_is_newer(timestamp, LOCAL_CHANGED_AT.load(Ordering::Acquire)) {
-                return "ignored: older than this computer's clipboard";
+            if current_text().is_some_and(|current| !current.is_empty()) || !clipboard_is_empty() {
+                return "ignored: this computer's clipboard is not empty";
             }
         }
     }
@@ -497,7 +538,6 @@ fn forget_examined(examined: &mut Option<(String, bool, u64)>, current: &str) {
 /// while a DeskLink window has focus.
 pub(crate) fn set_clipboard_text_from_remote(content: &str) {
     REMOTE_AT.store(now_ms(), Ordering::Release);
-    LOCAL_CHANGED_AT.store(now_ms(), Ordering::Release);
     if let Ok(mut placed) = PLACED.lock() {
         *placed = (content.to_string(), now_ms());
     }
@@ -812,7 +852,6 @@ pub(crate) static TEST_PLACED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 #[cfg(not(test))]
 fn place_image(png: &[u8]) {
     REMOTE_AT.store(now_ms(), Ordering::Release);
-    LOCAL_CHANGED_AT.store(now_ms(), Ordering::Release);
     debug_log!("[Clipboard] Image from the phone: {} bytes", png.len());
     let png = png.to_vec();
     thread::spawn(move || {
@@ -872,6 +911,7 @@ impl DaemonWorker {
         if !is_webrtc_feature(PACKET_TYPE_CLIPBOARD) {
             return;
         }
+        note_started(now_ms());
         let sessions = Arc::clone(&self.sessions);
         let shutdown = Arc::clone(&self.shutdown);
         let errors = Arc::clone(&self.errors);
@@ -990,7 +1030,6 @@ impl DaemonWorker {
                         remember(&current_text, None);
                     }
                     if !superseded(seen, REMOTE_AT.load(Ordering::Acquire)) {
-                        LOCAL_CHANGED_AT.store(seen, Ordering::Release);
                         LOCAL_COPY_AT.store(seen, Ordering::Release);
                     }
                     examined = Some((current_text.clone(), secret, seen));
@@ -1289,18 +1328,6 @@ mod tests {
     }
 
     #[test]
-    fn a_reconnect_replaces_the_desk_clipboard_only_with_a_newer_copy() {
-        assert!(connect_is_newer(Some(2_000), 1_000));
-        assert!(
-            !connect_is_newer(Some(1_000), 2_000),
-            "the desk copied since"
-        );
-        assert!(!connect_is_newer(Some(0), 0), "unknown time");
-        assert!(!connect_is_newer(None, 0));
-        assert!(connect_is_newer(Some(1), 0), "nothing copied here yet");
-    }
-
-    #[test]
     fn images_round_trip_through_png_and_large_ones_are_scaled() {
         let rgba: Vec<u8> = (0..4 * 3 * 2).map(|n| n as u8).collect();
         let png = rgba_to_png(3, 2, rgba.clone()).unwrap();
@@ -1384,10 +1411,11 @@ mod tests {
         assert_eq!(history()[0].from.as_deref(), Some("Pixel"));
     }
 
-    /// `clipboard.connect` replaces the computer's clipboard only when it
-    /// differs from what is there and is newer than this computer's change.
+    /// `clipboard.connect` only fills an empty clipboard: it never replaces
+    /// what the computer holds, however new it says it is (a desk that had
+    /// just started put the owner's phone's old copy over the laptop's).
     #[test]
-    fn a_connect_snapshot_is_placed_only_when_different_and_newer() {
+    fn a_connect_snapshot_only_fills_an_empty_clipboard() {
         let _globals = clipboard_globals();
         let text = format!("connect-{}", uuid::Uuid::new_v4().simple());
         note_current(&text);
@@ -1396,21 +1424,62 @@ mod tests {
             "unchanged",
             "already the clipboard"
         );
+        // Different text, the desk holds something: never placed, even
+        // stamped long after the desk's last change.
         note_current("something else");
-        LOCAL_CHANGED_AT.store(now_ms(), Ordering::Release);
-        assert_eq!(
-            clipboard_from_phone(&text, "Pixel", Some(Some(1))),
-            "ignored: older than this computer's clipboard"
-        );
-        assert_eq!(
-            clipboard_from_phone(&text, "Pixel", Some(None)),
-            "ignored: older than this computer's clipboard",
-            "an unknown time never replaces"
-        );
         assert_eq!(
             clipboard_from_phone(&text, "Pixel", Some(Some(now_ms() + 60_000))),
+            "ignored: this computer's clipboard is not empty"
+        );
+        // A desk just restarted (nothing seen yet) holding anything the
+        // probe sees, and an old phone build stamping the time it read its
+        // clipboard (after the restart): not placed.
+        if let Ok(mut current) = CURRENT.lock() {
+            *current = None;
+        }
+        TEST_CLIPBOARD_EMPTY.store(false, Ordering::Release);
+        assert_eq!(
+            clipboard_from_phone(&text, "Pixel", Some(Some(now_ms()))),
+            "ignored: this computer's clipboard is not empty"
+        );
+        // Nothing at all on the clipboard: filled.
+        TEST_CLIPBOARD_EMPTY.store(true, Ordering::Release);
+        assert_eq!(
+            clipboard_from_phone(&text, "Pixel", Some(None)),
             "placed on the clipboard"
         );
+        TEST_CLIPBOARD_EMPTY.store(false, Ordering::Release);
+    }
+
+    /// A copy made on the phone while connected (a plain packet) is still
+    /// placed over what the computer holds; one copied before DeskLink
+    /// started is not.
+    #[test]
+    fn a_live_copy_is_placed_but_not_one_made_before_the_desk_started() {
+        let _globals = clipboard_globals();
+        note_current("what the desk holds");
+        LOCAL_COPY_AT.store(0, Ordering::Release);
+        let started = now_ms();
+        note_started(started);
+        assert_eq!(
+            clipboard_from_phone_at(
+                &format!("live-{}", uuid::Uuid::new_v4().simple()),
+                "Pixel",
+                None,
+                Some(started + 1_000)
+            ),
+            "placed on the clipboard"
+        );
+        assert_eq!(
+            clipboard_from_phone_at(
+                &format!("before-{}", uuid::Uuid::new_v4().simple()),
+                "Pixel",
+                None,
+                Some(started - 60_000)
+            ),
+            "ignored: older than a copy made at this computer"
+        );
+        LOCAL_COPY_AT.store(0, Ordering::Release);
     }
 
     /// W11: a plain copy that carries `copiedAt` is ordered by it against the
@@ -1507,21 +1576,25 @@ mod tests {
                 }
                 note_current("what the desk holds");
                 LOCAL_COPY_AT.store(now.saturating_sub(desk_copy_ago_ms), Ordering::Release);
-                LOCAL_CHANGED_AT.store(now.saturating_sub(desk_copy_ago_ms), Ordering::Release);
             };
             if kind == "desklink.clipboard.connect" {
+                // Never over what the desk holds, however new; fills an empty one.
                 reset(60_000);
                 assert_eq!(
                     apply_phone_packet(&packet, "Pixel"),
-                    Ok("placed on the clipboard"),
-                    "{name}: newer than the desk's last change"
+                    Ok("ignored: this computer's clipboard is not empty"),
+                    "{name}: the desk holds something"
                 );
-                reset(10_000);
+                if let Ok(mut current) = CURRENT.lock() {
+                    *current = None;
+                }
+                TEST_CLIPBOARD_EMPTY.store(true, Ordering::Release);
                 assert_eq!(
                     apply_phone_packet(&packet, "Pixel"),
-                    Ok("ignored: older than this computer's clipboard"),
-                    "{name}: older than the desk's last change"
+                    Ok("placed on the clipboard"),
+                    "{name}: an empty clipboard"
                 );
+                TEST_CLIPBOARD_EMPTY.store(false, Ordering::Release);
                 continue;
             }
             // The desk copied just now: a phone copy made 5 s earlier is
