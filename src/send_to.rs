@@ -891,6 +891,65 @@ pub(crate) fn open_with_types(
         .collect()
 }
 
+/// The applications the `mimeapps.list` and `defaults.list` texts `lists`
+/// name as `mime`'s default, in order.
+pub(crate) fn pinned_defaults(lists: &[String], mime: &str) -> Vec<String> {
+    let mut named = Vec::new();
+    for text in lists {
+        let mut defaults = false;
+        for line in text.lines().map(str::trim) {
+            if line.starts_with('[') {
+                defaults = line == "[Default Applications]";
+            } else if let Some((key, value)) = line.split_once('=').filter(|_| defaults) {
+                if key.trim() == mime {
+                    named.extend(
+                        value
+                            .split(';')
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty())
+                            .map(String::from),
+                    );
+                }
+            }
+        }
+    }
+    named
+}
+
+/// Every `mimeapps.list` (desktop-specific first) and `defaults.list` GIO
+/// reads for defaults: the config directories, then each data directory's
+/// `applications`.
+fn default_lists() -> Vec<String> {
+    let desktops: Vec<String> = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|name| !name.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+    let names = |legacy: bool| {
+        let mut names: Vec<String> = desktops
+            .iter()
+            .map(|d| format!("{d}-mimeapps.list"))
+            .collect();
+        names.push("mimeapps.list".into());
+        if legacy {
+            names.push("defaults.list".into());
+        }
+        names
+    };
+    let config = std::iter::once(glib::user_config_dir())
+        .chain(glib::system_config_dirs())
+        .flat_map(|dir| names(false).into_iter().map(move |name| dir.join(name)));
+    let data = std::iter::once(glib::user_data_dir())
+        .chain(glib::system_data_dirs())
+        .map(|dir| dir.join("applications"))
+        .flat_map(|dir| names(true).into_iter().map(move |name| dir.join(name)));
+    config
+        .chain(data)
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .collect()
+}
+
 /// An "Open With" helper entry offered for `types`.
 fn open_with_helper(name: &str, comment: &str, exe: &Path, flag: &str, types: &[String]) -> String {
     let exe = desktop_exec_quoted(exe);
@@ -1086,10 +1145,17 @@ pub fn start(app: &DesklinkApplication) {
     // Off the UI thread: file IO, the MIME database and a child process.
     let (open_data, open_config, open_exe) = (data.clone(), glib::user_config_dir(), exe.clone());
     std::thread::spawn(move || {
+        // Only a default some mimeapps.list pins. One that is merely the
+        // first application found (Debian's Plasma, Xfce and others ship no
+        // defaults) loses to anything in ~/.local/share/applications, which
+        // is where these entries go: listing the type made DeskLink's
+        // Bucket the default for text, images and PDFs there.
+        let lists = default_lists();
         let default_for_type = |mime: &str| {
             gio::AppInfo::default_for_type(mime, false)
                 .and_then(|app| app.id())
                 .map(|id| id.to_string())
+                .filter(|id| pinned_defaults(&lists, mime).contains(id))
         };
         if refresh_open_with(&open_data, &open_config, &open_exe, default_for_type) {
             update_desktop_database(&open_data.join("applications"));
@@ -1609,6 +1675,23 @@ mod tests {
             defaults(&[("application/octet-stream", "gedit.desktop")])
         )
         .is_empty());
+    }
+
+    #[test]
+    fn only_a_default_some_mimeapps_list_names_counts() {
+        let lists = vec![
+            "[Added Associations]\ntext/plain=gedit.desktop;\n".to_string(),
+            "# Ubuntu\n[Default Applications]\nimage/png = loupe.desktop;eog.desktop;\napplication/pdf=\n".to_string(),
+            "[Default Applications]\nimage/png=org.gnome.Loupe.desktop\n".to_string(),
+        ];
+        assert_eq!(
+            pinned_defaults(&lists, "image/png"),
+            ["loupe.desktop", "eog.desktop", "org.gnome.Loupe.desktop"]
+        );
+        // An association is not a default, an empty value names nothing.
+        assert!(pinned_defaults(&lists, "text/plain").is_empty());
+        assert!(pinned_defaults(&lists, "application/pdf").is_empty());
+        assert!(pinned_defaults(&[], "image/png").is_empty());
     }
 
     #[test]
