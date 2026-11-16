@@ -155,14 +155,15 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         if let Some(bar) = now_playing_bar(daemon, device) {
             left.append(&bar);
         }
-        // Can't reach is said once, in the hero, with its Try again.
-        if device.status == DeviceStatus::Paired && !device.feature_transport_ready {
-            left.append(&reconnecting_row(device));
-        }
         // Away, nothing here can reach the phone: the hero says so once, with
         // Try again; the tiles (each "Can't reach"), the setup steps (they
-        // need the phone) and the feature list wait until it is back.
-        let away = device.status == DeviceStatus::Unreachable;
+        // need the phone; Settings lists them all the same) and the feature
+        // list wait until it is back.
+        let away = phone_away(device);
+        // Can't reach is said once, in the hero, with its Try again.
+        if device.status == DeviceStatus::Paired && !device.feature_transport_ready && !away {
+            left.append(&reconnecting_row(device));
+        }
         // The actions after the hero and what is going on now (activity, Now
         // playing, Connecting; UI-REDESIGN 3.11), before "Finish setting up":
         // that card, often several steps tall, hid them below the fold when it
@@ -173,7 +174,9 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
                 right.append(&card);
             }
         }
-        right.append(&columns(daemon, device));
+        // What came in sits under the actions: the two columns end near each
+        // other instead of the left stopping after the tiles.
+        left.append(&columns(daemon, device));
         right.append(&terminals_card(win, device));
         let split = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)

@@ -192,8 +192,8 @@ fn words_and(root: &gtk::Widget, class: &str) -> (Vec<String>, Vec<gtk::Widget>)
 
 /// Away for hours: "Can't reach" is said once (the pill and one line), with
 /// one Try again and no stale "dropped while it was being set up"; the
-/// hero's two buttons are unavailable like the tiles, the battery reads as
-/// old, and a tablet is drawn as one. (Needs a display.)
+/// hero's two buttons are left out (nothing to send to), the battery reads
+/// as old, and a tablet is drawn as one. (Needs a display.)
 #[test]
 fn an_away_tablet_says_so_once_and_nothing_reads_as_live() {
     crate::test_display::run(|| {
@@ -223,9 +223,10 @@ fn an_away_tablet_says_so_once_and_nothing_reads_as_live() {
         let (root, words, reach, retries) = once(&device);
         assert_eq!((reach, retries), (1, 1), "{words:?}");
         assert!(!words.iter().any(|w| w.contains("being set up")));
-        let actions = named_widgets(&root, "hero-actions");
-        let (_, dimmed) = words_and(&actions[0], "dl-unavailable");
-        assert_eq!(dimmed.len(), 2, "Send files and Send clipboard");
+        assert!(
+            named_widgets(&root, "hero-actions").is_empty(),
+            "no greyed Send files and Send clipboard: nothing to send them to"
+        );
         let (_, stale) = words_and(&root, "dl-stale");
         assert_eq!(stale.len(), 2, "the ring and its percent");
         let (_, art) = words_and(&root, "phone-art");
@@ -269,6 +270,22 @@ fn a_long_copied_line_is_cut_short() {
 
 /// A window showing Home for a fake phone in `state`, `width` px wide.
 fn home_window(state: &str, width: i32) -> super::super::DesklinkWindow {
+    home_window_of(state, width, |_| {})
+}
+
+/// A paired fake phone, changed by `change` first.
+fn home_window_with(
+    width: i32,
+    change: impl FnOnce(&mut DeviceView),
+) -> super::super::DesklinkWindow {
+    home_window_of("paired", width, change)
+}
+
+fn home_window_of(
+    state: &str,
+    width: i32,
+    change: impl FnOnce(&mut DeviceView),
+) -> super::super::DesklinkWindow {
     use adw::subclass::prelude::ObjectSubclassIsExt;
     let resources = crate::load_resources().expect("the bundled resources");
     gtk::gio::resources_register(&resources);
@@ -278,7 +295,8 @@ fn home_window(state: &str, width: i32) -> super::super::DesklinkWindow {
     let window = super::super::DesklinkWindow::new(&app);
     let (daemon, _commands) = DaemonHandle::detached();
     window.set_daemon(daemon);
-    let phone = super::super::debug_fake_device(state, "Pixel 9");
+    let mut phone = super::super::debug_fake_device(state, "Pixel 9");
+    change(&mut phone);
     let id = phone.id.clone();
     window.imp().fake_devices.borrow_mut().push(phone);
     window.select_device(&id);
@@ -392,6 +410,106 @@ fn an_away_phone_gets_a_calm_home() {
         let window = home_window("paired", 1920);
         assert!(shown(&window, "tile-row").is_some(), "back: the tiles");
         assert!(shown(&window, "everything").is_some(), "back: the list");
+        window.close();
+    });
+}
+
+fn spin() {
+    let context = gtk::glib::MainContext::default();
+    for _ in 0..60 {
+        while context.iteration(false) {}
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// The real breakpoint, crossed by resizing the window both ways, and the
+/// tile row re-measured from the width its column then has (read after the
+/// main loop ran, not before the new allocation). The test display is 1280
+/// px wide, so the text scale is 0.75: 1200sp is then 900 px. (Needs a
+/// display.)
+#[test]
+fn home_crosses_the_breakpoint_when_the_window_is_resized() {
+    use adw::subclass::prelude::ObjectSubclassIsExt;
+    crate::test_display::run(|| {
+        let settings = gtk::Settings::default().expect("GTK settings");
+        let dpi = settings.gtk_xft_dpi();
+        settings.set_gtk_xft_dpi((96.0 * 1024.0 * 0.75) as i32);
+        let window = home_window("paired", 1280);
+        let tiles_fit = |window: &super::super::DesklinkWindow| {
+            let tiles = shown(window, "tile-row")
+                .and_downcast::<gtk::FlowBox>()
+                .expect("the tile row");
+            let column = tiles.parent().expect("its column").width();
+            let tile = tiles
+                .first_child()
+                .map(|child| child.measure(gtk::Orientation::Horizontal, -1).1)
+                .unwrap();
+            assert_eq!(
+                tiles.max_children_per_line(),
+                tile_columns(column, tile),
+                "columns from the width the row has now ({column} px)"
+            );
+        };
+        let columns = |window: &super::super::DesklinkWindow| {
+            shown(window, "home-split")
+                .and_downcast::<gtk::Box>()
+                .unwrap()
+                .orientation()
+        };
+        for (width, wide) in [(1280, true), (700, false), (1280, true)] {
+            window.set_visible(false);
+            window.set_default_size(width, 1000);
+            window.present();
+            spin();
+            assert_eq!(window.imp().wide.get(), wide, "{width} px");
+            let expected = if wide {
+                gtk::Orientation::Horizontal
+            } else {
+                gtk::Orientation::Vertical
+            };
+            assert_eq!(columns(&window), expected, "{width} px");
+            tiles_fit(&window);
+        }
+        window.close();
+        settings.set_gtk_xft_dpi(dpi);
+    });
+}
+
+/// The reconnect ladder gave up while the phone still reads as paired: the
+/// same calm Home as away (the owner's screen had six greyed tiles, the
+/// setup steps and the feature list under "Can't reach · Try again"). A
+/// phone still connecting keeps its tiles. (Needs a display.)
+#[test]
+fn a_phone_the_ladder_gave_up_on_is_away_too() {
+    crate::test_display::run(|| {
+        let mut device = super::super::debug_fake_device("paired", "Pixel 9");
+        device.feature_transport_ready = false;
+        assert!(!phone_away(&device), "connecting is not away");
+        device.last_error = Some(crate::device_links::webrtc::coordinator::unavailable_words(
+            "Pixel 9",
+        ));
+        assert!(phone_away(&device), "the ladder gave up");
+        device.last_error = None;
+        device.status = DeviceStatus::Unreachable;
+        assert!(phone_away(&device));
+
+        let window = home_window_with(1100, |device| {
+            device.feature_transport_ready = false;
+            device.last_error = Some(crate::device_links::webrtc::coordinator::unavailable_words(
+                &device.name,
+            ));
+        });
+        assert!(shown(&window, "tile-row").is_none(), "no tiles");
+        assert!(shown(&window, "finish-setup").is_none(), "no setup steps");
+        assert!(shown(&window, "everything").is_none(), "no feature list");
+        assert!(shown(&window, "hero-actions").is_none(), "no greyed Send");
+        window.close();
+
+        let window = home_window_with(1100, |device| device.feature_transport_ready = false);
+        assert!(
+            shown(&window, "tile-row").is_some(),
+            "connecting: the tiles stay"
+        );
         window.close();
     });
 }

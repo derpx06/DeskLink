@@ -4,8 +4,22 @@
 
 use super::*;
 
+/// Whether the phone cannot be reached now: it is away, or the reconnect
+/// ladder gave up ("Can't reach … · Try again") while it still reads as
+/// paired. Home then says so once, in the hero, and leaves out what cannot
+/// work (the tiles, Send, Reply, the setup steps, the feature list); a phone
+/// still connecting is not away.
+pub(super) fn phone_away(device: &DeviceView) -> bool {
+    device.status == DeviceStatus::Unreachable
+        || device
+            .last_error
+            .as_deref()
+            .is_some_and(crate::device_links::webrtc::coordinator::is_unavailable)
+}
+
 /// The hero: the phone, its name, how it is connected, its battery, and
-/// the two things most people came to do: send files, send the clipboard.
+/// the two things most people came to do: send files, send the clipboard
+/// (not while it is away: there is nothing to send them to).
 pub(super) fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gtk::Box {
     let band = gtk::Box::builder()
         .spacing(24)
@@ -64,6 +78,10 @@ pub(super) fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gt
     link.append(&status_pill(words.status, words.word));
     let detail = text(&words.detail, &["dl-secondary"]);
     detail.set_wrap(true);
+    // Away, the line takes the room beside the pill: it wrapped at a third
+    // of it ("Check that Pixel 9 is on / and on your network"). Connected,
+    // it stays its own width, with the round trip right after it.
+    detail.set_hexpand(phone_away(device));
     detail.set_valign(gtk::Align::Center);
     link.append(&detail);
     let rtt = text("", &["dl-mono", "dl-caption"]);
@@ -140,7 +158,7 @@ pub(super) fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gt
     }
     // Away, or the ladder gave up: the one "Try again" on the page. Every
     // address gets a fresh chance and this computer announces itself.
-    if away || gave_up {
+    if phone_away(device) {
         let retry = button(
             ButtonKind::Tonal,
             "Try again",
@@ -157,6 +175,9 @@ pub(super) fn hero(daemon: &DaemonHandle, device: &DeviceView, time: &str) -> gt
         info.append(&retry);
     }
     band.append(&info);
+    if phone_away(device) {
+        return band;
+    }
 
     // One primary and one tonal button, stacked; under the name when narrow.
     let actions = gtk::Box::builder()

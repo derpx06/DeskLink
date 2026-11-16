@@ -268,7 +268,8 @@ fn notifications_card(device: &DeviceView) -> gtk::Box {
             words.append(&crate::window::notifications::heading_line(newest));
             words.append(&crate::window::notifications::body_label(newest, 2));
             row.append(&words);
-            if newest.request_reply_id.is_some() {
+            // Away, Reply could not be sent: it is left out, not greyed.
+            if newest.request_reply_id.is_some() && !phone_away(device) {
                 let reply = button(ButtonKind::Tonal, "Reply", Some("desklink-reply-symbolic"));
                 reply.set_halign(gtk::Align::End);
                 reply.set_margin_top(6);

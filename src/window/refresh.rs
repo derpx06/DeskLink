@@ -689,10 +689,17 @@ impl DesklinkWindow {
             }
         }
         self.apply_tile_columns();
-        let window = self.downgrade();
-        glib::idle_add_local_once(move || {
-            if let Some(window) = window.upgrade() {
-                window.apply_tile_columns();
+        // Again on the next frames, once the new layout has its widths: when
+        // a breakpoint changes the columns, the width read now is the old one
+        // (an idle could still run before the new allocation).
+        let frames = std::cell::Cell::new(0);
+        self.add_tick_callback(move |window, _| {
+            window.apply_tile_columns();
+            frames.set(frames.get() + 1);
+            if frames.get() < 3 {
+                glib::ControlFlow::Continue
+            } else {
+                glib::ControlFlow::Break
             }
         });
     }
