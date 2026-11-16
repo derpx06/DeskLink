@@ -273,13 +273,20 @@ fn clipboard_is_empty() -> bool {
             String::from_utf8_lossy(&output.stderr).contains("Nothing is copied")
         };
     }
-    clipboard_targets().is_some_and(|targets| {
-        targets.iter().all(|target| {
-            matches!(
-                target.as_str(),
-                "TARGETS" | "TIMESTAMP" | "MULTIPLE" | "SAVE_TARGETS"
-            )
-        })
+    // X11: an empty clipboard has no owner, which the probe cannot tell
+    // from a timeout (both `None`), so an unknown answer counts as not
+    // empty and X11 sessions never fill: the safe side. Wayland fills.
+    clipboard_targets().is_some_and(|targets| only_housekeeping_targets(&targets))
+}
+
+/// Whether `targets` hold nothing a person copied (only the selection
+/// protocol's own entries).
+fn only_housekeeping_targets(targets: &[String]) -> bool {
+    targets.iter().all(|target| {
+        matches!(
+            target.as_str(),
+            "TARGETS" | "TIMESTAMP" | "MULTIPLE" | "SAVE_TARGETS"
+        )
     })
 }
 
@@ -406,6 +413,12 @@ pub(super) fn clipboard_from_phone_at(
                 return "unchanged";
             }
             if current_text().is_some_and(|current| !current.is_empty()) || !clipboard_is_empty() {
+                return "ignored: this computer's clipboard is not empty";
+            }
+            // The probe can take seconds: a copy made here meanwhile (the poll
+            // saw it) is not overwritten. ponytail: the probe still runs on
+            // the packet path, once per connection (2 s at most).
+            if current_text().is_some_and(|current| !current.is_empty()) {
                 return "ignored: this computer's clipboard is not empty";
             }
         }
@@ -1454,6 +1467,18 @@ mod tests {
     /// A copy made on the phone while connected (a plain packet) is still
     /// placed over what the computer holds; one copied before DeskLink
     /// started is not.
+    #[test]
+    fn only_the_selection_protocols_own_targets_count_as_empty() {
+        let names = |list: &[&str]| list.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        assert!(only_housekeeping_targets(&names(&[])));
+        assert!(only_housekeeping_targets(&names(&["TARGETS", "TIMESTAMP"])));
+        assert!(!only_housekeeping_targets(&names(&[
+            "TARGETS",
+            "text/plain"
+        ])));
+        assert!(!only_housekeeping_targets(&names(&["image/png"])));
+    }
+
     #[test]
     fn a_live_copy_is_placed_but_not_one_made_before_the_desk_started() {
         let _globals = clipboard_globals();

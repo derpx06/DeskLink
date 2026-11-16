@@ -705,11 +705,6 @@ impl DaemonWorker {
         });
     }
 
-    /// The network changed (Wi-Fi switched, a cable plugged): recover in
-    /// about two seconds instead of waiting for silence. Announce again, drop
-    /// LAN links on addresses this computer no longer has, and rebuild peers
-    /// whose addresses all went; the redialer and the phones' answers to the
-    /// beacons bring the links back.
     /// The network as a phone's link sees it now (see `network::network_view`).
     pub(super) fn network_view(&self) -> super::network::NetworkView {
         let bootstrap: Vec<std::net::IpAddr> = self
@@ -725,7 +720,15 @@ impl DaemonWorker {
         )
     }
 
+    /// The network changed (Wi-Fi switched, a cable plugged): recover in
+    /// about two seconds instead of waiting for silence. Announce again, drop
+    /// LAN links on addresses this computer no longer has, and rebuild peers
+    /// whose addresses all went; the redialer and the phones' answers to the
+    /// beacons bring the links back.
     fn network_changed(&self) {
+        // Whoever asked (the OS signal, the explicit command, a resume), the
+        // view acted on is now this one: a later signal compares with it.
+        let _ = super::network::note_network_view(self.network_view());
         // A network change (or the computer waking) is never a walk away:
         // the count of a minute out of reach starts again.
         crate::device_links::walk_away::reset();

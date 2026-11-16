@@ -567,6 +567,25 @@ fn ssl_connector_builder(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_recorded_view_is_what_the_next_signal_is_compared_with() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let home = network_view(
+            &[("wlp2s0".into(), ip("192.168.1.13"))],
+            &["wlp2s0".into()],
+            &[],
+        );
+        let away = network_view(
+            &[("wlp2s0".into(), ip("10.0.0.5"))],
+            &["wlp2s0".into()],
+            &[],
+        );
+        let _ = note_network_view(home.clone());
+        // An explicit change to `away` is recorded too, so switching back is a change.
+        let _ = note_network_view(away);
+        assert_eq!(note_network_view(home), vec!["wlp2s0".to_string()]);
+    }
+
+    #[test]
     fn a_container_restarting_is_not_a_network_change() {
         let ip = |text: &str| text.parse::<IpAddr>().unwrap();
         let wifi = ("wlp2s0".to_string(), ip("192.168.1.13"));
