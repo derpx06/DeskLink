@@ -134,6 +134,15 @@ pub(in crate::window) fn glyph_for(name: &str) -> &'static str {
     }
 }
 
+/// The glyph of a file that is gone: a broken picture for an image, else
+/// the file's own kind (a PDF showed a broken picture).
+pub(in crate::window) fn missing_glyph(name: &str) -> &'static str {
+    match glyph_for(name) {
+        "desklink-image-symbolic" => "desklink-broken-image-symbolic",
+        other => other,
+    }
+}
+
 /// Which files the history shows: one choice, as the chips.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(in crate::window) enum Filter {

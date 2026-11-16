@@ -736,3 +736,21 @@ fn toasts_are_capped_and_repeats_coalesce() {
         ToastPlan::Dismiss(2)
     );
 }
+
+/// At 150 % text the sidebar's "Search" was cut to "Se…" beside its keys:
+/// the word is never ellipsized (the keycaps keep their width, so the cut
+/// always fell on the word).
+#[test]
+fn the_sidebar_search_word_is_never_cut() {
+    let ui = include_str!("../window.ui");
+    let field = ui
+        .split("id=\"sidebar_search\"")
+        .nth(1)
+        .and_then(|field| field.split("footer_list").next())
+        .expect("the sidebar has a search field");
+    let placeholder = field
+        .split("<object class=\"GtkLabel\">")
+        .find(|label| label.contains("dl-search-placeholder"))
+        .expect("the placeholder label");
+    assert!(!placeholder.contains("ellipsize"), "{placeholder}");
+}

@@ -394,3 +394,11 @@ fn the_failure_rows_do_not_keep_their_list_alive() {
         assert!(weak.upgrade().is_none());
     });
 }
+
+#[test]
+fn a_missing_file_shows_its_own_kind_and_only_an_image_a_broken_picture() {
+    assert_eq!(missing_glyph("a.jpg"), "desklink-broken-image-symbolic");
+    assert_eq!(missing_glyph("a.pdf"), "desklink-picture-as-pdf-symbolic");
+    assert_eq!(missing_glyph("a.zip"), "desklink-folder-zip-symbolic");
+    assert_eq!(missing_glyph("notes.txt"), "desklink-description-symbolic");
+}

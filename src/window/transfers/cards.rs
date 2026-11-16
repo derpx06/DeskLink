@@ -349,7 +349,7 @@ pub(super) fn missing_card(win: &DesklinkWindow, entry: &LoggedFile, device: &st
         .build();
     gone.append(
         &gtk::Image::builder()
-            .icon_name("desklink-broken-image-symbolic")
+            .icon_name(missing_glyph(&entry.name))
             .pixel_size(28)
             .css_classes(["files-glyph"])
             .accessible_role(gtk::AccessibleRole::Presentation)
