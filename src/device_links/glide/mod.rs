@@ -321,33 +321,39 @@ pub(crate) fn start() {
     }
 }
 
-/// What each phone last reported about glide: `allowed`, whether it said no
-/// only because it is locked (`reason: "locked"`), and whether only because
-/// its accessibility service is off or not bound (`reason: "accessibility"`). Unknown until it
-/// reports, and forgotten whenever its link is not ready: the phone reports
-/// on every feature-ready.
-/// `(allowed, locked, service_off)`.
-type Report = (bool, bool, bool);
+/// What a phone last said about glide.
+#[derive(Debug, Clone, Copy)]
+struct Report {
+    allowed: bool,
+    /// Said no only because it is locked (`reason: "locked"`).
+    locked: bool,
+    /// Said no only because its accessibility service is off or not bound
+    /// (`reason: "accessibility"`).
+    service_off: bool,
+}
 
+/// What each phone last reported about glide. Unknown until it reports, and
+/// forgotten whenever its link is not ready: the phone reports on every
+/// feature-ready.
 static ALLOWED: Mutex<Option<HashMap<String, Report>>> = Mutex::new(None);
 
 /// Whether the phone has said it allows glide: `None` until it reports (an
 /// older phone never does).
 pub(crate) fn phone_allows(device_id: &str) -> Option<bool> {
-    report_of(device_id).map(|(allowed, ..)| allowed)
+    report_of(device_id).map(|report| report.allowed)
 }
 
 /// Whether the phone said glide waits only for it to be unlocked (cleared by
 /// its next `allowed: true`).
 pub(crate) fn phone_locked(device_id: &str) -> bool {
-    report_of(device_id).is_some_and(|(_, locked, _)| locked)
+    report_of(device_id).is_some_and(|report| report.locked)
 }
 
 /// Whether the phone said Glide is allowed there but its accessibility
 /// service (which places the pointer) is off: ColorOS switches it off after
 /// an update or a force-stop. Allowing Glide again would change nothing.
 pub(crate) fn phone_needs_service(device_id: &str) -> bool {
-    report_of(device_id).is_some_and(|(_, _, service)| service)
+    report_of(device_id).is_some_and(|report| report.service_off)
 }
 
 /// What the person is told while the service is off: the step on the phone.
@@ -403,7 +409,14 @@ pub(crate) fn on_phone_packet(device_id: &str, packet: &NetworkPacket) {
             declined,
             service_off,
         } => {
-            set_allowed(device_id, Some((allowed, locked, service_off)));
+            set_allowed(
+                device_id,
+                Some(Report {
+                    allowed,
+                    locked,
+                    service_off,
+                }),
+            );
             if allowed {
                 crate::device_links::asks::note_on(device_id, PHONE_SETTING_KEY);
             } else if declined {

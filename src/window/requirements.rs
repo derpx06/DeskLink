@@ -473,7 +473,7 @@ pub(crate) fn missing(facts: &Facts) -> Vec<Need> {
 /// Glide is allowed on the phone but its accessibility service is off: the
 /// step there, and "Ask on phone" for control where its build takes it (that
 /// ask opens the Accessibility settings there).
-fn glide_service_off(phone: &PhoneFacts) -> Need {
+pub(crate) fn glide_service_off(phone: &PhoneFacts) -> Need {
     let name = &phone.name;
     let askable = phone.reports && phone.steps.iter().any(|step| step.key == "control");
     Need {
@@ -1352,6 +1352,29 @@ mod tests {
         assert_eq!(need.fix, Fix::AskPhone("p1".into(), "glide", false));
         assert_eq!(need.fix.label(), Some("Ask on phone"));
         assert!(need.allow.is_none(), "never switched from here");
+
+        // Accessibility off there: the step, and the control ask where the
+        // phone reports (the same need Settings and the tray show).
+        let mut service = off.clone();
+        service.glide_service_off = true;
+        let need = glide_need(service.clone()).expect("listed");
+        assert_eq!(
+            need.title,
+            "Turn on DeskLink in Pixel 9's Accessibility settings to use Glide"
+        );
+        assert_eq!(
+            need.fix,
+            Fix::None,
+            "a phone that does not report: words only"
+        );
+        service.reports = true;
+        service.steps = vec![PhoneStep {
+            key: "control",
+            on: Some(false),
+            ask: None,
+        }];
+        let need = glide_need(service).expect("listed");
+        assert_eq!(need.fix, Fix::AskPhone("p1".into(), "control", false));
 
         // Locked: the step to take there, no button, until allowed again.
         let mut locked = off.clone();

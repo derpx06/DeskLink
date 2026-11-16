@@ -56,7 +56,7 @@ mod notes_clipboard;
 pub(crate) mod notifications;
 mod onboarding;
 mod overview;
-mod requirements;
+pub(crate) mod requirements;
 pub(crate) use overview::link_to_send;
 mod pairing;
 mod palette;

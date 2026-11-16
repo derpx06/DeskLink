@@ -161,9 +161,18 @@ fn phone_section(phone: &DeviceView, settings: &AppSettings) -> Vec<TrayEntry> {
         .is_some_and(|glide| glide.device == phone.id)
         && crate::device_links::glide::phone_needs_service(&phone.id)
     {
-        menu.push(TrayEntry::Label(crate::device_links::glide::service_words(
-            &phone.name,
-        )));
+        // The same need Settings and Find anything show: the step, and the
+        // control ask where the phone takes it.
+        let need = crate::window::requirements::glide_service_off(
+            &crate::window::requirements::PhoneFacts::from_device(phone),
+        );
+        menu.push(TrayEntry::Label(need.title.clone()));
+        if let Some(label) = need.fix.label() {
+            menu.push(TrayEntry::action(
+                label,
+                format!("ask-control:{}", phone.id),
+            ));
+        }
     }
     menu.push(
         TrayEntry::action("Ring", format!("ring:{}", phone.id)).icon("audio-volume-high-symbolic"),
@@ -511,6 +520,9 @@ pub(crate) fn run(app: &DesklinkApplication, action: &str) {
             None,
         )),
         "lock" => daemon.send(DaemonCommand::SendLockRequest(target, true)),
+        "ask-control" => {
+            crate::device_links::asks::ask_phone(&target, "control", true);
+        }
         verb if verb.starts_with("insert-") => {
             let capture = verb
                 .trim_start_matches("insert-")
@@ -774,6 +786,28 @@ mod tests {
         other.last_error = Some("Update DeskLink on Phone tray-retry".into());
         assert!(!tray(other).contains(&"reconnect:tray-retry".to_string()));
         assert!(!tray(phone("tray-retry", false)).contains(&"reconnect:tray-retry".to_string()));
+    }
+
+    #[test]
+    fn the_tray_says_what_to_do_when_the_phones_accessibility_is_off() {
+        let device = phone("tray-service", true);
+        let mut settings = AppSettings::default();
+        settings.glide = Some(crate::device_links::glide::GlideSetting {
+            device: "tray-service".into(),
+            edge: crate::device_links::glide::Edge::Right,
+        });
+        let mut report = crate::device_links::packet::NetworkPacket::new(
+            crate::device_links::packet::PACKET_TYPE_SHARE_INPUT_DEVICES,
+        );
+        report.set("allowed", false);
+        report.set("reason", "accessibility");
+        crate::device_links::glide::on_phone_packet("tray-service", &report);
+        let menu = phone_section(&device, &settings);
+        let words = crate::device_links::glide::service_words(&device.name);
+        assert!(menu
+            .iter()
+            .any(|entry| matches!(entry, TrayEntry::Label(label) if *label == words)));
+        crate::device_links::glide::forget_phone("tray-service");
     }
 
     #[test]

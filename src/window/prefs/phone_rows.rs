@@ -391,6 +391,13 @@ pub(super) fn phone_step_rows(group: &adw::PreferencesGroup, device: &DeviceView
         let Some(need) = crate::window::requirements::phone_step(&facts, key) else {
             continue;
         };
+        need_row(group, need);
+    }
+}
+
+/// One need as a row: its words and its button.
+fn need_row(group: &adw::PreferencesGroup, need: crate::window::requirements::Need) {
+    {
         let row = adw::ActionRow::builder()
             .title(esc(&need.title))
             .subtitle(esc(&need.detail))
@@ -581,10 +588,14 @@ pub(super) fn add_glide_rows(
     // On here, off on the phone: said, with Ask on phone where the phone
     // takes it. (A locked phone is not "off": the row above says to unlock
     // it.)
-    if current.is_some()
-        && !crate::device_links::glide::phone_locked(&device.id)
-        && !crate::device_links::glide::phone_needs_service(&device.id)
-    {
+    if current.is_some() && crate::device_links::glide::phone_needs_service(&device.id) {
+        // The same need Find anything shows: the step, and the control ask.
+        let facts = crate::window::requirements::PhoneFacts::from_device(device);
+        need_row(
+            group,
+            crate::window::requirements::glide_service_off(&facts),
+        );
+    } else if current.is_some() && !crate::device_links::glide::phone_locked(&device.id) {
         phone_step_rows(group, device, &["glide"]);
     }
     if status.asking {

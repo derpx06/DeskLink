@@ -1279,3 +1279,184 @@ fn an_unanswered_enter_is_refused_within_the_wait_and_told_once() {
     assert!(again.iter().any(|o| matches!(o, Out::Release { .. })));
     assert!(!again.iter().any(|o| matches!(o, Out::Refused)));
 }
+
+// ---- Deterministic fault cases ---------------------------------------------
+
+fn count(outs: &[Out], what: impl Fn(&Out) -> bool) -> usize {
+    outs.iter().filter(|out| what(out)).count()
+}
+fn is_release(out: &Out) -> bool {
+    matches!(out, Out::Release { .. })
+}
+fn is_off(out: &Out) -> bool {
+    matches!(out, Out::Gliding(false))
+}
+fn right() -> Glide {
+    Glide::new(Barrier::on(Edge::Right, &screen()).unwrap())
+}
+
+#[test]
+fn reports_and_ticks_while_idle_do_nothing() {
+    let mut glide = right();
+    let now = Instant::now();
+    assert!(glide.phone_released(1.0, 2.0, now).is_empty());
+    assert!(glide.accepted(&keys, now).is_empty());
+    assert!(glide.disallowed(now).is_empty());
+    assert!(glide.tick(now).is_empty());
+    assert!(glide.take_back().is_empty());
+    assert!(glide.deactivated().is_empty());
+    assert!(glide.active.is_none());
+}
+
+#[test]
+fn a_lost_release_is_let_go_first_when_the_pointer_comes_back() {
+    let mut glide = Glide::accepting(Barrier::on(Edge::Right, &screen()).unwrap());
+    let now = Instant::now();
+    glide.activated(1, (1600.0, 10.0), &keys, now);
+    glide.input(Captured::Button(BTN_LEFT, true), &keys, now);
+    assert!(glide.left_down);
+    // The release never arrives (lost): the way out sends it.
+    let outs = glide.take_back();
+    assert!(matches!(&outs[0], Out::Send(p) if p.body.contains_key("singlerelease")));
+    assert!(!glide.left_down);
+}
+
+#[test]
+fn a_crossing_during_the_resting_edge_is_released_at_once_and_works_after_it() {
+    let mut glide = right();
+    let now = Instant::now();
+    glide.activated(1, (1600.0, 10.0), &keys, now);
+    let refusal = glide.phone_released(0.0, 0.0, now);
+    assert_eq!(count(&refusal, |o| matches!(o, Out::Refused)), 1);
+    let rest = now + Duration::from_secs(1);
+    let outs = glide.activated(2, (1600.0, 10.0), &keys, rest);
+    assert_eq!(count(&outs, is_release), 1);
+    assert_eq!(count(&outs, |o| matches!(o, Out::Refused)), 0, "told once");
+    assert!(glide.active.is_none());
+    let outs = glide.activated(
+        3,
+        (1600.0, 10.0),
+        &keys,
+        now + REFUSED_BACKOFF + Duration::from_millis(1),
+    );
+    assert!(glide.active == Some(3) && count(&outs, is_release) == 0);
+}
+
+#[test]
+fn a_second_activation_while_entering_leaves_one_capture_to_release() {
+    let mut glide = right();
+    let now = Instant::now();
+    glide.activated(1, (1600.0, 10.0), &keys, now);
+    // The compositor activated again (the first capture ended by itself).
+    glide.activated(2, (1600.0, 20.0), &keys, now);
+    let outs = glide.tick(now + ENTER_WAIT);
+    assert_eq!(count(&outs, is_release), 1);
+    assert!(matches!(
+        outs.iter().find(|o| is_release(o)),
+        Some(Out::Release { activation: 2, .. })
+    ));
+}
+
+#[test]
+fn an_accept_after_the_compositor_ended_the_capture_resurrects_nothing() {
+    let mut glide = right();
+    let now = Instant::now();
+    glide.activated(1, (1600.0, 10.0), &keys, now);
+    glide.deactivated();
+    assert!(glide.accepted(&keys, now).is_empty());
+    assert!(glide.active.is_none());
+}
+
+#[test]
+fn a_link_drop_in_every_state_ends_idle_with_one_release_and_one_indicator_off() {
+    let now = Instant::now();
+    let setups: Vec<(&str, Box<dyn Fn(&mut Glide)>, bool)> = vec![
+        ("idle", Box::new(|_| {}), false),
+        (
+            "entering",
+            Box::new(move |g| {
+                g.activated(1, (1600.0, 5.0), &keys, now);
+            }),
+            true,
+        ),
+        (
+            "active",
+            Box::new(move |g| {
+                g.activated(1, (1600.0, 5.0), &keys, now);
+                g.accepted(&keys, now);
+            }),
+            true,
+        ),
+        (
+            "left held",
+            Box::new(move |g| {
+                g.activated(1, (1600.0, 5.0), &keys, now);
+                g.accepted(&keys, now);
+                g.input(Captured::Button(BTN_LEFT, true), &keys, now);
+            }),
+            true,
+        ),
+        (
+            "pending",
+            Box::new(move |g| {
+                g.input(Captured::Motion(1.0, 1.0), &keys, now);
+            }),
+            false,
+        ),
+        (
+            "held",
+            Box::new(move |g| {
+                g.activated(1, (1600.0, 5.0), &keys, now);
+                g.input(Captured::Key(30, true), &keys, now);
+            }),
+            true,
+        ),
+    ];
+    for (name, setup, was_active) in setups {
+        let mut glide = right();
+        setup(&mut glide);
+        let outs = glide.take_back();
+        assert!(glide.active.is_none(), "{name}");
+        assert!(
+            !glide.left_down && glide.held.is_empty() && glide.pending.is_empty(),
+            "{name}"
+        );
+        assert_eq!(count(&outs, is_release), usize::from(was_active), "{name}");
+        assert_eq!(count(&outs, is_off), usize::from(was_active), "{name}");
+        assert!(
+            glide.take_back().is_empty(),
+            "{name}: a second drop does nothing"
+        );
+    }
+}
+
+#[test]
+fn input_held_past_the_limit_is_never_replayed_after_a_refusal() {
+    let mut glide = right();
+    let now = Instant::now();
+    glide.activated(1, (1600.0, 10.0), &keys, now);
+    for _ in 0..HELD_MAX + 30 {
+        glide.input(Captured::Key(30, true), &keys, now);
+    }
+    assert!(glide.dropped >= 30);
+    let outs = glide.disallowed(now);
+    assert!(sent(&outs).is_empty() || sent(&outs).iter().all(|p| p.get("exitEdge").is_some()));
+    assert!(glide.held.is_empty());
+    assert!(glide.accepted(&keys, now).is_empty());
+}
+
+#[test]
+fn a_phone_that_goes_silent_gets_the_pointer_back_unless_it_is_dozing() {
+    let late = GLIDE_SILENT_AFTER + Duration::from_millis(1);
+    assert!(link_silent(true, Some(late), false));
+    assert!(
+        !link_silent(true, Some(late), true),
+        "a dozing phone is kept by the LAN heartbeat"
+    );
+    assert!(!link_silent(true, Some(GLIDE_SILENT_AFTER), false));
+    assert!(
+        !link_silent(false, Some(late), false),
+        "nothing to give back"
+    );
+    assert!(!link_silent(true, None, false));
+}

@@ -437,11 +437,11 @@ pub(super) fn consider_replacement(
     let removed = config
         .lock()
         .map_err(|_| "Config lock poisoned".to_string())
+        // The same phone paired again: Glide onto it moves to the new pairing
+        // (a preference only; the phone's own allow is still needed), in the
+        // one save that drops the old record.
         .and_then(|mut config| {
-            // The same phone paired again: Glide onto it moves to the new
-            // pairing (the old one's setting would otherwise vanish with it).
-            config.move_glide(&candidate.old_id, &candidate.new_id)?;
-            config.untrust_device(&candidate.old_id)
+            config.untrust_device_for(&candidate.old_id, Some(&candidate.new_id))
         });
     if let Err(error) = removed {
         super::state::push_error(errors, error);
@@ -623,7 +623,9 @@ mod replaced_tests {
         ));
     }
 
-    /// Review finding C: two phones of one model must not delete each other.
+    /// Glide onto a replaced pairing moves to the new one (the preference
+    /// only); a kept twin does not move it; a setting for some other phone is
+    /// untouched; a plain unpair still clears it.
     #[test]
     fn glide_follows_a_replaced_pairing() {
         let setup = replacing("10.5.0.7", "10.5.0.7");
@@ -645,6 +647,55 @@ mod replaced_tests {
             glide.map(|g| (g.device, g.edge)),
             Some(("new-phone".to_string(), edge))
         );
+    }
+
+    fn set_glide(setup: &Replacing, device: &str) {
+        setup
+            .config
+            .lock()
+            .unwrap()
+            .update_settings(|settings| {
+                settings.glide = Some(crate::device_links::glide::GlideSetting {
+                    device: device.into(),
+                    edge: crate::device_links::glide::Edge::Top,
+                })
+            })
+            .unwrap();
+    }
+
+    fn glide_device(setup: &Replacing) -> Option<String> {
+        setup
+            .config
+            .lock()
+            .unwrap()
+            .app_settings_for_tests()
+            .glide
+            .map(|g| g.device)
+    }
+
+    #[test]
+    fn a_kept_twin_does_not_take_glide_and_another_phones_setting_is_untouched() {
+        let twin = replacing("10.5.0.7", "10.5.0.99");
+        set_glide(&twin, "old-phone");
+        run(&twin);
+        assert_eq!(glide_device(&twin).as_deref(), Some("old-phone"));
+        let other = replacing("10.5.0.7", "10.5.0.7");
+        set_glide(&other, "some-other-phone");
+        run(&other);
+        assert_eq!(glide_device(&other).as_deref(), Some("some-other-phone"));
+    }
+
+    #[test]
+    fn a_plain_unpair_still_clears_glide() {
+        let setup = replacing("10.5.0.7", "10.5.0.7");
+        set_glide(&setup, "old-phone");
+        setup
+            .config
+            .lock()
+            .unwrap()
+            .untrust_device("old-phone")
+            .unwrap();
+        assert_eq!(glide_device(&setup), None);
     }
 
     /// Review finding C: two phones of one model must not delete each other.

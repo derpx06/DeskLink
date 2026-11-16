@@ -672,26 +672,25 @@ impl Config {
         saved
     }
 
-    /// The same phone paired again under a new id: Glide onto it, if set,
-    /// continues onto the new pairing on the same edge.
-    pub fn move_glide(&mut self, old_id: &str, new_id: &str) -> Result<(), String> {
-        match self.stored.settings.glide.clone() {
-            Some(glide) if glide.device == old_id => self.update_settings(|settings| {
-                settings.glide = Some(crate::device_links::glide::GlideSetting {
-                    device: new_id.to_string(),
-                    edge: glide.edge,
-                });
-            }),
-            _ => Ok(()),
-        }
-    }
-
     #[cfg(test)]
     pub fn app_settings_for_tests(&self) -> AppSettings {
         self.stored.settings.clone()
     }
 
     pub fn untrust_device(&mut self, device_id: &str) -> Result<(), String> {
+        self.untrust_device_for(device_id, None)
+    }
+
+    /// [`Self::untrust_device`] for a pairing that a newer one of the same
+    /// phone replaces: Glide onto it, if set, moves to `successor` on the same
+    /// edge, in the same single save. It moves a PREFERENCE only (the desk's
+    /// choice of phone and edge); the phone's own "Let this computer control
+    /// this phone" is still required there.
+    pub fn untrust_device_for(
+        &mut self,
+        device_id: &str,
+        successor: Option<&str>,
+    ) -> Result<(), String> {
         let previous = self.stored.trusted_devices.remove(device_id);
         mirror_terminal_access(device_id, false);
         // Remote control of this desktop is a property of the pairing too,
@@ -720,7 +719,7 @@ impl Config {
         if cleared.contains(&true) {
             mirror_settings(&self.stored.settings);
         }
-        // Glide onto it, too (F4).
+        // Glide onto it, too (F4): cleared, or moved to the phone's new pairing.
         if self
             .stored
             .settings
@@ -728,7 +727,14 @@ impl Config {
             .as_ref()
             .is_some_and(|glide| glide.device == device_id)
         {
-            self.stored.settings.glide = None;
+            match successor {
+                Some(new_id) => {
+                    if let Some(glide) = self.stored.settings.glide.as_mut() {
+                        glide.device = new_id.to_string();
+                    }
+                }
+                None => self.stored.settings.glide = None,
+            }
             mirror_settings(&self.stored.settings);
         }
         self.save_or_restore(device_id, previous)?;
