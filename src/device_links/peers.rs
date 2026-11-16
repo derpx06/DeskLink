@@ -92,7 +92,7 @@ mod tests {
             "device_links/daemon/clipboard.rs:LAST_SENT_BY_DEVICE",
             "device_links/webrtc/audio_session.rs:SESSIONS",
             "device_links/webrtc/capture.rs:SESSIONS",
-            "device_links/webrtc/terminal_bridge.rs:BRIDGES",
+            "device_links/webrtc/terminal_bridge/registry.rs:BRIDGES",
             "device_links/calls.rs:HOLD",
             "device_links/contacts.rs:STORE",
             "device_links/daemon/discovery.rs:BOOK",

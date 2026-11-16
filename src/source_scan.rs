@@ -18,6 +18,33 @@ pub(crate) fn is_test_file(path: &std::path::Path) -> bool {
         .is_some_and(|name| name == "tests.rs" || name.ends_with("_tests.rs"))
 }
 
+/// The production part of every non-test file of a module directory, as one
+/// text, for a pin that must cover the whole module. `dir` is relative to
+/// `src/`; `files` pairs each file name with its `include_str!`. Panics when
+/// the directory holds a non-test file `files` does not name, so a new file
+/// cannot escape the pin.
+pub(crate) fn module_sources(dir: &str, files: &[(&str, &str)]) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join(dir);
+    let mut present: Vec<String> = std::fs::read_dir(&path)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs") && !is_test_file(path))
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    present.sort();
+    let mut listed: Vec<String> = files.iter().map(|(name, _)| name.to_string()).collect();
+    listed.sort();
+    assert_eq!(present, listed, "{dir}: a file is missing from this pin");
+    files
+        .iter()
+        .map(|(_, text)| production(text))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// `text` with every `#[cfg(test)]` item blanked out, each of its lines left
 /// empty so line numbers stay: an inline module, a function, a static, a
 /// `thread_local!`, a block, or a one-line `mod x;`/`use` declaration (with the
