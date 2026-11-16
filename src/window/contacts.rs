@@ -37,6 +37,9 @@ pub(super) struct Page {
     /// The device the details act for: id and whether it can call.
     device: Rc<RefCell<(String, bool)>>,
     vault: Rc<super::vault_banner::VaultBanner>,
+    /// On a big window, the chosen contact beside the list (`apply_layout`
+    /// shows it); otherwise a contact opens in a dialog.
+    detail: gtk::Box,
 }
 
 /// What a search term is matched against: name, numbers (digits too),
@@ -292,8 +295,28 @@ impl Page {
         let scroll = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
+            .hexpand(true)
             .child(&clamp)
             .build();
+        // The contact beside the list on a big window.
+        let detail = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .width_request(440)
+            .css_classes(["dl-contact-pane"])
+            .build();
+        detail.set_widget_name("contacts-detail");
+        detail.update_property(&[gtk::accessible::Property::Label("Contact")]);
+        detail.append(&pick_a_contact());
+        let pane = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .vexpand(true)
+            .visible(false)
+            .child(&detail)
+            .build();
+        pane.set_widget_name("contacts-pane");
+        let split = gtk::Box::builder().build();
+        split.append(&scroll);
+        split.append(&pane);
 
         let contacts: Rc<RefCell<HashMap<String, Contact>>> = Rc::default();
         let source: Rc<RefCell<Source>> = Rc::default();
@@ -320,8 +343,12 @@ impl Page {
         }
         let device: Rc<RefCell<(String, bool)>> = Rc::default();
         {
-            let (contacts, device, win) =
-                (Rc::clone(&contacts), Rc::clone(&device), win.downgrade());
+            let (contacts, device, win, detail) = (
+                Rc::clone(&contacts),
+                Rc::clone(&device),
+                win.downgrade(),
+                detail.clone(),
+            );
             list.connect_row_activated(move |_, row| {
                 let Some(win) = win.upgrade() else {
                     return;
@@ -329,12 +356,13 @@ impl Page {
                 let contact = contacts.borrow().get(row.widget_name().as_str()).cloned();
                 if let Some(contact) = contact {
                     let (id, can_call) = device.borrow().clone();
-                    show_details(&win, &id, can_call, &contact);
+                    show_details(&win, &id, can_call, &contact, &detail);
                 }
             });
         }
         let page = Self {
-            root: scroll.upcast(),
+            root: split.upcast(),
+            detail,
             search,
             refresh,
             count,
@@ -435,14 +463,34 @@ impl Page {
     pub(super) fn show_contact(&self, win: &DesklinkWindow, device_id: &str, uid: &str) {
         if let Some(contact) = contacts::by_uid(device_id, uid) {
             let can_call = self.device.borrow().1 && self.device.borrow().0 == device_id;
-            show_details(win, device_id, can_call, &contact);
+            show_details(win, device_id, can_call, &contact, &self.detail);
         }
     }
 }
 
+/// The pane's words before a contact is chosen.
+fn pick_a_contact() -> gtk::Widget {
+    let empty = clipboard::empty_state(
+        "desklink-person-symbolic",
+        "No contact chosen",
+        "Choose one in the list to see its numbers and call or message from here.",
+    );
+    empty.root.set_valign(gtk::Align::Center);
+    empty.root.set_vexpand(true);
+    empty.root.upcast()
+}
+
 /// The contact's card: photo, name, numbers with Call, Message and Copy,
-/// emails, company and note.
-fn show_details(win: &DesklinkWindow, device_id: &str, can_call: bool, contact: &Contact) {
+/// emails, company and note. In `pane` when it shows (a big window), else in
+/// a dialog.
+fn show_details(
+    win: &DesklinkWindow,
+    device_id: &str,
+    can_call: bool,
+    contact: &Contact,
+    pane: &gtk::Box,
+) {
+    let in_pane = pane.parent().is_some_and(|scroll| scroll.is_visible());
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(18)
@@ -472,6 +520,9 @@ fn show_details(win: &DesklinkWindow, device_id: &str, can_call: bool, contact: 
         .title(&contact.name)
         .content_width(420)
         .build();
+    if in_pane {
+        content.add_css_class("dl-contact-detail");
+    }
     let copy_button = |value: String, what: &'static str| {
         let button = ui_kit::icon_button("desklink-content-copy-symbolic", &format!("Copy {what}"));
         button.set_valign(gtk::Align::Center);
@@ -574,6 +625,13 @@ fn show_details(win: &DesklinkWindow, device_id: &str, can_call: bool, contact: 
         group.add(&label);
         content.append(&group);
     }
+    if in_pane {
+        while let Some(child) = pane.first_child() {
+            pane.remove(&child);
+        }
+        pane.append(&content);
+        return;
+    }
     let view = adw::ToolbarView::new();
     view.add_top_bar(&adw::HeaderBar::new());
     view.set_content(Some(
@@ -649,5 +707,34 @@ mod tests {
         for term in ["mara", "lindq", "4670123", "70-123", "example.org", "acme"] {
             assert!(found.contains(term), "{term}");
         }
+    }
+
+    /// On a big window a contact opens beside the list, in the pane, not in
+    /// a dialog; with the pane hidden it is a dialog again. (Needs a display.)
+    #[test]
+    fn a_contact_opens_beside_the_list_on_a_big_window() {
+        crate::test_display::run(|| {
+            let resources = crate::load_resources().expect("the bundled resources");
+            gtk::gio::resources_register(&resources);
+            let app = adw::Application::builder()
+                .application_id("derx06.desklink.com.test")
+                .build();
+            let window = super::super::DesklinkWindow::new(&app);
+            let contact = many(1).remove(0);
+            let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            pane.append(&pick_a_contact());
+            let scroll = gtk::ScrolledWindow::builder().child(&pane).build();
+            show_details(&window, "d", true, &contact, &pane);
+            let shown = pane.first_child().expect("the contact");
+            assert!(shown.has_css_class("dl-contact-detail"), "in the pane");
+            assert!(shown.next_sibling().is_none(), "the placeholder is gone");
+            scroll.set_visible(false);
+            show_details(&window, "d", true, &contact, &pane);
+            assert_eq!(
+                pane.first_child().as_ref(),
+                Some(&shown),
+                "a dialog, the pane untouched"
+            );
+        });
     }
 }

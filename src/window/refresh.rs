@@ -653,6 +653,8 @@ impl DesklinkWindow {
                         split.set_spacing(if wide { 24 } else { 16 });
                     }
                 }
+                // Contacts: the chosen contact beside the list on a big window.
+                "contacts-pane" => widget.set_visible(wide),
                 "home-clamp" => {
                     if let Some(clamp) = widget.downcast_ref::<adw::Clamp>() {
                         clamp.set_maximum_size(if wide {

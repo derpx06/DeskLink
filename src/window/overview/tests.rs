@@ -537,7 +537,7 @@ fn the_other_pages_use_a_big_window() {
             imp.compact.set(false);
             imp.wide.set(wide);
             // Only the pages being shown: show_page lays them out.
-            for page in ["files", "terminals", "notes"] {
+            for page in ["files", "terminals", "contacts", "notes"] {
                 assert!(window.show_page(page), "{page}");
                 spin();
             }
@@ -568,6 +568,10 @@ fn the_other_pages_use_a_big_window() {
             for grid in named_widgets(window.upcast_ref(), "terminal-grid") {
                 let grid = grid.downcast::<gtk::FlowBox>().unwrap();
                 assert_eq!(grid.max_children_per_line(), if wide { 4 } else { 3 });
+            }
+            // Contacts: the chosen contact beside the list on a big window.
+            for pane in named_widgets(window.upcast_ref(), "contacts-pane") {
+                assert_eq!(pane.is_visible(), wide, "the contact pane");
             }
             // The one-a-line list of moving files is not a card grid.
             for moving in named_widgets(window.upcast_ref(), "moving") {

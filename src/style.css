@@ -864,3 +864,6 @@ row.dl-unavailable .subtitle { opacity: 1; color: @dl_text_dim; }
 .dl-btn.dl-unavailable > * { opacity: 1; }
 .dl-need { padding: 14px 16px; }
 .dl-need-title { font-weight: 600; }
+
+/* Contacts on a big window: the chosen contact beside the list. */
+.dl-contact-pane { border-left: 1px solid @dl_hairline; padding: 0 12px; }
