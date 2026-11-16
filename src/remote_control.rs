@@ -564,6 +564,7 @@ pub fn show_remote_control_dialog(
         let kind = kind.downgrade();
         let tick = Cell::new(0u32);
         let lease_was = Cell::new(false);
+        let paint_watch: RefCell<Option<PaintWatch>> = RefCell::default();
         glib::timeout_add_local(std::time::Duration::from_millis(33), move || {
             let (Some(picture), Some(status)) = (picture.upgrade(), status.upgrade()) else {
                 return glib::ControlFlow::Break;
@@ -614,6 +615,13 @@ pub fn show_remote_control_dialog(
                 .and_then(|stream| stream.paintable());
             if picture.paintable() != paintable {
                 picture.set_paintable(paintable.as_ref());
+                paint_watch.replace(None);
+            }
+            // `DESKLINK_DEBUG`: once the window has a frame clock (realized).
+            if crate::debug_logging() && paint_watch.borrow().is_none() {
+                if let Some(paintable) = paintable.as_ref() {
+                    paint_watch.replace(PaintWatch::start(&picture, paintable, &device));
+                }
             }
             if let Some(at) = session_granted_at(device.as_str()) {
                 restarter.borrow_mut().answering(at);
@@ -646,7 +654,6 @@ pub fn show_remote_control_dialog(
             }
             let denial = session_control_denial(device.as_str());
             let ended = session_ended_reason(device.as_str());
-            #[cfg(debug_assertions)]
             save_frame_on_request(&picture);
             let lease_active = remote_control_lease_active(device.as_str());
             if lease_active {
@@ -971,15 +978,17 @@ pub fn show_remote_control_dialog(
     picture.grab_focus();
 }
 
-/// Debug builds only: `touch $DESKLINK_FRAME_DIR/request` and the window
-/// writes what it shows to `frame.png` there — the device test harness's eyes.
-#[cfg(debug_assertions)]
+/// With `DESKLINK_FRAME_DIR` set: `touch $DESKLINK_FRAME_DIR/request` and the
+/// window writes what it shows to `frame.png` there — the device test
+/// harness's eyes (a release build too, so latency is measured on what ships).
+/// The phone's screen is private: written for this user only (0600), never
+/// through a link, and only into a folder of this user's that nobody else can
+/// write ([`crate::device_links::webrtc::screen::frame_dir`]).
 fn save_frame_on_request(picture: &gtk::Picture) {
-    let Ok(dir) = std::env::var("DESKLINK_FRAME_DIR") else {
+    let Some(dir) = crate::device_links::webrtc::screen::frame_dir() else {
         return;
     };
-    let request = std::path::Path::new(&dir).join("request");
-    if std::fs::remove_file(&request).is_err() {
+    if std::fs::remove_file(dir.join("request")).is_err() {
         return;
     }
     let (Some(paintable), Some(native)) = (picture.paintable(), picture.native()) else {
@@ -992,8 +1001,89 @@ fn save_frame_on_request(picture: &gtk::Picture) {
     let snapshot = gtk::Snapshot::new();
     paintable.snapshot(&snapshot, f64::from(width), f64::from(height));
     if let Some(node) = snapshot.to_node() {
-        let texture = renderer.render_texture(node, None);
-        let _ = texture.save_to_png(std::path::Path::new(&dir).join("frame.png"));
+        let png = renderer.render_texture(node, None).save_to_png_bytes();
+        let written =
+            crate::device_links::webrtc::screen::open_private(dir, "frame.png.tmp", false)
+                .and_then(|mut file| std::io::Write::write_all(&mut file, &png))
+                .and_then(|()| std::fs::rename(dir.join("frame.png.tmp"), dir.join("frame.png")));
+        if let Err(error) = written {
+            eprintln!("[DeskLink] Could not save the shown frame: {error}");
+        }
+    }
+}
+
+/// `DESKLINK_DEBUG`: a `phone-screen-paint` line every 2 s while it lives —
+/// how long a decoded frame waits from the sink to GTK's main loop (the
+/// paintable invalidated) and from there to the frame clock painting it.
+/// Dropped (its handlers with it) when the window shows another paintable.
+struct PaintWatch {
+    paintable: gdk::Paintable,
+    invalidated: Option<glib::SignalHandlerId>,
+    clock: gdk::FrameClock,
+    painted: Option<glib::SignalHandlerId>,
+}
+
+impl PaintWatch {
+    /// `None` until the picture is realized (no frame clock yet).
+    fn start(picture: &gtk::Picture, paintable: &gdk::Paintable, device: &str) -> Option<Self> {
+        use std::time::{Duration, Instant};
+        let clock = picture.frame_clock()?;
+        // (sink to invalidate ms, invalidated at)
+        type Invalidated = (Option<f64>, Instant);
+        let pending: Rc<Cell<Option<Invalidated>>> = Rc::default();
+        let invalidated = {
+            let (pending, device) = (Rc::clone(&pending), device.to_string());
+            paintable.connect_invalidate_contents(move |_| {
+                if pending.get().is_none() {
+                    let queued = crate::device_links::webrtc::screen::stream_for(&device)
+                        .and_then(|stream| stream.since_last_frame())
+                        .map(|since| since.as_secs_f64() * 1e3);
+                    pending.set(Some((queued, Instant::now())));
+                }
+            })
+        };
+        // (queued sum, queued n, queued max, paint sum, painted n, paint max)
+        let sums = Cell::new((0.0, 0u32, 0f64, 0.0, 0u32, 0f64));
+        let line_at = Cell::new(Instant::now());
+        let painted = clock.connect_after_paint(move |_| {
+            if let Some((queued, at)) = pending.take() {
+                let painted = at.elapsed().as_secs_f64() * 1e3;
+                let (mut qs, mut qn, mut qm, ps, pn, pm) = sums.get();
+                if let Some(queued) = queued {
+                    (qs, qn, qm) = (qs + queued, qn + 1, qm.max(queued));
+                }
+                sums.set((qs, qn, qm, ps + painted, pn + 1, pm.max(painted)));
+            }
+            if line_at.get().elapsed() >= Duration::from_secs(2) {
+                let (qs, qn, qm, ps, pn, pm) = sums.take();
+                if pn > 0 {
+                    eprintln!(
+                        "[DeskLink] phone-screen-paint: {pn} frames, sink to main loop {:.1} ms avg / {qm:.1} max, \
+                         to painted {:.1} ms avg / {pm:.1} max",
+                        qs / f64::from(qn.max(1)),
+                        ps / f64::from(pn),
+                    );
+                }
+                line_at.set(Instant::now());
+            }
+        });
+        Some(Self {
+            paintable: paintable.clone(),
+            invalidated: Some(invalidated),
+            clock,
+            painted: Some(painted),
+        })
+    }
+}
+
+impl Drop for PaintWatch {
+    fn drop(&mut self) {
+        if let Some(id) = self.invalidated.take() {
+            self.paintable.disconnect(id);
+        }
+        if let Some(id) = self.painted.take() {
+            self.clock.disconnect(id);
+        }
     }
 }
 

@@ -25,6 +25,8 @@ pub(super) struct ScreenStreamInner {
     stopped: AtomicBool,
     /// Decoded frames that reached the sink.
     shown: Arc<AtomicU64>,
+    /// When the last decoded frame entered the sink (`DESKLINK_DEBUG` only).
+    last_frame: Mutex<Option<std::time::Instant>>,
 }
 
 impl ScreenStreamInner {
@@ -209,7 +211,6 @@ impl ScreenStream {
             .flatten()
     }
 
-    /// Decoded frames delivered to the display so far.
     /// Asks the sender for a keyframe the way a decoder does (an upstream
     /// `GstForceKeyUnit`, which the RTP session turns into a PLI).
     #[cfg(test)]
@@ -223,6 +224,13 @@ impl ScreenStream {
             ))
     }
 
+    /// How long ago the last decoded frame entered the display sink
+    /// (`DESKLINK_DEBUG` only; `None` otherwise).
+    pub fn since_last_frame(&self) -> Option<std::time::Duration> {
+        self.inner.last_frame.lock().ok()?.map(|at| at.elapsed())
+    }
+
+    /// Decoded frames delivered to the display so far.
     pub fn frames_shown(&self) -> u64 {
         self.inner.shown.load(Ordering::Relaxed)
     }
@@ -467,6 +475,7 @@ pub(crate) fn attach_incoming_video(
         sink,
         stopped: AtomicBool::new(false),
         shown,
+        last_frame: Mutex::new(None),
     });
     let weak_inner = Arc::downgrade(&inner);
     pad.connect_unlinked(move |_, _| {
@@ -532,6 +541,105 @@ pub(super) fn inbound_summary(sources: impl Iterator<Item = gst::Structure>) -> 
     })
 }
 
+/// The phone's latest RTCP sender report, from the same source as
+/// [`inbound_summary`]: its NTP wall-clock time (32.32) and the RTP timestamp
+/// of that instant. Maps a frame's RTP timestamp back to its capture time.
+pub(super) fn sender_report(sources: impl Iterator<Item = gst::Structure>) -> Option<(u64, u32)> {
+    let source = sources
+        .filter(|source| {
+            !source.get::<bool>("internal").unwrap_or(true)
+                && source.get::<bool>("is-sender").unwrap_or(false)
+        })
+        .max_by_key(|source| source.get::<u64>("octets-received").unwrap_or(0))?;
+    source
+        .get::<bool>("have-sr")
+        .unwrap_or(false)
+        .then(|| {
+            Some((
+                source.get::<u64>("sr-ntptime").ok()?,
+                source.get::<u32>("sr-rtptime").ok()?,
+            ))
+        })
+        .flatten()
+}
+
+/// Milliseconds from a frame's capture on the phone to `shown_unix_ns` here:
+/// the capture instant is the sender report's NTP time moved by the RTP
+/// clock (90 kHz) to the frame's timestamp. Phone clock against this one:
+/// the difference between the two clocks is still in it.
+pub(super) fn capture_to_shown_ms(report: (u64, u32), rtp: u32, shown_unix_ns: i128) -> f64 {
+    const NTP_TO_UNIX_SECONDS: i128 = 2_208_988_800;
+    let (ntp, report_rtp) = report;
+    let report_ns = ((ntp >> 32) as i128 - NTP_TO_UNIX_SECONDS) * 1_000_000_000
+        + (((ntp & 0xffff_ffff) as i128 * 1_000_000_000) >> 32);
+    let ticks = rtp.wrapping_sub(report_rtp) as i32;
+    let capture_ns = report_ns + i128::from(ticks) * 1_000_000_000 / 90_000;
+    (shown_unix_ns - capture_ns) as f64 / 1e6
+}
+
+/// `DESKLINK_FRAME_DIR`, the measurement harness's folder, read once: frames
+/// of the phone's screen are written there, so only a real directory of this
+/// user's that nobody else can write is taken.
+pub(crate) fn frame_dir() -> Option<&'static std::path::Path> {
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::path::PathBuf::from(std::env::var_os("DESKLINK_FRAME_DIR")?);
+        if private_dir(&dir) {
+            Some(dir)
+        } else {
+            eprintln!(
+                "[DeskLink] DESKLINK_FRAME_DIR ignored: {} is not a folder of this user's that only it can write",
+                dir.display()
+            );
+            None
+        }
+    })
+    .as_deref()
+}
+
+/// A directory itself (not a link to one), owned by this user, with no group
+/// or other write permission.
+pub(super) fn private_dir(dir: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(dir).is_ok_and(|meta| {
+        meta.is_dir() && meta.uid() == unsafe { libc::getuid() } && meta.mode() & 0o022 == 0
+    })
+}
+
+/// Opens `name` in `dir` for this user only (0600), never through a link at
+/// that name: appended to, or emptied first.
+pub(crate) fn open_private(
+    dir: &std::path::Path,
+    name: &str,
+    append: bool,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .append(append)
+        .truncate(!append)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(name))
+}
+
+/// The per-frame record stops growing here (about 300 000 frames).
+const FRAMES_CSV_MAX_BYTES: u64 = 8 << 20;
+
+fn unix_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos() as i128)
+}
+
+/// The RTP timestamp of an RTP packet (bytes 4-7 of its header).
+fn rtp_timestamp(buffer: &gst::BufferRef) -> Option<u32> {
+    let map = buffer.map_readable().ok()?;
+    let bytes: [u8; 4] = map.get(4..8)?.try_into().ok()?;
+    Some(u32::from_be_bytes(bytes))
+}
+
 /// UDP datagrams the kernel dropped because a socket's receive buffer was
 /// full, IPv4 and IPv6, every socket on this machine (`/proc/net/snmp{,6}`).
 pub(super) fn udp_receive_buffer_drops() -> Option<u64> {
@@ -566,12 +674,16 @@ fn watch_inbound(pad: &gst::Pad, inner: &Arc<ScreenStreamInner>) {
     let Some(webrtcbin) = pad.parent_element() else {
         return;
     };
-    let arrived: Arc<Mutex<HashMap<u64, Instant>>> = Arc::default();
+    // pts -> (arrival of the frame's last packet, its RTP timestamp).
+    type Arrivals = HashMap<u64, (Instant, Option<u32>)>;
+    let arrived: Arc<Mutex<Arrivals>> = Arc::default();
     // (sum ms, frames, max ms) since the last line.
     let chain: Arc<Mutex<(f64, u32, f64)>> = Arc::default();
-    let pts_of = |data: &Option<gst::PadProbeData>| match data {
-        Some(gst::PadProbeData::Buffer(buffer)) => buffer.pts(),
-        Some(gst::PadProbeData::BufferList(list)) => list.iter().last().and_then(|b| b.pts()),
+    // (RTP timestamp, wall clock ns) of each frame that reached the sink since the last line.
+    let shown_at: Arc<Mutex<Vec<(u32, i128)>>> = Arc::default();
+    let last_buffer = |data: &Option<gst::PadProbeData>| match data {
+        Some(gst::PadProbeData::Buffer(buffer)) => Some(buffer.to_owned()),
+        Some(gst::PadProbeData::BufferList(list)) => list.iter().last().map(|b| b.to_owned()),
         _ => None,
     };
     {
@@ -579,36 +691,65 @@ fn watch_inbound(pad: &gst::Pad, inner: &Arc<ScreenStreamInner>) {
         pad.add_probe(
             gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
             move |_, info| {
-                if let Some(pts) = pts_of(&info.data) {
-                    let mut arrived = arrived.lock().unwrap_or_else(|e| e.into_inner());
-                    if arrived.len() > 512 {
-                        arrived.clear();
+                if let Some(buffer) = last_buffer(&info.data) {
+                    if let Some(pts) = buffer.pts() {
+                        let mut arrived = arrived.lock().unwrap_or_else(|e| e.into_inner());
+                        if arrived.len() > 512 {
+                            arrived.clear();
+                        }
+                        // The frame's last packet: decoding can start from here.
+                        arrived.insert(pts.nseconds(), (Instant::now(), rtp_timestamp(&buffer)));
                     }
-                    // The frame's last packet: decoding can start from here.
-                    arrived.insert(pts.nseconds(), Instant::now());
                 }
                 gst::PadProbeReturn::Ok
             },
         );
     }
     if let Some(sink_pad) = inner.sink.static_pad("sink") {
-        let (arrived, chain) = (Arc::clone(&arrived), Arc::clone(&chain));
+        let (arrived, chain, shown_at) = (
+            Arc::clone(&arrived),
+            Arc::clone(&chain),
+            Arc::clone(&shown_at),
+        );
+        let first = AtomicBool::new(true);
+        let weak_for_sink = Arc::downgrade(inner);
         sink_pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-            let at = pts_of(&info.data).and_then(|pts| {
-                let mut arrived = arrived.lock().unwrap_or_else(|e| e.into_inner());
-                arrived.remove(&pts.nseconds())
-            });
-            if let Some(at) = at {
+            let now = unix_ns();
+            if let Some(inner) = weak_for_sink.upgrade() {
+                if let Ok(mut last) = inner.last_frame.lock() {
+                    *last = Some(Instant::now());
+                }
+            }
+            if first.swap(false, Ordering::Relaxed) {
+                // The harness's clock for "share start -> first frame".
+                eprintln!(
+                    "[DeskLink] phone-screen first frame at unix {:.3}",
+                    now as f64 / 1e9
+                );
+            }
+            let at = last_buffer(&info.data)
+                .and_then(|buffer| buffer.pts())
+                .and_then(|pts| {
+                    let mut arrived = arrived.lock().unwrap_or_else(|e| e.into_inner());
+                    arrived.remove(&pts.nseconds())
+                });
+            if let Some((at, rtp)) = at {
                 let ms = at.elapsed().as_secs_f64() * 1e3;
                 let mut chain = chain.lock().unwrap_or_else(|e| e.into_inner());
                 *chain = (chain.0 + ms, chain.1 + 1, chain.2.max(ms));
+                if let Some(rtp) = rtp {
+                    let mut shown_at = shown_at.lock().unwrap_or_else(|e| e.into_inner());
+                    if shown_at.len() < 4096 {
+                        shown_at.push((rtp, now));
+                    }
+                }
             }
             gst::PadProbeReturn::Ok
         });
     }
     // rtpbin's own session: webrtcbin's `get-stats` had no `inbound-rtp` for
     // this stream, so every line read "0 kbps, ?".
-    let read_inbound = move || {
+    let read_sources = move || {
         webrtcbin
             .downcast_ref::<gst::Bin>()
             .and_then(|bin| bin.by_name("rtpbin"))
@@ -618,12 +759,17 @@ fn watch_inbound(pad: &gst::Pad, inner: &Arc<ScreenStreamInner>) {
             .and_then(|session| {
                 let stats = session.property::<gst::Structure>("stats");
                 let sources = stats.get::<gst::glib::ValueArray>("source-stats").ok()?;
-                inbound_summary(
+                Some(
                     sources
                         .iter()
-                        .filter_map(|value| value.get::<gst::Structure>().ok()),
+                        .filter_map(|value| value.get::<gst::Structure>().ok())
+                        .collect::<Vec<_>>(),
                 )
             })
+    };
+    let read_inbound = {
+        let read_sources = read_sources.clone();
+        move || read_sources().and_then(|sources| inbound_summary(sources.into_iter()))
     };
     let weak = Arc::downgrade(inner);
     std::thread::spawn(move || {
@@ -687,6 +833,40 @@ fn watch_inbound(pad: &gst::Pad, inner: &Arc<ScreenStreamInner>) {
             let received = inbound.as_ref().map_or(bytes, |inbound| inbound.bytes);
             let seconds = since.elapsed().as_secs_f64();
             let show = |value: Option<String>| value.unwrap_or_else(|| "?".to_string());
+            // Capture on the phone to the sink here, by the phone's sender report.
+            let shown_now =
+                std::mem::take(&mut *shown_at.lock().unwrap_or_else(|e| e.into_inner()));
+            let capture = read_sources()
+                .and_then(|sources| sender_report(sources.into_iter()))
+                .filter(|_| !shown_now.is_empty())
+                .map(|report| {
+                    let ms: Vec<f64> = shown_now
+                        .iter()
+                        .map(|&(rtp, at)| capture_to_shown_ms(report, rtp, at))
+                        .collect();
+                    // The measurement harness's per-frame record (shown at, capture to sink).
+                    if let Some(dir) = frame_dir() {
+                        use std::io::Write;
+                        if let Ok(mut file) =
+                            open_private(dir, "frames.csv", true).and_then(|file| {
+                                match file.metadata()?.len() < FRAMES_CSV_MAX_BYTES {
+                                    true => Ok(file),
+                                    false => Err(std::io::ErrorKind::FileTooLarge.into()),
+                                }
+                            })
+                        {
+                            for (&(_, at), ms) in shown_now.iter().zip(&ms) {
+                                let _ = writeln!(file, "{:.3},{ms:.1}", at as f64 / 1e6);
+                            }
+                        }
+                    }
+                    format!(
+                        "{:.1} ms avg / {:.1} max",
+                        ms.iter().sum::<f64>() / ms.len() as f64,
+                        ms.iter().cloned().fold(f64::MIN, f64::max)
+                    )
+                })
+                .unwrap_or_else(|| "-".into());
             let drops_now = udp_receive_buffer_drops();
             let dropped = drops
                 .zip(drops_now)
@@ -695,7 +875,7 @@ fn watch_inbound(pad: &gst::Pad, inner: &Arc<ScreenStreamInner>) {
             eprintln!(
                 "[DeskLink] phone-screen-stats: {size} via {decoder}, shown {:.1} fps, in {} kbps, \
                  lost {}, nack {}, pli {}, udp drops {}, jitter {} ms, \
-                 after jitter buffer {} ms avg / {:.1} max",
+                 after jitter buffer {} ms avg / {:.1} max, capture to sink {capture} (phone clock)",
                 (shown - frames) as f64 / seconds,
                 ((received.saturating_sub(bytes)) as f64 * 8.0 / seconds / 1000.0) as u64,
                 show(inbound.as_ref().map(|i| i.lost.to_string())),

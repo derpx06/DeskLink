@@ -661,3 +661,74 @@ fn unlinked_inbound_track_stops_its_decode_chain() {
     assert_eq!(pipeline.children().len(), 2, "identity + parking fakesink");
     assert!(is_parked(&source_pad));
 }
+
+/// The phone's sender report maps a frame's RTP timestamp back to its
+/// capture time: 9000 ticks (100 ms) after the report, shown 130 ms after
+/// the report, is 30 ms from capture to the sink.
+#[test]
+fn a_frame_is_timed_from_its_capture_by_the_sender_report() {
+    // NTP 3_900_000_000.5 s = unix 1_691_011_200.5 s.
+    let ntp = (3_900_000_000u64 << 32) | (1u64 << 31);
+    let report_unix_ns = 1_691_011_200_500_000_000i128;
+    let ms = capture_to_shown_ms(
+        (ntp, 4_294_960_000),
+        4_294_960_000u32.wrapping_add(9_000),
+        report_unix_ns + 130_000_000,
+    );
+    assert!((ms - 30.0).abs() < 0.01, "{ms}");
+    // A frame captured before the report (RTP timestamp behind it).
+    let ms = capture_to_shown_ms((ntp, 100), 100u32.wrapping_sub(900), report_unix_ns);
+    assert!((ms - 10.0).abs() < 0.01, "{ms}");
+}
+
+#[test]
+fn the_sender_report_is_read_from_the_phones_video_source() {
+    if gst::init().is_err() {
+        return;
+    }
+    let source = |octets: u64, sr: bool| {
+        gst::Structure::builder("application/x-rtp-source-stats")
+            .field("internal", false)
+            .field("is-sender", true)
+            .field("octets-received", octets)
+            .field("have-sr", sr)
+            .field("sr-ntptime", octets)
+            .field("sr-rtptime", 7u32)
+            .build()
+    };
+    assert_eq!(
+        sender_report([source(40, true), source(5_000, true)].into_iter()),
+        Some((5_000, 7))
+    );
+    assert_eq!(sender_report([source(5_000, false)].into_iter()), None);
+}
+
+/// The harness folder gets frames of the phone's screen: only a real folder
+/// of this user's that nobody else can write is taken, and files are made
+/// 0600 and never written through a link.
+#[test]
+fn the_frame_folder_must_be_private_and_its_files_are() {
+    use std::os::unix::fs::PermissionsExt;
+    let base = std::env::temp_dir().join(format!("p34-frames-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir(&base).unwrap();
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(private_dir(&base));
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(!private_dir(&base), "world-writable");
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let link = base.with_extension("link");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&base, &link).unwrap();
+    assert!(!private_dir(&link), "a link to a folder");
+
+    let file = open_private(&base, "frames.csv", true).unwrap();
+    assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o600);
+    std::os::unix::fs::symlink(base.join("frames.csv"), base.join("frame.png.tmp")).unwrap();
+    assert!(
+        open_private(&base, "frame.png.tmp", false).is_err(),
+        "through a link"
+    );
+    let _ = std::fs::remove_file(&link);
+    std::fs::remove_dir_all(&base).unwrap();
+}

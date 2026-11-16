@@ -42,8 +42,8 @@ pub(crate) use encoder::pipewire_source;
 #[cfg(test)]
 pub(crate) use inbound::Inbound;
 pub(crate) use inbound::{
-    attach_incoming_video, clear_stream, forget_parked, park_pad, publish_stream, resume_parked,
-    stream_for, while_blocked, ScreenStream,
+    attach_incoming_video, clear_stream, forget_parked, frame_dir, open_private, park_pad,
+    publish_stream, resume_parked, stream_for, while_blocked, ScreenStream,
 };
 
 /// Body value of `role` for "send me the phone's screen".
