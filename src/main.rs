@@ -77,6 +77,7 @@ mod application;
 mod autostart;
 mod bucket_progress;
 mod config;
+mod dbus_names;
 mod desk_menu;
 mod desktop_env;
 mod device_links;

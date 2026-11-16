@@ -307,13 +307,9 @@ impl Tray {
 
         // Hosts look for items under this name; the object paths stay as they are.
         let service = item_bus_name(std::process::id());
-        let _owner = gio::bus_own_name_on_connection(
-            &connection,
-            &service,
-            gio::BusNameOwnerFlags::NONE,
-            |_, _| {},
-            |_, name| debug_log!("[Tray] Could not own {name}; registering by unique name"),
-        );
+        let _owner = crate::dbus_names::own_name(&connection, &service, |name| {
+            debug_log!("[Tray] Could not own {name}; registering by unique name")
+        });
 
         let hosted = Hosted::default();
         // Any change in which hosts exist: ask the watcher again rather than
@@ -342,15 +338,14 @@ impl Tray {
         let appeared = hosted.clone();
         let vanished = hosted.clone();
         // Watching lasts as long as the process; the tray is never torn down.
-        let _watch = gio::bus_watch_name_on_connection(
+        let _watch = crate::dbus_names::watch_name(
             &connection,
             WATCHER,
-            gio::BusNameWatcherFlags::NONE,
-            move |connection, _, _| {
-                register(&connection, &service, &appeared);
-                refresh_host(&connection, &appeared);
+            move |connection| {
+                register(connection, &service, &appeared);
+                refresh_host(connection, &appeared);
             },
-            move |_, _| {
+            move || {
                 vanished.registered.set(false);
                 vanished.host.set(false);
             },

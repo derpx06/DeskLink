@@ -147,14 +147,8 @@ pub(super) fn client_said_hello(
     sender: &str,
     capabilities: Vec<String>,
 ) {
-    let watch = gio::bus_watch_name_on_connection(
-        connection,
-        sender,
-        gio::BusNameWatcherFlags::NONE,
-        |_, _, _| {},
-        |_, _| forget_client(),
-    );
-    let unwatch: Box<dyn FnOnce()> = Box::new(move || gio::bus_unwatch_name(watch));
+    let watch = crate::dbus_names::watch_name(connection, sender, |_| {}, forget_client);
+    let unwatch: Box<dyn FnOnce()> = Box::new(move || watch.release());
     let previous = CLIENT.with(|client| {
         client.replace(Some(Client {
             capabilities,

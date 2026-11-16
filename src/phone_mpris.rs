@@ -217,7 +217,7 @@ pub(crate) fn request_for(
 /// One phone's exported player.
 struct Export {
     connection: gio::DBusConnection,
-    owner: gio::OwnerId,
+    owner: crate::dbus_names::NameHandle,
     shown: Rc<RefCell<Shown>>,
 }
 
@@ -297,13 +297,9 @@ impl Export {
                 .build()
                 .map_err(|error| error.to_string())?;
         }
-        let owner = gio::bus_own_name_on_connection(
-            &connection,
-            &bus_name_for(device_id),
-            gio::BusNameOwnerFlags::NONE,
-            |_, _| {},
-            |_, name| eprintln!("[DeskLink] Could not own {name}"),
-        );
+        let owner = crate::dbus_names::own_name(&connection, &bus_name_for(device_id), |name| {
+            eprintln!("[DeskLink] Could not own {name}")
+        });
         Ok(Self {
             connection,
             owner,
@@ -353,7 +349,7 @@ impl Export {
     }
 
     fn stop(self) {
-        gio::bus_unown_name(self.owner);
+        self.owner.release();
         let _ = self.connection.close_sync(gio::Cancellable::NONE);
     }
 }
