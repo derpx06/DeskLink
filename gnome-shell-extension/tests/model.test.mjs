@@ -1,7 +1,7 @@
 // Run with: node --test gnome-shell-extension/tests/
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import {existsSync, readFileSync} from 'node:fs';
+import {existsSync, readFileSync, readdirSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
 
 import {
@@ -187,13 +187,20 @@ test('live words and clocks', () => {
 });
 
 // The contract: everything the menu sends exists in the app's interface.
-const rust = readFileSync(
-    fileURLToPath(new URL('../../src/shell_dbus.rs', import.meta.url)), 'utf8').split('#[cfg(test)]')[0];
+// Every non-test file of src/shell_dbus/ (the module is split by responsibility;
+// its test modules are tests.rs and *_tests.rs; an inline test module ends a file's
+// production part, a `#[cfg(test)] mod tests;` declaration does not).
+const rustDir = fileURLToPath(new URL('../../src/shell_dbus/', import.meta.url));
+const rust = readdirSync(rustDir)
+    .filter(name => name.endsWith('.rs') && name !== 'tests.rs' && !name.endsWith('_tests.rs'))
+    .sort()
+    .map(name => readFileSync(rustDir + name, 'utf8').split(/\n#\[cfg\(test\)\]\nmod \w+ \{/)[0])
+    .join('\n');
 
-/// The text of one item of shell_dbus.rs, from its first line to its `end`.
+/// The text of one item of src/shell_dbus/, from its first line to its `end`.
 function part(start, end) {
     const from = rust.indexOf(start);
-    assert.ok(from >= 0, `${start} is not in shell_dbus.rs`);
+    assert.ok(from >= 0, `${start} is not in src/shell_dbus/`);
     return rust.slice(from, rust.indexOf(end, from));
 }
 const quoted = text => [...text.matchAll(/"([a-z][a-z-]*)"/g)].map(m => m[1]);

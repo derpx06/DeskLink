@@ -63,7 +63,7 @@ wobble returns when the phone stops looking. Other window effects (magic lamp, b
 
 The extension only talks to the app over D-Bus
 (`derx06.desklink.com.Shell1` at `/derx06/desklink/com/Shell`, see
-`src/shell_dbus.rs`). Files to send are picked in DeskLink's own dialog.
+`src/shell_dbus/`). Files to send are picked in DeskLink's own dialog.
 
 Interface version 9 adds to `Devices[]` the per-phone `settings` (the switches),
 `sound`, `rttMs`, `unread`, `textCapture` and `transfers`; to `Desk` the
@@ -74,7 +74,7 @@ the security keys refuse `on`) and `SendLink(device, link)`; and the actions
 `unpair`. An action is listed only when the phone takes it. An older app (interface
 below 9) simply shows fewer rows; below 10 it has no timeline. Interface 10 adds `media.positionMs|lengthMs|seekReason`, the `media-seek` action and the `SeekMedia(device, position_ms)` method. `model.js` has no GNOME imports and says what the
 menu holds; `tests/model.test.mjs` also checks that every action and key it names is
-in `shell_dbus.rs`. Run the tests with `node --test gnome-shell-extension/tests/*.test.mjs`.
+in `src/shell_dbus/`. Run the tests with `node --test gnome-shell-extension/tests/*.test.mjs`.
 
 ## Checking it on the real top bar
 
