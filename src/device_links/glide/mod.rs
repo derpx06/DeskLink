@@ -306,7 +306,10 @@ pub(crate) fn start() {
 /// its accessibility service is off or not bound (`reason: "accessibility"`). Unknown until it
 /// reports, and forgotten whenever its link is not ready: the phone reports
 /// on every feature-ready.
-static ALLOWED: Mutex<Option<HashMap<String, (bool, bool, bool)>>> = Mutex::new(None);
+/// `(allowed, locked, service_off)`.
+type Report = (bool, bool, bool);
+
+static ALLOWED: Mutex<Option<HashMap<String, Report>>> = Mutex::new(None);
 
 /// Whether the phone has said it allows glide: `None` until it reports (an
 /// older phone never does).
@@ -337,7 +340,7 @@ pub(crate) fn unlock_words(phone: &str) -> String {
     format!("Unlock {phone} to use Glide")
 }
 
-fn report_of(device_id: &str) -> Option<(bool, bool, bool)> {
+fn report_of(device_id: &str) -> Option<Report> {
     ALLOWED.lock().ok().and_then(|known| {
         known
             .as_ref()
@@ -345,7 +348,7 @@ fn report_of(device_id: &str) -> Option<(bool, bool, bool)> {
     })
 }
 
-fn set_allowed(device_id: &str, allowed: Option<(bool, bool, bool)>) {
+fn set_allowed(device_id: &str, allowed: Option<Report>) {
     if let Ok(mut known) = ALLOWED.lock() {
         let known = known.get_or_insert_with(HashMap::new);
         match allowed {
