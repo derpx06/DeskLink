@@ -171,7 +171,15 @@ fn side_list(nav: &adw::NavigationView) -> gtk::Widget {
         .css_classes(["navigation-sidebar"])
         .build();
     list.update_property(&[gtk::accessible::Property::Label("Settings pages")]);
-    for (_, index, icon, _) in PAGES {
+    // The row for the full list (Setup, quick switches, search results) comes
+    // first, so some row is always the one open.
+    let mut entries = vec![("list".to_string(), "desklink-settings-symbolic", "Overview")];
+    entries.extend(
+        PAGES
+            .iter()
+            .map(|(_, index, icon, _)| (tag(*index), *icon, GROUPS[*index])),
+    );
+    for (name, icon, title) in entries {
         let line = gtk::Box::builder().spacing(12).build();
         line.append(
             &gtk::Image::builder()
@@ -181,32 +189,43 @@ fn side_list(nav: &adw::NavigationView) -> gtk::Widget {
         );
         line.append(
             &gtk::Label::builder()
-                .label(GROUPS[index])
+                .label(title)
                 .xalign(0.0)
                 .ellipsize(gtk::pango::EllipsizeMode::End)
                 .css_classes(["nav-label"])
                 .build(),
         );
         let row = gtk::ListBoxRow::builder().child(&line).build();
-        row.set_widget_name(&tag(index));
-        row.update_property(&[gtk::accessible::Property::Label(GROUPS[index])]);
+        row.set_widget_name(&name);
+        row.update_property(&[gtk::accessible::Property::Label(title)]);
         list.append(&row);
     }
+    // The page open is the row marked, and the row marked is the page open:
+    // arrowing to a row opens it (as the main sidebar does), and a page opened
+    // another way marks its row without opening anything again.
+    let syncing = std::rc::Rc::new(std::cell::Cell::new(false));
     {
-        let nav = nav.downgrade();
-        list.connect_row_activated(move |_, row| {
-            let Some(nav) = nav.upgrade() else {
+        let (nav, syncing) = (nav.downgrade(), syncing.clone());
+        list.connect_row_selected(move |_, row| {
+            let (Some(nav), Some(row)) = (nav.upgrade(), row) else {
                 return;
             };
+            if syncing.get() {
+                return;
+            }
             let wanted = row.widget_name();
             let shown = nav.visible_page().and_then(|page| page.tag());
             if shown.as_deref() != Some(wanted.as_str()) {
-                nav.replace_with_tags(&["list", wanted.as_str()]);
+                if wanted == "list" {
+                    nav.replace_with_tags(&["list"]);
+                } else {
+                    nav.replace_with_tags(&["list", wanted.as_str()]);
+                }
             }
         });
     }
     let select = {
-        let list = list.downgrade();
+        let (list, syncing) = (list.downgrade(), syncing.clone());
         move |nav: &adw::NavigationView| {
             let (Some(list), Some(tag)) = (
                 list.upgrade(),
@@ -215,26 +234,54 @@ fn side_list(nav: &adw::NavigationView) -> gtk::Widget {
                 return;
             };
             let mut child = list.first_child();
-            let mut found = None;
             while let Some(row) = child {
                 if row.widget_name() == tag {
-                    found = row.downcast_ref::<gtk::ListBoxRow>().cloned();
+                    if let Some(row) = row.downcast_ref::<gtk::ListBoxRow>() {
+                        syncing.set(true);
+                        list.select_row(Some(row));
+                        syncing.set(false);
+                    }
                 }
                 child = row.next_sibling();
             }
-            list.select_row(found.as_ref());
         }
     };
     select(nav);
     nav.connect_visible_page_notify(select);
+    // Search from any page: it opens the full list and types into its search.
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Search settings")
+        .build();
+    search.update_property(&[gtk::accessible::Property::Label("Search settings")]);
+    {
+        let nav = nav.downgrade();
+        search.connect_search_changed(move |entry| {
+            let (Some(nav), text) = (nav.upgrade(), entry.text()) else {
+                return;
+            };
+            if text.trim().is_empty() {
+                return;
+            }
+            if nav.visible_page().and_then(|page| page.tag()).as_deref() != Some("list") {
+                nav.replace_with_tags(&["list"]);
+            }
+            if let Some(main) = SEARCH.with(|slot| slot.borrow().upgrade()) {
+                main.set_text(&text);
+            }
+            entry.set_text("");
+        });
+    }
     let side = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
         .width_request(260)
         .valign(gtk::Align::Start)
         .margin_top(8)
+        .margin_start(32)
         .visible(false)
         .build();
     side.set_widget_name("settings-side");
+    side.append(&search);
     side.append(&list);
     side.upcast()
 }
@@ -402,6 +449,8 @@ fn build_view(
         );
         back.set_halign(gtk::Align::Start);
         back.set_tooltip_text(Some("Back to Settings (Esc)"));
+        // Hidden on a big window: the side list is the way to the others.
+        back.set_widget_name("settings-back");
         {
             let nav = nav.downgrade();
             back.connect_clicked(move |_| {

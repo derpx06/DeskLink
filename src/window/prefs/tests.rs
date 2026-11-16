@@ -657,7 +657,7 @@ fn the_side_list_opens_a_page_and_follows_the_open_one() {
         let (view, _daemon) = view_for_tests();
         let side = side_list(&view.root);
         let list = side
-            .first_child()
+            .last_child()
             .and_downcast::<gtk::ListBox>()
             .expect("the pages");
         let row = |index: usize| {
@@ -676,7 +676,7 @@ fn the_side_list_opens_a_page_and_follows_the_open_one() {
                 .and_then(|page| page.tag())
                 .unwrap_or_default()
         };
-        row(1).emit_by_name::<()>("activate", &[]);
+        list.select_row(Some(&row(1)));
         assert_eq!(shown(), tag(1));
         assert_eq!(
             list.selected_row().map(|r| r.widget_name().to_string()),
@@ -691,9 +691,14 @@ fn the_side_list_opens_a_page_and_follows_the_open_one() {
             Some(tag(3))
         );
         // Back from a page opened in the side list leads to the full list.
-        row(5).emit_by_name::<()>("activate", &[]);
+        list.select_row(Some(&row(5)));
         assert_eq!(shown(), tag(5));
         view.root.pop();
         assert_eq!(shown(), "list");
+        assert_eq!(
+            list.selected_row().map(|r| r.widget_name().to_string()),
+            Some("list".to_string()),
+            "the Overview row is the one open"
+        );
     });
 }

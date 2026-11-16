@@ -40,6 +40,10 @@ pub(super) struct Page {
     /// On a big window, the chosen contact beside the list (`apply_layout`
     /// shows it); otherwise a contact opens in a dialog.
     detail: gtk::Box,
+    /// The pane's scroller: whether it shows says whether a contact opens in it.
+    pane: gtk::ScrolledWindow,
+    /// The contact in the pane: its phone's id and uid.
+    opened: Rc<RefCell<Option<(String, String)>>>,
 }
 
 /// What a search term is matched against: name, numbers (digits too),
@@ -252,7 +256,8 @@ impl Page {
         count.set_xalign(0.0);
 
         let list = gtk::ListBox::builder()
-            .selection_mode(gtk::SelectionMode::None)
+            // Single: the contact open in the pane is marked in the list.
+            .selection_mode(gtk::SelectionMode::Single)
             .css_classes(["dl-row-group"])
             .valign(gtk::Align::Start)
             .build();
@@ -301,17 +306,25 @@ impl Page {
         // The contact beside the list on a big window.
         let detail = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
-            .width_request(440)
             .css_classes(["dl-contact-pane"])
             .build();
         detail.set_widget_name("contacts-detail");
         detail.update_property(&[gtk::accessible::Property::Label("Contact")]);
         detail.append(&pick_a_contact());
+        // A fixed width: the list does not jump when the first contact is chosen.
         let pane = gtk::ScrolledWindow::builder()
             .hscrollbar_policy(gtk::PolicyType::Never)
             .vexpand(true)
+            .hexpand(false)
+            .width_request(460)
             .visible(false)
-            .child(&detail)
+            .child(
+                &adw::Clamp::builder()
+                    .maximum_size(440)
+                    .tightening_threshold(440)
+                    .child(&detail)
+                    .build(),
+            )
             .build();
         pane.set_widget_name("contacts-pane");
         let split = gtk::Box::builder().build();
@@ -342,12 +355,15 @@ impl Page {
             });
         }
         let device: Rc<RefCell<(String, bool)>> = Rc::default();
+        let opened: Rc<RefCell<Option<(String, String)>>> = Rc::default();
         {
-            let (contacts, device, win, detail) = (
+            let (contacts, device, win, detail, pane, opened) = (
                 Rc::clone(&contacts),
                 Rc::clone(&device),
                 win.downgrade(),
                 detail.clone(),
+                pane.clone(),
+                Rc::clone(&opened),
             );
             list.connect_row_activated(move |_, row| {
                 let Some(win) = win.upgrade() else {
@@ -356,13 +372,17 @@ impl Page {
                 let contact = contacts.borrow().get(row.widget_name().as_str()).cloned();
                 if let Some(contact) = contact {
                     let (id, can_call) = device.borrow().clone();
-                    show_details(&win, &id, can_call, &contact, &detail);
+                    let in_pane = pane.is_visible();
+                    opened.replace(in_pane.then(|| (id.clone(), contact.uid.clone())));
+                    show_details(&win, &id, can_call, &contact, &detail, in_pane);
                 }
             });
         }
         let page = Self {
             root: split.upcast(),
             detail,
+            pane,
+            opened,
             search,
             refresh,
             count,
@@ -437,6 +457,17 @@ impl Page {
             .iter()
             .map(|contact| (contact.uid.clone(), contact.clone()))
             .collect();
+        // The contact in the pane belongs to the phone and the list it was
+        // chosen from: another phone, a contact gone, or a phone that can no
+        // longer call put the pane back or redraw it (its Call and Message
+        // were bound to the old phone and the old state).
+        let opened = self.opened.borrow().clone();
+        match opened_contact(opened, &device.id, &by_uid) {
+            Some(contact) if self.pane.is_visible() => {
+                show_details(_win, &device.id, can_call, &contact, &self.detail, true);
+            }
+            _ => reset_pane(&self.detail, &self.opened, &self.list),
+        }
         self.contacts.replace(by_uid);
         {
             let mut source = self.source.borrow_mut();
@@ -446,6 +477,18 @@ impl Page {
             source.can_call = can_call;
         }
         draw(&self.list, &self.count, &self.source.borrow());
+        // The contact open in the pane stays marked in the redrawn list.
+        if let Some((_, uid)) = self.opened.borrow().as_ref() {
+            let mut child = self.list.first_child();
+            while let Some(row) = child {
+                if row.widget_name() == uid.as_str() {
+                    if let Some(row) = row.downcast_ref::<gtk::ListBoxRow>() {
+                        self.list.select_row(Some(row));
+                    }
+                }
+                child = row.next_sibling();
+            }
+        }
 
         if list.is_empty() {
             self.empty.title.set_label("No contacts yet");
@@ -463,9 +506,35 @@ impl Page {
     pub(super) fn show_contact(&self, win: &DesklinkWindow, device_id: &str, uid: &str) {
         if let Some(contact) = contacts::by_uid(device_id, uid) {
             let can_call = self.device.borrow().1 && self.device.borrow().0 == device_id;
-            show_details(win, device_id, can_call, &contact, &self.detail);
+            let in_pane = self.pane.is_visible();
+            self.opened
+                .replace(in_pane.then(|| (device_id.to_string(), uid.to_string())));
+            show_details(win, device_id, can_call, &contact, &self.detail, in_pane);
         }
     }
+}
+
+/// The contact the pane shows, if it is still the one it was opened for:
+/// the same phone, and still in that phone's list.
+fn opened_contact(
+    opened: Option<(String, String)>,
+    device_id: &str,
+    by_uid: &HashMap<String, Contact>,
+) -> Option<Contact> {
+    let (id, uid) = opened?;
+    (id == device_id)
+        .then(|| by_uid.get(&uid).cloned())
+        .flatten()
+}
+
+/// The pane back to its words, nothing chosen.
+fn reset_pane(pane: &gtk::Box, opened: &RefCell<Option<(String, String)>>, list: &gtk::ListBox) {
+    opened.replace(None);
+    list.unselect_all();
+    while let Some(child) = pane.first_child() {
+        pane.remove(&child);
+    }
+    pane.append(&pick_a_contact());
 }
 
 /// The pane's words before a contact is chosen.
@@ -489,8 +558,8 @@ fn show_details(
     can_call: bool,
     contact: &Contact,
     pane: &gtk::Box,
+    in_pane: bool,
 ) {
-    let in_pane = pane.parent().is_some_and(|scroll| scroll.is_visible());
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(18)
@@ -724,17 +793,78 @@ mod tests {
             let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
             pane.append(&pick_a_contact());
             let scroll = gtk::ScrolledWindow::builder().child(&pane).build();
-            show_details(&window, "d", true, &contact, &pane);
+            show_details(&window, "d", true, &contact, &pane, true);
             let shown = pane.first_child().expect("the contact");
             assert!(shown.has_css_class("dl-contact-detail"), "in the pane");
             assert!(shown.next_sibling().is_none(), "the placeholder is gone");
             scroll.set_visible(false);
-            show_details(&window, "d", true, &contact, &pane);
+            show_details(&window, "d", true, &contact, &pane, false);
             assert_eq!(
                 pane.first_child().as_ref(),
                 Some(&shown),
                 "a dialog, the pane untouched"
             );
+        });
+    }
+
+    /// The pane belongs to the phone and the contact it was opened for: it
+    /// goes back to its words for another phone or a contact that is gone,
+    /// and a phone that cannot call leaves Call and Message dead. (Needs a
+    /// display for the last part.)
+    #[test]
+    fn the_pane_follows_its_phone_and_its_contact() {
+        let list = many(2);
+        let by_uid: HashMap<String, Contact> =
+            list.iter().map(|c| (c.uid.clone(), c.clone())).collect();
+        let open = Some(("phone-a".to_string(), "u1".to_string()));
+        assert!(opened_contact(open.clone(), "phone-a", &by_uid).is_some());
+        assert!(
+            opened_contact(open.clone(), "phone-b", &by_uid).is_none(),
+            "another phone"
+        );
+        let mut gone = by_uid.clone();
+        gone.remove("u1");
+        assert!(
+            opened_contact(open, "phone-a", &gone).is_none(),
+            "contact deleted"
+        );
+        assert!(opened_contact(None, "phone-a", &by_uid).is_none());
+
+        crate::test_display::run(|| {
+            let resources = crate::load_resources().expect("the bundled resources");
+            gtk::gio::resources_register(&resources);
+            let app = adw::Application::builder()
+                .application_id("derx06.desklink.com.test")
+                .build();
+            let window = super::super::DesklinkWindow::new(&app);
+            let contact = many(1).remove(0);
+            let pane = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let opened = RefCell::new(Some(("phone-a".to_string(), "u0".to_string())));
+            let rows = gtk::ListBox::new();
+            // Offline: Call and Message are there but dead.
+            show_details(&window, "phone-a", false, &contact, &pane, true);
+            let mut dead = 0;
+            let mut stack = vec![pane.clone().upcast::<gtk::Widget>()];
+            while let Some(widget) = stack.pop() {
+                if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+                    if button
+                        .tooltip_text()
+                        .is_some_and(|t| t.starts_with("Connect the phone"))
+                    {
+                        assert!(!button.is_sensitive());
+                        dead += 1;
+                    }
+                }
+                let mut child = widget.first_child();
+                while let Some(next) = child {
+                    child = next.next_sibling();
+                    stack.push(next);
+                }
+            }
+            assert_eq!(dead, 2, "Call and Message");
+            reset_pane(&pane, &opened, &rows);
+            assert!(opened.borrow().is_none());
+            assert_eq!(pane.observe_children().n_items(), 1, "only the words");
         });
     }
 }

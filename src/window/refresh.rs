@@ -655,6 +655,7 @@ impl DesklinkWindow {
                 }
                 // Settings: the pages listed beside the open one on a big window.
                 "settings-side" => widget.set_visible(wide),
+                "settings-back" => widget.set_visible(!wide),
                 // Contacts: the chosen contact beside the list on a big window.
                 "contacts-pane" => widget.set_visible(wide),
                 "home-clamp" => {
