@@ -139,13 +139,104 @@ pub(super) fn update(win: &DesklinkWindow, daemon: &DaemonHandle, device: &Devic
         .get("settings")
         .map(|(scroll, _)| scroll.vadjustment());
     let view = build_view(scroll, daemon, &settings, device, &glide_status, approving);
-    win.replace_body(
-        "settings",
+    // On a big window the pages are listed beside the open one
+    // (`apply_layout` shows the list); the page keeps its 720 px measure.
+    let split = gtk::Box::builder().spacing(24).build();
+    split.append(&side_list(&view.root));
+    split.append(
         &adw::Clamp::builder()
             .maximum_size(720)
+            .hexpand(true)
             .child(&view.root)
             .build(),
     );
+    // The list and the page together, centred: not the list at the far
+    // left and the page in the middle of what is left.
+    win.replace_body(
+        "settings",
+        &adw::Clamp::builder()
+            .maximum_size(260 + 24 + 720)
+            .tightening_threshold(720)
+            .child(&split)
+            .build(),
+    );
+}
+
+/// The pages of Settings as a side list, for a big window: choosing one
+/// opens it beside the list (Back still leads to the full list). Follows the
+/// page open in `nav`.
+fn side_list(nav: &adw::NavigationView) -> gtk::Widget {
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .css_classes(["navigation-sidebar"])
+        .build();
+    list.update_property(&[gtk::accessible::Property::Label("Settings pages")]);
+    for (_, index, icon, _) in PAGES {
+        let line = gtk::Box::builder().spacing(12).build();
+        line.append(
+            &gtk::Image::builder()
+                .icon_name(icon)
+                .accessible_role(gtk::AccessibleRole::Presentation)
+                .build(),
+        );
+        line.append(
+            &gtk::Label::builder()
+                .label(GROUPS[index])
+                .xalign(0.0)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["nav-label"])
+                .build(),
+        );
+        let row = gtk::ListBoxRow::builder().child(&line).build();
+        row.set_widget_name(&tag(index));
+        row.update_property(&[gtk::accessible::Property::Label(GROUPS[index])]);
+        list.append(&row);
+    }
+    {
+        let nav = nav.downgrade();
+        list.connect_row_activated(move |_, row| {
+            let Some(nav) = nav.upgrade() else {
+                return;
+            };
+            let wanted = row.widget_name();
+            let shown = nav.visible_page().and_then(|page| page.tag());
+            if shown.as_deref() != Some(wanted.as_str()) {
+                nav.replace_with_tags(&["list", wanted.as_str()]);
+            }
+        });
+    }
+    let select = {
+        let list = list.downgrade();
+        move |nav: &adw::NavigationView| {
+            let (Some(list), Some(tag)) = (
+                list.upgrade(),
+                nav.visible_page().and_then(|page| page.tag()),
+            ) else {
+                return;
+            };
+            let mut child = list.first_child();
+            let mut found = None;
+            while let Some(row) = child {
+                if row.widget_name() == tag {
+                    found = row.downcast_ref::<gtk::ListBoxRow>().cloned();
+                }
+                child = row.next_sibling();
+            }
+            list.select_row(found.as_ref());
+        }
+    };
+    select(nav);
+    nav.connect_visible_page_notify(select);
+    let side = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .width_request(260)
+        .valign(gtk::Align::Start)
+        .margin_top(8)
+        .visible(false)
+        .build();
+    side.set_widget_name("settings-side");
+    side.append(&list);
+    side.upcast()
 }
 
 /// Where the ten groups sit in the list (`UI-REDESIGN.md` 3.17): the section,

@@ -653,6 +653,8 @@ impl DesklinkWindow {
                         split.set_spacing(if wide { 24 } else { 16 });
                     }
                 }
+                // Settings: the pages listed beside the open one on a big window.
+                "settings-side" => widget.set_visible(wide),
                 // Contacts: the chosen contact beside the list on a big window.
                 "contacts-pane" => widget.set_visible(wide),
                 "home-clamp" => {

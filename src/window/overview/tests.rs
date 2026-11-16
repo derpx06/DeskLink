@@ -537,7 +537,7 @@ fn the_other_pages_use_a_big_window() {
             imp.compact.set(false);
             imp.wide.set(wide);
             // Only the pages being shown: show_page lays them out.
-            for page in ["files", "terminals", "contacts", "notes"] {
+            for page in ["files", "terminals", "contacts", "settings", "notes"] {
                 assert!(window.show_page(page), "{page}");
                 spin();
             }
@@ -568,6 +568,10 @@ fn the_other_pages_use_a_big_window() {
             for grid in named_widgets(window.upcast_ref(), "terminal-grid") {
                 let grid = grid.downcast::<gtk::FlowBox>().unwrap();
                 assert_eq!(grid.max_children_per_line(), if wide { 4 } else { 3 });
+            }
+            // Settings: the pages beside the open one on a big window.
+            for side in named_widgets(window.upcast_ref(), "settings-side") {
+                assert_eq!(side.is_visible(), wide, "the Settings side list");
             }
             // Contacts: the chosen contact beside the list on a big window.
             for pane in named_widgets(window.upcast_ref(), "contacts-pane") {

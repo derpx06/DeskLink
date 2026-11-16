@@ -646,3 +646,54 @@ fn every_row_has_a_line_and_is_found_by_its_title_and_a_synonym() {
         search.emit_by_name::<()>("search-changed", &[]);
     });
 }
+
+/// On a big window Settings lists its pages beside the open one: choosing
+/// one there opens it (Back still leads to the full list), and the list
+/// marks the page that is open, whichever way it was opened. (Needs a
+/// display.)
+#[test]
+fn the_side_list_opens_a_page_and_follows_the_open_one() {
+    crate::test_display::run(|| {
+        let (view, _daemon) = view_for_tests();
+        let side = side_list(&view.root);
+        let list = side
+            .first_child()
+            .and_downcast::<gtk::ListBox>()
+            .expect("the pages");
+        let row = |index: usize| {
+            let mut child = list.first_child();
+            while let Some(row) = child {
+                if row.widget_name() == tag(index) {
+                    return row.downcast::<gtk::ListBoxRow>().unwrap();
+                }
+                child = row.next_sibling();
+            }
+            panic!("no row for page {index}");
+        };
+        let shown = || {
+            view.root
+                .visible_page()
+                .and_then(|page| page.tag())
+                .unwrap_or_default()
+        };
+        row(1).emit_by_name::<()>("activate", &[]);
+        assert_eq!(shown(), tag(1));
+        assert_eq!(
+            list.selected_row().map(|r| r.widget_name().to_string()),
+            Some(tag(1))
+        );
+        // Opened from the full list: the side list follows.
+        view.root.pop();
+        assert_eq!(shown(), "list");
+        view.root.push_by_tag(&tag(3));
+        assert_eq!(
+            list.selected_row().map(|r| r.widget_name().to_string()),
+            Some(tag(3))
+        );
+        // Back from a page opened in the side list leads to the full list.
+        row(5).emit_by_name::<()>("activate", &[]);
+        assert_eq!(shown(), tag(5));
+        view.root.pop();
+        assert_eq!(shown(), "list");
+    });
+}
