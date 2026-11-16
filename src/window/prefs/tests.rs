@@ -491,6 +491,10 @@ fn the_search_leaves_a_rows_own_visibility_alone() {
 #[test]
 fn a_second_activation_does_not_push_the_subpage_again() {
     crate::test_display::run(|| {
+        // The open-subpage memory is thread-local on the one GTK test thread
+        // every widget test shares: a page another test left open made this
+        // view open it on build, so the activation found it already pushed.
+        OPEN.with(|slot| slot.set(None));
         let (view, _daemon) = view_for_tests();
         let list = view.root.find_page("list").unwrap();
         let mut rows = Vec::new();
