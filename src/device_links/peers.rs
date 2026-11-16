@@ -74,7 +74,7 @@ mod tests {
             "device_links/sync.rs:STATE",
             "device_links/mpris.rs:ART_SENT",
             "device_links/features/registry.rs:PROFILES",
-            "device_links/webrtc/remote_session.rs:SESSIONS",
+            "device_links/webrtc/remote_session/mod.rs:SESSIONS",
             "device_links/webrtc/screen/inbound.rs:STREAMS",
             "device_links/webrtc/coordinator/ice_setup.rs:USED",
             "device_links/webrtc/coordinator/liveness.rs:DOZING",
