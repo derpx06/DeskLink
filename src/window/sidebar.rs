@@ -246,7 +246,14 @@ impl Sidebar {
             self.select(&page);
         }
         self.update_card(win, device);
-        self.update_rows(device);
+        // Files moving to or from this phone now, for the Files row's count.
+        let moving = win.daemon().map_or(0, |daemon| {
+            super::transfers::rows(&daemon)
+                .iter()
+                .filter(|row| row.device_id == device.id || row.device_id.is_empty())
+                .count()
+        });
+        self.update_rows(device, moving);
         self.update_switcher(devices, device);
         self.update_live_text(win, devices, device);
     }
@@ -324,7 +331,7 @@ impl Sidebar {
     }
 
     /// The counts at the end of the page rows.
-    fn update_rows(&self, device: &DeviceView) {
+    fn update_rows(&self, device: &DeviceView, moving: usize) {
         let sessions = crate::terminal_previews::sessions();
         let shared = sessions.iter().any(|info| {
             !crate::device_links::webrtc::terminal_bridge::attached_devices(&info.id).is_empty()
@@ -339,7 +346,7 @@ impl Sidebar {
         // The phone asked for a Bucket that is not on yet.
         let bucket_asked = device.trusted && super::bucket::asked(&device.id);
         let key = format!(
-            "{}\n{shared}\n{unread}\n{}\n{bucket_asked}\n{}",
+            "{}\n{shared}\n{unread}\n{}\n{bucket_asked}\n{moving}\n{}",
             sessions.len(),
             device.trusted,
             device.name
@@ -371,6 +378,13 @@ impl Sidebar {
                     }
                     end.append(&super::text(&sessions.len().to_string(), &["count-badge"]));
                     label.push_str(&format!(", {} open", sessions.len()));
+                }
+                "files" if moving > 0 => {
+                    end.append(&super::text(&moving.to_string(), &["count-badge"]));
+                    label.push_str(&format!(", {moving} moving"));
+                    if bucket_asked {
+                        label.push_str(", a question is waiting");
+                    }
                 }
                 "files" if bucket_asked => {
                     end.append(&super::text("1", &["count-badge"]));

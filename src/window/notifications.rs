@@ -1,13 +1,15 @@
-//! The Notifications page: the phone's notifications, each with Reply (an
-//! inline entry, sent to the phone), its own actions and Dismiss, and Clear
-//! all. Cards are the kit's; Delete or Backspace on a focused card dismisses
-//! it and Enter opens its reply.
+//! The Notifications page: the phone's notifications, grouped by app (the
+//! app with the newest first), each with Reply (an inline entry, sent to the
+//! phone), its own actions and Dismiss; a filter (All, Messages: the ones
+//! that take a reply, Other) and Clear all. Cards are the kit's; Delete or
+//! Backspace on a focused card dismisses it and Enter opens its reply.
 //!
 //! Cards are kept by notification id and only added, removed or reordered
 //! as notifications come and go, so a reply being typed survives the
 //! once-a-second refresh.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -34,10 +36,56 @@ struct Card {
     reply_id: Rc<RefCell<Option<String>>>,
 }
 
+/// Which notifications the page shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum Filter {
+    #[default]
+    All,
+    /// The ones that take a reply: someone wrote to you.
+    Messages,
+    Other,
+}
+
+impl Filter {
+    const CHIPS: [(Filter, &'static str); 3] = [
+        (Filter::All, "All"),
+        (Filter::Messages, "Messages"),
+        (Filter::Other, "Other"),
+    ];
+
+    fn shows(self, notification: &DeviceNotification) -> bool {
+        let message = notification.request_reply_id.is_some();
+        match self {
+            Self::All => true,
+            Self::Messages => message,
+            Self::Other => !message,
+        }
+    }
+}
+
+/// The notifications by app, in the order of each app's newest (the list
+/// comes newest first), the app's own in their order: (app, ids).
+pub(super) fn by_app(notifications: &[DeviceNotification]) -> Vec<(String, Vec<String>)> {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for notification in notifications {
+        match groups
+            .iter_mut()
+            .find(|(app, _)| *app == notification.app_name)
+        {
+            Some((_, ids)) => ids.push(notification.id.clone()),
+            None => groups.push((notification.app_name.clone(), vec![notification.id.clone()])),
+        }
+    }
+    groups
+}
+
 #[derive(Debug)]
 pub(super) struct Page {
     pub(super) root: gtk::Widget,
     list: gtk::Box,
+    filter: Rc<Cell<Filter>>,
+    /// One heading per app in the list: "WhatsApp · 2".
+    headings: RefCell<HashMap<String, gtk::Label>>,
     count: gtk::Label,
     clear: gtk::Button,
     empty: clipboard::EmptyState,
@@ -63,6 +111,28 @@ impl Page {
         count.set_valign(gtk::Align::Center);
         header.append(&count);
         header.append(&clear);
+        // The filter, one choice, scrolling sideways when it does not fit.
+        let filter = Rc::new(Cell::new(Filter::All));
+        let chips = gtk::Box::builder().spacing(8).build();
+        chips.set_widget_name("notification-filter");
+        chips.update_property(&[gtk::accessible::Property::Label("Show")]);
+        let mut first: Option<gtk::ToggleButton> = None;
+        for (choice, words) in Filter::CHIPS {
+            let chip = ui_kit::chip(words, None, choice == Filter::All);
+            match &first {
+                Some(first) => chip.set_group(Some(first)),
+                None => first = Some(chip.clone()),
+            }
+            let (filter, window) = (filter.clone(), win.downgrade());
+            chip.connect_toggled(move |chip| {
+                if chip.is_active() && filter.replace(choice) != choice {
+                    if let Some(window) = window.upgrade() {
+                        window.refresh_soon();
+                    }
+                }
+            });
+            chips.append(&chip);
+        }
 
         let list = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -90,6 +160,7 @@ impl Page {
             .css_classes(["page-margins"])
             .build();
         page.append(&header);
+        page.append(&chips);
         page.append(&list);
         page.append(&empty.root);
         page.append(&hidden.root);
@@ -142,6 +213,8 @@ impl Page {
         Self {
             root: scroll.upcast(),
             list,
+            filter,
+            headings: RefCell::default(),
             count,
             clear,
             empty,
@@ -183,6 +256,9 @@ impl Page {
             for card in self.cards.borrow_mut().drain(..) {
                 self.list.remove(&card.widget);
             }
+            for (_, heading) in self.headings.borrow_mut().drain() {
+                self.list.remove(&heading);
+            }
         }
         let shown = crate::device_links::config::app_settings().shows_notifications(&device.id);
         self.hidden.root.set_visible(!shown);
@@ -209,6 +285,14 @@ impl Page {
         let waiting = !device.feature_transport_ready && !notifications.is_empty();
         if waiting {
             count.push_str(&format!(" · Reply or dismiss once {} is back", device.name));
+        }
+        let filter = self.filter.get();
+        let shown_here = notifications.iter().filter(|n| filter.shows(n)).count();
+        if !notifications.is_empty() && shown_here == 0 {
+            count.push_str(match filter {
+                Filter::Messages => " · no messages",
+                _ => " · nothing else",
+            });
         }
         self.count.set_label(&count);
         self.empty.root.set_visible(notifications.is_empty());
@@ -298,6 +382,7 @@ impl Page {
             }
             previous = Some(cards[index].widget.clone());
         }
+        self.group(&cards, notifications);
         drop(cards);
         if built {
             // A new card is laid out for the page's width (buttons under the words when narrow).
@@ -313,6 +398,60 @@ impl Page {
             self.pending_reply.replace(None);
         }
         self.open_pending();
+    }
+}
+
+impl Page {
+    /// Puts each app's heading before its cards, the apps in the order of
+    /// their newest, and shows what the filter lets through (a heading only
+    /// over a card that shows). Cards are moved, never rebuilt: a reply being
+    /// typed stays.
+    fn group(&self, cards: &[Card], notifications: &[DeviceNotification]) {
+        let filter = self.filter.get();
+        let groups = by_app(notifications);
+        let mut headings = self.headings.borrow_mut();
+        headings.retain(|app, heading| {
+            let keep = groups.iter().any(|(name, _)| name == app);
+            if !keep {
+                self.list.remove(heading);
+            }
+            keep
+        });
+        let mut previous: Option<gtk::Widget> = None;
+        for (app, ids) in &groups {
+            let heading = headings.entry(app.clone()).or_insert_with(|| {
+                let heading = ui_kit::section_header(app);
+                heading.set_margin_top(8);
+                self.list.append(&heading);
+                heading
+            });
+            let words = if ids.len() > 1 {
+                format!("{app} · {}", ids.len())
+            } else {
+                app.clone()
+            };
+            if heading.label() != words {
+                heading.set_label(&words);
+            }
+            self.list.reorder_child_after(heading, previous.as_ref());
+            previous = Some(heading.clone().upcast());
+            let mut any = false;
+            for id in ids {
+                let Some(card) = cards.iter().find(|card| &card.id == id) else {
+                    continue;
+                };
+                let shows = notifications
+                    .iter()
+                    .find(|n| &n.id == id)
+                    .is_some_and(|n| filter.shows(n));
+                card.widget.set_visible(shows);
+                any |= shows;
+                self.list
+                    .reorder_child_after(&card.widget, previous.as_ref());
+                previous = Some(card.widget.clone().upcast());
+            }
+            heading.set_visible(any);
+        }
     }
 }
 
@@ -971,6 +1110,90 @@ mod tests {
             card.entry.emit_activate();
             assert!(commands.try_recv().is_err());
             assert_eq!(card.entry.text(), "late");
+        });
+    }
+
+    fn one(id: &str, app: &str, reply: bool) -> DeviceNotification {
+        DeviceNotification {
+            id: id.into(),
+            app_name: app.into(),
+            title: format!("Title {id}"),
+            request_reply_id: reply.then(|| format!("r{id}")),
+            actions: Vec::new(),
+            ..whatsapp()
+        }
+    }
+
+    /// Grouped by app, the app with the newest first, each app's own in the
+    /// order they came (newest first).
+    #[test]
+    fn notifications_group_by_app_newest_app_first() {
+        let list = [
+            one("1", "Signal", true),
+            one("2", "GitHub", false),
+            one("3", "Signal", true),
+            one("4", "Calendar", false),
+        ];
+        let groups = by_app(&list);
+        let names: Vec<&str> = groups.iter().map(|(app, _)| app.as_str()).collect();
+        assert_eq!(names, ["Signal", "GitHub", "Calendar"]);
+        assert_eq!(groups[0].1, ["1", "3"]);
+        assert!(Filter::Messages.shows(&list[0]) && !Filter::Messages.shows(&list[1]));
+        assert!(Filter::Other.shows(&list[1]) && !Filter::Other.shows(&list[0]));
+        assert!(list.iter().all(|n| Filter::All.shows(n)));
+    }
+
+    /// On the page: each app's heading before its cards ("Signal · 2"), and
+    /// the Messages filter hides the rest, headings included. (Needs a
+    /// display.)
+    #[test]
+    fn the_page_shows_app_headings_and_filters() {
+        crate::test_display::run(|| {
+            let resources = crate::load_resources().expect("the bundled resources");
+            gtk::gio::resources_register(&resources);
+            let app = adw::Application::builder()
+                .application_id("derx06.desklink.com.test")
+                .build();
+            let window = super::super::DesklinkWindow::new(&app);
+            let (daemon, _commands) = DaemonHandle::detached();
+            window.set_daemon(daemon.clone());
+            let mut device = super::super::debug_fake_device("paired", "Pixel 9");
+            device.notifications = vec![
+                one("1", "Signal", true),
+                one("2", "GitHub", false),
+                one("3", "Signal", true),
+            ];
+            let page = Page::new(&window);
+            page.update(&window, &daemon, &device);
+            let order = |page: &Page| {
+                let mut out = Vec::new();
+                let mut child = page.list.first_child();
+                while let Some(widget) = child {
+                    if widget.is_visible() {
+                        out.push(match widget.downcast_ref::<gtk::Label>() {
+                            Some(heading) => heading.label().to_string(),
+                            None => "card".to_string(),
+                        });
+                    }
+                    child = widget.next_sibling();
+                }
+                out
+            };
+            assert_eq!(
+                order(&page),
+                ["Signal · 2", "card", "card", "GitHub", "card"]
+            );
+            page.filter.set(Filter::Messages);
+            page.update(&window, &daemon, &device);
+            assert_eq!(order(&page), ["Signal · 2", "card", "card"]);
+            page.filter.set(Filter::Other);
+            page.update(&window, &daemon, &device);
+            assert_eq!(order(&page), ["GitHub", "card"]);
+            // The phone dismissed GitHub's: its heading goes too.
+            device.notifications.remove(1);
+            page.filter.set(Filter::All);
+            page.update(&window, &daemon, &device);
+            assert_eq!(order(&page), ["Signal · 2", "card", "card"]);
         });
     }
 }
