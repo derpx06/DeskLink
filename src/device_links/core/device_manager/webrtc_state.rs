@@ -1,0 +1,349 @@
+//! The registry's WebRTC state (`impl DeviceManager`): installing the one
+//! current peer, readiness, the active attempt, the feature queue before
+//! feature-ready, handover state, and taking signals and envelopes once.
+//!
+//! Sibling edges: `outcomes`. Outside: `webrtc` (the peer, handover, replay
+//! cache).
+
+use super::*;
+
+impl DeviceManager {
+    /// Atomically installs the only current WebRTC peer for a current DeskLink
+    /// session. The caller closes a replaced peer after this manager lock is
+    /// released so GStreamer callbacks cannot deadlock the session core.
+    pub fn install_webrtc_peer(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: String,
+        wire_binding: WebRtcWireBinding,
+        peer: DesktopWebRtcPeer,
+        transfer_manager: Arc<WebRtcTransferManager>,
+    ) -> Result<Option<Arc<DesktopWebRtcPeer>>, SessionError> {
+        match self.install_webrtc_peer_with(
+            binding,
+            attempt_id,
+            wire_binding,
+            peer,
+            transfer_manager,
+            false,
+        )? {
+            Installed::Replaced(replaced) => Ok(replaced),
+            Installed::Occupied(_) => unreachable!("a replacing install is never refused"),
+        }
+    }
+
+    /// Like [`Self::install_webrtc_peer`], but only if the session has no peer
+    /// yet, decided under the same lock as the install: two starters (a wake, a
+    /// beacon and a network change within milliseconds) can both have seen "no
+    /// peer", and the second used to replace the first's half-built pipeline.
+    /// A refused install gives the peer back for the caller to close.
+    pub fn install_webrtc_peer_if_none(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: String,
+        wire_binding: WebRtcWireBinding,
+        peer: DesktopWebRtcPeer,
+        transfer_manager: Arc<WebRtcTransferManager>,
+    ) -> Result<Installed, SessionError> {
+        self.install_webrtc_peer_with(
+            binding,
+            attempt_id,
+            wire_binding,
+            peer,
+            transfer_manager,
+            true,
+        )
+    }
+
+    fn install_webrtc_peer_with(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: String,
+        wire_binding: WebRtcWireBinding,
+        peer: DesktopWebRtcPeer,
+        transfer_manager: Arc<WebRtcTransferManager>,
+        only_if_none: bool,
+    ) -> Result<Installed, SessionError> {
+        self.with_session(binding, |session| {
+            if session.pairing.state != crate::device_links::pairing::PairState::Paired {
+                return Err(SessionError::NotPaired);
+            }
+            if only_if_none && session.active_webrtc.is_some() {
+                return Ok(Installed::Occupied(peer));
+            }
+            if session
+                .webrtc_handover
+                .as_ref()
+                .is_some_and(HandoverRuntime::features_ready)
+            {
+                crate::device_links::connection_log::note_ready(&session.device_id, false);
+            }
+            let replaced = session.active_webrtc.replace(Arc::new(peer));
+            session.transfer_manager = Some(transfer_manager);
+            session.webrtc_handover = Some(HandoverRuntime::new(attempt_id.clone(), wire_binding));
+            session.webrtc_attempt_id = Some(attempt_id);
+            session.seen_webrtc_request_ids.clear();
+            session.seen_webrtc_message_ids.clear();
+            Ok(Installed::Replaced(replaced))
+        })?
+    }
+
+    /// The feature-ready WebRTC peer for `device_id`, and whether its
+    /// bootstrap link is the relay (so a host-to-host pair is an internet
+    /// IPv6 path, not the LAN).
+    pub fn ready_peer(&self, device_id: &str) -> Option<(Arc<DesktopWebRtcPeer>, bool)> {
+        let sessions = self.sessions.lock().ok()?;
+        let session = sessions.get(device_id)?;
+        if !session
+            .webrtc_handover
+            .as_ref()
+            .is_some_and(HandoverRuntime::features_ready)
+        {
+            return None;
+        }
+        let via_relay = session
+            .active_link
+            .as_ref()
+            .is_some_and(|link| link.local_ip().is_none());
+        Some((Arc::clone(session.active_webrtc.as_ref()?), via_relay))
+    }
+
+    pub fn active_webrtc_peer(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+    ) -> Result<Arc<DesktopWebRtcPeer>, SessionError> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            session
+                .active_webrtc
+                .as_ref()
+                .cloned()
+                .ok_or(SessionError::UnknownSession)
+        })?
+    }
+
+    /// Returns the signed attempt currently associated with this transport
+    /// generation.  Bootstrap SDP/ICE messages must never replace it merely
+    /// because they arrived later on a retried TLS socket.
+    pub fn active_webrtc_attempt(
+        &self,
+        binding: &SessionBinding,
+    ) -> Result<Option<String>, SessionError> {
+        self.with_session(binding, |session| Ok(session.webrtc_attempt_id.clone()))?
+    }
+
+    /// Reads the handover state from the session owner. A false value is a
+    /// deliberate safe default: LAN feature traffic remains available only
+    /// until both peers have completed their authenticated handover.
+    #[allow(dead_code)] // Consumed by the shared feature-dispatcher slice.
+    pub fn webrtc_features_ready(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+    ) -> Result<bool, SessionError> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            Ok(session
+                .webrtc_handover
+                .as_ref()
+                .is_some_and(HandoverRuntime::features_ready))
+        })?
+    }
+
+    /// Invalidates one WebRTC attempt without dropping the authenticated LAN
+    /// bootstrap session. Only the current attempt may clear the peer; stale
+    /// GStreamer callbacks receive `StaleBinding` and cannot affect a newer
+    /// generation.
+    pub fn clear_webrtc_if_current(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+        reason: String,
+    ) -> Result<Option<Arc<DesktopWebRtcPeer>>, SessionError> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            session.last_disconnect_reason = Some(reason);
+            Ok(session.clear_webrtc_state())
+        })?
+    }
+
+    /// Drops the pairing state of a device that has no live link, so an unpair
+    /// done while it was offline cannot be undone by its session on return.
+    /// Returns the session's WebRTC peer, if any, for the caller to close
+    /// outside this lock — a revoked pairing must not leave a peer running.
+    pub fn forget_pairing(&self, device_id: &str) -> Option<Arc<DesktopWebRtcPeer>> {
+        let mut sessions = self.sessions.lock().ok()?;
+        let session = sessions.get_mut(device_id)?;
+        session.pairing = PairingHandler::new(false);
+        session.pending_features.clear();
+        session.clear_webrtc_state()
+    }
+
+    /// Holds a feature until WebRTC is ready, evicting the oldest past
+    /// `PENDING_FEATURE_LIMIT`. Returns `false` without queueing when the
+    /// handover is already feature-ready: the check and the push share one
+    /// lock, so a packet can never land in the queue after the flush ran.
+    pub fn queue_feature(
+        &self,
+        binding: &SessionBinding,
+        packet: crate::device_links::packet::NetworkPacket,
+    ) -> Result<bool, SessionError> {
+        self.with_session(binding, |session| {
+            if session
+                .webrtc_handover
+                .as_ref()
+                .is_some_and(HandoverRuntime::features_ready)
+            {
+                return false;
+            }
+            if session.pending_features.len()
+                >= crate::device_links::core::device_session::PENDING_FEATURE_LIMIT
+            {
+                session.pending_features.pop_front();
+            }
+            session.pending_features.push_back((Instant::now(), packet));
+            true
+        })
+    }
+
+    /// Drains the queue, dropping anything older than `PENDING_FEATURE_MAX_AGE`.
+    pub fn take_pending_features(
+        &self,
+        binding: &SessionBinding,
+    ) -> Vec<crate::device_links::packet::NetworkPacket> {
+        self.with_session(binding, |session| {
+            session
+                .pending_features
+                .drain(..)
+                .filter(|(queued_at, packet)| {
+                    let fresh = queued_at.elapsed()
+                        <= crate::device_links::core::device_session::PENDING_FEATURE_MAX_AGE;
+                    if !fresh {
+                        debug_log!("[DeskLink] Dropped stale queued {}", packet.packet_type);
+                    }
+                    fresh
+                })
+                .map(|(_, packet)| packet)
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Revokes the local pairing state and every WebRTC object derived from
+    /// it.  The returned peer is deliberately closed by the caller only after
+    /// the session lock has been released, because peer callbacks can trigger
+    /// lifecycle work.
+    pub fn revoke_pairing(
+        &self,
+        binding: &SessionBinding,
+        reason: String,
+    ) -> Result<
+        (
+            crate::device_links::packet::NetworkPacket,
+            Option<Arc<DesktopWebRtcPeer>>,
+        ),
+        SessionError,
+    > {
+        self.with_session(binding, |session| {
+            let packet = session.pairing.reject_packet();
+            session.last_disconnect_reason = Some(reason);
+            session.pending_features.clear();
+            (packet, session.clear_webrtc_state())
+        })
+    }
+
+    /// Serializes all mutations of the WebRTC handover runtime through the
+    /// authoritative session. It prevents a callback from a replaced peer
+    /// generation from changing current transport policy.
+    pub fn with_webrtc_handover<R>(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+        operation: impl FnOnce(&mut HandoverRuntime) -> Result<R, String>,
+    ) -> Result<R, String> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err("DeskLink WebRTC session was replaced".to_string());
+            }
+            let handover = session
+                .webrtc_handover
+                .as_mut()
+                .ok_or_else(|| "DeskLink WebRTC handover is not initialized".to_string())?;
+            operation(handover)
+        })
+        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())
+    }
+
+    /// Returns the active peer only once for a signed signaling request ID.
+    /// The bounded replay cache belongs to the session rather than a packet
+    /// reader so duplicate LAN links cannot bypass it.
+    pub fn accept_webrtc_signal(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+        request_id: String,
+    ) -> Result<Arc<DesktopWebRtcPeer>, SessionError> {
+        self.with_session(binding, |session| {
+            if session.pairing.state != crate::device_links::pairing::PairState::Paired {
+                return Err(SessionError::NotPaired);
+            }
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            if !session.seen_webrtc_request_ids.accept(request_id) {
+                return Err(SessionError::ReplayDetected);
+            }
+            session
+                .active_webrtc
+                .as_ref()
+                .cloned()
+                .ok_or(SessionError::UnknownSession)
+        })?
+    }
+
+    /// Takes a signed signaling request id once per session, before anything
+    /// is done for it (offers and restart requests included).
+    pub fn note_signal_request(
+        &self,
+        binding: &SessionBinding,
+        request_id: String,
+    ) -> Result<(), SessionError> {
+        self.with_session(binding, |session| {
+            if session.pairing.state != crate::device_links::pairing::PairState::Paired {
+                return Err(SessionError::NotPaired);
+            }
+            if !session.seen_signal_request_ids.accept(request_id) {
+                return Err(SessionError::ReplayDetected);
+            }
+            Ok(())
+        })?
+    }
+
+    /// Accepts a data-channel envelope message ID exactly once for the active
+    /// WebRTC attempt. The cache is session-owned so a stale peer callback
+    /// cannot bypass replay protection after a link replacement.
+    pub fn accept_webrtc_envelope(
+        &self,
+        binding: &SessionBinding,
+        attempt_id: &str,
+        message_id: String,
+    ) -> Result<(), SessionError> {
+        self.with_session(binding, |session| {
+            if session.webrtc_attempt_id.as_deref() != Some(attempt_id) {
+                return Err(SessionError::StaleBinding);
+            }
+            if !session.seen_webrtc_message_ids.accept(message_id) {
+                return Err(SessionError::ReplayDetected);
+            }
+            Ok(())
+        })?
+    }
+}

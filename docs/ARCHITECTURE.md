@@ -114,7 +114,7 @@ main.rs ─► application.rs ─► window/ (GTK pages, ui_kit)           main 
 | `window/` | One module per page (`overview`, `bucket`, `transfers`, `gallery`, `notes_clipboard`, `notes`, `clipboard`, `notifications`, `contacts`, `terminals`, `prefs`, `pairing`, `calls`, `insert`, `sound`, `history`, `system_check`, `viewer`, `pdf_view`, `vault_banner`, `sidebar`) and `ui_kit/` |
 | `ticker.rs` | Main-loop polling: 1 s while a window shows, 3 s with a phone live and nothing shown, 5 s otherwise; `wake_ui` delivers events at once (`daemon/mod.rs:68-102`) |
 | `device_links/daemon/` | `DaemonWorker` owns the TCP listener (ports 1716-1764), UDP discovery (1716), mDNS advertiser, redialer, clipboard listener, status reconciler and relay client. Submodules `discovery`, `connector`, `handshake`, `validation`, `packet_handler`, `dispatcher`, `commands` (`DaemonCommand`), `state`, `handle`, `network`, `file_transfer`, `pairing_commands`, `clipboard`, `power`, `test_peer`, `robust_fuzz` |
-| `device_links/core/` | `device_manager.rs` (generation-based session registry), `device_session.rs`, `session_link.rs` (+ `link_race`), `link_transport.rs` |
+| `device_links/core/` | `device_manager/` (generation-based session registry), `device_session.rs`, `session_link.rs` (+ `link_race`), `link_transport.rs` |
 | `device_links/transport.rs` | `FeatureTransport`: the only boundary paired features use to send |
 | `device_links/features/registry.rs` | `DESKTOP_INCOMING`, `DESKTOP_OUTGOING`, `WEBRTC_PROFILE`, peer profile intersection |
 | `device_links/webrtc/` | `coordinator/` (`mod.rs` signalling entry points; `signing`, `peer_worker`, `envelopes`, `liveness`, `recovery`, `ice_setup`, `file_link`, `terminal_pump`, `desktop_share`, `share_worker`, `desktop_input`, `phone_remote`: negotiation, recovery, liveness, remote/portal plumbing), `peer_connection/` (`webrtcbin`), `handover.rs`, `signaling.rs`, `ice.rs`, `mod.rs` (channels, envelope), `file_protocol.rs`, `transfer_manager{,/send,recv,store,replay}.rs`, `transfer_board.rs`, `file_lane.rs`, `remote_session/` (`message.rs`, `session.rs`), `screen/` (`inbound.rs`, `desktop_capture.rs`, `encoder.rs`, `bitrate.rs`), `remote_desktop_portal.rs`, `virtual_display.rs`, `x11_desktop.rs`, `capture.rs`, `audio*.rs`, `terminal_{bridge,protocol}.rs`, `text_focus.rs` |
@@ -156,7 +156,7 @@ A change to anything in this table is a **paired edit** (workspace `CLAUDE.md`, 
 |---|---|---|---|
 | Packet type strings (42) | `device_links/packet.rs` | `protocol/desklinkv9/DeskLinkProtocol.kt` | `packet_types.json` (F): `packet::shared_fixture_tests`, phone constants test |
 | Envelope / channels | `device_links/webrtc/mod.rs` (`WebRtcEnvelope`, `WebRtcChannel`) | `webrtc/WebRtcEnvelope.kt`, `WebRtcChannel.kt` | `envelope.json` (F) |
-| Session ownership | `core/device_manager.rs` | `session/DeviceManager.kt` | per-side tests |
+| Session ownership | `core/device_manager/` | `session/DeviceManager.kt` | per-side tests |
 | Transport boundary | `transport.rs` (`FeatureTransport`) | `transport/SessionTransport.kt` | |
 | Capabilities advertised | `features/registry.rs` (`DESKTOP_INCOMING`/`OUTGOING`) | each plugin's `supportedPacketTypes` / `outgoingPacketTypes`, `helpers/DeviceHelper.kt:157` | |
 | Enabled feature profile (33) | `WEBRTC_PROFILE` (`registry.rs:135`) | `WebRtcFeatureProfile.enabled` | `profile.json` (F); `profile_matches_the_android_webrtc_feature_profile`, `profileMatchesTheDesktopFeatureRegistry` |
@@ -318,7 +318,7 @@ Schedule: when the desk is the initiator it starts negotiation at 250, 1000, 200
 
 ### 5.2 State diagram
 
-There is no single enum for the whole link. The diagram below is derived from `DeviceConnection {linked, paired, feature_transport_ready}` (`device_manager.rs:106`), `HandoverState` (`handover.rs:15`), `Liveness {Fine, Probe, Dead}` and `PeerStateAction` (`coordinator/liveness.rs`) and the recovery counter.
+There is no single enum for the whole link. The diagram below is derived from `DeviceConnection {linked, paired, feature_transport_ready}` (`core/device_manager/outcomes.rs`), `HandoverState` (`handover.rs:15`), `Liveness {Fine, Probe, Dead}` and `PeerStateAction` (`coordinator/liveness.rs`) and the recovery counter.
 
 ```mermaid
 stateDiagram-v2
@@ -352,7 +352,7 @@ stateDiagram-v2
 
 ### 5.4 Restart epoch
 
-Each process generates a random `instanceId` (`device_info.rs:26`, `DeviceInfo.PROCESS_INSTANCE_ID`). A different `instanceId` for a known device means it restarted: `peer_restarted` (desk, `device_manager.rs:544`) / `DeviceInfo.peerRestarted()` (phone) drop the old WebRTC peer at once. `attach_bootstrap_link` then forces `Register` and skips adoption and the race; a beacon from a restarted peer is dialled even though a session exists. A fresh signed offer with a new attempt id is likewise a restart, never "stale".
+Each process generates a random `instanceId` (`device_info.rs:26`, `DeviceInfo.PROCESS_INSTANCE_ID`). A different `instanceId` for a known device means it restarted: `peer_restarted` (desk, `core/device_manager/mod.rs`) / `DeviceInfo.peerRestarted()` (phone) drop the old WebRTC peer at once. `attach_bootstrap_link` then forces `Register` and skips adoption and the race; a beacon from a restarted peer is dialled even though a session exists. A fresh signed offer with a new attempt id is likewise a restart, never "stale".
 
 ### 5.5 Liveness, dozing and the recovery ladder
 
@@ -375,11 +375,11 @@ Each process generates a random `instanceId` (`device_info.rs:26`, `DeviceInfo.P
 
 ### 5.6 The desk always holds a LAN TCP link
 
-`wants_bootstrap_connection` is `!has_live_bootstrap_link` and **deliberately ignores a surviving WebRTC peer** (`device_manager.rs:584`), so discovery keeps dialling. If the bootstrap socket closes while the peer is feature-ready, the session stays `Ready` with `feature_transport_retained` and only the socket closes (`bootstrap_disconnected`, `:795`); the redialer then dials and `adopt_or_keep` (`:298`) swaps the replacement socket in place (same link, same generation) provided the certificate PEM is identical. `PeerWorkerGuard` (`coordinator/peer_worker.rs`) clears the session's peer on any worker exit including a panic unwind; an orphaned peer would drop inbound features while reporting feature-ready and pin `wants_bootstrap_connection` false.
+`wants_bootstrap_connection` is `!has_live_bootstrap_link` and **deliberately ignores a surviving WebRTC peer** (`wants_bootstrap_connection`, `core/device_manager/mod.rs`), so discovery keeps dialling. If the bootstrap socket closes while the peer is feature-ready, the session stays `Ready` with `feature_transport_retained` and only the socket closes (`bootstrap_disconnected`, `core/device_manager/disconnects.rs`); the redialer then dials and `adopt_or_keep` (`core/device_manager/mod.rs`) swaps the replacement socket in place (same link, same generation) provided the certificate PEM is identical. `PeerWorkerGuard` (`coordinator/peer_worker.rs`) clears the session's peer on any worker exit including a panic unwind; an orphaned peer would drop inbound features while reporting feature-ready and pin `wants_bootstrap_connection` false.
 
 ### 5.7 Link race and generation ownership
 
-* **Generation-based registration** (`register_link`, `device_manager.rs:366`): a newly authenticated transport supersedes the old one: the old cancellation token is set, `connection_generation` increments, WebRTC state is cleared (the pending-feature queue is kept), `Requested`/`RequestedByPeer` pairing is abandoned, counters reset. Callbacks from the replaced generation fail `is_current` and become stale rather than erroring. The phone's `session/DeviceManager.kt` mirrors it (old transport closed with `REPLACED`).
+* **Generation-based registration** (`register_link`, `core/device_manager/mod.rs`): a newly authenticated transport supersedes the old one: the old cancellation token is set, `connection_generation` increments, WebRTC state is cleared (the pending-feature queue is kept), `Requested`/`RequestedByPeer` pairing is abandoned, counters reset. Callbacks from the replaced generation fail `is_current` and become stale rather than erroring. The phone's `session/DeviceManager.kt` mirrors it (old transport closed with `REPLACED`).
 * **Link race.** Two authenticated LAN links to one peer within `LINK_RACE_WINDOW` = 1000 ms, dialled by different sides, are one reconnection: both keep the link dialled by the **lower device id** (`link_race`, `session_link.rs:50`; `backends/lan/LinkRace.kt`). Simultaneous WebRTC offers resolve by the deterministic initiator only.
 * **Link priority.** LAN supersedes relay (`supersede_live`, `handshake.rs:182`); phone provider priorities LAN 20, relay 5, loopback 0 (`Device.kt:871-883`).
 * An unpaired link cannot replace a paired feature-ready session (`holds_paired_transport`); `FeatureTransport::for_binding` refuses unpaired sessions.
