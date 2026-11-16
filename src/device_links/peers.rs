@@ -113,9 +113,9 @@ mod tests {
             "shell_dbus/model.rs:LIVE_SINCE",
             "window/calls.rs:ANSWERED_HERE",
             "window/calls.rs:LAST_LIVE",
-            "window/transfers.rs:SHOWN",
-            "window/transfers.rs:FAILED",
-            "window/transfers.rs:WAITING",
+            "window/transfers/cards.rs:SHOWN",
+            "window/transfers/cards.rs:FAILED",
+            "window/transfers/cards.rs:WAITING",
             // Phones we asked to pair, and ones that did not accept: dropped
             // when they pair, after two minutes, or with the window.
             "window/pairing.rs:WATCH",
