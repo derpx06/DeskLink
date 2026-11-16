@@ -444,6 +444,20 @@ pub(crate) fn resolve(device_id: &str, pair: &str, path: &str, how: Resolve) {
     });
 }
 
+/// Takes the request `key` if it is for exactly `sha256` and `size`; any
+/// other request under that key stays.
+fn take_wanted_matching(key: &(String, String, String), sha256: &str, size: u64) -> Option<Entry> {
+    let mut wanted = WANTED.lock().ok()?;
+    let matches = wanted
+        .get(key)
+        .is_some_and(|entry| entry.sha256.eq_ignore_ascii_case(sha256) && entry.size == size);
+    if matches {
+        wanted.remove(key)
+    } else {
+        None
+    }
+}
+
 /// What the transfer manager asks before accepting a folder file (P4): a
 /// pair of `device_id`'s, a valid path, and a file this side asked for.
 pub(crate) fn accepts(device_id: &str, folder: &FolderRef, sha256: &str, size: u64) -> bool {

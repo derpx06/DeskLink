@@ -561,19 +561,16 @@ impl Worker {
             folder.folder.clone(),
             folder.relpath.clone(),
         );
-        let Some(entry) = WANTED
-            .lock()
-            .ok()
-            .and_then(|mut wanted| wanted.remove(&key))
-        else {
+        // Only the request this file answers: a stale arrival (the file
+        // changed on the phone meanwhile and was asked for again) must leave
+        // the newer request, or its offer is refused and the Bucket stays
+        // "Syncing" until the next manifest.
+        let Some(entry) = take_wanted_matching(&key, sha256, size) else {
             return;
         };
         let Some(index) = self.index_of(device, &folder.folder) else {
             return;
         };
-        if !entry.sha256.eq_ignore_ascii_case(sha256) || entry.size != size {
-            return;
-        }
         let live = &mut self.pairs[index];
         live.outstanding.retain(|path| *path != folder.relpath);
         let placed = target_path(&live.pair.root, &folder.relpath).and_then(|target| {

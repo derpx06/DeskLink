@@ -2912,3 +2912,29 @@ fn a_phone_path_that_clashes_with_a_desk_path_is_never_downloaded() {
         assert!(wanted.contains(&"new.txt") || live.outstanding.iter().any(|p| p == "new.txt"));
     }
 }
+
+/// The file changed on the phone while it was being fetched, and was asked
+/// for again: the old copy arriving must not take the newer request away.
+#[test]
+fn a_stale_arrival_keeps_the_newer_request() {
+    let device = format!("stale-{}", uuid::Uuid::new_v4().simple());
+    let wanted = FolderRef {
+        folder: "bucket".into(),
+        relpath: "docs/a.txt".into(),
+        mtime: None,
+    };
+    let newer = "b".repeat(64);
+    test_want(&device, &wanted, &newer, 10);
+    let key = (
+        device.clone(),
+        wanted.folder.clone(),
+        wanted.relpath.clone(),
+    );
+    assert!(take_wanted_matching(&key, &"a".repeat(64), 10).is_none());
+    assert!(
+        accepts(&device, &wanted, &newer, 10),
+        "the newer request stays"
+    );
+    assert!(take_wanted_matching(&key, &newer, 10).is_some());
+    assert!(!accepts(&device, &wanted, &newer, 10));
+}
