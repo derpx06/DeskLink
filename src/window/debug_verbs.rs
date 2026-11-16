@@ -1054,6 +1054,28 @@ pub(super) fn debug_fake_device(kind: &str, name: &str) -> DeviceView {
         charge_time_remaining: Some(25 * 60_000),
     });
     device.notifications = vec![
+        // A long, multi-paragraph message with buttons (the owner's
+        // WhatsApp screenshot).
+        DeviceNotification {
+            id: "4".into(),
+            app_name: "WhatsApp".into(),
+            title: "Writers' Circle".into(),
+            text: "⏳ Just a few hours left to participate in this week's challenge!\n\n\
+                   Choose from our 4 prompts:\n\
+                   ♦ The Feeling of Home 🏡\n\
+                   ♦ A Letter to My Younger Self ✉️\n\
+                   ♦ The Last Train 🚆\n\
+                   ♦ Colours of the Monsoon 🌧️\n\n\
+                   Submit your entry before midnight. Winners are announced on Sunday \
+                   and featured on our page.\n\nHappy writing! ✍️"
+                .into(),
+            ticker: String::new(),
+            is_clearable: true,
+            request_reply_id: Some("r4".into()),
+            actions: vec!["Mark as read".into(), "Mute".into()],
+            silent: false,
+            time: 0,
+        },
         DeviceNotification {
             id: "1".into(),
             app_name: "Signal".into(),
