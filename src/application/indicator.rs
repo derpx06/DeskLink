@@ -105,7 +105,8 @@ impl DesklinkApplication {
                         "app.bucket-turn-on",
                         Some(&offer.device.to_variant()),
                     );
-                    notification.set_default_action_and_target_value(
+                    crate::application::open_on_click(
+                        &notification,
                         "app.open-bucket",
                         Some(&offer.device.to_variant()),
                     );
@@ -244,7 +245,7 @@ impl DesklinkApplication {
                             Some(&(ask.device.as_str(), ask.key, allow).to_variant()),
                         );
                     }
-                    notification.set_default_action("app.show-window");
+                    crate::application::open_on_click(&notification, "app.show-window", None);
                     app.send_notification(
                         Some(&crate::device_links::asks::notice_id(&ask.device, ask.key)),
                         &notification,
@@ -362,7 +363,8 @@ impl DesklinkApplication {
                         "app.cancel-transfers",
                         Some(&device.to_variant()),
                     );
-                    notification.set_default_action_and_target_value(
+                    crate::application::open_on_click(
+                        &notification,
                         "app.open-bucket",
                         Some(&device.to_variant()),
                     );
@@ -378,7 +380,8 @@ impl DesklinkApplication {
                     let notification = gio::Notification::new("DeskLink");
                     notification.set_body(Some(&title));
                     notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
-                    notification.set_default_action_and_target_value(
+                    crate::application::open_on_click(
+                        &notification,
                         "app.open-bucket",
                         Some(&device.to_variant()),
                     );

@@ -557,6 +557,23 @@ pub(crate) fn prompts_shown() -> bool {
     BUTTONS.load(std::sync::atomic::Ordering::Relaxed) != 2
 }
 
+/// Whether the notification server draws a notification's default action as
+/// a button (xfce4-notifyd draws GLib's unlabelled "default" as an empty one).
+static DEFAULT_IS_A_BUTTON: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a click on a notification must be a labelled button here, not
+/// the default action (see [`DEFAULT_IS_A_BUTTON`]).
+pub(crate) fn default_action_shows_as_button() -> bool {
+    DEFAULT_IS_A_BUTTON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Which servers draw the default action as a button, by their name in
+/// `GetServerInformation`.
+fn default_action_as_button(server: Option<&str>) -> bool {
+    server == Some("Xfce Notify Daemon")
+}
+
 /// Asks the session bus who shows notifications, and with what. Main loop,
 /// at most once a minute; a changed answer is reported to the phones.
 pub(crate) fn probe_buttons(bus: &gtk::gio::DBusConnection) {
@@ -606,6 +623,29 @@ pub(crate) fn probe_buttons(bus: &gtk::gio::DBusConnection) {
             .map(|(caps,)| caps)
         })
         .flatten();
+    // Asked once: the server is the session's, and this is one more call on the main loop.
+    static SERVER_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if caps.is_some() && !SERVER_ASKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        let server = bus
+            .call_sync(
+                Some("org.freedesktop.Notifications"),
+                "/org/freedesktop/Notifications",
+                "org.freedesktop.Notifications",
+                "GetServerInformation",
+                None,
+                None,
+                gio::DBusCallFlags::NONE,
+                500,
+                gio::Cancellable::NONE,
+            )
+            .ok()
+            .and_then(|reply| reply.get::<(String, String, String, String)>())
+            .map(|(name, ..)| name);
+        DEFAULT_IS_A_BUTTON.store(
+            default_action_as_button(server.as_deref()),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
     let shown = buttons_shown(flatpak, gtk_notifications, caps.as_deref());
     let value = if shown { 1 } else { 2 };
     if BUTTONS.swap(value, std::sync::atomic::Ordering::Relaxed) != value {
@@ -648,6 +688,18 @@ pub(crate) fn forget(device_id: &str) {
         reports.remove(device_id);
     });
     with_incoming(|pending| pending.retain(|ask| ask.device != device_id));
+}
+
+#[cfg(test)]
+mod default_action_tests {
+    /// xfce4-notifyd drew GLib's unlabelled default action as an empty button.
+    #[test]
+    fn only_xfce_notifyd_gets_an_open_button_for_the_click() {
+        assert!(super::default_action_as_button(Some("Xfce Notify Daemon")));
+        for other in [Some("Plasma"), Some("dunst"), Some("gnome-shell"), None] {
+            assert!(!super::default_action_as_button(other), "{other:?}");
+        }
+    }
 }
 
 #[cfg(test)]

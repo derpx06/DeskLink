@@ -236,3 +236,23 @@ fn the_session_line_includes_sound() {
     });
     assert_eq!(session_line(&device), None);
 }
+
+/// A click's activation token is used once, by the window shown for it, and
+/// a stale one (from a click that showed nothing) never.
+#[test]
+fn a_fresh_activation_token_is_used_once_and_a_stale_one_never() {
+    let now = std::time::Instant::now();
+    super::note_activation_token("token-1");
+    assert_eq!(
+        super::take_activation_token(now).as_deref(),
+        Some("token-1")
+    );
+    assert_eq!(super::take_activation_token(now), None, "once");
+    super::note_activation_token("token-2");
+    assert_eq!(
+        super::take_activation_token(now + std::time::Duration::from_secs(10)),
+        None
+    );
+    super::note_activation_token("");
+    assert_eq!(super::take_activation_token(now), None);
+}

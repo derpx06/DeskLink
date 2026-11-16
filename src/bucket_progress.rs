@@ -600,7 +600,8 @@ fn tick(app: &crate::application::DesklinkApplication) -> bool {
             "app.open-bucket",
             Some(&sync.device.to_variant()),
         );
-        notification.set_default_action_and_target_value(
+        crate::application::open_on_click(
+            &notification,
             "app.open-bucket",
             Some(&sync.device.to_variant()),
         );

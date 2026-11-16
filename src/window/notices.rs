@@ -184,9 +184,12 @@ impl DesklinkWindow {
         notification.set_body(Some(body));
         notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
         match page {
-            Some(page) => notification
-                .set_default_action_and_target_value("app.show-page", Some(&page.to_variant())),
-            None => notification.set_default_action("app.show-window"),
+            Some(page) => crate::application::open_on_click(
+                &notification,
+                "app.show-page",
+                Some(&page.to_variant()),
+            ),
+            None => crate::application::open_on_click(&notification, "app.show-window", None),
         }
         application.send_notification(Some(id), &notification);
     }
@@ -203,7 +206,8 @@ impl DesklinkWindow {
             Some(png) => notification.set_icon(&gio::BytesIcon::new(&glib::Bytes::from(&*png))),
             None => notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic")),
         }
-        notification.set_default_action_and_target_value(
+        crate::application::open_on_click(
+            &notification,
             "app.show-page",
             Some(&"notifications".to_variant()),
         );
@@ -218,7 +222,7 @@ impl DesklinkWindow {
         notification.set_body(Some(body));
         notification.set_priority(gio::NotificationPriority::High);
         notification.set_icon(&gio::ThemedIcon::new("derx06.desklink.com-symbolic"));
-        notification.set_default_action("app.show-window");
+        crate::application::open_on_click(&notification, "app.show-window", None);
         application.send_notification(Some(id), &notification);
     }
 

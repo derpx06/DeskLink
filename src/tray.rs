@@ -39,11 +39,16 @@ pub const ICON_LIVE: &str = "desklink-tray-live-symbolic";
 
 const GLYPH: &str = "M2.5 1H9.5A1.5 1.5 0 0 1 11 2.5V6.5A1.5 1.5 0 0 1 9.5 8H2.5A1.5 1.5 0 0 1 1 6.5V2.5A1.5 1.5 0 0 1 2.5 1ZM10.5 4H12.5A1.5 1.5 0 0 1 14 5.5V12.5A1.5 1.5 0 0 1 12.5 14H10.5A1.5 1.5 0 0 1 9 12.5V5.5A1.5 1.5 0 0 1 10.5 4ZM4.5 9H7.5A0.5 0.5 0 0 1 8 9.5V9.5A0.5 0.5 0 0 1 7.5 10H4.5A0.5 0.5 0 0 1 4 9.5V9.5A0.5 0.5 0 0 1 4.5 9Z";
 
-/// The three icons, as symbolic SVG (a host recolours them; `error` is the
-/// theme's red).
+/// The three icons, as symbolic SVG (`error` is the theme's red). GTK-based
+/// hosts recolour them (their `fill` wins); Plasma recolours through the
+/// `current-color-scheme` sheet; a host that draws the file as it is
+/// (swaybar, Waybar) gets GTK's symbolic grey, readable on a dark bar and a
+/// light one (a fixed dark grey vanished on a dark bar).
 fn icon_svg(name: &str) -> String {
     let glyph = |opacity: &str| {
-        format!(r##"<path d="{GLYPH}" fill="#2e3436" fill-rule="evenodd" opacity="{opacity}"/>"##)
+        format!(
+            r##"<path class="ColorScheme-Text" d="{GLYPH}" fill="currentColor" fill-rule="evenodd" opacity="{opacity}"/>"##
+        )
     };
     let body = match name {
         ICON_OFFLINE => glyph("0.45"),
@@ -54,7 +59,7 @@ fn icon_svg(name: &str) -> String {
         _ => glyph("1"),
     };
     format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">{body}</svg>"#
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16"><style id="current-color-scheme" type="text/css">.ColorScheme-Text{{color:#bebebe}}</style>{body}</svg>"#
     )
 }
 
@@ -89,6 +94,7 @@ const XML: &str = r#"<node>
     <property name="ToolTip" type="(sa(iiay)ss)" access="read"/>
     <property name="ItemIsMenu" type="b" access="read"/>
     <property name="Menu" type="o" access="read"/>
+    <method name="ProvideXdgActivationToken"><arg type="s" direction="in"/></method>
     <method name="Activate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
     <method name="SecondaryActivate"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
     <method name="ContextMenu"><arg type="i" direction="in"/><arg type="i" direction="in"/></method>
@@ -258,8 +264,16 @@ impl Tray {
         let item_actions = Rc::clone(&actions);
         connection
             .register_object(ITEM_PATH, &item)
-            .method_call(move |_, _, _, _, method, _, invocation| {
+            .method_call(move |_, _, _, _, method, params, invocation| {
                 crate::guard("tray call", (), || {
+                    // Plasma hands the token for the click's raise first.
+                    if method == "ProvideXdgActivationToken" {
+                        if let Some(token) =
+                            params.try_child_value(0).and_then(|t| t.get::<String>())
+                        {
+                            crate::application::note_activation_token(&token);
+                        }
+                    }
                     if matches!(method, "Activate" | "SecondaryActivate") {
                         (item_actions.open)();
                     }
@@ -839,6 +853,16 @@ mod tests {
             icon_svg(ICON_LIVE).contains("class=\"error\""),
             "the red dot"
         );
+        // Recolourable everywhere, and light where nothing recolours (swaybar).
+        for name in [ICON_CONNECTED, ICON_OFFLINE, ICON_LIVE] {
+            let svg = icon_svg(name);
+            assert!(svg.contains("fill=\"currentColor\""), "{name}");
+            assert!(svg.contains("class=\"ColorScheme-Text\""), "{name}");
+            assert!(
+                svg.contains("#bebebe") && !svg.contains("#2e3436"),
+                "{name}"
+            );
+        }
         assert_eq!(
             item_property("ToolTip", &state).type_().as_str(),
             "(sa(iiay)ss)"

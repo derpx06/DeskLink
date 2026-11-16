@@ -50,7 +50,7 @@ impl DesklinkApplication {
             .parameter_type(Some(glib::VariantTy::STRING))
             .activate(move |app: &Self, _, target| {
                 let window = app.main_window();
-                window.present();
+                super::present_window(&window);
                 if let Some(device) = target.and_then(|target| target.get::<String>()) {
                     window.show_device(&device);
                 }
@@ -126,14 +126,14 @@ impl DesklinkApplication {
         // The "closed to the background" notification's click: with no tray
         // to reopen from, the notification is the way back.
         let show_window_action = gio::ActionEntry::builder("show-window")
-            .activate(move |app: &Self, _, _| app.main_window().present())
+            .activate(move |app: &Self, _, _| super::present_window(&app.main_window()))
             .build();
         // A notification's click: the window, on the page it is about.
         let show_page_action = gio::ActionEntry::builder("show-page")
             .parameter_type(Some(glib::VariantTy::STRING))
             .activate(move |app: &Self, _, target| {
                 let window = app.main_window();
-                window.present();
+                super::present_window(&window);
                 if let Some(page) = target.and_then(|target| target.get::<String>()) {
                     window.show_page(&page);
                 }
@@ -310,7 +310,7 @@ impl DesklinkApplication {
     /// Connection History, a dialog (Settings -> Advanced opens the same).
     fn show_history(&self) {
         let window = self.main_window();
-        window.present();
+        super::present_window(&window);
         if window.visible_dialog().is_some() {
             return;
         }
@@ -328,7 +328,7 @@ impl DesklinkApplication {
     /// phone is paired.
     fn show_preferences(&self) {
         let window = self.main_window();
-        window.present();
+        super::present_window(&window);
         if window.show_page("settings") || window.visible_dialog().is_some() {
             return;
         }

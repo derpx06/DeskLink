@@ -165,6 +165,9 @@ mod imp {
         fn startup(&self) {
             self.parent_startup();
             self.start_primary();
+            if let Some(connection) = self.obj().dbus_connection() {
+                super::follow_activation_tokens(&connection);
+            }
             crate::device_links::dnd::init();
             // Registered now (startup runs only in the primary instance), so
             // the notice is really shown before the crash is marked told.
@@ -228,7 +231,7 @@ mod imp {
                 crate::startup("window mapped");
                 first_paint(window);
             });
-            window.present();
+            super::present_window(&window);
         }
 
         // `tel:` links (the desktop file's `x-scheme-handler/tel`). Anything
@@ -409,21 +412,21 @@ impl DesklinkApplication {
     /// Like [`Self::dial_with`], for a text message.
     pub(crate) fn message_with(&self, number: &str, phone: &str) {
         let window = self.main_window();
-        window.present();
+        present_window(&window);
         crate::window::confirm_message(&window, number, Some(phone));
     }
 
     /// Like [`Self::dial`], with the phone that must place the call.
     pub(crate) fn dial_with(&self, number: &str, phone: &str) {
         let window = self.main_window();
-        window.present();
+        present_window(&window);
         crate::window::confirm_dial(&window, number, Some(phone));
     }
 
     /// Shows the window and asks before calling `number` with the phone.
     pub(crate) fn dial(&self, number: &str) {
         let window = self.main_window();
-        window.present();
+        present_window(&window);
         crate::window::confirm_dial(&window, number, None);
     }
 
@@ -483,7 +486,7 @@ impl DesklinkApplication {
             // A portal grant: Allow opens the desktop's own dialog.
             "control" => {
                 let window = self.main_window();
-                window.present();
+                present_window(&window);
                 crate::window::approve_control(&window, device);
             }
             _ => {}
@@ -544,7 +547,7 @@ impl DesklinkApplication {
                              the background. Click here, or start DeskLink from your launcher, \
                              to open it again.",
                         ));
-                        note.set_default_action("app.show-window");
+                        crate::application::open_on_click(&note, "app.show-window", None);
                         app.send_notification(Some("desklink-background"), &note);
                     }
                 }
@@ -570,7 +573,7 @@ impl DesklinkApplication {
     /// must not stack a second Preferences (or History, …) over the first.
     fn window_for_dialog(&self) -> Option<DesklinkWindow> {
         let window = self.main_window();
-        window.present();
+        present_window(&window);
         window.visible_dialog().is_none().then_some(window)
     }
 }
@@ -730,6 +733,78 @@ pub(crate) fn call_action_kind(action: &str) -> CallAction {
         "message" => CallAction::Message,
         "answer" | "decline" | "silence" | "end" | "mute" | "unmute" => CallAction::OnTheCall,
         _ => CallAction::Refused,
+    }
+}
+
+/// The xdg-activation token the last click came with (a notification's
+/// `ActivationToken`, a tray host's `ProvideXdgActivationToken`), and when.
+/// On Wayland a compositor that enforces focus stealing prevention (KWin)
+/// raises a window only when it is shown with one; GLib's notification
+/// backend does not pass it on, so DeskLink keeps it itself.
+static ACTIVATION: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// How long a token waits for the click it came with to show the window.
+const ACTIVATION_FRESH: std::time::Duration = std::time::Duration::from_secs(3);
+
+pub(crate) fn note_activation_token(token: &str) {
+    if token.is_empty() {
+        return;
+    }
+    if let Ok(mut held) = ACTIVATION.lock() {
+        *held = Some((token.to_string(), std::time::Instant::now()));
+    }
+}
+
+/// The waiting token, once, if it is fresh at `now`.
+fn take_activation_token(now: std::time::Instant) -> Option<String> {
+    ACTIVATION
+        .lock()
+        .ok()?
+        .take()
+        .filter(|(_, at)| now.saturating_duration_since(*at) <= ACTIVATION_FRESH)
+        .map(|(token, _)| token)
+}
+
+/// Shows `window` in front, with the click's activation token when one is
+/// waiting (KDE Wayland ignored a plain `present`).
+fn present_window(window: &impl IsA<gtk::Window>) {
+    if let Some(token) = take_activation_token(std::time::Instant::now()) {
+        window.set_startup_id(&token);
+    }
+    window.present();
+}
+
+/// Keeps the notification server's `ActivationToken` (sent just before its
+/// `ActionInvoked`) for [`present_window`].
+fn follow_activation_tokens(connection: &gio::DBusConnection) {
+    let _ = connection.signal_subscribe(
+        Some("org.freedesktop.Notifications"),
+        Some("org.freedesktop.Notifications"),
+        Some("ActivationToken"),
+        Some("/org/freedesktop/Notifications"),
+        None,
+        gio::DBusSignalFlags::NONE,
+        |_, _, _, _, _, parameters| {
+            if let Some((_, token)) = parameters.get::<(u32, String)>() {
+                note_activation_token(&token);
+            }
+        },
+    );
+}
+
+/// What a click on `notification` does: its default action, or on a server
+/// that draws the default action as an unlabelled button (xfce4-notifyd), an
+/// "Open" button instead.
+pub(crate) fn open_on_click(
+    notification: &gio::Notification,
+    action: &str,
+    target: Option<&glib::Variant>,
+) {
+    if crate::device_links::asks::default_action_shows_as_button() {
+        notification.add_button_with_target_value("Open", action, target);
+    } else {
+        notification.set_default_action_and_target_value(action, target);
     }
 }
 
