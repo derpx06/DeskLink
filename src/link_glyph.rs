@@ -65,6 +65,9 @@ pub(crate) struct Presentation {
     pub(crate) status: Status,
     /// The pill: "Connected", "Connecting…", "Can't reach", "Needs your OK".
     pub(crate) word: &'static str,
+    /// The state word for the narrow device card: never wider than
+    /// "Connected" ("Checking" for "Checking connection…").
+    pub(crate) card: &'static str,
     /// "over Wi-Fi · 9 ms", "Check that Pixel 9 is on and on your network".
     pub(crate) detail: String,
     /// "Wi-Fi · 9 ms": the same for a place that is 200 px wide.
@@ -85,6 +88,7 @@ impl Presentation {
         let make = |status, word, detail: &str, short: &str| Self {
             status,
             word,
+            card: word,
             detail: detail.to_string(),
             short: short.to_string(),
         };
@@ -127,6 +131,7 @@ impl Presentation {
                 Self {
                     status: Status::Ok,
                     word: "Connected",
+                    card: "Connected",
                     detail: with_rtt(route),
                     short: with_rtt(short_route),
                 }
@@ -137,15 +142,19 @@ impl Presentation {
                 "Setting up a secure connection",
                 "Setting up",
             ),
-            LinkState::Checking => make(
-                Status::Idle,
-                "Checking connection…",
-                "Not heard from for a moment",
-                "Checking",
-            ),
+            LinkState::Checking => Self {
+                card: "Checking",
+                ..make(
+                    Status::Idle,
+                    "Checking connection…",
+                    "Not heard from for a moment",
+                    "Checking",
+                )
+            },
             LinkState::Offline => Self {
                 status: Status::Err,
                 word: "Can't reach",
+                card: "Can't reach",
                 detail: format!("Check that {} is on and on your network", device.name),
                 short: "Not on your network".to_string(),
             },

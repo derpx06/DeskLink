@@ -98,6 +98,9 @@ pub struct DesklinkWindow {
     pub sticky_dismissed: RefCell<std::collections::HashSet<&'static str>>,
     /// The last error toast and when, so a repeating error toasts once.
     pub last_error_toast: RefCell<Option<(String, std::time::Instant)>>,
+    /// The last feature toast ("Asking X to ring") and when: a click that
+    /// then fails takes it down and is answered in its place.
+    pub last_feature_toast: RefCell<Option<(glib::WeakRef<adw::Toast>, std::time::Instant)>>,
     pub notified_pair_requests: RefCell<HashSet<String>>,
     pub notified_remote_notifications: RefCell<announce::Tracker>,
     /// Ringing calls ("device:callId") whose notification is up.

@@ -866,3 +866,50 @@ fn the_unreachable_answer_to_a_click_is_shown_as_written() {
     let named = "Can't reach Pixel 9. Check that it's on and on your network.";
     assert_eq!(friendly_error(named).0, named);
 }
+
+/// The same "Can't reach" answer twice, 15 s apart: shown again when the
+/// person clicked in between (they pressed it again because nothing
+/// happened), left out when nothing was clicked (a background repeat).
+#[test]
+fn a_click_answer_is_never_swallowed_by_the_repeat_filter() {
+    use super::notices::{is_unreachable_message, suppress_repeat};
+    let answer = "Can't reach Pixel. Check that it's on and on your network.";
+    let fifteen = std::time::Duration::from_secs(15);
+    assert!(is_unreachable_message(answer));
+    assert!(!is_unreachable_message("Something went wrong"));
+    // No click since: the repeat is suppressed.
+    assert!(suppress_repeat(answer, fifteen, answer, false));
+    // A click since: shown.
+    assert!(!suppress_repeat(answer, fifteen, answer, true));
+    // Other errors keep the half-minute rule, clicked or not (`clicked_again`
+    // is only ever true for the click answer).
+    assert!(!suppress_repeat(
+        answer,
+        std::time::Duration::from_secs(31),
+        answer,
+        false
+    ));
+    assert!(!suppress_repeat(answer, fifteen, "Another error", false));
+}
+
+/// The failing click takes the optimistic toast down (only a fresh one).
+#[test]
+fn a_failing_click_dismisses_its_optimistic_toast() {
+    crate::test_display::run(|| {
+        use std::cell::RefCell;
+        let toast = adw::Toast::new("Asking Pixel to ring");
+        let now = std::time::Instant::now();
+        let slot = RefCell::new(Some((toast.downgrade(), now)));
+        assert!(super::notices::dismiss_optimistic(&slot, now));
+        assert!(slot.borrow().is_none(), "taken");
+        assert!(
+            !super::notices::dismiss_optimistic(&slot, now),
+            "nothing left"
+        );
+        let old = RefCell::new(Some((toast.downgrade(), now)));
+        assert!(!super::notices::dismiss_optimistic(
+            &old,
+            now + std::time::Duration::from_secs(7)
+        ));
+    });
+}

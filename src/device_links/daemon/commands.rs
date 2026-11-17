@@ -28,6 +28,9 @@ pub enum DaemonCommand {
     StartQrPairing,
     CancelQrPairing,
     SendPing(String),
+    /// The Contacts page's refresh: a user click, so it is preflighted and
+    /// a dead phone is answered like any other click.
+    RequestContacts(String),
     SendMousepadRequest(String, serde_json::Map<String, serde_json::Value>),
     StartPhoneRemoteControl(String),
     StopPhoneRemoteControl(String),
@@ -358,6 +361,11 @@ impl DaemonWorker {
                 self.update_settings(|settings| settings.onboarding_seen = on)
             }
             DaemonCommand::SendFindPhone(id) => self.send_find_phone(&id),
+            DaemonCommand::RequestContacts(id) => {
+                self.with_feature_transport(&id, |transport| {
+                    transport.send(&crate::device_links::contacts::refresh_request())
+                });
+            }
             DaemonCommand::SendMprisAction(id, player, action) => {
                 self.send_mpris_action(&id, &player, &action)
             }

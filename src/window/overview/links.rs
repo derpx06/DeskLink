@@ -47,7 +47,7 @@ pub(in crate::window) fn show_send_link_dialog(
         }
         if let Some(link) = link_to_send(&entry.text()) {
             daemon.send(DaemonCommand::SendShareText(device_id.clone(), link));
-            toast_from(&toast_target, "Link sent");
+            toast_from(&toast_target, "Sending the link");
         }
     });
 }

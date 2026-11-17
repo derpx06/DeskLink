@@ -375,12 +375,27 @@ impl DesklinkWindow {
             imp.error_banner.set_revealed(true);
             return;
         }
+        // A click on a phone that does not answer: the optimistic toast that
+        // click raised ("Asking X to ring") goes, and the answer is shown
+        // again even if the same words were shown a few seconds ago (the
+        // person pressed it again because nothing happened).
+        let unreachable = is_unreachable_message(&message);
+        let clicked_since = {
+            let toast = imp.last_feature_toast.borrow();
+            let since_error = imp.last_error_toast.borrow().as_ref().map(|(_, at)| *at);
+            toast
+                .as_ref()
+                .is_some_and(|(_, clicked)| since_error.is_none_or(|error| *clicked > error))
+        };
+        if unreachable {
+            dismiss_optimistic(&imp.last_feature_toast, std::time::Instant::now());
+        }
         let repeated = imp
             .last_error_toast
             .borrow()
             .as_ref()
             .is_some_and(|(shown, at)| {
-                *shown == message && at.elapsed() < std::time::Duration::from_secs(30)
+                suppress_repeat(shown, at.elapsed(), &message, unreachable && clicked_since)
             });
         if repeated {
             return;
@@ -543,8 +558,52 @@ impl DesklinkWindow {
         let toast = adw::Toast::new(message);
         toast.set_use_markup(false);
         toast.set_timeout(3);
+        self.imp()
+            .last_feature_toast
+            .replace(Some((toast.downgrade(), std::time::Instant::now())));
         self.queue_toast(&toast);
     }
+}
+
+/// How long after a feature toast a failing click still takes it down.
+const OPTIMISTIC_TOAST_LIFE: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Takes down the feature toast a click raised, if it is still fresh at `now`.
+/// Whether one was dismissed.
+pub(super) fn dismiss_optimistic(
+    slot: &std::cell::RefCell<Option<(gtk::glib::WeakRef<adw::Toast>, std::time::Instant)>>,
+    now: std::time::Instant,
+) -> bool {
+    let Some((toast, at)) = slot.take() else {
+        return false;
+    };
+    if now.saturating_duration_since(at) >= OPTIMISTIC_TOAST_LIFE {
+        return false;
+    }
+    match toast.upgrade() {
+        Some(toast) => {
+            toast.dismiss();
+            true
+        }
+        None => false,
+    }
+}
+
+/// The answer to a click on a phone that does not answer ("Can't reach …").
+pub(super) fn is_unreachable_message(message: &str) -> bool {
+    message.starts_with("Can't reach ")
+}
+
+/// Whether an error toast with the same words as `shown` (`age` ago) is left
+/// out: a repeat within half a minute is, unless the person clicked again
+/// since (`clicked_again`: a click's answer is never swallowed).
+pub(super) fn suppress_repeat(
+    shown: &str,
+    age: std::time::Duration,
+    message: &str,
+    clicked_again: bool,
+) -> bool {
+    shown == message && age < std::time::Duration::from_secs(30) && !clicked_again
 }
 
 /// A toast's words: at most 160 characters (a toast is one or two lines).

@@ -820,7 +820,7 @@ fn build_card(
                 if let Some(revealer) = shown.upgrade() {
                     revealer.set_reveal_child(false);
                 }
-                toast_from(&entry, "Reply sent");
+                toast_from(&entry, "Sending your reply");
             }
         };
         entry.connect_activate({

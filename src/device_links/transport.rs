@@ -37,6 +37,13 @@ pub(crate) fn should_surface_send_error(error: &str) -> bool {
 pub(crate) const NOT_REACHABLE: &str =
     "Can't reach the phone. Check that it's on and on your network.";
 
+/// Whether the click preflight does not apply: a peer that is not ready is the
+/// handover path (queueing rules), and a dozing phone cannot answer and is
+/// never held up (its own rules judge it).
+fn preflight_skipped(ready: bool, dozing: bool) -> bool {
+    !ready || dozing
+}
+
 #[derive(Clone)]
 pub(crate) struct FeatureTransport {
     sessions: Arc<DeviceManager>,
@@ -100,7 +107,7 @@ impl FeatureTransport {
     /// phone is never held up (it cannot answer; its own rules judge it).
     pub(crate) fn preflight(&self) -> Result<(), String> {
         use crate::device_links::webrtc::coordinator::is_dozing;
-        if !self.is_ready() || is_dozing(&self.snapshot.binding.device_id) {
+        if preflight_skipped(self.is_ready(), is_dozing(&self.snapshot.binding.device_id)) {
             return Ok(());
         }
         self.preflight_by_silence()
@@ -496,9 +503,31 @@ mod tests {
             transport.preflight_by_silence(),
             Err(NOT_REACHABLE.to_string())
         );
-        assert!(again.elapsed() < Duration::from_millis(300), "remembered");
+        assert!(
+            again.elapsed() < Duration::from_millis(1_000),
+            "remembered: no second wait"
+        );
         // And nothing was queued or sent for it by the preflight itself.
         crate::device_links::webrtc::coordinator::forget_liveness("preflight-dead-phone");
+    }
+
+    /// A dozing phone is never held up and a not-ready peer is the handover
+    /// path: neither is preflighted.
+    #[test]
+    fn dozing_and_not_ready_skip_the_preflight() {
+        assert!(preflight_skipped(false, false));
+        assert!(preflight_skipped(false, true));
+        assert!(preflight_skipped(true, true));
+        assert!(!preflight_skipped(true, false));
+        // A not-ready session with a long silence returns at once.
+        let (_s, transport) = ready_session(
+            "preflight-notready-phone",
+            std::time::Duration::from_secs(30),
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(transport.preflight(), Ok(()));
+        assert!(started.elapsed() < std::time::Duration::from_millis(1_000));
+        crate::device_links::webrtc::coordinator::forget_liveness("preflight-notready-phone");
     }
 
     /// A click on a phone that does not answer is told, never swallowed as

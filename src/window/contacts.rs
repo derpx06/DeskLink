@@ -404,9 +404,13 @@ impl Page {
             );
             page.refresh.connect_clicked(move |button| {
                 let id = device.borrow().0.clone();
-                crate::device_links::desk_features::run_later(move || {
-                    crate::device_links::desk_features::send(&id, &contacts::refresh_request())
-                });
+                if let Some(daemon) = button
+                    .root()
+                    .and_downcast::<DesklinkWindow>()
+                    .and_then(|win| win.daemon())
+                {
+                    daemon.send(DaemonCommand::RequestContacts(id));
+                }
                 count.set_label(ASKING);
                 toast_from(button, "Asked the phone for its contacts");
                 // A phone that does not share contacts never answers: the

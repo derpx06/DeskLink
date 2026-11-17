@@ -67,17 +67,6 @@ fn card_key(device: &DeviceView) -> String {
     format!("{}\n{:?}", device.name, Presentation::steady(device))
 }
 
-/// The state word on the narrow device card: "Checking connection…" is twice
-/// as wide as "Connected" and made the sidebar jump by ten pixels when it
-/// appeared; the full words stay in the pill, the hero and the spoken label.
-fn card_word(word: &'static str) -> &'static str {
-    if word == "Checking connection…" {
-        "Checking…"
-    } else {
-        word
-    }
-}
-
 /// What the switcher is drawn from: not the round trips.
 fn switcher_key(devices: &[DeviceView], selected: &DeviceView) -> String {
     devices
@@ -450,7 +439,7 @@ impl Sidebar {
         status.append(&status_dot(words.status));
         status.append(
             &gtk::Label::builder()
-                .label(card_word(words.word))
+                .label(words.card)
                 .css_classes(["dl-label"])
                 // The card keeps its width whatever the state says.
                 .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -680,13 +669,34 @@ mod tests {
         device
     }
 
-    /// The card never grows for "Checking connection…": the narrow card says
-    /// "Checking…", which is no wider than "Connected".
+    /// The card never grows for "Checking connection…": its card word is no
+    /// wider than "Connected", measured as drawn (the sidebar jumped by ten
+    /// pixels before).
     #[test]
     fn the_card_word_for_checking_is_not_wider_than_connected() {
-        assert!(card_word("Checking connection…").chars().count() <= "Connected".chars().count());
-        assert_eq!(card_word("Connected"), "Connected");
-        assert_eq!(card_word("Can't reach"), "Can't reach");
+        use crate::device_links::device::DeviceStatus;
+        crate::test_display::run(|| {
+            let width = |text: &str| {
+                gtk::Label::new(Some(text))
+                    .create_pango_layout(Some(text))
+                    .pixel_size()
+                    .0
+            };
+            let mut phone = phone();
+            phone.status = DeviceStatus::Paired;
+            phone.feature_transport_ready = true;
+            let connected = Presentation::of(&phone);
+            phone.quiet = true;
+            let checking = Presentation::of(&phone);
+            assert_eq!(connected.card, "Connected");
+            assert_ne!(checking.word, connected.word);
+            assert!(
+                width(checking.card) <= width(connected.card),
+                "{} px against {} px",
+                width(checking.card),
+                width(connected.card)
+            );
+        });
     }
 
     /// A heartbeat changes the round trip every few seconds: the card and

@@ -803,7 +803,7 @@ fn go(button: &gtk::Button, what: &Go, daemon: &DaemonHandle, device: &DeviceVie
                             player.clone(),
                             "PlayPause".into(),
                         ));
-                        window.show_feature_toast(&format!("Play or pause sent to {name}"));
+                        window.show_feature_toast(&format!("Asking {name} to play or pause"));
                     }
                     None => window.show_feature_toast(&format!(
                         "Play music on {name} and its controls show at the top of Home"
