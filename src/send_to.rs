@@ -1,15 +1,20 @@
-//! "Send to <phone>" from Files: `desklink --send-files [--to <device>]
-//! <paths…>`, a script per paired phone for Nautilus, Nemo and Caja, a
-//! Dolphin service menu and Thunar "Send To" entries.
+//! "Send to <phone>" from the file manager: `desklink --send-files [--to
+//! <device>] <paths…>`, and the entries DeskLink writes for it under the
+//! user's own directories (nothing to install): a nautilus-python extension
+//! (top-level entry in Files, when python-nautilus is there) or a script per
+//! paired phone for Nautilus, Nemo and Caja, a static Nemo action for one
+//! phone, a Dolphin service menu and Thunar "Send To" entries. The entries
+//! follow the paired phones and Settings > Files > "Show Send to phone in the
+//! file manager"; switched off, or with the last phone unpaired, every one is
+//! removed (`desklink --remove-integration` does the same for a package hook).
 //!
 //! The command runs before GTK starts: it asks the running DeskLink (over
 //! its own D-Bus name, the `app.send-files` action) to send the files,
-//! starting it first if it is not running. The scripts and the service menu
-//! are written by the app itself, under the user's data dir: nothing to
-//! install. A script is removed when its phone is unpaired. DeskLink is never
-//! the default application for any file type: its "Open With" entries list
-//! only types that something else already opens, and the hijacking entries
-//! older builds wrote are removed (`refresh_open_with`).
+//! starting it first if it is not running, and says every refusal out loud
+//! (`file_manager`, which also holds the validation and the file writers).
+//! DeskLink is never the default application for any file type: its "Open
+//! With" entries list only types that something else already opens, and the
+//! hijacking entries older builds wrote are removed (`refresh_open_with`).
 
 use std::path::{Path, PathBuf};
 
@@ -678,15 +683,17 @@ fn to_bucket(app: &DesklinkApplication, device: &str, paths: Vec<PathBuf>) {
 
 thread_local! {
     static BURST: std::cell::RefCell<file_manager::Burst> = std::cell::RefCell::default();
+    static RECENT: std::cell::RefCell<file_manager::Recent> = std::cell::RefCell::default();
 }
 
 /// The `send-files` action's work: capped, rate limited, every path checked
-/// again here (the action is reachable by any process of this user's
-/// session), then queued, and always announced.
+/// again (the action is reachable by any process of this user's session) on a
+/// worker thread (a stalled network mount must not freeze the window), then
+/// queued, and always announced.
 fn send(app: &DesklinkApplication, device: &str, paths: &[String]) {
-    let Some(daemon) = app.daemon_handle() else {
+    if app.daemon_handle().is_none() {
         return;
-    };
+    }
     if paths.len() > file_manager::MAX_ENTRIES {
         say(
             app,
@@ -704,11 +711,58 @@ fn send(app: &DesklinkApplication, device: &str, paths: &[String]) {
         return;
     }
     let requested: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-    let (paths, skipped) = file_manager::classify(&requested);
+    let (app, device) = (app.clone(), device.to_string());
+    glib::spawn_future_local(async move {
+        let checked = gio::spawn_blocking(move || {
+            let (paths, skipped) = file_manager::classify(&requested);
+            let keyed: Vec<(String, (u64, i64))> = paths
+                .into_iter()
+                .map(|path| {
+                    let key = file_manager::fingerprint(&path);
+                    (path, key)
+                })
+                .collect();
+            (keyed, skipped)
+        })
+        .await;
+        if let Ok((keyed, skipped)) = checked {
+            queue_checked(&app, &device, keyed, skipped);
+        }
+    });
+}
+
+/// The second half of [`send`], back on the UI thread.
+fn queue_checked(
+    app: &DesklinkApplication,
+    device: &str,
+    keyed: Vec<(String, (u64, i64))>,
+    skipped: file_manager::Skipped,
+) {
+    let Some(daemon) = app.daemon_handle() else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let before = keyed.len();
+    let paths: Vec<String> = keyed
+        .into_iter()
+        .filter(|(path, (size, mtime))| {
+            RECENT.with(|recent| {
+                recent
+                    .borrow_mut()
+                    .fresh((path.clone(), *size, *mtime), now)
+            })
+        })
+        .map(|(path, _)| path)
+        .collect();
+    let again = before - paths.len();
     if paths.is_empty() {
-        let body = skipped
-            .message()
-            .unwrap_or_else(|| "Select one or more files to send.".into());
+        let body = skipped.message().unwrap_or_else(|| {
+            if again > 0 {
+                "Those files were just sent.".into()
+            } else {
+                "Select one or more files to send.".into()
+            }
+        });
         say(app, "Can't send to phone", &body);
         return;
     }
@@ -732,10 +786,10 @@ fn send(app: &DesklinkApplication, device: &str, paths: &[String]) {
             let notification = gio::Notification::new(&format!("Sending {what} to {}", phone.name));
             let mut body = Vec::new();
             if !phone.feature_transport_ready {
-                body.push(format!(
-                    "{} isn't connected. Your files are waiting and will be sent when it connects.",
-                    phone.name
-                ));
+                body.push(file_manager::waiting_body(&phone.name));
+            }
+            if again > 0 {
+                body.push(format!("{again} were just sent and are not sent twice."));
             }
             body.extend(skipped.message());
             if !body.is_empty() {
@@ -892,7 +946,7 @@ pub(crate) fn dolphin_menu(exe: &Path, phones: &[(String, String)]) -> String {
         .map(|index| format!("phone{index}"))
         .collect();
     let mut menu = format!(
-        "[Desktop Entry]\nType=Service\nMimeType=application/octet-stream;inode/directory;\nX-KDE-Protocols=file\nActions={};\nX-KDE-Priority=TopLevel\nX-KDE-Submenu=Send to Phone\n",
+        "[Desktop Entry]\nType=Service\nMimeType=application/octet-stream;inode/directory;\nX-KDE-Protocols=file\nActions={};\nX-KDE-Priority=TopLevel\nX-KDE-Submenu=Send to Phone\nX-DeskLink-Generated=send-to\n",
         ids.join(";")
     );
     for ((id, name), action) in phones.iter().zip(&ids) {
@@ -1131,20 +1185,13 @@ fn update_desktop_database(applications: &Path) {
         .status();
 }
 
-/// Writes `content` to `path` when it differs; `executable` sets mode 0755.
+/// Writes `content` to `path` when it differs (atomically); `executable`
+/// sets mode 0755, else 0644.
 fn write_if_changed(path: &Path, content: &str, executable: bool) -> std::io::Result<()> {
     if std::fs::read_to_string(path).ok().as_deref() == Some(content) {
         return Ok(());
     }
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    std::fs::write(path, content)?;
-    if executable {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
-    }
-    Ok(())
+    file_manager::write_atomic(path, content, executable)
 }
 
 /// One script per paired phone (`(id, name)`), and none for any other.
@@ -1184,9 +1231,13 @@ fn sync_per_phone(
             }
         }
     }
+    // One phone's failure never stops the others: the first is returned.
+    let mut first_error = None;
     for (path, id) in &existing {
         if !phones.iter().any(|(phone, _)| phone == id) {
-            std::fs::remove_file(path)?;
+            if let Err(error) = std::fs::remove_file(path) {
+                first_error.get_or_insert(error);
+            }
         }
     }
     for (id, name) in phones {
@@ -1203,9 +1254,17 @@ fn sync_per_phone(
                 let _ = std::fs::remove_file(path);
             }
         }
-        write_if_changed(&dir.join(file), &content(id, name), executable)?;
+        let written = file_manager::write_marked(
+            &dir.join(file),
+            &content(id, name),
+            executable,
+            &[SCRIPT_MARK],
+        );
+        if let Err(error) = written {
+            first_error.get_or_insert(error);
+        }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 /// Whether the file-manager integration (Nautilus scripts, the Dolphin menu)
@@ -1223,9 +1282,12 @@ pub fn start(app: &DesklinkApplication) {
     if !writes_host_integration(crate::device_links::pty::host::in_flatpak()) {
         return;
     }
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
+    // Not ".../desklink (deleted)" after an update replaced the binary, and the
+    // AppImage's own path inside an AppImage.
+    let exe = std::env::var_os("APPIMAGE")
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| crate::device_links::pty::host::own_executable(false));
     let dirs = file_manager::Dirs {
         data: glib::user_data_dir(),
         config: glib::user_config_dir(),
@@ -1246,6 +1308,9 @@ pub fn start(app: &DesklinkApplication) {
     type Written = (Vec<(String, String)>, bool, bool);
     let last = std::cell::RefCell::new(None::<Written>);
     let opened = std::cell::Cell::new(false);
+    // Paired phones load a moment after start: "none" must be seen twice in a
+    // row before the entries are removed (and written again).
+    let empty_once = std::cell::Cell::new(false);
     let weak = app.downgrade();
     crate::ticker::every_tick(move || {
         let Some(app) = weak.upgrade().filter(|app| !app.is_remote()) else {
@@ -1265,6 +1330,9 @@ pub fn start(app: &DesklinkApplication) {
         let python = python.load(std::sync::atomic::Ordering::Relaxed);
         let now = (phones, enabled, python);
         if last.borrow().as_ref() == Some(&now) {
+            return glib::ControlFlow::Continue;
+        }
+        if now.0.is_empty() && enabled && last.borrow().is_none() && !empty_once.replace(true) {
             return glib::ControlFlow::Continue;
         }
         let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();

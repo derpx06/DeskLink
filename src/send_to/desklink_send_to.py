@@ -51,18 +51,21 @@ def read_phones(path=PHONES_FILE):
 
 
 def local_paths(files):
-    """(paths of the local items, whether one of them is not a folder)."""
+    """(what to hand over, whether one of the items is a local file).
+
+    Local items go as paths; anything else (smb://, trash://, recent://) goes
+    as its URI, so DeskLink can say it cannot send it. No entry is offered
+    unless at least one item is a local file that is not a folder."""
     paths, has_file = [], False
     for item in files:
         try:
-            if item.get_uri_scheme() != "file":
-                continue
-            path = item.get_location().get_path()
-            if not path:
-                continue
-            paths.append(path)
-            if not item.is_directory():
-                has_file = True
+            path = item.get_location().get_path() if item.get_uri_scheme() == "file" else None
+            if path:
+                paths.append(path)
+                if not item.is_directory():
+                    has_file = True
+            else:
+                paths.append(item.get_uri())
         except Exception:
             continue
     return paths, has_file
@@ -103,7 +106,7 @@ def build_items(program, phones, paths):
     item = _item("DeskLink::SendTo", _("Send to phone"), tip)
     menu = Nautilus.Menu()
     for index, (phone_id, name) in enumerate(phones):
-        entry = _item("DeskLink::SendTo::%d" % index, _("Send to %s") % name, tip)
+        entry = _item("DeskLink::SendTo::%d" % index, _("Send to %s") % name.replace("_", "__"), tip)
         entry.connect("activate", lambda _i, p=phone_id: send(program, p, paths))
         menu.append_item(entry)
     item.set_submenu(menu)

@@ -16,6 +16,16 @@
 //! Nautilus extension is fixed code that reads a JSON file and starts the
 //! program with an argument list.
 //!
+//! Ownership: a file is written or removed only when it carries one of our
+//! markers (`write_marked`, `remove_if_ours`): a user's own file at one of the
+//! fixed names is never overwritten and never deleted. Writes are atomic (a
+//! temporary file in the same folder, fsync, rename). One phone's failure
+//! (a name too long for a file name) never stops the others.
+//!
+//! Validation happens when the request arrives (on a worker thread); the
+//! file is read later, possibly from the waiting queue (up to 24 h): the same
+//! trust domain, so there is no attempt to close that window.
+//!
 //! Sibling edges: none. Parent (`send_to`): the script and menu writers.
 
 use std::io::IsTerminal;
@@ -35,6 +45,8 @@ pub(crate) struct Skipped {
     pub(crate) special: usize,
     pub(crate) protected: usize,
     pub(crate) remote: usize,
+    /// File names that are not valid text (cannot cross to the desk intact).
+    pub(crate) badname: usize,
 }
 
 fn count(n: usize, one: &str, many: &str) -> String {
@@ -70,6 +82,13 @@ impl Skipped {
             parts.push(format!(
                 "{} aren't stored on this computer (network, trash or recent locations): copy them to a folder first.",
                 count(self.remote, "item", "items")
+            ));
+        }
+        if self.badname > 0 {
+            parts.push(format!(
+                "{} {} not valid text and can't be sent.",
+                count(self.badname, "file name", "file names"),
+                if self.badname == 1 { "is" } else { "are" }
             ));
         }
         if self.missing > 0 {
@@ -114,18 +133,51 @@ fn protected_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// (device, inode) of the files inside the protected folders (a few levels,
+/// a few hundred entries): a hard link elsewhere is the same file.
+fn protected_ids(dirs: &[PathBuf]) -> std::collections::HashSet<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut ids = std::collections::HashSet::new();
+    let mut folders: Vec<(PathBuf, u8)> = dirs.iter().map(|d| (d.clone(), 0)).collect();
+    while let Some((dir, depth)) = folders.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if ids.len() >= 500 {
+                return ids;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() {
+                if depth < 3 {
+                    folders.push((entry.path(), depth + 1));
+                }
+            } else if meta.is_file() {
+                ids.insert((meta.dev(), meta.ino()));
+            }
+        }
+    }
+    ids
+}
+
 /// Re-checks every path at action time: an existing, readable, ordinary file
 /// (symlinks followed), not under DeskLink's own folders. Returns the
 /// sendable paths and why the others are not.
 pub(crate) fn classify(paths: &[PathBuf]) -> (Vec<String>, Skipped) {
     let protected = protected_dirs();
+    let protected_ids = protected_ids(&protected);
     let mut sendable = Vec::new();
     let mut skipped = Skipped::default();
     for path in paths {
-        let Some(text) = path.to_str().filter(|_| path.is_absolute()) else {
-            skipped.missing += 1;
+        let Some(text) = path.to_str() else {
+            skipped.badname += 1;
             continue;
         };
+        if text.contains('\u{FFFD}') {
+            skipped.badname += 1;
+            continue;
+        }
+        if !path.is_absolute() {
+            skipped.missing += 1;
+            continue;
+        }
         let meta = match std::fs::metadata(path) {
             Ok(meta) => meta,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -146,6 +198,11 @@ pub(crate) fn classify(paths: &[PathBuf]) -> (Vec<String>, Skipped) {
             .canonicalize()
             .is_ok_and(|real| protected.iter().any(|dir| real.starts_with(dir)))
             || protected.iter().any(|dir| path.starts_with(dir))
+            || {
+                // A hard link to one of our files, from anywhere.
+                use std::os::unix::fs::MetadataExt;
+                meta.nlink() > 1 && protected_ids.contains(&(meta.dev(), meta.ino()))
+            }
         {
             skipped.protected += 1;
         } else if std::fs::File::open(path).is_err() {
@@ -182,8 +239,43 @@ impl Burst {
     }
 }
 
+/// Files already sent a moment ago (by path, size and modification time):
+/// an identical second request inside the window is not queued twice.
+#[derive(Default)]
+pub(crate) struct Recent(Vec<((String, u64, i64), std::time::Instant)>);
+
+impl Recent {
+    /// Whether `key` is new (and remembers it).
+    pub(crate) fn fresh(&mut self, key: (String, u64, i64), now: std::time::Instant) -> bool {
+        self.0
+            .retain(|(_, at)| now.saturating_duration_since(*at) < Burst::WINDOW);
+        if self.0.iter().any(|(seen, _)| *seen == key) {
+            return false;
+        }
+        self.0.push((key, now));
+        true
+    }
+}
+
+/// Size and modification time (seconds), for [`Recent`].
+pub(crate) fn fingerprint(path: &str) -> (u64, i64) {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).map_or((0, 0), |meta| (meta.len(), meta.mtime()))
+}
+
+/// The body of "Sending…" when the phone is not connected. The phone's name
+/// is escaped: notification bodies are markup.
+pub(crate) fn waiting_body(phone: &str) -> String {
+    format!(
+        "{} isn't connected. Your files are waiting (up to 200, for 24 hours) and will be sent when it connects.",
+        glib::markup_escape_text(phone)
+    )
+}
+
 pub(crate) fn too_many_message(entries: usize) -> String {
-    format!("{entries} files selected. Send up to {MAX_ENTRIES} at a time.")
+    // The count is not shown: the file manager's extension stops at 501.
+    let _ = entries;
+    format!("More than {MAX_ENTRIES} files selected. Send up to {MAX_ENTRIES} at a time.")
 }
 
 /// Says `body` where the person is looking: always on stderr (for a
@@ -239,21 +331,35 @@ pub(crate) fn safe_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
 }
 
-/// A phone's name as a menu label: no control characters, trimmed, short.
+/// Format and line/paragraph separators (bidi controls, zero-width, U+2028/9):
+/// invisible, and able to reorder what is around them.
+fn is_invisible(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+        | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}')
+}
+
+/// A phone's name as a menu label: no control or invisible characters,
+/// trimmed, at most 80 bytes (a file name is 255 at most, with "Send to ", a
+/// suffix and an extension around it).
 pub(crate) fn clean_name(name: &str) -> String {
-    let name: String = name
+    let mut clean = String::new();
+    for c in name
         .chars()
-        .filter(|c| !c.is_control())
-        .collect::<String>()
-        .trim()
-        .chars()
-        .take(60)
-        .collect();
-    let name = name.trim().to_string();
-    if name.is_empty() {
+        .filter(|c| !c.is_control() && !is_invisible(*c))
+    {
+        if clean.len() + c.len_utf8() > 80 {
+            break;
+        }
+        clean.push(c);
+    }
+    let clean = clean.trim().to_string();
+    if clean.is_empty() {
         "phone".into()
     } else {
-        name
+        clean
     }
 }
 
@@ -284,18 +390,26 @@ pub(crate) fn nemo_action(exe: &Path, device_id: &str) -> String {
 }
 
 /// An `Exec` program as Nemo's command-line parser reads it (GLib shell
-/// rules): single quotes, `'` as `'\''`; a backslash is doubled for the
-/// key file first.
+/// rules): single quotes, `'` as `'\''`; a literal `%` is a field code
+/// otherwise, so `%%`; a backslash is doubled for the key file last.
 fn shell_quote_for_nemo(exe: &Path) -> String {
-    keyfile_value(&shell_quote(&exe.to_string_lossy()))
+    keyfile_value(&shell_quote(&exe.to_string_lossy()).replace('%', "%%"))
 }
 
 pub(crate) const EXTENSION_MARK: &str = "# desklink-send-to-extension";
+/// In the phone list JSON and (as a line) the Dolphin menu.
+pub(crate) const JSON_MARK: &str = "desklink-send-to";
+pub(crate) const DOLPHIN_MARKS: [&str; 2] = [
+    "X-DeskLink-Generated=send-to",
+    // Written by older builds.
+    "X-KDE-Submenu=Send to Phone",
+];
 pub(crate) const EXTENSION: &str = include_str!("desklink_send_to.py");
 
 /// The JSON the Nautilus extension reads: the program and the phones.
 pub(crate) fn phones_json(exe: &Path, phones: &[(String, String)]) -> String {
     serde_json::json!({
+        "generator": JSON_MARK,
         "exe": exe.to_string_lossy(),
         "phones": phones.iter().map(|(id, name)| serde_json::json!({"id": id, "name": name})).collect::<Vec<_>>(),
     })
@@ -350,11 +464,65 @@ fn remove_file(path: &Path, errors: &mut Vec<String>) {
     }
 }
 
-/// Removes `path` only when it carries `mark` (a file of ours).
-fn remove_if_ours(path: &Path, mark: &str, errors: &mut Vec<String>) {
-    if std::fs::read_to_string(path).is_ok_and(|text| text.contains(mark)) {
+/// Removes `path` only when it carries one of `marks` (a file of ours).
+fn remove_if_ours(path: &Path, marks: &[&str], errors: &mut Vec<String>) {
+    if std::fs::read_to_string(path).is_ok_and(|text| marks.iter().any(|m| text.contains(m))) {
         remove_file(path, errors);
     }
+}
+
+/// Writes `content` atomically, but never over a file that is not ours (it
+/// carries none of `marks`): that is left alone and reported.
+pub(crate) fn write_marked(
+    path: &Path,
+    content: &str,
+    executable: bool,
+    marks: &[&str],
+) -> std::io::Result<()> {
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        if existing == content {
+            return Ok(());
+        }
+        if !marks.iter().any(|m| existing.contains(m)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("{} is not a DeskLink file; left alone", path.display()),
+            ));
+        }
+    } else if path.exists() {
+        // Unreadable, a folder, a dangling link: not ours either.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!("{} is not a DeskLink file; left alone", path.display()),
+        ));
+    }
+    write_atomic(path, content, executable)
+}
+
+/// A temporary file in the same folder, synced, then renamed over `path`.
+pub(crate) fn write_atomic(path: &Path, content: &str, executable: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let dir = path.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(dir)?;
+    let tmp = dir.join(format!(".desklink-tmp-{}", std::process::id()));
+    let mode = if executable { 0o755 } else { 0o644 };
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(&tmp)?;
+        file.write_all(content.as_bytes())?;
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Brings every integration file in step: `enabled` and at least one phone
@@ -402,7 +570,7 @@ pub(crate) fn sync(
         note(
             "Bucket script",
             if used {
-                write_if_changed(&bucket, &bucket_script(exe), true)
+                write_marked(&bucket, &bucket_script(exe), true, &[BUCKET_SCRIPT_MARK])
             } else if std::fs::read_to_string(&bucket).is_ok_and(|t| t.contains(BUCKET_SCRIPT_MARK))
             {
                 std::fs::remove_file(&bucket)
@@ -438,10 +606,10 @@ pub(crate) fn sync(
     if dolphin && any {
         note(
             "Dolphin menu",
-            write_if_changed(&menu, &dolphin_menu(exe, &phones), true),
+            write_marked(&menu, &dolphin_menu(exe, &phones), true, &DOLPHIN_MARKS),
         );
     } else {
-        remove_if_ours(&menu, "[Desktop Entry]", &mut errors);
+        remove_if_ours(&menu, &DOLPHIN_MARKS, &mut errors);
     }
     // The Nautilus extension and its data.
     let (ext, json) = (dirs.extension(), dirs.phones());
@@ -453,15 +621,15 @@ pub(crate) fn sync(
         };
         note(
             "Nautilus extension",
-            write_if_changed(&ext, EXTENSION, false),
+            write_marked(&ext, EXTENSION, false, &[EXTENSION_MARK]),
         );
         note(
             "Phone list",
-            write_if_changed(&json, &phones_json(exe, &phones), false),
+            write_marked(&json, &phones_json(exe, &phones), false, &[JSON_MARK]),
         );
     } else {
-        remove_if_ours(&ext, EXTENSION_MARK, &mut errors);
-        remove_file(&json, &mut errors);
+        remove_if_ours(&ext, &[EXTENSION_MARK], &mut errors);
+        remove_if_ours(&json, &[JSON_MARK], &mut errors);
         if let Some(dir) = json.parent() {
             let _ = std::fs::remove_dir(dir); // only when empty
         }
@@ -637,7 +805,16 @@ mod tests {
         ] {
             assert!(text.contains(part), "{part} in {text}");
         }
-        assert!(too_many_message(900).contains("500"));
+        assert!(too_many_message(900).starts_with("More than 500 files"));
+        assert_eq!(
+            Skipped {
+                badname: 2,
+                ..Skipped::default()
+            }
+            .message()
+            .as_deref(),
+            Some("2 file names are not valid text and can't be sent.")
+        );
     }
 
     #[test]
@@ -746,7 +923,7 @@ mod tests {
 
     // ---- S3: generated files ----
 
-    fn run_script(script: &str, args: &[&str]) -> Vec<String> {
+    fn run_script(args: &[&str]) -> Vec<String> {
         let dir = tmp();
         let out = dir.join("args");
         let stub = dir.join("a stub's \"desklink\" $HOME");
@@ -756,8 +933,6 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let script_text = script.replace("/usr/bin/desklink", &stub.to_string_lossy());
-        let _ = &script_text;
         let path = dir.join("script");
         std::fs::write(&path, super::super::script(&stub, "p1")).unwrap();
         let status = std::process::Command::new("sh")
@@ -783,7 +958,7 @@ mod tests {
             "-rf",
             "\u{e9}\u{1F4F1}.txt",
         ];
-        let got = run_script("", &names);
+        let got = run_script(&names);
         assert_eq!(&got[..4], ["--send-files", "--to", "p1", "--"]);
         assert_eq!(&got[4..], names);
         assert!(!Path::new("pwned").exists());
@@ -1087,26 +1262,184 @@ mod tests {
         let (dirs, root) = setup();
         let all = |_: &str| true;
         let evil = phones(&[("x; touch pwned", "Evil"), ("ok_1", "$(touch pwned)")]);
-        sync(
-            &dirs,
-            Path::new(EXE),
-            &evil,
-            true,
-            &env("GNOME:KDE:X-Cinnamon:XFCE", true, &all),
+        let e = env("GNOME:KDE:X-Cinnamon:XFCE", true, &all);
+        assert!(sync(&dirs, Path::new(EXE), &evil, true, &e).is_empty());
+        assert_eq!(
+            files(&root),
+            [
+                "config/caja/scripts/Add to DeskLink Bucket",
+                "config/caja/scripts/Send to $(touch pwned)",
+                "data/Thunar/sendto/Send to $(touch pwned).desktop",
+                "data/desklink/send-to-phones.json",
+                "data/kio/servicemenus/derx06.desklink.com-send.desktop",
+                "data/nautilus-python/extensions/desklink_send_to.py",
+                "data/nautilus/scripts/Add to DeskLink Bucket",
+                "data/nemo/actions/Send to $(touch pwned).nemo_action",
+                "data/nemo/scripts/Add to DeskLink Bucket",
+            ],
+            "only the plain-id phone, and its odd name is only ever text"
         );
-        for file in files(&root) {
-            assert!(
-                !file.contains("pwned") || file.contains("$(touch pwned)"),
-                "{file}"
-            );
-            assert!(!file.contains(';'), "{file}");
-        }
         for file in files(&root) {
             let text = std::fs::read_to_string(root.join(&file)).unwrap();
             assert!(!text.contains("x; touch"), "{file}");
         }
         assert!(!Path::new("pwned").exists());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_users_own_file_at_a_fixed_name_is_neither_overwritten_nor_deleted() {
+        let (dirs, root) = setup();
+        let all = |_: &str| true;
+        let e = env("GNOME:KDE:X-Cinnamon:XFCE", true, &all);
+        let theirs = "# my own file, nothing of DeskLink's\n[Desktop Entry]\nName=Mine\n";
+        let two = phones(&[("p1", "Pixel"), ("p2", "Tab")]);
+        let one = phones(&[("p1", "Pixel")]);
+        let spots = [
+            dirs.data
+                .join("nautilus-python/extensions/desklink_send_to.py"),
+            dirs.data.join("desklink/send-to-phones.json"),
+            dirs.data.join("kio/servicemenus").join(SERVICE_MENU),
+            dirs.data.join("nautilus/scripts").join(BUCKET_SCRIPT),
+            dirs.config.join("caja/scripts/Send to Pixel"),
+            dirs.data.join("nemo/actions/Send to Pixel.nemo_action"),
+            dirs.data.join("Thunar/sendto/Send to Pixel.desktop"),
+        ];
+        for spot in &spots {
+            std::fs::create_dir_all(spot.parent().unwrap()).unwrap();
+            std::fs::write(spot, theirs).unwrap();
+        }
+        // One phone (extension, nemo action) and two (scripts): every spot is hit.
+        for list in [&one, &two] {
+            let errors = sync(&dirs, Path::new(EXE), list, true, &e);
+            assert!(!errors.is_empty(), "said, not silent");
+            for spot in &spots {
+                assert_eq!(std::fs::read_to_string(spot).unwrap(), theirs, "{spot:?}");
+            }
+        }
+        // Switched off, and removed outright: still there.
+        sync(&dirs, Path::new(EXE), &one, false, &e);
+        remove_all(&dirs);
+        for spot in &spots {
+            assert_eq!(std::fs::read_to_string(spot).unwrap(), theirs, "{spot:?}");
+        }
+        // The phones' other entries were still written: one failure stops nothing.
+        assert!(dirs.config.join("caja/scripts/Send to Tab").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_menu_an_older_build_wrote_is_still_ours() {
+        let (dirs, root) = setup();
+        let menu = dirs.data.join("kio/servicemenus").join(SERVICE_MENU);
+        std::fs::create_dir_all(menu.parent().unwrap()).unwrap();
+        std::fs::write(
+            &menu,
+            "[Desktop Entry]\nType=Service\nMimeType=application/octet-stream;\nActions=phone0;\nX-KDE-Priority=TopLevel\nX-KDE-Submenu=Send to Phone\n",
+        )
+        .unwrap();
+        let kde = |p: &str| p == "dolphin";
+        let one = phones(&[("p1", "Pixel")]);
+        assert!(sync(&dirs, Path::new(EXE), &one, true, &env("KDE", false, &kde)).is_empty());
+        assert!(std::fs::read_to_string(&menu)
+            .unwrap()
+            .contains("X-DeskLink-Generated=send-to"));
+        sync(&dirs, Path::new(EXE), &one, false, &env("KDE", false, &kde));
+        assert!(!menu.exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn writes_are_atomic_and_leave_no_temporary_file() {
+        let dir = tmp();
+        let file = dir.join("sub/entry");
+        write_atomic(&file, "one", true).unwrap();
+        write_atomic(&file, "two", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "two");
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let plain = dir.join("sub/plain");
+        write_atomic(&plain, "x", false).unwrap();
+        assert_eq!(
+            std::fs::metadata(&plain).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        assert_eq!(files(&dir), ["sub/entry", "sub/plain"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_phone_name_is_escaped_in_a_notification_and_cannot_stop_the_others() {
+        let body = waiting_body("<a href=\"https://evil\">x</a> & co");
+        assert!(!body.contains('<') && body.contains("&lt;a href"), "{body}");
+        assert!(body.contains("200") && body.contains("24 hours"));
+        // 60 four-byte emoji, and a very long plain name.
+        let emoji = "\u{1F4F1}".repeat(60);
+        assert!(clean_name(&emoji).len() <= 80);
+        assert!(clean_name(&"a".repeat(400)).len() <= 80);
+        let (dirs, root) = setup();
+        let none = |_: &str| false;
+        let list = phones(&[("p1", emoji.as_str()), ("p2", "Tab"), ("p3", "Pixel")]);
+        let errors = sync(
+            &dirs,
+            Path::new(EXE),
+            &list,
+            true,
+            &env("GNOME", false, &none),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        let got = files(&root);
+        assert!(got.iter().any(|f| f.ends_with("Send to Tab")), "{got:?}");
+        assert!(got.iter().any(|f| f.ends_with("Send to Pixel")), "{got:?}");
+        assert_eq!(got.len(), 4, "three phones and the Bucket: {got:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn invisible_and_bidi_characters_are_dropped_from_names() {
+        assert_eq!(
+            clean_name("a\u{202E}b\u{200B}c\u{2028}d\u{FEFF}\u{2066}e"),
+            "abcde"
+        );
+        assert_eq!(clean_name("\u{200B}\u{202E}"), "phone");
+    }
+
+    #[test]
+    fn an_identical_request_inside_the_window_is_not_queued_twice() {
+        use std::time::{Duration, Instant};
+        let (mut recent, t0) = (Recent::default(), Instant::now());
+        let key = ("/a/b".to_string(), 10, 5);
+        assert!(recent.fresh(key.clone(), t0));
+        assert!(!recent.fresh(key.clone(), t0 + Duration::from_secs(3)));
+        assert!(
+            recent.fresh(("/a/b".into(), 11, 5), t0 + Duration::from_secs(3)),
+            "changed size"
+        );
+        assert!(
+            recent.fresh(key, t0 + Duration::from_secs(11)),
+            "window over"
+        );
+    }
+
+    #[test]
+    fn a_name_that_is_not_text_and_a_hard_link_to_our_key_are_refused() {
+        let own = glib::user_config_dir().join("desklink");
+        std::fs::create_dir_all(&own).unwrap();
+        let key = own.join("hardlinked.pem");
+        std::fs::write(&key, "secret").unwrap();
+        let dir = tmp();
+        let link = dir.join("innocent.txt");
+        std::fs::hard_link(&key, &link).unwrap();
+        let (ok, skipped) = classify(&[link, PathBuf::from("/tmp/bad\u{FFFD}name")]);
+        assert!(ok.is_empty(), "{ok:?}");
+        assert_eq!(
+            (skipped.protected, skipped.badname, skipped.missing),
+            (1, 1, 0)
+        );
+        std::fs::remove_file(&key).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -1187,6 +1520,7 @@ class F:
     def __init__(self, path, scheme="file", folder=False):
         self.path, self.scheme, self.folder = path, scheme, folder
     def get_uri_scheme(self): return self.scheme
+    def get_uri(self): return "%s://%s" % (self.scheme, self.path or "x")
     def is_directory(self): return self.folder
     def get_location(self): return types.SimpleNamespace(get_path=lambda: self.path)
 
@@ -1213,12 +1547,14 @@ for _ in range(100):
     time.sleep(0.05)
 time.sleep(0.2)
 got = open(out, "rb").read().split(b"\0")[:-1]
-assert got == [b"--send-files", b"--to", b"p1", b"--", "/tmp/it's \"x\" $(id)\n.txt".encode(), b"/tmp/dir"], got
+assert got == [b"--send-files", b"--to", b"p1", b"--", "/tmp/it's \"x\" $(id)\n.txt".encode(), b"/tmp/dir", b"smb:///x", b"file://x"], got
 # several phones: one entry, a submenu
 write([("p1", "Pixel"), ("p2", "$(rm -rf ~) \"Tab\"")])
 items = provider.get_file_items(files)
 assert len(items) == 1 and items[0].sub is not None and len(items[0].sub.items) == 2
-assert items[0].sub.items[1].kw["label"] == "Send to $(rm -rf ~) \"Tab\""
+assert items[0].sub.items[1].kw["label"] == "Send to $(rm -rf ~) \"Tab\"", "no _ in it"
+write([("p1", "Pixel"), ("p2", "my_phone")])
+assert provider.get_file_items(files)[0].sub.items[1].kw["label"] == "Send to my__phone", "mnemonic escaped"
 # a broken or hostile data file: nothing
 for bad in ["not json", "{}", json.dumps({"exe": "relative", "phones": []}), json.dumps({"exe": exe, "phones": [{"id": 1}]})]:
     with open(os.path.join(home, "desklink", "send-to-phones.json"), "w") as h: h.write(bad)
