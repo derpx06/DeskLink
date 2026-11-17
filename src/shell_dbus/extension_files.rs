@@ -68,11 +68,12 @@ pub(super) fn files_digest<'a>(files: impl Iterator<Item = (&'a str, Option<&'a 
         .collect()
 }
 
-/// Every extension DeskLink has shipped, by [`files_digest`] over the
-/// `EXTENSION_FILES` names (a file a build lacked counts as empty), from the
-/// git history of `gnome-shell-extension/` with
-/// `~/.cache/desklink-work/ext-digests.py`: a copy installed by hand, with no
-/// stamp, is still ours and safe to update.
+/// Every extension DeskLink has shipped, by [`files_digest`] (SHA-256 of
+/// name, NUL, content, NUL per file) over the `EXTENSION_FILES` names, one per
+/// version in the git history of `gnome-shell-extension/` (a file a build
+/// lacked counts as empty). The test `a_copy_is_ours_when_stamped_or_a_shipped_build`
+/// prints the digest to add. A copy installed by hand, with no stamp, is
+/// still ours and safe to update.
 pub(super) const KNOWN_BUILDS: [&str; 30] = [
     // One quiet update row and a dot (ShowUpdate), the narrower Checking... subtitle.
     "b02adfa5665f98d43b86b4356180c3b80e7f2d8804f1f314e4873a3fe89d0e2a",
